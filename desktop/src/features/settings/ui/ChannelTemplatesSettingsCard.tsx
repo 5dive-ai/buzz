@@ -78,7 +78,7 @@ export function ChannelTemplatesSettingsCard() {
       },
       onError: (error) => {
         toast.error(
-          error instanceof Error ? error.message : "Failed to duplicate",
+          error instanceof Error ? error.message : "Couldn't duplicate",
         );
       },
     });
@@ -92,9 +92,7 @@ export function ChannelTemplatesSettingsCard() {
         setDeleteTarget(null);
       },
       onError: (error) => {
-        toast.error(
-          error instanceof Error ? error.message : "Failed to delete",
-        );
+        toast.error(error instanceof Error ? error.message : "Couldn't delete");
       },
     });
   }
@@ -375,7 +373,7 @@ function TemplateFormDialog({
         },
         onError: (error) => {
           toast.error(
-            error instanceof Error ? error.message : "Failed to update",
+            error instanceof Error ? error.message : "Couldn't update",
           );
         },
       });
@@ -394,7 +392,7 @@ function TemplateFormDialog({
         },
         onError: (error) => {
           toast.error(
-            error instanceof Error ? error.message : "Failed to create",
+            error instanceof Error ? error.message : "Couldn't create",
           );
         },
       });

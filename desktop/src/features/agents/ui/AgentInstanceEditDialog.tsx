@@ -720,7 +720,7 @@ export function AgentInstanceEditDialog({
       // explicitly instead of relying on the user to know the policy.
       if (!isManagedAgentActive(result.agent)) {
         const startedName = result.agent.name;
-        toast(`${startedName} saved while stopped.`, {
+        toast(`Changes saved. ${startedName} is still stopped.`, {
           action: {
             label: "Start now",
             onClick: () => {
@@ -729,8 +729,8 @@ export function AgentInstanceEditDialog({
                 onError: (error) =>
                   toast.error(
                     error instanceof Error
-                      ? `${startedName} failed to start: ${error.message}`
-                      : `${startedName} failed to start.`,
+                      ? `Couldn't start ${startedName}: ${error.message}`
+                      : `Couldn't start ${startedName}`,
                   ),
               });
             },

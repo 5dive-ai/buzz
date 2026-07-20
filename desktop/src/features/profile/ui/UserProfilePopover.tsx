@@ -337,7 +337,7 @@ export function UserProfilePopover({
       toast.error(
         error instanceof Error
           ? error.message
-          : "Failed to open direct message.",
+          : "Couldn’t open direct message",
       );
     } finally {
       if (isMountedRef.current) {
@@ -471,7 +471,7 @@ export function UserProfilePopover({
       }
     } catch (error) {
       toast.error(
-        error instanceof Error ? error.message : "Failed to send wave.",
+        error instanceof Error ? error.message : "Couldn’t send wave",
       );
     } finally {
       if (isMountedRef.current) {

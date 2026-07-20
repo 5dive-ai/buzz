@@ -123,7 +123,7 @@ export function SignOutSection() {
         setIsPending(false);
         setIsOpen(false);
         resetDialogState();
-        toast.error(err instanceof Error ? err.message : "Sign out failed.");
+        toast.error(err instanceof Error ? err.message : "Couldn’t sign out");
       });
   }
 

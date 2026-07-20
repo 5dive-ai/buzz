@@ -117,9 +117,7 @@ function RelayMemberRow({
       toast.success(success);
     } catch (error) {
       toast.error(
-        error instanceof Error
-          ? error.message
-          : "Couldn’t update membership",
+        error instanceof Error ? error.message : "Couldn’t update membership",
       );
     }
   }

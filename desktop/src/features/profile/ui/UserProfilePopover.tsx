@@ -335,9 +335,7 @@ export function UserProfilePopover({
       }
     } catch (error) {
       toast.error(
-        error instanceof Error
-          ? error.message
-          : "Couldn’t open direct message",
+        error instanceof Error ? error.message : "Couldn’t open direct message",
       );
     } finally {
       if (isMountedRef.current) {

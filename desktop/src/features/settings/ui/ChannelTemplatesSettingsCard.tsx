@@ -166,10 +166,10 @@ export function ChannelTemplatesSettingsCard() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete template</AlertDialogTitle>
+            <AlertDialogTitle>Delete template?</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to delete &quot;{deleteTarget?.name}&quot;?
-              This action cannot be undone.
+              Delete &quot;{deleteTarget?.name}&quot;. This can&apos;t be
+              undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -178,7 +178,7 @@ export function ChannelTemplatesSettingsCard() {
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               onClick={handleDelete}
             >
-              Delete
+              Delete template
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

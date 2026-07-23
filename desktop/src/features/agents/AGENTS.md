@@ -96,12 +96,14 @@ with a TypeScript lookup table or an id comparison in a component.
    editor persists its visible fallback on the next save. Its dependent
    provider/model defaults are also ignored for new implicit fallback agents,
    without changing the persisted configuration used by existing agents.
-   `resolveStartRuntimeForDefinition` is the shared boundary that filters every
-   runtime-less start through the device's visible-runtime set; call it instead
-   of duplicating default selection in a start surface. Team deploys use the
-   same visible-runtime set only for members that need an implicit fallback, so
-   a fully pinned team remains deployable even when every installed runtime is
-   hidden. Definitions already pinned to a hidden runtime remain runnable.
+   `resolvePersonaRuntime` is the shared visibility boundary for every
+   runtime-less deployment or provisioning path. Definition-to-instance starts
+   use the stricter `resolveStartRuntimeForDefinition` wrapper; call one of
+   these shared resolvers instead of duplicating default selection in a start
+   surface. Team deploys use the same visible-runtime set only for members that
+   need an implicit fallback, so a fully pinned team remains deployable even
+   when every installed runtime is hidden. Definitions already pinned to a
+   hidden runtime remain runnable.
 10. **The defaults modal is progressively disclosed.** An unset global config
    starts on the Buzz Agent-first deployment fallback and carries that visible
    harness into the next saved edit. The `progressive-defaults` disclosure

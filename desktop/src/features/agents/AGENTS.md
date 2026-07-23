@@ -91,7 +91,9 @@ with a TypeScript lookup table or an id comparison in a component.
    from new choices while the raw Rust catalog remains authoritative for
    installation, capabilities, and existing agent configuration. Turning a
    runtime off must not uninstall it, stop it, or invalidate an existing
-   agent that already uses it.
+   agent that already uses it. If the disabled runtime was the saved global
+   default, consumers immediately ignore that preference and the defaults
+   editor persists its visible fallback on the next save.
 10. **The defaults modal is progressively disclosed.** An unset global config
    starts on the Buzz Agent-first deployment fallback and carries that visible
    harness into the next saved edit. The `progressive-defaults` disclosure

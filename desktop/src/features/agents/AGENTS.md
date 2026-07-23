@@ -85,7 +85,14 @@ with a TypeScript lookup table or an id comparison in a component.
    harnesses always keep the field. Gate: `defaults hides model when optional
    harness has empty discovery` (and the failed-discovery counterpart) in
    `onboarding-agent-defaults.spec.ts`.
-9. **The defaults modal is progressively disclosed.** An unset global config
+9. **Runtime enablement is a device-local menu preference, not a capability or
+   lifecycle fact.** Settings persists disabled runtime IDs through
+   `lib/runtimeVisibilityPreference.ts`; harness dropdowns filter those IDs
+   from new choices while the raw Rust catalog remains authoritative for
+   installation, capabilities, and existing agent configuration. Turning a
+   runtime off must not uninstall it, stop it, or invalidate an existing
+   agent that already uses it.
+10. **The defaults modal is progressively disclosed.** An unset global config
    starts on the Buzz Agent-first deployment fallback and carries that visible
    harness into the next saved edit. The `progressive-defaults` disclosure
    preset therefore begins at Provider for Buzz Agent, then reveals Model,

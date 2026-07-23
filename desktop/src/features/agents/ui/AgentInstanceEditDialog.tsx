@@ -80,6 +80,7 @@ import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentAiDefaultsNotice } from "./AgentAiDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
+import { useSelectableAcpRuntimes } from "../lib/runtimeVisibilityPreference";
 import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
 import { showAgentProfileSyncWarning } from "./agentProfileSyncWarning";
@@ -111,6 +112,7 @@ export function AgentInstanceEditDialog({
   const runtimesQuery = useAcpRuntimesQuery({ enabled: open });
   const configSurfaceQuery = useAgentConfigSurface(open ? agent.pubkey : null);
   const runtimes = runtimesQuery.data ?? [];
+  const selectableRuntimes = useSelectableAcpRuntimes(runtimes);
 
   const [name, setName] = React.useState(agent.name);
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
@@ -215,8 +217,8 @@ export function AgentInstanceEditDialog({
 
   // Build the sorted runtime catalog for the dropdown.
   const sortedRuntimes = React.useMemo(
-    () => sortPersonaRuntimes(runtimes),
-    [runtimes],
+    () => sortPersonaRuntimes(selectableRuntimes),
+    [selectableRuntimes],
   );
 
   const selectedRuntime = React.useMemo(

@@ -9,6 +9,10 @@ import {
   useGitBashPrerequisiteQuery,
   useInstallAcpRuntimeMutation,
 } from "@/features/agents/hooks";
+import {
+  setAcpRuntimeEnabled,
+  useAcpRuntimeEnabled,
+} from "@/features/agents/lib/runtimeVisibilityPreference";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { RuntimeIcon } from "@/features/onboarding/ui/RuntimeIcon";
 import type { AcpAuthMethod, AcpRuntimeCatalogEntry } from "@/shared/api/types";
@@ -185,6 +189,8 @@ function RuntimeActions({
 }) {
   const isAvailable = runtime.availability === "available";
   const canInstall = runtime.canAutoInstall && !runtime.nodeRequired;
+  const isEnabled = useAcpRuntimeEnabled(runtime.id);
+  const isOn = isAvailable && isEnabled;
   const isWorking = isInstalling || isConnecting;
 
   return (
@@ -206,13 +212,13 @@ function RuntimeActions({
         </div>
       ) : (
         <Switch
-          aria-label={`${runtime.label} availability`}
-          checked={isAvailable}
-          className="disabled:cursor-default disabled:opacity-100"
+          aria-label={`${runtime.label} enabled`}
+          checked={isOn}
           data-testid={`doctor-runtime-toggle-${runtime.id}`}
-          disabled={isAvailable || !canInstall}
+          disabled={!isAvailable && !canInstall}
           onCheckedChange={(checked) => {
-            if (checked) {
+            setAcpRuntimeEnabled(runtime.id, checked);
+            if (checked && !isAvailable) {
               onInstall();
             }
           }}
@@ -574,7 +580,7 @@ export function DoctorSettingsPanel() {
       <SectionHeader
         className="items-center"
         title="Agent runtimes"
-        description="Choose which agent tools Buzz can use on this device."
+        description="Choose which harnesses appear when configuring agents. Turning one off does not uninstall it or affect existing agents."
         action={
           <Button
             disabled={isRefreshing}

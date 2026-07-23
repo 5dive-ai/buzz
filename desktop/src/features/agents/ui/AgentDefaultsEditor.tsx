@@ -39,6 +39,7 @@ import {
 } from "@/features/agents/ui/AgentConfigFields";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
+import { useSelectableAcpRuntimes } from "@/features/agents/lib/runtimeVisibilityPreference";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
@@ -135,9 +136,10 @@ export function AgentDefaultsEditor({
   }, []);
 
   const runtimesQuery = useAcpRuntimesQuery();
+  const selectableRuntimes = useSelectableAcpRuntimes(runtimesQuery.data ?? []);
   const sortedRuntimes = React.useMemo(
-    () => sortPersonaRuntimes(runtimesQuery.data ?? []),
-    [runtimesQuery.data],
+    () => sortPersonaRuntimes(selectableRuntimes),
+    [selectableRuntimes],
   );
   // An unset preferred runtime uses the same Buzz Agent-first fallback as
   // deployment. The rendered draft below carries that fallback forward so the

@@ -83,7 +83,10 @@ import {
 } from "./agentAiConfigurationPolicy";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload";
-import { useSelectableAcpRuntimes } from "../lib/runtimeVisibilityPreference";
+import {
+  useSelectableAcpRuntimes,
+  visibleAcpRuntimeSeedForCreate,
+} from "../lib/runtimeVisibilityPreference";
 
 type AgentDefinitionDialogProps = {
   open: boolean;
@@ -143,16 +146,11 @@ export function AgentDefinitionDialog({
   const [behaviorDraft, setBehaviorDraft] = React.useState(
     emptyPersonaBehaviorDraft,
   );
-  // The seed the draft is diffed against at submit: an untouched quad
-  // submits no behavior group, keeping unrelated edits hash-quiet.
+  // Untouched behavior fields submit no group, keeping edits hash-quiet.
   const behaviorSeedRef = React.useRef(emptyPersonaBehaviorDraft);
-  // Tracks when the runtime was auto-seeded by the default-runtime effect in
-  // edit mode (i.e. the user never explicitly chose a runtime). Used to omit
-  // the seeded runtime from the submit payload for builtin definitions whose
-  // canonical runtime is null — the sync would revert it anyway.
+  // Lets edit-mode builtin definitions omit an untouched auto-seeded runtime.
   const isRuntimeAutoSeededRef = React.useRef(false);
-  // Seed once per open so choosing "No preference" cannot snap the dropdown
-  // back to the default.
+  // Prevent "No preference" from snapping back to the default.
   const hasSeededForOpenRef = React.useRef(false);
   const [showAdvancedFields, setShowAdvancedFields] = React.useState(false);
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
@@ -217,6 +215,38 @@ export function AgentDefinitionDialog({
   }, [initialValues, open]);
 
   React.useEffect(() => {
+    if (!open || !initialValues || "id" in initialValues || runtimesLoading) {
+      return;
+    }
+    const seededRuntime = initialValues.runtime?.trim() ?? "";
+    const nextRuntime = visibleAcpRuntimeSeedForCreate(
+      seededRuntime,
+      selectableRuntimes,
+      defaultRuntime?.id,
+    );
+    if (
+      !seededRuntime ||
+      runtime.trim() !== seededRuntime ||
+      nextRuntime === seededRuntime
+    ) {
+      return;
+    }
+    setRuntime(nextRuntime);
+    setModel("");
+    setProvider("");
+    setAiConfigurationMode("defaults");
+    setIsCustomModelEditing(false);
+    setIsCustomProviderEditing(false);
+  }, [
+    defaultRuntime?.id,
+    initialValues,
+    open,
+    runtime,
+    runtimesLoading,
+    selectableRuntimes,
+  ]);
+
+  React.useEffect(() => {
     if (
       !open ||
       !initialValues ||
@@ -232,10 +262,7 @@ export function AgentDefinitionDialog({
     setRuntime(defaultRuntime.id);
     hasSeededForOpenRef.current = true;
     if ("id" in initialValues) {
-      // Edit mode: record that this runtime was auto-seeded so the submit path
-      // can omit it from the payload for builtin definitions (canonical runtime
-      // null; sync would revert the value anyway). Explicit user changes via
-      // the dropdown clear this flag.
+      // Builtin definitions omit this untouched inferred runtime on submit.
       isRuntimeAutoSeededRef.current = true;
     }
   }, [defaultRuntime, initialValues, open, runtime, runtimesLoading]);
@@ -297,16 +324,14 @@ export function AgentDefinitionDialog({
       behaviorSeedRef.current = emptyPersonaBehaviorDraft;
       setShowAdvancedFields(false);
       setIsAvatarUploadPending(false);
-      // isRuntimeAutoSeededRef and hasSeededForOpenRef are NOT reset here — the
-      // [initialValues, open] effect resets both when the dialog re-opens.
+      // The open-seeding effect resets both refs on the next open.
     }
 
     onOpenChange(next);
   }
 
   async function handleSubmit() {
-    // D1: the same localModeSatisfied gate as canSubmit prevents form-submit
-    // (Enter) from bypassing a missing credential.
+    // Keep Enter submission on the same credential gate as the button.
     if (!initialValues || !localModeSatisfied || !canSubmit) return;
 
     const {
@@ -458,12 +483,6 @@ export function AgentDefinitionDialog({
   const modelFieldVisible =
     runtime.trim().length > 0 || blankRuntimeModelProviderEditable;
   const isExplicitModelRequired = aiConfigurationMode === "custom";
-  // Gate the provider requirement on the field's actual visibility, not the raw
-  // runtime capability. Codex/Claude hide the provider picker (they drive their
-  // own provider), so Customize must not require a provider there. But a
-  // runtime-less legacy/builtin definition still exposes the picker via
-  // blankRuntimeModelProviderEditable, so it must keep requiring a provider —
-  // otherwise Save could persist `provider: undefined` despite the visible field.
   const customAiPairSatisfied = agentAiConfigurationModeSatisfied(
     aiConfigurationMode,
     { provider, model },
@@ -472,8 +491,7 @@ export function AgentDefinitionDialog({
   const selectedRuntimeIsAvailable =
     runtime.trim().length === 0 ||
     selectedRuntime?.availability === "available";
-  // Gate model/provider validity through missingNormalizedFields — single
-  // source of truth with the readiness gate so display and Save can't drift.
+  // Keep model/provider validity aligned with the readiness gate.
   const canSubmit =
     canSubmitPersonaDialog({ displayName, isPending }) &&
     (!isCreateMode || runtime.trim().length > 0) &&
@@ -578,6 +596,7 @@ export function AgentDefinitionDialog({
     })),
   ];
   if (
+    !isCreateMode &&
     runtime.trim().length > 0 &&
     !runtimeDropdownOptions.some((option) => option.value === runtime)
   ) {

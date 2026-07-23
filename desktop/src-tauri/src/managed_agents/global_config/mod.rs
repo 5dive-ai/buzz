@@ -207,6 +207,53 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
     atomic_write_json_restricted(&path, &payload)
 }
 
+/// Return the global provider/model values that are safe for this record.
+///
+/// A runtime-less definition can be started on a fallback runtime when its
+/// saved global preference is hidden or unavailable. In that case the selected
+/// command is pinned on the record, and provider/model defaults belonging to a
+/// different preferred runtime must not cross the harness boundary. Explicitly
+/// configured definitions and standalone agents keep normal global inheritance.
+pub(crate) fn global_model_provider_for_record<'a>(
+    record: &ManagedAgentRecord,
+    personas: &[AgentDefinition],
+    global: &'a GlobalAgentConfig,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let global_values = (global.model.as_deref(), global.provider.as_deref());
+    if record.persona_id.is_none() {
+        return global_values;
+    }
+
+    let definition_runtime = record.runtime.as_deref().or_else(|| {
+        record
+            .persona_id
+            .as_deref()
+            .and_then(|id| personas.iter().find(|persona| persona.id == id))
+            .and_then(|persona| persona.runtime.as_deref())
+    });
+    if definition_runtime.is_some_and(|runtime| !runtime.trim().is_empty()) {
+        return global_values;
+    }
+
+    let Some(selected_runtime) = record
+        .agent_command_override
+        .as_deref()
+        .and_then(crate::managed_agents::known_acp_runtime)
+    else {
+        return global_values;
+    };
+    let preferred_runtime = global
+        .preferred_runtime
+        .as_deref()
+        .and_then(crate::managed_agents::known_acp_runtime);
+
+    if preferred_runtime.is_some_and(|preferred| std::ptr::eq(preferred, selected_runtime)) {
+        global_values
+    } else {
+        (None, None)
+    }
+}
+
 /// Resolve the effective model and provider for an agent.
 ///
 /// Delegates to `effective_config::resolve_effective_config` which enforces

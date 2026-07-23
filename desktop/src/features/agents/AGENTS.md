@@ -93,9 +93,12 @@ with a TypeScript lookup table or an id comparison in a component.
    runtime off must not uninstall it, stop it, or invalidate an existing
    agent that already uses it. If the disabled runtime was the saved global
    default, consumers immediately ignore that preference and the defaults
-   editor persists its visible fallback on the next save. Runtime-less agent
-   starts and team deploys must filter through the same visible-runtime set;
-   definitions already pinned to a hidden runtime remain runnable.
+   editor persists its visible fallback on the next save. Its dependent
+   provider/model defaults are also ignored for new implicit fallback agents,
+   without changing the persisted configuration used by existing agents.
+   Runtime-less agent starts and team deploys must filter through the same
+   visible-runtime set; definitions already pinned to a hidden runtime remain
+   runnable.
 10. **The defaults modal is progressively disclosed.** An unset global config
    starts on the Buzz Agent-first deployment fallback and carries that visible
    harness into the next saved edit. The `progressive-defaults` disclosure

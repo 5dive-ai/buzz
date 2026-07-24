@@ -33,6 +33,7 @@ import {
   getDefaultPersonaRuntime,
   getPersonaHiddenProviderIds,
   getPersonaProviderOptions,
+  getRelayMeshRuntime,
   getProviderApiKeyEnvVar,
   isMissingRequiredDropdownField,
   NO_RUNTIME_DROPDOWN_VALUE,
@@ -541,14 +542,17 @@ export function AgentInstanceEditDialog({
   function handleProviderDropdownChange(nextValue: string) {
     const nextProvider =
       nextValue === AUTO_PROVIDER_DROPDOWN_VALUE ? "" : nextValue;
-    if (nextProvider === "relay-mesh" && selectedRuntimeId !== "buzz-agent") {
-      handleRuntimeDropdownChange("buzz-agent");
+    const relayMeshRuntime =
+      nextProvider === "relay-mesh"
+        ? getRelayMeshRuntime(selectableRuntimes, selectedRuntime)
+        : null;
+    const nextRuntimeId =
+      relayMeshRuntime?.id ?? selectedRuntime?.id ?? selectedRuntimeId;
+    if (nextRuntimeId !== selectedRuntimeId) {
+      handleRuntimeDropdownChange(nextRuntimeId);
     }
     const nextSelection = selectionOnProviderDropdownChange(selection, {
-      runtime:
-        nextProvider === "relay-mesh"
-          ? "buzz-agent"
-          : (selectedRuntime?.id ?? selectedRuntimeId),
+      runtime: nextRuntimeId,
       nextValue,
       clearModelWhenApiKeyMissing: false,
     });
@@ -793,7 +797,7 @@ export function AgentInstanceEditDialog({
   const hideProviderIds = getPersonaHiddenProviderIds({
     bakedEnvKeys: bakedEnvKeys ?? [],
     selectableRuntimes,
-    currentRuntimeId: selectedRuntimeId,
+    currentRuntime: selectedRuntime,
     preserveCurrentRuntime: true,
   });
   const providerOptions = getPersonaProviderOptions(

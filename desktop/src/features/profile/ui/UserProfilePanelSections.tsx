@@ -50,6 +50,7 @@ import type {
 import { cn } from "@/shared/lib/cn";
 import { Alert, AlertDescription, AlertTitle } from "@/shared/ui/alert";
 import { Badge } from "@/shared/ui/badge";
+import { VerifiedBadge } from "@/shared/ui/VerifiedBadge";
 
 export { AgentInstructionsFocusedView } from "@/features/profile/ui/UserProfilePanelAgentDetails";
 
@@ -526,6 +527,16 @@ function ProfileHero({
             />
           ) : null}
         </div>
+
+        {profile?.verifiedName?.trim() ? (
+          <div
+            className="flex items-center justify-center gap-1.5 text-sm font-medium text-muted-foreground"
+            data-testid="user-profile-verified-alias"
+          >
+            <span>{profile.verifiedName.trim()}</span>
+            <VerifiedBadge verifiedName={profile.verifiedName.trim()} />
+          </div>
+        ) : null}
 
         {profile?.about?.trim() ? (
           <ProfileHeroDescription

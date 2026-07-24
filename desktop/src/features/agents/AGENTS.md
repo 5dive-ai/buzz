@@ -102,10 +102,14 @@ with a TypeScript lookup table or an id comparison in a component.
    runtime-less deployment or provisioning path. Definition-to-instance starts
    use the stricter `resolveStartRuntimeForDefinition` wrapper; call one of
    these shared resolvers instead of duplicating default selection in a start
-   surface. Team deploys use the same visible-runtime set only for members that
-   need an implicit fallback, so a fully pinned team remains deployable even
-   when every installed runtime is hidden. Definitions already pinned to a
-   hidden runtime remain runnable.
+   surface. Persona-backed provisioning uses
+   `resolveProvisioningRuntimeForDefinition` so the resolved runtime and
+   backend pinning bit cannot drift apart. Team deploys use the same
+   visible-runtime set only for members that need an implicit fallback, so a
+   fully pinned team remains deployable even when every installed runtime is
+   hidden. Definitions already pinned to a hidden runtime remain runnable.
+   Provider pickers use `getPersonaHiddenProviderIds` as the shared
+   relay-mesh visibility policy.
 10. **The defaults modal is progressively disclosed.** An unset global config
    starts on the Buzz Agent-first deployment fallback and carries that visible
    harness into the next saved edit. The `progressive-defaults` disclosure

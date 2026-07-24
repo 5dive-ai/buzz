@@ -28,6 +28,7 @@ import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
   AUTO_PROVIDER_DROPDOWN_VALUE,
   CUSTOM_PROVIDER_DROPDOWN_VALUE,
+  formatCurrentRuntimeOptionLabel,
   formatRuntimeOptionLabel,
   getDefaultLlmModelLabel,
   getDefaultPersonaRuntime,
@@ -243,12 +244,12 @@ export function AgentInstanceEditDialog({
       !options.some((o) => o.value === selectedRuntimeId)
     ) {
       options.push({
-        label: `${selectedRuntimeId} (current)`,
+        label: formatCurrentRuntimeOptionLabel(runtimes, selectedRuntimeId),
         value: selectedRuntimeId,
       });
     }
     return options;
-  }, [sortedRuntimes, selectedRuntimeId]);
+  }, [runtimes, sortedRuntimes, selectedRuntimeId]);
 
   // Resolve the dialog-opening command as the catalog loads. Edit-state runtime
   // ids mutate during selection changes and cannot identify the original state.

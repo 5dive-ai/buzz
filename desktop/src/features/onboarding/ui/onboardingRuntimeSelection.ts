@@ -39,8 +39,9 @@ export function getVisibleOnboardingRuntimes(
 
 export function getReadyOnboardingRuntimes(
   runtimes: readonly AcpRuntimeCatalogEntry[],
+  disabledRuntimeIds: readonly string[] = [],
 ) {
-  return getVisibleOnboardingRuntimes(runtimes).filter(
+  return getVisibleOnboardingRuntimes(runtimes, disabledRuntimeIds).filter(
     runtimeIsReadyForOnboarding,
   );
 }

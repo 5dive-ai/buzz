@@ -144,6 +144,34 @@ test("ready state is detected and enables Next without persisting a default", as
   expect(await readSavedRuntime(page)).toBeNull();
 });
 
+test("setup cannot advance to defaults when every ready harness is device-disabled", async ({
+  page,
+}) => {
+  await page.addInitScript((storageKey) => {
+    window.localStorage.setItem(
+      storageKey,
+      JSON.stringify(["claude", "codex"]),
+    );
+  }, ACP_RUNTIME_VISIBILITY_STORAGE_KEY);
+  await installMockBridge(
+    page,
+    {
+      acpRuntimesCatalog: [
+        runtime("claude", "available", { status: "logged_in" }),
+        runtime("codex", "available", { status: "logged_in" }),
+      ],
+    },
+    { skipCommunitySeed: true, skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+  await navigateToSetupPage(page);
+
+  await expect(page.getByTestId("onboarding-setup-next")).toBeDisabled();
+  await page.getByTestId("onboarding-setup-skip").click();
+  await expect(page.getByText("Join or create a community")).toBeVisible();
+  await expect(page.getByTestId("onboarding-page-config")).toHaveCount(0);
+});
+
 test("setup shows runtime discovery loading before rendering harnesses", async ({
   page,
 }) => {

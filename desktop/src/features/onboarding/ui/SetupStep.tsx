@@ -8,6 +8,7 @@ import {
   useConnectAcpRuntimeMutation,
   useInstallAcpRuntimeMutation,
 } from "@/features/agents/hooks";
+import { useDisabledAcpRuntimeIds } from "@/features/agents/lib/runtimeVisibilityPreference";
 import { describeResolvedCommand } from "@/features/agents/ui/agentUi";
 import type { AcpAuthMethod, AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import { getInstallErrorMessage } from "@/shared/lib/installError";
@@ -656,12 +657,14 @@ function SetupStepContent({
   const { runtimeProviders } = state;
   const [installResults, setInstallResults] =
     React.useState<InstallResultsState>({});
+  const disabledRuntimeIds = useDisabledAcpRuntimeIds();
   const readyRuntimeIds = React.useMemo(
     () =>
-      getReadyOnboardingRuntimes(runtimeProviders.items).map(
-        (runtime) => runtime.id,
-      ),
-    [runtimeProviders.items],
+      getReadyOnboardingRuntimes(
+        runtimeProviders.items,
+        disabledRuntimeIds,
+      ).map((runtime) => runtime.id),
+    [disabledRuntimeIds, runtimeProviders.items],
   );
   const readyRuntimeIdsKey = readyRuntimeIds.join("\0");
   // The key prevents catalog object refreshes from creating an effect loop

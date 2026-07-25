@@ -9,6 +9,7 @@ import {
   filterEnabledAcpRuntimes,
   useDisabledAcpRuntimeIds,
 } from "@/features/agents/lib/runtimeVisibilityPreference";
+import { getDefaultPersonaRuntime } from "@/features/agents/lib/resolvePersonaRuntime";
 import { clearActiveTurnsForAgentOnStop } from "@/features/agents/managedAgentRuntimeHooks";
 import { useImplicitGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useCommunities } from "@/features/communities/useCommunities";
@@ -61,9 +62,23 @@ export function resolveWelcomeAgentReadiness(
   globalConfig: GlobalAgentConfig,
   disabledRuntimeIds: readonly string[],
 ) {
+  const visibleRuntimes = filterEnabledAcpRuntimes(
+    runtimes,
+    disabledRuntimeIds,
+  );
+  const selectedRuntime = getDefaultPersonaRuntime(
+    visibleRuntimes,
+    globalConfig.preferred_runtime,
+  );
+  if (!selectedRuntime) return { ready: false } as const;
+
   return resolveAgentReadiness(
-    filterEnabledAcpRuntimes(runtimes, disabledRuntimeIds),
-    globalConfig,
+    visibleRuntimes,
+    {
+      ...globalConfig,
+      preferred_runtime: selectedRuntime.id,
+    },
+    "preferred",
   );
 }
 

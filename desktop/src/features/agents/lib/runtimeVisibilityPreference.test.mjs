@@ -118,3 +118,19 @@ test("a disabled saved runtime and its dependent defaults are masked", () => {
   });
   assert.equal(maskDisabledAcpRuntimePreference(config, ["claude"]), config);
 });
+
+test("legacy defaults without a saved runtime are owned by buzz-agent", () => {
+  const config = {
+    env_vars: {},
+    provider: "relay-mesh",
+    model: "auto",
+    preferred_runtime: null,
+  };
+
+  assert.deepEqual(maskDisabledAcpRuntimePreference(config, ["buzz-agent"]), {
+    ...config,
+    provider: null,
+    model: null,
+  });
+  assert.equal(maskDisabledAcpRuntimePreference(config, ["goose"]), config);
+});

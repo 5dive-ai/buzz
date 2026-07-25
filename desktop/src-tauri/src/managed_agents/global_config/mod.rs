@@ -214,6 +214,8 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
 /// command is pinned on the record, and provider/model defaults belonging to a
 /// different preferred runtime must not cross the harness boundary. Explicitly
 /// configured definitions and standalone agents keep normal global inheritance.
+/// Configs written before `preferred_runtime` existed implicitly belong to
+/// Buzz Agent.
 pub(crate) fn global_model_provider_for_record<'a>(
     record: &ManagedAgentRecord,
     personas: &[AgentDefinition],
@@ -235,17 +237,17 @@ pub(crate) fn global_model_provider_for_record<'a>(
         return global_values;
     }
 
-    let Some(preferred_runtime) = global
+    let preferred_runtime = global
         .preferred_runtime
         .as_deref()
         .and_then(crate::managed_agents::known_acp_runtime)
-    else {
-        return global_values;
-    };
+        .or_else(|| crate::managed_agents::known_acp_runtime("buzz-agent"));
     let selected_command = crate::managed_agents::record_agent_command(record, personas);
     let selected_runtime = crate::managed_agents::known_acp_runtime(&selected_command);
 
-    if selected_runtime.is_some_and(|selected| preferred_runtime.id == selected.id) {
+    if selected_runtime.is_some_and(|selected| {
+        preferred_runtime.is_some_and(|preferred| preferred.id == selected.id)
+    }) {
         global_values
     } else {
         (None, None)

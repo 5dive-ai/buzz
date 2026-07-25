@@ -57,6 +57,40 @@ test("welcome readiness ignores a hidden logged-in runtime", () => {
   );
 });
 
+test("welcome readiness evaluates the runtime selected by the visible fallback", () => {
+  const runtimes = [
+    {
+      id: "buzz-agent",
+      label: "Buzz Agent",
+      availability: "available",
+      authStatus: { status: "not_applicable" },
+    },
+    {
+      id: "goose",
+      label: "Goose",
+      availability: "available",
+      authStatus: { status: "not_applicable" },
+    },
+    {
+      id: "claude",
+      label: "Claude",
+      availability: "available",
+      authStatus: { status: "logged_in" },
+    },
+  ];
+  const globalConfig = {
+    env_vars: {},
+    provider: null,
+    model: null,
+    preferred_runtime: "buzz-agent",
+  };
+
+  assert.deepEqual(
+    resolveWelcomeAgentReadiness(runtimes, globalConfig, ["buzz-agent"]),
+    { ready: false },
+  );
+});
+
 test("welcome provisioning requires an enabled available runtime", () => {
   const runtimes = [
     {

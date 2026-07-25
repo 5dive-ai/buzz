@@ -166,7 +166,8 @@ export function visibleAcpRuntimeSeedForCreate<T extends { id: string }>(
  * The persisted config is left untouched until the user next saves defaults;
  * existing agents keep their configuration while new consumers immediately
  * fall back through the normal runtime selection path without carrying a
- * provider or model selected for the hidden harness.
+ * provider or model selected for the hidden harness. Configs written before
+ * preferred_runtime existed implicitly belong to Buzz Agent.
  */
 export function maskDisabledAcpRuntimePreference<
   T extends {
@@ -176,11 +177,11 @@ export function maskDisabledAcpRuntimePreference<
   },
 >(config: T, disabledRuntimeIds: readonly string[]): T {
   const preferredRuntime = config.preferred_runtime;
+  const implicitLegacyRuntime = preferredRuntime?.trim() || "buzz-agent";
   if (
-    !preferredRuntime ||
     !disabledRuntimeIds
       .map(normalizeRuntimeId)
-      .includes(normalizeRuntimeId(preferredRuntime))
+      .includes(normalizeRuntimeId(implicitLegacyRuntime))
   ) {
     return config;
   }

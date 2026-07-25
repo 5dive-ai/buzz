@@ -96,6 +96,9 @@ with a TypeScript lookup table or an id comparison in a component.
    editor persists its visible fallback on the next save. Its dependent
    provider/model defaults are also ignored for new implicit fallback agents,
    without changing the persisted configuration used by existing agents.
+   Legacy global defaults with no saved preferred runtime are treated as
+   Buzz Agent-owned for this masking boundary, so hiding Buzz Agent cannot
+   leak its provider/model into another implicit fallback.
    Create-mode dialogs use the implicit masked config; existing definition and
    instance edit dialogs use the raw persisted config.
    `resolvePersonaRuntime` is the shared visibility boundary for every

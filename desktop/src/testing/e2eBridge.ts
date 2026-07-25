@@ -75,6 +75,7 @@ type MockManagedAgentSeed = {
   name: string;
   avatarUrl?: string | null;
   personaId?: string | null;
+  teamId?: string | null;
   /** Harness/runtime id pin; `null` = inherit from persona (native default). */
   runtime?: string | null;
   status?: RawManagedAgent["status"];
@@ -714,6 +715,7 @@ type RawManagedAgent = {
   pubkey: string;
   name: string;
   persona_id: string | null;
+  team_id?: string | null;
   /** Record-level harness/runtime pin (`null` when inheriting from the persona). */
   runtime: string | null;
   relay_url: string;
@@ -1467,6 +1469,7 @@ function cloneManagedAgent(agent: MockManagedAgent): RawManagedAgent {
     pubkey: agent.pubkey,
     name: agent.name,
     persona_id: agent.persona_id,
+    team_id: agent.team_id ?? null,
     runtime: agent.runtime ?? null,
     relay_url: agent.relay_url,
     acp_command: agent.acp_command,
@@ -2001,6 +2004,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     pubkey: seed.pubkey,
     name: seed.name,
     persona_id: seed.personaId ?? null,
+    team_id: seed.teamId ?? null,
     // Native serde always emits this key (`null` when unpinned) — the bridge
     // must mirror the wire shape, not omit the key.
     runtime: seed.runtime ?? null,

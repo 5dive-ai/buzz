@@ -2,6 +2,7 @@ import { hexToBytes } from "@noble/hashes/utils.js";
 import { expect, test, type Page } from "@playwright/test";
 import { nsecEncode } from "nostr-tools/nip19";
 
+import { ACP_RUNTIME_VISIBILITY_STORAGE_KEY } from "@/features/agents/lib/runtimeVisibilityPreference";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 import { installFakeCamera } from "../helpers/fakeCamera";
 import {
@@ -2724,6 +2725,71 @@ test("first-run onboarding lands before Welcome team bootstrap completes", async
   );
   await page.waitForTimeout(1_500);
   expect(await commandCount(page, "create_managed_agent")).toBe(3);
+});
+
+test("first-run onboarding reuses the Welcome team when every harness is hidden", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await page.addInitScript((storageKey) => {
+    window.localStorage.setItem(storageKey, JSON.stringify(["goose"]));
+  }, ACP_RUNTIME_VISIBILITY_STORAGE_KEY);
+  await installMockBridge(
+    page,
+    {
+      acpRuntimesCatalog: [
+        {
+          id: "goose",
+          label: "Goose",
+          avatar_url: "",
+          availability: "available",
+          command: "goose",
+          binary_path: "/usr/local/bin/goose",
+          default_args: ["acp"],
+          mcp_command: null,
+          install_hint: "Install Goose",
+          install_instructions_url: "https://block.github.io/goose/",
+          can_auto_install: true,
+          requires_external_cli: true,
+          underlying_cli_path: null,
+          node_required: false,
+          auth_status: { status: "not_applicable" },
+          login_hint: null,
+        },
+      ],
+      managedAgents: [
+        {
+          pubkey: "f".repeat(64),
+          name: "Fizz",
+          personaId: "builtin:fizz",
+          teamId: "builtin-team:welcome",
+        },
+        {
+          pubkey: "e".repeat(64),
+          name: "Honey",
+          personaId: "builtin:honey",
+          teamId: "builtin-team:welcome",
+        },
+        {
+          pubkey: "d".repeat(64),
+          name: "Bumble",
+          personaId: "builtin:bumble",
+          teamId: "builtin-team:welcome",
+        },
+      ],
+    },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("onboarding-display-name").fill("Morty QA");
+  await completeProfileOnboarding(page);
+
+  await expectPrivateWelcomeLanding(page);
+  await expect(page.getByTestId("message-timeline")).toContainText(
+    "connect to an AI provider in Settings",
+  );
+  expect(await commandCount(page, "create_managed_agent")).toBe(0);
 });
 
 test("existing relay profile with display name auto-skips onboarding without localStorage", async ({

@@ -67,6 +67,15 @@ export function resolveWelcomeAgentReadiness(
   );
 }
 
+export function hasEnabledWelcomeRuntime(
+  runtimes: readonly AcpRuntimeCatalogEntry[],
+  disabledRuntimeIds: readonly string[],
+) {
+  return filterEnabledAcpRuntimes(runtimes, disabledRuntimeIds).some(
+    (runtime) => runtime.availability === "available",
+  );
+}
+
 function formatAgentNames(agents: readonly ManagedAgent[]) {
   if (agents.length === 0) return "";
   if (agents.length === 1) return agents[0]?.name ?? "";
@@ -579,11 +588,17 @@ export function useWelcomeKickoff(
       ),
     [disabledRuntimeIds, globalConfig, runtimesQuery.data],
   );
+  const canProvisionWelcomeTeam = React.useMemo(
+    () =>
+      hasEnabledWelcomeRuntime(runtimesQuery.data ?? [], disabledRuntimeIds),
+    [disabledRuntimeIds, runtimesQuery.data],
+  );
   React.useEffect(() => {
     if (
       !channelId ||
       !isActiveWelcome ||
       configLoading ||
+      managedAgentsQuery.isPending ||
       runtimesQuery.isPending
     ) {
       return;
@@ -596,6 +611,21 @@ export function useWelcomeKickoff(
       focusedWelcomeChannelRef.current !== channelId;
     void (async () => {
       try {
+        if (await markerExists(channelId, closerMarker)) {
+          return;
+        }
+        if (!canProvisionWelcomeTeam) {
+          if (!agentSet) return;
+          await sendManagedAgentChannelMessage({
+            agentPubkey: agentSet.lead.pubkey,
+            channelId,
+            content: WELCOME_KICKOFF_PROVIDER_MESSAGE,
+            marker: providerMarker,
+            markerScope: "channel",
+          });
+          return;
+        }
+
         const welcomeTeam = await ensureWelcomeTeam(
           channelId,
           activeCommunity?.relayUrl,
@@ -715,9 +745,12 @@ export function useWelcomeKickoff(
     })();
   }, [
     activeCommunity?.relayUrl,
+    agentSet,
+    canProvisionWelcomeTeam,
     channelId,
     configLoading,
     isActiveWelcome,
+    managedAgentsQuery.isPending,
     onKickoffOpenerPosted,
     queryClient,
     readiness,

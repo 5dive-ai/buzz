@@ -8,6 +8,7 @@ import {
   buildWelcomeKickoffOpenerSendInput,
   classifyWelcomeKickoffResolution,
   createWelcomeKickoffCoordinator,
+  hasEnabledWelcomeRuntime,
   mergeKickoffEvents,
   resolveWelcomeAgentReadiness,
   resolveWelcomeAgentSet,
@@ -54,6 +55,26 @@ test("welcome readiness ignores a hidden logged-in runtime", () => {
     resolveWelcomeAgentReadiness(runtimes, globalConfig, ["claude"]),
     { ready: false },
   );
+});
+
+test("welcome provisioning requires an enabled available runtime", () => {
+  const runtimes = [
+    {
+      id: "goose",
+      label: "Goose",
+      availability: "available",
+      authStatus: { status: "not_applicable" },
+    },
+    {
+      id: "claude",
+      label: "Claude",
+      availability: "adapter_missing",
+      authStatus: { status: "unknown" },
+    },
+  ];
+
+  assert.equal(hasEnabledWelcomeRuntime(runtimes, ["goose"]), false);
+  assert.equal(hasEnabledWelcomeRuntime(runtimes, []), true);
 });
 
 test("resolveWelcomeAgentSet orders agents by stable persona identity", () => {

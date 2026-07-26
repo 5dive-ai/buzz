@@ -389,7 +389,10 @@ const overrides = new Map([
   // the available-adapter and docs-only negatives, acp_install_plan resolution
   // for preset/builtin/custom-id, and a scope guard asserting Amp is the only
   // preset carrying install commands.
-  ["src-tauri/src/managed_agents/discovery/tests.rs", 2026],
+  // +59: Tier-3 boundary through the real loader — a custom definition whose
+  // free-text install hint looks executable must still report
+  // can_auto_install: false out of discover_acp_runtimes_from.
+  ["src-tauri/src/managed_agents/discovery/tests.rs", 2085],
   // identity-import-keyring: the identity resolution state machine's behavioral
   // matrix (46 tests over FakeIdentityStore — probe × marker × file cells,
   // adoption / read-back-corruption / marker-failure arms, recovery-mode

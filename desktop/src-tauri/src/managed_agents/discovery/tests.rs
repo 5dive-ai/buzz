@@ -417,6 +417,65 @@ fn test_custom_harness_id_has_no_install_plan() {
     assert!(acp_install_plan("").is_none());
 }
 
+/// The Tier-3 boundary as the catalog actually exposes it.
+///
+/// The static-lookup test above passes an id that no tier defines, so it would
+/// stay green even if a *loaded* custom entry set `can_auto_install: true`.
+/// This drives the real loader through `discover_acp_runtimes_from`, selects
+/// the `HarnessSource::Custom` entry, and pins the flag the UI gates on — with
+/// an install hint deliberately written to look like a runnable npm command, so
+/// the assertion fails if that free text is ever promoted to an install plan.
+#[test]
+fn test_loaded_custom_harness_never_offers_auto_install() {
+    use crate::managed_agents::custom_harnesses::registry_test_lock;
+    use crate::managed_agents::discovery::discover_acp_runtimes_from;
+    use crate::managed_agents::HarnessSource;
+    use std::fs;
+    use tempfile::tempdir;
+
+    // Discovery warms the process-global PATH caches and publishes to the
+    // global harness registry. Lock order matches the other discovery tests:
+    // path lock first, then registry.
+    let _path_guard = crate::managed_agents::lock_path_mutex();
+    let _lock = registry_test_lock();
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("sneaky-harness.json"),
+        r#"{
+            "id": "sneaky-harness",
+            "label": "Sneaky Harness",
+            "command": "sneaky-harness-bin",
+            "args": [],
+            "installHint": "npm install -g sneaky-harness"
+        }"#,
+    )
+    .unwrap();
+
+    let entries = discover_acp_runtimes_from(Some(dir.path()));
+    let entry = entries
+        .iter()
+        .find(|e| e.id == "sneaky-harness")
+        .expect("custom entry must appear in catalog");
+
+    assert_eq!(entry.source, HarnessSource::Custom);
+    assert_eq!(
+        entry.install_hint, "npm install -g sneaky-harness",
+        "precondition: the hint is executable-looking free text"
+    );
+    assert!(
+        !entry.can_auto_install,
+        "a loaded custom harness must never offer one-click install"
+    );
+    assert!(
+        !entry.node_required,
+        "no install plan means no Node.js gate to report"
+    );
+    assert!(
+        acp_install_plan(&entry.id).is_none(),
+        "and it must resolve to no install plan"
+    );
+}
+
 #[test]
 fn test_node_required_ignores_non_npm_install_commands() {
     // CLI installers are curl-pipes; they need no npm, so a missing npm must

@@ -589,10 +589,12 @@ function RuntimeProvidersLoadingState() {
 }
 
 function RuntimeProvidersSection({
+  disabledRuntimeIds,
   installResults,
   onInstallResultsChange,
   runtimeProviders,
 }: {
+  disabledRuntimeIds: readonly string[];
   installResults: InstallResultsState;
   onInstallResultsChange: React.Dispatch<
     React.SetStateAction<InstallResultsState>
@@ -600,7 +602,7 @@ function RuntimeProvidersSection({
   runtimeProviders: SetupStepState["runtimeProviders"];
 }) {
   const { errorMessage, isChecking, items } = runtimeProviders;
-  const orderedItems = getVisibleOnboardingRuntimes(items);
+  const orderedItems = getVisibleOnboardingRuntimes(items, disabledRuntimeIds);
 
   return (
     <section className="flex min-h-full w-full flex-col items-center">
@@ -682,6 +684,7 @@ function SetupStepContent({
       transitionKey={`setup-${direction}`}
     >
       <RuntimeProvidersSection
+        disabledRuntimeIds={disabledRuntimeIds}
         installResults={installResults}
         onInstallResultsChange={setInstallResults}
         runtimeProviders={runtimeProviders}

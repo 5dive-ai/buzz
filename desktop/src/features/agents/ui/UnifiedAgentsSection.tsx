@@ -1,7 +1,12 @@
 import * as React from "react";
-import { ChevronDown, ChevronRight, RefreshCw } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  RefreshCw,
+} from "lucide-react";
 
-import { formatAgentModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
+import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { useUserProfileQuery } from "@/features/profile/hooks";
@@ -260,10 +265,11 @@ function AgentPersonaCard({
   onStartPersona: (persona: AgentPersona) => void;
 }) {
   const title = persona.displayName;
-  const explicitModel = agent?.model ?? persona.model;
-  const modelLabel = explicitModel?.trim()
-    ? formatAgentModelLabel(explicitModel)
-    : formatDefaultModelLabel(defaultModel);
+  const modelLabel = resolveAgentCardModelLabel({
+    agent,
+    personaModel: persona.model,
+    defaultModel,
+  });
   const isActive = agent ? isManagedAgentActive(agent) : false;
   const profileQuery = useUserProfileQuery(agent?.pubkey);
   const avatarUrl = agent
@@ -321,7 +327,12 @@ function AgentPersonaCard({
         onOpenPersonaProfile(persona);
       }}
       statusBadge={
-        agent?.needsRestart ? (
+        agent?.personaOrphaned ? (
+          <Badge className="gap-1" variant="warning">
+            <AlertTriangle className="h-3 w-3" />
+            Configuration missing
+          </Badge>
+        ) : agent?.needsRestart ? (
           <Badge className="gap-1" variant="warning">
             <RefreshCw className="h-3 w-3" />
             Restart required
@@ -379,11 +390,11 @@ function StandaloneAgentCard({
       avatarUrl={profileQuery.data?.avatarUrl}
       dataTestId={`managed-agent-${agent.pubkey}`}
       label={title}
-      modelLabel={
-        agent.model?.trim()
-          ? formatAgentModelLabel(agent.model)
-          : formatDefaultModelLabel(defaultModel)
-      }
+      modelLabel={resolveAgentCardModelLabel({
+        agent,
+        personaModel: null,
+        defaultModel,
+      })}
       onClick={() => {
         onOpenAgentProfile(
           agent.pubkey,
@@ -391,7 +402,12 @@ function StandaloneAgentCard({
         );
       }}
       statusBadge={
-        agent.needsRestart ? (
+        agent.personaOrphaned ? (
+          <Badge className="gap-1" variant="warning">
+            <AlertTriangle className="h-3 w-3" />
+            Configuration missing
+          </Badge>
+        ) : agent.needsRestart ? (
           <Badge className="gap-1" variant="warning">
             <RefreshCw className="h-3 w-3" />
             Restart required
@@ -400,11 +416,6 @@ function StandaloneAgentCard({
       }
     />
   );
-}
-
-function formatDefaultModelLabel(defaultModel: string) {
-  const model = defaultModel.trim();
-  return model ? `Default model (${model})` : "Default model";
 }
 
 function firstAvatarUrl(

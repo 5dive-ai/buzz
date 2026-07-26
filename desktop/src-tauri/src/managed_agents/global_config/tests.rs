@@ -516,7 +516,6 @@ fn implicit_fallback_override_masks_defaults_from_a_different_preferred_runtime(
         model: Some("auto".to_string()),
         provider: Some("relay-mesh".to_string()),
         preferred_runtime: Some("buzz-agent".to_string()),
-        ..Default::default()
     };
 
     assert_eq!(

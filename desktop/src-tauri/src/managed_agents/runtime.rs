@@ -542,9 +542,10 @@ pub fn spawn_agent_child(
     // slow-starting harness (e.g. a gateway-backed adapter at several
     // seconds per worker) took minutes — and a mention sent in that window
     // predated the watermark and could be missed permanently. There is
-    // deliberately no parameter for this: no Desktop flow may spawn eager
-    // (see the F1 note in restore.rs; `spawn_lazy_pool_env_is_unconditional`
-    // pins the env contract).
+    // deliberately no parameter for this: the compiler is the guard — no
+    // Desktop flow can express an eager spawn (see the F1 note in
+    // restore.rs; `spawn_lazy_pool_env_writes_literal_true_once` pins the
+    // literal and single-write-site residue a scanner can catch).
     command.env("BUZZ_ACP_LAZY_POOL", "true");
     command.env("BUZZ_ACP_AGENT_COMMAND", &resolved_agent_command);
     command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));

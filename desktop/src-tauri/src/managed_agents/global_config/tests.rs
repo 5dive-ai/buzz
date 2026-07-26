@@ -309,6 +309,7 @@ fn bare_record() -> ManagedAgentRecord {
         acp_command: "buzz-acp".to_string(),
         agent_command: "goose".to_string(),
         agent_command_override: None,
+        agent_command_override_is_implicit: false,
         agent_args: vec![],
         mcp_command: "".to_string(),
         turn_timeout_seconds: 300,
@@ -473,10 +474,35 @@ fn resolve_global_fallback_when_record_and_persona_have_none() {
 }
 
 #[test]
-fn runtime_fallback_does_not_inherit_defaults_from_a_different_preferred_runtime() {
+fn explicit_harness_override_keeps_defaults_from_a_different_preferred_runtime() {
     let mut record = bare_record();
     record.persona_id = Some("p1".to_string());
     record.agent_command_override = Some("goose".to_string());
+    let personas = vec![persona("p1", None, None)];
+    let global = GlobalAgentConfig {
+        env_vars: BTreeMap::from([("BUZZ_AGENT_THINKING_EFFORT".to_string(), "high".to_string())]),
+        model: Some("auto".to_string()),
+        provider: Some("relay-mesh".to_string()),
+        preferred_runtime: Some("buzz-agent".to_string()),
+    };
+
+    assert_eq!(
+        resolve_effective_model_provider(&record, &personas, &global),
+        (Some("auto".to_string()), Some("relay-mesh".to_string()))
+    );
+    assert_eq!(
+        global_env_vars_for_record(&record, &personas, &global),
+        global.env_vars
+    );
+}
+
+#[test]
+fn implicit_fallback_override_masks_defaults_from_a_different_preferred_runtime() {
+    let mut record = bare_record();
+    record.persona_id = Some("p1".to_string());
+    record.agent_command = "goose".to_string();
+    record.agent_command_override = Some("goose".to_string());
+    record.agent_command_override_is_implicit = true;
     let personas = vec![persona("p1", None, None)];
     let global = GlobalAgentConfig {
         model: Some("auto".to_string()),
@@ -492,7 +518,7 @@ fn runtime_fallback_does_not_inherit_defaults_from_a_different_preferred_runtime
 }
 
 #[test]
-fn legacy_runtime_fallback_does_not_inherit_implicit_buzz_agent_defaults() {
+fn explicit_harness_override_keeps_legacy_global_defaults() {
     let mut record = bare_record();
     record.persona_id = Some("p1".to_string());
     record.agent_command_override = Some("goose".to_string());
@@ -506,7 +532,7 @@ fn legacy_runtime_fallback_does_not_inherit_implicit_buzz_agent_defaults() {
 
     assert_eq!(
         resolve_effective_model_provider(&record, &personas, &global),
-        (None, None)
+        (Some("auto".to_string()), Some("relay-mesh".to_string()))
     );
 }
 

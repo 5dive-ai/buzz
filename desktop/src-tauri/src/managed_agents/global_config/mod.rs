@@ -211,11 +211,15 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
 ///
 /// A runtime-less definition can be started on a fallback runtime when its
 /// saved global preference is hidden or unavailable. In that case the selected
-/// command is pinned on the record, and provider/model defaults belonging to a
-/// different preferred runtime must not cross the harness boundary. Explicitly
-/// configured definitions and standalone agents keep normal global inheritance.
-/// Configs written before `preferred_runtime` existed implicitly belong to
-/// Buzz Agent.
+/// command is stored as the record snapshot, and provider/model defaults
+/// belonging to a different preferred runtime must not cross the harness
+/// boundary. A non-empty `agent_command_override` keeps normal global
+/// inheritance only when it represents an explicit harness selection. An
+/// automatic runtime-less fallback carries a separate durable marker so its
+/// pin survives provisioning without adopting defaults owned by another
+/// harness. Explicitly configured definitions and standalone agents keep
+/// normal global inheritance. Configs written before `preferred_runtime`
+/// existed implicitly belong to Buzz Agent.
 pub(crate) fn global_model_provider_for_record<'a>(
     record: &ManagedAgentRecord,
     personas: &[AgentDefinition],
@@ -234,6 +238,15 @@ pub(crate) fn global_model_provider_for_record<'a>(
             .and_then(|persona| persona.runtime.as_deref())
     });
     if definition_runtime.is_some_and(|runtime| !runtime.trim().is_empty()) {
+        return global_values;
+    }
+
+    if !record.agent_command_override_is_implicit
+        && record
+            .agent_command_override
+            .as_deref()
+            .is_some_and(|command| !command.trim().is_empty())
+    {
         return global_values;
     }
 

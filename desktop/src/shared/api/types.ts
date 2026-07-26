@@ -456,6 +456,11 @@ export type CreateManagedAgentInput = {
    * same persona runtime id, while still ignoring missing-runtime fallbacks.
    */
   harnessOverride?: boolean;
+  /**
+   * True when `harnessOverride` pins an automatically selected runtime for a
+   * runtime-less persona rather than a runtime the user explicitly selected.
+   */
+  implicitHarnessFallback?: boolean;
   agentArgs?: string[];
   mcpCommand?: string;
   turnTimeoutSeconds?: number;

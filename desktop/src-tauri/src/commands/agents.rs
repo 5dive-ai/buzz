@@ -759,20 +759,21 @@ pub async fn create_managed_agent(
         // Load personas once for harness/pack/avatar resolution below.
         let personas = load_personas(&app).unwrap_or_default();
 
-        // Harness resolution: the persona's runtime is authoritative. A
-        // persona-backed create stores an `agent_command_override` ONLY when the
-        // user deliberately picked a divergent runtime (`harness_override`) —
-        // e.g. AddChannelBotDialog's runtime selector. A divergence WITHOUT that
-        // flag is a missing-runtime fallback from `resolvePersonaRuntime`, not a
-        // pin, and must inherit so it doesn't freeze on the fallback harness once
-        // the persona's runtime is installed. A persona-less create always
-        // preserves the picked command as a real pin.
-        let agent_command_override = crate::managed_agents::create_time_agent_command_override(
-            requested_persona_id.as_deref(),
-            &personas,
-            input.agent_command.as_deref(),
-            input.harness_override,
-        );
+        // The persona runtime is authoritative. Persist an override only when
+        // the selected runtime must remain pinned (`harness_override`). This
+        // includes explicit picks and the visible fallback for a runtime-less
+        // persona. `implicit_harness_fallback` distinguishes those intents so
+        // the pin cannot adopt defaults owned by another harness. A divergence
+        // without `harness_override` remains inherited so it can recover when
+        // its configured runtime is installed. Persona-less creates always pin.
+        let (agent_command_override, agent_command_override_is_implicit) =
+            crate::managed_agents::create_time_agent_command_override_state(
+                requested_persona_id.as_deref(),
+                &personas,
+                input.agent_command.as_deref(),
+                input.harness_override,
+                input.implicit_harness_fallback,
+            );
         // The create-time snapshot used for arg/mcp/avatar derivations and
         // legacy reconcile. Authoritative spawn resolution re-derives this via
         // `effective_agent_command` at use-time.
@@ -891,6 +892,7 @@ pub async fn create_managed_agent(
                 .to_string(),
             agent_command,
             agent_command_override,
+            agent_command_override_is_implicit,
             agent_args,
             mcp_command,
             // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness;

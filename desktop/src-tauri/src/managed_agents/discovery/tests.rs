@@ -324,6 +324,7 @@ fn record_with(
         acp_command: String::new(),
         agent_command: String::new(),
         agent_command_override: override_cmd.map(str::to_string),
+        agent_command_override_is_implicit: false,
         agent_args: vec![],
         mcp_command: String::new(),
         turn_timeout_seconds: 0,
@@ -698,10 +699,12 @@ fn apply_agent_command_update_inherit_sentinel_clears_pin_and_runtime() {
     // live definition immediately — not on the next spawn.
     let personas = vec![persona_with_runtime("p1", Some("goose"))];
     let mut record = record_with(Some("claude"), Some("p1"), Some("codex-acp"));
+    record.agent_command_override_is_implicit = true;
 
     apply_agent_command_update(&mut record, &personas, "", false);
 
     assert_eq!(record.agent_command_override, None);
+    assert!(!record.agent_command_override_is_implicit);
     assert_eq!(record.runtime, None);
     assert_eq!(record_agent_command(&record, &personas), "goose");
 }
@@ -726,10 +729,12 @@ fn apply_agent_command_update_concrete_pin_keeps_materialized_runtime() {
     // the next snapshot apply. The pin shadows it in resolution either way.
     let personas = vec![persona_with_runtime("p1", Some("goose"))];
     let mut record = record_with(Some("claude"), Some("p1"), None);
+    record.agent_command_override_is_implicit = true;
 
     apply_agent_command_update(&mut record, &personas, "codex-acp", true);
 
     assert_eq!(record.agent_command_override.as_deref(), Some("codex-acp"));
+    assert!(!record.agent_command_override_is_implicit);
     assert_eq!(record.runtime.as_deref(), Some("claude"));
     assert_eq!(record_agent_command(&record, &personas), "codex-acp");
 }

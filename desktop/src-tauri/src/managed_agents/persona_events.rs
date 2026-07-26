@@ -439,6 +439,7 @@ pub fn apply_persona_snapshot(record: &mut ManagedAgentRecord, persona: &AgentDe
         {
             if !std::ptr::eq(pin_runtime, def_runtime) {
                 record.agent_command_override = None;
+                record.agent_command_override_is_implicit = false;
             }
         }
     }

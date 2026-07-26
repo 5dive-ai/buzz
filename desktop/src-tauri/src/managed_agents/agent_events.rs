@@ -168,6 +168,7 @@ mod tests {
             acp_command: "buzz-acp".to_string(),
             agent_command: "goose".to_string(),
             agent_command_override: None,
+            agent_command_override_is_implicit: false,
             agent_args: vec!["--flag".to_string()],
             mcp_command: "buzz-dev-mcp".to_string(),
             turn_timeout_seconds: 320,

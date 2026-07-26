@@ -120,7 +120,10 @@ export function resolveProvisioningRuntimeForDefinition(
   runtimes: readonly AcpRuntime[],
   preferredRuntimeId?: string | null,
   disabledRuntimeIds: readonly string[] = getDisabledAcpRuntimeIdsSnapshot(),
-): ResolvePersonaRuntimeResult & { harnessOverride: boolean } {
+): ResolvePersonaRuntimeResult & {
+  harnessOverride: boolean;
+  implicitHarnessFallback: boolean;
+} {
   const defaultRuntime = getDefaultPersonaRuntime(runtimes, preferredRuntimeId);
   const resolved = resolvePersonaRuntime(
     definitionRuntimeId,
@@ -137,6 +140,8 @@ export function resolveProvisioningRuntimeForDefinition(
         definitionRuntimeId,
         resolved.runtime.id,
       ),
+    implicitHarnessFallback:
+      resolved.runtime !== null && !definitionRuntimeId?.trim(),
   };
 }
 
@@ -207,6 +212,7 @@ export async function buildInstanceInputForDefinition(
       persona.runtime,
       runtime.id,
     ),
+    implicitHarnessFallback: !persona.runtime?.trim(),
     model: persona.model ?? undefined,
     provider: persona.provider ?? undefined,
     spawnAfterCreate: true,

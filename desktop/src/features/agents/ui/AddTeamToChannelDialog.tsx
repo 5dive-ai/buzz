@@ -160,6 +160,7 @@ export function AddTeamToChannelDialog({
             persona.runtime,
             personaRuntime.id,
           ),
+          implicitHarnessFallback: !persona.runtime?.trim(),
           model: persona.model ?? undefined,
           personaId: persona.id,
           teamId: team.id,

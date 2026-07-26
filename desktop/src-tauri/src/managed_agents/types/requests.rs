@@ -136,10 +136,14 @@ pub struct CreateManagedAgentRequest {
     pub acp_command: Option<String>,
     pub agent_command: Option<String>,
     /// True when `agent_command` must survive linked-persona inheritance.
-    /// Includes explicit selections, installed aliases, and the visible
-    /// implicit fallback for a runtime-less persona.
+    /// Includes explicit selections, installed aliases, and automatic
+    /// fallbacks for runtime-less personas.
     #[serde(default)]
     pub harness_override: bool,
+    /// True when `harness_override` preserves an automatic runtime-less
+    /// fallback rather than an explicit harness selection.
+    #[serde(default)]
+    pub implicit_harness_fallback: bool,
     #[serde(default)]
     pub agent_args: Vec<String>,
     /// Accepted for wire compatibility; not applied to the record. The

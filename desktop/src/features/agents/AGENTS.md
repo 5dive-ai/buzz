@@ -98,7 +98,11 @@ with a TypeScript lookup table or an id comparison in a component.
    without changing the persisted configuration used by existing agents.
    Legacy global defaults with no saved preferred runtime are treated as
    Buzz Agent-owned for this masking boundary, so hiding Buzz Agent cannot
-   leak its provider/model into another implicit fallback.
+   leak its provider/model into another implicit fallback. A persisted
+   per-instance harness override carries a durable explicit-vs-implicit marker:
+   explicit selections continue to inherit global provider/model defaults even
+   when the selected harness differs from the global preference, while
+   automatic runtime-less fallback pins keep mismatched defaults masked.
    Create-mode dialogs use the implicit masked config; existing definition and
    instance edit dialogs use the raw persisted config.
    `resolvePersonaRuntime` is the shared visibility boundary for every

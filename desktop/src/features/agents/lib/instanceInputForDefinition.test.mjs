@@ -84,12 +84,14 @@ test("row 2: harnessOverride follows the backend-aligned formula", async () => {
     gooseRuntime,
   );
   assert.equal(match.harnessOverride, true, "picked == configured → true");
+  assert.equal(match.implicitHarnessFallback, false);
 
   const noPreference = await buildInstanceInputForDefinition(
     persona({ runtime: undefined }),
     gooseRuntime,
   );
   assert.equal(noPreference.harnessOverride, true, "no preference → true");
+  assert.equal(noPreference.implicitHarnessFallback, true);
 
   const differs = await buildInstanceInputForDefinition(
     persona({ runtime: "claude" }),
@@ -100,6 +102,7 @@ test("row 2: harnessOverride follows the backend-aligned formula", async () => {
     false,
     "picked != configured → false (definition stays authoritative)",
   );
+  assert.equal(differs.implicitHarnessFallback, false);
 });
 
 test("provisioning pins a visible fallback for a runtime-less definition", () => {
@@ -111,6 +114,7 @@ test("provisioning pins a visible fallback for a runtime-less definition", () =>
   );
   assert.equal(resolved.runtime, gooseRuntime);
   assert.equal(resolved.harnessOverride, true);
+  assert.equal(resolved.implicitHarnessFallback, true);
 });
 
 test("provisioning uses product ordering and leaves unavailable configured fallbacks unpinned", () => {
@@ -121,12 +125,14 @@ test("provisioning uses product ordering and leaves unavailable configured fallb
   ]);
   assert.equal(ordered.runtime, buzzAgentRuntime);
   assert.equal(ordered.harnessOverride, true);
+  assert.equal(ordered.implicitHarnessFallback, true);
 
   const unavailable = resolveProvisioningRuntimeForDefinition("missing", [
     gooseRuntime,
   ]);
   assert.equal(unavailable.runtime, gooseRuntime);
   assert.equal(unavailable.harnessOverride, false);
+  assert.equal(unavailable.implicitHarnessFallback, false);
 });
 
 test("row 3: plain avatar URLs pass through; base64 data URIs upload via the injectable", async () => {
@@ -205,6 +211,7 @@ test("no backend intent is byte-identical to the pre-intent mapping", async () =
     agentArgs: [],
     mcpCommand: "goose-mcp",
     harnessOverride: true,
+    implicitHarnessFallback: false,
     model: undefined,
     provider: undefined,
     spawnAfterCreate: true,

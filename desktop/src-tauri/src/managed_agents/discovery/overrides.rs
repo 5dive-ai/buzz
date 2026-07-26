@@ -102,6 +102,7 @@ pub fn apply_agent_command_update(
         Some(agent_command),
         harness_override,
     );
+    record.agent_command_override_is_implicit = false;
     if agent_command.trim().is_empty() && record.persona_id.is_some() {
         record.runtime = None;
     }
@@ -150,4 +151,27 @@ pub fn create_time_agent_command_override(
     }
 
     divergent_agent_command_override(persona_id, personas, picked_command)
+}
+
+/// Resolve the create-time harness pin and whether it represents an automatic
+/// runtime-less fallback rather than explicit selection intent.
+pub fn create_time_agent_command_override_state(
+    persona_id: Option<&str>,
+    personas: &[crate::managed_agents::types::AgentDefinition],
+    picked_command: Option<&str>,
+    harness_override: bool,
+    implicit_harness_fallback: bool,
+) -> (Option<String>, bool) {
+    let command =
+        create_time_agent_command_override(persona_id, personas, picked_command, harness_override);
+    let is_runtime_less_persona = persona_id
+        .and_then(|id| personas.iter().find(|persona| persona.id == id))
+        .is_some_and(|persona| {
+            persona
+                .runtime
+                .as_deref()
+                .is_none_or(|runtime| runtime.trim().is_empty())
+        });
+    let is_implicit = command.is_some() && implicit_harness_fallback && is_runtime_less_persona;
+    (command, is_implicit)
 }

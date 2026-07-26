@@ -326,7 +326,7 @@ export function useMentionSendFlow({
         }
         seenPersonaIds.add(persona.id);
 
-        const { harnessOverride, runtime } =
+        const { harnessOverride, implicitHarnessFallback, runtime } =
           resolveProvisioningRuntimeForDefinition(persona.runtime, runtimes);
         if (!runtime) {
           errors.push(`${displayName}: No agent runtime available.`);
@@ -342,6 +342,7 @@ export function useMentionSendFlow({
             name: persona.displayName,
             personaId: persona.id,
             harnessOverride,
+            implicitHarnessFallback,
             systemPrompt: persona.systemPrompt,
             avatarUrl: persona.avatarUrl ?? undefined,
             model: persona.model ?? undefined,

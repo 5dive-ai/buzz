@@ -95,6 +95,7 @@ impl AgentDefinition {
             acp_command: DEFAULT_ACP_COMMAND.to_string(),
             agent_command: String::new(),
             agent_command_override: None,
+            agent_command_override_is_implicit: false,
             agent_args: Vec::new(),
             mcp_command: String::new(),
             turn_timeout_seconds: DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
@@ -225,15 +226,21 @@ pub struct ManagedAgentRecord {
     pub avatar_url: Option<String>,
     pub acp_command: String,
     pub agent_command: String,
-    /// Explicit per-instance harness pin. `None` (the default) means inherit
-    /// the harness from the linked persona's `runtime`, so persona harness
-    /// edits propagate on the next spawn — mirroring the opt-in `model`
-    /// override. `Some` is set only when the user deliberately picks a harness
-    /// that diverges from the persona. Resolved via `effective_agent_command`;
-    /// `agent_command` above is the create-time snapshot kept for avatar/legacy
-    /// derivations and is not authoritative for spawn.
+    /// Per-instance harness pin. `None` (the default) means inherit the harness
+    /// from the linked persona's `runtime`, so persona harness edits propagate
+    /// on the next spawn — mirroring the opt-in `model` override. `Some` is
+    /// normally an explicit divergent selection, but may preserve the visible
+    /// automatic fallback chosen for a runtime-less persona; the accompanying
+    /// marker distinguishes those intents. Resolved via
+    /// `effective_agent_command`; `agent_command` above is the create-time
+    /// snapshot kept for avatar/legacy derivations and is not authoritative for
+    /// spawn.
     #[serde(default)]
     pub agent_command_override: Option<String>,
+    /// Whether `agent_command_override` preserves an automatic runtime-less
+    /// fallback rather than an explicit per-instance harness selection.
+    #[serde(default)]
+    pub agent_command_override_is_implicit: bool,
     pub agent_args: Vec<String>,
     /// Create-time snapshot of the catalog MCP command. Never read at spawn —
     /// the effective MCP command is always re-derived from the runtime catalog
@@ -473,10 +480,12 @@ pub struct ManagedAgentSummary {
     pub relay_url: String,
     pub acp_command: String,
     pub agent_command: String,
-    /// Mirrors `ManagedAgentRecord.agent_command_override`: `Some` when the user
-    /// has explicitly pinned this instance's harness, `None` when it inherits
-    /// from the persona. Lets the Edit dialog seed "Inherit from persona" vs a
-    /// concrete pin (`agent_command` above is the resolved/effective command).
+    /// Mirrors `ManagedAgentRecord.agent_command_override`: `Some` when this
+    /// instance has a durable harness pin, `None` when it inherits from the
+    /// persona. A pin may be an explicit selection or an automatic fallback
+    /// for a runtime-less persona. Lets the Edit dialog seed "Inherit from
+    /// persona" vs a concrete pin (`agent_command` above is the
+    /// resolved/effective command).
     pub agent_command_override: Option<String>,
     pub agent_args: Vec<String>,
     /// Catalog-derived from the effective harness (not the record's stored

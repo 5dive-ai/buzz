@@ -32,7 +32,7 @@ export function useQuickBotDrop(channelId: string | null) {
       setState({ pending: true, error: null });
 
       try {
-        const { harnessOverride, runtime } =
+        const { harnessOverride, implicitHarnessFallback, runtime } =
           resolveProvisioningRuntimeForDefinition(persona.runtime, providers);
 
         if (!runtime) {
@@ -51,6 +51,7 @@ export function useQuickBotDrop(channelId: string | null) {
           personaId: persona.id,
           model: persona.model ?? undefined,
           harnessOverride,
+          implicitHarnessFallback,
         });
 
         setState({ pending: false, error: null });

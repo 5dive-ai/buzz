@@ -113,6 +113,7 @@ fn test_record() -> ManagedAgentRecord {
         definition_parallelism: None,
         relay_mesh: None,
         agent_command_override: None,
+        agent_command_override_is_implicit: false,
         persona_source_version: None,
         provider: None,
     }

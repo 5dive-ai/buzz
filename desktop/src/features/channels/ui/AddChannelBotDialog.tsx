@@ -156,6 +156,7 @@ export function AddChannelBotDialog({
           name: persona.displayName,
           personaId: persona.id,
           harnessOverride: resolved.harnessOverride,
+          implicitHarnessFallback: resolved.implicitHarnessFallback,
           systemPrompt: persona.systemPrompt,
           avatarUrl: persona.avatarUrl ?? undefined,
           model: persona.model ?? undefined,

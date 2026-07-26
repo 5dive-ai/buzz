@@ -272,6 +272,22 @@ fn create_request_deserializes_camel_case_relay_mesh() {
             model_ref: "Qwen3".to_string()
         })
     );
+    assert!(!request.implicit_harness_fallback);
+}
+
+#[test]
+fn create_request_deserializes_implicit_harness_fallback_intent() {
+    let request: CreateManagedAgentRequest = serde_json::from_str(
+        r#"{
+            "name": "fallback-agent",
+            "harnessOverride": true,
+            "implicitHarnessFallback": true
+        }"#,
+    )
+    .expect("camelCase implicit fallback intent should deserialize");
+
+    assert!(request.harness_override);
+    assert!(request.implicit_harness_fallback);
 }
 
 /// Persisted records use snake_case; the camelCase alias must not break
@@ -442,6 +458,7 @@ fn managed_agent_record_without_key_deserializes_empty() {
     .expect("keyring-backed record without inline key should deserialize");
 
     assert_eq!(record.private_key_nsec, "");
+    assert!(!record.agent_command_override_is_implicit);
 }
 
 fn sample_agent_record() -> ManagedAgentRecord {

@@ -874,6 +874,7 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
         acpCommand: input.acpCommand,
         agentCommand: input.agentCommand,
         harnessOverride: input.harnessOverride ?? false,
+        implicitHarnessFallback: input.implicitHarnessFallback ?? false,
         agentArgs: input.agentArgs,
         mcpCommand: input.mcpCommand,
         turnTimeoutSeconds: input.turnTimeoutSeconds,

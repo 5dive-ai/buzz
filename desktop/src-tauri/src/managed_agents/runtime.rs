@@ -953,7 +953,16 @@ pub fn start_managed_agent_process(
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
-    let mut process = spawn_agent_child(app, record, &key.relay_url, false, owner_hex)?;
+    // Lazy, matching manual start, restart, reconcile, and restore (see the
+    // F1 note in restore.rs). This was the last eager call site. Eager init
+    // ran the full serial pool spawn BEFORE the harness connected to the
+    // relay, so create/start of a slow-starting agent (e.g. a gateway-backed
+    // harness at several seconds per worker) took minutes — and a mention
+    // sent in that window predated the startup watermark and could be missed
+    // permanently. Lazy connects/subscribes first, queues accepted work, and
+    // initializes the pool in the cancellable wake task on first flushable
+    // work.
+    let mut process = spawn_agent_child(app, record, &key.relay_url, true, owner_hex)?;
     let now = now_iso();
     let receipt = super::ManagedAgentRuntimeReceipt {
         key: key.clone(),

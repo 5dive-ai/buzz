@@ -1052,3 +1052,73 @@ fn restart_eligible_false_when_orphan_has_no_drift() {
 fn restart_eligible_false_when_non_orphan_has_no_drift() {
     assert!(!super::restart_eligible(false, false, false));
 }
+
+// ── every spawn_agent_child call site is lazy ────────────────────────
+//
+// The eager path (`lazy=false` → BUZZ_ACP_LAZY_POOL=false) makes buzz-acp
+// serially initialize the FULL worker pool before connecting to the relay.
+// For a slow-starting harness that is minutes of startup, and any mention
+// sent in that window predates the startup watermark and can be missed
+// permanently. Every Desktop flow (create/start, manual start, restart,
+// reconcile, restore) must therefore spawn lazy: relay connects first,
+// accepted work queues, and the pool initializes in the cancellable wake
+// task.
+//
+// `spawn_agent_child` spawns a real OS process, so this contract is pinned
+// at the source level: no call site may pass a literal `false` for the
+// `lazy` parameter. If a new call site legitimately needs eager init,
+// it must carry a documented exemption here.
+#[test]
+fn no_spawn_agent_child_call_site_is_eager() {
+    let sources = [
+        (
+            "runtime.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/managed_agents/runtime.rs"
+            )),
+        ),
+        (
+            "runtime_commands.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/managed_agents/runtime_commands.rs"
+            )),
+        ),
+        (
+            "restore.rs",
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/managed_agents/restore.rs"
+            )),
+        ),
+    ];
+    for (name, source) in sources {
+        for (idx, line) in source.lines().enumerate() {
+            let trimmed = line.trim();
+            // Skip comments; match only argument-position literal `false`
+            // in a spawn_agent_child call. The call spans multiple lines in
+            // restore.rs, so scan a small window after the call token.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains("spawn_agent_child(") {
+                let window: String = source
+                    .lines()
+                    .skip(idx)
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // The lazy flag is the 4th argument; a literal `false` in the
+                // window is the eager smell this test exists to catch.
+                assert!(
+                    !window.contains("false"),
+                    "{name}:{}: spawn_agent_child call site appears to pass \
+                     lazy=false (eager pool init). All Desktop spawns must be \
+                     lazy — see this test's doc comment. Call window:\n{window}",
+                    idx + 1
+                );
+            }
+        }
+    }
+}

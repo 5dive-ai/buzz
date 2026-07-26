@@ -33,6 +33,8 @@ use crate::managed_agents::env_vars::{
 use crate::managed_agents::storage::{atomic_write_json_restricted, managed_agents_base_dir};
 use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
 
+const HARNESS_DEPENDENT_GLOBAL_ENV_KEYS: &[&str] = &["BUZZ_AGENT_THINKING_EFFORT"];
+
 /// The global agent configuration record.
 ///
 /// Shape mirrors the per-agent/persona trio (`env_vars` + `provider` + `model`)
@@ -45,11 +47,12 @@ use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
 /// consulted); for a definition-less instance, instance → global.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GlobalAgentConfig {
-    /// Global env vars injected into ALL agents unconditionally.
+    /// Global env vars injected below persona and per-agent overrides.
     ///
     /// Lowest user-settable layer — per-agent and persona values win on any
-    /// key collision. Reserved and derived keys are rejected at save time and
-    /// stripped at spawn time.
+    /// key collision. Harness-dependent effort is masked when a runtime-less
+    /// definition falls back away from the preferred runtime. Reserved and
+    /// derived keys are rejected at save time and stripped at spawn time.
     #[serde(default)]
     pub env_vars: BTreeMap<String, String>,
 
@@ -207,11 +210,11 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
     atomic_write_json_restricted(&path, &payload)
 }
 
-/// Return the global provider/model values that are safe for this record.
+/// Whether harness-dependent global defaults are safe for this record.
 ///
 /// A runtime-less definition can be started on a fallback runtime when its
 /// saved global preference is hidden or unavailable. In that case the selected
-/// command is stored as the record snapshot, and provider/model defaults
+/// command is stored as the record snapshot, and harness-dependent defaults
 /// belonging to a different preferred runtime must not cross the harness
 /// boundary. A non-empty `agent_command_override` keeps normal global
 /// inheritance only when it represents an explicit harness selection. An
@@ -220,14 +223,13 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
 /// harness. Explicitly configured definitions and standalone agents keep
 /// normal global inheritance. Configs written before `preferred_runtime`
 /// existed implicitly belong to Buzz Agent.
-pub(crate) fn global_model_provider_for_record<'a>(
+fn global_harness_defaults_apply_to_record(
     record: &ManagedAgentRecord,
     personas: &[AgentDefinition],
-    global: &'a GlobalAgentConfig,
-) -> (Option<&'a str>, Option<&'a str>) {
-    let global_values = (global.model.as_deref(), global.provider.as_deref());
+    global: &GlobalAgentConfig,
+) -> bool {
     if record.persona_id.is_none() {
-        return global_values;
+        return true;
     }
 
     let definition_runtime = record.runtime.as_deref().or_else(|| {
@@ -238,7 +240,7 @@ pub(crate) fn global_model_provider_for_record<'a>(
             .and_then(|persona| persona.runtime.as_deref())
     });
     if definition_runtime.is_some_and(|runtime| !runtime.trim().is_empty()) {
-        return global_values;
+        return true;
     }
 
     if !record.agent_command_override_is_implicit
@@ -247,7 +249,7 @@ pub(crate) fn global_model_provider_for_record<'a>(
             .as_deref()
             .is_some_and(|command| !command.trim().is_empty())
     {
-        return global_values;
+        return true;
     }
 
     let preferred_runtime = global
@@ -258,13 +260,38 @@ pub(crate) fn global_model_provider_for_record<'a>(
     let selected_command = crate::managed_agents::record_agent_command(record, personas);
     let selected_runtime = crate::managed_agents::known_acp_runtime(&selected_command);
 
-    if selected_runtime.is_some_and(|selected| {
+    selected_runtime.is_some_and(|selected| {
         preferred_runtime.is_some_and(|preferred| preferred.id == selected.id)
-    }) {
-        global_values
+    })
+}
+
+/// Return the global provider/model values that are safe for this record.
+pub(crate) fn global_model_provider_for_record<'a>(
+    record: &ManagedAgentRecord,
+    personas: &[AgentDefinition],
+    global: &'a GlobalAgentConfig,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if global_harness_defaults_apply_to_record(record, personas, global) {
+        (global.model.as_deref(), global.provider.as_deref())
     } else {
         (None, None)
     }
+}
+
+/// Return global env vars with harness-dependent defaults masked when an
+/// implicit fallback crosses the preferred-runtime boundary.
+pub(crate) fn global_env_vars_for_record(
+    record: &ManagedAgentRecord,
+    personas: &[AgentDefinition],
+    global: &GlobalAgentConfig,
+) -> BTreeMap<String, String> {
+    let mut env_vars = global.env_vars.clone();
+    if !global_harness_defaults_apply_to_record(record, personas, global) {
+        for key in HARNESS_DEPENDENT_GLOBAL_ENV_KEYS {
+            env_vars.remove(*key);
+        }
+    }
+    env_vars
 }
 
 /// Resolve the effective model and provider for an agent.

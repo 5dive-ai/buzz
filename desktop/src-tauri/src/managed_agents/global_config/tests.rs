@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    normalize_global_config_fields, resolve_effective_model_provider, strip_empty_env_vars,
-    validate_global_config, GlobalAgentConfig,
+    global_env_vars_for_record, normalize_global_config_fields, resolve_effective_model_provider,
+    strip_empty_env_vars, validate_global_config, GlobalAgentConfig,
 };
 use crate::managed_agents::{AgentDefinition, BackendKind, ManagedAgentRecord, RespondTo};
 
@@ -494,6 +494,10 @@ fn explicit_harness_override_keeps_defaults_from_a_different_preferred_runtime()
         global_env_vars_for_record(&record, &personas, &global),
         global.env_vars
     );
+    assert_eq!(
+        global_env_vars_for_record(&record, &personas, &global),
+        global.env_vars
+    );
 }
 
 #[test]
@@ -505,6 +509,10 @@ fn implicit_fallback_override_masks_defaults_from_a_different_preferred_runtime(
     record.agent_command_override_is_implicit = true;
     let personas = vec![persona("p1", None, None)];
     let global = GlobalAgentConfig {
+        env_vars: BTreeMap::from([
+            ("BUZZ_AGENT_THINKING_EFFORT".to_string(), "high".to_string()),
+            ("SHARED_API_KEY".to_string(), "kept".to_string()),
+        ]),
         model: Some("auto".to_string()),
         provider: Some("relay-mesh".to_string()),
         preferred_runtime: Some("buzz-agent".to_string()),
@@ -514,6 +522,10 @@ fn implicit_fallback_override_masks_defaults_from_a_different_preferred_runtime(
     assert_eq!(
         resolve_effective_model_provider(&record, &personas, &global),
         (None, None)
+    );
+    assert_eq!(
+        global_env_vars_for_record(&record, &personas, &global),
+        BTreeMap::from([("SHARED_API_KEY".to_string(), "kept".to_string())])
     );
 }
 

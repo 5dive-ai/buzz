@@ -1,4 +1,5 @@
 import * as React from "react";
+import { withoutHarnessDependentAgentEnvVars } from "../ui/buzzAgentConfig";
 
 export const ACP_RUNTIME_VISIBILITY_STORAGE_KEY =
   "buzz-agent-runtime-visibility.v1";
@@ -166,11 +167,12 @@ export function visibleAcpRuntimeSeedForCreate<T extends { id: string }>(
  * The persisted config is left untouched until the user next saves defaults;
  * existing agents keep their configuration while new consumers immediately
  * fall back through the normal runtime selection path without carrying a
- * provider or model selected for the hidden harness. Configs written before
- * preferred_runtime existed implicitly belong to Buzz Agent.
+ * provider, model, or effort selected for the hidden harness. Configs written
+ * before preferred_runtime existed implicitly belong to Buzz Agent.
  */
 export function maskDisabledAcpRuntimePreference<
   T extends {
+    env_vars: Record<string, string>;
     model: string | null;
     preferred_runtime: string | null;
     provider: string | null;
@@ -188,6 +190,7 @@ export function maskDisabledAcpRuntimePreference<
 
   return {
     ...config,
+    env_vars: withoutHarnessDependentAgentEnvVars(config.env_vars),
     model: null,
     preferred_runtime: null,
     provider: null,

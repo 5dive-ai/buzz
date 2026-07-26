@@ -256,7 +256,9 @@ fn resolve_effective_agent_env_with_def(
     // Injected before persona/agent so per-agent values win on collision.
     // `merged_user_env` with an empty "lower" map applies reserved/malformed-key
     // filtering to the global map for free.
-    let global_env = merged_user_env(&BTreeMap::new(), &global.env_vars);
+    let applicable_global_env =
+        super::global_config::global_env_vars_for_record(record, personas, global);
+    let global_env = merged_user_env(&BTreeMap::new(), &applicable_global_env);
     env.extend(global_env);
 
     // Layer 3b: merged user env — live persona env under the record's own

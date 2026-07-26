@@ -104,7 +104,10 @@ test("stored runtime visibility is read from the versioned device key", () => {
 
 test("a disabled saved runtime and its dependent defaults are masked", () => {
   const config = {
-    env_vars: {},
+    env_vars: {
+      BUZZ_AGENT_THINKING_EFFORT: "high",
+      SHARED_API_KEY: "kept",
+    },
     provider: "relay-mesh",
     model: "auto",
     preferred_runtime: "Goose",
@@ -112,6 +115,7 @@ test("a disabled saved runtime and its dependent defaults are masked", () => {
 
   assert.deepEqual(maskDisabledAcpRuntimePreference(config, ["goose"]), {
     ...config,
+    env_vars: { SHARED_API_KEY: "kept" },
     provider: null,
     model: null,
     preferred_runtime: null,
@@ -121,7 +125,10 @@ test("a disabled saved runtime and its dependent defaults are masked", () => {
 
 test("legacy defaults without a saved runtime are owned by buzz-agent", () => {
   const config = {
-    env_vars: {},
+    env_vars: {
+      BUZZ_AGENT_THINKING_EFFORT: "medium",
+      SHARED_API_KEY: "kept",
+    },
     provider: "relay-mesh",
     model: "auto",
     preferred_runtime: null,
@@ -129,6 +136,7 @@ test("legacy defaults without a saved runtime are owned by buzz-agent", () => {
 
   assert.deepEqual(maskDisabledAcpRuntimePreference(config, ["buzz-agent"]), {
     ...config,
+    env_vars: { SHARED_API_KEY: "kept" },
     provider: null,
     model: null,
   });

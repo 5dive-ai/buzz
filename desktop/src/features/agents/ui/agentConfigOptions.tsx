@@ -2,7 +2,7 @@ import type {
   AcpRuntimeCatalogEntry,
   GlobalAgentConfig,
 } from "@/shared/api/types";
-import { BUZZ_AGENT_THINKING_EFFORT } from "./buzzAgentConfig";
+import { withoutHarnessDependentAgentEnvVars } from "./buzzAgentConfig";
 import type { RuntimeFileConfigSubset } from "@/shared/api/tauri";
 // Dialogs import getDefaultPersonaRuntime via this re-export; lib code imports
 // directly from lib/resolvePersonaRuntime.
@@ -222,12 +222,9 @@ export function resetConfigForHarnessChange(
   config: GlobalAgentConfig,
   runtimeId: string,
 ): GlobalAgentConfig {
-  const nextEnvVars = { ...config.env_vars };
-  delete nextEnvVars[BUZZ_AGENT_THINKING_EFFORT];
-
   return {
     ...config,
-    env_vars: nextEnvVars,
+    env_vars: withoutHarnessDependentAgentEnvVars(config.env_vars),
     model: null,
     preferred_runtime: runtimeId || null,
     provider:

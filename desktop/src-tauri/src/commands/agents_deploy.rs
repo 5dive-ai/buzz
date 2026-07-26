@@ -69,7 +69,9 @@ pub(super) fn build_deploy_payload(
     // on key collision). Without this, provider-backed agents wouldn't receive
     // credentials saved on the persona or the agent itself.
     let global_config = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
-    let global_env = global_config.env_vars.clone();
+    let personas = load_personas(app).unwrap_or_default();
+    let global_env =
+        crate::managed_agents::global_env_vars_for_record(record, &personas, &global_config);
     let persona_env =
         crate::managed_agents::resolve_persona_env(app, record.persona_id.as_deref())?;
     // Merge: global < persona (persona wins over global).
@@ -78,7 +80,6 @@ pub(super) fn build_deploy_payload(
     let merged_env =
         crate::managed_agents::merged_user_env(&global_persona_merged, &record.env_vars);
 
-    let personas = load_personas(app).unwrap_or_default();
     let cfg = crate::managed_agents::effective_config::resolve_effective_config(
         record,
         &personas,

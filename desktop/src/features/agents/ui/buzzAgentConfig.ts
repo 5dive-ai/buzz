@@ -8,6 +8,15 @@
 /** Env var key for the thinking/effort level sent to the LLM. */
 export const BUZZ_AGENT_THINKING_EFFORT = "BUZZ_AGENT_THINKING_EFFORT";
 
+/** Remove env-backed values whose semantics change with the harness. */
+export function withoutHarnessDependentAgentEnvVars(
+  envVars: Record<string, string>,
+): Record<string, string> {
+  const next = { ...envVars };
+  delete next[BUZZ_AGENT_THINKING_EFFORT];
+  return next;
+}
+
 /** Env var key for the maximum output token count per turn. */
 export const BUZZ_AGENT_MAX_OUTPUT_TOKENS = "BUZZ_AGENT_MAX_OUTPUT_TOKENS";
 

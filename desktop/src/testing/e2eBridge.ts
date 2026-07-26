@@ -383,6 +383,8 @@ type E2eConfig = {
       model: string | null;
       preferred_runtime?: string | null;
     };
+    /** Delay (ms) applied to `get_global_agent_config`. */
+    globalAgentConfigDelayMs?: number;
     /** File-layer config returned by runtime id. */
     runtimeFileConfigs?: Record<string, RuntimeFileConfigSubset | null>;
     /** Baked build env returned by the display and key-name Tauri commands. */
@@ -10524,6 +10526,13 @@ export function maybeInstallE2eTauriMocks() {
         return config.mock?.runtimeFileConfigs?.[runtimeId] ?? null;
       }
       case "get_global_agent_config": {
+        const globalAgentConfigDelayMs =
+          config?.mock?.globalAgentConfigDelayMs ?? 0;
+        if (globalAgentConfigDelayMs > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, globalAgentConfigDelayMs),
+          );
+        }
         // Return the mutable persisted mock value, seeded from the test config.
         return (
           mockGlobalAgentConfig ?? {

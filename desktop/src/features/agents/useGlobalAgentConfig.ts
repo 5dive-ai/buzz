@@ -33,7 +33,7 @@ export function useGlobalAgentConfig(): {
   globalConfig: GlobalAgentConfig;
   isLoading: boolean;
 } {
-  const { data, isPending } = useQuery({
+  const { data, isPending, isPlaceholderData } = useQuery({
     queryKey: globalAgentConfigQueryKey,
     queryFn: getGlobalAgentConfig,
     // Config is only mutated via setGlobalAgentConfig — treat as stable until
@@ -45,7 +45,7 @@ export function useGlobalAgentConfig(): {
 
   return {
     globalConfig: data ?? EMPTY_CONFIG,
-    isLoading: isPending,
+    isLoading: isPending || isPlaceholderData,
   };
 }
 

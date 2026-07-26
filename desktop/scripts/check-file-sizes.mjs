@@ -179,7 +179,7 @@ const overrides = new Map([
   // +7 (1041 -> 1048): rebase onto main — this PR's resolver tests land on top
   // of main's #2397 Windows shim tests. Test-only; queued to split.
   // +43 (1055 -> 1098): spawn_lazy_pool_env_writes_literal_true_once — source
-  // contract pinning the unconditional BUZZ_ACP_LAZY_POOL=true write (#3039).
+  // contract pinning one literal BUZZ_ACP_LAZY_POOL=true write site (#3039).
   // Test-only; queued to split.
   ["src-tauri/src/managed_agents/runtime/tests.rs", 1098],
   // applyWorkspace reposDir parameter plus the validateReposDir binding,

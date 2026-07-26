@@ -1053,72 +1053,37 @@ fn restart_eligible_false_when_non_orphan_has_no_drift() {
     assert!(!super::restart_eligible(false, false, false));
 }
 
-// ── every spawn_agent_child call site is lazy ────────────────────────
+// ── all Desktop spawns are lazy (BUZZ_ACP_LAZY_POOL) ─────────────────
 //
-// The eager path (`lazy=false` → BUZZ_ACP_LAZY_POOL=false) makes buzz-acp
-// serially initialize the FULL worker pool before connecting to the relay.
-// For a slow-starting harness that is minutes of startup, and any mention
-// sent in that window predates the startup watermark and can be missed
-// permanently. Every Desktop flow (create/start, manual start, restart,
-// reconcile, restore) must therefore spawn lazy: relay connects first,
-// accepted work queues, and the pool initializes in the cancellable wake
-// task.
+// Eager pool init (`BUZZ_ACP_LAZY_POOL=false`) made buzz-acp serially
+// initialize the FULL worker pool before connecting to the relay. For a
+// slow-starting harness that is minutes of startup, and any mention sent
+// in that window predates the startup watermark and can be missed
+// permanently. The fix removed the `lazy` parameter entirely so eager
+// spawning is structurally unrepresentable: `spawn_agent_child` writes
+// the env var as an unconditional literal.
 //
-// `spawn_agent_child` spawns a real OS process, so this contract is pinned
-// at the source level: no call site may pass a literal `false` for the
-// `lazy` parameter. If a new call site legitimately needs eager init,
-// it must carry a documented exemption here.
+// This test pins that contract at the source level (the function spawns
+// a real OS process, so it cannot run under `cargo test`): the env write
+// must be the unconditional literal `"true"` — no conditional, no
+// parameter, no second write site. If a future change reintroduces an
+// eager mode, it must be deliberate enough to rewrite this test.
 #[test]
-fn no_spawn_agent_child_call_site_is_eager() {
-    let sources = [
-        (
-            "runtime.rs",
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/managed_agents/runtime.rs"
-            )),
-        ),
-        (
-            "runtime_commands.rs",
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/managed_agents/runtime_commands.rs"
-            )),
-        ),
-        (
-            "restore.rs",
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/managed_agents/restore.rs"
-            )),
-        ),
-    ];
-    for (name, source) in sources {
-        for (idx, line) in source.lines().enumerate() {
-            let trimmed = line.trim();
-            // Skip comments; match only argument-position literal `false`
-            // in a spawn_agent_child call. The call spans multiple lines in
-            // restore.rs, so scan a small window after the call token.
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            if trimmed.contains("spawn_agent_child(") {
-                let window: String = source
-                    .lines()
-                    .skip(idx)
-                    .take(8)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                // The lazy flag is the 4th argument; a literal `false` in the
-                // window is the eager smell this test exists to catch.
-                assert!(
-                    !window.contains("false"),
-                    "{name}:{}: spawn_agent_child call site appears to pass \
-                     lazy=false (eager pool init). All Desktop spawns must be \
-                     lazy — see this test's doc comment. Call window:\n{window}",
-                    idx + 1
-                );
-            }
-        }
-    }
+fn spawn_lazy_pool_env_is_unconditional() {
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/managed_agents/runtime.rs"
+    ));
+    let writes: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("BUZZ_ACP_LAZY_POOL") && !line.starts_with("//"))
+        .collect();
+    assert_eq!(
+        writes,
+        vec![r#"command.env("BUZZ_ACP_LAZY_POOL", "true");"#],
+        "BUZZ_ACP_LAZY_POOL must be written exactly once, as the \
+         unconditional literal \"true\" — all Desktop spawns are lazy. \
+         See this test's doc comment before changing."
+    );
 }

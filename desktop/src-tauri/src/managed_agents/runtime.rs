@@ -427,7 +427,6 @@ pub fn spawn_agent_child(
     app: &AppHandle,
     record: &ManagedAgentRecord,
     relay_url: &str,
-    lazy: bool,
     owner_hex: Option<&str>,
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
@@ -535,7 +534,18 @@ pub fn spawn_agent_child(
     command.env("RUST_LOG", child_rust_log_filter());
     command.env("BUZZ_PRIVATE_KEY", &record.private_key_nsec);
     command.env("BUZZ_RELAY_URL", &effective_relay_url);
-    command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
+    // ALWAYS lazy: the harness connects/subscribes to the relay first,
+    // captures the startup watermark immediately, queues accepted work, and
+    // initializes the agent pool in the cancellable wake task on first
+    // flushable work. Eager init (`false`) made buzz-acp serially spawn the
+    // FULL worker pool before connecting to the relay, so create/start of a
+    // slow-starting harness (e.g. a gateway-backed adapter at several
+    // seconds per worker) took minutes — and a mention sent in that window
+    // predated the watermark and could be missed permanently. There is
+    // deliberately no parameter for this: no Desktop flow may spawn eager
+    // (see the F1 note in restore.rs; `spawn_lazy_pool_env_is_unconditional`
+    // pins the env contract).
+    command.env("BUZZ_ACP_LAZY_POOL", "true");
     command.env("BUZZ_ACP_AGENT_COMMAND", &resolved_agent_command);
     command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
     match &resolved_mcp_command {
@@ -953,16 +963,7 @@ pub fn start_managed_agent_process(
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
-    // Lazy, matching manual start, restart, reconcile, and restore (see the
-    // F1 note in restore.rs). This was the last eager call site. Eager init
-    // ran the full serial pool spawn BEFORE the harness connected to the
-    // relay, so create/start of a slow-starting agent (e.g. a gateway-backed
-    // harness at several seconds per worker) took minutes — and a mention
-    // sent in that window predated the startup watermark and could be missed
-    // permanently. Lazy connects/subscribes first, queues accepted work, and
-    // initializes the pool in the cancellable wake task on first flushable
-    // work.
-    let mut process = spawn_agent_child(app, record, &key.relay_url, true, owner_hex)?;
+    let mut process = spawn_agent_child(app, record, &key.relay_url, owner_hex)?;
     let now = now_iso();
     let receipt = super::ManagedAgentRuntimeReceipt {
         key: key.clone(),

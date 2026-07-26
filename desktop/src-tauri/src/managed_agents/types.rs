@@ -40,6 +40,11 @@ pub struct AgentDefinition {
     pub is_builtin: bool,
     #[serde(default = "default_record_active")]
     pub is_active: bool,
+    /// Whether this persona is discoverable by other members of the active
+    /// community. Persisted on the definition so every routine kind:30175
+    /// republish preserves the relay's exact `["shared", "true"]` tag.
+    #[serde(default)]
+    pub shared: bool,
     /// Team ID if this persona was imported from a team directory.
     /// Team personas are non-editable (system_prompt, model locked).
     #[serde(
@@ -130,6 +135,7 @@ impl AgentDefinition {
             name_pool: self.name_pool,
             is_builtin: self.is_builtin,
             is_active: self.is_active,
+            shared: self.shared,
             source_team: self.source_team,
             source_team_persona_slug: self.source_team_persona_slug,
             definition_respond_to: self.respond_to,
@@ -161,6 +167,7 @@ impl ManagedAgentRecord {
             name_pool: self.name_pool.clone(),
             is_builtin: self.is_builtin,
             is_active: self.is_active,
+            shared: self.shared,
             source_team: self.source_team.clone(),
             source_team_persona_slug: self.source_team_persona_slug.clone(),
             env_vars: self.env_vars.clone(),
@@ -362,6 +369,10 @@ pub struct ManagedAgentRecord {
     /// definition hidden from pickers. Defaults `true` for existing records.
     #[serde(default = "default_record_active")]
     pub is_active: bool,
+    /// Definition-level catalog visibility. Only meaningful for key-less
+    /// records with a `slug`; instances retain the default `false`.
+    #[serde(default)]
+    pub shared: bool,
     /// Absorbed from `AgentDefinition.source_team` — team ID when this
     /// definition was imported from a team directory (team definitions are
     /// non-editable). Distinct from `persona_team_dir`/`persona_name_in_team`,

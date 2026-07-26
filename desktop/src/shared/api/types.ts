@@ -748,6 +748,8 @@ export type AgentPersona = {
   namePool: string[];
   isBuiltIn: boolean;
   isActive: boolean;
+  /** Whether this persona is discoverable in the active community catalog. */
+  shared: boolean;
   /** Team ID if this persona was imported from a team directory. Team personas are non-editable. */
   sourceTeam?: string | null;
   /** Environment variables injected for agents created from this persona.

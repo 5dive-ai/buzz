@@ -121,6 +121,7 @@ fn built_in_persona_records(now: &str) -> Vec<AgentDefinition> {
             name_pool: persona.name_pool.iter().map(|s| s.to_string()).collect(),
             is_builtin: true,
             is_active: persona.default_active,
+            shared: false,
             source_team: None,
             source_team_persona_slug: None,
             env_vars: std::collections::BTreeMap::new(),

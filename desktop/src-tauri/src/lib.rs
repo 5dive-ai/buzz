@@ -811,6 +811,7 @@ pub fn run() {
             update_persona,
             delete_persona,
             set_persona_active,
+            set_persona_shared,
             reconcile_inbound_persona_event,
             list_channel_templates,
             create_channel_template,

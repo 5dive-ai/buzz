@@ -301,6 +301,7 @@ mod tests {
             name_pool: vec![],
             is_builtin: false,
             is_active: true,
+            shared: false,
             source_team: Some("SENTINEL_SOURCE_TEAM".to_string()), // MUST NOT appear
             source_team_persona_slug: Some("SENTINEL_SLUG".to_string()), // MUST NOT appear
             definition_respond_to: None,

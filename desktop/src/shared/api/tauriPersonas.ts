@@ -17,6 +17,7 @@ export type RawPersona = {
   name_pool?: string[];
   is_builtin: boolean;
   is_active?: boolean;
+  shared?: boolean;
   source_team?: string | null;
   env_vars?: Record<string, string>;
   respond_to?: string | null;
@@ -40,6 +41,7 @@ export function fromRawPersona(persona: RawPersona): AgentPersona {
     namePool: persona.name_pool ?? [],
     isBuiltIn: persona.is_builtin,
     isActive: persona.is_active ?? true,
+    shared: persona.shared ?? false,
     sourceTeam: persona.source_team ?? null,
     envVars: persona.env_vars ?? {},
     respondTo: (persona.respond_to as RespondToMode | undefined) ?? null,
@@ -113,6 +115,15 @@ export async function setPersonaActive(
 ): Promise<AgentPersona> {
   return fromRawPersona(
     await invokeTauri<RawPersona>("set_persona_active", { id, active }),
+  );
+}
+
+export async function setPersonaShared(
+  id: string,
+  shared: boolean,
+): Promise<AgentPersona> {
+  return fromRawPersona(
+    await invokeTauri<RawPersona>("set_persona_shared", { id, shared }),
   );
 }
 

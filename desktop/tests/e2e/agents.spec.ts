@@ -5,50 +5,31 @@ import type { RelayEvent } from "@/shared/api/types";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
-const DEFAULT_MOCK_OWNER_PUBKEY = "deadbeef".repeat(8);
-
 function createCatalogEvent(input: {
   ownerPubkey: string;
   sourcePersonaId: string;
-  sourceUpdatedAt: string;
   displayName: string;
   systemPrompt: string;
   createdAt?: number;
+  shared?: boolean;
 }): RelayEvent {
-  const snapshot = {
-    url: `https://relay.example/media/${"c".repeat(64)}`,
-    sha256: "c".repeat(64),
-    size: 512,
-    type: "application/json",
-    fileName: `${input.sourcePersonaId}.agent.json`,
-  } as const;
   return {
     id: "1".repeat(64),
     pubkey: input.ownerPubkey,
     created_at: input.createdAt ?? 1_721_750_400,
-    kind: 30178,
+    kind: 30175,
     tags: [
       ["d", input.sourcePersonaId],
-      ["status", "published"],
-      ["source_updated_at", input.sourceUpdatedAt],
-      ["memory", "none"],
+      ...(input.shared === false ? [] : [["shared", "true"]]),
     ],
     content: JSON.stringify({
-      format: "buzz-persona-catalog",
-      version: 1,
-      status: "published",
-      sourcePersonaId: input.sourcePersonaId,
-      sourceUpdatedAt: input.sourceUpdatedAt,
-      memoryLevel: "none",
-      agent: {
-        displayName: input.displayName,
-        avatarUrl: null,
-        systemPrompt: input.systemPrompt,
-        runtime: null,
-        model: null,
-        provider: null,
-      },
-      snapshot,
+      display_name: input.displayName,
+      system_prompt: input.systemPrompt,
+      avatar_url: null,
+      runtime: null,
+      model: null,
+      provider: null,
+      name_pool: [],
     }),
     sig: "2".repeat(128),
   };
@@ -1371,9 +1352,6 @@ This deliberately long fenced-code example must not establish the minimum width 
   const shareMainCard = shareDialog.getByTestId("persona-share-main-card");
   const copyLinkButton = shareDialog.getByTestId("persona-share-copy-link");
   const catalogSection = shareDialog.getByTestId("persona-share-catalog");
-  const publishCatalogUpdatesButton = page.getByTestId(
-    "persona-share-publish-catalog-updates",
-  );
   await expect(
     shareMainCard.getByTestId("persona-share-catalog"),
   ).toBeVisible();
@@ -1382,7 +1360,7 @@ This deliberately long fenced-code example must not establish the minimum width 
     "Anyone in this community can find and use a copy.",
   );
   await expect(catalogSection).toContainText(
-    "Catalog data is plaintext; secrets and response allowlists are never included.",
+    "Your agent instruction is shared as plaintext. Memories and secrets aren’t included.",
   );
   const [copyLinkButtonBox, catalogSectionBox, shareMainCardBox] =
     await Promise.all([
@@ -1399,7 +1377,6 @@ This deliberately long fenced-code example must not establish the minimum width 
     (shareMainCardBox?.y ?? 0) + (shareMainCardBox?.height ?? 0),
   );
   await expect(catalogAccess).toHaveText("Not shared");
-  await expect(publishCatalogUpdatesButton).toHaveCount(0);
   await catalogAccess.click();
   await expect(page.getByRole("menuitemradio")).toHaveText([
     "Not shared",
@@ -1409,19 +1386,12 @@ This deliberately long fenced-code example must not establish the minimum width 
     .getByRole("menuitemradio", { name: "Agent only", exact: true })
     .click();
   await expect(catalogAccess).toHaveText("Agent only");
-  await expect(publishCatalogUpdatesButton).toHaveCount(0);
-  const uploadCommand = (await readAgentShareCommands(page)).find(
-    (entry) => entry.command === "upload_media_bytes",
-  );
-  const uploadedSnapshot = JSON.parse(
-    new TextDecoder().decode(
-      Uint8Array.from(
-        (uploadCommand?.payload as { data?: number[] } | undefined)?.data ?? [],
-      ),
-    ),
-  );
-  expect(uploadedSnapshot.definition.respondTo).toBe("owner-only");
-  expect(uploadedSnapshot.definition).not.toHaveProperty("respondToAllowlist");
+  const storedPersonas = await invokeTauri<
+    Array<{ id: string; shared: boolean }>
+  >(page, "list_personas");
+  expect(
+    storedPersonas.find((persona) => persona.id === personaId)?.shared,
+  ).toBe(true);
   await page
     .getByTestId("persona-share-dialog")
     .getByRole("button", { name: "Close" })
@@ -1483,19 +1453,16 @@ This deliberately long fenced-code example must not establish the minimum width 
   await editDialog.getByRole("button", { name: "Save and publish" }).click();
   await expect(editDialog).toHaveCount(0);
 
-  await page.getByLabel("Open actions for Catalog Analyst").click();
-  await page.getByRole("menuitem", { name: "Share" }).click();
-  await expect(catalogAccess).toHaveText("Agent only");
-  await expect(publishCatalogUpdatesButton).toHaveCount(0);
-  await page
-    .getByTestId("persona-share-dialog")
-    .getByRole("button", { name: "Close" })
-    .click();
+  await openPersonaCatalog(page);
+  await selectCatalogPersona(page, personaId);
+  await expect(page.getByTestId("persona-catalog-detail-pane")).toContainText(
+    "Review the latest catalog changes.",
+  );
+  await page.keyboard.press("Escape");
 
   await page.getByLabel("Open actions for Catalog Analyst").click();
   await page.getByRole("menuitem", { name: "Share" }).click();
   await expect(catalogAccess).toHaveText("Agent only");
-  await expect(publishCatalogUpdatesButton).toHaveCount(0);
   await catalogAccess.click();
   await page
     .getByRole("menuitemradio", { name: "Not shared", exact: true })
@@ -1511,51 +1478,30 @@ This deliberately long fenced-code example must not establish the minimum width 
   ).toHaveCount(0);
 });
 
-test("catalog owners can publish local updates to an existing relay entry", async ({
+test("a foreign reader does not receive an unshared kind 30175 persona", async ({
   page,
 }) => {
-  const personaId = "custom:catalog-updates";
+  const personaId = "private-reviewer";
+  const remoteCatalogId = `catalog:${TEST_IDENTITIES.alice.pubkey}:${personaId}`;
   await installMockBridge(page, {
-    personas: [
-      {
-        id: personaId,
-        displayName: "Catalog Updates",
-        systemPrompt: "The locally updated instructions.",
-        updatedAt: "2026-07-23T17:00:00.000Z",
-      },
-    ],
     personaCatalogEvents: [
       createCatalogEvent({
-        ownerPubkey: DEFAULT_MOCK_OWNER_PUBKEY,
+        ownerPubkey: TEST_IDENTITIES.alice.pubkey,
         sourcePersonaId: personaId,
-        sourceUpdatedAt: "2026-07-23T16:00:00.000Z",
-        displayName: "Catalog Updates",
-        systemPrompt: "The previously published instructions.",
+        displayName: "Alice’s Private Reviewer",
+        systemPrompt: "This instruction must remain private.",
+        shared: false,
       }),
     ],
   });
   await gotoApp(page);
   await page.getByTestId("open-agents-view").click();
+  await openPersonaCatalog(page);
 
-  await page.getByLabel("Open actions for Catalog Updates").click();
-  await page.getByRole("menuitem", { name: "Share" }).click();
-  const catalogAccess = page.getByTestId("persona-share-catalog-access");
-  const publishButton = page.getByTestId(
-    "persona-share-publish-catalog-updates",
-  );
-  await expect(catalogAccess).toHaveText("Agent only");
-  await expect(publishButton).toBeVisible();
-  const [catalogAccessBox, publishButtonBox] = await Promise.all([
-    catalogAccess.boundingBox(),
-    publishButton.boundingBox(),
-  ]);
-  expect(
-    (publishButtonBox?.x ?? 0) + (publishButtonBox?.width ?? 0),
-  ).toBeLessThan(catalogAccessBox?.x ?? 0);
-
-  await publishButton.click();
-  await expect(publishButton).toHaveCount(0);
-  await expect(catalogAccess).toHaveText("Agent only");
+  await expect(
+    page.getByTestId(`persona-catalog-list-item-${remoteCatalogId}`),
+  ).toHaveCount(0);
+  await expect(page.getByTestId("persona-catalog-empty-state")).toBeVisible();
 });
 
 test("a community member can discover and add another member's catalog agent", async ({
@@ -1568,7 +1514,6 @@ test("a community member can discover and add another member's catalog agent", a
       createCatalogEvent({
         ownerPubkey: TEST_IDENTITIES.alice.pubkey,
         sourcePersonaId: personaId,
-        sourceUpdatedAt: "2026-07-23T16:00:00.000Z",
         displayName: "Alice’s Reviewer",
         systemPrompt: "Review changes for the whole community.",
       }),
@@ -1601,11 +1546,20 @@ test("a community member can discover and add another member's catalog agent", a
               __BUZZ_E2E_COMMANDS__?: string[];
             }
           ).__BUZZ_E2E_COMMANDS__?.filter(
-            (command) => command === "confirm_agent_snapshot_import",
+            (command) => command === "create_persona",
           ).length ?? 0,
       ),
     )
     .toBe(1);
+  const imported = await invokeTauri<
+    Array<{ display_name: string; system_prompt: string; shared: boolean }>
+  >(page, "list_personas");
+  expect(
+    imported.find((persona) => persona.display_name === "Alice’s Reviewer"),
+  ).toMatchObject({
+    system_prompt: "Review changes for the whole community.",
+    shared: false,
+  });
 });
 
 test("share access controls include the selected memories", async ({
@@ -1676,8 +1630,6 @@ test("share access controls include the selected memories", async ({
   await expect(page.getByRole("menuitemradio")).toHaveText([
     "Not shared",
     "Agent only",
-    "Agent + core memory",
-    "Agent + all memories",
   ]);
   await page.keyboard.press("Escape");
   const copyLinkButton = shareDialog.getByTestId("persona-share-copy-link");

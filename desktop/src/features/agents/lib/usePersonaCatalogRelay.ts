@@ -3,12 +3,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   fetchPersonaCatalogPublications,
-  publishPersonaToCatalog,
-  unpublishPersonaFromCatalog,
   type PersonaCatalogPublication,
 } from "@/features/agents/lib/personaCatalogRelay";
 import { relayClient } from "@/shared/api/relayClient";
-import { KIND_PERSONA_CATALOG } from "@/shared/constants/kinds";
+import { setPersonaShared } from "@/shared/api/tauriPersonas";
+import type { AgentPersona } from "@/shared/api/types";
+import { KIND_PERSONA } from "@/shared/constants/kinds";
 
 export function personaCatalogQueryKey(communityId: string | null) {
   return ["persona-catalog", communityId] as const;
@@ -33,7 +33,7 @@ export function usePersonaCatalogLiveUpdates(communityId: string | null): void {
     let dispose: (() => Promise<void>) | null = null;
 
     void relayClient
-      .subscribeLive({ kinds: [KIND_PERSONA_CATALOG], limit: 0 }, () => {
+      .subscribeLive({ kinds: [KIND_PERSONA], limit: 0 }, () => {
         void queryClient.invalidateQueries({
           queryKey: personaCatalogQueryKey(communityId),
         });
@@ -47,7 +47,7 @@ export function usePersonaCatalogLiveUpdates(communityId: string | null): void {
       })
       .catch((error) => {
         console.error(
-          "Failed to subscribe to the community agent catalog",
+          "Couldn’t subscribe to the community agent catalog",
           error,
         );
       });
@@ -66,42 +66,22 @@ export function usePersonaCatalogLiveUpdates(communityId: string | null): void {
   }, [communityId, queryClient]);
 }
 
-export function usePublishPersonaCatalogMutation(communityId: string | null) {
+export function useSetPersonaCatalogSharedMutation(communityId: string | null) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: publishPersonaToCatalog,
-    onSuccess: (publication) => {
-      queryClient.setQueryData<PersonaCatalogPublication[]>(
-        personaCatalogQueryKey(communityId),
-        (current) => [
-          publication,
-          ...(current ?? []).filter(
-            (candidate) =>
-              candidate.ownerPubkey !== publication.ownerPubkey ||
-              candidate.sourcePersonaId !== publication.sourcePersonaId,
-          ),
-        ],
+    mutationFn: ({ id, shared }: { id: string; shared: boolean }) =>
+      setPersonaShared(id, shared),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<AgentPersona[]>(
+        ["personas"],
+        (current) =>
+          current?.map((persona) =>
+            persona.id === updated.id ? updated : persona,
+          ) ?? [updated],
       );
-    },
-  });
-}
-
-export function useUnpublishPersonaCatalogMutation(communityId: string | null) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: unpublishPersonaFromCatalog,
-    onSuccess: (publication) => {
-      queryClient.setQueryData<PersonaCatalogPublication[]>(
-        personaCatalogQueryKey(communityId),
-        (current) => [
-          publication,
-          ...(current ?? []).filter(
-            (candidate) =>
-              candidate.ownerPubkey !== publication.ownerPubkey ||
-              candidate.sourcePersonaId !== publication.sourcePersonaId,
-          ),
-        ],
-      );
+      void queryClient.invalidateQueries({
+        queryKey: personaCatalogQueryKey(communityId),
+      });
     },
   });
 }

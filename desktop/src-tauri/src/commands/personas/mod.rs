@@ -33,6 +33,8 @@ fn trim_optional(value: Option<String>) -> Option<String> {
 mod pending;
 pub(in crate::commands) use pending::retain_persona_pending;
 pub(super) use pending::tombstone_persona_pending;
+mod sharing;
+pub use sharing::set_persona_shared;
 
 #[tauri::command]
 pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, String> {
@@ -88,6 +90,7 @@ pub async fn create_persona(
             name_pool,
             is_builtin: false,
             is_active: true,
+            shared: false,
             source_team: None,
             source_team_persona_slug: None,
             env_vars: input.env_vars,
@@ -815,6 +818,7 @@ fn apply_inbound_persona(personas: &mut Vec<AgentDefinition>, inbound: AgentDefi
             local.respond_to = inbound.respond_to;
             local.respond_to_allowlist = inbound.respond_to_allowlist;
             local.parallelism = inbound.parallelism;
+            local.shared = inbound.shared;
             local.updated_at = inbound.updated_at;
         }
         None => personas.push(inbound),

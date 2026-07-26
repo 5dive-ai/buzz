@@ -35,7 +35,7 @@ import {
   KIND_HUDDLE_STARTED,
   KIND_MEMBER_ADDED_NOTIFICATION,
   KIND_MEMBER_REMOVED_NOTIFICATION,
-  KIND_PERSONA_CATALOG,
+  KIND_PERSONA,
   KIND_REPO_ANNOUNCEMENT,
   KIND_REPO_STATE,
   KIND_STREAM_MESSAGE_EDIT,
@@ -108,6 +108,7 @@ type MockPersonaSeed = {
   systemPrompt: string;
   updatedAt?: string;
   isActive?: boolean;
+  shared?: boolean;
   sourceTeam?: string | null;
   envVars?: Record<string, string>;
   runtime?: string | null;
@@ -791,6 +792,7 @@ type RawPersona = {
   name_pool?: string[];
   is_builtin: boolean;
   is_active: boolean;
+  shared: boolean;
   source_team?: string | null;
   env_vars?: Record<string, string>;
   respond_to?: string | null;
@@ -2147,6 +2149,7 @@ function resetMockPersonas(config?: E2eConfig) {
     name_pool: [],
     is_builtin: true,
     is_active: activePersonaIds.has(persona.id),
+    shared: false,
     source_team: null,
     created_at: now,
     updated_at: now,
@@ -2169,6 +2172,7 @@ function resetMockPersonas(config?: E2eConfig) {
           : [],
       is_builtin: false,
       is_active: persona.isActive ?? true,
+      shared: persona.shared ?? false,
       source_team: persona.sourceTeam ?? null,
       env_vars: { ...(persona.envVars ?? {}) },
       created_at: now,
@@ -2767,7 +2771,7 @@ const mockChannels: MockChannel[] = [
 const mockMessages = new Map<string, RelayEvent[]>();
 const mockUserStatuses: RelayEvent[] = [];
 const mockReminderEvents: RelayEvent[] = [];
-const mockPersonaCatalogEvents: RelayEvent[] = [];
+const mockPersonaEvents: RelayEvent[] = [];
 let mockRelayMembers: RawRelayMember[] = [];
 const mockSockets = new Map<number, MockSocket>();
 let mockWebsocketSendMutexWedged = false;
@@ -2799,9 +2803,9 @@ function resetMockSaveSubscriptions(config: E2eConfig | undefined) {
 }
 
 function resetMockPersonaCatalogEvents(config: E2eConfig | undefined) {
-  mockPersonaCatalogEvents.length = 0;
+  mockPersonaEvents.length = 0;
   for (const event of config?.mock?.personaCatalogEvents ?? []) {
-    mockPersonaCatalogEvents.push({
+    mockPersonaEvents.push({
       ...event,
       tags: event.tags.map((tag) => [...tag]),
     });
@@ -3838,6 +3842,13 @@ function emitMockLiveEvent(channelId: string, event: RelayEvent) {
 }
 
 function emitMockGlobalEvent(event: RelayEvent) {
+  if (
+    event.kind === KIND_PERSONA &&
+    event.pubkey.toLowerCase() !== MOCK_IDENTITY_PUBKEY.toLowerCase() &&
+    !personaHasExactSharedTag(event)
+  ) {
+    return;
+  }
   for (const socket of mockSockets.values()) {
     for (const [subId, subscription] of socket.subscriptions) {
       if (subscription.kinds && !subscription.kinds.includes(event.kind)) {
@@ -7317,6 +7328,7 @@ async function handleCreatePersona(args: {
     provider: args.input.provider?.trim() || null,
     is_builtin: false,
     is_active: true,
+    shared: false,
     source_team: null,
     env_vars: { ...(args.input.envVars ?? {}) },
     created_at: now,
@@ -7324,6 +7336,7 @@ async function handleCreatePersona(args: {
   };
   applyMockPersonaBehavior(persona, args.input.behavior);
   mockPersonas.push(persona);
+  upsertMockPersonaEvent(persona);
   return { ...persona };
 }
 
@@ -7358,6 +7371,7 @@ async function handleUpdatePersona(args: {
   }
   applyMockPersonaBehavior(persona, args.input.behavior);
   persona.updated_at = new Date().toISOString();
+  upsertMockPersonaEvent(persona);
 
   for (const callback of tauriEventListeners.get("agents-data-changed") ?? []) {
     callback();
@@ -7421,6 +7435,67 @@ async function handleSetPersonaActive(args: {
 
   persona.is_active = args.active;
   persona.updated_at = new Date().toISOString();
+  return { ...persona };
+}
+
+function personaHasExactSharedTag(event: RelayEvent): boolean {
+  const tags = event.tags.filter((tag) => tag[0] === "shared");
+  return tags.length === 1 && tags[0]?.length === 2 && tags[0]?.[1] === "true";
+}
+
+function upsertMockPersonaRelayEvent(event: RelayEvent): void {
+  const sourceId = event.tags.find((tag) => tag[0] === "d")?.[1];
+  if (!sourceId) return;
+  const existingIndex = mockPersonaEvents.findIndex(
+    (candidate) =>
+      candidate.pubkey.toLowerCase() === event.pubkey.toLowerCase() &&
+      candidate.tags.some((tag) => tag[0] === "d" && tag[1] === sourceId),
+  );
+  if (existingIndex >= 0) {
+    mockPersonaEvents.splice(existingIndex, 1);
+  }
+  mockPersonaEvents.push(event);
+}
+
+function upsertMockPersonaEvent(persona: RawPersona): void {
+  const event: RelayEvent = {
+    id: mockEventId(),
+    pubkey: MOCK_IDENTITY_PUBKEY,
+    created_at: Math.floor(Date.now() / 1_000),
+    kind: KIND_PERSONA,
+    tags: [["d", persona.id], ...(persona.shared ? [["shared", "true"]] : [])],
+    content: JSON.stringify({
+      display_name: persona.display_name,
+      system_prompt: persona.system_prompt,
+      avatar_url: persona.avatar_url,
+      runtime: persona.runtime ?? null,
+      model: persona.model ?? null,
+      provider: persona.provider ?? null,
+      name_pool: persona.name_pool ?? [],
+      respond_to: persona.respond_to ?? null,
+      respond_to_allowlist: persona.respond_to_allowlist ?? [],
+      parallelism: persona.parallelism ?? null,
+    }),
+    sig: "0".repeat(128),
+  };
+  upsertMockPersonaRelayEvent(event);
+  emitMockGlobalEvent(event);
+}
+
+async function handleSetPersonaShared(args: {
+  id: string;
+  shared: boolean;
+}): Promise<RawPersona> {
+  const persona = mockPersonas.find((candidate) => candidate.id === args.id);
+  if (!persona) {
+    throw new Error(`agent ${args.id} not found`);
+  }
+  if (persona.is_builtin) {
+    throw new Error("Built-in agents cannot be shared to the catalog.");
+  }
+  persona.shared = args.shared;
+  persona.updated_at = new Date().toISOString();
+  upsertMockPersonaEvent(persona);
   return { ...persona };
 }
 
@@ -8835,11 +8910,17 @@ function sendToMockSocket(args: {
       return;
     }
 
-    if (filter.kinds?.includes(KIND_PERSONA_CATALOG)) {
+    if (filter.kinds?.includes(KIND_PERSONA)) {
       const authors = filter.authors?.map((author) => author.toLowerCase());
       const sourceIds = filter["#d"];
-      for (const event of mockPersonaCatalogEvents) {
+      for (const event of mockPersonaEvents) {
         if (authors && !authors.includes(event.pubkey.toLowerCase())) continue;
+        if (
+          event.pubkey.toLowerCase() !== MOCK_IDENTITY_PUBKEY.toLowerCase() &&
+          !personaHasExactSharedTag(event)
+        ) {
+          continue;
+        }
         const sourceId = event.tags.find((tag) => tag[0] === "d")?.[1];
         if (sourceIds && (!sourceId || !sourceIds.includes(sourceId))) continue;
         sendWsText(socket.handler, ["EVENT", subId, event]);
@@ -8949,26 +9030,31 @@ function sendToMockSocket(args: {
       return;
     }
 
-    if (event.kind === KIND_PERSONA_CATALOG) {
+    if (event.kind === KIND_PERSONA) {
       const sourceId = event.tags.find((tag) => tag[0] === "d")?.[1];
       if (!sourceId) {
         sendWsText(socket.handler, [
           "OK",
           event.id,
           false,
-          "invalid: persona catalog event missing d tag.",
+          "invalid: persona event missing d tag.",
         ]);
         return;
       }
-      const existingIndex = mockPersonaCatalogEvents.findIndex(
-        (candidate) =>
-          candidate.pubkey.toLowerCase() === event.pubkey.toLowerCase() &&
-          candidate.tags.some((tag) => tag[0] === "d" && tag[1] === sourceId),
-      );
-      if (existingIndex >= 0) {
-        mockPersonaCatalogEvents.splice(existingIndex, 1);
+      const sharedTags = event.tags.filter((tag) => tag[0] === "shared");
+      if (
+        sharedTags.length > 1 ||
+        (sharedTags.length === 1 && !personaHasExactSharedTag(event))
+      ) {
+        sendWsText(socket.handler, [
+          "OK",
+          event.id,
+          false,
+          'invalid: shared tag must be exactly ["shared","true"].',
+        ]);
+        return;
       }
-      mockPersonaCatalogEvents.push(event);
+      upsertMockPersonaRelayEvent(event);
       emitMockGlobalEvent(event);
       sendWsText(socket.handler, ["OK", event.id, true, ""]);
       return;
@@ -10161,11 +10247,16 @@ export function maybeInstallE2eTauriMocks() {
             };
             const now = new Date().toISOString();
             const existing = mockPersonas.find((p) => p.id === dTag);
+            const shared = nostrEvent.tags.some(
+              (tag) =>
+                tag.length === 2 && tag[0] === "shared" && tag[1] === "true",
+            );
             if (existing) {
               existing.display_name =
                 content.display_name ?? existing.display_name;
               existing.system_prompt =
                 content.system_prompt ?? existing.system_prompt;
+              existing.shared = shared;
               existing.updated_at = now;
             } else {
               mockPersonas.push({
@@ -10175,6 +10266,7 @@ export function maybeInstallE2eTauriMocks() {
                 system_prompt: content.system_prompt ?? "",
                 is_builtin: false,
                 is_active: true,
+                shared,
                 env_vars: {},
                 created_at: now,
                 updated_at: now,
@@ -10200,6 +10292,10 @@ export function maybeInstallE2eTauriMocks() {
       case "set_persona_active":
         return handleSetPersonaActive(
           payload as Parameters<typeof handleSetPersonaActive>[0],
+        );
+      case "set_persona_shared":
+        return handleSetPersonaShared(
+          payload as Parameters<typeof handleSetPersonaShared>[0],
         );
       case "list_teams":
         return handleListTeams();

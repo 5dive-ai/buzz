@@ -482,6 +482,7 @@ fn sample_persona() -> AgentDefinition {
         name_pool: vec!["Nimble".to_string()],
         is_builtin: false,
         is_active: true,
+        shared: false,
         source_team: Some("team-1".to_string()),
         source_team_persona_slug: Some("helper".to_string()),
         env_vars: [("K".to_string(), "v".to_string())].into_iter().collect(),

@@ -25,19 +25,15 @@ import {
   type CatalogPersonaShareLevel,
   catalogPersonasFromPublications,
   isCatalogPersona,
-  linkedAgentPubkeyForPersona,
-  ownCatalogPublication,
 } from "@/features/agents/lib/personaCatalogRelay";
 import {
   usePersonaCatalogLiveUpdates,
   usePersonaCatalogQuery,
-  usePublishPersonaCatalogMutation,
-  useUnpublishPersonaCatalogMutation,
+  useSetPersonaCatalogSharedMutation,
 } from "@/features/agents/lib/usePersonaCatalogRelay";
 import { useCreatedAgentChannelAttachment } from "@/features/agents/useCreatedAgentChannelAttachment";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import { fetchSnapshotBytes } from "@/shared/api/tauriMedia";
 import type {
   SnapshotFormat,
   SnapshotMemoryLevel,
@@ -75,9 +71,8 @@ export function usePersonaActions() {
   const personasQuery = usePersonasQuery();
   const catalogQuery = usePersonaCatalogQuery(communityId);
   usePersonaCatalogLiveUpdates(communityId);
-  const publishCatalogMutation = usePublishPersonaCatalogMutation(communityId);
-  const unpublishCatalogMutation =
-    useUnpublishPersonaCatalogMutation(communityId);
+  const setCatalogSharedMutation =
+    useSetPersonaCatalogSharedMutation(communityId);
   const [shouldLoadAcpRuntimes, setShouldLoadAcpRuntimes] =
     React.useState(false);
   const acpRuntimesQuery = useAcpRuntimesQuery({
@@ -129,17 +124,12 @@ export function usePersonaActions() {
   const personas = personasQuery.data ?? [];
   const publications = catalogQuery.data ?? [];
   const sharedCatalogPersonaIdSet = React.useMemo(() => {
-    const ownerPubkey = identityQuery.data?.pubkey?.toLowerCase();
     return new Set(
-      publications
-        .filter(
-          (publication) =>
-            publication.ownerPubkey === ownerPubkey &&
-            publication.status === "published",
-        )
-        .map((publication) => publication.sourcePersonaId),
+      personas
+        .filter((persona) => !persona.isBuiltIn && persona.shared)
+        .map((persona) => persona.id),
     );
-  }, [identityQuery.data?.pubkey, publications]);
+  }, [personas]);
   const availableRuntimes = React.useMemo(
     () =>
       (acpRuntimesQuery.data ?? []).filter(
@@ -179,7 +169,7 @@ export function usePersonaActions() {
     intent?: AgentCreateIntent,
     backendIntent?: BackendIntent | null,
     targetChannel?: Pick<Channel, "id" | "name"> | null,
-    options?: { publishCatalogUpdates?: boolean },
+    _options?: { publishCatalogUpdates?: boolean },
   ): Promise<boolean> {
     if (isPersonaSubmitPending) {
       return false;
@@ -189,10 +179,7 @@ export function usePersonaActions() {
     setIsPersonaSubmitPending(true);
     try {
       if ("id" in input) {
-        const updatedPersona = await updatePersonaMutation.mutateAsync(input);
-        if (options?.publishCatalogUpdates) {
-          await publishPersonaCatalogUpdates(updatedPersona);
-        }
+        await updatePersonaMutation.mutateAsync(input);
         setPersonaNoticeMessage(`Updated ${input.displayName}.`);
       } else {
         const runtime = availableRuntimes.find(
@@ -276,17 +263,6 @@ export function usePersonaActions() {
   async function handleDelete(persona: AgentPersona) {
     clearFeedback("library");
     try {
-      const publication = ownCatalogPublication(
-        publications,
-        identityQuery.data?.pubkey,
-        persona.id,
-      );
-      if (publication?.status === "published") {
-        await unpublishCatalogMutation.mutateAsync({
-          persona,
-          previousCreatedAt: publication.createdAt,
-        });
-      }
       await deletePersonaMutation.mutateAsync(persona.id);
       setPersonaNoticeMessage(`Deleted ${persona.displayName}.`);
       setPersonaToDelete(null);
@@ -305,10 +281,7 @@ export function usePersonaActions() {
     clearFeedback(surface);
     try {
       if (active && isCatalogPersona(persona)) {
-        const isOwnPublication =
-          persona.catalogSource.ownerPubkey ===
-          identityQuery.data?.pubkey?.toLowerCase();
-        const ownLocalPersona = isOwnPublication
+        const ownLocalPersona = persona.catalogSource.isOwn
           ? personas.find(
               (candidate) =>
                 candidate.id === persona.catalogSource.sourcePersonaId,
@@ -316,30 +289,26 @@ export function usePersonaActions() {
           : undefined;
 
         if (ownLocalPersona) {
-          await setPersonaActiveMutation.mutateAsync({
-            id: ownLocalPersona.id,
-            active: true,
-          });
+          if (!ownLocalPersona.isActive) {
+            await setPersonaActiveMutation.mutateAsync({
+              id: ownLocalPersona.id,
+              active: true,
+            });
+          }
         } else {
-          const snapshot = persona.catalogSource.snapshot;
-          const fileBytes = await fetchSnapshotBytes({
-            url: snapshot.url,
-            filename: snapshot.fileName,
-            expectedSha256: snapshot.sha256,
-            expectedSize: snapshot.size,
-          });
-          const result = await confirmSnapshotImportMutation.mutateAsync({
-            fileBytes,
-            // Catalog publication strips the source response allowlist, but
-            // fail closed at import too if a malicious entry bypassed it.
-            keepAllowlist: false,
-          });
-          void queryClient.invalidateQueries({ queryKey: personasQueryKey });
-          void queryClient.invalidateQueries({
-            queryKey: managedAgentsQueryKey,
-          });
-          void queryClient.invalidateQueries({
-            queryKey: ["user-profile", result.newPubkey.toLowerCase()],
+          await createPersonaMutation.mutateAsync({
+            displayName: persona.displayName,
+            avatarUrl: persona.avatarUrl ?? undefined,
+            systemPrompt: persona.systemPrompt,
+            runtime: persona.runtime ?? undefined,
+            model: persona.model ?? undefined,
+            provider: persona.provider ?? undefined,
+            namePool: persona.namePool,
+            behavior: {
+              respondTo:
+                persona.respondTo === "anyone" ? "anyone" : "owner-only",
+              parallelism: persona.parallelism ?? undefined,
+            },
           });
         }
       } else {
@@ -438,6 +407,7 @@ export function usePersonaActions() {
 
   function openCatalog() {
     clearFeedback("catalog");
+    void catalogQuery.refetch();
     setIsCatalogDialogOpen(true);
   }
 
@@ -493,49 +463,32 @@ export function usePersonaActions() {
   function getPersonaCatalogShareLevel(
     persona: AgentPersona,
   ): CatalogPersonaShareLevel {
-    const publication = ownCatalogPublication(
-      publications,
-      identityQuery.data?.pubkey,
-      persona.id,
-    );
-    if (
-      publication?.status !== "published" ||
-      publication.memoryLevel === null
-    ) {
-      return "not-shared";
-    }
-    return publication.memoryLevel;
+    return persona.shared ? "none" : "not-shared";
   }
 
   async function setPersonaCatalogShareLevel(
     persona: AgentPersona,
     shareLevel: CatalogPersonaShareLevel,
-    linkedAgentPubkey: string | null,
   ): Promise<void> {
     if (persona.isBuiltIn) return;
 
     clearFeedback("library");
-    const publication = ownCatalogPublication(
-      publications,
-      identityQuery.data?.pubkey,
-      persona.id,
-    );
     try {
-      if (shareLevel === "not-shared") {
-        await unpublishCatalogMutation.mutateAsync({
-          persona,
-          previousCreatedAt: publication?.createdAt,
-        });
+      const shared = shareLevel !== "not-shared";
+      const updated = await setCatalogSharedMutation.mutateAsync({
+        id: persona.id,
+        shared,
+      });
+      setPersonaToShare((current) =>
+        current?.persona.id === updated.id
+          ? { ...current, persona: updated }
+          : current,
+      );
+      if (!shared) {
         setPersonaNoticeMessage(
           `${persona.displayName} is no longer discoverable in the community catalog.`,
         );
       } else {
-        await publishCatalogMutation.mutateAsync({
-          persona,
-          memoryLevel: shareLevel,
-          linkedAgentPubkey,
-          previousCreatedAt: publication?.createdAt,
-        });
         setPersonaNoticeMessage(
           `Published ${persona.displayName} to the community catalog.`,
         );
@@ -549,59 +502,6 @@ export function usePersonaActions() {
     }
   }
 
-  function hasPersonaCatalogUpdates(persona: AgentPersona) {
-    const publication = ownCatalogPublication(
-      publications,
-      identityQuery.data?.pubkey,
-      persona.id,
-    );
-    return (
-      publication?.status === "published" &&
-      publication.sourceUpdatedAt !== persona.updatedAt
-    );
-  }
-
-  async function publishPersonaCatalogUpdates(
-    persona: AgentPersona,
-    linkedAgentPubkey?: string | null,
-  ): Promise<boolean> {
-    if (persona.isBuiltIn) return false;
-    const publication = ownCatalogPublication(
-      publications,
-      identityQuery.data?.pubkey,
-      persona.id,
-    );
-    if (
-      publication?.status !== "published" ||
-      publication.memoryLevel === null
-    ) {
-      return false;
-    }
-    const managedAgents =
-      queryClient.getQueryData<ManagedAgent[]>(managedAgentsQueryKey) ?? [];
-    try {
-      await publishCatalogMutation.mutateAsync({
-        persona,
-        memoryLevel: publication.memoryLevel,
-        linkedAgentPubkey:
-          linkedAgentPubkey ??
-          linkedAgentPubkeyForPersona(persona.id, managedAgents),
-        previousCreatedAt: publication.createdAt,
-      });
-      setPersonaNoticeMessage(
-        `Published updates to ${persona.displayName} in the community catalog.`,
-      );
-      return true;
-    } catch (error) {
-      setPersonaErrorMessage(
-        error instanceof Error
-          ? `${persona.displayName} was saved, but its catalog update failed: ${error.message}`
-          : `${persona.displayName} was saved, but its catalog update failed.`,
-      );
-      return false;
-    }
-  }
-
   const isPending =
     isPersonaSubmitPending ||
     createPersonaMutation.isPending ||
@@ -612,8 +512,7 @@ export function usePersonaActions() {
     exportAgentSnapshotMutation.isPending ||
     previewSnapshotImportMutation.isPending ||
     confirmSnapshotImportMutation.isPending ||
-    publishCatalogMutation.isPending ||
-    unpublishCatalogMutation.isPending;
+    setCatalogSharedMutation.isPending;
 
   return {
     personasQuery,
@@ -652,8 +551,6 @@ export function usePersonaActions() {
     handleExportSnapshot,
     getPersonaCatalogShareLevel,
     setPersonaCatalogShareLevel,
-    hasPersonaCatalogUpdates,
-    publishPersonaCatalogUpdates,
     sharedCatalogPersonaIdSet,
     clearFeedback,
     snapshotImportState,

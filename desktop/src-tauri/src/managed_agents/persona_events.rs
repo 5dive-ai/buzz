@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use buzz_core_pkg::kind::KIND_PERSONA;
+use buzz_core_pkg::kind::{persona_event_is_shared, KIND_PERSONA};
 use nostr::{EventBuilder, Kind, Tag};
 use serde::{Deserialize, Serialize};
 
@@ -138,7 +138,11 @@ pub fn build_persona_event(record: &AgentDefinition) -> Result<EventBuilder, Str
         .map_err(|e| format!("failed to serialize persona content: {e}"))?;
 
     let d_tag = persona_d_tag(record);
-    let tags = vec![Tag::parse(["d", d_tag.as_str()]).map_err(|e| format!("invalid d-tag: {e}"))?];
+    let mut tags =
+        vec![Tag::parse(["d", d_tag.as_str()]).map_err(|e| format!("invalid d-tag: {e}"))?];
+    if record.shared {
+        tags.push(Tag::parse(["shared", "true"]).map_err(|e| format!("invalid shared tag: {e}"))?);
+    }
 
     Ok(EventBuilder::new(Kind::Custom(KIND_PERSONA as u16), content_json).tags(tags))
 }
@@ -188,6 +192,7 @@ pub fn persona_from_event(event: &nostr::Event) -> Result<AgentDefinition, Strin
         name_pool: content.name_pool,
         is_builtin: false,
         is_active: true,
+        shared: persona_event_is_shared(event),
         source_team: None,
         source_team_persona_slug: Some(d_tag),
         env_vars: BTreeMap::new(),

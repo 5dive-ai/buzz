@@ -19,10 +19,11 @@ use crate::managed_agents::AgentDefinition;
 ///
 /// Unlike `retain_managed_agent_pending`, this has no projection-equality
 /// short-circuit: personas have no start/stop runtime churn, so a republish
-/// only happens on a genuine create/update/delete user edit (`set_persona_active`
-/// does not retain, so the local-only `is_active` toggle never republishes, and
-/// a byte-identical user-save republish is harmlessly NIP-33-replaced). The
-/// guard is intentionally omitted.
+/// only happens on a genuine create/update/delete/share user edit
+/// (`set_persona_active` does not retain, so the local-only `is_active` toggle
+/// never republishes, while `set_persona_shared` must retain because the tag is
+/// relay-authoritative). A byte-identical user-save republish is harmlessly
+/// NIP-33-replaced. The guard is intentionally omitted.
 pub(in crate::commands) fn retain_persona_pending(
     app: &AppHandle,
     state: &AppState,

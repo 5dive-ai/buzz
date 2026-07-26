@@ -90,6 +90,7 @@ type MockPersonaSeed = {
   systemPrompt: string;
   updatedAt?: string;
   isActive?: boolean;
+  shared?: boolean;
   sourceTeam?: string | null;
   envVars?: Record<string, string>;
   /**

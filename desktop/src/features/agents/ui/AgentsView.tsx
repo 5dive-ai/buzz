@@ -363,9 +363,6 @@ export function AgentsView() {
       ) : null}
       {personas.personaToShare ? (
         <PersonaShareDialog
-          hasCatalogUpdates={personas.hasPersonaCatalogUpdates(
-            personas.personaToShare.persona,
-          )}
           catalogShareLevel={personas.getPersonaCatalogShareLevel(
             personas.personaToShare.persona,
           )}
@@ -377,7 +374,6 @@ export function AgentsView() {
             void personas.setPersonaCatalogShareLevel(
               shareTarget.persona,
               shareLevel,
-              shareTarget.linkedAgentPubkey,
             );
           }}
           onExport={() => {
@@ -390,14 +386,6 @@ export function AgentsView() {
             if (!open) {
               personas.setPersonaToShare(null);
             }
-          }}
-          onPublishCatalogUpdates={() => {
-            const shareTarget = personas.personaToShare;
-            if (!shareTarget) return;
-            void personas.publishPersonaCatalogUpdates(
-              shareTarget.persona,
-              shareTarget.linkedAgentPubkey,
-            );
           }}
           open={personas.personaToShare !== null}
           persona={personas.personaToShare.persona}

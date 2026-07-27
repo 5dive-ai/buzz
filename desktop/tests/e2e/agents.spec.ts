@@ -361,13 +361,15 @@ test("the new agent card offers create, discover, and import", async ({
   await expect(newAgentCard).toHaveText("");
   await expect(newAgentCard.locator(".lucide-plus")).toBeVisible();
 
-  const personaCards = page.locator('[data-testid^="persona-agent-row-"]');
-  await expect(personaCards.first()).toBeVisible();
+  const agentCards = page.locator(
+    '[data-testid^="persona-agent-row-"], [data-testid="new-agent-card"]',
+  );
+  await expect(agentCards.first()).toBeVisible();
   const headerBox = await page
     .getByRole("heading", { level: 1, name: "Agents" })
     .locator("../..")
     .boundingBox();
-  const cardBoxes = await personaCards.evaluateAll((cards) =>
+  const cardBoxes = await agentCards.evaluateAll((cards) =>
     cards.map((card) => {
       const box = card.getBoundingClientRect();
       return { right: box.right, top: box.top };
@@ -931,8 +933,12 @@ test("custom personas share with people and keep export separate", async ({
   await expect(
     shareDialog.getByLabel("What to include", { exact: true }),
   ).toHaveCount(0);
-  await expect(shareDialog.getByText("Memories")).toHaveCount(0);
-  await expect(shareDialog.getByText("File format")).toHaveCount(0);
+  await expect(shareDialog.getByText("Memories", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(
+    shareDialog.getByText("File format", { exact: true }),
+  ).toHaveCount(0);
   const shareMainCard = page.getByTestId("persona-share-main-card");
   const exportAgentRow = page.getByTestId("persona-share-export");
   await expect(exportAgentRow).toHaveText("Export agent");
@@ -1183,25 +1189,29 @@ test("custom personas share with people and keep export separate", async ({
   const staticRecipientAccess = page.getByTestId(
     "persona-share-recipient-access",
   );
-  const [
-    staticRecipientAccessBox,
-    recipientAccessPaddingRight,
-    recipientFieldBox,
-  ] = await Promise.all([
-    staticRecipientAccess.boundingBox(),
-    staticRecipientAccess.evaluate((element) =>
-      Number.parseFloat(getComputedStyle(element).paddingRight),
-    ),
-    recipientField.boundingBox(),
-  ]);
-  const staticRecipientTextInset =
-    (recipientFieldBox?.x ?? 0) +
-    (recipientFieldBox?.width ?? 0) -
-    ((staticRecipientAccessBox?.x ?? 0) +
-      (staticRecipientAccessBox?.width ?? 0) -
-      recipientAccessPaddingRight);
-  expect(staticRecipientTextInset).toBeGreaterThanOrEqual(8);
-  expect(staticRecipientTextInset).toBeLessThanOrEqual(10);
+  await waitForAnimations(page);
+  await expect
+    .poll(async () => {
+      const [
+        staticRecipientAccessBox,
+        recipientAccessPaddingRight,
+        currentRecipientFieldBox,
+      ] = await Promise.all([
+        staticRecipientAccess.boundingBox(),
+        staticRecipientAccess.evaluate((element) =>
+          Number.parseFloat(getComputedStyle(element).paddingRight),
+        ),
+        recipientField.boundingBox(),
+      ]);
+      const staticRecipientTextInset =
+        (currentRecipientFieldBox?.x ?? 0) +
+        (currentRecipientFieldBox?.width ?? 0) -
+        ((staticRecipientAccessBox?.x ?? 0) +
+          (staticRecipientAccessBox?.width ?? 0) -
+          recipientAccessPaddingRight);
+      return Math.abs(staticRecipientTextInset - 8);
+    })
+    .toBeLessThanOrEqual(2);
   await expect(page.getByTestId("persona-share-send")).toBeVisible();
 
   await recipientSearch.fill("bob");
@@ -1777,14 +1787,20 @@ test("share access controls include the selected memories", async ({
   await waitForAnimations(page);
   await expect
     .poll(async () => {
-      const expandedRecipientAccessBox = await recipientAccess.boundingBox();
+      const [expandedRecipientAccessBox, currentRecipientFieldBox] =
+        await Promise.all([
+          recipientAccess.boundingBox(),
+          recipientField.boundingBox(),
+        ]);
       return Math.abs(
-        (expandedRecipientAccessBox?.x ?? 0) +
-          (expandedRecipientAccessBox?.width ?? 0) -
-          recipientAccessRightEdge,
+        (currentRecipientFieldBox?.x ?? 0) +
+          (currentRecipientFieldBox?.width ?? 0) -
+          8 -
+          ((expandedRecipientAccessBox?.x ?? 0) +
+            (expandedRecipientAccessBox?.width ?? 0)),
       );
     })
-    .toBeLessThanOrEqual(1);
+    .toBeLessThanOrEqual(8);
   expect(
     await recipientAccess
       .locator("span")

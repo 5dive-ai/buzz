@@ -31,8 +31,15 @@ publish = false
 name = "buzz_agent_core"
 path = "src/lib.rs"
 
+# Emitted as `buzz-agent`, not `buzz-agent-core`, on purpose. buzz-acp derives
+# a harness identity from the command's BASENAME
+# (`normalize_agent_command_identity`, buzz-acp/src/config.rs:600-615) and
+# already has a `"buzz-agent"` arm meaning "no extra args"
+# (`default_agent_args`, :617-624). Naming the binary this way makes it a
+# drop-in swap: point BUZZ_ACP_AGENT_COMMAND at it and buzz-acp cannot tell the
+# difference.
 [[bin]]
-name = "buzz-agent-core"
+name = "buzz-agent"
 path = "src/main.rs"
 
 # Test-only fake MCP server, copied from crates/buzz-agent. Built

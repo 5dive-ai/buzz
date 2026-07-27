@@ -116,7 +116,7 @@ struct Harness {
 
 impl Harness {
     fn start(base_url: &str, home: &std::path::Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_buzz-agent-core"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_buzz-agent"))
             .env("BUZZ_AGENT_PROVIDER", "openai-compat")
             .env("BUZZ_AGENT_MODEL", "fake-model")
             .env("OPENAI_COMPAT_API_KEY", "k")

@@ -154,7 +154,7 @@ struct Harness {
 
 impl Harness {
     fn start(base_url: &str, home: &std::path::Path) -> Self {
-        let exe = env!("CARGO_BIN_EXE_buzz-agent-core");
+        let exe = env!("CARGO_BIN_EXE_buzz-agent");
         let mut child = Command::new(exe)
             // Buzz-shaped config; config.rs translates these onto GOOSE_*.
             .env("BUZZ_AGENT_PROVIDER", "openai-compat")

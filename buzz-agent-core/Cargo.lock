@@ -750,6 +750,7 @@ dependencies = [
  "futures",
  "goose",
  "goose-provider-types",
+ "rmcp",
  "serde",
  "serde_json",
  "tempfile",

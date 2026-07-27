@@ -86,6 +86,10 @@ pub fn prompt_to_text(blocks: &[ContentBlock]) -> String {
 /// responsible for emitting `usage_update` *before* the `session/prompt`
 /// response — that ordering is load-bearing for kind-44200 metrics
 /// (`buzz-agent/src/lib.rs:701-706`).
+///
+/// `hook_extension` names the MCP extension carrying `_Stop`/`_PostCompact`
+/// (buzz-dev-mcp). When set, the turn is not allowed to end while `_Stop`
+/// objects — see [`crate::hooks`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     agent: Arc<Agent>,
@@ -94,10 +98,92 @@ pub async fn run_turn(
     max_rounds: Option<u32>,
     wire_tx: &WireSender,
     cancel: CancellationToken,
+    hook_extension: Option<&str>,
 ) -> (Result<StopReason, AgentError>, TurnTokens) {
-    let text = prompt_to_text(&prompt);
     let mut tokens = TurnTokens::default();
+    let mut next_message = Message::user().with_text(prompt_to_text(&prompt));
+    let mut stop_blocks: u32 = 0;
 
+    // Outer loop exists solely for the `_Stop` veto: goose's `reply()` stream
+    // ends when the model stops, so continuing means re-entering `reply()`
+    // with the objection appended. Goose's own Stop hook does the equivalent
+    // internally (`agent.rs:2891-2917`); we do it here because its
+    // `hook_manager` is private.
+    loop {
+        let stop = match drive_stream(
+            &agent,
+            session_id,
+            next_message,
+            max_rounds,
+            wire_tx,
+            &cancel,
+            &mut tokens,
+            hook_extension,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => return (Err(e), tokens),
+        };
+
+        // Only a clean end-of-turn is vetoable. Cancellation and refusals pass
+        // through untouched.
+        if !matches!(stop, StopReason::EndTurn) || cancel.is_cancelled() {
+            return (Ok(stop), tokens);
+        }
+
+        let Some(extension) = hook_extension else {
+            return (Ok(stop), tokens);
+        };
+
+        if stop_blocks >= crate::hooks::MAX_STOP_BLOCKS {
+            tracing::warn!(
+                blocks = stop_blocks,
+                "_Stop veto cap reached; ending turn anyway"
+            );
+            return (Ok(stop), tokens);
+        }
+
+        let Some(session) = current_session(session_id).await else {
+            return (Ok(stop), tokens);
+        };
+        let Some(objection) = crate::hooks::stop_objection(&agent, &session, extension).await
+        else {
+            return (Ok(stop), tokens);
+        };
+
+        stop_blocks += 1;
+        tracing::info!(blocks = stop_blocks, "_Stop hook vetoed end of turn");
+
+        // Agent-visible, user-invisible — the objection steers the model
+        // without appearing in the channel, matching both buzz-agent and
+        // goose's own Deny handling.
+        next_message = Message::user()
+            .with_text(format!("[Stop] {objection}"))
+            .with_visibility(false, true);
+    }
+}
+
+/// Look up the goose `Session` record needed to dispatch a hook tool.
+async fn current_session(session_id: &str) -> Option<goose::session::session_manager::Session> {
+    goose::session::session_manager::SessionManager::instance()
+        .get_session(session_id, false)
+        .await
+        .ok()
+}
+
+/// Drive a single `reply()` stream to completion.
+#[allow(clippy::too_many_arguments)]
+async fn drive_stream(
+    agent: &Arc<Agent>,
+    session_id: &str,
+    message: Message,
+    max_rounds: Option<u32>,
+    wire_tx: &WireSender,
+    cancel: &CancellationToken,
+    tokens: &mut TurnTokens,
+    hook_extension: Option<&str>,
+) -> Result<StopReason, AgentError> {
     let session_config = SessionConfig {
         id: session_id.to_string(),
         schedule_id: None,
@@ -106,15 +192,11 @@ pub async fn run_turn(
     };
 
     let mut stream = match agent
-        .reply(
-            Message::user().with_text(text),
-            session_config,
-            Some(cancel.clone()),
-        )
+        .reply(message, session_config, Some(cancel.clone()))
         .await
     {
         Ok(s) => s,
-        Err(e) => return (Err(AgentError::Llm(e.to_string())), tokens),
+        Err(e) => return Err(AgentError::Llm(e.to_string())),
     };
 
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
@@ -122,6 +204,7 @@ pub async fn run_turn(
     keepalive.tick().await; // first tick is immediate; discard it
 
     let mut stop = StopReason::EndTurn;
+    let mut compacted = false;
 
     loop {
         tokio::select! {
@@ -143,7 +226,9 @@ pub async fn run_turn(
                 let Some(event) = next else { break };
                 match event {
                     Ok(ev) => {
-                        if let Some(reason) = handle_event(ev, session_id, wire_tx, &mut tokens).await {
+                        if let Some(reason) =
+                            handle_event(ev, session_id, wire_tx, tokens, &mut compacted).await
+                        {
                             stop = reason;
                             break;
                         }
@@ -159,8 +244,31 @@ pub async fn run_turn(
                         } else {
                             AgentError::Llm(msg)
                         };
-                        return (Err(err), tokens);
+                        return Err(err);
                     }
+                }
+            }
+        }
+    }
+
+    // Goose compacted history mid-turn. Re-inject the todo list so it survives
+    // the truncation — this is what buzz-agent's `_PostCompact` existed for
+    // (`handoff.rs:73-81`). Steering is the right channel: goose drains it at
+    // the next round boundary (`agent.rs:1951-1974`).
+    if compacted && !cancel.is_cancelled() {
+        if let Some(extension) = hook_extension {
+            if let Some(session) = current_session(session_id).await {
+                if let Some(state) =
+                    crate::hooks::post_compact_state(agent, &session, extension).await
+                {
+                    agent
+                        .steer(
+                            session_id,
+                            Message::user()
+                                .with_text(format!("[PostCompact] {state}"))
+                                .with_visibility(false, true),
+                        )
+                        .await;
                 }
             }
         }
@@ -170,7 +278,7 @@ pub async fn run_turn(
         stop = StopReason::Cancelled;
     }
 
-    (Ok(stop), tokens)
+    Ok(stop)
 }
 
 /// Translate one `AgentEvent` into ACP notifications.
@@ -181,6 +289,7 @@ async fn handle_event(
     session_id: &str,
     wire_tx: &WireSender,
     tokens: &mut TurnTokens,
+    compacted: &mut bool,
 ) -> Option<StopReason> {
     match event {
         AgentEvent::Message(msg) => {
@@ -206,10 +315,12 @@ async fn handle_event(
         }
 
         // Compaction happened. buzz-agent surfaced this as a `[Context
-        // Handoff]` history rewrite; here Goose has already done it and we
-        // only need to note it.
+        // Handoff]` history rewrite; Goose has already done the rewrite, so we
+        // only flag it — the caller then asks `_PostCompact` for state to
+        // re-inject once the stream settles.
         AgentEvent::HistoryReplaced(_) => {
             tracing::info!(target: "buzz_agent::compaction", "history compacted");
+            *compacted = true;
             None
         }
 

@@ -35,6 +35,12 @@ path = "src/lib.rs"
 name = "buzz-agent-core"
 path = "src/main.rs"
 
+# Test-only fake MCP server, copied from crates/buzz-agent. Built
+# unconditionally because cargo can't gate bins on `cfg(test)`.
+[[bin]]
+name = "fake-mcp"
+path = "tests/bin/fake_mcp.rs"
+
 [dependencies]
 # Pinned to a release commit deliberately: goose's public `Agent` surface is
 # not semver-stable (many fields are `pub(super)`) and its MSRV moves quickly.
@@ -57,6 +63,7 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rmcp = { version = "1.8", default-features = false, features = ["schemars"] }
 
 [dev-dependencies]
 tempfile = "3"

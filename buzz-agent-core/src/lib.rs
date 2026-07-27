@@ -21,6 +21,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod hooks;
 pub mod types;
 pub mod wire;
 
@@ -61,6 +62,9 @@ struct Session {
     /// the override takes effect "from the next prompt" and never mutates a
     /// turn already in flight (`buzz-agent/src/lib.rs:494-502`).
     pending_model: Option<String>,
+    /// Name of the MCP extension carrying `_Stop`/`_PostCompact`, if any.
+    /// See [`crate::hooks`] for why we dispatch these ourselves.
+    hook_extension: Option<String>,
     accumulated_input_tokens: u64,
     accumulated_output_tokens: u64,
 }
@@ -82,7 +86,7 @@ async fn build_agent(
     cwd: &str,
     system_prompt: Option<&str>,
     mcp_servers: &[McpServerStdio],
-) -> Result<(Arc<Agent>, String), AgentError> {
+) -> Result<(Arc<Agent>, String, Option<String>), AgentError> {
     let session_manager = Arc::new(SessionManager::instance());
     let permission_manager = PermissionManager::instance();
 
@@ -174,7 +178,49 @@ async fn build_agent(
         }
     }
 
-    Ok((Arc::new(agent), session.id))
+    let agent = Arc::new(agent);
+
+    // Find the extension carrying `_Stop`, by asking rather than assuming the
+    // name — `buzz-acp` derives it from the MCP binary's file stem
+    // (`buzz-acp/src/lib.rs:4145-4149`), so it is not a fixed string.
+    //
+    // KNOWN DEVIATION: buzz-agent hid `_`-prefixed tools from the model
+    // (`agent.rs:328-336`) while still calling them itself. Goose's
+    // `available_tools` allowlist gates advertising *and* dispatch through the
+    // same cache (`extension_manager.rs:1421`, `:1698`), so hiding them would
+    // also make them undispatchable — which would break the veto. They stay
+    // visible; `hook_tool_guidance()` tells the model to leave them alone.
+    let mut hook_extension = None;
+    for tool in agent.list_tools(&session.id, None).await {
+        if tool.name.ends_with("___Stop") {
+            hook_extension = tool
+                .name
+                .strip_suffix("___Stop")
+                .map(|prefix| prefix.to_string());
+            break;
+        }
+    }
+
+    if let Some(ext) = &hook_extension {
+        agent
+            .extend_system_prompt("buzz_hook_tools".to_string(), hook_tool_guidance())
+            .await;
+        tracing::info!(extension = %ext, "lifecycle hooks available");
+    }
+
+    Ok((agent, session.id, hook_extension))
+}
+
+/// Keep the model's hands off the lifecycle hooks.
+///
+/// They are ordinary MCP tools on the wire, so a generic harness advertises
+/// them. buzz-agent solved this by hiding them; we cannot (see `build_agent`),
+/// so we ask instead.
+fn hook_tool_guidance() -> String {
+    "Tools whose names begin with an underscore (`_Stop`, `_PostCompact`) are \
+     lifecycle hooks invoked automatically by the runtime. Never call them \
+     yourself. Use the `todo` tool to manage your task list."
+        .to_string()
 }
 
 pub async fn serve(cfg: Config) -> anyhow::Result<()> {
@@ -350,7 +396,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         .await;
     }
 
-    let (agent, goose_session_id) =
+    let (agent, goose_session_id, hook_extension) =
         match build_agent(&app.cfg, &p.cwd, p.system_prompt.as_deref(), &p.mcp_servers).await {
             Ok(v) => v,
             Err(e) => {
@@ -379,6 +425,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             cancel: None,
             model_override: None,
             pending_model: None,
+            hook_extension,
             accumulated_input_tokens: 0,
             accumulated_output_tokens: 0,
         },
@@ -472,7 +519,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
     let cancel = CancellationToken::new();
 
     // Single-flight per session, and capture the agent handle.
-    let (agent, goose_session_id, pending_model) = {
+    let (agent, goose_session_id, pending_model, hook_extension) = {
         let mut sessions = app.sessions.lock().await;
         let Some(s) = sessions.get_mut(&p.session_id) else {
             return wire::send(
@@ -501,6 +548,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             s.agent.clone(),
             s.goose_session_id.clone(),
             s.pending_model.take(),
+            s.hook_extension.clone(),
         )
     };
 
@@ -538,6 +586,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
         app.cfg.max_rounds,
         wire_tx,
         cancel,
+        hook_extension.as_deref(),
     )
     .await;
 

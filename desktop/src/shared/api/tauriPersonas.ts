@@ -263,9 +263,15 @@ export async function confirmAgentSnapshotImport(
 
 // Patches a single inbound persona/team/agent projection event into the local
 // store (personas.json). The backend resolves the match key and the
-// pending-edit race; the frontend only forwards the raw Nostr event JSON.
+// pending-edit race; the frontend forwards the raw Nostr event JSON plus the
+// relay it arrived on, so a workspace switch mid-flight cannot retain the event
+// into the newly active community's scoped store.
 export async function reconcileInboundPersonaEvent(
   eventJson: string,
+  arrivalRelayUrl: string,
 ): Promise<void> {
-  await invokeTauri("reconcile_inbound_persona_event", { eventJson });
+  await invokeTauri("reconcile_inbound_persona_event", {
+    eventJson,
+    arrivalRelayUrl,
+  });
 }

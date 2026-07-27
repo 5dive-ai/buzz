@@ -234,6 +234,7 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
             super::tts_settings::pocket_voice_name(&settings.voice_preferences).to_string()
         })?;
     let constructed_voice = initial_voice.clone();
+    let playback_speed = state.tts_playback_speed.clone();
     let constructed = tokio::task::spawn_blocking(move || {
         tts::TtsPipeline::new_with_voice(
             model_dir,
@@ -241,6 +242,7 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
             tts_cancel,
             &initial_voice,
             output_device,
+            playback_speed,
         )
     })
     .await;

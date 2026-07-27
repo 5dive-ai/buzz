@@ -55,6 +55,7 @@ pub struct AppState {
     ///
     /// Set once during `setup()` in `lib.rs`; never cleared.
     pub app_handle: Mutex<Option<AppHandle>>,
+    pub tts_playback_speed: crate::huddle::playback_speed::PlaybackSpeedControl,
     /// Port of the localhost media streaming proxy (set during setup).
     pub media_proxy_port: AtomicU16,
     /// Set when identity resolution detected a "keyring-locked" state: the
@@ -213,6 +214,7 @@ pub fn build_app_state() -> AppState {
         huddle_state: Mutex::new(HuddleState::default()),
         huddle_audio: Default::default(),
         app_handle: Mutex::new(None),
+        tts_playback_speed: crate::huddle::playback_speed::PlaybackSpeedControl::default(),
         media_proxy_port: AtomicU16::new(0),
         prevent_sleep: Arc::new(Mutex::new(
             crate::prevent_sleep::PreventSleepState::default(),

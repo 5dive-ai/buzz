@@ -50,6 +50,7 @@ use std::{
 use super::pocket::{
     load_text_to_speech, load_voice_style, DEFAULT_VOICE, SAMPLE_RATE, VOICE_FILE_EXT,
 };
+use super::playback_speed::{PlaybackSpeedControl, PlaybackSpeedProcessor};
 use super::preprocessing::{preprocess_for_tts, split_sentences};
 
 #[path = "tts_voice_transition.rs"]
@@ -167,6 +168,7 @@ impl TtsPipeline {
         cancel: Arc<AtomicBool>,
         voice: &str,
         output_device: Option<String>,
+        playback_speed: PlaybackSpeedControl,
     ) -> Result<Self, String> {
         let (text_tx, text_rx) = mpsc::sync_channel::<QueuedText>(TEXT_QUEUE_DEPTH);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -204,6 +206,7 @@ impl TtsPipeline {
                     ),
                     output_device,
                     startup_tx,
+                    playback_speed,
                 )
             })
             .map_err(|e| format!("failed to spawn tts-worker thread: {e}"))?;
@@ -310,6 +313,7 @@ fn tts_worker(
     control_state: WorkerControlState,
     output_device: Option<String>,
     startup_tx: mpsc::SyncSender<Result<(), String>>,
+    playback_speed: PlaybackSpeedControl,
 ) {
     let (selected_voice, voice_generation, voice_change_ack) = voice_state;
     let (tts_active, shutdown, cancel_signals) = control_state;
@@ -754,6 +758,20 @@ fn tts_worker(
                 }
                 match synthesis {
                     Ok(samples) if !samples.is_empty() => {
+                        let speed = playback_speed.get();
+                        let samples = match PlaybackSpeedProcessor::new(speed, SAMPLE_RATE)
+                            .and_then(|mut processor| {
+                                processor.process_complete_chunk(&samples)
+                            }) {
+                            Ok(processed) => processed,
+                            Err(error) => {
+                                eprintln!(
+                                    "buzz-desktop: TTS playback-speed processing failed at \
+                                     {speed:.2}x: {error}; using 1x playback"
+                                );
+                                samples
+                            }
+                        };
                         if let Some(prepared) = playback_audio.push(
                             samples,
                             chunk_index,

@@ -774,8 +774,7 @@ export type AgentPersona = {
   shared: boolean;
   /** Team ID if this persona was imported from a team directory. Team personas are non-editable. */
   sourceTeam?: string | null;
-  /** Environment variables injected for agents created from this persona.
-   * Layered as: desktop parent env < persona envVars < agent envVars. */
+  /** Agent environment variables, layered after desktop parent and persona values. */
   envVars: Record<string, string>;
   /** NIP-AP behavioral defaults (wire shape). Null/empty = unset. */
   respondTo: RespondToMode | null;
@@ -786,9 +785,8 @@ export type AgentPersona = {
 };
 
 /**
- * NIP-AP behavioral group for a definition, sent as one group: absent = don't
- * touch the stored behavior group (legacy callers), present = replace the fields as a
- * unit. Mirrors `PersonaBehaviorRequest`.
+ * NIP-AP behavioral group for a definition: absent preserves the stored group
+ * for legacy callers; present replaces it as a unit. Mirrors `PersonaBehaviorRequest`.
  */
 export type PersonaBehaviorInput = {
   respondTo?: RespondToMode;

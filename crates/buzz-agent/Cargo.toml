@@ -25,6 +25,10 @@ name = "fake-mcp"
 path = "tests/bin/fake_mcp.rs"
 
 [dependencies]
+# For the `buzz-agent auth <provider>` subcommand only. Provider auth for the
+# agent loop itself is goose's; this is the interactive PKCE login that seeds
+# the token cache that goose (and the desktop model picker) then read.
+buzz-model-catalog = { path = "../buzz-model-catalog" }
 goose = { git = "https://github.com/aaif-goose/goose", rev = "305849b71709b95b86ed9f11bd3bc939899c0aab", default-features = false, features = ["rustls-tls"] }
 goose-provider-types = { git = "https://github.com/aaif-goose/goose", rev = "305849b71709b95b86ed9f11bd3bc939899c0aab" }
 # Resolution guard: goose pins icu_locale "=2.1.1" (needs icu_collections

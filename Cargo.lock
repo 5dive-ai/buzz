@@ -1139,6 +1139,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "buzz-model-catalog",
  "futures",
  "getrandom 0.4.3",
  "goose",

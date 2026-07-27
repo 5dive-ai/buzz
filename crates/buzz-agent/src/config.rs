@@ -103,6 +103,23 @@ fn parse_approval(raw: Option<&str>) -> GooseMode {
     }
 }
 
+/// Translate a Buzz provider id into the name goose's registry knows.
+///
+/// Unknown names pass through untouched — goose owns the registry, so
+/// gatekeeping here would break every provider it gains that we don't list.
+fn goose_provider_name(provider: &str) -> &str {
+    match provider {
+        // Buzz's OpenAI-wire-compatible providers; goose calls them `openai`.
+        "openai-compat" | "openai_compat" | "relay-mesh" | "relay_mesh" => "openai",
+        // The desktop persists this hyphenated (`agent_models.rs:757`) but
+        // goose registers `databricks_v2`
+        // (`goose-providers/src/databricks_v2.rs`). Without this alias an
+        // existing Databricks v2 agent fails to start.
+        "databricks-v2" => "databricks_v2",
+        other => other,
+    }
+}
+
 fn env_str(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
@@ -162,11 +179,7 @@ impl Config {
         // Provider: Buzz's `openai-compat` and `relay-mesh` are both
         // OpenAI-wire-compatible, and Goose knows them as plain `openai`.
         if let Some(provider) = env_str("BUZZ_AGENT_PROVIDER") {
-            let goose_provider = match provider.as_str() {
-                "openai-compat" | "openai_compat" | "relay-mesh" | "relay_mesh" => "openai",
-                other => other,
-            };
-            set_if_absent("GOOSE_PROVIDER", goose_provider);
+            set_if_absent("GOOSE_PROVIDER", goose_provider_name(&provider));
         }
 
         if let Some(model) = env_str("BUZZ_AGENT_MODEL") {
@@ -189,6 +202,25 @@ impl Config {
         }
         if let Some(ctx) = env_str("BUZZ_AGENT_MAX_CONTEXT_TOKENS") {
             set_if_absent("GOOSE_CONTEXT_LIMIT", &ctx);
+        }
+
+        // `BUZZ_AGENT_PREFER_MESH_FOR_AUTO` is still injected by the desktop
+        // (`managed_agents/relay_mesh.rs:42`) but is NOT honoured any more.
+        //
+        // It used to make the old loop re-resolve the relay-mesh `auto` model
+        // against the `/models` catalog mid-run, so a long-lived agent could
+        // join or leave MoA without restarting (`llm.rs:410-440`). Goose
+        // resolves the model once at session start and has no equivalent hook.
+        //
+        // The agent still works — it just pins whatever `auto` resolved to at
+        // startup. Warn rather than fail: silently ignoring a config the user
+        // set is how "why is MoA not kicking in" becomes a day of debugging.
+        if env_str("BUZZ_AGENT_PREFER_MESH_FOR_AUTO").is_some_and(|v| v != "0") {
+            tracing::warn!(
+                "BUZZ_AGENT_PREFER_MESH_FOR_AUTO is set but no longer supported: \
+                 the relay-mesh `auto` model is resolved once at session start \
+                 and will not follow catalog changes mid-run"
+            );
         }
     }
 }
@@ -220,6 +252,33 @@ mod tests {
         set_if_absent("BUZZ_TEST_MISSING", "translated");
         assert_eq!(std::env::var("BUZZ_TEST_MISSING").unwrap(), "translated");
         std::env::remove_var("BUZZ_TEST_MISSING");
+    }
+
+    #[test]
+    fn databricks_v2_hyphen_is_aliased_for_goose() {
+        // The desktop persists "databricks-v2" (agent_models.rs:757) but goose
+        // registers "databricks_v2". Without the alias an existing v2 agent
+        // fails to start.
+        assert_eq!(goose_provider_name("databricks-v2"), "databricks_v2");
+        assert_eq!(goose_provider_name("databricks_v2"), "databricks_v2");
+        assert_eq!(goose_provider_name("databricks"), "databricks");
+    }
+
+    #[test]
+    fn openai_wire_compatible_providers_map_to_openai() {
+        for alias in ["openai-compat", "openai_compat", "relay-mesh", "relay_mesh"] {
+            assert_eq!(goose_provider_name(alias), "openai", "alias {alias}");
+        }
+    }
+
+    #[test]
+    fn unknown_providers_pass_through_untouched() {
+        // Goose owns the registry; we must not gatekeep names we don't know.
+        assert_eq!(goose_provider_name("anthropic"), "anthropic");
+        assert_eq!(
+            goose_provider_name("some_future_provider"),
+            "some_future_provider"
+        );
     }
 
     #[test]

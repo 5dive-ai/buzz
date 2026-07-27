@@ -837,6 +837,20 @@ fn uuid_like() -> String {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // `buzz-agent auth <provider>` — interactive login, then exit.
+    //
+    // Preserved from the pre-goose crate. Goose owns provider auth for the
+    // agent loop, but nothing in goose performs an *interactive* Databricks
+    // PKCE login, and `buzz-model-catalog/src/auth.rs:417` still tells users
+    // to run this exact command when the token cache is empty.
+    let args: Vec<String> = std::env::args().collect();
+    if matches!(args.get(1).map(String::as_str), Some("auth")) {
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(auth_subcommand(&args[2..]));
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -851,4 +865,35 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()?
         .block_on(serve(cfg))?;
     Ok(())
+}
+
+/// `buzz-agent auth <provider>` — run a provider's interactive auth flow and
+/// persist the result. Needs a browser. Reads `DATABRICKS_HOST` from env.
+///
+/// The cached token is what lets both the agent loop and the desktop model
+/// picker work without a static `DATABRICKS_TOKEN`.
+async fn auth_subcommand(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use buzz_model_catalog::auth::{PkceOAuthConfig, PkceOAuthTokenSource};
+
+    match args.first().map(String::as_str) {
+        Some("databricks" | "databricks_v2" | "databricks-v2") => {
+            let host = std::env::var("DATABRICKS_HOST")
+                .map_err(|_| "auth databricks: DATABRICKS_HOST required")?;
+            let pkce = PkceOAuthConfig {
+                discovery_url: format!(
+                    "{}/oidc/.well-known/oauth-authorization-server",
+                    host.trim_end_matches('/')
+                ),
+                client_id: "databricks-cli".into(),
+                scopes: vec!["all-apis".into(), "offline_access".into()],
+                cache_namespace: "databricks".into(),
+                cache_dir_override: None,
+            };
+            PkceOAuthTokenSource::new(pkce)?.interactive_login().await?;
+            eprintln!("Authenticated. Token cached under ~/.config/buzz-agent/oauth/databricks/.");
+            Ok(())
+        }
+        Some(other) => Err(format!("auth: unknown provider {other:?}").into()),
+        None => Err("auth: provider required (try: buzz-agent auth databricks)".into()),
+    }
 }

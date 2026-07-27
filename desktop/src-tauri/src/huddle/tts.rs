@@ -50,7 +50,7 @@ use std::{
 use super::pocket::{
     load_text_to_speech, load_voice_style, DEFAULT_VOICE, SAMPLE_RATE, VOICE_FILE_EXT,
 };
-use super::playback_speed::{PlaybackSpeedControl, PlaybackSpeedProcessor};
+use super::playback_speed::{process_complete_chunk, PlaybackSpeedControl};
 use super::preprocessing::{preprocess_for_tts, split_sentences};
 
 #[path = "tts_voice_transition.rs"]
@@ -759,10 +759,7 @@ fn tts_worker(
                 match synthesis {
                     Ok(samples) if !samples.is_empty() => {
                         let speed = playback_speed.get();
-                        let samples = match PlaybackSpeedProcessor::new(speed, SAMPLE_RATE)
-                            .and_then(|mut processor| {
-                                processor.process_complete_chunk(&samples)
-                            }) {
+                        let samples = match process_complete_chunk(&samples, speed, SAMPLE_RATE) {
                             Ok(processed) => processed,
                             Err(error) => {
                                 eprintln!(

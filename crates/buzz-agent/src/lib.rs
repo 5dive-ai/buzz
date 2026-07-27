@@ -22,6 +22,7 @@
 pub mod agent;
 pub mod config;
 pub mod hooks;
+pub mod mesh;
 pub mod types;
 pub mod wire;
 
@@ -129,9 +130,7 @@ async fn build_agent(
         .or_else(|| std::env::var("GOOSE_MODEL").ok())
         .ok_or_else(|| AgentError::Llm("no model configured".into()))?;
 
-    let provider = goose::providers::create(&provider_name, Vec::new())
-        .await
-        .map_err(|e| map_provider_error(&e.to_string()))?;
+    let provider = build_provider(&provider_name).await?;
     let model_config =
         goose::model_config::model_config_from_user_config(&provider_name, &model_name)
             .map_err(|e| AgentError::LlmModelNotFound(e.to_string()))?;
@@ -793,15 +792,60 @@ async fn cancel_session(app: &Arc<App>, params: Value) {
 /// registry) and installs it with the new `ModelConfig`. `SharedProvider` is an
 /// `Arc<Mutex<Option<..>>>` precisely so this is hot-swappable
 /// (goose `agents/types.rs:11-12`).
+/// Construct the goose provider, wrapping it in Buzz's relay-mesh `auto`
+/// policy when the desktop asked for it.
+///
+/// `BUZZ_AGENT_PREFER_MESH_FOR_AUTO=1` is set on every relay-mesh agent
+/// (`desktop/src-tauri/src/managed_agents/relay_mesh.rs:41-44`). It means "when
+/// the configured model is `auto`, dynamically use mesh-llm's virtual
+/// Mixture-of-Agents model whenever the live catalog can support it". Goose
+/// resolves a model once per session and has no hook for that, so
+/// [`mesh::MeshAutoProvider`] re-resolves per request instead — see that module
+/// for why this is only possible with goose-as-a-library.
+async fn build_provider(
+    provider_name: &str,
+) -> Result<Arc<dyn goose::providers::base::Provider>, AgentError> {
+    let provider = goose::providers::create(provider_name, Vec::new())
+        .await
+        .map_err(|e| map_provider_error(&e.to_string()))?;
+
+    let prefer_mesh = std::env::var("BUZZ_AGENT_PREFER_MESH_FOR_AUTO")
+        .is_ok_and(|v| !v.trim().is_empty() && v != "0");
+    if !prefer_mesh {
+        return Ok(provider);
+    }
+
+    // The policy needs to poll the router's own `/models`, so it needs the
+    // base URL and key. Without them there is nothing to probe, and silently
+    // pinning `auto` would look like MoA is broken.
+    let Some(base_url) = env_first(&["OPENAI_BASE_URL", "OPENAI_COMPAT_BASE_URL"]) else {
+        tracing::warn!(
+            "BUZZ_AGENT_PREFER_MESH_FOR_AUTO is set but no OpenAI base URL is \
+             configured; relay-mesh auto policy disabled"
+        );
+        return Ok(provider);
+    };
+    let api_key = env_first(&["OPENAI_API_KEY", "OPENAI_COMPAT_API_KEY"]).unwrap_or_default();
+
+    tracing::info!(%base_url, "relay-mesh auto policy enabled");
+    Ok(Arc::new(mesh::MeshAutoProvider::new(
+        provider, base_url, api_key,
+    )))
+}
+
+fn env_first(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|v| !v.trim().is_empty())
+}
+
 async fn apply_model(
     agent: &Arc<Agent>,
     session_id: &str,
     model_id: &str,
 ) -> Result<(), AgentError> {
     let provider_name = std::env::var("GOOSE_PROVIDER").unwrap_or_else(|_| "openai".to_string());
-    let provider = goose::providers::create(&provider_name, Vec::new())
-        .await
-        .map_err(|e| map_provider_error(&e.to_string()))?;
+    let provider = build_provider(&provider_name).await?;
     let model_config = goose::model_config::model_config_from_user_config(&provider_name, model_id)
         .map_err(|e| AgentError::LlmModelNotFound(e.to_string()))?;
     agent

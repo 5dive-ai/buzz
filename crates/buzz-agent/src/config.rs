@@ -204,24 +204,9 @@ impl Config {
             set_if_absent("GOOSE_CONTEXT_LIMIT", &ctx);
         }
 
-        // `BUZZ_AGENT_PREFER_MESH_FOR_AUTO` is still injected by the desktop
-        // (`managed_agents/relay_mesh.rs:42`) but is NOT honoured any more.
-        //
-        // It used to make the old loop re-resolve the relay-mesh `auto` model
-        // against the `/models` catalog mid-run, so a long-lived agent could
-        // join or leave MoA without restarting (`llm.rs:410-440`). Goose
-        // resolves the model once at session start and has no equivalent hook.
-        //
-        // The agent still works — it just pins whatever `auto` resolved to at
-        // startup. Warn rather than fail: silently ignoring a config the user
-        // set is how "why is MoA not kicking in" becomes a day of debugging.
-        if env_str("BUZZ_AGENT_PREFER_MESH_FOR_AUTO").is_some_and(|v| v != "0") {
-            tracing::warn!(
-                "BUZZ_AGENT_PREFER_MESH_FOR_AUTO is set but no longer supported: \
-                 the relay-mesh `auto` model is resolved once at session start \
-                 and will not follow catalog changes mid-run"
-            );
-        }
+        // `BUZZ_AGENT_PREFER_MESH_FOR_AUTO` is consumed in `build_provider`
+        // (lib.rs), not here: it selects a provider *wrapper* rather than an
+        // env var goose reads. See `mesh.rs`.
     }
 }
 

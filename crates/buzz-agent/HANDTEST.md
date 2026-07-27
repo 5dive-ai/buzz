@@ -86,6 +86,11 @@ running that relay side by side.
   — though Databricks *model discovery* still uses our own code, moved to
   `buzz-model-catalog` (the desktop cannot link goose: native `sqlite3`
   collision with its own rusqlite).
+* **Relay-mesh MoA is restored but only tested against a fake router.** With
+  `mesh-llm` running, a relay-mesh agent on `auto` should switch to the virtual
+  `mesh` model within ~2 turns once ≥2 models are live, and fall back to `auto`
+  within 30s of the mesh shrinking. Grep the agent log for
+  `relay-mesh auto:`.
 * Binary is roughly +22.7 MiB raw / +6.0 MiB gzip.
 * Nothing changed in packaging or the harness catalog — same sidecar name, so
   nothing needed to.

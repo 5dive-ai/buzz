@@ -11,6 +11,7 @@ members = [
     "crates/buzz-audit",
     "crates/buzz-acp",
     "crates/buzz-agent",
+    "crates/buzz-model-catalog",
     "crates/sprig",
     "crates/buzz-test-client",
     "crates/buzz-ws-client",
@@ -28,7 +29,7 @@ members = [
     "crates/buzz-dev-mcp",
     "examples/countdown-bot",
 ]
-exclude = ["desktop/src-tauri", "buzz-agent-core"]
+exclude = ["desktop/src-tauri"]
 resolver = "2"
 
 [workspace.package]

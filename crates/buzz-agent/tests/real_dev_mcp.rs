@@ -22,19 +22,28 @@ use serde_json::{json, Value};
 
 /// Locate the real `buzz-dev-mcp` binary in the workspace target dir.
 ///
-/// It lives in the outer workspace, which this crate is deliberately excluded
-/// from, so `CARGO_BIN_EXE_` is unavailable and we resolve it by path.
-fn buzz_dev_mcp() -> Option<PathBuf> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .to_path_buf();
-    for profile in ["debug", "release"] {
-        let candidate = root.join("target").join(profile).join("buzz-dev-mcp");
-        if candidate.is_file() {
-            return Some(candidate);
+/// It is a separate binary crate, so `CARGO_BIN_EXE_` is unavailable here and
+/// we resolve it by walking up to the workspace target dir.
+fn buzz_dev_mcp() -> PathBuf {
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        for profile in ["debug", "release"] {
+            let candidate = dir.join("target").join(profile).join("buzz-dev-mcp");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        if !dir.pop() {
+            break;
         }
     }
-    None
+    // Fail loudly rather than skipping. buzz-dev-mcp is a workspace sibling
+    // that `just ci` always builds, so a miss means the search is wrong -- and
+    // a silent skip hides exactly the breakage this test exists to catch.
+    panic!(
+        "buzz-dev-mcp not found searching upward from {}. Run `cargo build -p buzz-dev-mcp`.",
+        env!("CARGO_MANIFEST_DIR")
+    );
 }
 
 /// Provider that drives a scripted conversation:
@@ -235,10 +244,7 @@ impl Drop for Harness {
 
 #[test]
 fn real_dev_mcp_stop_hook_blocks_end_of_turn() {
-    let Some(mcp) = buzz_dev_mcp() else {
-        eprintln!("skipping: buzz-dev-mcp not built (run `cargo build -p buzz-dev-mcp`)");
-        return;
-    };
+    let mcp = buzz_dev_mcp();
 
     let (base_url, requests, calls) = spawn_scripted_provider();
     let home = tempfile::tempdir().expect("home");
@@ -319,10 +325,7 @@ fn real_dev_mcp_stop_hook_blocks_end_of_turn() {
 
 #[test]
 fn real_dev_mcp_advertises_its_tools() {
-    let Some(mcp) = buzz_dev_mcp() else {
-        eprintln!("skipping: buzz-dev-mcp not built");
-        return;
-    };
+    let mcp = buzz_dev_mcp();
 
     let (base_url, requests, _) = spawn_scripted_provider();
     let home = tempfile::tempdir().expect("home");

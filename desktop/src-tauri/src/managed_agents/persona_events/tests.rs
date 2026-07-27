@@ -905,6 +905,7 @@ mod flush_barrier {
         }
 
         let state = build_app_state();
+        *state.keys.lock().unwrap() = keys;
         *state.relay_url_override.lock().unwrap() = Some(spawn_stub_relay().await);
 
         let flushed = flush_pending_events(&db_path, &state).await.expect("flush");

@@ -71,13 +71,13 @@ export function useSetPersonaCatalogSharedMutation(communityId: string | null) {
   return useMutation({
     mutationFn: ({ id, shared }: { id: string; shared: boolean }) =>
       setPersonaShared(id, shared),
-    onSuccess: (updated) => {
+    onSuccess: (result) => {
       queryClient.setQueryData<AgentPersona[]>(
         ["personas"],
         (current) =>
           current?.map((persona) =>
-            persona.id === updated.id ? updated : persona,
-          ) ?? [updated],
+            persona.id === result.persona.id ? result.persona : persona,
+          ) ?? [result.persona],
       );
       void queryClient.invalidateQueries({
         queryKey: personaCatalogQueryKey(communityId),

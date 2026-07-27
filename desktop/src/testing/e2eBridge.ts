@@ -222,6 +222,8 @@ type E2eConfig = {
     personas?: MockPersonaSeed[];
     /** Community catalog replaceable-event heads returned by relay queries. */
     personaCatalogEvents?: RelayEvent[];
+    /** Outcomes for successive explicit persona share publications. */
+    personaSharePublicationStatuses?: Array<"published" | "queued">;
     teams?: MockTeamSeed[];
     relayAgents?: MockRelayAgentSeed[];
     agentListDelayMs?: number;
@@ -7149,6 +7151,9 @@ let mockGlobalAgentConfig: {
 // Per-page get_nsec call counter for sequenced error testing.
 let nsecCallCount = 0;
 
+// Per-page explicit catalog publication outcomes.
+let personaSharePublicationCallCount = 0;
+
 // Per-page confirm_team_snapshot_import call counter for sequenced error testing.
 let teamSnapshotConfirmCallCount = 0;
 
@@ -7509,10 +7514,17 @@ function upsertMockPersonaEvent(persona: RawPersona): void {
   emitMockGlobalEvent(event);
 }
 
-async function handleSetPersonaShared(args: {
-  id: string;
-  shared: boolean;
-}): Promise<RawPersona> {
+async function handleSetPersonaShared(
+  args: {
+    id: string;
+    shared: boolean;
+  },
+  config?: E2eConfig,
+): Promise<{
+  persona: RawPersona;
+  publicationStatus: "published" | "queued";
+  relayMessage?: string;
+}> {
   const persona = mockPersonas.find((candidate) => candidate.id === args.id);
   if (!persona) {
     throw new Error(`agent ${args.id} not found`);
@@ -7522,8 +7534,20 @@ async function handleSetPersonaShared(args: {
   }
   persona.shared = args.shared;
   persona.updated_at = new Date().toISOString();
-  upsertMockPersonaEvent(persona);
-  return { ...persona };
+  const publicationStatus =
+    config?.mock?.personaSharePublicationStatuses?.[
+      personaSharePublicationCallCount++
+    ] ?? "published";
+  if (publicationStatus === "published") {
+    upsertMockPersonaEvent(persona);
+  }
+  return {
+    persona: { ...persona },
+    publicationStatus,
+    ...(publicationStatus === "queued"
+      ? { relayMessage: "relay unreachable: could not connect to relay" }
+      : {}),
+  };
 }
 
 function ensureMockPersonaIsActive(personaId: string) {
@@ -10342,6 +10366,7 @@ export function maybeInstallE2eTauriMocks() {
       case "set_persona_shared":
         return handleSetPersonaShared(
           payload as Parameters<typeof handleSetPersonaShared>[0],
+          activeConfig,
         );
       case "list_teams":
         return handleListTeams();

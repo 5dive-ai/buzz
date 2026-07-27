@@ -121,11 +121,24 @@ export async function setPersonaActive(
 export async function setPersonaShared(
   id: string,
   shared: boolean,
-): Promise<AgentPersona> {
-  return fromRawPersona(
-    await invokeTauri<RawPersona>("set_persona_shared", { id, shared }),
-  );
+): Promise<PersonaSharePublicationResult> {
+  const result = await invokeTauri<{
+    persona: RawPersona;
+    publicationStatus: "published" | "queued";
+    relayMessage?: string;
+  }>("set_persona_shared", { id, shared });
+  return {
+    persona: fromRawPersona(result.persona),
+    publicationStatus: result.publicationStatus,
+    relayMessage: result.relayMessage ?? null,
+  };
 }
+
+export type PersonaSharePublicationResult = {
+  persona: AgentPersona;
+  publicationStatus: "published" | "queued";
+  relayMessage: string | null;
+};
 
 export type SnapshotMemoryLevel = "none" | "core" | "everything";
 export type SnapshotFormat = "json" | "png";

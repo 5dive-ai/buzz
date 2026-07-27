@@ -1488,6 +1488,46 @@ This deliberately long fenced-code example must not establish the minimum width 
   ).toHaveCount(0);
 });
 
+test("a queued catalog share is not presented as relay-published", async ({
+  page,
+}) => {
+  const personaId = "custom:queued-catalog-agent";
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: personaId,
+        displayName: "Queued Catalog Agent",
+        systemPrompt: "Wait for relay acceptance.",
+      },
+    ],
+    personaSharePublicationStatuses: ["queued"],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+
+  await page.getByLabel("Open actions for Queued Catalog Agent").click();
+  await page.getByRole("menuitem", { name: "Share" }).click();
+  await page.getByTestId("persona-share-catalog-access").click();
+  await page
+    .getByRole("menuitemradio", { name: "Agent only", exact: true })
+    .click();
+
+  await expect(
+    page.getByText(
+      "Sharing Queued Catalog Agent is queued. It will appear after the relay accepts the update.",
+    ),
+  ).toBeVisible();
+  await page
+    .getByTestId("persona-share-dialog")
+    .getByRole("button", { name: "Close" })
+    .click();
+
+  await openPersonaCatalog(page);
+  await expect(
+    page.getByTestId(`persona-catalog-list-item-${personaId}`),
+  ).toHaveCount(0);
+});
+
 test("a foreign reader does not receive an unshared kind 30175 persona", async ({
   page,
 }) => {

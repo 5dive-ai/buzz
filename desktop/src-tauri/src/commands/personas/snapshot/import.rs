@@ -603,7 +603,6 @@ pub async fn confirm_agent_snapshot_import(
 fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgentRecord) {
     use crate::managed_agents::{
         agent_events::{agent_event_content, build_agent_event},
-        managed_agents_base_dir,
         persona_events::monotonic_created_at,
         retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
     };
@@ -611,11 +610,12 @@ fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgent
     use nostr::JsonUtil;
 
     let result = (|| -> Result<(), String> {
-        let conn = open_retention_db(&managed_agents_base_dir(app)?.join("retention.db"))?;
+        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let conn = open_retention_db(&scope.db_path)?;
         let content = serde_json::to_string(&agent_event_content(record))
             .map_err(|e| format!("failed to serialize agent content: {e}"))?;
         let (owner_pubkey, event) = {
-            let keys = state.signing_keys()?;
+            let keys = &scope.owner_keys;
             let owner_pubkey = keys.public_key().to_hex();
             let existing =
                 get_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
@@ -624,7 +624,7 @@ fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgent
             }
             let event = build_agent_event(record)?
                 .custom_created_at(monotonic_created_at(existing.map(|row| row.created_at)))
-                .sign_with_keys(&keys)
+                .sign_with_keys(keys)
                 .map_err(|e| format!("failed to sign agent event: {e}"))?;
             (owner_pubkey, event)
         };

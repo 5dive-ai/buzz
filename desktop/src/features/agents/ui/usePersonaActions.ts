@@ -124,12 +124,13 @@ export function usePersonaActions() {
   const personas = personasQuery.data ?? [];
   const publications = catalogQuery.data ?? [];
   const sharedCatalogPersonaIdSet = React.useMemo(() => {
+    const currentPubkey = identityQuery.data?.pubkey.toLowerCase();
     return new Set(
-      personas
-        .filter((persona) => !persona.isBuiltIn && persona.shared)
-        .map((persona) => persona.id),
+      publications
+        .filter((publication) => publication.ownerPubkey === currentPubkey)
+        .map((publication) => publication.sourcePersonaId),
     );
-  }, [personas]);
+  }, [identityQuery.data?.pubkey, publications]);
   const availableRuntimes = React.useMemo(
     () =>
       (acpRuntimesQuery.data ?? []).filter(
@@ -475,16 +476,31 @@ export function usePersonaActions() {
     clearFeedback("library");
     try {
       const shared = shareLevel !== "not-shared";
-      const updated = await setCatalogSharedMutation.mutateAsync({
+      const result = await setCatalogSharedMutation.mutateAsync({
         id: persona.id,
         shared,
       });
       setPersonaToShare((current) =>
-        current?.persona.id === updated.id
-          ? { ...current, persona: updated }
+        current?.persona.id === result.persona.id
+          ? { ...current, persona: result.persona }
           : current,
       );
-      if (!shared) {
+      if (result.publicationStatus === "queued") {
+        if (shared) {
+          setPersonaNoticeMessage(
+            `Sharing ${persona.displayName} is queued. It will appear after the relay accepts the update.`,
+          );
+        } else {
+          setPersonaNoticeMessage(
+            `Removing ${persona.displayName} is queued. It may remain discoverable until the relay accepts the update.`,
+          );
+        }
+        if (result.relayMessage) {
+          console.warn(
+            `[setPersonaShared] relay publication queued: ${result.relayMessage}`,
+          );
+        }
+      } else if (!shared) {
         setPersonaNoticeMessage(
           `${persona.displayName} is no longer discoverable in the community catalog.`,
         );

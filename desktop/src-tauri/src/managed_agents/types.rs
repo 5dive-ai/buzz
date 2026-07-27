@@ -40,9 +40,11 @@ pub struct AgentDefinition {
     pub is_builtin: bool,
     #[serde(default = "default_record_active")]
     pub is_active: bool,
-    /// Whether this persona is discoverable by other members of the active
-    /// community. Persisted on the definition so every routine kind:30175
-    /// republish preserves the relay's exact `["shared", "true"]` tag.
+    /// Whether this persona is discoverable in the currently active community.
+    ///
+    /// This is a command/view projection only. Durable share state lives in
+    /// the relay+owner-scoped retention head so one workspace's choice cannot
+    /// leak into another workspace's definition record.
     #[serde(default)]
     pub shared: bool,
     /// Team ID if this persona was imported from a team directory.
@@ -135,7 +137,8 @@ impl AgentDefinition {
             name_pool: self.name_pool,
             is_builtin: self.is_builtin,
             is_active: self.is_active,
-            shared: self.shared,
+            // Catalog visibility is relay+owner scoped, not definition-global.
+            shared: false,
             source_team: self.source_team,
             source_team_persona_slug: self.source_team_persona_slug,
             definition_respond_to: self.respond_to,
@@ -167,7 +170,8 @@ impl ManagedAgentRecord {
             name_pool: self.name_pool.clone(),
             is_builtin: self.is_builtin,
             is_active: self.is_active,
-            shared: self.shared,
+            // Projected by `list_personas` from the active retention scope.
+            shared: false,
             source_team: self.source_team.clone(),
             source_team_persona_slug: self.source_team_persona_slug.clone(),
             env_vars: self.env_vars.clone(),
@@ -375,9 +379,12 @@ pub struct ManagedAgentRecord {
     /// definition hidden from pickers. Defaults `true` for existing records.
     #[serde(default = "default_record_active")]
     pub is_active: bool,
-    /// Definition-level catalog visibility. Only meaningful for key-less
-    /// records with a `slug`; instances retain the default `false`.
-    #[serde(default)]
+    /// Legacy process-global catalog visibility field.
+    ///
+    /// New writes omit it and definition views ignore it. It remains
+    /// deserializable for branch-era stores, but active visibility is projected
+    /// from the relay+owner-scoped retention database instead.
+    #[serde(default, skip_serializing)]
     pub shared: bool,
     /// Absorbed from `AgentDefinition.source_team` — team ID when this
     /// definition was imported from a team directory (team definitions are

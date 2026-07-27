@@ -187,6 +187,20 @@ pub async fn apply_workspace(
     .map_err(|e| format!("spawn_blocking failed: {e}"))??;
 
     let state = restore_app.state::<AppState>();
+    // Backfill this exact relay+owner scope only after the workspace has been
+    // applied. Running at process boot would target the fallback relay and
+    // collapse every community into one pending-event store.
+    match crate::managed_agents::retention::active_retention_scope(&restore_app, &state) {
+        Ok(scope) => crate::event_sync::spawn_event_sync(
+            restore_app.clone(),
+            scope.owner_keys,
+            scope.db_path,
+        ),
+        Err(error) => {
+            eprintln!("buzz-desktop: scoped event-sync unavailable after workspace apply: {error}");
+        }
+    }
+
     let restore_pending = state
         .managed_agent_restore_pending
         .swap(false, Ordering::AcqRel);

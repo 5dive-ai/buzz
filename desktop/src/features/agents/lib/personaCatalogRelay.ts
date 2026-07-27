@@ -218,6 +218,9 @@ function publicationToPersona(
 
   return {
     ...basePersona,
+    // Catalog membership is relay-confirmed by the shared event itself. Do not
+    // let a local pending toggle override this projection.
+    shared: true,
     catalogSource: {
       eventId: publication.eventId,
       ownerPubkey: publication.ownerPubkey,
@@ -234,7 +237,6 @@ export function catalogPersonasFromPublications(
 ): CatalogPersona[] {
   const normalizedCurrentPubkey = currentPubkey?.toLowerCase() ?? null;
   const personas: CatalogPersona[] = [];
-  const seenCoordinates = new Set<string>();
 
   for (const publication of publications) {
     const isOwn = publication.ownerPubkey === normalizedCurrentPubkey;
@@ -243,29 +245,7 @@ export function catalogPersonasFromPublications(
           (persona) => persona.id === publication.sourcePersonaId,
         )
       : undefined;
-    if (ownLocalPersona && !ownLocalPersona.shared) {
-      continue;
-    }
-    const coordinate = `${publication.ownerPubkey}:${publication.sourcePersonaId}`;
-    seenCoordinates.add(coordinate);
     personas.push(publicationToPersona(publication, ownLocalPersona, isOwn));
-  }
-
-  if (normalizedCurrentPubkey) {
-    for (const persona of localPersonas) {
-      if (persona.isBuiltIn || !persona.shared) continue;
-      const coordinate = `${normalizedCurrentPubkey}:${persona.id}`;
-      if (seenCoordinates.has(coordinate)) continue;
-      personas.push({
-        ...persona,
-        catalogSource: {
-          eventId: `local:${persona.id}`,
-          ownerPubkey: normalizedCurrentPubkey,
-          isOwn: true,
-          sourcePersonaId: persona.id,
-        },
-      });
-    }
   }
 
   return personas.sort((left, right) =>

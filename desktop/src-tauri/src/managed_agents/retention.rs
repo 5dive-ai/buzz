@@ -5,10 +5,62 @@
 //! keyed on `(kind, pubkey, d_tag)`, replacing only on a newer-or-equal
 //! `created_at` for NIP-33 latest-wins semantics.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
+use tauri::AppHandle;
+
+use crate::app_state::AppState;
+
+/// Durable event-retention scope for one community relay and owner identity.
+///
+/// Persona, team, and managed-agent definitions are workspace-global, but
+/// their relay heads and pending publications are not. Keeping a separate
+/// database per `(relay_url, owner_pubkey)` prevents a pending write created in
+/// community A from being drained into community B after a workspace switch.
+pub struct RetentionScope {
+    pub db_path: PathBuf,
+    pub relay_url: String,
+    pub owner_keys: nostr::Keys,
+}
+
+/// Resolve the retention database path for a relay + owner pair.
+///
+/// The normalized scope is hashed so relay URLs never become path components.
+/// Trimming a trailing slash keeps equivalent workspace URLs on one scope.
+pub fn scoped_retention_db_path(base_dir: &Path, relay_url: &str, owner_pubkey: &str) -> PathBuf {
+    let normalized_relay = relay_url.trim().trim_end_matches('/');
+    let mut hasher = Sha256::new();
+    hasher.update(owner_pubkey.trim().to_ascii_lowercase().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(normalized_relay.as_bytes());
+    let scope_id = hex::encode(hasher.finalize());
+    base_dir.join("retention").join(format!("{scope_id}.db"))
+}
+
+/// Snapshot the active relay + owner and resolve their durable event store.
+///
+/// Callers keep the returned relay and keys alongside the path whenever work
+/// crosses an `.await`; a later workspace switch cannot retarget that work.
+pub fn active_retention_scope(app: &AppHandle, state: &AppState) -> Result<RetentionScope, String> {
+    let relay_url = crate::relay::relay_ws_url_with_override(state);
+    let owner_keys = state.signing_keys()?;
+    let base_dir = super::managed_agents_base_dir(app)?;
+    let db_path =
+        scoped_retention_db_path(&base_dir, &relay_url, &owner_keys.public_key().to_hex());
+    let parent = db_path
+        .parent()
+        .ok_or_else(|| "retention scope path has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create retention scope directory: {error}"))?;
+    Ok(RetentionScope {
+        db_path,
+        relay_url,
+        owner_keys,
+    })
+}
 
 /// A retained persona event row.
 #[derive(Debug, Clone)]
@@ -367,6 +419,26 @@ pub fn get_retained_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_scope_is_stable_and_separates_relay_and_owner() {
+        let base = Path::new("/tmp/buzz-retention-test");
+        let owner_a = "a".repeat(64);
+        let owner_b = "b".repeat(64);
+        let community_a = scoped_retention_db_path(base, "wss://a.example/", &owner_a);
+        assert_eq!(
+            community_a,
+            scoped_retention_db_path(base, "wss://a.example", &owner_a)
+        );
+        assert_ne!(
+            community_a,
+            scoped_retention_db_path(base, "wss://b.example", &owner_a)
+        );
+        assert_ne!(
+            community_a,
+            scoped_retention_db_path(base, "wss://a.example", &owner_b)
+        );
+    }
 
     #[test]
     fn concurrent_open_waits_for_initialization_lock() {

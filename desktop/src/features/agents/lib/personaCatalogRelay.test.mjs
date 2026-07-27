@@ -187,7 +187,7 @@ test("foreign allowlist behavior imports as owner-only", () => {
   assert.deepEqual(personas[0].respondToAllowlist, []);
 });
 
-test("a newly shared local persona appears before relay sync completes", () => {
+test("a pending local share does not appear before relay confirmation", () => {
   const localPersona = {
     id: "local-reviewer",
     displayName: "Local Reviewer",
@@ -210,7 +210,5 @@ test("a newly shared local persona appears before relay sync completes", () => {
   };
 
   const personas = catalogPersonasFromPublications([], [localPersona], ALICE);
-  assert.equal(personas.length, 1);
-  assert.equal(personas[0].catalogSource.eventId, "local:local-reviewer");
-  assert.equal(personas[0].catalogSource.isOwn, true);
+  assert.deepEqual(personas, []);
 });

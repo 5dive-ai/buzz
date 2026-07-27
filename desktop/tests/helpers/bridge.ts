@@ -219,6 +219,8 @@ type MockBridgeOptions = {
   personas?: MockPersonaSeed[];
   /** Community catalog replaceable-event heads returned by relay queries. */
   personaCatalogEvents?: RelayEvent[];
+  /** Outcomes for successive explicit persona share publications. */
+  personaSharePublicationStatuses?: Array<"published" | "queued">;
   teams?: MockTeamSeed[];
   relayAgents?: MockRelayAgentSeed[];
   agentListDelayMs?: number;

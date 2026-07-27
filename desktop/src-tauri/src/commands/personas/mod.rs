@@ -45,7 +45,9 @@ pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, Strin
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        load_personas(&app)
+        let mut personas = load_personas(&app)?;
+        pending::project_active_persona_sharing(&app, &state, &mut personas)?;
+        Ok(personas)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
@@ -72,6 +74,7 @@ pub async fn create_persona(
             .lock()
             .map_err(|error| error.to_string())?;
         let mut personas = load_personas(&app)?;
+        pending::project_active_persona_sharing(&app, &state, &mut personas)?;
         let name_pool: Vec<String> = input
             .name_pool
             .into_iter()
@@ -173,6 +176,7 @@ pub async fn update_persona(
                 .lock()
                 .map_err(|error| error.to_string())?;
             let mut personas = load_personas(&app)?;
+            pending::project_active_persona_sharing(&app, &state, &mut personas)?;
             let persona = personas
                 .iter_mut()
                 .find(|record| record.id == input.id)
@@ -554,7 +558,7 @@ fn reconcile_inbound_persona_event_blocking(
 ) -> Result<(), String> {
     use crate::managed_agents::{
         agent_events::managed_agent_content_from_event,
-        load_managed_agents, load_teams, managed_agents_base_dir,
+        load_managed_agents, load_teams,
         persona_events::persona_from_event,
         retention::{open_retention_db, retain_inbound_event, InboundOutcome, RetainedEvent},
         save_managed_agents, save_teams,
@@ -602,7 +606,8 @@ fn reconcile_inbound_persona_event_blocking(
         .map_err(|error| error.to_string())?;
 
     // Resolve inbound vs. any pending local edit before touching the store.
-    let conn = open_retention_db(&managed_agents_base_dir(&app)?.join("retention.db"))?;
+    let scope = crate::managed_agents::retention::active_retention_scope(&app, &state)?;
+    let conn = open_retention_db(&scope.db_path)?;
     let outcome = retain_inbound_event(
         &conn,
         &RetainedEvent {
@@ -706,7 +711,7 @@ fn reconcile_inbound_tombstone(
     state: &AppState,
 ) -> Result<(), String> {
     use crate::managed_agents::{
-        load_managed_agents, load_teams, managed_agents_base_dir,
+        load_managed_agents, load_teams,
         retention::{
             open_retention_db, retain_inbound_event, tombstone_retention_d_tag, InboundOutcome,
             RetainedEvent,
@@ -731,7 +736,8 @@ fn reconcile_inbound_tombstone(
     // Resolve against the retained tombstone row (keyed by the target
     // coordinate, F2c) so a re-received tombstone or one older than a pending
     // local edit is a no-op.
-    let conn = open_retention_db(&managed_agents_base_dir(app)?.join("retention.db"))?;
+    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+    let conn = open_retention_db(&scope.db_path)?;
     let outcome = retain_inbound_event(
         &conn,
         &RetainedEvent {

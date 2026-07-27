@@ -1,0 +1,71 @@
+# buzz-agent-core — buzz-agent's ACP wire layer on top of the Goose Rust
+# library (used as an SDK, not as a subprocess).
+#
+# WHY A SEPARATE CRATE, EXCLUDED FROM THE WORKSPACE
+#
+# `crates/buzz-agent` is a *library* linked into both `crates/sprig` and
+# `desktop/src-tauri` (which uses only `catalog`/`config` for the Databricks
+# model picker). Adding goose to that crate would pull goose's ~700-crate
+# dependency graph into the Tauri app and into the workspace lockfile.
+#
+# So this crate is excluded from the workspace (see the root Cargo.toml
+# `exclude` list) and carries its own Cargo.lock, exactly as PR #1526 did for
+# `goose-acp`. Goose's ACP/MCP dependency versions move independently.
+#
+# Build:  cargo build --release --manifest-path buzz-agent-core/Cargo.toml
+#
+# THIS IS NOT "GOOSE AS THE HARNESS". The binary keeps buzz-agent's identity
+# (`agentInfo.name = "buzz-agent"`), its 6-method ACP surface, its
+# `activeRunId` steering contract and its `usage_update` ordering. Only the
+# agent loop underneath is Goose's instead of hand-written. Picking "Goose"
+# from the harness gallery remains a separate thing: that shells out to a
+# user-installed `goose` CLI.
+
+[package]
+name = "buzz-agent-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "buzz_agent_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buzz-agent-core"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to a release commit deliberately: goose's public `Agent` surface is
+# not semver-stable (many fields are `pub(super)`) and its MSRV moves quickly.
+# 305849b71 == goose 1.44.0.
+#
+# default-features = false drops: telemetry, otel, aws-providers,
+# local-inference (candle/whisper), code-mode (pctx/V8), system-keyring, nostr.
+# We name only rustls-tls, which is mandatory — `goose` pulls reqwest/sqlx/rmcp
+# with default-features = false, so a TLS backend only arrives via this feature
+# (and `rustls-tls` + `native-tls` are mutually exclusive: see the
+# compile_error! at goose/src/lib.rs:3-4).
+goose = { path = "../../goose/crates/goose", default-features = false, features = ["rustls-tls"] }
+goose-provider-types = { path = "../../goose/crates/goose-provider-types" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Size-optimized. PR #1526 measured 32.5 MiB (macOS arm64) for a comparable
+# goose-linked binary; re-measure rather than trusting that number.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

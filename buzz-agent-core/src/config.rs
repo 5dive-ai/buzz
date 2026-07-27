@@ -14,6 +14,8 @@
 //! `Config` singleton is first touched, because `Config::global()` reads env at
 //! initialization.
 
+use goose_provider_types::goose_mode::GooseMode;
+
 /// ACP protocol version. Buzz squats on v2 ahead of the upstream RFD; see the
 /// note in `lib.rs::initialize`.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -37,6 +39,40 @@ pub struct Config {
     pub system_prompt: Option<String>,
     /// Per-turn wall-clock budget for a single provider request.
     pub llm_timeout_secs: u64,
+    /// Tool-call approval policy.
+    ///
+    /// `GooseMode::default()` is **`Auto`** (`goose_mode.rs:23-25`) — every
+    /// tool call is approved without asking. That matches what buzz ships
+    /// today (`buzz-acp/src/acp.rs:1671-1712` auto-approves every permission
+    /// request, and the desktop catalog sets `GOOSE_MODE=auto` for the
+    /// external goose runtime, `discovery.rs:89`), so it stays the default
+    /// here to avoid changing behaviour.
+    ///
+    /// It is now a knob rather than a hardcode: `BUZZ_AGENT_APPROVAL=approve`
+    /// makes goose ask before every tool call, `smart_approve` only for
+    /// sensitive ones, `chat` disables tools entirely. Nothing in buzz drives
+    /// this yet — wiring it to a real human affordance is the point of the
+    /// isolation work, and this is the seam it will use.
+    pub goose_mode: GooseMode,
+}
+
+/// Map `BUZZ_AGENT_APPROVAL` onto goose's tool-approval policy.
+///
+/// Unknown values fall back to the current shipped behaviour (`Auto`) rather
+/// than failing the process: a typo in an env var must not take an agent off
+/// the air, and silently tightening would be just as surprising as silently
+/// loosening.
+fn parse_approval(raw: Option<&str>) -> GooseMode {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("approve") => GooseMode::Approve,
+        Some("smart_approve") | Some("smart-approve") => GooseMode::SmartApprove,
+        Some("chat") => GooseMode::Chat,
+        Some("auto") | None => GooseMode::Auto,
+        Some(other) => {
+            tracing::warn!(value = other, "unknown BUZZ_AGENT_APPROVAL; using auto");
+            GooseMode::Auto
+        }
+    }
 }
 
 fn env_str(key: &str) -> Option<String> {
@@ -65,20 +101,13 @@ impl Config {
             max_sessions: env_parse("BUZZ_AGENT_MAX_SESSIONS").unwrap_or(8),
             system_prompt,
             llm_timeout_secs: env_parse("BUZZ_AGENT_LLM_TIMEOUT_SECS").unwrap_or(600),
+            goose_mode: parse_approval(env_str("BUZZ_AGENT_APPROVAL").as_deref()),
         }
     }
 
     /// Translate Buzz's provider configuration into Goose's environment.
     ///
-    /// Mirrors `goose_env.rs` from PR #1526, with one deliberate difference:
-    /// **`GOOSE_MODE` is not forced to `auto` here.** The desktop catalog
-    /// currently ships `default_env: &[("GOOSE_MODE", "auto")]`
-    /// (`discovery.rs:89`), i.e. auto-approve every tool call
-    /// (`goose_mode.rs:22-31`). Because this binary drives the agent in-process
-    /// we can gate tool calls ourselves later without inheriting that default;
-    /// leaving it unset means Goose falls back to its own default rather than
-    /// Buzz silently widening it. Callers that genuinely want auto-approve can
-    /// still set `GOOSE_MODE` explicitly.
+    /// Mirrors `goose_env.rs` from PR #1526.
     fn project_goose_env() {
         // Provider: Buzz's `openai-compat` and `relay-mesh` are both
         // OpenAI-wire-compatible, and Goose knows them as plain `openai`.
@@ -141,6 +170,36 @@ mod tests {
         set_if_absent("BUZZ_TEST_MISSING", "translated");
         assert_eq!(std::env::var("BUZZ_TEST_MISSING").unwrap(), "translated");
         std::env::remove_var("BUZZ_TEST_MISSING");
+    }
+
+    #[test]
+    fn approval_defaults_to_auto() {
+        // Matches what buzz ships today; changing this silently would alter
+        // the security posture of every existing agent.
+        assert_eq!(parse_approval(None), GooseMode::Auto);
+        assert_eq!(parse_approval(Some("auto")), GooseMode::Auto);
+    }
+
+    #[test]
+    fn approval_parses_the_stricter_modes() {
+        assert_eq!(parse_approval(Some("approve")), GooseMode::Approve);
+        assert_eq!(parse_approval(Some(" APPROVE ")), GooseMode::Approve);
+        assert_eq!(
+            parse_approval(Some("smart_approve")),
+            GooseMode::SmartApprove
+        );
+        assert_eq!(
+            parse_approval(Some("smart-approve")),
+            GooseMode::SmartApprove
+        );
+        assert_eq!(parse_approval(Some("chat")), GooseMode::Chat);
+    }
+
+    #[test]
+    fn approval_falls_back_to_auto_on_garbage() {
+        // A typo must not take an agent off the air, and must not silently
+        // tighten either — both would be surprising.
+        assert_eq!(parse_approval(Some("yolo")), GooseMode::Auto);
     }
 
     #[test]

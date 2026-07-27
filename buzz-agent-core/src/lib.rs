@@ -35,7 +35,6 @@ use tokio_util::sync::CancellationToken;
 use goose::agents::{Agent, AgentConfig, ExtensionConfig, GoosePlatform};
 use goose::config::PermissionManager;
 use goose::session::session_manager::{SessionManager, SessionType};
-use goose_provider_types::goose_mode::GooseMode;
 
 use config::{Config, MAX_PROMPT_BYTES, MAX_SYSTEM_PROMPT_BYTES, PROTOCOL_VERSION};
 use types::{AgentError, McpServerStdio};
@@ -94,11 +93,7 @@ async fn build_agent(
         session_manager.clone(),
         permission_manager,
         None,
-        // Deliberately Goose's own default rather than forcing `Auto`. The
-        // desktop catalog ships GOOSE_MODE=auto for the *external* goose
-        // runtime (`discovery.rs:89`), which auto-approves every tool call;
-        // driving the agent in-process means we don't have to inherit that.
-        GooseMode::default(),
+        cfg.goose_mode,
         // Session naming is a Goose UX affordance; the harness names sessions.
         true,
         GoosePlatform::GooseCli,
@@ -109,7 +104,7 @@ async fn build_agent(
             std::path::PathBuf::from(cwd),
             "buzz-agent".to_string(),
             SessionType::Acp,
-            GooseMode::default(),
+            cfg.goose_mode,
         )
         .await
         .map_err(|e| AgentError::Llm(format!("session create: {e}")))?;

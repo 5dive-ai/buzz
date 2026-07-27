@@ -46,7 +46,7 @@ pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, Strin
             .lock()
             .map_err(|error| error.to_string())?;
         let mut personas = load_personas(&app)?;
-        pending::project_active_persona_sharing(&app, &state, &mut personas)?;
+        pending::project_active_persona_sharing(&app, &state, &mut personas);
         Ok(personas)
     })
     .await
@@ -74,7 +74,7 @@ pub async fn create_persona(
             .lock()
             .map_err(|error| error.to_string())?;
         let mut personas = load_personas(&app)?;
-        pending::project_active_persona_sharing(&app, &state, &mut personas)?;
+        pending::project_active_persona_sharing(&app, &state, &mut personas);
         let name_pool: Vec<String> = input
             .name_pool
             .into_iter()
@@ -176,7 +176,7 @@ pub async fn update_persona(
                 .lock()
                 .map_err(|error| error.to_string())?;
             let mut personas = load_personas(&app)?;
-            pending::project_active_persona_sharing(&app, &state, &mut personas)?;
+            pending::project_active_persona_sharing(&app, &state, &mut personas);
             let persona = personas
                 .iter_mut()
                 .find(|record| record.id == input.id)

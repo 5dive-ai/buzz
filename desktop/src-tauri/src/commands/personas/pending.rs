@@ -82,9 +82,48 @@ fn retained_persona_is_shared(row: Option<&RetainedEvent>) -> bool {
         .is_some_and(|event| persona_event_is_shared(&event))
 }
 
+/// Project each persona's catalog visibility from the active relay+owner
+/// scope's retained head.
+///
+/// Infallible by design. The scope needs `signing_keys()`, which fails for the
+/// whole process whenever the identity is lost or the keyring is locked, and a
+/// propagated error there would break listing, creating, and updating EVERY
+/// agent. Share state is a view projection, so an unresolvable scope degrades
+/// to "not shared" — the safe direction: it can under-report visibility but can
+/// never present an unshared persona as published. The durable share state
+/// lives in the retention head, so nothing is lost: the true value reappears
+/// once the identity is signable again.
 pub(super) fn project_active_persona_sharing(
     app: &AppHandle,
     state: &AppState,
+    personas: &mut [AgentDefinition],
+) {
+    let scope = crate::managed_agents::retention::active_retention_scope(app, state);
+    project_scoped_persona_sharing(scope, personas);
+}
+
+fn project_scoped_persona_sharing(
+    scope: Result<RetentionScope, String>,
+    personas: &mut [AgentDefinition],
+) {
+    let projected = scope.and_then(|scope| {
+        project_persona_sharing_at(
+            &scope.db_path,
+            &scope.owner_keys.public_key().to_hex(),
+            personas,
+        )
+    });
+    if let Err(error) = projected {
+        eprintln!("buzz-desktop: persona-share-projection unavailable, reporting every agent as unshared: {error}");
+        for persona in personas {
+            persona.shared = false;
+        }
+    }
+}
+
+fn project_persona_sharing_at(
+    db_path: &std::path::Path,
+    owner_pubkey: &str,
     personas: &mut [AgentDefinition],
 ) -> Result<(), String> {
     use crate::managed_agents::{
@@ -93,16 +132,14 @@ pub(super) fn project_active_persona_sharing(
     };
     use buzz_core_pkg::kind::KIND_PERSONA;
 
-    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-    let owner_pubkey = scope.owner_keys.public_key().to_hex();
-    let conn = open_retention_db(&scope.db_path)?;
+    let conn = open_retention_db(db_path)?;
     for persona in personas {
         if persona.is_builtin {
             persona.shared = false;
             continue;
         }
         let retained =
-            get_retained_event(&conn, KIND_PERSONA, &owner_pubkey, &persona_d_tag(persona))?;
+            get_retained_event(&conn, KIND_PERSONA, owner_pubkey, &persona_d_tag(persona))?;
         persona.shared = retained_persona_is_shared(retained.as_ref());
     }
     Ok(())
@@ -277,6 +314,77 @@ mod tests {
                 .unwrap()
                 .as_ref()
         ));
+    }
+
+    /// A `shared = true` persona plus the scope that says so.
+    fn shared_persona_scope(dir: &std::path::Path) -> (RetentionScope, Vec<AgentDefinition>) {
+        let keys = nostr::Keys::generate();
+        let db_path = scoped_retention_db_path(dir, "wss://a.example", &keys.public_key().to_hex());
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        prepare_persona_publication_at(&db_path, &keys, &persona(), Some(true)).unwrap();
+        (
+            RetentionScope {
+                db_path,
+                relay_url: "wss://a.example".to_string(),
+                owner_keys: keys,
+            },
+            vec![persona()],
+        )
+    }
+
+    #[test]
+    fn test_resolvable_scope_projects_the_retained_share_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (scope, mut personas) = shared_persona_scope(dir.path());
+
+        project_scoped_persona_sharing(Ok(scope), &mut personas);
+
+        assert!(personas[0].shared);
+    }
+
+    #[test]
+    fn test_recovery_mode_identity_projects_unshared_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_scope, mut personas) = shared_persona_scope(dir.path());
+        personas[0].shared = true;
+
+        // The real recovery-mode failure: `active_retention_scope` cannot
+        // resolve a scope without signing keys, which is exactly what
+        // `identity_lost` / `keyring_locked` withhold.
+        let state = crate::app_state::build_app_state();
+        state
+            .identity_lost
+            .store(true, std::sync::atomic::Ordering::Release);
+        let error = state
+            .signing_keys()
+            .expect_err("recovery mode must withhold signing keys");
+
+        project_scoped_persona_sharing(Err(error), &mut personas);
+
+        assert!(
+            !personas[0].shared,
+            "an unresolvable scope degrades to unshared so list/create/update keep working"
+        );
+    }
+
+    #[test]
+    fn test_unopenable_retention_db_projects_unshared_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = nostr::Keys::generate();
+        let mut personas = vec![persona()];
+        personas[0].shared = true;
+
+        project_scoped_persona_sharing(
+            Ok(RetentionScope {
+                // A directory cannot be opened as the retention database.
+                db_path: dir.path().to_path_buf(),
+                relay_url: "wss://a.example".to_string(),
+                owner_keys: keys,
+            }),
+            &mut personas,
+        );
+
+        assert!(!personas[0].shared);
     }
 
     #[test]

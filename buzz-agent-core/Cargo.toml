@@ -46,8 +46,8 @@ path = "src/main.rs"
 # with default-features = false, so a TLS backend only arrives via this feature
 # (and `rustls-tls` + `native-tls` are mutually exclusive: see the
 # compile_error! at goose/src/lib.rs:3-4).
-goose = { path = "../../goose/crates/goose", default-features = false, features = ["rustls-tls"] }
-goose-provider-types = { path = "../../goose/crates/goose-provider-types" }
+goose = { git = "https://github.com/aaif-goose/goose", rev = "305849b71709b95b86ed9f11bd3bc939899c0aab", default-features = false, features = ["rustls-tls"] }
+goose-provider-types = { git = "https://github.com/aaif-goose/goose", rev = "305849b71709b95b86ed9f11bd3bc939899c0aab" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

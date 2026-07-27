@@ -53,7 +53,14 @@ struct Session {
     /// Set for the duration of a turn; advertised to steer-capable clients.
     active_run_id: Option<String>,
     cancel: Option<CancellationToken>,
+    /// Model id currently in force for this session (`session/set_model`).
+    /// Reported back on `usage_update`.
     model_override: Option<String>,
+    /// Set by `session/set_model`, consumed by the next `session/prompt`.
+    /// Applying it at prompt time rather than immediately matches buzz-agent:
+    /// the override takes effect "from the next prompt" and never mutates a
+    /// turn already in flight (`buzz-agent/src/lib.rs:494-502`).
+    pending_model: Option<String>,
     accumulated_input_tokens: u64,
     accumulated_output_tokens: u64,
 }
@@ -361,6 +368,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             active_run_id: None,
             cancel: None,
             model_override: None,
+            pending_model: None,
             accumulated_input_tokens: 0,
             accumulated_output_tokens: 0,
         },
@@ -402,7 +410,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
     let cancel = CancellationToken::new();
 
     // Single-flight per session, and capture the agent handle.
-    let (agent, goose_session_id) = {
+    let (agent, goose_session_id, pending_model) = {
         let mut sessions = app.sessions.lock().await;
         let Some(s) = sessions.get_mut(&p.session_id) else {
             return wire::send(
@@ -425,8 +433,29 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
         s.busy = true;
         s.active_run_id = Some(run_id.clone());
         s.cancel = Some(cancel.clone());
-        (s.agent.clone(), s.goose_session_id.clone())
+        // Take the pending override so a `session/set_model` applies exactly
+        // once, from the next prompt onward (buzz-agent `lib.rs:494-502`).
+        (
+            s.agent.clone(),
+            s.goose_session_id.clone(),
+            s.pending_model.take(),
+        )
     };
+
+    // Apply a pending `session/set_model` before the turn starts.
+    if let Some(model_id) = pending_model {
+        if let Err(e) = apply_model(&agent, &goose_session_id, &model_id).await {
+            {
+                let mut sessions = app.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(&p.session_id) {
+                    s.busy = false;
+                    s.active_run_id = None;
+                    s.cancel = None;
+                }
+            }
+            return wire::send(wire_tx, wire::err(id, e.json_rpc_code(), &e.to_string())).await;
+        }
+    }
 
     // Advertise the run id so steer-capable clients can target this turn.
     // `_meta` nests INSIDE `update` — see the module docs.
@@ -542,7 +571,8 @@ async fn set_model(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSende
     let mut sessions = app.sessions.lock().await;
     match sessions.get_mut(&p.session_id) {
         Some(s) => {
-            s.model_override = Some(p.model_id);
+            s.model_override = Some(p.model_id.clone());
+            s.pending_model = Some(p.model_id);
             drop(sessions);
             wire::send(wire_tx, wire::ok(id, Value::Null)).await;
         }
@@ -643,6 +673,30 @@ async fn cancel_session(app: &Arc<App>, params: Value) {
             c.cancel();
         }
     }
+}
+
+/// Swap the model for an existing session.
+///
+/// Rebuilds the provider (base-url/credential resolution lives in goose's
+/// registry) and installs it with the new `ModelConfig`. `SharedProvider` is an
+/// `Arc<Mutex<Option<..>>>` precisely so this is hot-swappable
+/// (goose `agents/types.rs:11-12`).
+async fn apply_model(
+    agent: &Arc<Agent>,
+    session_id: &str,
+    model_id: &str,
+) -> Result<(), AgentError> {
+    let provider_name = std::env::var("GOOSE_PROVIDER").unwrap_or_else(|_| "openai".to_string());
+    let provider = goose::providers::create(&provider_name, Vec::new())
+        .await
+        .map_err(|e| map_provider_error(&e.to_string()))?;
+    let model_config = goose::model_config::model_config_from_user_config(&provider_name, model_id)
+        .map_err(|e| AgentError::LlmModelNotFound(e.to_string()))?;
+    agent
+        .update_provider(provider, model_config, session_id)
+        .await
+        .map_err(|e| map_provider_error(&e.to_string()))?;
+    Ok(())
 }
 
 /// Preserve buzz-agent's error taxonomy across provider construction, so the

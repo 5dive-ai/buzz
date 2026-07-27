@@ -318,6 +318,66 @@ fn full_turn_over_stdio_carries_the_persona() {
 }
 
 #[test]
+fn set_model_applies_from_the_next_prompt() {
+    let (base_url, system_rx) = spawn_fake_provider();
+    let home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let mut h = Harness::start(&base_url, home.path());
+
+    let id = h.request("initialize", json!({ "protocolVersion": 2 }));
+    let _ = h.await_response(id);
+
+    let id = h.request(
+        "session/new",
+        json!({ "cwd": cwd.path().to_str().unwrap(), "mcpServers": [] }),
+    );
+    let (resp, _) = h.await_response(id);
+    let session_id = resp["result"]["sessionId"].as_str().unwrap().to_string();
+
+    // Unknown session and empty modelId are both invalid_params.
+    let id = h.request(
+        "session/set_model",
+        json!({ "sessionId": "ses_nope", "modelId": "x" }),
+    );
+    let (resp, _) = h.await_response(id);
+    assert_eq!(resp["error"]["code"], -32602, "unknown session");
+
+    let id = h.request(
+        "session/set_model",
+        json!({ "sessionId": session_id, "modelId": "  " }),
+    );
+    let (resp, _) = h.await_response(id);
+    assert_eq!(resp["error"]["code"], -32602, "empty modelId");
+
+    // A real switch is accepted...
+    let id = h.request(
+        "session/set_model",
+        json!({ "sessionId": session_id, "modelId": "fake-model-2" }),
+    );
+    let (resp, _) = h.await_response(id);
+    assert!(resp["error"].is_null(), "set_model rejected: {resp}");
+
+    // ...and the next turn still completes (the override is applied at prompt
+    // time, not mid-flight).
+    let id = h.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": "hi" }],
+        }),
+    );
+    let (resp, _) = h.await_response(id);
+    assert!(
+        resp["result"]["stopReason"].is_string(),
+        "turn failed after set_model: {resp}"
+    );
+
+    let _ = system_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("provider never received a request after set_model");
+}
+
+#[test]
 fn unknown_method_gets_method_not_found() {
     let (base_url, _rx) = spawn_fake_provider();
     let home = tempfile::tempdir().expect("tempdir");

@@ -359,6 +359,16 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         };
 
     let sid = format!("ses_{}", goose_session_id);
+
+    // Keep a handle for catalog discovery below; the Session takes ownership.
+    let session_agent = agent.clone();
+    let current_model = app
+        .cfg
+        .model
+        .clone()
+        .or_else(|| std::env::var("GOOSE_MODEL").ok())
+        .unwrap_or_default();
+
     app.sessions.lock().await.insert(
         sid.clone(),
         Session {
@@ -374,7 +384,59 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         },
     );
 
-    wire::send(wire_tx, wire::ok(id, json!({ "sessionId": sid }))).await;
+    // Advertise the model catalog. `buzz-acp` reads `models.availableModels`
+    // off this response (`acp.rs:1866`, `:1900`) to drive the desktop
+    // ModelPicker and to resolve `session/set_model` targets
+    // (`resolve_model_switch_method`, `acp.rs:1876`). Omitting it degrades the
+    // picker to "current model only" — which is what buzz-agent's `catalog.rs`
+    // existed to prevent.
+    //
+    // Goose builds the same structure internally (`build_model_state`,
+    // acp/response_builder.rs:130) but it is `pub(super)`, so an embedder
+    // cannot call it. The underlying data is public, though:
+    // `Provider::fetch_supported_models` (goose-provider-types/base.rs:425).
+    let mut result = json!({ "sessionId": sid });
+    if let Some(models) = discover_models(&session_agent, &current_model).await {
+        result["models"] = models;
+    }
+
+    wire::send(wire_tx, wire::ok(id, result)).await;
+}
+
+/// Build the `{currentModelId, availableModels}` object for `session/new`.
+///
+/// Mirrors goose's own `build_model_state`, including its rule that the
+/// current model is prepended when the provider's list omits it — otherwise
+/// `buzz-acp` cannot resolve a switch back to it.
+///
+/// Returns `None` when the provider cannot enumerate models (many can't;
+/// `fetch_supported_models` defaults to an empty list). A missing catalog is
+/// degraded UX, never a session failure — buzz-agent's Databricks discovery
+/// made the same choice (`catalog.rs:52-80`).
+async fn discover_models(agent: &Arc<Agent>, current_model: &str) -> Option<Value> {
+    let provider = agent.provider().await.ok()?;
+    let ids = provider.fetch_supported_models().await.ok()?;
+
+    let mut available: Vec<Value> = ids
+        .iter()
+        .map(|id| json!({ "modelId": id, "name": id }))
+        .collect();
+
+    if !ids.iter().any(|id| id == current_model) {
+        available.insert(
+            0,
+            json!({ "modelId": current_model, "name": current_model }),
+        );
+    }
+
+    if available.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "currentModelId": current_model,
+        "availableModels": available,
+    }))
 }
 
 async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {

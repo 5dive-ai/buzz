@@ -318,6 +318,49 @@ fn full_turn_over_stdio_carries_the_persona() {
 }
 
 #[test]
+fn session_new_advertises_the_model_catalog() {
+    let (base_url, _rx) = spawn_fake_provider();
+    let home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let mut h = Harness::start(&base_url, home.path());
+
+    let id = h.request("initialize", json!({ "protocolVersion": 2 }));
+    let _ = h.await_response(id);
+
+    let id = h.request(
+        "session/new",
+        json!({ "cwd": cwd.path().to_str().unwrap(), "mcpServers": [] }),
+    );
+    let (resp, _) = h.await_response(id);
+    let result = &resp["result"];
+
+    // buzz-acp reads `models.availableModels` to drive the desktop
+    // ModelPicker and to resolve session/set_model targets
+    // (`buzz-acp/src/acp.rs:1866`, `:1900`). Without it the picker degrades
+    // to "current model only".
+    let models = &result["models"];
+    assert!(
+        models.is_object(),
+        "session/new must advertise a model catalog, got: {result}"
+    );
+    assert_eq!(models["currentModelId"], "fake-model");
+
+    let available = models["availableModels"]
+        .as_array()
+        .expect("availableModels array");
+    assert!(!available.is_empty());
+    // Key must be `modelId` — that is what resolve_model_switch_method matches.
+    assert!(
+        available.iter().any(|m| m["modelId"] == "fake-model"),
+        "current model must appear in availableModels, got: {available:#?}"
+    );
+    assert!(
+        available.iter().all(|m| m["modelId"].is_string()),
+        "every entry needs a modelId key"
+    );
+}
+
+#[test]
 fn set_model_applies_from_the_next_prompt() {
     let (base_url, system_rx) = spawn_fake_provider();
     let home = tempfile::tempdir().expect("tempdir");

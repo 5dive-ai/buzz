@@ -60,6 +60,15 @@ const ERROR_REFLECTION: &str =
 /// conversation.
 const MAX_REFLECTIONS: usize = 8;
 
+/// How long to let goose unwind after `session/cancel` before giving up.
+///
+/// Cancellation is cooperative: goose has to notice the token, send
+/// `notifications/cancelled` to each in-flight MCP request
+/// (`mcp_client.rs:687-690`), emit the resulting tool responses, and end the
+/// stream. Dropping the stream instead skips all of that. This bounds the
+/// wait so a wedged MCP child cannot hold the turn open indefinitely.
+const CANCEL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Per-turn token accounting, mirroring buzz-agent's contract.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TurnTokens {
@@ -223,6 +232,14 @@ async fn drive_stream(
     let mut compacted = false;
     let mut reflections = 0usize;
 
+    // Set once cancellation is observed; bounds how long we let goose unwind.
+    let mut drain: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+
+    // Tool calls announced to the harness, minus those that reached a terminal
+    // state. Anything still here when the stream ends gets a synthetic
+    // terminal update — see the cancel arm below.
+    let mut open_tool_calls: Vec<String> = Vec::new();
+
     loop {
         tokio::select! {
             // Keep the harness idle clock alive during provider silence.
@@ -234,8 +251,28 @@ async fn drive_stream(
                 .await;
             }
 
-            _ = cancel.cancelled() => {
+            // Cancellation is a cooperative DRAIN, not an abort.
+            //
+            // Breaking here drops `stream`, which drops the futures goose is
+            // awaiting — so `mcp_client.rs:688` never reaches its
+            // `cancel_token.cancelled()` arm and never sends
+            // `notifications/cancelled`. The MCP child keeps running its tool
+            // after the turn is over, and any announced `tool_call` never
+            // reaches a terminal state, leaving the desktop UI spinning
+            // (the invariant buzz-agent held at `agent.rs:470-477`).
+            //
+            // So we keep polling the stream and let goose unwind: it emits the
+            // tool responses, sends the MCP cancellations, and ends the stream
+            // itself. `drain` only bounds how long we are willing to wait.
+            _ = cancel.cancelled(), if drain.is_none() => {
                 stop = StopReason::Cancelled;
+                drain = Some(Box::pin(tokio::time::sleep(CANCEL_DRAIN_TIMEOUT)));
+            }
+
+            // Goose did not unwind in time. Give up and synthesise terminal
+            // states, because a stuck spinner is worse than a wrong status.
+            _ = async { drain.as_mut().unwrap().await }, if drain.is_some() => {
+                tracing::warn!("cancel drain timed out; forcing terminal tool states");
                 break;
             }
 
@@ -251,6 +288,7 @@ async fn drive_stream(
                             tokens,
                             &mut compacted,
                             &mut reflections,
+                            &mut open_tool_calls,
                         )
                         .await
                         {
@@ -274,6 +312,26 @@ async fn drive_stream(
                 }
             }
         }
+    }
+
+    // Anything announced but never resolved gets a synthetic terminal update.
+    // buzz-agent guaranteed this invariant (`agent.rs:470-477`) because the
+    // desktop renders an unresolved `tool_call` as a spinner forever. Normally
+    // the drain above means this list is already empty; it only fires when
+    // goose failed to unwind inside CANCEL_DRAIN_TIMEOUT.
+    for tool_call_id in open_tool_calls.drain(..) {
+        wire::send(
+            wire_tx,
+            wire::session_update(
+                session_id,
+                json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tool_call_id,
+                    "status": "failed",
+                }),
+            ),
+        )
+        .await;
     }
 
     // Goose compacted history mid-turn. Re-inject the todo list so it survives
@@ -318,13 +376,20 @@ async fn handle_event(
     tokens: &mut TurnTokens,
     compacted: &mut bool,
     reflections: &mut usize,
+    open_tool_calls: &mut Vec<String>,
 ) -> Option<StopReason> {
     match event {
         AgentEvent::Message(msg) => {
             for content in &msg.content {
                 emit_content(content, session_id, wire_tx).await;
 
+                if let MessageContent::ToolRequest(req) = content {
+                    open_tool_calls.push(req.id.clone());
+                }
+
                 if let MessageContent::ToolResponse(resp) = content {
+                    open_tool_calls.retain(|id| id != &resp.id);
+
                     let failed = match &resp.tool_result {
                         Ok(r) => r.is_error.unwrap_or(false),
                         Err(_) => true,

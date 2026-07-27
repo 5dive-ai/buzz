@@ -44,6 +44,22 @@ use crate::wire::{self, WireSender};
 /// stays.
 const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Appended by buzz-agent to every failed tool result (`agent.rs:21-22`) so
+/// the model diagnoses a failure instead of blindly retrying it.
+///
+/// buzz-agent mutated the tool result itself. Goose gives no interception
+/// point for that: its `PostToolUseFailure` hook is fire-and-forget and its
+/// output is discarded (`agent.rs:589-620`). So we deliver the same text as a
+/// steer instead — goose drains pending steers at the round boundary
+/// (`agent.rs:1951-1974`), which is exactly when the model would next act on
+/// the failed result. Agent-visible, user-invisible.
+const ERROR_REFLECTION: &str =
+    "[Reflect] Before retrying, identify the cause and change your approach.";
+
+/// Cap on reflections per turn, so a tool failing in a loop cannot flood the
+/// conversation.
+const MAX_REFLECTIONS: usize = 8;
+
 /// Per-turn token accounting, mirroring buzz-agent's contract.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TurnTokens {
@@ -205,6 +221,7 @@ async fn drive_stream(
 
     let mut stop = StopReason::EndTurn;
     let mut compacted = false;
+    let mut reflections = 0usize;
 
     loop {
         tokio::select! {
@@ -226,8 +243,16 @@ async fn drive_stream(
                 let Some(event) = next else { break };
                 match event {
                     Ok(ev) => {
-                        if let Some(reason) =
-                            handle_event(ev, session_id, wire_tx, tokens, &mut compacted).await
+                        if let Some(reason) = handle_event(
+                            ev,
+                            agent,
+                            session_id,
+                            wire_tx,
+                            tokens,
+                            &mut compacted,
+                            &mut reflections,
+                        )
+                        .await
                         {
                             stop = reason;
                             break;
@@ -284,17 +309,38 @@ async fn drive_stream(
 /// Translate one `AgentEvent` into ACP notifications.
 ///
 /// Returns `Some(StopReason)` if the event terminates the turn.
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     event: AgentEvent,
+    agent: &Arc<Agent>,
     session_id: &str,
     wire_tx: &WireSender,
     tokens: &mut TurnTokens,
     compacted: &mut bool,
+    reflections: &mut usize,
 ) -> Option<StopReason> {
     match event {
         AgentEvent::Message(msg) => {
             for content in &msg.content {
                 emit_content(content, session_id, wire_tx).await;
+
+                if let MessageContent::ToolResponse(resp) = content {
+                    let failed = match &resp.tool_result {
+                        Ok(r) => r.is_error.unwrap_or(false),
+                        Err(_) => true,
+                    };
+                    if failed && *reflections < MAX_REFLECTIONS {
+                        *reflections += 1;
+                        agent
+                            .steer(
+                                session_id,
+                                Message::user()
+                                    .with_text(ERROR_REFLECTION)
+                                    .with_visibility(false, true),
+                            )
+                            .await;
+                    }
+                }
             }
             None
         }

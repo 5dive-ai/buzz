@@ -525,6 +525,37 @@ fn implicit_fallback_override_masks_defaults_from_a_different_preferred_runtime(
 }
 
 #[test]
+fn implicit_fallback_alias_inherits_defaults_from_the_same_preferred_runtime() {
+    let mut record = bare_record();
+    record.persona_id = Some("p1".to_string());
+    record.agent_command = "claude-code-acp".to_string();
+    record.agent_command_override = Some("claude-code-acp".to_string());
+    record.agent_command_override_is_implicit = true;
+    let personas = vec![persona("p1", None, None)];
+    let global = GlobalAgentConfig {
+        env_vars: BTreeMap::from([
+            ("BUZZ_AGENT_THINKING_EFFORT".to_string(), "high".to_string()),
+            ("SHARED_API_KEY".to_string(), "kept".to_string()),
+        ]),
+        model: Some("global-model".to_string()),
+        provider: Some("global-provider".to_string()),
+        preferred_runtime: Some("claude".to_string()),
+    };
+
+    assert_eq!(
+        resolve_effective_model_provider(&record, &personas, &global),
+        (
+            Some("global-model".to_string()),
+            Some("global-provider".to_string())
+        )
+    );
+    assert_eq!(
+        global_env_vars_for_record(&record, &personas, &global),
+        global.env_vars
+    );
+}
+
+#[test]
 fn explicit_harness_override_keeps_legacy_global_defaults() {
     let mut record = bare_record();
     record.persona_id = Some("p1".to_string());

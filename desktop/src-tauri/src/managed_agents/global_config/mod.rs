@@ -266,7 +266,17 @@ pub(crate) fn global_harness_defaults_apply_to_record(
         })
         .unwrap_or_else(|| preferred_runtime.to_string());
 
-    record.agent_command.trim() == preferred_command.trim()
+    let record_command = record.agent_command.trim();
+    let preferred_command = preferred_command.trim();
+    match (
+        crate::managed_agents::known_acp_runtime(record_command),
+        crate::managed_agents::known_acp_runtime(preferred_command),
+    ) {
+        (Some(record_runtime), Some(preferred_runtime)) => {
+            record_runtime.id == preferred_runtime.id
+        }
+        _ => record_command == preferred_command,
+    }
 }
 
 /// Return global env vars with harness-dependent defaults masked when an

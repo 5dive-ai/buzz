@@ -81,7 +81,6 @@ import { PreventSleepSettingsCard } from "./PreventSleepSettingsCard";
 import { AgentDefaultsSettingsCard } from "./AgentDefaultsSettingsCard";
 import { HostedCommunitiesSettingsCard } from "./HostedCommunitiesSettingsCard";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
-import { SpeechPlaybackSettings } from "./SpeechPlaybackSettings";
 import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
@@ -656,7 +655,6 @@ function ThemeSettingsCard() {
         </AnimatePresence>
       )}
 
-      <SpeechPlaybackSettings />
       <ThreadLayoutSetting />
     </section>
   );

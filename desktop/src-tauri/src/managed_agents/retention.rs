@@ -14,6 +14,9 @@ use tauri::AppHandle;
 
 use crate::app_state::AppState;
 
+mod legacy_migration;
+pub use legacy_migration::migrate_legacy_retention_db;
+
 /// Durable event-retention scope for one community relay and owner identity.
 ///
 /// Persona, team, and managed-agent definitions are workspace-global, but

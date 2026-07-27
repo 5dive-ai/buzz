@@ -923,14 +923,14 @@ fn probe_codex_acp_major_version_returns_version_when_descendant_holds_pipe_open
     // (the parent closed its write end), read_to_end() returns immediately
     // without waiting for the descendant to close its inherited fd.
     //
-    // `(exec sleep 60 &)` forks a subshell that execs `sleep 60`; the subshell
-    // inherits the parent's stdout fd and keeps it open.
+    // `sleep 60 &` starts a descendant that inherits the parent's stdout fd
+    // without making the direct child wait for a nested subshell to exit.
     let dir = std::env::temp_dir().join(format!("buzz-probe-descendant-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let bin = dir.join("codex-acp");
     std::fs::write(
         &bin,
-        "#!/bin/sh\necho '@agentclientprotocol/codex-acp 1.1.2'\n(exec sleep 60 &)\nexit 0\n",
+        "#!/bin/sh\necho '@agentclientprotocol/codex-acp 1.1.2'\nsleep 60 &\nexit 0\n",
     )
     .expect("write script");
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod script");

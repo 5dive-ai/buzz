@@ -223,7 +223,7 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
 /// harness. Explicitly configured definitions and standalone agents keep
 /// normal global inheritance. Configs written before `preferred_runtime`
 /// existed implicitly belong to Buzz Agent.
-fn global_harness_defaults_apply_to_record(
+pub(crate) fn global_harness_defaults_apply_to_record(
     record: &ManagedAgentRecord,
     personas: &[AgentDefinition],
     global: &GlobalAgentConfig,
@@ -255,27 +255,18 @@ fn global_harness_defaults_apply_to_record(
     let preferred_runtime = global
         .preferred_runtime
         .as_deref()
-        .and_then(crate::managed_agents::known_acp_runtime)
-        .or_else(|| crate::managed_agents::known_acp_runtime("buzz-agent"));
-    let selected_command = crate::managed_agents::record_agent_command(record, personas);
-    let selected_runtime = crate::managed_agents::known_acp_runtime(&selected_command);
+        .filter(|runtime| !runtime.trim().is_empty())
+        .unwrap_or("buzz-agent");
+    let preferred_command = crate::managed_agents::known_acp_runtime_exact(preferred_runtime)
+        .and_then(|runtime| runtime.commands.first().copied())
+        .map(str::to_string)
+        .or_else(|| {
+            crate::managed_agents::custom_harnesses::lookup_loaded_harness_by_id(preferred_runtime)
+                .map(|harness| harness.command.clone())
+        })
+        .unwrap_or_else(|| preferred_runtime.to_string());
 
-    selected_runtime.is_some_and(|selected| {
-        preferred_runtime.is_some_and(|preferred| preferred.id == selected.id)
-    })
-}
-
-/// Return the global provider/model values that are safe for this record.
-pub(crate) fn global_model_provider_for_record<'a>(
-    record: &ManagedAgentRecord,
-    personas: &[AgentDefinition],
-    global: &'a GlobalAgentConfig,
-) -> (Option<&'a str>, Option<&'a str>) {
-    if global_harness_defaults_apply_to_record(record, personas, global) {
-        (global.model.as_deref(), global.provider.as_deref())
-    } else {
-        (None, None)
-    }
+    record.agent_command.trim() == preferred_command.trim()
 }
 
 /// Return global env vars with harness-dependent defaults masked when an

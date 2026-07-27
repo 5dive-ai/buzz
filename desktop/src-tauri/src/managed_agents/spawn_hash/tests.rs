@@ -477,6 +477,7 @@ fn global_model_change_trips_hash_without_model_env_var() {
     let mut rec = record();
     rec.persona_id = Some("p1".into());
     rec.agent_command = "some-harness-without-model-env".into();
+    rec.agent_command_override = Some(rec.agent_command.clone());
 
     let personas = vec![{
         let mut p = persona("p1", None, "prompt");

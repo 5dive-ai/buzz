@@ -449,17 +449,10 @@ export type CreateManagedAgentInput = {
   relayUrl?: string;
   acpCommand?: string;
   agentCommand?: string;
-  /**
-   * True when `agentCommand` is a runtime command the caller deliberately wants
-   * to preserve instead of inheriting the linked persona command. This covers
-   * deploy-dialog runtime selections and discovered or installed aliases for the
-   * same persona runtime id, while still ignoring missing-runtime fallbacks.
-   */
+  /** True when `agentCommand` must remain pinned instead of inheriting the persona.
+   * Covers explicit choices and installed aliases, but not missing-runtime fallbacks. */
   harnessOverride?: boolean;
-  /**
-   * True when `harnessOverride` pins an automatically selected runtime for a
-   * runtime-less persona rather than a runtime the user explicitly selected.
-   */
+  /** Whether the pinned runtime is an automatic fallback for a runtime-less persona. */
   implicitHarnessFallback?: boolean;
   agentArgs?: string[];
   mcpCommand?: string;

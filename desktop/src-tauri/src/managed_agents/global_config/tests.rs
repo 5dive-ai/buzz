@@ -307,7 +307,7 @@ fn bare_record() -> ManagedAgentRecord {
         relay_url: "ws://localhost:3000".to_string(),
         avatar_url: None,
         acp_command: "buzz-acp".to_string(),
-        agent_command: "goose".to_string(),
+        agent_command: "buzz-agent".to_string(),
         agent_command_override: None,
         agent_command_override_is_implicit: false,
         agent_args: vec![],
@@ -494,10 +494,6 @@ fn explicit_harness_override_keeps_defaults_from_a_different_preferred_runtime()
         global_env_vars_for_record(&record, &personas, &global),
         global.env_vars
     );
-    assert_eq!(
-        global_env_vars_for_record(&record, &personas, &global),
-        global.env_vars
-    );
 }
 
 #[test]
@@ -548,6 +544,26 @@ fn explicit_harness_override_keeps_legacy_global_defaults() {
 }
 
 #[test]
+fn runtime_fallback_does_not_inherit_defaults_from_a_different_preferred_runtime() {
+    let mut record = bare_record();
+    record.persona_id = Some("p1".to_string());
+    record.agent_command = "goose".to_string();
+    record.agent_command_override = None;
+    let personas = vec![persona("p1", None, None)];
+    let global = GlobalAgentConfig {
+        model: Some("auto".to_string()),
+        provider: Some("relay-mesh".to_string()),
+        preferred_runtime: Some("buzz-agent".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        resolve_effective_model_provider(&record, &personas, &global),
+        (None, None)
+    );
+}
+
+#[test]
 fn default_command_fallback_does_not_inherit_defaults_from_another_preferred_runtime() {
     let mut record = bare_record();
     record.persona_id = Some("p1".to_string());
@@ -571,7 +587,8 @@ fn default_command_fallback_does_not_inherit_defaults_from_another_preferred_run
 fn runtime_fallback_inherits_defaults_when_it_matches_the_preferred_runtime() {
     let mut record = bare_record();
     record.persona_id = Some("p1".to_string());
-    record.agent_command_override = Some("goose".to_string());
+    record.agent_command = "goose".to_string();
+    record.agent_command_override = None;
     let personas = vec![persona("p1", None, None)];
     let global = GlobalAgentConfig {
         model: Some("global-model".to_string()),
@@ -582,7 +599,10 @@ fn runtime_fallback_inherits_defaults_when_it_matches_the_preferred_runtime() {
 
     assert_eq!(
         resolve_effective_model_provider(&record, &personas, &global),
-        (Some("global-model"), Some("global-provider"))
+        (
+            Some("global-model".to_string()),
+            Some("global-provider".to_string())
+        )
     );
 }
 
@@ -601,7 +621,10 @@ fn explicit_runtime_keeps_global_defaults_when_another_runtime_is_preferred() {
 
     assert_eq!(
         resolve_effective_model_provider(&record, &personas, &global),
-        (Some("global-model"), Some("global-provider"))
+        (
+            Some("global-model".to_string()),
+            Some("global-provider".to_string())
+        )
     );
 }
 

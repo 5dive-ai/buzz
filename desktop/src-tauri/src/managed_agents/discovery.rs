@@ -362,8 +362,6 @@ pub fn effective_agent_command(
 }
 
 mod overrides;
-#[cfg(test)]
-pub use overrides::create_time_agent_command_override;
 pub use overrides::{apply_agent_command_update, create_time_agent_command_override_state};
 
 /// Prefix of the typed dangling-harness error produced by

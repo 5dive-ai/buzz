@@ -759,13 +759,11 @@ pub async fn create_managed_agent(
         // Load personas once for harness/pack/avatar resolution below.
         let personas = load_personas(&app).unwrap_or_default();
 
-        // The persona runtime is authoritative. Persist an override only when
-        // the selected runtime must remain pinned (`harness_override`). This
-        // includes explicit picks and the visible fallback for a runtime-less
-        // persona. `implicit_harness_fallback` distinguishes those intents so
-        // the pin cannot adopt defaults owned by another harness. A divergence
-        // without `harness_override` remains inherited so it can recover when
-        // its configured runtime is installed. Persona-less creates always pin.
+        // The persona runtime is authoritative. Persist an override only for a
+        // pinned selection, including the visible runtime-less fallback.
+        // `implicit_harness_fallback` distinguishes that automatic fallback so
+        // it cannot adopt defaults owned by another harness. Other divergence
+        // stays inherited; persona-less creates always pin.
         let (agent_command_override, agent_command_override_is_implicit) =
             crate::managed_agents::create_time_agent_command_override_state(
                 requested_persona_id.as_deref(),

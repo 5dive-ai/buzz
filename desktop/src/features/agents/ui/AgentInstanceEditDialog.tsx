@@ -13,11 +13,9 @@ import {
 } from "@/features/agents/hooks";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import type {
-  ManagedAgent,
   RespondToMode,
   UpdateManagedAgentInput,
 } from "@/shared/api/types";
-import type { EditAgentFocusTarget } from "@/features/agents/openEditAgentEvent";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
@@ -85,12 +83,9 @@ import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { useSelectableAcpRuntimes } from "../lib/runtimeVisibilityPreference";
 import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
+import { ADVANCED_FIELDS_MOTION_TRANSITION } from "./agentAdvancedFieldsMotion";
+import type { AgentInstanceEditDialogProps } from "./AgentInstanceEditDialog.types";
 import { showAgentProfileSyncWarning } from "./agentProfileSyncWarning";
-
-const ADVANCED_FIELDS_MOTION_TRANSITION = {
-  duration: 0.18,
-  ease: [0.23, 1, 0.32, 1],
-} as const;
 
 export function AgentInstanceEditDialog({
   agent,
@@ -99,16 +94,7 @@ export function AgentInstanceEditDialog({
   onEditLinkedPersona,
   onOpenChange,
   onUpdated,
-}: {
-  agent: ManagedAgent;
-  /** Optional field to scroll/focus when the dialog opens from a card deep-link. */
-  initialFocus?: EditAgentFocusTarget;
-  open: boolean;
-  /** Present only when the linked definition is editable (non-built-in, resolved). Caller closes this dialog and enters definition-edit. */
-  onEditLinkedPersona?: () => void;
-  onOpenChange: (open: boolean) => void;
-  onUpdated?: (agent: ManagedAgent) => void;
-}) {
+}: AgentInstanceEditDialogProps) {
   const updateMutation = useUpdateManagedAgentMutation();
   const startMutation = useStartManagedAgentMutation();
   const runtimesQuery = useAcpRuntimesQuery({ enabled: open });

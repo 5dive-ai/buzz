@@ -91,6 +91,34 @@ test("welcome readiness evaluates the runtime selected by the visible fallback",
   );
 });
 
+test("welcome readiness keeps legacy Buzz Agent provider defaults", () => {
+  const runtimes = [
+    {
+      id: "goose",
+      label: "Goose",
+      availability: "available",
+      authStatus: { status: "not_applicable" },
+    },
+    {
+      id: "buzz-agent",
+      label: "Buzz Agent",
+      availability: "available",
+      authStatus: { status: "not_applicable" },
+    },
+  ];
+  const globalConfig = {
+    env_vars: { OPENAI_COMPAT_API_KEY: "e2e-placeholder" },
+    provider: "openai",
+    model: "gpt-5.5",
+    preferred_runtime: null,
+  };
+
+  assert.deepEqual(resolveWelcomeAgentReadiness(runtimes, globalConfig, []), {
+    ready: true,
+    reason: "buzz-agent",
+  });
+});
+
 test("welcome provisioning requires an enabled available runtime", () => {
   const runtimes = [
     {

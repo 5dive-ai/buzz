@@ -72,16 +72,22 @@ fn non_blank(v: Option<&str>) -> Option<&str> {
 }
 
 fn resolve_linked(
+    record: &ManagedAgentRecord,
     definition: &AgentDefinition,
+    definitions: &[AgentDefinition],
     global: &GlobalAgentConfig,
 ) -> EffectiveAgentConfig {
+    let global_defaults_apply =
+        super::global_config::global_harness_defaults_apply_to_record(record, definitions, global);
     let model = match non_blank(definition.model.as_deref()) {
         Some(m) => ResolvedField {
             value: Some(m.to_owned()),
             source: ConfigSource::Definition,
         },
         None => ResolvedField {
-            value: global.model.clone(),
+            value: global_defaults_apply
+                .then(|| global.model.clone())
+                .flatten(),
             source: ConfigSource::Global,
         },
     };
@@ -92,7 +98,9 @@ fn resolve_linked(
             source: ConfigSource::Definition,
         },
         None => ResolvedField {
-            value: global.provider.clone(),
+            value: global_defaults_apply
+                .then(|| global.provider.clone())
+                .flatten(),
             source: ConfigSource::Global,
         },
     };
@@ -251,7 +259,9 @@ pub fn resolve_effective_config(
 ) -> EffectiveConfigResult {
     match &record.persona_id {
         Some(pid) => match definitions.iter().find(|d| d.id == *pid) {
-            Some(def) => EffectiveConfigResult::Resolved(resolve_linked(def, global)),
+            Some(def) => {
+                EffectiveConfigResult::Resolved(resolve_linked(record, def, definitions, global))
+            }
             None => EffectiveConfigResult::OrphanedInstance {
                 record_pubkey: record.pubkey.clone(),
                 missing_persona_id: pid.clone(),

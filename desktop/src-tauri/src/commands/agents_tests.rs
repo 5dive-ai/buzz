@@ -17,7 +17,7 @@ fn bare_agent_record(
         relay_url: "ws://localhost:3000".to_string(),
         avatar_url: None,
         acp_command: "buzz-acp".to_string(),
-        agent_command: "goose".to_string(),
+        agent_command: "buzz-agent".to_string(),
         agent_command_override: None,
         agent_command_override_is_implicit: false,
         agent_args: vec![],
@@ -219,7 +219,7 @@ fn deploy_resolver_returns_none_for_orphaned_instance() {
 }
 
 #[test]
-fn deploy_resolver_ignores_defaults_from_a_different_implicit_runtime() {
+fn deploy_resolver_keeps_defaults_for_an_explicit_harness_override() {
     let mut record = bare_agent_record(Some("p1"), None, None);
     record.agent_command_override = Some("goose".to_string());
     let personas = vec![persona_record("p1", None, None)];
@@ -232,7 +232,7 @@ fn deploy_resolver_ignores_defaults_from_a_different_implicit_runtime() {
 
     assert_eq!(
         resolve_deploy_model_provider(&record, &personas, &global),
-        (None, None)
+        (Some("auto".to_string()), Some("relay-mesh".to_string()))
     );
 }
 

@@ -252,8 +252,7 @@ fn resolve_effective_agent_env_with_def(
         }
     }
 
-    // Layer 3a: global env vars — the lowest user-settable layer.
-    // Injected before persona/agent so per-agent values win on collision.
+    // Layer 3a: global env vars, injected before persona/agent overrides.
     // `merged_user_env` with an empty "lower" map applies reserved/malformed-key
     // filtering to the global map for free.
     let applicable_global_env =

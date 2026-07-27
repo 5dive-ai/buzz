@@ -28,6 +28,9 @@ use super::pocket::{
     april_model_info, PocketModelArtifact, APRIL_BUNDLE_ID, APRIL_MODEL_ID, APRIL_MODEL_REVISION,
 };
 
+#[path = "models_voice_upgrade.rs"]
+mod voice_upgrade;
+
 // ── Integrity verification ────────────────────────────────────────────────────
 //
 // All model artifacts are verified against pinned SHA-256 hashes before
@@ -186,6 +189,14 @@ https://datashare.ed.ac.uk/handle/10283/3443 (CC-BY-4.0).
 Recording enhancement (denoise/dereverb) by ai-coustics:
 https://ai-coustics.com/
 
+Bundled reference voice (marius.wav):
+\"Marius\", an audio-identical copy of Kyutai's
+`voice-donations/Selfie.wav`, distributed under CC0 1.0 Universal:
+https://huggingface.co/kyutai/tts-voices/blob/main/voice-donations/Selfie.wav
+https://creativecommons.org/publicdomain/zero/1.0/
+The contributor submitted their own voice under Kyutai's Unmute Voice Donation
+Project terms. Neither Kyutai nor the contributor endorses Buzz.
+
 Buzz ships all ONNX/model artifacts and the reference voice WAV unmodified,
 renamed only by placement in the local model directory.
 
@@ -205,6 +216,7 @@ const TTS_EXPECTED_FILES: &[&str] = &[
     "tokenizer.model",
     "LICENSE",
     "reference_sample.wav",
+    "marius.wav",
     TTS_LICENSE_FILE_NAME,
 ];
 
@@ -705,6 +717,9 @@ impl ModelManager {
 
     /// Start a background Pocket TTS download. No-op if already ready or downloading.
     pub fn start_tts_download(&self, http_client: reqwest::Client) {
+        if let Err(error) = voice_upgrade::install_marius_into_v3_model(&self.models_dir) {
+            eprintln!("buzz-desktop: could not upgrade existing Pocket voices in place: {error}");
+        }
         let manager = self.clone();
         self.tts.start_download(
             &self.models_dir,
@@ -822,7 +837,7 @@ impl ModelManager {
     ///   - five ONNX sessions selected by the April INT8 bundle
     ///   - bundle metadata, SentencePiece tokenizer, and learned voice BOS
     ///   - upstream `LICENSE` plus Buzz's `MODEL_LICENSE.txt` attribution sidecar
-    ///   - `reference_sample.wav` as the bundled default voice
+    ///   - `reference_sample.wav` and embedded `marius.wav` reference voices
     ///
     /// Files are written to a temp directory first, then moved atomically.
     async fn download_tts_model(&self, http_client: reqwest::Client) -> Result<(), String> {
@@ -907,6 +922,12 @@ impl ModelManager {
         tokio::fs::write(temp_dir.join(TTS_LICENSE_FILE_NAME), TTS_LICENSE_TEXT)
             .await
             .map_err(|e| format!("write TTS model license sidecar: {e}"))?;
+        tokio::fs::write(
+            temp_dir.join("marius.wav"),
+            voice_upgrade::POCKET_MARIUS_WAV,
+        )
+        .await
+        .map_err(|e| format!("install bundled Marius voice: {e}"))?;
 
         self.tts.set_status(ModelStatus::Downloading {
             progress_percent: 90,

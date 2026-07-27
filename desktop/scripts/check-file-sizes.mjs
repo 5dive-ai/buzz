@@ -94,10 +94,10 @@ const overrides = new Map([
   // 3-phase (stage/stop/commit) + commit_cascade_agents injectable helper for
   // retry-safety. Load-bearing reviewer-required change; queued to split.
   // Consolidation removed the legacy persona-card import/export codecs.
-  // Retired-in-place ratchet: the edit path moved to personas/update.rs,
-  // taking mod.rs from 1003 to 779. Kept as a ratchet so the edit-path split
-  // cannot silently refill.
-  ["src-tauri/src/commands/personas/mod.rs", 779],
+  // Retired-in-place ratchet: the edit path moved to personas/update.rs and
+  // the create path to personas/create.rs, taking mod.rs from 1003 to 719.
+  // Kept as a ratchet so neither split can silently refill.
+  ["src-tauri/src/commands/personas/mod.rs", 719],
   // #1418 read-path fix: get_thread_replies' blocker fix (shared TIMELINE_KINDS
   // const + build_thread_replies_filter helper, mirroring the channel sibling so
   // the two p-gate filters can't drift) plus two guard unit tests. The file was
@@ -381,7 +381,9 @@ const overrides = new Map([
   // Available both-present AND adapter-present/CLI-absent — the selectability
   // regression guard), bound to an injectable resolver so the tests stay
   // PATH-independent.
-  ["src-tauri/src/managed_agents/discovery/tests.rs", 1871],
+  // +2 (1871 -> 1873): the AgentDefinition and ManagedAgentRecord fixtures each
+  // set the new mandatory `catalog_source` field.
+  ["src-tauri/src/managed_agents/discovery/tests.rs", 1873],
   // identity-import-keyring: the identity resolution state machine's behavioral
   // matrix (46 tests over FakeIdentityStore — probe × marker × file cells,
   // adoption / read-back-corruption / marker-failure arms, recovery-mode
@@ -576,7 +578,9 @@ const overrides = new Map([
   // computing had_* so stale materialized snapshot bytes can never be tagged
   // BuzzExplicit and shadow the definition/global fallthrough; the dead
   // persona-model re-tag branch replaced; two new regression tests added.
-  ["src-tauri/src/commands/agent_config.rs", 1110],
+  // +2 (1110 -> 1112): the agent_record and persona_with_model test fixtures
+  // each set the new mandatory `catalog_source` field.
+  ["src-tauri/src/commands/agent_config.rs", 1112],
   // codex-install-auto-restart review-fixes: should_restart_after_install
   // takes pid_alive:bool (pure predicate, no OS-dependent call); 3 racy
   // cache tests replaced with 6 pure availability_drift predicate tests;

@@ -64,6 +64,7 @@ fn make_agent(
         shared: false,
         source_team: None,
         source_team_persona_slug: None,
+        catalog_source: None,
         relay_mesh: None,
         auto_restart_on_config_change: false,
         definition_respond_to: None,

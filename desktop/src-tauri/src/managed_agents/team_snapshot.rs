@@ -305,6 +305,7 @@ mod tests {
             source_team: Some("SENTINEL_SOURCE_TEAM".to_string()), // MUST NOT appear
             source_team_persona_slug: Some("SENTINEL_SLUG".to_string()), // MUST NOT appear
             definition_respond_to: None,
+            catalog_source: None,
             definition_respond_to_allowlist: vec![],
             definition_parallelism: None,
             relay_mesh: None,

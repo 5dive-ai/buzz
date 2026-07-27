@@ -1,15 +1,14 @@
 use tauri::{AppHandle, Emitter, Manager};
-use uuid::Uuid;
 
 use crate::{
     app_state::AppState,
     managed_agents::{
-        agent_events::ManagedAgentEventContent, apply_persona_behavior, current_instance_id,
-        delete_agent_key, load_managed_agents, load_personas, load_teams,
-        persona_events::persona_d_tag, save_managed_agents, save_personas,
-        stop_managed_agent_process, sync_managed_agent_processes, team_events::TeamEventContent,
-        try_regenerate_nest, validate_persona_activation_change, validate_persona_deletion,
-        AgentDefinition, CreatePersonaRequest, ManagedAgentRecord, TeamRecord,
+        agent_events::ManagedAgentEventContent, current_instance_id, delete_agent_key,
+        load_managed_agents, load_personas, load_teams, persona_events::persona_d_tag,
+        save_managed_agents, save_personas, stop_managed_agent_process,
+        sync_managed_agent_processes, team_events::TeamEventContent, try_regenerate_nest,
+        validate_persona_activation_change, validate_persona_deletion, AgentDefinition,
+        ManagedAgentRecord, TeamRecord,
     },
     util::now_iso,
 };
@@ -32,6 +31,8 @@ fn trim_optional(value: Option<String>) -> Option<String> {
 mod pending;
 pub(in crate::commands) use pending::retain_persona_pending;
 pub(super) use pending::tombstone_persona_pending;
+mod create;
+pub use create::create_persona;
 mod sharing;
 pub use sharing::set_persona_shared;
 pub use sharing::update_persona_and_publish;
@@ -50,67 +51,6 @@ pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, Strin
         let mut personas = load_personas(&app)?;
         pending::project_active_persona_sharing(&app, &state, &mut personas);
         Ok(personas)
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
-}
-
-#[tauri::command]
-pub async fn create_persona(
-    input: CreatePersonaRequest,
-    app: AppHandle,
-) -> Result<AgentDefinition, String> {
-    use tauri::Manager;
-    tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let display_name = trim_required(&input.display_name, "Display name")?;
-        // System prompt optional: core memory is auto-injected. Empty is valid.
-        let system_prompt = input.system_prompt.trim().to_string();
-        let avatar_url = trim_optional(input.avatar_url);
-        let runtime = trim_optional(input.runtime);
-        let model = trim_optional(input.model);
-        let provider = trim_optional(input.provider);
-        let now = now_iso();
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|error| error.to_string())?;
-        let mut personas = load_personas(&app)?;
-        pending::project_active_persona_sharing(&app, &state, &mut personas);
-        let name_pool: Vec<String> = input
-            .name_pool
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        crate::managed_agents::validate_user_env_keys(&input.env_vars)?;
-        let mut persona = AgentDefinition {
-            id: Uuid::new_v4().to_string(),
-            display_name,
-            avatar_url,
-            system_prompt,
-            runtime,
-            model,
-            provider,
-            name_pool,
-            is_builtin: false,
-            is_active: true,
-            shared: false,
-            source_team: None,
-            source_team_persona_slug: None,
-            env_vars: input.env_vars,
-            respond_to: None,
-            respond_to_allowlist: Vec::new(),
-            parallelism: None,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        apply_persona_behavior(&mut persona, input.behavior)?;
-        personas.push(persona.clone());
-        save_personas(&app, &personas)?;
-        retain_persona_pending(&app, &state, &persona);
-        try_regenerate_nest(&app);
-        Ok(persona)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?

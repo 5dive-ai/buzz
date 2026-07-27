@@ -64,6 +64,13 @@ pub struct AgentDefinition {
         alias = "source_pack_persona_slug"
     )]
     pub source_team_persona_slug: Option<String>,
+    /// Provenance of a persona copied from another owner's shared catalog.
+    ///
+    /// Set only on the copy, never on the original. It is what makes
+    /// "already added" answerable for a foreign catalog entry: the copy carries
+    /// a new local id, so the only link back to the publication is this pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_source: Option<CatalogSource>,
     /// Harness-level configuration passed to the agent subprocess as environment variables.
     /// Opaque to Buzz — keys and values are runtime-specific.
     ///
@@ -141,6 +148,7 @@ impl AgentDefinition {
             shared: false,
             source_team: self.source_team,
             source_team_persona_slug: self.source_team_persona_slug,
+            catalog_source: self.catalog_source,
             definition_respond_to: self.respond_to,
             definition_respond_to_allowlist: self.respond_to_allowlist,
             definition_parallelism: self.parallelism,
@@ -174,6 +182,7 @@ impl ManagedAgentRecord {
             shared: false,
             source_team: self.source_team.clone(),
             source_team_persona_slug: self.source_team_persona_slug.clone(),
+            catalog_source: self.catalog_source.clone(),
             env_vars: self.env_vars.clone(),
             respond_to: self.definition_respond_to.clone(),
             respond_to_allowlist: self.definition_respond_to_allowlist.clone(),
@@ -396,6 +405,10 @@ pub struct ManagedAgentRecord {
     /// definition's slug within its source team.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_team_persona_slug: Option<String>,
+    /// Absorbed from `AgentDefinition.catalog_source` — the publication this
+    /// definition was copied from, when it came from another owner's catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_source: Option<CatalogSource>,
     /// NIP-AP definition-level behavioral defaults, absorbed from
     /// `AgentDefinition` in WIRE shape (kebab-case string / optional u32),
     /// distinct from the instance-side `respond_to`/`respond_to_allowlist`/
@@ -972,6 +985,8 @@ pub fn resolve_mint_behavioral_defaults(
     })
 }
 
+mod catalog_source;
+pub use catalog_source::CatalogSource;
 mod requests;
 pub use requests::*;
 

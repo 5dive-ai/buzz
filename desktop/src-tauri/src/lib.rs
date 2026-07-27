@@ -803,6 +803,7 @@ pub fn run() {
             list_personas,
             create_persona,
             update_persona,
+            update_persona_and_publish,
             delete_persona,
             set_persona_active,
             set_persona_shared,

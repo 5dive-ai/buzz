@@ -94,7 +94,10 @@ const overrides = new Map([
   // 3-phase (stage/stop/commit) + commit_cascade_agents injectable helper for
   // retry-safety. Load-bearing reviewer-required change; queued to split.
   // Consolidation removed the legacy persona-card import/export codecs.
-  ["src-tauri/src/commands/personas/mod.rs", 984],
+  // Retired-in-place ratchet: the edit path moved to personas/update.rs,
+  // taking mod.rs from 1003 to 779. Kept as a ratchet so the edit-path split
+  // cannot silently refill.
+  ["src-tauri/src/commands/personas/mod.rs", 779],
   // #1418 read-path fix: get_thread_replies' blocker fix (shared TIMELINE_KINDS
   // const + build_thread_replies_filter helper, mirroring the channel sibling so
   // the two p-gate filters can't drift) plus two guard unit tests. The file was

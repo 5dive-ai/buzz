@@ -63,6 +63,33 @@ pub async fn set_persona_shared(
     publish_prepared_persona(&state, prepared).await
 }
 
+/// Save a persona edit AND publish its catalog head, returning the same
+/// `published | queued` outcome as [`set_persona_shared`].
+///
+/// The "save and publish" affordance in the edit dialog promises the change
+/// reaches the catalog on save. Plain `update_persona` only enqueues
+/// best-effort, so the UI could not report whether the relay accepted it. This
+/// takes the identical input and reuses the strict preparation path, then awaits
+/// the relay exactly like the share toggle does — a rejection or an unreachable
+/// relay stays durably queued for the flush loop and is reported as `queued`.
+#[tauri::command]
+pub async fn update_persona_and_publish(
+    input: crate::managed_agents::UpdatePersonaRequest,
+    app: AppHandle,
+) -> Result<SetPersonaSharedResult, String> {
+    let (_, prepared) =
+        super::update::update_persona_with(input, app.clone(), |app, state, persona| {
+            // Strict path: this command's contract is to report the publication
+            // outcome, so an enqueue failure must reach the UI rather than being
+            // logged and swallowed.
+            prepare_persona_publication(app, state, persona, None)
+        })
+        .await?;
+
+    let state = app.state::<AppState>();
+    publish_prepared_persona(&state, prepared).await
+}
+
 async fn publish_prepared_persona(
     state: &AppState,
     prepared: PreparedPersonaPublication,
@@ -165,9 +192,10 @@ mod tests {
         db_path: &std::path::Path,
         relay_url: String,
         keys: nostr::Keys,
+        shared_override: Option<bool>,
     ) -> PreparedPersonaPublication {
         let (event, retained, persona) =
-            prepare_persona_publication_at(db_path, &keys, &persona(), Some(true)).unwrap();
+            prepare_persona_publication_at(db_path, &keys, &persona(), shared_override).unwrap();
         PreparedPersonaPublication {
             scope: RetentionScope {
                 db_path: db_path.to_path_buf(),
@@ -186,7 +214,7 @@ mod tests {
         let db_path = dir.path().join("retention.db");
         let keys = nostr::Keys::generate();
         let owner = keys.public_key().to_hex();
-        let prepared = prepared(&db_path, spawn_relay(false).await, keys);
+        let prepared = prepared(&db_path, spawn_relay(false).await, keys, Some(true));
         let state = build_app_state();
 
         let result = publish_prepared_persona(&state, prepared).await.unwrap();
@@ -221,7 +249,7 @@ mod tests {
         let db_path = dir.path().join("retention.db");
         let keys = nostr::Keys::generate();
         let owner = keys.public_key().to_hex();
-        let prepared = prepared(&db_path, relay_url, keys);
+        let prepared = prepared(&db_path, relay_url, keys, Some(true));
         let state = build_app_state();
 
         let result = publish_prepared_persona(&state, prepared).await.unwrap();
@@ -253,7 +281,7 @@ mod tests {
         let db_path = dir.path().join("retention.db");
         let keys = nostr::Keys::generate();
         let owner = keys.public_key().to_hex();
-        let prepared = prepared(&db_path, spawn_relay(true).await, keys);
+        let prepared = prepared(&db_path, spawn_relay(true).await, keys, Some(true));
         let state = build_app_state();
 
         let result = publish_prepared_persona(&state, prepared).await.unwrap();
@@ -273,5 +301,90 @@ mod tests {
             .unwrap()
             .pending_sync
         );
+    }
+
+    /// `update_persona_and_publish` differs from the share toggle in one way:
+    /// it passes no share override, so the edit must keep whatever the scoped
+    /// head already says, and it reports the relay outcome to the caller.
+    #[tokio::test]
+    async fn test_update_and_publish_acceptance_publishes_the_edit_at_the_current_share_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retention.db");
+        let keys = nostr::Keys::generate();
+        let owner = keys.public_key().to_hex();
+        // The persona is already shared in this scope.
+        prepare_persona_publication_at(&db_path, &keys, &persona(), Some(true)).unwrap();
+        let prepared = prepared(&db_path, spawn_relay(true).await, keys, None);
+        let state = build_app_state();
+
+        let result = publish_prepared_persona(&state, prepared).await.unwrap();
+
+        assert_eq!(
+            result.publication_status,
+            PersonaSharePublicationStatus::Published
+        );
+        assert!(
+            result.persona.shared,
+            "an ordinary edit must not silently unshare the persona"
+        );
+        assert!(
+            !get_retained_event(
+                &open_retention_db(&db_path).unwrap(),
+                buzz_core_pkg::kind::KIND_PERSONA,
+                &owner,
+                "catalog-reviewer"
+            )
+            .unwrap()
+            .unwrap()
+            .pending_sync
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_and_publish_relay_rejection_reports_queued_not_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retention.db");
+        let keys = nostr::Keys::generate();
+        let owner = keys.public_key().to_hex();
+        prepare_persona_publication_at(&db_path, &keys, &persona(), Some(true)).unwrap();
+        let prepared = prepared(&db_path, spawn_relay(false).await, keys, None);
+        let state = build_app_state();
+
+        let result = publish_prepared_persona(&state, prepared).await.unwrap();
+
+        assert_eq!(
+            result.publication_status,
+            PersonaSharePublicationStatus::Queued
+        );
+        assert!(result
+            .relay_message
+            .as_deref()
+            .is_some_and(|message| message.contains("relay rejected event")));
+        assert!(
+            get_retained_event(
+                &open_retention_db(&db_path).unwrap(),
+                buzz_core_pkg::kind::KIND_PERSONA,
+                &owner,
+                "catalog-reviewer"
+            )
+            .unwrap()
+            .unwrap()
+            .pending_sync,
+            "the edit stays queued for the flush loop"
+        );
+    }
+
+    /// The save path swallows enqueue failures (`retain_persona_pending` logs
+    /// them). This command promises a publication outcome, so the strict
+    /// preparation it uses must surface the failure instead.
+    #[tokio::test]
+    async fn test_update_and_publish_enqueue_failure_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = nostr::Keys::generate();
+
+        let error = prepare_persona_publication_at(dir.path(), &keys, &persona(), None)
+            .expect_err("a directory cannot be opened as the retention database");
+
+        assert!(error.contains("failed to open retention db"));
     }
 }

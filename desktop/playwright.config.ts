@@ -104,6 +104,7 @@ export default defineConfig({
         "**/persona-model-combobox-screenshots.spec.ts",
         "**/drafts-screenshots.spec.ts",
         "**/inbox-refactor-screenshots.spec.ts",
+        "**/dm-label-spacing-screenshots.spec.ts",
         "**/buzz-theme-screenshots.spec.ts",
         "**/channel-sort.spec.ts",
         "**/identity-lost.spec.ts",

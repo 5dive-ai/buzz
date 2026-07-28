@@ -123,9 +123,9 @@ public struct PushCatchUpPager {
       $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt > $1.createdAt
     }
     if ordered.count < pageLimit {
-      // Every emitted filter is fully represented by the relay's SQL query.
-      // In particular, #h is exact after splitting, so a short raw page proves
-      // exhaustion rather than reflecting post-LIMIT filtering.
+      // `/query` exposes no exhaustion signal, so a short page is treated as
+      // exhausted even though post-LIMIT rejection makes that inference unsound.
+      // Relay support for an explicit exhaustion signal is required to fix this.
       subscriptionIndex += 1
       rawTail = nil
       if subscriptionIndex == queries.count {

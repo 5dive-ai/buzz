@@ -73,9 +73,8 @@ const SYNTH_STEPS: usize = 1;
 ///
 /// Applied only at the *end* of each synthesised sentence to eliminate the
 /// click that would otherwise occur when a non-zero waveform terminates
-/// abruptly. **No fade-in is applied** — see `apply_fade_out` for the
-/// rationale and `examples/pocket_onset_probe.rs` for the measurement that
-/// motivated removing the leading fade.
+/// abruptly. **No fade-in is applied** — see `apply_fade_out` for why preserving
+/// the leading waveform is important.
 const FADE_OUT_SAMPLES: usize = (SAMPLE_RATE as f64 * 0.008) as usize;
 
 /// Length of the zero-sample cushion prepended before each synthesized
@@ -491,29 +490,14 @@ fn tts_worker(
         // sentence stays alone (fast time-to-first-audio), the rest pack
         // greedily up to MAX_CHUNK_CHARS. Each chunk is one `generate()`
         // call; playback of chunk N overlaps synthesis of chunk N+1
-        // (lookahead pipelining). Grouping matches upstream's ~50-token
-        // chunking and halves the exposed prosody seams on multi-sentence
-        // replies — see MAX_CHUNK_CHARS.
+        // (lookahead pipelining). The Pocket engine applies its exact 50-token
+        // limit internally; keeping those internal units within one playback
+        // chunk avoids adding fades and pauses at token-only boundaries.
         let sentences: Vec<String> = split_sentences(&text)
             .into_iter()
             .filter(|s| !s.trim().is_empty())
             .collect();
-        let grouped_chunks = group_sentences_into_chunks(&sentences, MAX_CHUNK_CHARS);
-        let mut chunks = Vec::new();
-        let mut split_failed = false;
-        for chunk in grouped_chunks {
-            match engine.split_text_into_chunks(&chunk) {
-                Ok(model_chunks) => chunks.extend(model_chunks),
-                Err(error) => {
-                    eprintln!("buzz-desktop: TTS chunking failed: {error}");
-                    split_failed = true;
-                    break;
-                }
-            }
-        }
-        if split_failed {
-            continue;
-        }
+        let chunks = group_sentences_into_chunks(&sentences, MAX_CHUNK_CHARS);
 
         for chunk in &chunks {
             if handle_cancel_or_shutdown(
@@ -657,15 +641,10 @@ fn lock_player_ops(ops: &Mutex<()>) -> MutexGuard<'_, ()> {
 
 /// Hard-clamp samples to ±1.0 full scale.
 ///
-/// No gain is applied: Pocket TTS already emits speech-level audio
-/// (peaks 0.4–0.97, RMS ≈ −20 dBFS across varied sentences — measured by
-/// `examples/pocket_clip_probe`), matching the kyutai reference pipeline,
-/// which applies no output scaling. Two earlier gain stages were both
-/// regressions against that baseline: per-sentence peak normalization caused
-/// level pumping between sentences, and the fixed 9.3× gain that replaced it
-/// was calibrated on a single anomalously-quiet bench utterance (peak 0.076)
-/// and clipped 13–34% of samples on real speech ("blown out", 2026-06-12).
-/// The clamp alone remains as the safety net against outlier transients.
+/// No gain is applied because Pocket TTS already emits speech-level audio and
+/// the reference pipeline applies no output scaling. Normalizing each sentence
+/// would cause level pumping between chunks. The clamp remains only as a safety
+/// net against outlier transients.
 fn clamp_to_full_scale(samples: Vec<f32>) -> Vec<f32> {
     samples.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect()
 }
@@ -678,14 +657,10 @@ fn clamp_to_full_scale(samples: Vec<f32>) -> Vec<f32> {
 ///
 /// # Why no fade-in
 ///
-/// An earlier revision (pre 2026-05) symmetrically faded *in* over the same
-/// 8 ms window. That swallowed the leading consonant attack on every
-/// sentence — Pocket TTS produces real audio energy inside the first
-/// millisecond (RMS ≈ 0.02, peak ≈ 0.03 measured across four prompts in
-/// `examples/pocket_onset_probe.rs`), and a linear 0→1 ramp over 192 samples
-/// scales those onset samples by ≤50 % for the first ~4 ms. The result was
-/// the "first little sound or two is missing" regression heard on
-/// 2026-05-18.
+/// A symmetric fade-in would attenuate the leading consonant attack because
+/// Pocket TTS produces real audio energy inside the first millisecond. A
+/// linear 0→1 ramp over 192 samples scales those onset samples by ≤50% for the
+/// first ~4 ms, which can make the first phoneme sound clipped.
 ///
 /// The first sample of Pocket output measures ≈ 0.0018 (≈ −54 dBFS) — well
 /// below the threshold at which a DC-jump would be audible as a click — so

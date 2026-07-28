@@ -79,7 +79,6 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
   private let session: URLSession
   private let appGroupIdentifier: String?
   private let keychainAccessGroup: String?
-  private let defaults: UserDefaults?
   private let fileManager: FileManager
 
   init(
@@ -95,24 +94,30 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
     self.session = session
     self.appGroupIdentifier = appGroupIdentifier
     self.keychainAccessGroup = keychainAccessGroup
-    defaults = appGroupIdentifier.flatMap(UserDefaults.init(suiteName:))
     self.fileManager = fileManager
   }
 
   func resolve(completion: @escaping (BuzzPushResolutionResult) -> Void) {
-    let loadedCommunities: [PushLeaseCommunity]
+    let loaded: (communities: [PushLeaseCommunity], store: PushConsumptionStateStore)
     do {
-      loadedCommunities = try loadCommunities()
+      loaded = try loadState()
     } catch {
       completion(.diagnostic("Open Buzz to refresh notification subscriptions."))
       return
     }
-    removeStaleWatermarks(activeCommunityIDs: Set(loadedCommunities.map(\.id)))
-    let communities = loadedCommunities.filter {
+    let communities = loaded.communities.filter {
       $0.pubkey?.isEmpty == false && loadPrivateKey(communityID: $0.id) != nil
     }
     guard !communities.isEmpty else {
       completion(.diagnostic("Open Buzz to restore notification credentials."))
+      return
+    }
+
+    let consumptionState: PushConsumptionState
+    do {
+      consumptionState = try loaded.store.read()
+    } catch {
+      completion(.diagnostic("Buzz could not read notification history."))
       return
     }
 
@@ -122,7 +127,7 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
     var diagnostics: [String] = []
     for community in communities {
       group.enter()
-      query(community) { result in
+      query(community, consumptionState: consumptionState) { result in
         lock.lock()
         switch result {
         case .candidate(let candidate): candidates.append(candidate)
@@ -146,11 +151,25 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
         completion(diagnostics.sorted().first.map(BuzzPushResolutionResult.diagnostic) ?? .none)
         return
       }
-      for candidate in candidates {
-        self.defaults?.set(
-          PushWatermark.persistedTimestamp(eventTimestamp: candidate.event.createdAt),
-          forKey: PushWatermark.key(communityID: candidate.community.id)
-        )
+      let position = PushEventPosition(
+        createdAt: winner.event.createdAt,
+        id: winner.event.id
+      )
+      var shouldPresent = false
+      do {
+        try loaded.store.update { state in
+          state.removeInactiveOrigins(Set(communities.map(\.id)))
+          guard state.canSelect(position, for: winner.community.id) else { return }
+          state.consume(position, for: winner.community.id)
+          shouldPresent = true
+        }
+      } catch {
+        completion(.diagnostic("Buzz could not save notification history."))
+        return
+      }
+      guard shouldPresent else {
+        completion(.none)
+        return
       }
       completion(.notification(winner.resolution))
     }
@@ -164,6 +183,7 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
 
   private func query(
     _ community: PushLeaseCommunity,
+    consumptionState: PushConsumptionState,
     completion: @escaping (QueryResult) -> Void
   ) {
     guard let privateKey = loadPrivateKey(communityID: community.id) else {
@@ -177,11 +197,7 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
       completion(.diagnostic("Open Buzz to refresh notification subscriptions."))
       return
     }
-    let watermarkKey = PushWatermark.key(communityID: community.id)
-    let storedWatermark = defaults?.integer(forKey: watermarkKey) ?? 0
-    let watermark = PushWatermark.queryTimestamp(storedWatermark: storedWatermark)
-    if watermark != storedWatermark { defaults?.set(watermark, forKey: watermarkKey) }
-    let since = PushWatermark.querySince(watermark: watermark)
+    let since = consumptionState.querySince(for: community.id)
     let filters = subscriptions.map { $0.filter.queryFilter(since: since, limit: 10) }
     guard let body = try? JSONSerialization.data(withJSONObject: filters) else {
       completion(.diagnostic("Buzz notification subscriptions are invalid."))
@@ -223,7 +239,8 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
         Self.decodeResolution(
           events: events,
           community: community,
-          subscriptions: subscriptions
+          subscriptions: subscriptions,
+          consumptionState: consumptionState
         )
       )
     }.resume()
@@ -232,14 +249,21 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
   private static func decodeResolution(
     events: [VerifiedNostrEvent],
     community: PushLeaseCommunity,
-    subscriptions: [PushLeaseSubscription]
+    subscriptions: [PushLeaseSubscription],
+    consumptionState: PushConsumptionState
   ) -> QueryResult {
     let matching = events.filter { event in
-      event.hasValidIDAndSignature()
-        && PushWatermark.isAcceptable(eventTimestamp: event.createdAt)
-        && subscriptions.contains(where: {
+      guard event.hasValidIDAndSignature(),
+        subscriptions.contains(where: {
           PushLeaseMatcher.matches(event: event, subscription: $0)
         })
+      else {
+        return false
+      }
+      return consumptionState.canSelect(
+        PushEventPosition(createdAt: event.createdAt, id: event.id),
+        for: community.id
+      )
     }.sorted {
       $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt > $1.createdAt
     }
@@ -306,16 +330,6 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
     pubkey.count > 8 ? String(pubkey.prefix(8)) + "…" : pubkey
   }
 
-  private func removeStaleWatermarks(activeCommunityIDs: Set<String>) {
-    guard let defaults else { return }
-    for key in PushWatermark.staleKeys(
-      in: Array(defaults.dictionaryRepresentation().keys),
-      activeCommunityIDs: activeCommunityIDs
-    ) {
-      defaults.removeObject(forKey: key)
-    }
-  }
-
   private func loadPrivateKey(communityID: String) -> String? {
     var query: [String: Any] = [
       kSecClass as String: kSecClassGenericPassword,
@@ -334,7 +348,10 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
     return String(data: data, encoding: .utf8)
   }
 
-  private func loadCommunities() throws -> [PushLeaseCommunity] {
+  private func loadState() throws -> (
+    communities: [PushLeaseCommunity],
+    store: PushConsumptionStateStore
+  ) {
     guard let appGroupIdentifier,
       let container = fileManager.containerURL(
         forSecurityApplicationGroupIdentifier: appGroupIdentifier
@@ -344,7 +361,8 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
     }
     let snapshotURL = container.appendingPathComponent("push-communities.json")
     let data = try Data(contentsOf: snapshotURL)
-    return try JSONDecoder().decode(PushLeaseSnapshot.self, from: data).communities
+    let snapshot = try JSONDecoder().decode(PushLeaseSnapshot.self, from: data)
+    return (snapshot.communities, PushConsumptionStateStore(containerURL: container))
   }
 }
 

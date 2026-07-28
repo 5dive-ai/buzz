@@ -65,6 +65,12 @@ pub struct AgentSnapshotImportPreview {
     pub has_source_allowlist: bool,
     /// Number of source allowlist entries.
     pub source_allowlist_count: usize,
+    /// Full source allowlist entries, surfaced before import so hidden access
+    /// configuration is never reduced to a count.
+    pub source_allowlist: Vec<String>,
+    /// Pretty-printed, validated manifest exactly as decoded from the file.
+    /// The UI makes this available before confirmation for full payload review.
+    pub manifest_json: String,
 }
 
 /// The confirmation request sent from the UI after the user reviews the preview.
@@ -269,6 +275,10 @@ pub async fn preview_agent_snapshot_import(
         }
         .to_string();
 
+        let manifest_json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| format!("failed to render snapshot manifest: {e}"))?;
+        let source_allowlist = snapshot.definition.respond_to_allowlist.clone();
+
         Ok(AgentSnapshotImportPreview {
             display_name: snapshot.profile.display_name.clone(),
             system_prompt: snapshot.definition.system_prompt.clone(),
@@ -280,8 +290,10 @@ pub async fn preview_agent_snapshot_import(
                 .or_else(|| snapshot.profile.avatar_url.clone()),
             memory_level,
             memory_entry_count: snapshot.memory.entries.len(),
-            source_allowlist_count: snapshot.definition.respond_to_allowlist.len(),
-            has_source_allowlist: !snapshot.definition.respond_to_allowlist.is_empty(),
+            source_allowlist_count: source_allowlist.len(),
+            has_source_allowlist: !source_allowlist.is_empty(),
+            source_allowlist,
+            manifest_json,
         })
     })
     .await

@@ -181,6 +181,10 @@ export type AgentSnapshotImportPreview = {
   /** True when the snapshot's respond_to_allowlist is non-empty. */
   hasSourceAllowlist: boolean;
   sourceAllowlistCount: number;
+  /** Full source pubkeys shown before import, not only their count. */
+  sourceAllowlist: string[];
+  /** Validated, pretty-printed manifest for full payload disclosure. */
+  manifestJson: string;
 };
 
 /** Confirmation sent to `confirm_agent_snapshot_import`. */

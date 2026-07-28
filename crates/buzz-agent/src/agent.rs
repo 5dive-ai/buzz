@@ -8,10 +8,23 @@
 //! | `mcp.rs`      | 1139 | `goose::agents::extension_manager` |
 //! | `auth.rs`     |  845 | `goose::providers` (incl. Databricks OAuth) |
 //! | `agent.rs`    |  746 | `goose::agents::Agent::reply` |
-//! | `hints.rs`    |  726 | `goose`'s hint loader (`prompt_manager::with_hints`) |
+//! | `hints.rs`    |  726 | *partly* -- see the caveat below |
 //! | `catalog.rs`  |  631 | `goose::providers::init` model discovery |
-//! | `builtin.rs`  |  575 | `goose`'s `skills` platform extension |
+//! | `builtin.rs`  |  575 | **dropped** -- see the caveat below |
 //! | `handoff.rs`  |  430 | `goose::context_mgmt` (auto-compaction) |
+//!
+//! Two entries above are NOT clean substitutions, and saying otherwise would
+//! be worse than the loss itself:
+//!
+//! * **`builtin.rs` / `load_skill` is gone.** `Agent::with_config` loads zero
+//!   extensions and `build_agent` only adds the `mcpServers` the harness
+//!   declares, so goose's `skills` platform extension is never loaded. The
+//!   `load_skill` tool and `SKILL.md` discovery (old `hints.rs:110-204`) have
+//!   no replacement. Restoring them means explicitly adding the extension.
+//! * **`AGENTS.md` hints are not loaded.** Goose's loader keys off
+//!   `GOOSE_HINTS_FILENAME` (`.goosehints`); the old code walked the directory
+//!   chain for `AGENTS.md` plus `~/AGENTS.md`. Every repo here ships the
+//!   former and none ship the latter, so in practice no hints load at all.
 //!
 //! What this file keeps is the part Goose does *not* know about: the mapping
 //! from `AgentEvent` onto the exact `session/update` notifications `buzz-acp`

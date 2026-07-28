@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! buzz-agent's ACP server, with Goose as the agent loop.
 //!
 //! This is the layer `buzz-acp` actually talks to, and it is deliberately
@@ -225,7 +226,10 @@ fn hook_tool_guidance() -> String {
 
 pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     let (wire_tx, wire_rx) = tokio::sync::mpsc::channel(256);
-    tokio::spawn(wire::writer_task(wire_rx));
+    // Keep the join handle: on EOF we must await it so queued frames -- including
+    // the final response of a turn that finished on the same tick -- actually
+    // reach stdout before the runtime is dropped.
+    let writer = tokio::spawn(wire::writer_task(wire_rx));
 
     let app = Arc::new(App {
         cfg,
@@ -261,6 +265,25 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
             }
         }
     }
+
+    // Orderly shutdown. Both halves matter and both were missing:
+    //
+    // 1. Cancel every in-flight turn. Dropping a CancellationToken does NOT
+    //    cancel it, so goose would never send `notifications/cancelled` to its
+    //    MCP children and they would outlive us as orphans -- exactly the
+    //    failure `agent::run_turn` goes to lengths to avoid on session/cancel.
+    // 2. Await the writer. `wire_tx` is a bounded mpsc drained by a detached
+    //    task; returning here would discard anything still queued.
+    {
+        let sessions = app.sessions.lock().await;
+        for session in sessions.values() {
+            if let Some(token) = &session.cancel {
+                token.cancel();
+            }
+        }
+    }
+    drop(wire_tx);
+    let _ = writer.await;
     Ok(())
 }
 
@@ -388,6 +411,9 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         }
     }
 
+    // Cheap early reject. The authoritative check is re-done under the insert
+    // guard below -- `session/new` is dispatched on its own task, so N
+    // concurrent calls would otherwise all pass this and all insert.
     if app.sessions.lock().await.len() >= app.cfg.max_sessions {
         return wire::send(
             wire_tx,
@@ -415,21 +441,34 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         .or_else(|| std::env::var("GOOSE_MODEL").ok())
         .unwrap_or_default();
 
-    app.sessions.lock().await.insert(
-        sid.clone(),
-        Session {
-            agent,
-            goose_session_id,
-            busy: false,
-            active_run_id: None,
-            cancel: None,
-            model_override: None,
-            pending_model: None,
-            hook_extension,
-            accumulated_input_tokens: 0,
-            accumulated_output_tokens: 0,
-        },
-    );
+    {
+        let mut sessions = app.sessions.lock().await;
+        // Re-check under the guard we insert with: build_agent above spawns MCP
+        // children and does a provider round-trip, so other session/new tasks
+        // can land in that window.
+        if sessions.len() >= app.cfg.max_sessions {
+            return wire::send(
+                wire_tx,
+                wire::err(id, INVALID_PARAMS, "session/new: max sessions reached"),
+            )
+            .await;
+        }
+        sessions.insert(
+            sid.clone(),
+            Session {
+                agent,
+                goose_session_id,
+                busy: false,
+                active_run_id: None,
+                cancel: None,
+                model_override: None,
+                pending_model: None,
+                hook_extension,
+                accumulated_input_tokens: 0,
+                accumulated_output_tokens: 0,
+            },
+        );
+    }
 
     // Advertise the model catalog. `buzz-acp` reads `models.availableModels`
     // off this response (`acp.rs:1866`, `:1900`) to drive the desktop
@@ -629,6 +668,10 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
                     .get(&p.session_id)
                     .and_then(|s| s.model_override.clone())
                     .or_else(|| app.cfg.model.clone())
+                    // A session starts fine with only GOOSE_MODEL set
+                    // (build_agent falls back to it), so omitting it here
+                    // emitted `"model": ""` and blanked kind-44200 attribution.
+                    .or_else(|| std::env::var("GOOSE_MODEL").ok())
                     .unwrap_or_default()
             };
             wire::send(
@@ -716,6 +759,19 @@ async fn steer(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
         }
     };
 
+    // Reject an empty steer before touching the session map, matching main.
+    // buzz-acp maps a successful steer to SteerAck::Ok and considers the user's
+    // message delivered, so acknowledging a no-op would swallow it silently and
+    // suppress the cancel+merge fallback (`buzz-acp/src/pool.rs:329-366`).
+    let text = agent::prompt_to_text(&p.prompt);
+    if text.trim().is_empty() {
+        return wire::send(
+            wire_tx,
+            wire::err(id, INVALID_PARAMS, "steer: prompt must not be empty"),
+        )
+        .await;
+    }
+
     let (agent, goose_session_id) = {
         let sessions = app.sessions.lock().await;
         let Some(s) = sessions.get(&p.session_id) else {
@@ -744,13 +800,6 @@ async fn steer(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
         }
         (s.agent.clone(), s.goose_session_id.clone())
     };
-
-    let text = agent::prompt_to_text(&p.prompt);
-    if text.trim().is_empty() {
-        // Best-effort by contract: a whitespace-only steer is dropped, never
-        // fatal to the turn (buzz-agent `agent.rs:266-278`).
-        return wire::send(wire_tx, wire::ok(id, json!({ "runId": p.expected_run_id }))).await;
-    }
 
     let message_id = format!("steer_{}", uuid_like());
     agent

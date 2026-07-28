@@ -37,8 +37,6 @@ pub struct Config {
     pub max_sessions: usize,
     /// Default system prompt, used only when `session/new` omits one.
     pub system_prompt: Option<String>,
-    /// Per-turn wall-clock budget for a single provider request.
-    pub llm_timeout_secs: u64,
     /// Tool-call approval policy.
     ///
     /// `GooseMode::default()` is **`Auto`** (`goose_mode.rs:23-25`) — every
@@ -145,7 +143,6 @@ impl Config {
             max_rounds: env_parse::<u32>("BUZZ_AGENT_MAX_ROUNDS").filter(|n| *n > 0),
             max_sessions: env_parse("BUZZ_AGENT_MAX_SESSIONS").unwrap_or(8),
             system_prompt,
-            llm_timeout_secs: env_parse("BUZZ_AGENT_LLM_TIMEOUT_SECS").unwrap_or(600),
             goose_mode: parse_approval(env_str("BUZZ_AGENT_APPROVAL").as_deref()),
             // Discovery-only; the agent loop resolves providers through goose.
             provider: Provider::default(),
@@ -164,7 +161,6 @@ impl Config {
             max_rounds: None,
             max_sessions: 1,
             system_prompt: None,
-            llm_timeout_secs: 30,
             goose_mode: GooseMode::default(),
             provider,
             api_key,

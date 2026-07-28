@@ -112,7 +112,7 @@ public struct PushConsumptionState: Codable, Equatable, Sendable {
   ) -> Bool {
     let originState = state(for: origin)
     return position.createdAt <= now + allowedFutureSkew
-      && position.createdAt >= (originState.cursor?.createdAt ?? position.createdAt)
+      && position >= (originState.cursor ?? position)
       && !originState.contains(eventID: position.id)
   }
 

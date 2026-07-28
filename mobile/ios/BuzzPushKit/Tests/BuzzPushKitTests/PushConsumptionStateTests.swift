@@ -44,6 +44,25 @@ final class PushConsumptionStateTests: XCTestCase {
     XCTAssertEqual(state.state(for: "origin").delivered.count, 64)
   }
 
+  func testEvictedDeliveredEventBelowCompositeCursorIsNeverSelectedAgain() {
+    var state = PushConsumptionState()
+    for index in 0..<70 {
+      state.consume(
+        PushEventPosition(createdAt: 1_000, id: String(format: "%064x", index)),
+        for: "origin"
+      )
+    }
+    let evicted = PushEventPosition(createdAt: 1_000, id: String(format: "%064x", 0))
+    let sameSecondSuccessor = PushEventPosition(
+      createdAt: 1_000,
+      id: String(format: "%064x", 70)
+    )
+
+    XCTAssertFalse(state.hasConsumed(eventID: evicted.id, for: "origin"))
+    XCTAssertFalse(state.canSelect(evicted, for: "origin", now: 2_000))
+    XCTAssertTrue(state.canSelect(sameSecondSuccessor, for: "origin", now: 2_000))
+  }
+
   func testEventOlderThanCompositeCursorIsNotSelected() {
     var state = PushConsumptionState()
     state.consume(PushEventPosition(createdAt: 2_000, id: "newer"), for: "origin")

@@ -195,8 +195,8 @@ pub(crate) fn load_from_path(path: &Path) -> Result<TtsSettings, String> {
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("text-to-speech settings are not valid JSON: {error}"))?;
 
-    // Pre-V1 experiment builds stored an unversioned, incompatible shape.
-    // Migrate it to deterministic V1 defaults instead of carrying it over.
+    // Unversioned settings are incompatible with the V1 schema. Use
+    // deterministic V1 defaults rather than interpreting ambiguous fields.
     if value.get("version").is_none() {
         return Ok(TtsSettings::default());
     }
@@ -211,8 +211,8 @@ pub(crate) fn load_from_path(path: &Path) -> Result<TtsSettings, String> {
         ));
     }
 
-    // Early experiments used one bare Pocket `voiceId`. Preserve the toggle
-    // and qualify that value into the ordered cross-backend preference schema.
+    // Legacy V1 settings may contain one bare Pocket `voiceId`. Preserve the
+    // toggle and qualify it into the ordered cross-backend preference schema.
     if value.get("voicePreferences").is_none() {
         let legacy_voice = value
             .get("voiceId")

@@ -69,7 +69,11 @@ export function buildReconnectReplayFilter(
   return replayFilter;
 }
 
-export function shouldPageReconnectReplay(filter: RelaySubscriptionFilter) {
+export function shouldPageReconnectReplay(
+  filter: RelaySubscriptionFilter,
+  replayMissedHistory = false,
+) {
+  if (replayMissedHistory) return true;
   return (
     filter.limit > 0 &&
     Array.isArray(filter["#h"]) &&
@@ -176,7 +180,10 @@ export async function replayLiveSubscriptions({
             );
       const shouldPageReplay =
         replaySince !== undefined &&
-        shouldPageReconnectReplay(subscription.filter);
+        shouldPageReconnectReplay(
+          subscription.filter,
+          subscription.replayMissedHistory,
+        );
 
       return { subId, subscription, replaySince, shouldPageReplay };
     });

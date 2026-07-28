@@ -30,7 +30,10 @@ use crate::{
     managed_agents::{
         agent_snapshot::{
             build_snapshot, decode_avatar_data_url, decode_snapshot_png, encode_snapshot_png,
-            MemoryLevel,
+            extract_chunk_payload_png, MemoryLevel,
+        },
+        agent_snapshot_envelope::{
+            decrypt_envelope, encode_locked_snapshot_png, parse_chunk_payload, ChunkPayload,
         },
         load_agent_definitions, load_global_agent_config, load_managed_agents, load_personas,
     },
@@ -68,6 +71,9 @@ pub struct MintedCard {
     pub file_name: String,
     /// Designer commentary emitted alongside the image (may be empty).
     pub designer_notes: String,
+    /// True when the embedded snapshot is NIP-44-encrypted to the
+    /// (owner, agent) pair — only their nsecs can import this card.
+    pub locked: bool,
 }
 
 // ── Key resolution ────────────────────────────────────────────────────────────
@@ -194,17 +200,24 @@ pub(crate) fn extract_card_output(resp: &serde_json::Value) -> Result<(String, S
 /// Mint a trading card for the agent identified by `id` (instance pubkey,
 /// instance slug, or definition slug — same resolution as snapshot export).
 ///
+/// When `lock` is true the embedded manifest is NIP-44-encrypted to the
+/// (owner, agent) pair per the locked-envelope contract — this requires a
+/// linked agent instance (the second key endpoint); bare definitions cannot
+/// be locked.
+///
 /// Returns the final, chunk-injected, round-trip-verified `.agent.png` bytes.
 /// Reroll = call again; the command holds no session state.
 #[tauri::command]
 pub async fn mint_agent_card(
     id: String,
     style_notes: Option<String>,
+    lock: Option<bool>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<MintedCard, String> {
+    let lock = lock.unwrap_or(false);
     // ── Resolve the record + API key under lock ──────────────────────────────
-    let (record, api_key) = {
+    let (record, is_definition, api_key) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -212,7 +225,7 @@ pub async fn mint_agent_card(
 
         let instances = load_managed_agents(&app)?;
         let definitions = load_agent_definitions(&app)?;
-        let (record, _is_definition) =
+        let (record, is_definition) =
             resolve_from_lists(&id, &instances, &definitions).map(|(r, d)| (r.clone(), d))?;
 
         let global = load_global_agent_config(&app).unwrap_or_default();
@@ -237,7 +250,28 @@ pub async fn mint_agent_card(
             )
         })?;
 
-        (record, api_key)
+        (record, is_definition, api_key)
+    };
+
+    // ── Locking needs its two exact key endpoints up front, BEFORE the
+    //    API spend: the owner identity secret and the agent instance pubkey.
+    let lock_keys = if lock {
+        if is_definition {
+            return Err(
+                "Locked cards need a linked agent instance — this persona has never been \
+                 started, so there is no agent key to lock to."
+                    .to_string(),
+            );
+        }
+        let owner_keys = state.signing_keys()?;
+        let agent_pubkey = nostr::PublicKey::from_hex(&record.pubkey)
+            .map_err(|e| format!("Agent record has an invalid pubkey: {e}"))?;
+        if owner_keys.public_key() == agent_pubkey {
+            return Err("Cannot lock a card to itself: owner and agent keys match.".to_string());
+        }
+        Some((owner_keys, agent_pubkey))
+    } else {
+        None
     };
 
     let display_name = record
@@ -270,6 +304,20 @@ pub async fn mint_agent_card(
     );
 
     // ── One Responses API call ───────────────────────────────────────────────
+    // For locked mints, prove the manifest fits the NIP-44 plaintext cap
+    // BEFORE spending minutes on the API call (same fail-early rule as the
+    // memory guard above).
+    if lock_keys.is_some() {
+        let json_len =
+            crate::managed_agents::agent_snapshot::encode_snapshot_json(&snapshot)?.len();
+        if json_len > buzz_core_pkg::engram::NIP44_PLAINTEXT_MAX {
+            return Err(format!(
+                "Agent manifest is too large to lock ({json_len} bytes; the encrypted \
+                 format caps at {}). Reduce the avatar size or mint an unlocked card.",
+                buzz_core_pkg::engram::NIP44_PLAINTEXT_MAX
+            ));
+        }
+    }
     let instructions = build_card_instructions(
         &display_name,
         snapshot.definition.system_prompt.as_deref().unwrap_or(""),
@@ -347,13 +395,42 @@ pub async fn mint_agent_card(
         )
         .map_err(|e| format!("Failed to encode card PNG: {e}"))?;
 
-    let final_bytes = encode_snapshot_png(&snapshot, Some(&card_png))
-        .map_err(|e| format!("Failed to embed agent snapshot in card: {e}"))?;
+    let final_bytes = match &lock_keys {
+        None => encode_snapshot_png(&snapshot, Some(&card_png))
+            .map_err(|e| format!("Failed to embed agent snapshot in card: {e}"))?,
+        Some((owner_keys, agent_pubkey)) => {
+            encode_locked_snapshot_png(&snapshot, owner_keys, agent_pubkey, Some(&card_png))
+                .map_err(|e| format!("Failed to embed locked agent snapshot in card: {e}"))?
+        }
+    };
 
     // ── Verify: size ceiling + round-trip on the FINAL bytes ────────────────
+    // Locked cards: extract the actual chunk, parse the envelope, decrypt
+    // with the owner key, then compare the logical manifest (ciphertext is
+    // nondeterministic — never compare bytes).
     validate_snapshot_encode_size(final_bytes.len(), true)?;
-    let decoded = decode_snapshot_png(&final_bytes)
-        .map_err(|e| format!("Card failed round-trip verification: {e}"))?;
+    let decoded = match &lock_keys {
+        None => decode_snapshot_png(&final_bytes)
+            .map_err(|e| format!("Card failed round-trip verification: {e}"))?,
+        Some((owner_keys, _)) => {
+            let payload = extract_chunk_payload_png(&final_bytes)
+                .map_err(|e| format!("Card failed round-trip verification: {e}"))?;
+            match parse_chunk_payload(&payload)
+                .map_err(|e| format!("Card failed round-trip verification: {e}"))?
+            {
+                ChunkPayload::Locked(envelope) => {
+                    decrypt_envelope(&envelope, owner_keys.secret_key())
+                        .map_err(|e| format!("Card failed round-trip verification: {e}"))?
+                }
+                ChunkPayload::Plain(_) => {
+                    return Err(
+                        "Card round-trip verification failed: expected a locked envelope."
+                            .to_string(),
+                    )
+                }
+            }
+        }
+    };
     if decoded != snapshot {
         return Err("Card round-trip verification failed: manifest mismatch.".to_string());
     }
@@ -363,6 +440,7 @@ pub async fn mint_agent_card(
         card_png_base64: STANDARD.encode(&final_bytes),
         file_name: format!("{slug}.agent.png"),
         designer_notes,
+        locked: lock_keys.is_some(),
     })
 }
 
@@ -416,8 +494,10 @@ fn append_within_avatar_cap(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<(), Strin
 
 /// Save previously minted card bytes to disk via the OS save dialog.
 ///
-/// Re-validates the bytes (chunk decodes, size within the import ceiling)
-/// so a corrupted preview can never be written as a `.agent.png`.
+/// Re-validates the bytes (chunk parses as a plain manifest or a
+/// structurally valid locked envelope, size within the import ceiling) so a
+/// corrupted preview can never be written as a `.agent.png`. No decryption
+/// happens here — the mint already round-trip-verified with the real key.
 #[tauri::command]
 pub async fn save_agent_card(
     card_png_base64: String,
@@ -428,7 +508,9 @@ pub async fn save_agent_card(
         .decode(card_png_base64.as_bytes())
         .map_err(|e| format!("Card bytes were not valid base64: {e}"))?;
     validate_snapshot_encode_size(bytes.len(), true)?;
-    decode_snapshot_png(&bytes)
+    let payload = extract_chunk_payload_png(&bytes)
+        .map_err(|e| format!("Refusing to save: card failed snapshot validation: {e}"))?;
+    parse_chunk_payload(&payload)
         .map_err(|e| format!("Refusing to save: card failed snapshot validation: {e}"))?;
 
     let safe_name = if file_name.ends_with(".agent.png") && !file_name.contains(['/', '\\']) {

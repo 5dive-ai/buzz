@@ -969,3 +969,8 @@ fn validate_encode_size_png_over_boundary_is_rejected() {
         "error must mention size limit, got: {err}"
     );
 }
+
+// ── Import: decode_snapshot_for_import (locked cards) ─────────────────────
+
+#[path = "tests_locked.rs"]
+mod locked_import;

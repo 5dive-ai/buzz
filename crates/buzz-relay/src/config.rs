@@ -20,6 +20,17 @@ pub const DEFAULT_CORPORATE_IDENTITY_UID_CLAIM: &str = "sub";
 /// Default JWT claim displayed as the verified corporate identity.
 pub const DEFAULT_CORPORATE_IDENTITY_DISPLAY_CLAIM: &str = "email";
 
+/// Which identity source wins when a request carries both a JWT and a
+/// cryptographically verified NIP-OA owner declaration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CorporateIdentityAuthPrecedence {
+    /// Treat the JWT as the signer's identity. This is the provider-neutral default.
+    #[default]
+    Direct,
+    /// Treat the NIP-OA owner binding as the signer's delegated identity.
+    Delegated,
+}
+
 /// Errors that can occur while loading relay configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -67,6 +78,8 @@ pub struct CorporateIdentityConfig {
     /// Allow agents without JWTs to pass the corporate identity gate through
     /// NIP-OA when their owner pubkey already has an active identity binding.
     pub allow_delegation: bool,
+    /// Identity source selected when both a JWT and NIP-OA delegation are present.
+    pub auth_precedence: CorporateIdentityAuthPrecedence,
     /// JWKS URI used to verify JWT signatures.
     pub jwks_uri: String,
     /// Expected JWT issuer.
@@ -87,6 +100,7 @@ impl Default for CorporateIdentityConfig {
             require: false,
             jwt_header: DEFAULT_CORPORATE_IDENTITY_JWT_HEADER.to_string(),
             allow_delegation: true,
+            auth_precedence: CorporateIdentityAuthPrecedence::Direct,
             jwks_uri: String::new(),
             issuer: String::new(),
             audience: String::new(),
@@ -499,6 +513,16 @@ fn load_corporate_identity_config() -> Result<CorporateIdentityConfig, ConfigErr
         "BUZZ_ALLOW_CORPORATE_IDENTITY_DELEGATION",
         config.allow_delegation,
     );
+    config.auth_precedence = match env_trimmed("BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE").as_deref()
+    {
+        None | Some("direct") => CorporateIdentityAuthPrecedence::Direct,
+        Some("delegated") => CorporateIdentityAuthPrecedence::Delegated,
+        Some(value) => {
+            return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE must be direct or delegated, got {value}"
+            )));
+        }
+    };
     config.jwks_uri =
         env_trimmed("BUZZ_CORPORATE_IDENTITY_JWKS_URI").unwrap_or_else(|| config.jwks_uri.clone());
     config.issuer =
@@ -1130,6 +1154,7 @@ mod tests {
             "BUZZ_REQUIRE_CORPORATE_IDENTITY",
             "BUZZ_CORPORATE_IDENTITY_JWT_HEADER",
             "BUZZ_ALLOW_CORPORATE_IDENTITY_DELEGATION",
+            "BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE",
             "BUZZ_CORPORATE_IDENTITY_JWKS_URI",
             "BUZZ_CORPORATE_IDENTITY_ISSUER",
             "BUZZ_CORPORATE_IDENTITY_AUDIENCE",
@@ -1208,6 +1233,11 @@ mod tests {
             config.corporate_identity.allow_delegation,
             "corporate identity delegation should default to true for agents"
         );
+        assert_eq!(
+            config.corporate_identity.auth_precedence,
+            CorporateIdentityAuthPrecedence::Direct,
+            "an accompanying JWT should identify the signer by default"
+        );
     }
 
     #[test]
@@ -1239,6 +1269,7 @@ mod tests {
         std::env::set_var("BUZZ_CORPORATE_IDENTITY_UID_CLAIM", "employee_id");
         std::env::set_var("BUZZ_CORPORATE_IDENTITY_DISPLAY_CLAIM", "email");
         std::env::set_var("BUZZ_CORPORATE_IDENTITY_NPUB_CLAIM", "buzz_npub");
+        std::env::set_var("BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE", "delegated");
 
         let config = Config::from_env().expect("corporate identity config");
         clear_corporate_identity_env();
@@ -1249,6 +1280,26 @@ mod tests {
             config.corporate_identity.npub_claim.as_deref(),
             Some("buzz_npub")
         );
+        assert_eq!(
+            config.corporate_identity.auth_precedence,
+            CorporateIdentityAuthPrecedence::Delegated
+        );
+    }
+
+    #[test]
+    fn corporate_identity_rejects_invalid_auth_precedence() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_corporate_identity_env();
+        std::env::set_var("BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE", "automatic");
+
+        let err = Config::from_env().expect_err("invalid precedence must fail closed");
+        clear_corporate_identity_env();
+
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue(ref message)
+                if message.contains("BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE")
+        ));
     }
 
     #[test]

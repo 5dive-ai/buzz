@@ -1,10 +1,10 @@
 //! Corporate identity binding persistence.
 //!
-//! Bindings map a corporate IdP uid to the currently authorized Nostr pubkey
-//! inside one Buzz community. The active uniqueness indexes deliberately model
-//! one active pubkey per uid and one active uid per pubkey. Rotation/revocation
-//! flows clear that active state in a follow-up lifecycle layer rather than
-//! silently rewriting it during authentication.
+//! Bindings map an issuer-qualified IdP uid to the currently authorized Nostr
+//! pubkey inside one Buzz community. The active uniqueness indexes deliberately
+//! model one active pubkey per `(issuer, uid)` principal and one active principal
+//! per pubkey. Rotation/revocation flows clear that active state in a follow-up
+//! lifecycle layer rather than silently rewriting it during authentication.
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -20,6 +20,8 @@ pub const SOURCE_DB_BINDING: &str = "db_binding";
 /// Active corporate identity binding row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityBinding {
+    /// Validated identity-provider issuer.
+    pub issuer: String,
     /// Corporate IdP subject or configured stable uid claim.
     pub uid: String,
     /// Bound Nostr pubkey bytes.
@@ -39,6 +41,8 @@ pub struct IdentityBinding {
 /// Existing active binding that conflicts with a requested binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityBindingConflict {
+    /// Existing active issuer.
+    pub issuer: String,
     /// Existing active uid.
     pub uid: String,
     /// Existing active pubkey bytes.
@@ -56,9 +60,16 @@ pub enum BindIdentityResult {
     Matched,
     /// Another active binding already owns the uid or pubkey.
     Conflict(IdentityBindingConflict),
+    /// The requested uid/pubkey pair was previously revoked.
+    Revoked,
 }
 
-fn validate_inputs(uid: &str, pubkey: &[u8], source: &str) -> Result<()> {
+fn validate_inputs(issuer: &str, uid: &str, pubkey: &[u8], source: &str) -> Result<()> {
+    if issuer.trim().is_empty() {
+        return Err(DbError::InvalidData(
+            "identity binding issuer must not be empty".to_string(),
+        ));
+    }
     if uid.trim().is_empty() {
         return Err(DbError::InvalidData(
             "identity binding uid must not be empty".to_string(),
@@ -84,6 +95,7 @@ fn validate_pubkey(pubkey: &[u8]) -> Result<()> {
 
 fn row_to_binding(row: sqlx::postgres::PgRow) -> Result<IdentityBinding> {
     Ok(IdentityBinding {
+        issuer: row.try_get("issuer")?,
         uid: row.try_get("uid")?,
         pubkey: row.try_get("pubkey")?,
         display_name: row.try_get("display_name")?,
@@ -94,20 +106,22 @@ fn row_to_binding(row: sqlx::postgres::PgRow) -> Result<IdentityBinding> {
     })
 }
 
-async fn active_by_uid_tx(
+async fn active_by_principal_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
+    issuer: &str,
     uid: &str,
 ) -> Result<Option<IdentityBinding>> {
     let row = sqlx::query(
         r#"
-        SELECT uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
+        SELECT issuer, uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
         FROM identity_bindings
-        WHERE community_id = $1 AND uid = $2 AND revoked_at IS NULL
+        WHERE community_id = $1 AND issuer = $2 AND uid = $3 AND revoked_at IS NULL
         FOR UPDATE
         "#,
     )
     .bind(community_id.as_uuid())
+    .bind(issuer)
     .bind(uid)
     .fetch_optional(&mut **tx)
     .await?;
@@ -121,7 +135,7 @@ async fn active_by_pubkey_tx(
 ) -> Result<Option<IdentityBinding>> {
     let row = sqlx::query(
         r#"
-        SELECT uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
+        SELECT issuer, uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
         FROM identity_bindings
         WHERE community_id = $1 AND pubkey = $2 AND revoked_at IS NULL
         FOR UPDATE
@@ -134,8 +148,37 @@ async fn active_by_pubkey_tx(
     row.map(row_to_binding).transpose()
 }
 
+async fn revoked_pair_exists_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    issuer: &str,
+    uid: &str,
+    pubkey: &[u8],
+) -> Result<bool> {
+    let row = sqlx::query(
+        r#"
+        SELECT 1
+        FROM identity_bindings
+        WHERE community_id = $1
+          AND issuer = $2
+          AND uid = $3
+          AND pubkey = $4
+          AND revoked_at IS NOT NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(issuer)
+    .bind(uid)
+    .bind(pubkey)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.is_some())
+}
+
 fn conflict_from(binding: IdentityBinding) -> IdentityBindingConflict {
     IdentityBindingConflict {
+        issuer: binding.issuer,
         uid: binding.uid,
         pubkey: binding.pubkey,
         source: binding.source,
@@ -145,11 +188,12 @@ fn conflict_from(binding: IdentityBinding) -> IdentityBindingConflict {
 async fn lock_identity_keys_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
+    issuer: &str,
     uid: &str,
     pubkey: &[u8],
 ) -> Result<()> {
     let mut keys = [
-        format!("{}:uid:{uid}", community_id.as_uuid()),
+        format!("{}:principal:{issuer}:{uid}", community_id.as_uuid()),
         format!("{}:pubkey:{}", community_id.as_uuid(), hex::encode(pubkey)),
     ];
     keys.sort();
@@ -165,28 +209,30 @@ async fn lock_identity_keys_tx(
 /// Create or validate an active corporate identity binding.
 ///
 /// This is a fail-closed auth-time operation:
-/// - same uid + same pubkey updates display/last_seen and succeeds;
-/// - same uid + different pubkey conflicts;
-/// - same pubkey + different uid conflicts;
+/// - same issuer + uid + pubkey updates display/last_seen and succeeds;
+/// - same issuer + uid with a different pubkey conflicts;
+/// - same pubkey with a different issuer-qualified principal conflicts;
+/// - a previously revoked issuer/uid/pubkey tuple remains revoked;
 /// - no active row creates a new binding.
 pub async fn bind_or_validate_identity(
     pool: &PgPool,
     community_id: CommunityId,
+    issuer: &str,
     uid: &str,
     pubkey: &[u8],
     display_name: Option<&str>,
     source: &str,
 ) -> Result<BindIdentityResult> {
-    validate_inputs(uid, pubkey, source)?;
+    validate_inputs(issuer, uid, pubkey, source)?;
 
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL lock_timeout = '3s'")
         .execute(&mut *tx)
         .await?;
-    lock_identity_keys_tx(&mut tx, community_id, uid, pubkey).await?;
+    lock_identity_keys_tx(&mut tx, community_id, issuer, uid, pubkey).await?;
 
-    let active_uid = active_by_uid_tx(&mut tx, community_id, uid).await?;
-    if let Some(binding) = active_uid {
+    let active_principal = active_by_principal_tx(&mut tx, community_id, issuer, uid).await?;
+    if let Some(binding) = active_principal {
         if binding.pubkey != pubkey {
             tx.rollback().await?;
             return Ok(BindIdentityResult::Conflict(conflict_from(binding)));
@@ -195,17 +241,22 @@ pub async fn bind_or_validate_identity(
         sqlx::query(
             r#"
             UPDATE identity_bindings
-            SET display_name = $4,
+            SET display_name = $5,
                 source = CASE
-                    WHEN source = 'jwt_npub' AND $5 = 'db_binding' THEN source
-                    ELSE $5
+                    WHEN source = 'jwt_npub' AND $6 = 'db_binding' THEN source
+                    ELSE $6
                 END,
                 updated_at = NOW(),
                 last_seen_at = NOW()
-            WHERE community_id = $1 AND uid = $2 AND pubkey = $3 AND revoked_at IS NULL
+            WHERE community_id = $1
+              AND issuer = $2
+              AND uid = $3
+              AND pubkey = $4
+              AND revoked_at IS NULL
             "#,
         )
         .bind(community_id.as_uuid())
+        .bind(issuer)
         .bind(uid)
         .bind(pubkey)
         .bind(display_name)
@@ -218,19 +269,25 @@ pub async fn bind_or_validate_identity(
 
     let active_pubkey = active_by_pubkey_tx(&mut tx, community_id, pubkey).await?;
     if let Some(binding) = active_pubkey {
-        if binding.uid != uid {
+        if binding.issuer != issuer || binding.uid != uid {
             tx.rollback().await?;
             return Ok(BindIdentityResult::Conflict(conflict_from(binding)));
         }
     }
 
+    if revoked_pair_exists_tx(&mut tx, community_id, issuer, uid, pubkey).await? {
+        tx.rollback().await?;
+        return Ok(BindIdentityResult::Revoked);
+    }
+
     sqlx::query(
         r#"
-        INSERT INTO identity_bindings (community_id, uid, pubkey, display_name, source)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO identity_bindings (community_id, issuer, uid, pubkey, display_name, source)
+        VALUES ($1, $2, $3, $4, $5, $6)
         "#,
     )
     .bind(community_id.as_uuid())
+    .bind(issuer)
     .bind(uid)
     .bind(pubkey)
     .bind(display_name)
@@ -250,7 +307,7 @@ pub async fn get_active_identity_binding_by_pubkey(
     validate_pubkey(pubkey)?;
     let row = sqlx::query(
         r#"
-        SELECT uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
+        SELECT issuer, uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
         FROM identity_bindings
         WHERE community_id = $1 AND pubkey = $2 AND revoked_at IS NULL
         "#,
@@ -269,6 +326,7 @@ mod tests {
     use uuid::Uuid;
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+    const TEST_ISSUER: &str = "https://idp.example";
 
     async fn setup_pool() -> PgPool {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
@@ -309,6 +367,7 @@ mod tests {
         let created = bind_or_validate_identity(
             &pool,
             community,
+            TEST_ISSUER,
             "user-1",
             &pubkey,
             Some("first@example.com"),
@@ -321,6 +380,7 @@ mod tests {
         let matched = bind_or_validate_identity(
             &pool,
             community,
+            TEST_ISSUER,
             "user-1",
             &pubkey,
             Some("second@example.com"),
@@ -335,6 +395,7 @@ mod tests {
             .expect("lookup binding")
             .expect("binding exists");
         assert_eq!(binding.uid, "user-1");
+        assert_eq!(binding.issuer, TEST_ISSUER);
         assert_eq!(binding.display_name.as_deref(), Some("second@example.com"));
         assert_eq!(binding.source, SOURCE_JWT_NPUB);
     }
@@ -350,6 +411,7 @@ mod tests {
         bind_or_validate_identity(
             &pool,
             community,
+            TEST_ISSUER,
             "user-1",
             &original_pubkey,
             Some("user@example.com"),
@@ -361,6 +423,7 @@ mod tests {
         let result = bind_or_validate_identity(
             &pool,
             community,
+            TEST_ISSUER,
             "user-1",
             &conflicting_pubkey,
             Some("user@example.com"),
@@ -372,6 +435,7 @@ mod tests {
         assert_eq!(
             result,
             BindIdentityResult::Conflict(IdentityBindingConflict {
+                issuer: TEST_ISSUER.to_string(),
                 uid: "user-1".to_string(),
                 pubkey: original_pubkey,
                 source: SOURCE_DB_BINDING.to_string(),
@@ -389,6 +453,7 @@ mod tests {
         bind_or_validate_identity(
             &pool,
             community,
+            TEST_ISSUER,
             "user-1",
             &pubkey,
             Some("user@example.com"),
@@ -400,6 +465,7 @@ mod tests {
         let result = bind_or_validate_identity(
             &pool,
             community,
+            TEST_ISSUER,
             "user-2",
             &pubkey,
             Some("other@example.com"),
@@ -411,6 +477,7 @@ mod tests {
         assert_eq!(
             result,
             BindIdentityResult::Conflict(IdentityBindingConflict {
+                issuer: TEST_ISSUER.to_string(),
                 uid: "user-1".to_string(),
                 pubkey,
                 source: SOURCE_DB_BINDING.to_string(),
@@ -428,6 +495,7 @@ mod tests {
         bind_or_validate_identity(
             &pool,
             community,
+            TEST_ISSUER,
             "user-1",
             &pubkey,
             Some("user@example.com"),
@@ -439,6 +507,7 @@ mod tests {
         let matched = bind_or_validate_identity(
             &pool,
             community,
+            TEST_ISSUER,
             "user-1",
             &pubkey,
             Some("user@example.com"),
@@ -453,5 +522,103 @@ mod tests {
             .expect("lookup binding")
             .expect("binding exists");
         assert_eq!(binding.source, SOURCE_JWT_NPUB);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn bind_identity_does_not_recreate_revoked_pair() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let pubkey = random_pubkey();
+
+        bind_or_validate_identity(
+            &pool,
+            community,
+            TEST_ISSUER,
+            "user-1",
+            &pubkey,
+            Some("user@example.com"),
+            SOURCE_JWT_NPUB,
+        )
+        .await
+        .expect("create binding");
+
+        sqlx::query(
+            r#"
+            UPDATE identity_bindings
+            SET revoked_at = NOW(), revoked_reason = 'test revocation'
+            WHERE community_id = $1 AND issuer = $2 AND uid = $3 AND pubkey = $4
+            "#,
+        )
+        .bind(community.as_uuid())
+        .bind(TEST_ISSUER)
+        .bind("user-1")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .expect("revoke binding");
+
+        let result = bind_or_validate_identity(
+            &pool,
+            community,
+            TEST_ISSUER,
+            "user-1",
+            &pubkey,
+            Some("user@example.com"),
+            SOURCE_JWT_NPUB,
+        )
+        .await
+        .expect("revoked pair is a binding result");
+
+        assert_eq!(result, BindIdentityResult::Revoked);
+        assert!(
+            get_active_identity_binding_by_pubkey(&pool, community, &pubkey)
+                .await
+                .expect("lookup binding")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn bind_identity_qualifies_same_uid_by_issuer() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let first_pubkey = random_pubkey();
+        let second_pubkey = random_pubkey();
+
+        let first = bind_or_validate_identity(
+            &pool,
+            community,
+            "https://issuer-a.example",
+            "shared-subject",
+            &first_pubkey,
+            Some("first@example.com"),
+            SOURCE_DB_BINDING,
+        )
+        .await
+        .expect("create first issuer binding");
+        let second = bind_or_validate_identity(
+            &pool,
+            community,
+            "https://issuer-b.example",
+            "shared-subject",
+            &second_pubkey,
+            Some("second@example.com"),
+            SOURCE_DB_BINDING,
+        )
+        .await
+        .expect("create second issuer binding");
+
+        assert_eq!(first, BindIdentityResult::Created);
+        assert_eq!(second, BindIdentityResult::Created);
+        assert_eq!(
+            get_active_identity_binding_by_pubkey(&pool, community, &second_pubkey)
+                .await
+                .expect("lookup second binding")
+                .expect("second binding exists")
+                .issuer,
+            "https://issuer-b.example"
+        );
     }
 }

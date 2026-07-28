@@ -49,7 +49,7 @@ export type ProfileField = {
 
 const AGENT_INFO_LABELS = new Set([
   "Public key",
-  "Corporate identity",
+  "Relay-verified identity",
   "Managed by",
   "NIP-05",
   "Agent type",
@@ -182,8 +182,8 @@ export function buildPublicFields({
     fields.push({
       displayValue: verifiedName,
       icon: BadgeCheck,
-      label: "Corporate identity",
-      testId: "user-profile-corporate-identity",
+      label: "Relay-verified identity",
+      testId: "user-profile-relay-verified-identity",
       trailingNode: (
         <span className="flex shrink-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
           <VerifiedBadge verifiedName={verifiedName} />
@@ -430,19 +430,19 @@ export function buildOwnerFields({
 function orderProfileFields(fields: ProfileField[]) {
   const visibilityLabel = "Visibility";
   const publicKeyLabel = "Public key";
-  const corporateIdentityLabel = "Corporate identity";
+  const relayVerifiedIdentityLabel = "Relay-verified identity";
   const managedByLabel = "Managed by";
   const statusLabel = "Status";
   return [
     ...fields.filter((field) => field.label === visibilityLabel),
     ...fields.filter((field) => field.label === publicKeyLabel),
-    ...fields.filter((field) => field.label === corporateIdentityLabel),
+    ...fields.filter((field) => field.label === relayVerifiedIdentityLabel),
     ...fields.filter((field) => field.label === managedByLabel),
     ...fields.filter(
       (field) =>
         field.label !== visibilityLabel &&
         field.label !== publicKeyLabel &&
-        field.label !== corporateIdentityLabel &&
+        field.label !== relayVerifiedIdentityLabel &&
         field.label !== managedByLabel &&
         field.copyValue,
     ),
@@ -451,7 +451,7 @@ function orderProfileFields(fields: ProfileField[]) {
       if (
         field.label === visibilityLabel ||
         field.label === publicKeyLabel ||
-        field.label === corporateIdentityLabel ||
+        field.label === relayVerifiedIdentityLabel ||
         field.label === managedByLabel ||
         field.label === statusLabel
       ) {

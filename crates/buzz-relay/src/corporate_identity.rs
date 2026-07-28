@@ -27,7 +27,7 @@ use buzz_core::{kind::KIND_USER_TRUSTED_ASSERTION, CommunityId};
 use buzz_db::event::EventQuery;
 use buzz_db::identity_binding::{BindIdentityResult, SOURCE_DB_BINDING, SOURCE_JWT_NPUB};
 
-use crate::config::CorporateIdentityConfig;
+use crate::config::{CorporateIdentityAuthPrecedence, CorporateIdentityConfig};
 use crate::state::AppState;
 
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -41,6 +41,8 @@ struct CachedJwks {
 /// Validated corporate identity claims used by Buzz.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CorporateJwtClaims {
+    /// Validated identity-provider issuer.
+    pub issuer: String,
     /// Stable corporate uid claim.
     pub uid: String,
     /// Human-readable verified identity claim.
@@ -102,12 +104,14 @@ impl CorporateIdentityService {
         let decoded = decode::<RawJwtClaims>(token, &decoding_key, &validation)
             .map_err(|e| CorporateIdentityError::InvalidJwt(e.to_string()))?;
 
+        let issuer = claim_string(&decoded.claims.claims, "iss")?;
         let uid = claim_string(&decoded.claims.claims, &self.config.uid_claim)?;
         let display_name = claim_string(&decoded.claims.claims, &self.config.display_claim)?;
         let pubkey =
             optional_pubkey_claim(&decoded.claims.claims, self.config.npub_claim.as_deref())?;
 
         Ok(CorporateJwtClaims {
+            issuer,
             uid,
             display_name,
             pubkey,
@@ -162,6 +166,8 @@ pub enum CorporateIdentityDecision {
     NotRequired,
     /// The signer authenticated directly with a corporate identity JWT.
     Direct {
+        /// Validated identity-provider issuer.
+        issuer: String,
         /// Stable corporate uid claim.
         uid: String,
         /// Verified display claim.
@@ -205,6 +211,9 @@ pub enum CorporateIdentityError {
     /// The requested uid/pubkey binding conflicts with an active binding.
     #[error("corporate identity binding conflict")]
     BindingConflict,
+    /// The requested uid/pubkey binding was previously revoked.
+    #[error("corporate identity binding revoked")]
+    BindingRevoked,
     /// NIP-OA delegation was present but did not satisfy corporate identity.
     #[error("corporate identity delegation denied")]
     DelegationDenied,
@@ -223,6 +232,7 @@ impl CorporateIdentityError {
             Self::InvalidClaim { .. }
             | Self::NpubMismatch
             | Self::BindingConflict
+            | Self::BindingRevoked
             | Self::DelegationDenied => StatusCode::FORBIDDEN,
             Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -231,15 +241,16 @@ impl CorporateIdentityError {
     /// Sanitized message safe to return to clients.
     pub fn public_message(&self) -> &'static str {
         match self {
-            Self::MissingJwt => "corporate identity required",
+            Self::MissingJwt => "relay-verified identity required",
             Self::MissingKid | Self::InvalidJwt(_) | Self::Jwks(_) => {
-                "corporate identity verification failed"
+                "relay identity verification failed"
             }
-            Self::InvalidClaim { .. } => "corporate identity claim invalid",
-            Self::NpubMismatch => "corporate identity pubkey mismatch",
-            Self::BindingConflict => "corporate identity binding conflict",
-            Self::DelegationDenied => "corporate identity delegation denied",
-            Self::Db(_) => "corporate identity unavailable",
+            Self::InvalidClaim { .. } => "relay identity claim invalid",
+            Self::NpubMismatch => "relay identity pubkey mismatch",
+            Self::BindingConflict => "relay identity binding conflict",
+            Self::BindingRevoked => "relay identity binding revoked",
+            Self::DelegationDenied => "relay identity delegation denied",
+            Self::Db(_) => "relay identity unavailable",
         }
     }
 
@@ -303,17 +314,14 @@ async fn enforce_corporate_identity_inner(
         return Ok(CorporateIdentityDecision::NotRequired);
     };
 
-    // cf-doorman injects the owner's corporate JWT into every request,
-    // including requests signed by an agent. Prefer a cryptographically
-    // verified NIP-OA owner declaration when one is present so the owner's
-    // existing binding authorizes the agent. Treating the injected JWT as the
-    // agent's identity would instead try to bind the owner's uid to the agent
-    // key and incorrectly report a binding conflict.
-    //
-    // This is deliberately not a general agent bypass: an auth tag must prove
-    // ownership, delegation must be enabled, and the owner must have an active
-    // corporate identity binding.
-    if auth_tag_json.is_some() {
+    // Requests can carry both a direct identity JWT and a cryptographically
+    // verified NIP-OA owner declaration. The deployment selects which identity
+    // source wins; the provider-neutral default treats the JWT as the signer's
+    // identity. Delegated precedence supports identity-aware gateways that
+    // attach an owner's token to requests made by that owner's agents.
+    if select_identity_auth_path(&service.config, identity_jwt, auth_tag_json)
+        == IdentityAuthPath::Delegated
+    {
         return enforce_delegated_corporate_identity(
             &state.db,
             &service.config,
@@ -332,6 +340,7 @@ async fn enforce_corporate_identity_inner(
             .db
             .bind_or_validate_identity(
                 community_id,
+                &claims.issuer,
                 &claims.uid,
                 signer.as_bytes(),
                 Some(&claims.display_name),
@@ -347,10 +356,13 @@ async fn enforce_corporate_identity_inner(
                     community_id,
                     buzz_audit::AuditAction::CorporateIdentityBindingConflict,
                     signer,
+                    &claims.issuer,
                     &claims.uid,
                     serde_json::json!({
                         "source": source,
+                        "issuer": claims.issuer,
                         "existing_uid": conflict.uid,
+                        "existing_issuer": conflict.issuer,
                         "existing_pubkey": hex::encode(conflict.pubkey),
                         "existing_source": conflict.source,
                     }),
@@ -363,6 +375,26 @@ async fn enforce_corporate_identity_inner(
                 );
                 return Err(CorporateIdentityError::BindingConflict);
             }
+            BindIdentityResult::Revoked => {
+                metrics::counter!("buzz_corporate_identity_bindings_total", "result" => "revoked")
+                    .increment(1);
+                record_identity_binding_audit(
+                    state,
+                    community_id,
+                    buzz_audit::AuditAction::CorporateIdentityBindingRevokedAttempt,
+                    signer,
+                    &claims.issuer,
+                    &claims.uid,
+                    serde_json::json!({ "source": source, "issuer": claims.issuer }),
+                )
+                .await;
+                warn!(
+                    uid = %claims.uid,
+                    signer = %signer.to_hex(),
+                    "corporate identity binding was previously revoked"
+                );
+                return Err(CorporateIdentityError::BindingRevoked);
+            }
             binding => binding,
         };
         record_identity_binding_metric(&binding);
@@ -372,19 +404,14 @@ async fn enforce_corporate_identity_inner(
                 community_id,
                 buzz_audit::AuditAction::CorporateIdentityBindingCreated,
                 signer,
+                &claims.issuer,
                 &claims.uid,
-                serde_json::json!({ "source": source }),
+                serde_json::json!({ "source": source, "issuer": claims.issuer }),
             )
             .await;
         }
-        if let Err(error) = ensure_identity_assertion(
-            state,
-            community_id,
-            signer,
-            &claims.display_name,
-            &service.config.issuer,
-        )
-        .await
+        if let Err(error) =
+            ensure_identity_assertion(state, community_id, signer, &claims.display_name).await
         {
             // The binding remains the authorization authority. A projection
             // failure removes the verified affordance but must not lock an
@@ -405,6 +432,7 @@ async fn enforce_corporate_identity_inner(
             "corporate identity verified"
         );
         return Ok(CorporateIdentityDecision::Direct {
+            issuer: claims.issuer,
             uid: claims.uid,
             display_name: claims.display_name,
             binding,
@@ -425,16 +453,14 @@ fn build_identity_assertion(
     relay_keypair: &nostr::Keys,
     subject: PublicKey,
     display_name: &str,
-    issuer: &str,
     created_at: Timestamp,
 ) -> Result<Event, String> {
     let subject = subject.to_hex();
     let tags = [
         Tag::parse(["d", subject.as_str()]),
         Tag::parse(["p", subject.as_str()]),
-        Tag::parse(["verified", "corporate"]),
+        Tag::parse(["verified", "relay"]),
         Tag::parse(["display_name", display_name]),
-        Tag::parse(["issuer", issuer]),
     ]
     .into_iter()
     .collect::<Result<Vec<_>, _>>()
@@ -447,12 +473,7 @@ fn build_identity_assertion(
         .map_err(|error| format!("failed to sign corporate identity assertion: {error}"))
 }
 
-fn identity_assertion_matches(
-    event: &Event,
-    subject: &str,
-    display_name: &str,
-    issuer: &str,
-) -> bool {
+fn identity_assertion_matches(event: &Event, subject: &str, display_name: &str) -> bool {
     let has_tag = |name: &str, value: &str| {
         event.tags.iter().any(|tag| {
             let parts = tag.as_slice();
@@ -461,9 +482,8 @@ fn identity_assertion_matches(
     };
     has_tag("d", subject)
         && has_tag("p", subject)
-        && has_tag("verified", "corporate")
+        && has_tag("verified", "relay")
         && has_tag("display_name", display_name)
-        && has_tag("issuer", issuer)
 }
 
 async fn ensure_identity_assertion(
@@ -471,7 +491,6 @@ async fn ensure_identity_assertion(
     community_id: CommunityId,
     subject: PublicKey,
     display_name: &str,
-    issuer: &str,
 ) -> Result<(), String> {
     let subject_hex = subject.to_hex();
     let existing = state
@@ -489,9 +508,10 @@ async fn ensure_identity_assertion(
         .into_iter()
         .next();
 
-    if existing.as_ref().is_some_and(|stored| {
-        identity_assertion_matches(&stored.event, &subject_hex, display_name, issuer)
-    }) {
+    if existing
+        .as_ref()
+        .is_some_and(|stored| identity_assertion_matches(&stored.event, &subject_hex, display_name))
+    {
         return Ok(());
     }
 
@@ -505,7 +525,6 @@ async fn ensure_identity_assertion(
         &state.relay_keypair,
         subject,
         display_name,
-        issuer,
         Timestamp::from(created_at),
     )?;
 
@@ -517,6 +536,27 @@ async fn ensure_identity_assertion(
     metrics::counter!("buzz_corporate_identity_assertions_total", "result" => "published")
         .increment(1);
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityAuthPath {
+    Direct,
+    Delegated,
+}
+
+fn select_identity_auth_path(
+    config: &CorporateIdentityConfig,
+    identity_jwt: Option<&str>,
+    auth_tag_json: Option<&str>,
+) -> IdentityAuthPath {
+    match (identity_jwt.is_some(), auth_tag_json.is_some()) {
+        (true, true) => match config.auth_precedence {
+            CorporateIdentityAuthPrecedence::Direct => IdentityAuthPath::Direct,
+            CorporateIdentityAuthPrecedence::Delegated => IdentityAuthPath::Delegated,
+        },
+        (true, false) => IdentityAuthPath::Direct,
+        (false, _) => IdentityAuthPath::Delegated,
+    }
 }
 
 async fn enforce_delegated_corporate_identity(
@@ -665,6 +705,7 @@ fn record_identity_binding_metric(binding: &BindIdentityResult) {
         BindIdentityResult::Created => "created",
         BindIdentityResult::Matched => "matched",
         BindIdentityResult::Conflict(_) => "conflict",
+        BindIdentityResult::Revoked => "revoked",
     };
     metrics::counter!("buzz_corporate_identity_bindings_total", "result" => result).increment(1);
 }
@@ -678,6 +719,7 @@ fn record_corporate_identity_denial(error: &CorporateIdentityError) {
         CorporateIdentityError::InvalidClaim { .. } => "invalid_claim",
         CorporateIdentityError::NpubMismatch => "npub_mismatch",
         CorporateIdentityError::BindingConflict => "binding_conflict",
+        CorporateIdentityError::BindingRevoked => "binding_revoked",
         CorporateIdentityError::DelegationDenied => "delegation_denied",
         CorporateIdentityError::Db(_) => "db",
     };
@@ -691,6 +733,7 @@ async fn record_identity_binding_audit(
     community_id: CommunityId,
     action: buzz_audit::AuditAction,
     actor: PublicKey,
+    issuer: &str,
     uid: &str,
     detail: serde_json::Value,
 ) {
@@ -702,7 +745,7 @@ async fn record_identity_binding_audit(
             community_id,
             action,
             actor_pubkey: Some(actor.to_bytes().to_vec()),
-            object_id: Some(uid.to_string()),
+            object_id: Some(format!("{issuer}|{uid}")),
             detail,
         })
         .await
@@ -729,6 +772,7 @@ mod tests {
             require: true,
             jwt_header: "x-buzz-identity-token".to_string(),
             allow_delegation: true,
+            auth_precedence: CorporateIdentityAuthPrecedence::Direct,
             jwks_uri: "http://127.0.0.1:9/jwks".to_string(),
             issuer: "https://idp.example".to_string(),
             audience: "buzz-relay".to_string(),
@@ -739,17 +783,11 @@ mod tests {
     }
 
     #[test]
-    fn corporate_identity_projects_as_relay_signed_nip85_assertion() {
+    fn identity_projects_as_relay_signed_nip85_assertion_without_provider_details() {
         let relay = Keys::generate();
         let subject = Keys::generate().public_key();
-        let event = build_identity_assertion(
-            &relay,
-            subject,
-            "Franco Sola",
-            "cf-doorman-production",
-            Timestamp::from(123),
-        )
-        .unwrap();
+        let event = build_identity_assertion(&relay, subject, "Example User", Timestamp::from(123))
+            .unwrap();
 
         assert_eq!(event.kind.as_u16() as u32, KIND_USER_TRUSTED_ASSERTION);
         assert_eq!(event.pubkey, relay.public_key());
@@ -758,8 +796,7 @@ mod tests {
         assert!(identity_assertion_matches(
             &event,
             &subject.to_hex(),
-            "Franco Sola",
-            "cf-doorman-production"
+            "Example User",
         ));
         assert!(
             !event
@@ -767,6 +804,36 @@ mod tests {
                 .iter()
                 .any(|tag| tag.as_slice().first().is_some_and(|name| name == "uid")),
             "the public assertion must not expose the stable corporate uid"
+        );
+        assert!(
+            !event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice().first().is_some_and(|name| name == "issuer")),
+            "the public assertion must not expose the upstream identity provider"
+        );
+    }
+
+    #[test]
+    fn direct_jwt_precedes_delegation_by_default() {
+        let config = test_config();
+        assert_eq!(
+            select_identity_auth_path(&config, Some("jwt"), Some("auth-tag")),
+            IdentityAuthPath::Direct
+        );
+    }
+
+    #[test]
+    fn deployment_can_select_delegated_owner_precedence() {
+        let mut config = test_config();
+        config.auth_precedence = CorporateIdentityAuthPrecedence::Delegated;
+        assert_eq!(
+            select_identity_auth_path(&config, Some("jwt"), Some("auth-tag")),
+            IdentityAuthPath::Delegated
+        );
+        assert_eq!(
+            select_identity_auth_path(&config, Some("jwt"), None),
+            IdentityAuthPath::Direct
         );
     }
 
@@ -898,7 +965,7 @@ mod tests {
 
     async fn make_community(pool: &PgPool) -> CommunityId {
         let id = Uuid::new_v4();
-        let host = format!("corporate-identity-test-{}.example", id.simple());
+        let host = format!("relay-identity-test-{}.example", id.simple());
         sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
             .bind(id)
             .bind(host)
@@ -932,6 +999,7 @@ mod tests {
 
         db.bind_or_validate_identity(
             community,
+            &config.issuer,
             "owner-uid",
             owner_keys.public_key().as_bytes(),
             Some("owner@example.com"),

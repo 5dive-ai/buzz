@@ -5,9 +5,10 @@ export function VerifiedBadge({ verifiedName }: { verifiedName: string }) {
     <Tooltip>
       <TooltipTrigger asChild>
         <span
-          aria-label={`Verified corporate identity: ${verifiedName}`}
+          aria-label={`Relay-verified identity: ${verifiedName}`}
           className="inline-flex shrink-0 items-center"
-          data-testid="verified-corporate-identity"
+          data-testid="relay-verified-identity"
+          role="img"
         >
           <svg
             aria-hidden="true"

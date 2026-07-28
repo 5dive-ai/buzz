@@ -130,13 +130,13 @@ test("stabiliser: a real profile change swaps the reference (re-render fires)", 
 
 test("formats a chosen name followed by the authoritative display name", () => {
   assert.equal(
-    formatVerifiedUserLabel("Franco", "fsola"),
-    "Franco (fsola)",
+    formatVerifiedUserLabel("Example", "example"),
+    "Example (example)",
   );
 });
 
 test("does not duplicate equal chosen and authoritative names", () => {
-  assert.equal(formatVerifiedUserLabel("fsola", "fsola"), "fsola");
+  assert.equal(formatVerifiedUserLabel("example", "example"), "example");
 });
 
 test("resolved user labels keep the chosen name first", () => {
@@ -145,11 +145,11 @@ test("resolved user labels keep the chosen name first", () => {
       pubkey: USER_PUBKEY,
       profiles: {
         [USER_PUBKEY]: summary({
-          displayName: "Franco",
-          verifiedName: "fsola",
+          displayName: "Example",
+          verifiedName: "example",
         }),
       },
     }),
-    "Franco (fsola)",
+    "Example (example)",
   );
 });

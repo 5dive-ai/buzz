@@ -2541,6 +2541,7 @@ impl Db {
     pub async fn bind_or_validate_identity(
         &self,
         community_id: CommunityId,
+        issuer: &str,
         uid: &str,
         pubkey: &[u8],
         display_name: Option<&str>,
@@ -2549,6 +2550,7 @@ impl Db {
         identity_binding::bind_or_validate_identity(
             &self.pool,
             community_id,
+            issuer,
             uid,
             pubkey,
             display_name,

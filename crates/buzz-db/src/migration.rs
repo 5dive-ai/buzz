@@ -917,7 +917,7 @@ mod tests {
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
 
-        // Corporate identity bindings are additive and community-scoped.
+        // Relay-verified identity bindings are additive and community-scoped.
         assert_eq!(migrations[26].version, 27);
         assert!(migrations[26]
             .sql
@@ -926,7 +926,7 @@ mod tests {
         assert!(migrations[26]
             .sql
             .as_str()
-            .contains("idx_identity_bindings_active_uid"));
+            .contains("idx_identity_bindings_active_principal"));
     }
 
     #[test]

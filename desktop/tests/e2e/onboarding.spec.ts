@@ -1267,12 +1267,6 @@ test("first-community shows the scenario cards for localhost", async ({
 });
 
 test("first-community direct join reaches profile", async ({ page }) => {
-  await page.route(
-    "https://onboarding.communities.buzz.xyz/api/join-policy",
-    async (route) => {
-      await route.fulfill({ status: 404 });
-    },
-  );
   await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
   await page.addInitScript((pubkey) => {
     window.localStorage.setItem(
@@ -1325,12 +1319,6 @@ test("first-community direct join reaches profile", async ({ page }) => {
 test("first-community direct join cancel returns to request access", async ({
   page,
 }) => {
-  await page.route(
-    "https://onboarding.communities.buzz.xyz/api/join-policy",
-    async (route) => {
-      await route.fulfill({ status: 404 });
-    },
-  );
   await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
   await page.addInitScript((pubkey) => {
     window.localStorage.setItem(

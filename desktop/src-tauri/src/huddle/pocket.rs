@@ -87,18 +87,6 @@ pub fn load_text_to_speech(model_dir: &str) -> Result<PocketTts, String> {
 }
 
 impl PocketTts {
-    /// Split text into synthesis units that satisfy the bundle's exact
-    /// 50-token input limit.
-    pub fn split_text_into_chunks(&self, text: &str) -> Result<Vec<String>, String> {
-        let Some(prepared) = prepare_april_prompt(text) else {
-            return Ok(Vec::new());
-        };
-        self.inner
-            .lock()
-            .map_err(|_| "Pocket TTS engine lock poisoned".to_string())?
-            .split_prompt(&prepared)
-    }
-
     /// Synthesize text with the supplied reference voice.
     ///
     /// Pocket detects language from text and this model uses one synthesis

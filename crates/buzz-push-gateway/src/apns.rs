@@ -116,6 +116,9 @@ impl ApnsTransport {
     /// Build a reusable APNs client from an Apple `.p8` private key.
     pub fn token(p8: &[u8], key_id: &str, team_id: &str, topic: String) -> Result<Self, ApnsError> {
         let client = reqwest::Client::builder()
+            // APNs requires HTTP/2. This no-op method reference is intentionally
+            // feature-gated so removing reqwest's `http2` feature fails the build.
+            .http2_keep_alive_while_idle(false)
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|_| ApnsError::Client)?;

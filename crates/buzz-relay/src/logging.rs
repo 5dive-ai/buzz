@@ -42,18 +42,73 @@ const BUFFERED_LINES_LIMIT: usize = 4096;
 /// How often the drop counter is polled into the metrics recorder.
 const DROP_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Upper bound on how long guard drop may wait for the upstream flush.
+///
+/// The upstream [`WorkerGuard::drop`] is internally bounded at ~1.1s on its
+/// healthy paths (100ms shutdown send + 1s flush wait), so 2s only fires when
+/// the wedge described on [`BoundedWorkerGuard`] is actually happening.
+const GUARD_DROP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A [`WorkerGuard`] whose drop is guaranteed to return in bounded time even
+/// when stdout itself is wedged.
+///
+/// Why upstream drop is not safe here: when the queue is full at shutdown,
+/// `WorkerGuard::drop` (tracing-appender 0.2.5, `non_blocking.rs:296`) times
+/// out its 100ms shutdown send and then calls `println!` — into the exact
+/// stdout whose lock the worker thread is holding while parked in `write(2)`
+/// on the full pipe. That deadlocks the dropping thread forever, recreating
+/// the original SIGKILL-on-shutdown failure in the one code path this module
+/// exists to protect.
+///
+/// The fix: run the upstream drop on a sacrificial named thread and wait at
+/// most [`GUARD_DROP_TIMEOUT`]. Healthy shutdown keeps the full flush (the
+/// upstream drop finishes in ≲1.1s and we return as soon as it does). If the
+/// pipe is wedged, we abandon the helper thread and return — queued lines are
+/// lost, which is this module's stated loss policy, and process exit reaps
+/// the thread.
+pub struct BoundedWorkerGuard {
+    inner: Option<WorkerGuard>,
+}
+
+impl Drop for BoundedWorkerGuard {
+    fn drop(&mut self) {
+        let Some(guard) = self.inner.take() else {
+            return;
+        };
+        // ManuallyDrop so that if the thread cannot be spawned, dropping the
+        // unused closure leaks the guard instead of running the wedge-prone
+        // upstream drop on this thread. Leaked guard = lost queued lines,
+        // never a hang.
+        let guard = std::mem::ManuallyDrop::new(guard);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
+            .name("log-guard-drop".into())
+            .spawn(move || {
+                drop(std::mem::ManuallyDrop::into_inner(guard));
+                let _ = done_tx.send(());
+            });
+        if spawned.is_ok() {
+            // Ok(()) = flush completed; Err(Timeout) = wedged, abandon it;
+            // Err(Disconnected) = helper finished (send lost the race).
+            let _ = done_rx.recv_timeout(GUARD_DROP_TIMEOUT);
+        }
+    }
+}
+
 /// Wrap stdout in a lossy bounded non-blocking writer.
 ///
-/// The returned [`WorkerGuard`] must be bound to a **named** variable in
-/// `main` (e.g. `_log_guard`) and held for the process lifetime: binding it
-/// to bare `_` drops it immediately, shutting down the writer thread and
+/// The returned [`BoundedWorkerGuard`] must be bound to a **named** variable
+/// in `main` (e.g. `_log_guard`) and held for the process lifetime: binding
+/// it to bare `_` drops it immediately, shutting down the writer thread and
 /// silently discarding all subsequent log output. On drop the guard flushes
-/// buffered lines (bounded: 100ms send + 1s flush timeout upstream).
-pub fn non_blocking_stdout() -> (NonBlocking, WorkerGuard) {
-    NonBlockingBuilder::default()
+/// buffered lines when stdout is healthy, and gives up after
+/// [`GUARD_DROP_TIMEOUT`] when it is not — shutdown is bounded either way.
+pub fn non_blocking_stdout() -> (NonBlocking, BoundedWorkerGuard) {
+    let (writer, guard) = NonBlockingBuilder::default()
         .lossy(true)
         .buffered_lines_limit(BUFFERED_LINES_LIMIT)
-        .finish(std::io::stdout())
+        .finish(std::io::stdout());
+    (writer, BoundedWorkerGuard { inner: Some(guard) })
 }
 
 /// Periodically export the writer's cumulative drop count as the monotonic
@@ -249,6 +304,136 @@ mod tests {
             big.len(),
             "sink must receive the entire line, not a fragment"
         );
+    }
+
+    /// Healthy-shutdown path of the bounded guard: dropping it must still
+    /// deliver the upstream flush (queued lines reach the sink).
+    #[test]
+    fn bounded_guard_flushes_on_healthy_shutdown() {
+        let sink = StallableWriter::new(false);
+        let (writer, inner) = lossy_writer(sink.clone(), 8);
+        let bounded = BoundedWorkerGuard { inner: Some(inner) };
+
+        let line = b"{\"probe\":\"bounded-guard-flush\"}\n";
+        let mut w = writer.clone();
+        w.write_all(line).unwrap();
+
+        drop(bounded);
+        assert_eq!(
+            sink.bytes_written.load(Ordering::SeqCst),
+            line.len(),
+            "bounded guard drop must flush queued lines on a healthy sink"
+        );
+    }
+
+    /// Regression for the review finding on PR #3256: upstream
+    /// `WorkerGuard::drop` deadlocks when the queue is full and stdout is
+    /// wedged — its 100ms shutdown send times out and it then `println!`s
+    /// into the very stdout whose lock the worker holds while parked in
+    /// `write(2)` on the full pipe.
+    ///
+    /// This test re-executes itself as a child process whose stdout is a
+    /// pipe that is deliberately **never read** (the exact production
+    /// failure: stalled container-runtime log copier). The child saturates
+    /// the pipe *and* the bounded queue (proven via `dropped_lines() > 0`,
+    /// reported over stderr — stdout can't carry a readiness signal once
+    /// wedged), then drops the guard and exits. The parent asserts a clean
+    /// exit within the deadline. With the upstream guard drop run inline,
+    /// this test hangs the child and fails on the deadline (verified).
+    #[test]
+    fn guard_drop_bounded_with_wedged_stdout_through_process_exit() {
+        const CHILD_ENV: &str = "BUZZ_TEST_LOG_GUARD_WEDGE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            wedged_child();
+        }
+
+        // libtest names tests relative to the crate root: "logging::tests::…"
+        // (module_path!() = "buzz_relay::logging::tests").
+        let test_name = format!(
+            "{}::guard_drop_bounded_with_wedged_stdout_through_process_exit",
+            module_path!()
+                .split_once("::")
+                .expect("module path has crate prefix")
+                .1
+        );
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("current test binary path"))
+                .args([test_name.as_str(), "--exact", "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn wedged child");
+
+        // CRITICAL: keep the read end of the child's stdout open but never
+        // read from it — that is the wedge. Reading (e.g. via
+        // `wait_with_output`) would drain the pipe, un-wedge the worker, and
+        // test nothing. Closing it would turn the child's writes into EPIPE
+        // instead of blocking.
+        let _wedged_stdout = child.stdout.take().expect("child stdout handle");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll child") {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("child did not exit within deadline: guard drop wedged on blocked stdout");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        // Child has exited; its small stderr output is fully buffered in the
+        // pipe, so this read is bounded.
+        let mut stderr = String::new();
+        use std::io::Read as _;
+        child
+            .stderr
+            .take()
+            .expect("child stderr handle")
+            .read_to_string(&mut stderr)
+            .expect("read child stderr");
+        assert!(
+            stderr.contains("SATURATED"),
+            "child exited without reaching queue saturation — test proved nothing:\n{stderr}"
+        );
+        assert!(
+            status.success(),
+            "wedged child exited unsuccessfully ({status:?}):\n{stderr}"
+        );
+    }
+
+    /// Child half of the wedged-shutdown regression. Runs with stdout piped
+    /// and never read; must saturate pipe + queue, drop the guard, and exit.
+    fn wedged_child() -> ! {
+        // Production constructor: real stdout, real limits.
+        let (writer, guard) = non_blocking_stdout();
+        let errors = writer.error_counter();
+
+        // Fill the (unread) stdout pipe, then the bounded queue, until lines
+        // are provably dropping — i.e. the queue is full and the worker is
+        // parked in write(2). Generously bounded loop so a broken setup
+        // fails instead of spinning forever.
+        let line = format!("{{\"pad\":\"{}\"}}\n", "x".repeat(100));
+        let mut w = writer.clone();
+        for _ in 0..500_000 {
+            let _ = w.write(line.as_bytes());
+            if errors.dropped_lines() > 0 {
+                break;
+            }
+        }
+        if errors.dropped_lines() == 0 {
+            eprintln!("FAILED to saturate queue");
+            std::process::exit(2);
+        }
+        // stdout is wedged by construction; readiness goes out on stderr.
+        eprintln!("SATURATED dropped={}", errors.dropped_lines());
+
+        let start = std::time::Instant::now();
+        drop(guard);
+        eprintln!("GUARD_DROPPED elapsed_ms={}", start.elapsed().as_millis());
+        std::process::exit(0);
     }
 
     /// The drop-counter poller translates cumulative dropped_lines into

@@ -96,14 +96,18 @@ final class PushCatchUpTests: XCTestCase {
     state.consume(PushEventPosition(createdAt: 1_000, id: higherID), for: "origin")
 
     let originState = state.state(for: "origin")
-    let filters = PushCatchUp.queryFilters(
+    var pager = PushCatchUpPager(
       subscriptions: [subscription],
-      cursor: originState.cursor,
-      delivered: originState.delivered,
-      lastDisplayed: originState.lastDisplayed,
-      limit: 10
+      since: state.querySince(for: "origin", now: 2_000),
+      scan: originState.scan,
+      pageLimit: 10
     )
-    let relayPage = relayResponse(events: [lateLow, high], filters: filters)
+    var relayPage: [VerifiedNostrEvent] = []
+    while let filter = pager.nextFilter() {
+      let page = relayResponse(events: [lateLow, high], filters: [filter])
+      relayPage.append(contentsOf: page)
+      pager.receive(rawPage: page)
+    }
     let selections = PushCatchUp.orderedSelections(
       events: relayPage,
       origin: "origin",
@@ -116,41 +120,79 @@ final class PushCatchUpTests: XCTestCase {
     XCTAssertEqual(selections.map(\.wasPreviouslyConsumed), [false, true])
   }
 
-  func testCompositeSameSecondQueryReachesSuccessorsBeyondFirstRelayPage() {
+  func testRawTailPagingReachesEverySameSecondEvent() {
     let subscription = self.subscription()
     let events = (0..<25).map { event(id: String(format: "%064x", $0)) }
-    var state = PushConsumptionState()
-    var selected: [String] = []
+    var pager = PushCatchUpPager(
+      subscriptions: [subscription],
+      since: nil,
+      pageLimit: 10,
+      maximumPages: 10
+    )
+    var observed: Set<String> = []
 
-    while selected.count < events.count {
-      let originState = state.state(for: "origin")
-      let filters = PushCatchUp.queryFilters(
-        subscriptions: [subscription],
-        cursor: originState.cursor,
-        delivered: originState.delivered,
-        lastDisplayed: originState.lastDisplayed,
-        limit: 10
-      )
-      let relayPage = relayResponse(events: events, filters: filters)
-      let selection = PushCatchUp.orderedSelections(
-        events: relayPage,
-        origin: "origin",
-        subscriptions: [subscription],
-        consumptionState: state,
-        verify: { _ in true }
-      ).first
-      let winner = try! XCTUnwrap(selection)
-
-      XCTAssertFalse(winner.wasPreviouslyConsumed)
-      XCTAssertFalse(selected.contains(winner.event.id))
-      selected.append(winner.event.id)
-      state.consume(
-        PushEventPosition(createdAt: winner.event.createdAt, id: winner.event.id),
-        for: "origin"
-      )
+    while let filter = pager.nextFilter() {
+      let page = relayResponse(events: events, filters: [filter])
+      observed.formUnion(page.map(\.id))
+      pager.receive(rawPage: page)
     }
 
-    XCTAssertEqual(selected, events.map(\.id))
+    XCTAssertEqual(observed, Set(events.map(\.id)))
+    XCTAssertEqual(pager.stopReason, .complete)
+  }
+
+  func testBudgetedTraversalResumesFromPersistedRawTailAndClearsOnlyOnComplete() {
+    let subscription = self.subscription()
+    let events = (0..<25).map {
+      event(id: String(format: "%064x", $0), createdAt: 1_000 + $0)
+    }
+    var scan = PushCatchUpScan()
+    var observations: [String: Int] = [:]
+    var stops: [PushCatchUpStopReason] = []
+
+    for _ in 0..<3 {
+      var pager = PushCatchUpPager(
+        subscriptions: [subscription],
+        since: nil,
+        scan: scan,
+        pageLimit: 5,
+        maximumPages: 2
+      )
+      while let filter = pager.nextFilter() {
+        let page = relayResponse(events: events, filters: [filter])
+        for event in page { observations[event.id, default: 0] += 1 }
+        pager.receive(rawPage: page)
+      }
+      stops.append(try! XCTUnwrap(pager.stopReason))
+      scan = pager.scan
+    }
+
+    XCTAssertEqual(stops, [.pageBudgetExceeded, .pageBudgetExceeded, .complete])
+    XCTAssertEqual(observations.count, events.count)
+    XCTAssertTrue(observations.values.allSatisfy { $0 == 1 })
+    XCTAssertEqual(scan, PushCatchUpScan())
+  }
+
+  func testMultiChannelSubscriptionEmitsOneHTTPFilterPerHTag() {
+    let firstChannel = "11111111-1111-4111-8111-111111111111"
+    let secondChannel = "22222222-2222-4222-8222-222222222222"
+    let subscription = PushLeaseSubscription(
+      filter: PushLeaseFilter(
+        kinds: [9],
+        hTags: [firstChannel, secondChannel]
+      ),
+      notificationClass: "default"
+    )
+    var pager = PushCatchUpPager(subscriptions: [subscription], since: nil)
+    var emittedHTags: [[String]] = []
+
+    while let filter = pager.nextFilter() {
+      emittedHTags.append(filter["#h"] as? [String] ?? [])
+      pager.receive(rawPage: [])
+    }
+
+    XCTAssertEqual(emittedHTags, [[firstChannel], [secondChannel]])
+    XCTAssertEqual(pager.stopReason, .complete)
   }
 
   private func subscription() -> PushLeaseSubscription {

@@ -24,19 +24,52 @@ public struct PushEventPosition: Codable, Equatable, Comparable, Sendable {
   }
 }
 
+public struct PushCatchUpScan: Codable, Equatable, Sendable {
+  public let subscriptionIndex: Int
+  public let before: PushEventPosition?
+
+  public init(subscriptionIndex: Int = 0, before: PushEventPosition? = nil) {
+    precondition(subscriptionIndex >= 0, "Push catch-up scan index cannot be negative")
+    self.subscriptionIndex = subscriptionIndex
+    self.before = before
+  }
+
+  enum CodingKeys: String, CodingKey {
+    case subscriptionIndex
+    case before
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    let subscriptionIndex = try container.decode(Int.self, forKey: .subscriptionIndex)
+    guard subscriptionIndex >= 0 else {
+      throw DecodingError.dataCorruptedError(
+        forKey: .subscriptionIndex,
+        in: container,
+        debugDescription: "Push catch-up scan index cannot be negative"
+      )
+    }
+    self.subscriptionIndex = subscriptionIndex
+    before = try container.decodeIfPresent(PushEventPosition.self, forKey: .before)
+  }
+}
+
 public struct PushOriginState: Codable, Equatable, Sendable {
   public let cursor: PushEventPosition?
   public let delivered: [PushEventPosition]
   public let lastDisplayed: PushEventPosition?
+  public let scan: PushCatchUpScan
 
   public init(
     cursor: PushEventPosition? = nil,
     delivered: [PushEventPosition] = [],
-    lastDisplayed: PushEventPosition? = nil
+    lastDisplayed: PushEventPosition? = nil,
+    scan: PushCatchUpScan = PushCatchUpScan()
   ) {
     self.cursor = cursor
     self.delivered = delivered
     self.lastDisplayed = lastDisplayed
+    self.scan = scan
   }
 
   public func contains(eventID: String) -> Bool {
@@ -44,23 +77,24 @@ public struct PushOriginState: Codable, Equatable, Sendable {
   }
 
   public func consuming(
-    _ position: PushEventPosition
+    _ position: PushEventPosition,
+    advanceFloor: Bool = true,
+    scan: PushCatchUpScan? = nil
   ) -> PushOriginState {
-    let nextCursor = max(cursor ?? position, position)
-    let movedToNewSecond = cursor.map { position.createdAt > $0.createdAt } ?? true
-    var byID = Dictionary(
-      uniqueKeysWithValues: delivered
-        .filter { !movedToNewSecond || $0.createdAt == position.createdAt }
-        .map { ($0.id, $0) }
-    )
+    let nextCursor = advanceFloor ? max(cursor ?? position, position) : cursor
+    var byID = Dictionary(uniqueKeysWithValues: delivered.map { ($0.id, $0) })
     byID[position.id] = position
     let retained = byID.values
-      .filter { $0.createdAt >= nextCursor.createdAt }
+      .filter { displayedPosition in
+        guard let nextCursor else { return true }
+        return displayedPosition.createdAt >= nextCursor.createdAt
+      }
       .sorted()
     return PushOriginState(
       cursor: nextCursor,
       delivered: Array(retained),
-      lastDisplayed: position
+      lastDisplayed: position,
+      scan: scan ?? self.scan
     )
   }
 }
@@ -130,9 +164,25 @@ public struct PushConsumptionState: Codable, Equatable, Sendable {
 
   public mutating func consume(
     _ position: PushEventPosition,
-    for origin: String
+    for origin: String,
+    advanceFloor: Bool = true,
+    scan: PushCatchUpScan? = nil
   ) {
-    origins[origin] = state(for: origin).consuming(position)
+    origins[origin] = state(for: origin).consuming(
+      position,
+      advanceFloor: advanceFloor,
+      scan: scan
+    )
+  }
+
+  public mutating func updateScan(_ scan: PushCatchUpScan, for origin: String) {
+    let originState = state(for: origin)
+    origins[origin] = PushOriginState(
+      cursor: originState.cursor,
+      delivered: originState.delivered,
+      lastDisplayed: originState.lastDisplayed,
+      scan: scan
+    )
   }
 
   public mutating func removeInactiveOrigins(_ activeOrigins: Set<String>) {

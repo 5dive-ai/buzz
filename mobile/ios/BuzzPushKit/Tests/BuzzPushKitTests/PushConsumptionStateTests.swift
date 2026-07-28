@@ -62,6 +62,51 @@ final class PushConsumptionStateTests: XCTestCase {
     XCTAssertEqual(state.state(for: "origin").delivered, [nextSecond])
   }
 
+  func testDisplayedIDsAtOrAboveFloorAreRetained() {
+    var state = PushConsumptionState()
+    let floor = PushEventPosition(createdAt: 1_000, id: "floor")
+    let newer = PushEventPosition(createdAt: 1_002, id: "newer")
+    let middle = PushEventPosition(createdAt: 1_001, id: "middle")
+
+    state.consume(floor, for: "origin")
+    state.consume(newer, for: "origin", advanceFloor: false)
+    state.consume(middle, for: "origin", advanceFloor: false)
+
+    let originState = state.state(for: "origin")
+    XCTAssertEqual(originState.cursor, floor)
+    XCTAssertEqual(originState.delivered, [floor, middle, newer])
+  }
+
+  func testIncompleteTraversalKeepsFloorAndPersistsScanThroughConsumeAndCodable() throws {
+    let floor = PushEventPosition(createdAt: 1_000, id: "floor")
+    let displayed = PushEventPosition(createdAt: 1_015, id: "displayed")
+    let before = PushEventPosition(createdAt: 1_010, id: "raw-tail")
+    let scan = PushCatchUpScan(subscriptionIndex: 2, before: before)
+    var state = PushConsumptionState()
+    state.consume(floor, for: "origin")
+
+    state.consume(displayed, for: "origin", advanceFloor: false, scan: scan)
+
+    let originState = state.state(for: "origin")
+    XCTAssertEqual(originState.cursor, floor)
+    XCTAssertEqual(originState.scan, scan)
+    XCTAssertTrue(state.hasConsumed(eventID: displayed.id, for: "origin"))
+    let decoded = try JSONDecoder().decode(
+      PushConsumptionState.self,
+      from: JSONEncoder().encode(state)
+    )
+    XCTAssertEqual(decoded.state(for: "origin"), originState)
+  }
+
+  func testNegativePersistedScanIndexIsRejected() throws {
+    let data = try XCTUnwrap(
+      #"{"version":1,"origins":{"origin":{"delivered":[],"scan":{"subscriptionIndex":-1}}}}"#
+        .data(using: .utf8)
+    )
+
+    XCTAssertThrowsError(try JSONDecoder().decode(PushConsumptionState.self, from: data))
+  }
+
   func testLowerIDSiblingArrivingAfterHigherIDRemainsSelectable() {
     var state = PushConsumptionState()
     let higher = PushEventPosition(createdAt: 1_000, id: "ff")

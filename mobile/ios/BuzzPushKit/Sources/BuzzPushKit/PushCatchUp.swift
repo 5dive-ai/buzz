@@ -10,69 +10,136 @@ public struct PushCatchUpSelection: Sendable {
   }
 }
 
-public enum PushCatchUp {
-  /// Build catch-up filters that preserve the lease's constraints. The broad
-  /// timestamp filter finds newer events, while composite pages cover every gap
-  /// in the active second's exact delivered-ID set. A separate exact-id filter
-  /// keeps the last displayed event available only for duplicate cleanup.
-  public static func queryFilters(
+public enum PushCatchUpStopReason: Equatable, Sendable {
+  case complete
+  case pageBudgetExceeded
+  case deadlineExceeded
+}
+
+public struct PushCatchUpPager {
+  /// The NSE has about eight seconds. Reserve two seconds for state persistence,
+  /// duplicate absorption, and content delivery after bounded catch-up.
+  public static let traversalSeconds: TimeInterval = 6
+  public static let pageLimit = 10
+  public static let maximumPages = 12
+
+  private struct Query {
+    let filter: PushLeaseFilter
+    let hTag: String?
+  }
+
+  private let queries: [Query]
+  private let since: Int?
+  private let deadline: Date
+  private let pageLimit: Int
+  private let maximumPages: Int
+  private var subscriptionIndex: Int
+  private var rawTail: PushEventPosition?
+  private var pagesRequested = 0
+
+  public private(set) var stopReason: PushCatchUpStopReason?
+
+  public init(
     subscriptions: [PushLeaseSubscription],
-    cursor: PushEventPosition?,
-    delivered: [PushEventPosition],
-    lastDisplayed: PushEventPosition?,
-    limit: Int
-  ) -> [[String: Any]] {
-    subscriptions.flatMap { subscription in
-      var filters: [[String: Any]] = []
-      if let cursor {
-        // `+ 1` is safe only as the strictly-later half of this pair. The
-        // active-second filters below start at the bottom and drain same-second
-        // rows without making event-ID ordering the dedupe authority.
-        if cursor.createdAt < Int.max {
-          filters.append(
-            subscription.filter.queryFilter(
-              since: cursor.createdAt + 1,
-              limit: limit
-            )
-          )
-        }
-
-        var activeHead = subscription.filter.queryFilter(
-          since: cursor.createdAt,
-          limit: limit
-        )
-        activeHead["until"] = cursor.createdAt
-        filters.append(activeHead)
-
-        let activeDelivered = delivered
-          .filter { $0.createdAt == cursor.createdAt }
-          .sorted()
-        for boundaryIndex in stride(
-          from: limit - 1,
-          to: activeDelivered.count,
-          by: limit
-        ) {
-          var page = subscription.filter.queryFilter(
-            since: cursor.createdAt,
-            limit: limit
-          )
-          page["until"] = cursor.createdAt
-          page["before_id"] = activeDelivered[boundaryIndex].id
-          filters.append(page)
-        }
-      } else {
-        filters.append(subscription.filter.queryFilter(since: nil, limit: limit))
+    since: Int?,
+    scan: PushCatchUpScan = PushCatchUpScan(),
+    startedAt: Date = Date(),
+    traversalSeconds: TimeInterval = Self.traversalSeconds,
+    pageLimit: Int = Self.pageLimit,
+    maximumPages: Int = Self.maximumPages
+  ) {
+    precondition(traversalSeconds > 0, "Push catch-up traversal allowance must be positive")
+    precondition(pageLimit > 0, "Push catch-up page limit must be positive")
+    precondition(maximumPages > 0, "Push catch-up page budget must be positive")
+    queries = subscriptions.flatMap { subscription in
+      guard let hTags = subscription.filter.hTags, hTags.count > 1 else {
+        return [Query(filter: subscription.filter, hTag: nil)]
       }
+      return hTags.map { Query(filter: subscription.filter, hTag: $0) }
+    }
+    self.since = since
+    deadline = startedAt.addingTimeInterval(traversalSeconds)
+    self.pageLimit = pageLimit
+    self.maximumPages = maximumPages
 
-      if let lastDisplayed {
-        var duplicateFallback = subscription.filter.queryFilter(since: nil, limit: 1)
-        duplicateFallback["ids"] = [lastDisplayed.id]
-        filters.append(duplicateFallback)
-      }
-      return filters
+    // A subscription snapshot can legitimately shrink between NSE wakes. Treat
+    // a scan beyond the new query set as exhausted so the caller clears it and
+    // begins a fresh pass on the next wake.
+    if scan.subscriptionIndex >= queries.count {
+      subscriptionIndex = queries.count
+      rawTail = nil
+    } else {
+      subscriptionIndex = scan.subscriptionIndex
+      rawTail = scan.before
     }
   }
 
+  /// The position to persist for the next wake. A completed traversal clears
+  /// its scan so newly arrived events are visible from the top of the next pass.
+  public var scan: PushCatchUpScan {
+    guard stopReason != .complete else { return PushCatchUpScan() }
+    return PushCatchUpScan(subscriptionIndex: subscriptionIndex, before: rawTail)
+  }
+
+  public func remainingTraversalSeconds(now: Date = Date()) -> TimeInterval {
+    max(0, deadline.timeIntervalSince(now))
+  }
+
+  /// Return the next raw relay page. Continuation is derived only from the
+  /// observed raw page tail, never from post-selection or delivered-ID state.
+  public mutating func nextFilter(now: Date = Date()) -> [String: Any]? {
+    guard stopReason == nil else { return nil }
+    guard subscriptionIndex < queries.count else {
+      stopReason = .complete
+      return nil
+    }
+    guard pagesRequested < maximumPages else {
+      stopReason = .pageBudgetExceeded
+      return nil
+    }
+    guard now < deadline else {
+      stopReason = .deadlineExceeded
+      return nil
+    }
+
+    let query = queries[subscriptionIndex]
+    var filter = query.filter.queryFilter(since: since, limit: pageLimit)
+    if let hTag = query.hTag {
+      // The HTTP relay narrows a multi-value #h filter to its first channel.
+      // One filter per channel avoids depending on that broken contract.
+      filter["#h"] = [hTag]
+    }
+    if let rawTail {
+      filter["until"] = rawTail.createdAt
+      filter["before_id"] = rawTail.id
+    }
+    pagesRequested += 1
+    return filter
+  }
+
+  public mutating func receive(rawPage: [VerifiedNostrEvent]) {
+    guard stopReason == nil else { return }
+    let ordered = rawPage.sorted {
+      $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt > $1.createdAt
+    }
+    if ordered.count < pageLimit {
+      // Every emitted filter is fully represented by the relay's SQL query.
+      // In particular, #h is exact after splitting, so a short raw page proves
+      // exhaustion rather than reflecting post-LIMIT filtering.
+      subscriptionIndex += 1
+      rawTail = nil
+      if subscriptionIndex == queries.count {
+        stopReason = .complete
+      }
+    } else {
+      rawTail = ordered.last.map {
+        PushEventPosition(createdAt: $0.createdAt, id: $0.id)
+      }
+    }
+  }
+}
+
+public enum PushCatchUp {
   /// Return selectable events first and consumed duplicate fallbacks last.
   /// Duplicate cleanup therefore never competes with forward progress.
   public static func orderedSelections(

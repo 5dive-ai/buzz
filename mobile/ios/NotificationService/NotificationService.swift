@@ -97,6 +97,8 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
     let event: VerifiedNostrEvent
     let community: PushLeaseCommunity
     let wasPreviouslyConsumed: Bool
+    let catchUpStopReason: PushCatchUpStopReason
+    let catchUpScan: PushCatchUpScan
   }
 
   private let session: URLSession
@@ -151,34 +153,76 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
 
     let group = DispatchGroup()
     let lock = NSLock()
-    var candidates: [Candidate] = []
-    var diagnostics: [String] = []
+    var outcomes: [String: QueryResult] = [:]
     for community in communities {
       group.enter()
       query(community, consumptionState: consumptionState) { result in
         lock.lock()
-        switch result {
-        case .candidate(let candidate): candidates.append(candidate)
-        case .diagnostic(let diagnostic): diagnostics.append(diagnostic)
-        case .none: break
-        }
+        outcomes[community.id] = result
         lock.unlock()
         group.leave()
       }
     }
     group.notify(queue: .global(qos: .userInitiated)) { [weak self] in
       guard let self else { return }
+      let candidates = outcomes.values.compactMap { result -> Candidate? in
+        guard case .candidate(let candidate) = result else { return nil }
+        return candidate
+      }
+      let diagnostics = outcomes.values.compactMap { result -> String? in
+        switch result {
+        case .diagnostic(let diagnostic): return diagnostic
+        case .traversal(let traversal): return traversal.diagnostic
+        case .candidate(let candidate):
+          return candidate.catchUpStopReason == .complete
+            ? nil
+            : Self.incompleteTraversalMessage
+        }
+      }
+      let traversals = outcomes.values.compactMap { result -> CommunityTraversal? in
+        switch result {
+        case .candidate(let candidate):
+          return CommunityTraversal(
+            community: candidate.community,
+            scan: candidate.catchUpScan,
+            diagnostic: nil
+          )
+        case .traversal(let traversal): return traversal
+        case .diagnostic: return nil
+        }
+      }
       let sorted = candidates.sorted { lhs, rhs in
         if lhs.wasPreviouslyConsumed != rhs.wasPreviouslyConsumed {
           return !lhs.wasPreviouslyConsumed
         }
         if lhs.event.createdAt != rhs.event.createdAt {
-          return lhs.event.createdAt > rhs.event.createdAt
+          return lhs.event.createdAt < rhs.event.createdAt
         }
         if lhs.event.id != rhs.event.id { return lhs.event.id < rhs.event.id }
         return lhs.community.id < rhs.community.id
       }
+      let incompleteTraversal = outcomes.values.contains { result in
+        switch result {
+        case .candidate(let candidate):
+          return candidate.catchUpStopReason != .complete
+        case .traversal(let traversal):
+          return traversal.diagnostic == Self.incompleteTraversalMessage
+        case .diagnostic:
+          return false
+        }
+      }
       guard let winner = sorted.first else {
+        do {
+          try loaded.store.update { state in
+            state.removeInactiveOrigins(Set(communities.map(\.id)))
+            for traversal in traversals {
+              state.updateScan(traversal.scan, for: traversal.community.id)
+            }
+          }
+        } catch {
+          completion(.diagnostic("Buzz could not save notification history."))
+          return
+        }
         completion(diagnostics.sorted().first.map(BuzzPushResolutionResult.diagnostic) ?? .none)
         return
       }
@@ -191,12 +235,22 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
       do {
         try loaded.store.update { state in
           state.removeInactiveOrigins(Set(communities.map(\.id)))
+          for traversal in traversals {
+            guard traversal.community.id != winner.community.id else { continue }
+            state.updateScan(traversal.scan, for: traversal.community.id)
+          }
           if state.hasConsumed(eventID: position.id, for: winner.community.id) {
+            state.updateScan(winner.catchUpScan, for: winner.community.id)
             shouldPresent = true
             return
           }
           guard state.canSelect(position, for: winner.community.id) else { return }
-          state.consume(position, for: winner.community.id)
+          state.consume(
+            position,
+            for: winner.community.id,
+            advanceFloor: winner.catchUpStopReason == .complete,
+            scan: winner.catchUpScan
+          )
           shouldPresent = true
         }
       } catch {
@@ -207,15 +261,28 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
         completion(.none)
         return
       }
+      guard !incompleteTraversal else {
+        completion(.diagnostic(Self.incompleteTraversalMessage))
+        return
+      }
       absorbSequentialDuplicate(of: winner.resolution, completion: completion)
     }
   }
 
   private enum QueryResult {
     case candidate(Candidate)
+    case traversal(CommunityTraversal)
     case diagnostic(String)
-    case none
   }
+
+  private struct CommunityTraversal {
+    let community: PushLeaseCommunity
+    let scan: PushCatchUpScan
+    let diagnostic: String?
+  }
+
+  private static let incompleteTraversalMessage =
+    "Open Buzz to finish checking for new activity."
 
   private func query(
     _ community: PushLeaseCommunity,
@@ -234,27 +301,101 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
       return
     }
     let originState = consumptionState.state(for: community.id)
-    let filters = PushCatchUp.queryFilters(
+    let pager = PushCatchUpPager(
       subscriptions: subscriptions,
-      cursor: originState.cursor,
-      delivered: originState.delivered,
-      lastDisplayed: originState.lastDisplayed,
-      limit: 10
+      since: consumptionState.querySince(for: community.id),
+      scan: originState.scan
     )
-    guard let body = try? JSONSerialization.data(withJSONObject: filters) else {
-      completion(.diagnostic("Buzz notification subscriptions are invalid."))
-      return
-    }
     guard let relayURL = community.relayURL,
       let url = URL(string: "/query", relativeTo: relayURL)
     else {
       completion(.diagnostic("Buzz notification relay URL is invalid."))
       return
     }
+
+    queryNextPage(
+      pager: pager,
+      eventsByID: [:],
+      url: url,
+      privateKey: privateKey
+    ) { result in
+      switch result {
+      case .success(let traversalResult):
+        let traversal = CommunityTraversal(
+          community: community,
+          scan: traversalResult.scan,
+          diagnostic: traversalResult.stopReason == .complete
+            ? nil
+            : Self.incompleteTraversalMessage
+        )
+        let candidate = Self.decodeCandidate(
+          events: Array(traversalResult.eventsByID.values),
+          community: community,
+          subscriptions: subscriptions,
+          consumptionState: consumptionState,
+          stopReason: traversalResult.stopReason,
+          scan: traversalResult.scan
+        )
+        completion(candidate.map(QueryResult.candidate) ?? .traversal(traversal))
+      case .failure:
+        completion(
+          .traversal(
+            CommunityTraversal(
+              community: community,
+              scan: originState.scan,
+              diagnostic: nil
+            )
+          )
+        )
+      }
+    }
+  }
+
+  private enum CatchUpQueryError: Error {
+    case invalidFilters
+    case authentication
+    case relay
+  }
+
+  private struct CatchUpTraversal {
+    let eventsByID: [String: VerifiedNostrEvent]
+    let stopReason: PushCatchUpStopReason
+    let scan: PushCatchUpScan
+  }
+
+  private func queryNextPage(
+    pager: PushCatchUpPager,
+    eventsByID: [String: VerifiedNostrEvent],
+    url: URL,
+    privateKey: String,
+    completion: @escaping (Result<CatchUpTraversal, CatchUpQueryError>) -> Void
+  ) {
+    var pager = pager
+    guard let filter = pager.nextFilter() else {
+      guard let stopReason = pager.stopReason else {
+        completion(.failure(.relay))
+        return
+      }
+      completion(
+        .success(
+          CatchUpTraversal(
+            eventsByID: eventsByID,
+            stopReason: stopReason,
+            scan: pager.scan
+          )
+        )
+      )
+      return
+    }
+    guard let body = try? JSONSerialization.data(withJSONObject: [filter]) else {
+      completion(.failure(.invalidFilters))
+      return
+    }
+
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.httpBody = body
-    request.timeoutInterval = 8
+    request.timeoutInterval = max(1, pager.remainingTraversalSeconds())
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     guard
       let auth = try? NostrHTTPAuth.authorizationHeader(
@@ -264,36 +405,44 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
         privateKeyHex: privateKey
       )
     else {
-      completion(.diagnostic("Buzz could not authenticate notification catch-up."))
+      completion(.failure(.authentication))
       return
     }
     request.setValue(auth, forHTTPHeaderField: "Authorization")
-    session.dataTask(with: request) { data, response, _ in
-      guard let response = response as? HTTPURLResponse,
+
+    session.dataTask(with: request) { [weak self] data, response, _ in
+      guard let self,
+        let response = response as? HTTPURLResponse,
         (200..<300).contains(response.statusCode),
         let data,
         let events = try? JSONDecoder().decode([VerifiedNostrEvent].self, from: data)
       else {
-        completion(.none)
+        completion(.failure(.relay))
         return
       }
-      completion(
-        Self.decodeResolution(
-          events: events,
-          community: community,
-          subscriptions: subscriptions,
-          consumptionState: consumptionState
-        )
+      var nextEventsByID = eventsByID
+      for event in events {
+        nextEventsByID[event.id] = event
+      }
+      pager.receive(rawPage: events)
+      self.queryNextPage(
+        pager: pager,
+        eventsByID: nextEventsByID,
+        url: url,
+        privateKey: privateKey,
+        completion: completion
       )
     }.resume()
   }
 
-  private static func decodeResolution(
+  private static func decodeCandidate(
     events: [VerifiedNostrEvent],
     community: PushLeaseCommunity,
     subscriptions: [PushLeaseSubscription],
-    consumptionState: PushConsumptionState
-  ) -> QueryResult {
+    consumptionState: PushConsumptionState,
+    stopReason: PushCatchUpStopReason,
+    scan: PushCatchUpScan
+  ) -> Candidate? {
     let matching = PushCatchUp.orderedSelections(
       events: events,
       origin: community.id,
@@ -329,16 +478,16 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
           identity: identity
         )
       }
-      return .candidate(
-        Candidate(
-          resolution: resolution,
-          event: event,
-          community: community,
-          wasPreviouslyConsumed: selection.wasPreviouslyConsumed
-        )
+      return Candidate(
+        resolution: resolution,
+        event: event,
+        community: community,
+        wasPreviouslyConsumed: selection.wasPreviouslyConsumed,
+        catchUpStopReason: stopReason,
+        catchUpScan: scan
       )
     }
-    return .none
+    return nil
   }
 
   private func absorbSequentialDuplicate(

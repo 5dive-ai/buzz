@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use buzz_media::S3AddressingStyle;
 use nostr::{EventBuilder, Keys, Kind, Tag};
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
@@ -115,6 +116,27 @@ struct PointerSnapshot {
 }
 
 impl GitS3Probe {
+    fn bucket(
+        endpoint: String,
+        access_key: &str,
+        secret_key: &str,
+        bucket_name: &str,
+        region_name: String,
+        addressing_style: S3AddressingStyle,
+    ) -> Box<Bucket> {
+        let region = Region::Custom {
+            region: region_name,
+            endpoint,
+        };
+        let creds = Credentials::new(Some(access_key), Some(secret_key), None, None, None)
+            .expect("S3 credentials");
+        let bucket = Bucket::new(bucket_name, region, creds).expect("S3 bucket");
+        match addressing_style {
+            S3AddressingStyle::Path => bucket.with_path_style(),
+            S3AddressingStyle::Virtual => bucket,
+        }
+    }
+
     fn from_env() -> Self {
         let endpoint = std::env::var("BUZZ_GIT_S3_ENDPOINT")
             .or_else(|_| std::env::var("BUZZ_S3_ENDPOINT"))
@@ -125,19 +147,25 @@ impl GitS3Probe {
         let secret_key = std::env::var("BUZZ_GIT_S3_SECRET_KEY")
             .or_else(|_| std::env::var("BUZZ_S3_SECRET_KEY"))
             .unwrap_or_else(|_| "buzz_dev_secret".to_string());
-        let bucket = std::env::var("BUZZ_GIT_S3_BUCKET")
+        let bucket_name = std::env::var("BUZZ_GIT_S3_BUCKET")
             .or_else(|_| std::env::var("BUZZ_S3_BUCKET"))
             .unwrap_or_else(|_| "buzz-media".to_string());
+        let region_name = std::env::var("BUZZ_GIT_S3_REGION")
+            .or_else(|_| std::env::var("BUZZ_S3_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string());
+        let addressing_style = std::env::var("BUZZ_S3_ADDRESSING_STYLE")
+            .unwrap_or_else(|_| "path".to_string())
+            .parse::<S3AddressingStyle>()
+            .expect("BUZZ_S3_ADDRESSING_STYLE must be 'path' or 'virtual'");
 
-        let region = Region::Custom {
-            region: "us-east-1".into(),
+        let bucket = Self::bucket(
             endpoint,
-        };
-        let creds = Credentials::new(Some(&access_key), Some(&secret_key), None, None, None)
-            .expect("S3 credentials");
-        let bucket = Bucket::new(&bucket, region, creds)
-            .expect("S3 bucket")
-            .with_path_style();
+            &access_key,
+            &secret_key,
+            &bucket_name,
+            region_name,
+            addressing_style,
+        );
         Self { bucket }
     }
 
@@ -190,6 +218,31 @@ impl GitS3Probe {
             Err(e) => panic!("pointer named manifest {key}, but GET failed: {e}"),
         }
     }
+}
+
+#[test]
+fn git_s3_probe_builds_both_addressing_styles() {
+    let path = GitS3Probe::bucket(
+        "https://storage.example".to_string(),
+        "access",
+        "secret",
+        "buzz-media",
+        "us-east-1".to_string(),
+        S3AddressingStyle::Path,
+    );
+    assert!(path.is_path_style());
+    assert_eq!(path.url(), "https://storage.example/buzz-media");
+
+    let virtual_hosted = GitS3Probe::bucket(
+        "https://storage.example".to_string(),
+        "access",
+        "secret",
+        "buzz-media",
+        "auto".to_string(),
+        S3AddressingStyle::Virtual,
+    );
+    assert!(virtual_hosted.is_subdomain_style());
+    assert_eq!(virtual_hosted.url(), "https://buzz-media.storage.example");
 }
 
 #[tokio::test]

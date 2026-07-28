@@ -198,6 +198,11 @@
       "properties": {
         "endpoint": { "type": "string", "pattern": "^(https?://.+)?$" },
         "bucket": { "type": "string", "minLength": 1 },
+        "region": {
+          "type": "string",
+          "minLength": 1,
+          "description": "S3 region used for SigV4 signing. Defaults to us-east-1 for bundled MinIO compatibility."
+        },
         "addressingStyle": {
           "type": "string",
           "enum": ["path", "virtual"],

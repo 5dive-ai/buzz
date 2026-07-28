@@ -61,28 +61,36 @@ Buzz uses one URL style for both media and Git/CAS object-store requests:
 | `path` (default) | `https://endpoint/bucket/key` | Bundled MinIO and endpoints whose DNS does not resolve bucket subdomains |
 | `virtual` | `https://bucket.endpoint/key` | AWS-style providers and new Railway Storage Buckets |
 
-The chart renders this value as `BUZZ_S3_ADDRESSING_STYLE`. Only `path` and
-`virtual` are accepted; invalid values fail chart rendering and relay startup.
-The bundled MinIO quickstart deliberately keeps `path` because its Service DNS
-resolves one endpoint hostname, not arbitrary `<bucket>.<service>` names.
+The chart renders `s3.region` and `s3.addressingStyle` as `BUZZ_S3_REGION`
+and `BUZZ_S3_ADDRESSING_STYLE`. Only `path` and `virtual` addressing styles are
+accepted; invalid values fail chart rendering and relay startup. The bundled
+MinIO quickstart deliberately keeps `path` because its Service DNS resolves one
+endpoint hostname, not arbitrary `<bucket>.<service>` names.
 
-For a Railway Storage Bucket named `Object Storage`, map its variables onto the
-Buzz service and set the style explicitly:
+For a Railway Storage Bucket, map its variables to chart values in the service
+or generated Helm configuration:
 
-```text
-BUZZ_S3_ENDPOINT=${{Object Storage.ENDPOINT}}
-BUZZ_S3_BUCKET=${{Object Storage.BUCKET}}
-BUZZ_S3_ACCESS_KEY=${{Object Storage.ACCESS_KEY_ID}}
-BUZZ_S3_SECRET_KEY=${{Object Storage.SECRET_ACCESS_KEY}}
-BUZZ_S3_REGION=${{Object Storage.REGION}}
-BUZZ_S3_ADDRESSING_STYLE=virtual
+```yaml
+s3:
+  endpoint: "${{Object Storage.ENDPOINT}}"
+  bucket: "${{Object Storage.BUCKET}}"
+  region: "${{Object Storage.REGION}}"
+  addressingStyle: virtual
 ```
 
-Railway's Credentials tab is authoritative for older buckets, which may still
-require `path`. The setting changes request routing and SigV4 signing, so do not
-put the bucket into `BUZZ_S3_ENDPOINT`; pass Railway's base `ENDPOINT` and
-`BUCKET` separately. The relay validates storage before becoming ready, and the
-Git conformance probe remains startup-fatal when enabled.
+Store `BUZZ_S3_ACCESS_KEY=${{Object Storage.ACCESS_KEY_ID}}` and
+`BUZZ_S3_SECRET_KEY=${{Object Storage.SECRET_ACCESS_KEY}}` in the Secret named by
+`secrets.existingSecret`. Railway's Credentials tab is authoritative for older
+buckets, which may still require `path`. The setting changes request routing and
+SigV4 signing, so do not put the bucket into `s3.endpoint`; pass Railway's base
+`ENDPOINT` and `BUCKET` separately.
+
+Object storage is contacted during relay startup only when
+`BUZZ_GIT_CONFORMANCE_PROBE` is enabled (the relay default). A probe failure is
+startup-fatal, so Kubernetes readiness never opens. If an operator explicitly
+disables that probe through `relay.extraEnv`, `/_readiness` does not test object
+storage; configuration is still parsed strictly, but reachability and addressing
+errors surface on the first storage operation.
 
 ## Relay Pod extensions
 

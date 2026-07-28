@@ -15,7 +15,7 @@ class RunnerTests: XCTestCase {
           "activeCount": 2,
           "startedAtMillis": 1_785_152_800_000,
           "lastActivityAtMillis": 1_785_152_810_000,
-          "timeoutAfterMillis": 30_000,
+          "expiresAtMillis": 1_785_181_610_000,
           "channelId": "channel-2",
           "messageId": "message-2",
         ]
@@ -29,6 +29,10 @@ class RunnerTests: XCTestCase {
     )
     XCTAssertEqual(payload.contentState.publicTitle, "2 agents are working")
     XCTAssertEqual(payload.contentState.publicBody, "Open Buzz to view progress")
+    XCTAssertEqual(
+      payload.staleDate,
+      Date(timeIntervalSince1970: 1_785_181_610)
+    )
   }
 
   func testAgentLiveActivityPayloadRejectsMissingTimingData() {

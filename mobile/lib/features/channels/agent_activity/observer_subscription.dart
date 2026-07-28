@@ -11,6 +11,7 @@ import 'transcript_builder.dart';
 
 /// Maximum observer events to keep per agent.
 const _maxObserverEvents = 800;
+const _observerReplayLimit = 200;
 
 /// Key for channel-scoped transcript reads.
 typedef ObserverKey = ({String channelId, String agentPubkey});
@@ -137,7 +138,7 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
           tags: {
             '#p': [ownerPubkey],
           },
-          limit: 0,
+          limit: _observerReplayLimit,
         ),
         _handleEvent,
         onClosed: (message) {
@@ -232,7 +233,7 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       );
       final plaintext = nip44Decrypt(conversationKey, event.content);
       final json = jsonDecode(plaintext) as Map<String, dynamic>;
-      return ObserverFrame.fromJson(json);
+      return ObserverFrame.fromJson(json, receivedAt: DateTime.now().toUtc());
     } catch (error) {
       _errorMessage = 'Observer event decrypt failed: $error';
       _emit(connection: ObserverConnectionState.error);

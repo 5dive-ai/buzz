@@ -40,6 +40,9 @@ class App extends HookConsumerWidget {
     final agentLiveUpdate = isAuthenticated && agentLiveUpdatesEnabled
         ? ref.watch(agentLiveUpdateContentProvider)
         : null;
+    final agentLiveUpdateSynchronizer = useMemoized(
+      AgentLiveUpdateSynchronizer.new,
+    );
     final activeAgentPubkeys = isAuthenticated
         ? ref
               .watch(activeAgentTurnsProvider)
@@ -80,7 +83,7 @@ class App extends HookConsumerWidget {
     ref.watch(pendingDeepLinkProvider);
 
     useEffect(() {
-      unawaited(syncAgentLiveUpdate(agentLiveUpdate));
+      unawaited(agentLiveUpdateSynchronizer.sync(agentLiveUpdate));
       return null;
     }, [agentLiveUpdate, appLifecycleState]);
 

@@ -8,7 +8,7 @@ import '../channels_provider.dart';
 import 'active_agent_turns.dart';
 
 const _agentLiveUpdatesChannel = MethodChannel('buzz/agent_live_updates');
-const _notificationTimeout = Duration(seconds: 30);
+const _liveUpdateSafetyLifetime = Duration(hours: 8);
 
 @immutable
 class AgentLiveUpdateContent {
@@ -17,6 +17,7 @@ class AgentLiveUpdateContent {
   final int activeAgentCount;
   final DateTime startedAt;
   final DateTime lastActivityAt;
+  final DateTime expiresAt;
   final String channelId;
   final String? messageId;
 
@@ -26,6 +27,7 @@ class AgentLiveUpdateContent {
     required this.activeAgentCount,
     required this.startedAt,
     required this.lastActivityAt,
+    required this.expiresAt,
     required this.channelId,
     this.messageId,
   });
@@ -36,7 +38,7 @@ class AgentLiveUpdateContent {
     'activeCount': activeAgentCount,
     'startedAtMillis': startedAt.millisecondsSinceEpoch,
     'lastActivityAtMillis': lastActivityAt.millisecondsSinceEpoch,
-    'timeoutAfterMillis': _notificationTimeout.inMilliseconds,
+    'expiresAtMillis': expiresAt.millisecondsSinceEpoch,
     'channelId': channelId,
     'messageId': ?messageId,
   };
@@ -50,6 +52,7 @@ class AgentLiveUpdateContent {
           activeAgentCount == other.activeAgentCount &&
           startedAt == other.startedAt &&
           lastActivityAt == other.lastActivityAt &&
+          expiresAt == other.expiresAt &&
           channelId == other.channelId &&
           messageId == other.messageId;
 
@@ -60,6 +63,7 @@ class AgentLiveUpdateContent {
     activeAgentCount,
     startedAt,
     lastActivityAt,
+    expiresAt,
     channelId,
     messageId,
   );
@@ -107,6 +111,7 @@ AgentLiveUpdateContent? buildAgentLiveUpdateContent(
     activeAgentCount: agentCount,
     startedAt: startedAt,
     lastActivityAt: lastActivityAt,
+    expiresAt: lastActivityAt.add(_liveUpdateSafetyLifetime),
     channelId: target.channelId,
     messageId: target.triggeringEventId,
   );
@@ -168,5 +173,20 @@ Future<void> syncAgentLiveUpdate(AgentLiveUpdateContent? content) async {
     debugPrint('Unable to update agent live activity: ${error.message}');
   } on MissingPluginException {
     debugPrint('Agent live activity is unavailable in this build.');
+  }
+}
+
+class AgentLiveUpdateSynchronizer {
+  Future<void> _pending = Future.value();
+
+  Future<void> sync(AgentLiveUpdateContent? content) {
+    final operation = _pending.then((_) => syncAgentLiveUpdate(content));
+    _pending = operation.then<void>(
+      (_) {},
+      onError: (Object error, StackTrace stackTrace) {
+        debugPrint('Unable to serialize agent live activity updates: $error');
+      },
+    );
+    return operation;
   }
 }

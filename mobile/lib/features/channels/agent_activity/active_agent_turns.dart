@@ -1,8 +1,12 @@
 import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
+import '../../../shared/relay/relay.dart';
 import 'observer_models.dart';
 import 'observer_subscription.dart';
+
+const _activeTurnLivenessTimeout = Duration(seconds: 30);
+const _activeTurnClockInterval = Duration(seconds: 5);
 
 @immutable
 class ActiveAgentTurn {
@@ -34,8 +38,9 @@ class ActiveAgentTurn {
 }
 
 List<ActiveAgentTurn> reduceActiveAgentTurns(
-  Map<String, List<ObserverFrame>> framesByAgent,
-) {
+  Map<String, List<ObserverFrame>> framesByAgent, {
+  required DateTime now,
+}) {
   final activeTurns = <ActiveAgentTurn>[];
 
   for (final entry in framesByAgent.entries) {
@@ -45,7 +50,8 @@ List<ActiveAgentTurn> reduceActiveAgentTurns(
     final terminalAtById = <String, DateTime>{};
 
     for (final frame in frames) {
-      final frameAt = _frameTimestamp(frame);
+      final frameOrderAt = _frameTimestamp(frame);
+      final frameAt = _localFrameTimestamp(frame);
       switch (frame.kind) {
         case 'turn_started':
           final channelId = frame.channelId;
@@ -65,7 +71,7 @@ List<ActiveAgentTurn> reduceActiveAgentTurns(
         case 'agent_panic':
           final turnId = frame.turnId;
           if (turnId != null) {
-            terminalAtById[turnId] = frameAt;
+            terminalAtById[turnId] = frameOrderAt;
             turnsById.remove(turnId);
             continue;
           }
@@ -75,7 +81,7 @@ List<ActiveAgentTurn> reduceActiveAgentTurns(
               .where((turn) => turn.channelId == channelId)
               .firstOrNull;
           if (matchingTurn != null) {
-            terminalAtById[matchingTurn.turnId] = frameAt;
+            terminalAtById[matchingTurn.turnId] = frameOrderAt;
             turnsById.remove(matchingTurn.turnId);
           }
         case 'acp_read':
@@ -92,7 +98,7 @@ List<ActiveAgentTurn> reduceActiveAgentTurns(
           final channelId = frame.channelId;
           if (channelId == null) continue;
           final terminalAt = terminalAtById[turnId];
-          if (terminalAt != null && !frameAt.isAfter(terminalAt)) continue;
+          if (terminalAt != null && !frameOrderAt.isAfter(terminalAt)) continue;
           turnsById[turnId] = ActiveAgentTurn(
             agentPubkey: agentPubkey,
             channelId: channelId,
@@ -103,7 +109,13 @@ List<ActiveAgentTurn> reduceActiveAgentTurns(
       }
     }
 
-    activeTurns.addAll(turnsById.values);
+    activeTurns.addAll(
+      turnsById.values.where(
+        (turn) => !turn.lastActivityAt.isBefore(
+          now.subtract(_activeTurnLivenessTimeout),
+        ),
+      ),
+    );
   }
 
   activeTurns.sort((a, b) {
@@ -116,19 +128,38 @@ List<ActiveAgentTurn> reduceActiveAgentTurns(
   return List.unmodifiable(activeTurns);
 }
 
+final _activeAgentTurnClockProvider = StreamProvider<DateTime>((ref) async* {
+  yield DateTime.now().toUtc();
+  yield* Stream<DateTime>.periodic(
+    _activeTurnClockInterval,
+    (_) => DateTime.now().toUtc(),
+  );
+});
+
 final activeAgentTurnsProvider = Provider<List<ActiveAgentTurn>>((ref) {
   final observerState = ref.watch(observerRelayProvider);
-  return reduceActiveAgentTurns(observerState.framesByAgent);
+  ref.watch(appLifecycleProvider);
+  final now =
+      ref.watch(_activeAgentTurnClockProvider).value ?? DateTime.now().toUtc();
+  return reduceActiveAgentTurns(observerState.framesByAgent, now: now);
 });
 
 DateTime _frameTimestamp(ObserverFrame frame) =>
     DateTime.tryParse(frame.timestamp) ??
     DateTime.fromMillisecondsSinceEpoch(frame.seq);
 
+DateTime _localFrameTimestamp(ObserverFrame frame) =>
+    frame.receivedAt ?? _frameTimestamp(frame);
+
 DateTime _safeStartedAt(ObserverFrame frame, DateTime frameAt) {
-  final startedAt = DateTime.tryParse(frame.startedAt ?? '');
-  if (startedAt == null || startedAt.isAfter(frameAt)) return frameAt;
-  return startedAt;
+  final hostFrameAt = DateTime.tryParse(frame.timestamp);
+  final hostStartedAt = DateTime.tryParse(frame.startedAt ?? '');
+  if (hostFrameAt == null ||
+      hostStartedAt == null ||
+      hostStartedAt.isAfter(hostFrameAt)) {
+    return frameAt;
+  }
+  return frameAt.subtract(hostFrameAt.difference(hostStartedAt));
 }
 
 String? _triggeringEventId(dynamic payload) {

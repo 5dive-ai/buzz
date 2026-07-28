@@ -17,6 +17,7 @@ class ObserverFrame {
   final String? sessionId;
   final String? turnId;
   final String? startedAt;
+  final DateTime? receivedAt;
   final dynamic payload;
 
   const ObserverFrame({
@@ -28,10 +29,14 @@ class ObserverFrame {
     this.sessionId,
     this.turnId,
     this.startedAt,
+    this.receivedAt,
     this.payload,
   });
 
-  factory ObserverFrame.fromJson(Map<String, dynamic> json) => ObserverFrame(
+  factory ObserverFrame.fromJson(
+    Map<String, dynamic> json, {
+    DateTime? receivedAt,
+  }) => ObserverFrame(
     seq: json['seq'] as int? ?? 0,
     timestamp: json['timestamp'] as String? ?? '',
     kind: json['kind'] as String? ?? '',
@@ -40,6 +45,7 @@ class ObserverFrame {
     sessionId: json['sessionId'] as String?,
     turnId: json['turnId'] as String?,
     startedAt: json['startedAt'] as String?,
+    receivedAt: receivedAt,
     payload: json['payload'],
   );
 }

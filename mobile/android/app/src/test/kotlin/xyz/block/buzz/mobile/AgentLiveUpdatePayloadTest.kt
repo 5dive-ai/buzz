@@ -13,7 +13,7 @@ class AgentLiveUpdatePayloadTest {
                 "body" to "Working in #agents",
                 "activeCount" to 1,
                 "startedAtMillis" to 1_722_081_600_000L,
-                "timeoutAfterMillis" to 30_000,
+                "expiresAtMillis" to 1_722_110_400_000L,
                 "channelId" to "channel-1",
                 "messageId" to "message-1",
             ),
@@ -24,7 +24,7 @@ class AgentLiveUpdatePayloadTest {
         assertEquals("Working in #agents", payload.body)
         assertEquals(1, payload.activeCount)
         assertEquals(1_722_081_600_000L, payload.startedAtMillis)
-        assertEquals(30_000L, payload.timeoutAfterMillis)
+        assertEquals(1_722_110_400_000L, payload.expiresAtMillis)
         assertEquals("channel-1", payload.channelId)
         assertEquals("message-1", payload.messageId)
     }
@@ -39,7 +39,7 @@ class AgentLiveUpdatePayloadTest {
                     "body" to "Working in #agents",
                     "activeCount" to 0,
                     "startedAtMillis" to 1L,
-                    "timeoutAfterMillis" to 30_000,
+                    "expiresAtMillis" to 30_001,
                     "channelId" to "channel-1",
                 ),
             ),

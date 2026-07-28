@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:buzz/features/channels/agent_activity/active_agent_turns.dart';
 import 'package:buzz/features/channels/agent_activity/agent_live_updates.dart';
 import 'package:flutter/foundation.dart';
@@ -20,6 +22,15 @@ void main() {
     expect(content.activeAgentCount, 1);
     expect(content.channelId, 'channel-1');
     expect(content.messageId, 'message-1');
+    expect(content.expiresAt, DateTime.utc(2026, 7, 27, 20, 0, 10));
+    expect(
+      content.toPlatformArguments()['expiresAtMillis'],
+      content.expiresAt.millisecondsSinceEpoch,
+    );
+    expect(
+      content.toPlatformArguments(),
+      isNot(contains('timeoutAfterMillis')),
+    );
   });
 
   test('aggregates multiple agents and channels into one update', () {
@@ -113,6 +124,42 @@ void main() {
 
     expect(calls, hasLength(1));
     expect(calls.single.method, 'dismiss');
+  });
+
+  test('serializes rapid show and dismiss platform calls', () async {
+    final previousPlatform = debugDefaultTargetPlatformOverride;
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    final calls = <String>[];
+    final showGate = Completer<void>();
+    const channel = MethodChannel('buzz/agent_live_updates');
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      calls.add(call.method);
+      if (call.method == 'show') {
+        await showGate.future;
+      }
+      return true;
+    });
+    addTearDown(() {
+      messenger.setMockMethodCallHandler(channel, null);
+      debugDefaultTargetPlatformOverride = previousPlatform;
+    });
+
+    final content = buildAgentLiveUpdateContent(
+      [_turn(agent: 'agent-a', channel: 'channel-1')],
+      {'channel-1': 'agents'},
+    );
+    final synchronizer = AgentLiveUpdateSynchronizer();
+    final show = synchronizer.sync(content);
+    await Future<void>.delayed(Duration.zero);
+    final dismiss = synchronizer.sync(null);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(calls, ['show']);
+    showGate.complete();
+    await Future.wait([show, dismiss]);
+    expect(calls, ['show', 'dismiss']);
   });
 }
 

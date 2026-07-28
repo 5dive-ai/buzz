@@ -117,7 +117,9 @@ internal class AgentLiveUpdateManager(
             )
             .apply {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    setTimeoutAfter(payload.timeoutAfterMillis)
+                    val remainingLifetime =
+                        (payload.expiresAtMillis - System.currentTimeMillis()).coerceAtLeast(1L)
+                    setTimeoutAfter(remainingLifetime)
                 }
             }
             .build()

@@ -19,7 +19,7 @@ class AgentLiveUpdateDemoActivity : Activity() {
                 body = intent.getStringExtra(EXTRA_BODY) ?: "In #agents",
                 activeCount = intent.getIntExtra(EXTRA_ACTIVE_COUNT, 1),
                 startedAtMillis = System.currentTimeMillis() - DEMO_ELAPSED_MILLIS,
-                timeoutAfterMillis = DEMO_TIMEOUT_MILLIS,
+                expiresAtMillis = System.currentTimeMillis() + DEMO_LIFETIME_MILLIS,
                 channelId = "agents-demo",
                 messageId = null,
             ),
@@ -32,6 +32,6 @@ class AgentLiveUpdateDemoActivity : Activity() {
         private const val EXTRA_BODY = "body"
         private const val EXTRA_ACTIVE_COUNT = "activeCount"
         private const val DEMO_ELAPSED_MILLIS = 32_000L
-        private const val DEMO_TIMEOUT_MILLIS = 10 * 60_000L
+        private const val DEMO_LIFETIME_MILLIS = 8 * 60 * 60_000L
     }
 }

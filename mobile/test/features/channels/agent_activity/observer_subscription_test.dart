@@ -110,7 +110,7 @@ void main() {
       expect(relaySession.filters, hasLength(1));
       final filter = relaySession.filters.first;
       expect(filter.kinds, [EventKind.agentObserverFrame]);
-      expect(filter.limit, 0);
+      expect(filter.limit, 200);
       expect(filter.tags['#p'], contains(myPubkey));
       expect(filter.since, isNull);
     },

@@ -8,6 +8,8 @@ import UserNotifications
   private var mediaUploadChannel: FlutterMethodChannel?
   private var qrScannerChannel: FlutterMethodChannel?
   private var agentLiveUpdateChannel: FlutterMethodChannel?
+  private var inlinePhotoPickerSupportChannel: FlutterMethodChannel?
+  private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
 
   override func application(
     _ application: UIApplication,
@@ -47,7 +49,7 @@ import UserNotifications
           activeCount: 2,
           startedAtMillis: now - 32_000,
           lastActivityAtMillis: now,
-          timeoutAfterMillis: 10 * 60_000,
+          expiresAtMillis: now + 8 * 60 * 60_000,
           channelId: "agents-demo",
           messageId: "agent-live-activity-demo"
         )
@@ -62,27 +64,63 @@ import UserNotifications
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    let messenger = engineBridge.applicationRegistrar.messenger()
     mediaUploadChannel = FlutterMethodChannel(
       name: "buzz/media_upload",
-      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+      binaryMessenger: messenger
     )
     mediaUploadChannel?.setMethodCallHandler { [weak self] call, result in
       self?.handleMediaUploadMethodCall(call, result: result)
     }
     qrScannerChannel = FlutterMethodChannel(
       name: "buzz/qr_scanner",
-      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+      binaryMessenger: messenger
     )
     qrScannerChannel?.setMethodCallHandler { call, result in
       Self.handleQrScannerMethodCall(call, result: result)
     }
     agentLiveUpdateChannel = FlutterMethodChannel(
       name: "buzz/agent_live_updates",
-      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+      binaryMessenger: messenger
     )
     agentLiveUpdateChannel?.setMethodCallHandler { call, result in
       Self.handleAgentLiveUpdateMethodCall(call, result: result)
     }
+    inlinePhotoPickerSupportChannel = FlutterMethodChannel(
+      name: "buzz/inline_photo_picker",
+      binaryMessenger: messenger
+    )
+    inlinePhotoPickerSupportChannel?.setMethodCallHandler { call, result in
+      guard call.method == "isSupported" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      if #available(iOS 17.0, *) {
+        result(true)
+      } else {
+        result(false)
+      }
+    }
+
+    if let inlinePhotoPickerRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzInlinePhotoPicker"
+    ) {
+      inlinePhotoPickerRegistrar.register(
+        InlinePhotoPickerFactory(
+          messenger: messenger,
+          parentViewController: inlinePhotoPickerRegistrar.viewController
+        ),
+        withId: "buzz/inline_photo_picker"
+      )
+    }
+
+    let nativeAttachmentRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzNativeAttachmentPopover"
+    )
+    nativeAttachmentPopoverCoordinator = NativeAttachmentPopoverCoordinator(
+      messenger: messenger,
+      parentViewController: nativeAttachmentRegistrar?.viewController
+    )
   }
 
   private static func handleAgentLiveUpdateMethodCall(

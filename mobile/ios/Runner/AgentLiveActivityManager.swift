@@ -8,7 +8,7 @@ struct AgentLiveActivityPayload: Equatable {
   let activeCount: Int
   let startedAtMillis: Int64
   let lastActivityAtMillis: Int64
-  let timeoutAfterMillis: Int64
+  let expiresAtMillis: Int64
   let channelId: String
   let messageId: String?
 
@@ -23,10 +23,7 @@ struct AgentLiveActivityPayload: Equatable {
   }
 
   var staleDate: Date {
-    Date(
-      timeIntervalSince1970:
-        TimeInterval(lastActivityAtMillis + timeoutAfterMillis) / 1_000
-    )
+    Date(timeIntervalSince1970: TimeInterval(expiresAtMillis) / 1_000)
   }
 
   var deepLink: String {
@@ -54,11 +51,11 @@ struct AgentLiveActivityPayload: Equatable {
       let activeCount = number(values["activeCount"])?.intValue,
       let startedAtMillis = number(values["startedAtMillis"])?.int64Value,
       let lastActivityAtMillis = number(values["lastActivityAtMillis"])?.int64Value,
-      let timeoutAfterMillis = number(values["timeoutAfterMillis"])?.int64Value,
+      let expiresAtMillis = number(values["expiresAtMillis"])?.int64Value,
       activeCount > 0,
       startedAtMillis >= 0,
       lastActivityAtMillis >= startedAtMillis,
-      timeoutAfterMillis > 0
+      expiresAtMillis > lastActivityAtMillis
     else {
       return nil
     }
@@ -69,7 +66,7 @@ struct AgentLiveActivityPayload: Equatable {
       activeCount: activeCount,
       startedAtMillis: startedAtMillis,
       lastActivityAtMillis: lastActivityAtMillis,
-      timeoutAfterMillis: timeoutAfterMillis,
+      expiresAtMillis: expiresAtMillis,
       channelId: channelId,
       messageId: nonEmptyString(values["messageId"])
     )

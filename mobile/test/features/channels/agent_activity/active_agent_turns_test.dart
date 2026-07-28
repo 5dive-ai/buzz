@@ -16,7 +16,7 @@ void main() {
         ),
         _frame(seq: 2, second: 11, kind: 'turn_liveness'),
       ],
-    });
+    }, now: DateTime.utc(2026, 7, 27, 12, 0, 20));
 
     expect(turns, hasLength(1));
     expect(turns.single.agentPubkey, 'agent-a');
@@ -33,7 +33,7 @@ void main() {
         _frame(seq: 1, second: 1, kind: 'turn_started'),
         _frame(seq: 2, second: 2, kind: 'turn_completed'),
       ],
-    });
+    }, now: DateTime.utc(2026, 7, 27, 12, 0, 20));
 
     expect(turns, isEmpty);
   });
@@ -48,7 +48,7 @@ void main() {
           startedAt: DateTime.utc(2026, 7, 27, 12).toIso8601String(),
         ),
       ],
-    });
+    }, now: DateTime.utc(2026, 7, 27, 12, 0, 40));
 
     expect(turns, hasLength(1));
     expect(turns.single.startedAt, DateTime.utc(2026, 7, 27, 12));
@@ -67,10 +67,42 @@ void main() {
           channelId: 'channel-2',
         ),
       ],
-    });
+    }, now: DateTime.utc(2026, 7, 27, 12, 0, 20));
 
     expect(turns.map((turn) => turn.agentPubkey), ['agent-a', 'agent-b']);
     expect(turns.map((turn) => turn.channelId), ['channel-1', 'channel-2']);
+  });
+
+  test('expires a turn when its terminal frame was missed', () {
+    final turns = reduceActiveAgentTurns({
+      'agent-a': [
+        _frame(seq: 1, second: 1, kind: 'turn_started'),
+        _frame(seq: 2, second: 11, kind: 'turn_liveness'),
+      ],
+    }, now: DateTime.utc(2026, 7, 27, 12, 0, 42));
+
+    expect(turns, isEmpty);
+  });
+
+  test('translates host timestamps onto the device clock', () {
+    final receivedAt = DateTime.utc(2026, 7, 27, 12, 0, 10);
+    final turns = reduceActiveAgentTurns({
+      'agent-a': [
+        ObserverFrame(
+          seq: 1,
+          timestamp: DateTime.utc(2026, 7, 27, 13, 0, 10).toIso8601String(),
+          kind: 'turn_started',
+          channelId: 'channel-1',
+          turnId: 'turn-1',
+          startedAt: DateTime.utc(2026, 7, 27, 13).toIso8601String(),
+          receivedAt: receivedAt,
+        ),
+      ],
+    }, now: receivedAt);
+
+    expect(turns, hasLength(1));
+    expect(turns.single.startedAt, DateTime.utc(2026, 7, 27, 12));
+    expect(turns.single.lastActivityAt, receivedAt);
   });
 }
 

@@ -61,8 +61,24 @@ const COOLDOWN: Duration = Duration::from_secs(30);
 /// Consecutive positive observations required before enabling MoA.
 const ENABLE_OBSERVATIONS: u8 = 2;
 
-/// The 503 body mesh-llm returns when MoA is configured but under-provisioned.
+/// The 503 body mesh-llm returns when MoA is configured but under-provisioned
+/// (`mesh-llm-host-runtime/src/network/openai/moa_gateway/mod.rs:56`).
 const MOA_UNAVAILABLE_MESSAGE: &str = "MoA requires ≥2 models available in the mesh";
+
+/// Messages from mesh-llm's *other* failure path: `error_response`
+/// (`mesh-mixture-of-agents/src/lib.rs:1168`) returns a 502 whose body carries
+/// both `error.message` and `error.type = "moa_failure"`.
+///
+/// Goose keeps only the message (`http_status.rs:186-197`), so the type never
+/// reaches us and we have to match the messages themselves. These are every
+/// call site of `error_response` in mesh-llm.
+const MOA_FAILURE_MESSAGES: &[&str] = &[
+    "All MoA workers failed",
+    "All MoA reducers failed",
+    "MoA could not produce a usable answer",
+    "MoA reducer returned no usable answer",
+    "Reducer failed",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Observation {
@@ -110,45 +126,37 @@ fn catalog_supports_collective(catalog: &Value) -> Option<bool> {
 
 /// Did this error mean "the mesh shrank", as opposed to a generic failure?
 ///
-/// The old loop inspected the raw HTTP body (`llm.rs:1362-1388`) and accepted
-/// two shapes: a 503 whose `error.message` is exactly
-/// [`MOA_UNAVAILABLE_MESSAGE`], or any 5xx whose `error.type` is
-/// `moa_failure`.
+/// mesh-llm has two failure paths and both must be caught:
 ///
-/// **We only see what goose leaves us.** `extract_message`
-/// (`goose-providers/src/http_status.rs:186-197`) reduces the payload to
-/// `error.message` when that field exists, and only falls back to the whole
-/// JSON when it does not. So:
+/// * **503, gateway level** — under-provisioned mesh. Plain message, no JSON
+///   (`moa_gateway/mod.rs:56`).
+/// * **502, MoA level** — workers or reducers failed. Body carries
+///   `error.message` *and* `error.type = "moa_failure"`
+///   (`mesh-mixture-of-agents/src/lib.rs:1168`).
 ///
-/// * message shape — always detected (the message survives verbatim);
-/// * `moa_failure` with no `message` — detected (whole JSON survives);
-/// * `moa_failure` *alongside* a `message` — **not** detected, because the
-///   type is discarded before it reaches us. Such a request fails the turn
-///   instead of retrying on `auto`.
+/// Goose reduces a payload to `error.message` when that field exists
+/// (`goose-providers/src/http_status.rs:186-197`), so `moa_failure` never
+/// survives — we match [`MOA_FAILURE_MESSAGES`] instead. That second path is
+/// the *common* one at runtime (a worker dying mid-turn); the 503 only fires
+/// when the mesh is too small to start with.
 ///
-/// That last case is the one behaviour the provider-level wrapper cannot
-/// reproduce; recovering it needs an HTTP-level seam goose does not expose.
-/// mesh-llm's under-provisioned path sends the message shape, which is why the
-/// common case is covered.
-///
-/// Anything else is a real error and must surface — silently retrying every
-/// 5xx as `auto` would mask outages.
+/// Anything else is a real error and must surface — retrying every 5xx as
+/// `auto` would mask outages.
 fn is_mesh_contraction(err: &ProviderError) -> bool {
     let text = err.to_string();
-    if text.contains(MOA_UNAVAILABLE_MESSAGE) {
+    if text.contains(MOA_UNAVAILABLE_MESSAGE)
+        || MOA_FAILURE_MESSAGES.iter().any(|m| text.contains(m))
+    {
         return true;
     }
-    // Provider errors carry the body inline; find the JSON and inspect it.
+    // Fallback for the shape goose passes through whole: `moa_failure` with no
+    // `error.message` field at all.
     let Some(start) = text.find('{') else {
         return false;
     };
     serde_json::from_str::<Value>(&text[start..])
         .ok()
-        .is_some_and(|v| {
-            let message = v.pointer("/error/message").and_then(Value::as_str);
-            let kind = v.pointer("/error/type").and_then(Value::as_str);
-            message == Some(MOA_UNAVAILABLE_MESSAGE) || kind == Some("moa_failure")
-        })
+        .is_some_and(|v| v.pointer("/error/type").and_then(Value::as_str) == Some("moa_failure"))
 }
 
 /// Wraps a provider and applies Buzz's relay-mesh `auto` policy.
@@ -486,18 +494,20 @@ mod tests {
     }
 
     #[test]
-    fn moa_failure_alongside_a_message_is_a_known_blind_spot() {
-        // goose keeps only `error.message`, so `type` never reaches us. This
-        // pins the gap rather than pretending parity: if goose ever preserves
-        // the body, this test flips and we can delete the caveat in the docs.
-        let err = ProviderError::ServerError(
-            "Server error (500) at http://x: upstream exploded".to_string(),
-        );
-        assert!(
-            !is_mesh_contraction(&err),
-            "if this now passes, goose stopped stripping the body -- update the \
-             doc comment on is_mesh_contraction"
-        );
+    fn recognises_moa_worker_and_reducer_failures() {
+        // mesh-llm's 502 path always sends message AND type; goose strips the
+        // type, so these must be caught by message. This is the common runtime
+        // failure — a worker dying mid-turn.
+        for message in [
+            "All MoA workers failed",
+            "MoA could not produce a usable answer",
+            "MoA reducer returned no usable answer",
+            "Reducer failed (tried 3): timeout",
+        ] {
+            let err =
+                ProviderError::ServerError(format!("Server error (502) at http://x: {message}"));
+            assert!(is_mesh_contraction(&err), "missed: {message}");
+        }
     }
 
     #[test]

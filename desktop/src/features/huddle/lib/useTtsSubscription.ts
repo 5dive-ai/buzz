@@ -71,6 +71,11 @@ export function useTtsSubscription(
       },
       () => {},
       false,
+      (routeId, reason) => {
+        console.debug(
+          `[huddle] tts stage=queue status=dropped reason=${reason} route_id=${routeId}`,
+        );
+      },
     );
 
     const deliver = ({

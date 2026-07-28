@@ -112,6 +112,7 @@ export function createOrderedSpeaker(
   speak: (text: string, routeId: number) => Promise<void>,
   onError: (error: unknown) => void,
   initiallyEnabled = true,
+  onDrop: (routeId: number, reason: "disabled") => void = () => {},
 ): {
   enqueue: (text: string, routeId?: number) => "queued" | "disabled";
   setEnabled: (enabled: boolean) => void;
@@ -125,7 +126,10 @@ export function createOrderedSpeaker(
       const queuedGeneration = generation;
       tail = tail
         .then(() => {
-          if (!enabled || generation !== queuedGeneration) return;
+          if (!enabled || generation !== queuedGeneration) {
+            onDrop(routeId, "disabled");
+            return;
+          }
           return speak(text, routeId);
         })
         .catch(onError);

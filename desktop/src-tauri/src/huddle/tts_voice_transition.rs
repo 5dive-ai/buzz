@@ -158,20 +158,40 @@ pub(super) fn retain_cancelled_text(
     preserve_generation: Option<u64>,
 ) {
     if let Some(generation) = preserve_generation {
-        deferred_text.retain(|text| text.generation >= generation);
+        deferred_text.retain(|text| {
+            let preserve = text.generation >= generation;
+            if !preserve {
+                log_cancelled_route(text.route_id, "voice_switch");
+            }
+            preserve
+        });
         if let Some(text) = current_text.take() {
             if text.generation >= generation {
                 deferred_text.push_front(text);
+            } else {
+                log_cancelled_route(text.route_id, "voice_switch");
             }
         }
         while let Ok(text) = text_rx.try_recv() {
             if text.generation >= generation {
                 deferred_text.push_back(text);
+            } else {
+                log_cancelled_route(text.route_id, "voice_switch");
             }
         }
     } else {
-        deferred_text.clear();
-        current_text.take();
-        while text_rx.try_recv().is_ok() {}
+        for text in deferred_text.drain(..) {
+            log_cancelled_route(text.route_id, "barge_in");
+        }
+        if let Some(text) = current_text.take() {
+            log_cancelled_route(text.route_id, "barge_in");
+        }
+        while let Ok(text) = text_rx.try_recv() {
+            log_cancelled_route(text.route_id, "barge_in");
+        }
     }
+}
+
+fn log_cancelled_route(route_id: u64, reason: &str) {
+    eprintln!("buzz-desktop: tts stage=queue status=dropped reason={reason} route_id={route_id}");
 }

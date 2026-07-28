@@ -187,17 +187,23 @@ test("queues agent messages in live thread arrival order", async () => {
 
 test("disabling cancels queued speech and rejects new messages until enabled", async () => {
   const invoked = [];
+  const dropped = [];
   let releaseFirst;
   const firstBlocked = new Promise((resolve) => {
     releaseFirst = resolve;
   });
-  const speaker = createOrderedSpeaker(async (text) => {
-    invoked.push(text);
-    if (text === "first") await firstBlocked;
-  }, assert.fail);
+  const speaker = createOrderedSpeaker(
+    async (text) => {
+      invoked.push(text);
+      if (text === "first") await firstBlocked;
+    },
+    assert.fail,
+    true,
+    (routeId, reason) => dropped.push([routeId, reason]),
+  );
 
-  speaker.enqueue("first");
-  speaker.enqueue("queued-before-off");
+  speaker.enqueue("first", 51);
+  speaker.enqueue("queued-before-off", 52);
   await Promise.resolve();
   speaker.setEnabled(false);
   speaker.enqueue("while-off");
@@ -207,6 +213,7 @@ test("disabling cancels queued speech and rejects new messages until enabled", a
   speaker.enqueue("after-on");
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(invoked, ["first", "after-on"]);
+  assert.deepEqual(dropped, [[52, "disabled"]]);
 });
 
 test("does not speak before the native enabled state is known", async () => {

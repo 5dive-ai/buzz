@@ -218,7 +218,99 @@ test("reconcileSentThreadReply_echoArrivedFirst_staysSingleEntry", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. Error rollback: failed pending goes, in-flight live replies stay
+// 6. Concurrent identical replies: every echo/success interleaving keeps both
+// ---------------------------------------------------------------------------
+//
+// Two in-flight replies with the same author/content/root are semantically
+// indistinguishable, so echo reconciliation must never let a later event
+// steal a key already owned by a confirmed row (that eviction was the
+// concurrent-identical-replies blocker: echo1 → success1 → echo2 → success2
+// left only real-2 in the cache). Each success and each echo may arrive in
+// any order relative to the others, so we run the full 4! ordering matrix.
+
+test("concurrentIdenticalReplies_allEchoSuccessOrderings_keepBothAcceptedEvents", () => {
+  const operationNames = ["echo1", "success1", "echo2", "success2"];
+
+  function permutations(items) {
+    if (items.length <= 1) return [items];
+    return items.flatMap((item, index) =>
+      permutations([...items.slice(0, index), ...items.slice(index + 1)]).map(
+        (rest) => [item, ...rest],
+      ),
+    );
+  }
+
+  for (const ordering of permutations(operationNames)) {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(channelMessagesKey(CHANNEL_ID), [
+      makeEvent({ id: "root-1", content: "thread root" }),
+    ]);
+    const pending1 = makePendingReply(queryClient, "root-1", "same reply");
+    const threadKey = insertPendingThreadReply(
+      queryClient,
+      CHANNEL_ID,
+      pending1,
+    );
+    const pending2 = makePendingReply(queryClient, "root-1", "same reply");
+    insertPendingThreadReply(queryClient, CHANNEL_ID, pending2);
+
+    const confirmed = {
+      1: makeEvent({ id: "real-1", parentId: "root-1", content: "same reply" }),
+      2: makeEvent({ id: "real-2", parentId: "root-1", content: "same reply" }),
+    };
+    const operations = {
+      echo1: () =>
+        queryClient.setQueryData(
+          threadKey,
+          mergeMessages(queryClient.getQueryData(threadKey), confirmed[1]),
+        ),
+      echo2: () =>
+        queryClient.setQueryData(
+          threadKey,
+          mergeMessages(queryClient.getQueryData(threadKey), confirmed[2]),
+        ),
+      success1: () =>
+        reconcileSentThreadReply(
+          queryClient,
+          threadKey,
+          pending1.id,
+          confirmed[1],
+        ),
+      success2: () =>
+        reconcileSentThreadReply(
+          queryClient,
+          threadKey,
+          pending2.id,
+          confirmed[2],
+        ),
+    };
+
+    for (const name of ordering) {
+      operations[name]();
+    }
+
+    const label = ordering.join(" → ");
+    const cached = queryClient.getQueryData(threadKey);
+    assert.deepEqual(
+      cached.map((event) => event.id).sort(),
+      ["real-1", "real-2"],
+      `${label}: both accepted events must survive`,
+    );
+    assert.ok(
+      cached.every((event) => !event.pending),
+      `${label}: no pending rows may remain`,
+    );
+    const localKeys = new Set(cached.map((event) => event.localKey));
+    assert.equal(
+      localKeys.size,
+      2,
+      `${label}: confirmed rows must keep distinct render keys`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 7. Error rollback: failed pending goes, in-flight live replies stay
 // ---------------------------------------------------------------------------
 
 test("rollbackPendingThreadReply_removesPendingKeepsInFlightLiveReplies", () => {

@@ -280,10 +280,7 @@ pub fn channel_members_from_event(event: &Event) -> Result<ChannelMembersRespons
 
 // ── kind:0 (profile metadata) ───────────────────────────────────────────────
 
-/// Convert a kind:0 metadata event to [`ProfileInfo`].
-///
-/// The event's `content` is a JSON object per NIP-01:
-/// `{"name":"...","display_name":"...","picture":"...","about":"...","nip05":"..."}`.
+/// Convert a kind:0 profile metadata event to [`ProfileInfo`].
 pub fn profile_info_from_event(event: &Event) -> Result<ProfileInfo, String> {
     let v: Value = serde_json::from_str(&event.content)
         .map_err(|e| format!("kind:0 content is not valid JSON: {e}"))?;
@@ -309,10 +306,8 @@ pub fn profile_info_from_event(event: &Event) -> Result<ProfileInfo, String> {
     })
 }
 
-/// Convert multiple kind:0 events to [`UsersBatchResponse`].
-///
-/// `requested_pubkeys` lets us populate `missing` for any pubkey that had
-/// no metadata event in the input set.
+/// Convert the most recent kind:0 event per pubkey to [`UsersBatchResponse`].
+/// Requested pubkeys without metadata are returned separately.
 pub fn users_batch_from_events(
     events: &[Event],
     requested_pubkeys: &[String],

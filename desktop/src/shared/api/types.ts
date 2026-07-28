@@ -108,7 +108,7 @@ export type { Identity, IdentityStorage } from "./identityTypes";
 export type Profile = {
   pubkey: string;
   displayName: string | null;
-  /** Relay-authoritative corporate display identity bound to this pubkey. */
+  /** Relay-authoritative display identity bound to this pubkey. */
   verifiedName?: string | null;
   avatarUrl: string | null;
   about: string | null;
@@ -123,7 +123,7 @@ export type Profile = {
 
 export type UserProfileSummary = {
   displayName: string | null;
-  /** Relay-authoritative corporate display identity bound to this pubkey. */
+  /** Relay-authoritative display identity bound to this pubkey. */
   verifiedName?: string | null;
   /** Kind-0 `name` field, kept separate from `displayName` so @mention text
    * can be matched against either alias (agents/CLI resolve mentions against

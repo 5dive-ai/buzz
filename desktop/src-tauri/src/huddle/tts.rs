@@ -488,18 +488,17 @@ fn tts_worker(
 
         // Split into sentences, then group into synthesis chunks: the first
         // sentence stays alone (fast time-to-first-audio), the rest pack
-        // greedily up to MAX_CHUNK_CHARS. Each chunk is one `generate()`
-        // call; playback of chunk N overlaps synthesis of chunk N+1
-        // (lookahead pipelining). The Pocket engine applies its exact 50-token
-        // limit internally; keeping those internal units within one playback
-        // chunk avoids adding fades and pauses at token-only boundaries.
+        // greedily up to MAX_CHUNK_CHARS. Playback of each model unit overlaps
+        // synthesis of the next one. The Pocket engine applies its exact
+        // 50-token split; keeping those units within one playback chunk avoids
+        // adding fades and pauses at token-only boundaries.
         let sentences: Vec<String> = split_sentences(&text)
             .into_iter()
             .filter(|s| !s.trim().is_empty())
             .collect();
         let chunks = group_sentences_into_chunks(&sentences, MAX_CHUNK_CHARS);
 
-        for chunk in &chunks {
+        'playback_chunks: for chunk in &chunks {
             if handle_cancel_or_shutdown(
                 &cancel,
                 &shutdown,
@@ -516,51 +515,76 @@ fn tts_worker(
                 continue;
             }
 
-            match engine.synth_chunk(text, "en", &style, SYNTH_STEPS) {
-                Ok(samples) if !samples.is_empty() => {
-                    let mut audio = clamp_to_full_scale(samples);
-                    // Fade-out only — fading-in would attenuate the consonant
-                    // onset (see `apply_fade_out` docstring + the
-                    // 2026-05-18 "first little sound is missing" regression).
-                    apply_fade_out(&mut audio);
-
-                    // Build one contiguous buffer per synthesized sentence:
-                    // lead-in cushion + audio + trailing gap. Keeping this as
-                    // a single rodio source preserves the original queue/drain
-                    // semantics (one append per sentence) while still giving
-                    // every chunk a quiet device warm-up window.
-                    let buf =
-                        build_sentence_append_buffer(&mut first_append, audio, silence_buf_len);
-
-                    // Check-and-append under `player_ops`, serialized with
-                    // the monitor: a barge-in may have arrived during
-                    // synthesis (the blocking window the monitor thread
-                    // exists for). Don't append the now-stale sentence — the
-                    // human interrupted; speaking it anyway would talk over
-                    // them. Holding the lock for the check + append means the
-                    // monitor can never clear between our check passing and
-                    // the buffer landing. The flag is deliberately NOT
-                    // consumed here: the loop-top handle_cancel_or_shutdown
-                    // does the full consume (drain queue, reset lead-in) on
-                    // the next iteration.
-                    let _ops = lock_player_ops(&player_ops);
-                    if cancel.load(Ordering::Acquire) {
-                        // Nothing appended; the loop-top consume re-arms
-                        // `first_append` (the flag is still set — the worker
-                        // is its only consumer).
-                        break;
-                    }
-                    player.append(SamplesBuffer::new(channels, rate, buf));
-                    // NOTE: tts_active is set AFTER player.append(), not
-                    // before. Setting it before synthesis would cause STT to
-                    // discard user speech during the synthesis window as
-                    // "echo" even though no audio is actually playing yet.
-                    // See crossfire review C3.
-                    tts_active.store(true, Ordering::Release);
+            let model_chunks = match engine.split_text_into_chunks(text) {
+                Ok(model_chunks) => model_chunks,
+                Err(error) => {
+                    eprintln!("buzz-desktop: TTS chunking failed: {error}");
+                    break;
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("buzz-desktop: TTS synth failed: {e}");
+            };
+            let model_chunk_count = model_chunks.len();
+            for (model_chunk_index, model_chunk) in model_chunks.iter().enumerate() {
+                if handle_cancel_or_shutdown(
+                    &cancel,
+                    &shutdown,
+                    &tts_active,
+                    &text_rx,
+                    Some((&player, &player_ops)),
+                ) {
+                    first_append = true;
+                    break 'playback_chunks;
+                }
+
+                let ends_playback_chunk = model_chunk_index + 1 == model_chunk_count;
+                match engine.synth_chunk(model_chunk, "en", &style, SYNTH_STEPS) {
+                    Ok(samples) if !samples.is_empty() => {
+                        let mut audio = clamp_to_full_scale(samples);
+                        if ends_playback_chunk {
+                            // Fade only at the playback-chunk boundary. Applying
+                            // it at the model's internal token boundary would
+                            // create an audible dip between contiguous units.
+                            apply_fade_out(&mut audio);
+                        }
+
+                        let buf = build_sentence_append_buffer(
+                            &mut first_append,
+                            audio,
+                            silence_buf_len,
+                            model_chunk_index == 0,
+                            ends_playback_chunk,
+                        );
+
+                        // Check-and-append under `player_ops`, serialized with
+                        // the monitor: a barge-in may have arrived during
+                        // synthesis (the blocking window the monitor thread
+                        // exists for). Don't append the now-stale sentence — the
+                        // human interrupted; speaking it anyway would talk over
+                        // them. Holding the lock for the check + append means the
+                        // monitor can never clear between our check passing and
+                        // the buffer landing. The flag is deliberately NOT
+                        // consumed here: the loop-top handle_cancel_or_shutdown
+                        // does the full consume (drain queue, reset lead-in) on
+                        // the next iteration.
+                        let _ops = lock_player_ops(&player_ops);
+                        if cancel.load(Ordering::Acquire) {
+                            // Nothing appended; the loop-top consume re-arms
+                            // `first_append` (the flag is still set — the worker
+                            // is its only consumer).
+                            break;
+                        }
+                        player.append(SamplesBuffer::new(channels, rate, buf));
+                        // NOTE: tts_active is set AFTER player.append(), not
+                        // before. Setting it before synthesis would cause STT to
+                        // discard user speech during the synthesis window as
+                        // "echo" even though no audio is actually playing yet.
+                        // See crossfire review C3.
+                        tts_active.store(true, Ordering::Release);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("buzz-desktop: TTS synth failed: {e}");
+                        break 'playback_chunks;
+                    }
                 }
             }
         }
@@ -696,18 +720,34 @@ fn apply_fade_out(samples: &mut [f32]) {
 /// The worker uses it in the idle branch of the main loop to distinguish
 /// "never queued anything since last drain" from "drained after speaking",
 /// which controls when `tts_active` is released and the lead-in re-armed.
+/// Add silence only at the outer playback boundary.
+///
+/// A playback chunk may contain several model-sized synthesis units. The first
+/// unit receives the onset cushion, the last receives the remaining gap, and
+/// intermediate units stay sample-contiguous.
 fn build_sentence_append_buffer(
     first_append: &mut bool,
     audio: Vec<f32>,
     silence_buf_len: usize,
+    starts_playback_chunk: bool,
+    ends_playback_chunk: bool,
 ) -> Vec<f32> {
     if *first_append {
         *first_append = false;
     }
 
-    let trailing_silence_len = silence_buf_len.saturating_sub(SENTENCE_LEAD_IN_SAMPLES);
-    let mut buf = Vec::with_capacity(SENTENCE_LEAD_IN_SAMPLES + audio.len() + trailing_silence_len);
-    buf.extend(std::iter::repeat_n(0.0_f32, SENTENCE_LEAD_IN_SAMPLES));
+    let lead_in_len = if starts_playback_chunk {
+        SENTENCE_LEAD_IN_SAMPLES
+    } else {
+        0
+    };
+    let trailing_silence_len = if ends_playback_chunk {
+        silence_buf_len.saturating_sub(SENTENCE_LEAD_IN_SAMPLES)
+    } else {
+        0
+    };
+    let mut buf = Vec::with_capacity(lead_in_len + audio.len() + trailing_silence_len);
+    buf.extend(std::iter::repeat_n(0.0_f32, lead_in_len));
     buf.extend(audio);
     buf.extend(std::iter::repeat_n(0.0_f32, trailing_silence_len));
     buf

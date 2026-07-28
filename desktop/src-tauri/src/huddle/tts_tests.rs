@@ -812,6 +812,8 @@ fn lead_in_pad_is_present_for_every_sentence_chunk() {
             &mut first,
             vec![0.5_f32; SENTENCE_AUDIO_LEN],
             SILENCE_BUF_LEN,
+            true,
+            true,
         );
 
         assert_eq!(buf.len(), SENTENCE_AUDIO_LEN + SILENCE_BUF_LEN);
@@ -840,11 +842,11 @@ fn lead_in_pad_is_present_for_every_sentence_chunk() {
 #[test]
 fn build_sentence_append_buffer_flips_first_append() {
     let mut first = true;
-    let _ = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400);
+    let _ = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400, true, true);
     assert!(!first, "first call must flip the flag");
 
     // Subsequent call: still has a per-sentence lead-in, flag stays false.
-    let buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400);
+    let buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400, true, true);
     assert!(buf[..SENTENCE_LEAD_IN_SAMPLES].iter().all(|&s| s == 0.0));
     assert!(!first);
 }
@@ -853,7 +855,7 @@ fn build_sentence_append_buffer_flips_first_append() {
 #[test]
 fn first_sentence_leading_silence_is_exactly_lead_in() {
     let mut first = true;
-    let buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400);
+    let buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400, true, true);
     assert!(buf[..SENTENCE_LEAD_IN_SAMPLES].iter().all(|&s| s == 0.0));
     assert_eq!(buf[SENTENCE_LEAD_IN_SAMPLES], 0.5);
 }
@@ -863,8 +865,10 @@ fn first_sentence_leading_silence_is_exactly_lead_in() {
 fn sentence_gap_budget_is_preserved() {
     let mut first = true;
     let silence_buf_len = 2400;
-    let first_buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], silence_buf_len);
-    let second_buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], silence_buf_len);
+    let first_buf =
+        build_sentence_append_buffer(&mut first, vec![0.5; 100], silence_buf_len, true, true);
+    let second_buf =
+        build_sentence_append_buffer(&mut first, vec![0.5; 100], silence_buf_len, true, true);
 
     let first_tail = &first_buf[SENTENCE_LEAD_IN_SAMPLES + 100..];
     let second_lead = &second_buf[..SENTENCE_LEAD_IN_SAMPLES];
@@ -877,7 +881,7 @@ fn sentence_gap_budget_is_preserved() {
 #[test]
 fn sentence_append_buffer_is_one_contiguous_source() {
     let mut first = true;
-    let buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400);
+    let buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400, true, true);
 
     assert_eq!(buf.len(), 2400 + 100);
     assert!(buf[..SENTENCE_LEAD_IN_SAMPLES].iter().all(|&s| s == 0.0));
@@ -886,6 +890,23 @@ fn sentence_append_buffer_is_one_contiguous_source() {
             .iter()
             .all(|&s| s == 0.5)
     );
+}
+
+/// Model-token splits remain contiguous: only the playback chunk as a whole
+/// receives its onset cushion and trailing sentence gap.
+#[test]
+fn token_split_units_do_not_add_sentence_boundary_padding() {
+    let mut first = true;
+    let silence_buf_len = 2400;
+    let first_unit =
+        build_sentence_append_buffer(&mut first, vec![0.5; 100], silence_buf_len, true, false);
+    let last_unit =
+        build_sentence_append_buffer(&mut first, vec![0.25; 100], silence_buf_len, false, true);
+
+    assert_eq!(first_unit.len(), SENTENCE_LEAD_IN_SAMPLES + 100);
+    assert_eq!(first_unit.last(), Some(&0.5));
+    assert_eq!(last_unit.first(), Some(&0.25));
+    assert_eq!(first_unit.len() + last_unit.len(), 200 + silence_buf_len);
 }
 
 // ── clamp_to_full_scale tests ─────────────────────────────────────────────

@@ -367,7 +367,14 @@ pub async fn mint_agent_card(
 }
 
 /// Fetch an avatar over HTTP with a hard size cap.
+///
+/// The cap bounds network and memory, not just the final buffer: the
+/// Content-Length header is checked before any body bytes are read, and the
+/// body is streamed with a running count so a missing or dishonest header
+/// still cannot exceed the cap (same contract as `media_download.rs`).
 async fn fetch_avatar(url: &str) -> Result<Vec<u8>, String> {
+    use futures_util::StreamExt;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -380,14 +387,31 @@ async fn fetch_avatar(url: &str) -> Result<Vec<u8>, String> {
     if !resp.status().is_success() {
         return Err(format!("Avatar fetch failed: HTTP {}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read avatar bytes: {e}"))?;
-    if bytes.len() > MAX_AVATAR_FETCH_BYTES {
+
+    if let Some(content_length) = resp.content_length() {
+        if content_length > MAX_AVATAR_FETCH_BYTES as u64 {
+            return Err("Agent avatar is too large to use as card input.".to_string());
+        }
+    }
+
+    let mut bytes = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Failed to read avatar bytes: {e}"))?;
+        append_within_avatar_cap(&mut bytes, &chunk)?;
+    }
+    Ok(bytes)
+}
+
+/// Append a body chunk to the avatar buffer, rejecting before the append if
+/// the total would cross `MAX_AVATAR_FETCH_BYTES`. Split out so the cap
+/// boundary is unit-testable without an HTTP server.
+fn append_within_avatar_cap(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
+    if buf.len() + chunk.len() > MAX_AVATAR_FETCH_BYTES {
         return Err("Agent avatar is too large to use as card input.".to_string());
     }
-    Ok(bytes.to_vec())
+    buf.extend_from_slice(chunk);
+    Ok(())
 }
 
 /// Save previously minted card bytes to disk via the OS save dialog.
@@ -511,6 +535,25 @@ mod tests {
 
         let no_output = serde_json::json!({});
         assert!(extract_card_output(&no_output).is_err());
+    }
+
+    #[test]
+    fn avatar_cap_rejects_before_appending_crossing_chunk() {
+        // The streaming accumulator must reject a chunk that would cross the
+        // cap BEFORE buffering it — this is what bounds memory when
+        // Content-Length is missing or dishonest.
+        let mut buf = vec![0u8; MAX_AVATAR_FETCH_BYTES - 1];
+        assert!(append_within_avatar_cap(&mut buf, &[0u8]).is_ok());
+        assert_eq!(buf.len(), MAX_AVATAR_FETCH_BYTES);
+        // Exactly at the cap: one more byte must fail and not grow the buffer.
+        assert!(append_within_avatar_cap(&mut buf, &[0u8]).is_err());
+        assert_eq!(buf.len(), MAX_AVATAR_FETCH_BYTES);
+
+        // A single oversized chunk is rejected outright.
+        let mut fresh = Vec::new();
+        let oversized = vec![0u8; MAX_AVATAR_FETCH_BYTES + 1];
+        assert!(append_within_avatar_cap(&mut fresh, &oversized).is_err());
+        assert!(fresh.is_empty());
     }
 
     #[test]

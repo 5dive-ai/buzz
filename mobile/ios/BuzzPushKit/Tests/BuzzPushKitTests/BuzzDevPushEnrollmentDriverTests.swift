@@ -15,6 +15,7 @@
     private static let firstChallengeId = "11111111-1111-4111-8111-111111111111"
     private static let secondChallengeId = "33333333-3333-4333-8333-333333333333"
     private static let installationHandle = "22222222-2222-4222-8222-222222222222"
+    private static let installationId = "000102030405060708090a0b0c0d0e0f"
     private static let challenge = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
     private static let now: Int64 = 1_752_620_000
     private static let expiresAt: Int64 = 1_752_624_000
@@ -118,6 +119,7 @@
       )
 
       XCTAssertEqual(appAttest.clientData.count, 2)
+      XCTAssertEqual(record.relayOrigin, "wss://relay.example")
       try assertMatchesVector(
         "enroll",
         actual: appAttest.clientData[0],
@@ -143,17 +145,73 @@
       XCTAssertEqual(
         record,
         BuzzPushEndpointGrantRecord(
-          relayOrigin: "wss://relay.example/",
+          relayOrigin: "wss://relay.example",
           relayPubkey: Self.relayPubkey,
+          installationId: Self.installationId,
           endpointGrant: "opaque-grant",
           endpointHash: Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init)))),
           appProfile: "buzz-ios-sandbox",
           endpointEpoch: 1,
           generation: 1,
+          publishedGeneration: nil,
           expiresAt: Self.expiresAt
         )
       )
       XCTAssertEqual(store.saved, [record])
+    }
+
+    func testRelayOriginPreservesNonDefaultPortWithoutTrailingSlash() async throws {
+      let relayURL = URL(string: "wss://relay.example:8443/")!
+      let store = MemoryGrantStore()
+      let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+      var challengeCount = 0
+      URLProtocolStub.handler = { request in
+        switch (request.httpMethod, request.url?.absoluteString) {
+        case ("GET", "https://relay.example:8443/"):
+          return Self.response(
+            request,
+            status: 200,
+            json: ["push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]]]
+          )
+        case ("POST", "http://push.example/v1/installations/challenges"):
+          challengeCount += 1
+          return Self.response(
+            request,
+            status: 200,
+            json: [
+              "challenge_id": challengeCount == 1 ? Self.firstChallengeId : Self.secondChallengeId,
+              "challenge": Self.challenge,
+              "expires_at": Self.now + 300,
+            ]
+          )
+        case ("POST", "http://push.example/v1/installations"):
+          return Self.response(
+            request,
+            status: 201,
+            json: [
+              "installation_handle": Self.installationHandle,
+              "endpoint_epoch": 1,
+              "expires_at": Self.expiresAt,
+            ]
+          )
+        case ("POST", "http://push.example/v1/delegations"):
+          return Self.response(
+            request,
+            status: 201,
+            json: ["endpoint_grant": "opaque-grant"]
+          )
+        default:
+          XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+          return Self.response(request, status: 500, json: [:])
+        }
+      }
+
+      let record = try await driver.enroll(
+        deviceToken: Data((1...32).map(UInt8.init)),
+        relayURL: relayURL
+      )
+
+      XCTAssertEqual(record.relayOrigin, "wss://relay.example:8443")
     }
 
     func testDevelopmentAttestationMatchesGatewayBypassShape() throws {
@@ -177,13 +235,15 @@
 
     func testReusesPersistedUnexpiredGrant() async throws {
       let existing = BuzzPushEndpointGrantRecord(
-        relayOrigin: "wss://relay.example/",
+        relayOrigin: "wss://relay.example",
         relayPubkey: Self.relayPubkey,
+        installationId: Self.installationId,
         endpointGrant: "existing-grant",
         endpointHash: Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init)))),
         appProfile: "buzz-ios-sandbox",
         endpointEpoch: 1,
         generation: 1,
+        publishedGeneration: 1,
         expiresAt: Self.expiresAt
       )
       let store = MemoryGrantStore(records: [existing])
@@ -206,8 +266,86 @@
       )
 
       XCTAssertEqual(record, existing)
+      XCTAssertEqual(record.publishedGeneration, 1)
       XCTAssertEqual(store.saved, [existing])
       XCTAssertEqual(URLProtocolStub.requests.count, 1)
+    }
+
+    func testExpiredGrantRefreshReusesInstallationIdAndIncrementsGeneration() async throws {
+      let existing = BuzzPushEndpointGrantRecord(
+        relayOrigin: "wss://relay.example",
+        relayPubkey: Self.relayPubkey,
+        installationId: Self.installationId,
+        endpointGrant: "existing-grant",
+        endpointHash: Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init)))),
+        appProfile: "buzz-ios-sandbox",
+        endpointEpoch: 1,
+        generation: 7,
+        publishedGeneration: 7,
+        expiresAt: Self.now + 300
+      )
+      let store = MemoryGrantStore(records: [existing])
+      let driver = try makeDriver(
+        store: store,
+        appAttest: RecordingAppAttest(),
+        installationIdBytes: {
+          XCTFail("Grant refresh must reuse the persisted installation id")
+          return Data(repeating: 0xFF, count: 16)
+        }
+      )
+      var challengeCount = 0
+      URLProtocolStub.handler = { request in
+        switch (request.httpMethod, request.url?.absoluteString) {
+        case ("GET", "https://relay.example/"):
+          return Self.response(
+            request,
+            status: 200,
+            json: ["push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]]]
+          )
+        case ("POST", "http://push.example/v1/installations/challenges"):
+          challengeCount += 1
+          return Self.response(
+            request,
+            status: 200,
+            json: [
+              "challenge_id": challengeCount == 1 ? Self.firstChallengeId : Self.secondChallengeId,
+              "challenge": Self.challenge,
+              "expires_at": Self.now + 300,
+            ]
+          )
+        case ("POST", "http://push.example/v1/installations"):
+          return Self.response(
+            request,
+            status: 201,
+            json: [
+              "installation_handle": Self.installationHandle,
+              "endpoint_epoch": 1,
+              "expires_at": Self.expiresAt,
+            ]
+          )
+        case ("POST", "http://push.example/v1/delegations"):
+          let body = try Self.body(request)
+          XCTAssertEqual(body["generation"] as? Int, 8)
+          return Self.response(
+            request,
+            status: 201,
+            json: ["endpoint_grant": "refreshed-grant"]
+          )
+        default:
+          XCTFail("Unexpected request \(request.url?.absoluteString ?? "nil")")
+          return Self.response(request, status: 500, json: [:])
+        }
+      }
+
+      let record = try await driver.enroll(
+        deviceToken: Data((1...32).map(UInt8.init)),
+        relayURL: Self.relayURL
+      )
+
+      XCTAssertEqual(record.installationId, Self.installationId)
+      XCTAssertEqual(record.generation, 8)
+      XCTAssertNil(record.publishedGeneration)
+      XCTAssertEqual(record.endpointGrant, "refreshed-grant")
     }
 
     func testRejectsMultipleCurrentRelayKeysBeforeGatewayEnrollment() async throws {
@@ -267,7 +405,10 @@
 
     private func makeDriver(
       store: BuzzPushEndpointGrantStore,
-      appAttest: BuzzDevAppAttesting
+      appAttest: BuzzDevAppAttesting,
+      installationIdBytes: @escaping () throws -> Data = {
+        Data(0..<16)
+      }
     ) throws -> BuzzDevPushEnrollmentDriver {
       let configuration = URLSessionConfiguration.ephemeral
       configuration.protocolClasses = [URLProtocolStub.self]
@@ -277,7 +418,8 @@
         session: URLSession(configuration: configuration),
         appAttest: appAttest,
         now: { Date(timeIntervalSince1970: TimeInterval(Self.now)) },
-        lifetimeSeconds: Self.expiresAt - Self.now
+        lifetimeSeconds: Self.expiresAt - Self.now,
+        installationIdBytes: installationIdBytes
       )
     }
 
@@ -386,6 +528,30 @@
     init(records: [BuzzPushEndpointGrantRecord] = []) { saved = records }
     func records() throws -> [BuzzPushEndpointGrantRecord] { saved }
     func save(_ record: BuzzPushEndpointGrantRecord) throws { saved = [record] }
+    func markPublished(relayOrigin: String, appProfile: String, generation: Int64) throws {
+      precondition(generation > 0, "Published push lease generation must be positive")
+      guard
+        let current = saved.first(where: {
+          $0.relayOrigin == relayOrigin && $0.appProfile == appProfile
+        }), current.generation == generation
+      else {
+        throw NSError(domain: "MemoryGrantStore", code: 1)
+      }
+      saved = [
+        BuzzPushEndpointGrantRecord(
+          relayOrigin: current.relayOrigin,
+          relayPubkey: current.relayPubkey,
+          installationId: current.installationId,
+          endpointGrant: current.endpointGrant,
+          endpointHash: current.endpointHash,
+          appProfile: current.appProfile,
+          endpointEpoch: current.endpointEpoch,
+          generation: current.generation,
+          publishedGeneration: generation,
+          expiresAt: current.expiresAt
+        )
+      ]
+    }
   }
 
   private final class RecordingAppAttest: BuzzDevAppAttesting {

@@ -118,6 +118,8 @@ import UserNotifications
     #if DEBUG
       case "devEnrollPush":
         handleDevPushEnrollment(call, result: result)
+      case "devMarkPushLeasePublished":
+        handleDevPushLeasePublished(call, result: result)
     #endif
     default:
       result(FlutterMethodNotImplemented)
@@ -194,6 +196,45 @@ import UserNotifications
           FlutterError(
             code: "dev_enrollment_configuration_failed",
             message: "Development push enrollment is not configured.",
+            details: error.localizedDescription
+          )
+        )
+      }
+    }
+
+    private func handleDevPushLeasePublished(
+      _ call: FlutterMethodCall,
+      result: @escaping FlutterResult
+    ) {
+      guard let arguments = call.arguments as? [String: Any],
+        let relayOrigin = arguments["relayOrigin"] as? String,
+        let appProfile = arguments["appProfile"] as? String,
+        let generation = (arguments["generation"] as? NSNumber)?.int64Value,
+        !relayOrigin.isEmpty,
+        !appProfile.isEmpty,
+        generation > 0
+      else {
+        result(
+          FlutterError(
+            code: "invalid_arguments",
+            message: "Published push lease state requires relayOrigin, appProfile, and generation.",
+            details: nil
+          )
+        )
+        return
+      }
+      do {
+        try endpointGrantStore.markPublished(
+          relayOrigin: relayOrigin,
+          appProfile: appProfile,
+          generation: generation
+        )
+        result(nil)
+      } catch {
+        result(
+          FlutterError(
+            code: "push_lease_state_write_failed",
+            message: "Unable to persist the published push lease generation.",
             details: error.localizedDescription
           )
         )

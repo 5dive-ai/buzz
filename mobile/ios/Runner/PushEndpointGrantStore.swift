@@ -41,7 +41,61 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
       $0.relayOrigin == record.relayOrigin && $0.appProfile == record.appProfile
     }
     all.append(record)
-    let data = try JSONEncoder().encode(all)
+    try replace(all)
+  }
+
+  func markPublished(relayOrigin: String, appProfile: String, generation: Int64) throws {
+    precondition(generation > 0, "Published push lease generation must be positive")
+    var all = try records()
+    guard
+      let index = all.firstIndex(where: {
+        $0.relayOrigin == relayOrigin && $0.appProfile == appProfile
+      })
+    else {
+      throw NSError(
+        domain: "BuzzPushEndpointGrantStore",
+        code: 2,
+        userInfo: [NSLocalizedDescriptionKey: "Cannot mark a missing endpoint grant as published."]
+      )
+    }
+    let current = all[index]
+    guard current.publishedGeneration == nil else {
+      throw NSError(
+        domain: "BuzzPushEndpointGrantStore",
+        code: 3,
+        userInfo: [
+          NSLocalizedDescriptionKey:
+            "Push lease generation \(current.publishedGeneration!) is already marked as published."
+        ]
+      )
+    }
+    guard current.generation == generation else {
+      throw NSError(
+        domain: "BuzzPushEndpointGrantStore",
+        code: 4,
+        userInfo: [
+          NSLocalizedDescriptionKey:
+            "Published generation \(generation) does not match stored grant generation \(current.generation)."
+        ]
+      )
+    }
+    all[index] = BuzzPushEndpointGrantRecord(
+      relayOrigin: current.relayOrigin,
+      relayPubkey: current.relayPubkey,
+      installationId: current.installationId,
+      endpointGrant: current.endpointGrant,
+      endpointHash: current.endpointHash,
+      appProfile: current.appProfile,
+      endpointEpoch: current.endpointEpoch,
+      generation: current.generation,
+      publishedGeneration: generation,
+      expiresAt: current.expiresAt
+    )
+    try replace(all)
+  }
+
+  private func replace(_ records: [BuzzPushEndpointGrantRecord]) throws {
+    let data = try JSONEncoder().encode(records)
     let updateStatus = SecItemUpdate(
       baseQuery() as CFDictionary,
       [kSecValueData as String: data] as CFDictionary
@@ -86,9 +140,10 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
 
 extension BuzzPushEndpointGrantRecord {
   var flutterArguments: [String: Any] {
-    [
+    var arguments: [String: Any] = [
       "relayOrigin": relayOrigin,
       "relayPubkey": relayPubkey,
+      "installationId": installationId,
       "endpointGrant": endpointGrant,
       "endpointHash": endpointHash,
       "appProfile": appProfile,
@@ -96,5 +151,9 @@ extension BuzzPushEndpointGrantRecord {
       "generation": generation,
       "expiresAt": expiresAt,
     ]
+    if let publishedGeneration {
+      arguments["publishedGeneration"] = publishedGeneration
+    }
+    return arguments
   }
 }

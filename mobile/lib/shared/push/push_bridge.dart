@@ -20,33 +20,47 @@ final pushEndpointGrantError = ValueNotifier<String?>(null);
 class BuzzPushEndpointGrant {
   final String relayOrigin;
   final String relayPubkey;
+  final String installationId;
   final String endpointGrant;
   final String endpointHash;
   final String appProfile;
   final int endpointEpoch;
   final int generation;
+  final int? publishedGeneration;
   final int expiresAt;
 
   const BuzzPushEndpointGrant({
     required this.relayOrigin,
     required this.relayPubkey,
+    required this.installationId,
     required this.endpointGrant,
     required this.endpointHash,
     required this.appProfile,
     required this.endpointEpoch,
     required this.generation,
+    required this.publishedGeneration,
     required this.expiresAt,
   });
 
   factory BuzzPushEndpointGrant.fromMap(Map<dynamic, dynamic> map) {
+    final generation = map['generation'] as int;
+    final publishedGeneration = map['publishedGeneration'] as int?;
+    if (publishedGeneration != null &&
+        (publishedGeneration <= 0 || publishedGeneration > generation)) {
+      throw const FormatException(
+        'Published endpoint grant generation is invalid',
+      );
+    }
     return BuzzPushEndpointGrant(
       relayOrigin: map['relayOrigin'] as String,
       relayPubkey: map['relayPubkey'] as String,
+      installationId: map['installationId'] as String,
       endpointGrant: map['endpointGrant'] as String,
       endpointHash: map['endpointHash'] as String,
       appProfile: map['appProfile'] as String,
       endpointEpoch: map['endpointEpoch'] as int,
-      generation: map['generation'] as int,
+      generation: generation,
+      publishedGeneration: publishedGeneration,
       expiresAt: map['expiresAt'] as int,
     );
   }
@@ -85,6 +99,20 @@ Future<BuzzPushEndpointGrant> enrollBuzzDevPush(String relayUrl) async {
   final grant = BuzzPushEndpointGrant.fromMap(raw);
   await readBuzzPushEndpointGrants();
   return grant;
+}
+
+Future<void> markBuzzDevPushLeasePublished(BuzzPushEndpointGrant grant) async {
+  if (!kDebugMode) {
+    throw UnsupportedError(
+      'Development push publication state is unavailable outside debug builds.',
+    );
+  }
+  await _channel.invokeMethod<void>('devMarkPushLeasePublished', {
+    'relayOrigin': grant.relayOrigin,
+    'appProfile': grant.appProfile,
+    'generation': grant.generation,
+  });
+  await readBuzzPushEndpointGrants();
 }
 
 /// Latest failure to export the community snapshot used by the iOS

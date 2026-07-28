@@ -13,30 +13,42 @@ import Foundation
 public struct BuzzPushEndpointGrantRecord: Codable, Equatable, Sendable {
   public let relayOrigin: String
   public let relayPubkey: String
+  public let installationId: String
   public let endpointGrant: String
   public let endpointHash: String
   public let appProfile: String
   public let endpointEpoch: Int64
   public let generation: Int64
+  public let publishedGeneration: Int64?
   public let expiresAt: Int64
 
   public init(
     relayOrigin: String,
     relayPubkey: String,
+    installationId: String,
     endpointGrant: String,
     endpointHash: String,
     appProfile: String,
     endpointEpoch: Int64,
     generation: Int64,
+    publishedGeneration: Int64?,
     expiresAt: Int64
   ) {
+    precondition(generation > 0, "Endpoint grant generation must be positive")
+    precondition(
+      publishedGeneration == nil
+        || (publishedGeneration! > 0 && publishedGeneration! <= generation),
+      "Published push lease generation must be positive and no greater than the grant generation"
+    )
     self.relayOrigin = relayOrigin
     self.relayPubkey = relayPubkey
+    self.installationId = installationId
     self.endpointGrant = endpointGrant
     self.endpointHash = endpointHash
     self.appProfile = appProfile
     self.endpointEpoch = endpointEpoch
     self.generation = generation
+    self.publishedGeneration = publishedGeneration
     self.expiresAt = expiresAt
   }
 }
@@ -46,6 +58,7 @@ public struct BuzzPushEndpointGrantRecord: Codable, Equatable, Sendable {
 public protocol BuzzPushEndpointGrantStore {
   func records() throws -> [BuzzPushEndpointGrantRecord]
   func save(_ record: BuzzPushEndpointGrantRecord) throws
+  func markPublished(relayOrigin: String, appProfile: String, generation: Int64) throws
 }
 
 #if DEBUG
@@ -56,6 +69,7 @@ public protocol BuzzPushEndpointGrantStore {
     case invalidResponse(route: String)
     case unexpectedStatus(route: String, expected: Int, actual: Int, body: String)
     case randomGenerationFailed(Int32)
+    case generationExhausted
 
     public var errorDescription: String? {
       switch self {
@@ -71,6 +85,8 @@ public protocol BuzzPushEndpointGrantStore {
         return "The response from \(route) was HTTP \(actual), expected \(expected): \(body)"
       case .randomGenerationFailed(let status):
         return "Secure random generation failed with status \(status)."
+      case .generationExhausted:
+        return "The development push grant generation cannot advance further."
       }
     }
   }
@@ -92,7 +108,11 @@ public protocol BuzzPushEndpointGrantStore {
 
     let randomBytes: () throws -> Data
 
-    init(randomBytes: @escaping () throws -> Data = BuzzDevAppAttestProvider.secureRandomBytes) {
+    init(
+      randomBytes: @escaping () throws -> Data = {
+        try BuzzDevAppAttestProvider.secureRandomBytes()
+      }
+    ) {
       self.randomBytes = randomBytes
     }
 
@@ -117,8 +137,8 @@ public protocol BuzzPushEndpointGrantStore {
       return Self.assertionBytes.base64EncodedString()
     }
 
-    private static func secureRandomBytes() throws -> Data {
-      var bytes = [UInt8](repeating: 0, count: 32)
+    fileprivate static func secureRandomBytes(count: Int = 32) throws -> Data {
+      var bytes = [UInt8](repeating: 0, count: count)
       let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
       guard status == errSecSuccess else {
         throw BuzzDevPushEnrollmentError.randomGenerationFailed(status)
@@ -132,7 +152,6 @@ public protocol BuzzPushEndpointGrantStore {
   public final class BuzzDevPushEnrollmentDriver {
     public static let appProfile = "buzz-ios-sandbox"
     public static let endpointEpoch: Int64 = 1
-    public static let generation: Int64 = 1
 
     private let gatewayBaseURL: URL
     private let store: BuzzPushEndpointGrantStore
@@ -140,6 +159,7 @@ public protocol BuzzPushEndpointGrantStore {
     private let appAttest: BuzzDevAppAttesting
     private let now: () -> Date
     private let lifetimeSeconds: Int64
+    private let installationIdBytes: () throws -> Data
 
     public convenience init(
       gatewayBaseURL: URL,
@@ -152,7 +172,8 @@ public protocol BuzzPushEndpointGrantStore {
         session: session,
         appAttest: BuzzDevAppAttestProvider(),
         now: Date.init,
-        lifetimeSeconds: 2_592_000
+        lifetimeSeconds: 2_592_000,
+        installationIdBytes: { try BuzzDevAppAttestProvider.secureRandomBytes(count: 16) }
       )
     }
 
@@ -162,7 +183,10 @@ public protocol BuzzPushEndpointGrantStore {
       session: URLSession,
       appAttest: BuzzDevAppAttesting,
       now: @escaping () -> Date,
-      lifetimeSeconds: Int64
+      lifetimeSeconds: Int64,
+      installationIdBytes: @escaping () throws -> Data = {
+        try BuzzDevAppAttestProvider.secureRandomBytes(count: 16)
+      }
     ) throws {
       guard Self.isHTTPOrigin(gatewayBaseURL), lifetimeSeconds > 0 else {
         throw BuzzDevPushEnrollmentError.invalidGatewayURL
@@ -173,6 +197,7 @@ public protocol BuzzPushEndpointGrantStore {
       self.appAttest = appAttest
       self.now = now
       self.lifetimeSeconds = lifetimeSeconds
+      self.installationIdBytes = installationIdBytes
     }
 
     public func endpointGrants() throws -> [BuzzPushEndpointGrantRecord] {
@@ -192,16 +217,27 @@ public protocol BuzzPushEndpointGrantStore {
       let endpointHash = Self.lowercaseHex(Data(SHA256.hash(data: deviceToken)))
       let nowSeconds = Int64(now().timeIntervalSince1970)
 
-      if let current = try store.records().first(where: {
-        $0.relayOrigin == relayOrigin.text
-          && $0.relayPubkey == relayPubkey
-          && $0.endpointHash == endpointHash
-          && $0.appProfile == Self.appProfile
-          && $0.endpointEpoch == Self.endpointEpoch
-          && $0.generation == Self.generation
-          && $0.expiresAt > nowSeconds + 300
-      }) {
+      let storedRecords = try store.records()
+      let storedForOrigin = storedRecords.first {
+        $0.relayOrigin == relayOrigin.text && $0.appProfile == Self.appProfile
+      }
+      if let current = storedForOrigin,
+        current.relayPubkey == relayPubkey,
+        current.endpointHash == endpointHash,
+        current.endpointEpoch == Self.endpointEpoch,
+        current.expiresAt > nowSeconds + 300
+      {
         return current
+      }
+      let generation: Int64
+      if let storedForOrigin {
+        let (next, overflow) = storedForOrigin.generation.addingReportingOverflow(1)
+        guard !overflow, next > 0 else {
+          throw BuzzDevPushEnrollmentError.generationExhausted
+        }
+        generation = next
+      } else {
+        generation = 1
       }
 
       let (expiresAt, expiresOverflow) = nowSeconds.addingReportingOverflow(lifetimeSeconds)
@@ -240,7 +276,7 @@ public protocol BuzzPushEndpointGrantStore {
         challenge: delegationChallenge.value,
         installationHandle: installation,
         endpointEpoch: Self.endpointEpoch,
-        generation: Self.generation,
+        generation: generation,
         relayPubkey: relayPubkey,
         notBefore: nowSeconds,
         expiresAt: expiresAt
@@ -250,19 +286,35 @@ public protocol BuzzPushEndpointGrantStore {
         challenge: delegationChallenge,
         installationHandle: installation,
         relayPubkey: relayPubkey,
+        generation: generation,
         notBefore: nowSeconds,
         expiresAt: expiresAt,
         assertion: assertion
       )
 
+      let installationId: String
+      if let storedForOrigin {
+        installationId = storedForOrigin.installationId
+      } else {
+        let installationBytes = try installationIdBytes()
+        precondition(
+          installationBytes.count == 16,
+          "NIP-PL installation identity entropy must be exactly 16 bytes"
+        )
+        // NIP-PL:76 also requires a fresh value on reinstall. Keychain survival can
+        // retain this value across reinstall. Reinstall detection is intentionally deferred.
+        installationId = Self.lowercaseHex(installationBytes)
+      }
       let record = BuzzPushEndpointGrantRecord(
         relayOrigin: relayOrigin.text,
         relayPubkey: relayPubkey,
+        installationId: installationId,
         endpointGrant: endpointGrant,
         endpointHash: endpointHash,
         appProfile: Self.appProfile,
         endpointEpoch: Self.endpointEpoch,
-        generation: Self.generation,
+        generation: generation,
+        publishedGeneration: nil,
         expiresAt: expiresAt
       )
       try store.save(record)
@@ -320,6 +372,7 @@ public protocol BuzzPushEndpointGrantStore {
       challenge: Challenge,
       installationHandle: UUID,
       relayPubkey: String,
+      generation: Int64,
       notBefore: Int64,
       expiresAt: Int64,
       assertion: String
@@ -333,7 +386,7 @@ public protocol BuzzPushEndpointGrantStore {
           challenge: challenge.value,
           installationHandle: installationHandle.uuidString.lowercased(),
           endpointEpoch: Self.endpointEpoch,
-          generation: Self.generation,
+          generation: generation,
           relayPubkey: relayPubkey,
           notBefore: notBefore,
           expiresAt: expiresAt,
@@ -434,7 +487,8 @@ public protocol BuzzPushEndpointGrantStore {
       }
       var relayComponents = components
       relayComponents.scheme = url.scheme
-      guard let relayText = relayComponents.url?.absoluteString else {
+      relayComponents.path = ""
+      guard let relayText = relayComponents.string else {
         throw BuzzDevPushEnrollmentError.invalidRelayURL
       }
       return (httpURL, relayText)

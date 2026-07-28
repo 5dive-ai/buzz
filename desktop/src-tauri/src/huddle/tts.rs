@@ -639,7 +639,19 @@ fn tts_worker(
                 }
 
                 let ends_playback_chunk = model_chunk_index + 1 == model_chunk_count;
-                match engine.synth_chunk(model_chunk, "en", &style, SYNTH_STEPS) {
+                let synthesis = engine.synth_chunk(model_chunk, "en", &style, SYNTH_STEPS);
+                if cancel.load(Ordering::Acquire)
+                    || voice_cancel.load(Ordering::Acquire)
+                    || shutdown.load(Ordering::Acquire)
+                {
+                    // The monitor already stopped any queued playback. Discard
+                    // synthesis that completed after cancellation so stale audio
+                    // never reaches the player, while keeping buzz-voice's
+                    // extracted April engine API unchanged.
+                    first_append = true;
+                    break 'playback_chunks;
+                }
+                match synthesis {
                     Ok(samples) if !samples.is_empty() => {
                         let mut audio = clamp_to_full_scale(samples);
                         if ends_playback_chunk {
@@ -669,7 +681,10 @@ fn tts_worker(
                         // does the full consume (drain queue, reset lead-in) on
                         // the next iteration.
                         let _ops = lock_player_ops(&player_ops);
-                        if cancel.load(Ordering::Acquire) || voice_cancel.load(Ordering::Acquire) {
+                        if cancel.load(Ordering::Acquire)
+                            || voice_cancel.load(Ordering::Acquire)
+                            || shutdown.load(Ordering::Acquire)
+                        {
                             // Nothing appended; the loop-top consume re-arms
                             // `first_append` (the flag is still set — the worker
                             // is its only consumer).

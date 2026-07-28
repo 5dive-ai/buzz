@@ -233,8 +233,12 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
       completion(.diagnostic("Open Buzz to refresh notification subscriptions."))
       return
     }
-    let since = consumptionState.querySince(for: community.id)
-    let filters = subscriptions.map { $0.filter.queryFilter(since: since, limit: 10) }
+    let cursor = consumptionState.state(for: community.id).cursor
+    let filters = PushCatchUp.queryFilters(
+      subscriptions: subscriptions,
+      cursor: cursor,
+      limit: 10
+    )
     guard let body = try? JSONSerialization.data(withJSONObject: filters) else {
       completion(.diagnostic("Buzz notification subscriptions are invalid."))
       return
@@ -288,22 +292,15 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
     subscriptions: [PushLeaseSubscription],
     consumptionState: PushConsumptionState
   ) -> QueryResult {
-    let matching = events.filter { event in
-      guard event.hasValidIDAndSignature(),
-        subscriptions.contains(where: {
-          PushLeaseMatcher.matches(event: event, subscription: $0)
-        })
-      else {
-        return false
-      }
-      let position = PushEventPosition(createdAt: event.createdAt, id: event.id)
-      return consumptionState.hasConsumed(eventID: event.id, for: community.id)
-        || consumptionState.canSelect(position, for: community.id)
-    }.sorted {
-      $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt > $1.createdAt
-    }
+    let matching = PushCatchUp.orderedSelections(
+      events: events,
+      origin: community.id,
+      subscriptions: subscriptions,
+      consumptionState: consumptionState
+    )
 
-    for event in matching {
+    for selection in matching {
+      let event = selection.event
       let identity = PushNotificationIdentity(eventID: event.id, origin: community.id)
       let resolution: BuzzPushResolution
       if event.kind == 9 {
@@ -335,10 +332,7 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
           resolution: resolution,
           event: event,
           community: community,
-          wasPreviouslyConsumed: consumptionState.hasConsumed(
-            eventID: event.id,
-            for: community.id
-          )
+          wasPreviouslyConsumed: selection.wasPreviouslyConsumed
         )
       )
     }

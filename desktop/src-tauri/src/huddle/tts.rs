@@ -101,13 +101,9 @@ const SENTENCE_LEAD_IN_SAMPLES: usize = (SAMPLE_RATE as f64 * 0.020) as usize;
 /// names chunk stitching as the reliability lever). Our previous
 /// sentence-per-call path created ~2–4× more seams than upstream.
 ///
-/// We don't ship the SentencePiece tokenizer, so 50 tokens is approximated
-/// with a character budget. The bundled 4k-entry vocab averages ~4 chars per
-/// token, but usage-weighted English text leans on short common tokens, so
-/// the effective ratio is ~2–4 chars/token and 200 chars ≈ 60–100 tokens —
-/// modestly above upstream's 50, deliberately: erring large means fewer
-/// seams, and even ~100 tokens is far below the model's 500-LM-step (~40 s)
-/// ceiling. Do not shrink this budget to chase an exact 50-token match.
+/// This character budget performs only coarse sentence packing. The April
+/// engine applies its SentencePiece tokenizer afterward and refines every
+/// result at the bundle's exact 50-token boundary.
 const MAX_CHUNK_CHARS: usize = 200;
 
 /// Silence inserted between sentences by the TTS pipeline (seconds).
@@ -502,7 +498,22 @@ fn tts_worker(
             .into_iter()
             .filter(|s| !s.trim().is_empty())
             .collect();
-        let chunks = group_sentences_into_chunks(&sentences, MAX_CHUNK_CHARS);
+        let grouped_chunks = group_sentences_into_chunks(&sentences, MAX_CHUNK_CHARS);
+        let mut chunks = Vec::new();
+        let mut split_failed = false;
+        for chunk in grouped_chunks {
+            match engine.split_text_into_chunks(&chunk) {
+                Ok(model_chunks) => chunks.extend(model_chunks),
+                Err(error) => {
+                    eprintln!("buzz-desktop: TTS chunking failed: {error}");
+                    split_failed = true;
+                    break;
+                }
+            }
+        }
+        if split_failed {
+            continue;
+        }
 
         for chunk in &chunks {
             if handle_cancel_or_shutdown(
@@ -734,9 +745,8 @@ fn build_sentence_append_buffer(
 /// single-sentence cost. Subsequent sentences pack greedily: a sentence
 /// joins the current chunk while the combined length stays within
 /// `max_chars`; otherwise it starts a new chunk. A single sentence longer
-/// than `max_chars` becomes its own chunk unsplit — Pocket TTS handles long
-/// single sentences fine (the ceiling is the 500-LM-step default), it's the
-/// *seams* we're minimizing.
+/// than `max_chars` becomes its own chunk here, then the Pocket engine splits
+/// it at the April bundle's exact token limit before synthesis.
 ///
 /// Sentences within a chunk are joined with a single space; sentence-ending
 /// punctuation is preserved by `split_sentences`, so the model sees natural

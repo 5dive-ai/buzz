@@ -3,8 +3,6 @@ import Flutter
 import UIKit
 import UserNotifications
 
-private let deliberateMobileIosCiCompileFailure: Int = "remove after red CI proof"
-
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var mediaUploadChannel: FlutterMethodChannel?

@@ -35,6 +35,57 @@ final class PushCatchUpTests: XCTestCase {
     XCTAssertEqual(second.map(\.wasPreviouslyConsumed), [false, true])
   }
 
+  func testColdStartSelectsOldestAcrossDistinctSeconds() {
+    let subscription = self.subscription()
+    let older = event(id: String(format: "%064x", 1))
+    let newer = event(id: String(format: "%064x", 2), createdAt: 1_001)
+    let state = PushConsumptionState()
+
+    let first = PushCatchUp.orderedSelections(
+      events: [newer, older],
+      origin: "origin",
+      subscriptions: [subscription],
+      consumptionState: state,
+      verify: { _ in true }
+    ).first
+
+    XCTAssertEqual(first?.event.id, older.id)
+  }
+
+  func testActiveSecondSiblingWinsBeforeNewerSecondCandidate() {
+    let subscription = self.subscription()
+    let displayed = event(id: String(format: "%064x", 0))
+    let activeSibling = event(id: String(format: "%064x", 1))
+    let newer = event(id: String(format: "%064x", 2), createdAt: 1_001)
+    var state = PushConsumptionState()
+    state.consume(
+      PushEventPosition(createdAt: displayed.createdAt, id: displayed.id),
+      for: "origin"
+    )
+
+    let first = PushCatchUp.orderedSelections(
+      events: [newer, activeSibling, displayed],
+      origin: "origin",
+      subscriptions: [subscription],
+      consumptionState: state,
+      verify: { _ in true }
+    ).first
+    XCTAssertEqual(first?.event.id, activeSibling.id)
+
+    state.consume(
+      PushEventPosition(createdAt: activeSibling.createdAt, id: activeSibling.id),
+      for: "origin"
+    )
+    let second = PushCatchUp.orderedSelections(
+      events: [newer, activeSibling, displayed],
+      origin: "origin",
+      subscriptions: [subscription],
+      consumptionState: state,
+      verify: { _ in true }
+    ).first
+    XCTAssertEqual(second?.event.id, newer.id)
+  }
+
   func testLateLowerIDSiblingIsSelectedThenDuplicateFallbackStaysSeparate() {
     let subscription = self.subscription()
     let higherID = String(repeating: "f", count: 64)
@@ -109,11 +160,11 @@ final class PushCatchUpTests: XCTestCase {
     )
   }
 
-  private func event(id: String) -> VerifiedNostrEvent {
+  private func event(id: String, createdAt: Int = 1_000) -> VerifiedNostrEvent {
     VerifiedNostrEvent(
       id: id,
       pubkey: other,
-      createdAt: 1_000,
+      createdAt: createdAt,
       kind: 9,
       tags: [["p", mine]],
       content: "message",

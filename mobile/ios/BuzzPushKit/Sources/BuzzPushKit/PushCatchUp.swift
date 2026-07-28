@@ -93,7 +93,7 @@ public enum PushCatchUp {
     }
 
     let ordered = eventsByID.values.sorted {
-      $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt > $1.createdAt
+      $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt < $1.createdAt
     }
     let selectable = ordered.compactMap { event -> PushCatchUpSelection? in
       let position = PushEventPosition(createdAt: event.createdAt, id: event.id)

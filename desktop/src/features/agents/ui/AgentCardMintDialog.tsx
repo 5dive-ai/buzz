@@ -1,13 +1,26 @@
 import * as React from "react";
-import { Download, Lock, RefreshCw, Send, Sparkles } from "lucide-react";
-import { useMutation } from "@tanstack/react-query";
+import {
+  Download,
+  KeyRound,
+  Lock,
+  RefreshCw,
+  Send,
+  Sparkles,
+} from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import {
   useOpenDmMutation,
   useUpsertCachedChannel,
 } from "@/features/channels/hooks";
+import { globalAgentConfigQueryKey } from "@/features/agents/useGlobalAgentConfig";
 import {
+  getGlobalAgentConfig,
+  setGlobalAgentConfig,
+} from "@/shared/api/tauriGlobalAgentConfig";
+import {
+  cardMintKeyStatus,
   mintAgentCard,
   NO_OPENAI_KEY_PREFIX,
   saveAgentCard,
@@ -22,6 +35,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/shared/ui/dialog";
+import { Input } from "@/shared/ui/input";
 import { Switch } from "@/shared/ui/switch";
 import { Textarea } from "@/shared/ui/textarea";
 
@@ -61,10 +75,42 @@ export function AgentCardMintDialog({
   const [lockCard, setLockCard] = React.useState(false);
   const [card, setCard] = React.useState<MintedAgentCard | null>(null);
   const [recipients, setRecipients] = React.useState<UserSearchResult[]>([]);
+  const [keyDraft, setKeyDraft] = React.useState("");
 
+  const queryClient = useQueryClient();
   const sendController = useSnapshotSendController(card !== null);
   const openDmMutation = useOpenDmMutation();
   const upsertCachedChannel = useUpsertCachedChannel();
+
+  // Whether a key already resolves through the agent's env layering. While
+  // unknown (loading/error) we show the normal mint form — the mint itself
+  // still fails cleanly if no key exists.
+  const keyStatusQuery = useQuery({
+    queryKey: ["cardMintKeyStatus", agentId],
+    queryFn: () => cardMintKeyStatus(agentId),
+  });
+  const needsKey = keyStatusQuery.data === false;
+
+  // Save the pasted key into the global Agent Defaults env — the same single
+  // source of truth every agent inherits. No card-specific key store exists.
+  const saveKeyMutation = useMutation({
+    mutationFn: async (key: string) => {
+      const config = await getGlobalAgentConfig();
+      const result = await setGlobalAgentConfig({
+        ...config,
+        env_vars: { ...config.env_vars, OPENAI_API_KEY: key },
+      });
+      return result.config;
+    },
+    onSuccess: (savedConfig) => {
+      queryClient.setQueryData(globalAgentConfigQueryKey, savedConfig);
+      queryClient.setQueryData(["cardMintKeyStatus", agentId], true);
+      setKeyDraft("");
+      toast.success("API key saved to your agent defaults.");
+    },
+    onError: (error) =>
+      toast.error(typeof error === "string" ? error : "Couldn't save the key."),
+  });
 
   const mintMutation = useMutation({
     mutationFn: () =>
@@ -76,9 +122,9 @@ export function AgentCardMintDialog({
     onSuccess: (minted) => setCard(minted),
     onError: (error: Error) => {
       if (error.message.startsWith(NO_OPENAI_KEY_PREFIX)) {
-        toast.error(
-          "No OpenAI API key found. Add OPENAI_API_KEY in the agent's environment variables or global agent settings.",
-        );
+        // The pre-check missed (e.g. key removed since open) — flip the
+        // dialog into key-setup mode instead of leaving a dead-end toast.
+        queryClient.setQueryData(["cardMintKeyStatus", agentId], false);
       } else {
         toast.error(error.message);
       }
@@ -197,12 +243,59 @@ export function AgentCardMintDialog({
               ) : null}
             </div>
           </div>
+        ) : needsKey ? (
+          <div
+            className="flex flex-col gap-4"
+            data-testid="agent-card-key-setup"
+          >
+            <div className="flex flex-col gap-2 rounded-md border border-border p-3">
+              <span className="flex items-center gap-1.5 text-sm font-medium">
+                <KeyRound className="h-3.5 w-3.5" />
+                One-time setup: OpenAI API key
+              </span>
+              <p className="text-xs text-muted-foreground">
+                Minting a card costs money — it generates the art and card text
+                through the OpenAI API with your key (typically well under a
+                dollar per mint, billed by OpenAI). The key is saved to your
+                agent defaults, so you only do this once.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Create a key at platform.openai.com under API keys.
+              </p>
+              <Input
+                autoFocus
+                data-testid="agent-card-key-input"
+                disabled={saveKeyMutation.isPending}
+                onChange={(e) => setKeyDraft(e.target.value)}
+                placeholder="sk-…"
+                type="password"
+                value={keyDraft}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Don’t want to spend money? The Export action on the agent shares
+              the same importable agent as a plain file — free, just without the
+              collectible card art.
+            </p>
+            <div className="flex justify-end">
+              <Button
+                data-testid="agent-card-key-save"
+                disabled={
+                  saveKeyMutation.isPending || keyDraft.trim().length === 0
+                }
+                onClick={() => saveKeyMutation.mutate(keyDraft.trim())}
+              >
+                <KeyRound className="mr-2 h-4 w-4" />
+                {saveKeyMutation.isPending ? "Saving…" : "Save key & continue"}
+              </Button>
+            </div>
+          </div>
         ) : (
           <div className="flex flex-col gap-4">
             <Textarea
               disabled={isMinting}
               onChange={(e) => setStyleNotes(e.target.value)}
-              placeholder="Optional art direction — e.g. “stormy night, lightning motif”. The card always matches the agent's avatar style."
+              placeholder="Optional directions — art (“stormy night, lightning motif”) and/or card text (“ability: Verify — scry 2”). Your directions take priority; anything you leave open is designed for you."
               rows={3}
               value={styleNotes}
             />

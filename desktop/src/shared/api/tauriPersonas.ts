@@ -185,6 +185,14 @@ export type MintedAgentCard = {
 export const NO_OPENAI_KEY_PREFIX = "NO_OPENAI_KEY:";
 
 /**
+ * Check whether an OpenAI key would resolve for a card mint of this agent
+ * (same env layering as the mint itself). Never returns the key.
+ */
+export async function cardMintKeyStatus(id: string): Promise<boolean> {
+  return invokeTauri<boolean>("card_mint_key_status", { id });
+}
+
+/**
  * Mint a trading card for an agent. One long API call (~2–3 minutes).
  * Reroll = call again; the backend holds no session state.
  *

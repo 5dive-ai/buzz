@@ -80,37 +80,53 @@ pub struct MintedCard {
 
 /// Pure layering: global env < persona env < agent record env, then the
 /// process environment as a development fallback. Returns the first
-/// non-empty `OPENAI_API_KEY`.
-pub(crate) fn resolve_openai_key_from_layers(
+/// non-empty value for `key`.
+pub(crate) fn resolve_env_from_layers(
+    key: &str,
     global_env: &std::collections::BTreeMap<String, String>,
     persona_env: &std::collections::BTreeMap<String, String>,
     record_env: &std::collections::BTreeMap<String, String>,
-    process_key: Option<String>,
+    process_value: Option<String>,
 ) -> Option<String> {
     for layer in [record_env, persona_env, global_env] {
-        if let Some(v) = layer.get("OPENAI_API_KEY") {
+        if let Some(v) = layer.get(key) {
             let v = v.trim();
             if !v.is_empty() {
                 return Some(v.to_string());
             }
         }
     }
-    process_key.filter(|k| !k.trim().is_empty())
+    process_value.filter(|k| !k.trim().is_empty())
+}
+
+/// The Responses endpoint to post mints to. `OPENAI_BASE_URL` (same env
+/// layering as the key) overrides the default host — this is what makes
+/// Azure OpenAI and Responses-speaking proxies work without code changes.
+pub(crate) fn responses_url(base_url: Option<String>) -> String {
+    let base = base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    format!("{}/responses", base.trim_end_matches('/'))
 }
 
 // ── Prompt construction ───────────────────────────────────────────────────────
 
 /// Build the designer instructions. Pure so tests can pin the contract:
-/// style-match-the-avatar is DEFAULT behavior, user style notes are additive.
+/// style-match-the-avatar is DEFAULT behavior; owner directions (art AND
+/// card text) take primacy over those style defaults, but never over the
+/// fixed contract (frame identity, geometry, text fidelity).
 pub(crate) fn build_card_instructions(
     agent_name: &str,
     persona_notes: &str,
     style_notes: &str,
 ) -> String {
-    let extra_style = if style_notes.trim().is_empty() {
+    let owner_directions = if style_notes.trim().is_empty() {
         String::new()
     } else {
-        format!("\nAdditional art direction from the owner: {style_notes}\n")
+        format!(
+            "\nOWNER'S DIRECTIONS — these override the default art-style and copy guidance \
+             below wherever they conflict (they cannot change the frame, layout, or \
+             text-fidelity requirements). The owner may direct the art, the card text \
+             (type line, ability, flavor), or both:\n{style_notes}\n"
+        )
     };
     format!(
         r#"You are designing one premium collectible trading card for the Buzz agent "{agent_name}".
@@ -119,16 +135,17 @@ Input image 1 is the official Buzz card frame template (gold honeycomb border, d
 
 Persona notes for the card copy:
 {persona_notes}
-{extra_style}
+{owner_directions}
 First, write professional trading-card copy at Magic: The Gathering editorial quality:
 - a type line (e.g. "Legendary Agent — Team Lead"),
 - ONE keyworded ability: short bolded ability name + one sentence of crisp rules text written like real MTG rules (present tense, precise, no fluff),
 - ONE italic flavor-text line, evocative and short, the kind that gets quoted.
+Where the owner's directions specify card text, use their wording (edited only for spelling); invent copy only for the parts they left open.
 Keep total text-box copy under 220 characters so it renders cleanly.
 
 Then generate the finished card with the image tool, exactly 1024x1536 portrait:
 - The frame must follow input image 1 faithfully: same gold honeycomb border, same layout, honey drip detail.
-- The art window must match input image 2's art style EXACTLY — same medium, same pixel density if pixel art, same palette, same background honeycomb-lattice sky. It must look like the same artist drew a larger scene: the character in a confident pose, conjuring glowing golden hexagons.
+- Default art style: match input image 2's art style EXACTLY — same medium, same pixel density if pixel art, same palette, same background honeycomb-lattice sky. It must look like the same artist drew a larger scene: the character in a confident pose, conjuring glowing golden hexagons. The owner's directions above override any of this default styling where they conflict.
 - Name banner: "{agent_name}" plus the type line beneath it in smaller type.
 - Text box: the ability name in bold, rules text in regular, then the flavor line in italics, cleanly typeset like a real MTG card — professional kerning, no misspellings, hyphenate nothing.
 - Top-right hex badge: one small emblem of your choice, no text.
@@ -197,6 +214,44 @@ pub(crate) fn extract_card_output(resp: &serde_json::Value) -> Result<(String, S
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
+/// Report whether an OpenAI key would resolve for a card mint of agent `id`,
+/// using exactly the same env layering as `mint_agent_card`. Lets the mint
+/// dialog offer inline key setup BEFORE the user commits to a mint, instead
+/// of failing after the fact. Never returns the key itself.
+#[tauri::command]
+pub fn card_mint_key_status(
+    id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+
+    let instances = load_managed_agents(&app)?;
+    let definitions = load_agent_definitions(&app)?;
+    let (record, _) = resolve_from_lists(&id, &instances, &definitions)?;
+
+    let global = load_global_agent_config(&app).unwrap_or_default();
+    let personas = load_personas(&app).unwrap_or_default();
+    let persona_env = record
+        .persona_id
+        .as_deref()
+        .and_then(|pid| personas.iter().find(|p| p.id == pid))
+        .map(|p| p.env_vars.clone())
+        .unwrap_or_default();
+
+    Ok(resolve_env_from_layers(
+        "OPENAI_API_KEY",
+        &global.env_vars,
+        &persona_env,
+        &record.env_vars,
+        std::env::var("OPENAI_API_KEY").ok(),
+    )
+    .is_some())
+}
+
 /// Mint a trading card for the agent identified by `id` (instance pubkey,
 /// instance slug, or definition slug — same resolution as snapshot export).
 ///
@@ -217,7 +272,7 @@ pub async fn mint_agent_card(
 ) -> Result<MintedCard, String> {
     let lock = lock.unwrap_or(false);
     // ── Resolve the record + API key under lock ──────────────────────────────
-    let (record, is_definition, api_key) = {
+    let (record, is_definition, api_key, base_url) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -237,7 +292,8 @@ pub async fn mint_agent_card(
             .map(|p| p.env_vars.clone())
             .unwrap_or_default();
 
-        let api_key = resolve_openai_key_from_layers(
+        let api_key = resolve_env_from_layers(
+            "OPENAI_API_KEY",
             &global.env_vars,
             &persona_env,
             &record.env_vars,
@@ -249,8 +305,15 @@ pub async fn mint_agent_card(
                  environment variables or global agent settings to mint cards."
             )
         })?;
+        let base_url = resolve_env_from_layers(
+            "OPENAI_BASE_URL",
+            &global.env_vars,
+            &persona_env,
+            &record.env_vars,
+            std::env::var("OPENAI_BASE_URL").ok(),
+        );
 
-        (record, is_definition, api_key)
+        (record, is_definition, api_key, base_url)
     };
 
     // ── Locking needs its two exact key endpoints up front, BEFORE the
@@ -358,7 +421,7 @@ pub async fn mint_agent_card(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
     let resp = client
-        .post("https://api.openai.com/v1/responses")
+        .post(responses_url(base_url))
         .bearer_auth(&api_key)
         .json(&body)
         .send()
@@ -557,26 +620,34 @@ mod tests {
         record.insert("OPENAI_API_KEY".to_string(), "record".to_string());
 
         assert_eq!(
-            resolve_openai_key_from_layers(&global, &persona, &record, None).as_deref(),
+            resolve_env_from_layers("OPENAI_API_KEY", &global, &persona, &record, None).as_deref(),
             Some("record")
         );
         record.clear();
         assert_eq!(
-            resolve_openai_key_from_layers(&global, &persona, &record, None).as_deref(),
+            resolve_env_from_layers("OPENAI_API_KEY", &global, &persona, &record, None).as_deref(),
             Some("persona")
         );
         persona.clear();
         assert_eq!(
-            resolve_openai_key_from_layers(&global, &persona, &record, None).as_deref(),
+            resolve_env_from_layers("OPENAI_API_KEY", &global, &persona, &record, None).as_deref(),
             Some("global")
         );
         global.clear();
         assert_eq!(
-            resolve_openai_key_from_layers(&global, &persona, &record, Some("process".to_string()))
-                .as_deref(),
+            resolve_env_from_layers(
+                "OPENAI_API_KEY",
+                &global,
+                &persona,
+                &record,
+                Some("process".to_string())
+            )
+            .as_deref(),
             Some("process")
         );
-        assert!(resolve_openai_key_from_layers(&global, &persona, &record, None).is_none());
+        assert!(
+            resolve_env_from_layers("OPENAI_API_KEY", &global, &persona, &record, None).is_none()
+        );
     }
 
     #[test]
@@ -586,22 +657,46 @@ mod tests {
         let mut persona = BTreeMap::new();
         persona.insert("OPENAI_API_KEY".to_string(), "persona".to_string());
         assert_eq!(
-            resolve_openai_key_from_layers(&BTreeMap::new(), &persona, &record, None).as_deref(),
+            resolve_env_from_layers("OPENAI_API_KEY", &BTreeMap::new(), &persona, &record, None)
+                .as_deref(),
             Some("persona")
         );
     }
 
     #[test]
-    fn instructions_pin_style_match_default_and_additive_notes() {
+    fn responses_url_default_and_override() {
+        assert_eq!(responses_url(None), "https://api.openai.com/v1/responses");
+        // Trailing slashes must not produce a double-slash path.
+        assert_eq!(
+            responses_url(Some("https://proxy.example/v1/".to_string())),
+            "https://proxy.example/v1/responses"
+        );
+        assert_eq!(
+            responses_url(Some("https://proxy.example/v1".to_string())),
+            "https://proxy.example/v1/responses"
+        );
+    }
+
+    #[test]
+    fn instructions_pin_style_match_default_and_owner_primacy() {
         let base = build_card_instructions("Eva", "leads the team", "");
         assert!(base.contains("match input image 2's art style EXACTLY"));
         assert!(base.contains("\"Eva\""));
-        assert!(!base.contains("Additional art direction"));
+        assert!(!base.contains("OWNER'S DIRECTIONS"));
 
-        let styled = build_card_instructions("Eva", "leads the team", "make it stormy");
-        assert!(styled.contains("Additional art direction from the owner: make it stormy"));
-        // Style notes are additive — the default style anchor must survive.
-        assert!(styled.contains("match input image 2's art style EXACTLY"));
+        let directed = build_card_instructions("Eva", "leads the team", "make it stormy");
+        // Owner directions take primacy over style defaults...
+        assert!(directed.contains("OWNER'S DIRECTIONS"));
+        assert!(directed.contains("make it stormy"));
+        assert!(directed.contains("override the default art-style and copy guidance"));
+        // ...but the fixed contract survives: frame, style anchor (as an
+        // overridable default), and text-fidelity requirements stay present.
+        assert!(directed.contains("match input image 2's art style EXACTLY"));
+        assert!(directed.contains("cannot change the frame, layout, or"));
+        assert!(directed.contains("Render all text with perfect fidelity"));
+        // Card-text direction is an explicitly named capability.
+        assert!(directed.contains("card text"));
+        assert!(directed.contains("use their wording"));
     }
 
     #[test]

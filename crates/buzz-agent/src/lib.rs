@@ -21,7 +21,9 @@
 //! * `keepalive` — see `agent.rs`.
 
 pub mod agent;
+pub mod builtin;
 pub mod config;
+pub mod hints;
 pub mod hooks;
 pub mod mesh;
 pub mod types;
@@ -69,6 +71,8 @@ struct Session {
     /// the override takes effect "from the next prompt" and never mutates a
     /// turn already in flight (`buzz-agent/src/lib.rs:494-502`).
     pending_model: Option<String>,
+    /// Skills discovered at session start; the bodies `load_skill` serves.
+    skills: Vec<crate::hints::SkillEntry>,
     /// Name of the MCP extension carrying `_Stop`/`_PostCompact`, if any.
     /// See [`crate::hooks`] for why we dispatch these ourselves.
     hook_extension: Option<String>,
@@ -93,7 +97,15 @@ async fn build_agent(
     cwd: &str,
     system_prompt: Option<&str>,
     mcp_servers: &[McpServerStdio],
-) -> Result<(Arc<Agent>, String, Option<String>), AgentError> {
+) -> Result<
+    (
+        Arc<Agent>,
+        String,
+        Option<String>,
+        Vec<crate::hints::SkillEntry>,
+    ),
+    AgentError,
+> {
     let session_manager = Arc::new(SessionManager::instance());
     let permission_manager = PermissionManager::instance();
 
@@ -179,6 +191,44 @@ async fn build_agent(
         }
     }
 
+    // AGENTS.md hints + the skill index. `system_prompt_extras` are appended
+    // whether the base prompt came from the override or goose's template
+    // (`prompt_manager.rs:170-198`), so this survives `override_system_prompt`.
+    let (hints, skills) = crate::hints::build_hints_section(std::path::Path::new(cwd));
+    if !hints.trim().is_empty() {
+        agent
+            .extend_system_prompt("buzz_hints".to_string(), hints)
+            .await;
+    }
+
+    // `load_skill` runs in-process. The prompt carries only skill names and
+    // descriptions; the body is pulled on demand, which is the whole point of
+    // the index above. Registered as a goose *frontend* tool: goose advertises
+    // it, then hands the call back to us rather than dispatching it itself
+    // (`agent.rs:1167`).
+    if !skills.is_empty() {
+        let def = crate::builtin::load_skill_def();
+        let tool = rmcp::model::Tool::new(
+            def.name.clone(),
+            def.description.clone(),
+            match def.input_schema {
+                serde_json::Value::Object(map) => std::sync::Arc::new(map),
+                _ => std::sync::Arc::new(serde_json::Map::new()),
+            },
+        );
+        let ext = ExtensionConfig::Frontend {
+            name: "buzz_builtin".to_string(),
+            description: String::new(),
+            tools: vec![tool],
+            instructions: None,
+            bundled: None,
+            available_tools: Vec::new(),
+        };
+        if let Err(e) = agent.add_extension(ext, &session.id).await {
+            tracing::warn!("load_skill unavailable: {e}");
+        }
+    }
+
     let agent = Arc::new(agent);
 
     // Find the extension carrying `_Stop`, by asking rather than assuming the
@@ -209,7 +259,7 @@ async fn build_agent(
         tracing::info!(extension = %ext, "lifecycle hooks available");
     }
 
-    Ok((agent, session.id, hook_extension))
+    Ok((agent, session.id, hook_extension, skills))
 }
 
 /// Keep the model's hands off the lifecycle hooks.
@@ -422,7 +472,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         .await;
     }
 
-    let (agent, goose_session_id, hook_extension) =
+    let (agent, goose_session_id, hook_extension, skills) =
         match build_agent(&app.cfg, &p.cwd, p.system_prompt.as_deref(), &p.mcp_servers).await {
             Ok(v) => v,
             Err(e) => {
@@ -464,6 +514,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
                 model_override: None,
                 pending_model: None,
                 hook_extension,
+                skills,
                 accumulated_input_tokens: 0,
                 accumulated_output_tokens: 0,
             },
@@ -558,7 +609,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
     let cancel = CancellationToken::new();
 
     // Single-flight per session, and capture the agent handle.
-    let (agent, goose_session_id, pending_model, hook_extension) = {
+    let (agent, goose_session_id, pending_model, hook_extension, skills) = {
         let mut sessions = app.sessions.lock().await;
         let Some(s) = sessions.get_mut(&p.session_id) else {
             return wire::send(
@@ -588,6 +639,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             s.goose_session_id.clone(),
             s.pending_model.take(),
             s.hook_extension.clone(),
+            s.skills.clone(),
         )
     };
 
@@ -626,6 +678,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
         wire_tx,
         cancel,
         hook_extension.as_deref(),
+        &skills,
     )
     .await;
 

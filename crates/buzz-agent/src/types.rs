@@ -105,3 +105,61 @@ impl AgentError {
         }
     }
 }
+
+/// A tool definition advertised to the model. Used by [`crate::builtin`] for
+/// the in-process `load_skill` tool.
+#[derive(Debug, Clone)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// One piece of a tool result.
+#[derive(Debug, Clone)]
+pub enum ToolResultContent {
+    Text(String),
+    Image { data: String, mime_type: String },
+}
+
+impl ToolResultContent {
+    pub fn as_text_lossy(&self) -> String {
+        match self {
+            Self::Text(t) => t.clone(),
+            Self::Image { mime_type, .. } => format!("[image: {mime_type}]"),
+        }
+    }
+}
+
+/// Result of an in-process tool call.
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    pub provider_id: String,
+    pub content: Vec<ToolResultContent>,
+    pub is_error: bool,
+}
+
+impl ToolResult {
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .map(ToolResultContent::as_text_lossy)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character.
+///
+/// Lifted from the deleted `mcp.rs`; `hints` and `builtin` both cap what they
+/// read off disk with it.
+pub fn truncate_at_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}

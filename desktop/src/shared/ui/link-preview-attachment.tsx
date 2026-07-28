@@ -1,4 +1,4 @@
-import { ExternalLink } from "lucide-react";
+import { ExternalLink, Globe } from "lucide-react";
 
 import type { SupportedLinkPreview } from "@/shared/lib/linkPreview";
 import { cn } from "@/shared/lib/cn";
@@ -107,7 +107,7 @@ function LinkPreviewLogo({ preview }: { preview: SupportedLinkPreview }) {
     case "google-slides-presentation":
       return <GoogleSlidesLogo className="h-4 w-4" />;
     case "generic-link":
-      return <ExternalLink aria-hidden="true" className="h-4 w-4" />;
+      return <Globe aria-hidden="true" className="h-4 w-4" />;
   }
 }
 

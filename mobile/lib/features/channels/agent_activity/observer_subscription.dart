@@ -132,13 +132,32 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       _emit(connection: ObserverConnectionState.connecting);
 
       final session = ref.read(relaySessionProvider.notifier);
+      final replayBoundary =
+          DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000;
+      final filterTags = {
+        '#p': [ownerPubkey],
+      };
+      final history = await session.fetchHistory(
+        NostrFilter(
+          kinds: [EventKind.agentObserverFrame],
+          tags: filterTags,
+          limit: _observerReplayLimit,
+          until: replayBoundary,
+        ),
+      );
+      if (_disposed || epoch != _subscriptionEpoch) {
+        return;
+      }
+      for (final event in history) {
+        _handleEvent(event, isHistorical: true);
+      }
+
       final unsubscribe = await session.subscribe(
         NostrFilter(
           kinds: [EventKind.agentObserverFrame],
-          tags: {
-            '#p': [ownerPubkey],
-          },
+          tags: filterTags,
           limit: _observerReplayLimit,
+          since: replayBoundary,
         ),
         _handleEvent,
         onClosed: (message) {
@@ -168,7 +187,7 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
     }
   }
 
-  void _handleEvent(NostrEvent event) {
+  void _handleEvent(NostrEvent event, {bool isHistorical = false}) {
     final agentPubkey = event.getTagValue('agent');
     if (agentPubkey == null || event.getTagValue('frame') != 'telemetry') {
       return;
@@ -190,7 +209,12 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       return;
     }
 
-    final frame = _decryptFrame(event, normalizedAgent, privHex);
+    final frame = _decryptFrame(
+      event,
+      normalizedAgent,
+      privHex,
+      isHistorical: isHistorical,
+    );
     if (frame == null) return;
 
     final dedupeKey = '${frame.seq}:${frame.timestamp}';
@@ -218,14 +242,19 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
     }
 
     _errorMessage = null;
-    _emit(connection: ObserverConnectionState.open);
+    _emit(
+      connection: isHistorical
+          ? ObserverConnectionState.connecting
+          : ObserverConnectionState.open,
+    );
   }
 
   ObserverFrame? _decryptFrame(
     NostrEvent event,
     String normalizedAgent,
-    String privHex,
-  ) {
+    String privHex, {
+    required bool isHistorical,
+  }) {
     try {
       final conversationKey = _conversationKeysByAgent.putIfAbsent(
         normalizedAgent,
@@ -233,7 +262,11 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       );
       final plaintext = nip44Decrypt(conversationKey, event.content);
       final json = jsonDecode(plaintext) as Map<String, dynamic>;
-      return ObserverFrame.fromJson(json, receivedAt: DateTime.now().toUtc());
+      return ObserverFrame.fromJson(
+        json,
+        receivedAt: DateTime.now().toUtc(),
+        isHistorical: isHistorical,
+      );
     } catch (error) {
       _errorMessage = 'Observer event decrypt failed: $error';
       _emit(connection: ObserverConnectionState.error);
@@ -332,7 +365,8 @@ final observerSubscriptionProvider =
       final frames = relayState.framesByAgent[normalizedAgent] ?? const [];
       final channelFrames = [
         for (final frame in frames)
-          if (frame.channelId == null || frame.channelId == key.channelId)
+          if (!frame.isHistorical &&
+              (frame.channelId == null || frame.channelId == key.channelId))
             frame,
       ];
 

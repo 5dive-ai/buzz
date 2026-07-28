@@ -1,15 +1,13 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../../shared/utils/string_utils.dart';
-import '../../profile/user_cache_provider.dart';
-import '../channels_provider.dart';
 import 'active_agent_turns.dart';
 
 const _agentLiveUpdatesChannel = MethodChannel('buzz/agent_live_updates');
 const _liveUpdateSafetyLifetime = Duration(hours: 8);
 
+/// Platform-neutral content rendered by Android and iOS live updates.
 @immutable
 class AgentLiveUpdateContent {
   final String title;
@@ -69,6 +67,7 @@ class AgentLiveUpdateContent {
   );
 }
 
+/// Builds one aggregate live update for the supplied active agent turns.
 AgentLiveUpdateContent? buildAgentLiveUpdateContent(
   List<ActiveAgentTurn> turns,
   Map<String, String> channelNames, [
@@ -117,21 +116,6 @@ AgentLiveUpdateContent? buildAgentLiveUpdateContent(
   );
 }
 
-final agentLiveUpdateContentProvider = Provider<AgentLiveUpdateContent?>((ref) {
-  final turns = ref.watch(activeAgentTurnsProvider);
-  final channels = ref.watch(channelsProvider).value ?? const [];
-  final channelNames = {
-    for (final channel in channels) channel.id: channel.name,
-  };
-  final profiles = ref.watch(userCacheProvider);
-  final agentNames = {
-    for (final turn in turns)
-      if (profiles[turn.agentPubkey.toLowerCase()] case final profile?)
-        turn.agentPubkey: profile.label,
-  };
-  return buildAgentLiveUpdateContent(turns, channelNames, agentNames);
-});
-
 String _agentLabel(String pubkey, Map<String, String> agentNames) {
   final name = agentNames[pubkey]?.trim();
   return name?.isNotEmpty == true ? name! : shortPubkey(pubkey);
@@ -153,6 +137,7 @@ String _channelSummary(
     'Across ${channelLabels.take(2).join(', ')} and ${channelLabels.length - 2} more',
 };
 
+/// Shows, updates, or dismisses the native agent live update.
 Future<void> syncAgentLiveUpdate(AgentLiveUpdateContent? content) async {
   if (kIsWeb ||
       (defaultTargetPlatform != TargetPlatform.android &&
@@ -176,6 +161,7 @@ Future<void> syncAgentLiveUpdate(AgentLiveUpdateContent? content) async {
   }
 }
 
+/// Serializes native live-update calls so their final state matches Dart.
 class AgentLiveUpdateSynchronizer {
   Future<void> _pending = Future.value();
 

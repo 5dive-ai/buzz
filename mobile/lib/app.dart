@@ -12,6 +12,7 @@ import 'features/pairing/pairing_page.dart';
 import 'features/channels/agent_activity/active_agent_turns.dart';
 import 'features/channels/agent_activity/agent_live_updates.dart';
 import 'features/channels/agent_activity/observer_subscription.dart';
+import 'features/channels/channels_provider.dart';
 import 'features/channels/deep_link_dispatcher.dart';
 import 'features/profile/user_cache_provider.dart';
 import 'features/profile/user_status_cache_provider.dart';
@@ -37,19 +38,19 @@ class App extends HookConsumerWidget {
     final appLifecycleState = isAuthenticated
         ? ref.watch(appLifecycleProvider)
         : null;
+    final activeAgentTurns = isAuthenticated
+        ? ref.watch(activeAgentTurnsProvider)
+        : const <ActiveAgentTurn>[];
     final agentLiveUpdate = isAuthenticated && agentLiveUpdatesEnabled
-        ? ref.watch(agentLiveUpdateContentProvider)
+        ? _buildAgentLiveUpdate(ref, activeAgentTurns)
         : null;
     final agentLiveUpdateSynchronizer = useMemoized(
       AgentLiveUpdateSynchronizer.new,
     );
-    final activeAgentPubkeys = isAuthenticated
-        ? ref
-              .watch(activeAgentTurnsProvider)
-              .map((turn) => turn.agentPubkey)
-              .toSet()
-              .toList()
-        : const <String>[];
+    final activeAgentPubkeys = activeAgentTurns
+        .map((turn) => turn.agentPubkey)
+        .toSet()
+        .toList();
 
     final resolved = resolveSchemes(schemeName, themeMode);
     final lightScheme = applyAccent(resolved.light, accentIndex);
@@ -136,6 +137,23 @@ class App extends HookConsumerWidget {
       ),
     );
   }
+}
+
+AgentLiveUpdateContent? _buildAgentLiveUpdate(
+  WidgetRef ref,
+  List<ActiveAgentTurn> turns,
+) {
+  final channels = ref.watch(channelsProvider).value ?? const [];
+  final channelNames = {
+    for (final channel in channels) channel.id: channel.name,
+  };
+  final profiles = ref.watch(userCacheProvider);
+  final agentNames = {
+    for (final turn in turns)
+      if (profiles[turn.agentPubkey.toLowerCase()] case final profile?)
+        turn.agentPubkey: profile.label,
+  };
+  return buildAgentLiveUpdateContent(turns, channelNames, agentNames);
 }
 
 Widget _buildSettingsPage(BuildContext context) =>

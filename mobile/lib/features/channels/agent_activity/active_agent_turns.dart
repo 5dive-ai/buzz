@@ -8,6 +8,7 @@ import 'observer_subscription.dart';
 const _activeTurnLivenessTimeout = Duration(seconds: 30);
 const _activeTurnClockInterval = Duration(seconds: 5);
 
+/// An agent turn reconstructed from observer frames and still considered live.
 @immutable
 class ActiveAgentTurn {
   final String agentPubkey;
@@ -26,6 +27,7 @@ class ActiveAgentTurn {
     this.triggeringEventId,
   });
 
+  /// Returns this turn with an updated locally observed activity time.
   ActiveAgentTurn copyWith({required DateTime lastActivityAt}) =>
       ActiveAgentTurn(
         agentPubkey: agentPubkey,
@@ -37,6 +39,7 @@ class ActiveAgentTurn {
       );
 }
 
+/// Reconstructs live turns from replay and live frames, pruning stale turns.
 List<ActiveAgentTurn> reduceActiveAgentTurns(
   Map<String, List<ObserverFrame>> framesByAgent, {
   required DateTime now,

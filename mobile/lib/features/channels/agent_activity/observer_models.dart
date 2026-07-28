@@ -18,6 +18,7 @@ class ObserverFrame {
   final String? turnId;
   final String? startedAt;
   final DateTime? receivedAt;
+  final bool isHistorical;
   final dynamic payload;
 
   const ObserverFrame({
@@ -30,12 +31,14 @@ class ObserverFrame {
     this.turnId,
     this.startedAt,
     this.receivedAt,
+    this.isHistorical = false,
     this.payload,
   });
 
   factory ObserverFrame.fromJson(
     Map<String, dynamic> json, {
     DateTime? receivedAt,
+    bool isHistorical = false,
   }) => ObserverFrame(
     seq: json['seq'] as int? ?? 0,
     timestamp: json['timestamp'] as String? ?? '',
@@ -46,6 +49,7 @@ class ObserverFrame {
     turnId: json['turnId'] as String?,
     startedAt: json['startedAt'] as String?,
     receivedAt: receivedAt,
+    isHistorical: isHistorical,
     payload: json['payload'],
   );
 }

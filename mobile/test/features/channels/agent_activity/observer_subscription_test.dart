@@ -6,6 +6,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:nostr/nostr.dart' as nostr;
 import 'package:buzz/features/channels/agent_activity/observer_models.dart';
 import 'package:buzz/features/channels/agent_activity/observer_subscription.dart';
+import 'package:buzz/features/channels/agent_activity/active_agent_turns.dart';
 import 'package:buzz/shared/crypto/nip44.dart';
 import 'package:buzz/shared/relay/relay.dart';
 
@@ -112,7 +113,14 @@ void main() {
       expect(filter.kinds, [EventKind.agentObserverFrame]);
       expect(filter.limit, 200);
       expect(filter.tags['#p'], contains(myPubkey));
-      expect(filter.since, isNull);
+      expect(filter.since, isNotNull);
+
+      expect(relaySession.historyFilters, hasLength(1));
+      final historyFilter = relaySession.historyFilters.single;
+      expect(historyFilter.kinds, [EventKind.agentObserverFrame]);
+      expect(historyFilter.limit, 200);
+      expect(historyFilter.tags['#p'], contains(myPubkey));
+      expect(historyFilter.until, filter.since);
     },
   );
 
@@ -220,6 +228,63 @@ void main() {
     expect(relaySession.filters, hasLength(1));
   });
 
+  test('keeps replay frames out of the live transcript', () async {
+    final ownerKeychain = nostr.Keys.generate();
+    final agentKeychain = nostr.Keys.generate();
+    const channelId = 'test-channel';
+    final relaySession = _RecordingRelaySession()
+      ..historyEvents = [
+        _observerEvent(
+          ownerKeychain: ownerKeychain,
+          agentKeychain: agentKeychain,
+          channelId: channelId,
+          seq: 1,
+        ),
+      ];
+    final container = ProviderContainer(
+      overrides: [
+        relaySessionProvider.overrideWith(() => relaySession),
+        relayConfigProvider.overrideWith(
+          () => _FakeRelayConfigNotifier(nsec: ownerKeychain.nsec),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    final key = (channelId: channelId, agentPubkey: agentKeychain.public);
+    container.read(observerSubscriptionProvider(key));
+    await Future<void>.delayed(Duration.zero);
+
+    final relayState = container.read(observerRelayProvider);
+    final replayFrames = relayState.framesByAgent[agentKeychain.public];
+    expect(replayFrames, hasLength(1));
+    expect(replayFrames!.single.isHistorical, isTrue);
+    expect(
+      reduceActiveAgentTurns(
+        relayState.framesByAgent,
+        now: replayFrames.single.receivedAt!,
+      ),
+      hasLength(1),
+    );
+    expect(
+      container.read(observerSubscriptionProvider(key)).transcript,
+      isEmpty,
+    );
+
+    relaySession.emit(
+      _observerEvent(
+        ownerKeychain: ownerKeychain,
+        agentKeychain: agentKeychain,
+        channelId: channelId,
+        seq: 2,
+      ),
+    );
+
+    final state = container.read(observerSubscriptionProvider(key));
+    expect(state.transcript, hasLength(1));
+    expect((state.transcript.single as LifecycleItem).title, 'Turn started');
+  });
+
   test(
     'decrypts observer frames and exposes channel-scoped transcript',
     () async {
@@ -293,13 +358,24 @@ void main() {
 
 class _RecordingRelaySession extends RelaySessionNotifier {
   final List<NostrFilter> filters = [];
+  final List<NostrFilter> historyFilters = [];
   final List<void Function(NostrEvent)> _listeners = [];
   final List<void Function(String message)> _closedListeners = [];
   final List<Completer<void>> _subscribeGates = [];
+  List<NostrEvent> historyEvents = [];
   bool delaySubscribes = false;
 
   @override
   SessionState build() => const SessionState(status: SessionStatus.connected);
+
+  @override
+  Future<List<NostrEvent>> fetchHistory(
+    NostrFilter filter, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    historyFilters.add(filter);
+    return historyEvents;
+  }
 
   @override
   Future<void Function()> subscribe(
@@ -347,6 +423,40 @@ class _RecordingRelaySession extends RelaySessionNotifier {
       gate.complete();
     }
   }
+}
+
+NostrEvent _observerEvent({
+  required nostr.Keys ownerKeychain,
+  required nostr.Keys agentKeychain,
+  required String channelId,
+  required int seq,
+}) {
+  final conversationKey = getConversationKey(
+    agentKeychain.secret,
+    ownerKeychain.public,
+  );
+  final encrypted = nip44Encrypt(
+    conversationKey,
+    jsonEncode({
+      'seq': seq,
+      'timestamp': '2026-07-28T12:00:${seq.toString().padLeft(2, '0')}.000Z',
+      'kind': 'turn_started',
+      'channelId': channelId,
+      'turnId': 'turn-$seq',
+    }),
+  );
+  final event = nostr.Event.from(
+    kind: EventKind.agentObserverFrame,
+    content: encrypted,
+    tags: [
+      ['p', ownerKeychain.public],
+      ['agent', agentKeychain.public],
+      ['frame', 'telemetry'],
+    ],
+    secretKey: agentKeychain.secret,
+    verify: false,
+  );
+  return NostrEvent.fromJson(event.toMap());
 }
 
 class _FakeRelayConfigNotifier extends RelayConfigNotifier {

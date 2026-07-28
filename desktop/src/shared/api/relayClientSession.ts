@@ -624,6 +624,9 @@ export class RelayClient {
       filter,
       onEvent,
       replayMissedHistory: options?.replayMissedHistory,
+      lastSeenCreatedAt: options?.replayMissedHistory
+        ? Math.floor(Date.now() / 1_000)
+        : undefined,
       resolveReady,
     });
 

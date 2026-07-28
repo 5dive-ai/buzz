@@ -1,0 +1,134 @@
+import 'package:buzz/features/channels/agent_activity/active_agent_turns.dart';
+import 'package:buzz/features/channels/agent_activity/agent_live_updates.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('builds a single-agent update with a deep-link target', () {
+    final content = buildAgentLiveUpdateContent(
+      [_turn(agent: 'agent-a', channel: 'channel-1', message: 'message-1')],
+      {'channel-1': 'agents'},
+      {'agent-a': 'Codex'},
+    );
+
+    expect(content, isNotNull);
+    expect(content!.title, 'Codex is working');
+    expect(content.body, 'In #agents');
+    expect(content.activeAgentCount, 1);
+    expect(content.channelId, 'channel-1');
+    expect(content.messageId, 'message-1');
+  });
+
+  test('aggregates multiple agents and channels into one update', () {
+    final content = buildAgentLiveUpdateContent(
+      [
+        _turn(agent: 'agent-a', channel: 'channel-1'),
+        _turn(
+          agent: 'agent-b',
+          channel: 'channel-2',
+          minute: 1,
+          message: 'message-2',
+        ),
+        _turn(agent: 'agent-b', channel: 'channel-2', minute: 2),
+      ],
+      {'channel-1': 'agents', 'channel-2': 'design'},
+      {'agent-a': 'Codex', 'agent-b': 'Maya'},
+    );
+
+    expect(content, isNotNull);
+    expect(content!.title, 'Codex and Maya are working');
+    expect(content.body, 'Across #agents and #design');
+    expect(content.activeAgentCount, 2);
+    expect(content.startedAt, DateTime.utc(2026, 7, 27, 12));
+    expect(content.channelId, 'channel-2');
+    expect(content.messageId, 'message-2');
+  });
+
+  test('returns no content without active turns', () {
+    expect(buildAgentLiveUpdateContent(const [], const {}), isNull);
+  });
+
+  test('summarizes additional agents and channels', () {
+    final content = buildAgentLiveUpdateContent(
+      [
+        _turn(agent: 'agent-a', channel: 'channel-1'),
+        _turn(agent: 'agent-b', channel: 'channel-2'),
+        _turn(agent: 'agent-c', channel: 'channel-3'),
+      ],
+      {
+        'channel-1': 'agents',
+        'channel-2': 'design',
+        'channel-3': 'engineering',
+      },
+      {'agent-a': 'Codex', 'agent-b': 'Maya', 'agent-c': 'Theo'},
+    );
+
+    expect(content, isNotNull);
+    expect(content!.title, 'Codex and 2 more agents are working');
+    expect(content.body, 'Across #agents, #design and 1 more');
+  });
+
+  test('dismisses the Android update when no agent is active', () async {
+    final previousPlatform = debugDefaultTargetPlatformOverride;
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    final calls = <MethodCall>[];
+    const channel = MethodChannel('buzz/agent_live_updates');
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      return true;
+    });
+    addTearDown(() {
+      messenger.setMockMethodCallHandler(channel, null);
+      debugDefaultTargetPlatformOverride = previousPlatform;
+    });
+
+    await syncAgentLiveUpdate(null);
+
+    expect(calls, hasLength(1));
+    expect(calls.single.method, 'dismiss');
+  });
+
+  test('dismisses the iOS Live Activity when no agent is active', () async {
+    final previousPlatform = debugDefaultTargetPlatformOverride;
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    final calls = <MethodCall>[];
+    const channel = MethodChannel('buzz/agent_live_updates');
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      return true;
+    });
+    addTearDown(() {
+      messenger.setMockMethodCallHandler(channel, null);
+      debugDefaultTargetPlatformOverride = previousPlatform;
+    });
+
+    await syncAgentLiveUpdate(null);
+
+    expect(calls, hasLength(1));
+    expect(calls.single.method, 'dismiss');
+  });
+}
+
+ActiveAgentTurn _turn({
+  required String agent,
+  required String channel,
+  int minute = 0,
+  String? message,
+}) {
+  final startedAt = DateTime.utc(2026, 7, 27, 12, minute);
+  return ActiveAgentTurn(
+    agentPubkey: agent,
+    channelId: channel,
+    turnId: '$agent-$minute',
+    startedAt: startedAt,
+    lastActivityAt: startedAt.add(const Duration(seconds: 10)),
+    triggeringEventId: message,
+  );
+}

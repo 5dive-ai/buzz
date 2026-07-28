@@ -7,14 +7,58 @@ import UserNotifications
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var mediaUploadChannel: FlutterMethodChannel?
   private var qrScannerChannel: FlutterMethodChannel?
+  private var agentLiveUpdateChannel: FlutterMethodChannel?
 
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    UNUserNotificationCenter.current().requestAuthorization(options: [.badge]) { _, _ in }
-    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+    #if targetEnvironment(simulator)
+      if !ProcessInfo.processInfo.arguments.contains("--agent-live-activity-demo") {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.badge]) { _, _ in }
+      }
+    #else
+      UNUserNotificationCenter.current().requestAuthorization(options: [.badge]) { _, _ in }
+    #endif
+    let didFinish = super.application(
+      application,
+      didFinishLaunchingWithOptions: launchOptions
+    )
+    #if targetEnvironment(simulator)
+      startAgentLiveActivityDemoIfRequested()
+    #endif
+    return didFinish
   }
+
+  #if targetEnvironment(simulator)
+    private func startAgentLiveActivityDemoIfRequested() {
+      guard
+        ProcessInfo.processInfo.arguments.contains("--agent-live-activity-demo"),
+        #available(iOS 16.1, *)
+      else {
+        return
+      }
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        let payload = AgentLiveActivityPayload(
+          title: "Codex and Claude are working",
+          body: "In #agents · Adding iOS Live Activities",
+          activeCount: 2,
+          startedAtMillis: now - 32_000,
+          lastActivityAtMillis: now,
+          timeoutAfterMillis: 10 * 60_000,
+          channelId: "agents-demo",
+          messageId: "agent-live-activity-demo"
+        )
+        Task {
+          await AgentLiveActivityManager.dismiss()
+          try? await Task.sleep(nanoseconds: 250_000_000)
+          _ = try? await AgentLiveActivityManager.show(payload)
+        }
+      }
+    }
+  #endif
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
@@ -31,6 +75,64 @@ import UserNotifications
     )
     qrScannerChannel?.setMethodCallHandler { call, result in
       Self.handleQrScannerMethodCall(call, result: result)
+    }
+    agentLiveUpdateChannel = FlutterMethodChannel(
+      name: "buzz/agent_live_updates",
+      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+    )
+    agentLiveUpdateChannel?.setMethodCallHandler { call, result in
+      Self.handleAgentLiveUpdateMethodCall(call, result: result)
+    }
+  }
+
+  private static func handleAgentLiveUpdateMethodCall(
+    _ call: FlutterMethodCall,
+    result: @escaping FlutterResult
+  ) {
+    guard #available(iOS 16.1, *) else {
+      result(false)
+      return
+    }
+
+    switch call.method {
+    case "show":
+      guard let payload = AgentLiveActivityPayload.from(arguments: call.arguments) else {
+        result(
+          FlutterError(
+            code: "invalid_arguments",
+            message: "Expected valid agent activity details.",
+            details: nil
+          )
+        )
+        return
+      }
+      Task {
+        do {
+          let didShow = try await AgentLiveActivityManager.show(payload)
+          await MainActor.run {
+            result(didShow)
+          }
+        } catch {
+          await MainActor.run {
+            result(
+              FlutterError(
+                code: "agent_live_activity_failed",
+                message: "Unable to show agent activity.",
+                details: error.localizedDescription
+              )
+            )
+          }
+        }
+      }
+    case "dismiss":
+      Task {
+        await AgentLiveActivityManager.dismiss()
+        await MainActor.run {
+          result(nil)
+        }
+      }
+    default:
+      result(FlutterMethodNotImplemented)
     }
   }
 
@@ -231,10 +333,12 @@ import UserNotifications
     let sourceURL = URL(fileURLWithPath: sourcePath)
     let asset = AVURLAsset(url: sourceURL)
 
-    guard let exportSession = AVAssetExportSession(
-      asset: asset,
-      presetName: AVAssetExportPresetPassthrough
-    ) else {
+    guard
+      let exportSession = AVAssetExportSession(
+        asset: asset,
+        presetName: AVAssetExportPresetPassthrough
+      )
+    else {
       result(
         FlutterError(
           code: "transcode_failed",
@@ -259,7 +363,8 @@ import UserNotifications
       case .completed:
         result(outputURL.path)
       default:
-        let errorMessage = exportSession.error?.localizedDescription
+        let errorMessage =
+          exportSession.error?.localizedDescription
           ?? "Video transcoding failed with status \(exportSession.status.rawValue)."
         result(
           FlutterError(

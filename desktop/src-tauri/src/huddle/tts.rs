@@ -550,7 +550,7 @@ fn tts_worker(
                             &mut first_append,
                             audio,
                             silence_buf_len,
-                            model_chunk_index == 0,
+                            model_chunk_index == 0 || player.empty(),
                             ends_playback_chunk,
                         );
 
@@ -699,13 +699,12 @@ fn apply_fade_out(samples: &mut [f32]) {
     }
 }
 
-/// Build the single buffer appended to the rodio `Player` for one synthesised
-/// sentence.
+/// Build one buffer appended to the rodio `Player` for a synthesis unit.
 ///
-/// Every sentence chunk gets a short lead-in pad immediately before its audio.
-/// This matters for chunks that start with soft first phonemes (`I'm`, `I've`):
-/// the synthesized buffer can begin with speech within the first millisecond,
-/// so the playback layer must provide the device/mixer cushion.
+/// Every playback boundary gets a short lead-in pad immediately before its
+/// audio. This matters for chunks that start with soft first phonemes (`I'm`,
+/// `I've`): the synthesized buffer can begin with speech within the first
+/// millisecond, so the playback layer must provide the device/mixer cushion.
 /// To keep the audible gap unchanged, the trailing silence after this chunk is
 /// shortened by the same amount (`silence_buf_len - SENTENCE_LEAD_IN_SAMPLES`):
 /// sentence N contributes 80 ms of post-speech silence and sentence N+1
@@ -716,15 +715,15 @@ fn apply_fade_out(samples: &mut [f32]) {
 /// tracked source per synthesized sentence, avoiding source-boundary/drain
 /// regressions from enqueueing the lead-in, audio, and tail as separate sounds.
 ///
+/// A playback chunk may contain several model-sized synthesis units. Only the
+/// first unit receives the onset cushion and only the last receives the
+/// remaining gap. If playback underruns while the next unit is synthesized,
+/// that unit becomes a new playback boundary and receives a fresh cushion.
+///
 /// `first_append` is flipped on the first call after the player goes idle.
 /// The worker uses it in the idle branch of the main loop to distinguish
 /// "never queued anything since last drain" from "drained after speaking",
 /// which controls when `tts_active` is released and the lead-in re-armed.
-/// Add silence only at the outer playback boundary.
-///
-/// A playback chunk may contain several model-sized synthesis units. The first
-/// unit receives the onset cushion, the last receives the remaining gap, and
-/// intermediate units stay sample-contiguous.
 fn build_sentence_append_buffer(
     first_append: &mut bool,
     audio: Vec<f32>,

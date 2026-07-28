@@ -100,8 +100,13 @@ public enum PushCatchUp {
       guard consumptionState.canSelect(position, for: origin) else { return nil }
       return PushCatchUpSelection(event: event, wasPreviouslyConsumed: false)
     }
+    let duplicateFallbackID = consumptionState.state(for: origin).lastDisplayed?.id
     let duplicates = ordered.compactMap { event -> PushCatchUpSelection? in
-      guard consumptionState.hasConsumed(eventID: event.id, for: origin) else { return nil }
+      guard event.id == duplicateFallbackID,
+        consumptionState.hasConsumed(eventID: event.id, for: origin)
+      else {
+        return nil
+      }
       return PushCatchUpSelection(event: event, wasPreviouslyConsumed: true)
     }
     return selectable + duplicates

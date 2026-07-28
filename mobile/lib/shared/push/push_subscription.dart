@@ -282,7 +282,7 @@ List<BuzzPushSubscription> buildDesiredBuzzPushSubscriptions({
   }
 
   final selfAuthored = BuzzPushFilter(
-    kinds: buzzPushEligibleKinds,
+    kinds: buzzPushRenderableKinds,
     authors: [normalizedPubkey],
   );
   final ignores = [selfAuthored, ...mutedIgnoreFilters];

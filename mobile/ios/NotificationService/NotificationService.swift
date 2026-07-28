@@ -318,9 +318,10 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
           identity: identity
         )
       } else {
-        // Wake-only kinds are fetched from the authoritative lease, but this
-        // extension cannot render them yet. The explicit result distinguishes
-        // that state from a catch-up network failure.
+        // This extension renders kind 9 only. Other lease-authorized wake kinds
+        // stay selectable so issue 10's catch-up sets remain aligned, but the
+        // user sees an explicit diagnostic instead of kind-aware content (issue
+        // 20) or a silent miss.
         resolution = BuzzPushResolution(
           title: "Buzz notification needs attention",
           body: "Buzz received a kind \(event.kind) wake that this app version cannot display.",

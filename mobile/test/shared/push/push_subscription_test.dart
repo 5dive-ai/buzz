@@ -56,6 +56,7 @@ void main() {
     expect(subscriptions.last.filter.kinds, buzzPushChannelKinds);
     expect(subscriptions.last.filter.hTags, [channelA]);
     expect(subscriptions.first.ignore, hasLength(2));
+    expect(subscriptions.first.ignore.first.kinds, buzzPushRenderableKinds);
     expect(subscriptions.first.ignore.last.hTags, [channelB]);
     expect(
       subscriptions.first.suppress?.pTagsMax,

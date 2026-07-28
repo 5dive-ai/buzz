@@ -2,21 +2,37 @@ package xyz.block.buzz.mobile
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 
+private const val CHANNEL_ID = "buzz_agent_live_updates"
+private const val NOTIFICATION_TAG = "buzz_agent_live_update"
+private const val NOTIFICATION_ID = 24_200
+private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 24_201
+private const val CONTENT_INTENT_REQUEST_CODE = 24_202
+private const val EXPIRY_INTENT_REQUEST_CODE = 24_203
+private const val EXPIRY_INTENT_ACTION = "xyz.block.buzz.mobile.AGENT_LIVE_UPDATE_EXPIRED"
+private const val PREFERENCES_NAME = "buzz_agent_live_updates"
+private const val PERMISSION_REQUESTED_KEY = "notification_permission_requested"
+private const val REQUEST_PROMOTED_ONGOING_EXTRA = "android.requestPromotedOngoing"
+
 internal class AgentLiveUpdateManager(
     private val activity: Activity,
 ) {
     private val notificationManager =
         activity.getSystemService(NotificationManager::class.java)
+    private val alarmManager =
+        activity.getSystemService(AlarmManager::class.java)
     private val preferences =
         activity.getSharedPreferences(PREFERENCES_NAME, Activity.MODE_PRIVATE)
 
@@ -37,6 +53,7 @@ internal class AgentLiveUpdateManager(
 
     fun dismiss() {
         pendingPayload = null
+        cancelLegacyExpiry()
         notificationManager.cancel(NOTIFICATION_TAG, NOTIFICATION_ID)
     }
 
@@ -125,6 +142,7 @@ internal class AgentLiveUpdateManager(
             .build()
 
         notificationManager.notify(NOTIFICATION_TAG, NOTIFICATION_ID, notification)
+        scheduleLegacyExpiry(payload.expiresAtMillis)
     }
 
     private fun newNotificationBuilder(): Notification.Builder =
@@ -151,6 +169,34 @@ internal class AgentLiveUpdateManager(
         notificationManager.createNotificationChannel(channel)
     }
 
+    private fun scheduleLegacyExpiry(expiresAtMillis: Long) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            cancelLegacyExpiry()
+            return
+        }
+        alarmManager.setExactAndAllowWhileIdle(
+            AlarmManager.RTC_WAKEUP,
+            legacyExpiryTriggerAt(expiresAtMillis, System.currentTimeMillis()),
+            expiryIntent(),
+        )
+    }
+
+    private fun cancelLegacyExpiry() {
+        val intent = expiryIntent()
+        alarmManager.cancel(intent)
+        intent.cancel()
+    }
+
+    private fun expiryIntent(): PendingIntent =
+        PendingIntent.getBroadcast(
+            activity,
+            EXPIRY_INTENT_REQUEST_CODE,
+            Intent(activity, AgentLiveUpdateExpiryReceiver::class.java).apply {
+                action = EXPIRY_INTENT_ACTION
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
     private fun contentIntent(payload: AgentLiveUpdatePayload): PendingIntent {
         val messageId = payload.messageId
         val intent = if (messageId != null) {
@@ -176,15 +222,21 @@ internal class AgentLiveUpdateManager(
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
     }
+}
 
-    companion object {
-        private const val CHANNEL_ID = "buzz_agent_live_updates"
-        private const val NOTIFICATION_TAG = "buzz_agent_live_update"
-        private const val NOTIFICATION_ID = 24_200
-        private const val NOTIFICATION_PERMISSION_REQUEST_CODE = 24_201
-        private const val CONTENT_INTENT_REQUEST_CODE = 24_202
-        private const val PREFERENCES_NAME = "buzz_agent_live_updates"
-        private const val PERMISSION_REQUESTED_KEY = "notification_permission_requested"
-        private const val REQUEST_PROMOTED_ONGOING_EXTRA = "android.requestPromotedOngoing"
+internal fun legacyExpiryTriggerAt(
+    expiresAtMillis: Long,
+    nowMillis: Long,
+): Long = expiresAtMillis.coerceAtLeast(nowMillis + 1L)
+
+internal class AgentLiveUpdateExpiryReceiver : BroadcastReceiver() {
+    override fun onReceive(
+        context: Context,
+        intent: Intent,
+    ) {
+        if (intent.action != EXPIRY_INTENT_ACTION) return
+        context
+            .getSystemService(NotificationManager::class.java)
+            .cancel(NOTIFICATION_TAG, NOTIFICATION_ID)
     }
 }

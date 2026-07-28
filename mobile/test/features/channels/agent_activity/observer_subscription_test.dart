@@ -148,6 +148,10 @@ void main() {
       expect(historyFilter.limit, 200);
       expect(historyFilter.tags['#p'], contains(myPubkey));
       expect(historyFilter.until, filter.since);
+      expect(
+        historyFilter.until! - historyFilter.since!,
+        const Duration(hours: 24, minutes: 1).inSeconds,
+      );
     },
   );
 
@@ -312,6 +316,59 @@ void main() {
     expect((state.transcript.single as LifecycleItem).title, 'Turn started');
   });
 
+  test('preserves replay age so stale turns do not restart', () async {
+    final ownerKeychain = nostr.Keys.generate();
+    final agentKeychain = nostr.Keys.generate();
+    final nowSeconds =
+        DateTime.now().toUtc().millisecondsSinceEpoch ~/
+        Duration.millisecondsPerSecond;
+    final eventCreatedAt = nowSeconds - 120;
+    final relaySession = _RecordingRelaySession()
+      ..historyEvents = [
+        _observerEvent(
+          ownerKeychain: ownerKeychain,
+          agentKeychain: agentKeychain,
+          channelId: 'test-channel',
+          seq: 1,
+          createdAt: eventCreatedAt,
+        ),
+      ];
+    final container = ProviderContainer(
+      overrides: [
+        relaySessionProvider.overrideWith(() => relaySession),
+        relayConfigProvider.overrideWith(
+          () => _FakeRelayConfigNotifier(nsec: ownerKeychain.nsec),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    const channelId = 'test-channel';
+    final key = (channelId: channelId, agentPubkey: agentKeychain.public);
+    container.read(observerSubscriptionProvider(key));
+    await Future<void>.delayed(Duration.zero);
+
+    final relayState = container.read(observerRelayProvider);
+    final replayFrame = relayState.framesByAgent[agentKeychain.public]!.single;
+    expect(
+      replayFrame.receivedAt,
+      DateTime.fromMillisecondsSinceEpoch(
+        eventCreatedAt * Duration.millisecondsPerSecond,
+        isUtc: true,
+      ),
+    );
+    expect(
+      reduceActiveAgentTurns(
+        relayState.framesByAgent,
+        now: DateTime.fromMillisecondsSinceEpoch(
+          nowSeconds * Duration.millisecondsPerSecond,
+          isUtc: true,
+        ),
+      ),
+      isEmpty,
+    );
+  });
+
   test(
     'decrypts observer frames and exposes channel-scoped transcript',
     () async {
@@ -459,6 +516,7 @@ NostrEvent _observerEvent({
   required nostr.Keys agentKeychain,
   required String channelId,
   required int seq,
+  int? createdAt,
 }) {
   final conversationKey = getConversationKey(
     agentKeychain.secret,
@@ -485,7 +543,17 @@ NostrEvent _observerEvent({
     secretKey: agentKeychain.secret,
     verify: false,
   );
-  return NostrEvent.fromJson(event.toMap());
+  final signedEvent = NostrEvent.fromJson(event.toMap());
+  if (createdAt == null) return signedEvent;
+  return NostrEvent(
+    id: signedEvent.id,
+    pubkey: signedEvent.pubkey,
+    createdAt: createdAt,
+    kind: signedEvent.kind,
+    tags: signedEvent.tags,
+    content: signedEvent.content,
+    sig: signedEvent.sig,
+  );
 }
 
 class _FakeRelayConfigNotifier extends RelayConfigNotifier {

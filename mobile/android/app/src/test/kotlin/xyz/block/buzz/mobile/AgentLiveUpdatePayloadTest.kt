@@ -6,6 +6,16 @@ import kotlin.test.assertNull
 
 class AgentLiveUpdatePayloadTest {
     @Test
+    fun legacyExpiryTriggerUsesPayloadDeadlineWhenStillFuture() {
+        assertEquals(2_000L, legacyExpiryTriggerAt(2_000L, 1_000L))
+    }
+
+    @Test
+    fun legacyExpiryTriggerSchedulesImmediateCancellationWhenAlreadyExpired() {
+        assertEquals(1_001L, legacyExpiryTriggerAt(500L, 1_000L))
+    }
+
+    @Test
     fun `parses Flutter method channel values`() {
         val payload = AgentLiveUpdatePayload.from(
             mapOf(

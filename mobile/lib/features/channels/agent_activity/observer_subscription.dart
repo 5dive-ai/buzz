@@ -12,6 +12,7 @@ import 'transcript_builder.dart';
 /// Maximum observer events to keep per agent.
 const _maxObserverEvents = 800;
 const _observerReplayLimit = 200;
+const _observerReplayWindow = Duration(hours: 24, minutes: 1);
 
 /// Key for channel-scoped transcript reads.
 typedef ObserverKey = ({String channelId, String agentPubkey});
@@ -134,6 +135,7 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       final session = ref.read(relaySessionProvider.notifier);
       final replayBoundary =
           DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000;
+      final replaySince = replayBoundary - _observerReplayWindow.inSeconds;
       final filterTags = {
         '#p': [ownerPubkey],
       };
@@ -144,6 +146,7 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
             kinds: [EventKind.agentObserverFrame],
             tags: filterTags,
             limit: _observerReplayLimit,
+            since: replaySince,
             until: replayBoundary,
           ),
         );
@@ -271,9 +274,12 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       );
       final plaintext = nip44Decrypt(conversationKey, event.content);
       final json = jsonDecode(plaintext) as Map<String, dynamic>;
+      final receivedAt = isHistorical
+          ? _historicalFrameTime(event)
+          : DateTime.now().toUtc();
       return ObserverFrame.fromJson(
         json,
-        receivedAt: DateTime.now().toUtc(),
+        receivedAt: receivedAt,
         isHistorical: isHistorical,
       );
     } catch (error) {
@@ -281,6 +287,18 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       _emit(connection: ObserverConnectionState.error);
       return null;
     }
+  }
+
+  DateTime _historicalFrameTime(NostrEvent event) {
+    final now = DateTime.now().toUtc();
+    final eventAt = DateTime.fromMillisecondsSinceEpoch(
+      event.createdAt * Duration.millisecondsPerSecond,
+      isUtc: true,
+    );
+    // Historical frames were not received now. Preserve their signed event age
+    // so replay cannot make an old, unterminated turn look newly active. Clamp
+    // future-dated events to now so host clock skew cannot extend freshness.
+    return eventAt.isAfter(now) ? now : eventAt;
   }
 
   void _emit({required ObserverConnectionState connection}) {

@@ -13,6 +13,7 @@ class AgentLiveUpdatesEnabledNotifier extends Notifier<bool> {
   bool build() =>
       ref.read(savedPrefsProvider).getBool(_agentLiveUpdatesEnabledKey) ?? true;
 
+  /// Persists whether agent Live Updates should be shown on this device.
   void setEnabled(bool enabled) {
     state = enabled;
     ref.read(savedPrefsProvider).setBool(_agentLiveUpdatesEnabledKey, enabled);

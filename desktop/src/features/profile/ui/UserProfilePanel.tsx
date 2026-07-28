@@ -982,6 +982,16 @@ export function UserProfilePanel({
           agentId={cardMintTarget.id}
           agentName={cardMintTarget.name}
           canLock={cardMintTarget.canLock}
+          onExportInstead={
+            resolvedPersona
+              ? () => {
+                  // Free path: swap the mint dialog for the ordinary
+                  // snapshot export flow (same importable agent, no spend).
+                  setCardMintTarget(null);
+                  setPersonaToExportSnapshot(resolvedPersona);
+                }
+              : undefined
+          }
           onOpenChange={(open) => {
             if (!open) setCardMintTarget(null);
           }}

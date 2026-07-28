@@ -36,6 +36,7 @@ use crate::{
             decrypt_envelope, encode_locked_snapshot_png, parse_chunk_payload, ChunkPayload,
         },
         load_agent_definitions, load_global_agent_config, load_managed_agents, load_personas,
+        save_global_agent_config, validate_global_config,
     },
 };
 
@@ -100,8 +101,10 @@ pub(crate) fn resolve_env_from_layers(
 }
 
 /// The Responses endpoint to post mints to. `OPENAI_BASE_URL` (same env
-/// layering as the key) overrides the default host — this is what makes
-/// Azure OpenAI and Responses-speaking proxies work without code changes.
+/// layering as the key) overrides the default host, supporting endpoints and
+/// proxies that speak the OpenAI Responses shape with Bearer auth. Azure
+/// OpenAI is NOT covered by this override alone — it uses its own URL scheme
+/// and `api-key` auth header, which would need a real driver.
 pub(crate) fn responses_url(base_url: Option<String>) -> String {
     let base = base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
     format!("{}/responses", base.trim_end_matches('/'))
@@ -140,7 +143,7 @@ First, write professional trading-card copy at Magic: The Gathering editorial qu
 - a type line (e.g. "Legendary Agent — Team Lead"),
 - ONE keyworded ability: short bolded ability name + one sentence of crisp rules text written like real MTG rules (present tense, precise, no fluff),
 - ONE italic flavor-text line, evocative and short, the kind that gets quoted.
-Where the owner's directions specify card text, use their wording (edited only for spelling); invent copy only for the parts they left open.
+Where the owner's directions specify card text, use their wording within the 220-character text-box limit below (edited only for spelling; if their text exceeds the limit, condense it minimally while keeping their words and intent); invent copy only for the parts they left open.
 Keep total text-box copy under 220 characters so it renders cleanly.
 
 Then generate the finished card with the image tool, exactly 1024x1536 portrait:
@@ -213,6 +216,48 @@ pub(crate) fn extract_card_output(resp: &serde_json::Value) -> Result<(String, S
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
+
+/// Save an `OPENAI_API_KEY` into the global Agent Defaults env for card
+/// minting — a narrow seam with deliberately different semantics from the
+/// general `set_global_agent_config`:
+///
+/// - **No agent restarts.** The general command stops/restarts every running
+///   local agent whose effective env changes, because agent env is baked at
+///   spawn time. The mint command re-reads the config from disk on every
+///   mint, so minting needs no restart — and a card setup must never disrupt
+///   running agents as a side effect. Agents pick the key up naturally on
+///   their next (re)start.
+/// - **Read-modify-write of the latest on-disk config.** The config is
+///   re-read immediately before the single-key insert + write (under the
+///   managed-agents store lock, which serializes it against the other card
+///   and agent-store commands), so a settings save that landed after this
+///   dialog opened is not clobbered with a stale dialog-open snapshot.
+///   (The general settings editor performs its own whole-config write; as
+///   today, the last writer wins between the two surfaces.)
+///
+/// Standard global-config validation still applies (POSIX key shape,
+/// reserved-key reject, size caps) — this is not a validation bypass.
+#[tauri::command]
+pub fn card_mint_save_openai_key(
+    key: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err("API key cannot be empty.".to_string());
+    }
+
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+
+    let mut config = load_global_agent_config(&app)?;
+    config.env_vars.insert("OPENAI_API_KEY".to_string(), key);
+    validate_global_config(&config)?;
+    save_global_agent_config(&app, &config)
+}
 
 /// Report whether an OpenAI key would resolve for a card mint of agent `id`,
 /// using exactly the same env layering as `mint_agent_card`. Lets the mint
@@ -694,9 +739,11 @@ mod tests {
         assert!(directed.contains("match input image 2's art style EXACTLY"));
         assert!(directed.contains("cannot change the frame, layout, or"));
         assert!(directed.contains("Render all text with perfect fidelity"));
-        // Card-text direction is an explicitly named capability.
+        // Card-text direction is an explicitly named capability, and the
+        // owner-wording rule acknowledges the fixed 220-char text-box limit
+        // (no mutually impossible "verbatim" vs "under 220 chars" pair).
         assert!(directed.contains("card text"));
-        assert!(directed.contains("use their wording"));
+        assert!(directed.contains("use their wording within the 220-character text-box limit"));
     }
 
     #[test]

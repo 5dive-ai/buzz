@@ -1,6 +1,7 @@
 import * as React from "react";
 import {
   Download,
+  ExternalLink,
   KeyRound,
   Lock,
   RefreshCw,
@@ -8,6 +9,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 
 import {
@@ -16,11 +18,8 @@ import {
 } from "@/features/channels/hooks";
 import { globalAgentConfigQueryKey } from "@/features/agents/useGlobalAgentConfig";
 import {
-  getGlobalAgentConfig,
-  setGlobalAgentConfig,
-} from "@/shared/api/tauriGlobalAgentConfig";
-import {
   cardMintKeyStatus,
+  cardMintSaveOpenaiKey,
   mintAgentCard,
   NO_OPENAI_KEY_PREFIX,
   saveAgentCard,
@@ -47,6 +46,46 @@ function cardBytesFromBase64(b64: string): number[] {
   return Array.from(atob(b64), (char) => char.charCodeAt(0));
 }
 
+const OPENAI_KEYS_URL = "https://platform.openai.com/api-keys";
+
+/**
+ * The free alternative, as an action: ordinary snapshot export shares the
+ * same importable agent without card art or API spend. Rendered in both the
+ * key-setup panel and the normal pre-mint form (the cost disclosure and its
+ * escape hatch must be visible BEFORE any spend, not only during onboarding).
+ */
+function FreeSharePathRow({
+  disabled,
+  onExportInstead,
+}: {
+  disabled: boolean;
+  onExportInstead?: () => void;
+}) {
+  return (
+    <div
+      className="flex items-center justify-between gap-3"
+      data-testid="agent-card-free-path"
+    >
+      <p className="text-xs text-muted-foreground">
+        Don’t want to spend money? Ordinary export shares the same importable
+        agent — free, just without the card art.
+      </p>
+      {onExportInstead ? (
+        <Button
+          className="shrink-0"
+          data-testid="agent-card-export-instead"
+          disabled={disabled}
+          onClick={onExportInstead}
+          size="sm"
+          variant="outline"
+        >
+          Share without card art
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
 /**
  * Mint-a-trading-card dialog: optional style notes → one long Rust-side
  * Responses API call → preview with reroll → save as `.agent.png`.
@@ -59,6 +98,7 @@ export function AgentCardMintDialog({
   agentId,
   agentName,
   canLock,
+  onExportInstead,
   onOpenChange,
 }: {
   /** Instance pubkey or definition slug — same resolution as snapshot export. */
@@ -69,6 +109,11 @@ export function AgentCardMintDialog({
    * Locking is disabled — with an explanation — for bare definitions.
    */
   canLock: boolean;
+  /**
+   * Free alternative: close this dialog and open the ordinary snapshot
+   * export flow (no API spend). Omitted = the action is not rendered.
+   */
+  onExportInstead?: () => void;
   onOpenChange: (open: boolean) => void;
 }) {
   const [styleNotes, setStyleNotes] = React.useState("");
@@ -92,21 +137,22 @@ export function AgentCardMintDialog({
   const needsKey = keyStatusQuery.data === false;
 
   // Save the pasted key into the global Agent Defaults env — the same single
-  // source of truth every agent inherits. No card-specific key store exists.
+  // source of truth every agent inherits. Narrow Rust seam: validated
+  // single-key merge, never restarts running agents (the mint re-reads
+  // config per call, so no restart is needed for minting).
   const saveKeyMutation = useMutation({
-    mutationFn: async (key: string) => {
-      const config = await getGlobalAgentConfig();
-      const result = await setGlobalAgentConfig({
-        ...config,
-        env_vars: { ...config.env_vars, OPENAI_API_KEY: key },
-      });
-      return result.config;
-    },
-    onSuccess: (savedConfig) => {
-      queryClient.setQueryData(globalAgentConfigQueryKey, savedConfig);
+    mutationFn: (key: string) => cardMintSaveOpenaiKey(key),
+    onSuccess: () => {
       queryClient.setQueryData(["cardMintKeyStatus", agentId], true);
+      // The Agent Defaults editor caches the whole config — refetch it so a
+      // later-opened settings view shows the key we just wrote.
+      void queryClient.invalidateQueries({
+        queryKey: globalAgentConfigQueryKey,
+      });
       setKeyDraft("");
-      toast.success("API key saved to your agent defaults.");
+      toast.success(
+        "API key saved to your agent defaults. Running agents pick it up on their next restart.",
+      );
     },
     onError: (error) =>
       toast.error(typeof error === "string" ? error : "Couldn't save the key."),
@@ -259,9 +305,20 @@ export function AgentCardMintDialog({
                 dollar per mint, billed by OpenAI). The key is saved to your
                 agent defaults, so you only do this once.
               </p>
-              <p className="text-xs text-muted-foreground">
-                Create a key at platform.openai.com under API keys.
-              </p>
+              <Button
+                className="w-fit px-0 text-xs"
+                data-testid="agent-card-key-link"
+                onClick={() =>
+                  void openUrl(OPENAI_KEYS_URL).catch(() => {
+                    toast.error("Failed to open link");
+                  })
+                }
+                size="sm"
+                variant="link"
+              >
+                <ExternalLink className="mr-1 h-3 w-3" />
+                Get a key at platform.openai.com
+              </Button>
               <Input
                 autoFocus
                 data-testid="agent-card-key-input"
@@ -272,11 +329,10 @@ export function AgentCardMintDialog({
                 value={keyDraft}
               />
             </div>
-            <p className="text-xs text-muted-foreground">
-              Don’t want to spend money? The Export action on the agent shares
-              the same importable agent as a plain file — free, just without the
-              collectible card art.
-            </p>
+            <FreeSharePathRow
+              disabled={saveKeyMutation.isPending}
+              onExportInstead={onExportInstead}
+            />
             <div className="flex justify-end">
               <Button
                 data-testid="agent-card-key-save"
@@ -318,6 +374,17 @@ export function AgentCardMintDialog({
                 onCheckedChange={setLockCard}
               />
             </div>
+            <p
+              className="text-xs text-muted-foreground"
+              data-testid="agent-card-cost-note"
+            >
+              Minting calls the OpenAI API with your key and costs money —
+              typically well under a dollar per mint, billed by OpenAI.
+            </p>
+            <FreeSharePathRow
+              disabled={isMinting}
+              onExportInstead={onExportInstead}
+            />
             <div className="flex justify-end">
               <Button
                 disabled={isMinting}

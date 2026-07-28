@@ -840,6 +840,7 @@ pub fn run() {
             delete_team,
             export_agent_snapshot,
             card_mint_key_status,
+            card_mint_save_openai_key,
             mint_agent_card,
             save_agent_card,
             preview_agent_snapshot_import,

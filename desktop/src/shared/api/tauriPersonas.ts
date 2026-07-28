@@ -193,6 +193,18 @@ export async function cardMintKeyStatus(id: string): Promise<boolean> {
 }
 
 /**
+ * Save an OPENAI_API_KEY into the global Agent Defaults env for card minting.
+ *
+ * Narrow seam: validated read-modify-write of the single key against the
+ * latest on-disk config. Unlike the general set_global_agent_config, this
+ * NEVER restarts running agents — the mint re-reads config per call, and a
+ * card setup must not disrupt unrelated agents.
+ */
+export async function cardMintSaveOpenaiKey(key: string): Promise<void> {
+  return invokeTauri<void>("card_mint_save_openai_key", { key });
+}
+
+/**
  * Mint a trading card for an agent. One long API call (~2–3 minutes).
  * Reroll = call again; the backend holds no session state.
  *

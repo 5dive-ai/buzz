@@ -22,15 +22,11 @@ use crate::app_state::AppState;
 #[path = "playback_speed_dsp.rs"]
 mod playback_speed_dsp;
 pub(crate) use playback_speed_dsp::process_complete_chunk_preserving_lead_in;
-#[allow(unused_imports)]
-pub use playback_speed_dsp::{
-    process_complete_chunk, validate_speed, DEFAULT_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED,
-    MIN_PLAYBACK_SPEED,
-};
+use playback_speed_dsp::{validate_speed, DEFAULT_PLAYBACK_SPEED};
 
 const SETTINGS_FILE: &str = "tts-playback-settings.json";
 #[cfg(test)]
-use playback_speed_dsp::UNITY_EPSILON;
+use playback_speed_dsp::{process_complete_chunk, UNITY_EPSILON};
 
 /// Lock-free shared control read by the TTS worker before each synthesis chunk.
 #[derive(Clone, Debug)]

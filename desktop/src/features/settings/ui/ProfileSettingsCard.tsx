@@ -189,9 +189,9 @@ function EncryptedBackupRow() {
     <div className="px-4 py-3" data-testid="profile-encrypted-backup-row">
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0 space-y-1">
-          <p className="text-sm font-medium">Encrypted backup</p>
+          <p className="text-sm font-medium">Password Backup</p>
           <p className="text-sm text-muted-foreground">
-            Protect your key with a passphrase and save a recoverable backup.
+            Protect your key with a password and save a recoverable backup.
           </p>
         </div>
         <button

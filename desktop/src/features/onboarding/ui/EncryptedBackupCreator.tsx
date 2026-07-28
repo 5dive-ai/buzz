@@ -29,7 +29,7 @@ type EncryptedBackupCreatorProps = {
 
 /**
  * Passphrase-first NIP-49 backup creation flow, shared by the onboarding
- * BackupStep and the settings Encrypted backup row.
+ * BackupStep and the settings Password Backup row.
  *
  * The raw private key never enters this component: it collects a passphrase,
  * asks Rust to create + persist the encrypted backup, and displays the

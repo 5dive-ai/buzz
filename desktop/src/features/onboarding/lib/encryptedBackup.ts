@@ -1,6 +1,6 @@
 /**
  * Pure state model for the encrypted-key-backup (NIP-49) creation flow,
- * shared by the onboarding BackupStep and the settings Encrypted backup row.
+ * shared by the onboarding BackupStep and the settings Password Backup row.
  *
  * All validation and phase logic lives here so it can be unit-tested without
  * React. Hosts wire the reducer to the Tauri commands

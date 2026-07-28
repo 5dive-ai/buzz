@@ -583,7 +583,7 @@ fn tts_worker(
                     Ok(_) => {}
                     Err(e) => {
                         eprintln!("buzz-desktop: TTS synth failed: {e}");
-                        break 'playback_chunks;
+                        break;
                     }
                 }
             }

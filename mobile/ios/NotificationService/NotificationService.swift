@@ -29,6 +29,16 @@ final class NotificationService: UNNotificationServiceExtension {
         if let threadIdentifier = resolution.threadIdentifier {
           content.threadIdentifier = threadIdentifier
         }
+        var userInfo = content.userInfo
+        userInfo[PushNotificationIdentity.userInfoKey] = resolution.identity.userInfoValue
+        content.userInfo = userInfo
+        do {
+          _ = try PushNotificationIdentity.require(from: content.userInfo)
+        } catch {
+          content.title = "Buzz notification needs attention"
+          content.body = "Buzz could not persist notification identity."
+          content.subtitle = ""
+        }
       case .diagnostic(let message):
         content.title = "Buzz notification needs attention"
         content.body = message
@@ -57,6 +67,7 @@ struct BuzzPushResolution {
   let body: String
   let subtitle: String?
   let threadIdentifier: String?
+  let identity: PushNotificationIdentity
 }
 
 enum BuzzPushResolutionResult {
@@ -69,16 +80,29 @@ protocol BuzzPushNotificationResolving {
   func resolve(completion: @escaping (BuzzPushResolutionResult) -> Void)
 }
 
+protocol BuzzDeliveredNotificationManaging {
+  func deliveredNotifications(completion: @escaping ([UNNotification]) -> Void)
+  func removeDeliveredNotifications(withIdentifiers identifiers: [String])
+}
+
+extension UNUserNotificationCenter: BuzzDeliveredNotificationManaging {
+  func deliveredNotifications(completion: @escaping ([UNNotification]) -> Void) {
+    getDeliveredNotifications(completionHandler: completion)
+  }
+}
+
 final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
   private struct Candidate {
     let resolution: BuzzPushResolution
     let event: VerifiedNostrEvent
     let community: PushLeaseCommunity
+    let wasPreviouslyConsumed: Bool
   }
 
   private let session: URLSession
   private let appGroupIdentifier: String?
   private let keychainAccessGroup: String?
+  private let notificationCenter: BuzzDeliveredNotificationManaging
   private let fileManager: FileManager
 
   init(
@@ -89,11 +113,14 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
     keychainAccessGroup: String? = Bundle.main.object(
       forInfoDictionaryKey: "BuzzKeychainAccessGroup"
     ) as? String,
+    notificationCenter: BuzzDeliveredNotificationManaging =
+      UNUserNotificationCenter.current(),
     fileManager: FileManager = .default
   ) {
     self.session = session
     self.appGroupIdentifier = appGroupIdentifier
     self.keychainAccessGroup = keychainAccessGroup
+    self.notificationCenter = notificationCenter
     self.fileManager = fileManager
   }
 
@@ -105,6 +132,7 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
       completion(.diagnostic("Open Buzz to refresh notification subscriptions."))
       return
     }
+
     let communities = loaded.communities.filter {
       $0.pubkey?.isEmpty == false && loadPrivateKey(communityID: $0.id) != nil
     }
@@ -141,6 +169,9 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
     group.notify(queue: .global(qos: .userInitiated)) { [weak self] in
       guard let self else { return }
       let sorted = candidates.sorted { lhs, rhs in
+        if lhs.wasPreviouslyConsumed != rhs.wasPreviouslyConsumed {
+          return !lhs.wasPreviouslyConsumed
+        }
         if lhs.event.createdAt != rhs.event.createdAt {
           return lhs.event.createdAt > rhs.event.createdAt
         }
@@ -151,14 +182,19 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
         completion(diagnostics.sorted().first.map(BuzzPushResolutionResult.diagnostic) ?? .none)
         return
       }
+
       let position = PushEventPosition(
         createdAt: winner.event.createdAt,
         id: winner.event.id
       )
-      var shouldPresent = false
+      var shouldPresent = winner.wasPreviouslyConsumed
       do {
         try loaded.store.update { state in
           state.removeInactiveOrigins(Set(communities.map(\.id)))
+          if state.hasConsumed(eventID: position.id, for: winner.community.id) {
+            shouldPresent = true
+            return
+          }
           guard state.canSelect(position, for: winner.community.id) else { return }
           state.consume(position, for: winner.community.id)
           shouldPresent = true
@@ -171,7 +207,7 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
         completion(.none)
         return
       }
-      completion(.notification(winner.resolution))
+      absorbSequentialDuplicate(of: winner.resolution, completion: completion)
     }
   }
 
@@ -260,15 +296,15 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
       else {
         return false
       }
-      return consumptionState.canSelect(
-        PushEventPosition(createdAt: event.createdAt, id: event.id),
-        for: community.id
-      )
+      let position = PushEventPosition(createdAt: event.createdAt, id: event.id)
+      return consumptionState.hasConsumed(eventID: event.id, for: community.id)
+        || consumptionState.canSelect(position, for: community.id)
     }.sorted {
       $0.createdAt == $1.createdAt ? $0.id < $1.id : $0.createdAt > $1.createdAt
     }
 
     for event in matching {
+      let identity = PushNotificationIdentity(eventID: event.id, origin: community.id)
       let resolution: BuzzPushResolution
       if event.kind == 9 {
         let body = previewBody(event.content)
@@ -278,21 +314,73 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
           title: shortPubkey(event.pubkey),
           body: body,
           subtitle: community.name,
-          threadIdentifier: channel ?? community.id
+          threadIdentifier: channel ?? community.id,
+          identity: identity
         )
       } else {
         // Wake-only kinds are fetched from the authoritative lease, but this
-        // extension cannot render them yet.
+        // extension cannot render them yet. The explicit result distinguishes
+        // that state from a catch-up network failure.
         resolution = BuzzPushResolution(
           title: "Buzz notification needs attention",
           body: "Buzz received a kind \(event.kind) wake that this app version cannot display.",
           subtitle: community.name,
-          threadIdentifier: "buzz.push.unsupported-kind.\(event.kind)"
+          threadIdentifier: "buzz.push.unsupported-kind.\(event.kind)",
+          identity: identity
         )
       }
-      return .candidate(Candidate(resolution: resolution, event: event, community: community))
+      return .candidate(
+        Candidate(
+          resolution: resolution,
+          event: event,
+          community: community,
+          wasPreviouslyConsumed: consumptionState.hasConsumed(
+            eventID: event.id,
+            for: community.id
+          )
+        )
+      )
     }
     return .none
+  }
+
+  private func absorbSequentialDuplicate(
+    of resolution: BuzzPushResolution,
+    completion: @escaping (BuzzPushResolutionResult) -> Void
+  ) {
+    notificationCenter.deliveredNotifications { [weak self] notifications in
+      guard let self else { return }
+      let records = notifications.map {
+        PushDeliveredNotificationRecord(
+          requestIdentifier: $0.request.identifier,
+          userInfo: $0.request.content.userInfo
+        )
+      }
+      let requestIdentifiers: [String]
+      do {
+        requestIdentifiers = try PushDuplicateAbsorption.requestIdentifiersToRemove(
+          matching: resolution.identity,
+          from: records
+        )
+      } catch {
+        completion(.diagnostic("Buzz could not inspect notification identity."))
+        return
+      }
+      if !requestIdentifiers.isEmpty {
+        self.notificationCenter.removeDeliveredNotifications(
+          withIdentifiers: requestIdentifiers
+        )
+      }
+
+      // Limitation 1: A duplicate wake can still alert before the older copy is
+      // removed. The stack stops growing; the user can still be notified twice
+      // for one event.
+      // Limitation 2: Two concurrent NSE invocations can each miss the other's
+      // delivered notification and both leave a copy. Sequential duplicates are
+      // absorbed; truly concurrent delivery still races. Exact absorption needs
+      // gateway-side apns-collapse-id, which is issue 18 and out of scope.
+      completion(.notification(resolution))
+    }
   }
 
   private static func previewBody(_ content: String) -> String {

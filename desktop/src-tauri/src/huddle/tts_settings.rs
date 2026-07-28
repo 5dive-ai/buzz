@@ -81,11 +81,7 @@ pub struct VoiceProvenance {
 /// may have that backend installed. Resolution is always local.
 pub type VoicePreferences = Vec<String>;
 
-/// Cross-backend registry for voices known to this client.
-///
-/// V1 contains Pocket entries only. Siri, Kokoro, imported voices, and
-/// per-agent assignment can add entries or reuse the preference type without
-/// changing the registry/settings boundary.
+/// Bundled Pocket voices available without local imports.
 pub fn bundled_voice_registry() -> Vec<VoiceRegistryEntry> {
     POCKET_VOICES
         .iter()
@@ -107,6 +103,7 @@ pub fn bundled_voice_registry() -> Vec<VoiceRegistryEntry> {
         .collect()
 }
 
+/// Cross-backend registry of bundled and locally installed voices.
 pub fn voice_registry(app: &AppHandle) -> Vec<VoiceRegistryEntry> {
     let mut registry = bundled_voice_registry();
     match super::tts_voice_import::load_registry(app) {

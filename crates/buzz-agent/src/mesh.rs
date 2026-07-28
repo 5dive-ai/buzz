@@ -110,10 +110,29 @@ fn catalog_supports_collective(catalog: &Value) -> Option<bool> {
 
 /// Did this error mean "the mesh shrank", as opposed to a generic failure?
 ///
-/// Two shapes, both from the old implementation (`llm.rs:1362-1388`): a 503
-/// whose `error.message` is exactly [`MOA_UNAVAILABLE_MESSAGE`], or any server
-/// error whose `error.type` is `moa_failure`. Anything else is a real error and
-/// must surface — silently retrying every 5xx as `auto` would mask outages.
+/// The old loop inspected the raw HTTP body (`llm.rs:1362-1388`) and accepted
+/// two shapes: a 503 whose `error.message` is exactly
+/// [`MOA_UNAVAILABLE_MESSAGE`], or any 5xx whose `error.type` is
+/// `moa_failure`.
+///
+/// **We only see what goose leaves us.** `extract_message`
+/// (`goose-providers/src/http_status.rs:186-197`) reduces the payload to
+/// `error.message` when that field exists, and only falls back to the whole
+/// JSON when it does not. So:
+///
+/// * message shape — always detected (the message survives verbatim);
+/// * `moa_failure` with no `message` — detected (whole JSON survives);
+/// * `moa_failure` *alongside* a `message` — **not** detected, because the
+///   type is discarded before it reaches us. Such a request fails the turn
+///   instead of retrying on `auto`.
+///
+/// That last case is the one behaviour the provider-level wrapper cannot
+/// reproduce; recovering it needs an HTTP-level seam goose does not expose.
+/// mesh-llm's under-provisioned path sends the message shape, which is why the
+/// common case is covered.
+///
+/// Anything else is a real error and must surface — silently retrying every
+/// 5xx as `auto` would mask outages.
 fn is_mesh_contraction(err: &ProviderError) -> bool {
     let text = err.to_string();
     if text.contains(MOA_UNAVAILABLE_MESSAGE) {
@@ -458,10 +477,27 @@ mod tests {
     }
 
     #[test]
-    fn recognises_moa_failure_type() {
+    fn recognises_moa_failure_type_when_no_message_field() {
+        // Reachable only because goose falls back to the whole payload when
+        // `error.message` is absent (http_status.rs:196).
         let err =
             ProviderError::ServerError("500: {\"error\":{\"type\":\"moa_failure\"}}".to_string());
         assert!(is_mesh_contraction(&err));
+    }
+
+    #[test]
+    fn moa_failure_alongside_a_message_is_a_known_blind_spot() {
+        // goose keeps only `error.message`, so `type` never reaches us. This
+        // pins the gap rather than pretending parity: if goose ever preserves
+        // the body, this test flips and we can delete the caveat in the docs.
+        let err = ProviderError::ServerError(
+            "Server error (500) at http://x: upstream exploded".to_string(),
+        );
+        assert!(
+            !is_mesh_contraction(&err),
+            "if this now passes, goose stopped stripping the body -- update the \
+             doc comment on is_mesh_contraction"
+        );
     }
 
     #[test]

@@ -37,14 +37,12 @@ test("Pocket-only V1 filters the shared registry by backend", () => {
 test("local selection uses the first compatible qualified preference", () => {
   const voices = [
     voice("pocket:mary", "Mary", null),
-    voice("pocket:marius", "Marius"),
+    voice("pocket:eve", "Eve"),
   ];
   assert.equal(
-    selectedVoiceForBackend(
-      ["siri:aaron", "pocket:marius", "pocket:mary"],
-      voices,
-    )?.key,
-    "pocket:marius",
+    selectedVoiceForBackend(["siri:aaron", "pocket:eve", "pocket:mary"], voices)
+      ?.key,
+    "pocket:eve",
   );
 });
 

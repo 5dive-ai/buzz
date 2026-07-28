@@ -1,3 +1,8 @@
+import {
+  KIND_STREAM_MESSAGE,
+  KIND_STREAM_MESSAGE_V2,
+} from "../../../shared/constants/kinds.ts";
+
 export type LiveTtsEvent = {
   id: string;
   kind: number;
@@ -5,6 +10,23 @@ export type LiveTtsEvent = {
   content: string;
   tags: string[][];
 };
+
+export type LiveTtsEligibility =
+  | { text: string; reason: null }
+  | {
+      text: null;
+      reason:
+        | "unsupported_kind"
+        | "h_tag_mismatch"
+        | "author_not_agent"
+        | "self_authored"
+        | "empty_or_system";
+    };
+
+export type LiveTtsRouteResult =
+  | "queued"
+  | "disabled"
+  | Exclude<LiveTtsEligibility, { text: string }>["reason"];
 
 function textWithoutAttachments(event: LiveTtsEvent): string {
   const urls = new Set(
@@ -30,18 +52,56 @@ function textWithoutAttachments(event: LiveTtsEvent): string {
   );
 }
 
+export function classifySpeakableAgentText(
+  event: LiveTtsEvent,
+  agentPubkeys: ReadonlySet<string>,
+  selfPubkey: string | null,
+  channelId: string,
+): LiveTtsEligibility {
+  if (
+    event.kind !== KIND_STREAM_MESSAGE &&
+    event.kind !== KIND_STREAM_MESSAGE_V2
+  )
+    return { text: null, reason: "unsupported_kind" };
+  if (!event.tags.some((tag) => tag[0] === "h" && tag[1] === channelId))
+    return { text: null, reason: "h_tag_mismatch" };
+  if (!agentPubkeys.has(event.pubkey))
+    return { text: null, reason: "author_not_agent" };
+  if (event.pubkey === selfPubkey)
+    return { text: null, reason: "self_authored" };
+  const content = textWithoutAttachments(event).trim();
+  if (content.length === 0 || content.startsWith("[System]"))
+    return { text: null, reason: "empty_or_system" };
+  return { text: content, reason: null };
+}
+
+/** Classify and enqueue one live event through the production routing seam. */
+export function routeLiveAgentText(
+  event: LiveTtsEvent,
+  agentPubkeys: ReadonlySet<string>,
+  selfPubkey: string | null,
+  channelId: string,
+  routeId: number,
+  enqueue: (text: string, routeId: number) => "queued" | "disabled",
+): LiveTtsRouteResult {
+  const eligibility = classifySpeakableAgentText(
+    event,
+    agentPubkeys,
+    selfPubkey,
+    channelId,
+  );
+  if (eligibility.text === null) return eligibility.reason;
+  return enqueue(eligibility.text, routeId);
+}
+
 export function speakableAgentText(
   event: LiveTtsEvent,
   agentPubkeys: ReadonlySet<string>,
   selfPubkey: string | null,
+  channelId: string,
 ): string | null {
-  if (event.kind !== 9) return null;
-  if (!agentPubkeys.has(event.pubkey)) return null;
-  if (event.pubkey === selfPubkey) return null;
-  const content = textWithoutAttachments(event).trim();
-  if (content.length <= 1) return null;
-  if (content.startsWith("[System]")) return null;
-  return content;
+  return classifySpeakableAgentText(event, agentPubkeys, selfPubkey, channelId)
+    .text;
 }
 
 /**
@@ -49,25 +109,27 @@ export function speakableAgentText(
  * in thread arrival order even when the bridge resolves calls asynchronously.
  */
 export function createOrderedSpeaker(
-  speak: (text: string) => Promise<void>,
+  speak: (text: string, routeId: number) => Promise<void>,
   onError: (error: unknown) => void,
+  initiallyEnabled = true,
 ): {
-  enqueue: (text: string) => void;
+  enqueue: (text: string, routeId?: number) => "queued" | "disabled";
   setEnabled: (enabled: boolean) => void;
 } {
   let tail = Promise.resolve();
-  let enabled = true;
+  let enabled = initiallyEnabled;
   let generation = 0;
   return {
-    enqueue(text) {
-      if (!enabled) return;
+    enqueue(text, routeId = 0) {
+      if (!enabled) return "disabled";
       const queuedGeneration = generation;
       tail = tail
         .then(() => {
           if (!enabled || generation !== queuedGeneration) return;
-          return speak(text);
+          return speak(text, routeId);
         })
         .catch(onError);
+      return "queued";
     },
     setEnabled(nextEnabled) {
       if (!nextEnabled) generation += 1;
@@ -97,7 +159,10 @@ export function createLatestStateGate<T>(apply: (value: T) => void): {
 }
 
 /** Hold live events until the first authoritative agent-membership lookup. */
-export function createInitialMembershipGate<T>(deliver: (event: T) => void): {
+export function createInitialMembershipGate<T>(
+  deliver: (event: T) => void,
+  drop: (event: T) => void = () => {},
+): {
   push: (event: T) => void;
   succeed: () => void;
   fail: () => void;
@@ -118,7 +183,9 @@ export function createInitialMembershipGate<T>(deliver: (event: T) => void): {
     },
     fail() {
       settled = true;
+      const dropped = pending;
       pending = [];
+      for (const event of dropped) drop(event);
     },
   };
 }

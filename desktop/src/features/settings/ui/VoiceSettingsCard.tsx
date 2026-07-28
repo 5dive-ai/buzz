@@ -184,7 +184,10 @@ export function VoiceSettingsCard() {
                       <ChevronDown className="h-4 w-4" />
                     </Button>
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
+                  <DropdownMenuContent
+                    align="end"
+                    className="max-h-80 overflow-y-auto"
+                  >
                     <DropdownMenuRadioGroup
                       onValueChange={(voiceKey) => {
                         if (settings) void savePocketVoice(voiceKey);

@@ -8,14 +8,21 @@ import {
   createInitialMembershipGate,
   createLatestStateGate,
   createOrderedSpeaker,
-  speakableAgentText,
+  routeLiveAgentText,
 } from "./ttsLiveMessages";
 
 const AGENT_PUBKEY_REFRESH_INTERVAL_MS = 30_000;
+let nextTtsRouteId = 1;
+
+function allocateTtsRouteId(): number {
+  const routeId = nextTtsRouteId;
+  nextTtsRouteId += 1;
+  return routeId;
+}
 
 /**
  * Subscribe to agent TTS messages on the ephemeral huddle channel.
- * Pipes agent kind:9 messages to `speak_agent_message` on the Rust backend.
+ * Pipes new agent message events to `speak_agent_message` on the Rust backend.
  *
  * Extracted from HuddleContext to keep file sizes manageable.
  */
@@ -29,6 +36,7 @@ export function useTtsSubscription(
     let disposed = false;
     let cleanup: (() => void) | null = null;
     let unlistenHuddleState: (() => void) | null = null;
+    let ttsStateKnown = false;
 
     // ── Agent identity (authoritative, fail-closed) ───────────────────────
     //
@@ -43,26 +51,72 @@ export function useTtsSubscription(
     const agentPubkeys = new Set<string>();
 
     const speakInOrder = createOrderedSpeaker(
-      async (text) => {
+      async (text, routeId) => {
         if (!disposed) {
-          await invoke("speak_agent_message", { text });
+          console.debug(
+            `[huddle] tts stage=invoke status=attempted route_id=${routeId}`,
+          );
+          try {
+            await invoke("speak_agent_message", { text, routeId });
+            console.debug(
+              `[huddle] tts stage=invoke status=accepted route_id=${routeId}`,
+            );
+          } catch (error) {
+            console.warn(
+              `[huddle] tts stage=invoke status=failed reason=native_error route_id=${routeId}`,
+            );
+            throw error;
+          }
         }
       },
-      (err) => {
-        console.warn("[huddle] TTS speak failed:", err);
-      },
+      () => {},
+      false,
     );
 
-    const deliver = (event: Parameters<typeof speakableAgentText>[0]) => {
-      if (!agentsLoaded || disposed) return;
-      const text = speakableAgentText(
+    const deliver = ({
+      event,
+      routeId,
+    }: {
+      event: Parameters<typeof routeLiveAgentText>[0];
+      routeId: number;
+    }) => {
+      if (disposed) return;
+      if (!agentsLoaded) {
+        console.debug(
+          `[huddle] tts stage=eligibility status=rejected reason=membership_unavailable route_id=${routeId}`,
+        );
+        return;
+      }
+      const result = routeLiveAgentText(
         event,
         agentPubkeys,
         selfPubkeyRef.current,
+        ephemeralChannelId,
+        routeId,
+        speakInOrder.enqueue,
       );
-      if (text) speakInOrder.enqueue(text);
+      if (result === "queued") {
+        console.debug(
+          `[huddle] tts stage=eligibility status=accepted route_id=${routeId}`,
+        );
+      } else {
+        const reason =
+          result === "disabled" && !ttsStateKnown
+            ? "tts_state_unknown"
+            : result;
+        console.debug(
+          `[huddle] tts stage=eligibility status=rejected reason=${reason} route_id=${routeId}`,
+        );
+      }
     };
-    const initialMembershipGate = createInitialMembershipGate(deliver);
+    const initialMembershipGate = createInitialMembershipGate(
+      deliver,
+      ({ routeId }) => {
+        console.debug(
+          `[huddle] tts stage=eligibility status=rejected reason=membership_unavailable route_id=${routeId}`,
+        );
+      },
+    );
 
     async function loadAgentPubkeys(initial = false) {
       try {
@@ -97,7 +151,10 @@ export function useTtsSubscription(
     // event arrives while IPC is pending, it supersedes the stale snapshot.
     const ttsStateGate = createLatestStateGate<{ tts_enabled: boolean }>(
       (state) => {
-        if (!disposed) speakInOrder.setEnabled(state.tts_enabled);
+        if (!disposed) {
+          ttsStateKnown = true;
+          speakInOrder.setEnabled(state.tts_enabled);
+        }
       },
     );
     void listen<{ tts_enabled: boolean }>("huddle-state-changed", (event) => {
@@ -115,7 +172,6 @@ export function useTtsSubscription(
             if (!disposed) applyBootstrap(state);
           })
           .catch((err) => {
-            if (!disposed) applyBootstrap({ tts_enabled: false });
             console.warn("[huddle] Failed to load TTS state:", err);
           });
       })
@@ -125,7 +181,7 @@ export function useTtsSubscription(
       });
 
     // ── Live-only subscription ───────────────────────────────────────────
-    // A kind:9, limit:0 subscription receives future fan-out while the relay
+    // A limit:0 subscription receives future message fan-out while the relay
     // returns no stored rows, including pre-join rows from the current second.
     // Event-ID dedup handles reconnect replay (same event arriving twice).
     const seenEventIds = new Set<string>();
@@ -147,7 +203,13 @@ export function useTtsSubscription(
 
           // Preserve arrival order while the initial authoritative membership
           // lookup is pending. A failed lookup clears this buffer fail-closed.
-          initialMembershipGate.push(event);
+          const routeId = allocateTtsRouteId();
+          if (!agentsLoaded) {
+            console.debug(
+              `[huddle] tts stage=eligibility status=deferred reason=membership_unavailable route_id=${routeId}`,
+            );
+          }
+          initialMembershipGate.push({ event, routeId });
         },
         { replayMissedHistory: true },
       )

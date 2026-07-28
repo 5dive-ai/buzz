@@ -5,59 +5,140 @@ import {
   createInitialMembershipGate,
   createLatestStateGate,
   createOrderedSpeaker,
+  routeLiveAgentText,
   speakableAgentText,
 } from "./ttsLiveMessages.ts";
 
 const agents = new Set(["agent"]);
+const CHANNEL = "active-huddle";
 const base = {
   id: "1",
   kind: 9,
   pubkey: "agent",
   content: "Hello there",
-  tags: [],
+  tags: [["h", CHANNEL]],
 };
 
 test("speaks only new agent-authored text message events", () => {
-  assert.equal(speakableAgentText(base, agents, "human"), "Hello there");
   assert.equal(
-    speakableAgentText({ ...base, kind: 7 }, agents, "human"),
+    speakableAgentText(base, agents, "human", CHANNEL),
+    "Hello there",
+  );
+  assert.equal(
+    speakableAgentText({ ...base, kind: 40002 }, agents, "human", CHANNEL),
+    "Hello there",
+    "managed stream-message-v2 replies are spoken",
+  );
+  assert.equal(
+    speakableAgentText({ ...base, kind: 7 }, agents, "human", CHANNEL),
     null,
     "reactions and other event kinds are excluded",
   );
   assert.equal(
-    speakableAgentText({ ...base, kind: 10 }, agents, "human"),
+    speakableAgentText({ ...base, kind: 10 }, agents, "human", CHANNEL),
     null,
     "edits and status events are excluded",
   );
   assert.equal(
-    speakableAgentText({ ...base, pubkey: "human" }, agents, "human"),
+    speakableAgentText({ ...base, pubkey: "human" }, agents, "human", CHANNEL),
     null,
     "human-authored messages are excluded",
   );
   assert.equal(
-    speakableAgentText({ ...base, content: " " }, agents, "human"),
+    speakableAgentText({ ...base, content: " " }, agents, "human", CHANNEL),
     null,
     "empty and non-text content are excluded",
+  );
+  assert.equal(
+    speakableAgentText({ ...base, content: "K" }, agents, "human", CHANNEL),
+    "K",
+    "one-character agent text remains speakable",
   );
   assert.equal(
     speakableAgentText(
       { ...base, content: "[System] tool started" },
       agents,
       "human",
+      CHANNEL,
     ),
     null,
     "legacy system rows are excluded",
   );
+  assert.equal(
+    speakableAgentText(
+      { ...base, tags: [["h", "another-huddle"]] },
+      agents,
+      "human",
+      CHANNEL,
+    ),
+    null,
+    "messages for another huddle are excluded",
+  );
+});
+
+test("routes managed stream-message-v2 through membership and enabled ordering", async () => {
+  const invoked = [];
+  const speaker = createOrderedSpeaker(async (text, routeId) => {
+    invoked.push({ text, routeId });
+  }, assert.fail);
+
+  assert.equal(
+    routeLiveAgentText(
+      { ...base, kind: 40002 },
+      agents,
+      "human",
+      CHANNEL,
+      77,
+      speaker.enqueue,
+    ),
+    "queued",
+  );
+  assert.equal(
+    routeLiveAgentText(
+      { ...base, kind: 7 },
+      agents,
+      "human",
+      CHANNEL,
+      78,
+      speaker.enqueue,
+    ),
+    "unsupported_kind",
+  );
+  assert.equal(
+    routeLiveAgentText(
+      { ...base, tags: [["h", "wrong"]] },
+      agents,
+      "human",
+      CHANNEL,
+      79,
+      speaker.enqueue,
+    ),
+    "h_tag_mismatch",
+  );
+  assert.equal(
+    routeLiveAgentText(
+      { ...base, pubkey: "human" },
+      agents,
+      "human",
+      CHANNEL,
+      80,
+      speaker.enqueue,
+    ),
+    "author_not_agent",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(invoked, [{ text: "Hello there", routeId: 77 }]);
 });
 
 test("strips attachment markup and skips attachment-only events", () => {
   const url = "https://cdn.example/voice.png";
-  const tags = [["imeta", `url ${url}`, "m image/png"]];
+  const tags = [...base.tags, ["imeta", `url ${url}`, "m image/png"]];
   assert.equal(
     speakableAgentText(
       { ...base, content: `![image](${url})`, tags },
       agents,
       "human",
+      CHANNEL,
     ),
     null,
   );
@@ -66,6 +147,7 @@ test("strips attachment markup and skips attachment-only events", () => {
       { ...base, content: `Here is the diagram.\n\n![image](${url})`, tags },
       agents,
       "human",
+      CHANNEL,
     ),
     "Here is the diagram.",
   );
@@ -74,6 +156,7 @@ test("strips attachment markup and skips attachment-only events", () => {
       { ...base, content: `||\n![image](${url})\n||`, tags },
       agents,
       "human",
+      CHANNEL,
     ),
     null,
   );
@@ -85,18 +168,21 @@ test("queues agent messages in live thread arrival order", async () => {
   const firstBlocked = new Promise((resolve) => {
     releaseFirst = resolve;
   });
-  const speaker = createOrderedSpeaker(async (text) => {
+  const speaker = createOrderedSpeaker(async (text, routeId) => {
     if (text === "first") await firstBlocked;
-    spoken.push(text);
+    spoken.push([text, routeId]);
   }, assert.fail);
 
-  speaker.enqueue("first");
-  speaker.enqueue("second");
+  speaker.enqueue("first", 41);
+  speaker.enqueue("second", 42);
   await Promise.resolve();
   assert.deepEqual(spoken, []);
   releaseFirst();
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.deepEqual(spoken, ["first", "second"]);
+  assert.deepEqual(spoken, [
+    ["first", 41],
+    ["second", 42],
+  ]);
 });
 
 test("disabling cancels queued speech and rejects new messages until enabled", async () => {
@@ -123,6 +209,22 @@ test("disabling cancels queued speech and rejects new messages until enabled", a
   assert.deepEqual(invoked, ["first", "after-on"]);
 });
 
+test("does not speak before the native enabled state is known", async () => {
+  const invoked = [];
+  const speaker = createOrderedSpeaker(
+    async (text) => invoked.push(text),
+    assert.fail,
+    false,
+  );
+
+  speaker.enqueue("before-state");
+  await Promise.resolve();
+  speaker.setEnabled(true);
+  speaker.enqueue("after-state");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(invoked, ["after-state"]);
+});
+
 test("a live TTS state event supersedes a delayed bootstrap result", () => {
   const applied = [];
   const gate = createLatestStateGate((enabled) => applied.push(enabled));
@@ -147,8 +249,14 @@ test("buffers initial live events until membership resolves in order", () => {
 
 test("drops the initial buffer fail-closed when membership lookup fails", () => {
   const delivered = [];
-  const gate = createInitialMembershipGate((event) => delivered.push(event));
+  const dropped = [];
+  const gate = createInitialMembershipGate(
+    (event) => delivered.push(event),
+    (event) => dropped.push(event),
+  );
   gate.push("unverified");
   gate.fail();
-  assert.deepEqual(delivered, []);
+  gate.push("after-failure");
+  assert.deepEqual(delivered, ["after-failure"]);
+  assert.deepEqual(dropped, ["unverified"]);
 });

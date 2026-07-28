@@ -17,14 +17,17 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::{app_state::AppState, managed_agents::storage::atomic_write_json_restricted};
 
-use super::{models, pocket::DEFAULT_VOICE, HuddlePhase, HuddleState};
+use super::{
+    models,
+    pocket::DEFAULT_VOICE,
+    tts_voice_registry::{source_url, MARY_VOICE_KEY, POCKET_VOICES},
+    HuddlePhase, HuddleState,
+};
 
 const SETTINGS_FILE: &str = "tts-settings.json";
 const CURRENT_VERSION: u32 = 1;
 const VOICE_CHANGE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const POCKET_BACKEND_ID: &str = "pocket";
-pub const MARY_VOICE_KEY: &str = "pocket:mary";
-pub const MARIUS_VOICE_KEY: &str = "pocket:marius";
 
 type VoiceChangeWait = (
     Arc<super::tts::TtsPipeline>,
@@ -74,47 +77,24 @@ pub type VoicePreferences = Vec<String>;
 /// per-agent assignment can add entries or reuse the preference type without
 /// changing the registry/settings boundary.
 pub fn voice_registry() -> Vec<VoiceRegistryEntry> {
-    vec![
-        VoiceRegistryEntry {
-            key: MARY_VOICE_KEY.to_string(),
-            display_name: "Mary".to_string(),
+    POCKET_VOICES
+        .iter()
+        .map(|voice| VoiceRegistryEntry {
+            key: voice.key.to_string(),
+            display_name: voice.display_name.to_string(),
             backend: POCKET_BACKEND_ID.to_string(),
             backend_name: "Pocket TTS".to_string(),
             availability: VOICE_AVAILABILITY_BUNDLED.to_string(),
-            fallback_key: None,
-            reference_file: Some("reference_sample.wav".to_string()),
+            fallback_key: (voice.key != MARY_VOICE_KEY).then(|| MARY_VOICE_KEY.to_string()),
+            reference_file: Some(voice.reference_file.to_string()),
             provenance: VoiceProvenance {
                 source: "bundled".to_string(),
-                content_hash: Some(
-                    "a35b0468382218e9f37a9a7494d1e4b74deaf18d7ced22265b4e325bb55c183f"
-                        .to_string(),
-                ),
+                content_hash: Some(voice.sha256.to_string()),
                 license: Some("CC-BY-4.0".to_string()),
-                source_url: Some("https://datashare.ed.ac.uk/handle/10283/3443".to_string()),
+                source_url: Some(source_url(voice)),
             },
-        },
-        VoiceRegistryEntry {
-            key: MARIUS_VOICE_KEY.to_string(),
-            display_name: "Marius".to_string(),
-            backend: POCKET_BACKEND_ID.to_string(),
-            backend_name: "Pocket TTS".to_string(),
-            availability: VOICE_AVAILABILITY_BUNDLED.to_string(),
-            fallback_key: Some(MARY_VOICE_KEY.to_string()),
-            reference_file: Some("marius.wav".to_string()),
-            provenance: VoiceProvenance {
-                source: "bundled".to_string(),
-                content_hash: Some(
-                    "076968c3122520f3412eb7090e8c1c3f75fe57be1e24a2f96465583d84c71e16"
-                        .to_string(),
-                ),
-                license: Some("CC0-1.0".to_string()),
-                source_url: Some(
-                    "https://huggingface.co/kyutai/tts-voices/blob/323332d33f997de8394f24a193e1a76df720e01a/voice-donations/Selfie.wav"
-                        .to_string(),
-                ),
-            },
-        },
-    ]
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -353,16 +333,18 @@ fn enable_tts_runtime(huddle: &mut HuddleState, voice: &str) -> Option<VoiceChan
     // OFF removes the pipeline. Clear a prior cancellation only when enabling
     // a fresh pipeline; an idempotent ON write must not erase a voice
     // transition that the existing worker still needs to drain.
-    if huddle.tts_pipeline.is_none() {
-        huddle
-            .tts_cancel
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
+    prepare_enable_cancel(&huddle.tts_cancel, huddle.tts_pipeline.is_some());
     huddle.tts_pipeline.as_ref().and_then(|pipeline| {
         pipeline
             .select_voice(voice)
             .map(|acknowledged| (Arc::clone(pipeline), acknowledged))
     })
+}
+
+fn prepare_enable_cancel(cancel: &std::sync::atomic::AtomicBool, has_pipeline: bool) {
+    if !has_pipeline {
+        cancel.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 async fn apply_tts_settings(
@@ -518,7 +500,14 @@ pub async fn set_pocket_voice(
     let settings = settings_with_pocket_voice(settings, &voice_key)?;
     let voice_change = apply_tts_settings(settings, &app, &state).await?;
     drop(transition);
-    finish_voice_change(voice_change).await?;
+    if let Err(error) = finish_voice_change(voice_change).await {
+        // The preference is already durable. Report the delayed live
+        // transition diagnostically without telling the UI that saving failed;
+        // the next pipeline start resolves the persisted voice normally.
+        eprintln!(
+            "buzz-desktop: tts stage=voice_switch status=delayed reason=ack_timeout error={error}"
+        );
+    }
     current_settings(&state)
 }
 
@@ -574,6 +563,7 @@ pub async fn preview_pocket_voice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const EVE_VOICE_KEY: &str = "pocket:eve";
 
     #[tokio::test]
     async fn stalled_voice_change_returns_an_actionable_error() {
@@ -588,34 +578,11 @@ mod tests {
 
     #[test]
     fn idempotent_enable_preserves_an_existing_pipeline_cancel() {
-        let state = crate::app_state::build_app_state();
-        let model_dir = tempfile::tempdir().expect("temp model dir");
-        let cancel = state.huddle().expect("huddle state").tts_cancel.clone();
-        let pipeline = Arc::new(
-            super::super::tts::TtsPipeline::new_with_voice(
-                model_dir.path().to_path_buf(),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                Arc::clone(&cancel),
-                "reference_sample",
-                None,
-            )
-            .expect("pipeline"),
-        );
-        pipeline.shutdown();
-        for _ in 0..100 {
-            if pipeline.is_finished() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(pipeline.is_finished(), "test pipeline should stop");
-
-        cancel.store(true, std::sync::atomic::Ordering::Release);
-        let mut huddle = state.huddle().expect("huddle state");
-        huddle.tts_pipeline = Some(pipeline);
-
-        assert!(enable_tts_runtime(&mut huddle, "reference_sample").is_none());
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        prepare_enable_cancel(&cancel, true);
         assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        prepare_enable_cancel(&cancel, false);
+        assert!(!cancel.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
@@ -631,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_registry_has_exactly_the_two_reviewed_bundled_voices() {
+    fn registry_has_all_official_english_vctk_presets() {
         assert_eq!(
             voice_registry()
                 .iter()
@@ -644,8 +611,18 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             vec![
+                ("pocket:anna", "Anna", Some("anna.wav")),
+                ("pocket:vera", "Vera", Some("vera.wav")),
+                ("pocket:fantine", "Fantine", Some("fantine.wav")),
+                ("pocket:charles", "Charles", Some("charles.wav")),
+                ("pocket:paul", "Paul", Some("paul.wav")),
+                ("pocket:eponine", "Eponine", Some("eponine.wav")),
+                ("pocket:azelma", "Azelma", Some("azelma.wav")),
+                ("pocket:george", "George", Some("george.wav")),
                 ("pocket:mary", "Mary", Some("reference_sample.wav")),
-                ("pocket:marius", "Marius", Some("marius.wav")),
+                ("pocket:jane", "Jane", Some("jane.wav")),
+                ("pocket:michael", "Michael", Some("michael.wav")),
+                ("pocket:eve", "Eve", Some("eve.wav")),
             ]
         );
     }
@@ -654,7 +631,7 @@ mod tests {
     fn local_backend_resolution_uses_first_compatible_preference() {
         let preferences = vec![
             "siri:aaron".to_string(),
-            MARIUS_VOICE_KEY.to_string(),
+            EVE_VOICE_KEY.to_string(),
             MARY_VOICE_KEY.to_string(),
             "kokoro:af_heart".to_string(),
         ];
@@ -662,7 +639,7 @@ mod tests {
             resolve_voice_for_backend(&preferences, POCKET_BACKEND_ID)
                 .expect("Pocket fallback")
                 .key,
-            MARIUS_VOICE_KEY
+            EVE_VOICE_KEY
         );
     }
 
@@ -683,7 +660,7 @@ mod tests {
     #[test]
     fn identity_is_qualified_key_not_display_label() {
         assert!(is_qualified_voice_key("pocket:imported:audio-content-hash"));
-        assert_ne!(MARY_VOICE_KEY, MARIUS_VOICE_KEY);
+        assert_ne!(MARY_VOICE_KEY, EVE_VOICE_KEY);
         let mut registry = voice_registry();
         registry[0].display_name = "Jim".to_string();
         registry[1].display_name = "Jim".to_string();
@@ -700,15 +677,20 @@ mod tests {
     }
 
     #[test]
-    fn bundled_marius_asset_has_reviewed_size_and_wav_container() {
-        let bytes = include_bytes!("../../resources/pocket-voices/marius.wav");
-        assert_eq!(bytes.len(), 480_044);
-        assert_eq!(&bytes[0..4], b"RIFF");
-        assert_eq!(&bytes[8..12], b"WAVE");
-        assert_eq!(
-            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes)),
-            "076968c3122520f3412eb7090e8c1c3f75fe57be1e24a2f96465583d84c71e16"
-        );
+    fn bundled_vctk_assets_match_the_registry_manifest() {
+        for voice in POCKET_VOICES {
+            let Some(bytes) = voice.bytes else {
+                continue;
+            };
+            assert_eq!(&bytes[0..4], b"RIFF", "{}", voice.display_name);
+            assert_eq!(&bytes[8..12], b"WAVE", "{}", voice.display_name);
+            assert_eq!(
+                hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes)),
+                voice.sha256,
+                "{}",
+                voice.display_name
+            );
+        }
     }
 
     #[test]
@@ -728,7 +710,7 @@ mod tests {
         let path = dir.path().join(SETTINGS_FILE);
         std::fs::write(
             &path,
-            r#"{"version":1,"agentTextToSpeech":false,"voiceId":"marius"}"#,
+            r#"{"version":1,"agentTextToSpeech":false,"voiceId":"eve"}"#,
         )
         .expect("fixture write");
         assert_eq!(
@@ -736,7 +718,7 @@ mod tests {
             TtsSettings {
                 version: 1,
                 agent_text_to_speech: false,
-                voice_preferences: vec![MARIUS_VOICE_KEY.to_string()],
+                voice_preferences: vec![EVE_VOICE_KEY.to_string()],
             }
         );
     }
@@ -791,13 +773,9 @@ mod tests {
             voice_preferences: vec!["siri:aaron".to_string(), MARY_VOICE_KEY.to_string()],
             ..TtsSettings::default()
         };
-        let updated =
-            settings_with_pocket_voice(current, MARIUS_VOICE_KEY).expect("available voice");
+        let updated = settings_with_pocket_voice(current, EVE_VOICE_KEY).expect("available voice");
         assert!(!updated.agent_text_to_speech);
-        assert_eq!(
-            updated.voice_preferences,
-            vec!["siri:aaron", MARIUS_VOICE_KEY]
-        );
+        assert_eq!(updated.voice_preferences, vec!["siri:aaron", EVE_VOICE_KEY]);
     }
 
     #[test]
@@ -809,7 +787,7 @@ mod tests {
         // from effective memory state, not the stale last-persisted ON value.
         let current = state.tts_settings.lock().expect("settings").clone();
         let voice_update =
-            settings_with_pocket_voice(current, MARIUS_VOICE_KEY).expect("available voice");
+            settings_with_pocket_voice(current, EVE_VOICE_KEY).expect("available voice");
         assert!(!voice_update.agent_text_to_speech);
     }
 
@@ -822,13 +800,12 @@ mod tests {
             .expect("settings")
             .agent_text_to_speech = false;
         let current = state.tts_settings.lock().expect("settings").clone();
-        let unsaved =
-            settings_with_pocket_voice(current, MARIUS_VOICE_KEY).expect("available voice");
+        let unsaved = settings_with_pocket_voice(current, EVE_VOICE_KEY).expect("available voice");
 
         // This is the only pre-persistence mutation for an OFF candidate.
         commit_effective_off(&state).expect("commit effective OFF state");
         let remembered = state.tts_settings.lock().expect("settings").clone();
         assert_eq!(remembered.voice_preferences, vec![MARY_VOICE_KEY]);
-        assert_eq!(unsaved.voice_preferences, vec![MARIUS_VOICE_KEY]);
+        assert_eq!(unsaved.voice_preferences, vec![EVE_VOICE_KEY]);
     }
 }

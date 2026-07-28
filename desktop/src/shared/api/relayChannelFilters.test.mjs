@@ -15,9 +15,9 @@ const IDS = [
   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 ];
 
-test("huddle TTS filter is future-only kind:9 with no same-second replay", () => {
+test("huddle TTS filter is future-only for both message kinds", () => {
   assert.deepEqual(buildHuddleTtsLiveFilter(CHANNEL), {
-    kinds: [9],
+    kinds: [9, 40002],
     "#h": [CHANNEL],
     limit: 0,
   });

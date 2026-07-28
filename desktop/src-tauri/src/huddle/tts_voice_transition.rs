@@ -29,6 +29,7 @@ pub(super) type CancelSignals<'a> = (&'a AtomicBool, &'a AtomicBool);
 #[derive(Debug)]
 pub(super) struct QueuedText {
     pub(super) generation: u64,
+    pub(super) route_id: u64,
     pub(super) text: String,
 }
 
@@ -39,10 +40,11 @@ pub(crate) struct TtsTextSender {
 }
 
 impl TtsTextSender {
-    pub(crate) fn send(&self, text: String) -> Result<(), String> {
+    pub(crate) fn send(&self, route_id: u64, text: String) -> Result<(), String> {
         self.text_tx
             .send(QueuedText {
                 generation: self.generation,
+                route_id,
                 text,
             })
             .map_err(|error| error.to_string())
@@ -125,10 +127,8 @@ pub(super) fn reconcile_selected_voice(
             *voice_name = requested_voice;
             true
         }
-        Err(error) => {
-            eprintln!(
-                "buzz-desktop: Pocket voice {requested_voice} is unavailable ({error}); falling back to Mary"
-            );
+        Err(_) => {
+            eprintln!("buzz-desktop: tts stage=voice_switch status=fallback reason=voice_style");
             let fallback_path = model_dir.join(format!("{DEFAULT_VOICE}.{VOICE_FILE_EXT}"));
             match load_voice_style(&fallback_path) {
                 Ok(fallback_style) => {
@@ -140,8 +140,10 @@ pub(super) fn reconcile_selected_voice(
                         DEFAULT_VOICE.to_string();
                     true
                 }
-                Err(fallback_error) => {
-                    eprintln!("buzz-desktop: Mary voice fallback is unavailable: {fallback_error}");
+                Err(_) => {
+                    eprintln!(
+                        "buzz-desktop: tts stage=voice_switch status=failed reason=fallback_voice_style"
+                    );
                     false
                 }
             }

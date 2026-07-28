@@ -23,9 +23,10 @@ test.describe("Pocket voice settings", () => {
     ).toBeVisible();
 
     await page.getByTestId("pocket-voice-selector").click();
-    await page.getByRole("menuitemradio", { name: "Marius" }).click();
+    await expect(page.getByRole("menuitemradio")).toHaveCount(12);
+    await page.getByRole("menuitemradio", { name: "Eve" }).click();
     await expect(page.getByTestId("pocket-voice-selector")).toContainText(
-      "Marius",
+      "Eve",
     );
 
     await page.getByTestId("agent-text-to-speech-toggle").click();
@@ -37,7 +38,7 @@ test.describe("Pocket voice settings", () => {
       "true",
     );
     await expect(page.getByTestId("pocket-voice-selector")).toContainText(
-      "Marius",
+      "Eve",
     );
 
     const savedCommands = await page.evaluate(() =>
@@ -50,7 +51,7 @@ test.describe("Pocket voice settings", () => {
     expect(savedCommands).toEqual([
       {
         command: "set_pocket_voice",
-        payload: { voiceKey: "pocket:marius" },
+        payload: { voiceKey: "pocket:eve" },
       },
       {
         command: "set_tts_enabled",
@@ -59,12 +60,14 @@ test.describe("Pocket voice settings", () => {
     ]);
   });
 
-  test("captures the complete two-voice settings surface", async ({ page }) => {
+  test("captures the complete VCTK preset settings surface", async ({
+    page,
+  }) => {
     await installMockBridge(page, {
       ttsSettings: {
         version: 1,
         agentTextToSpeech: true,
-        voicePreferences: ["pocket:marius"],
+        voicePreferences: ["pocket:eve"],
       },
     });
     await page.goto("/", { waitUntil: "domcontentloaded" });
@@ -73,9 +76,37 @@ test.describe("Pocket voice settings", () => {
     const card = page.getByTestId("settings-voice");
     await expect(card).toBeVisible();
     await expect(page.getByTestId("pocket-voice-selector")).toContainText(
-      "Marius",
+      "Eve",
     );
+    await page.getByTestId("pocket-voice-selector").click();
+    await expect(page.getByRole("menuitemradio")).toHaveCount(12);
+    const menu = page.getByRole("menu");
+    await expect(menu).toBeVisible();
     await waitForAnimations(page);
-    await card.screenshot({ path: SCREENSHOT_PATH });
+    const cardBox = await card.boundingBox();
+    const menuBox = await menu.boundingBox();
+    const viewport = page.viewportSize();
+    if (!cardBox || !menuBox || !viewport) {
+      throw new Error("Voice settings screenshot bounds are unavailable");
+    }
+    const x = Math.max(0, Math.min(cardBox.x, menuBox.x) - 16);
+    const y = Math.max(0, Math.min(cardBox.y, menuBox.y) - 16);
+    const right = Math.min(
+      viewport.width,
+      Math.max(cardBox.x + cardBox.width, menuBox.x + menuBox.width) + 16,
+    );
+    const bottom = Math.min(
+      viewport.height,
+      Math.max(cardBox.y + cardBox.height, menuBox.y + menuBox.height) + 16,
+    );
+    await page.screenshot({
+      path: SCREENSHOT_PATH,
+      clip: {
+        x: Math.floor(x),
+        y: Math.floor(y),
+        width: Math.ceil(right - x),
+        height: Math.ceil(bottom - y),
+      },
+    });
   });
 });

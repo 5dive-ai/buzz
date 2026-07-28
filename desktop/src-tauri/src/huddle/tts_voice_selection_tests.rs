@@ -2,21 +2,34 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+fn inert_pipeline(cancel: Arc<AtomicBool>) -> TtsPipeline {
+    let (text_tx, text_rx) = std::sync::mpsc::sync_channel(TEXT_QUEUE_DEPTH);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = Arc::clone(&shutdown);
+    let thread = std::thread::spawn(move || {
+        while !worker_shutdown.load(Ordering::Acquire) {
+            let _ = text_rx.recv_timeout(RECV_TIMEOUT);
+        }
+    });
+    TtsPipeline {
+        text_tx,
+        tts_active: Arc::new(AtomicBool::new(false)),
+        shutdown,
+        cancel,
+        voice_cancel: Arc::new(AtomicBool::new(false)),
+        voice: Arc::new(std::sync::Mutex::new("reference_sample".to_string())),
+        voice_generation: Arc::new(AtomicU64::new(1)),
+        voice_change_ack: Arc::new(std::sync::Mutex::new(None)),
+        thread: Some(thread),
+    }
+}
+
 #[test]
 fn selecting_a_voice_raises_only_the_internal_cancel_and_retains_the_engine_handle() {
-    let model_dir = tempfile::tempdir().expect("temp model dir");
-    let active = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
-    let pipeline = TtsPipeline::new_with_voice(
-        model_dir.path().to_path_buf(),
-        active,
-        Arc::clone(&cancel),
-        "reference_sample",
-        None,
-    )
-    .expect("pipeline handle");
+    let pipeline = inert_pipeline(Arc::clone(&cancel));
 
-    let _acknowledged = pipeline.select_voice("marius");
+    let _acknowledged = pipeline.select_voice("eve");
 
     assert!(!cancel.load(Ordering::Acquire));
     assert!(pipeline.voice_cancel.load(Ordering::Acquire));
@@ -26,25 +39,16 @@ fn selecting_a_voice_raises_only_the_internal_cancel_and_retains_the_engine_hand
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .as_str(),
-        "marius"
+        "eve"
     );
 }
 
 #[test]
 fn reconciling_an_unpublished_pipeline_does_not_cancel_its_first_message() {
-    let model_dir = tempfile::tempdir().expect("temp model dir");
-    let active = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
-    let pipeline = TtsPipeline::new_with_voice(
-        model_dir.path().to_path_buf(),
-        active,
-        Arc::clone(&cancel),
-        "reference_sample",
-        None,
-    )
-    .expect("pipeline handle");
+    let pipeline = inert_pipeline(Arc::clone(&cancel));
 
-    pipeline.select_voice_before_publish("marius");
+    pipeline.select_voice_before_publish("eve");
 
     assert!(!cancel.load(Ordering::Acquire));
     assert_eq!(
@@ -53,7 +57,7 @@ fn reconciling_an_unpublished_pipeline_does_not_cancel_its_first_message() {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .as_str(),
-        "marius"
+        "eve"
     );
 }
 
@@ -61,13 +65,13 @@ fn reconciling_an_unpublished_pipeline_does_not_cancel_its_first_message() {
 fn received_text_reconciles_a_voice_changed_while_the_worker_was_waiting() {
     let model_dir = tempfile::tempdir().expect("temp model dir");
     let bundled_voice =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/pocket-voices/marius.wav");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/pocket-voices/eve.wav");
     std::fs::copy(
         &bundled_voice,
         model_dir.path().join("reference_sample.wav"),
     )
     .expect("Mary test voice");
-    std::fs::copy(&bundled_voice, model_dir.path().join("marius.wav")).expect("Marius test voice");
+    std::fs::copy(&bundled_voice, model_dir.path().join("eve.wav")).expect("Eve test voice");
 
     let selected_voice = Arc::new(std::sync::Mutex::new("reference_sample".to_string()));
     let mut style =
@@ -91,14 +95,45 @@ fn received_text_reconciles_a_voice_changed_while_the_worker_was_waiting() {
     });
 
     waiting.wait();
-    *selected_voice.lock().expect("selected voice") = "marius".to_string();
+    *selected_voice.lock().expect("selected voice") = "eve".to_string();
     text_tx
         .send("first message".to_string())
         .expect("queue first message");
 
     assert_eq!(
         worker.join().expect("worker"),
-        ("first message".to_string(), "marius".to_string())
+        ("first message".to_string(), "eve".to_string())
+    );
+}
+
+#[test]
+fn corrupt_selected_voice_falls_back_to_mary() {
+    let model_dir = tempfile::tempdir().expect("temp model dir");
+    let bundled_voice =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/pocket-voices/eve.wav");
+    std::fs::copy(bundled_voice, model_dir.path().join("reference_sample.wav"))
+        .expect("Mary test voice");
+    std::fs::write(model_dir.path().join("eve.wav"), b"not a wave")
+        .expect("corrupt selected voice");
+
+    let selected_voice = std::sync::Mutex::new("eve".to_string());
+    let mut voice_name = "reference_sample".to_string();
+    let mut style =
+        load_voice_style(&model_dir.path().join("reference_sample.wav")).expect("Mary style");
+
+    assert!(reconcile_selected_voice(
+        model_dir.path(),
+        &selected_voice,
+        &mut voice_name,
+        &mut style,
+    ));
+    assert_eq!(voice_name, DEFAULT_VOICE);
+    assert_eq!(
+        selected_voice
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_str(),
+        DEFAULT_VOICE
     );
 }
 
@@ -115,7 +150,7 @@ fn an_in_hand_post_change_message_survives_cancellation() {
         &voice_generation,
         &voice_cancel,
         &voice_change_ack,
-        "marius",
+        "eve",
     )
     .expect("voice changed");
     assert!(voice_cancel.load(Ordering::Acquire));
@@ -131,6 +166,7 @@ fn an_in_hand_post_change_message_survives_cancellation() {
     text_tx
         .send(QueuedText {
             generation: voice_generation.load(Ordering::Acquire),
+            route_id: 1,
             text: "new message".to_string(),
         })
         .expect("new message");
@@ -141,10 +177,12 @@ fn an_in_hand_post_change_message_survives_cancellation() {
     let mut deferred_text = VecDeque::from([
         QueuedText {
             generation: 1,
+            route_id: 2,
             text: "old message".to_string(),
         },
         QueuedText {
             generation: voice_generation.load(Ordering::Acquire),
+            route_id: 3,
             text: "later new message".to_string(),
         },
     ]);
@@ -154,6 +192,7 @@ fn an_in_hand_post_change_message_survives_cancellation() {
         &active,
         (&text_rx, &mut deferred_text, &mut current_text),
         &voice_change_ack,
+        None,
         None,
     ));
     acknowledge_voice_change(&voice_change_ack, &voice_cancel);
@@ -194,12 +233,13 @@ fn superseding_voice_change_removes_earlier_deferred_messages() {
         &voice_generation,
         &voice_cancel,
         &voice_change_ack,
-        "marius",
+        "eve",
     )
     .expect("first voice change");
     deferred_text.push_back(QueuedText {
         generation: voice_generation.load(Ordering::Acquire),
-        text: "message for Marius".to_string(),
+        route_id: 4,
+        text: "message for Eve".to_string(),
     });
     assert!(handle_cancel_or_shutdown(
         (&barge_in, &voice_cancel),
@@ -207,6 +247,7 @@ fn superseding_voice_change_removes_earlier_deferred_messages() {
         &active,
         (&text_rx, &mut deferred_text, &mut current_text),
         &voice_change_ack,
+        None,
         None,
     ));
     acknowledge_voice_change(&voice_change_ack, &voice_cancel);
@@ -227,6 +268,7 @@ fn superseding_voice_change_removes_earlier_deferred_messages() {
         (&text_rx, &mut deferred_text, &mut current_text),
         &voice_change_ack,
         None,
+        None,
     ));
 
     assert!(deferred_text.is_empty());
@@ -242,6 +284,7 @@ fn barge_in_clears_deferred_voice_change_messages() {
     let (_text_tx, text_rx) = std::sync::mpsc::channel();
     let mut deferred_text = VecDeque::from([QueuedText {
         generation: 2,
+        route_id: 5,
         text: "deferred message".to_string(),
     }]);
     let mut current_text = None;
@@ -252,6 +295,7 @@ fn barge_in_clears_deferred_voice_change_messages() {
         &active,
         (&text_rx, &mut deferred_text, &mut current_text),
         &voice_change_ack,
+        None,
         None,
     ));
 
@@ -276,11 +320,12 @@ fn barge_in_during_a_voice_change_clears_post_change_messages() {
         &voice_generation,
         &voice_cancel,
         &voice_change_ack,
-        "marius",
+        "eve",
     )
     .expect("voice change");
     deferred_text.push_back(QueuedText {
         generation: voice_generation.load(Ordering::Acquire),
+        route_id: 6,
         text: "post-change message".to_string(),
     });
     barge_in.store(true, Ordering::Release);
@@ -291,6 +336,7 @@ fn barge_in_during_a_voice_change_clears_post_change_messages() {
         &active,
         (&text_rx, &mut deferred_text, &mut current_text),
         &voice_change_ack,
+        None,
         None,
     ));
     assert!(deferred_text.is_empty());
@@ -318,7 +364,7 @@ fn a_sender_captured_before_voice_change_is_stale_even_if_it_sends_after_drain()
         &voice_generation,
         &voice_cancel,
         &voice_change_ack,
-        "marius",
+        "eve",
     )
     .expect("voice change");
     assert!(handle_cancel_or_shutdown(
@@ -328,9 +374,10 @@ fn a_sender_captured_before_voice_change_is_stale_even_if_it_sends_after_drain()
         (&text_rx, &mut deferred_text, &mut current_text),
         &voice_change_ack,
         None,
+        None,
     ));
     old_sender
-        .send("late old message".to_string())
+        .send(7, "late old message".to_string())
         .expect("late send");
     let late = text_rx.recv().expect("late queued text");
 

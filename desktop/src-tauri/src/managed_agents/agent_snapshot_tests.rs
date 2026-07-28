@@ -133,6 +133,78 @@ fn png_round_trip_with_avatar_png() {
     assert_eq!(parsed.definition.name, snapshot.definition.name);
 }
 
+/// Plain-card byte compatibility: `encode_snapshot_png` was refactored
+/// through the shared `encode_chunk_payload_png` when locked cards were
+/// added. Plain cards must emit byte-identical PNGs to the pre-envelope
+/// encoder. This vector reimplements the legacy encoder body verbatim and
+/// asserts equality on all three composition paths: placeholder (no avatar),
+/// PNG-avatar (where tEXt chunk injection ordering matters), and
+/// JPEG-avatar transcode.
+#[test]
+fn plain_encoder_bytes_identical_to_pre_envelope_encoder() {
+    // Verbatim pre-refactor `encode_snapshot_png` body (post memory guard).
+    fn legacy_encode(
+        snapshot: &AgentSnapshot,
+        avatar_bytes: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        let json_bytes = encode_snapshot_json(snapshot)?;
+        let chunk_text = STANDARD.encode(&json_bytes);
+        let png_bytes = match avatar_bytes.filter(|bytes| !bytes.is_empty()) {
+            Some(bytes) => {
+                let encoded_avatar = if bytes.starts_with(b"\x89PNG") {
+                    inject_text_chunk(bytes, PNG_CHUNK_KEYWORD, &chunk_text).or_else(|_| {
+                        transcode_avatar_to_png_with_text(bytes, PNG_CHUNK_KEYWORD, &chunk_text)
+                    })
+                } else {
+                    transcode_avatar_to_png_with_text(bytes, PNG_CHUNK_KEYWORD, &chunk_text)
+                };
+                match encoded_avatar {
+                    Ok(png_bytes) => png_bytes,
+                    Err(_) => make_png_with_text(PNG_CHUNK_KEYWORD, &chunk_text)?,
+                }
+            }
+            None => make_png_with_text(PNG_CHUNK_KEYWORD, &chunk_text)?,
+        };
+        Ok(png_bytes)
+    }
+
+    let record = minimal_record();
+
+    // Placeholder path (no avatar).
+    let snapshot = build_snapshot(&record, MemoryLevel::None, vec![], None);
+    assert_eq!(
+        encode_snapshot_png(&snapshot, None).unwrap(),
+        legacy_encode(&snapshot, None).unwrap(),
+        "placeholder-path plain PNG bytes must match the pre-envelope encoder"
+    );
+
+    // PNG-avatar path: chunk injected into the avatar image body.
+    let avatar = make_png_with_text("dummy", "value").unwrap();
+    let snapshot = build_snapshot(&record, MemoryLevel::None, vec![], Some(&avatar));
+    assert_eq!(
+        encode_snapshot_png(&snapshot, Some(&avatar)).unwrap(),
+        legacy_encode(&snapshot, Some(&avatar)).unwrap(),
+        "avatar-path plain PNG bytes must match the pre-envelope encoder"
+    );
+
+    // JPEG-avatar path: transcode-to-PNG composition.
+    let jpeg_avatar = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        4,
+        4,
+        image::Rgb([0x10, 0x20, 0x30]),
+    ));
+    let mut jpeg_bytes = Vec::new();
+    jpeg_avatar
+        .write_to(&mut Cursor::new(&mut jpeg_bytes), image::ImageFormat::Jpeg)
+        .unwrap();
+    let snapshot = build_snapshot(&record, MemoryLevel::None, vec![], Some(&jpeg_bytes));
+    assert_eq!(
+        encode_snapshot_png(&snapshot, Some(&jpeg_bytes)).unwrap(),
+        legacy_encode(&snapshot, Some(&jpeg_bytes)).unwrap(),
+        "transcode-path plain PNG bytes must match the pre-envelope encoder"
+    );
+}
+
 #[test]
 fn png_snapshot_transcodes_jpeg_avatar_into_image_body() {
     let avatar = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(

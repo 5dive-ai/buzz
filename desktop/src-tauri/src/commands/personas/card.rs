@@ -264,8 +264,16 @@ pub async fn mint_agent_card(
             );
         }
         let owner_keys = state.signing_keys()?;
-        let agent_pubkey = nostr::PublicKey::from_hex(&record.pubkey)
-            .map_err(|e| format!("Agent record has an invalid pubkey: {e}"))?;
+        // Same canonical check the envelope decoder enforces (incl. curve
+        // validation) — a non-point record pubkey must fail BEFORE the API
+        // spend, not at post-mint encryption.
+        let agent_pubkey = crate::managed_agents::agent_snapshot_envelope::parse_canonical_pubkey(
+            "agentPubkey",
+            &record.pubkey,
+        )
+        .map_err(|_| {
+            "Agent record has an invalid pubkey (not a canonical x-only key).".to_string()
+        })?;
         if owner_keys.public_key() == agent_pubkey {
             return Err("Cannot lock a card to itself: owner and agent keys match.".to_string());
         }

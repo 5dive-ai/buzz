@@ -102,8 +102,11 @@ struct FormatProbe {
 
 /// Canonical pubkey check: exactly 64 lowercase hex chars that parse as a
 /// valid x-only pubkey. Lowercase is required so string comparisons against
-/// record pubkeys (always `to_hex()` output) stay sound.
-fn parse_canonical_pubkey(field: &str, value: &str) -> Result<PublicKey, String> {
+/// record pubkeys (always `to_hex()` output) stay sound. Curve validation is
+/// explicit: nostr's `PublicKey::from_hex` only decodes 32 bytes and defers
+/// lift-x validation to `xonly()`, so a non-point like `"f" * 64` would
+/// otherwise pass structurally and fail only at decrypt time.
+pub(crate) fn parse_canonical_pubkey(field: &str, value: &str) -> Result<PublicKey, String> {
     if value.len() != 64
         || !value
             .chars()
@@ -113,7 +116,12 @@ fn parse_canonical_pubkey(field: &str, value: &str) -> Result<PublicKey, String>
             "Locked card envelope has a malformed {field} (expected 64 lowercase hex chars)."
         ));
     }
-    PublicKey::from_hex(value).map_err(|_| format!("Locked card envelope has an invalid {field}."))
+    let pubkey = PublicKey::from_hex(value)
+        .map_err(|_| format!("Locked card envelope has an invalid {field}."))?;
+    pubkey
+        .xonly()
+        .map_err(|_| format!("Locked card envelope has an invalid {field} (not a curve point)."))?;
+    Ok(pubkey)
 }
 
 /// Structural validation of a locked envelope: exact version + scheme,
@@ -483,7 +491,7 @@ mod tests {
 
     #[test]
     fn malformed_pubkeys_rejected_structurally() {
-        let (env, owner, _agent) = locked_envelope();
+        let (env, _owner, _agent) = locked_envelope();
 
         let mut short = env.clone();
         short.encryption.owner_pubkey = "abc123".to_string();
@@ -493,16 +501,14 @@ mod tests {
         upper.encryption.agent_pubkey = upper.encryption.agent_pubkey.to_uppercase();
         assert!(validate_envelope(&upper).unwrap_err().contains("malformed"));
 
-        // A 64-hex string that is not a curve point passes the string check
-        // (nostr's PublicKey defers lift-x validation) but can never decrypt:
-        // the owner still selects it as counterparty, NIP-44 derivation/MAC
-        // fails, and only the refusal surfaces.
+        // A 64-hex string that is not a curve point (lift-x fails for
+        // x = p-1... all-f) must be rejected STRUCTURALLY — before any key
+        // lookup or decrypt work — per the wire contract.
         let mut not_a_point = env.clone();
         not_a_point.encryption.agent_pubkey = "f".repeat(64);
-        assert_eq!(
-            decrypt_envelope(&not_a_point, owner.secret_key()).unwrap_err(),
-            LOCKED_CARD_REFUSAL
-        );
+        assert!(validate_envelope(&not_a_point)
+            .unwrap_err()
+            .contains("not a curve point"));
 
         let mut same = env;
         same.encryption.agent_pubkey = same.encryption.owner_pubkey.clone();

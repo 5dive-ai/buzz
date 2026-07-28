@@ -106,6 +106,8 @@ function LinkPreviewLogo({ preview }: { preview: SupportedLinkPreview }) {
       return <GoogleSheetsLogo className="h-4 w-4" />;
     case "google-slides-presentation":
       return <GoogleSlidesLogo className="h-4 w-4" />;
+    case "generic-link":
+      return <ExternalLink aria-hidden="true" className="h-4 w-4" />;
   }
 }
 

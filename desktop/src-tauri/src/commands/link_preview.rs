@@ -1,90 +1,157 @@
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
 use futures_util::StreamExt;
 use reqwest::{
-    header::{ACCEPT, CONTENT_TYPE, USER_AGENT},
+    header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, USER_AGENT},
     redirect::Policy,
 };
+use serde::Serialize;
 use url::Url;
 
-const MAX_TITLE_FETCH_BYTES: usize = 256 * 1024;
-const TITLE_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
+const MAX_PREVIEW_FETCH_BYTES: usize = 256 * 1024;
+const PREVIEW_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
+const PREVIEW_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REDIRECTS: usize = 3;
+const MAX_METADATA_CHARS: usize = 180;
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPreviewMetadata {
+    title: String,
+    site_name: Option<String>,
+}
 
 #[tauri::command]
-pub async fn fetch_link_preview_title(href: String) -> Result<Option<String>, String> {
-    let url = Url::parse(href.trim()).map_err(|error| format!("invalid URL: {error}"))?;
-    if !is_supported_google_link(&url) {
-        return Ok(None);
+pub async fn fetch_link_preview_metadata(
+    href: String,
+) -> Result<Option<LinkPreviewMetadata>, String> {
+    tokio::time::timeout(
+        PREVIEW_TOTAL_TIMEOUT,
+        fetch_link_preview_metadata_inner(href),
+    )
+    .await
+    .map_err(|_| "link preview request timed out".to_string())?
+}
+
+async fn fetch_link_preview_metadata_inner(
+    href: String,
+) -> Result<Option<LinkPreviewMetadata>, String> {
+    let mut url = Url::parse(href.trim()).map_err(|error| format!("invalid URL: {error}"))?;
+    validate_public_https_url(&url).await?;
+
+    for redirect_count in 0..=MAX_REDIRECTS {
+        let response = send_pinned_request(&url).await?;
+
+        if response.status().is_redirection() {
+            if redirect_count == MAX_REDIRECTS {
+                return Ok(None);
+            }
+            let Some(location) = response.headers().get(LOCATION) else {
+                return Ok(None);
+            };
+            let location = location
+                .to_str()
+                .map_err(|_| "link preview redirect has an invalid location".to_string())?;
+            url = url
+                .join(location)
+                .map_err(|error| format!("invalid link preview redirect: {error}"))?;
+            validate_public_https_url(&url).await?;
+            continue;
+        }
+
+        if !response.status().is_success() || !is_html_response(&response) {
+            return Ok(None);
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_PREVIEW_FETCH_BYTES as u64)
+        {
+            return Ok(None);
+        }
+
+        let body = read_limited_text(response).await?;
+        return Ok(extract_link_preview_metadata(&body));
     }
 
-    let client = reqwest::Client::builder()
-        .redirect(Policy::none())
-        .pool_idle_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(1)
-        .build()
-        .map_err(|error| format!("link preview title client failed: {error}"))?;
+    Ok(None)
+}
 
+async fn validate_public_https_url(url: &Url) -> Result<(), String> {
+    if url.scheme() != "https" || url.username() != "" || url.password().is_some() {
+        return Err("link previews require an HTTPS URL without credentials".to_string());
+    }
+    if url.port().is_some_and(|port| port != 443) {
+        return Err("link previews require the default HTTPS port".to_string());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| "link preview URL has no host".to_string())?;
+    resolve_public_addresses(host).await.map(|_| ())
+}
+
+async fn resolve_public_addresses(host: &str) -> Result<Vec<IpAddr>, String> {
+    let host = host.to_string();
+    let addresses = tokio::net::lookup_host((host.as_str(), 443))
+        .await
+        .map_err(|error| format!("link preview DNS resolution failed: {error}"))?
+        .map(|address| address.ip())
+        .collect::<Vec<_>>();
+
+    if addresses.is_empty() {
+        return Err("link preview DNS resolution returned no addresses".to_string());
+    }
+    if addresses.iter().any(buzz_core_pkg::network::is_private_ip) {
+        return Err("link preview host resolved to a private or reserved address".to_string());
+    }
+
+    Ok(addresses)
+}
+
+async fn send_pinned_request(url: &Url) -> Result<reqwest::Response, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "link preview URL has no host".to_string())?;
+    let addresses = resolve_public_addresses(host).await?;
+    let socket_addresses = addresses
+        .into_iter()
+        .map(|address| std::net::SocketAddr::new(address, 443))
+        .collect::<Vec<_>>();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(Policy::none())
+        .pool_max_idle_per_host(0)
+        .resolve_to_addrs(host, &socket_addresses)
+        .build()
+        .map_err(|error| format!("link preview client failed: {error}"))?;
     let request = client
         .get(url.as_str())
-        .header(
-            ACCEPT,
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
+        .header(ACCEPT, "text/html,application/xhtml+xml;q=0.9")
         .header(USER_AGENT, "Buzz Desktop link preview");
 
-    let response = tokio::time::timeout(TITLE_FETCH_TIMEOUT, request.send())
+    tokio::time::timeout(PREVIEW_FETCH_TIMEOUT, request.send())
         .await
-        .map_err(|_| "link preview title request timed out".to_string())?
-        .map_err(|error| format!("link preview title request failed: {error}"))?;
+        .map_err(|_| "link preview request timed out".to_string())?
+        .map_err(|error| format!("link preview request failed: {error}"))
+}
 
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-
-    let is_html = response
+fn is_html_response(response: &reqwest::Response) -> bool {
+    response
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase().contains("text/html"))
-        .unwrap_or(true);
-    if !is_html {
-        return Ok(None);
-    }
-
-    let body = read_limited_text(response).await?;
-    Ok(extract_google_title(&body))
-}
-
-fn is_supported_google_link(url: &Url) -> bool {
-    if url.scheme() != "https" {
-        return false;
-    }
-
-    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
-        return false;
-    };
-    let segments = url
-        .path_segments()
-        .map(|segments| segments.collect::<Vec<_>>())
-        .unwrap_or_default();
-
-    match host.trim_start_matches("www.") {
-        "docs.google.com" => {
-            matches!(
-                segments.as_slice(),
-                ["document", "d", _, ..]
-                    | ["spreadsheets", "d", _, ..]
-                    | ["presentation", "d", _, ..]
-            )
-        }
-        "drive.google.com" => {
-            matches!(segments.as_slice(), ["file", "d", _, ..])
-                || matches!(segments.as_slice(), ["drive", "folders", _, ..])
-                || (segments.first() == Some(&"open")
-                    && url.query_pairs().any(|(key, _)| key == "id"))
-        }
-        _ => false,
-    }
+        .map(|value| {
+            let mime = value.split(';').next().unwrap_or_default().trim();
+            mime.eq_ignore_ascii_case("text/html")
+                || mime.eq_ignore_ascii_case("application/xhtml+xml")
+        })
+        .unwrap_or(false)
+        && response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_none_or(|size| size <= MAX_PREVIEW_FETCH_BYTES)
 }
 
 async fn read_limited_text(response: reqwest::Response) -> Result<String, String> {
@@ -92,11 +159,9 @@ async fn read_limited_text(response: reqwest::Response) -> Result<String, String
     let mut bytes = Vec::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("reading title response failed: {error}"))?;
-        if bytes.len() + chunk.len() > MAX_TITLE_FETCH_BYTES {
-            let remaining = MAX_TITLE_FETCH_BYTES.saturating_sub(bytes.len());
-            bytes.extend_from_slice(&chunk[..remaining]);
-            break;
+        let chunk = chunk.map_err(|error| format!("reading link preview failed: {error}"))?;
+        if bytes.len() + chunk.len() > MAX_PREVIEW_FETCH_BYTES {
+            return Err("link preview response exceeded the size limit".to_string());
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -104,13 +169,18 @@ async fn read_limited_text(response: reqwest::Response) -> Result<String, String
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn extract_google_title(html: &str) -> Option<String> {
-    extract_meta_title(html)
+fn extract_link_preview_metadata(html: &str) -> Option<LinkPreviewMetadata> {
+    let title = extract_meta_content(html, "property", "og:title")
+        .or_else(|| extract_meta_content(html, "name", "twitter:title"))
         .or_else(|| extract_title_tag(html))
-        .and_then(|title| normalize_google_title(&title))
+        .and_then(|value| normalize_metadata_text(&value))?;
+    let site_name = extract_meta_content(html, "property", "og:site_name")
+        .and_then(|value| normalize_metadata_text(&value));
+
+    Some(LinkPreviewMetadata { title, site_name })
 }
 
-fn extract_meta_title(html: &str) -> Option<String> {
+fn extract_meta_content(html: &str, key_attr: &str, key_value: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
     let mut search_from = 0;
 
@@ -121,14 +191,11 @@ fn extract_meta_title(html: &str) -> Option<String> {
         };
         let end = start + relative_end + 1;
         let tag = &html[start..end];
-        let lower_tag = &lower[start..end];
-
-        if lower_tag.contains("og:title") || lower_tag.contains("twitter:title") {
+        if attr_value(tag, key_attr).is_some_and(|value| value.eq_ignore_ascii_case(key_value)) {
             if let Some(content) = attr_value(tag, "content") {
                 return Some(content);
             }
         }
-
         search_from = end;
     }
 
@@ -140,7 +207,7 @@ fn extract_title_tag(html: &str) -> Option<String> {
     let start = lower.find("<title")?;
     let content_start = start + lower[start..].find('>')? + 1;
     let content_end = content_start + lower[content_start..].find("</title>")?;
-    Some(html[content_start..content_end].to_string())
+    Some(decode_html_entities(&html[content_start..content_end]))
 }
 
 fn attr_value(tag: &str, attr: &str) -> Option<String> {
@@ -157,62 +224,49 @@ fn attr_value(tag: &str, attr: &str) -> Option<String> {
             && !matches!(after, Some(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_');
 
         if has_name_boundary {
-            let lower_rest = &lower[name_end..];
-            let equals_offset = lower_rest.find('=')?;
-            let value_start = name_end + equals_offset + 1;
-            let value = tag[value_start..].trim_start();
+            let rest = &tag[name_end..];
+            let equals_offset = rest.find('=')?;
+            let value = rest[equals_offset + 1..].trim_start();
             let quote = value.chars().next()?;
-
             if quote == '"' || quote == '\'' {
                 let value_body = &value[quote.len_utf8()..];
                 let value_end = value_body.find(quote)?;
                 return Some(decode_html_entities(&value_body[..value_end]));
             }
-
             let value_end = value
                 .find(|c: char| c.is_ascii_whitespace() || c == '>')
                 .unwrap_or(value.len());
             return Some(decode_html_entities(&value[..value_end]));
         }
-
         search_from = name_end;
     }
 
     None
 }
 
-fn normalize_google_title(raw_title: &str) -> Option<String> {
-    let mut title = decode_html_entities(raw_title)
+fn normalize_metadata_text(raw: &str) -> Option<String> {
+    let mut normalized = decode_html_entities(raw)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-
     for suffix in [
         " - Google Docs",
         " - Google Sheets",
         " - Google Slides",
         " - Google Drive",
     ] {
-        if let Some(stripped) = title.strip_suffix(suffix) {
-            title = stripped.trim().to_string();
+        if let Some(stripped) = normalized.strip_suffix(suffix) {
+            normalized = stripped.trim().to_string();
             break;
         }
     }
-
-    match title.as_str() {
-        ""
-        | "Document"
-        | "Spreadsheet"
-        | "Presentation"
-        | "Drive file"
-        | "Drive folder"
-        | "Google Docs"
-        | "Google Sheets"
-        | "Google Slides"
-        | "Google Drive"
-        | "Sign in - Google Accounts" => None,
-        _ => Some(title.chars().take(180).collect()),
+    if matches!(
+        normalized.as_str(),
+        "" | "Sign in - Google Accounts" | "Google Docs" | "Google Sheets" | "Google Slides"
+    ) {
+        return None;
     }
+    Some(normalized.chars().take(MAX_METADATA_CHARS).collect())
 }
 
 fn decode_html_entities(value: &str) -> String {
@@ -231,71 +285,54 @@ fn decode_html_entities(value: &str) -> String {
         };
         let end = start + relative_end + 1;
         let entity = &decoded[start + 2..end - 1];
-        let parsed = if let Some(hex) = entity
+        let parsed = entity
             .strip_prefix('x')
             .or_else(|| entity.strip_prefix('X'))
-        {
-            u32::from_str_radix(hex, 16).ok()
-        } else {
-            entity.parse::<u32>().ok()
-        };
-
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .or_else(|| entity.parse::<u32>().ok());
         let Some(ch) = parsed.and_then(char::from_u32) else {
             break;
         };
         decoded.replace_range(start..end, &ch.to_string());
     }
-
     decoded
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_google_title, is_supported_google_link};
-    use url::Url;
+    use super::{extract_link_preview_metadata, LinkPreviewMetadata};
 
     #[test]
-    fn title_prefers_open_graph_title() {
-        let html = r#"
-          <html>
-            <head>
-              <meta property="og:title" content="Composer links &amp; previews - Google Docs">
-              <title>Fallback - Google Docs</title>
-            </head>
-          </html>
-        "#;
-
+    fn metadata_prefers_open_graph_and_reads_site_name() {
+        let html = r#"<meta content="Buzz" property="og:site_name">
+          <meta content="Rich previews &amp; cards" property="og:title">
+          <meta name="twitter:title" content="Twitter fallback"><title>Fallback</title>"#;
         assert_eq!(
-            extract_google_title(html).as_deref(),
-            Some("Composer links & previews")
+            extract_link_preview_metadata(html),
+            Some(LinkPreviewMetadata {
+                title: "Rich previews & cards".to_string(),
+                site_name: Some("Buzz".to_string()),
+            })
         );
     }
 
     #[test]
-    fn title_ignores_generic_google_titles() {
+    fn metadata_falls_back_to_twitter_then_title() {
         assert_eq!(
-            extract_google_title("<title>Sign in - Google Accounts</title>"),
-            None
+            extract_link_preview_metadata("<meta content='Tweet title' name='twitter:title'>")
+                .map(|metadata| metadata.title),
+            Some("Tweet title".to_string())
         );
-        assert_eq!(extract_google_title("<title>Google Docs</title>"), None);
+        assert_eq!(
+            extract_link_preview_metadata("<title> Plain   title </title>")
+                .map(|metadata| metadata.title),
+            Some("Plain title".to_string())
+        );
     }
 
     #[test]
-    fn supported_urls_are_google_file_links_only() {
-        assert!(is_supported_google_link(
-            &Url::parse("https://docs.google.com/document/d/abc/edit").unwrap()
-        ));
-        assert!(is_supported_google_link(
-            &Url::parse("https://docs.google.com/spreadsheets/d/abc/edit").unwrap()
-        ));
-        assert!(is_supported_google_link(
-            &Url::parse("https://drive.google.com/file/d/abc/view").unwrap()
-        ));
-        assert!(!is_supported_google_link(
-            &Url::parse("https://example.com/document/d/abc/edit").unwrap()
-        ));
-        assert!(!is_supported_google_link(
-            &Url::parse("http://docs.google.com/document/d/abc/edit").unwrap()
-        ));
+    fn metadata_requires_a_non_empty_title() {
+        assert_eq!(extract_link_preview_metadata("<title>   </title>"), None);
+        assert_eq!(extract_link_preview_metadata("<html></html>"), None);
     }
 }

@@ -7,18 +7,13 @@ export type SupportedLinkPreviewKind =
   | "google-drive-folder"
   | "google-docs-document"
   | "google-sheets-spreadsheet"
-  | "google-slides-presentation";
+  | "google-slides-presentation"
+  | "generic-link";
 
 export type SupportedLinkPreview = {
   kind: SupportedLinkPreviewKind;
   href: string;
-  provider:
-    | "GitHub"
-    | "Linear"
-    | "Google Drive"
-    | "Google Docs"
-    | "Google Sheets"
-    | "Google Slides";
+  provider: string;
   title: string;
   typeLabel:
     | "PR"
@@ -28,13 +23,14 @@ export type SupportedLinkPreview = {
     | "folder"
     | "document"
     | "spreadsheet"
-    | "presentation";
+    | "presentation"
+    | "link";
 };
 
 const SUPPORTED_URL_RE =
-  /(^|[\s([{<>"'])((?:https?:\/\/)?(?:(?:www\.)?github\.com|(?:www\.)?linear\.app|drive\.google\.com|docs\.google\.com)\/[^\s<>"'\]]+)/gi;
+  /(^|[\s([{<>"'])(https:\/\/[^\s<>"'\]]+|(?:(?:www\.)?github\.com|(?:www\.)?linear\.app|drive\.google\.com|docs\.google\.com)\/[^\s<>"'\]]+)/gi;
 const MARKDOWN_SUPPORTED_LINK_RE =
-  /!?\[([^\]\n]+)\]\(((?:https?:\/\/)?(?:(?:www\.)?github\.com|(?:www\.)?linear\.app|drive\.google\.com|docs\.google\.com)\/[^)\s<>"']+)\)/gi;
+  /!?\[([^\]\n]+)\]\((https:\/\/[^)\s<>"']+|(?:(?:www\.)?github\.com|(?:www\.)?linear\.app|drive\.google\.com|docs\.google\.com)\/[^)\s<>"']+)\)/gi;
 const MAX_PREVIEWS = 8;
 
 type HiddenRange = {
@@ -431,12 +427,27 @@ export function parseSupportedLinkPreview(
     return null;
   }
 
-  return (
+  const recognized =
     parseGithubLink(parsed) ??
     parseLinearIssue(parsed) ??
     parseGoogleDriveLink(parsed) ??
-    parseGoogleDocsLink(parsed)
-  );
+    parseGoogleDocsLink(parsed);
+  if (recognized) return recognized;
+  const hostname = normalizeHostname(parsed);
+  if (
+    parsed.protocol !== "https:" ||
+    [
+      "github.com",
+      "linear.app",
+      "drive.google.com",
+      "docs.google.com",
+    ].includes(hostname)
+  ) {
+    return null;
+  }
+
+  const provider = hostname;
+  return createPreview("generic-link", parsed, provider, "link", provider);
 }
 
 export function isSupportedLinkAutolinkLabel(

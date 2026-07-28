@@ -4,61 +4,64 @@ import { invokeTauri } from "@/shared/api/tauri";
 
 import type { SupportedLinkPreview } from "./linkPreview";
 
-const GOOGLE_FALLBACK_TITLES = new Set([
-  "Drive file",
-  "Drive folder",
-  "Document",
-  "Spreadsheet",
-  "Presentation",
-]);
+type LinkPreviewMetadata = {
+  title: string;
+  siteName: string | null;
+};
 
-const titleCache = new Map<string, Promise<string | null> | string | null>();
+const metadataCache = new Map<
+  string,
+  Promise<LinkPreviewMetadata | null> | LinkPreviewMetadata | null
+>();
 
-function fetchLinkPreviewTitle(href: string): Promise<string | null> {
-  return invokeTauri<string | null>("fetch_link_preview_title", { href });
+/** Clear ephemeral metadata when the active relay/community changes. */
+export function resetLinkPreviewMetadataCache(): void {
+  metadataCache.clear();
 }
 
-function shouldResolveTitle(preview: SupportedLinkPreview): boolean {
-  return (
-    preview.kind.startsWith("google-") &&
-    GOOGLE_FALLBACK_TITLES.has(preview.title)
+function fetchLinkPreviewMetadata(
+  href: string,
+): Promise<LinkPreviewMetadata | null> {
+  return invokeTauri<LinkPreviewMetadata | null>(
+    "fetch_link_preview_metadata",
+    {
+      href,
+    },
   );
 }
 
-function cacheTitle(href: string): Promise<string | null> {
-  const cached = titleCache.get(href);
+function cacheMetadata(href: string): Promise<LinkPreviewMetadata | null> {
+  const cached = metadataCache.get(href);
   if (cached instanceof Promise) return cached;
   if (cached !== undefined) return Promise.resolve(cached);
 
-  const promise = fetchLinkPreviewTitle(href)
-    .then((title) => {
-      titleCache.set(href, title);
-      return title;
+  const promise = fetchLinkPreviewMetadata(href)
+    .then((metadata) => {
+      metadataCache.set(href, metadata);
+      return metadata;
     })
     .catch(() => {
-      titleCache.set(href, null);
+      metadataCache.set(href, null);
       return null;
     });
-  titleCache.set(href, promise);
+  metadataCache.set(href, promise);
   return promise;
 }
 
 export function useResolvedLinkPreviews(
   previews: SupportedLinkPreview[],
 ): SupportedLinkPreview[] {
-  const [resolvedTitles, setResolvedTitles] = React.useState<
-    Record<string, string>
+  const [resolvedMetadata, setResolvedMetadata] = React.useState<
+    Record<string, LinkPreviewMetadata>
   >({});
 
   React.useEffect(() => {
     let cancelled = false;
-    const pending = previews.filter(shouldResolveTitle);
-    if (pending.length === 0) return undefined;
 
-    for (const preview of pending) {
-      const cached = titleCache.get(preview.href);
-      if (typeof cached === "string" && cached) {
-        setResolvedTitles((current) =>
+    for (const preview of previews) {
+      const cached = metadataCache.get(preview.href);
+      if (cached && !(cached instanceof Promise)) {
+        setResolvedMetadata((current) =>
           current[preview.href] === cached
             ? current
             : { ...current, [preview.href]: cached },
@@ -66,12 +69,12 @@ export function useResolvedLinkPreviews(
         continue;
       }
 
-      void cacheTitle(preview.href).then((title) => {
-        if (cancelled || !title) return;
-        setResolvedTitles((current) =>
-          current[preview.href] === title
+      void cacheMetadata(preview.href).then((metadata) => {
+        if (cancelled || !metadata) return;
+        setResolvedMetadata((current) =>
+          current[preview.href] === metadata
             ? current
-            : { ...current, [preview.href]: title },
+            : { ...current, [preview.href]: metadata },
         );
       });
     }
@@ -84,9 +87,17 @@ export function useResolvedLinkPreviews(
   return React.useMemo(
     () =>
       previews.map((preview) => {
-        const title = resolvedTitles[preview.href];
-        return title ? { ...preview, title } : preview;
+        const metadata = resolvedMetadata[preview.href];
+        if (!metadata) return preview;
+        return {
+          ...preview,
+          title: metadata.title,
+          provider:
+            preview.kind === "generic-link" && metadata.siteName
+              ? metadata.siteName
+              : preview.provider,
+        };
       }),
-    [previews, resolvedTitles],
+    [previews, resolvedMetadata],
   );
 }

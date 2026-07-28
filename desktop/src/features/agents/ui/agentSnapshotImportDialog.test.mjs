@@ -82,6 +82,7 @@ function makePreview(overrides = {}) {
     sourceAllowlistCount: 2,
     sourceAllowlist: ["a".repeat(64), "b".repeat(64)],
     manifestJson: '{\n  "format": "buzz-agent-snapshot"\n}',
+    locked: false,
     ...overrides,
   };
 }
@@ -111,6 +112,25 @@ test("preview_body_discloses_prompt_allowlist_and_full_manifest", () => {
     ).length,
     1,
   );
+});
+
+// ── locked-card provenance notice ─────────────────────────────────────────────
+
+test("preview_body_shows_locked_notice_only_for_locked_cards", () => {
+  const lockedNotice = (locked) =>
+    findAll(
+      PreviewBody({
+        preview: makePreview({ locked }),
+        hasMemory: false,
+        memoryLevelLabel: "none",
+        keepAllowlist: false,
+        onKeepAllowlistChange: () => {},
+      }),
+      (n) => n.props?.["data-testid"] === "agent-snapshot-import-locked-notice",
+    );
+
+  assert.equal(lockedNotice(true).length, 1);
+  assert.equal(lockedNotice(false).length, 0);
 });
 
 // ── memory errors detail list ─────────────────────────────────────────────────

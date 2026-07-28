@@ -1,5 +1,5 @@
 import * as React from "react";
-import { AlertCircle, Upload } from "lucide-react";
+import { AlertCircle, Lock, Upload } from "lucide-react";
 
 import type {
   AgentSnapshotImportPreview,
@@ -158,6 +158,22 @@ export function PreviewBody({
       <div className="space-y-1">
         <p className="text-sm font-medium">{preview.displayName}</p>
       </div>
+
+      {/* Locked-card provenance: this file was encrypted to this machine's
+          keys and has been unlocked for review. */}
+      {preview.locked ? (
+        <div
+          className="flex items-start gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm"
+          data-testid="agent-snapshot-import-locked-notice"
+        >
+          <Lock className="mt-0.5 h-4 w-4 shrink-0" />
+          <p>
+            This card is <strong>locked</strong> — its agent is encrypted to the
+            original owner and agent keys. Your keys unlocked it; the full
+            decrypted payload is shown below.
+          </p>
+        </div>
+      ) : null}
 
       {/* Portable behavior — never hide executable configuration behind a summary. */}
       <section

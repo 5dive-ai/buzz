@@ -177,6 +177,8 @@ export type MintedAgentCard = {
   fileName: string;
   /** Designer commentary emitted alongside the image (may be empty). */
   designerNotes: string;
+  /** True when the embedded manifest is encrypted to the (owner, agent) pair. */
+  locked: boolean;
 };
 
 /** Error prefix Rust returns when no OpenAI key is configured. */
@@ -185,14 +187,20 @@ export const NO_OPENAI_KEY_PREFIX = "NO_OPENAI_KEY:";
 /**
  * Mint a trading card for an agent. One long API call (~2–3 minutes).
  * Reroll = call again; the backend holds no session state.
+ *
+ * When `lock` is true, the embedded manifest is NIP-44-encrypted to the
+ * (owner, agent) pair: only those two keys can import the card. Requires a
+ * linked agent instance.
  */
 export async function mintAgentCard(
   id: string,
   styleNotes?: string,
+  lock?: boolean,
 ): Promise<MintedAgentCard> {
   return invokeTauri<MintedAgentCard>("mint_agent_card", {
     id,
     styleNotes: styleNotes || null,
+    lock: lock ?? null,
   });
 }
 
@@ -222,6 +230,12 @@ export type AgentSnapshotImportPreview = {
   sourceAllowlist: string[];
   /** Validated, pretty-printed manifest for full payload disclosure. */
   manifestJson: string;
+  /**
+   * True when the snapshot came from a locked (encrypted) card this machine
+   * unlocked. Cards that cannot be unlocked fail with a refusal error and
+   * never reach a preview.
+   */
+  locked: boolean;
 };
 
 /** Confirmation sent to `confirm_agent_snapshot_import`. */

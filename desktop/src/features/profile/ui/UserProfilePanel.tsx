@@ -185,6 +185,7 @@ export function UserProfilePanel({
   const [cardMintTarget, setCardMintTarget] = React.useState<{
     id: string;
     name: string;
+    canLock: boolean;
   } | null>(null);
 
   const personasQuery = usePersonasQuery();
@@ -837,6 +838,8 @@ export function UserProfilePanel({
                     // persona/definition id (same resolution as export).
                     id: managedAgent?.pubkey ?? resolvedPersona.id,
                     name: resolvedPersona.displayName,
+                    // Locking needs an instance keypair to encrypt to.
+                    canLock: Boolean(managedAgent?.pubkey),
                   })
               : undefined
           }
@@ -978,6 +981,7 @@ export function UserProfilePanel({
         <AgentCardMintDialog
           agentId={cardMintTarget.id}
           agentName={cardMintTarget.name}
+          canLock={cardMintTarget.canLock}
           onOpenChange={(open) => {
             if (!open) setCardMintTarget(null);
           }}

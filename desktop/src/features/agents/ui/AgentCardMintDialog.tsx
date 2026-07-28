@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Download, RefreshCw, Send, Sparkles } from "lucide-react";
+import { Download, Lock, RefreshCw, Send, Sparkles } from "lucide-react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -22,6 +22,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/shared/ui/dialog";
+import { Switch } from "@/shared/ui/switch";
 import { Textarea } from "@/shared/ui/textarea";
 
 import { PersonaShareRecipients } from "./PersonaShareRecipients";
@@ -43,14 +44,21 @@ function cardBytesFromBase64(b64: string): number[] {
 export function AgentCardMintDialog({
   agentId,
   agentName,
+  canLock,
   onOpenChange,
 }: {
   /** Instance pubkey or definition slug — same resolution as snapshot export. */
   agentId: string;
   agentName: string;
+  /**
+   * True when the agent has a linked instance (a keypair to lock to).
+   * Locking is disabled — with an explanation — for bare definitions.
+   */
+  canLock: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const [styleNotes, setStyleNotes] = React.useState("");
+  const [lockCard, setLockCard] = React.useState(false);
   const [card, setCard] = React.useState<MintedAgentCard | null>(null);
   const [recipients, setRecipients] = React.useState<UserSearchResult[]>([]);
 
@@ -59,7 +67,12 @@ export function AgentCardMintDialog({
   const upsertCachedChannel = useUpsertCachedChannel();
 
   const mintMutation = useMutation({
-    mutationFn: () => mintAgentCard(agentId, styleNotes.trim() || undefined),
+    mutationFn: () =>
+      mintAgentCard(
+        agentId,
+        styleNotes.trim() || undefined,
+        canLock && lockCard,
+      ),
     onSuccess: (minted) => setCard(minted),
     onError: (error: Error) => {
       if (error.message.startsWith(NO_OPENAI_KEY_PREFIX)) {
@@ -127,7 +140,9 @@ export function AgentCardMintDialog({
           </DialogTitle>
           <DialogDescription>
             {card
-              ? "The card carries the agent — anyone who imports this PNG gets a working copy (config only, fresh identity, no memories)."
+              ? card.locked
+                ? "This card is locked: only you and the agent can import it. Anyone else sees just the image."
+                : "The card carries the agent — anyone who imports this PNG gets a working copy (config only, fresh identity, no memories)."
               : "Mint a collectible trading card that doubles as a shareable, importable copy of this agent."}
           </DialogDescription>
         </DialogHeader>
@@ -191,6 +206,25 @@ export function AgentCardMintDialog({
               rows={3}
               value={styleNotes}
             />
+            <div className="flex items-start justify-between gap-3 rounded-md border border-border p-3">
+              <div className="flex flex-col gap-0.5">
+                <span className="flex items-center gap-1.5 text-sm font-medium">
+                  <Lock className="h-3.5 w-3.5" />
+                  Lock card
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {canLock
+                    ? "Encrypt the embedded agent so only you and this agent can import it. Anyone else sees just the image."
+                    : "Locking needs a linked agent instance — start this agent once to enable it."}
+                </span>
+              </div>
+              <Switch
+                checked={canLock && lockCard}
+                data-testid="agent-card-lock-toggle"
+                disabled={isMinting || !canLock}
+                onCheckedChange={setLockCard}
+              />
+            </div>
             <div className="flex justify-end">
               <Button
                 disabled={isMinting}

@@ -7,6 +7,8 @@ import 'observer_subscription.dart';
 
 const _activeTurnLivenessTimeout = Duration(seconds: 30);
 const _activeTurnClockInterval = Duration(seconds: 5);
+const _maximumLivenessInterval = Duration(hours: 24);
+const _livenessTimeoutSlack = Duration(seconds: 30);
 
 /// An agent turn reconstructed from observer frames and still considered live.
 @immutable
@@ -16,6 +18,7 @@ class ActiveAgentTurn {
   final String turnId;
   final DateTime startedAt;
   final DateTime lastActivityAt;
+  final Duration livenessTimeout;
   final String? triggeringEventId;
 
   const ActiveAgentTurn({
@@ -24,19 +27,23 @@ class ActiveAgentTurn {
     required this.turnId,
     required this.startedAt,
     required this.lastActivityAt,
+    this.livenessTimeout = _activeTurnLivenessTimeout,
     this.triggeringEventId,
   });
 
   /// Returns this turn with an updated locally observed activity time.
-  ActiveAgentTurn copyWith({required DateTime lastActivityAt}) =>
-      ActiveAgentTurn(
-        agentPubkey: agentPubkey,
-        channelId: channelId,
-        turnId: turnId,
-        startedAt: startedAt,
-        lastActivityAt: lastActivityAt,
-        triggeringEventId: triggeringEventId,
-      );
+  ActiveAgentTurn copyWith({
+    required DateTime lastActivityAt,
+    Duration? livenessTimeout,
+  }) => ActiveAgentTurn(
+    agentPubkey: agentPubkey,
+    channelId: channelId,
+    turnId: turnId,
+    startedAt: startedAt,
+    lastActivityAt: lastActivityAt,
+    livenessTimeout: livenessTimeout ?? this.livenessTimeout,
+    triggeringEventId: triggeringEventId,
+  );
 }
 
 /// Reconstructs live turns from replay and live frames, pruning stale turns.
@@ -67,6 +74,7 @@ List<ActiveAgentTurn> reduceActiveAgentTurns(
             turnId: turnId,
             startedAt: startedAt,
             lastActivityAt: frameAt,
+            livenessTimeout: _livenessTimeout(frame.payload),
             triggeringEventId: _triggeringEventId(frame.payload),
           );
         case 'turn_completed':
@@ -94,7 +102,12 @@ List<ActiveAgentTurn> reduceActiveAgentTurns(
           if (turnId == null) continue;
           final activeTurn = turnsById[turnId];
           if (activeTurn != null) {
-            turnsById[turnId] = activeTurn.copyWith(lastActivityAt: frameAt);
+            turnsById[turnId] = activeTurn.copyWith(
+              lastActivityAt: frameAt,
+              livenessTimeout: frame.kind == 'turn_liveness'
+                  ? _livenessTimeout(frame.payload)
+                  : null,
+            );
             continue;
           }
 
@@ -108,15 +121,14 @@ List<ActiveAgentTurn> reduceActiveAgentTurns(
             turnId: turnId,
             startedAt: _safeStartedAt(frame, frameAt),
             lastActivityAt: frameAt,
+            livenessTimeout: _livenessTimeout(frame.payload),
           );
       }
     }
 
     activeTurns.addAll(
       turnsById.values.where(
-        (turn) => !turn.lastActivityAt.isBefore(
-          now.subtract(_activeTurnLivenessTimeout),
-        ),
+        (turn) => now.difference(turn.lastActivityAt) <= turn.livenessTimeout,
       ),
     );
   }
@@ -173,6 +185,26 @@ String? _triggeringEventId(dynamic payload) {
     if (eventId is String && eventId.isNotEmpty) return eventId;
   }
   return null;
+}
+
+Duration _livenessTimeout(dynamic payload) {
+  final rawInterval = payload is Map ? payload['livenessIntervalSecs'] : null;
+  if (rawInterval is! num) return _activeTurnLivenessTimeout;
+
+  final intervalSeconds = rawInterval.toInt();
+  if (intervalSeconds <= 0) {
+    return _maximumLivenessInterval + _livenessTimeoutSlack;
+  }
+  final boundedInterval = intervalSeconds.clamp(
+    5,
+    _maximumLivenessInterval.inSeconds,
+  );
+  final timeoutSeconds = boundedInterval + _livenessTimeoutSlack.inSeconds;
+  return Duration(
+    seconds: timeoutSeconds < _activeTurnLivenessTimeout.inSeconds
+        ? _activeTurnLivenessTimeout.inSeconds
+        : timeoutSeconds,
+  );
 }
 
 int _compareFrames(ObserverFrame a, ObserverFrame b) {

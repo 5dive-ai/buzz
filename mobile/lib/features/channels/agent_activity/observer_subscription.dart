@@ -137,14 +137,23 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       final filterTags = {
         '#p': [ownerPubkey],
       };
-      final history = await session.fetchHistory(
-        NostrFilter(
-          kinds: [EventKind.agentObserverFrame],
-          tags: filterTags,
-          limit: _observerReplayLimit,
-          until: replayBoundary,
-        ),
-      );
+      List<NostrEvent> history;
+      try {
+        history = await session.fetchHistory(
+          NostrFilter(
+            kinds: [EventKind.agentObserverFrame],
+            tags: filterTags,
+            limit: _observerReplayLimit,
+            until: replayBoundary,
+          ),
+        );
+      } catch (error) {
+        history = const [];
+        debugPrint(
+          'Unable to replay observer history; continuing live: '
+          '${_observerErrorMessage(error)}',
+        );
+      }
       if (_disposed || epoch != _subscriptionEpoch) {
         return;
       }

@@ -84,6 +84,26 @@ void main() {
     expect(turns, isEmpty);
   });
 
+  test('uses the harness liveness interval when pruning a quiet turn', () {
+    final frame = _frame(
+      seq: 1,
+      second: 1,
+      kind: 'turn_started',
+      payload: {'livenessIntervalSecs': 60},
+    );
+
+    final stillActive = reduceActiveAgentTurns({
+      'agent-a': [frame],
+    }, now: DateTime.utc(2026, 7, 27, 12, 1, 1));
+    final expired = reduceActiveAgentTurns({
+      'agent-a': [frame],
+    }, now: DateTime.utc(2026, 7, 27, 12, 1, 32));
+
+    expect(stillActive, hasLength(1));
+    expect(stillActive.single.livenessTimeout, const Duration(seconds: 90));
+    expect(expired, isEmpty);
+  });
+
   test('translates host timestamps onto the device clock', () {
     final receivedAt = DateTime.utc(2026, 7, 27, 12, 0, 10);
     final turns = reduceActiveAgentTurns({

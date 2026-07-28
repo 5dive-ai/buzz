@@ -76,6 +76,33 @@ void main() {
     expect(state.transcript, isEmpty);
   });
 
+  test('subscribes live when observer history replay fails', () async {
+    final userKeychain = nostr.Keys.generate();
+    final agentKeychain = nostr.Keys.generate();
+    final relaySession = _RecordingRelaySession()
+      ..historyError = TimeoutException('history unavailable');
+    final container = ProviderContainer(
+      overrides: [
+        relaySessionProvider.overrideWith(() => relaySession),
+        relayConfigProvider.overrideWith(
+          () => _FakeRelayConfigNotifier(nsec: userKeychain.nsec),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    final key = (channelId: 'test-channel', agentPubkey: agentKeychain.public);
+    container.read(observerSubscriptionProvider(key));
+    await Future<void>.delayed(Duration.zero);
+
+    expect(relaySession.historyFilters, hasLength(1));
+    expect(relaySession.filters, hasLength(1));
+    expect(
+      container.read(observerSubscriptionProvider(key)).connection,
+      ObserverConnectionState.open,
+    );
+  });
+
   test(
     'subscribes with correct filter shape and transitions to open',
     () async {
@@ -363,6 +390,7 @@ class _RecordingRelaySession extends RelaySessionNotifier {
   final List<void Function(String message)> _closedListeners = [];
   final List<Completer<void>> _subscribeGates = [];
   List<NostrEvent> historyEvents = [];
+  Object? historyError;
   bool delaySubscribes = false;
 
   @override
@@ -374,6 +402,7 @@ class _RecordingRelaySession extends RelaySessionNotifier {
     Duration timeout = const Duration(seconds: 8),
   }) async {
     historyFilters.add(filter);
+    if (historyError case final error?) throw error;
     return historyEvents;
   }
 

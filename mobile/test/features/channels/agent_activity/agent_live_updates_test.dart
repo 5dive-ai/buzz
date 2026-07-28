@@ -62,6 +62,21 @@ void main() {
     expect(buildAgentLiveUpdateContent(const [], const {}), isNull);
   });
 
+  test('keeps the platform expiry beyond a slow liveness interval', () {
+    final content = buildAgentLiveUpdateContent(
+      [
+        _turn(
+          agent: 'agent-a',
+          channel: 'channel-1',
+          livenessTimeout: const Duration(hours: 24, seconds: 30),
+        ),
+      ],
+      {'channel-1': 'agents'},
+    );
+
+    expect(content!.expiresAt, DateTime.utc(2026, 7, 28, 12, 0, 40));
+  });
+
   test('summarizes additional agents and channels', () {
     final content = buildAgentLiveUpdateContent(
       [
@@ -168,6 +183,7 @@ ActiveAgentTurn _turn({
   required String channel,
   int minute = 0,
   String? message,
+  Duration livenessTimeout = const Duration(seconds: 30),
 }) {
   final startedAt = DateTime.utc(2026, 7, 27, 12, minute);
   return ActiveAgentTurn(
@@ -176,6 +192,7 @@ ActiveAgentTurn _turn({
     turnId: '$agent-$minute',
     startedAt: startedAt,
     lastActivityAt: startedAt.add(const Duration(seconds: 10)),
+    livenessTimeout: livenessTimeout,
     triggeringEventId: message,
   );
 }

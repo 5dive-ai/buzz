@@ -97,6 +97,10 @@ AgentLiveUpdateContent? buildAgentLiveUpdateContent(
   final lastActivityAt = turns
       .map((turn) => turn.lastActivityAt)
       .reduce((latest, value) => value.isAfter(latest) ? value : latest);
+  final livenessExpiresAt = turns
+      .map((turn) => turn.lastActivityAt.add(turn.livenessTimeout))
+      .reduce((latest, value) => value.isAfter(latest) ? value : latest);
+  final safetyExpiresAt = lastActivityAt.add(_liveUpdateSafetyLifetime);
   final tapTarget = [...turns]
     ..sort((a, b) => b.lastActivityAt.compareTo(a.lastActivityAt));
   final targetWithMessage = tapTarget
@@ -110,7 +114,9 @@ AgentLiveUpdateContent? buildAgentLiveUpdateContent(
     activeAgentCount: agentCount,
     startedAt: startedAt,
     lastActivityAt: lastActivityAt,
-    expiresAt: lastActivityAt.add(_liveUpdateSafetyLifetime),
+    expiresAt: livenessExpiresAt.isAfter(safetyExpiresAt)
+        ? livenessExpiresAt
+        : safetyExpiresAt,
     channelId: target.channelId,
     messageId: target.triggeringEventId,
   );

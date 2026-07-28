@@ -657,6 +657,48 @@ test("first-launch encrypted backup import asks for a passphrase and continues",
   await expect(page.getByTestId("machine-onboarding-gate")).toBeVisible();
 });
 
+test("first-launch import accepts an .ncryptsec backup file", async ({
+  page,
+}) => {
+  await installMockBridge(page, undefined, {
+    skipCommunitySeed: true,
+    skipOnboardingSeed: true,
+  });
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Use an existing key" }).click();
+
+  // The spotlight variant must expose a file path: a wiped user returns with
+  // exactly the identity.ncryptsec our own save dialog produced. The accept
+  // attribute is asserted explicitly because setInputFiles bypasses it — the
+  // OS picker is what filters on it in real use.
+  await expect(page.getByTestId("nostr-import-file-button")).toBeVisible();
+  const fileInput = page.getByTestId("nostr-import-file-input");
+  await expect(fileInput).toHaveAttribute(
+    "accept",
+    ".key,.ncryptsec,text/plain",
+  );
+
+  // Spec-vector blob the mock bridge accepts with the mock passphrase.
+  const mockNcryptsec =
+    "ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p";
+  await fileInput.setInputFiles({
+    buffer: Buffer.from(`${mockNcryptsec}\n`),
+    mimeType: "text/plain",
+    name: "identity.ncryptsec",
+  });
+
+  // File contents land in the key field and switch the form to encrypted mode.
+  await expect(page.getByTestId("nostr-import-encrypted-badge")).toBeVisible();
+  await page
+    .getByTestId("nostr-import-passphrase")
+    .fill("mock horse battery staple lake orbit");
+  await page.getByTestId("nostr-import-submit").click();
+
+  await expect(page.getByTestId("onboarding-page-2")).toBeVisible();
+  await expect(page.getByTestId("machine-onboarding-gate")).toBeVisible();
+});
+
 test("non-local runtime override keeps community selection without release flag", async ({
   page,
 }) => {

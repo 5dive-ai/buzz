@@ -96,7 +96,7 @@ export function NostrKeyImportForm({
 
     if (file.size > NOSTR_KEY_FILE_MAX_BYTES) {
       setImportError(
-        "That file is too large to be a key. Drop a .key file or paste your nsec.",
+        "That file is too large to be a key. Choose a .key or .ncryptsec backup file, or paste your key.",
       );
       return;
     }
@@ -243,89 +243,107 @@ export function NostrKeyImportForm({
         )}
       </div>
 
-      {variant === "spotlight" ? null : (
-        <>
-          <input
-            accept=".key,text/plain"
-            className="sr-only"
-            disabled={isInteractionDisabled}
-            onChange={(event) => {
-              void handleFiles(event.currentTarget.files);
-              event.currentTarget.value = "";
-            }}
-            ref={fileInputRef}
-            tabIndex={-1}
-            type="file"
-          />
+      {/* Hidden file input shared by both variants: the default drop zone and
+          the spotlight "Import from a file" button both open it. Accepts the
+          .ncryptsec archives our own save flow emits alongside raw .key files. */}
+      <input
+        accept=".key,.ncryptsec,text/plain"
+        className="sr-only"
+        data-testid="nostr-import-file-input"
+        disabled={isInteractionDisabled}
+        onChange={(event) => {
+          void handleFiles(event.currentTarget.files);
+          event.currentTarget.value = "";
+        }}
+        ref={fileInputRef}
+        tabIndex={-1}
+        type="file"
+      />
 
-          <button
-            className={cn(
-              "relative flex h-[120px] flex-col items-center justify-center gap-3 overflow-hidden rounded-xl border border-transparent bg-muted text-foreground transition-[background-color,border-color,box-shadow,color] duration-[250ms] ease-out hover:bg-muted/80 disabled:opacity-60",
-              isDragging &&
-                "border-primary bg-primary/10 text-primary ring-1 ring-primary/35 hover:bg-primary/10",
-            )}
-            data-dragging={isDragging ? "true" : undefined}
-            data-testid="nostr-import-drop"
+      {variant === "spotlight" ? (
+        // First-launch/wiped-identity treatment: no drop zone, but the file
+        // path must still exist — a backup saved through the OS dialog is
+        // exactly what a wiped user returns with.
+        <div className="mt-2 text-center">
+          <Button
+            className="h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
+            data-testid="nostr-import-file-button"
             disabled={isInteractionDisabled}
             onClick={openFilePicker}
-            onDragEnter={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              if (!isInteractionDisabled) {
-                setIsDragging(true);
-              }
-            }}
-            onDragLeave={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              if (
-                event.currentTarget.contains(event.relatedTarget as Node | null)
-              ) {
-                return;
-              }
-              setIsDragging(false);
-            }}
-            onDragOver={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              if (!isInteractionDisabled) {
-                event.dataTransfer.dropEffect = "copy";
-              }
-            }}
-            onDrop={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              setIsDragging(false);
-              if (isInteractionDisabled) {
-                return;
-              }
-              void handleFiles(event.dataTransfer.files);
-            }}
             type="button"
+            variant="ghost"
           >
-            <span
-              aria-hidden="true"
-              className={cn(
-                "pointer-events-none absolute inset-0 rounded-[inherit] bg-primary/10 opacity-0 transition-opacity duration-[250ms] ease-out",
-                isDragging && "opacity-100",
-              )}
-            />
-            <KeyRound
-              className={cn(
-                "relative h-8 w-8 text-muted-foreground transition-colors duration-[250ms] ease-out",
-                isDragging && "text-primary",
-              )}
-            />
-            <span
-              className={cn(
-                "relative text-sm font-medium text-muted-foreground transition-colors duration-[250ms] ease-out",
-                isDragging && "text-primary",
-              )}
-            >
-              Drop a key here
-            </span>
-          </button>
-        </>
+            Import from a file
+          </Button>
+        </div>
+      ) : (
+        <button
+          className={cn(
+            "relative flex h-[120px] flex-col items-center justify-center gap-3 overflow-hidden rounded-xl border border-transparent bg-muted text-foreground transition-[background-color,border-color,box-shadow,color] duration-[250ms] ease-out hover:bg-muted/80 disabled:opacity-60",
+            isDragging &&
+              "border-primary bg-primary/10 text-primary ring-1 ring-primary/35 hover:bg-primary/10",
+          )}
+          data-dragging={isDragging ? "true" : undefined}
+          data-testid="nostr-import-drop"
+          disabled={isInteractionDisabled}
+          onClick={openFilePicker}
+          onDragEnter={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!isInteractionDisabled) {
+              setIsDragging(true);
+            }
+          }}
+          onDragLeave={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (
+              event.currentTarget.contains(event.relatedTarget as Node | null)
+            ) {
+              return;
+            }
+            setIsDragging(false);
+          }}
+          onDragOver={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!isInteractionDisabled) {
+              event.dataTransfer.dropEffect = "copy";
+            }
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            setIsDragging(false);
+            if (isInteractionDisabled) {
+              return;
+            }
+            void handleFiles(event.dataTransfer.files);
+          }}
+          type="button"
+        >
+          <span
+            aria-hidden="true"
+            className={cn(
+              "pointer-events-none absolute inset-0 rounded-[inherit] bg-primary/10 opacity-0 transition-opacity duration-[250ms] ease-out",
+              isDragging && "opacity-100",
+            )}
+          />
+          <KeyRound
+            className={cn(
+              "relative h-8 w-8 text-muted-foreground transition-colors duration-[250ms] ease-out",
+              isDragging && "text-primary",
+            )}
+          />
+          <span
+            className={cn(
+              "relative text-sm font-medium text-muted-foreground transition-colors duration-[250ms] ease-out",
+              isDragging && "text-primary",
+            )}
+          >
+            Drop a key here
+          </span>
+        </button>
       )}
 
       {isEncryptedInput ? (

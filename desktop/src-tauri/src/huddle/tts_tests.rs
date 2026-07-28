@@ -949,9 +949,8 @@ fn chunk_grouping_packs_up_to_budget_then_spills() {
     assert_eq!(chunks[2], d);
 }
 
-/// A single sentence longer than the budget is passed through unsplit —
-/// long single sentences are fine (the LM cap bounds runaway); only seams
-/// are being minimized.
+/// A single sentence longer than the coarse budget is passed through here;
+/// the loaded April engine subsequently enforces its exact 50-token limit.
 #[test]
 fn chunk_grouping_oversized_sentence_passes_through() {
     let long = "word ".repeat(60).trim_end().to_string() + ".";

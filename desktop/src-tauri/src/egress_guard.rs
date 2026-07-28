@@ -8,7 +8,7 @@
 //! |---|----------|------|
 //! | 1 | `submit_event_at_with_keys` (funnel for `submit_event`) | `relay/submit.rs` |
 //! | 2 | `sync_managed_agent_profile` | `relay.rs` |
-//! | 3 | `submit_signed_event` | `relay.rs` |
+//! | 3 | `submit_signed_event_at_with_keys` (pre-signed funnel behind 1) | `relay/submit.rs` |
 //! | 4 | `submit_signed_event_with_keys` | `relay.rs` |
 //! | 5 | huddle STT publisher | `huddle/pipeline.rs` |
 //! | 6 | `submit_engram_event` (team snapshot) | `commands/team_snapshot.rs` |

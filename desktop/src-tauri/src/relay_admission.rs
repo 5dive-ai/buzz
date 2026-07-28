@@ -5,8 +5,9 @@
 //! `relayRateLimitGate.ts` that already governs WebSocket operations.
 //!
 //! **Coverage:** all entry points in `relay.rs` (`query_relay_at`,
-//! `submit_event`, `submit_signed_event`, `submit_signed_event_with_keys`,
-//! `sync_managed_agent_profile`) and the three previously-direct senders
+//! `submit_event`, `submit_signed_event_at_with_keys`,
+//! `submit_signed_event_with_keys`, `sync_managed_agent_profile`) and the
+//! three previously-direct senders
 //! (`submit_engram_event` in snapshot import + team_snapshot, huddle STT)
 //! all call `wait_for_rate_limit()` before `.send()`.
 //!

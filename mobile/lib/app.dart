@@ -13,6 +13,7 @@ import 'features/profile/user_status_cache_provider.dart';
 import 'shared/auth/auth.dart';
 import 'shared/deeplink/pending_deep_link_provider.dart';
 import 'shared/relay/relay.dart';
+import 'shared/push/push_subscription_provider.dart';
 import 'shared/theme/theme.dart';
 
 class App extends HookConsumerWidget {
@@ -39,6 +40,7 @@ class App extends HookConsumerWidget {
       ref.watch(observerRelayProvider);
       ref.watch(appLifecycleProvider);
       ref.watch(userStatusCacheProvider);
+      ref.watch(pushSubscriptionSyncProvider);
     }
 
     // Start listening for buzz:// links immediately (even pre-auth) so a

@@ -37,6 +37,7 @@ Future<void> registerBuzzPushCommunitySnapshot(
           name: community.name,
           relayUrl: community.relayUrl,
           pubkey: community.pubkey ?? pubkeyFromNsec(community.nsec),
+          pushSubscriptionState: community.pushSubscriptionState,
         ),
     ];
     final signingKeys = <String, String>{};

@@ -198,7 +198,7 @@ test("extractSupportedLinkPreviews skips markdown image link URLs", () => {
   );
 });
 
-test("extractSupportedLinkPreviews requires bare URL boundaries", () => {
+test("extractSupportedLinkPreviews treats other absolute HTTPS URLs as generic", () => {
   assert.deepEqual(
     extractSupportedLinkPreviews(
       [
@@ -207,7 +207,7 @@ test("extractSupportedLinkPreviews requires bare URL boundaries", () => {
         "(https://github.com/block/sprout/pull/2)",
       ].join(" "),
     ).map((preview) => preview.title),
-    ["block/sprout #2"],
+    ["evil-github.com", "example.com", "block/sprout #2"],
   );
 });
 
@@ -251,4 +251,40 @@ test("isSupportedLinkAutolinkLabel matches normalized bare URL labels", () => {
     true,
   );
   assert.equal(isSupportedLinkAutolinkLabel("review this", preview), false);
+});
+
+test("parseSupportedLinkPreview parses generic HTTPS URLs", () => {
+  assert.deepEqual(
+    parseSupportedLinkPreview("https://example.com/articles/rich-previews"),
+    {
+      kind: "generic-link",
+      href: "https://example.com/articles/rich-previews",
+      provider: "example.com",
+      title: "example.com",
+      typeLabel: "link",
+    },
+  );
+});
+
+test("parseSupportedLinkPreview rejects generic HTTP URLs", () => {
+  assert.equal(
+    parseSupportedLinkPreview("http://example.com/articles/rich-previews"),
+    null,
+  );
+});
+
+test("extractSupportedLinkPreviews finds generic links and preserves exclusions", () => {
+  assert.deepEqual(
+    extractSupportedLinkPreviews(
+      [
+        "Read https://example.com/article first.",
+        "`https://hidden.example.com/secret`",
+        "then [the details](https://docs.example.org/details)",
+      ].join(" "),
+    ).map(({ kind, title }) => ({ kind, title })),
+    [
+      { kind: "generic-link", title: "example.com" },
+      { kind: "generic-link", title: "the details" },
+    ],
+  );
 });

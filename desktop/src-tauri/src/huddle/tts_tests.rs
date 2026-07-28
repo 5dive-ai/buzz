@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+#[path = "tts_tests/token_split.rs"]
+mod token_split;
+
 // ── Remote interrupt tracker ──────────────────────────────────────────────
 //
 // Models the per-peer frame counting logic in the recv task of
@@ -785,16 +788,6 @@ fn apply_fade_out_single_sample() {
     assert_eq!(samples[0], 1.0);
 }
 
-/// Sanity-check the per-sentence cushion length: 20 ms at 24 kHz must
-/// land at exactly 480 samples. This is a const computation, so the
-/// real value of this test is documenting *why* 20 ms was chosen — it
-/// covers a typical CoreAudio buffer turnover (256–1024 samples)
-/// without being audible as user-facing latency.
-#[test]
-fn sentence_lead_in_is_sane() {
-    assert_eq!(SENTENCE_LEAD_IN_SAMPLES, 480, "20 ms × 24 kHz");
-}
-
 // ── build_sentence_append_buffer tests ───────────────────────────────────
 
 /// REGRESSION: every chunk needs an onset cushion; synthesized chunks
@@ -890,23 +883,6 @@ fn sentence_append_buffer_is_one_contiguous_source() {
             .iter()
             .all(|&s| s == 0.5)
     );
-}
-
-/// Model-token splits remain contiguous: only the playback chunk as a whole
-/// receives its onset cushion and trailing sentence gap.
-#[test]
-fn token_split_units_do_not_add_sentence_boundary_padding() {
-    let mut first = true;
-    let silence_buf_len = 2400;
-    let first_unit =
-        build_sentence_append_buffer(&mut first, vec![0.5; 100], silence_buf_len, true, false);
-    let last_unit =
-        build_sentence_append_buffer(&mut first, vec![0.25; 100], silence_buf_len, false, true);
-
-    assert_eq!(first_unit.len(), SENTENCE_LEAD_IN_SAMPLES + 100);
-    assert_eq!(first_unit.last(), Some(&0.5));
-    assert_eq!(last_unit.first(), Some(&0.25));
-    assert_eq!(first_unit.len() + last_unit.len(), 200 + silence_buf_len);
 }
 
 // ── clamp_to_full_scale tests ─────────────────────────────────────────────

@@ -543,8 +543,15 @@ mod tests {
     #[tokio::test]
     async fn materialized_repo_is_created_under_configured_scratch_dir() {
         let scratch = TempDir::new().unwrap();
-        let store = GitStore::new("http://localhost:9000", "x", "x", "x", "us-east-1")
-            .expect("construct store");
+        let store = GitStore::new(
+            "http://localhost:9000",
+            "x",
+            "x",
+            "x",
+            "us-east-1",
+            buzz_media::config::S3AddressingStyle::Path,
+        )
+        .expect("construct store");
         let manifest = Manifest {
             version: 1,
             head: "refs/heads/main".into(),
@@ -581,14 +588,34 @@ mod tests {
     }
 
     fn store() -> GitStore {
+        let endpoint = std::env::var("BUZZ_GIT_S3_ENDPOINT")
+            .or_else(|_| std::env::var("BUZZ_S3_ENDPOINT"))
+            .unwrap_or_else(|_| "http://localhost:9000".into());
+        let access_key = std::env::var("BUZZ_GIT_S3_ACCESS_KEY")
+            .or_else(|_| std::env::var("BUZZ_S3_ACCESS_KEY"))
+            .unwrap_or_else(|_| "buzz_dev".into());
+        let secret_key = std::env::var("BUZZ_GIT_S3_SECRET_KEY")
+            .or_else(|_| std::env::var("BUZZ_S3_SECRET_KEY"))
+            .unwrap_or_else(|_| "buzz_dev_secret".into());
+        let bucket = std::env::var("BUZZ_GIT_S3_BUCKET")
+            .or_else(|_| std::env::var("BUZZ_S3_BUCKET"))
+            .unwrap_or_else(|_| "buzz-git".into());
+        let region = std::env::var("BUZZ_GIT_S3_REGION")
+            .or_else(|_| std::env::var("BUZZ_S3_REGION"))
+            .unwrap_or_else(|_| "us-east-1".into());
+        let addressing_style = std::env::var("BUZZ_S3_ADDRESSING_STYLE")
+            .unwrap_or_else(|_| "path".into())
+            .parse()
+            .expect("BUZZ_S3_ADDRESSING_STYLE must be path or virtual");
         GitStore::new(
-            "http://localhost:9000",
-            "buzz_dev",
-            "buzz_dev_secret",
-            "buzz-git",
-            "us-east-1",
+            &endpoint,
+            &access_key,
+            &secret_key,
+            &bucket,
+            &region,
+            addressing_style,
         )
-        .expect("connect minio")
+        .expect("connect S3-compatible storage")
     }
 
     /// Build a tiny on-disk repo, return (pack bytes, head_oid).

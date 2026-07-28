@@ -52,6 +52,38 @@ See:
 
 The chart fails at `helm install` / `helm template` time with a clear message if any of these are missing or malformed (see `templates/_validate.tpl`).
 
+## S3 URL addressing
+
+Buzz uses one URL style for both media and Git/CAS object-store requests:
+
+| `s3.addressingStyle` | Request shape | Use for |
+|---|---|---|
+| `path` (default) | `https://endpoint/bucket/key` | Bundled MinIO and endpoints whose DNS does not resolve bucket subdomains |
+| `virtual` | `https://bucket.endpoint/key` | AWS-style providers and new Railway Storage Buckets |
+
+The chart renders this value as `BUZZ_S3_ADDRESSING_STYLE`. Only `path` and
+`virtual` are accepted; invalid values fail chart rendering and relay startup.
+The bundled MinIO quickstart deliberately keeps `path` because its Service DNS
+resolves one endpoint hostname, not arbitrary `<bucket>.<service>` names.
+
+For a Railway Storage Bucket named `Object Storage`, map its variables onto the
+Buzz service and set the style explicitly:
+
+```text
+BUZZ_S3_ENDPOINT=${{Object Storage.ENDPOINT}}
+BUZZ_S3_BUCKET=${{Object Storage.BUCKET}}
+BUZZ_S3_ACCESS_KEY=${{Object Storage.ACCESS_KEY_ID}}
+BUZZ_S3_SECRET_KEY=${{Object Storage.SECRET_ACCESS_KEY}}
+BUZZ_S3_REGION=${{Object Storage.REGION}}
+BUZZ_S3_ADDRESSING_STYLE=virtual
+```
+
+Railway's Credentials tab is authoritative for older buckets, which may still
+require `path`. The setting changes request routing and SigV4 signing, so do not
+put the bucket into `BUZZ_S3_ENDPOINT`; pass Railway's base `ENDPOINT` and
+`BUCKET` separately. The relay validates storage before becoming ready, and the
+Git conformance probe remains startup-fatal when enabled.
+
 ## Relay Pod extensions
 
 The chart exposes narrow extension points for init containers, volumes, relay

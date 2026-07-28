@@ -1598,7 +1598,19 @@ mod tests {
         let region = std::env::var("BUZZ_GIT_S3_REGION")
             .or_else(|_| std::env::var("BUZZ_S3_REGION"))
             .unwrap_or_else(|_| "us-east-1".into());
-        GitStore::new(&endpoint, &access_key, &secret_key, &bucket, &region).expect("connect minio")
+        let addressing_style = std::env::var("BUZZ_S3_ADDRESSING_STYLE")
+            .unwrap_or_else(|_| "path".into())
+            .parse()
+            .expect("BUZZ_S3_ADDRESSING_STYLE must be path or virtual");
+        GitStore::new(
+            &endpoint,
+            &access_key,
+            &secret_key,
+            &bucket,
+            &region,
+            addressing_style,
+        )
+        .expect("connect minio")
     }
 
     fn tenant() -> TenantContext {

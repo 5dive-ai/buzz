@@ -198,6 +198,11 @@
       "properties": {
         "endpoint": { "type": "string", "pattern": "^(https?://.+)?$" },
         "bucket": { "type": "string", "minLength": 1 },
+        "addressingStyle": {
+          "type": "string",
+          "enum": ["path", "virtual"],
+          "description": "S3 URL style shared by media and Git/CAS clients. Defaults to path for bundled MinIO compatibility."
+        },
         "accessKey": { "type": "string" },
         "secretKey": { "type": "string" }
       }

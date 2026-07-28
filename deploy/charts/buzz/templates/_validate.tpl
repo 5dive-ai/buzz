@@ -75,6 +75,12 @@ surface at template time regardless of which manifest helm renders first.
   {{- fail "Postgres source missing: enable postgresql.enabled=true, set externalPostgresql.url, or provide secrets.existingSecret with key DATABASE_URL." -}}
 {{- end -}}
 
+{{/* S3 addressing style is duplicated here in addition to values.schema.json
+     because Helm unittest does not consistently apply schema validation. */}}
+{{- if not (has .Values.s3.addressingStyle (list "path" "virtual")) -}}
+  {{- fail "s3.addressingStyle must be 'path' or 'virtual'. Use path for bundled MinIO and virtual for providers such as new Railway Storage Buckets." -}}
+{{- end -}}
+
 {{/* S3 / object-storage source must exist somewhere (relay hard-fails its
      startup conformance probe without a reachable bucket). */}}
 {{- if not (or .Values.minio.enabled .Values.s3.endpoint .Values.secrets.existingSecret) -}}

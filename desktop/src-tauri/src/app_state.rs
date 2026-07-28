@@ -52,7 +52,6 @@ pub struct AppState {
     /// Tauri app handle — stored after setup so huddle commands can emit
     /// `huddle-state-changed` events without needing the handle threaded
     /// through every call site.
-    ///
     /// Set once during `setup()` in `lib.rs`; never cleared.
     pub app_handle: Mutex<Option<AppHandle>>,
     pub tts_playback_speed: crate::huddle::playback_speed::PlaybackSpeedControl,

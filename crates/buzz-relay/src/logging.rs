@@ -27,10 +27,12 @@ use tracing_appender::non_blocking::{ErrorCounter, NonBlocking, NonBlockingBuild
 
 /// Bounded queue size, in lines.
 ///
-/// Derived from measured production line sizes (bb-block fleet, 2026-07-28:
-/// p50=248B, p99=641B, max=641B across 26k lines): 4096 × 641B ≈ 2.6MB
-/// worst-case queue memory against a 2Gi pod limit, several minutes of
-/// steady-state log volume. The buffer absorbs bursts; it is not sized to
+/// Derived from measured production line sizes (bb-block fleet, 2026-07-28,
+/// 26k-line sample: p50=248B, largest observed 641B — p99 equaled max in
+/// that sample, so the true tail may be somewhat larger): 4096 × 641B ≈
+/// 2.6MB of queue memory against a 2Gi pod limit, several minutes of
+/// steady-state log volume, with ample headroom for a fatter tail. The
+/// buffer absorbs bursts; it is not sized to
 /// ride out a sustained copier outage — once the sink is stalled, preserving
 /// more backlog has diminishing value.
 ///

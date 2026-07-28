@@ -621,6 +621,7 @@ export async function editMessage(
   mediaTags?: string[][],
   emojiTags?: string[][],
   mentionPubkeys?: string[],
+  suppressLinkPreviews?: boolean,
 ): Promise<void> {
   await invokeTauri("edit_message", {
     channelId,
@@ -629,6 +630,7 @@ export async function editMessage(
     mediaTags: mediaTags ?? [],
     emojiTags: emojiTags ?? [],
     mentionPubkeys: mentionPubkeys ?? null,
+    suppressLinkPreviews: suppressLinkPreviews ?? false,
   });
 }
 

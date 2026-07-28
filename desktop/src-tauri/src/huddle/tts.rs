@@ -921,6 +921,9 @@ fn lock_player_ops(ops: &Mutex<()>) -> MutexGuard<'_, ()> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[path = "tts_playback_speed_tests.rs"]
+mod playback_speed_tests;
+#[cfg(test)]
 #[path = "tts_tests.rs"]
 mod tests;
 #[cfg(test)]

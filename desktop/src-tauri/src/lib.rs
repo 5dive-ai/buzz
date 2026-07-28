@@ -839,6 +839,8 @@ pub fn run() {
             update_team,
             delete_team,
             export_agent_snapshot,
+            mint_agent_card,
+            save_agent_card,
             preview_agent_snapshot_import,
             confirm_agent_snapshot_import,
             encode_agent_snapshot_for_send,

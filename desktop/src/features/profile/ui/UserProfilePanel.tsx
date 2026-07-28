@@ -73,6 +73,7 @@ import { useProfileFieldBuckets } from "@/features/profile/ui/UserProfilePanelFi
 import { submitProfilePersonaDialog } from "@/features/profile/ui/UserProfilePanelPersonaSubmit";
 import { UserProfilePersonaDialogs } from "@/features/profile/ui/UserProfilePersonaDialogs";
 import { UserProfileSnapshotExportDialog } from "@/features/profile/ui/UserProfileSnapshotExportDialog";
+import { AgentCardMintDialog } from "@/features/agents/ui/AgentCardMintDialog";
 import {
   deriveProfileChannels,
   type ProfilePanelTab,
@@ -181,6 +182,10 @@ export function UserProfilePanel({
     React.useState<AgentPersona | null>(null);
   const [personaToExportSnapshot, setPersonaToExportSnapshot] =
     React.useState<AgentPersona | null>(null);
+  const [cardMintTarget, setCardMintTarget] = React.useState<{
+    id: string;
+    name: string;
+  } | null>(null);
 
   const personasQuery = usePersonasQuery();
   const managedAgentsQuery = useManagedAgentsQuery({ enabled: true });
@@ -824,6 +829,17 @@ export function UserProfilePanel({
           onOpenInstructions={() => setView("instructions")}
           onTabChange={setTab}
           onOpenDm={onOpenDm}
+          onCreateCard={
+            canManagePersona && resolvedPersona
+              ? () =>
+                  setCardMintTarget({
+                    // Prefer the live instance pubkey; fall back to the
+                    // persona/definition id (same resolution as export).
+                    id: managedAgent?.pubkey ?? resolvedPersona.id,
+                    name: resolvedPersona.displayName,
+                  })
+              : undefined
+          }
           presenceStatus={presenceStatus}
           profile={profile}
           pubkey={effectivePubkey}
@@ -956,6 +972,15 @@ export function UserProfilePanel({
             if (!open) setPersonaToExportSnapshot(null);
           }}
           persona={personaToExportSnapshot}
+        />
+      ) : null}
+      {cardMintTarget ? (
+        <AgentCardMintDialog
+          agentId={cardMintTarget.id}
+          agentName={cardMintTarget.name}
+          onOpenChange={(open) => {
+            if (!open) setCardMintTarget(null);
+          }}
         />
       ) : null}
     </>

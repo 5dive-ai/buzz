@@ -167,6 +167,43 @@ export async function encodeAgentSnapshotForSend(
   });
 }
 
+// ── Agent trading cards ───────────────────────────────────────────────────────
+
+/** Result of `mint_agent_card`. */
+export type MintedAgentCard = {
+  /** Final `.agent.png` bytes (chunk-injected, verified), base64-encoded. */
+  cardPngBase64: string;
+  /** Suggested filename, e.g. `eva.agent.png`. */
+  fileName: string;
+  /** Designer commentary emitted alongside the image (may be empty). */
+  designerNotes: string;
+};
+
+/** Error prefix Rust returns when no OpenAI key is configured. */
+export const NO_OPENAI_KEY_PREFIX = "NO_OPENAI_KEY:";
+
+/**
+ * Mint a trading card for an agent. One long API call (~2–3 minutes).
+ * Reroll = call again; the backend holds no session state.
+ */
+export async function mintAgentCard(
+  id: string,
+  styleNotes?: string,
+): Promise<MintedAgentCard> {
+  return invokeTauri<MintedAgentCard>("mint_agent_card", {
+    id,
+    styleNotes: styleNotes || null,
+  });
+}
+
+/** Save minted card bytes to disk via the OS save dialog. */
+export async function saveAgentCard(
+  cardPngBase64: string,
+  fileName: string,
+): Promise<boolean> {
+  return invokeTauri<boolean>("save_agent_card", { cardPngBase64, fileName });
+}
+
 // ── Snapshot import ───────────────────────────────────────────────────────────
 
 /** Preview returned by `preview_agent_snapshot_import` before any write. */

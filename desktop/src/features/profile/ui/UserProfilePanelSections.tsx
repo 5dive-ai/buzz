@@ -9,6 +9,7 @@ import {
   Pencil,
   Play,
   RefreshCw,
+  Sparkles,
   Square,
   UserMinus,
   UserPlus,
@@ -105,6 +106,8 @@ export type ProfileSummaryViewProps = {
   onOpenInstructions: () => void;
   onTabChange: (tab: ProfilePanelTab, options?: { replace?: boolean }) => void;
   onOpenDm?: (pubkeys: string[]) => Promise<void> | void;
+  /** Mint an agent trading card. Present only for owner-managed personas. */
+  onCreateCard?: () => void;
   presenceStatus: "online" | "away" | "offline" | undefined;
   profile: ReturnType<typeof useUserProfileQuery>["data"];
   pubkey: string | null;
@@ -218,6 +221,7 @@ export function ProfileSummaryView({
   onOpenInstructions,
   onTabChange,
   onOpenDm,
+  onCreateCard,
   presenceStatus,
   profile,
   pubkey,
@@ -349,6 +353,7 @@ export function ProfileSummaryView({
         <ProfilePersonaPrimaryActions
           canEditAgent={canEditAgent}
           disabled={isAgentActionPending}
+          onCreateCard={onCreateCard}
           onEditAgent={handleEditAgent}
           onStartAgent={handleInstantiateAgent}
         />
@@ -356,6 +361,7 @@ export function ProfileSummaryView({
         <ProfilePrimaryActions
           canEditAgent={canEditAgent}
           followMutation={followMutation}
+          onCreateCard={onCreateCard}
           onEditAgent={handleEditAgent}
           agentActionDisabled={isAgentActionPending}
           agentActionLabel={
@@ -641,6 +647,7 @@ function ProfilePrimaryActions({
   messagePending,
   onAgentPrimaryAction,
   onAgentRestart,
+  onCreateCard,
   onEditAgent,
   onMessage,
   pubkey,
@@ -655,6 +662,7 @@ function ProfilePrimaryActions({
   messagePending?: boolean;
   onAgentPrimaryAction?: () => void;
   onAgentRestart?: () => void;
+  onCreateCard?: () => void;
   onEditAgent: () => void;
   onMessage?: () => void;
   pubkey: string;
@@ -720,6 +728,14 @@ function ProfilePrimaryActions({
           testId="user-profile-agent-restart"
         />
       ) : null}
+      {onCreateCard ? (
+        <ProfileQuickAction
+          icon={Sparkles}
+          label="Create card"
+          onClick={onCreateCard}
+          testId="user-profile-create-card"
+        />
+      ) : null}
     </div>
   );
 }
@@ -727,11 +743,13 @@ function ProfilePrimaryActions({
 function ProfilePersonaPrimaryActions({
   canEditAgent,
   disabled,
+  onCreateCard,
   onEditAgent,
   onStartAgent,
 }: {
   canEditAgent: boolean;
   disabled: boolean;
+  onCreateCard?: () => void;
   onEditAgent: () => void;
   onStartAgent: () => void;
 }) {
@@ -751,6 +769,15 @@ function ProfilePersonaPrimaryActions({
           label="Edit"
           onClick={onEditAgent}
           testId="user-profile-edit-agent"
+        />
+      ) : null}
+      {onCreateCard ? (
+        <ProfileQuickAction
+          disabled={disabled}
+          icon={Sparkles}
+          label="Create card"
+          onClick={onCreateCard}
+          testId="user-profile-create-card"
         />
       ) : null}
     </div>

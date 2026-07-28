@@ -51,7 +51,8 @@ void main() {
     );
 
     expect(subscriptions, hasLength(2));
-    expect(subscriptions.first.filter.kinds, buzzPushEligibleKinds);
+    expect(subscriptions.first.filter.kinds, buzzPushSelfDirectedKinds);
+    expect(subscriptions.first.filter.kinds, isNot(contains(7)));
     expect(subscriptions.first.filter.pTags, [me]);
     expect(subscriptions.last.filter.kinds, buzzPushChannelKinds);
     expect(subscriptions.last.filter.hTags, [channelA]);

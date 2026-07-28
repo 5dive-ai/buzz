@@ -1,6 +1,9 @@
 import 'dart:convert';
 
 const buzzPushEligibleKinds = [7, 9, 1059, 40007, 46010];
+// Buzz reaction events carry no `p` tag, so kind 7 cannot match this exact
+// self-directed filter even though the relay remains eligible to wake on it.
+const buzzPushSelfDirectedKinds = [9, 1059, 40007, 46010];
 const buzzPushRenderableKinds = [9];
 const buzzPushChannelKinds = [9];
 const buzzPushChannelChunkSize = 50;
@@ -292,7 +295,7 @@ List<BuzzPushSubscription> buildDesiredBuzzPushSubscriptions({
   final subscriptions = <BuzzPushSubscription>[
     BuzzPushSubscription(
       filter: BuzzPushFilter(
-        kinds: buzzPushEligibleKinds,
+        kinds: buzzPushSelfDirectedKinds,
         pTags: [normalizedPubkey],
       ),
       notificationClass: 'default',

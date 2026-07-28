@@ -319,14 +319,14 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
         )
       } else {
         // This extension renders kind 9 only. Other lease-authorized wake kinds
-        // stay selectable so issue 10's catch-up sets remain aligned, but the
-        // user sees an explicit diagnostic instead of kind-aware content (issue
-        // 20) or a silent miss.
+        // stay selectable so issue 10's catch-up sets remain aligned, but use
+        // neutral activity copy until kind-aware rendering lands in issue 20.
+        let channel = event.tags.first { $0.count >= 2 && $0[0] == "h" }?[1]
         resolution = BuzzPushResolution(
-          title: "Buzz notification needs attention",
-          body: "Buzz received a kind \(event.kind) wake that this app version cannot display.",
-          subtitle: community.name,
-          threadIdentifier: "buzz.push.unsupported-kind.\(event.kind)",
+          title: community.name,
+          body: "Open Buzz to view your new activity.",
+          subtitle: nil,
+          threadIdentifier: channel ?? community.id,
           identity: identity
         )
       }

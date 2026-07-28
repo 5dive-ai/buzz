@@ -1,4 +1,5 @@
 import 'package:buzz/shared/push/push_bridge.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -10,7 +11,15 @@ void main() {
   setUp(() {
     apnsDeviceToken.value = null;
     apnsRegistrationError.value = null;
+    pushEndpointGrants.value = const [];
+    pushEndpointGrantError.value = null;
     installBuzzPushMethodHandler();
+  });
+
+  tearDown(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, null);
+    debugDefaultTargetPlatformOverride = null;
   });
 
   test('captures APNs token success and clears the previous error', () async {
@@ -27,6 +36,57 @@ void main() {
     expect(apnsRegistrationError.value, isNull);
   });
 
+  test('reads and exposes persisted endpoint grants on iOS', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(_channel, (call) async {
+      expect(call.method, 'endpointGrants');
+      return [_grantMap('opaque-grant')];
+    });
+
+    final grants = await readBuzzPushEndpointGrants();
+
+    expect(grants, hasLength(1));
+    expect(grants.single.relayOrigin, 'wss://relay.example/');
+    expect(grants.single.relayPubkey, 'a' * 64);
+    expect(grants.single.endpointGrant, 'opaque-grant');
+    expect(grants.single.endpointHash, 'b' * 64);
+    expect(grants.single.appProfile, 'buzz-ios-sandbox');
+    expect(grants.single.endpointEpoch, 1);
+    expect(grants.single.generation, 1);
+    expect(grants.single.expiresAt, 1752624000);
+    expect(pushEndpointGrants.value.single.endpointGrant, 'opaque-grant');
+    expect(pushEndpointGrantError.value, isNull);
+  });
+
+  test(
+    'debug enrollment invokes native driver then refreshes grants',
+    () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      final methods = <String>[];
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(_channel, (call) async {
+        methods.add(call.method);
+        if (call.method == 'devEnrollPush') {
+          expect(call.arguments, {'relayUrl': 'wss://relay.example/'});
+          return _grantMap('new-grant');
+        }
+        if (call.method == 'endpointGrants') {
+          return [_grantMap('new-grant')];
+        }
+        fail('Unexpected method ${call.method}');
+      });
+
+      final grant = await enrollBuzzDevPush('wss://relay.example/');
+
+      expect(grant.endpointGrant, 'new-grant');
+      expect(methods, ['devEnrollPush', 'endpointGrants']);
+      expect(pushEndpointGrants.value.single.endpointGrant, 'new-grant');
+    },
+  );
+
   test('exposes APNs registration failure', () async {
     await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .handlePlatformMessage(
@@ -39,3 +99,14 @@ void main() {
     expect(apnsRegistrationError.value, 'denied');
   });
 }
+
+Map<String, Object> _grantMap(String endpointGrant) => {
+  'relayOrigin': 'wss://relay.example/',
+  'relayPubkey': 'a' * 64,
+  'endpointGrant': endpointGrant,
+  'endpointHash': 'b' * 64,
+  'appProfile': 'buzz-ios-sandbox',
+  'endpointEpoch': 1,
+  'generation': 1,
+  'expiresAt': 1752624000,
+};

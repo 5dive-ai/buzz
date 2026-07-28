@@ -9,6 +9,13 @@ import UserNotifications
   private var mediaUploadChannel: FlutterMethodChannel?
   private var pushChannel: FlutterMethodChannel?
   private let apnsRegistrationBuffer = APNsRegistrationBuffer()
+  private var apnsDeviceToken: Data?
+  private lazy var endpointGrantStore = BuzzPushEndpointGrantKeychainStore(
+    accessGroup: Bundle.main.object(forInfoDictionaryKey: "BuzzKeychainAccessGroup") as? String
+  )
+  #if DEBUG
+    private var devEnrollmentTask: Task<Void, Never>?
+  #endif
   private var appGroupIdentifier: String? {
     Bundle.main.object(forInfoDictionaryKey: "BuzzAppGroupIdentifier") as? String
   }
@@ -55,6 +62,7 @@ import UserNotifications
     didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
   ) {
     super.application(application, didRegisterForRemoteNotificationsWithDeviceToken: deviceToken)
+    apnsDeviceToken = deviceToken
     apnsRegistrationBuffer.recordToken(deviceToken)
   }
 
@@ -95,10 +103,103 @@ import UserNotifications
             code: "save_failed", message: "Unable to save push community credentials.",
             details: error.localizedDescription))
       }
+    case "endpointGrants":
+      do {
+        result(try endpointGrantStore.records().map(\.flutterArguments))
+      } catch {
+        result(
+          FlutterError(
+            code: "endpoint_grant_read_failed",
+            message: "Unable to read persisted push endpoint grants.",
+            details: error.localizedDescription
+          )
+        )
+      }
+    #if DEBUG
+      case "devEnrollPush":
+        handleDevPushEnrollment(call, result: result)
+    #endif
     default:
       result(FlutterMethodNotImplemented)
     }
   }
+
+  #if DEBUG
+    private func handleDevPushEnrollment(
+      _ call: FlutterMethodCall,
+      result: @escaping FlutterResult
+    ) {
+      guard devEnrollmentTask == nil else {
+        result(
+          FlutterError(
+            code: "enrollment_in_progress",
+            message: "Development push enrollment is already running.",
+            details: nil
+          )
+        )
+        return
+      }
+      guard let deviceToken = apnsDeviceToken else {
+        result(
+          FlutterError(
+            code: "missing_apns_token",
+            message: "APNs has not supplied a device token.",
+            details: nil
+          )
+        )
+        return
+      }
+      guard !deviceToken.isEmpty else {
+        preconditionFailure("APNs supplied an empty device token")
+      }
+      guard let arguments = call.arguments as? [String: Any],
+        let relayText = arguments["relayUrl"] as? String,
+        let relayURL = URL(string: relayText),
+        let gatewayURL = URL(string: "http://localhost:8080")
+      else {
+        result(
+          FlutterError(
+            code: "invalid_arguments",
+            message: "Development push enrollment requires relayUrl.",
+            details: nil
+          )
+        )
+        return
+      }
+
+      do {
+        let driver = try BuzzDevPushEnrollmentDriver(
+          gatewayBaseURL: gatewayURL,
+          store: endpointGrantStore
+        )
+        devEnrollmentTask = Task { [weak self] in
+          defer { self?.devEnrollmentTask = nil }
+          do {
+            let record = try await driver.enroll(deviceToken: deviceToken, relayURL: relayURL)
+            await MainActor.run { result(record.flutterArguments) }
+          } catch {
+            await MainActor.run {
+              result(
+                FlutterError(
+                  code: "dev_enrollment_failed",
+                  message: "Development push enrollment failed.",
+                  details: error.localizedDescription
+                )
+              )
+            }
+          }
+        }
+      } catch {
+        result(
+          FlutterError(
+            code: "dev_enrollment_configuration_failed",
+            message: "Development push enrollment is not configured.",
+            details: error.localizedDescription
+          )
+        )
+      }
+    }
+  #endif
 
   private func savePushCommunitySnapshot(_ communities: [[String: Any]]) throws {
     guard let appGroupIdentifier else {

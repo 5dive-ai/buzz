@@ -14,6 +14,79 @@ const _channel = MethodChannel('buzz/push');
 final apnsDeviceToken = ValueNotifier<String?>(null);
 final apnsRegistrationError = ValueNotifier<String?>(null);
 
+final pushEndpointGrants = ValueNotifier<List<BuzzPushEndpointGrant>>([]);
+final pushEndpointGrantError = ValueNotifier<String?>(null);
+
+class BuzzPushEndpointGrant {
+  final String relayOrigin;
+  final String relayPubkey;
+  final String endpointGrant;
+  final String endpointHash;
+  final String appProfile;
+  final int endpointEpoch;
+  final int generation;
+  final int expiresAt;
+
+  const BuzzPushEndpointGrant({
+    required this.relayOrigin,
+    required this.relayPubkey,
+    required this.endpointGrant,
+    required this.endpointHash,
+    required this.appProfile,
+    required this.endpointEpoch,
+    required this.generation,
+    required this.expiresAt,
+  });
+
+  factory BuzzPushEndpointGrant.fromMap(Map<dynamic, dynamic> map) {
+    return BuzzPushEndpointGrant(
+      relayOrigin: map['relayOrigin'] as String,
+      relayPubkey: map['relayPubkey'] as String,
+      endpointGrant: map['endpointGrant'] as String,
+      endpointHash: map['endpointHash'] as String,
+      appProfile: map['appProfile'] as String,
+      endpointEpoch: map['endpointEpoch'] as int,
+      generation: map['generation'] as int,
+      expiresAt: map['expiresAt'] as int,
+    );
+  }
+}
+
+Future<List<BuzzPushEndpointGrant>> readBuzzPushEndpointGrants() async {
+  if (defaultTargetPlatform != TargetPlatform.iOS) return const [];
+  try {
+    final raw = await _channel.invokeListMethod<dynamic>('endpointGrants');
+    final grants = [
+      for (final value in raw ?? const [])
+        BuzzPushEndpointGrant.fromMap(value as Map<dynamic, dynamic>),
+    ];
+    pushEndpointGrants.value = grants;
+    pushEndpointGrantError.value = null;
+    return grants;
+  } catch (error) {
+    pushEndpointGrantError.value = error.toString();
+    rethrow;
+  }
+}
+
+Future<BuzzPushEndpointGrant> enrollBuzzDevPush(String relayUrl) async {
+  if (!kDebugMode) {
+    throw UnsupportedError(
+      'Development push enrollment is unavailable outside debug builds.',
+    );
+  }
+  final raw = await _channel.invokeMapMethod<dynamic, dynamic>(
+    'devEnrollPush',
+    {'relayUrl': relayUrl},
+  );
+  if (raw == null) {
+    throw StateError('Native development push enrollment returned no grant.');
+  }
+  final grant = BuzzPushEndpointGrant.fromMap(raw);
+  await readBuzzPushEndpointGrants();
+  return grant;
+}
+
 /// Latest failure to export the community snapshot used by the iOS
 /// notification service extension. Snapshot export is push enrichment and must
 /// never gate authentication or community persistence.

@@ -233,10 +233,12 @@ final class BuzzPushNotificationResolver: BuzzPushNotificationResolving {
       completion(.diagnostic("Open Buzz to refresh notification subscriptions."))
       return
     }
-    let cursor = consumptionState.state(for: community.id).cursor
+    let originState = consumptionState.state(for: community.id)
     let filters = PushCatchUp.queryFilters(
       subscriptions: subscriptions,
-      cursor: cursor,
+      cursor: originState.cursor,
+      delivered: originState.delivered,
+      lastDisplayed: originState.lastDisplayed,
       limit: 10
     )
     guard let body = try? JSONSerialization.data(withJSONObject: filters) else {

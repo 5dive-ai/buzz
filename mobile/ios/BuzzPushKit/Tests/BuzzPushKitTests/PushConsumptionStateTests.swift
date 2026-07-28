@@ -30,7 +30,7 @@ final class PushConsumptionStateTests: XCTestCase {
     XCTAssertNil(state.querySince(for: "loser-origin", now: 3_000))
   }
 
-  func testDeliveredEventIsNeverSelectedAgainAndHistoryIsBounded() {
+  func testDeliveredEventIsNeverSelectedAgainAndActiveSecondHistoryIsExact() {
     var state = PushConsumptionState()
     for index in 0..<70 {
       state.consume(
@@ -41,10 +41,10 @@ final class PushConsumptionStateTests: XCTestCase {
     let latest = PushEventPosition(createdAt: 1_000, id: String(format: "%064x", 69))
 
     XCTAssertFalse(state.canSelect(latest, for: "origin", now: 2_000))
-    XCTAssertEqual(state.state(for: "origin").delivered.count, 64)
+    XCTAssertEqual(state.state(for: "origin").delivered.count, 70)
   }
 
-  func testEvictedDeliveredEventBelowCompositeCursorIsNeverSelectedAgain() {
+  func testActiveSecondHistoryPrunesWhenTimestampAdvances() {
     var state = PushConsumptionState()
     for index in 0..<70 {
       state.consume(
@@ -52,15 +52,24 @@ final class PushConsumptionStateTests: XCTestCase {
         for: "origin"
       )
     }
-    let evicted = PushEventPosition(createdAt: 1_000, id: String(format: "%064x", 0))
-    let sameSecondSuccessor = PushEventPosition(
-      createdAt: 1_000,
-      id: String(format: "%064x", 70)
-    )
+    let first = PushEventPosition(createdAt: 1_000, id: String(format: "%064x", 0))
+    let nextSecond = PushEventPosition(createdAt: 1_001, id: "next")
 
-    XCTAssertFalse(state.hasConsumed(eventID: evicted.id, for: "origin"))
-    XCTAssertFalse(state.canSelect(evicted, for: "origin", now: 2_000))
-    XCTAssertTrue(state.canSelect(sameSecondSuccessor, for: "origin", now: 2_000))
+    XCTAssertTrue(state.hasConsumed(eventID: first.id, for: "origin"))
+    state.consume(nextSecond, for: "origin")
+
+    XCTAssertFalse(state.hasConsumed(eventID: first.id, for: "origin"))
+    XCTAssertEqual(state.state(for: "origin").delivered, [nextSecond])
+  }
+
+  func testLowerIDSiblingArrivingAfterHigherIDRemainsSelectable() {
+    var state = PushConsumptionState()
+    let higher = PushEventPosition(createdAt: 1_000, id: "ff")
+    let laterLower = PushEventPosition(createdAt: 1_000, id: "00")
+
+    state.consume(higher, for: "origin")
+
+    XCTAssertTrue(state.canSelect(laterLower, for: "origin", now: 2_000))
   }
 
   func testEventOlderThanCompositeCursorIsNotSelected() {

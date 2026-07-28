@@ -27,34 +27,46 @@ public struct PushEventPosition: Codable, Equatable, Comparable, Sendable {
 public struct PushOriginState: Codable, Equatable, Sendable {
   public let cursor: PushEventPosition?
   public let delivered: [PushEventPosition]
+  public let lastDisplayed: PushEventPosition?
 
-  public init(cursor: PushEventPosition? = nil, delivered: [PushEventPosition] = []) {
+  public init(
+    cursor: PushEventPosition? = nil,
+    delivered: [PushEventPosition] = [],
+    lastDisplayed: PushEventPosition? = nil
+  ) {
     self.cursor = cursor
     self.delivered = delivered
+    self.lastDisplayed = lastDisplayed
   }
 
   public func contains(eventID: String) -> Bool {
-    delivered.contains { $0.id == eventID }
+    lastDisplayed?.id == eventID || delivered.contains { $0.id == eventID }
   }
 
   public func consuming(
-    _ position: PushEventPosition,
-    deliveredLimit: Int = PushConsumptionState.maximumDeliveredPerOrigin
+    _ position: PushEventPosition
   ) -> PushOriginState {
     let nextCursor = max(cursor ?? position, position)
-    var byID = Dictionary(uniqueKeysWithValues: delivered.map { ($0.id, $0) })
+    let movedToNewSecond = cursor.map { position.createdAt > $0.createdAt } ?? true
+    var byID = Dictionary(
+      uniqueKeysWithValues: delivered
+        .filter { !movedToNewSecond || $0.createdAt == position.createdAt }
+        .map { ($0.id, $0) }
+    )
     byID[position.id] = position
-    let bounded = byID.values
+    let retained = byID.values
       .filter { $0.createdAt >= nextCursor.createdAt }
       .sorted()
-      .suffix(deliveredLimit)
-    return PushOriginState(cursor: nextCursor, delivered: Array(bounded))
+    return PushOriginState(
+      cursor: nextCursor,
+      delivered: Array(retained),
+      lastDisplayed: position
+    )
   }
 }
 
 public struct PushConsumptionState: Codable, Equatable, Sendable {
   public static let version = 1
-  public static let maximumDeliveredPerOrigin = 64
   public static let allowedFutureSkewSeconds = 300
 
   public var origins: [String: PushOriginState]
@@ -112,16 +124,15 @@ public struct PushConsumptionState: Codable, Equatable, Sendable {
   ) -> Bool {
     let originState = state(for: origin)
     return position.createdAt <= now + allowedFutureSkew
-      && position >= (originState.cursor ?? position)
+      && position.createdAt >= (originState.cursor?.createdAt ?? position.createdAt)
       && !originState.contains(eventID: position.id)
   }
 
   public mutating func consume(
     _ position: PushEventPosition,
-    for origin: String,
-    deliveredLimit: Int = maximumDeliveredPerOrigin
+    for origin: String
   ) {
-    origins[origin] = state(for: origin).consuming(position, deliveredLimit: deliveredLimit)
+    origins[origin] = state(for: origin).consuming(position)
   }
 
   public mutating func removeInactiveOrigins(_ activeOrigins: Set<String>) {

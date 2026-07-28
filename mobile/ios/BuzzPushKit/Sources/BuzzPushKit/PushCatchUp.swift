@@ -11,40 +11,64 @@ public struct PushCatchUpSelection: Sendable {
 }
 
 public enum PushCatchUp {
-  /// Build catch-up filters that preserve the lease's constraints while moving
-  /// strictly beyond a composite cursor. A second, exact-id filter keeps the
-  /// current cursor event available only as a duplicate-cleanup fallback.
+  /// Build catch-up filters that preserve the lease's constraints. The broad
+  /// timestamp filter finds newer events, while composite pages cover every gap
+  /// in the active second's exact delivered-ID set. A separate exact-id filter
+  /// keeps the last displayed event available only for duplicate cleanup.
   public static func queryFilters(
     subscriptions: [PushLeaseSubscription],
     cursor: PushEventPosition?,
+    delivered: [PushEventPosition],
+    lastDisplayed: PushEventPosition?,
     limit: Int
   ) -> [[String: Any]] {
     subscriptions.flatMap { subscription in
-      guard let cursor else {
-        return [subscription.filter.queryFilter(since: nil, limit: limit)]
-      }
-
       var filters: [[String: Any]] = []
-      if cursor.createdAt < Int.max {
-        filters.append(
-          subscription.filter.queryFilter(
-            since: cursor.createdAt + 1,
+      if let cursor {
+        // `+ 1` is safe only as the strictly-later half of this pair. The
+        // active-second filters below start at the bottom and drain same-second
+        // rows without making event-ID ordering the dedupe authority.
+        if cursor.createdAt < Int.max {
+          filters.append(
+            subscription.filter.queryFilter(
+              since: cursor.createdAt + 1,
+              limit: limit
+            )
+          )
+        }
+
+        var activeHead = subscription.filter.queryFilter(
+          since: cursor.createdAt,
+          limit: limit
+        )
+        activeHead["until"] = cursor.createdAt
+        filters.append(activeHead)
+
+        let activeDelivered = delivered
+          .filter { $0.createdAt == cursor.createdAt }
+          .sorted()
+        for boundaryIndex in stride(
+          from: limit - 1,
+          to: activeDelivered.count,
+          by: limit
+        ) {
+          var page = subscription.filter.queryFilter(
+            since: cursor.createdAt,
             limit: limit
           )
-        )
+          page["until"] = cursor.createdAt
+          page["before_id"] = activeDelivered[boundaryIndex].id
+          filters.append(page)
+        }
+      } else {
+        filters.append(subscription.filter.queryFilter(since: nil, limit: limit))
       }
 
-      var sameSecond = subscription.filter.queryFilter(
-        since: cursor.createdAt,
-        limit: limit
-      )
-      sameSecond["until"] = cursor.createdAt
-      sameSecond["before_id"] = cursor.id
-      filters.append(sameSecond)
-
-      var duplicateFallback = subscription.filter.queryFilter(since: nil, limit: 1)
-      duplicateFallback["ids"] = [cursor.id]
-      filters.append(duplicateFallback)
+      if let lastDisplayed {
+        var duplicateFallback = subscription.filter.queryFilter(since: nil, limit: 1)
+        duplicateFallback["ids"] = [lastDisplayed.id]
+        filters.append(duplicateFallback)
+      }
       return filters
     }
   }

@@ -35,6 +35,36 @@ final class PushCatchUpTests: XCTestCase {
     XCTAssertEqual(second.map(\.wasPreviouslyConsumed), [false, true])
   }
 
+  func testLateLowerIDSiblingIsSelectedThenDuplicateFallbackStaysSeparate() {
+    let subscription = self.subscription()
+    let higherID = String(repeating: "f", count: 64)
+    let lowerID = String(repeating: "0", count: 64)
+    let high = event(id: higherID)
+    let lateLow = event(id: lowerID)
+    var state = PushConsumptionState()
+    state.consume(PushEventPosition(createdAt: 1_000, id: higherID), for: "origin")
+
+    let originState = state.state(for: "origin")
+    let filters = PushCatchUp.queryFilters(
+      subscriptions: [subscription],
+      cursor: originState.cursor,
+      delivered: originState.delivered,
+      lastDisplayed: originState.lastDisplayed,
+      limit: 10
+    )
+    let relayPage = relayResponse(events: [lateLow, high], filters: filters)
+    let selections = PushCatchUp.orderedSelections(
+      events: relayPage,
+      origin: "origin",
+      subscriptions: [subscription],
+      consumptionState: state,
+      verify: { _ in true }
+    )
+
+    XCTAssertEqual(selections.map(\.event.id), [lowerID, higherID])
+    XCTAssertEqual(selections.map(\.wasPreviouslyConsumed), [false, true])
+  }
+
   func testCompositeSameSecondQueryReachesSuccessorsBeyondFirstRelayPage() {
     let subscription = self.subscription()
     let events = (0..<25).map { event(id: String(format: "%064x", $0)) }
@@ -42,10 +72,12 @@ final class PushCatchUpTests: XCTestCase {
     var selected: [String] = []
 
     while selected.count < events.count {
-      let cursor = state.state(for: "origin").cursor
+      let originState = state.state(for: "origin")
       let filters = PushCatchUp.queryFilters(
         subscriptions: [subscription],
-        cursor: cursor,
+        cursor: originState.cursor,
+        delivered: originState.delivered,
+        lastDisplayed: originState.lastDisplayed,
         limit: 10
       )
       let relayPage = relayResponse(events: events, filters: filters)

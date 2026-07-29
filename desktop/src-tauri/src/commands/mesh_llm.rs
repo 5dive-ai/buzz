@@ -9,6 +9,11 @@ use crate::{app_state::AppState, mesh_llm, relay};
 #[serde(rename_all = "camelCase")]
 struct MeshSharingConfig {
     enabled: bool,
+    /// A fresh Share Compute request that must cross a process boundary before
+    /// it can start. Consumed before startup so an interrupted download is not
+    /// resumed on a later launch.
+    #[serde(default)]
+    start_on_next_launch: bool,
     model_id: String,
     max_vram_gb: Option<u64>,
     /// Community relay where Share Compute was explicitly enabled. Older
@@ -17,9 +22,17 @@ struct MeshSharingConfig {
     relay_url: Option<String>,
 }
 
-fn disabled_sharing_checkpoint(config: &MeshSharingConfig) -> MeshSharingConfig {
+fn pending_new_start_checkpoint(config: &MeshSharingConfig) -> MeshSharingConfig {
     let mut checkpoint = config.clone();
     checkpoint.enabled = false;
+    checkpoint.start_on_next_launch = false;
+    checkpoint
+}
+
+fn one_shot_restart_checkpoint(config: &MeshSharingConfig) -> MeshSharingConfig {
+    let mut checkpoint = config.clone();
+    checkpoint.enabled = false;
+    checkpoint.start_on_next_launch = true;
     checkpoint
 }
 
@@ -99,6 +112,7 @@ fn sharing_config_from_request(
         .ok_or_else(|| "modelId is required for serve mode".to_string())?;
     Ok(MeshSharingConfig {
         enabled: true,
+        start_on_next_launch: false,
         model_id: model_id.to_string(),
         max_vram_gb: request.max_vram_gb,
         relay_url: request.relay_url.clone(),
@@ -128,7 +142,7 @@ fn restart_to_share(
     app: &AppHandle,
     config: &MeshSharingConfig,
 ) -> CmdResult<mesh_llm::MeshNodeStatus> {
-    save_mesh_sharing_config(app, config)?;
+    save_mesh_sharing_config(app, &one_shot_restart_checkpoint(config))?;
     let status = restarting_share_status(config);
     app.request_restart();
     Ok(status)
@@ -326,7 +340,7 @@ pub(crate) async fn restore_mesh_sharing(app: &AppHandle, state: &AppState) -> C
     let Some(mut config) = load_mesh_sharing_config(app)? else {
         return Ok(());
     };
-    if !config.enabled || config.model_id.trim().is_empty() {
+    if (!config.enabled && !config.start_on_next_launch) || config.model_id.trim().is_empty() {
         return Ok(());
     }
     config.model_id = mesh_llm::canonical_curated_model_id(&config.model_id).to_string();
@@ -342,10 +356,16 @@ pub(crate) async fn restore_mesh_sharing(app: &AppHandle, state: &AppState) -> C
     if runtime.is_some() {
         return Ok(());
     }
-    // The enabled config above has already authorized this restore. Disarm the
-    // next launch while startup is in progress; only proven inference below
-    // re-arms it. This covers both primary weights and lazy package layers.
-    save_mesh_sharing_config(app, &disabled_sharing_checkpoint(&config))?;
+    if config.start_on_next_launch {
+        // Consume a role-switch request before doing any potentially long model
+        // work. If Buzz exits during that work, the next launch stays stopped.
+        config = pending_new_start_checkpoint(&config);
+        save_mesh_sharing_config(app, &config)?;
+    }
+    // This is restoration of a previously inference-ready serving node. Keep
+    // the enabled checkpoint armed while restoring so a transient startup
+    // failure does not silently turn Share Compute off. New starts remain
+    // disarmed in `mesh_start_node` until their first inference probe passes.
     let request = mesh_llm::StartMeshNodeRequest {
         mode: mesh_llm::MeshNodeMode::Serve,
         model_id: Some(config.model_id.clone()),
@@ -368,6 +388,8 @@ pub(crate) async fn restore_mesh_sharing(app: &AppHandle, state: &AppState) -> C
         return Err(format!("failed to restore Share Compute: {error}"));
     }
     *runtime = Some(started);
+    config.enabled = true;
+    config.start_on_next_launch = false;
     save_mesh_sharing_config(app, &config)?;
     drop(runtime);
     mesh_llm::publish_current_status_once(app, "restore").await;
@@ -448,7 +470,7 @@ pub async fn mesh_start_node(
         // Do not arm launch restoration until the exact inference path used by
         // agents succeeds. Mesh may bind its ports after primary weights load
         // while package layers are still downloading.
-        save_mesh_sharing_config(&app, &disabled_sharing_checkpoint(config))?;
+        save_mesh_sharing_config(&app, &pending_new_start_checkpoint(config))?;
     }
 
     let started = mesh_llm::DesktopMeshRuntime::start(request)
@@ -898,6 +920,7 @@ pub async fn mesh_stop_node(
         &app,
         &MeshSharingConfig {
             enabled: false,
+            start_on_next_launch: false,
             model_id: String::new(),
             max_vram_gb: None,
             relay_url: None,

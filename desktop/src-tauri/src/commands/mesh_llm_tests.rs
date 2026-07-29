@@ -136,22 +136,46 @@ fn legacy_sharing_config_without_community_binding_still_loads() {
     .expect("legacy sharing config");
 
     assert_eq!(config.relay_url, None);
+    assert!(!config.start_on_next_launch);
 }
 
 #[test]
-fn download_checkpoint_disarms_launch_restore_without_losing_selection() {
+fn new_start_checkpoint_prevents_incomplete_download_restore() {
     let config = MeshSharingConfig {
         enabled: true,
+        start_on_next_launch: false,
         model_id: "test-model".to_string(),
         max_vram_gb: Some(24),
         relay_url: Some("wss://community.example".to_string()),
     };
 
-    let checkpoint = disabled_sharing_checkpoint(&config);
+    let checkpoint = pending_new_start_checkpoint(&config);
     assert!(!checkpoint.enabled);
+    assert!(!checkpoint.start_on_next_launch);
     assert_eq!(checkpoint.model_id, config.model_id);
     assert_eq!(checkpoint.max_vram_gb, config.max_vram_gb);
     assert_eq!(checkpoint.relay_url, config.relay_url);
+}
+
+#[test]
+fn role_switch_checkpoint_starts_exactly_once_after_restart() {
+    let config = MeshSharingConfig {
+        enabled: true,
+        start_on_next_launch: false,
+        model_id: "test-model".to_string(),
+        max_vram_gb: Some(24),
+        relay_url: Some("wss://community.example".to_string()),
+    };
+
+    let restart = one_shot_restart_checkpoint(&config);
+    assert!(!restart.enabled);
+    assert!(restart.start_on_next_launch);
+
+    let consumed = pending_new_start_checkpoint(&restart);
+    assert!(!consumed.enabled);
+    assert!(!consumed.start_on_next_launch);
+    assert_eq!(consumed.model_id, config.model_id);
+    assert_eq!(consumed.relay_url, config.relay_url);
 }
 
 #[test]

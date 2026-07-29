@@ -550,8 +550,6 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
-    /// Slot-scoped files used to pass automatic reply anchors to tool processes.
-    pub reply_to_files: Vec<std::path::PathBuf>,
 }
 
 impl AgentPool {
@@ -859,30 +857,6 @@ async fn resolve_new_session_channel_context(
     let is_dm = info.channel_type == "dm";
     let title_channel = (!is_dm && info.name != UNKNOWN_CHANNEL_NAME).then_some(info.name);
     (is_dm, title_channel)
-}
-
-fn write_reply_anchor(path: &std::path::Path, reply_anchor: Option<&str>) -> std::io::Result<()> {
-    use std::io::Write;
-
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "reply context path has no parent",
-        )
-    })?;
-    let permissions = std::fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    if let Some(anchor) = reply_anchor {
-        temp.write_all(anchor.as_bytes())?;
-    }
-    temp.as_file().sync_all()?;
-    if let Some(permissions) = permissions {
-        temp.as_file().set_permissions(permissions)?;
-    }
-    temp.persist(path).map_err(|error| error.error)?;
-    Ok(())
 }
 
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
@@ -1829,27 +1803,6 @@ pub async fn run_prompt_task(
     // follows as a second block.
     let mut slash_command: Option<String> = None;
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
-        if let Some(path) = ctx.reply_to_files.get(agent.index) {
-            if let Err(error) = write_reply_anchor(path, None) {
-                tracing::error!(
-                    target: "pool::prompt",
-                    agent = agent.index,
-                    path = %path.display(),
-                    "failed to clear reply context: {error}"
-                );
-                send_prompt_result(
-                    &result_tx,
-                    &turn_id,
-                    agent,
-                    source,
-                    PromptOutcome::Error(AcpError::Protocol(format!(
-                        "failed to clear reply context: {error}"
-                    ))),
-                    requeue_batch_if_queue(&ctx, batch),
-                );
-                return;
-            }
-        }
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
         let text = prepend_base_for_legacy(
@@ -1875,30 +1828,6 @@ pub async fn run_prompt_task(
 
         let profile_lookup =
             fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
-
-        let reply_anchor =
-            crate::queue::reply_anchor_for_batch(b, channel_info.as_ref(), profile_lookup.as_ref());
-        if let Some(path) = ctx.reply_to_files.get(agent.index) {
-            if let Err(error) = write_reply_anchor(path, reply_anchor.as_deref()) {
-                tracing::error!(
-                    target: "pool::prompt",
-                    agent = agent.index,
-                    path = %path.display(),
-                    "failed to update reply context: {error}"
-                );
-                send_prompt_result(
-                    &result_tx,
-                    &turn_id,
-                    agent,
-                    source,
-                    PromptOutcome::Error(AcpError::Protocol(format!(
-                        "failed to update reply context: {error}"
-                    ))),
-                    requeue_batch_if_queue(&ctx, batch),
-                );
-                return;
-            }
-        }
 
         let known_names: Vec<&str> = profile_lookup
             .iter()
@@ -3806,38 +3735,6 @@ mod tests {
     // message. This is the exact regression that shipped in the round-2 bug.
 
     #[test]
-    fn reply_anchor_rewrite_replaces_and_clears_atomically() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent-0");
-        std::fs::write(&path, "stale-anchor").unwrap();
-
-        write_reply_anchor(&path, Some("current-anchor")).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "current-anchor");
-
-        write_reply_anchor(&path, None).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn reply_anchor_rewrite_preserves_file_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent-0");
-        std::fs::write(&path, "").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-        write_reply_anchor(&path, Some("current-anchor")).unwrap();
-
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-
-    #[test]
     fn test_initial_message_legacy_agent_gets_base_prepended() {
         // protocol_version 1 + Some(base_prompt): [Base] rides along in the
         // user message, composed as `[Base]\n{bp}\n\n{initial_msg}`.
@@ -5491,7 +5388,6 @@ mod tests {
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
-            reply_to_files: vec![],
         }
     }
 

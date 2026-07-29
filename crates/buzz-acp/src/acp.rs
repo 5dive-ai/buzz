@@ -509,8 +509,7 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            // Reply context is slot-scoped harness state, not an operator override.
-            if key == "BUZZ_REPLY_TO_FILE" || std::env::var_os(key).is_none() {
+            if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
         }

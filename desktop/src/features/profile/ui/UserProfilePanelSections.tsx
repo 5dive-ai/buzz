@@ -55,8 +55,6 @@ import { getCurrentVerifiedName } from "@/shared/lib/verifiedIdentity";
 
 export { AgentInstructionsFocusedView } from "@/features/profile/ui/UserProfilePanelAgentDetails";
 
-// ── Summary view ─────────────────────────────────────────────────────────────
-
 export type ProfileSummaryViewProps = {
   activityAgent: ProfileActivityAgent | null;
   callerChannelId: string | null;
@@ -462,8 +460,6 @@ export function ProfileSummaryView({
     </div>
   );
 }
-
-// ── Hero & metadata ──────────────────────────────────────────────────────────
 
 function ProfileHero({
   displayName,

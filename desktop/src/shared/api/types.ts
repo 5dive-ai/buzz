@@ -108,9 +108,7 @@ export type { Identity, IdentityStorage } from "./identityTypes";
 export type Profile = {
   pubkey: string;
   displayName: string | null;
-  /** Relay-authoritative display identity bound to this pubkey. */
   verifiedName?: string | null;
-  /** Unix timestamp (seconds) after which `verifiedName` is no longer trusted. */
   verifiedNameExpiresAt?: number | null;
   avatarUrl: string | null;
   about: string | null;
@@ -125,9 +123,7 @@ export type Profile = {
 
 export type UserProfileSummary = {
   displayName: string | null;
-  /** Relay-authoritative display identity bound to this pubkey. */
   verifiedName?: string | null;
-  /** Unix timestamp (seconds) after which `verifiedName` is no longer trusted. */
   verifiedNameExpiresAt?: number | null;
   /** Kind-0 `name` field, kept separate from `displayName` so @mention text
    * can be matched against either alias (agents/CLI resolve mentions against
@@ -984,14 +980,10 @@ export type ThreadRepliesResponse = {
 };
 
 /**
- * Composite backward keyset cursor for channel-timeline paging via the bridge
- * (`getChannelMessagesBefore`).
- *
- * The event-id tiebreak is load-bearing for the dense-second case: the relay
- * orders `created_at DESC, id ASC` and advances past a second denser than one
- * page with `id > eventId`. A bare `createdAt` (`until`) cursor cannot escape
- * such a second — it re-returns the same slice forever, leaving older history
- * unreachable. `(createdAt, eventId)` moves strictly older every page.
+ * Composite backward keyset cursor for channel-timeline paging via
+ * `getChannelMessagesBefore`. The relay orders `created_at DESC, id ASC`; the
+ * event-id tiebreak advances through a second denser than one page. A timestamp-
+ * only cursor would re-return the same slice forever.
  */
 export type ChannelPageCursor = {
   createdAt: number;
@@ -1008,12 +1000,9 @@ export type ChannelMessagesPageResponse = {
 // ── Global agent configuration ────────────────────────────────────────────────
 
 /**
- * Global agent configuration defaults applied to ALL agents.
- *
- * Lowest user-settable layer — per-agent and persona values win on any key
- * collision. Mirrors the Rust `GlobalAgentConfig` struct.
- *
- * Precedence: baked floor < global < persona < per-agent.
+ * Global defaults applied to all agents. Persona and per-agent values win on
+ * collisions. Precedence: baked floor < global < persona < per-agent.
+ * Mirrors the Rust `GlobalAgentConfig` struct.
  */
 export type GlobalAgentConfig = {
   /** Global env vars injected into all agents unconditionally. */

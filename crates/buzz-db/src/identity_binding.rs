@@ -1140,12 +1140,7 @@ mod tests {
             )
             .await
             .expect("old key result"),
-            BindIdentityResult::Conflict(IdentityBindingConflict {
-                issuer: TEST_ISSUER.to_string(),
-                uid: "rotating-user".to_string(),
-                pubkey: new_pubkey,
-                source: SOURCE_JWT_NPUB.to_string(),
-            })
+            BindIdentityResult::Revoked
         );
     }
 

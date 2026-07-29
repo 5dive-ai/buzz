@@ -548,8 +548,7 @@ pub fn relay_members_from_event(event: &Event) -> Value {
 pub(crate) fn timestamp_to_iso(secs: u64) -> String {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     let dt = UNIX_EPOCH + Duration::from_secs(secs);
-    // Format manually as RFC-3339 — the `time` crate is already a transitive
-    // dep, but using SystemTime keeps this self-contained.
+    // Format manually as RFC-3339; SystemTime keeps this self-contained.
     let dur = dt
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
@@ -563,8 +562,7 @@ pub(crate) fn timestamp_to_iso(secs: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-/// Convert days-since-1970-01-01 to (year, month, day) using the civil-from-days
-/// algorithm by Howard Hinnant (public domain).
+/// Convert epoch days to a date using Howard Hinnant's public-domain algorithm.
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

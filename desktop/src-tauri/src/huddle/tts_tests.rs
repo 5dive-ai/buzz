@@ -541,6 +541,60 @@ fn monitor_tick_noop_without_cancel() {
     );
 }
 
+#[test]
+fn monitor_releases_mic_gate_when_streaming_playback_drains() {
+    let tts_active = AtomicBool::new(true);
+
+    release_tts_active_if_drained(true, &tts_active);
+
+    assert!(
+        !tts_active.load(Ordering::Acquire),
+        "silent synthesis gaps must not suppress user speech",
+    );
+}
+
+#[test]
+fn monitor_keeps_mic_gate_while_streaming_playback_is_queued() {
+    let tts_active = AtomicBool::new(true);
+
+    release_tts_active_if_drained(false, &tts_active);
+
+    assert!(tts_active.load(Ordering::Acquire));
+}
+
+#[test]
+fn streaming_gap_keeps_barge_in_armed_after_releasing_mic_gate() {
+    let tts_active = AtomicBool::new(true);
+    let tts_synthesizing = AtomicBool::new(true);
+
+    release_tts_active_if_drained(true, &tts_active);
+
+    assert!(!tts_active.load(Ordering::Acquire));
+    assert!(is_tts_interruptible(&tts_active, &tts_synthesizing));
+}
+
+#[test]
+fn completed_stream_disarms_barge_in_after_playback_drains() {
+    let tts_active = AtomicBool::new(true);
+    let tts_synthesizing = AtomicBool::new(false);
+
+    release_tts_active_if_drained(true, &tts_active);
+
+    assert!(!is_tts_interruptible(&tts_active, &tts_synthesizing));
+}
+
+#[test]
+fn synthesis_activity_stays_armed_until_final_queueing_finishes() {
+    let tts_synthesizing = AtomicBool::new(false);
+
+    {
+        let _activity = SynthesisActivityGuard::new(&tts_synthesizing);
+        assert!(tts_synthesizing.load(Ordering::Acquire));
+    }
+
+    assert!(!tts_synthesizing.load(Ordering::Acquire));
+}
+
 /// Stale-branch race (PR #997 review blocker): monitor observes
 /// `cancel == true`, then the worker — under `player_ops` — consumes the
 /// cancel and appends a fresh post-cancel utterance before the monitor
@@ -786,103 +840,6 @@ fn apply_fade_out_single_sample() {
     let mut samples = vec![1.0f32];
     apply_fade_out(&mut samples);
     assert_eq!(samples[0], 1.0);
-}
-
-// ── build_sentence_append_buffer tests ───────────────────────────────────
-
-/// REGRESSION: every chunk needs an onset cushion; synthesized chunks
-/// can start with speech energy within the first millisecond.
-#[test]
-fn lead_in_pad_is_present_for_every_sentence_chunk() {
-    const SENTENCE_AUDIO_LEN: usize = 1000;
-    const SILENCE_BUF_LEN: usize = 2400; // 100 ms at 24 kHz, like production
-    const N_SENTENCES: usize = 5;
-
-    let mut first = true;
-
-    for _ in 0..N_SENTENCES {
-        let buf = build_sentence_append_buffer(
-            &mut first,
-            vec![0.5_f32; SENTENCE_AUDIO_LEN],
-            SILENCE_BUF_LEN,
-            true,
-            true,
-        );
-
-        assert_eq!(buf.len(), SENTENCE_AUDIO_LEN + SILENCE_BUF_LEN);
-        assert!(
-            buf[..SENTENCE_LEAD_IN_SAMPLES].iter().all(|&s| s == 0.0),
-            "lead-in pad must be pure silence"
-        );
-        assert!(
-            buf[SENTENCE_LEAD_IN_SAMPLES..SENTENCE_LEAD_IN_SAMPLES + SENTENCE_AUDIO_LEN]
-                .iter()
-                .all(|&s| s == 0.5),
-            "sentence audio must immediately follow the lead-in"
-        );
-        assert!(
-            buf[SENTENCE_LEAD_IN_SAMPLES + SENTENCE_AUDIO_LEN..]
-                .iter()
-                .all(|&s| s == 0.0),
-            "trailing gap must be pure silence"
-        );
-    }
-
-    assert!(!first, "first_append flag must be cleared after first call");
-}
-
-/// `first_append` still flips on the first call for `tts_active` gating.
-#[test]
-fn build_sentence_append_buffer_flips_first_append() {
-    let mut first = true;
-    let _ = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400, true, true);
-    assert!(!first, "first call must flip the flag");
-
-    // Subsequent call: still has a per-sentence lead-in, flag stays false.
-    let buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400, true, true);
-    assert!(buf[..SENTENCE_LEAD_IN_SAMPLES].iter().all(|&s| s == 0.0));
-    assert!(!first);
-}
-
-/// Leading silence is exactly the lead-in; no pre-audio gap is double-counted.
-#[test]
-fn first_sentence_leading_silence_is_exactly_lead_in() {
-    let mut first = true;
-    let buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400, true, true);
-    assert!(buf[..SENTENCE_LEAD_IN_SAMPLES].iter().all(|&s| s == 0.0));
-    assert_eq!(buf[SENTENCE_LEAD_IN_SAMPLES], 0.5);
-}
-
-/// Tail silence plus the next lead-in preserves the 100 ms sentence gap.
-#[test]
-fn sentence_gap_budget_is_preserved() {
-    let mut first = true;
-    let silence_buf_len = 2400;
-    let first_buf =
-        build_sentence_append_buffer(&mut first, vec![0.5; 100], silence_buf_len, true, true);
-    let second_buf =
-        build_sentence_append_buffer(&mut first, vec![0.5; 100], silence_buf_len, true, true);
-
-    let first_tail = &first_buf[SENTENCE_LEAD_IN_SAMPLES + 100..];
-    let second_lead = &second_buf[..SENTENCE_LEAD_IN_SAMPLES];
-    assert_eq!(first_tail.len(), silence_buf_len - SENTENCE_LEAD_IN_SAMPLES);
-    assert_eq!(second_lead.len(), SENTENCE_LEAD_IN_SAMPLES);
-    assert_eq!(first_tail.len() + second_lead.len(), silence_buf_len);
-}
-
-/// Regression guard: one contiguous rodio source per synthesized sentence.
-#[test]
-fn sentence_append_buffer_is_one_contiguous_source() {
-    let mut first = true;
-    let buf = build_sentence_append_buffer(&mut first, vec![0.5; 100], 2400, true, true);
-
-    assert_eq!(buf.len(), 2400 + 100);
-    assert!(buf[..SENTENCE_LEAD_IN_SAMPLES].iter().all(|&s| s == 0.0));
-    assert!(
-        buf[SENTENCE_LEAD_IN_SAMPLES..SENTENCE_LEAD_IN_SAMPLES + 100]
-            .iter()
-            .all(|&s| s == 0.5)
-    );
 }
 
 // ── clamp_to_full_scale tests ─────────────────────────────────────────────

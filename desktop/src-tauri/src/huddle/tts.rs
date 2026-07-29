@@ -8,8 +8,8 @@
 //!   → tts_worker thread (owns 1 Pocket TTS engine + 1 persistent Player)
 //!       1. Preprocess text
 //!       2. Split into sentences
-//!       3. Synthesize each sentence individually → f32 PCM
-//!       4. Clamp to full scale + fade out each sentence
+//!       3. Synthesize each sentence while decoder blocks become available
+//!       4. Queue monotonic PCM deltas while retaining the final fade suffix
 //!       5. Append each buffer to the persistent rodio Player (gapless)
 //!       6. While audio is draining, keep pulling queued text items and
 //!          synthesizing ahead — playback of item N overlaps synthesis of
@@ -48,9 +48,15 @@ use std::{
 };
 
 use super::pocket::{
-    load_text_to_speech, load_voice_style, DEFAULT_VOICE, SAMPLE_RATE, VOICE_FILE_EXT,
+    load_text_to_speech, load_voice_style, SynthesisOutcome, DEFAULT_VOICE, SAMPLE_RATE,
+    VOICE_FILE_EXT,
 };
 use super::preprocessing::{preprocess_for_tts, split_sentences};
+#[path = "tts_streaming.rs"]
+mod streaming;
+#[cfg(test)]
+use streaming::STREAM_TAIL_SAMPLES;
+use streaming::{CumulativePcmDelta, PocketStreamAssembler};
 
 #[path = "tts_voice_transition.rs"]
 mod voice_transition;
@@ -75,9 +81,24 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 /// latency: a cancel is noticed within one tick, and rodio's internal
 /// `periodic_access` wrapper stops the in-flight source within a further
 /// ~5 ms — so playing audio dies ~15 ms after the flag is set, even while
-/// the worker is blocked inside `synth_chunk`.
+/// the worker is between decoder callbacks.
 const MONITOR_TICK: Duration = Duration::from_millis(10);
 const AUDIO_PRIME_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct SynthesisActivityGuard<'a>(&'a AtomicBool);
+
+impl<'a> SynthesisActivityGuard<'a> {
+    fn new(active: &'a AtomicBool) -> Self {
+        active.store(true, Ordering::Release);
+        Self(active)
+    }
+}
+
+impl Drop for SynthesisActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// Pocket TTS is a one-step consistency model, not diffusion. Kept for API compat.
 const SYNTH_STEPS: usize = 1;
@@ -122,7 +143,12 @@ const MAX_CHUNK_CHARS: usize = 200;
 /// Injected as a silent buffer between each synthesized sentence chunk.
 const INTER_SENTENCE_SILENCE: f32 = 0.1;
 
-type WorkerControlState = (Arc<AtomicBool>, Arc<AtomicBool>, WorkerCancelSignals);
+type WorkerControlState = (
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    WorkerCancelSignals,
+);
 
 // ── Public pipeline handle ────────────────────────────────────────────────────
 
@@ -164,6 +190,7 @@ impl TtsPipeline {
     pub fn new_with_voice(
         model_dir: PathBuf,
         tts_active: Arc<AtomicBool>,
+        tts_synthesizing: Arc<AtomicBool>,
         cancel: Arc<AtomicBool>,
         voice: &str,
         output_device: Option<String>,
@@ -177,6 +204,7 @@ impl TtsPipeline {
         let voice_cancel = Arc::new(AtomicBool::new(false));
         let worker_voice_cancel = Arc::clone(&voice_cancel);
         let tts_active_worker = Arc::clone(&tts_active);
+        let tts_synthesizing_worker = Arc::clone(&tts_synthesizing);
         let voice = Arc::new(Mutex::new(voice.to_string()));
         let voice_worker = Arc::clone(&voice);
         let voice_generation = Arc::new(AtomicU64::new(1));
@@ -199,6 +227,7 @@ impl TtsPipeline {
                     text_rx,
                     (
                         tts_active_worker,
+                        tts_synthesizing_worker,
                         shutdown_worker,
                         (cancel_worker, worker_voice_cancel),
                     ),
@@ -312,7 +341,7 @@ fn tts_worker(
     startup_tx: mpsc::SyncSender<Result<(), String>>,
 ) {
     let (selected_voice, voice_generation, voice_change_ack) = voice_state;
-    let (tts_active, shutdown, cancel_signals) = control_state;
+    let (tts_active, tts_synthesizing, shutdown, cancel_signals) = control_state;
     let (cancel, voice_cancel) = cancel_signals;
     // ── 1. Initialise TTS engine ──────────────────────────────────────────────
     let model_dir_str = model_dir.to_string_lossy().to_string();
@@ -434,15 +463,13 @@ fn tts_worker(
 
     // ── 3b. Barge-in monitor thread ───────────────────────────────────────────
     //
-    // The worker loop only observes `cancel` between sentences — while it is
-    // blocked inside `synth_chunk` (hundreds of ms for a long sentence),
-    // nothing would silence the audio that is already playing. The monitor
-    // closes that gap: every MONITOR_TICK it checks the flag and, while set,
-    // silences the player and releases the mic gate. It does NOT consume the
-    // flag — the worker still owns that (drain queue, reset lead-in), so the
-    // monitor keeps re-clearing until the worker catches up, which also
-    // covers a sentence appended in the race window after the worker's own
-    // post-synthesis cancel check.
+    // The decoder callback observes `cancel`, but audio queued by an earlier
+    // block must stop immediately rather than waiting for the next callback.
+    // Every MONITOR_TICK the monitor checks the flag and, while set, silences
+    // the player and releases the mic gate. It does NOT consume the flag — the
+    // worker still owns that (drain queue, reset lead-in), so the monitor keeps
+    // re-clearing until the worker catches up. This also covers a block
+    // appended in the race window after the worker's own cancel check.
     //
     // `player_ops` closes the converse race (found in review): the monitor
     // loads `cancel == true`, is preempted, the worker consumes the cancel
@@ -460,6 +487,7 @@ fn tts_worker(
         let cancel = Arc::clone(&cancel);
         let voice_cancel = Arc::clone(&voice_cancel);
         let tts_active = Arc::clone(&tts_active);
+        let tts_synthesizing = Arc::clone(&tts_synthesizing);
         let stop = Arc::clone(&monitor_stop);
         let player_ops = Arc::clone(&player_ops);
         thread::Builder::new()
@@ -479,6 +507,14 @@ fn tts_worker(
                             player.clear();
                             player.play();
                             tts_active.store(false, Ordering::Release);
+                        }
+                    } else if tts_synthesizing.load(Ordering::Acquire)
+                        && tts_active.load(Ordering::Acquire)
+                    {
+                        let _ops = lock_player_ops(&player_ops);
+                        if !cancel.load(Ordering::Acquire) && !voice_cancel.load(Ordering::Acquire)
+                        {
+                            release_tts_active_if_drained(player.empty(), tts_active.as_ref());
                         }
                     }
                     thread::sleep(MONITOR_TICK);
@@ -501,39 +537,12 @@ fn tts_worker(
     // arm or on item receipt before synthesis begins.
     let silence_buf_len = (INTER_SENTENCE_SILENCE * SAMPLE_RATE as f32) as usize;
     // `first_append` = "no audio queued since the player last went idle".
-    // Flipped by `build_sentence_append_buffer` on the first real append; the
-    // idle branch below uses it to decide when to drop `tts_active` and to
-    // arm a fresh lead-in cushion for the next utterance.
+    // Flipped after the first streamed append; the idle branch below uses it
+    // to decide when to drop `tts_active` and arm a fresh lead-in cushion for
+    // the next utterance.
     let mut first_append = true;
     let mut last_route_id = 0;
     let mut deferred_text = VecDeque::new();
-    let append_audio = |prepared: PreparedModelAudio, route_id: u64| {
-        let _ops = lock_player_ops(&player_ops);
-        if cancel.load(Ordering::Acquire)
-            || voice_cancel.load(Ordering::Acquire)
-            || shutdown.load(Ordering::Acquire)
-        {
-            let reason = if shutdown.load(Ordering::Acquire) {
-                "shutdown"
-            } else if cancel.load(Ordering::Acquire) {
-                "barge_in"
-            } else {
-                "voice_switch"
-            };
-            eprintln!(
-                "buzz-desktop: tts stage=synthesis status=cancelled reason={reason} route_id={route_id}"
-            );
-            return false;
-        }
-        player.append(SamplesBuffer::new(channels, rate, prepared.buffer));
-        eprintln!(
-            "buzz-desktop: tts stage=player status=append_accepted route_id={route_id} chunk_index={} sample_count={}",
-            prepared.chunk_index, prepared.sample_count
-        );
-        // Set this only after append so STT remains open during synthesis.
-        tts_active.store(true, Ordering::Release);
-        true
-    };
 
     loop {
         let mut no_current_text = None;
@@ -672,8 +681,7 @@ fn tts_worker(
 
         let mut synthesis_outcome = "completed";
         let mut appended_audio = false;
-        let mut model_unit_index = 0_usize;
-        'playback_chunks: for chunk in &chunks {
+        'playback_chunks: for (chunk_index, chunk) in chunks.iter().enumerate() {
             let mut no_current_text = None;
             if handle_cancel_or_shutdown(
                 (&cancel, &voice_cancel),
@@ -694,109 +702,142 @@ fn tts_worker(
                 continue;
             }
 
-            let model_chunks = match engine.split_text_into_chunks(text) {
-                Ok(model_chunks) => model_chunks,
-                Err(_) => {
-                    eprintln!(
-                        "buzz-desktop: tts stage=synthesis status=failed reason=chunking route_id={route_id}"
-                    );
-                    synthesis_outcome = "failed";
-                    break 'playback_chunks;
-                }
-            };
-            if model_chunks.is_empty() {
-                eprintln!(
-                    "buzz-desktop: tts stage=synthesis status=empty reason=no_chunks route_id={route_id}"
-                );
-                continue;
-            }
-            let mut playback_audio = PlaybackChunkAudio::new();
-            for model_chunk in &model_chunks {
-                let chunk_index = model_unit_index;
-                model_unit_index += 1;
-                let mut no_current_text = None;
-                if handle_cancel_or_shutdown(
-                    (&cancel, &voice_cancel),
-                    &shutdown,
-                    &tts_active,
-                    (&text_rx, &mut deferred_text, &mut no_current_text),
-                    &voice_change_ack,
-                    Some(route_id),
-                    Some((&player, &player_ops)),
-                ) {
-                    first_append = true;
-                    synthesis_outcome = "cancelled";
-                    break 'playback_chunks;
-                }
-
-                let synthesis = engine.synth_chunk(model_chunk, "en", &style, SYNTH_STEPS);
+            let mut stream = PocketStreamAssembler::default();
+            let mut cumulative_delta = CumulativePcmDelta::default();
+            let mut callback_error = None::<String>;
+            let callback = |samples: &[f32], _progress: f32| {
                 if cancel.load(Ordering::Acquire)
                     || voice_cancel.load(Ordering::Acquire)
                     || shutdown.load(Ordering::Acquire)
                 {
-                    let reason = if shutdown.load(Ordering::Acquire) {
-                        "shutdown"
-                    } else if cancel.load(Ordering::Acquire) {
-                        "barge_in"
-                    } else {
-                        "voice_switch"
-                    };
+                    return false;
+                }
+
+                let delta = match cumulative_delta.next(samples) {
+                    Ok(Some(delta)) => delta,
+                    Ok(None) => return true,
+                    Err(error) => {
+                        callback_error = Some(error);
+                        return false;
+                    }
+                };
+                let sample_count = delta.len();
+                let _ops = lock_player_ops(&player_ops);
+                let playback_idle = player.empty();
+                let result = stream.push(delta, playback_idle, |buffer| {
+                    if cancel.load(Ordering::Acquire)
+                        || voice_cancel.load(Ordering::Acquire)
+                        || shutdown.load(Ordering::Acquire)
+                    {
+                        return Err("Pocket TTS streaming cancelled".to_string());
+                    }
+                    player.append(SamplesBuffer::new(channels, rate, buffer));
                     eprintln!(
-                        "buzz-desktop: tts stage=synthesis status=cancelled reason={reason} route_id={route_id}"
+                        "buzz-desktop: tts stage=player status=append_accepted route_id={route_id} chunk_index={chunk_index} sample_count={sample_count}"
                     );
-                    // The monitor already stopped any queued playback. Discard
-                    // synthesis that completed after cancellation so stale audio
-                    // never reaches the player, while keeping buzz-voice's
-                    // extracted April engine API unchanged.
-                    first_append = true;
-                    synthesis_outcome = "cancelled";
-                    break 'playback_chunks;
+                    tts_active.store(true, Ordering::Release);
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    callback_error = Some(error);
+                    return false;
                 }
-                match synthesis {
-                    Ok(samples) if !samples.is_empty() => {
-                        if let Some(prepared) = playback_audio.push(
-                            samples,
-                            chunk_index,
-                            &mut first_append,
-                            silence_buf_len,
-                            player.empty(),
-                        ) {
-                            if !append_audio(prepared, route_id) {
-                                first_append = true;
-                                synthesis_outcome = "cancelled";
-                                break 'playback_chunks;
-                            }
-                            appended_audio = true;
-                            last_route_id = route_id;
-                        }
-                    }
-                    Ok(_) => {
-                        eprintln!(
-                            "buzz-desktop: tts stage=synthesis status=empty route_id={route_id} chunk_index={chunk_index}"
-                        );
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "buzz-desktop: tts stage=synthesis status=failed reason=inference route_id={route_id} chunk_index={chunk_index}"
-                        );
-                        synthesis_outcome = "failed";
-                        break;
-                    }
-                }
-            }
-            if let Some(prepared) =
-                playback_audio.finish(&mut first_append, silence_buf_len, player.empty())
-            {
-                if !append_audio(prepared, route_id) {
-                    first_append = true;
-                    synthesis_outcome = "cancelled";
-                    break 'playback_chunks;
-                }
+                true
+            };
+
+            let _synthesis_activity = SynthesisActivityGuard::new(tts_synthesizing.as_ref());
+            let synth_result =
+                engine.synth_chunk_streaming(text, "en", &style, SYNTH_STEPS, callback);
+
+            if stream.queued_samples > 0 {
+                first_append = false;
                 appended_audio = true;
                 last_route_id = route_id;
             }
-            if synthesis_outcome == "failed" {
+            if let Some(error) = callback_error {
+                if !cancel.load(Ordering::Acquire)
+                    && !voice_cancel.load(Ordering::Acquire)
+                    && !shutdown.load(Ordering::Acquire)
+                {
+                    eprintln!(
+                        "buzz-desktop: tts stage=player status=failed reason=queue route_id={route_id} error={error}"
+                    );
+                    synthesis_outcome = "failed";
+                } else {
+                    synthesis_outcome = "cancelled";
+                }
                 break 'playback_chunks;
+            }
+
+            match synth_result {
+                Ok(SynthesisOutcome::Complete(samples)) if !samples.is_empty() => {
+                    if cancel.load(Ordering::Acquire)
+                        || voice_cancel.load(Ordering::Acquire)
+                        || shutdown.load(Ordering::Acquire)
+                    {
+                        first_append = true;
+                        synthesis_outcome = "cancelled";
+                        break 'playback_chunks;
+                    }
+
+                    let _ops = lock_player_ops(&player_ops);
+                    let playback_idle = player.empty();
+                    let finish_result =
+                        stream.finish(&samples, silence_buf_len, playback_idle, |buffer| {
+                        let sample_count = buffer.len();
+                        if cancel.load(Ordering::Acquire)
+                            || voice_cancel.load(Ordering::Acquire)
+                            || shutdown.load(Ordering::Acquire)
+                        {
+                            return Err("Pocket TTS streaming cancelled".to_string());
+                        }
+                        player.append(SamplesBuffer::new(channels, rate, buffer));
+                        eprintln!(
+                            "buzz-desktop: tts stage=player status=append_accepted route_id={route_id} chunk_index={chunk_index} sample_count={sample_count}"
+                        );
+                        tts_active.store(true, Ordering::Release);
+                        Ok(())
+                    });
+                    match finish_result {
+                        Ok(()) => {
+                            first_append = false;
+                            appended_audio = true;
+                            last_route_id = route_id;
+                        }
+                        Err(_)
+                            if cancel.load(Ordering::Acquire)
+                                || voice_cancel.load(Ordering::Acquire)
+                                || shutdown.load(Ordering::Acquire) =>
+                        {
+                            first_append = true;
+                            synthesis_outcome = "cancelled";
+                            break 'playback_chunks;
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "buzz-desktop: tts stage=player status=failed reason=queue route_id={route_id} error={error}"
+                            );
+                            synthesis_outcome = "failed";
+                            break 'playback_chunks;
+                        }
+                    }
+                }
+                Ok(SynthesisOutcome::Complete(_)) => {
+                    eprintln!(
+                        "buzz-desktop: tts stage=synthesis status=empty route_id={route_id} chunk_index={chunk_index}"
+                    );
+                }
+                Ok(SynthesisOutcome::Interrupted) => {
+                    synthesis_outcome = "cancelled";
+                    break 'playback_chunks;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "buzz-desktop: tts stage=synthesis status=failed reason=inference route_id={route_id} chunk_index={chunk_index}"
+                    );
+                    synthesis_outcome = "failed";
+                    break 'playback_chunks;
+                }
             }
         }
         if synthesis_outcome == "completed" && appended_audio {
@@ -816,6 +857,7 @@ fn tts_worker(
     }
 
     finish_voice_change_ack(&voice_change_ack);
+    tts_synthesizing.store(false, Ordering::Release);
     tts_active.store(false, Ordering::Release);
 }
 
@@ -903,8 +945,21 @@ fn lock_player_ops(ops: &Mutex<()>) -> MutexGuard<'_, ()> {
     ops.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn release_tts_active_if_drained(player_empty: bool, tts_active: &AtomicBool) {
+    if player_empty {
+        tts_active.store(false, Ordering::Release);
+    }
+}
+
+pub(super) fn is_tts_interruptible(tts_active: &AtomicBool, tts_synthesizing: &AtomicBool) -> bool {
+    tts_active.load(Ordering::Acquire) || tts_synthesizing.load(Ordering::Acquire)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+#[path = "tts_streaming_tests.rs"]
+mod streaming_tests;
 #[cfg(test)]
 #[path = "tts_tests.rs"]
 mod tests;

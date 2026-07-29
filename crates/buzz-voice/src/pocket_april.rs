@@ -108,6 +108,11 @@ pub(crate) struct AprilPocketTts {
     cached_voice: Option<CachedVoice>,
 }
 
+pub(crate) enum AprilSynthesisOutcome {
+    Complete,
+    Interrupted,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AprilPreparedPrompt {
     pub(crate) text: String,
@@ -304,11 +309,15 @@ impl AprilPocketTts {
             .collect()
     }
 
-    pub(crate) fn synth_chunk(
+    pub(crate) fn synth_chunk_streaming<F>(
         &mut self,
         prepared: &AprilPreparedPrompt,
         style: &VoiceStyle,
-    ) -> Result<Vec<f32>, String> {
+        callback: F,
+    ) -> Result<AprilSynthesisOutcome, String>
+    where
+        F: FnMut(&[f32], f32) -> bool,
+    {
         let voice_embeddings = self.voice_embeddings(style)?;
         let mut flow_state = self.condition_voice(&voice_embeddings)?;
         let token_ids = self
@@ -321,7 +330,7 @@ impl AprilPocketTts {
             .map(i64::from)
             .collect::<Vec<_>>();
         if token_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AprilSynthesisOutcome::Complete);
         }
         if token_ids.len() > self.bundle.max_token_per_chunk {
             return Err(format!(
@@ -337,7 +346,7 @@ impl AprilPocketTts {
         let max_frames = estimate_max_frames(token_count, self.bundle.frame_rate);
         let latents =
             self.generate_latents(max_frames, prepared.frames_after_eos, &mut flow_state)?;
-        self.decode_latents(&latents)
+        self.decode_latents(&latents, callback)
     }
 
     fn prepared_token_count(&self, text: &str) -> Result<usize, String> {
@@ -597,9 +606,16 @@ impl AprilPocketTts {
         Ok(latents)
     }
 
-    fn decode_latents(&mut self, latents: &[f32]) -> Result<Vec<f32>, String> {
+    fn decode_latents<F>(
+        &mut self,
+        latents: &[f32],
+        mut callback: F,
+    ) -> Result<AprilSynthesisOutcome, String>
+    where
+        F: FnMut(&[f32], f32) -> bool,
+    {
         if latents.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AprilSynthesisOutcome::Complete);
         }
         if !latents.len().is_multiple_of(self.bundle.latent_dim) {
             return Err(format!(
@@ -610,7 +626,6 @@ impl AprilPocketTts {
         }
         let frame_count = latents.len() / self.bundle.latent_dim;
         let mut state = initialize_state(&self.bundle.mimi_state_manifest)?;
-        let mut audio = Vec::new();
 
         for start in (0..frame_count).step_by(DECODER_CHUNK_FRAMES) {
             let end = (start + DECODER_CHUNK_FRAMES).min(frame_count);
@@ -630,11 +645,14 @@ impl AprilPocketTts {
             let samples = outputs[0]
                 .try_extract_tensor::<f32>()
                 .map_err(ort_error("extract Mimi audio"))?
-                .1;
-            audio.extend_from_slice(samples);
+                .1
+                .to_vec();
             replace_state_from_outputs(&mut state, &mut outputs)?;
+            if !callback(&samples, end as f32 / frame_count as f32) {
+                return Ok(AprilSynthesisOutcome::Interrupted);
+            }
         }
-        Ok(audio)
+        Ok(AprilSynthesisOutcome::Complete)
     }
 }
 

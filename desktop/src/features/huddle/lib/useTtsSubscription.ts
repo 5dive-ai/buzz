@@ -193,31 +193,27 @@ export function useTtsSubscription(
     const seenOrder: string[] = [];
     const MAX_SEEN_EVENTS = 5000;
     relayClient
-      .subscribeLive(
-        buildHuddleTtsLiveFilter(ephemeralChannelId),
-        (event) => {
-          if (disposed) return;
-          // Dedup by event ID (covers reconnect replay).
-          if (seenEventIds.has(event.id)) return;
-          seenEventIds.add(event.id);
-          seenOrder.push(event.id);
-          if (seenOrder.length > MAX_SEEN_EVENTS) {
-            const oldest = seenOrder.shift();
-            if (oldest !== undefined) seenEventIds.delete(oldest);
-          }
+      .subscribeLive(buildHuddleTtsLiveFilter(ephemeralChannelId), (event) => {
+        if (disposed) return;
+        // Dedup by event ID if a relay repeats live fan-out.
+        if (seenEventIds.has(event.id)) return;
+        seenEventIds.add(event.id);
+        seenOrder.push(event.id);
+        if (seenOrder.length > MAX_SEEN_EVENTS) {
+          const oldest = seenOrder.shift();
+          if (oldest !== undefined) seenEventIds.delete(oldest);
+        }
 
-          // Preserve arrival order while the initial authoritative membership
-          // lookup is pending. A failed lookup clears this buffer fail-closed.
-          const routeId = allocateTtsRouteId();
-          if (!agentsLoaded) {
-            console.debug(
-              `[huddle] tts stage=eligibility status=deferred reason=membership_unavailable route_id=${routeId}`,
-            );
-          }
-          initialMembershipGate.push({ event, routeId });
-        },
-        { replayMissedHistory: true },
-      )
+        // Preserve arrival order while the initial authoritative membership
+        // lookup is pending. A failed lookup clears this buffer fail-closed.
+        const routeId = allocateTtsRouteId();
+        if (!agentsLoaded) {
+          console.debug(
+            `[huddle] tts stage=eligibility status=deferred reason=membership_unavailable route_id=${routeId}`,
+          );
+        }
+        initialMembershipGate.push({ event, routeId });
+      })
       .then((dispose) => {
         if (disposed) {
           void dispose();

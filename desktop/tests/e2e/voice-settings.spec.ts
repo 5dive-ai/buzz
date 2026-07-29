@@ -21,6 +21,10 @@ test.describe("Pocket voice settings", () => {
     await expect(
       page.getByText("Agent text to speech", { exact: true }),
     ).toBeVisible();
+    await expect(
+      page.getByText("Pocket TTS voice", { exact: true }),
+    ).toBeVisible();
+    await expect(card).not.toContainText("April INT8");
 
     await page.getByTestId("pocket-voice-selector").click();
     await expect(page.getByRole("menuitemradio")).toHaveCount(12);
@@ -28,6 +32,9 @@ test.describe("Pocket voice settings", () => {
     await expect(page.getByTestId("pocket-voice-selector")).toContainText(
       "Eve",
     );
+    await expect(
+      page.getByRole("button", { name: "Pocket TTS voice: Eve" }),
+    ).toBeVisible();
 
     await page.getByTestId("agent-text-to-speech-toggle").click();
     await expect(

@@ -94,16 +94,6 @@ export function routeLiveAgentText(
   return enqueue(eligibility.text, routeId);
 }
 
-export function speakableAgentText(
-  event: LiveTtsEvent,
-  agentPubkeys: ReadonlySet<string>,
-  selfPubkey: string | null,
-  channelId: string,
-): string | null {
-  return classifySpeakableAgentText(event, agentPubkeys, selfPubkey, channelId)
-    .text;
-}
-
 /**
  * Serialize native speak calls so live messages enter the bounded Pocket queue
  * in thread arrival order even when the bridge resolves calls asynchronously.

@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  classifySpeakableAgentText,
   createInitialMembershipGate,
   createLatestStateGate,
   createOrderedSpeaker,
   routeLiveAgentText,
-  speakableAgentText,
 } from "./ttsLiveMessages.ts";
 
 const agents = new Set(["agent"]);
@@ -18,59 +18,48 @@ const base = {
   content: "Hello there",
   tags: [["h", CHANNEL]],
 };
+const speakableText = (event, selfPubkey = "human") =>
+  classifySpeakableAgentText(event, agents, selfPubkey, CHANNEL).text;
 
 test("speaks only new agent-authored text message events", () => {
+  assert.equal(speakableText(base), "Hello there");
   assert.equal(
-    speakableAgentText(base, agents, "human", CHANNEL),
-    "Hello there",
-  );
-  assert.equal(
-    speakableAgentText({ ...base, kind: 40002 }, agents, "human", CHANNEL),
+    speakableText({ ...base, kind: 40002 }),
     "Hello there",
     "managed stream-message-v2 replies are spoken",
   );
   assert.equal(
-    speakableAgentText({ ...base, kind: 7 }, agents, "human", CHANNEL),
+    speakableText({ ...base, kind: 7 }),
     null,
     "reactions and other event kinds are excluded",
   );
   assert.equal(
-    speakableAgentText({ ...base, kind: 10 }, agents, "human", CHANNEL),
+    speakableText({ ...base, kind: 10 }),
     null,
     "edits and status events are excluded",
   );
   assert.equal(
-    speakableAgentText({ ...base, pubkey: "human" }, agents, "human", CHANNEL),
+    speakableText({ ...base, pubkey: "human" }),
     null,
     "human-authored messages are excluded",
   );
   assert.equal(
-    speakableAgentText({ ...base, content: " " }, agents, "human", CHANNEL),
+    speakableText({ ...base, content: " " }),
     null,
     "empty and non-text content are excluded",
   );
   assert.equal(
-    speakableAgentText({ ...base, content: "K" }, agents, "human", CHANNEL),
+    speakableText({ ...base, content: "K" }),
     "K",
     "one-character agent text remains speakable",
   );
   assert.equal(
-    speakableAgentText(
-      { ...base, content: "[System] tool started" },
-      agents,
-      "human",
-      CHANNEL,
-    ),
+    speakableText({ ...base, content: "[System] tool started" }),
     null,
     "legacy system rows are excluded",
   );
   assert.equal(
-    speakableAgentText(
-      { ...base, tags: [["h", "another-huddle"]] },
-      agents,
-      "human",
-      CHANNEL,
-    ),
+    speakableText({ ...base, tags: [["h", "another-huddle"]] }),
     null,
     "messages for another huddle are excluded",
   );
@@ -134,30 +123,19 @@ test("strips attachment markup and skips attachment-only events", () => {
   const url = "https://cdn.example/voice.png";
   const tags = [...base.tags, ["imeta", `url ${url}`, "m image/png"]];
   assert.equal(
-    speakableAgentText(
-      { ...base, content: `![image](${url})`, tags },
-      agents,
-      "human",
-      CHANNEL,
-    ),
+    speakableText({ ...base, content: `![image](${url})`, tags }),
     null,
   );
   assert.equal(
-    speakableAgentText(
-      { ...base, content: `Here is the diagram.\n\n![image](${url})`, tags },
-      agents,
-      "human",
-      CHANNEL,
-    ),
+    speakableText({
+      ...base,
+      content: `Here is the diagram.\n\n![image](${url})`,
+      tags,
+    }),
     "Here is the diagram.",
   );
   assert.equal(
-    speakableAgentText(
-      { ...base, content: `||\n![image](${url})\n||`, tags },
-      agents,
-      "human",
-      CHANNEL,
-    ),
+    speakableText({ ...base, content: `||\n![image](${url})\n||`, tags }),
     null,
   );
 });

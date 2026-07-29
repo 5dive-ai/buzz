@@ -58,7 +58,6 @@ type LiveSubscription = {
   mode: "live";
   filter: RelaySubscriptionFilter;
   onEvent: (event: RelayEvent) => void;
-  replayMissedHistory?: boolean;
   resolveReady?: () => void;
   lastSeenCreatedAt?: number;
   closedRetryAttempt?: number;

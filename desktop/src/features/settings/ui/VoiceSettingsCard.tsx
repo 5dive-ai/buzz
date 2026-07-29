@@ -163,7 +163,7 @@ export function VoiceSettingsCard() {
           <SettingsOptionGroup>
             <SettingsOptionRow>
               <div className="min-w-0">
-                <p className="text-sm font-medium">Voice</p>
+                <p className="text-sm font-medium">Pocket TTS voice</p>
                 <p className="text-sm text-muted-foreground">
                   Voice files stay private on this device.
                 </p>
@@ -173,6 +173,7 @@ export function VoiceSettingsCard() {
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
+                      aria-label={`Pocket TTS voice: ${selectedVoice?.displayName ?? "Mary"}`}
                       className="min-w-32 justify-between"
                       data-testid="pocket-voice-selector"
                       disabled={controlsDisabled}

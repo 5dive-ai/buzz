@@ -129,7 +129,7 @@ test("reconnect replay preserves the live-only zero-history contract", () => {
   });
 });
 
-test("missed-history replay is explicit for live-only subscriptions", () => {
+test("live-only subscriptions do not page reconnect history", () => {
   const filter = {
     kinds: [9],
     "#h": ["channel-1"],
@@ -137,7 +137,6 @@ test("missed-history replay is explicit for live-only subscriptions", () => {
   };
 
   assert.equal(shouldPageReconnectReplay(filter), false);
-  assert.equal(shouldPageReconnectReplay(filter, true), true);
 });
 
 test("reconnect replay keeps the stricter existing since window", () => {

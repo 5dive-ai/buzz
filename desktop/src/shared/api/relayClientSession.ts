@@ -430,9 +430,8 @@ export class RelayClient {
   async subscribeLive(
     filter: RelaySubscriptionFilter,
     onEvent: (event: RelayEvent) => void,
-    options?: { replayMissedHistory?: boolean },
   ) {
-    return this.subscribe(filter, onEvent, options);
+    return this.subscribe(filter, onEvent);
   }
 
   async subscribeToChannelMentionEvents(
@@ -586,7 +585,6 @@ export class RelayClient {
   private async subscribe(
     filter: RelaySubscriptionFilter,
     onEvent: (event: RelayEvent) => void,
-    options?: { replayMissedHistory?: boolean },
   ) {
     await this.ensureConnected();
 
@@ -608,10 +606,6 @@ export class RelayClient {
       mode: "live",
       filter,
       onEvent,
-      replayMissedHistory: options?.replayMissedHistory,
-      lastSeenCreatedAt: options?.replayMissedHistory
-        ? Math.floor(Date.now() / 1_000)
-        : undefined,
       resolveReady,
     });
 

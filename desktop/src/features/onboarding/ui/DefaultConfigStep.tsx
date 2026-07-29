@@ -531,15 +531,20 @@ export function DefaultConfigStep({
     () => getVisibleOnboardingRuntimes(runtimesQuery.data ?? []),
     [runtimesQuery.data],
   );
-  const selectedRuntime = visibleRuntimes.find(
-    (runtime) => runtime.id === selectedRuntimeId,
-  );
-  const { data: runtimeFileConfig, isLoading: runtimeFileConfigLoading } =
-    useRuntimeFileConfigQuery(selectedRuntimeId ?? "", {
-      enabled: Boolean(selectedRuntimeId),
-    });
   const [config, setConfig] =
     React.useState<GlobalAgentConfig>(EMPTY_GLOBAL_CONFIG);
+  // Reopening machine config from the first-community flow starts directly on
+  // this page, without a chooser draft. Fall back to the persisted default so
+  // the same selected-harness setup renders instead of a missing-runtime state.
+  const effectiveSelectedRuntimeId =
+    selectedRuntimeId ?? config.preferred_runtime;
+  const selectedRuntime = visibleRuntimes.find(
+    (runtime) => runtime.id === effectiveSelectedRuntimeId,
+  );
+  const { data: runtimeFileConfig, isLoading: runtimeFileConfigLoading } =
+    useRuntimeFileConfigQuery(effectiveSelectedRuntimeId ?? "", {
+      enabled: Boolean(effectiveSelectedRuntimeId),
+    });
   const [bakedEnv, setBakedEnv] = React.useState<BakedEnvEntry[]>([]);
   const [isConfigLoading, setIsConfigLoading] = React.useState(true);
   const [configValid, setConfigValid] = React.useState(false);
@@ -643,20 +648,20 @@ export function DefaultConfigStep({
   }, [installMutation, runtimesQuery, selectedRuntime]);
 
   const handleComplete = React.useCallback(async () => {
-    if (!selectedRuntimeId) return;
+    if (!effectiveSelectedRuntimeId) return;
     setIsCompleting(true);
     setCompletionError(null);
     try {
       await setGlobalAgentConfig({
         ...config,
-        preferred_runtime: selectedRuntimeId,
+        preferred_runtime: effectiveSelectedRuntimeId,
       });
       actions.complete();
     } catch {
       setCompletionError("Couldn't save your default harness. Try again.");
       setIsCompleting(false);
     }
-  }, [actions, config, selectedRuntimeId]);
+  }, [actions, config, effectiveSelectedRuntimeId]);
 
   return (
     <OnboardingSlideTransition

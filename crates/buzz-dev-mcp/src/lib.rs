@@ -13,6 +13,7 @@ use std::sync::Arc;
 mod paths;
 mod read_file;
 mod rg;
+mod send_message;
 mod shell;
 mod shim;
 mod str_replace;
@@ -47,6 +48,18 @@ impl DevMcp {
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         shell::run(&self.state, p, context.ct).await
+    }
+
+    #[tool(
+        name = "send_message",
+        description = "Send a message to a Buzz channel. This is the ONLY way to say anything to a human: your assistant text and reasoning are never shown to anyone. Set `channel` to the channel UUID from the `[Context]` block, `content` to your message, and `reply_to` to the reply destination from `[Context]` when replying in a thread."
+    )]
+    async fn send_message(
+        &self,
+        Parameters(p): Parameters<send_message::SendMessageParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        send_message::run(&self.state, p, context.ct).await
     }
 
     #[tool(

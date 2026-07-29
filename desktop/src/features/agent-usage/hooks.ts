@@ -8,6 +8,7 @@ import {
 } from "@/shared/api/tauriArchive";
 import {
   buildLocalDayBoundaries,
+  deriveUsageIngressTrailing,
   msUntilNextLocalMidnight,
   type UsageWindowDays,
 } from "./lib/agentUsage";
@@ -99,4 +100,26 @@ export function useAgentUsageSeries({
     staleTime: 60_000,
     gcTime: 5 * 60_000,
   });
+}
+
+/**
+ * Trailing text for the profile Info tab's usage ingress row (plan:328).
+ *
+ * Owns its own 7-day window deliberately: the row summarises recent usage
+ * independently of the focused view's 7d/30d selector, so the two must not
+ * share a query. Returns `undefined` while the query is disabled or still
+ * loading, which the row renders as no trailing text at all.
+ *
+ * `enabled` gates the query off entirely when the row won't render.
+ */
+export function useUsageIngress(
+  agentPubkey: string | null,
+  enabled: boolean,
+): string | undefined {
+  const query = useAgentUsageSeries({
+    agentPubkey: agentPubkey ?? undefined,
+    days: 7,
+    enabled,
+  });
+  return query.data ? deriveUsageIngressTrailing(query.data) : undefined;
 }

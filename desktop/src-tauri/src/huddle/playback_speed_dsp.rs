@@ -71,27 +71,6 @@ pub fn process_complete_chunk(
     Ok(output[0][start..end].to_vec())
 }
 
-/// Preserve a fixed device lead-in while pitch-preserving the remaining audio.
-pub(crate) fn process_complete_chunk_preserving_lead_in(
-    input: &[f32],
-    fixed_lead_in_samples: usize,
-    speed: f32,
-    sample_rate: u32,
-) -> Result<Vec<f32>, String> {
-    if fixed_lead_in_samples > input.len() {
-        return Err(format!(
-            "fixed lead-in of {fixed_lead_in_samples} samples exceeds input length {}",
-            input.len()
-        ));
-    }
-
-    let processed = process_complete_chunk(&input[fixed_lead_in_samples..], speed, sample_rate)?;
-    let mut output = Vec::with_capacity(fixed_lead_in_samples + processed.len());
-    output.extend_from_slice(&input[..fixed_lead_in_samples]);
-    output.extend_from_slice(&processed);
-    Ok(output)
-}
-
 /// Return Signalsmith's compensated output lookahead for descriptive reporting.
 #[allow(dead_code)]
 pub(crate) fn compensated_output_latency_samples(sample_rate: u32) -> usize {

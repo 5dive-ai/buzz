@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   applyLoadedPlaybackSpeed,
+  cancelPlaybackSpeedPersistence,
   commitPlaybackSpeed,
 } from "./playbackSpeedPersistence.ts";
 
@@ -22,6 +23,7 @@ function harness() {
   const saves = [];
   const speeds = [];
   const state = {
+    active: { current: true },
     confirmedSpeed: { current: 1 },
     desiredSpeed: { current: 1 },
     flushPromise: { current: null },
@@ -103,4 +105,24 @@ test("a delayed initial load cannot overwrite a local intent", async () => {
   await settle(h.state);
   assert.equal(h.state.confirmedSpeed.current, 1.5);
   assert.equal(h.state.desiredSpeed.current, 1.5);
+});
+
+test("an unmounted instance cannot persist stale queued intent", async () => {
+  const oldInstance = harness();
+  commitPlaybackSpeed(oldInstance.state, oldInstance.callbacks, 1.25);
+  commitPlaybackSpeed(oldInstance.state, oldInstance.callbacks, 1.5);
+  cancelPlaybackSpeedPersistence(oldInstance.state);
+
+  const newInstance = harness();
+  commitPlaybackSpeed(newInstance.state, newInstance.callbacks, 0.75);
+  assert.deepEqual(oldInstance.calls, [1.25]);
+  assert.deepEqual(newInstance.calls, [0.75]);
+
+  oldInstance.saves[0].resolve();
+  await settle(oldInstance.state);
+  assert.deepEqual(oldInstance.calls, [1.25]);
+
+  newInstance.saves[0].resolve();
+  await settle(newInstance.state);
+  assert.equal(newInstance.state.confirmedSpeed.current, 0.75);
 });

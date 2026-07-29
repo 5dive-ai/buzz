@@ -6,6 +6,7 @@ import {
 import { Button } from "@/shared/ui/button";
 import {
   applyLoadedPlaybackSpeed,
+  cancelPlaybackSpeedPersistence,
   commitPlaybackSpeed,
 } from "./playbackSpeedPersistence";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
@@ -19,18 +20,21 @@ export function SpeechPlaybackSettings() {
   const [speed, setSpeed] = useState(DEFAULT_SPEED);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const active = useRef(true);
   const confirmedSpeed = useRef(DEFAULT_SPEED);
   const desiredSpeed = useRef(DEFAULT_SPEED);
   const flushPromise = useRef<Promise<void> | null>(null);
   const hasLocalIntent = useRef(false);
 
   useEffect(() => {
-    let active = true;
+    active.current = true;
+    let loadActive = true;
     getTtsPlaybackSpeed()
       .then((savedSpeed) => {
-        if (active) {
+        if (loadActive) {
           applyLoadedPlaybackSpeed(
             {
+              active,
               confirmedSpeed,
               desiredSpeed,
               flushPromise,
@@ -42,19 +46,32 @@ export function SpeechPlaybackSettings() {
         }
       })
       .catch((cause) => {
-        if (active) setError(String(cause));
+        if (loadActive) setError(String(cause));
       })
       .finally(() => {
-        if (active) setLoaded(true);
+        if (loadActive) setLoaded(true);
       });
     return () => {
-      active = false;
+      loadActive = false;
+      cancelPlaybackSpeedPersistence({
+        active,
+        confirmedSpeed,
+        desiredSpeed,
+        flushPromise,
+        hasLocalIntent,
+      });
     };
   }, []);
 
   const commitSpeed = (nextSpeed: number) => {
     commitPlaybackSpeed(
-      { confirmedSpeed, desiredSpeed, flushPromise, hasLocalIntent },
+      {
+        active,
+        confirmedSpeed,
+        desiredSpeed,
+        flushPromise,
+        hasLocalIntent,
+      },
       { persist: setTtsPlaybackSpeed, setError, setSpeed },
       nextSpeed,
     );

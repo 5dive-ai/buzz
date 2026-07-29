@@ -3,6 +3,7 @@ mod agent;
 pub mod auth;
 mod builtin;
 pub mod catalog;
+pub(crate) mod databricks_model_names;
 pub mod config;
 mod handoff;
 mod hints;

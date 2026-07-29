@@ -10,6 +10,8 @@
 //! - PKCE cache empty / no token: returns `Err(AgentError::LlmAuth)` — the
 //!   caller degrades gracefully; no browser, no hang.
 
+use crate::databricks_model_names::DATABRICKS_MODEL_NAMES;
+
 use reqwest::Client;
 
 use crate::{
@@ -18,8 +20,24 @@ use crate::{
     types::AgentError,
 };
 
+/// Returns the curated display name for a Databricks endpoint ID, or the raw
+/// ID when no entry exists in the registry.
+///
+/// The registry (`DATABRICKS_MODEL_NAMES`) is generated from
+/// [models.dev](https://models.dev/api.json) and covers the ~30 managed
+/// Databricks endpoints. Any custom/workspace endpoint not in the table is
+/// returned untouched — no heuristic guessing.
+pub(crate) fn databricks_model_name(id: &str) -> &str {
+    DATABRICKS_MODEL_NAMES
+        .iter()
+        .find(|(k, _)| *k == id)
+        .map(|(_, v)| *v)
+        .unwrap_or(id)
+}
+
 /// A discovered model entry: `id` is the picker value, `name` is the display
-/// label (same as `id` for Databricks — the API has no separate display name).
+/// label (curated from models.dev for known managed endpoints; raw ID for
+/// custom/unknown endpoints).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelEntry {
     pub id: String,
@@ -55,7 +73,7 @@ pub fn discovery_failure_fallback(provider: Provider, configured_model: &str) ->
     let configured_model = configured_model.trim();
     let configured = ModelEntry {
         id: configured_model.to_string(),
-        name: configured_model.to_string(),
+        name: databricks_model_name(configured_model).to_string(),
     };
     match provider {
         Provider::DatabricksV2 => {
@@ -69,7 +87,7 @@ pub fn discovery_failure_fallback(provider: Provider, configured_model: &str) ->
                     .filter(|id| **id != configured_model)
                     .map(|id| ModelEntry {
                         id: id.to_string(),
-                        name: id.to_string(),
+                        name: databricks_model_name(id).to_string(),
                     }),
             );
             entries
@@ -207,7 +225,7 @@ pub(crate) fn parse_v1_endpoints(json: &serde_json::Value) -> Result<Vec<ModelEn
 
             Some(ModelEntry {
                 id: name.clone(),
-                name,
+                name: databricks_model_name(&name).to_string(),
             })
         })
         .collect();
@@ -290,7 +308,7 @@ async fn fetch_v2_models(
             .iter()
             .map(|id| ModelEntry {
                 id: id.to_string(),
-                name: id.to_string(),
+                name: databricks_model_name(id).to_string(),
             })
             .collect());
     }
@@ -373,7 +391,7 @@ pub(crate) fn parse_v2_endpoints_page(
             Some(V2Endpoint {
                 entry: ModelEntry {
                     id: name.clone(),
-                    name,
+                    name: databricks_model_name(&name).to_string(),
                 },
                 created_ms: endpoint_created_ms(endpoint),
             })
@@ -627,5 +645,65 @@ mod tests {
             discovery_failure_fallback(Provider::DatabricksV2, &format!("  {configured} "));
         let ids: Vec<&str> = result.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, DATABRICKS_V2_KNOWN_MODELS.to_vec());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Databricks model name registry
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn databricks_model_name_known_id_returns_curated_name() {
+        assert_eq!(databricks_model_name("databricks-gpt-5-5"), "GPT-5.5");
+        assert_eq!(
+            databricks_model_name("databricks-claude-opus-4-7"),
+            "Claude Opus 4.7"
+        );
+        assert_eq!(
+            databricks_model_name("databricks-gpt-oss-120b"),
+            "GPT OSS 120B"
+        );
+    }
+
+    #[test]
+    fn databricks_model_name_unknown_custom_endpoint_returns_raw_id() {
+        // Custom workspace endpoints must never be guessed — pass through unchanged.
+        assert_eq!(
+            databricks_model_name("databricks-team-2025-01"),
+            "databricks-team-2025-01"
+        );
+        assert_eq!(
+            databricks_model_name("databricks-finance-2025-01-30"),
+            "databricks-finance-2025-01-30"
+        );
+        assert_eq!(
+            databricks_model_name("some-unknown-endpoint"),
+            "some-unknown-endpoint"
+        );
+    }
+
+    #[test]
+    fn v2_known_models_fallback_entries_get_curated_names() {
+        // The DATABRICKS_V2_KNOWN_MODELS constant lists IDs that are in the
+        // registry, so their fallback entries must carry curated names.
+        for id in DATABRICKS_V2_KNOWN_MODELS {
+            let name = databricks_model_name(id);
+            assert_ne!(
+                name, *id,
+                "known model {id} should have a curated name, not raw ID"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_discovery_failure_fallback_known_models_have_curated_names() {
+        let result = discovery_failure_fallback(Provider::DatabricksV2, "");
+        for entry in &result {
+            // All DATABRICKS_V2_KNOWN_MODELS should have curated names now.
+            assert_ne!(
+                entry.name, entry.id,
+                "fallback entry {} should have a curated name, not raw ID",
+                entry.id
+            );
+        }
     }
 }

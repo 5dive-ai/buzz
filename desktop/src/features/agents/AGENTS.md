@@ -143,3 +143,10 @@ matches the code is worse than no rule; a new pattern that isn't written down
 here will be broken by the next agent that never learns it existed. Reviewers:
 treat a config-behavior diff without a matching AGENTS.md diff (or an explicit
 "no rules changed" note) as incomplete.
+
+## Model display-name precedence
+
+Labels shown in cards, pickers, and popovers follow a three-tier cascade:
+1. **API/runtime `name`** — `AgentModelInfo.name` from discovery (`AgentModelsResponse`). This is the authoritative source; all providers populate it at discover time (`openai_model_display_name`, Anthropic `display_name`, ACP runtime name, Databricks registry lookup).
+2. **Table-backed fallback** — for persisted raw Databricks endpoint IDs that render before discovery data is available, `databricksModelName(id)` in `desktop/src/features/agents/lib/databricksModelNames.ts` does a static lookup against the models.dev-seeded registry. Refresh by rerunning `scripts/generate-databricks-model-names.py`.
+3. **Raw ID** — any ID not covered by tiers 1 or 2 renders unchanged. No heuristic string mangling.

@@ -27,6 +27,7 @@ import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastE
 import { ManagedAgentLogPanel } from "./ManagedAgentLogPanel";
 import { PubKey } from "@/shared/ui/PubKey";
 import { SubsectionLabel } from "@/shared/ui/PageHeader";
+import { databricksModelName } from "@/features/agents/lib/databricksModelNames";
 
 export function ManagedAgentRow({
   agent,
@@ -410,7 +411,7 @@ function RuntimeBlock({
       {runtimeSource || agent.model ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
           {runtimeSource ? <span>{runtimeSource}</span> : null}
-          {agent.model ? <span>{agent.model}</span> : null}
+          {agent.model ? <span>{databricksModelName(agent.model)}</span> : null}
         </div>
       ) : null}
     </div>

@@ -51,6 +51,7 @@ import { BotIdenticon } from "@/features/messages/ui/BotIdenticon";
 import { useNow } from "@/shared/lib/useNow";
 import { Button } from "@/shared/ui/button";
 import { Spinner } from "@/shared/ui/spinner";
+import { databricksModelName } from "@/features/agents/lib/databricksModelNames";
 
 type UserProfilePopoverProps = {
   children: React.ReactNode;
@@ -611,7 +612,7 @@ export function UserProfilePopover({
                 <InfoBadge>{runtimeLabel(relayAgent.agentType)}</InfoBadge>
               ) : null}
               {managedAgent?.model ? (
-                <InfoBadge>{managedAgent.model}</InfoBadge>
+                <InfoBadge>{databricksModelName(managedAgent.model)}</InfoBadge>
               ) : null}
               {managedAgent?.acpCommand ? (
                 <InfoBadge>ACP: {managedAgent.acpCommand}</InfoBadge>

@@ -1,6 +1,7 @@
 use buzz_push_gateway::{
     apns::ApnsTransport,
     app_attest::AppAttestVerifier,
+    app_attest_policy::AppAttestPolicy,
     authority::AuthorityStore,
     config::Config,
     grant::{GrantKey, GrantKeyring},
@@ -77,10 +78,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    let app_attest = Arc::new(AppAttestVerifier::new(
-        c.app_attest_app_id,
-        fs::read(&c.app_attest_root_cert_path)?,
-    )?);
+    let apple_app_attest =
+        AppAttestVerifier::new(c.app_attest_app_id, fs::read(&c.app_attest_root_cert_path)?)?;
+    #[cfg(feature = "dev-app-attest-bypass")]
+    let app_attest = if c.dev_app_attest_bypass {
+        tracing::warn!(
+            "DEVELOPMENT APP ATTEST BYPASS ACTIVE; Apple attestation and assertion verification are disabled"
+        );
+        Arc::new(AppAttestPolicy::development())
+    } else {
+        Arc::new(AppAttestPolicy::apple(apple_app_attest))
+    };
+    #[cfg(not(feature = "dev-app-attest-bypass"))]
+    let app_attest = Arc::new(AppAttestPolicy::apple(apple_app_attest));
     let accepting = Arc::new(AtomicBool::new(true));
     let (public, health) = router_with_metrics(
         AppState {

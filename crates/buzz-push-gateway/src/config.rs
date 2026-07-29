@@ -25,6 +25,8 @@ pub struct Config {
     pub database_url: String,
     pub app_attest_app_id: String,
     pub app_attest_root_cert_path: PathBuf,
+    #[cfg(feature = "dev-app-attest-bypass")]
+    pub dev_app_attest_bypass: bool,
     /// Ordered current key first, followed by decrypt-only predecessors.
     pub grant_keys: Vec<KeyConfig>,
     /// Independent token-custody keyring. These keys MUST NOT be reused for
@@ -152,19 +154,38 @@ impl Config {
         if enabled_profiles.is_empty() {
             return Err(ConfigError::Invalid("BUZZ_PUSH_ENABLED_PROFILES"));
         }
+        let bind_addr = e
+            .get("BUZZ_PUSH_BIND_ADDR")
+            .map(String::as_str)
+            .unwrap_or("0.0.0.0:8080")
+            .parse::<SocketAddr>()
+            .map_err(|_| ConfigError::Invalid("BUZZ_PUSH_BIND_ADDR"))?;
+        let health_addr = e
+            .get("BUZZ_PUSH_HEALTH_ADDR")
+            .map(String::as_str)
+            .unwrap_or("0.0.0.0:8081")
+            .parse::<SocketAddr>()
+            .map_err(|_| ConfigError::Invalid("BUZZ_PUSH_HEALTH_ADDR"))?;
+        #[cfg(feature = "dev-app-attest-bypass")]
+        let dev_app_attest_bypass = e
+            .get("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS")
+            .is_some_and(|value| value == "true");
+        #[cfg(feature = "dev-app-attest-bypass")]
+        if dev_app_attest_bypass
+            && (!bind_addr.ip().is_loopback() || !health_addr.ip().is_loopback())
+        {
+            return Err(ConfigError::Invalid("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS"));
+        }
+        #[cfg(feature = "dev-app-attest-bypass")]
+        if dev_app_attest_bypass
+            && (enabled_profiles.len() != 1
+                || !enabled_profiles.contains(&crate::model::AppProfile::BuzzIosSandbox))
+        {
+            return Err(ConfigError::Invalid("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS"));
+        }
         Ok(Self {
-            bind_addr: e
-                .get("BUZZ_PUSH_BIND_ADDR")
-                .map(String::as_str)
-                .unwrap_or("0.0.0.0:8080")
-                .parse()
-                .map_err(|_| ConfigError::Invalid("BUZZ_PUSH_BIND_ADDR"))?,
-            health_addr: e
-                .get("BUZZ_PUSH_HEALTH_ADDR")
-                .map(String::as_str)
-                .unwrap_or("0.0.0.0:8081")
-                .parse()
-                .map_err(|_| ConfigError::Invalid("BUZZ_PUSH_HEALTH_ADDR"))?,
+            bind_addr,
+            health_addr,
             public_delivery_url,
             max_grant_lifetime_seconds,
             max_installation_lifetime_seconds,
@@ -174,6 +195,8 @@ impl Config {
             database_url: req(e, "DATABASE_URL")?.to_owned(),
             app_attest_app_id: req(e, "BUZZ_PUSH_APP_ATTEST_APP_ID")?.to_owned(),
             app_attest_root_cert_path: req(e, "BUZZ_PUSH_APP_ATTEST_ROOT_CERT_PATH")?.into(),
+            #[cfg(feature = "dev-app-attest-bypass")]
+            dev_app_attest_bypass,
             grant_keys,
             token_keys,
             apns_key_path: req(e, "BUZZ_PUSH_APNS_KEY_PATH")?.into(),
@@ -220,7 +243,7 @@ mod tests {
             ),
             (
                 "DATABASE_URL".into(),
-                "postgres://buzz:test@localhost/buzz".into(),
+                "postgres://buzz:test@localhost/buzz".into(), // sadscan:disable np.postgres.1 -- existing local test-only credentials
             ),
             ("BUZZ_PUSH_APP_ATTEST_APP_ID".into(), "TEAM.app".into()),
             (
@@ -231,6 +254,8 @@ mod tests {
             ("BUZZ_PUSH_APNS_KEY_ID".into(), "key".into()),
             ("BUZZ_PUSH_APNS_TEAM_ID".into(), "team".into()),
             ("BUZZ_PUSH_APNS_TOPIC".into(), "app".into()),
+            ("BUZZ_PUSH_BIND_ADDR".into(), "127.0.0.1:8080".into()),
+            ("BUZZ_PUSH_HEALTH_ADDR".into(), "127.0.0.1:8081".into()),
         ])
     }
 
@@ -277,6 +302,135 @@ mod tests {
             env.insert("BUZZ_PUSH_TOKEN_KEYS".into(), token_keys);
             assert!(Config::from_map(&env).is_err());
         }
+    }
+
+    #[test]
+    fn listener_defaults_remain_public_when_addresses_are_absent() {
+        let mut env = base();
+        env.remove("BUZZ_PUSH_BIND_ADDR");
+        env.remove("BUZZ_PUSH_HEALTH_ADDR");
+
+        let config = Config::from_map(&env).unwrap();
+        assert_eq!(config.bind_addr, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
+    }
+
+    #[cfg(feature = "dev-app-attest-bypass")]
+    #[test]
+    fn dev_app_attest_bypass_is_off_when_absent_or_exactly_false() {
+        let absent = Config::from_map(&base()).unwrap();
+        assert!(!absent.dev_app_attest_bypass);
+
+        let mut explicit_false = base();
+        explicit_false.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "false".into());
+        let explicit_false = Config::from_map(&explicit_false).unwrap();
+        assert!(!explicit_false.dev_app_attest_bypass);
+    }
+
+    #[cfg(feature = "dev-app-attest-bypass")]
+    #[test]
+    fn dev_app_attest_bypass_selects_apple_for_every_value_other_than_exact_true() {
+        for value in [
+            None,
+            Some(""),
+            Some("false"),
+            Some("TRUE"),
+            Some("1"),
+            Some("yes"),
+            Some(" true"),
+        ] {
+            let mut env = base();
+            if let Some(value) = value {
+                env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), value.into());
+            }
+            let config = Config::from_map(&env).unwrap();
+            assert!(!config.dev_app_attest_bypass, "enabled for {value:?}");
+        }
+    }
+
+    #[cfg(feature = "dev-app-attest-bypass")]
+    #[test]
+    fn dev_app_attest_bypass_requires_both_loopback_listeners() {
+        for (key, value) in [
+            ("BUZZ_PUSH_BIND_ADDR", "0.0.0.0:8080"),
+            ("BUZZ_PUSH_HEALTH_ADDR", "[::]:8081"),
+        ] {
+            let mut env = base();
+            env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+            env.insert(
+                "BUZZ_PUSH_ENABLED_PROFILES".into(),
+                "buzz-ios-sandbox".into(),
+            );
+            env.insert(key.into(), value.into());
+            assert!(Config::from_map(&env).is_err(), "accepted {key}={value}");
+        }
+    }
+
+    #[cfg(feature = "dev-app-attest-bypass")]
+    #[test]
+    fn non_loopback_bind_is_rejected_before_loopback_equivalent_is_accepted() {
+        let mut non_loopback = base();
+        non_loopback.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+        non_loopback.insert(
+            "BUZZ_PUSH_ENABLED_PROFILES".into(),
+            "buzz-ios-sandbox".into(),
+        );
+        non_loopback.insert("BUZZ_PUSH_BIND_ADDR".into(), "0.0.0.0:8080".into());
+        assert!(Config::from_map(&non_loopback).is_err());
+
+        non_loopback.insert("BUZZ_PUSH_BIND_ADDR".into(), "127.0.0.1:8080".into());
+        assert!(
+            Config::from_map(&non_loopback)
+                .unwrap()
+                .dev_app_attest_bypass
+        );
+    }
+
+    #[cfg(feature = "dev-app-attest-bypass")]
+    #[test]
+    fn dev_app_attest_bypass_requires_sandbox_as_the_only_profile() {
+        for profiles in [
+            "buzz-ios-production",
+            "buzz-ios-sandbox,buzz-ios-production",
+        ] {
+            let mut env = base();
+            env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+            env.insert("BUZZ_PUSH_ENABLED_PROFILES".into(), profiles.into());
+            assert!(
+                Config::from_map(&env).is_err(),
+                "accepted profiles {profiles}"
+            );
+        }
+    }
+
+    #[cfg(feature = "dev-app-attest-bypass")]
+    #[test]
+    fn dev_app_attest_bypass_accepts_explicit_true_for_loopback_sandbox() {
+        let mut env = base();
+        env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+        env.insert(
+            "BUZZ_PUSH_ENABLED_PROFILES".into(),
+            "buzz-ios-sandbox".into(),
+        );
+        assert!(Config::from_map(&env).unwrap().dev_app_attest_bypass);
+    }
+
+    #[cfg(feature = "dev-app-attest-bypass")]
+    #[test]
+    fn second_profile_is_rejected_before_sandbox_only_is_accepted() {
+        let mut env = base();
+        env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+        env.insert(
+            "BUZZ_PUSH_ENABLED_PROFILES".into(),
+            "buzz-ios-sandbox,buzz-ios-production".into(),
+        );
+        assert!(Config::from_map(&env).is_err());
+
+        env.insert(
+            "BUZZ_PUSH_ENABLED_PROFILES".into(),
+            "buzz-ios-sandbox".into(),
+        );
+        assert!(Config::from_map(&env).unwrap().dev_app_attest_bypass);
     }
 
     #[test]

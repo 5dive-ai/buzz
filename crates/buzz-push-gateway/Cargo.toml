@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+dev-app-attest-bypass = []
+
 [lib]
 name = "buzz_push_gateway"
 path = "src/lib.rs"

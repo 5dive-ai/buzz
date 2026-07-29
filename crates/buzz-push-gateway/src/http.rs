@@ -1,7 +1,7 @@
 //! Stateful installation, delegation, delivery, and health APIs.
 use crate::{
     apns::{DeliveryAttempt, DeliveryOutcome, PushTransport},
-    app_attest::AppAttestVerifier,
+    app_attest_policy::AppAttestPolicy,
     authority::{
         AuthorityError, AuthorityStore, Challenge, Delegation, DeliveryDisposition, NewInstallation,
     },
@@ -36,7 +36,7 @@ use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 #[derive(Clone)]
 pub struct AppState {
     pub grant_keyring: Arc<GrantKeyring>,
-    pub app_attest: Arc<AppAttestVerifier>,
+    pub app_attest: Arc<AppAttestPolicy>,
     pub authority: Arc<dyn AuthorityStore>,
     pub token_keyring: Arc<TokenKeyring>,
     pub transport: Arc<dyn PushTransport>,

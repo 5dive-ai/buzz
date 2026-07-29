@@ -218,6 +218,7 @@ impl PushTransport for ApnsTransport {
             AppProfile::BuzzIosProduction => &self.production_base_url,
             AppProfile::BuzzIosSandbox => &self.sandbox_base_url,
         };
+        crate::metrics::record_apns_send_attempt();
         let response = self
             .client
             .post(format!("{base_url}/3/device/{endpoint}"))

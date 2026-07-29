@@ -42,7 +42,7 @@ assert j['metadata']['annotations']=={
     'helm.sh/hook-delete-policy':'before-hook-creation,hook-succeeded',
 }
 env={e['name'] for e in d['spec']['template']['spec']['containers'][0]['env']}
-required={'DATABASE_URL','BUZZ_PUSH_APNS_KEY_ID','BUZZ_PUSH_APNS_TEAM_ID','BUZZ_PUSH_APNS_TOPIC','BUZZ_PUSH_GRANT_KEYS','BUZZ_PUSH_TOKEN_KEYS','BUZZ_PUSH_MAX_GRANT_LIFETIME_SECONDS'}
+required={'DATABASE_URL','BUZZ_PUSH_APNS_CERT_PATH','BUZZ_PUSH_APNS_TOPIC','BUZZ_PUSH_GRANT_KEYS','BUZZ_PUSH_TOKEN_KEYS','BUZZ_PUSH_MAX_GRANT_LIFETIME_SECONDS'}
 assert required <= env
 assert d['spec']['replicas'] >= 2
 assert not any(x and x.get('kind')=='HTTPRoute' for x in xs)

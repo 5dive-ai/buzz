@@ -2,3 +2,8 @@
 exclude_rules_for_files:
   sq.pii.cc.visa:
     - Cargo.lock
+  # Self-signed test fixture generated solely to exercise reqwest identity parsing.
+  kingfisher.privkey.2:
+    - "*apns-test-identity.pem"
+  np.pem.1:
+    - "*apns-test-identity.pem"

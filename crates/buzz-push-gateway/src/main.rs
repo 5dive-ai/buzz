@@ -35,10 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let c = Config::from_env()?;
     let metrics_handle = buzz_push_gateway::metrics::install()?;
-    let transport = Arc::new(ApnsTransport::token(
-        &fs::read(&c.apns_key_path)?,
-        &c.apns_key_id,
-        &c.apns_team_id,
+    let transport = Arc::new(ApnsTransport::certificate(
+        &fs::read(&c.apns_cert_path)?,
         c.apns_topic,
     )?);
     let grant_keyring = GrantKeyring::new(

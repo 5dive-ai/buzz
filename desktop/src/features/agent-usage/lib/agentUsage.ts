@@ -197,10 +197,11 @@ export function bigintRatio(part: bigint, whole: bigint): number {
  *
  * - `exact`: `totalTokens.value` is present and parsed. `partial` mirrors the
  *   wire field's `incomplete` flag.
- * - `approximate`: `totalTokens.value` is absent but at least one of
- *   `inputTokens` / `outputTokens` is known; `value` is their bigint-safe sum.
- *   `partial` is `inputTokens.incomplete || outputTokens.incomplete`.
- *   Callers MUST render `≈` to distinguish this from a provider total.
+ * - `approximate`: `totalTokens.value` is absent and BOTH `inputTokens` and
+ *   `outputTokens` are known; `value` is their bigint-safe sum. `partial` is
+ *   `inputTokens.incomplete || outputTokens.incomplete`. Callers MUST render
+ *   `≈` to distinguish this from a provider total. A missing category is
+ *   unknown, not zero — one-sided i/o yields `unknown`, not `approximate`.
  * - `unknown`: no token counts are available at all; `value` is `null`.
  *
  * This is a *display* value only — it is NEVER written to the wire or stored.
@@ -223,10 +224,10 @@ export function deriveDisplayTotal(usage: {
   }
   const input = parseTokenCount(usage.inputTokens.value);
   const output = parseTokenCount(usage.outputTokens.value);
-  if (input !== null || output !== null) {
+  if (input !== null && output !== null) {
     return {
       kind: "approximate",
-      value: (input ?? 0n) + (output ?? 0n),
+      value: input + output,
       partial: isPartialField(usage.inputTokens) || isPartialField(usage.outputTokens),
     };
   }
@@ -366,54 +367,57 @@ export function deriveUsageIngressTrailing(series: AgentUsageSeries): string {
 }
 
 /**
- * Bigint-safe sum of each bucket's known `totalTokens` across a daily
- * series, for the overview/focused-view header total. `partial` is true
- * when any bucket has a known-but-incomplete total OR any bucket's total is
- * fully unknown (activity happened somewhere in the window that this exact
- * sum cannot include) — never silently reported as a complete figure.
- * Returns `knownTotal: null` only when every bucket has zero reports (a
- * true empty window, not partial data).
+ * Aggregate the per-bucket display totals across a daily series into a single
+ * provenance-bearing `DisplayTotal` for the overview/focused-view header.
  *
- * Also returns `approxTotal`: when `knownTotal` is null but at least one
- * bucket has known input/output, this is the sum of all known i/o fields
- * (labeled `≈` at the call site). Null when even i/o is unavailable.
- * The approximation is a display-only convenience — never stored or wired.
+ * Aggregation rules:
+ * - `exact`: every report-bearing bucket has an exact display total.
+ * - `approximate`: at least one bucket is approximate (sum of all
+ *   exact+approximate display values); a report-bearing bucket that is
+ *   approximate or has no total does NOT force unknown if i/o is available.
+ * - `unknown`: any report-bearing bucket has no display value at all (neither
+ *   exact nor approximate i/o available).
+ * - Empty window (no report-bearing buckets): `{ kind: "unknown", value: null, partial: false }`.
+ *
+ * `partial` reflects the i/o and total completeness of the contributing
+ * buckets (union of each bucket's `DisplayTotal.partial`) — it does NOT fire
+ * from total absence alone. An approximate aggregate with complete i/o carries
+ * `partial: false` even though no genuine provider total was emitted.
+ *
+ * The returned value is a *display* value only — never stored or wired.
  */
 export function sumKnownBucketTotals(
   buckets: readonly AgentUsageSeriesBucket[],
-): {
-  knownTotal: bigint | null;
-  approxTotal: bigint | null;
-  partial: boolean;
-} {
-  let sum = 0n;
-  let sawKnown = false;
+): DisplayTotal {
+  let sumValue = 0n;
+  let sawAny = false;        // any report-bearing bucket processed
+  let anyApprox = false;     // at least one approximate bucket
+  let anyUnknown = false;    // at least one report-bearing bucket with no display value
   let partial = false;
-  let approxSum = 0n;
-  let sawApprox = false;
 
   for (const bucket of buckets) {
-    const total = bucket.usage.totalTokens;
-    const known = parseTokenCount(total.value);
-    if (known !== null) {
-      sum += known;
-      sawKnown = true;
-    }
-    if (isPartialField(total) || (bucket.reportCount > 0 && known === null)) {
-      partial = true;
-    }
-    if (known === null) {
-      const dt = deriveDisplayTotal(bucket.usage);
-      if (dt.kind === "approximate") {
-        approxSum += dt.value;
-        sawApprox = true;
-      }
+    if (bucket.reportCount === 0) continue;
+    sawAny = true;
+    const dt = deriveDisplayTotal(bucket.usage);
+    if (dt.kind === "exact" || dt.kind === "approximate") {
+      sumValue += dt.value;
+      if (dt.partial) partial = true;
+      if (dt.kind === "approximate") anyApprox = true;
+    } else {
+      // Report-bearing bucket with no display value → aggregate is unknown.
+      anyUnknown = true;
     }
   }
 
-  return {
-    knownTotal: sawKnown ? sum : null,
-    approxTotal: !sawKnown && sawApprox ? approxSum : null,
-    partial,
-  };
+  if (!sawAny) {
+    // Truly empty window — no report-bearing buckets at all.
+    return { kind: "unknown", value: null, partial: false };
+  }
+  if (anyUnknown) {
+    return { kind: "unknown", value: null, partial: false };
+  }
+  if (anyApprox) {
+    return { kind: "approximate", value: sumValue, partial };
+  }
+  return { kind: "exact", value: sumValue, partial };
 }

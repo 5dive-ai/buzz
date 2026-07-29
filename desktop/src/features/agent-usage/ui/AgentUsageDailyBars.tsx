@@ -70,8 +70,10 @@ function deriveBarState(bucket: AgentUsageSeriesBucket) {
   const dt = deriveDisplayTotal(bucket.usage);
   if (dt.kind === "approximate") {
     return {
-      accessibleLabel: `${dateLabel} · ≈ ${formatTokenCountCompact(dt.value)} tokens (approx)`,
-      kind: "approx" as const,
+      accessibleLabel: `${dateLabel} · ≈ ${formatTokenCountCompact(dt.value)} tokens${
+        dt.partial ? " (partial)" : ""
+      }`,
+      kind: dt.partial ? ("approx-partial" as const) : ("approx" as const),
       knownTokens: dt.value,
     };
   }
@@ -154,7 +156,7 @@ function DailyBar({
       ? "—"
       : kind === "partial"
         ? `≥${formatTokenCountCompact(knownTokens ?? 0n)}`
-        : kind === "approx"
+        : kind === "approx" || kind === "approx-partial"
           ? `≈${formatTokenCountCompact(knownTokens ?? 0n)}`
           : formatTokenCountCompact(knownTokens ?? 0n);
 
@@ -180,7 +182,7 @@ function DailyBar({
             aria-label={accessibleLabel}
             className={cn(
               "w-full rounded-t-sm",
-              kind === "partial"
+              kind === "partial" || kind === "approx-partial"
                 ? "bg-primary/50"
                 : kind === "approx"
                   ? "bg-primary/70"

@@ -379,22 +379,24 @@ test("deriveDisplayTotal approximate partial=true when either i/o field is incom
   assert.equal(dt.partial, true);
 });
 
-test("deriveDisplayTotal returns approximate from input alone when output is null", () => {
+test("deriveDisplayTotal returns unknown when only input is known and output is null (fail-closed)", () => {
   const usage = reportedUsage({
     inputTokens: usageField({ value: "500" }),
+    // outputTokens: null (default)
   });
   const dt = deriveDisplayTotal(usage);
-  assert.equal(dt.kind, "approximate");
-  assert.equal(dt.value, 500n);
+  assert.equal(dt.kind, "unknown");
+  assert.equal(dt.value, null);
 });
 
-test("deriveDisplayTotal returns approximate from output alone when input is null", () => {
+test("deriveDisplayTotal returns unknown when only output is known and input is null (fail-closed)", () => {
   const usage = reportedUsage({
     outputTokens: usageField({ value: "300" }),
+    // inputTokens: null (default)
   });
   const dt = deriveDisplayTotal(usage);
-  assert.equal(dt.kind, "approximate");
-  assert.equal(dt.value, 300n);
+  assert.equal(dt.kind, "unknown");
+  assert.equal(dt.value, null);
 });
 
 test("deriveDisplayTotal returns unknown kind when all fields are null", () => {
@@ -438,6 +440,7 @@ test("sortAgentsByDisplayTotal ranks approximate totals above unknown totals", (
   const approxAgent = agentUsage("approx", null, {
     usage: reportedUsage({
       inputTokens: usageField({ value: "100" }),
+      outputTokens: usageField({ value: "50" }),
     }),
   });
   const unknownAgent = agentUsage("unknown", null);
@@ -451,12 +454,18 @@ test("sortAgentsByDisplayTotal handles mixed exact/approximate/unknown populatio
     agentUsage("u1", null), // unknown
     agentUsage("e1", "100"), // exact
     agentUsage("a1", null, { // approximate
-      usage: reportedUsage({ inputTokens: usageField({ value: "500" }) }),
+      usage: reportedUsage({
+        inputTokens: usageField({ value: "400" }),
+        outputTokens: usageField({ value: "100" }),
+      }),
     }),
     agentUsage("u2", null), // unknown
     agentUsage("e2", "300"), // exact
     agentUsage("a2", null, { // approximate
-      usage: reportedUsage({ inputTokens: usageField({ value: "200" }) }),
+      usage: reportedUsage({
+        inputTokens: usageField({ value: "150" }),
+        outputTokens: usageField({ value: "50" }),
+      }),
     }),
   ];
   const sorted = sortAgentsByDisplayTotal(agents);
@@ -582,8 +591,8 @@ test("sumKnownBucketTotals returns knownTotal null and partial false for an all-
     bucket({ reportCount: 0 }),
     bucket({ reportCount: 0 }),
   ]);
-  assert.equal(result.knownTotal, null);
-  assert.equal(result.approxTotal, null);
+  assert.equal(result.kind, "unknown");
+  assert.equal(result.value, null);
   assert.equal(result.partial, false);
 });
 
@@ -598,8 +607,8 @@ test("sumKnownBucketTotals sums all known totals when every bucket is fully know
       reportCount: 1,
     }),
   ]);
-  assert.equal(result.knownTotal, 300n);
-  assert.equal(result.approxTotal, null); // genuine total is known, no approx needed
+  assert.equal(result.kind, "exact");
+  assert.equal(result.value, 300n);
   assert.equal(result.partial, false);
 });
 
@@ -616,23 +625,25 @@ test("sumKnownBucketTotals marks partial true when any bucket has an incomplete 
       reportCount: 1,
     }),
   ]);
-  assert.equal(result.knownTotal, 300n);
+  assert.equal(result.kind, "exact");
+  assert.equal(result.value, 300n);
   assert.equal(result.partial, true);
 });
 
-test("sumKnownBucketTotals marks partial true when any bucket has reports but null total (activity not fully counted)", () => {
+test("sumKnownBucketTotals returns unknown when any report-bearing bucket has no display value", () => {
   const result = sumKnownBucketTotals([
     bucket({
       usage: reportedUsage({ totalTokens: usageField({ value: "100" }) }),
       reportCount: 1,
     }),
+    // report-bearing bucket with no total and no i/o — display is unknown
     bucket({ usage: reportedUsage(), reportCount: 1, hasUnknownUsage: true }),
   ]);
-  assert.equal(result.knownTotal, 100n);
-  assert.equal(result.partial, true);
+  assert.equal(result.kind, "unknown");
+  assert.equal(result.value, null);
 });
 
-test("sumKnownBucketTotals returns approxTotal from i/o sum when all bucket totals are null but i/o is known", () => {
+test("sumKnownBucketTotals returns approximate from i/o sum when all bucket totals are null but i/o is known", () => {
   // Real-world case: no publisher emits totalTokens, but i/o are always present.
   const result = sumKnownBucketTotals([
     bucket({
@@ -650,18 +661,61 @@ test("sumKnownBucketTotals returns approxTotal from i/o sum when all bucket tota
       reportCount: 1,
     }),
   ]);
-  assert.equal(result.knownTotal, null);
-  assert.equal(result.approxTotal, 1500n); // (800+200) + (400+100)
-  assert.equal(result.partial, true); // null totals with reports → partial
+  assert.equal(result.kind, "approximate");
+  assert.equal(result.value, 1500n); // (800+200) + (400+100)
+  assert.equal(result.partial, false); // i/o fields are complete — no PARTIAL badge
 });
 
-test("sumKnownBucketTotals returns null approxTotal when even i/o is unavailable", () => {
+test("sumKnownBucketTotals marks partial true when any approximate bucket has incomplete i/o", () => {
+  const result = sumKnownBucketTotals([
+    bucket({
+      usage: reportedUsage({
+        inputTokens: usageField({ value: "800", incomplete: true }),
+        outputTokens: usageField({ value: "200" }),
+      }),
+      reportCount: 1,
+    }),
+    bucket({
+      usage: reportedUsage({
+        inputTokens: usageField({ value: "400" }),
+        outputTokens: usageField({ value: "100" }),
+      }),
+      reportCount: 1,
+    }),
+  ]);
+  assert.equal(result.kind, "approximate");
+  assert.equal(result.partial, true);
+});
+
+test("sumKnownBucketTotals returns unknown when even i/o is unavailable for a report-bearing bucket", () => {
   const result = sumKnownBucketTotals([
     bucket({ usage: reportedUsage(), reportCount: 1, hasUnknownUsage: true }),
   ]);
-  assert.equal(result.knownTotal, null);
-  assert.equal(result.approxTotal, null);
-  assert.equal(result.partial, true);
+  assert.equal(result.kind, "unknown");
+  assert.equal(result.value, null);
+  assert.equal(result.partial, false);
+});
+
+test("sumKnownBucketTotals returns approximate when mixed exact and approximate buckets exist (mixed provider support)", () => {
+  // Steady-state once Task B supplies genuine totals for some providers:
+  // one bucket has an exact total; another has null total but known i/o.
+  const result = sumKnownBucketTotals([
+    bucket({
+      usage: reportedUsage({ totalTokens: usageField({ value: "1000" }) }),
+      reportCount: 1,
+    }),
+    bucket({
+      usage: reportedUsage({
+        inputTokens: usageField({ value: "300" }),
+        outputTokens: usageField({ value: "200" }),
+      }),
+      reportCount: 1,
+    }),
+  ]);
+  // Any approximate bucket → aggregate is approximate; sums exact+approx display values.
+  assert.equal(result.kind, "approximate");
+  assert.equal(result.value, 1500n); // 1000 + (300+200)
+  assert.equal(result.partial, false);
 });
 
 // ── deriveUsageIngressTrailing ────────────────────────────────────────────────

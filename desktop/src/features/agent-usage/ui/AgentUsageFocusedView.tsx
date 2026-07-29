@@ -208,16 +208,19 @@ function AgentUsageFocusedTotals({
   const { estimatedCostUsd, inputTokens, outputTokens } =
     agent.usage;
   const models = sortModelsByDisplayTotal(agent.models);
-  // `explainPartial` controls the caveat paragraph. Each sentence is gated
-  // only on the condition that proves it:
-  //   - unknown-intervals sentence: `agent.hasUnknownUsage` — true when
-  //     deltaReliable is false for at least one interval in the window.
+  // Each caveat sentence is gated only on the condition that proves it:
+  //   - unknown-intervals sentence: direct i/o incompleteness — true when at
+  //     least one input or output field is known but flagged incomplete. This
+  //     is the condition the copy claims ("input/output usage could not be
+  //     counted"). `hasUnknownUsage` is NOT used here because it ORs total
+  //     and cost incompleteness too, which cannot prove an i/o interval claim.
   //   - invalid-reports sentence: `coverage.invalidReportCount > 0` — true
   //     when rows were excluded from buckets due to bad timestamps or missing
   //     session cumulative totals.
   // We do NOT trigger on totalTokens.value being null — that's the permanent
   // state for all real publishers today, not a data quality problem.
-  const showUnknownIntervalsCaveat = agent.hasUnknownUsage;
+  const showUnknownIntervalsCaveat =
+    isPartialField(inputTokens) || isPartialField(outputTokens);
   const showInvalidReportsCaveat = coverage.invalidReportCount > 0;
 
   // Display total for the Total tokens stat.
@@ -304,8 +307,8 @@ function AgentUsageFocusedTotals({
         </p>
         {showUnknownIntervalsCaveat ? (
           <p data-testid="agent-usage-focused-unknown-intervals-caveat">
-            Some usage could not be counted: unknown intervals are omitted
-            rather than shown as zero.
+            Some input/output usage could not be counted and is omitted rather
+            than shown as zero.
           </p>
         ) : null}
         {showInvalidReportsCaveat ? (

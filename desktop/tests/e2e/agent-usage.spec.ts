@@ -775,13 +775,24 @@ test("focused view shows daily bars, coverage dates, and a partial explanation w
               {
                 start: bucketStart,
                 end: bucketStart + 86_400,
-                // incomplete=true → triggers partial explanation
-                usage: reportedUsage({ totalTokens: "500" }),
+                usage: reportedUsage({
+                  // Incomplete i/o — proves the "input/output usage could not
+                  // be counted" caveat sentence and triggers the gate.
+                  inputTokens: "400",
+                  outputTokens: "100",
+                  totalTokens: "500",
+                }),
                 reportCount: 2,
                 hasUnknownUsage: true,
               },
             ],
-            usage: reportedUsage({ totalTokens: "500" }),
+            usage: {
+              // Incomplete inputTokens → showUnknownIntervalsCaveat fires.
+              estimatedCostUsd: costField(null),
+              inputTokens: usageField("400", true), // incomplete
+              outputTokens: usageField("100", false),
+              totalTokens: usageField("500"),
+            },
           }),
         ],
         coverage: {
@@ -900,6 +911,109 @@ test("overview and focused view distinguish invalid-only windows from ordinary e
   ).toHaveCount(0);
 });
 
+// ── T1b: Behavioral regression guard — null totalTokens with known i/o renders ≈ ─
+//
+// This scenario will fail if the approximate display fallback is removed.
+// It covers the real-world prod shape where no publisher emits totalTokens
+// today — the overview row, header, daily bar, and focused total must all
+// visibly render ≈ rather than "No usage reported".
+
+test("overview row, header, daily bar, and focused total all render ≈ when totalTokens is null but i/o is known", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await openAgentsView(page);
+
+  const agentPubkey = await addGenericAgent(page, "general", "Approx Bot");
+
+  await page.evaluate(
+    ({ series }) => {
+      const testWindow = window as Window & {
+        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
+      };
+      testWindow.__BUZZ_E2E__ ??= {};
+      testWindow.__BUZZ_E2E__.mock ??= {};
+      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
+    },
+    {
+      series: mockUsageSeries({
+        agents: [
+          mockAgentUsage(agentPubkey, {
+            buckets: [
+              {
+                start: 1_700_000_000,
+                end: 1_700_086_400,
+                hasUnknownUsage: false,
+                reportCount: 1,
+                usage: reportedUsage({
+                  inputTokens: "800",
+                  outputTokens: "200",
+                  totalTokens: null, // real prod shape — no provider total
+                }),
+              },
+            ],
+            usage: reportedUsage({
+              inputTokens: "800",
+              outputTokens: "200",
+              totalTokens: null, // real prod shape — no provider total
+            }),
+          }),
+        ],
+        buckets: [
+          {
+            start: 1_700_000_000,
+            end: 1_700_086_400,
+            hasUnknownUsage: false,
+            reportCount: 1,
+            usage: reportedUsage({
+              inputTokens: "800",
+              outputTokens: "200",
+              totalTokens: null,
+            }),
+          },
+        ],
+        coverage: {
+          firstArchivedAt: 1_700_000_000,
+          firstReportedAt: 1_700_000_000,
+          hasUnknownUsage: false,
+          invalidReportCount: 0,
+          lastArchivedAt: 1_700_086_400,
+          lastReportedAt: 1_700_086_400,
+          reportCount: 1,
+        },
+      }),
+    },
+  );
+
+  await page.getByTestId("open-agents-view").click();
+
+  // Overview row must render ≈ approximate total, not "No usage reported".
+  const row = page.getByTestId(`agent-usage-row-${agentPubkey}`);
+  await expect(row).toBeVisible();
+  await expect(row).toContainText("≈");
+  await expect(row).not.toContainText("No usage reported");
+
+  // Section header must render ≈ total (sumKnownBucketTotals → approximate).
+  const overallBars = page.getByTestId("agent-usage-overall-bars");
+  await expect(overallBars).toBeVisible();
+  await expect(overallBars).toContainText("≈");
+
+  // Daily bar must render with a bar (not a hatched unknown baseline) and
+  // show ≈ trailing label.
+  const dailyBars = page.getByTestId("agent-usage-daily-bars");
+  await expect(dailyBars).toBeVisible();
+  await expect(dailyBars).toContainText("≈");
+
+  // Focused total must render ≈ approximate stat.
+  await row.click();
+  await expect(page.getByTestId("user-profile-panel")).toBeVisible();
+  await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible();
+  const focusedTotals = page.getByTestId("agent-usage-focused-totals");
+  await expect(focusedTotals).toBeVisible();
+  await expect(focusedTotals).toContainText("≈");
+  await expect(focusedTotals).not.toContainText("No usage reported");
+});
+
 // ── T2: I/O-incomplete partial behavioral coverage ────────────────────────────
 
 test("overview row shows Partial badge and ingress shows partial marker when I/O fields are incomplete with null total", async ({
@@ -940,10 +1054,10 @@ test("overview row shows Partial badge and ingress shows partial marker when I/O
   const row = page.getByTestId(`agent-usage-row-${agentPubkey}`);
   await expect(row).toBeVisible();
 
-  // Row must show Partial badge — not just the I/O text.
+  // Row must show Partial badge — the approximate total carries partial provenance.
   await expect(row.getByText("Partial", { exact: true })).toBeVisible();
-  // Row must show the I/O breakdown text.
-  await expect(row).toContainText("in 800");
+  // Row must show the ≈ approximate total (both i/o present, null total → approx display).
+  await expect(row).toContainText("≈ 1K");
 
   // Open the profile panel to reach the Info tab for ingress verification.
   await row.click();

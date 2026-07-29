@@ -175,14 +175,15 @@ function AgentUsageCard({
           <div className="flex items-baseline justify-between gap-2">
             <h3 className="text-sm font-medium text-foreground">Daily usage</h3>
             <span className="text-sm text-muted-foreground">
-              {overallTotal.knownTotal !== null
-                ? `${formatTokenCountCompact(overallTotal.knownTotal)} tokens`
-                : overallTotal.approxTotal !== null
-                  ? `≈ ${formatTokenCountCompact(overallTotal.approxTotal)} tokens`
+              {overallTotal.kind === "exact"
+                ? `${formatTokenCountCompact(overallTotal.value)} tokens`
+                : overallTotal.kind === "approximate"
+                  ? `≈ ${formatTokenCountCompact(overallTotal.value)} tokens`
                   : hasInvalidOnlyInWindow
                     ? "Usage uncountable"
                     : "No usage reported"}
-              {overallTotal.partial || hasInvalidOnlyInWindow ? (
+              {(overallTotal.kind !== "unknown" && overallTotal.partial) ||
+              hasInvalidOnlyInWindow ? (
                 <Badge className="ml-2" variant="outline">
                   Partial
                 </Badge>

@@ -111,6 +111,50 @@ fn buzz_mesh_name_is_stable_and_does_not_expose_the_relay() {
 }
 
 #[test]
+fn sharing_config_keeps_the_community_where_sharing_was_enabled() {
+    let request = mesh_llm::StartMeshNodeRequest {
+        mode: mesh_llm::MeshNodeMode::Serve,
+        model_id: Some("test-model".to_string()),
+        max_vram_gb: Some(24),
+        join_token: None,
+        mesh_name: Some("buzz-community-test".to_string()),
+        relay_url: Some("wss://community.example".to_string()),
+        trusted_owner_ids: Some(Vec::new()),
+    };
+
+    let config = sharing_config_from_request(&request).expect("valid sharing config");
+    assert_eq!(config.relay_url.as_deref(), Some("wss://community.example"));
+}
+
+#[test]
+fn legacy_sharing_config_without_community_binding_still_loads() {
+    let config: MeshSharingConfig = serde_json::from_value(serde_json::json!({
+        "enabled": true,
+        "modelId": "test-model",
+        "maxVramGb": null
+    }))
+    .expect("legacy sharing config");
+
+    assert_eq!(config.relay_url, None);
+}
+
+#[test]
+fn download_checkpoint_disarms_launch_restore_without_losing_selection() {
+    let config = MeshSharingConfig {
+        enabled: true,
+        model_id: "test-model".to_string(),
+        max_vram_gb: Some(24),
+        relay_url: Some("wss://community.example".to_string()),
+    };
+
+    let checkpoint = disabled_sharing_checkpoint(&config);
+    assert!(!checkpoint.enabled);
+    assert_eq!(checkpoint.model_id, config.model_id);
+    assert_eq!(checkpoint.max_vram_gb, config.max_vram_gb);
+    assert_eq!(checkpoint.relay_url, config.relay_url);
+}
+
+#[test]
 fn readiness_failure_is_catalog_sync_when_model_never_visible() {
     assert_eq!(
         classify_mesh_readiness_failure(false),
@@ -345,6 +389,7 @@ fn ensure_serve_runtime_serves_other_model() {
                         max_vram_gb: None,
                         join_token: None,
                         mesh_name: None,
+                        relay_url: None,
                         trusted_owner_ids: None,
                     })
                     .await

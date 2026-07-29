@@ -8,10 +8,10 @@
 //!   P2 auto-model chat      — agent sends `model: "auto"`; mesh router picks.
 //!   P3 context-fit regression — an oversized output budget (150k tokens)
 //!      must FAIL with the router's context error (proves the router's fit
-//!      gate — the failure mode the 1024 preset cap protects against).
+//!      gate — the failure mode the 4096 preset cap protects against).
 //!   P4 agentic tool use     — agent + buzz-dev-mcp writes a file on disk.
-//!   P5 Buzz reply command   — agent runs the exact `buzz messages send`
-//!      command used to publish a reply and receives an accepted result.
+//!   P5 Buzz reply command   — agent asks the real developer MCP to run the
+//!      exact `buzz messages send` command used to publish a reply.
 //!
 //! The serve node is the same `mesh_llm_sdk::serve` path Share-compute uses
 //! (publish off, mdns, loopback). The agent legs spawn the real
@@ -34,6 +34,36 @@ use tokio::process::{Child, Command};
 const DEFAULT_MODEL: &str = "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M";
 const API_PORT: u16 = 19437;
 const CONSOLE_PORT: u16 = 13231;
+
+#[derive(Clone)]
+struct McpServerEnv {
+    name: String,
+    value: String,
+}
+
+#[derive(Clone)]
+struct McpServerSpec {
+    name: String,
+    command: String,
+    env: Vec<McpServerEnv>,
+}
+
+impl McpServerSpec {
+    fn new(name: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: command.into(),
+            env: Vec::new(),
+        }
+    }
+
+    fn set_env(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.env.push(McpServerEnv {
+            name: name.into(),
+            value: value.into(),
+        });
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
@@ -168,7 +198,7 @@ async fn run() -> anyhow::Result<()> {
     let prompt = format!(
         "Use your developer tools to create {marker_name} in the current working directory containing exactly the text BUZZ_OK (no quotes, no newline commentary). Then confirm."
     );
-    let mcp = vec![("dev".to_string(), repo_bin("buzz-dev-mcp")?)];
+    let mcp = vec![McpServerSpec::new("dev", repo_bin("buzz-dev-mcp")?)];
     let (r, marker) =
         agent_chat_with_marker(&base, &served_id, None, &prompt, &mcp, &marker_name).await;
     let file_ok = std::fs::read_to_string(&marker)
@@ -188,16 +218,19 @@ async fn run() -> anyhow::Result<()> {
     }
     let _ = std::fs::remove_file(&marker);
 
-    // P5: prove the model follows Buzz's real reply path. The isolated PATH
-    // contains a fake `buzz` executable so this remains deterministic and
-    // cannot publish to a real community. The fake records the exact argv and
-    // returns the same accepted-write shape as buzz-cli.
+    // P5: prove the model follows Buzz's real reply path. buzz-dev-mcp always
+    // prepends its own multicall `buzz` shim to PATH, so a fake `buzz` later on
+    // PATH cannot isolate this test. Instead, inject a fake shell into the real
+    // MCP server. It records the exact command at the execution boundary and
+    // returns the same accepted-write shape as buzz-cli, without contacting a
+    // community.
     let send_marker = format!("mesh-e2e-buzz-send-{}.txt", std::process::id());
     let prompt = "Use the developer shell tool to run exactly this command: buzz messages send --channel test-channel --content BUZZ_REPLY_OK. Do not simulate or substitute another command. After it succeeds, confirm briefly.";
     let (r, marker) =
-        agent_chat_with_fake_buzz(&base, &served_id, prompt, &mcp, &send_marker).await;
+        agent_chat_with_fake_shell(&base, &served_id, prompt, &mcp, &send_marker).await;
     let recorded = std::fs::read_to_string(&marker).unwrap_or_default();
-    let send_ok = recorded.trim() == "messages send --channel test-channel --content BUZZ_REPLY_OK";
+    let send_ok =
+        recorded.trim() == "buzz messages send --channel test-channel --content BUZZ_REPLY_OK";
     match r {
         Ok(text) => record(
             "P5 Buzz reply command",
@@ -260,7 +293,7 @@ async fn agent_chat(
     model: &str,
     max_output_tokens: Option<&str>,
     prompt: &str,
-    mcp_servers: &[(String, String)],
+    mcp_servers: &[McpServerSpec],
 ) -> anyhow::Result<String> {
     let (result, _) =
         agent_chat_in_isolated_home(base, model, max_output_tokens, prompt, mcp_servers, None)
@@ -273,7 +306,7 @@ async fn agent_chat_with_marker(
     model: &str,
     max_output_tokens: Option<&str>,
     prompt: &str,
-    mcp_servers: &[(String, String)],
+    mcp_servers: &[McpServerSpec],
     marker_name: &str,
 ) -> (anyhow::Result<String>, std::path::PathBuf) {
     let (result, home) =
@@ -282,11 +315,11 @@ async fn agent_chat_with_marker(
     (result, home.join(marker_name))
 }
 
-async fn agent_chat_with_fake_buzz(
+async fn agent_chat_with_fake_shell(
     base: &str,
     model: &str,
     prompt: &str,
-    mcp_servers: &[(String, String)],
+    mcp_servers: &[McpServerSpec],
     marker_name: &str,
 ) -> (anyhow::Result<String>, std::path::PathBuf) {
     let (result, home) =
@@ -300,8 +333,8 @@ async fn agent_chat_in_isolated_home(
     model: &str,
     max_output_tokens: Option<&str>,
     prompt: &str,
-    mcp_servers: &[(String, String)],
-    fake_buzz_marker_name: Option<&str>,
+    mcp_servers: &[McpServerSpec],
+    fake_shell_marker_name: Option<&str>,
 ) -> (anyhow::Result<String>, std::path::PathBuf) {
     let agent = match repo_bin("buzz-agent") {
         Ok(agent) => agent,
@@ -313,17 +346,22 @@ async fn agent_chat_in_isolated_home(
         return (Err(error.into()), home);
     }
 
-    let inherited_path = std::env::var("PATH").unwrap_or_default();
-    let mut child_path = inherited_path.clone();
-    let mut fake_buzz_marker = None;
-    if let Some(marker_name) = fake_buzz_marker_name {
-        match install_fake_buzz(&home) {
-            Ok(bin_dir) => {
-                child_path = format!("{}:{inherited_path}", bin_dir.to_string_lossy());
-                fake_buzz_marker = Some(home.join(marker_name));
-            }
+    let child_path = std::env::var("PATH").unwrap_or_default();
+    let mut effective_mcp_servers = mcp_servers.to_vec();
+    if let Some(marker_name) = fake_shell_marker_name {
+        let fake_shell = match install_fake_shell(&home) {
+            Ok(fake_shell) => fake_shell,
             Err(error) => return (Err(error), home),
-        }
+        };
+        let marker = home.join(marker_name);
+        let Some(dev_server) = effective_mcp_servers
+            .iter_mut()
+            .find(|server| server.name == "dev")
+        else {
+            return (Err(anyhow::anyhow!("P5 requires the dev MCP server")), home);
+        };
+        dev_server.set_env("BUZZ_SHELL", fake_shell.to_string_lossy());
+        dev_server.set_env("BUZZ_E2E_SEND_MARKER", marker.to_string_lossy());
     }
 
     let mut command = Command::new(&agent);
@@ -343,9 +381,6 @@ async fn agent_chat_in_isolated_home(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    if let Some(marker) = &fake_buzz_marker {
-        command.env("BUZZ_E2E_SEND_MARKER", marker);
-    }
     // P3 deliberately overrides the production default to exercise the
     // router's context-fit rejection. Normal and tool turns leave it unset,
     // matching the desktop provider path.
@@ -357,27 +392,29 @@ async fn agent_chat_in_isolated_home(
         Err(error) => return (Err(error.into()), home),
     };
 
-    let result = drive_acp(&mut child, prompt, mcp_servers, &home).await;
+    let result = drive_acp(&mut child, prompt, &effective_mcp_servers, &home).await;
     let _ = child.kill().await;
     (result, home)
 }
 
 #[cfg(unix)]
-fn install_fake_buzz(home: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+fn install_fake_shell(home: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let bin_dir = home.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
-    let executable = bin_dir.join("buzz");
+    let executable = bin_dir.join("mesh-e2e-shell");
     std::fs::write(
         &executable,
         r#"#!/bin/sh
-if [ "$1" = "messages" ] && [ "$2" = "send" ]; then
-  printf '%s\n' "$*" > "$BUZZ_E2E_SEND_MARKER"
+if [ "$1" = "-lc" ]; then
+  printf '%s\n' "$2" > "$BUZZ_E2E_SEND_MARKER"
+fi
+if [ "$1" = "-lc" ] && [ "$2" = "buzz messages send --channel test-channel --content BUZZ_REPLY_OK" ]; then
   printf '%s\n' '{"event_id":"mesh-e2e-event","accepted":true,"message":"ok"}'
   exit 0
 fi
-printf 'unsupported fake buzz invocation: %s\n' "$*" >&2
+printf 'unsupported fake shell invocation: %s\n' "$*" >&2
 exit 2
 "#,
     )?;
@@ -388,14 +425,14 @@ exit 2
 }
 
 #[cfg(not(unix))]
-fn install_fake_buzz(_home: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+fn install_fake_shell(_home: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!("the mesh agent hardware harness currently requires Unix")
 }
 
 async fn drive_acp(
     child: &mut Child,
     prompt: &str,
-    mcp_servers: &[(String, String)],
+    mcp_servers: &[McpServerSpec],
     cwd: &std::path::Path,
 ) -> anyhow::Result<String> {
     let mut stdin = child
@@ -410,8 +447,18 @@ async fn drive_acp(
 
     let mcp_json: Vec<serde_json::Value> = mcp_servers
         .iter()
-        .map(|(name, command)| {
-            serde_json::json!({ "name": name, "command": command, "args": [], "env": [] })
+        .map(|server| {
+            let env: Vec<serde_json::Value> = server
+                .env
+                .iter()
+                .map(|entry| serde_json::json!({ "name": &entry.name, "value": &entry.value }))
+                .collect();
+            serde_json::json!({
+                "name": &server.name,
+                "command": &server.command,
+                "args": [],
+                "env": env,
+            })
         })
         .collect();
 

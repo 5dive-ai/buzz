@@ -63,6 +63,36 @@ struct MediaReadAuth {
     tenant: TenantContext,
 }
 
+async fn enforce_media_corporate_identity(
+    state: &AppState,
+    tenant: &TenantContext,
+    headers: &HeaderMap,
+    pubkey: nostr::PublicKey,
+) -> Result<(), MediaError> {
+    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    let identity_jwt = crate::corporate_identity::identity_jwt_from_headers(
+        headers,
+        &state.config.corporate_identity,
+    );
+    crate::corporate_identity::enforce_corporate_identity(
+        state,
+        tenant.community(),
+        pubkey,
+        identity_jwt.as_deref(),
+        auth_tag,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| {
+        tracing::warn!(pubkey = %pubkey.to_hex(), error = %e, "media: corporate identity denied");
+        if e.status_code() == StatusCode::UNAUTHORIZED {
+            MediaError::Unauthorized
+        } else {
+            MediaError::RelayMembershipRequired
+        }
+    })
+}
+
 const MEDIA_UPLOAD_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 struct UploadPermit {
@@ -208,26 +238,7 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         // media). On open relays (membership disabled) any valid Blossom signer
         // may upload, matching the WS door's admission policy.
         let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-        let identity_jwt = crate::corporate_identity::identity_jwt_from_headers(
-            headers,
-            &state.config.corporate_identity,
-        );
-        crate::corporate_identity::enforce_corporate_identity(
-            state,
-            tenant.community(),
-            auth_event.pubkey,
-            identity_jwt.as_deref(),
-            auth_tag,
-        )
-        .await
-        .map_err(|e| {
-            tracing::warn!(pubkey = %auth_event.pubkey.to_hex(), error = %e, "media: corporate identity denied");
-            if e.status_code() == StatusCode::UNAUTHORIZED {
-                MediaError::Unauthorized
-            } else {
-                MediaError::RelayMembershipRequired
-            }
-        })?;
+        enforce_media_corporate_identity(state, &tenant, headers, auth_event.pubkey).await?;
 
         crate::api::relay_members::enforce_relay_membership(
             state,
@@ -523,6 +534,7 @@ async fn authenticate_media_read(
     buzz_media::auth::verify_blossom_get_auth(&auth_event, sha256, Some(tenant.host()), 3600)?;
 
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    enforce_media_corporate_identity(state, &tenant, headers, auth_event.pubkey).await?;
     crate::api::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
@@ -967,13 +979,26 @@ mod tests {
     }
 
     async fn test_state() -> Arc<AppState> {
-        test_state_with_media_get_auth(false).await
+        test_state_with_media_auth(false, false).await
     }
 
     async fn test_state_with_media_get_auth(require_media_get_auth: bool) -> Arc<AppState> {
+        test_state_with_media_auth(require_media_get_auth, false).await
+    }
+
+    async fn test_state_with_media_auth(
+        require_media_get_auth: bool,
+        require_corporate_identity: bool,
+    ) -> Arc<AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.require_media_get_auth = require_media_get_auth;
+        config.corporate_identity.require = require_corporate_identity;
+        if require_corporate_identity {
+            config.corporate_identity.jwks_uri = "http://127.0.0.1:9/jwks".to_string();
+            config.corporate_identity.issuer = "https://idp.example".to_string();
+            config.corporate_identity.audience = "buzz-relay".to_string();
+        }
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.media_uploads_per_minute = 1;
         config.media_max_concurrent_uploads = 2;
@@ -1017,6 +1042,16 @@ mod tests {
 
     async fn media_get_auth_router(require_media_get_auth: bool) -> axum::Router {
         let state = test_state_with_media_get_auth(require_media_get_auth).await;
+        axum::Router::new()
+            .route(
+                "/media/{sha256_ext}",
+                axum::routing::get(get_blob).head(head_blob),
+            )
+            .with_state(state)
+    }
+
+    async fn media_get_auth_router_with_corporate_identity() -> axum::Router {
+        let state = test_state_with_media_auth(true, true).await;
         axum::Router::new()
             .route(
                 "/media/{sha256_ext}",
@@ -1096,6 +1131,22 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn protected_media_reads_require_corporate_identity_for_get_and_head() {
+        let keys = Keys::generate();
+
+        for method in ["GET", "HEAD"] {
+            let auth = media_get_auth_header(&keys, media_get_tags_for("relay.example", None));
+            let response = media_get_auth_router_with_corporate_identity()
+                .await
+                .oneshot(media_request(method, Some(auth)))
+                .await
+                .expect("response");
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+        }
     }
 
     #[tokio::test]

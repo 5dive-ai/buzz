@@ -97,9 +97,7 @@ impl CorporateIdentityService {
             CorporateIdentityError::InvalidJwt(format!("invalid JWK for kid {kid}: {e}"))
         })?;
 
-        let mut validation = Validation::new(header.alg);
-        validation.set_issuer(&[self.config.issuer.as_str()]);
-        validation.set_audience(&[self.config.audience.as_str()]);
+        let validation = jwt_validation(header.alg, &self.config);
 
         let decoded = decode::<RawJwtClaims>(token, &decoding_key, &validation)
             .map_err(|e| CorporateIdentityError::InvalidJwt(e.to_string()))?;
@@ -157,6 +155,17 @@ impl CorporateIdentityService {
             .await
             .map_err(|e| CorporateIdentityError::Jwks(e.to_string()))
     }
+}
+
+fn jwt_validation(algorithm: Algorithm, config: &CorporateIdentityConfig) -> Validation {
+    let mut validation = Validation::new(algorithm);
+    validation.set_issuer(&[config.issuer.as_str()]);
+    validation.set_audience(&[config.audience.as_str()]);
+    // jsonwebtoken only validates `aud` when the claim is present unless it is
+    // also listed as required. A correctly signed token minted for some other
+    // service must not be able to omit `aud` and enroll a Buzz identity binding.
+    validation.required_spec_claims.insert("aud".to_string());
+    validation
 }
 
 /// Outcome of corporate identity enforcement.
@@ -867,6 +876,34 @@ mod tests {
             .await
             .expect_err("HS256 must be rejected");
         assert!(matches!(err, CorporateIdentityError::InvalidJwt(_)));
+    }
+
+    #[test]
+    fn jwt_validation_rejects_token_without_audience_claim() {
+        let secret = b"test-secret";
+        let header = Header::new(Algorithm::HS256);
+        let token = encode(
+            &header,
+            &serde_json::json!({
+                "iss": "https://idp.example",
+                "sub": "user-1",
+                "email": "user@example.com",
+                "exp": 4_102_444_800_u64
+            }),
+            &EncodingKey::from_secret(secret),
+        )
+        .expect("encode test JWT");
+
+        let err = decode::<RawJwtClaims>(
+            &token,
+            &DecodingKey::from_secret(secret),
+            &jwt_validation(Algorithm::HS256, &test_config()),
+        )
+        .expect_err("a token without aud must not enroll an identity binding");
+        assert!(
+            err.to_string().contains("aud"),
+            "unexpected validation error: {err}"
+        );
     }
 
     #[test]

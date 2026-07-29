@@ -156,9 +156,11 @@ function DailyBar({
       ? "—"
       : kind === "partial"
         ? `≥${formatTokenCountCompact(knownTokens ?? 0n)}`
-        : kind === "approx" || kind === "approx-partial"
-          ? `≈${formatTokenCountCompact(knownTokens ?? 0n)}`
-          : formatTokenCountCompact(knownTokens ?? 0n);
+        : kind === "approx-partial"
+          ? `≈${formatTokenCountCompact(knownTokens ?? 0n)}*`
+          : kind === "approx"
+            ? `≈${formatTokenCountCompact(knownTokens ?? 0n)}`
+            : formatTokenCountCompact(knownTokens ?? 0n);
 
   return (
     <div

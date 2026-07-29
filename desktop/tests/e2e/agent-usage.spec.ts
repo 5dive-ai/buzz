@@ -826,9 +826,9 @@ test("focused view shows daily bars, coverage dates, and a partial explanation w
   await expect(coverage).toBeVisible();
   await expect(coverage).toContainText("reported turn");
 
-  // The partial explanation must appear when usage is known-incomplete.
-  // The seed has hasUnknownUsage=true AND invalidReportCount=1, so both
-  // per-condition caveat sentences must appear independently.
+  // Both caveat sentences must appear when the gate conditions are met.
+  // The seed has inputTokens.incomplete=true (fires unknown-intervals sentence)
+  // AND invalidReportCount=1 (fires invalid-reports sentence).
   await expect(
     page.getByTestId("agent-usage-focused-unknown-intervals-caveat"),
   ).toBeVisible();
@@ -994,9 +994,12 @@ test("overview row, header, daily bar, and focused total all render ≈ when tot
   await expect(row).not.toContainText("No usage reported");
 
   // Section header must render ≈ total (sumKnownBucketTotals → approximate).
-  const overallBars = page.getByTestId("agent-usage-overall-bars");
-  await expect(overallBars).toBeVisible();
-  await expect(overallBars).toContainText("≈");
+  // Assert the dedicated value node directly so the header fails independently
+  // even if a child daily bar still shows ≈.
+  const headerValue = page.getByTestId("agent-usage-header-value");
+  await expect(headerValue).toBeVisible();
+  await expect(headerValue).toContainText("≈");
+  await expect(headerValue).not.toContainText("No usage reported");
 
   // Daily bar must render with a bar (not a hatched unknown baseline) and
   // show ≈ trailing label.
@@ -1005,13 +1008,15 @@ test("overview row, header, daily bar, and focused total all render ≈ when tot
   await expect(dailyBars).toContainText("≈");
 
   // Focused total must render ≈ approximate stat.
+  // Assert the dedicated value node directly so the stat fails independently
+  // even if a focused daily bar still shows ≈.
   await row.click();
   await expect(page.getByTestId("user-profile-panel")).toBeVisible();
   await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible();
-  const focusedTotals = page.getByTestId("agent-usage-focused-totals");
-  await expect(focusedTotals).toBeVisible();
-  await expect(focusedTotals).toContainText("≈");
-  await expect(focusedTotals).not.toContainText("No usage reported");
+  const focusedTotalValue = page.getByTestId("agent-usage-focused-total-value");
+  await expect(focusedTotalValue).toBeVisible();
+  await expect(focusedTotalValue).toContainText("≈");
+  await expect(focusedTotalValue).not.toHaveText("—");
 });
 
 // ── T2: I/O-incomplete partial behavioral coverage ────────────────────────────
@@ -1037,6 +1042,21 @@ test("overview row shows Partial badge and ingress shows partial marker when I/O
       series: mockUsageSeries({
         agents: [
           mockAgentUsage(agentPubkey, {
+            buckets: [
+              {
+                start: 1_700_000_000,
+                end: 1_700_086_400,
+                hasUnknownUsage: false,
+                reportCount: 1,
+                usage: {
+                  // null total, incomplete input — approx-partial bar kind
+                  estimatedCostUsd: costField(null),
+                  inputTokens: usageField("800", true), // incomplete
+                  outputTokens: usageField("200", false),
+                  totalTokens: usageField(null),
+                },
+              },
+            ],
             usage: {
               // null total, incomplete I/O — per-field Partial must surface
               estimatedCostUsd: costField(null),
@@ -1045,6 +1065,21 @@ test("overview row shows Partial badge and ingress shows partial marker when I/O
               totalTokens: usageField(null),
             },
           }),
+        ],
+        buckets: [
+          {
+            start: 1_700_000_000,
+            end: 1_700_086_400,
+            hasUnknownUsage: false,
+            reportCount: 1,
+            usage: {
+              // null total, incomplete input — approx-partial aggregate
+              estimatedCostUsd: costField(null),
+              inputTokens: usageField("800", true), // incomplete
+              outputTokens: usageField("200", false),
+              totalTokens: usageField(null),
+            },
+          },
         ],
       }),
     },
@@ -1058,6 +1093,12 @@ test("overview row shows Partial badge and ingress shows partial marker when I/O
   await expect(row.getByText("Partial", { exact: true })).toBeVisible();
   // Row must show the ≈ approximate total (both i/o present, null total → approx display).
   await expect(row).toContainText("≈ 1K");
+
+  // Daily bar for an approx-partial bucket must use ≈N* trailing text
+  // (distinct from plain ≈N so a sighted user sees the partial signal).
+  const dailyBars = page.getByTestId("agent-usage-daily-bars");
+  await expect(dailyBars).toBeVisible();
+  await expect(dailyBars).toContainText("≈1K*");
 
   // Open the profile panel to reach the Info tab for ingress verification.
   await row.click();

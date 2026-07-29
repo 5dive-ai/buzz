@@ -371,18 +371,17 @@ export function deriveUsageIngressTrailing(series: AgentUsageSeries): string {
  * provenance-bearing `DisplayTotal` for the overview/focused-view header.
  *
  * Aggregation rules:
- * - `exact`: every report-bearing bucket has an exact display total.
- * - `approximate`: at least one bucket is approximate (sum of all
- *   exact+approximate display values); a report-bearing bucket that is
- *   approximate or has no total does NOT force unknown if i/o is available.
- * - `unknown`: any report-bearing bucket has no display value at all (neither
- *   exact nor approximate i/o available).
+ * - `exact`: every report-bearing bucket contributed an exact display total.
+ * - `approximate`: at least one bucket contributed an approximate value;
+ *   `partial` is the union of contributing buckets' `DisplayTotal.partial`.
+ *   Unknown-bucket peers set `partial = true` but do NOT erase the known sum —
+ *   the result surfaces a labeled lower bound rather than hiding measured data.
+ * - `unknown`: NO report-bearing bucket has any display value at all.
  * - Empty window (no report-bearing buckets): `{ kind: "unknown", value: null, partial: false }`.
  *
- * `partial` reflects the i/o and total completeness of the contributing
- * buckets (union of each bucket's `DisplayTotal.partial`) — it does NOT fire
- * from total absence alone. An approximate aggregate with complete i/o carries
- * `partial: false` even though no genuine provider total was emitted.
+ * `partial` reflects i/o and total completeness of contributing buckets.
+ * An approximate aggregate with complete i/o and no exact totals carries
+ * `partial: false` — total absence alone does NOT trigger partial.
  *
  * The returned value is a *display* value only — never stored or wired.
  */
@@ -391,8 +390,8 @@ export function sumKnownBucketTotals(
 ): DisplayTotal {
   let sumValue = 0n;
   let sawAny = false;        // any report-bearing bucket processed
-  let anyApprox = false;     // at least one approximate bucket
-  let anyUnknown = false;    // at least one report-bearing bucket with no display value
+  let anyApprox = false;     // at least one approximate bucket contributed a value
+  let anyWithValue = false;  // at least one bucket contributed a numeric value
   let partial = false;
 
   for (const bucket of buckets) {
@@ -401,11 +400,13 @@ export function sumKnownBucketTotals(
     const dt = deriveDisplayTotal(bucket.usage);
     if (dt.kind === "exact" || dt.kind === "approximate") {
       sumValue += dt.value;
+      anyWithValue = true;
       if (dt.partial) partial = true;
       if (dt.kind === "approximate") anyApprox = true;
     } else {
-      // Report-bearing bucket with no display value → aggregate is unknown.
-      anyUnknown = true;
+      // Report-bearing bucket with no display value — sets partial but does NOT
+      // erase the sum already accumulated from sibling buckets.
+      partial = true;
     }
   }
 
@@ -413,7 +414,8 @@ export function sumKnownBucketTotals(
     // Truly empty window — no report-bearing buckets at all.
     return { kind: "unknown", value: null, partial: false };
   }
-  if (anyUnknown) {
+  if (!anyWithValue) {
+    // Report-bearing buckets exist but none had any display value.
     return { kind: "unknown", value: null, partial: false };
   }
   if (anyApprox) {

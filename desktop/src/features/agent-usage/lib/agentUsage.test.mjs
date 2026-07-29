@@ -630,17 +630,20 @@ test("sumKnownBucketTotals marks partial true when any bucket has an incomplete 
   assert.equal(result.partial, true);
 });
 
-test("sumKnownBucketTotals returns unknown when any report-bearing bucket has no display value", () => {
+test("sumKnownBucketTotals preserves known exact subtotal when a sibling bucket is unknown (partial=true)", () => {
+  // Thufir's explicit ruling: one unknown report-bearing bucket must NOT erase the known subtotal.
+  // The result surfaces the labeled lower bound rather than hiding measured data.
   const result = sumKnownBucketTotals([
     bucket({
       usage: reportedUsage({ totalTokens: usageField({ value: "100" }) }),
       reportCount: 1,
     }),
-    // report-bearing bucket with no total and no i/o — display is unknown
+    // report-bearing bucket with no total and no i/o — display is unknown, but does NOT erase sum
     bucket({ usage: reportedUsage(), reportCount: 1, hasUnknownUsage: true }),
   ]);
-  assert.equal(result.kind, "unknown");
-  assert.equal(result.value, null);
+  assert.equal(result.kind, "exact");
+  assert.equal(result.value, 100n);
+  assert.equal(result.partial, true); // unknown sibling sets partial
 });
 
 test("sumKnownBucketTotals returns approximate from i/o sum when all bucket totals are null but i/o is known", () => {
@@ -715,6 +718,34 @@ test("sumKnownBucketTotals returns approximate when mixed exact and approximate 
   // Any approximate bucket → aggregate is approximate; sums exact+approx display values.
   assert.equal(result.kind, "approximate");
   assert.equal(result.value, 1500n); // 1000 + (300+200)
+  assert.equal(result.partial, false);
+});
+
+test("sumKnownBucketTotals preserves known approximate subtotal when a sibling bucket is unknown (partial=true)", () => {
+  // Parallel to the exact+unknown case: approximate data from one bucket must not be erased.
+  const result = sumKnownBucketTotals([
+    bucket({
+      usage: reportedUsage({
+        inputTokens: usageField({ value: "400" }),
+        outputTokens: usageField({ value: "100" }),
+      }),
+      reportCount: 1,
+    }),
+    // report-bearing bucket with no display value — sets partial, does NOT erase sum
+    bucket({ usage: reportedUsage(), reportCount: 1, hasUnknownUsage: true }),
+  ]);
+  assert.equal(result.kind, "approximate");
+  assert.equal(result.value, 500n);
+  assert.equal(result.partial, true); // unknown sibling sets partial
+});
+
+test("sumKnownBucketTotals returns unknown when all report-bearing buckets have no display value", () => {
+  const result = sumKnownBucketTotals([
+    bucket({ usage: reportedUsage(), reportCount: 1, hasUnknownUsage: true }),
+    bucket({ usage: reportedUsage(), reportCount: 1, hasUnknownUsage: true }),
+  ]);
+  assert.equal(result.kind, "unknown");
+  assert.equal(result.value, null);
   assert.equal(result.partial, false);
 });
 

@@ -174,7 +174,10 @@ function AgentUsageCard({
         <div className="space-y-2" data-testid="agent-usage-overall-bars">
           <div className="flex items-baseline justify-between gap-2">
             <h3 className="text-sm font-medium text-foreground">Daily usage</h3>
-            <span className="text-sm text-muted-foreground">
+            <span
+              className="text-sm text-muted-foreground"
+              data-testid="agent-usage-header-value"
+            >
               {overallTotal.kind === "exact"
                 ? `${formatTokenCountCompact(overallTotal.value)} tokens`
                 : overallTotal.kind === "approximate"

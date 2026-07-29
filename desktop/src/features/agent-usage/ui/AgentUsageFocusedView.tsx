@@ -361,7 +361,12 @@ function ApproxTokenStat({
         ? `≈ ${formatTokenCountExact(displayTotal.value)}`
         : null;
   return (
-    <UsageStat display={display} isPartial={displayTotal.partial} label={label} />
+    <UsageStat
+      display={display}
+      isPartial={displayTotal.partial}
+      label={label}
+      testId="agent-usage-focused-total-value"
+    />
   );
 }
 
@@ -369,15 +374,22 @@ function UsageStat({
   display,
   isPartial,
   label,
+  testId,
 }: {
   display: string | null;
   isPartial: boolean;
   label: string;
+  testId?: string;
 }) {
   return (
     <div className="space-y-1">
       <p className="text-xs text-muted-foreground">{label}</p>
-      <p className="text-lg font-semibold text-foreground">{display ?? "—"}</p>
+      <p
+        className="text-lg font-semibold text-foreground"
+        data-testid={testId}
+      >
+        {display ?? "—"}
+      </p>
       {isPartial ? <Badge variant="outline">Partial</Badge> : null}
     </div>
   );

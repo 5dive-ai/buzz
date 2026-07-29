@@ -10,6 +10,8 @@
 //!      must FAIL with the router's context error (proves the router's fit
 //!      gate — the failure mode the 1024 preset cap protects against).
 //!   P4 agentic tool use     — agent + buzz-dev-mcp writes a file on disk.
+//!   P5 Buzz reply command   — agent runs the exact `buzz messages send`
+//!      command used to publish a reply and receives an accepted result.
 //!
 //! The serve node is the same `mesh_llm_sdk::serve` path Share-compute uses
 //! (publish off, mdns, loopback). The agent legs spawn the real
@@ -26,11 +28,10 @@ use mesh_llm_sdk::{serve, MeshDiscoveryMode};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
-// Qwen3-8B: cached GGUF *and* complete layer package on this class of
-// machine, so the serve node starts in seconds. Qwen3-30B-A3B works too but
-// mesh-llm serves it from layer packages and will download them on first
-// serve (~7GB) — fine in the app (progress UI), too slow for a smoke.
-const DEFAULT_MODEL: &str = "unsloth/Qwen3-8B-GGUF:Q4_K_M";
+// Non-reasoning Gemma 4 is the small Buzz-curated default. It reaches tool
+// calls promptly instead of spending the output budget in a hidden reasoning
+// loop. MESH_E2E_MODEL can still exercise any other served model explicitly.
+const DEFAULT_MODEL: &str = "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M";
 const API_PORT: u16 = 19437;
 const CONSOLE_PORT: u16 = 13231;
 
@@ -187,6 +188,37 @@ async fn run() -> anyhow::Result<()> {
     }
     let _ = std::fs::remove_file(&marker);
 
+    // P5: prove the model follows Buzz's real reply path. The isolated PATH
+    // contains a fake `buzz` executable so this remains deterministic and
+    // cannot publish to a real community. The fake records the exact argv and
+    // returns the same accepted-write shape as buzz-cli.
+    let send_marker = format!("mesh-e2e-buzz-send-{}.txt", std::process::id());
+    let prompt = "Use the developer shell tool to run exactly this command: buzz messages send --channel test-channel --content BUZZ_REPLY_OK. Do not simulate or substitute another command. After it succeeds, confirm briefly.";
+    let (r, marker) =
+        agent_chat_with_fake_buzz(&base, &served_id, prompt, &mcp, &send_marker).await;
+    let recorded = std::fs::read_to_string(&marker).unwrap_or_default();
+    let send_ok = recorded.trim() == "messages send --channel test-channel --content BUZZ_REPLY_OK";
+    match r {
+        Ok(text) => record(
+            "P5 Buzz reply command",
+            send_ok,
+            if send_ok {
+                format!("accepted send command; agent said: {text}")
+            } else {
+                format!(
+                    "unexpected command {:?}; agent said: {text}",
+                    recorded.trim()
+                )
+            },
+        ),
+        Err(e) => record(
+            "P5 Buzz reply command",
+            send_ok,
+            format!("agent error: {e}; recorded command: {:?}", recorded.trim()),
+        ),
+    }
+    let _ = std::fs::remove_file(&marker);
+
     eprintln!("[e2e] {pass} passed, {fail} failed");
     if fail > 0 {
         eprintln!("[e2e] FAIL: {fail} permutation(s) failed");
@@ -231,7 +263,8 @@ async fn agent_chat(
     mcp_servers: &[(String, String)],
 ) -> anyhow::Result<String> {
     let (result, _) =
-        agent_chat_in_isolated_home(base, model, max_output_tokens, prompt, mcp_servers).await;
+        agent_chat_in_isolated_home(base, model, max_output_tokens, prompt, mcp_servers, None)
+            .await;
     result
 }
 
@@ -244,7 +277,21 @@ async fn agent_chat_with_marker(
     marker_name: &str,
 ) -> (anyhow::Result<String>, std::path::PathBuf) {
     let (result, home) =
-        agent_chat_in_isolated_home(base, model, max_output_tokens, prompt, mcp_servers).await;
+        agent_chat_in_isolated_home(base, model, max_output_tokens, prompt, mcp_servers, None)
+            .await;
+    (result, home.join(marker_name))
+}
+
+async fn agent_chat_with_fake_buzz(
+    base: &str,
+    model: &str,
+    prompt: &str,
+    mcp_servers: &[(String, String)],
+    marker_name: &str,
+) -> (anyhow::Result<String>, std::path::PathBuf) {
+    let (result, home) =
+        agent_chat_in_isolated_home(base, model, None, prompt, mcp_servers, Some(marker_name))
+            .await;
     (result, home.join(marker_name))
 }
 
@@ -254,6 +301,7 @@ async fn agent_chat_in_isolated_home(
     max_output_tokens: Option<&str>,
     prompt: &str,
     mcp_servers: &[(String, String)],
+    fake_buzz_marker_name: Option<&str>,
 ) -> (anyhow::Result<String>, std::path::PathBuf) {
     let agent = match repo_bin("buzz-agent") {
         Ok(agent) => agent,
@@ -265,10 +313,23 @@ async fn agent_chat_in_isolated_home(
         return (Err(error.into()), home);
     }
 
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let mut child_path = inherited_path.clone();
+    let mut fake_buzz_marker = None;
+    if let Some(marker_name) = fake_buzz_marker_name {
+        match install_fake_buzz(&home) {
+            Ok(bin_dir) => {
+                child_path = format!("{}:{inherited_path}", bin_dir.to_string_lossy());
+                fake_buzz_marker = Some(home.join(marker_name));
+            }
+            Err(error) => return (Err(error), home),
+        }
+    }
+
     let mut command = Command::new(&agent);
     command
         .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", child_path)
         .env("HOME", &home)
         // Exactly the environment apply_relay_mesh_env() supplies.
         .env("BUZZ_AGENT_PROVIDER", "openai")
@@ -282,6 +343,9 @@ async fn agent_chat_in_isolated_home(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if let Some(marker) = &fake_buzz_marker {
+        command.env("BUZZ_E2E_SEND_MARKER", marker);
+    }
     // P3 deliberately overrides the production default to exercise the
     // router's context-fit rejection. Normal and tool turns leave it unset,
     // matching the desktop provider path.
@@ -296,6 +360,36 @@ async fn agent_chat_in_isolated_home(
     let result = drive_acp(&mut child, prompt, mcp_servers, &home).await;
     let _ = child.kill().await;
     (result, home)
+}
+
+#[cfg(unix)]
+fn install_fake_buzz(home: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = home.join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let executable = bin_dir.join("buzz");
+    std::fs::write(
+        &executable,
+        r#"#!/bin/sh
+if [ "$1" = "messages" ] && [ "$2" = "send" ]; then
+  printf '%s\n' "$*" > "$BUZZ_E2E_SEND_MARKER"
+  printf '%s\n' '{"event_id":"mesh-e2e-event","accepted":true,"message":"ok"}'
+  exit 0
+fi
+printf 'unsupported fake buzz invocation: %s\n' "$*" >&2
+exit 2
+"#,
+    )?;
+    let mut permissions = std::fs::metadata(&executable)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions)?;
+    Ok(bin_dir)
+}
+
+#[cfg(not(unix))]
+fn install_fake_buzz(_home: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    anyhow::bail!("the mesh agent hardware harness currently requires Unix")
 }
 
 async fn drive_acp(

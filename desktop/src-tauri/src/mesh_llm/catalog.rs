@@ -256,6 +256,8 @@ mod tests {
 
     #[test]
     fn recommendation_follows_buzz_curated_tiers() {
+        assert_eq!(CURATED_SMALL, "Gemma-4-E4B-it-Q4_K_M");
+        assert_eq!(CURATED_LARGE, "gemma-4-26B-A4B-it-UD-Q4_K_M");
         // 64GB+ rated machines get the large curated pick.
         let large = build_catalog(None, 64_000_000_000, 64.0, &[]);
         assert_eq!(large.recommended.as_deref(), Some(CURATED_LARGE));

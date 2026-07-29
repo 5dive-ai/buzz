@@ -579,7 +579,17 @@ export const MessageRow = React.memo(
         ) : (
           authorNode
         )}
-        {verifiedName ? <VerifiedBadge verifiedName={verifiedName} /> : null}
+        {verifiedName ? (
+          <VerifiedBadge
+            verifiedName={verifiedName}
+            verifiedNameExpiresAt={
+              message.pubkey
+                ? profiles?.[normalizePubkey(message.pubkey)]
+                    ?.verifiedNameExpiresAt
+                : null
+            }
+          />
+        ) : null}
         {agentOwnerNode}
         {inlineMetadataNode}
         {message.personaDisplayName &&

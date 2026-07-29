@@ -298,6 +298,7 @@ pub fn profile_info_from_event(event: &Event) -> Result<ProfileInfo, String> {
         pubkey: event.pubkey.to_hex(),
         display_name,
         verified_name: None,
+        verified_name_expires_at: None,
         avatar_url,
         about,
         nip05_handle,
@@ -339,6 +340,7 @@ pub fn users_batch_from_events(
                 .or_else(|| v.get("name").and_then(Value::as_str))
                 .map(str::to_string),
             verified_name: None,
+            verified_name_expires_at: None,
             name: v.get("name").and_then(Value::as_str).map(str::to_string),
             avatar_url: v.get("picture").and_then(Value::as_str).map(str::to_string),
             nip05_handle: v.get("nip05").and_then(Value::as_str).map(str::to_string),

@@ -11,6 +11,8 @@ import {
 const OWNER_PUBKEY =
   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const USER_PUBKEY = "11".repeat(32);
+const NOW_MS = 1_800_000_000_000;
+const FUTURE_EXPIRATION = NOW_MS / 1_000 + 60;
 
 const summary = (over = {}) => ({
   displayName: "Ada",
@@ -65,6 +67,7 @@ test("profileLookupsEqual: a changed field is not equal", () => {
   for (const field of [
     "displayName",
     "verifiedName",
+    "verifiedNameExpiresAt",
     "avatarUrl",
     "nip05Handle",
     "ownerPubkey",
@@ -130,13 +133,23 @@ test("stabiliser: a real profile change swaps the reference (re-render fires)", 
 
 test("formats a chosen name followed by the authoritative display name", () => {
   assert.equal(
-    formatVerifiedUserLabel("Example", "example"),
+    formatVerifiedUserLabel("Example", "example", FUTURE_EXPIRATION, NOW_MS),
     "Example (example)",
   );
 });
 
 test("does not duplicate equal chosen and authoritative names", () => {
-  assert.equal(formatVerifiedUserLabel("example", "example"), "example");
+  assert.equal(
+    formatVerifiedUserLabel("example", "example", FUTURE_EXPIRATION, NOW_MS),
+    "example",
+  );
+});
+
+test("expired authoritative names fail closed", () => {
+  assert.equal(
+    formatVerifiedUserLabel("Example", "example", NOW_MS / 1_000, NOW_MS),
+    "Example",
+  );
 });
 
 test("resolved user labels keep the chosen name first", () => {
@@ -147,6 +160,7 @@ test("resolved user labels keep the chosen name first", () => {
         [USER_PUBKEY]: summary({
           displayName: "Example",
           verifiedName: "example",
+          verifiedNameExpiresAt: Math.floor(Date.now() / 1_000) + 60,
         }),
       },
     }),

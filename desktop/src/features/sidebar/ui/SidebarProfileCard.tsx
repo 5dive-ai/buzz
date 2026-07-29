@@ -154,6 +154,7 @@ export function SidebarProfileCard({
             currentStatus={selfPresenceStatus}
             displayName={resolvedDisplayName}
             verifiedName={profile?.verifiedName}
+            verifiedNameExpiresAt={profile?.verifiedNameExpiresAt}
             isStatusPending={isPresencePending}
             onClearUserStatus={onClearUserStatus}
             onOpenSettings={onOpenSettings}
@@ -200,7 +201,10 @@ export function SidebarProfileCard({
                   {resolvedDisplayName}
                 </span>
                 {profile?.verifiedName ? (
-                  <VerifiedBadge verifiedName={profile.verifiedName} />
+                  <VerifiedBadge
+                    verifiedName={profile.verifiedName}
+                    verifiedNameExpiresAt={profile.verifiedNameExpiresAt}
+                  />
                 ) : null}
               </span>
             </button>

@@ -24,6 +24,7 @@ import type {
   RelayAgent,
 } from "@/shared/api/types";
 import { VerifiedBadge } from "@/shared/ui/VerifiedBadge";
+import { getCurrentVerifiedName } from "@/shared/lib/verifiedIdentity";
 
 const RUNTIME_LABELS: Record<string, string> = {
   goose: "Goose",
@@ -177,7 +178,10 @@ export function buildPublicFields({
     });
   }
 
-  const verifiedName = profile?.verifiedName?.trim();
+  const verifiedName = getCurrentVerifiedName(
+    profile?.verifiedName,
+    profile?.verifiedNameExpiresAt,
+  );
   if (verifiedName) {
     fields.push({
       displayValue: verifiedName,
@@ -186,7 +190,10 @@ export function buildPublicFields({
       testId: "user-profile-relay-verified-identity",
       trailingNode: (
         <span className="flex shrink-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
-          <VerifiedBadge verifiedName={verifiedName} />
+          <VerifiedBadge
+            verifiedName={verifiedName}
+            verifiedNameExpiresAt={profile?.verifiedNameExpiresAt}
+          />
           Binding active
         </span>
       ),

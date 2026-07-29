@@ -110,6 +110,8 @@ export type Profile = {
   displayName: string | null;
   /** Relay-authoritative display identity bound to this pubkey. */
   verifiedName?: string | null;
+  /** Unix timestamp (seconds) after which `verifiedName` is no longer trusted. */
+  verifiedNameExpiresAt?: number | null;
   avatarUrl: string | null;
   about: string | null;
   nip05Handle: string | null;
@@ -125,6 +127,8 @@ export type UserProfileSummary = {
   displayName: string | null;
   /** Relay-authoritative display identity bound to this pubkey. */
   verifiedName?: string | null;
+  /** Unix timestamp (seconds) after which `verifiedName` is no longer trusted. */
+  verifiedNameExpiresAt?: number | null;
   /** Kind-0 `name` field, kept separate from `displayName` so @mention text
    * can be matched against either alias (agents/CLI resolve mentions against
    * `display_name` *or* `name` at send time). */
@@ -144,6 +148,7 @@ export type UserSearchResult = {
   pubkey: string;
   displayName: string | null;
   verifiedName?: string | null;
+  verifiedNameExpiresAt?: number | null;
   avatarUrl: string | null;
   nip05Handle: string | null;
   ownerPubkey: string | null;

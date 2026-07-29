@@ -237,8 +237,11 @@ export function UserProfilePopover({
       managedAgentsQuery.isPending ||
       usersBatchQuery.isPending);
   const displayName =
-    formatVerifiedUserLabel(profile?.displayName, profile?.verifiedName) ??
-    truncatePubkey(pubkey);
+    formatVerifiedUserLabel(
+      profile?.displayName,
+      profile?.verifiedName,
+      profile?.verifiedNameExpiresAt,
+    ) ?? truncatePubkey(pubkey);
   // Owner signal mirrors UserProfilePanel: a declared NIP-OA owner whose agent
   // runs elsewhere holds no local seckey, so key custody (`isOwner`) alone
   // wrongly hides the affordance from them — and gating on bot-ness alone shows
@@ -533,7 +536,10 @@ export function UserProfilePopover({
         <div className="flex items-center gap-1.5">
           <HoverPubkeyName displayName={displayName} pubkey={pubkey} />
           {profile?.verifiedName ? (
-            <VerifiedBadge verifiedName={profile.verifiedName} />
+            <VerifiedBadge
+              verifiedName={profile.verifiedName}
+              verifiedNameExpiresAt={profile.verifiedNameExpiresAt}
+            />
           ) : null}
           {isBotProfile && botIdenticonValue ? (
             <BotIdenticon

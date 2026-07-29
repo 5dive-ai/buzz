@@ -262,7 +262,7 @@ async fn handle_active_audio_connection(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
     let parent_channel_id = auth_msg.parent_channel_id;
 
-    if let Err(e) = crate::corporate_identity::enforce_corporate_identity(
+    let identity_proof = match crate::corporate_identity::verify_corporate_identity(
         &state,
         tenant.community(),
         pubkey,
@@ -271,16 +271,19 @@ async fn handle_active_audio_connection(
     )
     .await
     {
-        warn!(channel_id = %channel_id, pubkey = %pubkey_hex, error = %e, "audio: corporate identity denied");
-        let _ = ws_send
-            .send(WsMessage::Text(
-                serde_json::json!({"type": "error", "message": e.public_message()})
-                    .to_string()
-                    .into(),
-            ))
-            .await;
-        return;
-    }
+        Ok(proof) => proof,
+        Err(e) => {
+            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, error = %e, "audio: corporate identity denied");
+            let _ = ws_send
+                .send(WsMessage::Text(
+                    serde_json::json!({"type": "error", "message": e.public_message()})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            return;
+        }
+    };
 
     if crate::api::relay_members::enforce_relay_membership(
         &state,
@@ -303,7 +306,7 @@ async fn handle_active_audio_connection(
     }
 
     // ── Step 3: membership check / auto-add ───────────────────────────────────
-    let parent_id_for_event = match ensure_membership(
+    let (parent_id_for_event, auto_add_member_by) = match ensure_membership(
         &state,
         &tenant,
         channel_id,
@@ -325,6 +328,60 @@ async fn handle_active_audio_connection(
             return;
         }
     };
+
+    let identity_decision = match crate::corporate_identity::finalize_corporate_identity(
+        &state,
+        tenant.community(),
+        pubkey,
+        identity_proof,
+    )
+    .await
+    {
+        Ok(decision) => decision,
+        Err(e) => {
+            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, error = %e, "audio: corporate identity finalization denied");
+            let _ = ws_send
+                .send(WsMessage::Text(
+                    serde_json::json!({"type": "error", "message": e.public_message()})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            return;
+        }
+    };
+    crate::corporate_identity::spawn_session_revalidation(
+        Arc::clone(&state),
+        tenant.community(),
+        pubkey,
+        identity_decision,
+        cancel.clone(),
+    );
+    if let Some(added_by) = auto_add_member_by {
+        if let Err(e) = state
+            .db
+            .add_member(
+                tenant.community(),
+                channel_id,
+                &pubkey_bytes,
+                MemberRole::Member,
+                Some(&added_by),
+            )
+            .await
+        {
+            warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership auto-add failed: {e}");
+            let _ = ws_send
+                .send(WsMessage::Text(
+                    serde_json::json!({"type":"error","message":"not a member"})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            cancel.cancel();
+            return;
+        }
+        state.invalidate_membership(&tenant, channel_id, &pubkey_bytes);
+    }
 
     // Huddle cross-pod routing (mesh) OR single-pod guardrail.
     //
@@ -1197,7 +1254,7 @@ async fn ensure_membership(
     channel_id: Uuid,
     pubkey_bytes: &[u8],
     parent_channel_id: Option<Uuid>,
-) -> Result<Uuid, String> {
+) -> Result<(Uuid, Option<Vec<u8>>), String> {
     // Load channel first — reject archived channels before any membership check.
     // This ensures auto-ended huddles can't be rejoined by existing members.
     let channel = state
@@ -1240,11 +1297,11 @@ async fn ensure_membership(
         .map_err(|e| format!("db error: {e}"))?;
 
     if is_member {
-        return Ok(lifecycle_parent_id);
+        return Ok((lifecycle_parent_id, None));
     }
 
     if channel.visibility == "open" {
-        return Ok(lifecycle_parent_id);
+        return Ok((lifecycle_parent_id, None));
     }
 
     // Auto-add path: private ephemeral channel + caller is member of parent.
@@ -1255,20 +1312,7 @@ async fn ensure_membership(
             .map_err(|e| format!("db error: {e}"))?;
 
         if parent_member {
-            state
-                .db
-                .add_member(
-                    tenant.community(),
-                    channel_id,
-                    pubkey_bytes,
-                    MemberRole::Member,
-                    Some(&channel.created_by),
-                )
-                .await
-                .map_err(|e| format!("auto-add failed: {e}"))?;
-            state.invalidate_membership(tenant, channel_id, pubkey_bytes);
-
-            return Ok(lifecycle_parent_id);
+            return Ok((lifecycle_parent_id, Some(channel.created_by)));
         }
     }
 

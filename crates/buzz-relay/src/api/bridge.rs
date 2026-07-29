@@ -182,18 +182,18 @@ async fn check_nip98_replay_with_guard(
     }
 }
 
-async fn enforce_bridge_corporate_identity(
+async fn verify_bridge_corporate_identity(
     state: &AppState,
     tenant: &TenantContext,
     headers: &HeaderMap,
     pubkey: nostr::PublicKey,
     auth_tag: Option<&str>,
-) -> Result<(), (StatusCode, Json<Value>)> {
+) -> Result<crate::corporate_identity::CorporateIdentityProof, (StatusCode, Json<Value>)> {
     let identity_jwt = crate::corporate_identity::identity_jwt_from_headers(
         headers,
         &state.config.corporate_identity,
     );
-    crate::corporate_identity::enforce_corporate_identity(
+    crate::corporate_identity::verify_corporate_identity(
         state,
         tenant.community(),
         pubkey,
@@ -201,8 +201,19 @@ async fn enforce_bridge_corporate_identity(
         auth_tag,
     )
     .await
-    .map(|_| ())
     .map_err(|e| e.into_api_error())
+}
+
+async fn finalize_bridge_corporate_identity(
+    state: &AppState,
+    tenant: &TenantContext,
+    pubkey: nostr::PublicKey,
+    proof: crate::corporate_identity::CorporateIdentityProof,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    crate::corporate_identity::finalize_corporate_identity(state, tenant.community(), pubkey, proof)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.into_api_error())
 }
 
 /// Construct the NIP-98 `u`-tag expected URL for a request bound to `tenant`.
@@ -834,14 +845,16 @@ async fn submit_event_authed(
 
     // Enforce relay membership (with NIP-OA fallback via x-auth-tag header).
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    if let Err(e) =
-        enforce_bridge_corporate_identity(state, tenant, headers, pubkey, auth_tag).await
-    {
-        return SubmitOutcome::Err {
-            status: e.0,
-            response: e,
+    let identity_proof =
+        match verify_bridge_corporate_identity(state, tenant, headers, pubkey, auth_tag).await {
+            Ok(proof) => proof,
+            Err(e) => {
+                return SubmitOutcome::Err {
+                    status: e.0,
+                    response: e,
+                };
+            }
         };
-    }
     let nip_oa_owner = match super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
@@ -864,6 +877,13 @@ async fn submit_event_authed(
             };
         }
     };
+    if let Err(e) = finalize_bridge_corporate_identity(state, tenant, pubkey, identity_proof).await
+    {
+        return SubmitOutcome::Err {
+            status: e.0,
+            response: e,
+        };
+    }
     if let Some(owner) = nip_oa_owner {
         super::relay_members::materialize_nip_oa_owner(state, tenant, &pubkey, &owner).await;
     }
@@ -1005,7 +1025,8 @@ async fn query_events_authed(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    enforce_bridge_corporate_identity(state, tenant, headers, pubkey, auth_tag).await?;
+    let identity_proof =
+        verify_bridge_corporate_identity(state, tenant, headers, pubkey, auth_tag).await?;
     super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
@@ -1013,7 +1034,6 @@ async fn query_events_authed(
         auth_tag,
     )
     .await?;
-
     // Two-pass parse: preserve raw JSON for custom extension fields (before_id,
     // depth_limit, feed_types) that nostr::Filter silently drops.
     let raw_filters: Vec<Value> = serde_json::from_slice(body)
@@ -1051,6 +1071,7 @@ async fn query_events_authed(
         .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
+    finalize_bridge_corporate_identity(state, tenant, pubkey, identity_proof).await?;
 
     if filters.iter().any(|f| f.search.is_some()) {
         if has_mixed_search_filters(&filters) {
@@ -1450,7 +1471,8 @@ async fn count_events_authed(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    enforce_bridge_corporate_identity(state, tenant, headers, pubkey, auth_tag).await?;
+    let identity_proof =
+        verify_bridge_corporate_identity(state, tenant, headers, pubkey, auth_tag).await?;
     super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
@@ -1458,7 +1480,6 @@ async fn count_events_authed(
         auth_tag,
     )
     .await?;
-
     let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
 
@@ -1488,6 +1509,7 @@ async fn count_events_authed(
         .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
+    finalize_bridge_corporate_identity(state, tenant, pubkey, identity_proof).await?;
 
     let mut total: u64 = 0;
     for filter in &filters {
@@ -2150,7 +2172,8 @@ async fn authorize_moderation_read(
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    enforce_bridge_corporate_identity(state, &tenant, headers, pubkey, auth_tag).await?;
+    let identity_proof =
+        verify_bridge_corporate_identity(state, &tenant, headers, pubkey, auth_tag).await?;
 
     crate::handlers::moderation_authz::authorize_moderation_action(
         &tenant,
@@ -2167,6 +2190,7 @@ async fn authorize_moderation_read(
             "restricted: moderator access required",
         )
     })?;
+    finalize_bridge_corporate_identity(state, &tenant, pubkey, identity_proof).await?;
 
     Ok(tenant)
 }

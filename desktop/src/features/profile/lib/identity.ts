@@ -1,5 +1,6 @@
 import type { Profile, UserProfileSummary } from "@/shared/api/types";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { getCurrentVerifiedName } from "@/shared/lib/verifiedIdentity";
 
 export type UserProfileLookup = Record<string, UserProfileSummary>;
 
@@ -8,9 +9,15 @@ export { truncatePubkey };
 export function formatVerifiedUserLabel(
   chosenName: string | null | undefined,
   verifiedName: string | null | undefined,
+  verifiedNameExpiresAt: number | null | undefined,
+  nowMs = Date.now(),
 ): string | null {
   const chosen = chosenName?.trim();
-  const verified = verifiedName?.trim();
+  const verified = getCurrentVerifiedName(
+    verifiedName,
+    verifiedNameExpiresAt,
+    nowMs,
+  );
 
   if (chosen && verified && chosen !== verified) {
     return `${chosen} (${verified})`;
@@ -52,6 +59,7 @@ export function profileLookupsEqual(
       next === undefined ||
       prev.displayName !== next.displayName ||
       prev.verifiedName !== next.verifiedName ||
+      prev.verifiedNameExpiresAt !== next.verifiedNameExpiresAt ||
       prev.name !== next.name ||
       prev.avatarUrl !== next.avatarUrl ||
       prev.nip05Handle !== next.nip05Handle ||
@@ -81,7 +89,12 @@ export function mergeCurrentProfileIntoLookup(
   currentProfile:
     | Pick<
         Profile,
-        "pubkey" | "displayName" | "verifiedName" | "avatarUrl" | "nip05Handle"
+        | "pubkey"
+        | "displayName"
+        | "verifiedName"
+        | "verifiedNameExpiresAt"
+        | "avatarUrl"
+        | "nip05Handle"
       >
     | null
     | undefined,
@@ -95,6 +108,7 @@ export function mergeCurrentProfileIntoLookup(
     [normalizePubkey(currentProfile.pubkey)]: {
       displayName: currentProfile.displayName,
       verifiedName: currentProfile.verifiedName ?? null,
+      verifiedNameExpiresAt: currentProfile.verifiedNameExpiresAt ?? null,
       // `Profile` does not carry the kind-0 `name`; keep whatever the batch
       // lookup already resolved so mention aliases survive the merge.
       name: profiles?.[normalizePubkey(currentProfile.pubkey)]?.name ?? null,
@@ -132,13 +146,13 @@ export function resolveUserLabel(input: {
   }
 
   const profile = getResolvedProfile(pubkey, profiles);
-  const verifiedName = profile?.verifiedName?.trim();
   const displayName = profile?.displayName?.trim();
   const nip05Handle = profile?.nip05Handle?.trim();
   const safeFallback = fallbackName?.trim();
   const label = formatVerifiedUserLabel(
     displayName || nip05Handle || safeFallback,
-    verifiedName,
+    profile?.verifiedName,
+    profile?.verifiedNameExpiresAt,
   );
   if (label) {
     return label;
@@ -151,9 +165,10 @@ export function resolveUserVerification(input: {
   pubkey: string;
   profiles?: UserProfileLookup;
 }): string | null {
-  return (
-    getResolvedProfile(input.pubkey, input.profiles)?.verifiedName?.trim() ||
-    null
+  const profile = getResolvedProfile(input.pubkey, input.profiles);
+  return getCurrentVerifiedName(
+    profile?.verifiedName,
+    profile?.verifiedNameExpiresAt,
   );
 }
 

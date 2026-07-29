@@ -477,6 +477,7 @@ export function AppSidebar({
   const resolvedProfileDisplayName = formatVerifiedUserLabel(
     profile?.displayName,
     profile?.verifiedName,
+    profile?.verifiedNameExpiresAt,
   );
   const { dmChannelLabels, dmParticipantsByChannelId, dmPresenceByChannelId } =
     useDmSidebarMetadata({

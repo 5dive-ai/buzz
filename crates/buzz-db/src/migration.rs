@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 26);
+        assert_eq!(migrations.len(), 28);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -927,6 +927,32 @@ mod tests {
             .sql
             .as_str()
             .contains("idx_identity_bindings_active_principal"));
+        assert_eq!(migrations[27].version, 28);
+        assert!(migrations[27].sql.as_str().contains("revocation_scope"));
+        assert!(migrations[27]
+            .sql
+            .as_str()
+            .contains("idx_identity_bindings_revoked_principal"));
+        assert!(migrations[27]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE identity_principals"));
+        assert!(migrations[27]
+            .sql
+            .as_str()
+            .contains("INSERT INTO identity_principals"));
+        assert!(migrations[27]
+            .sql
+            .as_str()
+            .contains("INSERT INTO identity_revoked_keys"));
+        assert!(migrations[27]
+            .sql
+            .as_str()
+            .contains("rotation_completed_at"));
+        assert!(migrations[27]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE identity_revoked_keys"));
     }
 
     #[test]
@@ -1169,7 +1195,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(26));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
     }
 
     #[tokio::test]

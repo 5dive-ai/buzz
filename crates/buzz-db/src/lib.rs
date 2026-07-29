@@ -2569,6 +2569,67 @@ impl Db {
             .await
     }
 
+    /// Disable a corporate principal and revoke its active key.
+    pub async fn revoke_identity_principal(
+        &self,
+        community_id: CommunityId,
+        issuer: &str,
+        uid: &str,
+        revoked_by: Option<&[u8]>,
+        reason: &str,
+    ) -> Result<bool> {
+        identity_binding::revoke_identity_principal(
+            &self.pool,
+            community_id,
+            issuer,
+            uid,
+            revoked_by,
+            reason,
+        )
+        .await
+    }
+
+    /// Revoke one corporate identity key without disabling its principal.
+    pub async fn revoke_identity_key(
+        &self,
+        community_id: CommunityId,
+        pubkey: &[u8],
+        revoked_by: Option<&[u8]>,
+        reason: &str,
+    ) -> Result<bool> {
+        identity_binding::revoke_identity_key(&self.pool, community_id, pubkey, revoked_by, reason)
+            .await
+    }
+
+    /// Atomically rotate a corporate principal to a replacement key.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rotate_identity_binding(
+        &self,
+        community_id: CommunityId,
+        issuer: &str,
+        uid: &str,
+        old_pubkey: &[u8],
+        new_pubkey: &[u8],
+        display_name: Option<&str>,
+        source: &str,
+        rotated_by: Option<&[u8]>,
+        reason: &str,
+    ) -> Result<()> {
+        identity_binding::rotate_identity_binding(
+            &self.pool,
+            community_id,
+            issuer,
+            uid,
+            old_pubkey,
+            new_pubkey,
+            display_name,
+            source,
+            rotated_by,
+            reason,
+        )
+        .await
+    }
+
     /// Atomically set agent owner — only if no owner is currently assigned.
     /// Returns Ok(true) if set, Ok(false) if an owner already exists.
     pub async fn set_agent_owner(
@@ -4106,6 +4167,27 @@ impl Db {
             .await
     }
 
+    /// Claims invite membership and an optional corporate identity binding in
+    /// one transaction.
+    pub async fn claim_relay_membership_with_identity(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+        role: &str,
+        policy_version: Option<&str>,
+        identity: Option<&identity_binding::IdentityBindingInput<'_>>,
+    ) -> Result<relay_members::MembershipClaimOutcome> {
+        relay_members::claim_relay_membership_with_identity(
+            &self.pool,
+            community,
+            pubkey,
+            role,
+            policy_version,
+            identity,
+        )
+        .await
+    }
+
     /// Returns whether a member has persisted acceptance evidence for a policy version.
     pub async fn has_join_policy_acceptance(
         &self,
@@ -4229,6 +4311,27 @@ impl Db {
             token_hash,
             claimer_pubkey,
             policy_version,
+        )
+        .await
+    }
+
+    /// Atomically claims a v2 invite and commits the staged corporate identity
+    /// binding in the same transaction as membership and invite consumption.
+    pub async fn claim_relay_invite_with_identity(
+        &self,
+        community: CommunityId,
+        token_hash: &[u8; 32],
+        claimer_pubkey: &str,
+        policy_version: Option<&str>,
+        identity: Option<&identity_binding::IdentityBindingInput<'_>>,
+    ) -> Result<relay_invite::ClaimOutcome> {
+        relay_invite::claim_relay_invite_with_identity(
+            &self.pool,
+            community,
+            token_hash,
+            claimer_pubkey,
+            policy_version,
+            identity,
         )
         .await
     }

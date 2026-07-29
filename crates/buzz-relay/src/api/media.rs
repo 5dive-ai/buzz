@@ -63,18 +63,18 @@ struct MediaReadAuth {
     tenant: TenantContext,
 }
 
-async fn enforce_media_corporate_identity(
+async fn verify_media_corporate_identity(
     state: &AppState,
     tenant: &TenantContext,
     headers: &HeaderMap,
     pubkey: nostr::PublicKey,
-) -> Result<(), MediaError> {
+) -> Result<crate::corporate_identity::CorporateIdentityProof, MediaError> {
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
     let identity_jwt = crate::corporate_identity::identity_jwt_from_headers(
         headers,
         &state.config.corporate_identity,
     );
-    crate::corporate_identity::enforce_corporate_identity(
+    crate::corporate_identity::verify_corporate_identity(
         state,
         tenant.community(),
         pubkey,
@@ -82,9 +82,32 @@ async fn enforce_media_corporate_identity(
         auth_tag,
     )
     .await
-    .map(|_| ())
     .map_err(|e| {
         tracing::warn!(pubkey = %pubkey.to_hex(), error = %e, "media: corporate identity denied");
+        if e.status_code() == StatusCode::UNAUTHORIZED {
+            MediaError::Unauthorized
+        } else {
+            MediaError::RelayMembershipRequired
+        }
+    })
+}
+
+async fn finalize_media_corporate_identity(
+    state: &AppState,
+    tenant: &TenantContext,
+    pubkey: nostr::PublicKey,
+    proof: crate::corporate_identity::CorporateIdentityProof,
+) -> Result<(), MediaError> {
+    crate::corporate_identity::finalize_corporate_identity(
+        state,
+        tenant.community(),
+        pubkey,
+        proof,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| {
+        tracing::warn!(pubkey = %pubkey.to_hex(), error = %e, "media: corporate identity finalization denied");
         if e.status_code() == StatusCode::UNAUTHORIZED {
             MediaError::Unauthorized
         } else {
@@ -238,7 +261,8 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         // media). On open relays (membership disabled) any valid Blossom signer
         // may upload, matching the WS door's admission policy.
         let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-        enforce_media_corporate_identity(state, &tenant, headers, auth_event.pubkey).await?;
+        let identity_proof =
+            verify_media_corporate_identity(state, &tenant, headers, auth_event.pubkey).await?;
 
         crate::api::relay_members::enforce_relay_membership(
             state,
@@ -248,7 +272,6 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         )
         .await
         .map_err(|_| MediaError::RelayMembershipRequired)?;
-
         if upload_rate_limited(state, tenant.community(), &auth_event.pubkey) {
             metrics::counter!("buzz_media_upload_rejections_total", "reason" => "rate_limit")
                 .increment(1);
@@ -259,6 +282,8 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
                 metrics::counter!("buzz_media_upload_rejections_total", "reason" => "concurrency")
                     .increment(1);
             })?;
+        finalize_media_corporate_identity(state, &tenant, auth_event.pubkey, identity_proof)
+            .await?;
 
         Ok(AuthenticatedUpload {
             auth_event,
@@ -534,7 +559,8 @@ async fn authenticate_media_read(
     buzz_media::auth::verify_blossom_get_auth(&auth_event, sha256, Some(tenant.host()), 3600)?;
 
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    enforce_media_corporate_identity(state, &tenant, headers, auth_event.pubkey).await?;
+    let identity_proof =
+        verify_media_corporate_identity(state, &tenant, headers, auth_event.pubkey).await?;
     crate::api::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
@@ -543,6 +569,7 @@ async fn authenticate_media_read(
     )
     .await
     .map_err(|_| MediaError::RelayMembershipRequired)?;
+    finalize_media_corporate_identity(state, &tenant, auth_event.pubkey, identity_proof).await?;
 
     Ok(MediaReadAuth { tenant })
 }
@@ -1134,6 +1161,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn protected_media_reads_require_corporate_identity_for_get_and_head() {
         let keys = Keys::generate();
 

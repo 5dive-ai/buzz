@@ -24,6 +24,7 @@ interface ProfilePopoverProps {
   onOpenChange: (open: boolean) => void;
   displayName: string;
   verifiedName?: string | null;
+  verifiedNameExpiresAt?: number | null;
   avatarUrl: string | null;
   avatarDataUrl?: string | null;
   currentStatus: PresenceStatus;
@@ -55,6 +56,7 @@ export function ProfilePopover({
   onOpenChange,
   displayName,
   verifiedName,
+  verifiedNameExpiresAt,
   avatarUrl,
   avatarDataUrl,
   currentStatus,
@@ -147,7 +149,10 @@ export function ProfilePopover({
                     {displayName}
                   </p>
                   {verifiedName ? (
-                    <VerifiedBadge verifiedName={verifiedName} />
+                    <VerifiedBadge
+                      verifiedName={verifiedName}
+                      verifiedNameExpiresAt={verifiedNameExpiresAt}
+                    />
                   ) : null}
                 </div>
                 {/* ── Presence chip (opens status chooser) ─────────── */}

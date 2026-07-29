@@ -220,7 +220,11 @@ export function deriveDisplayTotal(usage: {
 }): DisplayTotal {
   const exact = parseTokenCount(usage.totalTokens.value);
   if (exact !== null) {
-    return { kind: "exact", value: exact, partial: isPartialField(usage.totalTokens) };
+    return {
+      kind: "exact",
+      value: exact,
+      partial: isPartialField(usage.totalTokens),
+    };
   }
   const input = parseTokenCount(usage.inputTokens.value);
   const output = parseTokenCount(usage.outputTokens.value);
@@ -228,7 +232,8 @@ export function deriveDisplayTotal(usage: {
     return {
       kind: "approximate",
       value: input + output,
-      partial: isPartialField(usage.inputTokens) || isPartialField(usage.outputTokens),
+      partial:
+        isPartialField(usage.inputTokens) || isPartialField(usage.outputTokens),
     };
   }
   return { kind: "unknown", value: null, partial: false };
@@ -259,7 +264,11 @@ function tierOf(dt: DisplayTotal): DisplayTierKey {
  */
 function rankByDisplayTotal<T>(
   items: readonly T[],
-  getUsage: (item: T) => { inputTokens: UsageField; outputTokens: UsageField; totalTokens: UsageField },
+  getUsage: (item: T) => {
+    inputTokens: UsageField;
+    outputTokens: UsageField;
+    totalTokens: UsageField;
+  },
   tiebreak: (a: T, b: T) => number,
 ): T[] {
   const withDisplay: RankedWithDisplay<T>[] = items.map((item) => {
@@ -389,9 +398,9 @@ export function sumKnownBucketTotals(
   buckets: readonly AgentUsageSeriesBucket[],
 ): DisplayTotal {
   let sumValue = 0n;
-  let sawAny = false;        // any report-bearing bucket processed
-  let anyApprox = false;     // at least one approximate bucket contributed a value
-  let anyWithValue = false;  // at least one bucket contributed a numeric value
+  let sawAny = false; // any report-bearing bucket processed
+  let anyApprox = false; // at least one approximate bucket contributed a value
+  let anyWithValue = false; // at least one bucket contributed a numeric value
   let partial = false;
 
   for (const bucket of buckets) {

@@ -453,7 +453,8 @@ test("sortAgentsByDisplayTotal handles mixed exact/approximate/unknown populatio
   const agents = [
     agentUsage("u1", null), // unknown
     agentUsage("e1", "100"), // exact
-    agentUsage("a1", null, { // approximate
+    agentUsage("a1", null, {
+      // approximate
       usage: reportedUsage({
         inputTokens: usageField({ value: "400" }),
         outputTokens: usageField({ value: "100" }),
@@ -461,7 +462,8 @@ test("sortAgentsByDisplayTotal handles mixed exact/approximate/unknown populatio
     }),
     agentUsage("u2", null), // unknown
     agentUsage("e2", "300"), // exact
-    agentUsage("a2", null, { // approximate
+    agentUsage("a2", null, {
+      // approximate
       usage: reportedUsage({
         inputTokens: usageField({ value: "150" }),
         outputTokens: usageField({ value: "50" }),

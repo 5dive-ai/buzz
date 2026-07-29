@@ -205,8 +205,7 @@ function AgentUsageFocusedTotals({
   agent: AgentUsageSeries["agents"][number];
   coverage: AgentUsageSeries["coverage"];
 }) {
-  const { estimatedCostUsd, inputTokens, outputTokens } =
-    agent.usage;
+  const { estimatedCostUsd, inputTokens, outputTokens } = agent.usage;
   const models = sortModelsByDisplayTotal(agent.models);
   // Each caveat sentence is gated only on the condition that proves it:
   //   - unknown-intervals sentence: direct i/o incompleteness — true when at
@@ -229,10 +228,7 @@ function AgentUsageFocusedTotals({
   return (
     <Card className="space-y-4 p-6" data-testid="agent-usage-focused-totals">
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-        <ApproxTokenStat
-          displayTotal={displayTotal}
-          label="Total tokens"
-        />
+        <ApproxTokenStat displayTotal={displayTotal} label="Total tokens" />
         <TokenStat field={inputTokens} label="Input tokens" />
         <TokenStat field={outputTokens} label="Output tokens" />
         <UsageStat
@@ -316,8 +312,8 @@ function AgentUsageFocusedTotals({
             {coverage.invalidReportCount === 1
               ? "1 report"
               : `${coverage.invalidReportCount} reports`}{" "}
-            excluded: reports with an unreadable timestamp or a cumulative
-            total missing its session are not assigned to any day.
+            excluded: reports with an unreadable timestamp or a cumulative total
+            missing its session are not assigned to any day.
           </p>
         ) : null}
       </div>
@@ -384,10 +380,7 @@ function UsageStat({
   return (
     <div className="space-y-1">
       <p className="text-xs text-muted-foreground">{label}</p>
-      <p
-        className="text-lg font-semibold text-foreground"
-        data-testid={testId}
-      >
+      <p className="text-lg font-semibold text-foreground" data-testid={testId}>
         {display ?? "—"}
       </p>
       {isPartial ? <Badge variant="outline">Partial</Badge> : null}

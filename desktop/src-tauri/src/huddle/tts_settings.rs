@@ -482,6 +482,14 @@ async fn finish_voice_change(voice_change: Option<VoiceChangeWait>) -> Result<()
     .await
 }
 
+async fn finish_durable_voice_change(voice_change: Option<VoiceChangeWait>) {
+    if let Err(error) = finish_voice_change(voice_change).await {
+        eprintln!(
+            "buzz-desktop: tts stage=voice_switch status=delayed reason=ack_timeout error={error}"
+        );
+    }
+}
+
 async fn wait_for_voice_change_ack(
     mut acknowledged: tokio::sync::oneshot::Receiver<()>,
     timeout: Duration,
@@ -581,14 +589,7 @@ pub async fn set_pocket_voice(
     let settings = settings_with_pocket_voice(settings, &voice_key, &app)?;
     let voice_change = apply_tts_settings(settings, &app, &state).await?;
     drop(transition);
-    if let Err(error) = finish_voice_change(voice_change).await {
-        // The preference is already durable. Report the delayed live
-        // transition diagnostically without telling the UI that saving failed;
-        // the next pipeline start resolves the persisted voice normally.
-        eprintln!(
-            "buzz-desktop: tts stage=voice_switch status=delayed reason=ack_timeout error={error}"
-        );
-    }
+    finish_durable_voice_change(voice_change).await;
     current_settings(&state)
 }
 
@@ -656,12 +657,12 @@ pub async fn import_pocket_voice(
     let Some(imported) = super::tts_voice_import::pick_and_import(&app).await? else {
         return Ok(None);
     };
-    let transition = state.tts_settings_transition.lock().await;
+    let transition = state.huddle_audio.tts_transition.lock().await;
     let settings = current_settings(&state)?;
     let settings = settings_with_pocket_voice(settings, &imported.key, &app)?;
     let voice_change = apply_tts_settings(settings, &app, &state).await?;
     drop(transition);
-    finish_voice_change(voice_change).await?;
+    finish_durable_voice_change(voice_change).await;
     Ok(Some(TtsVoiceMutation {
         settings: current_settings(&state)?,
         registry: voice_registry(&app),
@@ -681,7 +682,7 @@ pub async fn delete_pocket_voice(
         return Err(format!("Unknown imported voice: {voice_key}"));
     }
 
-    let transition = state.tts_settings_transition.lock().await;
+    let transition = state.huddle_audio.tts_transition.lock().await;
     let current = current_settings(&state)?;
     let selected = resolve_voice_for_backend_in_registry(
         &current.voice_preferences,
@@ -696,7 +697,7 @@ pub async fn delete_pocket_voice(
         None
     };
     drop(transition);
-    finish_voice_change(voice_change).await?;
+    finish_durable_voice_change(voice_change).await;
     super::tts_voice_import::delete(&app, &voice_key)?;
     Ok(TtsVoiceMutation {
         settings: current_settings(&state)?,

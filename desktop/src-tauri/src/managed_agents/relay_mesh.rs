@@ -42,12 +42,15 @@ pub fn apply_relay_mesh_env(
         RELAY_MESH_PREFER_MESH_FOR_AUTO_ENV.to_string(),
         "1".to_string(),
     );
-    // Keep the requested response inside smaller local-model context windows,
-    // and spend that budget on an answer/tool call instead of hidden reasoning.
+    // Keep the entire turn inside smaller local-model context windows, and
+    // spend a bounded output budget on an answer/tool call instead of hidden
+    // reasoning. The ordinary buzz-agent defaults (200K context / 32K output)
+    // are appropriate for frontier APIs but can wedge a local Mesh runtime.
     // These are defaults, not policy: the effective agent/persona/global env
     // may deliberately choose a smaller cap or enable thinking. This function
     // runs after those layers during readiness, so never clobber their values.
-    insert_default_if_unset(env, "BUZZ_AGENT_MAX_OUTPUT_TOKENS", "4096");
+    insert_default_if_unset(env, "BUZZ_AGENT_MAX_CONTEXT_TOKENS", "32768");
+    insert_default_if_unset(env, "BUZZ_AGENT_MAX_OUTPUT_TOKENS", "1024");
     insert_default_if_unset(env, "BUZZ_AGENT_THINKING_EFFORT", "none");
 }
 
@@ -73,7 +76,11 @@ pub fn relay_mesh_process_env(
     model: &str,
 ) -> std::collections::BTreeMap<String, String> {
     let mut env = std::collections::BTreeMap::new();
-    for key in ["BUZZ_AGENT_MAX_OUTPUT_TOKENS", "BUZZ_AGENT_THINKING_EFFORT"] {
+    for key in [
+        "BUZZ_AGENT_MAX_CONTEXT_TOKENS",
+        "BUZZ_AGENT_MAX_OUTPUT_TOKENS",
+        "BUZZ_AGENT_THINKING_EFFORT",
+    ] {
         if let Some(value) = effective_env.get(key) {
             env.insert(key.to_string(), value.clone());
         }
@@ -98,8 +105,12 @@ mod tests {
         );
 
         assert_eq!(
+            env.get("BUZZ_AGENT_MAX_CONTEXT_TOKENS").map(String::as_str),
+            Some("32768")
+        );
+        assert_eq!(
             env.get("BUZZ_AGENT_MAX_OUTPUT_TOKENS").map(String::as_str),
-            Some("4096")
+            Some("1024")
         );
         assert_eq!(
             env.get("BUZZ_AGENT_THINKING_EFFORT").map(String::as_str),
@@ -116,6 +127,10 @@ mod tests {
     fn native_provider_preserves_explicit_generation_controls() {
         let mut env = BTreeMap::from([
             (
+                "BUZZ_AGENT_MAX_CONTEXT_TOKENS".to_string(),
+                "65536".to_string(),
+            ),
+            (
                 "BUZZ_AGENT_MAX_OUTPUT_TOKENS".to_string(),
                 "2048".to_string(),
             ),
@@ -127,6 +142,10 @@ mod tests {
             Some(RELAY_MESH_AUTO_MODEL_ID),
         );
 
+        assert_eq!(
+            env.get("BUZZ_AGENT_MAX_CONTEXT_TOKENS").map(String::as_str),
+            Some("65536")
+        );
         assert_eq!(
             env.get("BUZZ_AGENT_MAX_OUTPUT_TOKENS").map(String::as_str),
             Some("2048")
@@ -141,6 +160,10 @@ mod tests {
     fn process_env_seeds_controls_without_restoring_unrelated_credentials() {
         let effective_env = BTreeMap::from([
             (
+                "BUZZ_AGENT_MAX_CONTEXT_TOKENS".to_string(),
+                "16384".to_string(),
+            ),
+            (
                 "BUZZ_AGENT_MAX_OUTPUT_TOKENS".to_string(),
                 "1024".to_string(),
             ),
@@ -149,6 +172,10 @@ mod tests {
 
         let env = relay_mesh_process_env(&effective_env, "Gemma-4");
 
+        assert_eq!(
+            env.get("BUZZ_AGENT_MAX_CONTEXT_TOKENS").map(String::as_str),
+            Some("16384")
+        );
         assert_eq!(
             env.get("BUZZ_AGENT_MAX_OUTPUT_TOKENS").map(String::as_str),
             Some("1024")

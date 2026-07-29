@@ -4,7 +4,6 @@ use std::time::Instant;
 mod playback_speed_dsp;
 
 const SAMPLE_RATE: u32 = 24_000;
-const SENTENCE_LEAD_IN_SAMPLES: usize = 480;
 const TONE_SECONDS: f64 = 10.0;
 
 fn main() {
@@ -16,7 +15,6 @@ fn main() {
 
     let compensated_lookahead = playback_speed_dsp::compensated_output_latency_samples(SAMPLE_RATE);
     let compensated_lookahead_ms = compensated_lookahead as f64 * 1_000.0 / SAMPLE_RATE as f64;
-    let fixed_lead_in_ms = SENTENCE_LEAD_IN_SAMPLES as f64 * 1_000.0 / SAMPLE_RATE as f64;
 
     for speed in [0.75_f32, 1.25, 1.5] {
         let started = Instant::now();
@@ -25,7 +23,7 @@ fn main() {
         let elapsed = started.elapsed();
         println!(
             "{speed:.2}x: processing={:.2}ms, {:.3}% realtime, output={} samples, compensated \
-             lookahead={compensated_lookahead_ms:.1}ms, fixed playback lead-in={fixed_lead_in_ms:.1}ms",
+             DSP lookahead={compensated_lookahead_ms:.1}ms",
             elapsed.as_secs_f64() * 1_000.0,
             elapsed.as_secs_f64() / TONE_SECONDS * 100.0,
             output.len(),

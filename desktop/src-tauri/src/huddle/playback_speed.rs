@@ -25,8 +25,6 @@ pub(crate) use playback_speed_dsp::process_complete_chunk;
 use playback_speed_dsp::{validate_speed, DEFAULT_PLAYBACK_SPEED};
 
 const SETTINGS_FILE: &str = "tts-playback-settings.json";
-#[cfg(test)]
-use playback_speed_dsp::UNITY_EPSILON;
 
 /// Lock-free shared control read by the TTS worker before each synthesis chunk.
 #[derive(Clone, Debug)]
@@ -136,31 +134,16 @@ fn save_to_path(path: &Path, speed: f32) -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProcessorKind {
-    Bypass,
-    Signalsmith,
-}
-
-#[cfg(test)]
-fn processor_kind(speed: f32) -> ProcessorKind {
-    if (speed - DEFAULT_PLAYBACK_SPEED).abs() <= UNITY_EPSILON {
-        ProcessorKind::Bypass
-    } else {
-        ProcessorKind::Signalsmith
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
     const SAMPLE_RATE: u32 = 24_000;
 
     #[test]
-    fn selects_bypass_only_at_unity() {
-        assert_eq!(processor_kind(1.0), ProcessorKind::Bypass);
-        assert_eq!(processor_kind(1.25), ProcessorKind::Signalsmith);
+    fn unity_processing_is_a_bit_exact_bypass() {
+        let input = vec![0.0, 0.125, -0.5, 1.0];
+        let output = process_complete_chunk(&input, 1.0, SAMPLE_RATE).expect("unity output");
+        assert_eq!(output, input);
     }
 
     #[test]

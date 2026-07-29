@@ -271,7 +271,11 @@ export function MachineOnboardingFlow({
             backupSubview === "password" ? (
               <DownloadKeyStep
                 direction={backupDirection}
-                onNext={() => setPage("setup")}
+                onBack={() => {
+                  setBackupDirection("backward");
+                  setReturningFromSecurity(false);
+                  setBackupSubview("options");
+                }}
                 session={backupSession}
               />
             ) : (

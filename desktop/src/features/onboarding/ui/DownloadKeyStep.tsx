@@ -22,7 +22,7 @@ type DownloadKeyStepProps = {
    * the backup-test progress.
    */
   session: EncryptedBackupSession;
-  onNext: () => void;
+  onBack: () => void;
 };
 
 /**
@@ -33,16 +33,12 @@ type DownloadKeyStepProps = {
 export function DownloadKeyStep({
   direction,
   session,
-  onNext,
+  onBack,
 }: DownloadKeyStepProps) {
   const reduceMotion = useReducedMotion() ?? false;
-  // True once the encrypted payload exists — the create button (living in the
-  // footer's primary slot) disappears with the form, so Next takes its place.
+  // Once the encrypted payload is saved, the creator advances to its guided
+  // backup test while this surface keeps its own navigation.
   const hasCreated = session.created;
-  // True once the user has passed the backup test — until then Next stays
-  // disabled and "Skip for now" remains the escape hatch.
-  const hasVerified = session.verified;
-  // Footer slot the creator portals its "Download" button into.
   const [createButtonSlot, setCreateButtonSlot] =
     React.useState<HTMLElement | null>(null);
 
@@ -90,56 +86,22 @@ export function DownloadKeyStep({
       </div>
 
       <OnboardingFooter>
-        {hasCreated ? (
-          hasVerified ? (
-            <Button
-              className={ONBOARDING_PRIMARY_CTA_CLASS}
-              data-testid="onboarding-next"
-              onClick={onNext}
-              type="button"
-            >
-              Next
-            </Button>
-          ) : (
-            /* No disabled Next while the test is unfinished — skipping is
-               the only way forward until verification succeeds. */
-            <Button
-              className="h-9 whitespace-nowrap rounded-full px-6 hover:bg-foreground/10"
-              data-testid="onboarding-skip"
-              onClick={onNext}
-              type="button"
-              variant="ghost"
-            >
-              Skip for now
-            </Button>
-          )
-        ) : (
-          /* Relative row keeps the Download CTA truly centered while Skip
-             hangs off its right edge without shifting the center. */
-          <div className="relative flex items-center justify-center">
-            <div
-              className="flex justify-center"
-              data-testid="onboarding-create-slot"
-              ref={setCreateButtonSlot}
-            />
-            <Button
-              className="absolute left-full ml-3 h-9 animate-in whitespace-nowrap rounded-full px-6 fade-in fill-mode-backwards [animation-delay:1000ms] animation-duration-[500ms] hover:bg-foreground/10 motion-reduce:animate-none"
-              data-testid="onboarding-skip"
-              onClick={onNext}
-              type="button"
-              variant="ghost"
-            >
-              Skip for now
-            </Button>
-          </div>
-        )}
-
         {hasCreated ? null : (
-          <p className="text-xs text-foreground/50">
-            You can back up your key anytime in Settings &rarr; Profile &rarr;
-            Identity.
-          </p>
+          <div
+            className="flex justify-center"
+            data-testid="onboarding-create-slot"
+            ref={setCreateButtonSlot}
+          />
         )}
+        <Button
+          className="h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
+          data-testid="onboarding-back"
+          onClick={onBack}
+          type="button"
+          variant="ghost"
+        >
+          Back
+        </Button>
       </OnboardingFooter>
     </OnboardingSlideTransition>
   );

@@ -221,8 +221,8 @@ type EncryptedBackupCreatorProps = {
   /** "spotlight" is the onboarding treatment; "boxed" fits settings cards. */
   variant?: "spotlight" | "boxed";
   /**
-   * When set, the "Download" button is portaled into this element
-   * (e.g. the onboarding footer's primary slot) instead of rendering inline.
+   * When set, the "Download" button is portaled into this element instead of
+   * rendering inline.
    */
   createButtonPortal?: HTMLElement | null;
   /** Extra classes for the "Download" button. */

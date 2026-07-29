@@ -47,10 +47,10 @@ use std::{
     time::Duration,
 };
 
+use super::playback_speed::{process_complete_chunk, PlaybackSpeedControl};
 use super::pocket::{
     load_text_to_speech, load_voice_style, DEFAULT_VOICE, SAMPLE_RATE, VOICE_FILE_EXT,
 };
-use super::playback_speed::{process_complete_chunk, PlaybackSpeedControl};
 use super::preprocessing::{preprocess_for_tts, split_sentences};
 
 #[path = "tts_voice_transition.rs"]

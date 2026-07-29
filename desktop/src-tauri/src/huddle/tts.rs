@@ -122,6 +122,8 @@ const MAX_CHUNK_CHARS: usize = 200;
 /// Injected as a silent buffer between each synthesized sentence chunk.
 const INTER_SENTENCE_SILENCE: f32 = 0.1;
 
+type WorkerControlState = (Arc<AtomicBool>, Arc<AtomicBool>, WorkerCancelSignals);
+
 // ── Public pipeline handle ────────────────────────────────────────────────────
 
 /// Handle to the running TTS pipeline.
@@ -195,9 +197,11 @@ impl TtsPipeline {
                         worker_voice_change_ack,
                     ),
                     text_rx,
-                    tts_active_worker,
-                    shutdown_worker,
-                    (cancel_worker, worker_voice_cancel),
+                    (
+                        tts_active_worker,
+                        shutdown_worker,
+                        (cancel_worker, worker_voice_cancel),
+                    ),
                     output_device,
                     startup_tx,
                 )
@@ -303,13 +307,12 @@ fn tts_worker(
     model_dir: PathBuf,
     voice_state: WorkerVoiceState,
     text_rx: mpsc::Receiver<QueuedText>,
-    tts_active: Arc<AtomicBool>,
-    shutdown: Arc<AtomicBool>,
-    cancel_signals: WorkerCancelSignals,
+    control_state: WorkerControlState,
     output_device: Option<String>,
     startup_tx: mpsc::SyncSender<Result<(), String>>,
 ) {
     let (selected_voice, voice_generation, voice_change_ack) = voice_state;
+    let (tts_active, shutdown, cancel_signals) = control_state;
     let (cancel, voice_cancel) = cancel_signals;
     // ── 1. Initialise TTS engine ──────────────────────────────────────────────
     let model_dir_str = model_dir.to_string_lossy().to_string();

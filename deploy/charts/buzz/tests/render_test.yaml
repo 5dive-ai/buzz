@@ -30,11 +30,10 @@ tests:
           path: kind
           value: Service
         template: templates/service.yaml
-      - contains:
+      - notContains:
           path: spec.template.spec.containers[0].env
           content:
             name: BUZZ_S3_REGION
-            value: "us-east-1"
         template: templates/deployment.yaml
       - contains:
           path: spec.template.spec.containers[0].env

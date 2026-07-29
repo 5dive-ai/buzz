@@ -588,34 +588,15 @@ mod tests {
     }
 
     fn store() -> GitStore {
-        let endpoint = std::env::var("BUZZ_GIT_S3_ENDPOINT")
-            .or_else(|_| std::env::var("BUZZ_S3_ENDPOINT"))
-            .unwrap_or_else(|_| "http://localhost:9000".into());
-        let access_key = std::env::var("BUZZ_GIT_S3_ACCESS_KEY")
-            .or_else(|_| std::env::var("BUZZ_S3_ACCESS_KEY"))
-            .unwrap_or_else(|_| "buzz_dev".into());
-        let secret_key = std::env::var("BUZZ_GIT_S3_SECRET_KEY")
-            .or_else(|_| std::env::var("BUZZ_S3_SECRET_KEY"))
-            .unwrap_or_else(|_| "buzz_dev_secret".into());
-        let bucket = std::env::var("BUZZ_GIT_S3_BUCKET")
-            .or_else(|_| std::env::var("BUZZ_S3_BUCKET"))
-            .unwrap_or_else(|_| "buzz-git".into());
-        let region = std::env::var("BUZZ_GIT_S3_REGION")
-            .or_else(|_| std::env::var("BUZZ_S3_REGION"))
-            .unwrap_or_else(|_| "us-east-1".into());
-        let addressing_style = std::env::var("BUZZ_S3_ADDRESSING_STYLE")
-            .unwrap_or_else(|_| "path".into())
-            .parse()
-            .expect("BUZZ_S3_ADDRESSING_STYLE must be path or virtual");
         GitStore::new(
-            &endpoint,
-            &access_key,
-            &secret_key,
-            &bucket,
-            &region,
-            addressing_style,
+            "http://localhost:9000",
+            "buzz_dev",
+            "buzz_dev_secret",
+            "buzz-git",
+            "us-east-1",
+            buzz_media::config::S3AddressingStyle::Path,
         )
-        .expect("connect S3-compatible storage")
+        .expect("connect local MinIO")
     }
 
     /// Build a tiny on-disk repo, return (pack bytes, head_oid).

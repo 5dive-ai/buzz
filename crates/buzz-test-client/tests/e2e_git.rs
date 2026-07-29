@@ -138,21 +138,20 @@ impl GitS3Probe {
     }
 
     fn from_env() -> Self {
-        let endpoint = std::env::var("BUZZ_GIT_S3_ENDPOINT")
-            .or_else(|_| std::env::var("BUZZ_S3_ENDPOINT"))
+        // These E2E assertions inspect the relay's backing bucket directly, so
+        // they must receive the same provider connection and URL style as the
+        // relay. Unit/live MinIO probes in buzz-relay keep explicit local
+        // fixtures and do not need provider overrides.
+        let endpoint = std::env::var("BUZZ_S3_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:9000".to_string());
-        let access_key = std::env::var("BUZZ_GIT_S3_ACCESS_KEY")
-            .or_else(|_| std::env::var("BUZZ_S3_ACCESS_KEY"))
-            .unwrap_or_else(|_| "buzz_dev".to_string());
-        let secret_key = std::env::var("BUZZ_GIT_S3_SECRET_KEY")
-            .or_else(|_| std::env::var("BUZZ_S3_SECRET_KEY"))
-            .unwrap_or_else(|_| "buzz_dev_secret".to_string());
-        let bucket_name = std::env::var("BUZZ_GIT_S3_BUCKET")
-            .or_else(|_| std::env::var("BUZZ_S3_BUCKET"))
-            .unwrap_or_else(|_| "buzz-media".to_string());
-        let region_name = std::env::var("BUZZ_GIT_S3_REGION")
-            .or_else(|_| std::env::var("BUZZ_S3_REGION"))
-            .unwrap_or_else(|_| "us-east-1".to_string());
+        let access_key =
+            std::env::var("BUZZ_S3_ACCESS_KEY").unwrap_or_else(|_| "buzz_dev".to_string());
+        let secret_key =
+            std::env::var("BUZZ_S3_SECRET_KEY").unwrap_or_else(|_| "buzz_dev_secret".to_string());
+        let bucket_name =
+            std::env::var("BUZZ_S3_BUCKET").unwrap_or_else(|_| "buzz-media".to_string());
+        let region_name =
+            std::env::var("BUZZ_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
         let addressing_style = std::env::var("BUZZ_S3_ADDRESSING_STYLE")
             .unwrap_or_else(|_| "path".to_string())
             .parse::<S3AddressingStyle>()

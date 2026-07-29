@@ -61,11 +61,13 @@ Buzz uses one URL style for both media and Git/CAS object-store requests:
 | `path` (default) | `https://endpoint/bucket/key` | Bundled MinIO and endpoints whose DNS does not resolve bucket subdomains |
 | `virtual` | `https://bucket.endpoint/key` | AWS-style providers and new Railway Storage Buckets |
 
-The chart renders `s3.region` and `s3.addressingStyle` as `BUZZ_S3_REGION`
-and `BUZZ_S3_ADDRESSING_STYLE`. Only `path` and `virtual` addressing styles are
-accepted; invalid values fail chart rendering and relay startup. The bundled
-MinIO quickstart deliberately keeps `path` because its Service DNS resolves one
-endpoint hostname, not arbitrary `<bucket>.<service>` names.
+The chart always renders `s3.addressingStyle` as
+`BUZZ_S3_ADDRESSING_STYLE`. It renders `s3.region` as `BUZZ_S3_REGION` only
+when explicitly set, preserving the relay's existing `AWS_REGION` fallback for
+upgrades. Only `path` and `virtual` addressing styles are accepted; invalid
+values fail chart rendering and relay startup. The bundled MinIO quickstart
+deliberately keeps `path` because its Service DNS resolves one endpoint
+hostname, not arbitrary `<bucket>.<service>` names.
 
 For a Railway Storage Bucket, map its variables to chart values in the service
 or generated Helm configuration:

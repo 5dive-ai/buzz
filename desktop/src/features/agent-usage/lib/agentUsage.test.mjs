@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   bigintRatio,
   buildLocalDayBoundaries,
+  deriveApproxTotal,
   deriveUsageIngressTrailing,
   formatCoverageDate,
   formatEstimatedCostUsd,
@@ -333,6 +334,44 @@ test("bigintRatio clamps part to [0, whole]", () => {
   assert.equal(bigintRatio(200n, 100n), 1);
 });
 
+// ── deriveApproxTotal ─────────────────────────────────────────────────────────
+
+test("deriveApproxTotal returns null when genuine total is known (no approximation needed)", () => {
+  const usage = reportedUsage({
+    inputTokens: usageField({ value: "800" }),
+    outputTokens: usageField({ value: "200" }),
+    totalTokens: usageField({ value: "1100" }),
+  });
+  assert.equal(deriveApproxTotal(usage), null);
+});
+
+test("deriveApproxTotal sums input and output when total is null", () => {
+  const usage = reportedUsage({
+    inputTokens: usageField({ value: "800" }),
+    outputTokens: usageField({ value: "200" }),
+  });
+  assert.equal(deriveApproxTotal(usage), 1000n);
+});
+
+test("deriveApproxTotal returns input alone when output is null", () => {
+  const usage = reportedUsage({
+    inputTokens: usageField({ value: "500" }),
+  });
+  assert.equal(deriveApproxTotal(usage), 500n);
+});
+
+test("deriveApproxTotal returns output alone when input is null", () => {
+  const usage = reportedUsage({
+    outputTokens: usageField({ value: "300" }),
+  });
+  assert.equal(deriveApproxTotal(usage), 300n);
+});
+
+test("deriveApproxTotal returns null when total, input, and output are all null", () => {
+  const usage = reportedUsage();
+  assert.equal(deriveApproxTotal(usage), null);
+});
+
 // ── sortAgentsByKnownTotal / sortModelsByKnownTotal ─────────────────────────
 
 test("sortAgentsByKnownTotal ranks known totals descending", () => {
@@ -452,6 +491,7 @@ test("sumKnownBucketTotals returns knownTotal null and partial false for an all-
     bucket({ reportCount: 0 }),
   ]);
   assert.equal(result.knownTotal, null);
+  assert.equal(result.approxTotal, null);
   assert.equal(result.partial, false);
 });
 
@@ -467,6 +507,7 @@ test("sumKnownBucketTotals sums all known totals when every bucket is fully know
     }),
   ]);
   assert.equal(result.knownTotal, 300n);
+  assert.equal(result.approxTotal, null); // genuine total is known, no approx needed
   assert.equal(result.partial, false);
 });
 
@@ -496,6 +537,38 @@ test("sumKnownBucketTotals marks partial true when any bucket has reports but nu
     bucket({ usage: reportedUsage(), reportCount: 1, hasUnknownUsage: true }),
   ]);
   assert.equal(result.knownTotal, 100n);
+  assert.equal(result.partial, true);
+});
+
+test("sumKnownBucketTotals returns approxTotal from i/o sum when all bucket totals are null but i/o is known", () => {
+  // Real-world case: no publisher emits totalTokens, but i/o are always present.
+  const result = sumKnownBucketTotals([
+    bucket({
+      usage: reportedUsage({
+        inputTokens: usageField({ value: "800" }),
+        outputTokens: usageField({ value: "200" }),
+      }),
+      reportCount: 1,
+    }),
+    bucket({
+      usage: reportedUsage({
+        inputTokens: usageField({ value: "400" }),
+        outputTokens: usageField({ value: "100" }),
+      }),
+      reportCount: 1,
+    }),
+  ]);
+  assert.equal(result.knownTotal, null);
+  assert.equal(result.approxTotal, 1500n); // (800+200) + (400+100)
+  assert.equal(result.partial, true); // null totals with reports → partial
+});
+
+test("sumKnownBucketTotals returns null approxTotal when even i/o is unavailable", () => {
+  const result = sumKnownBucketTotals([
+    bucket({ usage: reportedUsage(), reportCount: 1, hasUnknownUsage: true }),
+  ]);
+  assert.equal(result.knownTotal, null);
+  assert.equal(result.approxTotal, null);
   assert.equal(result.partial, true);
 });
 

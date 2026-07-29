@@ -18,6 +18,7 @@ import {
   formatEstimatedCostUsd,
   formatTokenCountCompact,
   formatTokenCountExact,
+  deriveApproxTotal,
   isPartialField,
   isUnknownField,
   parseTokenCount,
@@ -206,13 +207,27 @@ function AgentUsageFocusedTotals({
   const { estimatedCostUsd, inputTokens, outputTokens, totalTokens } =
     agent.usage;
   const models = sortModelsByKnownTotal(agent.models);
+  // Show the caveat paragraph only when there are genuinely invalid/excluded
+  // rows or truly unknown i/o deltas. `agent.hasUnknownUsage` is true when
+  // deltaReliable is false (some intervals couldn't be computed). The
+  // `coverage.invalidReportCount > 0` path covers rows excluded from buckets.
+  // We do NOT trigger on totalTokens.value being null: that's the permanent
+  // state for all real publishers today (no harness emits a total yet), and
+  // showing the caveat permanently would make it read as a persistent error.
   const explainPartial =
     agent.hasUnknownUsage || coverage.invalidReportCount > 0;
+
+  // Approximation for the Total tokens stat when no genuine total is available.
+  const approxTotal = deriveApproxTotal(agent.usage);
 
   return (
     <Card className="space-y-4 p-6" data-testid="agent-usage-focused-totals">
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-        <TokenStat field={totalTokens} label="Total tokens" />
+        <ApproxTokenStat
+          approxTotal={approxTotal}
+          field={totalTokens}
+          label="Total tokens"
+        />
         <TokenStat field={inputTokens} label="Input tokens" />
         <TokenStat field={outputTokens} label="Output tokens" />
         <UsageStat
@@ -311,6 +326,32 @@ function TokenStat({
       isPartial={isPartialField(field)}
       label={label}
     />
+  );
+}
+
+/**
+ * Total-tokens stat that falls back to an `≈` approximation (in+out) when
+ * the genuine total is unavailable. The `≈` prefix keeps the approximation
+ * honest without hiding that real token activity was counted.
+ */
+function ApproxTokenStat({
+  approxTotal,
+  field,
+  label,
+}: {
+  approxTotal: bigint | null;
+  field: { value: string | null; incomplete: boolean };
+  label: string;
+}) {
+  const parsed = parseTokenCount(field.value);
+  const display =
+    parsed !== null
+      ? formatTokenCountExact(parsed)
+      : approxTotal !== null
+        ? `≈ ${formatTokenCountExact(approxTotal)}`
+        : null;
+  return (
+    <UsageStat display={display} isPartial={isPartialField(field)} label={label} />
   );
 }
 

@@ -65,7 +65,11 @@ function mockAgentUsage(
     hasUnknownUsage: false,
     models: [],
     reportCount: 1,
-    usage: reportedUsage({ totalTokens: "1500" }),
+    // Real-world shape: no publisher emits totalTokens today; i/o are always
+    // present. Seeding this as the default ensures the suite exercises the
+    // "approx ≈" display path that prod users see, not just the happy-path
+    // seed that previously masked the "No usage reported" regression.
+    usage: reportedUsage({ inputTokens: "1200", outputTokens: "300" }),
     ...overrides,
   };
 }

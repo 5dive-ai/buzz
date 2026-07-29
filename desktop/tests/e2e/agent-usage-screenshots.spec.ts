@@ -53,7 +53,8 @@ function mockAgentUsage(
     hasUnknownUsage: false,
     models: [],
     reportCount: 1,
-    usage: reportedUsage({ totalTokens: "1500" }),
+    // Real-world shape: no publisher emits totalTokens; i/o are always present.
+    usage: reportedUsage({ inputTokens: "1200", outputTokens: "300" }),
     ...overrides,
   };
 }

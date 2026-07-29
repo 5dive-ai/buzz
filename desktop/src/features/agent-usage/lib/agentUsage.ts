@@ -189,6 +189,30 @@ export function bigintRatio(part: bigint, whole: bigint): number {
   return Number(permille) / 1000;
 }
 
+// ── Display approximation (A2 presentation layer) ────────────────────────────
+
+/**
+ * Derive a display approximation of the total by summing known input and output
+ * token counts. Returns `null` if neither field is known. This is a *display
+ * label* only — it is NEVER written to the wire or stored; NIP-AM's
+ * "MUST NOT derive total = input + output" governs published/stored data only.
+ * Callers MUST prefix the result with `≈` so the approximation is honest.
+ */
+export function deriveApproxTotal(usage: {
+  inputTokens: UsageField;
+  outputTokens: UsageField;
+  totalTokens: UsageField;
+}): bigint | null {
+  if (parseTokenCount(usage.totalTokens.value) !== null) {
+    // Genuine total is known — callers should use it directly; no approximation needed.
+    return null;
+  }
+  const input = parseTokenCount(usage.inputTokens.value);
+  const output = parseTokenCount(usage.outputTokens.value);
+  if (input === null && output === null) return null;
+  return (input ?? 0n) + (output ?? 0n);
+}
+
 // ── Ranking (A2: known lower-bound totals rank; null totals list after) ─────
 
 type Ranked<T> = { item: T; totalTokens: bigint | null };
@@ -316,16 +340,24 @@ export function deriveUsageIngressTrailing(series: AgentUsageSeries): string {
  * sum cannot include) — never silently reported as a complete figure.
  * Returns `knownTotal: null` only when every bucket has zero reports (a
  * true empty window, not partial data).
+ *
+ * Also returns `approxTotal`: when `knownTotal` is null but at least one
+ * bucket has known input/output, this is the sum of all known i/o fields
+ * (labeled `≈` at the call site). Null when even i/o is unavailable.
+ * The approximation is a display-only convenience — never stored or wired.
  */
 export function sumKnownBucketTotals(
   buckets: readonly AgentUsageSeriesBucket[],
 ): {
   knownTotal: bigint | null;
+  approxTotal: bigint | null;
   partial: boolean;
 } {
   let sum = 0n;
   let sawKnown = false;
   let partial = false;
+  let approxSum = 0n;
+  let sawApprox = false;
 
   for (const bucket of buckets) {
     const total = bucket.usage.totalTokens;
@@ -337,7 +369,18 @@ export function sumKnownBucketTotals(
     if (isPartialField(total) || (bucket.reportCount > 0 && known === null)) {
       partial = true;
     }
+    if (known === null) {
+      const approx = deriveApproxTotal(bucket.usage);
+      if (approx !== null) {
+        approxSum += approx;
+        sawApprox = true;
+      }
+    }
   }
 
-  return { knownTotal: sawKnown ? sum : null, partial };
+  return {
+    knownTotal: sawKnown ? sum : null,
+    approxTotal: !sawKnown && sawApprox ? approxSum : null,
+    partial,
+  };
 }

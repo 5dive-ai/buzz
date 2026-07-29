@@ -4,6 +4,7 @@ import { cn } from "@/shared/lib/cn";
 import type { AgentUsageSeriesBucket } from "@/shared/api/tauriArchive";
 import {
   bigintRatio,
+  deriveApproxTotal,
   formatTokenCountCompact,
   isPartialField,
   parseTokenCount,
@@ -38,6 +39,10 @@ function dateLabelOf(unixSeconds: number): string {
  * day (the field is `null` because nothing happened), which is a different
  * state from `hasUnknownUsage` (activity happened but the total could not
  * be fully counted) even though both leave `usage.totalTokens.value` null.
+ *
+ * When no genuine total is available but i/o counts are known, the bar falls
+ * back to an approx i/o sum (`kind: "approx"`) rather than the hatched
+ * unknown baseline — the bar height becomes meaningful and is labeled `≈`.
  */
 function deriveBarState(bucket: AgentUsageSeriesBucket) {
   const total = bucket.usage.totalTokens;
@@ -51,20 +56,29 @@ function deriveBarState(bucket: AgentUsageSeriesBucket) {
       knownTokens: 0n,
     };
   }
-  if (known === null) {
+  if (known !== null) {
+    const partial = isPartialField(total);
     return {
-      accessibleLabel: `${dateLabel} · unknown usage`,
-      kind: "unknown" as const,
-      knownTokens: null,
+      accessibleLabel: `${dateLabel} · ${formatTokenCountCompact(known)} reported tokens${
+        partial ? " (partial)" : ""
+      }`,
+      kind: partial ? ("partial" as const) : ("known" as const),
+      knownTokens: known,
     };
   }
-  const partial = isPartialField(total);
+  // Genuine total unknown — try i/o approximation before falling back to hatched.
+  const approx = deriveApproxTotal(bucket.usage);
+  if (approx !== null) {
+    return {
+      accessibleLabel: `${dateLabel} · ≈ ${formatTokenCountCompact(approx)} tokens (approx)`,
+      kind: "approx" as const,
+      knownTokens: approx,
+    };
+  }
   return {
-    accessibleLabel: `${dateLabel} · ${formatTokenCountCompact(known)} reported tokens${
-      partial ? " (partial)" : ""
-    }`,
-    kind: partial ? ("partial" as const) : ("known" as const),
-    knownTokens: known,
+    accessibleLabel: `${dateLabel} · unknown usage`,
+    kind: "unknown" as const,
+    knownTokens: null,
   };
 }
 
@@ -86,7 +100,11 @@ export function AgentUsageDailyBars({
     () =>
       buckets.reduce<bigint>((max, bucket) => {
         const total = parseTokenCount(bucket.usage.totalTokens.value);
-        return total !== null && total > max ? total : max;
+        if (total !== null) return total > max ? total : max;
+        // Fall back to the i/o approximation so bars scale correctly when
+        // no bucket reports a genuine total.
+        const approx = deriveApproxTotal(bucket.usage);
+        return approx !== null && approx > max ? approx : max;
       }, 0n),
     [buckets],
   );
@@ -136,7 +154,9 @@ function DailyBar({
       ? "—"
       : kind === "partial"
         ? `≥${formatTokenCountCompact(knownTokens ?? 0n)}`
-        : formatTokenCountCompact(knownTokens ?? 0n);
+        : kind === "approx"
+          ? `≈${formatTokenCountCompact(knownTokens ?? 0n)}`
+          : formatTokenCountCompact(knownTokens ?? 0n);
 
   return (
     <div
@@ -162,9 +182,11 @@ function DailyBar({
               "w-full rounded-t-sm",
               kind === "partial"
                 ? "bg-primary/50"
-                : kind === "empty"
-                  ? "bg-muted/40"
-                  : "bg-primary",
+                : kind === "approx"
+                  ? "bg-primary/70"
+                  : kind === "empty"
+                    ? "bg-muted/40"
+                    : "bg-primary",
             )}
             role="img"
             style={{ height: knownHeightPx }}

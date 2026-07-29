@@ -21,6 +21,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 import { useAgentUsageSeries } from "../hooks";
 import {
   bigintRatio,
+  deriveApproxTotal,
   formatCoverageDate,
   formatTokenCountCompact,
   isPartialField,
@@ -154,13 +155,17 @@ function AgentUsageCard({
     series.coverage.invalidReportCount > 0;
 
   // Relative bars are decorative (aria-hidden, per plan) — scale each agent's
-  // known total against the largest known total in the current window so the
-  // sorted-by-total list also reads as a bar chart.
+  // known total (or i/o approximation) against the largest such value in the
+  // current window so the sorted-by-total list also reads as a bar chart.
   const maxKnownTotal = React.useMemo(
     () =>
       agents.reduce<bigint>((max, agent) => {
         const total = parseTokenCount(agent.usage.totalTokens.value);
-        return total !== null && total > max ? total : max;
+        if (total !== null) return total > max ? total : max;
+        // Fall back to the i/o approximation so bars are still visible when
+        // no agent reports a genuine total.
+        const approx = deriveApproxTotal(agent.usage);
+        return approx !== null && approx > max ? approx : max;
       }, 0n),
     [agents],
   );
@@ -179,9 +184,11 @@ function AgentUsageCard({
             <span className="text-sm text-muted-foreground">
               {overallTotal.knownTotal !== null
                 ? `${formatTokenCountCompact(overallTotal.knownTotal)} tokens`
-                : hasInvalidOnlyInWindow
-                  ? "Usage uncountable"
-                  : "No usage reported"}
+                : overallTotal.approxTotal !== null
+                  ? `≈ ${formatTokenCountCompact(overallTotal.approxTotal)} tokens`
+                  : hasInvalidOnlyInWindow
+                    ? "Usage uncountable"
+                    : "No usage reported"}
               {overallTotal.partial || hasInvalidOnlyInWindow ? (
                 <Badge className="ml-2" variant="outline">
                   Partial
@@ -276,10 +283,18 @@ function AgentUsageRow({
     (isPartialField(agent.usage.inputTokens) ||
       isPartialField(agent.usage.outputTokens));
 
+  // Approximate total for display when no genuine total is available.
+  const approxTotal =
+    knownTotal === null ? deriveApproxTotal(agent.usage) : null;
+  // Effective value for the relative bar width — prefer genuine total, then approx.
+  const barTotal = knownTotal ?? approxTotal;
+
   const trailing =
     knownTotal !== null
       ? formatTokenCountCompact(knownTotal)
-      : formatIndependentFields(agent);
+      : approxTotal !== null
+        ? `≈ ${formatTokenCountCompact(approxTotal)}`
+        : formatIndependentFields(agent);
 
   return (
     <button
@@ -298,13 +313,13 @@ function AgentUsageRow({
         <span className="block truncate text-sm font-medium text-foreground">
           {label}
         </span>
-        {!unknown ? (
+        {!unknown || approxTotal !== null ? (
           <Progress
             aria-hidden="true"
             className="mt-1.5 h-1.5"
             value={
-              knownTotal !== null && maxKnownTotal > 0n
-                ? bigintRatio(knownTotal, maxKnownTotal) * 100
+              barTotal !== null && maxKnownTotal > 0n
+                ? bigintRatio(barTotal, maxKnownTotal) * 100
                 : null
             }
           />

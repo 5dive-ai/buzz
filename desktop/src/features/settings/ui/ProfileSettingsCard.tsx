@@ -13,7 +13,6 @@ import {
   useUpdateProfileMutation,
 } from "@/features/profile/hooks";
 import { NsecMaskedDisplay } from "@/features/onboarding/ui/NsecMaskedDisplay";
-import { EncryptedBackupCreator } from "@/features/onboarding/ui/EncryptedBackupCreator";
 import { getNsec } from "@/shared/api/tauriIdentity";
 import { MaskedAvatarBadgeFrame } from "@/features/profile/ui/MaskedAvatarBadgeFrame";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
@@ -25,6 +24,7 @@ import { cn } from "@/shared/lib/cn";
 import { Input } from "@/shared/ui/input";
 import { Spinner } from "@/shared/ui/spinner";
 import { Textarea } from "@/shared/ui/textarea";
+import { EncryptedBackupRow } from "./EncryptedBackupRow";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 import { SignOutSection } from "./SignOutSection";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
@@ -171,42 +171,6 @@ function NsecRevealRow() {
           ) : nsec ? (
             <NsecMaskedDisplay nsec={nsec} />
           ) : null}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-/**
- * Collapsible row for creating an encrypted NIP-49 backup on demand. The raw
- * private key never reaches this flow — the passphrase goes to Rust, which
- * returns the persisted `ncryptsec1…` blob.
- */
-function EncryptedBackupRow() {
-  const [isOpen, setIsOpen] = React.useState(false);
-
-  return (
-    <div className="px-4 py-3" data-testid="profile-encrypted-backup-row">
-      <div className="flex items-center justify-between gap-4">
-        <div className="min-w-0 space-y-1">
-          <p className="text-sm font-medium">Password Backup</p>
-          <p className="text-sm text-muted-foreground">
-            Protect your key with a password and save a recoverable backup.
-          </p>
-        </div>
-        <button
-          aria-expanded={isOpen}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-muted px-3 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-muted/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-          data-testid="profile-encrypted-backup-toggle"
-          onClick={() => setIsOpen((open) => !open)}
-          type="button"
-        >
-          {isOpen ? "Close" : "Create"}
-        </button>
-      </div>
-      {isOpen ? (
-        <div className="mt-3">
-          <EncryptedBackupCreator variant="boxed" />
         </div>
       ) : null}
     </div>

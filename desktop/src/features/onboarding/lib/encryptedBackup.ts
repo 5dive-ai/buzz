@@ -1,117 +1,128 @@
-/**
- * Pure state model for the encrypted-key-backup (NIP-49) creation flow,
- * shared by the onboarding BackupStep and the settings Password Backup row.
- *
- * All validation and phase logic lives here so it can be unit-tested without
- * React. Hosts wire the reducer to the Tauri commands
- * (`generate_backup_passphrase`, `create_ncryptsec_backup`) and dispatch
- * events; the model never touches the raw private key — by construction the
- * default backup path cannot invoke `get_nsec`.
- */
-
-export type PassphraseMode = "generated" | "custom";
-
-/** Mirrors `MIN_PASSPHRASE_LEN` in `src-tauri/src/key_backup.rs`. */
-export const MIN_CUSTOM_PASSPHRASE_LEN = 12;
+/** Pure state model for NIP-49 backup creation. */
+export const MIN_PASSPHRASE_LEN = 12;
 
 export type EncryptedBackupState = {
-  /** Six-word passphrase generated in Rust; null until loaded. */
-  generatedPassphrase: string | null;
-  generateError: string | null;
-  mode: PassphraseMode;
-  customPassphrase: string;
-  customConfirm: string;
-  isCreating: boolean;
+  passphrase: string;
+  requestId: number | null;
+  nextRequestId: number;
+  encrypted: string | null;
   createError: string | null;
-  /** The persisted `ncryptsec1…` blob once the backup exists. */
+  downloadPending: boolean;
   ncryptsec: string | null;
+  savedPassword: boolean;
 };
 
 export const initialEncryptedBackupState: EncryptedBackupState = {
-  generatedPassphrase: null,
-  generateError: null,
-  mode: "generated",
-  customPassphrase: "",
-  customConfirm: "",
-  isCreating: false,
+  passphrase: "",
+  requestId: null,
+  nextRequestId: 1,
+  encrypted: null,
   createError: null,
+  downloadPending: false,
   ncryptsec: null,
+  savedPassword: false,
 };
 
 export type EncryptedBackupEvent =
-  | { type: "passphrase-generated"; passphrase: string }
-  | { type: "passphrase-generate-failed"; message: string }
-  | { type: "set-mode"; mode: PassphraseMode }
-  | { type: "set-custom-passphrase"; value: string }
-  | { type: "set-custom-confirm"; value: string }
-  | { type: "create-started" }
-  | { type: "create-succeeded"; ncryptsec: string }
-  | { type: "create-failed"; message: string };
+  | { type: "set-passphrase"; value: string }
+  | { type: "encrypt-started"; requestId: number }
+  | { type: "encrypt-succeeded"; requestId: number; ncryptsec: string }
+  | { type: "encrypt-failed"; requestId: number; message: string }
+  | { type: "download-clicked" }
+  | { type: "back-to-password" }
+  | { type: "start-new-backup" };
 
 export function encryptedBackupReducer(
   state: EncryptedBackupState,
   event: EncryptedBackupEvent,
 ): EncryptedBackupState {
   switch (event.type) {
-    case "passphrase-generated":
+    case "set-passphrase":
       return {
         ...state,
-        generatedPassphrase: event.passphrase,
-        generateError: null,
+        passphrase: event.value,
+        encrypted: null,
+        createError: null,
       };
-    case "passphrase-generate-failed":
-      return { ...state, generateError: event.message };
-    case "set-mode":
-      // Editing state carries across toggles; validation re-derives.
-      return { ...state, mode: event.mode, createError: null };
-    case "set-custom-passphrase":
-      return { ...state, customPassphrase: event.value, createError: null };
-    case "set-custom-confirm":
-      return { ...state, customConfirm: event.value, createError: null };
-    case "create-started":
-      return { ...state, isCreating: true, createError: null };
-    case "create-succeeded":
-      return { ...state, isCreating: false, ncryptsec: event.ncryptsec };
-    case "create-failed":
-      return { ...state, isCreating: false, createError: event.message };
+    case "encrypt-started":
+      return {
+        ...state,
+        requestId: event.requestId,
+        nextRequestId: Math.max(state.nextRequestId, event.requestId + 1),
+        createError: null,
+      };
+    case "encrypt-succeeded":
+      if (event.requestId !== state.requestId) return state;
+      return {
+        ...state,
+        passphrase: "",
+        requestId: null,
+        encrypted: event.ncryptsec,
+        ncryptsec: state.downloadPending ? event.ncryptsec : state.ncryptsec,
+        downloadPending: false,
+        savedPassword: true,
+      };
+    case "encrypt-failed":
+      if (event.requestId !== state.requestId) return state;
+      return {
+        ...state,
+        passphrase: "",
+        requestId: null,
+        createError: event.message,
+        downloadPending: false,
+      };
+    case "download-clicked":
+      if (
+        state.ncryptsec ||
+        state.downloadPending ||
+        (!state.encrypted && !effectivePassphrase(state))
+      )
+        return state;
+      return state.encrypted
+        ? {
+            ...state,
+            ncryptsec: state.encrypted,
+            passphrase: "",
+            savedPassword: true,
+          }
+        : { ...state, downloadPending: true };
+    case "back-to-password":
+      return { ...state, createError: null };
+    case "start-new-backup":
+      return {
+        ...initialEncryptedBackupState,
+        nextRequestId: state.nextRequestId + 1,
+      };
   }
 }
 
-/**
- * Validation issue for a custom passphrase, or null when acceptable.
- * Confirm mismatch is only reported once the confirm field has content, so
- * the user isn't scolded mid-typing.
- */
-export function customPassphraseIssue(
-  passphrase: string,
-  confirm: string,
-): string | null {
+export function passphraseIssue(passphrase: string): string | null {
   if (passphrase.length === 0) return null;
-  if ([...passphrase].length < MIN_CUSTOM_PASSPHRASE_LEN) {
-    return `Use at least ${MIN_CUSTOM_PASSPHRASE_LEN} characters.`;
-  }
-  if (confirm.length > 0 && passphrase !== confirm) {
-    return "Passphrases don't match.";
-  }
-  return null;
+  return [...passphrase].length < MIN_PASSPHRASE_LEN
+    ? `Use at least ${MIN_PASSPHRASE_LEN} characters.`
+    : null;
 }
-
-/** The passphrase the Create action would submit, or null when not ready. */
 export function effectivePassphrase(
   state: EncryptedBackupState,
 ): string | null {
-  if (state.mode === "generated") return state.generatedPassphrase;
-  const { customPassphrase, customConfirm } = state;
-  if (
-    [...customPassphrase].length < MIN_CUSTOM_PASSPHRASE_LEN ||
-    customPassphrase !== customConfirm
-  ) {
-    return null;
-  }
-  return customPassphrase;
+  return [...state.passphrase].length < MIN_PASSPHRASE_LEN
+    ? null
+    : state.passphrase;
 }
-
-/** Whether the "Create backup" action is currently actionable. */
-export function createDisabled(state: EncryptedBackupState): boolean {
-  return state.isCreating || effectivePassphrase(state) === null;
+export function pendingEncryptPassphrase(
+  state: EncryptedBackupState,
+): string | null {
+  if (state.savedPassword || state.encrypted || state.requestId !== null)
+    return null;
+  return effectivePassphrase(state);
+}
+export function isEncrypting(state: EncryptedBackupState): boolean {
+  return state.requestId !== null;
+}
+export function downloadDisabled(state: EncryptedBackupState): boolean {
+  if (state.savedPassword && state.ncryptsec) return false;
+  return (
+    state.downloadPending ||
+    (!state.encrypted && effectivePassphrase(state) === null)
+  );
 }

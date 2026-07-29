@@ -41,7 +41,7 @@ fn wrong_password_is_a_friendly_error() {
     let keys = Keys::generate();
     let blob = create_backup_blob(&keys, "right password", FAST_LOG_N).unwrap();
     let err = decrypt_ncryptsec(&blob, "wrong password").unwrap_err();
-    assert_eq!(err, "wrong passphrase or corrupted backup");
+    assert_eq!(err, "wrong backup password or damaged key backup");
 }
 
 #[test]
@@ -90,13 +90,13 @@ fn recover_keys_ncryptsec_happy_path() {
 #[test]
 fn recover_keys_ncryptsec_requires_password() {
     let err = recover_keys_from_input(SPEC_NCRYPTSEC, None).unwrap_err();
-    assert_eq!(err, "encrypted backup requires a passphrase");
+    assert_eq!(err, "key backup requires a password");
 }
 
 #[test]
 fn recover_keys_ncryptsec_wrong_password() {
     let err = recover_keys_from_input(SPEC_NCRYPTSEC, Some("wrong")).unwrap_err();
-    assert_eq!(err, "wrong passphrase or corrupted backup");
+    assert_eq!(err, "wrong backup password or damaged key backup");
 }
 
 /// Bech32 permits an all-uppercase encoding: `NCRYPTSEC1…` must classify as
@@ -108,7 +108,7 @@ fn recover_keys_uppercase_ncryptsec_classifies_as_encrypted() {
     let upper = SPEC_NCRYPTSEC.to_ascii_uppercase();
     // Routing proof: encrypted path demands a passphrase.
     let err = recover_keys_from_input(&upper, None).unwrap_err();
-    assert_eq!(err, "encrypted backup requires a passphrase");
+    assert_eq!(err, "key backup requires a password");
     // With the passphrase, the bech32 decoder accepts the uppercase form.
     let keys = recover_keys_from_input(&upper, Some("nostr")).unwrap();
     assert_eq!(keys.secret_key().to_secret_hex(), SPEC_SECRET_HEX);
@@ -198,28 +198,42 @@ fn cleanup_stale_backup_removes_only_on_identity_change() {
 // ── Passphrase generation ─────────────────────────────────────────────────────
 
 #[test]
-fn generated_passphrase_is_six_known_words() {
+fn generated_passphrase_respects_word_count_and_separator() {
     let words: std::collections::HashSet<&str> =
         WORDLIST.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(words.len(), 1296, "EFF short wordlist 2.0 has 1296 words");
 
-    for _ in 0..8 {
-        let phrase = generate_passphrase().unwrap();
-        let parts: Vec<&str> = phrase.split(' ').collect();
-        assert_eq!(parts.len(), 6);
-        for w in &parts {
-            assert!(words.contains(w), "unknown word {w:?}");
+    for (count, separator) in [(3, "-"), (4, "-"), (6, " "), (5, "."), (10, "")] {
+        let phrase = generate_passphrase(count, separator).unwrap();
+        if separator.is_empty() {
+            // No separator to split on; length gate below still applies.
+        } else {
+            let parts: Vec<&str> = phrase.split(separator).collect();
+            assert_eq!(parts.len(), count);
+            for w in &parts {
+                assert!(words.contains(w), "unknown word {w:?}");
+            }
         }
         assert!(phrase.chars().count() >= MIN_PASSPHRASE_LEN);
     }
 }
 
 #[test]
+fn generated_passphrase_clamps_word_count() {
+    // Below the floor: clamped up to MIN_PASSPHRASE_WORDS, never shorter.
+    let phrase = generate_passphrase(1, "-").unwrap();
+    assert_eq!(phrase.split('-').count(), MIN_PASSPHRASE_WORDS);
+    // Above the ceiling: clamped down to MAX_PASSPHRASE_WORDS.
+    let phrase = generate_passphrase(50, "-").unwrap();
+    assert_eq!(phrase.split('-').count(), MAX_PASSPHRASE_WORDS);
+}
+
+#[test]
 fn generated_passphrases_are_not_repeated() {
-    // 6 words × ~10.3 bits each — a collision across 8 draws would indicate a
+    // 3 words × ~10.3 bits each — a collision across 8 draws would indicate a
     // broken entropy source, not bad luck.
     let mut seen = std::collections::HashSet::new();
     for _ in 0..8 {
-        assert!(seen.insert(generate_passphrase().unwrap()));
+        assert!(seen.insert(generate_passphrase(DEFAULT_PASSPHRASE_WORDS, "-").unwrap()));
     }
 }

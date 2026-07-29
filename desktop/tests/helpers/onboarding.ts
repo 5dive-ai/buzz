@@ -16,13 +16,12 @@ export async function seedActiveIdentity(
   );
 }
 
-/** Navigate through the backup step (fresh-key path, encrypted default). */
+/** Navigate through the backup steps (fresh-key path). */
 export async function passThroughBackupStep(page: Page) {
   await expect(page.getByTestId("onboarding-page-backup")).toBeVisible();
-  // Encrypted-by-default: create the backup with the generated passphrase,
-  // then advance. (The raw key path is behind "Show raw key instead".)
-  await expect(page.getByTestId("backup-passphrase-generated")).toBeVisible();
-  await page.getByTestId("encrypted-backup-create").click();
-  await expect(page.getByTestId("ncryptsec-value")).toBeVisible();
+  // Next always leads into the "Backup your key" step; backing up is
+  // recommended, never required — "Skip for now" there advances to setup.
   await page.getByTestId("onboarding-next").click();
+  await expect(page.getByTestId("onboarding-page-download")).toBeVisible();
+  await page.getByTestId("onboarding-skip").click();
 }

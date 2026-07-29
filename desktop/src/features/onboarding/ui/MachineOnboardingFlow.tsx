@@ -10,6 +10,11 @@ import { Button } from "@/shared/ui/button";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 import { BackupStep } from "./BackupStep";
 import { DefaultConfigStep } from "./DefaultConfigStep";
+import { DownloadKeyStep } from "./DownloadKeyStep";
+import {
+  backupSessionToPasswordEntry,
+  useEncryptedBackupSession,
+} from "./EncryptedBackupCreator";
 import { IdentityKeyHelpDialog } from "./IdentityKeyHelpDialog";
 import { LandingBees } from "./LandingBees";
 import { NostrKeyImportForm } from "./NostrKeyImportForm";
@@ -25,6 +30,7 @@ export type MachineOnboardingPage =
   | "identity"
   | "key-import"
   | "backup"
+  | "download"
   | "setup"
   | "config";
 
@@ -65,6 +71,9 @@ export function MachineOnboardingFlow({
     null,
   );
   const [readyRuntimeIds, setReadyRuntimeIds] = React.useState<string[]>([]);
+  // Owned here (not by DownloadKeyStep) so Back navigation — which unmounts
+  // the step — keeps the created backup, entered password, and test progress.
+  const backupSession = useEncryptedBackupSession();
   const handleReadyRuntimeIdsChange = React.useCallback(
     (runtimeIds: readonly string[]) => {
       setReadyRuntimeIds(Array.from(new Set(runtimeIds)));
@@ -136,7 +145,15 @@ export function MachineOnboardingFlow({
       {page === "identity" ? <LandingBees /> : null}
       {page !== "identity" ? (
         <OnboardingChrome
-          current={page === "config" ? 4 : page === "setup" ? 3 : 2}
+          current={
+            page === "config"
+              ? 5
+              : page === "setup"
+                ? 4
+                : page === "download"
+                  ? 3
+                  : 2
+          }
         />
       ) : null}
       <OnboardingFooterProvider>
@@ -227,13 +244,29 @@ export function MachineOnboardingFlow({
             <BackupStep
               direction="forward"
               onBack={() => setPage("identity")}
+              onDownload={() => setPage("download")}
+            />
+          ) : page === "download" ? (
+            <DownloadKeyStep
+              direction="forward"
+              onBack={() => setPage("backup")}
               onNext={() => setPage("setup")}
+              session={backupSession}
             />
           ) : page === "setup" ? (
             <SetupStep
               actions={{
-                back: () =>
-                  setPage(identityWasImported ? "key-import" : "backup"),
+                // Fresh-key users return to the "Backup your key with a
+                // password" form (not the test flow they may have finished);
+                // imported keys skip that step entirely.
+                back: () => {
+                  if (identityWasImported) {
+                    setPage("key-import");
+                    return;
+                  }
+                  backupSessionToPasswordEntry(backupSession);
+                  setPage("download");
+                },
                 next: (runtimeIds) => {
                   const ids = Array.from(runtimeIds);
                   setReadyRuntimeIds(ids);

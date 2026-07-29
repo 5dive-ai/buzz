@@ -10,14 +10,9 @@ type NsecMaskedDisplayProps = {
   /**
    * What kind of secret is displayed. Drives labels, aria and testids:
    * a raw private key ("nsec", default) can impersonate its holder; an
-   * encrypted backup ("ncryptsec") is only as sensitive as its passphrase.
+   * encrypted key ("ncryptsec") is only as sensitive as its passphrase.
    */
   kind?: "nsec" | "ncryptsec";
-  /**
-   * Called when the user reveals or copies the key. Lets flows that require
-   * a backup (e.g. sign-out) gate on actual interaction with the key.
-   */
-  onKeyInteraction?: () => void;
 };
 
 const KIND_LABELS = {
@@ -26,7 +21,7 @@ const KIND_LABELS = {
     testIdPrefix: "nsec",
   },
   ncryptsec: {
-    noun: "encrypted backup",
+    noun: "encrypted key",
     testIdPrefix: "ncryptsec",
   },
 } as const;
@@ -48,7 +43,6 @@ export function NsecMaskedDisplay({
   nsec,
   variant = "boxed",
   kind = "nsec",
-  onKeyInteraction,
 }: NsecMaskedDisplayProps) {
   const labels = KIND_LABELS[kind];
   const [isRevealed, setIsRevealed] = React.useState(false);
@@ -65,13 +59,11 @@ export function NsecMaskedDisplay({
   }, []);
 
   function handleRevealToggle() {
-    if (!isRevealed) onKeyInteraction?.();
     setIsRevealed((prev) => !prev);
   }
 
   async function handleCopy() {
     await writeTextToClipboard(nsec);
-    onKeyInteraction?.();
     setIsCopied(true);
     if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
     copyTimerRef.current = setTimeout(() => setIsCopied(false), 2000);
@@ -113,7 +105,9 @@ export function NsecMaskedDisplay({
         <div className="min-w-0 flex-1">
           <p
             className={`${
-              isBare ? ONBOARDING_KEY_TEXT_CLASS : "text-xs leading-5"
+              isBare
+                ? ONBOARDING_KEY_TEXT_CLASS
+                : "break-all font-mono text-xs leading-5 wrap-anywhere"
             } ${
               isRevealed
                 ? `select-text ${isBare ? "" : "text-foreground"}`

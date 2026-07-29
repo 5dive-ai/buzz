@@ -37,9 +37,15 @@ pub const BACKUP_LOG_N: u8 = 18;
 /// Filename of the app-managed canonical backup inside the app data dir.
 pub const BACKUP_FILE_NAME: &str = "identity.ncryptsec";
 
-/// Number of words in a generated backup passphrase. Six words from a
-/// 1296-word list ≈ 62 bits of entropy before the scrypt work factor.
-const PASSPHRASE_WORDS: usize = 6;
+/// Default number of words in a generated backup passphrase. Three words
+/// from a 1296-word list ≈ 31 bits of entropy before the scrypt work factor.
+pub const DEFAULT_PASSPHRASE_WORDS: usize = 3;
+
+/// Bounds for the generator's word-count control. At the lower bound a draw
+/// can fall below [`MIN_PASSPHRASE_LEN`] (three 3-char words), so
+/// [`generate_passphrase`] re-draws until the phrase meets the minimum.
+pub const MIN_PASSPHRASE_WORDS: usize = 3;
+pub const MAX_PASSPHRASE_WORDS: usize = 10;
 
 /// EFF short wordlist 2.0 (1296 words, one per line).
 const WORDLIST: &str = include_str!("assets/eff_short_wordlist_2_0.txt");
@@ -100,7 +106,7 @@ pub fn decrypt_ncryptsec(input: &str, password: &str) -> Result<Keys, String> {
     let encrypted = parse_ncryptsec(input)?;
     let secret_key = encrypted
         .decrypt(password)
-        .map_err(|_| "wrong passphrase or corrupted backup".to_string())?;
+        .map_err(|_| "wrong backup password or damaged key backup".to_string())?;
     Ok(Keys::new(secret_key))
 }
 
@@ -119,8 +125,7 @@ pub fn recover_keys_from_input(input: &str, password: Option<&str>) -> Result<Ke
         .get(..NCRYPTSEC_HRP.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(NCRYPTSEC_HRP));
     if hrp_match {
-        let password =
-            password.ok_or_else(|| "encrypted backup requires a passphrase".to_string())?;
+        let password = password.ok_or_else(|| "key backup requires a password".to_string())?;
         decrypt_ncryptsec(trimmed, password)
     } else {
         Keys::parse(trimmed).map_err(|e| format!("Invalid private key: {e}"))
@@ -190,10 +195,17 @@ pub fn cleanup_stale_backup(
     Ok(())
 }
 
-/// Generate a 6-word passphrase from the EFF short wordlist using OS entropy.
+/// Generate a passphrase of `word_count` EFF short-wordlist words joined by
+/// `separator`, using OS entropy.
 ///
-/// Uses rejection sampling for a uniform distribution over the 1296 words.
-pub fn generate_passphrase() -> Result<String, String> {
+/// `word_count` is clamped to `MIN_PASSPHRASE_WORDS..=MAX_PASSPHRASE_WORDS`.
+/// Because a low-word-count draw can land under [`MIN_PASSPHRASE_LEN`]
+/// (e.g. three 3-char words), whole phrases below the minimum are rejected
+/// and re-drawn — the result always passes the same length gate applied to
+/// user-chosen passphrases. Uses rejection sampling for a uniform
+/// distribution over the 1296 words.
+pub fn generate_passphrase(word_count: usize, separator: &str) -> Result<String, String> {
+    let word_count = word_count.clamp(MIN_PASSPHRASE_WORDS, MAX_PASSPHRASE_WORDS);
     let words: Vec<&str> = WORDLIST.lines().filter(|l| !l.is_empty()).collect();
     if words.len() != 1296 {
         return Err(format!(
@@ -202,19 +214,27 @@ pub fn generate_passphrase() -> Result<String, String> {
         ));
     }
 
-    let mut chosen: Vec<&str> = Vec::with_capacity(PASSPHRASE_WORDS);
-    while chosen.len() < PASSPHRASE_WORDS {
-        let mut buf = [0u8; 2];
-        getrandom::getrandom(&mut buf).map_err(|e| format!("entropy source: {e}"))?;
-        let value = u16::from_le_bytes(buf);
-        // Rejection sampling: accept only values below the largest multiple
-        // of 1296 that fits in u16 (65536 - 65536 % 1296 = 64800).
-        if value < 64800 {
-            chosen.push(words[(value as usize) % 1296]);
+    // At 3 words the under-length probability per draw is small, so a few
+    // attempts always suffice; the cap only guards against a logic bug
+    // becoming an infinite loop.
+    for _ in 0..128 {
+        let mut chosen: Vec<&str> = Vec::with_capacity(word_count);
+        while chosen.len() < word_count {
+            let mut buf = [0u8; 2];
+            getrandom::getrandom(&mut buf).map_err(|e| format!("entropy source: {e}"))?;
+            let value = u16::from_le_bytes(buf);
+            // Rejection sampling: accept only values below the largest
+            // multiple of 1296 that fits in u16 (65536 - 65536 % 1296 = 64800).
+            if value < 64800 {
+                chosen.push(words[(value as usize) % 1296]);
+            }
+        }
+        let phrase = chosen.join(separator);
+        if phrase.chars().count() >= MIN_PASSPHRASE_LEN {
+            return Ok(phrase);
         }
     }
-
-    Ok(chosen.join(" "))
+    Err("could not generate a passphrase meeting the minimum length".to_string())
 }
 
 #[cfg(test)]

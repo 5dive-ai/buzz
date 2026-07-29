@@ -40,9 +40,21 @@ export async function importIdentity(
   );
 }
 
-/** Generate a 6-word passphrase (EFF short wordlist, OS entropy) in Rust. */
-export async function generateBackupPassphrase(): Promise<string> {
-  return invokeTauri<string>("generate_backup_passphrase");
+export type GeneratePassphraseOptions = {
+  /** Word count; Rust clamps to its allowed range (currently 4–10). */
+  words?: number;
+  /** Separator joined between words. Defaults to a space in Rust. */
+  separator?: string;
+};
+
+/** Generate a word passphrase (EFF short wordlist, OS entropy) in Rust. */
+export async function generateBackupPassphrase(
+  options?: GeneratePassphraseOptions,
+): Promise<string> {
+  return invokeTauri<string>("generate_backup_passphrase", {
+    words: options?.words,
+    separator: options?.separator,
+  });
 }
 
 /**
@@ -82,4 +94,21 @@ export async function persistCurrentIdentity(): Promise<Identity> {
  */
 export async function signOut(): Promise<void> {
   await invokeTauri("sign_out");
+}
+
+export type BackupVerification = {
+  pubkey: string;
+  npub: string;
+  matchesCurrentIdentity: boolean;
+};
+
+/** Decrypt a NIP-49 backup in Rust and return only its public identity. */
+export async function verifyNcryptsecBackup(
+  ncryptsec: string,
+  password: string,
+): Promise<BackupVerification> {
+  return invokeTauri<BackupVerification>("verify_ncryptsec_backup", {
+    ncryptsec,
+    password,
+  });
 }

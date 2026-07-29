@@ -255,10 +255,12 @@ function PassphraseGeneratorPopover({
   disabled = false,
   onRequestGenerate,
   onGenerated,
+  securityTheme = false,
 }: {
   disabled?: boolean;
   onRequestGenerate?: () => void;
   onGenerated: (value: string) => void;
+  securityTheme?: boolean;
 }) {
   const [open, setOpen] = React.useState(false);
   const [words, setWords] = React.useState(DEFAULT_GENERATED_WORDS);
@@ -335,7 +337,10 @@ function PassphraseGeneratorPopover({
       </PopoverAnchor>
       <PopoverContent
         align="end"
-        className="w-72 space-y-3"
+        className={cn(
+          "w-72 space-y-3",
+          securityTheme && "buzz-onboarding-security-theme",
+        )}
         onInteractOutside={(event) => {
           // Clicking the anchor icon is "outside" the content — keep the
           // popover open so that click re-rolls instead of closing.
@@ -677,6 +682,7 @@ export function EncryptedBackupCreator({
             // A generated password must be visible so the user can save it.
             setIsRevealed(true);
           }}
+          securityTheme={variant === "spotlight"}
         />
         {issue ? (
           <p
@@ -769,7 +775,12 @@ export function EncryptedBackupCreator({
         open={confirmNewPassword}
         onOpenChange={setConfirmNewPassword}
       >
-        <AlertDialogContent data-testid="backup-change-password-dialog">
+        <AlertDialogContent
+          className={cn(
+            variant === "spotlight" && "buzz-onboarding-security-theme",
+          )}
+          data-testid="backup-change-password-dialog"
+        >
           <AlertDialogHeader>
             <AlertDialogTitle>Create a new backup password?</AlertDialogTitle>
             <AlertDialogDescription>

@@ -1,12 +1,11 @@
 import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
 
 /**
- * Positions in the first-launch flow: landing, identity/key, key download,
- * harness setup, default config, community choice, community profile, meet
- * the team. Used as the default pagination length when a flow doesn't pass an
- * explicit total.
+ * Positions in the first-launch flow: landing, identity/key, harness setup,
+ * default config, community choice, community profile, meet the team. Password
+ * backup is an optional subview of identity/key, not another position.
  */
-export const TOTAL_ONBOARDING_PAGES = 8;
+export const TOTAL_ONBOARDING_PAGES = 7;
 
 /** Shared pill shape (38px tall) for every onboarding primary CTA. */
 const ONBOARDING_CTA_SHAPE = "h-[2.375rem] rounded-full px-6";

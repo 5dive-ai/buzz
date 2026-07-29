@@ -448,7 +448,7 @@ export function CommunityOnboardingFlow({
     >
       <StartupWindowDragRegion />
       {isProfileStage || isTeamStage ? (
-        <OnboardingChrome current={isTeamStage ? 8 : 7} />
+        <OnboardingChrome current={isTeamStage ? 7 : 6} />
       ) : null}
       <OnboardingFooterProvider>
         <div

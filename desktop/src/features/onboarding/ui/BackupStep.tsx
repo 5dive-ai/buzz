@@ -1,4 +1,12 @@
-import { Check, Copy, Eye, EyeOff, Info } from "lucide-react";
+import {
+  Check,
+  ChevronDown,
+  Copy,
+  Eye,
+  EyeOff,
+  Info,
+  ShieldCheck,
+} from "lucide-react";
 import * as React from "react";
 
 import { getNsec } from "@/shared/api/tauriIdentity";
@@ -8,7 +16,6 @@ import { Button } from "@/shared/ui/button";
 import { FuzzyLogo } from "@/shared/ui/buzz-logo/FuzzyLogo";
 import { Card } from "@/shared/ui/card";
 import { Spinner } from "@/shared/ui/spinner";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { ONBOARDING_PRIMARY_CTA_CLASS } from "./OnboardingChrome";
 import { OnboardingFooter } from "./OnboardingFooter";
 import {
@@ -42,18 +49,28 @@ export function backupNextDisabled(): boolean {
 type BackupStepProps = {
   direction: OnboardingTransitionDirection;
   onBack: () => void;
-  /** Advances to the dedicated "Download your key" onboarding step. */
-  onDownload: () => void;
+  onNext: () => void;
+  onOpenPasswordBackup: () => void;
+  onShowOptions: () => void;
+  optionsExpanded: boolean;
+  returningFromSecurity: boolean;
 };
 
 /**
- * Onboarding backup step — shows the freshly created key and offers a direct
- * clipboard copy destined for a password manager. Next leads into the
- * encrypted download step (its own onboarding page, via `onDownload`), which
- * is skippable there. The raw key is fetched only when the user explicitly
- * clicks Copy or Reveal, and is never held in state before that.
+ * Onboarding identity-key step — shows the freshly created key, then opens a
+ * dark backup-options state. Copy fetches the raw key only after an explicit
+ * click; password backup opens the separate security flow. Neither method
+ * blocks Next.
  */
-export function BackupStep({ direction, onBack, onDownload }: BackupStepProps) {
+export function BackupStep({
+  direction,
+  onBack,
+  onNext,
+  onOpenPasswordBackup,
+  onShowOptions,
+  optionsExpanded,
+  returningFromSecurity,
+}: BackupStepProps) {
   const [created, setCreated] = React.useState(introPlayed);
   const [copyState, setCopyState] = React.useState<
     "idle" | "copying" | "copied"
@@ -136,12 +153,116 @@ export function BackupStep({ direction, onBack, onDownload }: BackupStepProps) {
     [nsec],
   );
 
+  if (optionsExpanded) {
+    return (
+      <OnboardingSlideTransition
+        className="flex min-h-0 w-full flex-col items-center"
+        data-testid="onboarding-page-backup-options"
+        direction={direction}
+        effect={direction === "forward" ? "mask-reveal-up" : "line-slide"}
+        transitionKey={`backup-options-${direction}`}
+      >
+        <div className="flex w-full max-w-140 shrink-0 flex-col text-center">
+          <h1 className="text-title font-normal text-foreground">
+            Backup options
+          </h1>
+          <p className="mt-5 text-sm leading-6 text-foreground/75">
+            Choose how you want to keep a restorable copy of your identity key.
+          </p>
+        </div>
+
+        <div className="flex w-full max-w-240 flex-1 flex-col justify-center py-10">
+          <div
+            className="grid w-full grid-cols-1 gap-8 md:grid-cols-2"
+            data-testid="backup-options"
+          >
+            <div className="relative min-h-56 w-full">
+              <Card
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-0 brightness-[0.005]"
+                variant="textured"
+              />
+              <div className="relative z-10 flex min-h-56 w-full flex-col justify-center p-20 text-left text-foreground">
+                <span className="text-lg font-medium">
+                  Save your key safely
+                </span>
+                <span className="mt-3 block text-sm leading-6 text-foreground/65">
+                  A password manager such as 1Password is a good place to keep
+                  your private key.
+                </span>
+                <Button
+                  className="mt-5 h-9 w-fit gap-2 rounded-full border border-white/20 bg-white/10 px-5 text-foreground hover:bg-white/15 hover:text-foreground"
+                  data-testid="backup-copy-key"
+                  disabled={copyState === "copying"}
+                  onClick={() => void copyKeyToClipboard()}
+                  type="button"
+                  variant="ghost"
+                >
+                  {copyState === "copying" ? (
+                    <Spinner className="h-4 w-4 border-2" />
+                  ) : copyState === "copied" ? (
+                    <Check className="h-4 w-4" aria-hidden="true" />
+                  ) : (
+                    <Copy className="h-4 w-4" aria-hidden="true" />
+                  )}
+                  {copyState === "copying"
+                    ? "Copying…"
+                    : copyState === "copied"
+                      ? "Copied to clipboard"
+                      : "Copy to clipboard"}
+                </Button>
+              </div>
+            </div>
+
+            <div className="relative min-h-56 w-full">
+              <Card
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-0 brightness-[0.005]"
+                variant="textured"
+              />
+              <div className="relative z-10 flex min-h-56 w-full flex-col justify-center p-20 text-left text-foreground">
+                <span className="text-lg font-medium">
+                  Create a portable backup
+                </span>
+                <span className="mt-3 block text-sm leading-6 text-foreground/65">
+                  Create a password-protected file you can store safely and use
+                  to restore your identity.
+                </span>
+                <Button
+                  className="mt-5 h-9 w-fit gap-2 rounded-full border border-white/20 bg-white/10 px-5 text-foreground hover:bg-white/15 hover:text-foreground"
+                  data-testid="backup-option-password"
+                  onClick={onOpenPasswordBackup}
+                  type="button"
+                  variant="ghost"
+                >
+                  <ShieldCheck className="h-5 w-5" aria-hidden="true" />
+                  Back up with a password
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          {copyError ? (
+            <p
+              className="mt-4 text-center text-sm text-destructive"
+              data-testid="backup-copy-error"
+            >
+              Could not retrieve your private key: {copyError}. You can continue
+              and find it later in Settings &gt; Profile &gt; Identity.
+            </p>
+          ) : null}
+        </div>
+      </OnboardingSlideTransition>
+    );
+  }
+
   return (
     <OnboardingSlideTransition
       className="flex min-h-0 w-full flex-col items-center"
       data-testid="onboarding-page-backup"
       direction={direction}
-      transitionKey={`backup-${direction}`}
+      effect={returningFromSecurity ? "mask-reveal-down" : "line-slide"}
+      transitionKey={`backup-${direction}-${returningFromSecurity ? "down" : "line"}`}
     >
       <div className="flex w-full max-w-[500px] shrink-0 flex-col text-center">
         {/* Plain string concat: cn()'s tailwind-merge misreads the custom
@@ -204,55 +325,37 @@ export function BackupStep({ direction, onBack, onDownload }: BackupStepProps) {
                     {isRevealed && nsec ? nsec : maskedKey}
                   </p>
                 </div>
-                <div className="flex shrink-0 gap-1.5">
-                  <Button
-                    aria-label={
-                      isRevealed ? "Hide private key" : "Reveal private key"
-                    }
-                    className="h-10 w-10 text-muted-foreground hover:text-foreground"
-                    data-testid="backup-key-reveal-toggle"
-                    onClick={() => void toggleReveal()}
-                    size="icon"
-                    type="button"
-                    variant="ghost"
-                  >
-                    {isRevealed ? (
-                      <EyeOff className="h-6 w-6" aria-hidden="true" />
-                    ) : (
-                      <Eye className="h-6 w-6" aria-hidden="true" />
-                    )}
-                  </Button>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        aria-label="Copy private key"
-                        className="h-10 w-10 text-muted-foreground hover:text-foreground"
-                        data-testid="backup-copy-key"
-                        disabled={copyState === "copying"}
-                        onClick={() => void copyKeyToClipboard()}
-                        size="icon"
-                        type="button"
-                        variant="ghost"
-                      >
-                        {copyState === "copying" ? (
-                          <Spinner className="h-5 w-5 border-2" />
-                        ) : copyState === "copied" ? (
-                          <Check
-                            className="h-6 w-6 text-primary"
-                            aria-hidden="true"
-                          />
-                        ) : (
-                          <Copy className="h-6 w-6" aria-hidden="true" />
-                        )}
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-[240px] text-center">
-                      Copy your key and save it somewhere safe — a password
-                      manager is a great place for it.
-                    </TooltipContent>
-                  </Tooltip>
-                </div>
+                <Button
+                  aria-label={
+                    isRevealed ? "Hide private key" : "Reveal private key"
+                  }
+                  className="h-10 w-10 shrink-0 text-muted-foreground hover:text-foreground"
+                  data-testid="backup-key-reveal-toggle"
+                  onClick={() => void toggleReveal()}
+                  size="icon"
+                  type="button"
+                  variant="ghost"
+                >
+                  {isRevealed ? (
+                    <EyeOff className="h-6 w-6" aria-hidden="true" />
+                  ) : (
+                    <Eye className="h-6 w-6" aria-hidden="true" />
+                  )}
+                </Button>
               </div>
+            </Card>
+
+            <div className="mt-4 flex flex-col items-center">
+              <Button
+                className="h-9 gap-1.5 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
+                data-testid="backup-options-toggle"
+                onClick={onShowOptions}
+                type="button"
+                variant="ghost"
+              >
+                Backup options
+                <ChevronDown className="h-4 w-4" aria-hidden="true" />
+              </Button>
               {copyError ? (
                 <p
                   className="mt-3 text-center text-sm text-destructive"
@@ -263,9 +366,9 @@ export function BackupStep({ direction, onBack, onDownload }: BackupStepProps) {
                   Identity.
                 </p>
               ) : null}
-            </Card>
+            </div>
 
-            <p className="mx-auto mt-6 flex max-w-[440px] items-start justify-center gap-1.5 text-center text-xs leading-5 text-[var(--buzz-onboarding-backup-ink)]">
+            <p className="mx-auto mt-5 flex max-w-[440px] items-start justify-center gap-1.5 text-center text-xs leading-5 text-[var(--buzz-onboarding-backup-ink)]">
               <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>
                 Never share your private key. Anyone with this key can
@@ -282,7 +385,7 @@ export function BackupStep({ direction, onBack, onDownload }: BackupStepProps) {
             className={ONBOARDING_PRIMARY_CTA_CLASS}
             data-testid="onboarding-next"
             disabled={backupNextDisabled()}
-            onClick={onDownload}
+            onClick={onNext}
             type="button"
           >
             Next

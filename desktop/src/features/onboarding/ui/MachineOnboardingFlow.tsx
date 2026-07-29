@@ -1,5 +1,6 @@
 import * as React from "react";
 import type { QueryClient } from "@tanstack/react-query";
+import { ArrowUp } from "lucide-react";
 
 import {
   getIdentity,
@@ -30,9 +31,10 @@ export type MachineOnboardingPage =
   | "identity"
   | "key-import"
   | "backup"
-  | "download"
   | "setup"
   | "config";
+
+type BackupSubview = "created" | "options" | "password";
 
 /** A pending navigation the parent should execute after RouterProvider mounts. */
 export type PostOnboardingNavigation = {
@@ -71,9 +73,17 @@ export function MachineOnboardingFlow({
     null,
   );
   const [readyRuntimeIds, setReadyRuntimeIds] = React.useState<string[]>([]);
-  // Owned here (not by DownloadKeyStep) so Back navigation — which unmounts
-  // the step — keeps the created backup, entered password, and test progress.
+  const [backupSubview, setBackupSubview] =
+    React.useState<BackupSubview>("created");
+  const [backupDirection, setBackupDirection] = React.useState<
+    "forward" | "backward"
+  >("forward");
+  const [returningFromSecurity, setReturningFromSecurity] =
+    React.useState(false);
+  // Owned here so switching between the yellow onboarding view and the dark
+  // security subview keeps the created backup, password, and test progress.
   const backupSession = useEncryptedBackupSession();
+  const isSecuritySubview = page === "backup" && backupSubview !== "created";
   const handleReadyRuntimeIdsChange = React.useCallback(
     (runtimeIds: readonly string[]) => {
       setReadyRuntimeIds(Array.from(new Set(runtimeIds)));
@@ -88,6 +98,9 @@ export function MachineOnboardingFlow({
       const identity = await getIdentity();
       queryClient.setQueryData(["identity"], identity);
       setSelectedPubkey(identity.pubkey);
+      setBackupDirection("forward");
+      setReturningFromSecurity(false);
+      setBackupSubview("created");
       setPage("backup");
     } catch (cause) {
       setError(
@@ -110,6 +123,9 @@ export function MachineOnboardingFlow({
       const identity = await persistCurrentIdentity();
       queryClient.setQueryData(["identity"], identity);
       setSelectedPubkey(identity.pubkey);
+      setBackupDirection("forward");
+      setReturningFromSecurity(false);
+      setBackupSubview("created");
       setPage("backup");
     } catch (cause) {
       setError(
@@ -135,6 +151,8 @@ export function MachineOnboardingFlow({
   return (
     <div
       className={`buzz-onboarding-neutral-theme buzz-startup-shell flex max-h-dvh items-start justify-center overflow-x-hidden overflow-y-auto px-4 text-foreground ${
+        isSecuritySubview ? "buzz-onboarding-security-theme" : ""
+      } ${
         page === "identity"
           ? "buzz-onboarding-welcome py-8"
           : "pb-28 pt-[106px]"
@@ -143,17 +161,26 @@ export function MachineOnboardingFlow({
     >
       <StartupWindowDragRegion />
       {page === "identity" ? <LandingBees /> : null}
-      {page !== "identity" ? (
+      {isSecuritySubview ? (
+        <div className="fixed inset-x-0 top-8 z-20 flex justify-center px-6">
+          <Button
+            className="h-9 gap-2 rounded-full bg-foreground/10 px-5 text-foreground hover:bg-foreground/15 hover:text-foreground"
+            data-testid="backup-return-to-onboarding"
+            onClick={() => {
+              setBackupDirection("backward");
+              setReturningFromSecurity(true);
+              setBackupSubview("created");
+            }}
+            type="button"
+            variant="ghost"
+          >
+            <ArrowUp className="h-4 w-4" aria-hidden="true" />
+            Return to onboarding
+          </Button>
+        </div>
+      ) : page !== "identity" ? (
         <OnboardingChrome
-          current={
-            page === "config"
-              ? 5
-              : page === "setup"
-                ? 4
-                : page === "download"
-                  ? 3
-                  : 2
-          }
+          current={page === "config" ? 4 : page === "setup" ? 3 : 2}
         />
       ) : null}
       <OnboardingFooterProvider>
@@ -241,31 +268,47 @@ export function MachineOnboardingFlow({
               </div>
             </OnboardingSlideTransition>
           ) : page === "backup" ? (
-            <BackupStep
-              direction="forward"
-              onBack={() => setPage("identity")}
-              onDownload={() => setPage("download")}
-            />
-          ) : page === "download" ? (
-            <DownloadKeyStep
-              direction="forward"
-              onBack={() => setPage("backup")}
-              onNext={() => setPage("setup")}
-              session={backupSession}
-            />
+            backupSubview === "password" ? (
+              <DownloadKeyStep
+                direction={backupDirection}
+                onNext={() => setPage("setup")}
+                session={backupSession}
+              />
+            ) : (
+              <BackupStep
+                direction={backupDirection}
+                onBack={() => setPage("identity")}
+                onNext={() => setPage("setup")}
+                onOpenPasswordBackup={() => {
+                  setBackupDirection("forward");
+                  setReturningFromSecurity(false);
+                  setBackupSubview("password");
+                }}
+                onShowOptions={() => {
+                  setBackupDirection("forward");
+                  setReturningFromSecurity(false);
+                  setBackupSubview("options");
+                }}
+                optionsExpanded={backupSubview === "options"}
+                returningFromSecurity={returningFromSecurity}
+              />
+            )
           ) : page === "setup" ? (
             <SetupStep
               actions={{
-                // Fresh-key users return to the "Backup your key with a
-                // password" form (not the test flow they may have finished);
-                // imported keys skip that step entirely.
+                // Fresh-key users return to whichever identity backup subview
+                // they used to reach setup; imported keys skip backup entirely.
                 back: () => {
                   if (identityWasImported) {
                     setPage("key-import");
                     return;
                   }
-                  backupSessionToPasswordEntry(backupSession);
-                  setPage("download");
+                  if (backupSubview === "password") {
+                    backupSessionToPasswordEntry(backupSession);
+                  }
+                  setBackupDirection("backward");
+                  setReturningFromSecurity(false);
+                  setPage("backup");
                 },
                 next: (runtimeIds) => {
                   const ids = Array.from(runtimeIds);

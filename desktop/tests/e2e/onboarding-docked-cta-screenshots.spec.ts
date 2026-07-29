@@ -68,8 +68,17 @@ test("machine onboarding: landing, backup, setup docked CTAs", async ({
   await waitForAnimations(page);
   await page.screenshot({ path: `${SHOT_DIR}/02b-backup-revealed.png` });
 
-  // Next leads into the download step; Skip there continues to setup.
-  await page.getByTestId("onboarding-next").click();
+  // Backup options leave the yellow flow for the dark security view without
+  // adding a progress step or a generic Next action.
+  await page.getByTestId("backup-options-toggle").click();
+  await expect(
+    page.getByTestId("onboarding-page-backup-options"),
+  ).toBeVisible();
+  await expect(page.getByTestId("onboarding-next")).toHaveCount(0);
+  await waitForAnimations(page);
+  await page.screenshot({ path: `${SHOT_DIR}/02c-backup-options.png` });
+
+  await page.getByTestId("backup-option-password").click();
   await expect(page.getByTestId("onboarding-page-download")).toBeVisible();
   await page.getByTestId("onboarding-skip").click();
   await expect(

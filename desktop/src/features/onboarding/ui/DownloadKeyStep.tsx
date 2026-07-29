@@ -11,7 +11,6 @@ import {
 } from "./OnboardingSlideTransition";
 import {
   type EncryptedBackupSession,
-  backupSessionToPasswordEntry,
   EncryptedBackupCreator,
 } from "./EncryptedBackupCreator";
 
@@ -23,20 +22,17 @@ type DownloadKeyStepProps = {
    * the backup-test progress.
    */
   session: EncryptedBackupSession;
-  onBack: () => void;
   onNext: () => void;
 };
 
 /**
- * Onboarding download step — the password-first encrypted key download
- * flow, promoted to its own page in the machine onboarding flow.
+ * Password-backup security subview within the identity-key onboarding step.
  * The raw key never enters this component: Rust builds the NIP-49 payload
  * locally and the native save dialog produces the user-owned file.
  */
 export function DownloadKeyStep({
   direction,
   session,
-  onBack,
   onNext,
 }: DownloadKeyStepProps) {
   const reduceMotion = useReducedMotion() ?? false;
@@ -79,7 +75,7 @@ export function DownloadKeyStep({
             initial={reduceMotion ? false : { opacity: 0, y: 12 }}
             transition={{ delay: 0.12, duration: 0.4, ease: "easeOut" }}
           >
-            <Card className="w-full px-8 py-6" variant="textured">
+            <Card className="w-full border-foreground/15 bg-card px-8 py-6 shadow-none">
               <div className="mx-auto w-full max-w-[832px]">
                 <EncryptedBackupCreator
                   createButtonClassName={ONBOARDING_PRIMARY_CTA_CLASS}
@@ -137,20 +133,6 @@ export function DownloadKeyStep({
             </Button>
           </div>
         )}
-
-        <Button
-          className="h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
-          data-testid="onboarding-back"
-          onClick={
-            // From the test view, Back first returns to the password form;
-            // only from the form does it leave the step entirely.
-            hasCreated ? () => backupSessionToPasswordEntry(session) : onBack
-          }
-          type="button"
-          variant="ghost"
-        >
-          Back
-        </Button>
 
         {hasCreated ? null : (
           <p className="text-xs text-foreground/50">

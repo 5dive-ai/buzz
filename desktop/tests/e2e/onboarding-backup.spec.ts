@@ -16,6 +16,20 @@ async function enterMachineBackup(page: import("@playwright/test").Page) {
   await page.getByRole("button", { name: "Create a new identity key" }).click();
 }
 
+async function openBackupOptions(page: import("@playwright/test").Page) {
+  await expect(page.getByTestId("backup-intro-logo")).toHaveCount(0);
+  await page.getByTestId("backup-options-toggle").click();
+  await expect(
+    page.getByTestId("onboarding-page-backup-options"),
+  ).toBeVisible();
+}
+
+async function openPasswordBackup(page: import("@playwright/test").Page) {
+  await openBackupOptions(page);
+  await page.getByTestId("backup-option-password").click();
+  await expect(page.getByTestId("onboarding-page-download")).toBeVisible();
+}
+
 async function invokedCommands(page: import("@playwright/test").Page) {
   return page.evaluate(
     () =>
@@ -55,11 +69,11 @@ test("backup step appears on fresh-key path after profile submit", async ({
 });
 
 // ---------------------------------------------------------------------------
-// Chooser: masked key with reveal toggle and inline copy. The raw key is
-// fetched only on explicit reveal/copy, and Next is never blocked.
+// Key-created view: masked key with reveal toggle. Backup options open the
+// dark security view; the raw key is fetched only on explicit reveal/copy.
 // ---------------------------------------------------------------------------
 
-test("chooser shows masked key; reveal and copy fetch it explicitly", async ({
+test("key view reveals explicitly; options copy explicitly", async ({
   page,
 }) => {
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
@@ -86,18 +100,24 @@ test("chooser shows masked key; reveal and copy fetch it explicitly", async ({
   await page.getByTestId("backup-key-reveal-toggle").click();
   await expect(key).not.toContainText("nsec1");
 
-  // Inline copy goes straight to the clipboard.
+  // Copy is available only after opening the dark backup-options view.
+  await page.getByTestId("backup-options-toggle").click();
+  await expect(
+    page.getByTestId("onboarding-page-backup-options"),
+  ).toBeVisible();
+  await expect(page.getByTestId("onboarding-next")).toHaveCount(0);
   await page.getByTestId("backup-copy-key").click();
   await expect
     .poll(async () => invokedCommands(page))
     .toContain("copy_text_to_clipboard");
   expect(await invokedCommands(page)).toContain("get_nsec");
 
-  // Next leads into the download step, where backup stays skippable.
+  // Return restores the yellow key-created view; its Next skips backup and
+  // continues directly to setup.
+  await page.getByTestId("backup-return-to-onboarding").click();
+  await expect(page.getByTestId("onboarding-page-backup")).toBeVisible();
   await expect(page.getByTestId("onboarding-next")).toBeEnabled();
   await page.getByTestId("onboarding-next").click();
-  await expect(page.getByTestId("onboarding-page-download")).toBeVisible();
-  await page.getByTestId("onboarding-skip").click();
   await expect(page.getByTestId("onboarding-page-2")).toBeVisible();
 });
 
@@ -112,10 +132,9 @@ test("download happy path: generated password, encrypt, native save, Next", asyn
 }) => {
   await enterMachineBackup(page);
 
-  // The download flow is its own onboarding step behind the footer's Next.
-  await expect(page.getByTestId("backup-intro-logo")).toHaveCount(0);
-  await page.getByTestId("onboarding-next").click();
-  await expect(page.getByTestId("onboarding-page-download")).toBeVisible();
+  // Password backup opens from the dark options state without adding an
+  // onboarding progress step.
+  await openPasswordBackup(page);
 
   // The password field starts empty; the create button sits in the footer's
   // primary slot and stays disabled until a valid password exists.
@@ -239,28 +258,27 @@ test("download happy path: generated password, encrypt, native save, Next", asyn
   await expect(page.getByTestId("onboarding-page-2")).toBeVisible();
 });
 
-test("download step Back returns to the backup chooser", async ({ page }) => {
+test("security view returns to the yellow onboarding view", async ({
+  page,
+}) => {
   await enterMachineBackup(page);
+  await openPasswordBackup(page);
 
-  await page.getByTestId("onboarding-next").click();
-  await expect(page.getByTestId("onboarding-page-download")).toBeVisible();
   await expect(page.getByTestId("backup-passphrase-input")).toBeVisible();
-  // The chooser's footer Next belongs to the previous step; the download
-  // step only mounts its own Next once the backup exists.
+  await expect(page.getByTestId("onboarding-step-dots")).toHaveCount(0);
   await expect(page.getByTestId("onboarding-next")).toHaveCount(0);
 
-  await page.getByTestId("onboarding-back").click();
+  await page.getByTestId("backup-return-to-onboarding").click();
   await expect(page.getByTestId("onboarding-page-backup")).toBeVisible();
   await expect(page.getByTestId("backup-key-value")).toBeVisible();
   await expect(page.getByTestId("onboarding-next")).toBeVisible();
 });
 
-test("test-view Back returns to a secure saved-password placeholder", async ({
+test("returning to onboarding preserves password-backup progress", async ({
   page,
 }) => {
   await enterMachineBackup(page);
-  await page.getByTestId("onboarding-next").click();
-  await expect(page.getByTestId("onboarding-page-download")).toBeVisible();
+  await openPasswordBackup(page);
 
   const input = page.getByTestId("backup-passphrase-input");
   await input.fill("mock-horse-battery-staple");
@@ -269,30 +287,20 @@ test("test-view Back returns to a secure saved-password placeholder", async ({
     page.getByRole("heading", { name: "Now, test your backup" }),
   ).toBeVisible();
 
-  // Back retains only the encrypted blob and renders a fixed visual mask over
-  // an empty readonly input.
-  await page.getByTestId("onboarding-back").click();
-  await expect(
-    page.getByRole("heading", { name: "Backup your key with a password" }),
-  ).toBeVisible();
-  await expect(input).toHaveValue("");
-  await expect(input).toHaveAttribute("readonly", "");
-  await expect(page.getByTestId("backup-saved-password-mask")).toBeVisible();
+  await page.getByTestId("backup-return-to-onboarding").click();
+  await expect(page.getByTestId("onboarding-page-backup")).toBeVisible();
 
-  // Re-downloading needs no password or re-encryption.
-  await page.getByTestId("encrypted-backup-create").click();
+  // Re-entering the security flow restores the in-progress backup test.
+  await openPasswordBackup(page);
   await expect(
     page.getByRole("heading", { name: "Now, test your backup" }),
   ).toBeVisible();
-
-  await page.getByTestId("onboarding-back").click();
-  await page.getByTestId("onboarding-back").click();
-  await expect(page.getByTestId("onboarding-page-backup")).toBeVisible();
+  await expect(page.getByTestId("backup-test-dropzone")).toBeVisible();
 });
 
 test("typed password requires 12 characters", async ({ page }) => {
   await enterMachineBackup(page);
-  await page.getByTestId("onboarding-next").click();
+  await openPasswordBackup(page);
 
   const create = page.getByTestId("encrypted-backup-create");
   await expect(create).toBeDisabled(); // empty field
@@ -345,12 +353,10 @@ test("reveal shows inline error when get_nsec fails and Next still advances", as
   await page.getByTestId("backup-key-reveal-toggle").click();
 
   await expect(page.getByTestId("backup-copy-error")).toBeVisible();
-  // Keychain failure does not trap the user: Next still advances into the
-  // download step, and Skip there continues to setup.
+  // Keychain failure does not trap the user: Next still skips backup and
+  // advances directly to setup.
   await expect(page.getByTestId("onboarding-next")).toBeEnabled();
   await page.getByTestId("onboarding-next").click();
-  await expect(page.getByTestId("onboarding-page-download")).toBeVisible();
-  await page.getByTestId("onboarding-skip").click();
   await expect(page.getByTestId("onboarding-page-2")).toBeVisible();
 });
 

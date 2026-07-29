@@ -222,8 +222,11 @@ async fn current_allow_returns_request_scoped_snapshot() {
     };
 
     assert_eq!(snapshot.authorization_domain(), domain(1));
+    assert_eq!(snapshot.transport(), AuthTransport::RelayWebSocket);
     assert_eq!(snapshot.actor_pubkey(), actor.public_key());
     assert_eq!(snapshot.owner_pubkey(), None);
+    assert_eq!(snapshot.binding_id(), None);
+    assert_eq!(snapshot.binding_version(), None);
     assert_eq!(snapshot.proof_method(), AuthMethod::Nip42);
     assert_eq!(snapshot.principal(), request.principal());
     assert_eq!(snapshot.profile_id(), request.profile_id());
@@ -433,6 +436,33 @@ async fn domain_principal_and_capability_mismatches_deny() {
 }
 
 #[tokio::test]
+async fn invite_mint_does_not_authorize_invite_claim() {
+    let actor = Keys::generate();
+    let request = direct_request_with_expiry(
+        &actor,
+        200,
+        capabilities(&[AuthorizationCapability::InviteClaim]),
+    );
+    let provider = FakeProvider::returning(allow_for(
+        &request,
+        capabilities(&[AuthorizationCapability::InviteMint]),
+        "version-a",
+        90,
+        180,
+    ));
+
+    let AuthorizationOutcome::Deny(denial) =
+        resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+    else {
+        panic!("invitation minting must not authorize a claim");
+    };
+    assert_eq!(
+        denial.reason(),
+        AuthorizationDenialReason::MissingCapability
+    );
+}
+
+#[tokio::test]
 async fn assertion_expiry_bounds_provider_freshness() {
     let actor = Keys::generate();
     let request = direct_request_with_expiry(
@@ -464,7 +494,7 @@ async fn delegated_owner_admission_does_not_require_owner_assertion() {
     let request = delegated_request(&actor, &owner, 140);
     assert!(matches!(
         request.authority(),
-        AuthorizationAuthority::Delegated { owner_pubkey }
+        AuthorizationAuthority::Delegated { owner_pubkey, .. }
             if *owner_pubkey == owner.public_key()
     ));
     assert_eq!(
@@ -487,6 +517,9 @@ async fn delegated_owner_admission_does_not_require_owner_assertion() {
     assert_eq!(snapshot.effective_until(), 140);
     assert_eq!(snapshot.actor_pubkey(), actor.public_key());
     assert_eq!(snapshot.owner_pubkey(), Some(owner.public_key()));
+    assert_eq!(snapshot.binding_id(), Some(Uuid::from_u128(10)));
+    assert_eq!(snapshot.binding_version(), Some(BindingVersion::INITIAL));
+    assert_eq!(snapshot.transport(), AuthTransport::RelayWebSocket);
 }
 
 #[tokio::test]
@@ -811,7 +844,8 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
         format!("{request:?}"),
         concat!(
             "AuthorizationRequest { authorization_domain: \"[redacted]\", ",
-            "actor_pubkey: \"[redacted]\", proof_method: \"[redacted]\", ",
+            "transport: \"[redacted]\", actor_pubkey: \"[redacted]\", ",
+            "proof_method: \"[redacted]\", ",
             "authority: \"[redacted]\", principal: \"[redacted]\", ",
             "profile_id: \"[redacted]\", requested_capabilities: \"[redacted]\", ",
             "correlation_id: \"[redacted]\", decision_source: \"[redacted]\", ",
@@ -853,8 +887,10 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
         format!("{snapshot:?}"),
         concat!(
             "CapabilitySnapshot { authorization_domain: \"[redacted]\", ",
-            "actor_pubkey: \"[redacted]\", owner_pubkey: \"[redacted]\", ",
-            "proof_method: \"[redacted]\", principal: \"[redacted]\", ",
+            "transport: \"[redacted]\", actor_pubkey: \"[redacted]\", ",
+            "owner_pubkey: \"[redacted]\", binding_id: \"[redacted]\", ",
+            "binding_version: \"[redacted]\", proof_method: \"[redacted]\", ",
+            "principal: \"[redacted]\", ",
             "profile_id: \"[redacted]\", capabilities: \"[redacted]\", ",
             "policy_version: \"[redacted]\", issued_at: \"[redacted]\", ",
             "fresh_until: \"[redacted]\", effective_until: \"[redacted]\", ",

@@ -12,8 +12,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::context::{
-    AuthMethod, FederatedPrincipal, VerifiedFederatedAssertion, VerifiedNostrProof,
-    VersionedBindingRef,
+    AuthMethod, AuthTransport, BindingVersion, FederatedPrincipal, VerifiedFederatedAssertion,
+    VerifiedNostrProof, VersionedBindingRef,
 };
 
 const MAX_OPAQUE_ID_BYTES: usize = 256;
@@ -33,8 +33,10 @@ pub enum AuthorizationCapability {
     CommunityWrite,
     /// Perform moderation operations.
     Moderate,
-    /// Mint or claim invitations.
-    Invite,
+    /// Mint invitations.
+    InviteMint,
+    /// Claim an invitation before membership exists.
+    InviteClaim,
     /// Read authenticated media.
     MediaRead,
     /// Upload media.
@@ -132,6 +134,9 @@ impl fmt::Debug for AuthorizationProfileId {
 }
 
 /// Opaque, equality-comparable policy version returned by a provider.
+///
+/// This is the typed policy-change seam that later lease and invalidation code
+/// can use without assuming a provider-specific numeric ordering.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PolicyVersion(String);
 
@@ -173,6 +178,10 @@ pub enum AuthorizationAuthority {
     Delegated {
         /// Cryptographically verified and actively bound owner key.
         owner_pubkey: PublicKey,
+        /// Stable identifier of the active owner binding.
+        binding_id: Uuid,
+        /// Exact active owner-binding version used for this decision.
+        binding_version: BindingVersion,
     },
 }
 
@@ -208,6 +217,7 @@ impl fmt::Debug for DecisionSource {
 #[derive(PartialEq, Eq)]
 pub struct AuthorizationRequest {
     authorization_domain: CommunityId,
+    transport: AuthTransport,
     actor_pubkey: PublicKey,
     proof_method: AuthMethod,
     authority: AuthorizationAuthority,
@@ -225,6 +235,7 @@ impl AuthorizationRequest {
     /// An unattested assertion is intentionally insufficient in this phase. A
     /// future trust-on-first-use path must also consume authoritative active or
     /// atomic-enrollment binding evidence before it can produce direct authority.
+    /// `now_unix_seconds` must come from the server clock.
     pub fn direct(
         proof: &VerifiedNostrProof,
         assertion: &VerifiedFederatedAssertion,
@@ -262,6 +273,7 @@ impl AuthorizationRequest {
         }
         Ok(Self {
             authorization_domain: proof.authorization_domain(),
+            transport: proof.authorized_transport(),
             actor_pubkey: proof.actor_pubkey(),
             proof_method: proof.proof_method(),
             authority: AuthorizationAuthority::Direct,
@@ -278,6 +290,7 @@ impl AuthorizationRequest {
     ///
     /// This path does not require an owner assertion. The provider resolves
     /// current admission for the exact issuer-qualified bound owner.
+    /// `now_unix_seconds` must come from the server clock.
     pub fn delegated(
         proof: &VerifiedNostrProof,
         owner: &VersionedBindingRef,
@@ -306,10 +319,13 @@ impl AuthorizationRequest {
         }
         Ok(Self {
             authorization_domain: proof.authorization_domain(),
+            transport: proof.authorized_transport(),
             actor_pubkey: proof.actor_pubkey(),
             proof_method: proof.proof_method(),
             authority: AuthorizationAuthority::Delegated {
                 owner_pubkey: owner.bound_pubkey(),
+                binding_id: owner.binding_id(),
+                binding_version: owner.binding_version(),
             },
             principal: owner.principal().clone(),
             profile_id,
@@ -323,6 +339,11 @@ impl AuthorizationRequest {
     /// Server-resolved authorization domain.
     pub const fn authorization_domain(&self) -> CommunityId {
         self.authorization_domain
+    }
+
+    /// Exact protected transport authorized by the verified proof.
+    pub const fn transport(&self) -> AuthTransport {
+        self.transport
     }
 
     /// Authenticated Nostr actor.
@@ -364,6 +385,11 @@ impl AuthorizationRequest {
     pub const fn decision_source(&self) -> DecisionSource {
         self.decision_source
     }
+
+    /// Earliest validity bound supplied by verified assertion or delegation evidence.
+    pub const fn evidence_valid_until(&self) -> Option<u64> {
+        self.evidence_valid_until
+    }
 }
 
 impl fmt::Debug for AuthorizationRequest {
@@ -371,6 +397,7 @@ impl fmt::Debug for AuthorizationRequest {
         formatter
             .debug_struct("AuthorizationRequest")
             .field("authorization_domain", &"[redacted]")
+            .field("transport", &"[redacted]")
             .field("actor_pubkey", &"[redacted]")
             .field("proof_method", &"[redacted]")
             .field("authority", &"[redacted]")
@@ -714,11 +741,16 @@ impl fmt::Debug for ProviderAllowReason {
 ///
 /// This type has no public constructor, default, or deserialization path. Only
 /// [`resolve_authorization`] can create it after checking the provider response.
+/// The move-only snapshot is the private finalizer evidence for a later phase;
+/// callers may inspect its bounded metadata but cannot recreate trusted state.
 #[derive(PartialEq, Eq)]
 pub struct CapabilitySnapshot {
     authorization_domain: CommunityId,
+    transport: AuthTransport,
     actor_pubkey: PublicKey,
     owner_pubkey: Option<PublicKey>,
+    binding_id: Option<Uuid>,
+    binding_version: Option<BindingVersion>,
     proof_method: AuthMethod,
     principal: FederatedPrincipal,
     profile_id: AuthorizationProfileId,
@@ -738,6 +770,11 @@ impl CapabilitySnapshot {
         self.authorization_domain
     }
 
+    /// Exact protected transport for which this snapshot was resolved.
+    pub const fn transport(&self) -> AuthTransport {
+        self.transport
+    }
+
     /// Exact authenticated Nostr actor for this decision.
     pub const fn actor_pubkey(&self) -> PublicKey {
         self.actor_pubkey
@@ -746,6 +783,19 @@ impl CapabilitySnapshot {
     /// Exact verified owner for delegated authority, when present.
     pub const fn owner_pubkey(&self) -> Option<PublicKey> {
         self.owner_pubkey
+    }
+
+    /// Stable active binding identifier for delegated authority.
+    pub const fn binding_id(&self) -> Option<Uuid> {
+        self.binding_id
+    }
+
+    /// Exact active binding version for delegated authority.
+    ///
+    /// This is not a lease: later consumers must compare it with current
+    /// authoritative binding state before reusing a cached snapshot.
+    pub const fn binding_version(&self) -> Option<BindingVersion> {
+        self.binding_version
     }
 
     /// Cryptographic proof method for the authenticated actor.
@@ -809,8 +859,11 @@ impl fmt::Debug for CapabilitySnapshot {
         formatter
             .debug_struct("CapabilitySnapshot")
             .field("authorization_domain", &"[redacted]")
+            .field("transport", &"[redacted]")
             .field("actor_pubkey", &"[redacted]")
             .field("owner_pubkey", &"[redacted]")
+            .field("binding_id", &"[redacted]")
+            .field("binding_version", &"[redacted]")
             .field("proof_method", &"[redacted]")
             .field("principal", &"[redacted]")
             .field("profile_id", &"[redacted]")
@@ -851,6 +904,7 @@ impl fmt::Debug for AuthorizationOutcome {
 ///
 /// Unavailability is preserved as a fail-closed outcome. This function never
 /// falls back to Nostr-only authorization or applies an implicit grace period.
+/// `now_unix_seconds` must come from the server clock.
 pub async fn resolve_authorization(
     provider: &dyn AuthorizationProvider,
     request: &AuthorizationRequest,
@@ -906,10 +960,21 @@ pub async fn resolve_authorization(
 
     AuthorizationOutcome::Allow(Box::new(CapabilitySnapshot {
         authorization_domain: allow.authorization_domain,
+        transport: request.transport,
         actor_pubkey: request.actor_pubkey,
         owner_pubkey: match &request.authority {
             AuthorizationAuthority::Direct => None,
-            AuthorizationAuthority::Delegated { owner_pubkey } => Some(*owner_pubkey),
+            AuthorizationAuthority::Delegated { owner_pubkey, .. } => Some(*owner_pubkey),
+        },
+        binding_id: match &request.authority {
+            AuthorizationAuthority::Direct => None,
+            AuthorizationAuthority::Delegated { binding_id, .. } => Some(*binding_id),
+        },
+        binding_version: match &request.authority {
+            AuthorizationAuthority::Direct => None,
+            AuthorizationAuthority::Delegated {
+                binding_version, ..
+            } => Some(*binding_version),
         },
         proof_method: request.proof_method,
         principal: allow.principal,

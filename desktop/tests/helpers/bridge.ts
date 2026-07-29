@@ -295,6 +295,7 @@ type MockBridgeOptions = {
   linkPreviewMetadata?: {
     title: string;
     siteName: string | null;
+    description: string | null;
     imageDataUrl: string | null;
     imageDomain: string | null;
   } | null;

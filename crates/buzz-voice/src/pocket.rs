@@ -24,7 +24,7 @@ mod pocket_april;
 #[path = "pocket_models.rs"]
 mod pocket_models;
 
-use pocket_april::{prepare_april_prompt, AprilPocketTts};
+use pocket_april::{prepare_april_prompt, AprilPocketTts, AprilSynthesisOutcome};
 pub(crate) use pocket_models::{
     april_model_info, PocketModelArtifact, APRIL_BUNDLE_ID, APRIL_MODEL_ID, APRIL_MODEL_REVISION,
 };
@@ -105,6 +105,16 @@ pub struct PocketTts {
     inner: Mutex<AprilPocketTts>,
 }
 
+/// Result of a callback-driven Pocket synthesis request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SynthesisOutcome {
+    /// Synthesis finished and contains the same PCM exposed cumulatively to
+    /// the callback.
+    Complete(Vec<f32>),
+    /// The callback requested cancellation before synthesis completed.
+    Interrupted,
+}
+
 /// Load Buzz Desktop's pinned April INT8 model.
 pub fn load_text_to_speech(model_dir: &str) -> Result<PocketTts, String> {
     let dir = PathBuf::from(model_dir);
@@ -150,76 +160,130 @@ impl PocketTts {
         style: &VoiceStyle,
         steps: usize,
     ) -> Result<Vec<f32>, String> {
-        self.synth_chunk_with_callback(text, lang, style, steps, None::<fn(&[f32], f32) -> bool>)
+        match self.synth_chunk_streaming(text, lang, style, steps, |_, _| true)? {
+            SynthesisOutcome::Complete(samples) => Ok(samples),
+            SynthesisOutcome::Interrupted => Ok(Vec::new()),
+        }
     }
 
-    /// Synthesize text, allowing the caller to stop generation early.
+    /// Synthesize text with the mobile-compatible optional callback API.
     ///
-    /// The callback receives PCM accumulated after each decoded text chunk
-    /// and progress in `[0, 1]`. During latent generation the callback is
-    /// invoked with an empty sample slice so cancellation can remain
-    /// responsive before PCM is available. Return `true` to continue or
-    /// `false` to stop and return the audio generated so far. Progress is
-    /// monotonic across split text chunks. Calls back into the same
-    /// [`PocketTts`] return an error instead of blocking on its engine lock.
+    /// This compatibility surface returns all PCM produced before cancellation.
+    /// New callers that need to distinguish completion from interruption should
+    /// use [`PocketTts::synth_chunk_streaming`].
     pub fn synth_chunk_with_callback<F>(
         &self,
         text: &str,
-        _lang: &str,
+        lang: &str,
         style: &VoiceStyle,
-        _steps: usize,
+        steps: usize,
         mut callback: Option<F>,
     ) -> Result<Vec<f32>, String>
     where
         F: FnMut(&[f32], f32) -> bool + 'static,
     {
+        let mut latest_samples = Vec::new();
+        let outcome =
+            self.synth_chunk_streaming(text, lang, style, steps, |samples, progress| {
+                latest_samples.clear();
+                latest_samples.extend_from_slice(samples);
+                callback
+                    .as_mut()
+                    .is_none_or(|callback| callback(samples, progress))
+            })?;
+        match outcome {
+            SynthesisOutcome::Complete(samples) => Ok(samples),
+            SynthesisOutcome::Interrupted => Ok(latest_samples),
+        }
+    }
+
+    /// Synthesize text while reporting cumulative PCM as decoder blocks finish.
+    ///
+    /// Callback sample buffers contain all PCM produced for this call so far.
+    /// Their lengths never decrease, but equal lengths are allowed while the
+    /// engine advances between internal model-safe text chunks. Returning
+    /// `false` interrupts synthesis before the next decoder block.
+    pub fn synth_chunk_streaming<F>(
+        &self,
+        text: &str,
+        _lang: &str,
+        style: &VoiceStyle,
+        _steps: usize,
+        mut callback: F,
+    ) -> Result<SynthesisOutcome, String>
+    where
+        F: FnMut(&[f32], f32) -> bool,
+    {
         let _call_guard = SynthesisCallGuard::enter(self as *const Self as usize)?;
         let Some(prepared) = prepare_april_prompt(text) else {
-            return Ok(Vec::new());
+            return Ok(SynthesisOutcome::Complete(Vec::new()));
         };
         let mut engine = self
             .inner
             .lock()
             .map_err(|_| "Pocket TTS engine lock poisoned".to_string())?;
         let chunks = engine.split_prompt(&prepared)?;
-        let mut samples = Vec::new();
         let chunk_count = chunks.len();
-        for (index, chunk) in chunks.into_iter().enumerate() {
+        let mut samples = Vec::new();
+        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+            if chunk_index > 0
+                && !callback_allows_progress(
+                    &mut callback,
+                    &samples,
+                    chunk_index as f32 / chunk_count as f32,
+                )?
+            {
+                return Ok(SynthesisOutcome::Interrupted);
+            }
             let prepared = prepare_april_prompt(&chunk)
                 .ok_or_else(|| "Pocket TTS prompt chunk became empty".to_string())?;
-            let progress_offset = index as f32 / chunk_count as f32;
-            let progress_scale = 1.0 / chunk_count as f32;
-            let (chunk_samples, cancelled) = engine.synth_chunk_with_callback(
-                &prepared,
-                style,
-                &mut callback,
-                progress_offset,
-                progress_scale,
-            )?;
-            samples.extend(chunk_samples);
-            if cancelled {
-                break;
+            let mut callback_error = None;
+            let outcome = engine.synth_chunk_streaming(&prepared, style, |block, progress| {
+                match append_and_callback(
+                    &mut samples,
+                    block,
+                    &mut callback,
+                    (chunk_index as f32 + progress) / chunk_count as f32,
+                ) {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        callback_error = Some(error);
+                        false
+                    }
+                }
+            })?;
+            if let Some(error) = callback_error {
+                return Err(error);
             }
-            let progress = (index + 1) as f32 / chunk_count as f32;
-            if !callback_allows_progress(&mut callback, &samples, progress)? {
-                break;
+            if matches!(outcome, AprilSynthesisOutcome::Interrupted) {
+                return Ok(SynthesisOutcome::Interrupted);
             }
         }
-        Ok(samples)
+        Ok(SynthesisOutcome::Complete(samples))
     }
 }
 
+fn append_and_callback<F>(
+    samples: &mut Vec<f32>,
+    block: &[f32],
+    callback: &mut F,
+    progress: f32,
+) -> Result<bool, String>
+where
+    F: FnMut(&[f32], f32) -> bool,
+{
+    samples.extend_from_slice(block);
+    callback_allows_progress(callback, samples, progress)
+}
+
 fn callback_allows_progress<F>(
-    callback: &mut Option<F>,
+    callback: &mut F,
     samples: &[f32],
     progress: f32,
 ) -> Result<bool, String>
 where
     F: FnMut(&[f32], f32) -> bool,
 {
-    let Some(callback) = callback.as_mut() else {
-        return Ok(true);
-    };
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(samples, progress)))
         .map_err(|_| "Pocket TTS synthesis callback panicked".to_string())
 }
@@ -244,20 +308,40 @@ mod tests {
     }
 
     #[test]
-    fn callback_can_cancel_before_pcm_is_available() {
-        let mut callback = Some(|samples: &[f32], progress: f32| {
-            assert!(samples.is_empty());
-            assert_eq!(progress, 0.25);
-            false
-        });
-        assert!(!callback_allows_progress(&mut callback, &[], 0.25).expect("callback"));
+    fn cumulative_callback_allows_growth_equal_repeats_and_cancellation() {
+        let mut observed = Vec::new();
+        let mut callback = |samples: &[f32], progress: f32| {
+            observed.push((samples.to_vec(), progress));
+            progress < 0.75
+        };
+        let mut samples = Vec::new();
+
+        assert!(
+            append_and_callback(&mut samples, &[1.0, 2.0], &mut callback, 0.25)
+                .expect("first callback")
+        );
+        assert!(append_and_callback(&mut samples, &[], &mut callback, 0.5)
+            .expect("equal-length callback"));
+        assert!(
+            !append_and_callback(&mut samples, &[3.0], &mut callback, 0.75)
+                .expect("cancelling callback")
+        );
+
+        assert_eq!(
+            observed,
+            vec![
+                (vec![1.0, 2.0], 0.25),
+                (vec![1.0, 2.0], 0.5),
+                (vec![1.0, 2.0, 3.0], 0.75),
+            ]
+        );
     }
 
     #[test]
     fn callback_panic_is_reported_without_unwinding() {
-        let mut callback = Some(|_: &[f32], _: f32| -> bool {
+        let mut callback = |_: &[f32], _: f32| -> bool {
             panic!("callback failure");
-        });
+        };
         assert_eq!(
             callback_allows_progress(&mut callback, &[], 0.0).unwrap_err(),
             "Pocket TTS synthesis callback panicked"
@@ -286,5 +370,90 @@ mod tests {
         assert!(!samples.is_empty());
         assert!(samples.iter().all(|sample| sample.is_finite()));
         assert!(samples.iter().any(|sample| sample.abs() > 1.0e-6));
+    }
+
+    #[test]
+    #[ignore = "requires BUZZ_POCKET_TEST_MODEL_DIR"]
+    fn production_streaming_callbacks_are_cumulative_across_model_chunks() {
+        let dir = std::env::var("BUZZ_POCKET_TEST_MODEL_DIR")
+            .expect("set BUZZ_POCKET_TEST_MODEL_DIR to an April INT8 model directory");
+        let engine = load_text_to_speech(&dir).expect("load April INT8 engine");
+        let style = load_voice_style(&Path::new(&dir).join("reference_sample.wav"))
+            .expect("load reference voice");
+        engine
+            .synth_chunk("Warm up.", "en", &style, 1)
+            .expect("warm production engine");
+        let text = "And sometimes, when I am certain the reader is rested, I will engage him with a sentence of considerable length, a sentence that burns with energy and builds with all the impetus of a crescendo, the roll of the drums, the crash of the cymbals–sounds that say listen to this, it is important.";
+        let mut reconstructed = Vec::new();
+        let mut previous_len = 0;
+        let mut saw_equal_repeat = false;
+        let mut callback_count = 0;
+        let mut first_callback = None;
+        let started = std::time::Instant::now();
+
+        let outcome = engine
+            .synth_chunk_streaming(text, "en", &style, 1, |cumulative, _| {
+                callback_count += 1;
+                first_callback.get_or_insert_with(|| started.elapsed());
+                assert!(cumulative.len() >= previous_len);
+                saw_equal_repeat |= cumulative.len() == previous_len;
+                reconstructed.extend_from_slice(&cumulative[previous_len..]);
+                previous_len = cumulative.len();
+                true
+            })
+            .expect("stream through the production API");
+        let SynthesisOutcome::Complete(samples) = outcome else {
+            panic!("uninterrupted synthesis must complete");
+        };
+        let total = started.elapsed();
+        let first_callback = first_callback.expect("decoder must produce a callback");
+        let audio_duration =
+            std::time::Duration::from_secs_f64(samples.len() as f64 / SAMPLE_RATE as f64);
+        eprintln!(
+            "first_callback_ms={:.1} total_ms={:.1} audio_seconds={:.3} rtf={:.3} callbacks={callback_count}",
+            first_callback.as_secs_f64() * 1000.0,
+            total.as_secs_f64() * 1000.0,
+            audio_duration.as_secs_f64(),
+            total.as_secs_f64() / audio_duration.as_secs_f64(),
+        );
+
+        assert!(saw_equal_repeat);
+        assert_eq!(reconstructed, samples);
+    }
+
+    #[test]
+    #[ignore = "requires BUZZ_POCKET_TEST_MODEL_DIR"]
+    fn production_streaming_callback_interrupts_after_first_decoder_block() {
+        let dir = std::env::var("BUZZ_POCKET_TEST_MODEL_DIR")
+            .expect("set BUZZ_POCKET_TEST_MODEL_DIR to an April INT8 model directory");
+        let engine = load_text_to_speech(&dir).expect("load April INT8 engine");
+        let style = load_voice_style(&Path::new(&dir).join("reference_sample.wav"))
+            .expect("load reference voice");
+        engine
+            .synth_chunk("Warm up.", "en", &style, 1)
+            .expect("warm production engine");
+        let mut callback_at = None;
+        let started = std::time::Instant::now();
+
+        let outcome = engine
+            .synth_chunk_streaming(
+                "This sentence is long enough to require more than one decoder block.",
+                "en",
+                &style,
+                1,
+                |_, _| {
+                    callback_at = Some(started.elapsed());
+                    false
+                },
+            )
+            .expect("interrupt production streaming");
+        let callback_at = callback_at.expect("decoder must produce a callback");
+        let cancellation_latency = started.elapsed().saturating_sub(callback_at);
+        eprintln!(
+            "callback_to_cancel_return_ms={:.1}",
+            cancellation_latency.as_secs_f64() * 1000.0
+        );
+
+        assert!(matches!(outcome, SynthesisOutcome::Interrupted));
     }
 }

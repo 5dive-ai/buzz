@@ -115,18 +115,24 @@ async fn boundary_sync_managed_agent_profile_blocks_ncryptsec() {
     assert_guard_error(&err);
 }
 
-/// Boundary 3: `relay.rs` `submit_signed_event`.
+/// Boundary 3: `relay/submit.rs` `submit_signed_event_at_with_keys` — the
+/// pre-signed entry into the boundary-1 funnel (main's submit refactor
+/// replaced `relay.rs` `submit_signed_event` with this scoped form).
 #[tokio::test]
-async fn boundary_submit_signed_event_blocks_ncryptsec() {
+async fn boundary_submit_signed_event_at_with_keys_blocks_ncryptsec() {
     let state = crate::app_state::build_app_state();
-    *state.relay_url_override.lock().unwrap() = Some("ws://127.0.0.1:9".to_string());
-    let keys = state.signing_keys().unwrap();
+    let keys = nostr::Keys::generate();
     let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), NCRYPTSEC)
         .sign_with_keys(&keys)
         .unwrap();
-    let err = crate::relay::submit_signed_event(&event, &state)
-        .await
-        .unwrap_err();
+    let err = crate::relay::submit_signed_event_at_with_keys(
+        &event,
+        &state,
+        "http://127.0.0.1:9", // discard port — must never be reached
+        &keys,
+    )
+    .await
+    .unwrap_err();
     assert_guard_error(&err);
 }
 
@@ -234,8 +240,8 @@ fn src_rust_files() -> Vec<std::path::PathBuf> {
 /// guard + adding an injection test for the new site.
 const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Production egress boundaries (see egress_guard.rs table):
-    ("src/relay.rs", 3, 3),                             // boundaries 2, 3, 4
-    ("src/relay/submit.rs", 1, 1),                      // boundary 1
+    ("src/relay.rs", 2, 2),                             // boundaries 2, 4
+    ("src/relay/submit.rs", 1, 1),                      // boundaries 1 + 3 (shared funnel)
     ("src/huddle/pipeline.rs", 1, 1),                   // boundary 5
     ("src/commands/team_snapshot.rs", 1, 1),            // boundary 6
     ("src/commands/personas/snapshot/import.rs", 2, 1), // boundary 7 + its in-file injection-test fixture URL
@@ -245,6 +251,9 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     ("src/archive/mod_tests.rs", 1, 0),
     ("src/managed_agents/persona_events/tests.rs", 1, 0),
     ("src/commands/team_snapshot/tests.rs", 1, 0),
+    // Mock-relay route in its in-file tests; production publish goes through
+    // the guarded boundary-1 funnel (`submit_signed_event_at_with_keys`).
+    ("src/commands/personas/sharing.rs", 1, 0),
 ];
 
 // Needles are assembled at runtime so this scan file itself contains no

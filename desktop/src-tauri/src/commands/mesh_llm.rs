@@ -133,7 +133,7 @@ fn buzz_mesh_name_for_relay(relay_url: &str) -> String {
     format!("buzz-community-{}", &digest[..32])
 }
 
-fn buzz_mesh_name(state: &AppState) -> String {
+pub(super) fn buzz_mesh_name(state: &AppState) -> String {
     buzz_mesh_name_for_relay(&relay::relay_ws_url_with_override(state))
 }
 

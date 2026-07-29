@@ -10,6 +10,32 @@ use crate::managed_agents::{
 };
 use crate::relay;
 
+#[cfg(feature = "mesh-llm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshWorkspaceApplyAction {
+    Continue,
+    RestartProcess,
+}
+
+/// Decide whether an embedded MeshLLM runtime belongs to the workspace that
+/// has just been applied. A running node is relay-scoped through `mesh_name`;
+/// carrying it across a workspace boundary would publish old-community state
+/// on the new relay. Rebuilding it also requires a process boundary because
+/// MeshLLM's native listeners are not safe to stop and recreate in-process.
+#[cfg(feature = "mesh-llm")]
+fn mesh_workspace_apply_action(
+    request: Option<&crate::mesh_llm::StartMeshNodeRequest>,
+    expected_mesh_name: &str,
+) -> MeshWorkspaceApplyAction {
+    match request {
+        None => MeshWorkspaceApplyAction::Continue,
+        Some(request) if request.mesh_name.as_deref() == Some(expected_mesh_name) => {
+            MeshWorkspaceApplyAction::Continue
+        }
+        Some(_) => MeshWorkspaceApplyAction::RestartProcess,
+    }
+}
+
 /// Adopt the pre-scoping global retention database's pending rows into `scope`.
 ///
 /// Best-effort: a failure is logged and the boot proceeds. The migration's own
@@ -212,6 +238,32 @@ pub async fn apply_workspace(
     .map_err(|e| format!("spawn_blocking failed: {e}"))??;
 
     let state = restore_app.state::<AppState>();
+
+    // A running MeshLLM node is bound to the relay-derived community mesh
+    // name it started with. Never let the old runtime survive a workspace
+    // switch: besides advertising the wrong community, trying to repair it by
+    // stopping and starting the embedded native runtime can terminate Buzz.
+    // The persisted Share Compute config is intentionally left intact, so the
+    // normal launch restore recreates the same serving model for this workspace.
+    #[cfg(feature = "mesh-llm")]
+    {
+        let expected_mesh_name = crate::commands::mesh_llm::buzz_mesh_name(&state);
+        let action = {
+            let runtime = state.mesh_llm_runtime.lock().await;
+            mesh_workspace_apply_action(
+                runtime.as_ref().map(|runtime| runtime.start_request()),
+                &expected_mesh_name,
+            )
+        };
+        if action == MeshWorkspaceApplyAction::RestartProcess {
+            eprintln!(
+                "buzz-mesh: workspace community changed; restarting Buzz to bind MeshLLM to the selected relay"
+            );
+            restore_app.request_restart();
+            return Ok(());
+        }
+    }
+
     // Backfill this exact relay+owner scope only after the workspace has been
     // applied. Running at process boot would target the fallback relay and
     // collapse every community into one pending-event store.
@@ -281,4 +333,55 @@ pub async fn apply_workspace(
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "mesh-llm"))]
+mod tests {
+    use super::*;
+
+    fn mesh_request(mesh_name: Option<&str>) -> crate::mesh_llm::StartMeshNodeRequest {
+        crate::mesh_llm::StartMeshNodeRequest {
+            mode: crate::mesh_llm::MeshNodeMode::Serve,
+            model_id: Some("test-model".to_string()),
+            max_vram_gb: None,
+            join_token: None,
+            mesh_name: mesh_name.map(str::to_string),
+            trusted_owner_ids: Some(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn workspace_apply_continues_without_a_mesh_runtime() {
+        assert_eq!(
+            mesh_workspace_apply_action(None, "buzz-community-new"),
+            MeshWorkspaceApplyAction::Continue
+        );
+    }
+
+    #[test]
+    fn workspace_apply_keeps_runtime_bound_to_selected_community() {
+        let request = mesh_request(Some("buzz-community-current"));
+        assert_eq!(
+            mesh_workspace_apply_action(Some(&request), "buzz-community-current"),
+            MeshWorkspaceApplyAction::Continue
+        );
+    }
+
+    #[test]
+    fn workspace_apply_restarts_for_runtime_bound_to_another_community() {
+        let request = mesh_request(Some("buzz-community-old"));
+        assert_eq!(
+            mesh_workspace_apply_action(Some(&request), "buzz-community-new"),
+            MeshWorkspaceApplyAction::RestartProcess
+        );
+    }
+
+    #[test]
+    fn workspace_apply_restarts_when_runtime_binding_is_unknown() {
+        let request = mesh_request(None);
+        assert_eq!(
+            mesh_workspace_apply_action(Some(&request), "buzz-community-new"),
+            MeshWorkspaceApplyAction::RestartProcess
+        );
+    }
 }

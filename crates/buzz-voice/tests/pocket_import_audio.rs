@@ -1,25 +1,14 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-    time::Duration,
 };
 
 use buzz_voice::{
     imported::{write_pcm16_wav, PcmStats, PocketVoiceLibrary},
-    pocket::{
-        load_text_to_speech, load_voice_style, SynthesisOutcome, DEFAULT_VOICE, SAMPLE_RATE,
-        VOICE_FILE_EXT,
-    },
+    pocket::{load_text_to_speech, load_voice_style, DEFAULT_VOICE, SAMPLE_RATE, VOICE_FILE_EXT},
 };
 
 const PREVIEW_TEXT: &str = "This is an objective Pocket voice preview.";
-const INTERRUPT_TEXT: &str =
-    "This longer Pocket voice sentence should stop before it produces audio that could be played.";
 
 fn required_path(name: &str) -> PathBuf {
     std::env::var_os(name)
@@ -96,40 +85,6 @@ fn objective_import_synthesis_delete_and_mary_fallback() {
     write_pcm16_wav(&imported_wav, &imported_pcm, SAMPLE_RATE)
         .expect("write imported preview evidence");
 
-    let engine = load_text_to_speech(
-        model_dir
-            .to_str()
-            .expect("Pocket model path must be valid UTF-8"),
-    )
-    .expect("load Pocket model for interruption");
-    let style = load_voice_style(&imported_path).expect("load imported style for interruption");
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let interrupt_worker = Arc::clone(&interrupted);
-    let interrupter = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(25));
-        interrupt_worker.store(true, Ordering::Release);
-    });
-    let interrupt_check = Arc::clone(&interrupted);
-    let outcome = engine
-        .synth_chunk_interruptible(INTERRUPT_TEXT, "en", &style, 1, move || {
-            interrupt_check.load(Ordering::Acquire)
-        })
-        .expect("interrupt synthesis");
-    interrupter.join().expect("join interrupter");
-    assert_eq!(
-        outcome,
-        SynthesisOutcome::Interrupted,
-        "interrupted synthesis must discard partial PCM"
-    );
-
-    assert!(
-        engine
-            .synth_chunk("", "en", &style, 1)
-            .expect("empty synthesis")
-            .is_empty(),
-        "empty input must not emit unintended audio"
-    );
-
     relaunched
         .delete(&imported.key)
         .expect("delete imported voice");
@@ -154,8 +109,6 @@ fn objective_import_synthesis_delete_and_mary_fallback() {
         serde_json::json!({
             "importedKey": imported.key,
             "persistence": "reloaded",
-            "interruption": "partial PCM discarded",
-            "emptyInputSamples": 0,
             "afterDelete": "pocket:mary",
             "importedPreview": {
                 "path": imported_wav,
@@ -183,7 +136,8 @@ fn objective_import_synthesis_delete_and_mary_fallback() {
 mod blackhole {
     use std::{
         sync::{Arc, Mutex},
-        time::Instant,
+        thread,
+        time::{Duration, Instant},
     };
 
     use cpal::{

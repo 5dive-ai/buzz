@@ -1174,12 +1174,15 @@ dependencies = [
 name = "buzz-voice"
 version = "0.1.0"
 dependencies = [
+ "atomic-write-file",
+ "hex",
  "ort",
  "ort-sys",
  "rand 0.10.2",
  "sentencepiece-model",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sherpa-onnx",
  "tokenizers",
 ]

@@ -51,34 +51,19 @@ import {
   shouldScheduleReconnect,
 } from "@/shared/api/relayReconnectPolicy";
 import { RelayStallWatchdog } from "@/shared/api/relayStallWatchdog";
+import {
+  AUTH_TIMEOUT_MS,
+  BACKOFF_RESET_STABLE_MS,
+  EVENT_BATCH_MS,
+  HISTORY_TIMEOUT_MS,
+  PUBLISH_TIMEOUT_MS,
+  RECONNECT_BASE_DELAY_MS,
+  RECONNECT_MAX_DELAY_MS,
+  STALL_CHECK_INTERVAL_MS,
+  STALL_IDLE_TIMEOUT_MS,
+} from "@/shared/api/relayClientTimings";
 import { closeWebSocket } from "@/shared/api/relayWebSocketClose";
 import { buildThreadReferenceTags } from "@/features/messages/lib/threading";
-const RECONNECT_BASE_DELAY_MS = 1_000,
-  RECONNECT_MAX_DELAY_MS = 30_000,
-  EVENT_BATCH_MS = 16;
-
-/**
- * Op-level timeout constants. Raised from 8 s to 25 s to survive degraded
- * networks where TLS handshakes and DNS resolution can take 3–10 s.
- */
-export const AUTH_TIMEOUT_MS = 25_000;
-export const HISTORY_TIMEOUT_MS = 25_000;
-export const PUBLISH_TIMEOUT_MS = 25_000;
-
-/**
- * The connection must remain stable for this long after a successful AUTH
- * before the reconnect backoff delay resets to its base value. Stability-
- * gated reset prevents repeated fast reconnects (flapping) from erasing the
- * backoff that throttles them.
- */
-export const BACKOFF_RESET_STABLE_MS = 60_000;
-
-/**
- * Passive liveness check. The relay sends heartbeat pings every 30s; if no
- * inbound frame arrives for two heartbeat windows, treat the socket as stalled.
- */
-const STALL_CHECK_INTERVAL_MS = 10_000;
-const STALL_IDLE_TIMEOUT_MS = 60_000;
 
 export class RelayClient {
   private wsId: number | null = null;

@@ -220,12 +220,14 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
     // Construct outside the lock — this spawns the TTS worker thread and
     // loads ONNX sessions (~200ms). If this fails, clear the sentinel.
     let output_device = state
-        .audio_output_device
+        .huddle_audio
+        .output_device
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let initial_voice = state
-        .tts_settings
+        .huddle_audio
+        .tts
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
         .map(|settings| {
@@ -315,7 +317,8 @@ fn finalize_tts_pipeline_start(
         return Ok(false);
     }
     let voice = state
-        .tts_settings
+        .huddle_audio
+        .tts
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
         .map(|settings| {
@@ -525,7 +528,8 @@ mod tts_start_race_tests {
             .tts_starting
             .load(Ordering::Acquire));
         state
-            .tts_settings
+            .huddle_audio
+            .tts
             .lock()
             .expect("text-to-speech settings")
             .voice_preferences = vec!["pocket:eve".to_string()];

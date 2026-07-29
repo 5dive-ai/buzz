@@ -454,10 +454,10 @@ pub fn run() {
 
             let (tts_settings, tts_settings_load_error) =
                 huddle::tts_settings::load_for_app(&app_handle);
-            if let Ok(mut guard) = state.tts_settings.lock() {
+            if let Ok(mut guard) = state.huddle_audio.tts.lock() {
                 *guard = tts_settings.clone();
             }
-            if let Ok(mut guard) = state.tts_settings_load_error.lock() {
+            if let Ok(mut guard) = state.huddle_audio.tts_load_error.lock() {
                 *guard = tts_settings_load_error;
             }
             if let Ok(mut huddle) = state.huddle_state.lock() {

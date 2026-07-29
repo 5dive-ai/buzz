@@ -8,7 +8,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -36,6 +36,16 @@ type VoiceChangeWait = (
 
 const VOICE_AVAILABILITY_BUNDLED: &str = "bundled";
 const VOICE_AVAILABILITY_INSTALLED: &str = "installed";
+
+/// Installation-global huddle audio and speech preferences.
+#[derive(Default)]
+pub struct HuddleAudioSettingsState {
+    pub tts: Mutex<TtsSettings>,
+    pub tts_load_error: Mutex<Option<String>>,
+    pub tts_transition: tokio::sync::Mutex<()>,
+    /// Selected huddle output device. `None` uses the system default.
+    pub output_device: Mutex<Option<String>>,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -261,7 +271,8 @@ pub fn load_for_app(app: &AppHandle) -> (TtsSettings, Option<String>) {
 #[tauri::command]
 pub fn get_tts_settings(state: State<'_, AppState>) -> Result<TtsSettings, String> {
     if let Some(error) = state
-        .tts_settings_load_error
+        .huddle_audio
+        .tts_load_error
         .lock()
         .map_err(|lock_error| format!("text-to-speech settings lock poisoned: {lock_error}"))?
         .clone()
@@ -271,7 +282,8 @@ pub fn get_tts_settings(state: State<'_, AppState>) -> Result<TtsSettings, Strin
         ));
     }
     state
-        .tts_settings
+        .huddle_audio
+        .tts
         .lock()
         .map(|settings| settings.clone())
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
@@ -284,7 +296,8 @@ pub fn list_voice_registry() -> Vec<VoiceRegistryEntry> {
 
 fn ensure_settings_writable(state: &AppState) -> Result<(), String> {
     if let Some(error) = state
-        .tts_settings_load_error
+        .huddle_audio
+        .tts_load_error
         .lock()
         .map_err(|lock_error| format!("text-to-speech settings lock poisoned: {lock_error}"))?
         .as_ref()
@@ -321,7 +334,8 @@ fn disable_tts_runtime(state: &AppState) -> Result<(), String> {
 
 fn commit_effective_off(state: &AppState) -> Result<(), String> {
     state
-        .tts_settings
+        .huddle_audio
+        .tts
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))?
         .agent_text_to_speech = false;
@@ -370,7 +384,8 @@ async fn apply_tts_settings(
     save_to_path(&settings_path(app)?, &settings)?;
 
     *state
-        .tts_settings
+        .huddle_audio
+        .tts
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))? =
         settings.clone();
@@ -399,7 +414,8 @@ async fn apply_tts_settings(
 
 fn current_settings(state: &AppState) -> Result<TtsSettings, String> {
     state
-        .tts_settings
+        .huddle_audio
+        .tts
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
         .map(|settings| settings.clone())
@@ -448,9 +464,10 @@ pub async fn set_tts_enabled(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TtsSettings, String> {
-    let transition = state.tts_settings_transition.lock().await;
+    let transition = state.huddle_audio.tts_transition.lock().await;
     let mut settings = state
-        .tts_settings
+        .huddle_audio
+        .tts
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))?
         .clone();
@@ -491,9 +508,10 @@ pub async fn set_pocket_voice(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TtsSettings, String> {
-    let transition = state.tts_settings_transition.lock().await;
+    let transition = state.huddle_audio.tts_transition.lock().await;
     let settings = state
-        .tts_settings
+        .huddle_audio
+        .tts
         .lock()
         .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))?
         .clone();
@@ -525,7 +543,8 @@ pub async fn preview_pocket_voice(
     }
     let model_dir = models::tts_model_dir().ok_or("Pocket voice files are unavailable")?;
     let output_device = state
-        .audio_output_device
+        .huddle_audio
+        .output_device
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone();
@@ -785,7 +804,7 @@ mod tests {
 
         // This models the next command after the OFF save fails: it must merge
         // from effective memory state, not the stale last-persisted ON value.
-        let current = state.tts_settings.lock().expect("settings").clone();
+        let current = state.huddle_audio.tts.lock().expect("settings").clone();
         let voice_update =
             settings_with_pocket_voice(current, EVE_VOICE_KEY).expect("available voice");
         assert!(!voice_update.agent_text_to_speech);
@@ -795,16 +814,17 @@ mod tests {
     fn failed_disabled_voice_save_does_not_change_the_remembered_voice() {
         let state = crate::app_state::build_app_state();
         state
-            .tts_settings
+            .huddle_audio
+            .tts
             .lock()
             .expect("settings")
             .agent_text_to_speech = false;
-        let current = state.tts_settings.lock().expect("settings").clone();
+        let current = state.huddle_audio.tts.lock().expect("settings").clone();
         let unsaved = settings_with_pocket_voice(current, EVE_VOICE_KEY).expect("available voice");
 
         // This is the only pre-persistence mutation for an OFF candidate.
         commit_effective_off(&state).expect("commit effective OFF state");
-        let remembered = state.tts_settings.lock().expect("settings").clone();
+        let remembered = state.huddle_audio.tts.lock().expect("settings").clone();
         assert_eq!(remembered.voice_preferences, vec![MARY_VOICE_KEY]);
         assert_eq!(unsaved.voice_preferences, vec![EVE_VOICE_KEY]);
     }

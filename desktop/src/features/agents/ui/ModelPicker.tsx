@@ -23,6 +23,7 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
+import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
 
 export function ModelPicker({
   agent,
@@ -82,13 +83,13 @@ export function ModelPicker({
   );
 
   const currentValue = agent.model ?? modelsData?.agentDefaultModel ?? "";
-  const displayLabel =
-    agent.model ??
-    (modelsData?.agentDefaultModel
-      ? `${modelsData.agentDefaultModel} (default)`
+  const displayLabel = agent.model
+    ? resolveModelLabel(agent.model)
+    : modelsData?.agentDefaultModel
+      ? `${resolveModelLabel(modelsData.agentDefaultModel)} (default)`
       : hasRequestedModels && loading
         ? "Loading..."
-        : "Auto");
+        : "Auto";
 
   // Provenance label shown only for post-spawn agents where the model origin
   // is known from the config surface and the source is not a user-explicit
@@ -221,7 +222,9 @@ export function ModelPicker({
             <div className="px-3 py-2 text-sm text-muted-foreground">
               {agent.model ? (
                 <>
-                  <p className="font-medium text-foreground">{agent.model}</p>
+                  <p className="font-medium text-foreground">
+                    {resolveModelLabel(agent.model)}
+                  </p>
                   <p className="mt-0.5 text-xs">
                     This runtime does not support switching models.
                   </p>

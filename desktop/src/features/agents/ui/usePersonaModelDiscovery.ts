@@ -12,6 +12,7 @@ import {
 } from "./personaModelDiscoveryStatus";
 import type { PersonaModelOption } from "./agentConfigOptions";
 import { providerRequiresExplicitModel } from "./agentConfigOptions";
+import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
 
 export const MODEL_DISCOVERY_LOADING_VALUE = "__model_discovery_loading__";
 
@@ -64,7 +65,7 @@ export function getDiscoveredPersonaModelOptions(
               provider === "relay-mesh"
                 ? "Default (auto)"
                 : agentDefaultModel
-                  ? `Default model (${agentDefaultModel})`
+                  ? `Default model (${resolveModelLabel(agentDefaultModel)})`
                   : "Default model",
           },
         ];

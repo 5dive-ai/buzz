@@ -211,6 +211,16 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Whether the current turn has produced anything an observer would call
+    /// work: at least one non-empty `agent_message_chunk`, or at least one
+    /// tool call that completed without an error flag.
+    ///
+    /// Set by [`handle_session_update`](Self::handle_session_update), cleared
+    /// at the top of every `session/prompt`. Read by the pool after a turn
+    /// returns `end_turn`: a channel turn that ends with this still `false`
+    /// answered a user's mention with nothing at all, which is a failure the
+    /// harness must retry rather than dequeue as a success.
+    turn_produced_output: bool,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -550,6 +560,7 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            turn_produced_output: false,
         })
     }
 
@@ -755,6 +766,10 @@ impl AcpClient {
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
+        // Reset before the prompt is written so nothing a previous turn (or
+        // session setup) emitted can vouch for this one.
+        self.turn_produced_output = false;
+
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
@@ -825,6 +840,18 @@ impl AcpClient {
     /// Returns `true` if a `session/prompt` request is currently in flight.
     pub fn has_in_flight_prompt(&self) -> bool {
         self.last_prompt_id.is_some()
+    }
+
+    /// Whether the turn that just ran produced any observable work — a
+    /// non-empty assistant message chunk or a tool call that completed
+    /// without an error flag.
+    ///
+    /// Valid only between a `session/prompt` returning and the next one
+    /// starting (each prompt clears the flag). See
+    /// [`turn_produced_output`](Self::turn_produced_output) for why the
+    /// harness cares.
+    pub fn turn_produced_output(&self) -> bool {
+        self.turn_produced_output
     }
 
     /// Most recently observed goose `_meta.goose.activeRunId` from a
@@ -1714,6 +1741,10 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
+                    // Whitespace-only chunks are formatting, not an answer.
+                    if !text.trim().is_empty() {
+                        self.turn_produced_output = true;
+                    }
                     tracing::info!(target: "buzz_acp::acp::stream", "{text}");
                 }
                 false
@@ -1736,6 +1767,14 @@ impl AcpClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
                 let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                // A tool call only counts as work when it completed AND the
+                // agent didn't flag the result as an error. buzz-agent reports
+                // a rejected call as `completed` with `rawOutput.isError` set
+                // (`crates/buzz-agent/src/agent.rs` `emit_completed`), which is
+                // exactly the shape of a turn that accomplished nothing.
+                if status == "completed" && update["rawOutput"]["isError"] != true {
+                    self.turn_produced_output = true;
+                }
                 tracing::info!(target: "buzz_acp::acp::tool", "tool_call_update: {tool_id} → {status}");
                 false
             }
@@ -3523,6 +3562,163 @@ mod tests {
             client.active_run_id(),
             Some("run-stable"),
             "non-string/non-null activeRunId must leave state untouched"
+        );
+    }
+
+    // ── Per-turn output tracking ─────────────────────────────────────────
+    //
+    // `turn_produced_output` is what tells the pool a channel turn answered
+    // with nothing. These pin the discriminations that matter: a rejected
+    // tool call reports `completed` with `rawOutput.isError` (the exact shape
+    // of the turn this flag exists to catch), and a thought chunk is
+    // reasoning, not an answer.
+
+    /// Build a `session/update` notification for a `tool_call_update`.
+    fn tool_call_update_msg(status: &str, is_error: Option<bool>) -> serde_json::Value {
+        let mut update = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-1",
+            "status": status,
+        });
+        if let Some(flag) = is_error {
+            update["rawOutput"] = serde_json::json!({ "isError": flag });
+        }
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": { "sessionId": "test-session", "update": update },
+        })
+    }
+
+    /// Build a `session/update` notification carrying a text chunk of
+    /// `chunk_type` (`agent_message_chunk` or `agent_thought_chunk`).
+    fn text_chunk_msg(chunk_type: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "test-session",
+                "update": {
+                    "sessionUpdate": chunk_type,
+                    "content": { "type": "text", "text": text },
+                },
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn turn_output_starts_false_and_message_chunk_sets_it() {
+        let mut client = spawn_inert_client().await;
+        assert!(
+            !client.turn_produced_output(),
+            "a client that has never prompted has produced nothing"
+        );
+
+        let _ = client.handle_session_update(&text_chunk_msg("agent_message_chunk", "here you go"));
+
+        assert!(
+            client.turn_produced_output(),
+            "an assistant message chunk is output"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_output_ignores_blank_message_chunk() {
+        let mut client = spawn_inert_client().await;
+
+        let _ = client.handle_session_update(&text_chunk_msg("agent_message_chunk", "  \n "));
+
+        assert!(
+            !client.turn_produced_output(),
+            "a whitespace-only chunk is formatting, not an answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_output_ignores_thought_chunk() {
+        let mut client = spawn_inert_client().await;
+
+        let _ = client.handle_session_update(&text_chunk_msg("agent_thought_chunk", "thinking…"));
+
+        assert!(
+            !client.turn_produced_output(),
+            "reasoning the user never sees is not output"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_output_set_by_clean_completed_tool_call() {
+        let mut client = spawn_inert_client().await;
+
+        let _ = client.handle_session_update(&tool_call_update_msg("completed", Some(false)));
+
+        assert!(
+            client.turn_produced_output(),
+            "a tool call that completed cleanly is work"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_output_set_by_completed_tool_call_without_raw_output() {
+        // Agents that omit `rawOutput` entirely still report real work —
+        // absence of an error flag must not read as an error.
+        let mut client = spawn_inert_client().await;
+
+        let _ = client.handle_session_update(&tool_call_update_msg("completed", None));
+
+        assert!(
+            client.turn_produced_output(),
+            "a completed call with no rawOutput must count"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_output_not_set_by_errored_or_unfinished_tool_calls() {
+        // The three shapes a fruitless tool call takes on the wire. The
+        // first is turn 2 of the incident: buzz-agent reports an MCP
+        // rejection as `completed` with `rawOutput.isError`.
+        for (status, is_error) in [
+            ("completed", Some(true)),
+            ("failed", None),
+            ("in_progress", None),
+        ] {
+            let mut client = spawn_inert_client().await;
+
+            let _ = client.handle_session_update(&tool_call_update_msg(status, is_error));
+
+            assert!(
+                !client.turn_produced_output(),
+                "status={status} isError={is_error:?} must not count as output"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_output_resets_when_a_new_prompt_starts() {
+        // A productive turn must not vouch for the turn after it. Drives the
+        // real `session_prompt_*` entry point (against an agent that never
+        // answers) so the reset is pinned where production clears it, not in
+        // a hand-rolled reset.
+        let mut client = spawn_script("sleep 5").await;
+        let _ = client.handle_session_update(&text_chunk_msg("agent_message_chunk", "turn 1 said"));
+        assert!(client.turn_produced_output(), "precondition: turn 1 spoke");
+
+        let result = client
+            .session_prompt_with_idle_timeout(
+                "test-session",
+                "turn 2",
+                std::time::Duration::from_millis(150),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AcpError::IdleTimeout(_))),
+            "silent agent must idle out, got {result:?}"
+        );
+        assert!(
+            !client.turn_produced_output(),
+            "turn 2 must start with a clean slate"
         );
     }
 

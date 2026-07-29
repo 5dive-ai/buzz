@@ -816,6 +816,29 @@ const CONTROL_CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// Timeout for permission-mode requests (`session/set_config_option` with `configId: "mode"`).
 const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Reported by [`is_dead_turn`] as an [`AcpError::AgentError`]. The
+/// application-class variant is deliberate: the stdio pipe is intact and the
+/// agent answered normally, so `handle_prompt_result` must return the process
+/// to the pool rather than respawn it against the crash circuit. Phrased as a
+/// reason clause because the retries-exhausted notice renders it inside one
+/// (`"I couldn't process the last request after multiple retries (…)"`, via
+/// the error's `Display`).
+const DEAD_TURN_MESSAGE: &str = "the agent finished without producing a response";
+
+/// Code carried by the [`DEAD_TURN_MESSAGE`] error. `-32000` is the JSON-RPC
+/// implementation-defined server-error code the ACP agents already use for
+/// application faults; it is surfaced to the observer feed as `code`.
+const DEAD_TURN_CODE: i64 = -32000;
+
+/// The failure a dead turn is reported as. See [`DEAD_TURN_MESSAGE`] for why
+/// this is application-class rather than [`AcpError::Protocol`].
+pub(crate) fn dead_turn_error() -> AcpError {
+    AcpError::AgentError {
+        code: DEAD_TURN_CODE,
+        message: DEAD_TURN_MESSAGE.to_string(),
+    }
+}
+
 /// Placeholder [`fetch_channel_info`] substitutes when a channel's metadata
 /// event carries no `name` tag. Not a real channel name — consumers that need
 /// an identifying name must treat it as absent.
@@ -2080,6 +2103,36 @@ pub async fn run_prompt_task(
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
 
+            if is_dead_turn(&source, &stop_reason, agent.acp.turn_produced_output()) {
+                tracing::error!(
+                    target: "buzz_acp::pool::prompt",
+                    "turn for {} ended with no message and no completed tool call — treating as failed",
+                    prompt_label(&source)
+                );
+                // The session produced nothing; whatever state it is in did
+                // not serve this turn, so start the retry on a fresh one.
+                agent.state.invalidate(&source);
+                let usage = agent.acp.take_turn_usage();
+                publish_agent_turn_metric(
+                    &ctx,
+                    usage,
+                    observer_channel_id,
+                    &session_id,
+                    &turn_id,
+                    Some(buzz_core::agent_turn_metric::StopReason::Error),
+                )
+                .await;
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(dead_turn_error()),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
+
             let should_rotate = matches!(
                 stop_reason,
                 StopReason::MaxTokens | StopReason::MaxTurnRequests
@@ -3141,6 +3194,25 @@ fn classify_control_cancel_failure(
         retry_batch: requeue_cancelled_batch(ctx, signal, batch),
         invalidate_all,
     }
+}
+
+/// Whether a turn that returned normally in fact produced nothing at all.
+///
+/// A mention that ends `end_turn` having streamed no assistant text and
+/// completed no tool call answered the user with silence. That is
+/// indistinguishable from a healthy turn at the protocol level — `end_turn`
+/// is what the agent reports either way — so it must be classified here
+/// rather than inferred later, and reported as a failure so the batch flows
+/// through the same backoff/dead-letter path as any other failed turn.
+///
+/// Only channel turns qualify. Heartbeats are self-prompts with no waiting
+/// user and no batch to retry, and an agent with nothing to say on a
+/// heartbeat is behaving correctly. Every non-`EndTurn` stop is already
+/// classified by its own arm.
+fn is_dead_turn(source: &PromptSource, stop_reason: &StopReason, produced_output: bool) -> bool {
+    matches!(source, PromptSource::Channel(_))
+        && matches!(stop_reason, StopReason::EndTurn)
+        && !produced_output
 }
 
 /// How a turn's source is named in the `buzz_acp::pool::prompt` log lines.
@@ -4792,6 +4864,78 @@ mod tests {
                 case.expected_reason.is_some(),
                 "{}: test table internally inconsistent",
                 case.name
+            );
+        }
+    }
+
+    // ── is_dead_turn ────────────────────────────────────────────────────────
+    // The sole discriminator between "the agent had nothing to add" and "the
+    // mention silently vanished". Every axis is pinned: source, stop reason,
+    // and whether the turn produced anything.
+
+    #[test]
+    fn test_is_dead_turn_only_fires_for_silent_channel_end_turns() {
+        let channel = PromptSource::Channel(Uuid::new_v4());
+        let cases = [
+            // (source, stop_reason, produced_output, expected, why)
+            (
+                &channel,
+                StopReason::EndTurn,
+                false,
+                true,
+                "a channel mention answered with nothing is the bug",
+            ),
+            (
+                &channel,
+                StopReason::EndTurn,
+                true,
+                false,
+                "a channel turn that produced output is a normal success",
+            ),
+            (
+                &PromptSource::Heartbeat,
+                StopReason::EndTurn,
+                false,
+                false,
+                "a silent heartbeat is correct behaviour — nobody is waiting",
+            ),
+            // Non-EndTurn stops are already classified by their own arms;
+            // re-reporting them here would double-count the failure.
+            (
+                &channel,
+                StopReason::Cancelled,
+                false,
+                false,
+                "cancelled is owned by the cancel path",
+            ),
+            (
+                &channel,
+                StopReason::MaxTokens,
+                false,
+                false,
+                "max_tokens already rotates the session",
+            ),
+            (
+                &channel,
+                StopReason::MaxTurnRequests,
+                false,
+                false,
+                "max_turn_requests already rotates the session",
+            ),
+            (
+                &channel,
+                StopReason::Refusal,
+                false,
+                false,
+                "a refusal is a deliberate answer, not a dead turn",
+            ),
+        ];
+
+        for (source, stop_reason, produced_output, expected, why) in cases {
+            assert_eq!(
+                is_dead_turn(source, &stop_reason, produced_output),
+                expected,
+                "{source:?} + {stop_reason:?} + produced_output={produced_output}: {why}"
             );
         }
     }

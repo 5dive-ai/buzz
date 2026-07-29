@@ -6424,6 +6424,100 @@ mod error_outcome_emission_tests {
             "non-auth application error must preserve the event for retry"
         );
     }
+
+    /// A dead turn (`pool::is_dead_turn`) reaches `handle_prompt_result` as an
+    /// application-class `AgentError`. It must requeue the mention for retry
+    /// AND return the agent to the pool: the stdio pipe is intact and the
+    /// subprocess answered normally, so respawning it would charge the crash
+    /// circuit for a fault the process didn't have.
+    #[tokio::test]
+    async fn dead_turn_error_requeues_batch_and_keeps_agent_alive() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(crate::pool::dead_turn_error()),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            None,
+        );
+
+        assert_eq!(
+            queue.queued_event_count(&channel_id),
+            1,
+            "the vanished mention must be requeued for retry"
+        );
+        assert_eq!(
+            pool.live_count(),
+            1,
+            "a healthy agent must be returned to the pool, not respawned"
+        );
+        assert_eq!(
+            respawn_tasks.len(),
+            0,
+            "a dead turn must not charge the crash circuit with a respawn"
+        );
+
+        let events = observer.snapshot();
+        let turn_error = events
+            .iter()
+            .find(|e| e.kind == "turn_error")
+            .expect("a dead turn must surface on the observer feed");
+        assert_eq!(turn_error.payload["outcome"].as_str().unwrap(), "error");
+    }
 }
 
 #[cfg(test)]

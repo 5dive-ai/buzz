@@ -49,9 +49,8 @@ pub struct AppState {
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
     pub huddle_state: Mutex<HuddleState>,
     pub huddle_audio: crate::huddle::tts_settings::HuddleAudioSettingsState,
-    /// Tauri app handle — stored after setup so huddle commands can emit
-    /// `huddle-state-changed` events without needing the handle threaded
-    /// through every call site.
+    /// Tauri app handle, stored after setup so huddle commands can emit
+    /// `huddle-state-changed` without threading it through every call site.
     /// Set once during `setup()` in `lib.rs`; never cleared.
     pub app_handle: Mutex<Option<AppHandle>>,
     pub tts_playback_speed: crate::huddle::playback_speed::PlaybackSpeedControl,

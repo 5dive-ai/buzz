@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { getTtsPlaybackSpeed, setTtsPlaybackSpeed } from "@/shared/api/tauri";
+import {
+  getTtsPlaybackSpeed,
+  setTtsPlaybackSpeed,
+} from "@/shared/api/ttsPlayback";
 import { Button } from "@/shared/ui/button";
 import {
   applyLoadedPlaybackSpeed,

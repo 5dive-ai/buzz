@@ -54,7 +54,6 @@ import {
 } from "@/shared/layout/chromeLayout";
 import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
 import { cn } from "@/shared/lib/cn";
-import { isSafeUrl } from "@/shared/lib/url";
 import { ProfilePanelProvider } from "@/shared/context/ProfilePanelContext";
 import { useHistorySearchState } from "@/shared/hooks/useHistorySearchState";
 import { useThreadPanelWidth } from "@/shared/hooks/useThreadPanelWidth";
@@ -70,8 +69,10 @@ import {
   resolveProjectDefaultBranch,
 } from "@/features/projects/lib/projectBranches";
 import { normalizeRepositoryUrl } from "@/features/projects/lib/projectsViewHelpers";
+import { useProjectRepoPresentation } from "@/features/projects/useProjectRepoHost";
 import { WorkspaceTabs } from "./ProjectWorkspaceTabs";
 import type { RepoSourceHeaderControls } from "./ProjectRepositorySource";
+import { showProjectCloneErrorToast } from "./projectGitErrorToast";
 import {
   projectTerminalLabel,
   useOpenProjectTerminal,
@@ -111,6 +112,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const projectQuery = useProjectQuery(projectId);
   const projectsQuery = useProjectsQuery();
   const project = projectQuery.data;
+  const repoRemote = useProjectRepoPresentation(project);
   const repoStateQuery = useRepoStateQuery(project);
   const pullRequestsQuery = useProjectPullRequestsQuery(project);
   const defaultBranch = project
@@ -214,6 +216,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     activeBranch,
     selectedTag ? null : selectedBranchPullRequest,
     activeTag,
+    repoRemote.host.kind === "buzz",
   );
   const repoDiffQuery = useProjectRepoDiffQuery(
     project,
@@ -375,9 +378,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       : repoSyncStatusQuery.data?.localPath || localRepoSnapshotQuery.data
         ? "Local"
         : "Local missing",
-    remoteLabel: repoSnapshotQuery.isLoading ? "Remote checking" : "Remote",
+    ...repoRemote.controls,
     onCloneLocal:
-      !selectedTag && project?.cloneUrls[0]
+      !selectedTag && project?.cloneUrls[0] && repoRemote.canCloneLocally
         ? () => {
             void handleCloneRepo();
           }
@@ -566,11 +569,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       toast.success(result.message);
       setRepoSource("local");
     } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "Failed to clone repository",
-      );
+      showProjectCloneErrorToast(error, project?.cloneUrls[0]);
     }
-  }, [cloneRepoMutation]);
+  }, [cloneRepoMutation, project?.cloneUrls]);
   const handlePullRequestCreated = React.useCallback(
     async (createdProject: Project, pullRequestId: string) => {
       if (createdProject.id !== projectId) {
@@ -719,8 +720,6 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   }
 
   const repoContributors = repoSnapshotQuery.data?.contributors ?? [];
-  const safeWebUrl =
-    project.webUrl && isSafeUrl(project.webUrl) ? project.webUrl : null;
   const selectedPullRequest =
     pullRequestsQuery.data?.find((item) => item.id === selectedPullRequestId) ??
     null;
@@ -886,7 +885,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                       <h2 className="truncate text-xl font-semibold tracking-tight">
                         {project.name}
                       </h2>
-                      {safeWebUrl ? (
+                      {repoRemote.webUrl &&
+                      (repoRemote.host.kind !== "external" ||
+                        repoSource === "local") ? (
                         <Button
                           asChild
                           aria-label="Open project web page"
@@ -895,7 +896,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                           variant="ghost"
                         >
                           <a
-                            href={safeWebUrl}
+                            href={repoRemote.webUrl}
                             rel="noopener noreferrer"
                             target="_blank"
                           >
@@ -959,6 +960,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 pullRequestsError={pullRequestsQuery.error}
                 pullRequestsLoading={pullRequestsQuery.isLoading}
                 repoContributors={repoContributors}
+                repoHost={repoRemote.host}
                 repoSource={repoSource}
                 selectedCommitHash={selectedCommitHash}
                 selectedIssueId={selectedIssueId}

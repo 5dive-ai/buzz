@@ -189,85 +189,119 @@ export function bigintRatio(part: bigint, whole: bigint): number {
   return Number(permille) / 1000;
 }
 
-// ── Display approximation (A2 presentation layer) ────────────────────────────
+// ── Display total derivation (A2 presentation layer) ─────────────────────────
 
 /**
- * Derive a display approximation of the total by summing known input and output
- * token counts. Returns `null` if neither field is known. This is a *display
- * label* only — it is NEVER written to the wire or stored; NIP-AM's
- * "MUST NOT derive total = input + output" governs published/stored data only.
- * Callers MUST prefix the result with `≈` so the approximation is honest.
+ * A provenance-bearing display total for the usage UI. Only one of three
+ * states is ever active:
+ *
+ * - `exact`: `totalTokens.value` is present and parsed. `partial` mirrors the
+ *   wire field's `incomplete` flag.
+ * - `approximate`: `totalTokens.value` is absent but at least one of
+ *   `inputTokens` / `outputTokens` is known; `value` is their bigint-safe sum.
+ *   `partial` is `inputTokens.incomplete || outputTokens.incomplete`.
+ *   Callers MUST render `≈` to distinguish this from a provider total.
+ * - `unknown`: no token counts are available at all; `value` is `null`.
+ *
+ * This is a *display* value only — it is NEVER written to the wire or stored.
+ * NIP-AM's "MUST NOT derive total = input + output" governs published/stored
+ * data; this label lives entirely in the presentation layer.
  */
-export function deriveApproxTotal(usage: {
+export type DisplayTotal =
+  | { kind: "exact"; value: bigint; partial: boolean }
+  | { kind: "approximate"; value: bigint; partial: boolean }
+  | { kind: "unknown"; value: null; partial: false };
+
+export function deriveDisplayTotal(usage: {
   inputTokens: UsageField;
   outputTokens: UsageField;
   totalTokens: UsageField;
-}): bigint | null {
-  if (parseTokenCount(usage.totalTokens.value) !== null) {
-    // Genuine total is known — callers should use it directly; no approximation needed.
-    return null;
+}): DisplayTotal {
+  const exact = parseTokenCount(usage.totalTokens.value);
+  if (exact !== null) {
+    return { kind: "exact", value: exact, partial: isPartialField(usage.totalTokens) };
   }
   const input = parseTokenCount(usage.inputTokens.value);
   const output = parseTokenCount(usage.outputTokens.value);
-  if (input === null && output === null) return null;
-  return (input ?? 0n) + (output ?? 0n);
+  if (input !== null || output !== null) {
+    return {
+      kind: "approximate",
+      value: (input ?? 0n) + (output ?? 0n),
+      partial: isPartialField(usage.inputTokens) || isPartialField(usage.outputTokens),
+    };
+  }
+  return { kind: "unknown", value: null, partial: false };
 }
 
-// ── Ranking (A2: known lower-bound totals rank; null totals list after) ─────
+// ── Ranking (A2: rank by display total — exact > approximate > unknown) ──────
 
-type Ranked<T> = { item: T; totalTokens: bigint | null };
+type DisplayTierKey = 0 | 1 | 2; // 0 = exact, 1 = approximate, 2 = unknown
 
-function rankByKnownTotal<T>(
+type RankedWithDisplay<T> = {
+  item: T;
+  displayTotal: DisplayTotal;
+  tierKey: DisplayTierKey;
+};
+
+function tierOf(dt: DisplayTotal): DisplayTierKey {
+  if (dt.kind === "exact") return 0;
+  if (dt.kind === "approximate") return 1;
+  return 2;
+}
+
+/**
+ * Sort items by their display total:
+ * 1. Exact totals rank first, descending by value.
+ * 2. Approximate totals (≈ in+out) rank next, descending by value.
+ * 3. Unknown totals rank last, unordered beyond the tiebreak.
+ * Within the same tier and value, `tiebreak` resolves the order.
+ */
+function rankByDisplayTotal<T>(
   items: readonly T[],
-  totalTokens: (item: T) => UsageField,
+  getUsage: (item: T) => { inputTokens: UsageField; outputTokens: UsageField; totalTokens: UsageField },
   tiebreak: (a: T, b: T) => number,
 ): T[] {
-  const withTotals: Ranked<T>[] = items.map((item) => ({
-    item,
-    totalTokens: parseTokenCount(totalTokens(item).value),
-  }));
+  const withDisplay: RankedWithDisplay<T>[] = items.map((item) => {
+    const dt = deriveDisplayTotal(getUsage(item));
+    return { item, displayTotal: dt, tierKey: tierOf(dt) };
+  });
 
-  return withTotals
+  return withDisplay
     .sort((a, b) => {
-      if (a.totalTokens !== null && b.totalTokens !== null) {
-        if (a.totalTokens !== b.totalTokens) {
-          return a.totalTokens > b.totalTokens ? -1 : 1;
+      if (a.tierKey !== b.tierKey) return a.tierKey - b.tierKey;
+      // Same tier — for exact/approximate, sort descending by value.
+      if (a.displayTotal.value !== null && b.displayTotal.value !== null) {
+        if (a.displayTotal.value !== b.displayTotal.value) {
+          return a.displayTotal.value > b.displayTotal.value ? -1 : 1;
         }
-        return tiebreak(a.item, b.item);
       }
-      // Known-total rows rank before unknown-total rows; never interleave.
-      if (a.totalTokens !== null) return -1;
-      if (b.totalTokens !== null) return 1;
       return tiebreak(a.item, b.item);
     })
     .map((ranked) => ranked.item);
 }
 
-/** Agents sort by known `totalTokens` descending, then normalized pubkey (A2/plan). Unknown-total agents list after all known-total agents, unranked among themselves beyond the pubkey tiebreak. */
-export function sortAgentsByKnownTotal(
+/** Agents sort by display total (exact → approximate → unknown), descending by value within tier, then normalized pubkey. */
+export function sortAgentsByDisplayTotal(
   agents: readonly AgentUsage[],
 ): AgentUsage[] {
-  return rankByKnownTotal(
+  return rankByDisplayTotal(
     agents,
-    (agent) => agent.usage.totalTokens,
+    (agent) => agent.usage,
     (a, b) => a.agentPubkey.localeCompare(b.agentPubkey),
   );
 }
 
-/** Model rows use the same ranking rule as agents, tiebroken by harness name
+/** Model rows use the same display-total ranking, tiebroken by harness name
  * (null harness sorts last), then by model name (null model sorts last).
  * Ordinal (`<`/`>`) comparators are used so ordering is locale-independent
- * and matches the Rust backend's `String::cmp` byte order.
- * Note: harness/model identifiers are ASCII in practice; UTF-16 vs UTF-8
- * scalar divergence for astral code points is accepted and not a use case. */
-export function sortModelsByKnownTotal(
+ * and matches the Rust backend's `String::cmp` byte order. */
+export function sortModelsByDisplayTotal(
   models: readonly AgentUsageModel[],
 ): AgentUsageModel[] {
-  return rankByKnownTotal(
+  return rankByDisplayTotal(
     models,
-    (model) => model.usage.totalTokens,
+    (model) => model.usage,
     (a, b) => {
-      // Harness tiebreak first (ordinal, None last).
       const harnessCmp =
         a.harness === b.harness
           ? 0
@@ -279,7 +313,6 @@ export function sortModelsByKnownTotal(
                 ? -1
                 : 1;
       if (harnessCmp !== 0) return harnessCmp;
-      // Then model (ordinal, None last).
       if (a.model === b.model) return 0;
       if (a.model === null) return 1;
       if (b.model === null) return -1;
@@ -370,9 +403,9 @@ export function sumKnownBucketTotals(
       partial = true;
     }
     if (known === null) {
-      const approx = deriveApproxTotal(bucket.usage);
-      if (approx !== null) {
-        approxSum += approx;
+      const dt = deriveDisplayTotal(bucket.usage);
+      if (dt.kind === "approximate") {
+        approxSum += dt.value;
         sawApprox = true;
       }
     }

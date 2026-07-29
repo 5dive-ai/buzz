@@ -816,9 +816,13 @@ test("focused view shows daily bars, coverage dates, and a partial explanation w
   await expect(coverage).toContainText("reported turn");
 
   // The partial explanation must appear when usage is known-incomplete.
-  // (explainPartial = hasUnknownUsage || invalidReportCount > 0 — both true here.)
+  // The seed has hasUnknownUsage=true AND invalidReportCount=1, so both
+  // per-condition caveat sentences must appear independently.
   await expect(
-    page.getByTestId("agent-usage-focused-partial-explanation"),
+    page.getByTestId("agent-usage-focused-unknown-intervals-caveat"),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId("agent-usage-focused-invalid-reports-caveat"),
   ).toBeVisible();
 });
 

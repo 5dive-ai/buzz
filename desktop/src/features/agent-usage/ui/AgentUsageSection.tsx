@@ -21,13 +21,10 @@ import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 import { useAgentUsageSeries } from "../hooks";
 import {
   bigintRatio,
-  deriveApproxTotal,
+  deriveDisplayTotal,
   formatCoverageDate,
   formatTokenCountCompact,
-  isPartialField,
-  isUnknownField,
-  parseTokenCount,
-  sortAgentsByKnownTotal,
+  sortAgentsByDisplayTotal,
   sumKnownBucketTotals,
   type UsageWindowDays,
 } from "../lib/agentUsage";
@@ -51,7 +48,7 @@ export function AgentUsageSection({
   const { onOpenSettings } = useAppShell();
 
   const agents = React.useMemo(
-    () => sortAgentsByKnownTotal(query.data?.agents ?? []),
+    () => sortAgentsByDisplayTotal(query.data?.agents ?? []),
     [query.data?.agents],
   );
   const pubkeys = React.useMemo(
@@ -155,17 +152,13 @@ function AgentUsageCard({
     series.coverage.invalidReportCount > 0;
 
   // Relative bars are decorative (aria-hidden, per plan) — scale each agent's
-  // known total (or i/o approximation) against the largest such value in the
-  // current window so the sorted-by-total list also reads as a bar chart.
-  const maxKnownTotal = React.useMemo(
+  // display total (exact or approximate) against the largest such value in the
+  // current window so the sorted-by-display-total list also reads as a bar chart.
+  const maxDisplayValue = React.useMemo(
     () =>
       agents.reduce<bigint>((max, agent) => {
-        const total = parseTokenCount(agent.usage.totalTokens.value);
-        if (total !== null) return total > max ? total : max;
-        // Fall back to the i/o approximation so bars are still visible when
-        // no agent reports a genuine total.
-        const approx = deriveApproxTotal(agent.usage);
-        return approx !== null && approx > max ? approx : max;
+        const dt = deriveDisplayTotal(agent.usage);
+        return dt.value !== null && dt.value > max ? dt.value : max;
       }, 0n),
     [agents],
   );
@@ -229,7 +222,7 @@ function AgentUsageCard({
               days={days}
               key={agent.agentPubkey}
               label={resolveUserLabel({ profiles, pubkey: agent.agentPubkey })}
-              maxKnownTotal={maxKnownTotal}
+              maxDisplayValue={maxDisplayValue}
               onOpenAgentProfile={onOpenAgentProfile}
               profileAvatarUrl={
                 profiles?.[agent.agentPubkey]?.avatarUrl ?? null
@@ -257,44 +250,28 @@ function AgentUsageRow({
   agent,
   days,
   label,
-  maxKnownTotal,
+  maxDisplayValue,
   onOpenAgentProfile,
   profileAvatarUrl,
 }: {
   agent: AgentUsage;
   days: UsageWindowDays;
   label: string;
-  maxKnownTotal: bigint;
+  maxDisplayValue: bigint;
   onOpenAgentProfile: (
     pubkey: string,
     options?: ProfilePanelOpenOptions,
   ) => void;
   profileAvatarUrl: string | null;
 }) {
-  const total = agent.usage.totalTokens;
-  const knownTotal = parseTokenCount(total.value);
-  const partial = isPartialField(total);
-  const unknown = isUnknownField(total);
-
-  // When total is null (unknown), check whether any displayed I/O field is
-  // incomplete — per-field partial truth must be preserved at every seam (A2).
-  const ioPartial =
-    knownTotal === null &&
-    (isPartialField(agent.usage.inputTokens) ||
-      isPartialField(agent.usage.outputTokens));
-
-  // Approximate total for display when no genuine total is available.
-  const approxTotal =
-    knownTotal === null ? deriveApproxTotal(agent.usage) : null;
-  // Effective value for the relative bar width — prefer genuine total, then approx.
-  const barTotal = knownTotal ?? approxTotal;
+  const dt = deriveDisplayTotal(agent.usage);
 
   const trailing =
-    knownTotal !== null
-      ? formatTokenCountCompact(knownTotal)
-      : approxTotal !== null
-        ? `≈ ${formatTokenCountCompact(approxTotal)}`
-        : formatIndependentFields(agent);
+    dt.kind === "exact"
+      ? formatTokenCountCompact(dt.value)
+      : dt.kind === "approximate"
+        ? `≈ ${formatTokenCountCompact(dt.value)}`
+        : "No usage reported";
 
   return (
     <button
@@ -313,34 +290,22 @@ function AgentUsageRow({
         <span className="block truncate text-sm font-medium text-foreground">
           {label}
         </span>
-        {!unknown || approxTotal !== null ? (
+        {dt.kind !== "unknown" ? (
           <Progress
             aria-hidden="true"
             className="mt-1.5 h-1.5"
             value={
-              barTotal !== null && maxKnownTotal > 0n
-                ? bigintRatio(barTotal, maxKnownTotal) * 100
+              maxDisplayValue > 0n
+                ? bigintRatio(dt.value, maxDisplayValue) * 100
                 : null
             }
           />
         ) : null}
       </span>
       <span className="flex shrink-0 items-center gap-2 text-sm text-muted-foreground">
-        {partial || ioPartial ? <Badge variant="outline">Partial</Badge> : null}
+        {dt.partial ? <Badge variant="outline">Partial</Badge> : null}
         {trailing}
       </span>
     </button>
   );
-}
-
-function formatIndependentFields(agent: AgentUsage): string {
-  const input = parseTokenCount(agent.usage.inputTokens.value);
-  const output = parseTokenCount(agent.usage.outputTokens.value);
-  if (input !== null || output !== null) {
-    const parts: string[] = [];
-    if (input !== null) parts.push(`in ${formatTokenCountCompact(input)}`);
-    if (output !== null) parts.push(`out ${formatTokenCountCompact(output)}`);
-    return parts.join(" · ");
-  }
-  return "No usage reported";
 }

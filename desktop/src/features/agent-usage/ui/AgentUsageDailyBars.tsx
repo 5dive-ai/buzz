@@ -4,7 +4,7 @@ import { cn } from "@/shared/lib/cn";
 import type { AgentUsageSeriesBucket } from "@/shared/api/tauriArchive";
 import {
   bigintRatio,
-  deriveApproxTotal,
+  deriveDisplayTotal,
   formatTokenCountCompact,
   isPartialField,
   parseTokenCount,
@@ -66,13 +66,13 @@ function deriveBarState(bucket: AgentUsageSeriesBucket) {
       knownTokens: known,
     };
   }
-  // Genuine total unknown — try i/o approximation before falling back to hatched.
-  const approx = deriveApproxTotal(bucket.usage);
-  if (approx !== null) {
+  // Genuine total unknown — derive the display total for the bar.
+  const dt = deriveDisplayTotal(bucket.usage);
+  if (dt.kind === "approximate") {
     return {
-      accessibleLabel: `${dateLabel} · ≈ ${formatTokenCountCompact(approx)} tokens (approx)`,
+      accessibleLabel: `${dateLabel} · ≈ ${formatTokenCountCompact(dt.value)} tokens (approx)`,
       kind: "approx" as const,
-      knownTokens: approx,
+      knownTokens: dt.value,
     };
   }
   return {
@@ -101,10 +101,10 @@ export function AgentUsageDailyBars({
       buckets.reduce<bigint>((max, bucket) => {
         const total = parseTokenCount(bucket.usage.totalTokens.value);
         if (total !== null) return total > max ? total : max;
-        // Fall back to the i/o approximation so bars scale correctly when
-        // no bucket reports a genuine total.
-        const approx = deriveApproxTotal(bucket.usage);
-        return approx !== null && approx > max ? approx : max;
+        // Fall back to the display total's approximate value so bars scale
+        // correctly when no bucket reports a genuine total.
+        const dt = deriveDisplayTotal(bucket.usage);
+        return dt.kind === "approximate" && dt.value > max ? dt.value : max;
       }, 0n),
     [buckets],
   );

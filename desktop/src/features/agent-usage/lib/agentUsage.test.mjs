@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   bigintRatio,
   buildLocalDayBoundaries,
-  deriveApproxTotal,
+  deriveDisplayTotal,
   deriveUsageIngressTrailing,
   formatCoverageDate,
   formatEstimatedCostUsd,
@@ -14,8 +14,8 @@ import {
   isUnknownField,
   msUntilNextLocalMidnight,
   parseTokenCount,
-  sortAgentsByKnownTotal,
-  sortModelsByKnownTotal,
+  sortAgentsByDisplayTotal,
+  sortModelsByDisplayTotal,
   sumKnownBucketTotals,
 } from "./agentUsage.ts";
 
@@ -334,120 +334,212 @@ test("bigintRatio clamps part to [0, whole]", () => {
   assert.equal(bigintRatio(200n, 100n), 1);
 });
 
-// ── deriveApproxTotal ─────────────────────────────────────────────────────────
+// ── deriveDisplayTotal ────────────────────────────────────────────────────────
 
-test("deriveApproxTotal returns null when genuine total is known (no approximation needed)", () => {
+test("deriveDisplayTotal returns exact kind when totalTokens is present", () => {
   const usage = reportedUsage({
     inputTokens: usageField({ value: "800" }),
     outputTokens: usageField({ value: "200" }),
     totalTokens: usageField({ value: "1100" }),
   });
-  assert.equal(deriveApproxTotal(usage), null);
+  const dt = deriveDisplayTotal(usage);
+  assert.equal(dt.kind, "exact");
+  assert.equal(dt.value, 1100n);
+  assert.equal(dt.partial, false);
 });
 
-test("deriveApproxTotal sums input and output when total is null", () => {
+test("deriveDisplayTotal carries partial=true for an exact total flagged incomplete", () => {
+  const usage = reportedUsage({
+    totalTokens: usageField({ value: "900", incomplete: true }),
+  });
+  const dt = deriveDisplayTotal(usage);
+  assert.equal(dt.kind, "exact");
+  assert.equal(dt.value, 900n);
+  assert.equal(dt.partial, true);
+});
+
+test("deriveDisplayTotal returns approximate kind when totalTokens is null but i/o is known", () => {
   const usage = reportedUsage({
     inputTokens: usageField({ value: "800" }),
     outputTokens: usageField({ value: "200" }),
   });
-  assert.equal(deriveApproxTotal(usage), 1000n);
+  const dt = deriveDisplayTotal(usage);
+  assert.equal(dt.kind, "approximate");
+  assert.equal(dt.value, 1000n);
+  assert.equal(dt.partial, false);
 });
 
-test("deriveApproxTotal returns input alone when output is null", () => {
+test("deriveDisplayTotal approximate partial=true when either i/o field is incomplete", () => {
+  const usage = reportedUsage({
+    inputTokens: usageField({ value: "800", incomplete: true }),
+    outputTokens: usageField({ value: "200" }),
+  });
+  const dt = deriveDisplayTotal(usage);
+  assert.equal(dt.kind, "approximate");
+  assert.equal(dt.partial, true);
+});
+
+test("deriveDisplayTotal returns approximate from input alone when output is null", () => {
   const usage = reportedUsage({
     inputTokens: usageField({ value: "500" }),
   });
-  assert.equal(deriveApproxTotal(usage), 500n);
+  const dt = deriveDisplayTotal(usage);
+  assert.equal(dt.kind, "approximate");
+  assert.equal(dt.value, 500n);
 });
 
-test("deriveApproxTotal returns output alone when input is null", () => {
+test("deriveDisplayTotal returns approximate from output alone when input is null", () => {
   const usage = reportedUsage({
     outputTokens: usageField({ value: "300" }),
   });
-  assert.equal(deriveApproxTotal(usage), 300n);
+  const dt = deriveDisplayTotal(usage);
+  assert.equal(dt.kind, "approximate");
+  assert.equal(dt.value, 300n);
 });
 
-test("deriveApproxTotal returns null when total, input, and output are all null", () => {
+test("deriveDisplayTotal returns unknown kind when all fields are null", () => {
   const usage = reportedUsage();
-  assert.equal(deriveApproxTotal(usage), null);
+  const dt = deriveDisplayTotal(usage);
+  assert.equal(dt.kind, "unknown");
+  assert.equal(dt.value, null);
+  assert.equal(dt.partial, false);
 });
 
-// ── sortAgentsByKnownTotal / sortModelsByKnownTotal ─────────────────────────
+// ── sortAgentsByDisplayTotal / sortModelsByDisplayTotal ─────────────────────
 
-test("sortAgentsByKnownTotal ranks known totals descending", () => {
+test("sortAgentsByDisplayTotal ranks known exact totals descending", () => {
   const agents = [
     agentUsage("a1", "100"),
     agentUsage("a2", "300"),
     agentUsage("a3", "200"),
   ];
-  const sorted = sortAgentsByKnownTotal(agents);
+  const sorted = sortAgentsByDisplayTotal(agents);
   assert.deepEqual(
     sorted.map((a) => a.agentPubkey),
     ["a2", "a3", "a1"],
   );
 });
 
-test("sortAgentsByKnownTotal lists unknown-total agents after all known-total agents, never interleaved", () => {
+test("sortAgentsByDisplayTotal ranks exact totals above approximate totals", () => {
+  const exactAgent = agentUsage("exact", "50");
+  const approxAgent = agentUsage("approx", null, {
+    usage: reportedUsage({
+      inputTokens: usageField({ value: "9000" }),
+      outputTokens: usageField({ value: "9000" }),
+    }),
+  });
+  const sorted = sortAgentsByDisplayTotal([approxAgent, exactAgent]);
+  // exact(50) < approximate(18000) numerically, but exact tier wins
+  assert.equal(sorted[0].agentPubkey, "exact");
+  assert.equal(sorted[1].agentPubkey, "approx");
+});
+
+test("sortAgentsByDisplayTotal ranks approximate totals above unknown totals", () => {
+  const approxAgent = agentUsage("approx", null, {
+    usage: reportedUsage({
+      inputTokens: usageField({ value: "100" }),
+    }),
+  });
+  const unknownAgent = agentUsage("unknown", null);
+  const sorted = sortAgentsByDisplayTotal([unknownAgent, approxAgent]);
+  assert.equal(sorted[0].agentPubkey, "approx");
+  assert.equal(sorted[1].agentPubkey, "unknown");
+});
+
+test("sortAgentsByDisplayTotal handles mixed exact/approximate/unknown population in tier order", () => {
+  const agents = [
+    agentUsage("u1", null), // unknown
+    agentUsage("e1", "100"), // exact
+    agentUsage("a1", null, { // approximate
+      usage: reportedUsage({ inputTokens: usageField({ value: "500" }) }),
+    }),
+    agentUsage("u2", null), // unknown
+    agentUsage("e2", "300"), // exact
+    agentUsage("a2", null, { // approximate
+      usage: reportedUsage({ inputTokens: usageField({ value: "200" }) }),
+    }),
+  ];
+  const sorted = sortAgentsByDisplayTotal(agents);
+  // Tier order: exact first (e2=300 > e1=100), then approx (a1=500 > a2=200), then unknown (u1 < u2 by pubkey)
+  assert.deepEqual(
+    sorted.map((a) => a.agentPubkey),
+    ["e2", "e1", "a1", "a2", "u1", "u2"],
+  );
+});
+
+test("sortAgentsByDisplayTotal lists unknown-total agents after all other agents, tiebroken by pubkey", () => {
   const agents = [
     agentUsage("unknown-b", null),
     agentUsage("known", "50"),
     agentUsage("unknown-a", null),
   ];
-  const sorted = sortAgentsByKnownTotal(agents);
+  const sorted = sortAgentsByDisplayTotal(agents);
   assert.equal(sorted[0].agentPubkey, "known");
-  // Unknown-total agents tiebreak by normalized pubkey.
   assert.deepEqual(
     sorted.slice(1).map((a) => a.agentPubkey),
     ["unknown-a", "unknown-b"],
   );
 });
 
-test("sortAgentsByKnownTotal tiebreaks equal known totals by pubkey", () => {
+test("sortAgentsByDisplayTotal tiebreaks equal exact totals by pubkey", () => {
   const agents = [agentUsage("b", "100"), agentUsage("a", "100")];
-  const sorted = sortAgentsByKnownTotal(agents);
+  const sorted = sortAgentsByDisplayTotal(agents);
   assert.deepEqual(
     sorted.map((a) => a.agentPubkey),
     ["a", "b"],
   );
 });
 
-test("sortModelsByKnownTotal sorts null model ('Unknown model') last among ties", () => {
+test("sortModelsByDisplayTotal sorts null model ('Unknown model') last among ties", () => {
   const models = [
     modelUsage(null, "100"),
     modelUsage("gpt-4", "100"),
     modelUsage("claude", "100"),
   ];
-  const sorted = sortModelsByKnownTotal(models);
+  const sorted = sortModelsByDisplayTotal(models);
   assert.deepEqual(
     sorted.map((m) => m.model),
     ["claude", "gpt-4", null],
   );
 });
 
-test("sortModelsByKnownTotal tiebreaks harness before model when totals are equal", () => {
+test("sortModelsByDisplayTotal tiebreaks harness before model when totals are equal", () => {
   const models = [
     modelUsage("m", "100", { harness: "z-harness" }),
     modelUsage("m", "100", { harness: "a-harness" }),
     modelUsage("m", "100", { harness: null }),
   ];
-  const sorted = sortModelsByKnownTotal(models);
+  const sorted = sortModelsByDisplayTotal(models);
   assert.deepEqual(
     sorted.map((m) => m.harness),
     ["a-harness", "z-harness", null],
   );
 });
 
-test("sortModelsByKnownTotal same model two harnesses produces two rows in harness order", () => {
+test("sortModelsByDisplayTotal same model two harnesses produces two rows in harness order", () => {
   // Same model via two harnesses should be distinct rows; harness-ascending tiebreak.
   const models = [
     modelUsage("claude-sonnet", "500", { harness: "goose" }),
     modelUsage("claude-sonnet", "500", { harness: "claude-code" }),
   ];
-  const sorted = sortModelsByKnownTotal(models);
+  const sorted = sortModelsByDisplayTotal(models);
   assert.deepEqual(
     sorted.map((m) => m.harness),
     ["claude-code", "goose"],
   );
+});
+
+test("sortModelsByDisplayTotal ranks exact tier above approximate tier regardless of value", () => {
+  const exactModel = modelUsage("small-model", "10");
+  const approxModel = modelUsage("big-approx", null, {
+    usage: reportedUsage({
+      inputTokens: usageField({ value: "9999" }),
+      outputTokens: usageField({ value: "9999" }),
+    }),
+  });
+  const sorted = sortModelsByDisplayTotal([approxModel, exactModel]);
+  assert.equal(sorted[0].model, "small-model"); // exact tier wins
+  assert.equal(sorted[1].model, "big-approx");
 });
 
 // ── isPartialField / isUnknownField ──────────────────────────────────────────

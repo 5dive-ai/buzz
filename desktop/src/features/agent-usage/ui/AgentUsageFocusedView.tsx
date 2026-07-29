@@ -14,15 +14,16 @@ import { Skeleton } from "@/shared/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 import { useAgentUsageSeries } from "../hooks";
 import {
+  deriveDisplayTotal,
   formatCoverageDate,
   formatEstimatedCostUsd,
   formatTokenCountCompact,
   formatTokenCountExact,
-  deriveApproxTotal,
   isPartialField,
   isUnknownField,
   parseTokenCount,
-  sortModelsByKnownTotal,
+  sortModelsByDisplayTotal,
+  type DisplayTotal,
   type UsageWindowDays,
 } from "../lib/agentUsage";
 import { AgentUsageDailyBars } from "./AgentUsageDailyBars";
@@ -204,28 +205,29 @@ function AgentUsageFocusedTotals({
   agent: AgentUsageSeries["agents"][number];
   coverage: AgentUsageSeries["coverage"];
 }) {
-  const { estimatedCostUsd, inputTokens, outputTokens, totalTokens } =
+  const { estimatedCostUsd, inputTokens, outputTokens } =
     agent.usage;
-  const models = sortModelsByKnownTotal(agent.models);
-  // Show the caveat paragraph only when there are genuinely invalid/excluded
-  // rows or truly unknown i/o deltas. `agent.hasUnknownUsage` is true when
-  // deltaReliable is false (some intervals couldn't be computed). The
-  // `coverage.invalidReportCount > 0` path covers rows excluded from buckets.
-  // We do NOT trigger on totalTokens.value being null: that's the permanent
-  // state for all real publishers today (no harness emits a total yet), and
-  // showing the caveat permanently would make it read as a persistent error.
-  const explainPartial =
-    agent.hasUnknownUsage || coverage.invalidReportCount > 0;
+  const models = sortModelsByDisplayTotal(agent.models);
+  // `explainPartial` controls the caveat paragraph. Each sentence is gated
+  // only on the condition that proves it:
+  //   - unknown-intervals sentence: `agent.hasUnknownUsage` — true when
+  //     deltaReliable is false for at least one interval in the window.
+  //   - invalid-reports sentence: `coverage.invalidReportCount > 0` — true
+  //     when rows were excluded from buckets due to bad timestamps or missing
+  //     session cumulative totals.
+  // We do NOT trigger on totalTokens.value being null — that's the permanent
+  // state for all real publishers today, not a data quality problem.
+  const showUnknownIntervalsCaveat = agent.hasUnknownUsage;
+  const showInvalidReportsCaveat = coverage.invalidReportCount > 0;
 
-  // Approximation for the Total tokens stat when no genuine total is available.
-  const approxTotal = deriveApproxTotal(agent.usage);
+  // Display total for the Total tokens stat.
+  const displayTotal = deriveDisplayTotal(agent.usage);
 
   return (
     <Card className="space-y-4 p-6" data-testid="agent-usage-focused-totals">
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
         <ApproxTokenStat
-          approxTotal={approxTotal}
-          field={totalTokens}
+          displayTotal={displayTotal}
           label="Total tokens"
         />
         <TokenStat field={inputTokens} label="Input tokens" />
@@ -300,11 +302,19 @@ function AgentUsageFocusedTotals({
           {" · "}
           {formatCoverageRange(coverage)}
         </p>
-        {explainPartial ? (
-          <p data-testid="agent-usage-focused-partial-explanation">
-            Some usage could not be counted: reports with an unreadable
-            timestamp or a cumulative total missing its session are excluded,
-            and unknown intervals are omitted rather than shown as zero.
+        {showUnknownIntervalsCaveat ? (
+          <p data-testid="agent-usage-focused-unknown-intervals-caveat">
+            Some usage could not be counted: unknown intervals are omitted
+            rather than shown as zero.
+          </p>
+        ) : null}
+        {showInvalidReportsCaveat ? (
+          <p data-testid="agent-usage-focused-invalid-reports-caveat">
+            {coverage.invalidReportCount === 1
+              ? "1 report"
+              : `${coverage.invalidReportCount} reports`}{" "}
+            excluded: reports with an unreadable timestamp or a cumulative
+            total missing its session are not assigned to any day.
           </p>
         ) : null}
       </div>
@@ -335,23 +345,20 @@ function TokenStat({
  * honest without hiding that real token activity was counted.
  */
 function ApproxTokenStat({
-  approxTotal,
-  field,
+  displayTotal,
   label,
 }: {
-  approxTotal: bigint | null;
-  field: { value: string | null; incomplete: boolean };
+  displayTotal: DisplayTotal;
   label: string;
 }) {
-  const parsed = parseTokenCount(field.value);
   const display =
-    parsed !== null
-      ? formatTokenCountExact(parsed)
-      : approxTotal !== null
-        ? `≈ ${formatTokenCountExact(approxTotal)}`
+    displayTotal.kind === "exact"
+      ? formatTokenCountExact(displayTotal.value)
+      : displayTotal.kind === "approximate"
+        ? `≈ ${formatTokenCountExact(displayTotal.value)}`
         : null;
   return (
-    <UsageStat display={display} isPartial={isPartialField(field)} label={label} />
+    <UsageStat display={display} isPartial={displayTotal.partial} label={label} />
   );
 }
 

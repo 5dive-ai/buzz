@@ -11,16 +11,28 @@
 //!      gate — the failure mode the 4096 preset cap protects against).
 //!   P4 agentic tool use     — agent + buzz-dev-mcp writes a file on disk.
 //!   P5 Buzz reply command   — agent asks the real developer MCP to run the
-//!      exact `buzz messages send` command used to publish a reply.
+//!      exact `buzz messages send` command used to publish a reply. A fake
+//!      shell records the command at the execution boundary, so this proves
+//!      the model emits the right command but NOT that a reply lands.
+//!   P6 live relay send      — the genuine `buzz messages send` (dev-mcp's
+//!      multicall shim, real buzz-cli) against a running relay. The harness
+//!      then queries the relay itself: the agent's prose is not evidence.
+//!      Skipped unless the live-relay env vars below are set.
 //!
 //! The serve node is the same `mesh_llm_sdk::serve` path Share-compute uses
 //! (publish off, mdns, loopback). The agent legs spawn the real
 //! `buzz-agent` binary with the exact env vars the relay-mesh preset ships.
 //!
 //! Hardware-gated, not CI. Run:
-//!   cargo build --release -p buzz-agent -p buzz-dev-mcp
+//!   cargo build --release -p buzz-agent -p buzz-dev-mcp -p buzz-cli
 //!   cargo run -p buzz-relay --example mesh_agent_e2e
 //! Env: MESH_E2E_MODEL overrides the served model ref.
+//!
+//! P6 additionally needs a relay (`just relay` — Postgres + Redis) plus:
+//!   BUZZ_E2E_RELAY_URL=ws://localhost:3000
+//!   BUZZ_E2E_PRIVATE_KEY=<hex identity that may post to the channel>
+//!   BUZZ_E2E_CHANNEL=<channel uuid>
+//! All three must be set or P6 is skipped (P1-P5 still run).
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -229,28 +241,71 @@ async fn run() -> anyhow::Result<()> {
     let (r, marker) =
         agent_chat_with_fake_shell(&base, &served_id, prompt, &mcp, &send_marker).await;
     let recorded = std::fs::read_to_string(&marker).unwrap_or_default();
-    let send_ok =
-        recorded.trim() == "buzz messages send --channel test-channel --content BUZZ_REPLY_OK";
+    // The fake shell appends every command it is handed. Small models often
+    // probe with an unrelated command first, so the pass condition is that the
+    // exact Buzz send reached the execution boundary on some line — not that it
+    // was the only command attempted.
+    const EXPECTED_SEND: &str = "buzz messages send --channel test-channel --content BUZZ_REPLY_OK";
+    let attempts: Vec<&str> = recorded
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let send_ok = attempts.contains(&EXPECTED_SEND);
     match r {
         Ok(text) => record(
             "P5 Buzz reply command",
             send_ok,
-            if send_ok {
-                format!("accepted send command; agent said: {text}")
-            } else {
-                format!(
-                    "unexpected command {:?}; agent said: {text}",
-                    recorded.trim()
-                )
-            },
+            format!("commands attempted {attempts:?}; agent said: {text}"),
         ),
         Err(e) => record(
             "P5 Buzz reply command",
             send_ok,
-            format!("agent error: {e}; recorded command: {:?}", recorded.trim()),
+            format!("agent error: {e}; commands attempted: {attempts:?}"),
         ),
     }
     let _ = std::fs::remove_file(&marker);
+
+    // P6: live relay end-to-end. P5 stops at the shell boundary with a fake
+    // shell, so it cannot prove a reply ever reaches a channel. Here the agent
+    // runs the genuine `buzz messages send` (dev-mcp's multicall shim, real
+    // buzz-cli code) against a running relay, and the harness independently
+    // queries the relay afterwards rather than trusting the agent's prose.
+    //
+    // Infra-gated: needs `just relay` (Postgres + Redis) and an identity:
+    //   BUZZ_E2E_RELAY_URL, BUZZ_E2E_PRIVATE_KEY, BUZZ_E2E_CHANNEL
+    match (
+        std::env::var("BUZZ_E2E_RELAY_URL").ok(),
+        std::env::var("BUZZ_E2E_PRIVATE_KEY").ok(),
+        std::env::var("BUZZ_E2E_CHANNEL").ok(),
+    ) {
+        (Some(relay_url), Some(private_key), Some(channel)) => {
+            let live_marker = format!("BUZZ_LIVE_OK_{}", std::process::id());
+            let mut dev = McpServerSpec::new("dev", repo_bin("buzz-dev-mcp")?);
+            dev.set_env("BUZZ_RELAY_URL", relay_url.as_str());
+            dev.set_env("BUZZ_PRIVATE_KEY", private_key.as_str());
+            let prompt = format!(
+                "You are a Buzz agent with shell access. The `buzz` CLI is on your PATH; `buzz messages send` publishes to a channel. Post a message containing exactly the token {live_marker} to channel {channel}."
+            );
+            let r = agent_chat(&base, &served_id, None, &prompt, &[dev]).await;
+            let landed = relay_has_message(&relay_url, &private_key, &channel, &live_marker).await;
+            let landed_ok = matches!(landed, Ok(true));
+            let detail = match (&r, &landed) {
+                (Ok(text), Ok(true)) => {
+                    format!("relay returned {live_marker}; agent said: {text}")
+                }
+                (Ok(text), Ok(false)) => {
+                    format!("{live_marker} never reached the relay; agent said: {text}")
+                }
+                (Ok(text), Err(e)) => format!("relay verification failed: {e}; agent said: {text}"),
+                (Err(e), _) => format!("agent error: {e}"),
+            };
+            record("P6 live relay send", landed_ok, detail);
+        }
+        _ => eprintln!(
+            "[e2e] SKIP P6 live relay send (set BUZZ_E2E_RELAY_URL, BUZZ_E2E_PRIVATE_KEY, BUZZ_E2E_CHANNEL)"
+        ),
+    }
 
     eprintln!("[e2e] {pass} passed, {fail} failed");
     if fail > 0 {
@@ -283,6 +338,45 @@ fn repo_bin(name: &str) -> anyhow::Result<String> {
         path.display()
     );
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Ask the relay directly whether `marker` is present in `channel`.
+///
+/// This is the independent check that makes P6 meaningful: the agent's prose is
+/// not evidence, and neither is the shell exit code. The harness performs its
+/// own authenticated read against the relay in a separate process and only
+/// trusts what comes back. Polls because the relay persists and fans out
+/// asynchronously, so an immediate read can race the write.
+async fn relay_has_message(
+    relay_url: &str,
+    private_key: &str,
+    channel: &str,
+    marker: &str,
+) -> anyhow::Result<bool> {
+    let buzz = repo_bin("buzz")?;
+    for _ in 0..15 {
+        let output = Command::new(&buzz)
+            .args([
+                "--format",
+                "compact",
+                "messages",
+                "get",
+                "--channel",
+                channel,
+                "--limit",
+                "50",
+            ])
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("BUZZ_RELAY_URL", relay_url)
+            .env("BUZZ_PRIVATE_KEY", private_key)
+            .output()
+            .await?;
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(marker) {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Ok(false)
 }
 
 /// Spawn the real buzz-agent with relay-mesh preset env and drive one ACP
@@ -404,30 +498,52 @@ fn install_fake_shell(home: &std::path::Path) -> anyhow::Result<std::path::PathB
     let bin_dir = home.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
     let executable = bin_dir.join("mesh-e2e-shell");
+    // buzz-dev-mcp spawns `<shell> -c "<command>"` on Unix (`shell_flag()`
+    // returns `-c` for every non-cmd/pwsh shell). Accept `-lc` too so a future
+    // login-shell dialect change does not silently stop recording.
+    // Every command is appended, one per line: a small model often probes with
+    // an unrelated command first, and overwriting would discard the real send.
     std::fs::write(
         &executable,
         r#"#!/bin/sh
-if [ "$1" = "-lc" ]; then
-  printf '%s\n' "$2" > "$BUZZ_E2E_SEND_MARKER"
-fi
-if [ "$1" = "-lc" ] && [ "$2" = "buzz messages send --channel test-channel --content BUZZ_REPLY_OK" ]; then
+case "$1" in
+  -c|-lc) command_string="$2" ;;
+  *)
+    printf 'unsupported fake shell invocation: %s\n' "$*" >&2
+    exit 2
+    ;;
+esac
+printf '%s\n' "$command_string" >> "$BUZZ_E2E_SEND_MARKER"
+if [ "$command_string" = "buzz messages send --channel test-channel --content BUZZ_REPLY_OK" ]; then
   printf '%s\n' '{"event_id":"mesh-e2e-event","accepted":true,"message":"ok"}'
   exit 0
 fi
-printf 'unsupported fake shell invocation: %s\n' "$*" >&2
+printf 'unsupported fake shell command: %s\n' "$command_string" >&2
 exit 2
 "#,
     )?;
     let mut permissions = std::fs::metadata(&executable)?.permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&executable, permissions)?;
-    Ok(bin_dir)
+    // BUZZ_SHELL must name the executable itself. Returning the directory made
+    // `resolve_bash()` reject it as "not a file" and fall back to real bash, so
+    // the fake shell never ran and P5 could never record a command.
+    Ok(executable)
 }
 
 #[cfg(not(unix))]
 fn install_fake_shell(_home: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!("the mesh agent hardware harness currently requires Unix")
 }
+
+/// The real Buzz system prompt every managed agent receives, straight from the
+/// harness crate rather than a paraphrase.
+///
+/// A terse hand-written test prompt is not a proxy for this: it is ~3.2k tokens
+/// of instructions, and the reply-delivery rules the model must follow to get a
+/// message into a channel live in here. Testing with a short prompt measures a
+/// toy, not Buzz.
+const BUZZ_BASE_PROMPT: &str = include_str!("../../buzz-acp/src/base_prompt.md");
 
 async fn drive_acp(
     child: &mut Child,
@@ -479,7 +595,7 @@ async fn drive_acp(
                 "params": {
                     "cwd": cwd.to_string_lossy(),
                     "mcpServers": mcp_json,
-                    "systemPrompt": "You are a terse test agent. Follow instructions exactly."
+                    "systemPrompt": BUZZ_BASE_PROMPT
                 }
             }))
             .as_bytes(),

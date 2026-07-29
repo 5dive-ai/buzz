@@ -33,6 +33,7 @@ pub struct SharedState {
     /// bootstrap hint and every `run()` call read the SAME resolution — no drift.
     pub resolved_shell: Result<(PathBuf, String), String>,
     pub artifacts: Mutex<VecDeque<PathBuf>>,
+    pub reply_delivery: crate::reply_delivery::ReplyDeliveryState,
     next_call_id: Mutex<u64>,
 }
 
@@ -58,6 +59,7 @@ impl SharedState {
             bootstrap_instructions,
             resolved_shell,
             artifacts: Mutex::new(VecDeque::with_capacity(ARTIFACT_RING_SIZE)),
+            reply_delivery: crate::reply_delivery::ReplyDeliveryState::default(),
             next_call_id: Mutex::new(0),
         })
     }
@@ -305,6 +307,10 @@ pub async fn run(
         finalize_stream(state, id, "stdout", stdout_cap, &mut notes);
     let (stderr_text, stderr_truncated, stderr_artifact) =
         finalize_stream(state, id, "stderr", stderr_cap, &mut notes);
+
+    state
+        .reply_delivery
+        .record_shell_result(&p.command, exit_code, &stdout_text);
 
     let body = serde_json::json!({
         "exit_code": exit_code,

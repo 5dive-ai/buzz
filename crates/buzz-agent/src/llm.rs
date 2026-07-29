@@ -1077,6 +1077,9 @@ fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
         Some("completed") => ProviderStop::EndTurn,
         _ => ProviderStop::Other,
     };
+    if text.is_empty() && !reasoning.is_empty() && tool_calls.is_empty() {
+        text = reasoning.clone();
+    }
     let input_tokens = sum_usage(&v, &["input_tokens"]);
     let output_tokens = sum_usage(&v, &["output_tokens"]);
     Ok(LlmResponse {
@@ -1204,7 +1207,7 @@ fn parse_openai(v: Value) -> Result<LlmResponse, AgentError> {
     let msg = choice
         .get("message")
         .ok_or_else(|| AgentError::Llm("missing message".into()))?;
-    let text = str_field(msg, "content");
+    let mut text = str_field(msg, "content");
     // DeepSeek and vLLM-style OpenAI-compat hosts expose reasoning tokens on the
     // message object. Prefer `reasoning_content` (DeepSeek's field name); fall
     // back to `reasoning` (some other providers). Both are absent for standard
@@ -1232,6 +1235,9 @@ fn parse_openai(v: Value) -> Result<LlmResponse, AgentError> {
                 args,
             )?);
         }
+    }
+    if text.is_empty() && !reasoning.is_empty() && tool_calls.is_empty() {
+        text = reasoning.clone();
     }
     let input_tokens = openai_chat_input_tokens(&v);
     let output_tokens = sum_usage(&v, &["completion_tokens"]);
@@ -2408,6 +2414,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_responses_uses_reasoning_when_text_is_empty() {
+        let v = serde_json::json!({
+            "status": "completed",
+            "output": [{
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "local model reply"}],
+            }],
+        });
+        let r = parse_responses(v).unwrap();
+        assert_eq!(r.text, "local model reply");
+        assert_eq!(r.reasoning, "local model reply");
+        assert!(r.tool_calls.is_empty());
+    }
+
+    #[test]
     fn parse_responses_completed_with_function_call_is_tool_use() {
         let v = serde_json::json!({
             "status": "completed",
@@ -3490,6 +3511,23 @@ mod tests {
             "usage": {"prompt_tokens": 123, "completion_tokens": 4, "total_tokens": 127}
         });
         assert_eq!(parse_openai(v).unwrap().input_tokens, Some(123));
+    }
+
+    #[test]
+    fn parse_openai_uses_reasoning_content_when_content_is_empty() {
+        let v = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": "",
+                    "reasoning_content": "local model reply"
+                }
+            }]
+        });
+        let r = parse_openai(v).unwrap();
+        assert_eq!(r.text, "local model reply");
+        assert_eq!(r.reasoning, "local model reply");
+        assert!(r.tool_calls.is_empty());
     }
 
     #[test]

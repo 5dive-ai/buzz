@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 mod paths;
 mod read_file;
+mod reply_delivery;
 mod rg;
 mod shell;
 mod shim;
@@ -106,7 +107,17 @@ impl DevMcp {
         &self,
         Parameters(_): Parameters<todo::HookParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        todo::text_result(self.todos.stop_objection())
+        let objections = [
+            self.todos.stop_objection(),
+            self.state.reply_delivery.stop_objection(),
+        ]
+        .into_iter()
+        .filter(|objection| !objection.is_empty())
+        .collect::<Vec<_>>();
+        if objections.is_empty() {
+            self.state.reply_delivery.reset_after_allowed_stop();
+        }
+        todo::text_result(objections.join("\n\n"))
     }
 
     /// Hook: called by the agent after context compaction/handoff so the

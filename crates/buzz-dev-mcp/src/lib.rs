@@ -28,13 +28,37 @@ struct DevMcp {
     tool_router: ToolRouter<DevMcp>,
 }
 
+/// Whether the harness asked for the first-class `send_message` reply tool.
+///
+/// Set by `buzz-acp` for the shared-compute preset only. Any non-empty value
+/// other than `0`/`false` enables it, so `1` and `true` both work.
+fn send_message_tool_enabled() -> bool {
+    match std::env::var("BUZZ_MCP_SEND_MESSAGE_TOOL") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
+}
+
 #[tool_router]
 impl DevMcp {
     fn new(state: Arc<shell::SharedState>) -> Self {
+        let mut tool_router = Self::tool_router();
+        // `send_message` is offered only when the harness asks for it via
+        // BUZZ_MCP_SEND_MESSAGE_TOOL. Adding a tool changes the toolset — and
+        // so the prompt — that every agent sees; only shared compute, where
+        // small local models need a typed reply path, has a measured benefit.
+        // Agents without it publish replies with `buzz messages send` via the
+        // shell tool, exactly as before this tool existed.
+        if !send_message_tool_enabled() {
+            tool_router.remove_route("send_message");
+        }
         Self {
             state,
             todos: Arc::new(todo::TodoState::new()),
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -223,4 +247,51 @@ pub(crate) fn configure_no_window_async(cmd: &mut tokio::process::Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+#[cfg(test)]
+mod send_message_gate_tests {
+    use super::send_message_tool_enabled;
+
+    /// Serialize env mutation: these tests share process-global env.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_var(value: Option<&str>, f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("BUZZ_MCP_SEND_MESSAGE_TOOL").ok();
+        match value {
+            Some(v) => std::env::set_var("BUZZ_MCP_SEND_MESSAGE_TOOL", v),
+            None => std::env::remove_var("BUZZ_MCP_SEND_MESSAGE_TOOL"),
+        }
+        f();
+        match prev {
+            Some(v) => std::env::set_var("BUZZ_MCP_SEND_MESSAGE_TOOL", v),
+            None => std::env::remove_var("BUZZ_MCP_SEND_MESSAGE_TOOL"),
+        }
+    }
+
+    #[test]
+    fn unset_means_tool_is_not_offered() {
+        // Default for every non-shared-compute agent: toolset unchanged.
+        with_var(None, || assert!(!send_message_tool_enabled()));
+    }
+
+    #[test]
+    fn truthy_values_enable_the_tool() {
+        for v in ["1", "true", "TRUE", "yes"] {
+            with_var(Some(v), || {
+                assert!(send_message_tool_enabled(), "expected {v:?} to enable")
+            });
+        }
+    }
+
+    #[test]
+    fn falsey_and_empty_values_leave_it_disabled() {
+        // Guards against an empty env var being read as opt-in.
+        for v in ["", "  ", "0", "false", "False"] {
+            with_var(Some(v), || {
+                assert!(!send_message_tool_enabled(), "expected {v:?} to disable")
+            });
+        }
+    }
 }

@@ -4213,6 +4213,19 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                     });
                 }
             }
+            // Offer the first-class `send_message` reply tool only where it is
+            // needed. Small local models served over shared compute deliver
+            // replies far more reliably with a typed tool than by composing a
+            // `buzz messages send` shell command; capable cloud models already
+            // publish reliably, and adding a tool changes the toolset every
+            // agent sees, so this stays scoped to the preset that measured a
+            // benefit. dev-mcp omits the tool entirely when this is unset.
+            if config.send_message_tool {
+                env.push(EnvVar {
+                    name: "BUZZ_MCP_SEND_MESSAGE_TOOL".into(),
+                    value: "1".into(),
+                });
+            }
             env
         },
     }]
@@ -5019,6 +5032,7 @@ mod build_mcp_servers_tests {
             lazy_pool: false,
             agent_owner: None,
             no_base_prompt: false,
+            send_message_tool: false,
             deliver_plain_replies: false,
             base_prompt_content: None,
         }
@@ -5241,6 +5255,7 @@ mod error_outcome_emission_tests {
             lazy_pool: false,
             agent_owner: None,
             no_base_prompt: false,
+            send_message_tool: false,
             deliver_plain_replies: false,
             base_prompt_content: None,
         }

@@ -409,6 +409,16 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_BASE_PROMPT")]
     pub no_base_prompt: bool,
 
+    /// Offer the first-class `send_message` reply tool to the agent.
+    ///
+    /// Off by default: adding a tool changes the toolset — and so the prompt —
+    /// that every agent sees, and capable cloud models already publish their
+    /// own replies by composing a `buzz messages send` shell command. Small
+    /// local models served over shared compute deliver far more reliably with
+    /// a typed tool, so the desktop shared-compute preset opts in.
+    #[arg(long, env = "BUZZ_ACP_SEND_MESSAGE_TOOL")]
+    pub send_message_tool: bool,
+
     /// Publish the agent's plain reply text when it ends a turn without calling
     /// `send_message`.
     ///
@@ -572,6 +582,9 @@ pub struct Config {
     /// `from_cli()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
+    /// Offer the first-class `send_message` reply tool. Opt-in; see the CLI
+    /// flag for rationale.
+    pub send_message_tool: bool,
     /// Publish the agent's plain reply text when a turn ends without a
     /// `send_message` call. Opt-in; see the CLI flag for rationale.
     pub deliver_plain_replies: bool,
@@ -1116,6 +1129,7 @@ impl Config {
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
+            send_message_tool: args.send_message_tool,
             deliver_plain_replies: args.deliver_plain_replies,
         };
 
@@ -1486,6 +1500,7 @@ mod tests {
             lazy_pool: false,
             agent_owner: None,
             no_base_prompt: false,
+            send_message_tool: false,
             deliver_plain_replies: false,
             base_prompt_content: None,
         }

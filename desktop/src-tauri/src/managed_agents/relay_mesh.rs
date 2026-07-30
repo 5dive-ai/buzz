@@ -52,6 +52,11 @@ pub fn apply_relay_mesh_env(
         "BUZZ_ACP_DELIVER_PLAIN_REPLIES".to_string(),
         "true".to_string(),
     );
+    // Offer the typed `send_message` reply tool here too. Small local models
+    // deliver replies far more reliably with it than by composing a
+    // `buzz messages send` shell command; scoped to this preset because adding
+    // a tool changes the toolset — and so the prompt — that every agent sees.
+    env.insert("BUZZ_ACP_SEND_MESSAGE_TOOL".to_string(), "true".to_string());
     // Keep the requested response inside smaller local-model context windows.
     // These are defaults, not policy: the effective agent/persona/global env
     // may deliberately choose a smaller cap or a different effort. This function
@@ -137,6 +142,11 @@ mod tests {
             // exits at startup with "invalid value '1'".
             Some("true")
         );
+        // Typed reply tool: measured 3/8 -> 8/8 delivery on gemma-4-E4B.
+        assert_eq!(
+            env.get("BUZZ_ACP_SEND_MESSAGE_TOOL").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -147,6 +157,8 @@ mod tests {
         // Cloud models publish their own replies; delivering streamed text
         // there would double-post.
         assert_eq!(env.get("BUZZ_ACP_DELIVER_PLAIN_REPLIES"), None);
+        // And their toolset must stay exactly as it was before this PR.
+        assert_eq!(env.get("BUZZ_ACP_SEND_MESSAGE_TOOL"), None);
     }
 
     #[test]

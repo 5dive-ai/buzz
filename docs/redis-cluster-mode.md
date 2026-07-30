@@ -50,8 +50,9 @@ prove:
   resharding completes within a window, is empirical — characterized by the
   profiling gate (G0) and load tests, not by theorem.
 - **Shard count.** The shardable-keyspace vs. unshardable-broadcast ratio is
-  an unmeasured input (§Open Decisions, D1). Committing a shard count before
-  the profile exists would be fiction with units.
+  a measured input, not a theorem (§Open Decisions, D1 — composed
+  2026-07-30). Committing a shard count before that profile existed would
+  have been fiction with units; with it, initial N is an ops/cost trade.
 - **redis-rs / deadpool-redis / ElastiCache internals.** The cluster client's
   MOVED/ASK routing, RESP3 push delivery, and ElastiCache's online resharding
   are trusted vendor components, admitted per-deployment by conformance gates
@@ -754,17 +755,41 @@ REDIS_CLUSTER_PRODUCTION_PRIOR_ART.md`, `…_OPEN_SOURCE_PRIOR_ART.md`,
   replica-subtraction natural experiment: the never-read replica carries
   7.8pp of the primary's 19.5pp): **~40% of primary engine CPU is
   write-apply + publish propagation; ~60% is client-facing** (reads, Lua,
-  connection I/O, subscriber delivery) and divides only as connections and
-  subscriptions redistribute across shards. One dependency inside the 40%:
-  write-apply partitions by key unconditionally, but by A4 the propagation
-  component confines to the owning shard **only after P2 lands** — with
-  classic pub/sub, every node processes every publish. So the ~40% is the
-  shardable fraction *with* P2, an upper bound without it. Two further
-  cautions from the same measurement set: engine CPU cannot be split
+  connection I/O, subscriber delivery). That split answers *what the
+  replica pays*, not *what sharding divides* — reads and Lua are keyed and
+  divide by N exactly like writes, so the genuinely non-dividing terms are
+  narrower: classic pub/sub propagation (pre-P2 only — by A4 every node
+  processes every publish until P2 lands, after which propagation confines
+  to the owning shard) and client connection I/O (every pod dials every
+  shard). Estimated shardable fraction: **f ≈ 0.60 pre-P2 (band
+  0.45–0.70), f ≈ 0.75 post-P2 (band 0.60–0.85)**. Two further cautions
+  from the same measurement set: engine CPU cannot be split
   pub/sub-vs-keyed by regression (rates collinear at r=0.997; subsampled
   shares swing 4%→37%), and the apparent sublinearity of CPU vs. rate is a
   ~1.1% fixed baseline, not economies of scale — do not project on the
-  exponent. D1 stays open pending the P2/imbalance-adjusted arithmetic.
+  exponent. **Composed arithmetic (2026-07-30,
+  `RESEARCH/BB_PUBLIC_REDIS_D1_SHARD_COUNT_ARITHMETIC.md`):** with
+  `scale(N,f) = (1-f) + f·IMB(N)/N` applied to the variable load only (the
+  ~1.1% baseline must not be scaled), at the central 3.45-day doubling the
+  do-nothing runway is 7.2d — **band 5.2–9.0d across fit windows; plan
+  against the band, not the point** — and N=4 buys **+2.3d pre-P2 / +3.1d
+  post-P2** (N=8 post-P2: +4.3d). Any one-time capacity gain of factor M
+  buys exactly `Td·log₂(M)` days, so no N reachable this week buys two
+  doublings, and every available lever — sharding, r8g (+1.4d), presence
+  reduction, all stacked (~3.4d) — is smaller than the migration's own
+  duration estimate (14d aggressive / 21d likely / 35d conservative; soft,
+  LOC-derived, not a bottom-up plan). **Shard count is therefore not a
+  runway purchase, and the honest case for cluster mode is optionality,
+  not headroom**: G5 online resharding makes N a repeatable dial — each
+  doubling of N buys another Td on demand, without another one-way door —
+  while single-shard has no dial left (r8g is one-shot and forecloses G3
+  while in flight). This case does not depend on the growth curve holding;
+  the runway numbers do, and at 3.45d the curve implies unreachable user
+  counts within a month, so *when it flattens* is a product question, and
+  if it does not flatten on its own, the gap closes with product-side load
+  reduction, not any infra lever. D1's remaining open item is the choice
+  of initial N — an ops/cost trade within 2–8, no longer a capacity
+  computation.
 - **D2 — Pattern subscribers stay classic.** Accepted in design; re-opens
   only if G0 shows their volume is non-trivial. **Measured 2026-07-30: D2
   holds.** All publishers are lifecycle/admin-rate (code trace, verified
@@ -791,5 +816,5 @@ REDIS_CLUSTER_PRODUCTION_PRIOR_ART.md`, `…_OPEN_SOURCE_PRIOR_ART.md`,
 | Vendor cluster behaviors | Empirical | Conformance matrix (G2) |
 | Sharded pub/sub necessity | Documented fact | Axiom A4 (Valkey cluster spec) |
 | Sharded pub/sub at scale | **No prior art** | Buzz-specific load/reconnect gate in G2 |
-| Shard count | **Open** | G0 profile (D1) |
-| Timeline | ~7 days to 80% on the primary (fitted, post-onset window) | G1 starts now; fallback = replica offload (degraded — replica not idle, ~14d to its own saturation) |
+| Shard count | **Arithmetic composed** — N=4 buys +2.3d pre-P2 / +3.1d post-P2; value is the repeatable dial, not runway. Open only on initial N (ops/cost, 2–8) | D1 composed arithmetic |
+| Timeline | ~7 days to 80% on the primary (fitted central; band 5.2–9.0d across fit windows) | G1 starts now; fallback = replica offload (degraded — replica not idle, ~14d to its own saturation) |

@@ -13,7 +13,9 @@
 (* This module models the staged migration:                                *)
 (*   version O (0): legacy scripts — old keys only, checks old lease.      *)
 (*   version A (1): union lease check; lease written to OLD key;           *)
-(*                  generation = max(oldGen,newGen)+1 written to BOTH.     *)
+(*                  generation = max(oldGen,newGen)+1 written to OLD ctr   *)
+(*                  (an earlier draft dual-wrote both; mutation testing    *)
+(*                  proved the new-counter write redundant).               *)
 (*   version B (2): union lease check; lease written to NEW key;           *)
 (*                  generation = max(oldGen,newGen)+1 written to NEW.      *)
 (*                  B's renewer MIGRATES any old-key lease it owns to the  *)
@@ -193,10 +195,11 @@ EnableCluster ==
                  oldGen, newGen, backfilled, lastIssued, monoOk>>
 
 (***************************************************************************)
-(* Acquire, per script version. Each is one atomic Lua script. O, A, B    *)
-(* and the B-migrate touch both keyspaces (cross-slot), so they are        *)
-(* guarded on mode = 0: under slot rules they fail loudly and mutate       *)
-(* nothing, which the guard models by absence.                             *)
+(* Acquire, per script version. Each is one atomic Lua script. A, B and   *)
+(* the B-migrate touch both keyspaces; O touches only the old pair, but    *)
+(* that pair is itself cross-slot (un-tagged lease + generation keys).     *)
+(* All four are therefore guarded on mode = 0: under slot rules they fail  *)
+(* loudly and mutate nothing, which the guard models by absence.           *)
 (***************************************************************************)
 
 RecordIssue(g) ==

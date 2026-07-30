@@ -487,6 +487,14 @@ the check); TLC green means the migration deadlocks at the gate forever.
 With `MigrateB`: violated (C reachable). M10 (without it): green — the
 exact round-1 bug, now permanently visible to the model.
 
+Both configs run in CI (`scripts/check-tla-specs.sh`, job `TLA+ Spec
+Checks`, triggered by `docs/spec/**`), so the inverted verdict is
+machinery rather than discipline: the script asserts on the specific
+string `Invariant Probe_NotC is violated` rather than on TLC's exit
+status, because a parse error also exits non-zero and must fail the build
+instead of counting as the expected violation. tla2tools is pinned by
+release tag *and* sha256. Deleting `MigrateB` fails the job.
+
 M4 is the operationally scary one: it is exactly "someone deploys the final
 script version early because everything looks green." M6–M8 are the price
 of admitting that rollbacks happen; they are what the Deployment Gate's

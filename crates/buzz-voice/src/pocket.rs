@@ -210,8 +210,9 @@ impl PocketTts {
     ///
     /// Callback sample buffers contain all PCM produced for this call so far.
     /// Their lengths never decrease, but equal lengths are allowed while the
-    /// engine advances between internal model-safe text chunks. Returning
-    /// `false` interrupts synthesis before the next decoder block.
+    /// engine advances before PCM is available or between internal model-safe
+    /// text chunks. Returning `false` interrupts synthesis before the next
+    /// model or decoder step.
     pub fn synth_chunk_streaming<F>(
         &self,
         text: &str,
@@ -347,6 +348,19 @@ mod tests {
     }
 
     #[test]
+    fn equal_length_pre_decoder_callback_can_cancel() {
+        let mut callback = |samples: &[f32], progress: f32| {
+            assert!(samples.is_empty());
+            assert_eq!(progress, 0.25);
+            false
+        };
+        let mut samples = Vec::new();
+
+        assert!(!append_and_callback(&mut samples, &[], &mut callback, 0.25)
+            .expect("pre-decoder cancellation callback"));
+    }
+
+    #[test]
     fn callback_panic_is_reported_without_unwinding() {
         let mut callback = |_: &[f32], _: f32| -> bool {
             panic!("callback failure");
@@ -432,7 +446,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires BUZZ_POCKET_TEST_MODEL_DIR"]
-    fn production_streaming_callback_interrupts_after_first_decoder_block() {
+    fn production_streaming_callback_interrupts_before_pcm_is_available() {
         let dir = std::env::var("BUZZ_POCKET_TEST_MODEL_DIR")
             .expect("set BUZZ_POCKET_TEST_MODEL_DIR to an April INT8 model directory");
         let engine = load_text_to_speech(&dir).expect("load April INT8 engine");
@@ -450,7 +464,9 @@ mod tests {
                 "en",
                 &style,
                 1,
-                |_, _| {
+                |samples, progress| {
+                    assert!(samples.is_empty());
+                    assert!(progress <= 0.5);
                     callback_at = Some(started.elapsed());
                     false
                 },
@@ -460,6 +476,43 @@ mod tests {
         let cancellation_latency = started.elapsed().saturating_sub(callback_at);
         eprintln!(
             "callback_to_cancel_return_ms={:.1}",
+            cancellation_latency.as_secs_f64() * 1000.0
+        );
+
+        assert!(matches!(outcome, SynthesisOutcome::Interrupted));
+    }
+
+    #[test]
+    #[ignore = "requires BUZZ_POCKET_TEST_MODEL_DIR"]
+    fn production_streaming_callback_interrupts_after_first_decoder_block() {
+        let dir = std::env::var("BUZZ_POCKET_TEST_MODEL_DIR")
+            .expect("set BUZZ_POCKET_TEST_MODEL_DIR to an April INT8 model directory");
+        let engine = load_text_to_speech(&dir).expect("load April INT8 engine");
+        let style = load_voice_style(&Path::new(&dir).join("reference_sample.wav"))
+            .expect("load reference voice");
+        let mut callback_at = None;
+        let started = std::time::Instant::now();
+
+        let outcome = engine
+            .synth_chunk_streaming(
+                "This sentence is long enough to require more than one decoder block.",
+                "en",
+                &style,
+                1,
+                |samples, progress| {
+                    if samples.is_empty() {
+                        return true;
+                    }
+                    assert!(progress > 0.5);
+                    callback_at = Some(started.elapsed());
+                    false
+                },
+            )
+            .expect("interrupt production streaming after decoded PCM");
+        let callback_at = callback_at.expect("decoder must produce a callback");
+        let cancellation_latency = started.elapsed().saturating_sub(callback_at);
+        eprintln!(
+            "decoded_callback_to_cancel_return_ms={:.1}",
             cancellation_latency.as_secs_f64() * 1000.0
         );
 

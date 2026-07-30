@@ -285,7 +285,7 @@ impl AprilPocketTts {
         &mut self,
         prepared: &AprilPreparedPrompt,
         style: &VoiceStyle,
-        callback: F,
+        mut callback: F,
     ) -> Result<AprilSynthesisOutcome, String>
     where
         F: FnMut(&[f32], f32) -> bool,
@@ -316,9 +316,18 @@ impl AprilPocketTts {
         let text_embeddings = self.text_embeddings(token_ids)?;
         self.run_flow_main_prefix(&text_embeddings, &mut flow_state)?;
         let max_frames = estimate_max_frames(token_count, self.bundle.frame_rate);
-        let latents =
-            self.generate_latents(max_frames, prepared.frames_after_eos, &mut flow_state)?;
-        self.decode_latents(&latents, callback)
+        let (latents, interrupted) = self.generate_latents(
+            max_frames,
+            prepared.frames_after_eos,
+            &mut flow_state,
+            &mut callback,
+        )?;
+        if interrupted {
+            return Ok(AprilSynthesisOutcome::Interrupted);
+        }
+        self.decode_latents(&latents, |samples, progress| {
+            callback(samples, 0.5 + progress * 0.5)
+        })
     }
 
     fn prepared_token_count(&self, text: &str) -> Result<usize, String> {
@@ -478,18 +487,29 @@ impl AprilPocketTts {
         replace_state_from_outputs(state, &mut outputs)
     }
 
-    fn generate_latents(
+    fn generate_latents<F>(
         &mut self,
         max_frames: usize,
         frames_after_eos: usize,
         state: &mut [StateValue],
-    ) -> Result<Vec<f32>, String> {
+        callback: &mut F,
+    ) -> Result<(Vec<f32>, bool), String>
+    where
+        F: FnMut(&[f32], f32) -> bool,
+    {
         let mut current = vec![f32::NAN; self.bundle.latent_dim];
         let mut latents = Vec::with_capacity(max_frames * self.bundle.latent_dim);
         let mut eos_step = None;
         let mut rng = rand::rng();
 
         for step in 0..max_frames {
+            // Preserve the mobile callback's pre-PCM cancellation point while
+            // reserving the second half of progress for decoder-block output.
+            // The empty block becomes an equal-length cumulative callback in
+            // `PocketTts::synth_chunk_streaming`.
+            if !callback(&[], step as f32 / max_frames as f32 * 0.5) {
+                return Ok((latents, true));
+            }
             let sequence = Tensor::from_array((
                 vec![1_i64, 1, self.bundle.latent_dim as i64],
                 current.clone().into_boxed_slice(),
@@ -575,7 +595,7 @@ impl AprilPocketTts {
             current.clone_from(&noise);
             latents.extend_from_slice(&noise);
         }
-        Ok(latents)
+        Ok((latents, false))
     }
 
     fn decode_latents<F>(

@@ -436,8 +436,13 @@ Model checking completed. No error has been found.
 $ java -cp tla2tools.jar tlc2.TLC RedisClusterFencingMigration.tla \
     -config RedisClusterFencingMigrationDrain.cfg -deadlock
 Error: Invariant Probe_NotC is violated.   # INVERTED verdict: this is PASS
-93 states generated, 44 distinct states found.
 ```
+
+(State counts on the drain probe's violating run are **not reproducible**:
+TLC halts at the first violation, so the count varies with worker count
+and scheduling — 9/8 at `-workers 1`, ~100/~45 at `-workers 4`. Only the
+verdict is the check. Exhaustive-pass counts, like the main model's
+12636/3637 and M10's green run, are deterministic.)
 
 (`-deadlock` disables deadlock reporting because the model has *intended*
 terminal states — migration complete, or the MaxGen finiteness bound reached
@@ -476,8 +481,9 @@ the stall state (fleet fully on B, backfilled, one live B-pod owning an
 old-key lease), removes spontaneous expiry (faithful to a lease whose
 owner is alive and renewing — renew is `PEXPIRE`), and checks
 `Probe_NotC == phase /= 3` with **inverted verdict semantics**: TLC
-reporting the "invariant" *violated* proves C is *reachable* (pass, 93/44
-states); TLC green means the migration deadlocks at the gate forever.
+reporting the "invariant" *violated* proves C is *reachable* (pass; state
+counts on a violating run vary with worker scheduling — the verdict is
+the check); TLC green means the migration deadlocks at the gate forever.
 With `MigrateB`: violated (C reachable). M10 (without it): green — the
 exact round-1 bug, now permanently visible to the model.
 

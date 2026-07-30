@@ -322,6 +322,17 @@ export function backupSessionToPasswordEntry(
   session.setTest(initialBackupTestProgress);
 }
 
+/** Discard all backup-creation and verification progress. */
+export function resetEncryptedBackupSession(
+  session: EncryptedBackupSession,
+): void {
+  session.dispatch({ type: "start-new-backup" });
+  session.setVerified(false);
+  session.setSavedPath(null);
+  session.savedForRef.current = null;
+  session.setTest(initialBackupTestProgress);
+}
+
 type EncryptedBackupCreatorProps = {
   /** "spotlight" is the onboarding treatment; "boxed" fits settings cards. */
   variant?: "spotlight" | "boxed";
@@ -330,6 +341,8 @@ type EncryptedBackupCreatorProps = {
    * rendering inline.
    */
   createButtonPortal?: HTMLElement | null;
+  /** Optional onboarding footer target for the guided-test verification CTA. */
+  verifyButtonPortal?: HTMLElement | null;
   /** Extra classes for the "Download" button. */
   createButtonClassName?: string;
   /**
@@ -534,6 +547,7 @@ function PassphraseGeneratorPopover({
 export function EncryptedBackupCreator({
   variant = "spotlight",
   createButtonPortal,
+  verifyButtonPortal,
   createButtonClassName,
   session: sessionProp,
   onCreated,
@@ -692,8 +706,8 @@ export function EncryptedBackupCreator({
           onVerified={handleVerified}
           progress={test}
           saveError={saveError}
-          savedPath={savedPath}
           variant={variant}
+          verifyButtonPortal={verifyButtonPortal}
         />
       </div>
     );

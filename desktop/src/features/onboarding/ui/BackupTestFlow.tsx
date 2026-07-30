@@ -1,6 +1,7 @@
-import { Check, Eye, EyeOff, FileKey2, FileUp } from "lucide-react";
+import { Check, CircleHelp, Eye, EyeOff, FileKey2, FileUp } from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
 import * as React from "react";
+import { createPortal } from "react-dom";
 
 import {
   verifyNcryptsecBackup,
@@ -15,7 +16,6 @@ import { Spinner } from "@/shared/ui/spinner";
 import {
   ONBOARDING_SECURITY_PRIMARY_CTA_CLASS,
   ONBOARDING_SECONDARY_CTA_CLASS,
-  ONBOARDING_SECURITY_ICON_CLASS,
 } from "./OnboardingChrome";
 
 type BackupTestStage = "drop" | "password" | "success";
@@ -56,8 +56,9 @@ type BackupTestFlowProps = {
   /** Re-open the native save dialog for another copy of the backup file. */
   onSaveCopy?: () => void;
   isSaving?: boolean;
-  savedPath?: string | null;
   saveError?: string | null;
+  /** Optional onboarding footer target for the verification CTA. */
+  verifyButtonPortal?: HTMLElement | null;
   /** Host-owned progress so it survives this component unmounting. */
   progress: BackupTestProgress;
   onProgressChange: React.Dispatch<React.SetStateAction<BackupTestProgress>>;
@@ -67,6 +68,22 @@ type BackupTestFlowProps = {
 
 const BURST_EMOJIS = ["🎉", "✨", "🐝", "🍯", "🔑", "💛"] as const;
 const BURST_PARTICLE_COUNT = 18;
+const VERIFICATION_CONNECTOR_DOTS = [
+  "verification-dot-1",
+  "verification-dot-2",
+  "verification-dot-3",
+  "verification-dot-4",
+] as const;
+const VERIFICATION_DOT_ANIMATION = {
+  opacity: [0.35, 1, 0.35],
+  scale: [0.85, 1.25, 0.85],
+};
+const VERIFICATION_DOT_TRANSITION = {
+  duration: 0.7,
+  ease: "easeInOut" as const,
+  repeat: Number.POSITIVE_INFINITY,
+  repeatDelay: 1.2,
+};
 
 type BurstParticle = {
   id: number;
@@ -132,6 +149,43 @@ function SuccessBurst() {
   );
 }
 
+function VerificationConnector({
+  delayOffset,
+  reduceMotion,
+}: {
+  delayOffset: number;
+  reduceMotion: boolean;
+}) {
+  return (
+    <div
+      aria-hidden
+      className="my-5 flex h-14 flex-col items-center justify-between py-1"
+    >
+      {VERIFICATION_CONNECTOR_DOTS.map((dot, index) => (
+        <motion.span
+          animate={reduceMotion ? undefined : VERIFICATION_DOT_ANIMATION}
+          className="block size-1.5 rounded-full bg-foreground/65"
+          initial={reduceMotion ? false : { opacity: 0.35, scale: 0.85 }}
+          key={dot}
+          transition={
+            reduceMotion
+              ? undefined
+              : {
+                  ...VERIFICATION_DOT_TRANSITION,
+                  delay:
+                    (VERIFICATION_CONNECTOR_DOTS.length -
+                      1 -
+                      index +
+                      delayOffset) *
+                    0.16,
+                }
+          }
+        />
+      ))}
+    </div>
+  );
+}
+
 /**
  * "Test your backup" flow: the user drops a backup file onto a large
  * dropzone, then enters its password. Verification is a real NIP-49 decrypt
@@ -143,8 +197,8 @@ export function BackupTestFlow({
   expectedNcryptsec,
   onSaveCopy,
   isSaving = false,
-  savedPath,
   saveError,
+  verifyButtonPortal,
   progress,
   onProgressChange,
   onVerified,
@@ -443,14 +497,6 @@ export function BackupTestFlow({
                 {isSaving ? <Spinner className="h-4 w-4 border-2" /> : null}
                 Re-download backup
               </Button>
-              {savedPath ? (
-                <p
-                  className="text-center text-xs text-muted-foreground"
-                  data-testid="encrypted-backup-saved-path"
-                >
-                  Saved to {savedPath}
-                </p>
-              ) : null}
             </div>
           ) : null}
           {saveError ? (
@@ -465,119 +511,142 @@ export function BackupTestFlow({
           key="password"
           transition={{ duration: reduceMotion ? 0 : 0.3, ease: "easeOut" }}
         >
-          <div
-            className="flex items-center justify-center gap-2 text-sm text-foreground animate-in fade-in slide-in-from-bottom-1 duration-300 motion-reduce:animate-none"
-            data-testid="backup-test-file-accepted"
-          >
-            <FileKey2
-              aria-hidden="true"
-              className="h-4 w-4 text-muted-foreground"
-            />
-            <span className="max-w-70 truncate font-mono text-xs">
-              {fileName}
-            </span>
-            <Check aria-hidden="true" className="h-4 w-4 text-primary" />
-          </div>
-          <p className="text-center text-sm leading-6 text-muted-foreground">
-            That's the one. Now enter your password to prove you can unlock it.
-          </p>
-          <div className="relative">
-            <Input
-              aria-label="Backup password"
-              autoComplete="off"
-              className={cn(
-                "font-mono",
-                isSpotlight
-                  ? "h-14 rounded-none border-0 bg-transparent px-14 text-center text-lg shadow-none focus-visible:ring-0"
-                  : "h-10 bg-background pr-10",
-              )}
-              data-testid="backup-test-password"
-              disabled={isVerifying}
-              onChange={(event) => setAttempt(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  void handleVerify();
-                }
-              }}
-              placeholder="Your backup password"
-              ref={passwordInputRef}
-              type={isRevealed ? "text" : "password"}
-              value={attempt}
-            />
-            <Button
-              aria-label={isRevealed ? "Hide password" : "Reveal password"}
-              className={cn(
-                "absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground",
-                isSpotlight && ONBOARDING_SECURITY_ICON_CLASS,
-              )}
-              data-testid="backup-test-password-reveal-toggle"
-              disabled={isVerifying}
-              onClick={() => setIsRevealed((revealed) => !revealed)}
-              size="icon"
-              type="button"
-              variant="ghost"
-            >
-              {isRevealed ? (
-                <EyeOff aria-hidden="true" className="h-4 w-4" />
-              ) : (
-                <Eye aria-hidden="true" className="h-4 w-4" />
-              )}
-            </Button>
-            {error ? (
-              <p
-                className="absolute left-1 top-full mt-1 text-xs text-destructive animate-in fade-in duration-200 motion-reduce:animate-none"
-                data-testid="backup-test-error"
-                role="alert"
+          {(() => {
+            const fileRow = (
+              <div
+                className="flex max-w-full items-center gap-3 rounded-2xl border border-foreground/15 bg-foreground/10 px-4 py-3 text-foreground shadow-sm animate-in fade-in slide-in-from-bottom-1 duration-300 motion-reduce:animate-none"
+                data-testid="backup-test-file-accepted"
               >
-                {error}
-              </p>
-            ) : null}
-          </div>
-          <div className="flex items-center justify-center gap-3 pt-2">
-            <Button
-              className={cn(
-                "font-medium",
-                isSpotlight
-                  ? ONBOARDING_SECURITY_PRIMARY_CTA_CLASS
-                  : "h-9 px-6 text-sm text-primary-foreground",
-              )}
-              data-testid="backup-test-verify"
-              disabled={!attempt || isVerifying}
-              onClick={() => void handleVerify()}
-              type="button"
-            >
-              {isVerifying ? (
+                <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-foreground/10">
+                  <FileKey2
+                    aria-hidden="true"
+                    className="size-5 text-foreground/80"
+                  />
+                </span>
+                <span className="max-w-70 truncate font-mono text-sm">
+                  {fileName}
+                </span>
+              </div>
+            );
+            const passwordField = (
+              <div className="relative w-full">
+                <Input
+                  aria-label="Backup password"
+                  autoComplete="off"
+                  className={cn(
+                    "font-mono",
+                    isSpotlight
+                      ? "h-14 rounded-2xl border-black/20 bg-white px-14 text-center text-lg text-black/80 shadow-none placeholder:text-black/55 focus-visible:ring-black/35"
+                      : "h-10 bg-background pr-10",
+                  )}
+                  data-testid="backup-test-password"
+                  disabled={isVerifying}
+                  onChange={(event) => setAttempt(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void handleVerify();
+                    }
+                  }}
+                  placeholder="Your backup password"
+                  ref={passwordInputRef}
+                  type={isRevealed ? "text" : "password"}
+                  value={attempt}
+                />
+                <Button
+                  aria-label={isRevealed ? "Hide password" : "Reveal password"}
+                  className={cn(
+                    "absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground",
+                    isSpotlight &&
+                      "text-black/55 hover:bg-black/5 hover:text-black/80",
+                  )}
+                  data-testid="backup-test-password-reveal-toggle"
+                  disabled={isVerifying}
+                  onClick={() => setIsRevealed((revealed) => !revealed)}
+                  size="icon"
+                  type="button"
+                  variant="ghost"
+                >
+                  {isRevealed ? (
+                    <EyeOff aria-hidden="true" className="h-4 w-4" />
+                  ) : (
+                    <Eye aria-hidden="true" className="h-4 w-4" />
+                  )}
+                </Button>
+                {error ? (
+                  <p
+                    className="absolute left-1 top-full mt-1 text-xs text-destructive animate-in fade-in duration-200 motion-reduce:animate-none"
+                    data-testid="backup-test-error"
+                    role="alert"
+                  >
+                    {error}
+                  </p>
+                ) : null}
+              </div>
+            );
+            if (!isSpotlight) {
+              return (
                 <>
-                  <Spinner className="h-4 w-4 border-2" />
-                  Checking…
+                  {fileRow}
+                  <p className="text-center text-sm leading-6 text-muted-foreground">
+                    Enter the password to prove you can unlock this backup.
+                  </p>
+                  {passwordField}
                 </>
-              ) : (
-                "Verify backup"
-              )}
-            </Button>
-            <Button
-              className={
-                isSpotlight
-                  ? ONBOARDING_SECONDARY_CTA_CLASS
-                  : "h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
-              }
-              data-testid="backup-test-use-different-file"
-              disabled={isVerifying}
-              onClick={() => {
-                requestRef.current += 1;
-                setAttempt("");
-                setError(null);
-                setIsRevealed(false);
-                onProgressChange(initialBackupTestProgress);
-              }}
-              size="sm"
-              type="button"
-              variant="ghost"
-            >
-              Use a different file
-            </Button>
-          </div>
+              );
+            }
+            return (
+              <div className="flex w-full flex-col items-center">
+                <CircleHelp
+                  aria-hidden="true"
+                  className="size-10 text-foreground/85"
+                />
+                <VerificationConnector
+                  delayOffset={VERIFICATION_CONNECTOR_DOTS.length}
+                  reduceMotion={reduceMotion}
+                />
+                {passwordField}
+                <VerificationConnector
+                  delayOffset={0}
+                  reduceMotion={reduceMotion}
+                />
+                {fileRow}
+              </div>
+            );
+          })()}
+          {(() => {
+            const verifyButton = (
+              <Button
+                className={cn(
+                  "font-medium",
+                  isSpotlight
+                    ? ONBOARDING_SECURITY_PRIMARY_CTA_CLASS
+                    : "h-9 px-6 text-sm text-primary-foreground",
+                )}
+                data-testid="backup-test-verify"
+                disabled={!attempt || isVerifying}
+                onClick={() => void handleVerify()}
+                type="button"
+              >
+                {isVerifying ? (
+                  <>
+                    <Spinner className="h-4 w-4 border-2" />
+                    Checking…
+                  </>
+                ) : (
+                  "Verify backup"
+                )}
+              </Button>
+            );
+            if (verifyButtonPortal === undefined) {
+              return (
+                <div className="flex justify-center pt-2">{verifyButton}</div>
+              );
+            }
+            return verifyButtonPortal
+              ? createPortal(verifyButton, verifyButtonPortal)
+              : null;
+          })()}
         </motion.div>
       )}
     </div>

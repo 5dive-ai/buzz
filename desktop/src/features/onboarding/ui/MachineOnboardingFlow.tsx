@@ -15,6 +15,7 @@ import { DefaultConfigStep } from "./DefaultConfigStep";
 import { DownloadKeyStep } from "./DownloadKeyStep";
 import {
   backupSessionToPasswordEntry,
+  resetEncryptedBackupSession,
   useEncryptedBackupSession,
 } from "./EncryptedBackupCreator";
 import { IdentityKeyHelpDialog } from "./IdentityKeyHelpDialog";
@@ -279,6 +280,7 @@ export function MachineOnboardingFlow({
               <DownloadKeyStep
                 direction={backupDirection}
                 onBack={() => {
+                  resetEncryptedBackupSession(backupSession);
                   setBackupDirection("backward");
                   setReturningFromSecurity(false);
                   setBackupSubview("options");
@@ -292,6 +294,7 @@ export function MachineOnboardingFlow({
                 onBack={() => setPage("identity")}
                 onNext={() => setPage("setup")}
                 onOpenPasswordBackup={() => {
+                  resetEncryptedBackupSession(backupSession);
                   setBackupDirection("forward");
                   setReturningFromSecurity(false);
                   setBackupSubview("password");

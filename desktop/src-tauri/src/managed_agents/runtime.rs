@@ -244,27 +244,30 @@ pub fn build_managed_agent_summary(
     // env layering below — the caller loads it once and passes it in, so
     // list-style callers pay one disk read per call rather than one per record.
 
-    let restart_diff = pair_key
-        .as_ref()
-        .and_then(|key| runtimes.get(key).map(|runtime| (key, runtime)))
-        .map(|(key, runtime)| {
-            let teams = crate::managed_agents::load_teams(app).unwrap_or_default();
-            let current = crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
-                record,
-                personas,
-                &teams,
-                &key.relay_url,
-                global_config,
-            );
-            crate::managed_agents::spawn_snapshot::eligible_restart_diff(
-                persona_orphaned,
-                &runtime.spawn_config,
-                &current,
-                runtime.adapter_availability.as_ref(),
-                super::adapter_availability_cached(),
-            )
-        })
-        .unwrap_or_default();
+    // The prospective side is computed only for a tracked pair: it costs a
+    // teams-store read, and an unstamped agent has nothing to compare against.
+    let tracked_spawn = pair_key.as_ref().zip(pair_runtime).map(|(key, runtime)| {
+        let teams = crate::managed_agents::load_teams(app).unwrap_or_default();
+        let current = crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+            record,
+            personas,
+            &teams,
+            &key.relay_url,
+            global_config,
+        );
+        (runtime, current)
+    });
+    let restart_diff = crate::managed_agents::spawn_snapshot::eligible_restart_diff(
+        persona_orphaned,
+        tracked_spawn.as_ref().map(|(runtime, current)| {
+            crate::managed_agents::spawn_snapshot::TrackedSpawnState {
+                stamped: &runtime.spawn_config,
+                current,
+                stamped_availability: runtime.adapter_availability.as_ref(),
+                current_availability: super::adapter_availability_cached(),
+            }
+        }),
+    );
     // One vector is the whole truth: badge on ⟺ there is a diff to show.
     let needs_restart = !restart_diff.is_empty();
 

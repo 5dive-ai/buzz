@@ -228,30 +228,42 @@ fn availability_value(status: Option<&AcpAvailabilityStatus>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// The final restart-diff for one tracked runtime — the single source of both
-/// the wire field and the badge, which is `!result.is_empty()`.
+/// What a tracked runtime was launched with, paired with what a launch would
+/// use now. Absent (`None` at the call site) for every agent this workspace
+/// tracks no live pair for — stopped, or `runtime_pid`-adopted across an app
+/// restart, whose spawn config was never stamped and so can never be shown to
+/// have drifted.
+pub(crate) struct TrackedSpawnState<'a> {
+    pub stamped: &'a SpawnConfigSnapshot,
+    pub current: &'a SpawnConfigSnapshot,
+    pub stamped_availability: Option<&'a AcpAvailabilityStatus>,
+    pub current_availability: Option<AcpAvailabilityStatus>,
+}
+
+/// The final restart-diff for one agent — the single source of both the wire
+/// field and the badge, which is `!result.is_empty()`.
 ///
-/// Suppressed entirely for an orphaned instance: `spawn_agent_child` refuses
-/// to spawn one before any side effect, so "Restart required" would offer an
-/// action guaranteed to fail. The UI surfaces `persona_orphaned` instead.
+/// Empty for an un-stamped agent (see [`TrackedSpawnState`]) and for an
+/// orphaned instance: `spawn_agent_child` refuses to spawn an orphan before
+/// any side effect, so "Restart required" would offer an action guaranteed to
+/// fail. The UI surfaces `persona_orphaned` instead.
 pub(crate) fn eligible_restart_diff(
     persona_orphaned: bool,
-    stamped: &SpawnConfigSnapshot,
-    current: &SpawnConfigSnapshot,
-    stamped_availability: Option<&AcpAvailabilityStatus>,
-    current_availability: Option<AcpAvailabilityStatus>,
+    tracked: Option<TrackedSpawnState<'_>>,
 ) -> Vec<RestartDiffEntry> {
-    if persona_orphaned {
+    let Some(tracked) = tracked.filter(|_| !persona_orphaned) else {
         return Vec::new();
-    }
-    let mut entries = diff(stamped, current);
-    if crate::managed_agents::availability_drift(stamped_availability, current_availability.clone())
-    {
+    };
+    let mut entries = diff(tracked.stamped, tracked.current);
+    if crate::managed_agents::availability_drift(
+        tracked.stamped_availability,
+        tracked.current_availability.clone(),
+    ) {
         entries.push(RestartDiffEntry {
             field: ADAPTER_AVAILABILITY_FIELD.to_string(),
             change: RestartChange::Value {
-                before: availability_value(stamped_availability),
-                after: availability_value(current_availability.as_ref()),
+                before: availability_value(tracked.stamped_availability),
+                after: availability_value(tracked.current_availability.as_ref()),
             },
         });
     }

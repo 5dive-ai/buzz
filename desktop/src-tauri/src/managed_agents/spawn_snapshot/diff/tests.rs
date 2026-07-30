@@ -397,10 +397,12 @@ fn eligible(
 ) -> (bool, Vec<RestartDiffEntry>) {
     let entries = eligible_restart_diff(
         orphaned,
-        stamped,
-        current,
-        stamped_availability.as_ref(),
-        current_availability,
+        Some(TrackedSpawnState {
+            stamped,
+            current,
+            stamped_availability: stamped_availability.as_ref(),
+            current_availability,
+        }),
     );
     (!entries.is_empty(), entries)
 }
@@ -476,4 +478,25 @@ fn unstamped_availability_is_not_drift() {
     );
     assert!(!needs_restart);
     assert!(entries.is_empty());
+}
+
+#[test]
+fn unstamped_agent_yields_no_badge_and_no_entries() {
+    // A `runtime_pid`-adopted process — and any agent this workspace tracks no
+    // live pair for — has no `ManagedAgentProcess`, so no spawn config was ever
+    // stamped. With nothing to compare against there is no drift to report, and
+    // the badge derives from that emptiness. Distinct from the case above,
+    // where a real pair IS tracked and only its availability stamp is absent.
+    for orphaned in [false, true] {
+        let entries = eligible_restart_diff(orphaned, None);
+        let needs_restart = !entries.is_empty();
+        assert!(
+            entries.is_empty(),
+            "unstamped agent (orphaned={orphaned}) must report no changed fields"
+        );
+        assert!(
+            !needs_restart,
+            "unstamped agent (orphaned={orphaned}) must not light the badge"
+        );
+    }
 }

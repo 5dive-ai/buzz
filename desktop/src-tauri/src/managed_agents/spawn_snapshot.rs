@@ -41,7 +41,7 @@ use super::{
 };
 
 pub(crate) mod diff;
-pub(crate) use diff::{eligible_restart_diff, RestartDiffEntry};
+pub(crate) use diff::{eligible_restart_diff, RestartDiffEntry, TrackedSpawnState};
 
 /// Resolve the current instructions for this instance's deployment-time team binding.
 /// A deleted team deliberately degrades to no team section.

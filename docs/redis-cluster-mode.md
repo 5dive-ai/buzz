@@ -90,13 +90,25 @@ profile `bb-public-operations-ro`).
   speed; r8g (Graviton4) buys ~25–30% single-thread ≈ 1.1–1.3 days at the
   fitted 3.45-day doubling (1.25–1.30x → Td·log₂(M); vendor range, not
   benchmarked by anyone in this effort).
-- **Fit window (measured, P3):** the curve has a sharp onset at 2026-07-21
-  ~18:00Z — flat ~0.55% for the preceding five days, then exponential within
-  one 15-min bin (subscribed channels 74→1303 in four hours at a pinned
+- **Fit window (measured, P3; onset attributed 2026-07-30):** the curve has a
+  sharp onset at 2026-07-21 **16:40Z** (5-min bins; the earlier ~18:00Z was a
+  15-min-bin artifact) — flat ~0.55% for the preceding five days, then
+  exponential (subscribed channels 74→1303 in four hours at a pinned
   connection count). Growth fits must start after the onset or they mix two
   regimes. `curr_connections` moves in pool-config plateaus (40.0 → 74.9 →
-  ~280) and must not be read as demand. The onset is unattributed; confirming
-  what reached bb-public at 18:00Z needs deploy-history access.
+  ~280) and must not be read as demand. **The onset is not a deploy** — it is
+  organic community creation (58 → 425 communities in two hours, first move in
+  the same 5-min bin as the Redis breakout; one pub/sub topic per community
+  makes the chain mechanical, and subscriptions-per-connection stayed flat
+  across the onset, which excludes a subscription-behavior code change).
+  Community creation has since gone **linear** (~3,100/day) while Redis load
+  remains **exponential** — the exponential is carried by intensification
+  within communities, so the curve-break indicator to watch is
+  **channels-per-community** (rising as of Jul 30), not community count.
+  Receipts: `RESEARCH/BB_PUBLIC_REDIS_ONSET_ATTRIBUTION.md`. Measurement
+  trap: `cacheclusterid:buzz-001-001` exists in **four** AWS accounts, so
+  every ElastiCache query must scope `aws_account:433851229429` — a bare-tag
+  `avg:` dilutes engine CPU ~3.4x.
 
 ## System Model
 

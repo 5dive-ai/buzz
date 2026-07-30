@@ -91,8 +91,8 @@ export function RichLinkPreviewCard({
     <div
       ref={cardRef}
       className={cn(
-        "group/rich-preview relative w-96 max-w-full overflow-hidden rounded-2xl border border-border/70 bg-muted/30 px-3 py-2.5 transition-colors",
-        "hover:border-border hover:bg-muted/50",
+        "group/rich-preview relative w-96 max-w-full overflow-hidden rounded-2xl border border-border/70 px-3 py-2.5 transition-colors",
+        "hover:border-border",
         className,
       )}
       data-rich-link-preview=""

@@ -518,7 +518,6 @@ function MessageComposerImpl({
   // ── Submit message ──────────────────────────────────────────────────
   const submitMessage = React.useCallback(async () => {
     if (!prepareDictationSubmitRef.current()) return;
-
     const trimmed = syncComposerContentFromEditor().trim();
 
     // Edit mode
@@ -838,13 +837,16 @@ function MessageComposerImpl({
       disabled ||
       media.isUploading ||
       mentionSendFlow.isPreparingMentionSend ||
-      (isContentEmpty && media.pendingImeta.length === 0),
+      (isContentEmpty &&
+        media.pendingImeta.length === 0 &&
+        !dictation.canStopFromSend),
     [
       disabled,
       media.isUploading,
       mentionSendFlow.isPreparingMentionSend,
       isContentEmpty,
       media.pendingImeta.length,
+      dictation.canStopFromSend,
     ],
   );
 

@@ -462,6 +462,11 @@ test("link preview no-image collapse restores the compact card", async ({
       .locator('[data-link-preview="github-pull-request"]');
     await expect(card).toHaveAttribute("data-image-state", "pending");
     await expect(card).toBeVisible();
+    await expect
+      .poll(() =>
+        card.evaluate((element) => element.getBoundingClientRect().height),
+      )
+      .toBe(80);
     const pending = await card.evaluate((element) => ({
       height: element.getBoundingClientRect().height,
       textLeft: element

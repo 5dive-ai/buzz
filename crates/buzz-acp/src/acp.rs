@@ -211,16 +211,37 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
-    /// Whether the current turn has produced anything an observer would call
-    /// work: at least one non-empty `agent_message_chunk`, or at least one
-    /// tool call that completed without an error flag.
+    /// How many times the current turn has produced something an observer
+    /// would call work: a non-empty `agent_message_chunk`, or a tool call
+    /// that reported completion without an error flag.
     ///
-    /// Set by [`handle_session_update`](Self::handle_session_update), cleared
-    /// at the top of every `session/prompt`. Read by the pool after a turn
-    /// returns `end_turn`: a channel turn that ends with this still `false`
-    /// answered a user's mention with nothing at all, which is a failure the
-    /// harness must retry rather than dequeue as a success.
-    turn_produced_output: bool,
+    /// Incremented by [`handle_session_update`](Self::handle_session_update)
+    /// and reset to 0 at the top of every `session/prompt`. This is a counter
+    /// rather than a flag because dead-turn classification is per *delivered
+    /// event*, not per turn: an event injected mid-turn by a native steer is
+    /// only answered if output arrives **after** its delivery. Comparing the
+    /// counter read at delivery against the counter at turn end distinguishes
+    /// "the agent spoke, then went silent on the new message" from "the agent
+    /// spoke after being steered". A bare boolean cannot express that: output
+    /// produced before the steer would mask the silence after it.
+    ///
+    /// Read by the pool after a turn returns `end_turn`; see
+    /// [`crate::pool::is_dead_turn`].
+    turn_output_epoch: u64,
+}
+
+/// Whether a `tool_call` / `tool_call_update` payload reports a tool that
+/// finished its work successfully.
+///
+/// A tool call counts as work only when it completed AND the agent did not
+/// flag the result as an error. buzz-agent reports a rejected call as
+/// `completed` with `rawOutput.isError` set (`crates/buzz-agent/src/agent.rs`
+/// `emit_completed`), which is exactly the shape of a turn that accomplished
+/// nothing. Shared by both arms because the ACP schema allows either event to
+/// carry the terminal status.
+fn tool_call_succeeded(update: &serde_json::Value) -> bool {
+    update.get("status").and_then(|v| v.as_str()) == Some("completed")
+        && update["rawOutput"]["isError"] != true
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -560,7 +581,7 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
-            turn_produced_output: false,
+            turn_output_epoch: 0,
         })
     }
 
@@ -768,7 +789,7 @@ impl AcpClient {
 
         // Reset before the prompt is written so nothing a previous turn (or
         // session setup) emitted can vouch for this one.
-        self.turn_produced_output = false;
+        self.turn_output_epoch = 0;
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
         // prompt so that any setup notifications recorded earlier are not
@@ -842,16 +863,23 @@ impl AcpClient {
         self.last_prompt_id.is_some()
     }
 
-    /// Whether the turn that just ran produced any observable work — a
-    /// non-empty assistant message chunk or a tool call that completed
-    /// without an error flag.
+    /// How much observable work the current turn has produced so far — a
+    /// monotonic count of non-empty assistant message chunks and tool calls
+    /// that completed without an error flag.
     ///
-    /// Valid only between a `session/prompt` returning and the next one
-    /// starting (each prompt clears the flag). See
-    /// [`turn_produced_output`](Self::turn_produced_output) for why the
-    /// harness cares.
-    pub fn turn_produced_output(&self) -> bool {
-        self.turn_produced_output
+    /// Read at two points: when a mid-turn steer is accepted (to remember what
+    /// the turn had produced *before* the new event was delivered) and after
+    /// the prompt returns. Equal readings mean nothing was produced in between,
+    /// which is what makes a delivered event unanswered. Each prompt resets it
+    /// to 0, so a reading is only comparable within one turn. See
+    /// [`turn_output_epoch`](Self::turn_output_epoch) for why this is a counter.
+    pub fn turn_output_epoch(&self) -> u64 {
+        self.turn_output_epoch
+    }
+
+    /// Record one unit of observable work for the current turn.
+    fn record_output(&mut self) {
+        self.turn_output_epoch = self.turn_output_epoch.saturating_add(1);
     }
 
     /// Most recently observed goose `_meta.goose.activeRunId` from a
@@ -1613,11 +1641,27 @@ impl AcpClient {
                                                 // so leave it alone and let the
                                                 // prompt response land on its
                                                 // original budget.
+                                                //
+                                                // The epoch is still reported.
+                                                // The detached turn streams its
+                                                // updates over this same
+                                                // connection, so output it
+                                                // produces before the awaited
+                                                // response lands does advance
+                                                // the epoch and retires the
+                                                // event. If nothing is observed,
+                                                // the event is redelivered —
+                                                // a visible duplicate is the
+                                                // right side to err on against
+                                                // the silent loss this ledger
+                                                // exists to close.
                                                 tracing::info!(
                                                     "steer accepted as {STEER_OUTCOME_STARTED_NEW_TURN}: \
                                                      awaited turn had ended — hard deadline not renewed"
                                                 );
-                                                crate::pool::SteerAck::Success
+                                                crate::pool::SteerAck::Success {
+                                                    output_epoch: self.turn_output_epoch,
+                                                }
                                             }
                                             Some(_) => {
                                                 let renew_now = Instant::now();
@@ -1629,7 +1673,9 @@ impl AcpClient {
                                                         "steer success: renewed hard deadline ({max_duration:?} from now)"
                                                     );
                                                 }
-                                                crate::pool::SteerAck::Success
+                                                crate::pool::SteerAck::Success {
+                                                    output_epoch: self.turn_output_epoch,
+                                                }
                                             }
                                             None => {
                                                 // Report the raw string when
@@ -1743,7 +1789,7 @@ impl AcpClient {
                 if let Some(text) = update["content"]["text"].as_str() {
                     // Whitespace-only chunks are formatting, not an answer.
                     if !text.trim().is_empty() {
-                        self.turn_produced_output = true;
+                        self.record_output();
                     }
                     tracing::info!(target: "buzz_acp::acp::stream", "{text}");
                 }
@@ -1758,6 +1804,13 @@ impl AcpClient {
                     .get("kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
+                // The ACP schema permits a tool call to be reported complete in
+                // its very first event, so the initial `tool_call` can itself
+                // carry successful work. Counting it here keeps a connector that
+                // never sends a follow-up `tool_call_update` from looking dead.
+                if tool_call_succeeded(update) {
+                    self.record_output();
+                }
                 tracing::info!(target: "buzz_acp::acp::tool", "tool_call: {title} ({kind})");
                 true
             }
@@ -1767,13 +1820,8 @@ impl AcpClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
                 let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                // A tool call only counts as work when it completed AND the
-                // agent didn't flag the result as an error. buzz-agent reports
-                // a rejected call as `completed` with `rawOutput.isError` set
-                // (`crates/buzz-agent/src/agent.rs` `emit_completed`), which is
-                // exactly the shape of a turn that accomplished nothing.
-                if status == "completed" && update["rawOutput"]["isError"] != true {
-                    self.turn_produced_output = true;
+                if tool_call_succeeded(update) {
+                    self.record_output();
                 }
                 tracing::info!(target: "buzz_acp::acp::tool", "tool_call_update: {tool_id} → {status}");
                 false
@@ -3567,16 +3615,23 @@ mod tests {
 
     // ── Per-turn output tracking ─────────────────────────────────────────
     //
-    // `turn_produced_output` is what tells the pool a channel turn answered
-    // with nothing. These pin the discriminations that matter: a rejected
-    // tool call reports `completed` with `rawOutput.isError` (the exact shape
-    // of the turn this flag exists to catch), and a thought chunk is
-    // reasoning, not an answer.
+    // `turn_output_epoch` is what tells the pool a channel turn answered with
+    // nothing, and what tells it whether a mid-turn steered event was answered
+    // *after* it arrived. These pin the discriminations that matter: a
+    // rejected tool call reports `completed` with `rawOutput.isError` (the
+    // exact shape of the turn this counter exists to catch), a thought chunk
+    // is reasoning rather than an answer, and either tool-call event may carry
+    // the terminal status.
 
-    /// Build a `session/update` notification for a `tool_call_update`.
-    fn tool_call_update_msg(status: &str, is_error: Option<bool>) -> serde_json::Value {
+    /// Build a `session/update` notification for a tool call, as either the
+    /// initial `tool_call` or a follow-up `tool_call_update`.
+    fn tool_call_msg(
+        session_update: &str,
+        status: &str,
+        is_error: Option<bool>,
+    ) -> serde_json::Value {
         let mut update = serde_json::json!({
-            "sessionUpdate": "tool_call_update",
+            "sessionUpdate": session_update,
             "toolCallId": "call-1",
             "status": status,
         });
@@ -3607,18 +3662,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_output_starts_false_and_message_chunk_sets_it() {
+    async fn turn_output_starts_at_zero_and_message_chunk_advances_it() {
         let mut client = spawn_inert_client().await;
-        assert!(
-            !client.turn_produced_output(),
+        assert_eq!(
+            client.turn_output_epoch(),
+            0,
             "a client that has never prompted has produced nothing"
         );
 
         let _ = client.handle_session_update(&text_chunk_msg("agent_message_chunk", "here you go"));
 
-        assert!(
-            client.turn_produced_output(),
+        assert_eq!(
+            client.turn_output_epoch(),
+            1,
             "an assistant message chunk is output"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_output_counts_each_message_chunk() {
+        // The epoch must advance per output event, not saturate at "some" —
+        // that is what lets a steer accepted at epoch N be told apart from
+        // output produced after it.
+        let mut client = spawn_inert_client().await;
+
+        for _ in 0..3 {
+            let _ = client.handle_session_update(&text_chunk_msg("agent_message_chunk", "chunk"));
+        }
+
+        assert_eq!(
+            client.turn_output_epoch(),
+            3,
+            "each chunk advances the epoch"
         );
     }
 
@@ -3628,8 +3703,9 @@ mod tests {
 
         let _ = client.handle_session_update(&text_chunk_msg("agent_message_chunk", "  \n "));
 
-        assert!(
-            !client.turn_produced_output(),
+        assert_eq!(
+            client.turn_output_epoch(),
+            0,
             "a whitespace-only chunk is formatting, not an answer"
         );
     }
@@ -3640,56 +3716,74 @@ mod tests {
 
         let _ = client.handle_session_update(&text_chunk_msg("agent_thought_chunk", "thinking…"));
 
-        assert!(
-            !client.turn_produced_output(),
+        assert_eq!(
+            client.turn_output_epoch(),
+            0,
             "reasoning the user never sees is not output"
         );
     }
 
     #[tokio::test]
-    async fn turn_output_set_by_clean_completed_tool_call() {
-        let mut client = spawn_inert_client().await;
-
-        let _ = client.handle_session_update(&tool_call_update_msg("completed", Some(false)));
-
-        assert!(
-            client.turn_produced_output(),
-            "a tool call that completed cleanly is work"
-        );
-    }
-
-    #[tokio::test]
-    async fn turn_output_set_by_completed_tool_call_without_raw_output() {
-        // Agents that omit `rawOutput` entirely still report real work —
-        // absence of an error flag must not read as an error.
-        let mut client = spawn_inert_client().await;
-
-        let _ = client.handle_session_update(&tool_call_update_msg("completed", None));
-
-        assert!(
-            client.turn_produced_output(),
-            "a completed call with no rawOutput must count"
-        );
-    }
-
-    #[tokio::test]
-    async fn turn_output_not_set_by_errored_or_unfinished_tool_calls() {
-        // The three shapes a fruitless tool call takes on the wire. The
-        // first is turn 2 of the incident: buzz-agent reports an MCP
-        // rejection as `completed` with `rawOutput.isError`.
-        for (status, is_error) in [
-            ("completed", Some(true)),
-            ("failed", None),
-            ("in_progress", None),
-        ] {
+    async fn turn_output_advanced_by_clean_completed_tool_call() {
+        // Both wire shapes: ACP allows the initial `tool_call` to carry the
+        // terminal status, so a connector that never sends a follow-up
+        // `tool_call_update` still did real work.
+        for session_update in ["tool_call", "tool_call_update"] {
             let mut client = spawn_inert_client().await;
 
-            let _ = client.handle_session_update(&tool_call_update_msg(status, is_error));
+            let _ = client.handle_session_update(&tool_call_msg(
+                session_update,
+                "completed",
+                Some(false),
+            ));
 
-            assert!(
-                !client.turn_produced_output(),
-                "status={status} isError={is_error:?} must not count as output"
+            assert_eq!(
+                client.turn_output_epoch(),
+                1,
+                "{session_update} that completed cleanly is work"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_output_advanced_by_completed_tool_call_without_raw_output() {
+        // Agents that omit `rawOutput` entirely still report real work —
+        // absence of an error flag must not read as an error.
+        for session_update in ["tool_call", "tool_call_update"] {
+            let mut client = spawn_inert_client().await;
+
+            let _ = client.handle_session_update(&tool_call_msg(session_update, "completed", None));
+
+            assert_eq!(
+                client.turn_output_epoch(),
+                1,
+                "{session_update} completed with no rawOutput must count"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_output_not_advanced_by_errored_or_unfinished_tool_calls() {
+        // The three shapes a fruitless tool call takes on the wire, in both
+        // events. The first is turn 2 of the incident: buzz-agent reports an
+        // MCP rejection as `completed` with `rawOutput.isError`.
+        for session_update in ["tool_call", "tool_call_update"] {
+            for (status, is_error) in [
+                ("completed", Some(true)),
+                ("failed", None),
+                ("in_progress", None),
+            ] {
+                let mut client = spawn_inert_client().await;
+
+                let _ =
+                    client.handle_session_update(&tool_call_msg(session_update, status, is_error));
+
+                assert_eq!(
+                    client.turn_output_epoch(),
+                    0,
+                    "{session_update} status={status} isError={is_error:?} must not count as output"
+                );
+            }
         }
     }
 
@@ -3701,7 +3795,7 @@ mod tests {
         // a hand-rolled reset.
         let mut client = spawn_script("sleep 5").await;
         let _ = client.handle_session_update(&text_chunk_msg("agent_message_chunk", "turn 1 said"));
-        assert!(client.turn_produced_output(), "precondition: turn 1 spoke");
+        assert_eq!(client.turn_output_epoch(), 1, "precondition: turn 1 spoke");
 
         let result = client
             .session_prompt_with_idle_timeout(
@@ -3716,8 +3810,9 @@ mod tests {
             matches!(result, Err(AcpError::IdleTimeout(_))),
             "silent agent must idle out, got {result:?}"
         );
-        assert!(
-            !client.turn_produced_output(),
+        assert_eq!(
+            client.turn_output_epoch(),
+            0,
             "turn 2 must start with a clean slate"
         );
     }
@@ -3866,7 +3961,7 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Success => {}
+            crate::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
     }
@@ -3927,7 +4022,7 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Success => {}
+            crate::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
     }
@@ -4111,7 +4206,7 @@ mod tests {
             "_session/steering must not carry expectedRunId; wrote: {written}"
         );
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "injected outcome must ack Success, got {ack:?}"
         );
     }
@@ -4143,7 +4238,7 @@ mod tests {
         // no `outcome`) — the OutcomeRejected guard applies only to
         // `_session/steering`.
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "goose success result must ack Success, got {ack:?}"
         );
     }
@@ -4177,8 +4272,9 @@ mod tests {
     /// Test 8: **codex `extMethod` silent-loss regression guard.** codex-acp's
     /// ext dispatcher answers unrecognized methods with a bare `{}` — a
     /// JSON-RPC *success*, not `-32601` (`src/CodexAcpServer.ts:255-258`).
-    /// Buzz maps `SteerAck::Success` to `queue.remove_event`, so decoding
-    /// `{}` as success would delete the user's message with no error, no
+    /// Buzz maps `SteerAck::Success` to `queue.record_delivered_steer`, which
+    /// takes the event out of normal dispatch, so decoding `{}` as success
+    /// would stop redelivering the user's message with no error, no
     /// fallback, and no log. An absent `outcome` must therefore be a
     /// rejection, which releases the event and fires cancel+merge.
     #[tokio::test]
@@ -4248,7 +4344,7 @@ mod tests {
         assert_eq!(result.unwrap()["done"], serde_json::json!(true));
         let ack = ack_rx.await.expect("ack must be received");
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "injected must ack Success, got {ack:?}"
         );
     }
@@ -4305,7 +4401,7 @@ mod tests {
         // rather than released — hence Success, not an Err.
         let ack = ack_rx.await.expect("ack must be received");
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "startedNewTurn is a delivery success, got {ack:?}"
         );
     }

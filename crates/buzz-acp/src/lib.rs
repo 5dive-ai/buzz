@@ -2171,8 +2171,8 @@ async fn tokio_main() -> Result<()> {
                             }
 
                             let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
-                            let prompt_tag = match matched {
-                                Some(m) => m.prompt_tag,
+                            let (prompt_tag, requires_response) = match matched {
+                                Some(m) => (m.prompt_tag, m.requires_response),
                                 None => {
                                     tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
                                     continue;
@@ -2199,6 +2199,7 @@ async fn tokio_main() -> Result<()> {
                                 event: buzz_event.event,
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
+                                requires_response,
                             });
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -2423,14 +2424,20 @@ async fn tokio_main() -> Result<()> {
                 //
                 //   Success
                 //     The agent received the steer via the non-cancelling
-                //     path. Drop the withheld event so normal dispatch
-                //     never redelivers it.
+                //     path. Move the withheld event into the delivered
+                //     ledger so normal dispatch never redelivers it while
+                //     the turn runs — but keep it recoverable: if the turn
+                //     then ends without producing any output after the
+                //     delivery, the event was swallowed and
+                //     `resolve_delivered_steers` releases it for retry.
+                //     Dropping it here (the prior behaviour) is how a
+                //     mid-turn mention could silently disappear.
                 //
                 //     Also covers `_session/steering`'s `startedNewTurn`
                 //     outcome: the message was delivered, but into a fresh
                 //     turn because the one being steered had already
                 //     finished. Delivery is what this arm keys on, so the
-                //     event is still dropped. The read loop deliberately
+                //     event is still ledgered. The read loop deliberately
                 //     does NOT renew its hard deadline in that case (the
                 //     awaited turn is settled), while
                 //     `extend_in_flight_deadline` below still applies —
@@ -2492,15 +2499,17 @@ async fn tokio_main() -> Result<()> {
                 //     pending_steer on every return path. If it does,
                 //     treat as PromptCompletedNeutral to avoid leaking
                 //     the withheld event in `withheld_native_steer`.
-                let (release_withheld, drop_withheld, signal_fallback) = match &ack {
-                    Ok(pool::SteerAck::Success) => (false, true, false),
+                let (release_withheld, deliver_withheld, signal_fallback) = match &ack {
+                    Ok(pool::SteerAck::Success { output_epoch }) => {
+                        (false, Some(*output_epoch), false)
+                    }
                     // -32601 = method_not_found: agent does not implement the
                     // steer extension. Fire cancel+merge so the message still
                     // reaches the agent.
                     Ok(pool::SteerAck::Err(pool::SteerError::AgentError { code, .. }))
                         if *code == -32601 =>
                     {
-                        (true, false, true)
+                        (true, None, true)
                     }
                     // AgentError: write landed, agent rejected it at the
                     // application level (e.g. wrong run id). Release for
@@ -2508,29 +2517,27 @@ async fn tokio_main() -> Result<()> {
                     // running or just ended — either way there is nothing to
                     // cancel).
                     Ok(pool::SteerAck::Err(pool::SteerError::AgentError { .. })) => {
-                        (true, false, false)
+                        (true, None, false)
                     }
                     // Transport / ExpectedRunIdMissing / OutcomeRejected: the
                     // steer did not land. Release and fire the cancel+merge
                     // fallback so the message still reaches the agent.
-                    Ok(pool::SteerAck::Err(_)) => (true, false, true),
-                    Ok(pool::SteerAck::PromptCompletedNeutral) => (true, false, false),
-                    Err(_recv_err) => (true, false, false),
+                    Ok(pool::SteerAck::Err(_)) => (true, None, true),
+                    Ok(pool::SteerAck::PromptCompletedNeutral) => (true, None, false),
+                    Err(_recv_err) => (true, None, false),
                 };
                 tracing::info!(
                     channel = %channel_id,
                     event_id = %event_id,
                     ?ack,
                     release_withheld,
-                    drop_withheld,
+                    delivered = deliver_withheld.is_some(),
                     signal_fallback,
                     "non-cancelling steer ack received"
                 );
-                if matches!(ack, Ok(pool::SteerAck::Success)) {
+                if let Some(output_epoch) = deliver_withheld {
                     queue.extend_in_flight_deadline(channel_id, config.max_turn_duration_secs);
-                }
-                if drop_withheld {
-                    queue.remove_event(channel_id, &event_id);
+                    queue.record_delivered_steer(channel_id, &event_id, output_epoch);
                 }
                 if release_withheld {
                     queue.release_native_steer(channel_id, &event_id);
@@ -2844,12 +2851,7 @@ fn try_native_steer(
     // steering (which is to inject only what's new).
     let (header, closing) = queue::native_steer_framing();
     let event_id_hex = event.id.to_hex();
-    let be = queue::BatchEvent {
-        event,
-        prompt_tag: prompt_tag.clone(),
-        received_at: std::time::Instant::now(),
-    };
-    let event_block = queue::format_event_block(channel_id, None, &be, None);
+    let event_block = queue::format_event_block(channel_id, None, &event, None);
     let body = format!("{header}\n\n[Buzz event: {prompt_tag}]\n{event_block}\n\n{closing}");
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
@@ -3188,6 +3190,35 @@ fn handle_prompt_result(
         }
     }
 
+    // Settle any events a native steer injected into the turn that just ended.
+    // Placed after the batch requeue and before `mark_complete` for the same
+    // reason: released events go to the queue front, and the channel must
+    // still be in-flight while the queue is mutated so nothing dispatches
+    // half-settled state.
+    //
+    // Channels the agent was removed from are skipped: `drain_channel` clears
+    // both steer tables, and `record_delivered_steer` only ever moves an event
+    // out of the withheld table, so a removed channel's ledger is provably
+    // empty — there is nothing to release and nowhere to release it to.
+    if let PromptSource::Channel(ch) = &result.source {
+        if !removed_channels.contains(ch) {
+            let released = queue.resolve_delivered_steers(*ch, result.final_output_epoch);
+            if released > 0 {
+                // Not routed through `is_dead_turn`: these events were never in
+                // the batch, so there is no batch fate to change. Releasing them
+                // to the queue front is the retry — the next flush redelivers
+                // them as an ordinary batch, which then has the full
+                // backoff/dead-letter budget of its own.
+                tracing::error!(
+                    target: "buzz_acp::pool::prompt",
+                    channel_id = %ch,
+                    released,
+                    "turn ended without answering event(s) steered into it — requeued"
+                );
+            }
+        }
+    }
+
     match &result.source {
         PromptSource::Channel(ch) => queue.mark_complete(*ch),
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
@@ -3458,6 +3489,19 @@ fn recover_panicked_agent(
     }
 
     if let Some(ch) = meta.channel_id {
+        // A panicked task never reports a result, so nothing else will settle
+        // events a steer delivered into its turn. Release them as unanswered
+        // (epoch 0): whatever the turn emitted died with it.
+        if !removed_channels.contains(&ch) {
+            let released = queue.resolve_delivered_steers(ch, 0);
+            if released > 0 {
+                tracing::warn!(
+                    channel_id = %ch,
+                    released,
+                    "requeued event(s) steered into the panicked turn"
+                );
+            }
+        }
         queue.mark_complete(ch);
         typing_channels.remove(&ch);
         tracing::warn!("cleared wedged in-flight channel {ch} from panicked agent {i}");
@@ -5338,6 +5382,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome,
             batch: None,
+            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -5504,6 +5549,7 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: None,
+                final_output_epoch: 0,
             };
             handle_prompt_result(
                 &mut pool,
@@ -5554,6 +5600,7 @@ mod error_outcome_emission_tests {
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    requires_response: true,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -5594,6 +5641,7 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
+                final_output_epoch: 0,
             };
             handle_prompt_result(
                 &mut pool,
@@ -5660,6 +5708,7 @@ mod error_outcome_emission_tests {
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    requires_response: true,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -5699,6 +5748,7 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
+                final_output_epoch: 0,
             };
             handle_prompt_result(
                 &mut pool,
@@ -5778,6 +5828,7 @@ mod error_outcome_emission_tests {
                     .unwrap(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5790,6 +5841,7 @@ mod error_outcome_emission_tests {
                 recently_active: true,
             }),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -5871,6 +5923,7 @@ mod error_outcome_emission_tests {
                     .unwrap(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5883,6 +5936,7 @@ mod error_outcome_emission_tests {
                 recently_active: true,
             }),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -5949,6 +6003,7 @@ mod error_outcome_emission_tests {
                 event: original_event.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: Some(CancelReason::Steer),
@@ -5978,6 +6033,7 @@ mod error_outcome_emission_tests {
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
             prompt_tag: "test".into(),
+            requires_response: true,
         });
         let config = test_config();
         let mut heartbeat_in_flight = false;
@@ -5997,6 +6053,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -6129,6 +6186,7 @@ mod error_outcome_emission_tests {
             // `classify_control_cancel_failure` — `handle_prompt_result`
             // never sees one to requeue.
             batch: None,
+            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -6270,6 +6328,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -6312,6 +6371,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(auth_error),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -6355,6 +6415,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -6397,6 +6458,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(usage_error),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -6443,6 +6505,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -6480,6 +6543,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(crate::pool::dead_turn_error()),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -6517,6 +6581,145 @@ mod error_outcome_emission_tests {
             .find(|e| e.kind == "turn_error")
             .expect("a dead turn must surface on the observer feed");
         assert_eq!(turn_error.payload["outcome"].as_str().unwrap(), "error");
+    }
+
+    // ── Delivered-steer settlement at the terminal boundary ─────────────────
+    //
+    // `handle_prompt_result` is the single place a completed turn's delivered
+    // steers are settled. These drive it end to end: a mid-turn mention that
+    // reached the agent must survive a turn that then said nothing, and must
+    // NOT be redelivered when the agent answered it.
+
+    /// Drive one completed turn through `handle_prompt_result` with a single
+    /// event already delivered into it by a native steer, and return how many
+    /// events are queued for the channel afterwards.
+    ///
+    /// `accepted_at_epoch` is the turn's output epoch when the steer was
+    /// acked; `final_output_epoch` is the epoch when the turn ended.
+    async fn queued_after_steered_turn(
+        requires_response: bool,
+        accepted_at_epoch: u64,
+        final_output_epoch: u64,
+    ) -> usize {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "mid-turn mention")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let event_id = event.id.to_hex();
+        let channel_id = uuid::Uuid::new_v4();
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        queue.push(QueuedEvent {
+            channel_id,
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+            requires_response,
+        });
+        // The real sequence: the mode gate withholds the event for the steer
+        // write, then the ack handler records it as delivered.
+        assert!(queue.mark_native_steer_pending(channel_id, &event_id));
+        queue.record_delivered_steer(channel_id, &event_id, accepted_at_epoch);
+        assert_eq!(
+            queue.queued_event_count(&channel_id),
+            0,
+            "precondition: a delivered event is not dispatchable"
+        );
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            PromptResult {
+                agent,
+                source: PromptSource::Channel(channel_id),
+                turn_id: "test-turn-id".to_string(),
+                // The batch itself completed normally — only the steered
+                // event's fate is under test.
+                outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+                batch: None,
+                final_output_epoch,
+            },
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        queue.queued_event_count(&channel_id)
+    }
+
+    /// The mid-turn version of the incident: the steer landed, the turn then
+    /// produced nothing at all. Before the ledger, the ack dropped the event
+    /// outright and it was gone for good.
+    #[tokio::test]
+    async fn steered_mention_survives_a_turn_that_produced_nothing() {
+        assert_eq!(
+            queued_after_steered_turn(true, 0, 0).await,
+            1,
+            "an unanswered mid-turn mention must be requeued, not lost"
+        );
+    }
+
+    /// Output that happened *before* the steer landed does not answer it —
+    /// the case a single per-turn boolean could not express.
+    #[tokio::test]
+    async fn steered_mention_is_requeued_when_output_only_preceded_it() {
+        assert_eq!(
+            queued_after_steered_turn(true, 3, 3).await,
+            1,
+            "the agent spoke before the mention arrived, then went silent"
+        );
+    }
+
+    /// Output after delivery retires the event; redelivering it would prompt
+    /// the agent twice with the same message.
+    #[tokio::test]
+    async fn answered_steered_mention_is_not_redelivered() {
+        assert_eq!(
+            queued_after_steered_turn(true, 3, 4).await,
+            0,
+            "the agent answered after the mention landed"
+        );
+    }
+
+    /// Passive traffic steered mid-turn keeps the base prompt's
+    /// silence-as-success contract.
+    #[tokio::test]
+    async fn passive_steered_event_is_not_requeued_when_unanswered() {
+        assert_eq!(
+            queued_after_steered_turn(false, 0, 0).await,
+            0,
+            "nobody asked the agent anything"
+        );
     }
 }
 

@@ -226,6 +226,13 @@ pub struct PromptResult {
     pub outcome: PromptOutcome,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
+    /// The turn's [`crate::acp::AcpClient::turn_output_epoch`] at termination.
+    ///
+    /// Read by the main loop to settle any events a native steer delivered
+    /// into this turn: one that arrived at an epoch the turn never advanced
+    /// past was never answered. See
+    /// [`crate::queue::EventQueue::resolve_delivered_steers`].
+    pub final_output_epoch: u64,
 }
 
 /// Whether the prompt came from a channel event or a heartbeat.
@@ -392,9 +399,17 @@ pub enum SteerError {
 #[derive(Debug)]
 pub enum SteerAck {
     /// The agent returned a successful response to the steer request.
-    /// The main loop must drop the withheld event (`remove_event`) — it
-    /// has been delivered via the non-cancelling path.
-    Success,
+    /// The main loop must move the withheld event into the delivered-steer
+    /// ledger — it has reached the agent via the non-cancelling path, so
+    /// normal dispatch must not redeliver it, but whether the agent actually
+    /// *answered* it is not known until the turn ends.
+    ///
+    /// `output_epoch` is [`crate::acp::AcpClient::turn_output_epoch`] read at
+    /// the moment the steer was accepted. Comparing it against the turn's
+    /// final epoch is what distinguishes an answered injection from one the
+    /// agent swallowed: equal readings mean the agent produced nothing at all
+    /// after the event was delivered.
+    Success { output_epoch: u64 },
     /// The steer was attempted but failed. Delivery state for the
     /// underlying message is unknown after prompt completion; the main
     /// loop must release the withheld event and fall back to the
@@ -1335,12 +1350,18 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    // Read the epoch here rather than at each call site: this is the one
+    // funnel every terminal path goes through, so the reading is guaranteed to
+    // be the turn's final one and can never drift out of sync with the outcome
+    // it accompanies.
+    let final_output_epoch = agent.acp.turn_output_epoch();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
         turn_id: turn_id.to_owned(),
         outcome,
         batch,
+        final_output_epoch,
     });
 }
 
@@ -2074,6 +2095,28 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
+                        // The prompt's own `Ok(EndTurn)` was consumed by
+                        // `select!`, so this path synthesizes it — and must
+                        // therefore classify it exactly like the natural one.
+                        // The polling invariant above (biased `select!`, and
+                        // no yield between clearing `last_prompt_id` and
+                        // returning) makes this unreachable for a natural
+                        // completion today, but that invariant lives in
+                        // another function and one inserted `.await` would
+                        // silently turn this branch into a dead-turn bypass.
+                        // Sharing the classifier removes the drift entirely.
+                        if is_dead_turn(
+                            &source,
+                            &StopReason::EndTurn,
+                            batch_requires_response(batch.as_ref()),
+                            agent.acp.turn_output_epoch(),
+                        ) {
+                            finish_dead_turn(
+                                &ctx, &result_tx, agent, source, batch, &session_id, &turn_id,
+                            )
+                            .await;
+                            return;
+                        }
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -2103,33 +2146,22 @@ pub async fn run_prompt_task(
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
 
-            if is_dead_turn(&source, &stop_reason, agent.acp.turn_produced_output()) {
-                tracing::error!(
-                    target: "buzz_acp::pool::prompt",
-                    "turn for {} ended with no message and no completed tool call — treating as failed",
-                    prompt_label(&source)
-                );
-                // The session produced nothing; whatever state it is in did
-                // not serve this turn, so start the retry on a fresh one.
-                agent.state.invalidate(&source);
-                let usage = agent.acp.take_turn_usage();
-                publish_agent_turn_metric(
+            if is_dead_turn(
+                &source,
+                &stop_reason,
+                batch_requires_response(batch.as_ref()),
+                agent.acp.turn_output_epoch(),
+            ) {
+                finish_dead_turn(
                     &ctx,
-                    usage,
-                    observer_channel_id,
-                    &session_id,
-                    &turn_id,
-                    Some(buzz_core::agent_turn_metric::StopReason::Error),
-                )
-                .await;
-                send_prompt_result(
                     &result_tx,
-                    &turn_id,
                     agent,
                     source,
-                    PromptOutcome::Error(dead_turn_error()),
-                    requeue_batch_if_queue(&ctx, batch),
-                );
+                    batch,
+                    &session_id,
+                    &turn_id,
+                )
+                .await;
                 return;
             }
 
@@ -3196,7 +3228,7 @@ fn classify_control_cancel_failure(
     }
 }
 
-/// Whether a turn that returned normally in fact produced nothing at all.
+/// Whether a turn that returned normally in fact left a question unanswered.
 ///
 /// A mention that ends `end_turn` having streamed no assistant text and
 /// completed no tool call answered the user with silence. That is
@@ -3205,14 +3237,93 @@ fn classify_control_cancel_failure(
 /// rather than inferred later, and reported as a failure so the batch flows
 /// through the same backoff/dead-letter path as any other failed turn.
 ///
+/// Silence is only a failure when someone was owed an answer. A batch of
+/// passive traffic — matched by a `require_mention: false` rule and not
+/// p-tagging the agent — is entitled to produce nothing, which is exactly what
+/// the shipped base prompt tells agents to do when they have nothing to add.
+/// Retrying that would turn correct restraint into ten retries and a failure
+/// notice, so `batch_requires_response` gates the whole predicate.
+///
 /// Only channel turns qualify. Heartbeats are self-prompts with no waiting
 /// user and no batch to retry, and an agent with nothing to say on a
 /// heartbeat is behaving correctly. Every non-`EndTurn` stop is already
 /// classified by its own arm.
-fn is_dead_turn(source: &PromptSource, stop_reason: &StopReason, produced_output: bool) -> bool {
+///
+/// Mid-turn steered events are NOT judged here — they arrived after the batch
+/// and carry their own acceptance epoch, so the queue settles them in
+/// [`crate::queue::EventQueue::resolve_delivered_steers`].
+fn is_dead_turn(
+    source: &PromptSource,
+    stop_reason: &StopReason,
+    batch_requires_response: bool,
+    final_output_epoch: u64,
+) -> bool {
     matches!(source, PromptSource::Channel(_))
         && matches!(stop_reason, StopReason::EndTurn)
-        && !produced_output
+        && batch_requires_response
+        && final_output_epoch == 0
+}
+
+/// Whether any event in `batch` is one the agent is expected to answer.
+///
+/// Cancelled events count: a merged re-prompt still owes an answer to the
+/// mention that was interrupted.
+fn batch_requires_response(batch: Option<&FlushBatch>) -> bool {
+    batch.is_some_and(|b| {
+        b.events
+            .iter()
+            .chain(b.cancelled_events.iter())
+            .any(|be| be.requires_response)
+    })
+}
+
+/// Report a turn [`is_dead_turn`] classified as dead: log it, drop the session
+/// that produced nothing, publish the turn metric as an error, and return the
+/// agent with an error outcome so the batch flows through the main loop's
+/// existing backoff/dead-letter path.
+///
+/// Shared by both completion paths — the natural `Ok(stop_reason)` arm and the
+/// synthesized completion in the control-signal race — so neither can classify
+/// the same turn differently.
+async fn finish_dead_turn(
+    ctx: &PromptContext,
+    result_tx: &mpsc::UnboundedSender<PromptResult>,
+    mut agent: OwnedAgent,
+    source: PromptSource,
+    batch: Option<FlushBatch>,
+    session_id: &str,
+    turn_id: &str,
+) {
+    tracing::error!(
+        target: "buzz_acp::pool::prompt",
+        "turn for {} ended with no message and no completed tool call — treating as failed",
+        prompt_label(&source)
+    );
+    // The session produced nothing; whatever state it is in did not serve this
+    // turn, so start the retry on a fresh one.
+    agent.state.invalidate(&source);
+    let observer_channel_id = match &source {
+        PromptSource::Channel(channel_id) => Some(*channel_id),
+        PromptSource::Heartbeat => None,
+    };
+    let usage = agent.acp.take_turn_usage();
+    publish_agent_turn_metric(
+        ctx,
+        usage,
+        observer_channel_id,
+        session_id,
+        turn_id,
+        Some(buzz_core::agent_turn_metric::StopReason::Error),
+    )
+    .await;
+    send_prompt_result(
+        result_tx,
+        turn_id,
+        agent,
+        source,
+        PromptOutcome::Error(dead_turn_error()),
+        requeue_batch_if_queue(ctx, batch),
+    );
 }
 
 /// How a turn's source is named in the `buzz_acp::pool::prompt` log lines.
@@ -4325,6 +4436,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4651,6 +4763,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4871,17 +4984,19 @@ mod tests {
     // ── is_dead_turn ────────────────────────────────────────────────────────
     // The sole discriminator between "the agent had nothing to add" and "the
     // mention silently vanished". Every axis is pinned: source, stop reason,
-    // and whether the turn produced anything.
+    // whether anyone was owed an answer, and whether the turn produced
+    // anything.
 
     #[test]
     fn test_is_dead_turn_only_fires_for_silent_channel_end_turns() {
         let channel = PromptSource::Channel(Uuid::new_v4());
         let cases = [
-            // (source, stop_reason, produced_output, expected, why)
+            // (source, stop_reason, requires_response, epoch, expected, why)
             (
                 &channel,
                 StopReason::EndTurn,
-                false,
+                true,
+                0,
                 true,
                 "a channel mention answered with nothing is the bug",
             ),
@@ -4889,13 +5004,23 @@ mod tests {
                 &channel,
                 StopReason::EndTurn,
                 true,
+                1,
                 false,
                 "a channel turn that produced output is a normal success",
             ),
             (
-                &PromptSource::Heartbeat,
+                &channel,
                 StopReason::EndTurn,
                 false,
+                0,
+                false,
+                "passive traffic is entitled to silence — base_prompt.md says so",
+            ),
+            (
+                &PromptSource::Heartbeat,
+                StopReason::EndTurn,
+                true,
+                0,
                 false,
                 "a silent heartbeat is correct behaviour — nobody is waiting",
             ),
@@ -4904,40 +5029,113 @@ mod tests {
             (
                 &channel,
                 StopReason::Cancelled,
-                false,
+                true,
+                0,
                 false,
                 "cancelled is owned by the cancel path",
             ),
             (
                 &channel,
                 StopReason::MaxTokens,
-                false,
+                true,
+                0,
                 false,
                 "max_tokens already rotates the session",
             ),
             (
                 &channel,
                 StopReason::MaxTurnRequests,
-                false,
+                true,
+                0,
                 false,
                 "max_turn_requests already rotates the session",
             ),
             (
                 &channel,
                 StopReason::Refusal,
-                false,
+                true,
+                0,
                 false,
                 "a refusal is a deliberate answer, not a dead turn",
             ),
         ];
 
-        for (source, stop_reason, produced_output, expected, why) in cases {
+        for (source, stop_reason, requires_response, epoch, expected, why) in cases {
             assert_eq!(
-                is_dead_turn(source, &stop_reason, produced_output),
+                is_dead_turn(source, &stop_reason, requires_response, epoch),
                 expected,
-                "{source:?} + {stop_reason:?} + produced_output={produced_output}: {why}"
+                "{source:?} + {stop_reason:?} + requires_response={requires_response} \
+                 + epoch={epoch}: {why}"
             );
         }
+    }
+
+    // ── batch_requires_response ─────────────────────────────────────────────
+
+    fn batch_event(requires_response: bool) -> crate::queue::BatchEvent {
+        let keys = Keys::generate();
+        crate::queue::BatchEvent {
+            event: EventBuilder::new(Kind::Custom(9), "hi")
+                .sign_with_keys(&keys)
+                .unwrap(),
+            prompt_tag: "test".into(),
+            received_at: std::time::Instant::now(),
+            requires_response,
+        }
+    }
+
+    #[test]
+    fn test_batch_requires_response_is_true_when_any_event_needs_an_answer() {
+        let channel_id = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![batch_event(false), batch_event(true)],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        assert!(
+            batch_requires_response(Some(&batch)),
+            "one mention among passive events still owes an answer"
+        );
+    }
+
+    #[test]
+    fn test_batch_requires_response_counts_cancelled_events() {
+        // A merged re-prompt still owes an answer to the mention that was
+        // interrupted, even though the new events are all passive.
+        let channel_id = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![batch_event(false)],
+            cancelled_events: vec![batch_event(true)],
+            cancel_reason: Some(CancelReason::Steer),
+        };
+
+        assert!(
+            batch_requires_response(Some(&batch)),
+            "the interrupted mention is still owed an answer"
+        );
+    }
+
+    #[test]
+    fn test_batch_requires_response_is_false_for_passive_and_absent_batches() {
+        let channel_id = Uuid::new_v4();
+        let passive = FlushBatch {
+            channel_id,
+            events: vec![batch_event(false), batch_event(false)],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        assert!(
+            !batch_requires_response(Some(&passive)),
+            "no event in the batch asked the agent anything"
+        );
+        assert!(
+            !batch_requires_response(None),
+            "a heartbeat has no batch and no one waiting"
+        );
     }
 
     // ── turn liveness emission ───────────────────────────────────────────────

@@ -82,21 +82,12 @@ fn test_default_filter_drops_unprefixed_targets_and_passes_prefixed_ones() {
 fn test_every_tracing_target_in_the_crate_passes_the_default_filter() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
-
-    for entry in std::fs::read_dir(&src).expect("crate src is readable") {
-        let path = entry.expect("readable dir entry").path();
-        if path.extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
+    for path in rust_sources(&src) {
         let contents = std::fs::read_to_string(&path).expect("source file is utf-8");
-        for (lineno, line) in contents.lines().enumerate() {
-            let Some(rest) = line.split_once("target: \"") else {
-                continue;
-            };
-            let target = rest.1.split('"').next().unwrap_or_default();
-            if !target.starts_with("buzz_acp") {
-                let file = path.file_name().unwrap_or_default().to_string_lossy();
-                offenders.push(format!("{file}:{} target: \"{target}\"", lineno + 1));
+        let rel = path.strip_prefix(&src).unwrap_or(&path).to_string_lossy();
+        for (lineno, target) in target_literals(&contents) {
+            if !target.starts_with("buzz_acp::") {
+                offenders.push(format!("{rel}:{lineno} target: \"{target}\""));
             }
         }
     }
@@ -106,4 +97,53 @@ fn test_every_tracing_target_in_the_crate_passes_the_default_filter() {
         "these targets are invisible under {DEFAULT_FILTER}; prefix them with `buzz_acp::`:\n  {}",
         offenders.join("\n  ")
     );
+}
+
+/// Every `.rs` file under `dir`, at any depth — a target added in a submodule
+/// directory is as invisible as one added at the crate root.
+fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("crate src is readable") {
+        let path = entry.expect("readable dir entry").path();
+        if path.is_dir() {
+            found.extend(rust_sources(&path));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// Each `target: "…"` string literal in `source`, as `(1-based line, target)`.
+///
+/// Scans the whole file rather than line by line so a target rustfmt wrapped
+/// onto the next line is still checked, and requires a string literal after
+/// the colon so ordinary struct fields named `target` are not reported.
+fn target_literals(source: &str) -> Vec<(usize, &str)> {
+    const KEY: &str = "target:";
+    let mut found = Vec::new();
+    for (offset, _) in source.match_indices(KEY) {
+        // Reject suffix matches like `self_target:`.
+        if source[..offset]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let after = &source[offset + KEY.len()..];
+        let Some(open) = after.find(|c: char| !c.is_whitespace()) else {
+            continue;
+        };
+        if !after[open..].starts_with('"') {
+            continue;
+        }
+        let literal = &after[open + 1..];
+        let Some(end) = literal.find('"') else {
+            continue;
+        };
+        let lineno = source[..offset].matches('\n').count() + 1;
+        found.push((lineno, &literal[..end]));
+    }
+    found
 }

@@ -49,17 +49,11 @@ export function LinkPreviewList({
         <AlertDialog onOpenChange={setDialogOpen} open={dialogOpen}>
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>
-                Remove {previewNoun} for everyone?
-              </AlertDialogTitle>
+              <AlertDialogTitle>Remove {previewNoun}?</AlertDialogTitle>
               <AlertDialogDescription>
-                No one will see{" "}
-                {previews.length === 1 ? "the preview" : "the previews"} on this
-                message anymore.{" "}
-                {previews.length === 1
-                  ? "The link itself will stay"
-                  : "The links themselves will stay"}{" "}
-                in the message. This can't be undone.
+                This removes{" "}
+                {previews.length === 1 ? "the preview" : "the previews"} for
+                everyone.
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>

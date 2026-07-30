@@ -245,10 +245,18 @@ mod tests {
     fn persisted_speed_round_trips_and_rejects_invalid_values() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join(SETTINGS_FILE);
-        save_to_path(&path, 1.25).expect("save");
-        assert_eq!(load_from_path(&path).expect("load"), 1.25);
+        save_to_path(&path, playback_speed_dsp::MIN_PLAYBACK_SPEED).expect("save minimum");
+        assert_eq!(
+            load_from_path(&path).expect("load minimum"),
+            playback_speed_dsp::MIN_PLAYBACK_SPEED
+        );
+        save_to_path(&path, playback_speed_dsp::MAX_PLAYBACK_SPEED).expect("save maximum");
+        assert_eq!(
+            load_from_path(&path).expect("load maximum"),
+            playback_speed_dsp::MAX_PLAYBACK_SPEED
+        );
 
-        std::fs::write(&path, br#"{"speed":2.0}"#).expect("invalid fixture");
+        std::fs::write(&path, br#"{"speed":4.1}"#).expect("invalid fixture");
         assert!(load_from_path(&path).is_err());
     }
 

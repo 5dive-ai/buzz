@@ -5,9 +5,9 @@
 //! the exact same DSP boundary.
 
 /// Slowest supported generated-speech playback speed.
-pub const MIN_PLAYBACK_SPEED: f32 = 0.75;
+pub const MIN_PLAYBACK_SPEED: f32 = 0.25;
 /// Fastest supported generated-speech playback speed.
-pub const MAX_PLAYBACK_SPEED: f32 = 1.5;
+pub const MAX_PLAYBACK_SPEED: f32 = 4.0;
 /// Default generated-speech playback speed.
 pub const DEFAULT_PLAYBACK_SPEED: f32 = 1.0;
 

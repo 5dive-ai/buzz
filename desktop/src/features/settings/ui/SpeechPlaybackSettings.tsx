@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getTtsPlaybackSpeed,
   setTtsPlaybackSpeed,
@@ -12,12 +12,15 @@ import {
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 
 const DEFAULT_SPEED = 1;
-const MIN_SPEED = 0.75;
-const MAX_SPEED = 1.5;
+const SLIDER_MIN_SPEED = 0.5;
+const SLIDER_MAX_SPEED = 2;
+const INPUT_MIN_SPEED = 0.25;
+const INPUT_MAX_SPEED = 4;
 const SPEED_STEP = 0.05;
 
 export function SpeechPlaybackSettings() {
   const [speed, setSpeed] = useState(DEFAULT_SPEED);
+  const [speedInput, setSpeedInput] = useState(String(DEFAULT_SPEED));
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const active = useRef(true);
@@ -25,6 +28,11 @@ export function SpeechPlaybackSettings() {
   const desiredSpeed = useRef(DEFAULT_SPEED);
   const flushPromise = useRef<Promise<void> | null>(null);
   const hasLocalIntent = useRef(false);
+
+  const setDisplayedSpeed = useCallback((nextSpeed: number) => {
+    setSpeed(nextSpeed);
+    setSpeedInput(String(nextSpeed));
+  }, []);
 
   useEffect(() => {
     active.current = true;
@@ -40,7 +48,7 @@ export function SpeechPlaybackSettings() {
               flushPromise,
               hasLocalIntent,
             },
-            { setSpeed },
+            { setSpeed: setDisplayedSpeed },
             savedSpeed,
           );
         }
@@ -61,7 +69,7 @@ export function SpeechPlaybackSettings() {
         hasLocalIntent,
       });
     };
-  }, []);
+  }, [setDisplayedSpeed]);
 
   const commitSpeed = (nextSpeed: number) => {
     commitPlaybackSpeed(
@@ -72,9 +80,18 @@ export function SpeechPlaybackSettings() {
         flushPromise,
         hasLocalIntent,
       },
-      { persist: setTtsPlaybackSpeed, setError, setSpeed },
+      { persist: setTtsPlaybackSpeed, setError, setSpeed: setDisplayedSpeed },
       nextSpeed,
     );
+  };
+
+  const commitTypedSpeed = () => {
+    const nextSpeed = Number(speedInput);
+    if (Number.isFinite(nextSpeed)) {
+      commitSpeed(nextSpeed);
+    } else {
+      setSpeedInput(String(speed));
+    }
   };
 
   return (
@@ -89,17 +106,31 @@ export function SpeechPlaybackSettings() {
               >
                 Speech playback speed
               </label>
-              <p className="text-sm font-normal text-muted-foreground">
-                Changes generated speech playback without changing voice pitch.
-              </p>
             </div>
             <div className="flex shrink-0 items-center gap-2">
-              <span
-                aria-live="polite"
-                className="min-w-10 text-right text-sm tabular-nums"
-              >
-                {speed.toFixed(2)}x
-              </span>
+              <div className="flex items-center gap-1">
+                <input
+                  aria-label="Speech playback speed value"
+                  className="h-8 w-16 rounded-md border border-input bg-background px-2 text-right text-sm tabular-nums"
+                  disabled={!loaded}
+                  max={INPUT_MAX_SPEED}
+                  min={INPUT_MIN_SPEED}
+                  onBlur={commitTypedSpeed}
+                  onChange={(event) => setSpeedInput(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      commitTypedSpeed();
+                      event.currentTarget.blur();
+                    }
+                  }}
+                  step={SPEED_STEP}
+                  type="number"
+                  value={speedInput}
+                />
+                <span aria-hidden="true" className="text-sm">
+                  ×
+                </span>
+              </div>
               <Button
                 disabled={!loaded || speed === DEFAULT_SPEED}
                 onClick={() => commitSpeed(DEFAULT_SPEED)}
@@ -116,10 +147,12 @@ export function SpeechPlaybackSettings() {
             className="mt-3 w-full accent-primary"
             disabled={!loaded}
             id="speech-playback-speed"
-            max={MAX_SPEED}
-            min={MIN_SPEED}
+            max={SLIDER_MAX_SPEED}
+            min={SLIDER_MIN_SPEED}
             onBlur={(event) => commitSpeed(Number(event.currentTarget.value))}
-            onChange={(event) => setSpeed(Number(event.currentTarget.value))}
+            onChange={(event) =>
+              setDisplayedSpeed(Number(event.currentTarget.value))
+            }
             onKeyUp={(event) => commitSpeed(Number(event.currentTarget.value))}
             onPointerUp={(event) =>
               commitSpeed(Number(event.currentTarget.value))

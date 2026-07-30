@@ -74,11 +74,16 @@ disabled, auto-failover **enabled**, Multi-AZ **enabled** (verified via
 `describe-replication-groups` / `describe-cache-clusters`,
 profile `bb-public-operations-ro`).
 
-- `EngineCPUUtilization` (primary): 0.3% (Jul 21) → 8.4% (Jul 27) → 19.2%
-  (Jul 30) — doubling every ~3.5–4 days. Saturation in ~8–10 days if the
-  curve holds.
-- Driver is command volume: get/set/eval families each ~150x in two weeks,
-  pub/sub ~400x. Product growth (~80k users added), not a leak.
+- `EngineCPUUtilization` (primary): 0.3% (Jul 21) → 8.4% (Jul 27) → 19.5%
+  (Jul 30). **Fitted post-onset clock (P3, log-linear, r²=0.92): doubling
+  every ~3.4–3.5 days; ~7 days to 80%, ~8 to saturation.** (Kickoff's
+  eyeballed "~3.5–4 days / 8–10 days" spanned the pre-onset regime — see the
+  fit-window bullet below — and understated the urgency; the fitted number
+  is the citable one.)
+- Driver is command volume — product growth (~80k users added), not a leak.
+  Fitted 9-day post-onset growth is x9.6–12.4 across all command families
+  (kickoff's "~150x / ~400x in two weeks" were coarser eyeballs over a
+  window spanning the onset).
 - Whole-instance CPU ~4%, memory 0.09%, replication lag <1ms. Vertical
   scaling is dead: same-family bigger instances have identical single-core
   speed; r8g (Graviton4) buys ~25–30% single-thread ≈ 1.5 days at the current

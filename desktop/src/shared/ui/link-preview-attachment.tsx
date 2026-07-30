@@ -6,6 +6,7 @@ import { Button } from "@/shared/ui/button";
 import {
   Attachment,
   AttachmentContent,
+  AttachmentDescription,
   AttachmentMedia,
   AttachmentTitle,
   AttachmentTrigger,
@@ -142,11 +143,15 @@ export function LinkPreviewAttachment({
 }) {
   const reserveImage = preview.imageState !== "none";
   const showImage = preview.imageState === "image";
+  const hostname = getHostname(preview);
 
   return (
-    <div className={cn("relative w-80 max-w-full shrink-0", className)}>
+    <div className={cn("relative w-[22.5rem] max-w-full shrink-0", className)}>
       <Attachment
-        className="w-full no-underline shadow-none"
+        className={cn(
+          "w-full no-underline shadow-none",
+          reserveImage && "h-20 min-h-20 max-h-20 gap-0 p-0",
+        )}
         data-image-state={preview.imageState}
         data-link-preview={preview.kind}
         orientation="horizontal"
@@ -154,7 +159,7 @@ export function LinkPreviewAttachment({
         {reserveImage ? (
           <AttachmentMedia
             aria-hidden={showImage ? undefined : "true"}
-            className="h-12 w-16 rounded-lg bg-muted sm:h-14 sm:w-[6.6875rem]"
+            className="aspect-auto h-full min-h-0 w-28 min-w-28 max-w-28 self-stretch rounded-none bg-muted sm:w-32 sm:min-w-32 sm:max-w-32"
             data-link-preview-thumbnail=""
             variant="image"
           >
@@ -176,14 +181,27 @@ export function LinkPreviewAttachment({
             <LinkPreviewLogo preview={preview} />
           </AttachmentMedia>
         )}
-        <AttachmentContent>
+        <AttachmentContent className={reserveImage ? "px-3 py-2.5" : undefined}>
           <div
-            className="truncate text-xs font-medium leading-4 text-muted-foreground"
+            className="truncate text-xs font-normal leading-4 text-muted-foreground"
             data-link-preview-hostname=""
           >
-            {getHostname(preview)}
+            {reserveImage ? hostname : preview.provider}
           </div>
-          <AttachmentTitle>{preview.title}</AttachmentTitle>
+          <AttachmentTitle
+            className={
+              reserveImage
+                ? preview.description
+                  ? "truncate"
+                  : "line-clamp-2 whitespace-normal"
+                : undefined
+            }
+          >
+            {preview.title}
+          </AttachmentTitle>
+          {reserveImage && preview.description ? (
+            <AttachmentDescription>{preview.description}</AttachmentDescription>
+          ) : null}
         </AttachmentContent>
         <AttachmentTrigger asChild>
           <a

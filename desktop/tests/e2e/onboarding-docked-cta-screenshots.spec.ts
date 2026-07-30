@@ -100,9 +100,9 @@ test("machine onboarding: landing, backup, setup docked CTAs", async ({
   await page.screenshot({ path: `${SHOT_DIR}/02d-backup-password.png` });
 
   await page.getByTestId("backup-passphrase-generate").click();
-  const compactPopover = page.locator(".buzz-card-textured-compact");
-  await expect(compactPopover).toBeVisible();
-  await expect(compactPopover).toHaveCSS("border-image-outset", "24px");
+  const generatorPopover = page.getByRole("dialog");
+  await expect(generatorPopover).toBeVisible();
+  await expect(generatorPopover).not.toHaveClass(/buzz-card-textured/);
   await waitForAnimations(page);
   await page.screenshot({ path: `${SHOT_DIR}/02e-backup-generator.png` });
   await page.keyboard.press("Escape");

@@ -152,9 +152,9 @@ test("download happy path: generated password, encrypt, native save, Next", asyn
   // fills the field (mock default: 3 words, spaces).
   await page.getByTestId("backup-passphrase-generate").click();
   await expect(input).toHaveValue("mock horse battery");
-  const generatorPopover = page.locator(".buzz-card-textured-compact");
+  const generatorPopover = page.getByRole("dialog");
   await expect(generatorPopover).toBeVisible();
-  await expect(generatorPopover).toHaveCSS("border-image-outset", "24px");
+  await expect(generatorPopover).not.toHaveClass(/buzz-card-textured/);
 
   // Popover controls regenerate in place: word count (slider) and separator.
   await page.getByTestId("backup-passphrase-words").focus();
@@ -172,38 +172,27 @@ test("download happy path: generated password, encrypt, native save, Next", asyn
   await waitForAnimations(page);
   await page.screenshot({ path: `${SHOTS}/03-backup-download-passphrase.png` });
 
-  // Encryption may finish while the generator popover is still open. Once it
-  // does, the real password is cleared and only the fixed saved-password mask
-  // remains over an empty read-only input.
+  // Encryption may still be running when the user commits the download. The
+  // explicit click queues the native save without exposing the password or
+  // fetching the raw key.
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("backup-passphrase-separator")).toHaveCount(0);
-  await expect(input).toHaveValue("");
-  await expect(input).toHaveAttribute("readonly", "");
-  await expect(page.getByTestId("backup-saved-password-mask")).toBeVisible();
-  await page.getByTestId("backup-passphrase-reveal-toggle").click();
-  const changePasswordDialog = page.getByTestId(
-    "backup-change-password-dialog",
-  );
-  await expect(changePasswordDialog).toBeVisible();
-  await expect(changePasswordDialog).toHaveClass(/buzz-card-textured-compact/);
-  await page.getByRole("button", { name: "Keep current backup" }).click();
 
-  // Saving uses the retained encrypted blob; it does not re-encrypt or need
-  // the cleared password.
+  // Saving commits the encrypted payload only after this explicit action.
   await page.getByTestId("encrypted-backup-create").click();
 
   // Only a successful save (the mock "picks" a path) advances to the
-  // "Now, test your backup" flow: a select-file button for the saved file
+  // "Optionally, test your backup" flow: a select-file button for the saved file
   // (a composer-style drop overlay takes over the card while a file drag is
   // over the window), then the password to unlock it.
   await expect(
-    page.getByRole("heading", { name: "Now, test your backup" }),
+    page.getByRole("heading", { name: "Optionally, test your backup" }),
   ).toBeVisible();
   const dropzone = page.getByTestId("backup-test-dropzone");
   await expect(dropzone).toBeVisible();
-  await expect(page.getByTestId("encrypted-backup-saved-path")).toContainText(
-    "identity.ncryptsec",
-  );
+  await expect(
+    page.getByRole("button", { name: "Re-download backup" }),
+  ).toBeVisible();
 
   // The optional security subview has no onboarding Next action. Returning to
   // the yellow key view is the single exit throughout the ceremony.
@@ -291,7 +280,7 @@ test("security view returns to the yellow onboarding view", async ({
   await expect(page.getByTestId("onboarding-next")).toBeVisible();
 });
 
-test("returning to onboarding preserves password-backup progress", async ({
+test("returning to onboarding resets password-backup progress", async ({
   page,
 }) => {
   await enterMachineBackup(page);
@@ -301,18 +290,20 @@ test("returning to onboarding preserves password-backup progress", async ({
   await input.fill("mock-horse-battery-staple");
   await page.getByTestId("encrypted-backup-create").click();
   await expect(
-    page.getByRole("heading", { name: "Now, test your backup" }),
+    page.getByRole("heading", { name: "Optionally, test your backup" }),
   ).toBeVisible();
 
   await page.getByTestId("backup-return-to-onboarding").click();
   await expect(page.getByTestId("onboarding-page-backup")).toBeVisible();
 
-  // Re-entering the security flow restores the in-progress backup test.
+  // Re-entering the security flow intentionally starts a fresh optional
+  // backup session so no password or completed state leaks across navigation.
   await openPasswordBackup(page);
   await expect(
-    page.getByRole("heading", { name: "Now, test your backup" }),
+    page.getByRole("heading", { name: "Backup your key with a password" }),
   ).toBeVisible();
-  await expect(page.getByTestId("backup-test-dropzone")).toBeVisible();
+  await expect(page.getByTestId("backup-passphrase-input")).toHaveValue("");
+  await expect(page.getByTestId("encrypted-backup-create")).toBeDisabled();
 });
 
 test("typed password requires 12 characters", async ({ page }) => {

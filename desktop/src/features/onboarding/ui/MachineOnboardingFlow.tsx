@@ -7,6 +7,7 @@ import {
   importIdentity,
   persistCurrentIdentity,
 } from "@/shared/api/tauriIdentity";
+import type { IdentityStorage } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 import { BackupStep } from "./BackupStep";
@@ -72,6 +73,9 @@ export function MachineOnboardingFlow({
   const [selectedPubkey, setSelectedPubkey] = React.useState<string | null>(
     null,
   );
+  const [identityStorage, setIdentityStorage] = React.useState<
+    IdentityStorage | undefined
+  >();
   const [readyRuntimeIds, setReadyRuntimeIds] = React.useState<string[]>([]);
   const [backupSubview, setBackupSubview] =
     React.useState<BackupSubview>("created");
@@ -98,6 +102,7 @@ export function MachineOnboardingFlow({
       const identity = await getIdentity();
       queryClient.setQueryData(["identity"], identity);
       setSelectedPubkey(identity.pubkey);
+      setIdentityStorage(identity.storage);
       setBackupDirection("forward");
       setReturningFromSecurity(false);
       setBackupSubview("created");
@@ -123,6 +128,7 @@ export function MachineOnboardingFlow({
       const identity = await persistCurrentIdentity();
       queryClient.setQueryData(["identity"], identity);
       setSelectedPubkey(identity.pubkey);
+      setIdentityStorage(identity.storage);
       setBackupDirection("forward");
       setReturningFromSecurity(false);
       setBackupSubview("created");
@@ -281,6 +287,7 @@ export function MachineOnboardingFlow({
             ) : (
               <BackupStep
                 direction={backupDirection}
+                identityStorage={identityStorage}
                 onBack={() => setPage("identity")}
                 onNext={() => setPage("setup")}
                 onOpenPasswordBackup={() => {

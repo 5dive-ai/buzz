@@ -10,6 +10,7 @@ import {
 import * as React from "react";
 
 import { getNsec } from "@/shared/api/tauriIdentity";
+import type { IdentityStorage } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
 import { Button } from "@/shared/ui/button";
@@ -48,6 +49,7 @@ export function backupNextDisabled(): boolean {
 
 type BackupStepProps = {
   direction: OnboardingTransitionDirection;
+  identityStorage?: IdentityStorage;
   onBack: () => void;
   onNext: () => void;
   onOpenPasswordBackup: () => void;
@@ -64,6 +66,7 @@ type BackupStepProps = {
  */
 export function BackupStep({
   direction,
+  identityStorage,
   onBack,
   onNext,
   onOpenPasswordBackup,
@@ -152,6 +155,24 @@ export function BackupStep({
     () => Array.from({ length: nsec?.length ?? 63 }, () => "•").join("\u200b"),
     [nsec],
   );
+  const storageMessage =
+    identityStorage === "system-keyring"
+      ? {
+          title: "Protected by your system keychain",
+          description:
+            "Buzz uses your system keychain to protect your identity key. Your system may ask for your computer password when Buzz accesses it.",
+        }
+      : identityStorage === "local-file"
+        ? {
+            title: "Stored on this device",
+            description:
+              "Your system keychain wasn’t available, so Buzz stores your identity key in a private file on this device.",
+          }
+        : {
+            title: "Protected on this device",
+            description:
+              "Keep a separate backup so you can restore your identity if you lose access to this device.",
+          };
 
   if (optionsExpanded) {
     return (
@@ -171,18 +192,37 @@ export function BackupStep({
           </p>
         </div>
 
-        <div className="flex w-full max-w-240 flex-1 flex-col justify-center py-10">
+        <div className="flex w-full max-w-260 flex-1 flex-col justify-center py-10">
           <div
-            className="grid w-full grid-cols-1 gap-8 md:grid-cols-2"
+            className="grid w-full grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3"
             data-testid="backup-options"
           >
+            <div
+              className="relative min-h-56 w-full md:col-span-2 lg:col-span-1"
+              data-testid="backup-storage-info"
+            >
+              <Card
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-0 brightness-[0.02]"
+                variant="textured"
+              />
+              <div className="relative z-10 flex min-h-56 w-full flex-col justify-center p-10 text-left text-foreground">
+                <span className="text-lg font-medium">
+                  {storageMessage.title}
+                </span>
+                <span className="mt-3 block text-sm leading-6 text-foreground/65">
+                  {storageMessage.description}
+                </span>
+              </div>
+            </div>
+
             <div className="relative min-h-56 w-full">
               <Card
                 aria-hidden="true"
                 className="pointer-events-none absolute inset-0 brightness-[0.005]"
                 variant="textured"
               />
-              <div className="relative z-10 flex min-h-56 w-full flex-col justify-center p-20 text-left text-foreground">
+              <div className="relative z-10 flex min-h-56 w-full flex-col justify-center p-10 text-left text-foreground">
                 <span className="text-lg font-medium">
                   Save your key safely
                 </span>
@@ -220,7 +260,7 @@ export function BackupStep({
                 className="pointer-events-none absolute inset-0 brightness-[0.005]"
                 variant="textured"
               />
-              <div className="relative z-10 flex min-h-56 w-full flex-col justify-center p-20 text-left text-foreground">
+              <div className="relative z-10 flex min-h-56 w-full flex-col justify-center p-10 text-left text-foreground">
                 <span className="text-lg font-medium">
                   Create a portable backup
                 </span>
@@ -282,9 +322,8 @@ export function BackupStep({
               REVEAL_ANIMATION_CLASS,
             )}
           >
-            Your identity key will be saved to your keychain. Back it up
-            somewhere safe so you can restore your account. Never share your
-            key.
+            Your identity key is protected on this device. Back it up somewhere
+            safe so you can restore your account. Never share your key.
           </p>
         ) : null}
       </div>

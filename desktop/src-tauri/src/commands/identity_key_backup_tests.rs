@@ -1,5 +1,5 @@
 use super::{create_and_persist_backup_with_log_n, verify_ncryptsec_backup_inner};
-use crate::app_state::build_app_state;
+use crate::app_state::{build_app_state, IdentityStorage};
 use nostr::Keys;
 
 /// Fast scrypt tier for tests; production uses BACKUP_LOG_N (18), covered
@@ -174,19 +174,21 @@ fn successful_import_removes_stale_backup_after_commit() {
     let new_keys = Keys::generate();
     let backup_present_at_persist = std::cell::Cell::new(false);
     let _guard = state.identity_mutation.lock().unwrap();
-    let pubkey = super::commit_imported_identity(&state, dir.path(), new_keys.clone(), |_| {
-        // Ordering probe: the old backup must still exist while
-        // persistence is running (cleanup has not happened yet).
-        backup_present_at_persist.set(backup_path.exists());
-        Ok(())
-    })
-    .unwrap();
+    let (pubkey, storage) =
+        super::commit_imported_identity(&state, dir.path(), new_keys.clone(), |_| {
+            // Ordering probe: the old backup must still exist while
+            // persistence is running (cleanup has not happened yet).
+            backup_present_at_persist.set(backup_path.exists());
+            Ok(IdentityStorage::SystemKeyring)
+        })
+        .unwrap();
 
     assert!(
         backup_present_at_persist.get(),
         "cleanup must not precede persist"
     );
     assert_eq!(pubkey, new_keys.public_key());
+    assert_eq!(storage, IdentityStorage::SystemKeyring);
     assert_eq!(
         state.keys.lock().unwrap().public_key(),
         new_keys.public_key()

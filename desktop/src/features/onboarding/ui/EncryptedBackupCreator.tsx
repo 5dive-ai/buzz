@@ -345,10 +345,7 @@ function PassphraseGeneratorPopover({
       </PopoverAnchor>
       <PopoverContent
         align="end"
-        className={cn(
-          "w-72 space-y-3 text-foreground",
-          securityTheme && "buzz-onboarding-security-theme",
-        )}
+        className="w-72 space-y-3 text-foreground"
         onInteractOutside={(event) => {
           // Clicking the anchor icon is "outside" the content — keep the
           // popover open so that click re-rolls instead of closing.
@@ -360,9 +357,6 @@ function PassphraseGeneratorPopover({
           }
         }}
         onOpenAutoFocus={(event) => event.preventDefault()}
-        surface={securityTheme ? "textured" : "default"}
-        textureSize="compact"
-        textureTone={securityTheme ? "dark" : "light"}
       >
         <div className="flex items-center justify-between gap-4">
           <label
@@ -614,7 +608,7 @@ export function EncryptedBackupCreator({
           className={cn(
             "font-mono",
             variant === "spotlight"
-              ? "h-14 rounded-none border-0 bg-transparent px-20 text-center text-lg shadow-none focus-visible:ring-0"
+              ? "h-14 rounded-2xl border-foreground/15 bg-white px-20 text-center text-lg text-black/80 shadow-none placeholder:text-black/55"
               : "h-10 bg-background pr-19",
           )}
           data-testid="backup-passphrase-input"
@@ -651,7 +645,10 @@ export function EncryptedBackupCreator({
         {state.savedPassword ? (
           <div
             aria-hidden
-            className="pointer-events-none absolute inset-y-0 left-3 flex items-center font-mono tracking-widest text-foreground"
+            className={cn(
+              "pointer-events-none absolute inset-y-0 left-3 flex items-center font-mono tracking-widest text-foreground",
+              variant === "spotlight" && "text-black/80",
+            )}
             data-testid="backup-saved-password-mask"
           >
             ••••••••••••••••••••••••••••••••

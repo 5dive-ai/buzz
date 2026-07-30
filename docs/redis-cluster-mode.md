@@ -23,11 +23,17 @@ never forked. Cluster mode forces these keys into one hash slot, which forces
 a key rename, which forces a live migration of fencing authority under a
 rolling deploy. We prove three safety theorems over that migration —
 **single-authority** (at no instant do two live leases exist for one session,
-across both old and new keyspaces), **generation-monotonicity** (no generation
-is ever issued twice across the counter handoff), and **one-way-door safety**
-(cluster mode is enabled only after old-keyspace authority is provably
-drained) — mechanized in TLA+ (`docs/spec/RedisClusterFencingMigration.tla`)
-with every invariant shown non-vacuous by mutation.
+across both old and new keyspaces, including under emergency rollback),
+**generation-monotonicity** (no generation is ever issued twice across the
+counter handoff or a rollback re-merge), and **slot-rules safety** (cluster
+protocol modes are entered only after old-keyspace authority is provably
+drained and the fleet runs only slot-clean scripts) — mechanized in TLA+
+(`docs/spec/RedisClusterFencingMigration.tla`) with every invariant shown
+non-vacuous by mutation (9 mutants, all killed). The proof is scoped
+precisely: it covers acquisition authority, generation issuance, lease
+migration, and the mode doors, under a **deployment-gate assumption (E1)
+that must be discharged operationally** — it is *not* a property of our
+Kubernetes rollout machinery (§Deployment Gate).
 
 Everything else in the migration is specified as ordered, gated engineering
 work with named failure modes: the split client architecture, the sharded
@@ -113,16 +119,38 @@ Redis — they are not the get/set driver.
   16384`; if the key contains a `{...}` hash tag, only the tagged substring is
   hashed. Two keys sharing a tag always share a slot, on every topology.
   (Valkey cluster spec, key distribution model.)
-- **(A2) Single-slot Lua atomicity.** A Lua script whose declared `KEYS` all
-  map to one slot executes atomically on that slot's primary, exactly as on a
-  standalone node. A script whose keys span slots is **rejected** (loud
-  failure). Scripts must declare all keys via `KEYS`; ours do.
-- **(A3) Staged mode change.** ElastiCache supports `cluster-mode: disabled →
-  compatible → enabled`. In *compatible*, one shard speaks both protocols and
-  exposes a configuration endpoint; `compatible → disabled` is a supported
-  revert. **`enabled` is irreversible** ("Reverting this configuration is not
-  possible" — modify-cluster-mode.md). While *compatible*: scaling and
-  engine-version changes are blocked.
+- **(A2) Single-slot Lua atomicity, declared-keys slot check.** A Lua script
+  whose declared `KEYS` all map to one slot executes atomically on that
+  slot's primary, exactly as on a standalone node. A script whose declared
+  keys span slots is **rejected with `CROSSSLOT`** (loud failure) on any
+  cluster-enabled node — **including a single-shard node that owns all
+  16384 slots**: the check is on declared slot equality, not slot
+  ownership (falsified live: single-shard cluster-enabled node, all slots
+  assigned, `cluster_state:ok`, two-key `EVAL` on the un-tagged fencing
+  pair → `CROSSSLOT`; raw RESP, no client library involved). Scripts must
+  declare all keys via `KEYS`; ours do — and this is an **enforced
+  prohibition, not an observation**: keys accessed via `redis.call` but
+  not declared in `KEYS` bypass the slot check entirely and succeed on a
+  single shard, then break silently the moment slots split. That is the
+  deadline-pressure "fix" this spec explicitly forbids (verified live:
+  `numkeys=0` script reading a tagged + untagged key succeeds). The G2
+  validator (§Conformance) mechanically rejects undeclared key access.
+- **(A3) Staged mode change; slot rules start at compatible.** ElastiCache
+  supports `cluster-mode: disabled → compatible → enabled`. In *compatible*,
+  one shard speaks both protocols and exposes a configuration endpoint;
+  `compatible → disabled` is a supported revert. **`enabled` is
+  irreversible** ("Reverting this configuration is not possible" —
+  modify-cluster-mode.md). While *compatible*: scaling and engine-version
+  changes are blocked. **Working assumption: slot rules (A2's `CROSSSLOT`
+  rejection) are enforced from `compatible` onward** — compatible sets the
+  cluster-enabled parameter, and the OSS behavior A2 documents attaches to
+  cluster-enabled, not to shard count. We have not tested AWS compatible
+  mode itself (it could conceivably relax slot checks for
+  standalone-protocol clients); a one-command probe (`EVAL` on an
+  un-tagged two-key pair) is a **pre-G3 checklist item**, and even if AWS
+  turns out to permit it, the plan does not rely on that — vendor-tested
+  leniency is not a protocol property, and it would silently vanish at
+  `enabled`.
 - **(A4) Classic pub/sub is broadcast.** `PUBLISH` to any node is propagated
   to every node in the cluster; each node's engine thread processes every
   message. Sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE`) confines propagation to
@@ -161,16 +189,28 @@ Therefore the target architecture is a **split**:
   does not exist here); reconnect handling must tolerate auto-resubscribe and
   duplicate `SSubscribe` pushes.
 
-**Version floor:** `redis` ≥ **1.4.1** (prefer current 1.5.0), for:
+**Version floor:** `redis` ≥ **1.4.1** (target **1.5.0**), for:
 non-blocking replica connection repair (#2120, 1.4.0), cluster retry-backoff
 clamp (#2158, 1.3.0), and READONLY-path sleep removal (#2223, 1.4.1).
 **Residual failure mode, not a fixed bug:** on every released version, a
 **dead primary halts dispatch** pending topology refresh. Any degradation
 argument that assumes graceful behavior during primary loss is wrong; this
 belongs in shard-count risk math (more shards = smaller blast radius but more
-primaries that can die). `deadpool-redis 0.23`'s `redis` requirement (`^1.0.3`)
-admits 1.5.0 without a deadpool bump; the floor is admitted only by
-`cargo update -p redis --precise <v>` plus a full workspace test run.
+primaries that can die). **The 1.2.4 → 1.5.0 bump is verified free in the
+current single-node world** (Dawn, on `origin/main` `73589408d`):
+`cargo update -p redis --precise 1.5.0` resolves cleanly with no deadpool
+bump and no other crate moved; `cargo build --workspace --all-targets` is
+clean with zero source changes; all five redis-touching crates' tests pass
+(buzz-core, buzz-pubsub, buzz-relay-mesh, buzz-admin, buzz-relay — 0
+failed), **including buzz-pubsub's 11 live-Redis `#[ignore]` tests**
+(pub/sub roundtrip, cache invalidation, presence, nip98 replay, cross-
+community isolation). The floor can therefore ship ahead of and
+independently from the cluster work — one less thing moving during the
+migration. That run proves nothing about cluster behavior (#2120/#2223 are
+cluster-only paths); the multi-shard suite (G2) still owns those. One
+additional known gap: async pub/sub reconnect fix redis-rs#2242 merged
+*after* 1.5.0's release — G2 must force-disconnect the subscription client
+and assert resubscription + delivery, never infer it from command tests.
 
 ## The Fencing Migration (mechanized core)
 
@@ -190,51 +230,179 @@ frame passes the fence).
 
 ### The protocol
 
-Script versions, deployed as a phased rollout where the fleet spans at most
-two adjacent versions (the model enforces this):
+Script versions, deployed as a phased rollout. **The fleet spanning at most
+two adjacent versions is NOT something Kubernetes gives us — it is
+environment assumption E1, discharged by the Deployment Gate below.** All of
+O/A/B run in **`disabled` mode only**: A and B are cross-slot scripts, and
+cross-slot access is illegal on *any* cluster-enabled topology including a
+single shard (A2). There is no "compatible-mode grace period" for the
+migration — compatible comes after C.
 
 - **O (legacy, deployed today):** old keys only.
 - **A:** acquire checks **both** lease keys (union check); lease still
-  written to the **old** key; generation issued as
-  `max(oldGen, newGen) + 1`, written to **both** counters.
+  written to the **old** key; generation issued as `max(oldGen, newGen) + 1`,
+  written to the old counter. (The union *read* of both counters is the
+  load-bearing part — mutation M5. An earlier draft also dual-wrote the
+  generation to the new counter; mutation testing showed that write
+  redundant, and it was removed: the smallest sufficient script wins.)
 - **B:** union lease check; lease written to the **new** (hash-tagged) key;
   generation `max(oldGen, newGen) + 1` written to the **new** counter.
-  (A/B read old keys cross-slot, so phases A and B run **before** cluster
-  mode is enabled — in disabled or compatible mode, where cross-slot access
-  on a single shard is legal.)
-- **Backfill (once, after full-B):** fold `oldGen` into `newGen` by max-merge.
-  Idempotent.
-- **C:** new keys only. No cross-slot access exists anywhere. Gate into C:
-  backfill has run **and** no live old-key lease remains (operationally: wait
-  ≥ one lease TTL — 30s, `DEFAULT_LEASE_TTL` — after full-B).
-- **Enable:** `cluster-mode=enabled` only when the whole fleet runs C. Old
-  keys become unreachable garbage; the fence never consults them again.
+  **B's renewer migrates**: when a B-pod's renew tick finds its own lease
+  still on the old key (acquired before the pod upgraded), it moves the
+  lease to the new key — same owner, **same generation** (no new issuance),
+  one atomic cross-slot Lua script, legal because we are in `disabled`
+  mode. This is what makes the drain *reachable* (see C-gate below).
+- **Backfill (once, after full-B):** fold `oldGen` into `newGen` by
+  max-merge. Idempotent.
+- **C:** new keys only. No cross-slot access exists anywhere. **C-gate
+  (participation-based, not temporal):** backfill has run **and** no live
+  old-key lease remains, verified **by direct observation** (count
+  old-keyspace leases = 0), *never* by waiting out a TTL. A fixed wait is
+  wrong on its face: `RENEW_SCRIPT` is `PEXPIRE` (`directory.rs`) on a 10s
+  cadence against the 30s TTL (`reliable.rs`), so a renewed lease **never
+  expires while its pod lives** — "wait one TTL after full-B" drains
+  nothing, and no session-lifetime bound exists in `tunnel/` or `audio/`
+  to save it. What actually drains the old keyspace: B-pods migrate their
+  own leases at the next renew tick (≤10s), and leases whose owners died
+  expire by TTL because nobody renews them. Full-B therefore implies
+  drain within bounded time — but the gate checks the *state*, not the
+  clock. (The huddle lane, `audio/join.rs`, mirrors the reliable lane's
+  10s/30s renewer against the same directory and is expected to behave
+  identically; that expectation is read, not traced, and the G2 drill
+  covers both lanes explicitly.)
+- **Enter compatible (G3):** only with the whole fleet on C. Slot rules
+  turn on here (A3); C is the only slot-clean script version. Revert to
+  `disabled` remains available.
+- **Enable (G4):** `compatible → enabled` — the one-way door. Old keys
+  become unreachable garbage; the fence never consults them again.
 
-Renew/release in A/B operate on whichever key the caller's lease names —
-they never create authority, so acquire is where the proof lives.
+### Per-phase operation table
+
+"Renew/release operate on whichever key the caller's lease names" is not
+implementable with today's `SessionLease` — it carries no keyspace
+discriminator (`directory.rs`, `SessionLease` fields). The migration does
+not add one: instead each script version has a **fixed, version-local key
+rule**, and the table below is the normative statement per operation. A
+pod always addresses the keyspace its own script version dictates; the one
+cross-version case (a B-pod holding a lease acquired while it ran A-code
+on the old key) is handled by B's renew-migrate, not by lease-carried
+state. This version-local rule is an assumption the conformance suite
+tests across pod termination and rollback, not something the type system
+enforces.
+
+| Op | O | A | B | C |
+|---|---|---|---|---|
+| `acquire` | old key; `INCR` old ctr | union check; write old key; `max(old,new)+1` → old ctr | union check; write new key; `max(old,new)+1` → new ctr | new key; `INCR` new ctr |
+| `renew` | old key `PEXPIRE` | old key `PEXPIRE` | **migrate-then-renew**: own lease on old key → move to new key (same gen, atomic); then new key `PEXPIRE` | new key `PEXPIRE` |
+| `release` | old key | old key | try new key; fall back old key (owner+gen guarded, so wrong-key release is a no-op) | new key |
+| `lookup` | old key | union (new wins) | union (new wins) | new key |
+| `known_generation` | old ctr | `max(old, new)` ctrs | `max(old, new)` ctrs | new ctr |
+| `validate_fenced_header` | old pair | union pair, `max` of counters | union pair, `max` of counters | new pair |
+
+`validate_fenced_header` is the hop-by-hop fence (`directory.rs`); its A/B
+variants read both pairs in one cross-slot script (legal: disabled mode)
+and fence against the max — a frame that passes validation under A/B
+would pass under whichever single keyspace currently holds authority,
+because T1 guarantees at most one does.
+
+### Scope of the mechanized proof
+
+The TLA+ model covers **acquisition authority, generation issuance, lease
+migration (B's renew-migrate), lease loss, phase machinery including
+emergency rollback, and the mode doors**. It does not model renew, release,
+lookup, or validate as distinct transitions, and that is a scoping decision,
+not an omission:
+
+- **renew** (TTL extension) is subsumed by the model's untimed
+  nondeterminism — a renewed lease is exactly one where `Expire` has not
+  yet fired. The renew-*migrate* step, which does change authority
+  location, **is** modeled (`MigrateB`).
+- **release** is state-identical to expiry (lease loss, generation
+  preserved) — `Expire` covers both.
+- **lookup / known_generation / validate** are read-only; they cannot
+  violate T1/T2. Their per-phase read rules (table above) are specified
+  and belong to the G2 test matrix.
+
+So the honest claim is: **T1/T2 are proved for every write to fencing
+state, under assumption E1; the read-side per-phase rules are specified
+and tested, not proved.**
+
+### Deployment Gate (discharging E1)
+
+The model's phase machinery assumes: the fleet chases one target phase,
+a phase advances only when every pod runs it, and rollback never skips a
+phase or overlaps a running downgrade. **Kubernetes gives none of this.**
+bb-public deploys a plain `RollingUpdate` (`maxSurge: 1`,
+`maxUnavailable: 0`) via GitOps; nothing prevents applying B while A is
+still rolling, rolling back two phases at once, or a new ReplicaSet
+coexisting with two older ones. E1 is therefore an **operational gate**,
+with these rules (each maps to a mutation that shows what its absence
+costs):
+
+1. **One image per phase.** Each of A, B, C is a separately released,
+   separately tagged image. No phase is a config flag on a shared image.
+2. **Advance gate:** the next image change is blocked until (a) every
+   live pod reports the expected phase and (b) all older ReplicaSets are
+   at zero. Pods expose their script phase as a **metric/readiness fact**
+   (e.g. a `buzz_fencing_phase` gauge), so the gate checks *behavior*,
+   not an image tag. (Absence → mutants M1/M2-class forks: O+B coexist
+   and fork authority.)
+3. **C-gate addition:** backfill complete **and** observed old-keyspace
+   lease count = 0 (direct observation, per §The protocol). (Absence →
+   M4.)
+4. **Rollback matrix** (emergency path, modeled as `RollbackPhase`):
+   - Roll back **one adjacent phase at a time**; never start a second
+     rollback while pods are still above the current target (absence →
+     M8).
+   - Any rollback **invalidates the backfill**; it must re-run before the
+     C-gate can ever pass again.
+   - Rolling back past A into O additionally requires the **new keyspace
+     lease-drained** (observed zero; absence → M6) and an operator-run
+     **reverse max-merge** of the new counter into the old one — O issues
+     from the old counter alone and would otherwise re-issue generations
+     B already issued (absence → M7).
+   - No phase rollback while in `compatible`; revert the mode to
+     `disabled` first (the mode doors and phase machinery never move in
+     the same step).
+5. **Pre-G3 checklist:** compute `CLUSTER KEYSLOT` on both members of a
+   real hash-tagged pair and require equality **before** entering
+   compatible — a mis-tagged pair is invisible in disabled mode (slot
+   rules unenforced) and becomes a `CROSSSLOT` outage at G3. This is the
+   only point the bug is catchable cheaply. Also run the one-command AWS
+   compatible-mode probe from A3.
 
 ### Safety theorems
 
-> **T1 (Single Authority).** At every instant of the migration, at most one
-> live lease exists per session across both keyspaces.
+> **T1 (Single Authority).** At every instant of the migration — including
+> under emergency rollback — at most one live lease exists per session
+> across both keyspaces.
 >
 > **T2 (Generation Monotonicity).** Generations issued to leases are strictly
-> increasing per session across the old→new counter handoff; no generation is
-> ever issued twice.
+> increasing per session across the old→new counter handoff, the
+> renew-migrate, and any rollback re-merge; no generation is ever issued
+> twice.
 >
-> **T3 (One-Way-Door Safety).** Cluster mode is enabled only in states where
-> old-keyspace authority is drained (backfill complete, no live old-key
-> lease), so no post-enable execution ever consults a stale fencing key.
+> **T3 (Slot-Rules Safety).** A cluster-protocol mode (compatible or
+> enabled) is entered only in states where old-keyspace authority is
+> drained (backfill complete, no live old-key lease) and the whole fleet
+> runs slot-clean C scripts — so no post-door execution ever attempts a
+> cross-slot fencing script or consults a stale fencing key. That
+> `enabled` is one-way is an environment axiom (A3), encoded as an action
+> guard, not a theorem.
+
+All three hold **under environment assumption E1** (Deployment Gate).
 
 **Proof sketch.** T1: every acquire version checks the union of both lease
-keys before creating authority, and phase adjacency means no pod that skips a
-keyspace coexists with a pod that writes it (O writes old and checks old; the
-last old-writer, A, checks new; the first new-writer, B, checks old; C checks
-new after old is drained). T2: A and B issue `max(oldGen,newGen)+1` and write
-it to the counter(s) subsequent versions read, so the issue sequence is
-strictly increasing regardless of which version issues; the backfill max-merge
-makes C's counter dominate every generation ever issued. T3: the phase gate
-into C requires `backfilled ∧ oldOwner = None`, and enable requires full-C. ∎
+keys before creating authority; the renew-migrate moves a lease atomically
+(delete-old and write-new in one script) so no interleaving observes two;
+E1's phase adjacency means no pod that skips a keyspace coexists with a pod
+that writes it. T2: A and B issue `max(oldGen,newGen)+1`; the migrate
+carries an existing generation without issuing; the backfill max-merge makes
+C's counter dominate every generation ever issued; the rollback reverse
+max-merge restores that dominance to the old counter before O can issue
+again. T3: the mode door requires `backfilled ∧ oldOwner = None ∧ fleet
+fully C`, and phase rollback is disallowed while any cluster-protocol mode
+is active. ∎
 
 The sketch is not the proof; the model is.
 
@@ -242,36 +410,48 @@ The sketch is not the proof; the model is.
 
 `docs/spec/RedisClusterFencingMigration.tla` models one session (sessions are
 independent — per-session keys), 3 pods, phased deployment with per-pod
-upgrade interleaving, TTL expiry, backfill, and the enable action. TLC checks
-five invariants; the history variables (`lastIssued`, `monoOk`) encode T2 as a
-single-run safety invariant.
+upgrade **and downgrade** interleaving, emergency rollback, TTL expiry,
+B's renew-migrate, backfill, and the three-position mode variable
+(disabled/compatible/enabled) with slot-rule enforcement from compatible
+onward. TLC checks five invariants; the history variables (`lastIssued`,
+`monoOk`) encode T2 as a single-run safety invariant.
 
 ```
 $ java -cp tla2tools.jar tlc2.TLC RedisClusterFencingMigration.tla \
     -config RedisClusterFencingMigration.cfg -deadlock
 Model checking completed. No error has been found.
-4153 states generated, 1487 distinct states found.
+12636 states generated, 3637 distinct states found.
 ```
 
 (`-deadlock` disables deadlock reporting because the model has *intended*
-terminal states — migration complete, or the MaxGen finiteness bound reached —
-which TLC would otherwise report as errors. Pods = {p1,p2,p3}, MaxGen = 4. Three pods exercise every adjacent-version
-race — old/old, old/new, new/new writers; a fourth adds no qualitatively new
-interleaving. Bounded check, mutation-shown non-vacuous — the standard claim
-for a TLC-checked safety spec.)
+terminal states — migration complete, or the MaxGen finiteness bound reached
+— which TLC would otherwise report as errors. Pods = {p1,p2,p3}, MaxGen = 4.
+Three pods exercise every adjacent-version race — old/old, old/new, new/new
+writers; a fourth adds no qualitatively new interleaving. Bounded check,
+mutation-shown non-vacuous — the standard claim for a TLC-checked safety
+spec.)
 
-**Every invariant is non-vacuous by mutation** (each mutant run in isolation):
+**Every invariant is non-vacuous by mutation** (9 mutants, each run in
+isolation, all killed):
 
 | Mutation | Models the real bug | Trips |
 |---|---|---|
 | M1: `AcquireB` drops the old-lease check | new-script pod ignores legacy leases → two owners | `Inv_SingleAuthority` |
 | M2: `AcquireA` drops the new-lease check | old-keyspace writer ignores new leases during rollback/mixed fleet | `Inv_SingleAuthority` |
 | M3: `AcquireB` issues `newGen+1` without max-merge | fresh counter re-issues generation 1 → stale frame passes fence | `Inv_Monotonic` |
-| M4: phase gate into C dropped (no backfill/drain requirement) | C deployed while an old-key lease is live → C-pod acquires over it | `Inv_SingleAuthority` |
-| M5: `AcquireA` bumps only `oldGen`, skips dual-write | B never learns A's issues → reuse | `Inv_Monotonic` |
+| M4: C-gate dropped (no backfill/drain requirement) | C deployed while an old-key lease is live → C-pod acquires over it | `Inv_SingleAuthority` |
+| M5: `AcquireA` drops the union max-merge read | A never sees B's issues → reuse | `Inv_Monotonic` |
+| M6: rollback into O drops the new-keyspace drain check | O-pod acquires on the old key while a B-era lease lives on the new key → fork | `Inv_SingleAuthority` |
+| M7: rollback into O drops the reverse max-merge | O re-issues generations B already issued | `Inv_Monotonic` |
+| M8: rollback allowed past a running downgrade | skipped-phase rollback: O and B pods coexist | `Inv_SingleAuthority` |
+| M9: compatible entered without fleet fully on C | A/B cross-slot scripts meet live slot rules | `Inv_SlotRulesSafe` |
 
 M4 is the operationally scary one: it is exactly "someone deploys the final
-script version early because everything looks green."
+script version early because everything looks green." M6–M8 are the price
+of admitting that rollbacks happen; they are what the Deployment Gate's
+rollback matrix discharges. Mutation testing also *removed* a mechanism:
+A's dual-write of the generation counter survived every invariant when
+deleted, so the protocol no longer carries it (§The protocol).
 
 ## Sharded Pub/Sub Conversion (prerequisite P2)
 
@@ -324,6 +504,14 @@ would corrupt sessions. (Table in §System Model.)
 
 ## Migration Plan (gates, in order)
 
+The ordering headline (changed from the first draft, per Dawn's live
+falsification): **the entire fencing sequence A→B→backfill→drain→C happens
+in `disabled` mode.** Compatible mode is not a grace period for cross-slot
+work — slot rules are assumed live from compatible onward (A3). This is
+strictly safer than the original ordering and costs nothing; it also means
+the vertical escape hatch (r8g) stays available for the whole of G1, since
+the scaling freeze only starts at G3.
+
 **G0 — Profile the hot path** *(informs everything; owner: option-3 owner)*.
 Attribute the 150x get/set and 400x pub/sub growth to code paths; measure the
 shardable-vs-broadcast ratio (this is the shard-count input) and the two
@@ -332,26 +520,35 @@ driver; suspects are presence and per-event rate-limiter Lua — hypothesis,
 not finding. If the driver is the rate limiter, "batch it" is not available
 (atomic per-event counter); volume reduction takes a different shape.
 
-**G1 — Code prerequisites** *(can start now, independent of G0)*:
-  1. Fencing migration phases A→B→backfill→C per the mechanized protocol.
-  2. Registry scored-expiry index replacing `SCAN`.
-  3. Split client architecture + `redis` ≥ 1.4.1 + feature flags.
-  4. Subscriber loops rearchitected (push_sender, RESP3, auto-resubscribe).
-  5. Sharded pub/sub conversion for exact topics (D2 leaves patterns classic).
+**G1 — Code prerequisites, all in `disabled` mode** *(can start now,
+independent of G0)*:
+  1. `redis` 1.2.4 → 1.5.0 (verified free; ship first, separately).
+  2. Fencing migration phases A→B→backfill→C per the mechanized protocol
+     and the Deployment Gate (one image per phase, phase metric, advance
+     gates, rollback matrix).
+  3. Registry scored-expiry index replacing `SCAN`.
+  4. Split client architecture + feature flags.
+  5. Subscriber loops rearchitected (push_sender, RESP3, auto-resubscribe).
+  6. Sharded pub/sub conversion for exact topics (D2 leaves patterns classic).
 
 **G2 — Conformance against a real multi-shard Valkey cluster** (test matrix
-below). No date is committed before this compiles and passes.
+below). The A/B/backfill/C staged deploy gets its own **disabled-mode
+integration/chaos gate** (it can never legally run on a cluster-enabled
+topology); everything else tests C-scripts on multi-shard. No date is
+committed before this compiles and passes.
 
-**G3 — `cluster-mode=compatible`** (revert available). Client cutover to the
-configuration endpoint; validate under real traffic. No scaling/engine
-changes while here (A3) — **the r8g tourniquet and this migration are
-mutually exclusive in flight**; entering compatible forecloses the vertical
-escape hatch for the duration.
+**G3 — `cluster-mode=compatible`** (revert available). Entered only with
+the fleet fully on C (T3). Pre-G3 checklist: `CLUSTER KEYSLOT` equality
+assertion on a real tagged pair; the AWS compatible-mode cross-slot probe
+(A3). Client cutover to the configuration endpoint; validate under real
+traffic. No scaling/engine changes while here (A3) — **the r8g tourniquet
+and compatible-onward are mutually exclusive in flight**; entering G3
+forecloses the vertical escape hatch for the duration.
 
-**G4 — `cluster-mode=enabled`** — **the one-way door** (A3). Requires: fleet
-fully on C-scripts (T3 gate), G2/G3 green, and a key-size sanity pass (slots
-holding items >256MB silently refuse to migrate; our 0.09% memory makes this
-unlikely — "unlikely" is not "checked").
+**G4 — `cluster-mode=enabled`** — **the one-way door** (A3). Requires:
+G2/G3 green and a key-size sanity pass (slots holding items >256MB silently
+refuse to migrate; our 0.09% memory makes this unlikely — "unlikely" is not
+"checked").
 
 **G5 — Add shards** (online resharding). Do it **early**: AWS guidance says
 keep CPU <80% during resharding — resharding is compute-intensive, and doing
@@ -367,30 +564,39 @@ too, not just hygiene.
 ## Conformance (test matrix, gate G2)
 
 Run against a real multi-shard Valkey 8 cluster (not a mock, not a single
-node in cluster mode). Two verdict columns — **errors** and **silently
+node in cluster mode) — except the fencing-migration row, which by
+construction runs on a standalone node (disabled mode is the only place
+A/B legally execute). Two verdict columns — **errors** and **silently
 wrong** — because three of our bugs would pass an error-only harness:
 
 | Surface | Must verify |
 |---|---|
 | Routing | MOVED/ASK redirects under slot migration; TLS/auth on the configuration endpoint |
-| Fencing scripts | Hash-tagged pairs execute atomically; cross-slot rejection observed for un-tagged pairs (negative test); per-node script cache / NOSCRIPT handling |
-| Fencing migration | A/B/backfill/C staged deploy against live traffic in compatible mode; generation strictly increases across the handoff (assert, don't assume) |
+| **Locality contract** | Atomic-looking work is never silently scattered: multi-key ops either share a slot or are explicitly per-key pipelines with partial-failure handling declared at the call site (the ioredis production resolution; Stripe's narrow-tag rule). A **GitLab-style executable cross-slot validator** in CI computes slots for every Lua `KEYS` declaration, pipeline, and multi-key command in the workspace, and rejects undeclared `redis.call` key access (A2's prohibition) |
+| Fencing scripts | Hash-tagged pairs execute atomically; `CROSSSLOT` observed for un-tagged pairs (negative test); `CLUSTER KEYSLOT` equality asserted on real tagged pairs; per-node script cache / NOSCRIPT handling |
+| Fencing migration | A/B/backfill/drain/C staged deploy against live traffic **on a standalone (disabled-mode) node** with chaos (pod kill mid-phase, rollback per the matrix, both tunnel lanes — reliable and huddle); generation strictly increases across the handoff and the renew-migrate (assert, don't assume); old-keyspace lease count observed to reach zero |
 | Presence `MGET` | Nil/order preservation when split per node |
 | Registry index | **Completeness**: every live runtime discoverable within one heartbeat; assert against known population, not absence of errors |
-| Subscriptions | RESP3 push delivery; dynamic ssubscribe/sunsubscribe; reconnect with auto-resubscribe; duplicate subscription-confirmation pushes handled; message routing correct across shards |
+| Subscriptions | RESP3 push delivery; dynamic ssubscribe/sunsubscribe; **forced disconnect** of the subscription client with asserted resubscription + delivery (redis-rs#2242 merged after 1.5.0 — never infer this from command tests); duplicate subscription-confirmation pushes handled; message routing correct across shards |
 | Failure drills | Replica connection repair **under load** (the #2120 path); primary failover — characterize the dispatch halt window; both clients (command pool + subscription client) have independent recovery behavior — drill both |
 | Protocol choice | Command pool compiled and integration-tested under its chosen protocol (RESP2 or RESP3) — admitted by test, never assumed |
+| Telemetry | Per-shard/slot/channel metrics exist before G5: aggregate CPU cannot attribute a hot slot, and the phase gauge (`buzz_fencing_phase`) feeds the Deployment Gate |
 
 ## Failure Modes (named, with dispositions)
 
 | Failure | Loud/Silent | Disposition |
 |---|---|---|
 | Cross-slot Lua (fencing keys, pre-fix) | Loud | Fixed by design (hash tag + mechanized migration) |
+| Mis-tagged fencing pair (looks fine in disabled mode) | **Silent until G3**, then loud outage | Pre-G3 `CLUSTER KEYSLOT` equality assertion; G2 validator |
+| Undeclared `redis.call` key access (bypasses slot check) | **Silent** until slots split | Prohibited by A2; G2 validator rejects mechanically |
+| Deployment gate breach (phase skip, overlapping rollback, early phase apply) | **Silent** (authority fork / generation reuse) | E1 discharged operationally (§Deployment Gate); mutants M6–M8 show the cost |
+| Old-keyspace drain assumed temporal ("wait one TTL") | **Silent** (renew = `PEXPIRE`; renewed leases never expire) | C-gate is participation-based + observed-zero; B renew-migrates |
 | `SCAN` partial discovery | **Silent** | Fixed by design (scored-expiry index); completeness-asserting test |
 | Dead primary halts client dispatch pending topology refresh | Loud-ish (latency wall) | Residual on all redis-rs versions; goes in shard-count risk math; drilled in G2 |
 | Missed cache-invalidate / conn-control message | Silent | Avoided by D2 (patterns stay classic broadcast) |
 | Generation fork/reuse during migration | Silent (fence passes stale frame) | Excluded by T1/T2 (mechanized, mutation-tested) |
-| Premature `enabled` | Irreversible | Excluded by T3 gate + A3 named as one-way door |
+| Premature `compatible`/`enabled` | Loud (`CROSSSLOT`) / Irreversible | Excluded by T3 gate + A3 named as one-way door |
+| Subscription client fails to resubscribe after disconnect | **Silent** (missed events) | Forced-disconnect drill in G2 (#2242 postdates 1.5.0) |
 | >256MB items refuse slot migration | Silent (permanent imbalance) | Key-size pass at G4 |
 | Resharding under CPU pressure | Loud | G5 scheduled early, <80% CPU rule |
 
@@ -409,9 +615,49 @@ Code pins are at deployed commit `22be8bb35` (verified against image tag
 | Exact topics for sharded pub/sub | `EventTopicKey::redis_channel` (`buzz-pubsub/src/topic.rs`) |
 | Pattern subscribers staying classic | `cache_invalidation.rs`, `conn_control.rs` (`psubscribe`) |
 | Subscriber loops to rearchitect | `subscriber.rs` (`get_async_pubsub` + `split`) |
+| Huddle-lane lease renewer (mirrors reliable lane; drilled in G2) | `audio/join.rs` |
 | Presence bulk read (auto-split, no change) | `get_presence_bulk` (`presence.rs`) |
 | Command pool construction | `deadpool_redis::Config::from_url` (`buzz-relay/src/main.rs`) |
 | Feature flags to add | workspace `Cargo.toml` `redis`/`deadpool-redis` entries |
+| Phase gauge for the Deployment Gate | new metric (`buzz_fencing_phase`), exported per pod |
+
+## Prior Art (what this spec adopts, and from where)
+
+Three source-linked briefs inform this design (`RESEARCH/
+REDIS_CLUSTER_PRODUCTION_PRIOR_ART.md`, `…_OPEN_SOURCE_PRIOR_ART.md`,
+`…_OPERATIONAL_PRIOR_ART.md`):
+
+- **Stripe** (brandur.org/redis-cluster): a single hot engine core at scale,
+  fixed by cluster mode with **narrow, entity-scoped hash tags** — adopted
+  as the per-session fencing tag and the no-`{community}`-tag rule for
+  topics. Their hardest part was hardening the client, not operating the
+  cluster; this spec's weight distribution (client architecture + G2 over
+  cluster ops) follows.
+- **GitLab** (`multi_store.rb`, `redis_cluster_validator`): treats the move
+  as an application migration with an old/dual/new state machine and an
+  executable cross-slot validator — adopted as the O/A/B/C protocol shape
+  (with the fencing-specific monotonic-generation handling GitLab doesn't
+  need) and the G2 validator row.
+- **BullMQ**: smallest-atomic-domain hash tags, spread across shards —
+  corroborates per-session tagging; its years of cluster-fix changelog is
+  the cautionary tale behind the version floor and G2's chaos rows.
+- **Sidekiq** (negative prior art): refuses cluster configuration except a
+  narrow cluster-safe subsystem — adopted as the per-family obligations
+  table: cluster readiness is a capability boundary, not a client flag.
+- **Grafana Alertmanager HA**: classic pub/sub coexisting with a cluster
+  client — supports D2 (patterns stay classic) as viable, while proving
+  nothing about fan-out capacity.
+- **ioredis #1842** (maintainer resolution): the locality contract — atomic
+  work gets a narrow tag; unrelated multi-key work becomes per-slot
+  pipelines with *visible* partial-failure semantics — adopted verbatim as
+  the G2 locality row.
+- **No published production precedent** exists for sharded pub/sub at
+  Buzz-like fan-out scale (searched; Stripe validates command sharding
+  only). The `SPUBLISH`/`SSUBSCRIBE` conversion therefore carries its own
+  Buzz-specific load/reconnect gate rather than an appeal to prior art.
+- **AWS guidance** (modify-cluster-mode.md, online-resharding best
+  practices): compatible-as-revert-point (A3) and the <80% CPU resharding
+  rule (G5).
 
 ## Open Decisions
 
@@ -430,10 +676,14 @@ Code pins are at deployed commit `22be8bb35` (verified against image tag
 
 | Property | Status | Discharged by |
 |---|---|---|
-| Fencing single-authority (T1) | Proved | TLA+ model, mutation-tested |
-| Generation monotonicity (T2) | Proved | TLA+ model, mutation-tested |
-| One-way-door safety (T3) | Proved | Phase gate + A3, mechanized |
+| Fencing single-authority (T1) | Proved (write-side, under E1) | TLA+ model, 9 mutants killed |
+| Generation monotonicity (T2) | Proved (write-side, under E1) | TLA+ model, incl. rollback re-merge |
+| Slot-rules safety (T3) | Proved (under E1) | Mode-door gate + A3, mechanized |
+| Deployment gate E1 | **Operational obligation** | §Deployment Gate (phase images, advance gates, rollback matrix, phase metric) |
+| Read-side per-phase rules (lookup/validate/renew/release) | Specified + tested | §Per-phase operation table; G2 |
+| `redis` 1.2.4 → 1.5.0 | Verified free (single-node) | Dawn's build+test run on `73589408d`; cluster paths remain G2's |
 | Vendor cluster behaviors | Empirical | Conformance matrix (G2) |
 | Sharded pub/sub necessity | Documented fact | Axiom A4 (Valkey cluster spec) |
+| Sharded pub/sub at scale | **No prior art** | Buzz-specific load/reconnect gate in G2 |
 | Shard count | **Open** | G0 profile (D1) |
 | Timeline | ~8–10 days of runway at current doubling | G1 starts now; fallback = replica offload |

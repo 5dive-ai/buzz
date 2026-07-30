@@ -182,7 +182,7 @@ A separate, opt-in relay-signed projection protocol such as NIP-85 MAY publish a
 - **Availability vs. safety**: issuer, key-set, and storage outages deny. Availability MUST NOT override identity safety.
 - **Cross-issuer collision**: identical `sub` values under different issuers are distinct identities and MUST never collide or inherit each other's bindings.
 
-A companion formal model of this protocol — state machine, safety and liveness properties, and attack traces — accompanies this specification.
+The companion [formal model](NIP-FI-MODEL.md) defines the state machine and safety/liveness properties. The [conformance matrix](NIP-FI-CONFORMANCE.md) supplies stable, reviewable success, denial, concurrency, lifecycle, session, disclosure, and privacy traces.
 
 ## Implementation relationship
 

@@ -239,32 +239,9 @@ Assuming the issuer, key source, binding store, and network are available:
 
 No authorization liveness is promised while identity disablement, key revocation, pair retirement, or pending replacement blocks a request. Liveness is also intentionally not guaranteed during issuer/JWKS/storage outage; availability must not override identity safety.
 
-# Representative attack traces
+# Conformance traces
 
-| Trace | Required result |
-|---|---|
-| Valid assertion for `i`, attacker proves unbound `k_x`, `i` already bound to `k_v` | Deny `binding_conflict` |
-| Valid assertion with key claim `k_v`, attacker proves `k_x` | Deny `key_mismatch` before mutation |
-| Stolen assertion for never-enrolled `i`, attacker proves `k_x` | Deny in `attested-key`/`provisioned`; TOFU can bind and explicitly accepts this risk |
-| Client injects trusted-proxy header while bypassing proxy | Deployment is non-conforming; verifier must reject direct/untrusted ingress |
-| Assertion for issuer `A`, same `sub` as issuer `B` | Distinct identities; never collide or inherit binding |
-| Assertion has wrong audience, expired `exp`, unknown algorithm/key, malformed subject/key | Deny without binding mutation |
-| Concurrent first use of `(i,k1)` and `(i,k2)` | At most one commits; the other denies conflict |
-| Reuse of valid WebSocket authorization after assertion expiry | Deny protected operation or reauthenticate/close |
-| Retire `(i,k)`, then replay a matching assertion and proof in TOFU | Deny `pair_retired` without mutation |
-| Retire `(i,k)`, then replay an issuer key claim matching `k` | Deny `pair_retired` without mutation |
-| Disable never-enrolled `i`, then present any valid assertion and proof | Deny `identity_disabled` without mutation |
-| Revoke `k`, then present it for another identity | Deny `key_revoked` without mutation |
-| Revoke active `k`, then present fresh `k_new` for the same identity | Deny `explicit_replacement_required`; require privileged replacement |
-| `Authorize` races pair retirement or key revocation | Serialize; no binding that violates the completed transition survives |
-| Rotate to an active, revoked, or previously retired replacement | Deny without partial mutation |
-| Two concurrent replacements for one identity | At most one commits; the other denies after observing committed state |
-| Successful explicit replacement | Old pair and key remain denied; new active pair authorizes |
-| Lifecycle-state lookup fails | Deny without enrollment mutation |
-| New key presented for bound identity | Deny; require explicit rotation |
-| Display name/email changes while `(iss,sub)` is stable | May update metadata; binding identity is unchanged |
-| One NIP-42 connection authenticates `k1` and `k2`, only `k1` is bound | Only operations attributed to `k1` receive its lease |
-| JWT or corporate identifier is accidentally published as event/tag | Non-conforming privacy failure; assertion transport must not enter relay event history |
+The companion [NIP-FI conformance matrix](NIP-FI-CONFORMANCE.md) defines stable-ID success, denial, concurrency, lifecycle, session, delegation, disclosure, and privacy traces. In particular, its revoked-pair replay trace requires a stable denial with no mutation even when the still-valid assertion carries a matching key claim; only the separately authorized replacement transition can restore authority.
 
 # Conformance hooks for the NIP
 
@@ -287,4 +264,5 @@ It should not standardize database schema, lock mechanism, Okta-specific claims,
 - NIP-05 issuer-controlled identifier mapping precedent: https://github.com/nostr-protocol/nips/blob/8f8444d05a8842c40211ded5d10af3521541f865/05.md
 - NIP-46 external auth challenge precedent: https://github.com/nostr-protocol/nips/blob/8f8444d05a8842c40211ded5d10af3521541f865/46.md
 - Companion protocol specification: [`NIP-FI.md`](NIP-FI.md)
+- Companion conformance matrix: [`NIP-FI-CONFORMANCE.md`](NIP-FI-CONFORMANCE.md)
 - Buzz PR #1476 at `1e9822de8dbe0ae91c00c0ce0ed8ff583915692f` is a disabled partial foundation, not a complete NIP-FI implementation; future-`iat`, discovery, lifecycle, and lease conformance remain additive work.

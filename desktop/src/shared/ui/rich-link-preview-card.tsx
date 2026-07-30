@@ -43,7 +43,7 @@ function PreviewImage({ src }: { src: string }) {
   return (
     <img
       alt=""
-      className="mt-2 max-h-44 w-full rounded-lg border border-border/50 object-cover"
+      className="h-16 w-16 shrink-0 rounded-lg border border-border/50 object-cover"
       loading="lazy"
       onError={() => setFailed(true)}
       src={src}
@@ -97,19 +97,23 @@ export function RichLinkPreviewCard({
       )}
       data-rich-link-preview=""
     >
-      <div className="flex items-center gap-1.5 text-xs font-medium leading-4 text-muted-foreground">
-        <Favicon metadata={metadata} />
-        <span className="truncate">{metadata.siteName ?? hostname}</span>
-      </div>
-      <div className="mt-1 truncate text-sm font-semibold leading-5 text-primary">
-        {metadata.title}
-      </div>
-      {metadata.description ? (
-        <div className="mt-0.5 line-clamp-2 text-xs leading-4 text-muted-foreground">
-          {metadata.description}
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5 text-xs font-medium leading-4 text-muted-foreground">
+            <Favicon metadata={metadata} />
+            <span className="truncate">{metadata.siteName ?? hostname}</span>
+          </div>
+          <div className="mt-1 truncate text-sm font-semibold leading-5 text-primary">
+            {metadata.title}
+          </div>
+          {metadata.description ? (
+            <div className="mt-0.5 line-clamp-2 text-xs leading-4 text-muted-foreground">
+              {metadata.description}
+            </div>
+          ) : null}
         </div>
-      ) : null}
-      {metadata.imageUrl ? <PreviewImage src={metadata.imageUrl} /> : null}
+        {metadata.imageUrl ? <PreviewImage src={metadata.imageUrl} /> : null}
+      </div>
       <a
         aria-label={`Open link: ${metadata.title ?? hostname}`}
         className="absolute inset-0 z-10"

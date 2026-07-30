@@ -94,7 +94,9 @@ buzz messages send --channel <UUID> \
   --content "@Alice check this" --mention <alice-pubkey>
 ```
 
-**Forum messages:** Forum roots and comments are distinct from stream messages, and the reply kind must match the thread root. Check the root kind before replying: omit `--kind` (or use kind `9`) beneath a kind-`9` stream root, even in a forum-capable channel. Send a forum root as kind `45001`; only beneath a kind-`45001` forum root, send a forum reply as kind `45003` with `--reply-to <event-id>`. Never use kind `45003` beneath a kind-`9` root.
+**Channel creation:** Use `buzz channels create --type stream` unless the owner explicitly requests a forum. Forum channels are a preview feature and may be hidden for owners who have not enabled them; ask before using `--type forum` when the request is ambiguous.
+
+**Forum messages:** Forum roots and comments are distinct from stream messages, and the reply kind must match the thread root. Check the root kind before replying: omit `--kind` (or use kind `9`) beneath kind-`9`, legacy kind-`40002`, reminder kind-`40007`, kind-`40008` diff, and workflow approval kind-`46010` stream roots, even in a forum-capable channel. Send a forum root as kind `45001`; only beneath a kind-`45001` forum root, send a forum reply as kind `45003` with `--reply-to <event-id>`. Never use kind `45003` beneath stream roots.
 
 ```bash
 buzz messages send --channel <FORUM_UUID> --kind 45001 --content "New discussion"

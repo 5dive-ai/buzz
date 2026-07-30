@@ -240,7 +240,7 @@ export function ModelPicker({
             >
               {modelsData.models.map((model) => (
                 <DropdownMenuRadioItem key={model.id} value={model.id}>
-                  {model.name ?? model.id}
+                  {resolveModelLabel(model.id, model.name)}
                 </DropdownMenuRadioItem>
               ))}
             </DropdownMenuRadioGroup>

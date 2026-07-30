@@ -78,7 +78,7 @@ export function getDiscoveredPersonaModelOptions(
     ...defaultModelOption,
     ...explicitModels.map((model) => ({
       id: model.id,
-      label: model.name?.trim() || model.id,
+      label: resolveModelLabel(model.id, model.name),
     })),
   ];
 }

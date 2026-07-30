@@ -144,6 +144,59 @@ def write_ts(entries: list[tuple[str, str]]) -> None:
     print(f"Wrote {TS_OUT.relative_to(REPO_ROOT)}")
 
 
+def extract_entries(data: object) -> list[tuple[str, str]]:
+    """Pull sorted (id, name) pairs out of the models.dev payload.
+
+    Every container and leaf shape is checked explicitly so an upstream
+    restructure fails with an actionable message instead of a bare KeyError
+    or — worse — a silently degraded table where a malformed entry emits
+    `id -> id` and permanently masks the real curated name.
+    """
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Unexpected models.dev shape: root must be an object, got {type(data).__name__}"
+        )
+    provider = data.get("databricks")
+    if provider is None:
+        raise RuntimeError("Unexpected models.dev shape: missing data['databricks']")
+    if not isinstance(provider, dict):
+        raise RuntimeError(
+            "Unexpected models.dev shape: data['databricks'] must be an object, "
+            f"got {type(provider).__name__}"
+        )
+    models = provider.get("models")
+    if models is None:
+        raise RuntimeError(
+            "Unexpected models.dev shape: missing data['databricks']['models']"
+        )
+    if not isinstance(models, dict):
+        raise RuntimeError(
+            "Unexpected models.dev shape: data['databricks']['models'] must be an "
+            f"object, got {type(models).__name__}"
+        )
+    if not models:
+        raise RuntimeError(
+            "Unexpected models.dev shape: data['databricks']['models'] is empty"
+        )
+
+    entries: list[tuple[str, str]] = []
+    for model_id, model in models.items():
+        where = f"data['databricks']['models'][{model_id!r}]"
+        if not isinstance(model, dict):
+            raise RuntimeError(
+                f"Unexpected models.dev shape: {where} must be an object, "
+                f"got {type(model).__name__}"
+            )
+        name = model.get("name")
+        if not isinstance(name, str):
+            raise RuntimeError(
+                f"Unexpected models.dev shape: {where}['name'] must be a string, "
+                f"got {type(name).__name__}"
+            )
+        entries.append((model_id, name))
+    return sorted(entries)
+
+
 def main() -> None:
     raw = fetch(URL)
     try:
@@ -151,16 +204,7 @@ def main() -> None:
     except json.JSONDecodeError as e:
         raise RuntimeError(f"models.dev response is not valid JSON: {e}") from e
 
-    if "databricks" not in data or "models" not in data["databricks"]:
-        raise RuntimeError(
-            "Unexpected models.dev shape: missing data['databricks']['models']"
-        )
-
-    models: dict = data["databricks"]["models"]
-    raw_entries = sorted(
-        (k, v["name"] if isinstance(v, dict) else k) for k, v in models.items()
-    )
-    entries = validate_entries(raw_entries)
+    entries = validate_entries(extract_entries(data))
 
     write_rust(entries)
     write_ts(entries)

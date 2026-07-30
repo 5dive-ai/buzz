@@ -183,10 +183,21 @@ export function LinkPreviewAttachment({
         )}
         <AttachmentContent className={reserveImage ? "px-3 py-2.5" : undefined}>
           <div
-            className="truncate text-xs font-normal leading-4 text-muted-foreground"
+            className="flex min-w-0 items-center gap-1.5 text-xs font-normal leading-4 text-muted-foreground"
             data-link-preview-hostname=""
           >
-            {reserveImage ? hostname : preview.provider}
+            {reserveImage && preview.faviconDataUrl ? (
+              <img
+                alt=""
+                aria-hidden="true"
+                className="size-3 shrink-0 rounded-sm object-contain"
+                data-link-preview-hostname-favicon=""
+                src={preview.faviconDataUrl}
+              />
+            ) : null}
+            <span className="truncate">
+              {reserveImage ? hostname : preview.provider}
+            </span>
           </div>
           <AttachmentTitle
             className={

@@ -170,7 +170,7 @@ export function BackupStep({
   );
   const storageDescription =
     identityStorage === "system-keyring"
-      ? "Buzz keeps your identity key in your system keychain. Your computer may ask for its password when Buzz uses the key."
+      ? "Buzz keeps your identity key in your system keychain. Your computer may ask for your password when Buzz needs to read the key."
       : identityStorage === "local-file"
         ? "Your system keychain wasn’t available, so Buzz keeps your identity key in a private file on this device."
         : "Buzz keeps your identity key protected on this device. Make a separate backup in case you lose access.";
@@ -180,6 +180,12 @@ export function BackupStep({
       : identityStorage === "local-file"
         ? "Stored in private device storage"
         : "Protected in private device storage";
+  const introStorageDescription =
+    identityStorage === "system-keyring"
+      ? "Buzz keeps your identity key in your system keychain."
+      : identityStorage === "local-file"
+        ? "Buzz keeps your identity key in a private file on this device because the system keychain wasn’t available."
+        : "Your identity key is protected on this device.";
 
   if (optionsExpanded) {
     return (
@@ -320,8 +326,8 @@ export function BackupStep({
               REVEAL_ANIMATION_CLASS,
             )}
           >
-            Your identity key is protected on this device. Back it up somewhere
-            safe so you can restore your account. Never share your key.
+            {introStorageDescription} Back it up somewhere safe so you can
+            restore your account. Never share your key.
           </p>
         ) : null}
       </div>

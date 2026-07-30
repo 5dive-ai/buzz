@@ -4,6 +4,7 @@ mod archive;
 mod builderlab;
 mod commands;
 mod deep_link;
+mod dictation;
 mod egress_guard;
 mod event_sync;
 mod events;

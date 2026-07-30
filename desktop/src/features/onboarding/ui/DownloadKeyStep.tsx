@@ -3,7 +3,7 @@ import * as React from "react";
 
 import { Button } from "@/shared/ui/button";
 import {
-  ONBOARDING_PRIMARY_CTA_CLASS,
+  ONBOARDING_SECURITY_PRIMARY_CTA_CLASS,
   ONBOARDING_SECONDARY_CTA_CLASS,
 } from "./OnboardingChrome";
 import { OnboardingFooter } from "./OnboardingFooter";
@@ -89,7 +89,7 @@ export function DownloadKeyStep({
               data-testid="backup-password-panel"
             >
               <EncryptedBackupCreator
-                createButtonClassName={ONBOARDING_PRIMARY_CTA_CLASS}
+                createButtonClassName={ONBOARDING_SECURITY_PRIMARY_CTA_CLASS}
                 createButtonPortal={createButtonSlot}
                 session={session}
                 variant="spotlight"

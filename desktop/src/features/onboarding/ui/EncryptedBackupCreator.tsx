@@ -46,7 +46,7 @@ import {
   initialBackupTestProgress,
 } from "./BackupTestFlow";
 import {
-  ONBOARDING_PRIMARY_CTA_CLASS,
+  ONBOARDING_SECURITY_PRIMARY_CTA_CLASS,
   ONBOARDING_SECONDARY_CTA_CLASS,
 } from "./OnboardingChrome";
 
@@ -939,7 +939,7 @@ export function EncryptedBackupCreator({
             <AlertDialogAction
               className={
                 variant === "spotlight"
-                  ? ONBOARDING_PRIMARY_CTA_CLASS
+                  ? ONBOARDING_SECURITY_PRIMARY_CTA_CLASS
                   : undefined
               }
               data-testid="backup-start-new-password"

@@ -13,7 +13,7 @@ import { Input } from "@/shared/ui/input";
 import { PubKey } from "@/shared/ui/PubKey";
 import { Spinner } from "@/shared/ui/spinner";
 import {
-  ONBOARDING_PRIMARY_CTA_CLASS,
+  ONBOARDING_SECURITY_PRIMARY_CTA_CLASS,
   ONBOARDING_SECONDARY_CTA_CLASS,
   ONBOARDING_SECURITY_ICON_CLASS,
 } from "./OnboardingChrome";
@@ -378,7 +378,7 @@ export function BackupTestFlow({
             className={cn(
               "mx-auto",
               isSpotlight
-                ? ONBOARDING_PRIMARY_CTA_CLASS
+                ? ONBOARDING_SECURITY_PRIMARY_CTA_CLASS
                 : "h-9 px-6 text-primary-foreground",
             )}
             data-testid="backup-test-dropzone"
@@ -539,7 +539,7 @@ export function BackupTestFlow({
               className={cn(
                 "font-medium",
                 isSpotlight
-                  ? ONBOARDING_PRIMARY_CTA_CLASS
+                  ? ONBOARDING_SECURITY_PRIMARY_CTA_CLASS
                   : "h-9 px-6 text-sm text-primary-foreground",
               )}
               data-testid="backup-test-verify"

@@ -32,15 +32,16 @@ test("valid password requests encryption without copying it into events", () => 
   assert.equal(started.requestId, 1);
   assert.equal(Object.hasOwn(started, "encryptingPassphrase"), false);
 });
-test("success clears password and retains only encrypted blob", () => {
+test("background encryption remains silent until download is clicked", () => {
   const state = reduce([
     { type: "set-passphrase", value: "one-two-three-four" },
     { type: "encrypt-started", requestId: 1 },
     { type: "encrypt-succeeded", requestId: 1, ncryptsec: "ncryptsec1abc" },
   ]);
-  assert.equal(state.passphrase, "");
+  assert.equal(state.passphrase, "one-two-three-four");
   assert.equal(state.encrypted, "ncryptsec1abc");
-  assert.equal(state.savedPassword, true);
+  assert.equal(state.ncryptsec, null);
+  assert.equal(state.savedPassword, false);
   assert.equal(state.requestId, null);
 });
 test("stale async completions cannot replace current request", () => {

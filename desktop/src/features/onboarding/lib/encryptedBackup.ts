@@ -53,14 +53,21 @@ export function encryptedBackupReducer(
       };
     case "encrypt-succeeded":
       if (event.requestId !== state.requestId) return state;
+      if (state.downloadPending) {
+        return {
+          ...state,
+          passphrase: "",
+          requestId: null,
+          encrypted: event.ncryptsec,
+          ncryptsec: event.ncryptsec,
+          downloadPending: false,
+          savedPassword: true,
+        };
+      }
       return {
         ...state,
-        passphrase: "",
         requestId: null,
         encrypted: event.ncryptsec,
-        ncryptsec: state.downloadPending ? event.ncryptsec : state.ncryptsec,
-        downloadPending: false,
-        savedPassword: true,
       };
     case "encrypt-failed":
       if (event.requestId !== state.requestId) return state;

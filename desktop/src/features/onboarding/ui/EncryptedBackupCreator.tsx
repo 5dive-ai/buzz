@@ -31,7 +31,6 @@ import {
 } from "@/shared/ui/alert-dialog";
 import {
   downloadDisabled,
-  isEncrypting,
   passphraseIssue,
   pendingEncryptPassphrase,
   encryptedBackupReducer,
@@ -529,8 +528,8 @@ function PassphraseGeneratorPopover({
  * The flow is a single password input; a refresh icon inset in the field
  * opens a 1Password-style generator popover (word count + separator).
  * Encryption starts eagerly once the password is valid, so Download usually
- * opens the save dialog instantly; clicking mid-encryption queues the
- * download until the KDF finishes.
+ * opens the save dialog instantly. Background encryption is silent; clicking
+ * mid-encryption reveals the queued-download ticker until the KDF finishes.
  */
 export function EncryptedBackupCreator({
   variant = "spotlight",
@@ -865,11 +864,11 @@ export function EncryptedBackupCreator({
       ) : null}
 
       {(() => {
-        // Absolute spinner: signals the background encryption without
-        // shifting the centered button while it appears and disappears.
+        // A queued download gets an explicit progress treatment. Background
+        // encryption stays silent until the user asks to download.
         const createButton = (
           <div className="relative">
-            {isEncrypting(state) || state.downloadPending || isSaving ? (
+            {state.downloadPending || isSaving ? (
               <Spinner
                 aria-label="Encrypting your key"
                 className="absolute right-full top-1/2 mr-3 h-4 w-4 -translate-y-1/2 border-2"

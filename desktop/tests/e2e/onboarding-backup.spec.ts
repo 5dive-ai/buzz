@@ -142,12 +142,19 @@ test("download happy path: generated password, encrypt, native save, Next", asyn
   await expect(input).toHaveValue("");
   await expect(page.getByTestId("encrypted-backup-create")).toBeDisabled();
   await expect(page.getByTestId("onboarding-next")).toHaveCount(0);
-  await expect(page.getByTestId("onboarding-skip")).toBeVisible();
+  await expect(page.getByTestId("backup-return-to-onboarding")).toBeVisible();
+  const passwordPanel = page.getByTestId("backup-password-panel");
+  await expect(passwordPanel).toBeVisible();
+  await expect(passwordPanel).not.toHaveClass(/buzz-card-textured/);
+  await expect(passwordPanel).toHaveCSS("padding-left", "24px");
 
   // The inset refresh icon opens the generator popover and immediately
   // fills the field (mock default: 3 words, spaces).
   await page.getByTestId("backup-passphrase-generate").click();
   await expect(input).toHaveValue("mock horse battery");
+  const generatorPopover = page.locator(".buzz-card-textured-compact");
+  await expect(generatorPopover).toBeVisible();
+  await expect(generatorPopover).toHaveCSS("border-image-outset", "24px");
 
   // Popover controls regenerate in place: word count (slider) and separator.
   await page.getByTestId("backup-passphrase-words").focus();
@@ -173,6 +180,13 @@ test("download happy path: generated password, encrypt, native save, Next", asyn
   await expect(input).toHaveValue("");
   await expect(input).toHaveAttribute("readonly", "");
   await expect(page.getByTestId("backup-saved-password-mask")).toBeVisible();
+  await page.getByTestId("backup-passphrase-reveal-toggle").click();
+  const changePasswordDialog = page.getByTestId(
+    "backup-change-password-dialog",
+  );
+  await expect(changePasswordDialog).toBeVisible();
+  await expect(changePasswordDialog).toHaveClass(/buzz-card-textured-compact/);
+  await page.getByRole("button", { name: "Keep current backup" }).click();
 
   // Saving uses the retained encrypted blob; it does not re-encrypt or need
   // the cleared password.
@@ -191,10 +205,10 @@ test("download happy path: generated password, encrypt, native save, Next", asyn
     "identity.ncryptsec",
   );
 
-  // Until the test passes there is no Next at all — Skip is the only way
-  // forward.
+  // The optional security subview has no onboarding Next action. Returning to
+  // the yellow key view is the single exit throughout the ceremony.
   await expect(page.getByTestId("onboarding-next")).toHaveCount(0);
-  await expect(page.getByTestId("onboarding-skip")).toBeVisible();
+  await expect(page.getByTestId("backup-return-to-onboarding")).toBeVisible();
 
   await waitForAnimations(page);
   await page.screenshot({ path: `${SHOTS}/04-backup-test-dropzone.png` });
@@ -251,9 +265,12 @@ test("download happy path: generated password, encrypt, native save, Next", asyn
   expect(commands).not.toContain("get_nsec");
   expect(commands).toContain("create_ncryptsec_backup");
 
-  // A passed test unlocks Next and retires the Skip escape hatch.
+  // Completion remains inside the optional security subview. Return to the
+  // yellow key view, whose standard Next action continues onboarding.
+  await expect(page.getByTestId("onboarding-next")).toHaveCount(0);
+  await page.getByTestId("backup-return-to-onboarding").click();
+  await expect(page.getByTestId("onboarding-page-backup")).toBeVisible();
   await expect(page.getByTestId("onboarding-next")).toBeEnabled();
-  await expect(page.getByTestId("onboarding-skip")).toHaveCount(0);
   await page.getByTestId("onboarding-next").click();
   await expect(page.getByTestId("onboarding-page-2")).toBeVisible();
 });

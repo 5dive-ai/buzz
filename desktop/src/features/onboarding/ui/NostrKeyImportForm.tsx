@@ -11,7 +11,10 @@ import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { Input } from "@/shared/ui/input";
 import { Spinner } from "@/shared/ui/spinner";
-import { ONBOARDING_PRIMARY_CTA_CLASS } from "./OnboardingChrome";
+import {
+  ONBOARDING_PRIMARY_CTA_CLASS,
+  ONBOARDING_SECONDARY_CTA_CLASS,
+} from "./OnboardingChrome";
 import { OnboardingFooter } from "./OnboardingFooter";
 
 const NOSTR_KEY_FILE_MAX_BYTES = 1024;
@@ -266,7 +269,7 @@ export function NostrKeyImportForm({
         // exactly what a wiped user returns with.
         <div className="mt-2 text-center">
           <Button
-            className="h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
+            className={ONBOARDING_SECONDARY_CTA_CLASS}
             data-testid="nostr-import-file-button"
             disabled={isInteractionDisabled}
             onClick={openFilePicker}
@@ -472,7 +475,7 @@ export function NostrKeyImportForm({
         <Button
           className={
             variant === "spotlight"
-              ? "h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
+              ? ONBOARDING_SECONDARY_CTA_CLASS
               : "h-10 w-full text-muted-foreground hover:text-accent-foreground"
           }
           disabled={isImporting}

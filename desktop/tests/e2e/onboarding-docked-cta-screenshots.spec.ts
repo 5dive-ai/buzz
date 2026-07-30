@@ -75,12 +75,41 @@ test("machine onboarding: landing, backup, setup docked CTAs", async ({
     page.getByTestId("onboarding-page-backup-options"),
   ).toBeVisible();
   await expect(page.getByTestId("onboarding-next")).toHaveCount(0);
+  const optionPanels = page.getByTestId("backup-option-panel");
+  await expect(optionPanels).toHaveCount(3);
+  await expect(
+    page.getByTestId("backup-options").locator(".buzz-card-textured"),
+  ).toHaveCount(0);
+  await expect(optionPanels.first()).toHaveCSS("padding-left", "24px");
+  const titleTops = await optionPanels
+    .locator("span.text-lg")
+    .evaluateAll((titles) =>
+      titles.map((title) => title.getBoundingClientRect().top),
+    );
+  expect(Math.max(...titleTops) - Math.min(...titleTops)).toBeLessThan(1);
   await waitForAnimations(page);
   await page.screenshot({ path: `${SHOT_DIR}/02c-backup-options.png` });
 
   await page.getByTestId("backup-option-password").click();
   await expect(page.getByTestId("onboarding-page-download")).toBeVisible();
-  await page.getByTestId("onboarding-skip").click();
+  const passwordPanel = page.getByTestId("backup-password-panel");
+  await expect(passwordPanel).toBeVisible();
+  await expect(passwordPanel).not.toHaveClass(/buzz-card-textured/);
+  await expect(passwordPanel).toHaveCSS("padding-left", "24px");
+  await waitForAnimations(page);
+  await page.screenshot({ path: `${SHOT_DIR}/02d-backup-password.png` });
+
+  await page.getByTestId("backup-passphrase-generate").click();
+  const compactPopover = page.locator(".buzz-card-textured-compact");
+  await expect(compactPopover).toBeVisible();
+  await expect(compactPopover).toHaveCSS("border-image-outset", "24px");
+  await waitForAnimations(page);
+  await page.screenshot({ path: `${SHOT_DIR}/02e-backup-generator.png` });
+  await page.keyboard.press("Escape");
+
+  await page.getByTestId("backup-return-to-onboarding").click();
+  await expect(page.getByTestId("onboarding-page-backup")).toBeVisible();
+  await page.getByTestId("onboarding-next").click();
   await expect(
     page.getByRole("heading", { name: "Set up your agent harnesses" }),
   ).toBeVisible();
@@ -128,6 +157,39 @@ test("machine key import remains usable in a short viewport", async ({
   expect(layout.footerTop).toBeGreaterThan(layout.inputBottom);
   expect(layout.scrollHeight).toBeGreaterThanOrEqual(620);
   expect(layout.scrollWidth).toBe(layout.clientWidth);
+});
+
+test("backup options keep one-column geometry on narrow windows", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 600, height: 700 });
+  await installMockBridge(page, undefined, {
+    skipCommunitySeed: true,
+    skipOnboardingSeed: true,
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Create a new identity key" }).click();
+  await expect(
+    page.getByRole("heading", {
+      name: "Your unique identity key has been created",
+    }),
+  ).toBeVisible();
+  await page.getByTestId("backup-options-toggle").click();
+
+  const panels = page.getByTestId("backup-option-panel");
+  await expect(panels).toHaveCount(3);
+  const geometry = await panels.evaluateAll((elements) => ({
+    clientWidth: document.documentElement.clientWidth,
+    lefts: elements.map((element) => element.getBoundingClientRect().left),
+    rights: elements.map((element) => element.getBoundingClientRect().right),
+    scrollWidth: document.documentElement.scrollWidth,
+  }));
+  expect(new Set(geometry.lefts.map(Math.round)).size).toBe(1);
+  expect(geometry.lefts.every((left) => left >= 0)).toBe(true);
+  expect(geometry.rights.every((right) => right <= geometry.clientWidth)).toBe(
+    true,
+  );
+  expect(geometry.scrollWidth).toBe(geometry.clientWidth);
 });
 
 test("relay onboarding: profile and avatar docked CTAs", async ({ page }) => {

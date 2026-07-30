@@ -24,6 +24,10 @@ export const ONBOARDING_PRIMARY_CTA_CLASS = `${ONBOARDING_CTA_SHAPE} text-[var(-
  */
 export const ONBOARDING_LANDING_CTA_CLASS = `${ONBOARDING_CTA_SHAPE} text-[var(--buzz-welcome-chartreuse)]`;
 
+/** Shared quiet pill for secondary actions throughout onboarding. */
+export const ONBOARDING_SECONDARY_CTA_CLASS =
+  "h-9 rounded-full bg-foreground/10 px-6 text-foreground hover:bg-foreground/15 hover:text-foreground";
+
 /**
  * Icon-control styling for onboarding surfaces that sit on the textured card:
  * olive backup ink (`--buzz-onboarding-backup-ink`) with a plain
@@ -33,6 +37,10 @@ export const ONBOARDING_LANDING_CTA_CLASS = `${ONBOARDING_CTA_SHAPE} text-[var(-
  */
 export const ONBOARDING_INK_ICON_CLASS =
   "text-[color:var(--buzz-onboarding-backup-ink)] hover:bg-transparent hover:text-foreground";
+
+/** Icon controls on the dark noisy backup surfaces stay visually unboxed. */
+export const ONBOARDING_SECURITY_ICON_CLASS =
+  "text-muted-foreground hover:bg-transparent hover:text-foreground";
 
 /**
  * Shared onboarding chrome shown on every page after the landing screen: a

@@ -8,9 +8,15 @@ import {
 } from "@/shared/api/tauriIdentity";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
+import { Card } from "@/shared/ui/card";
 import { Input } from "@/shared/ui/input";
 import { PubKey } from "@/shared/ui/PubKey";
 import { Spinner } from "@/shared/ui/spinner";
+import {
+  ONBOARDING_PRIMARY_CTA_CLASS,
+  ONBOARDING_SECONDARY_CTA_CLASS,
+  ONBOARDING_SECURITY_ICON_CLASS,
+} from "./OnboardingChrome";
 
 type BackupTestStage = "drop" | "password" | "success";
 
@@ -347,7 +353,13 @@ export function BackupTestFlow({
       data-testid="backup-test-flow"
     >
       {stage === "drop" ? (
-        <>
+        <motion.div
+          animate={{ opacity: 1, y: 0 }}
+          className="relative space-y-4"
+          initial={reduceMotion ? false : { opacity: 0, y: 10 }}
+          key="drop"
+          transition={{ duration: reduceMotion ? 0 : 0.3, ease: "easeOut" }}
+        >
           <input
             accept=".ncryptsec,text/plain"
             className="sr-only"
@@ -362,28 +374,19 @@ export function BackupTestFlow({
             tabIndex={-1}
             type="file"
           />
-          <button
+          <Button
             className={cn(
-              "mx-auto flex items-center justify-center rounded-full bg-primary text-center shadow transition-colors hover:bg-primary/90",
-              // The CTA-label variable only exists inside the onboarding
-              // theme; elsewhere fall back to the standard primary pair.
+              "mx-auto",
               isSpotlight
-                ? "h-14 px-12 text-(--buzz-onboarding-cta-label)"
+                ? ONBOARDING_PRIMARY_CTA_CLASS
                 : "h-9 px-6 text-primary-foreground",
             )}
             data-testid="backup-test-dropzone"
             onClick={() => fileInputRef.current?.click()}
             type="button"
           >
-            <span
-              className={cn(
-                "font-medium",
-                isSpotlight ? "text-base" : "text-sm",
-              )}
-            >
-              Select your backup file
-            </span>
-          </button>
+            <span className="font-medium text-sm">Select your backup file</span>
+          </Button>
           {isWindowDragging ? (
             /*
              * Composer-style takeover: fills the nearest positioned host
@@ -393,7 +396,7 @@ export function BackupTestFlow({
              */
             // biome-ignore lint/a11y/noStaticElementInteractions: pointer-only drop target; the select button is the keyboard-accessible path
             <div
-              className="absolute inset-2 z-10 mt-0! flex items-center justify-center rounded-2xl border-2 border-dashed border-primary bg-primary/10 backdrop-blur-sm"
+              className="absolute inset-2 z-10 mt-0! flex items-center justify-center bg-primary/10 backdrop-blur-sm"
               data-testid="backup-test-drop-overlay"
               onDragOver={(event) => event.preventDefault()}
               onDrop={(event) => {
@@ -402,10 +405,15 @@ export function BackupTestFlow({
                 if (file) void handleFile(file);
               }}
             >
-              <span className="flex items-center gap-2 rounded-full bg-foreground px-4 py-2 text-sm font-semibold text-background shadow-sm ring-1 ring-background/15">
+              <Card
+                className="flex-row items-center gap-2 px-10 py-8 text-sm font-semibold text-foreground"
+                textureSize="compact"
+                textureTone="dark"
+                variant="textured"
+              >
                 <FileUp aria-hidden="true" className="size-4" />
                 <span>Drop your backup file here</span>
-              </span>
+              </Card>
             </div>
           ) : null}
           {error ? (
@@ -421,8 +429,10 @@ export function BackupTestFlow({
             <div className="flex flex-col items-center gap-2">
               <Button
                 className={cn(
-                  "gap-1.5 rounded-full bg-foreground/10 hover:bg-foreground/15",
-                  isSpotlight ? "h-12 px-10 text-base" : "h-9 px-6 text-sm",
+                  "gap-1.5",
+                  isSpotlight
+                    ? ONBOARDING_SECONDARY_CTA_CLASS
+                    : "h-9 rounded-full bg-foreground/10 px-6 text-sm hover:bg-foreground/15",
                 )}
                 data-testid="encrypted-backup-save-copy"
                 disabled={isSaving}
@@ -446,9 +456,15 @@ export function BackupTestFlow({
           {saveError ? (
             <p className="text-center text-sm text-destructive">{saveError}</p>
           ) : null}
-        </>
+        </motion.div>
       ) : (
-        <>
+        <motion.div
+          animate={{ opacity: 1, y: 0 }}
+          className="space-y-4"
+          initial={reduceMotion ? false : { opacity: 0, y: 10 }}
+          key="password"
+          transition={{ duration: reduceMotion ? 0 : 0.3, ease: "easeOut" }}
+        >
           <div
             className="flex items-center justify-center gap-2 text-sm text-foreground animate-in fade-in slide-in-from-bottom-1 duration-300 motion-reduce:animate-none"
             data-testid="backup-test-file-accepted"
@@ -469,7 +485,12 @@ export function BackupTestFlow({
             <Input
               aria-label="Backup password"
               autoComplete="off"
-              className="h-10 bg-background pr-10 font-mono"
+              className={cn(
+                "font-mono",
+                isSpotlight
+                  ? "h-14 rounded-none border-0 bg-transparent px-14 text-center text-lg shadow-none focus-visible:ring-0"
+                  : "h-10 bg-background pr-10",
+              )}
               data-testid="backup-test-password"
               disabled={isVerifying}
               onChange={(event) => setAttempt(event.target.value)}
@@ -486,7 +507,10 @@ export function BackupTestFlow({
             />
             <Button
               aria-label={isRevealed ? "Hide password" : "Reveal password"}
-              className="absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              className={cn(
+                "absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground",
+                isSpotlight && ONBOARDING_SECURITY_ICON_CLASS,
+              )}
               data-testid="backup-test-password-reveal-toggle"
               disabled={isVerifying}
               onClick={() => setIsRevealed((revealed) => !revealed)}
@@ -513,9 +537,9 @@ export function BackupTestFlow({
           <div className="flex items-center justify-center gap-3 pt-2">
             <Button
               className={cn(
-                "rounded-full bg-primary font-medium shadow transition-colors hover:bg-primary/90",
+                "font-medium",
                 isSpotlight
-                  ? "h-12 px-10 text-base text-(--buzz-onboarding-cta-label)"
+                  ? ONBOARDING_PRIMARY_CTA_CLASS
                   : "h-9 px-6 text-sm text-primary-foreground",
               )}
               data-testid="backup-test-verify"
@@ -533,7 +557,11 @@ export function BackupTestFlow({
               )}
             </Button>
             <Button
-              className="h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+              className={
+                isSpotlight
+                  ? ONBOARDING_SECONDARY_CTA_CLASS
+                  : "h-7 px-2 text-xs text-muted-foreground hover:text-foreground"
+              }
               data-testid="backup-test-use-different-file"
               disabled={isVerifying}
               onClick={() => {
@@ -550,7 +578,7 @@ export function BackupTestFlow({
               Use a different file
             </Button>
           </div>
-        </>
+        </motion.div>
       )}
     </div>
   );

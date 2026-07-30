@@ -2,8 +2,10 @@ import { motion, useReducedMotion } from "motion/react";
 import * as React from "react";
 
 import { Button } from "@/shared/ui/button";
-import { Card } from "@/shared/ui/card";
-import { ONBOARDING_PRIMARY_CTA_CLASS } from "./OnboardingChrome";
+import {
+  ONBOARDING_PRIMARY_CTA_CLASS,
+  ONBOARDING_SECONDARY_CTA_CLASS,
+} from "./OnboardingChrome";
 import { OnboardingFooter } from "./OnboardingFooter";
 import {
   type OnboardingTransitionDirection,
@@ -49,7 +51,13 @@ export function DownloadKeyStep({
       direction={direction}
       transitionKey={`download-${direction}`}
     >
-      <div className="flex w-full max-w-[500px] shrink-0 flex-col text-center">
+      <motion.div
+        animate={{ opacity: 1, y: 0 }}
+        className="flex w-full max-w-[500px] shrink-0 flex-col text-center"
+        initial={reduceMotion ? false : { opacity: 0, y: 10 }}
+        key={hasCreated ? "test-heading" : "password-heading"}
+        transition={{ duration: reduceMotion ? 0 : 0.3, ease: "easeOut" }}
+      >
         {/* Plain string concat: cn()'s tailwind-merge misreads the custom
             text-title size token as conflicting with text-foreground. */}
         <h1 className="text-title font-normal text-foreground">
@@ -62,25 +70,31 @@ export function DownloadKeyStep({
             ? "Make sure your backup works: drop the file you just saved and unlock it with your password."
             : "Keep the downloaded file private — you need both it and your password to restore your identity. Save the backup password somewhere safe; Buzz cannot reset it if lost."}
         </p>
-      </div>
+      </motion.div>
 
       <div className="flex w-full max-w-[1040px] flex-1 flex-col justify-center py-10">
         <div className="w-full">
           <motion.div
             animate={{ opacity: 1, y: 0 }}
             initial={reduceMotion ? false : { opacity: 0, y: 12 }}
-            transition={{ delay: 0.12, duration: 0.4, ease: "easeOut" }}
+            key={hasCreated ? "test-panel" : "password-panel"}
+            transition={{
+              delay: reduceMotion ? 0 : 0.12,
+              duration: reduceMotion ? 0 : 0.4,
+              ease: "easeOut",
+            }}
           >
-            <Card className="w-full border-foreground/15 bg-card px-8 py-6 shadow-none">
-              <div className="mx-auto w-full max-w-[832px]">
-                <EncryptedBackupCreator
-                  createButtonClassName={ONBOARDING_PRIMARY_CTA_CLASS}
-                  createButtonPortal={createButtonSlot}
-                  session={session}
-                  variant="spotlight"
-                />
-              </div>
-            </Card>
+            <div
+              className="mx-auto w-full max-w-140 px-6 py-5"
+              data-testid="backup-password-panel"
+            >
+              <EncryptedBackupCreator
+                createButtonClassName={ONBOARDING_PRIMARY_CTA_CLASS}
+                createButtonPortal={createButtonSlot}
+                session={session}
+                variant="spotlight"
+              />
+            </div>
           </motion.div>
         </div>
       </div>
@@ -94,7 +108,7 @@ export function DownloadKeyStep({
           />
         )}
         <Button
-          className="h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
+          className={ONBOARDING_SECONDARY_CTA_CLASS}
           data-testid="onboarding-back"
           onClick={onBack}
           type="button"

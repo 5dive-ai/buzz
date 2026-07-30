@@ -7,6 +7,7 @@ import {
   Info,
   ShieldCheck,
 } from "lucide-react";
+import { useReducedMotion } from "motion/react";
 import * as React from "react";
 
 import { getNsec } from "@/shared/api/tauriIdentity";
@@ -17,7 +18,10 @@ import { Button } from "@/shared/ui/button";
 import { FuzzyLogo } from "@/shared/ui/buzz-logo/FuzzyLogo";
 import { Card } from "@/shared/ui/card";
 import { Spinner } from "@/shared/ui/spinner";
-import { ONBOARDING_PRIMARY_CTA_CLASS } from "./OnboardingChrome";
+import {
+  ONBOARDING_PRIMARY_CTA_CLASS,
+  ONBOARDING_SECONDARY_CTA_CLASS,
+} from "./OnboardingChrome";
 import { OnboardingFooter } from "./OnboardingFooter";
 import {
   type OnboardingTransitionDirection,
@@ -41,6 +45,9 @@ let introPlayed = false;
 
 const REVEAL_ANIMATION_CLASS =
   "animate-in fade-in duration-700 motion-reduce:animate-none";
+
+const BACKUP_OPTION_CLASS =
+  "flex min-h-48 w-full flex-col items-start justify-start px-6 py-5 text-left text-foreground";
 
 /** Viewing the key never blocks onboarding — Next is always actionable. */
 export function backupNextDisabled(): boolean {
@@ -74,7 +81,8 @@ export function BackupStep({
   optionsExpanded,
   returningFromSecurity,
 }: BackupStepProps) {
-  const [created, setCreated] = React.useState(introPlayed);
+  const reduceMotion = useReducedMotion() ?? false;
+  const [created, setCreated] = React.useState(introPlayed || reduceMotion);
   const [copyState, setCopyState] = React.useState<
     "idle" | "copying" | "copied"
   >("idle");
@@ -86,12 +94,17 @@ export function BackupStep({
 
   React.useEffect(() => {
     if (introPlayed) return;
+    if (reduceMotion) {
+      introPlayed = true;
+      setCreated(true);
+      return;
+    }
     const timer = window.setTimeout(() => {
       introPlayed = true;
       setCreated(true);
     }, INTRO_HOLD_MS);
     return () => window.clearTimeout(timer);
-  }, []);
+  }, [reduceMotion]);
 
   React.useEffect(() => {
     cancelledRef.current = false;
@@ -155,24 +168,18 @@ export function BackupStep({
     () => Array.from({ length: nsec?.length ?? 63 }, () => "•").join("\u200b"),
     [nsec],
   );
-  const storageMessage =
+  const storageDescription =
     identityStorage === "system-keyring"
-      ? {
-          title: "Protected by your system keychain",
-          description:
-            "Buzz uses your system keychain to protect your identity key. Your system may ask for your computer password when Buzz accesses it.",
-        }
+      ? "Buzz keeps your identity key in your system keychain. Your computer may ask for its password when Buzz uses the key."
       : identityStorage === "local-file"
-        ? {
-            title: "Stored on this device",
-            description:
-              "Your system keychain wasn’t available, so Buzz stores your identity key in a private file on this device.",
-          }
-        : {
-            title: "Protected on this device",
-            description:
-              "Keep a separate backup so you can restore your identity if you lose access to this device.",
-          };
+        ? "Your system keychain wasn’t available, so Buzz keeps your identity key in a private file on this device."
+        : "Buzz keeps your identity key protected on this device. Make a separate backup in case you lose access.";
+  const storageTitle =
+    identityStorage === "system-keyring"
+      ? "Protected by your system keychain"
+      : identityStorage === "local-file"
+        ? "Stored in private device storage"
+        : "Protected in private device storage";
 
   if (optionsExpanded) {
     return (
@@ -188,7 +195,9 @@ export function BackupStep({
             Backup options
           </h1>
           <p className="mt-5 text-sm leading-6 text-foreground/75">
-            Choose how you want to keep a restorable copy of your identity key.
+            Your identity key works like a password for your Buzz account. Keep
+            a copy somewhere safe. You can create a backup file and lock it with
+            a password you can remember.
           </p>
         </div>
 
@@ -198,87 +207,76 @@ export function BackupStep({
             data-testid="backup-options"
           >
             <div
-              className="relative min-h-56 w-full md:col-span-2 lg:col-span-1"
-              data-testid="backup-storage-info"
+              className={cn(BACKUP_OPTION_CLASS, "md:col-span-2 lg:col-span-1")}
+              data-testid="backup-option-panel"
             >
-              <Card
-                aria-hidden="true"
-                className="pointer-events-none absolute inset-0 brightness-[0.02]"
-                variant="textured"
-              />
-              <div className="relative z-10 flex min-h-56 w-full flex-col justify-center p-10 text-left text-foreground">
-                <span className="text-lg font-medium">
-                  {storageMessage.title}
-                </span>
-                <span className="mt-3 block text-sm leading-6 text-foreground/65">
-                  {storageMessage.description}
-                </span>
-              </div>
+              <span className="text-lg font-medium">{storageTitle}</span>
+              <span className="mt-3 block text-sm leading-6 text-foreground/65">
+                {storageDescription}
+              </span>
             </div>
 
-            <div className="relative min-h-56 w-full">
-              <Card
-                aria-hidden="true"
-                className="pointer-events-none absolute inset-0 brightness-[0.005]"
-                variant="textured"
-              />
-              <div className="relative z-10 flex min-h-56 w-full flex-col justify-center p-10 text-left text-foreground">
-                <span className="text-lg font-medium">
-                  Save your key safely
-                </span>
-                <span className="mt-3 block text-sm leading-6 text-foreground/65">
-                  A password manager such as 1Password is a good place to keep
-                  your private key.
-                </span>
-                <Button
-                  className="mt-5 h-9 w-fit gap-2 rounded-full border border-white/20 bg-white/10 px-5 text-foreground hover:bg-white/15 hover:text-foreground"
-                  data-testid="backup-copy-key"
-                  disabled={copyState === "copying"}
-                  onClick={() => void copyKeyToClipboard()}
-                  type="button"
-                  variant="ghost"
-                >
-                  {copyState === "copying" ? (
-                    <Spinner className="h-4 w-4 border-2" />
-                  ) : copyState === "copied" ? (
-                    <Check className="h-4 w-4" aria-hidden="true" />
-                  ) : (
-                    <Copy className="h-4 w-4" aria-hidden="true" />
-                  )}
-                  {copyState === "copying"
-                    ? "Copying…"
-                    : copyState === "copied"
-                      ? "Copied to clipboard"
-                      : "Copy to clipboard"}
-                </Button>
-              </div>
+            <div
+              className={BACKUP_OPTION_CLASS}
+              data-testid="backup-option-panel"
+            >
+              <span className="text-lg font-medium">
+                Saved in your password manager
+              </span>
+              <span className="mt-3 block text-sm leading-6 text-foreground/65">
+                Copy your identity key, then save it in a password manager like
+                1Password.
+              </span>
+              <Button
+                className={cn(
+                  ONBOARDING_SECONDARY_CTA_CLASS,
+                  "mt-5 w-fit gap-2 px-5",
+                )}
+                data-testid="backup-copy-key"
+                disabled={copyState === "copying"}
+                onClick={() => void copyKeyToClipboard()}
+                type="button"
+                variant="ghost"
+              >
+                {copyState === "copying" ? (
+                  <Spinner className="h-4 w-4 border-2" />
+                ) : copyState === "copied" ? (
+                  <Check className="h-4 w-4" aria-hidden="true" />
+                ) : (
+                  <Copy className="h-4 w-4" aria-hidden="true" />
+                )}
+                {copyState === "copying"
+                  ? "Copying…"
+                  : copyState === "copied"
+                    ? "Copied to clipboard"
+                    : "Copy to clipboard"}
+              </Button>
             </div>
 
-            <div className="relative min-h-56 w-full">
-              <Card
-                aria-hidden="true"
-                className="pointer-events-none absolute inset-0 brightness-[0.005]"
-                variant="textured"
-              />
-              <div className="relative z-10 flex min-h-56 w-full flex-col justify-center p-10 text-left text-foreground">
-                <span className="text-lg font-medium">
-                  Create a portable backup
-                </span>
-                <span className="mt-3 block text-sm leading-6 text-foreground/65">
-                  Create a password-protected file you can store safely and use
-                  to restore your identity.
-                </span>
-                <Button
-                  className="mt-5 h-9 w-fit gap-2 rounded-full border border-white/20 bg-white/10 px-5 text-foreground hover:bg-white/15 hover:text-foreground"
-                  data-testid="backup-option-password"
-                  onClick={onOpenPasswordBackup}
-                  type="button"
-                  variant="ghost"
-                >
-                  <ShieldCheck className="h-5 w-5" aria-hidden="true" />
-                  Back up with a password
-                </Button>
-              </div>
+            <div
+              className={BACKUP_OPTION_CLASS}
+              data-testid="backup-option-panel"
+            >
+              <span className="text-lg font-medium">
+                Locked in a backup file
+              </span>
+              <span className="mt-3 block text-sm leading-6 text-foreground/65">
+                Create a backup file and choose a password you can remember.
+                You’ll need both to restore your account.
+              </span>
+              <Button
+                className={cn(
+                  ONBOARDING_SECONDARY_CTA_CLASS,
+                  "mt-5 w-fit gap-2 px-5",
+                )}
+                data-testid="backup-option-password"
+                onClick={onOpenPasswordBackup}
+                type="button"
+                variant="ghost"
+              >
+                <ShieldCheck className="h-5 w-5" aria-hidden="true" />
+                Create locked backup
+              </Button>
             </div>
           </div>
 
@@ -386,7 +384,7 @@ export function BackupStep({
 
             <div className="mt-4 flex flex-col items-center">
               <Button
-                className="h-9 gap-1.5 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
+                className={cn(ONBOARDING_SECONDARY_CTA_CLASS, "gap-1.5")}
                 data-testid="backup-options-toggle"
                 onClick={onShowOptions}
                 type="button"
@@ -431,7 +429,7 @@ export function BackupStep({
           </Button>
 
           <Button
-            className="h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
+            className={ONBOARDING_SECONDARY_CTA_CLASS}
             data-testid="onboarding-back"
             onClick={onBack}
             type="button"

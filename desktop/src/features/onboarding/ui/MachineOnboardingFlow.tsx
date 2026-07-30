@@ -22,6 +22,7 @@ import { LandingBees } from "./LandingBees";
 import { NostrKeyImportForm } from "./NostrKeyImportForm";
 import {
   ONBOARDING_LANDING_CTA_CLASS,
+  ONBOARDING_SECONDARY_CTA_CLASS,
   OnboardingChrome,
 } from "./OnboardingChrome";
 import { OnboardingFooterProvider } from "./OnboardingFooter";
@@ -170,7 +171,7 @@ export function MachineOnboardingFlow({
       {isSecuritySubview ? (
         <div className="fixed inset-x-0 top-8 z-20 flex justify-center px-6">
           <Button
-            className="h-9 gap-2 rounded-full bg-foreground/10 px-5 text-foreground hover:bg-foreground/15 hover:text-foreground"
+            className={`${ONBOARDING_SECONDARY_CTA_CLASS} gap-2 px-5`}
             data-testid="backup-return-to-onboarding"
             onClick={() => {
               setBackupDirection("backward");
@@ -228,7 +229,7 @@ export function MachineOnboardingFlow({
                       : "Create a new identity key"}
                 </Button>
                 <Button
-                  className="h-9 rounded-full bg-foreground/10 px-5 hover:bg-foreground/15"
+                  className={`${ONBOARDING_SECONDARY_CTA_CLASS} px-5`}
                   disabled={isPending}
                   onClick={() => setPage("key-import")}
                   type="button"

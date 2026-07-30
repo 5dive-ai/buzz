@@ -38,6 +38,11 @@ import {
   BackupTestFlow,
   initialBackupTestProgress,
 } from "./BackupTestFlow";
+import {
+  ONBOARDING_PRIMARY_CTA_CLASS,
+  ONBOARDING_SECONDARY_CTA_CLASS,
+  ONBOARDING_SECURITY_ICON_CLASS,
+} from "./OnboardingChrome";
 
 /** Word-count bounds mirroring `key_backup.rs` (Rust clamps regardless). */
 const MIN_GENERATED_WORDS = 3;
@@ -314,7 +319,10 @@ function PassphraseGeneratorPopover({
       <PopoverAnchor asChild>
         <Button
           aria-label="Generate a password"
-          className="absolute right-9 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+          className={cn(
+            "absolute right-9 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground",
+            securityTheme && ONBOARDING_SECURITY_ICON_CLASS,
+          )}
           data-testid="backup-passphrase-generate"
           disabled={disabled}
           onClick={() => {
@@ -338,7 +346,7 @@ function PassphraseGeneratorPopover({
       <PopoverContent
         align="end"
         className={cn(
-          "w-72 space-y-3",
+          "w-72 space-y-3 text-foreground",
           securityTheme && "buzz-onboarding-security-theme",
         )}
         onInteractOutside={(event) => {
@@ -352,6 +360,9 @@ function PassphraseGeneratorPopover({
           }
         }}
         onOpenAutoFocus={(event) => event.preventDefault()}
+        surface={securityTheme ? "textured" : "default"}
+        textureSize="compact"
+        textureTone={securityTheme ? "dark" : "light"}
       >
         <div className="flex items-center justify-between gap-4">
           <label
@@ -600,7 +611,12 @@ export function EncryptedBackupCreator({
         <Input
           aria-label="Encryption password"
           autoComplete="new-password"
-          className="h-10 bg-background pr-19 font-mono"
+          className={cn(
+            "font-mono",
+            variant === "spotlight"
+              ? "h-14 rounded-none border-0 bg-transparent px-20 text-center text-lg shadow-none focus-visible:ring-0"
+              : "h-10 bg-background pr-19",
+          )}
           data-testid="backup-passphrase-input"
           disabled={state.downloadPending}
           readOnly={state.savedPassword}
@@ -654,7 +670,10 @@ export function EncryptedBackupCreator({
                 ? "Hide password"
                 : "Reveal password"
           }
-          className="absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+          className={cn(
+            "absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground",
+            variant === "spotlight" && ONBOARDING_SECURITY_ICON_CLASS,
+          )}
           data-testid="backup-passphrase-reveal-toggle"
           disabled={state.downloadPending}
           onClick={() =>
@@ -780,6 +799,9 @@ export function EncryptedBackupCreator({
             variant === "spotlight" && "buzz-onboarding-security-theme",
           )}
           data-testid="backup-change-password-dialog"
+          surface={variant === "spotlight" ? "textured" : "default"}
+          textureSize="compact"
+          textureTone={variant === "spotlight" ? "dark" : "light"}
         >
           <AlertDialogHeader>
             <AlertDialogTitle>Create a new backup password?</AlertDialogTitle>
@@ -790,8 +812,21 @@ export function EncryptedBackupCreator({
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Keep current backup</AlertDialogCancel>
+            <AlertDialogCancel
+              className={
+                variant === "spotlight"
+                  ? ONBOARDING_SECONDARY_CTA_CLASS
+                  : undefined
+              }
+            >
+              Keep current backup
+            </AlertDialogCancel>
             <AlertDialogAction
+              className={
+                variant === "spotlight"
+                  ? ONBOARDING_PRIMARY_CTA_CLASS
+                  : undefined
+              }
               data-testid="backup-start-new-password"
               onClick={() => {
                 dispatch({ type: "start-new-backup" });

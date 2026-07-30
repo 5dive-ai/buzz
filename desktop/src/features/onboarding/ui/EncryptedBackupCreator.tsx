@@ -1,4 +1,11 @@
-import { AlertTriangle, Eye, EyeOff, RefreshCw } from "lucide-react";
+import {
+  AlertTriangle,
+  Eye,
+  EyeOff,
+  LockKeyhole,
+  RefreshCw,
+} from "lucide-react";
+import { motion, useReducedMotion } from "motion/react";
 import * as React from "react";
 import { createPortal } from "react-dom";
 
@@ -74,6 +81,101 @@ const PENDING_TICKER_INTERVAL_MS = 2500;
 
 /** Matches the `duration-300` slide transition on the ticker column. */
 const PENDING_TICKER_SLIDE_MS = 300;
+
+const BACKUP_KEY_DOTS = [
+  "key-dot-1",
+  "key-dot-2",
+  "key-dot-3",
+  "key-dot-4",
+  "key-dot-5",
+  "key-dot-6",
+  "key-dot-7",
+  "key-dot-8",
+  "key-dot-9",
+] as const;
+
+const TIMELINE_CONNECTOR_DOTS = [
+  "connector-dot-1",
+  "connector-dot-2",
+  "connector-dot-3",
+  "connector-dot-4",
+] as const;
+
+const TIMELINE_DOT_INITIAL = { opacity: 0.35, scale: 0.85 };
+const TIMELINE_DOT_PULSE = {
+  opacity: [0.35, 1, 0.35],
+  scale: [0.85, 1.25, 0.85],
+};
+const TIMELINE_DOT_TRANSITION = {
+  duration: 0.7,
+  ease: "easeInOut" as const,
+  repeat: Number.POSITIVE_INFINITY,
+  repeatDelay: 1.2,
+};
+const TIMELINE_TOP_DOT_TRANSITIONS = TIMELINE_CONNECTOR_DOTS.map(
+  (_, index) => ({
+    ...TIMELINE_DOT_TRANSITION,
+    delay: index * 0.16,
+  }),
+);
+const TIMELINE_BOTTOM_DOT_TRANSITIONS = TIMELINE_CONNECTOR_DOTS.map(
+  (_, index) => ({
+    ...TIMELINE_DOT_TRANSITION,
+    delay: (index + TIMELINE_CONNECTOR_DOTS.length) * 0.16 + 0.24,
+  }),
+);
+
+/**
+ * Decorative key → password → lock timeline for the onboarding security
+ * surface. The password field is layered over its center by the caller.
+ */
+function BackupPasswordTimeline() {
+  const reduceMotion = useReducedMotion() ?? false;
+
+  return (
+    <div
+      aria-hidden
+      className="pointer-events-none absolute inset-0 [@media(max-height:40rem)]:hidden"
+      data-testid="backup-password-timeline"
+    >
+      <div className="absolute inset-x-0 top-4 flex items-center justify-center gap-2">
+        {BACKUP_KEY_DOTS.map((dot) => (
+          <span
+            className="block size-2 rounded-full bg-foreground/85"
+            key={dot}
+          />
+        ))}
+      </div>
+      <div className="absolute left-1/2 top-11 flex h-12 -translate-x-1/2 flex-col justify-between">
+        {TIMELINE_CONNECTOR_DOTS.map((dot, index) => (
+          <motion.span
+            animate={reduceMotion ? undefined : TIMELINE_DOT_PULSE}
+            className="block size-1.5 rounded-full bg-foreground/65"
+            initial={reduceMotion ? false : TIMELINE_DOT_INITIAL}
+            key={`top-${dot}`}
+            transition={
+              reduceMotion ? undefined : TIMELINE_TOP_DOT_TRANSITIONS[index]
+            }
+          />
+        ))}
+      </div>
+      <div className="absolute bottom-15 left-1/2 flex h-12 -translate-x-1/2 flex-col justify-between">
+        {TIMELINE_CONNECTOR_DOTS.map((dot, index) => (
+          <motion.span
+            animate={reduceMotion ? undefined : TIMELINE_DOT_PULSE}
+            className="block size-1.5 rounded-full bg-foreground/65"
+            initial={reduceMotion ? false : TIMELINE_DOT_INITIAL}
+            key={`bottom-${dot}`}
+            transition={
+              reduceMotion ? undefined : TIMELINE_BOTTOM_DOT_TRANSITIONS[index]
+            }
+          />
+        ))}
+      </div>
+      <LockKeyhole className="absolute bottom-0 left-1/2 size-10 -translate-x-1/2 text-foreground/85" />
+    </div>
+  );
+}
 
 /**
  * Vertical ticker for the queued-download button label — cycles through the
@@ -572,6 +674,11 @@ export function EncryptedBackupCreator({
   }, [onVerified, setVerified]);
 
   const issue = passphraseIssue(state.passphrase);
+  const showBackupTimeline =
+    variant === "spotlight" &&
+    !state.savedPassword &&
+    !state.createError &&
+    !saveError;
 
   // The test view requires a successful save, not just a committed blob —
   // while the native save dialog is open the password form stays put.
@@ -601,114 +708,124 @@ export function EncryptedBackupCreator({
       className={cn("mx-auto w-full max-w-[500px] space-y-3 text-left")}
       data-testid="encrypted-backup-creator"
     >
-      <div className="relative">
-        <Input
-          aria-label="Encryption password"
-          autoComplete="new-password"
-          className={cn(
-            "font-mono",
-            variant === "spotlight"
-              ? "h-14 rounded-2xl border-black/20 bg-white px-20 text-center text-lg text-black/80 shadow-none placeholder:text-black/55 focus-visible:ring-black/35"
-              : "h-10 bg-background pr-19",
-          )}
-          data-testid="backup-passphrase-input"
-          disabled={state.downloadPending}
-          readOnly={state.savedPassword}
-          aria-describedby={
-            state.savedPassword
-              ? "backup-saved-password-description"
-              : undefined
-          }
-          onBeforeInput={(event) => {
-            if (state.savedPassword) {
-              event.preventDefault();
-              setConfirmNewPassword(true);
-            }
-          }}
-          onPaste={(event) => {
-            if (state.savedPassword) {
-              event.preventDefault();
-              setConfirmNewPassword(true);
-            }
-          }}
-          onChange={(event) =>
-            dispatch({ type: "set-passphrase", value: event.target.value })
-          }
-          placeholder={
-            state.savedPassword
-              ? ""
-              : `Password (min ${MIN_PASSPHRASE_LEN} characters)`
-          }
-          type={isRevealed ? "text" : "password"}
-          value={state.passphrase}
-        />
-        {state.savedPassword ? (
-          <div
-            aria-hidden
+      <div
+        className={cn(
+          "relative",
+          showBackupTimeline && "pb-32 pt-28 [@media(max-height:40rem)]:py-0",
+        )}
+      >
+        {showBackupTimeline ? <BackupPasswordTimeline /> : null}
+        <div className="relative z-10">
+          <Input
+            aria-label="Encryption password"
+            autoComplete="new-password"
             className={cn(
-              "pointer-events-none absolute inset-y-0 left-3 flex items-center font-mono tracking-widest text-foreground",
-              variant === "spotlight" && "text-black/80",
+              "font-mono",
+              variant === "spotlight"
+                ? "h-14 rounded-2xl border-black/20 bg-white px-20 text-center text-lg text-black/80 shadow-none placeholder:text-black/55 focus-visible:ring-black/35"
+                : "h-10 bg-background pr-19",
             )}
-            data-testid="backup-saved-password-mask"
+            data-testid="backup-passphrase-input"
+            disabled={state.downloadPending}
+            readOnly={state.savedPassword}
+            aria-describedby={
+              state.savedPassword
+                ? "backup-saved-password-description"
+                : undefined
+            }
+            onBeforeInput={(event) => {
+              if (state.savedPassword) {
+                event.preventDefault();
+                setConfirmNewPassword(true);
+              }
+            }}
+            onPaste={(event) => {
+              if (state.savedPassword) {
+                event.preventDefault();
+                setConfirmNewPassword(true);
+              }
+            }}
+            onChange={(event) =>
+              dispatch({ type: "set-passphrase", value: event.target.value })
+            }
+            placeholder={
+              state.savedPassword
+                ? ""
+                : `Password (min ${MIN_PASSPHRASE_LEN} characters)`
+            }
+            type={isRevealed ? "text" : "password"}
+            value={state.passphrase}
+          />
+          {state.savedPassword ? (
+            <div
+              aria-hidden
+              className={cn(
+                "pointer-events-none absolute inset-y-0 left-3 flex items-center font-mono tracking-widest text-foreground",
+                variant === "spotlight" && "text-black/80",
+              )}
+              data-testid="backup-saved-password-mask"
+            >
+              ••••••••••••••••••••••••••••••••
+            </div>
+          ) : null}
+          {state.savedPassword ? (
+            <span className="sr-only" id="backup-saved-password-description">
+              Backup password saved; hidden for security.
+            </span>
+          ) : null}
+          <Button
+            aria-label={
+              state.savedPassword
+                ? "Change saved backup password"
+                : isRevealed
+                  ? "Hide password"
+                  : "Reveal password"
+            }
+            className={cn(
+              "absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground",
+              variant === "spotlight" &&
+                "text-black/55 hover:bg-black/5 hover:text-black/80",
+            )}
+            data-testid="backup-passphrase-reveal-toggle"
+            disabled={state.downloadPending}
+            onClick={() =>
+              state.savedPassword
+                ? setConfirmNewPassword(true)
+                : setIsRevealed((revealed) => !revealed)
+            }
+            size="icon"
+            type="button"
+            variant="ghost"
           >
-            ••••••••••••••••••••••••••••••••
-          </div>
-        ) : null}
-        {state.savedPassword ? (
-          <span className="sr-only" id="backup-saved-password-description">
-            Backup password saved; hidden for security.
-          </span>
-        ) : null}
-        <Button
-          aria-label={
-            state.savedPassword
-              ? "Change saved backup password"
-              : isRevealed
-                ? "Hide password"
-                : "Reveal password"
-          }
-          className={cn(
-            "absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground",
-            variant === "spotlight" &&
-              "text-black/55 hover:bg-black/5 hover:text-black/80",
-          )}
-          data-testid="backup-passphrase-reveal-toggle"
-          disabled={state.downloadPending}
-          onClick={() =>
-            state.savedPassword
-              ? setConfirmNewPassword(true)
-              : setIsRevealed((revealed) => !revealed)
-          }
-          size="icon"
-          type="button"
-          variant="ghost"
-        >
-          {isRevealed ? (
-            <EyeOff className="h-4 w-4" aria-hidden="true" />
-          ) : (
-            <Eye className="h-4 w-4" aria-hidden="true" />
-          )}
-        </Button>
-        <PassphraseGeneratorPopover
-          disabled={state.downloadPending}
-          onRequestGenerate={
-            state.savedPassword ? () => setConfirmNewPassword(true) : undefined
-          }
-          onGenerated={(value) => {
-            dispatch({ type: "set-passphrase", value });
-            // A generated password must be visible so the user can save it.
-            setIsRevealed(true);
-          }}
-          securityTheme={variant === "spotlight"}
-        />
-        {issue ? (
-          <p
-            className="absolute left-1 top-full mt-1 animate-in text-xs text-muted-foreground fade-in slide-in-from-top-1 duration-200 motion-reduce:animate-none"
-            data-testid="backup-passphrase-issue"
-          >
-            {issue}
-          </p>
-        ) : null}
+            {isRevealed ? (
+              <EyeOff className="h-4 w-4" aria-hidden="true" />
+            ) : (
+              <Eye className="h-4 w-4" aria-hidden="true" />
+            )}
+          </Button>
+          <PassphraseGeneratorPopover
+            disabled={state.downloadPending}
+            onRequestGenerate={
+              state.savedPassword
+                ? () => setConfirmNewPassword(true)
+                : undefined
+            }
+            onGenerated={(value) => {
+              dispatch({ type: "set-passphrase", value });
+              // A generated password must be visible so the user can save it.
+              setIsRevealed(true);
+            }}
+            securityTheme={variant === "spotlight"}
+          />
+          {issue ? (
+            <p
+              className="absolute left-1 top-full mt-1 animate-in text-xs text-muted-foreground fade-in slide-in-from-top-1 duration-200 motion-reduce:animate-none"
+              data-testid="backup-passphrase-issue"
+            >
+              {issue}
+            </p>
+          ) : null}
+        </div>
       </div>
 
       {state.savedPassword && state.ncryptsec && savedPath ? (

@@ -300,6 +300,51 @@ test("markdown tables overflow wide content and fill the message when narrow", a
     .toBeLessThanOrEqual(1);
 });
 
+test("link preview style defaults to compact and Rich unfurls descriptions", async ({
+  page,
+}) => {
+  const previewUrl = "https://github.com/block/buzz/pull/3246";
+  await page.setViewportSize({ width: 800, height: 900 });
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page.getByTestId("message-input").fill(previewUrl);
+  await page.getByTestId("send-message").click();
+
+  const row = page.getByTestId("message-row").last();
+  await expect(
+    row.locator('[data-link-preview="github-pull-request"]'),
+  ).toHaveCSS("border-top-left-radius", "16px");
+
+  await openSettings(page, "appearance");
+  await expect(page.getByTestId("link-preview-style-trigger")).toHaveText(
+    "Compact",
+  );
+  await page.getByTestId("link-preview-style-trigger").click();
+  await page.getByTestId("link-preview-style-rich").click();
+  await expect(page.getByTestId("link-preview-style-trigger")).toHaveText(
+    "Rich",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        localStorage.getItem("buzz.appearance.linkPreviewStyle"),
+      ),
+    )
+    .toBe("rich");
+
+  await page.getByTestId("settings-back-to-app").click();
+  const richPreview = row.locator(
+    '[data-link-preview="github-pull-request"][data-link-preview-inline]',
+  );
+  await expect(richPreview).toBeVisible();
+  await expect(
+    richPreview.locator('[data-slot="attachment-description"]'),
+  ).toBeVisible();
+  await expect(richPreview.locator("[data-link-preview-hostname]")).toHaveText(
+    "github.com",
+  );
+});
+
 test("link preview image geometry stays stable while loading", async ({
   page,
 }) => {

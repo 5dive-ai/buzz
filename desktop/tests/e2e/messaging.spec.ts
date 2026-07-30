@@ -310,7 +310,9 @@ test("link preview image geometry stays stable while loading", async ({
     await page.goto("/");
     await page.getByTestId("channel-general").click();
     await page.setViewportSize({ width, height: 700 });
-    await page.getByTestId("message-input").fill(previewUrl);
+    await page
+      .getByTestId("message-input")
+      .fill(`${previewUrl}?viewport=${width}`);
     await page.getByTestId("send-message").click();
 
     const card = page
@@ -328,9 +330,23 @@ test("link preview image geometry stays stable while loading", async ({
     }
     const pending = await card.evaluate((element) => ({
       height: element.getBoundingClientRect().height,
+      width: element.getBoundingClientRect().width,
       textLeft: element
         .querySelector('[data-slot="attachment-content"]')
         ?.getBoundingClientRect().left,
+      textInset: (() => {
+        const content = element.querySelector("[data-link-preview-hostname]");
+        const thumbnail = element.querySelector(
+          "[data-link-preview-thumbnail]",
+        );
+        return content && thumbnail
+          ? content.getBoundingClientRect().left -
+              thumbnail.getBoundingClientRect().right
+          : undefined;
+      })(),
+      thumbnailHeight: element
+        .querySelector("[data-link-preview-thumbnail]")
+        ?.getBoundingClientRect().height,
       thumbnailWidth: element
         .querySelector("[data-link-preview-thumbnail]")
         ?.getBoundingClientRect().width,
@@ -344,19 +360,35 @@ test("link preview image geometry stays stable while loading", async ({
       });
     }
     const loaded = await card.evaluate((element) => ({
+      description: element.querySelector('[data-slot="attachment-description"]')
+        ?.textContent,
       height: element.getBoundingClientRect().height,
+      titleClass: element.querySelector('[data-slot="attachment-title"]')
+        ?.className,
       textLeft: element
         .querySelector('[data-slot="attachment-content"]')
         ?.getBoundingClientRect().left,
+      thumbnailHeight: element
+        .querySelector("[data-link-preview-thumbnail]")
+        ?.getBoundingClientRect().height,
       thumbnailWidth: element
         .querySelector("[data-link-preview-thumbnail]")
         ?.getBoundingClientRect().width,
     }));
 
+    expect(pending.width).toBe(width < 640 ? 325 : 360);
+    expect(pending.height).toBe(80);
+    expect(pending.textInset).toBe(12);
+    expect(pending.thumbnailHeight).toBe(78);
     expect(loaded.height).toBe(pending.height);
     expect(loaded.textLeft).toBe(pending.textLeft);
+    expect(loaded.thumbnailHeight).toBe(pending.thumbnailHeight);
     expect(loaded.thumbnailWidth).toBe(pending.thumbnailWidth);
-    expect(loaded.thumbnailWidth).toBe(width < 640 ? 64 : 107);
+    expect(loaded.thumbnailWidth).toBe(width < 640 ? 112 : 128);
+    expect(loaded.titleClass).toContain("truncate");
+    expect(loaded.description).toBe(
+      "A polished, stable preview for shared links.",
+    );
   }
 });
 
@@ -370,7 +402,9 @@ test("link preview no-image collapse restores the compact card", async ({
     await page.goto("/");
     await page.getByTestId("channel-general").click();
     await page.setViewportSize({ width, height: 700 });
-    await page.getByTestId("message-input").fill(previewUrl);
+    await page
+      .getByTestId("message-input")
+      .fill(`${previewUrl}&viewport=${width}`);
     await page.getByTestId("send-message").click();
 
     const card = page
@@ -378,6 +412,7 @@ test("link preview no-image collapse restores the compact card", async ({
       .last()
       .locator('[data-link-preview="github-pull-request"]');
     await expect(card).toHaveAttribute("data-image-state", "pending");
+    await expect(card).toBeVisible();
     const pending = await card.evaluate((element) => ({
       height: element.getBoundingClientRect().height,
       textLeft: element

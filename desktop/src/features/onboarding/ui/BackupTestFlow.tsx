@@ -4,6 +4,7 @@ import * as React from "react";
 import { createPortal } from "react-dom";
 
 import {
+  getNsec,
   verifyNcryptsecBackup,
   type BackupVerification,
 } from "@/shared/api/tauriIdentity";
@@ -84,6 +85,7 @@ const VERIFICATION_DOT_TRANSITION = {
   repeat: Number.POSITIVE_INFINITY,
   repeatDelay: 1.2,
 };
+const PRIVATE_KEY_MASK = Array.from({ length: 63 }, () => "•").join("\u200b");
 
 type BurstParticle = {
   id: number;
@@ -244,6 +246,13 @@ export function BackupTestFlow({
   const [error, setError] = React.useState<string | null>(null);
   const [isVerifying, setIsVerifying] = React.useState(false);
   const [isRevealed, setIsRevealed] = React.useState(false);
+  const [successNsec, setSuccessNsec] = React.useState<string | null>(null);
+  const [isSuccessNsecRevealed, setIsSuccessNsecRevealed] =
+    React.useState(false);
+  const [isLoadingSuccessNsec, setIsLoadingSuccessNsec] = React.useState(false);
+  const [successNsecError, setSuccessNsecError] = React.useState<string | null>(
+    null,
+  );
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
   const passwordInputRef = React.useRef<HTMLInputElement | null>(null);
   const mountedRef = React.useRef(true);
@@ -328,6 +337,32 @@ export function BackupTestFlow({
     }
   }, [attempt, isVerifying, ncryptsec, onProgressChange, onVerified]);
 
+  const toggleSuccessNsec = React.useCallback(async () => {
+    if (isSuccessNsecRevealed) {
+      setIsSuccessNsecRevealed(false);
+      return;
+    }
+    if (successNsec) {
+      setIsSuccessNsecRevealed(true);
+      return;
+    }
+    setIsLoadingSuccessNsec(true);
+    setSuccessNsecError(null);
+    try {
+      const value = await getNsec();
+      if (!mountedRef.current) return;
+      setSuccessNsec(value);
+      setIsSuccessNsecRevealed(true);
+    } catch (err) {
+      if (!mountedRef.current) return;
+      setSuccessNsecError(
+        err instanceof Error ? err.message : "Could not retrieve your key.",
+      );
+    } finally {
+      if (mountedRef.current) setIsLoadingSuccessNsec(false);
+    }
+  }, [isSuccessNsecRevealed, successNsec]);
+
   const isSpotlight = variant === "spotlight";
 
   if (stage === "success" && result) {
@@ -360,24 +395,80 @@ export function BackupTestFlow({
             reduceMotion ? { duration: 0 } : { delay: 0.15, duration: 0.35 }
           }
         >
-          <p className="text-lg font-medium text-foreground">
-            {isCeremony ? "Your backup works!" : "This backup works"}
-          </p>
-          <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
-            {isCeremony
-              ? "File and password verified. Keep them both somewhere safe — that's all you need to restore your identity."
-              : result.matchesCurrentIdentity
-                ? "It restores your current Buzz identity."
-                : "It restores a different identity than the one signed in here."}
-          </p>
-          {isCeremony ? null : (
-            <div className="mt-3 flex justify-center">
-              <PubKey
-                pubkey={result.pubkey}
-                testId="backup-test-npub"
-                variant="full"
-              />
+          {isCeremony ? (
+            <div className="w-full max-w-140">
+              <p className="text-lg font-medium text-foreground">
+                Your backup works!
+              </p>
+              <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+                File and password verified. Keep them both somewhere safe —
+                that&apos;s all you need to restore your identity.
+              </p>
+              <div className="mx-auto mt-4 flex max-w-110 min-w-0 items-center gap-2 text-left">
+                <p
+                  className={cn(
+                    "min-w-0 flex-1 break-all font-mono text-base leading-6 wrap-anywhere",
+                    isSuccessNsecRevealed
+                      ? "select-text text-foreground"
+                      : "select-none blur-[2px] text-muted-foreground",
+                  )}
+                  data-testid="backup-success-nsec-value"
+                >
+                  {isSuccessNsecRevealed && successNsec
+                    ? successNsec
+                    : PRIVATE_KEY_MASK}
+                </p>
+                <Button
+                  aria-label={
+                    isSuccessNsecRevealed
+                      ? "Hide unlocked private key"
+                      : "Reveal unlocked private key"
+                  }
+                  className="size-9 shrink-0 text-muted-foreground hover:text-foreground"
+                  data-testid="backup-success-nsec-toggle"
+                  disabled={isLoadingSuccessNsec}
+                  onClick={() => void toggleSuccessNsec()}
+                  size="icon"
+                  type="button"
+                  variant="ghost"
+                >
+                  {isLoadingSuccessNsec ? (
+                    <Spinner className="size-4 border-2" />
+                  ) : isSuccessNsecRevealed ? (
+                    <EyeOff aria-hidden="true" className="size-4" />
+                  ) : (
+                    <Eye aria-hidden="true" className="size-4" />
+                  )}
+                </Button>
+              </div>
+              {successNsecError ? (
+                <p
+                  className="mt-2 text-xs text-destructive"
+                  data-testid="backup-success-nsec-error"
+                  role="alert"
+                >
+                  {successNsecError}
+                </p>
+              ) : null}
             </div>
+          ) : (
+            <>
+              <p className="text-lg font-medium text-foreground">
+                This backup works
+              </p>
+              <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+                {result.matchesCurrentIdentity
+                  ? "It restores your current Buzz identity."
+                  : "It restores a different identity than the one signed in here."}
+              </p>
+              <div className="mt-3 flex justify-center">
+                <PubKey
+                  pubkey={result.pubkey}
+                  testId="backup-test-npub"
+                  variant="full"
+                />
+              </div>
+            </>
           )}
         </motion.div>
         {isCeremony ? null : (

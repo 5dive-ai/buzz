@@ -732,6 +732,7 @@ export function EncryptedBackupCreator({
           <Input
             aria-label="Encryption password"
             autoComplete="new-password"
+            autoFocus={variant === "spotlight"}
             className={cn(
               "font-mono",
               variant === "spotlight"
@@ -761,6 +762,17 @@ export function EncryptedBackupCreator({
             onChange={(event) =>
               dispatch({ type: "set-passphrase", value: event.target.value })
             }
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" || event.nativeEvent.isComposing)
+                return;
+              event.preventDefault();
+              if (downloadDisabled(state) || isSaving) return;
+              if (state.savedPassword && state.ncryptsec) {
+                void handleSaveCopy();
+                return;
+              }
+              dispatch({ type: "download-clicked" });
+            }}
             placeholder={
               state.savedPassword
                 ? ""

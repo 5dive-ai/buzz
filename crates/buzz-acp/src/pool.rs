@@ -231,7 +231,7 @@ pub struct PromptResult {
     /// Read by the main loop to settle any events a native steer delivered
     /// into this turn: one that arrived at an epoch the turn never advanced
     /// past was never answered. See
-    /// [`crate::queue::EventQueue::resolve_delivered_steers`].
+    /// [`crate::queue::EventQueue::settle_turn_steers`].
     pub final_output_epoch: u64,
 }
 
@@ -3251,7 +3251,7 @@ fn classify_control_cancel_failure(
 ///
 /// Mid-turn steered events are NOT judged here — they arrived after the batch
 /// and carry their own acceptance epoch, so the queue settles them in
-/// [`crate::queue::EventQueue::resolve_delivered_steers`].
+/// [`crate::queue::EventQueue::settle_turn_steers`].
 fn is_dead_turn(
     source: &PromptSource,
     stop_reason: &StopReason,

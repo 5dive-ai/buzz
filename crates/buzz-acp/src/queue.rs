@@ -192,7 +192,7 @@ pub struct EventQueue {
     /// prior behaviour) is exactly how a mid-turn mention could vanish.
     ///
     /// Populated by [`record_delivered_steer`](Self::record_delivered_steer),
-    /// drained by [`resolve_delivered_steers`](Self::resolve_delivered_steers)
+    /// drained by [`settle_turn_steers`](Self::settle_turn_steers)
     /// when the turn terminates.
     delivered_native_steer: HashMap<Uuid, Vec<DeliveredSteer>>,
     /// Duration after which an in-flight channel is auto-expired as orphaned.
@@ -452,6 +452,10 @@ impl EventQueue {
     /// its fairness position. The retry delay comes from exponential backoff,
     /// not from resetting received_at.
     ///
+    /// The whole batch is reinserted — see
+    /// [`reinsert_batch_front`](Self::reinsert_batch_front) for why
+    /// `cancelled_events` are normalised into ordinary queued events.
+    ///
     /// After [`MAX_RETRIES`] attempts the batch is dead-lettered: logged at
     /// ERROR and returned to the caller (rather than requeued) so a visible
     /// failure notice can be posted to the channel. Returns `None` when the
@@ -468,13 +472,14 @@ impl EventQueue {
         };
 
         if attempt > MAX_RETRIES {
+            let events = batch.events.len() + batch.cancelled_events.len();
             tracing::error!(
                 channel_id = %channel_id,
                 attempt,
-                events = batch.events.len(),
+                events,
                 "dead-lettering batch after {} retries — discarding {} events",
                 MAX_RETRIES,
-                batch.events.len(),
+                events,
             );
             self.retry_counts.remove(&channel_id);
             // Also clear retry_after so fresh traffic on this channel isn't
@@ -501,13 +506,39 @@ impl EventQueue {
             attempt,
             max = MAX_RETRIES,
             delay_secs = delay.as_secs_f64(),
-            events = batch.events.len(),
+            events = batch.events.len() + batch.cancelled_events.len(),
             "requeueing failed batch with backoff"
         );
 
+        self.reinsert_batch_front(batch);
+        self.retry_after.insert(channel_id, Instant::now() + delay);
+        None
+    }
+
+    /// Push every event a batch was prompted with back to the FRONT of its
+    /// channel's queue, preserving each event's `prompt_tag`, `received_at`,
+    /// and `requires_response`.
+    ///
+    /// Both buckets are reinserted. A merged re-prompt carries the earlier,
+    /// interrupted events in `cancelled_events`; restoring only `events` would
+    /// silently discard them, which for a response-required mention is exactly
+    /// the silent-loss class the retry path exists to prevent.
+    ///
+    /// `cancelled_events` are normalised into ordinary queued events rather
+    /// than returned to the cancelled side table, for two reasons. The side
+    /// table is exempt from `retry_after` in `flush_next`'s cancelled-only
+    /// fallback, so restoring them there would let a throttled batch re-flush
+    /// immediately and spin. And the merge annotation frames work an agent was
+    /// interrupted part-way through; after a failed turn there is no
+    /// in-progress work left to frame — every event is simply pending again.
+    ///
+    /// Cancelled events precede the newer events they were merged with, so the
+    /// queue front stays in arrival order.
+    fn reinsert_batch_front(&mut self, batch: FlushBatch) {
+        let channel_id = batch.channel_id;
         let queue = self.queues.entry(channel_id).or_default();
         // Push to front in reverse order so original order is preserved.
-        for be in batch.events.into_iter().rev() {
+        for be in batch.cancelled_events.into_iter().chain(batch.events).rev() {
             queue.push_front(QueuedEvent {
                 channel_id,
                 event: be.event,
@@ -516,19 +547,16 @@ impl EventQueue {
                 requires_response: be.requires_response,
             });
         }
-        // Enforce per-channel cap: trim oldest (back) events if requeue pushed
-        // the queue over the limit. Without this, repeated requeue+push cycles
+        // Enforce per-channel cap. Without this, repeated requeue+push cycles
         // can grow the queue unboundedly.
         while queue.len() > MAX_PENDING_PER_CHANNEL {
             queue.pop_back();
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
-                "requeue overflow — dropped oldest event to enforce cap"
+                "batch reinsert overflow — dropped newest event to enforce cap"
             );
         }
-        self.retry_after.insert(channel_id, Instant::now() + delay);
-        None
     }
 
     /// Re-queue a batch preserving original `received_at` timestamps.
@@ -540,27 +568,7 @@ impl EventQueue {
     /// Does NOT set `retry_after`. Does NOT remove from `in_flight_channels` —
     /// caller must call `mark_complete` separately.
     pub fn requeue_preserve_timestamps(&mut self, batch: FlushBatch) {
-        let channel_id = batch.channel_id;
-        let queue = self.queues.entry(channel_id).or_default();
-        // Push to front in reverse order so original order is preserved.
-        for be in batch.events.into_iter().rev() {
-            queue.push_front(QueuedEvent {
-                channel_id,
-                event: be.event,
-                prompt_tag: be.prompt_tag,
-                received_at: be.received_at,
-                requires_response: be.requires_response,
-            });
-        }
-        // Enforce per-channel cap: trim newest (back) events if over limit.
-        while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
-            tracing::warn!(
-                channel_id = %channel_id,
-                limit = MAX_PENDING_PER_CHANNEL,
-                "requeue_preserve overflow — dropped newest event to enforce cap"
-            );
-        }
+        self.reinsert_batch_front(batch);
     }
 
     /// Requeue a cancelled batch so its events appear as `cancelled_events`
@@ -634,6 +642,17 @@ impl EventQueue {
     #[cfg(test)]
     pub fn queued_event_count(&self, channel_id: &Uuid) -> usize {
         self.queues.get(channel_id).map_or(0, |q| q.len())
+    }
+
+    /// Event IDs queued for a channel, in dispatch order. Test-only — lets
+    /// tests outside this module assert *which* events survived a requeue,
+    /// not just how many.
+    #[cfg(test)]
+    pub fn queued_event_ids(&self, channel_id: &Uuid) -> Vec<String> {
+        self.queues
+            .get(channel_id)
+            .map(|q| q.iter().map(|qe| qe.event.id.to_hex()).collect())
+            .unwrap_or_default()
     }
 
     /// Force a channel's retry-attempt counter to `count`, simulating `count`
@@ -735,20 +754,26 @@ impl EventQueue {
     ///
     /// Called on `SteerAck::Err(_)` and `SteerAck::PromptCompletedNeutral`
     /// (delivery unknown after prompt completion; restoring queued event
-    /// for normal dispatch). Idempotent: a no-op if the event was already
-    /// removed or never withheld.
+    /// for normal dispatch).
     ///
-    /// Push-to-front matches the discipline of `requeue_preserve_timestamps`
-    /// at line 453, preserving fairness across channels.
-    pub fn release_native_steer(&mut self, channel_id: Uuid, event_id: &str) {
+    /// Returns `true` if the event was withheld and has been released.
+    /// Returns `false` — an idempotent no-op — when it is not in the withheld
+    /// table: it was already released, drained, or settled by
+    /// [`settle_turn_steers`](Self::settle_turn_steers) because the ack lost
+    /// the race with its turn's result. A `false` return means the caller must
+    /// not act on this ack any further; the event's fate is already decided.
+    ///
+    /// Push-to-front matches the discipline of `requeue_preserve_timestamps`,
+    /// preserving fairness across channels.
+    pub fn release_native_steer(&mut self, channel_id: Uuid, event_id: &str) -> bool {
         let Some(entries) = self.withheld_native_steer.get_mut(&channel_id) else {
-            return;
+            return false;
         };
         let Some(pos) = entries
             .iter()
             .position(|qe| qe.event.id.to_hex() == event_id)
         else {
-            return;
+            return false;
         };
         let qe = entries.remove(pos);
         if entries.is_empty() {
@@ -767,6 +792,7 @@ impl EventQueue {
                 "release_native_steer overflow — dropped newest event to enforce cap"
             );
         }
+        true
     }
 
     /// Move a withheld event into the delivered-steer ledger.
@@ -774,26 +800,27 @@ impl EventQueue {
     /// Called on `SteerAck::Success`: the agent has the event, so normal
     /// dispatch must not redeliver it, but the harness cannot yet tell whether
     /// the agent answered it. `accepted_at_epoch` is the turn's output epoch at
-    /// acceptance; [`resolve_delivered_steers`](Self::resolve_delivered_steers)
+    /// acceptance; [`settle_turn_steers`](Self::settle_turn_steers)
     /// compares it against the turn's final epoch.
     ///
-    /// Idempotent no-op when the event is not withheld (already released,
-    /// drained, or never queued) — the same race `mark_native_steer_pending`
-    /// tolerates.
+    /// Idempotent no-op returning `false` when the event is not withheld —
+    /// already released, drained, never queued, or settled by
+    /// [`settle_turn_steers`](Self::settle_turn_steers) because this ack lost
+    /// the race with its own turn's result.
     pub fn record_delivered_steer(
         &mut self,
         channel_id: Uuid,
         event_id: &str,
         accepted_at_epoch: u64,
-    ) {
+    ) -> bool {
         let Some(entries) = self.withheld_native_steer.get_mut(&channel_id) else {
-            return;
+            return false;
         };
         let Some(pos) = entries
             .iter()
             .position(|qe| qe.event.id.to_hex() == event_id)
         else {
-            return;
+            return false;
         };
         let event = entries.remove(pos);
         if entries.is_empty() {
@@ -806,97 +833,73 @@ impl EventQueue {
                 event,
                 accepted_at_epoch,
             });
+        true
     }
 
-    /// Settle every delivered steer for `channel_id` against the turn that has
-    /// just ended, and report how many of them went unanswered.
+    /// Settle **every** steer event a channel is holding — delivered and still
+    /// withheld — against the turn that has just ended, and report how many
+    /// were released back to the queue.
     ///
-    /// `final_output_epoch` is the turn's output epoch at termination. A
-    /// delivered event was answered iff the turn produced output *after* it
-    /// arrived, i.e. `final_output_epoch > accepted_at_epoch`.
+    /// `final_output_epoch` is the turn's output epoch at termination.
     ///
-    /// - Answered, or not response-required: retired. The agent handled it (or
-    ///   was never obliged to), and redelivering would double-deliver.
-    /// - Response-required and unanswered: pushed back to the queue front with
-    ///   its original `received_at`, so normal dispatch retries it. The retry
-    ///   is bounded like any other: the released event is dispatched as an
-    ///   ordinary batch, and a second silent turn takes the batch through
-    ///   `requeue`'s backoff and [`MAX_RETRIES`] dead-letter.
+    /// - **Delivered** (a `Success` ack was processed): answered iff the turn
+    ///   produced output *after* the delivery, i.e.
+    ///   `final_output_epoch > accepted_at_epoch`. Answered, or not
+    ///   response-required: retired — the agent handled it (or was never
+    ///   obliged to), and redelivering would double-deliver. Otherwise
+    ///   released for retry.
+    /// - **Withheld** (no ack processed before the turn ended): delivery is
+    ///   unknown, so every entry is released, matching the existing
+    ///   `PromptCompletedNeutral` policy.
     ///
-    /// Returns the number of events released. Callers log it with whatever
-    /// terminal condition they are settling — the queue cannot name that.
+    /// Covering both tables in one operation is what makes a late ack safe.
+    /// The ack watcher is a separate task on a separate channel from
+    /// `PromptResult`, so a genuinely-sent `Success` can be processed *after*
+    /// the turn it belongs to has terminated. Leaving the withheld entry for
+    /// that ack to move into the delivered ledger would strand it there with
+    /// no result left to settle it. Instead the turn settles it now, and the
+    /// late ack finds nothing in either table and is a no-op. The cost is at
+    /// most one visible duplicate — the same duplicate-over-silent-loss trade
+    /// the `startedNewTurn` outcome already accepts.
     ///
-    /// Always drains the ledger for the channel, including on the paths that
-    /// release nothing, so a delivered steer can never outlive its turn.
-    pub fn resolve_delivered_steers(&mut self, channel_id: Uuid, final_output_epoch: u64) -> usize {
-        let Some(entries) = self.delivered_native_steer.remove(&channel_id) else {
+    /// Released events go to the queue front with their original `received_at`
+    /// in arrival order across both tables. Retry stays bounded: a released
+    /// event is redispatched as an ordinary batch, so a second silent turn
+    /// takes it through `requeue`'s backoff and [`MAX_RETRIES`] dead-letter.
+    ///
+    /// Always drains both tables, including on the paths that release nothing,
+    /// so no steer event can outlive its turn.
+    pub fn settle_turn_steers(&mut self, channel_id: Uuid, final_output_epoch: u64) -> usize {
+        let delivered = self
+            .delivered_native_steer
+            .remove(&channel_id)
+            .unwrap_or_default();
+        let withheld = self
+            .withheld_native_steer
+            .remove(&channel_id)
+            .unwrap_or_default();
+        if delivered.is_empty() && withheld.is_empty() {
             return 0;
-        };
-        // Reverse so per-entry `push_front` composes back to original FIFO
-        // order at the queue front (same discipline as
-        // `recover_steer_events_for_expired_channel`).
-        let mut released = 0usize;
-        for delivered in entries.into_iter().rev() {
-            let answered = final_output_epoch > delivered.accepted_at_epoch;
-            if answered || !delivered.event.requires_response {
-                continue;
-            }
-            self.queues
-                .entry(channel_id)
-                .or_default()
-                .push_front(delivered.event);
-            released += 1;
         }
+
+        let mut releasing: Vec<QueuedEvent> = delivered
+            .into_iter()
+            .filter(|d| {
+                let answered = final_output_epoch > d.accepted_at_epoch;
+                !answered && d.event.requires_response
+            })
+            .map(|d| d.event)
+            .chain(withheld)
+            .collect();
+        let released = releasing.len();
         if released == 0 {
             return 0;
         }
+        // Sort then push_front in reverse so the queue front ends up in
+        // arrival order regardless of which table each event came from.
+        releasing.sort_by_key(|qe| qe.received_at);
         let queue = self.queues.entry(channel_id).or_default();
-        while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
-            tracing::warn!(
-                channel_id = %channel_id,
-                limit = MAX_PENDING_PER_CHANNEL,
-                "delivered-steer release overflow — dropped newest event to enforce cap"
-            );
-        }
-        released
-    }
-
-    /// Bulk-release every steer event held for `channel_id` — withheld or
-    /// already delivered — back to the queue front, preserving relative FIFO
-    /// order.
-    ///
-    /// Called from the `in_flight_deadline` expiry blocks in
-    /// `flush_next` and `has_flushable_work` — if a steer ack never arrives
-    /// (read loop hung, watcher never posted), the withheld events would
-    /// otherwise be permanently orphaned. Recover, do not log-and-drop: the
-    /// events were never delivered to the agent, so normal dispatch must
-    /// have a chance to deliver them.
-    ///
-    /// An expired in-flight channel also never reaches terminal
-    /// classification, so its delivered-steer ledger is settled here as if
-    /// the turn produced nothing — that turn is gone, and nothing it may have
-    /// emitted after the delivery is observable any more.
-    ///
-    /// Iterates the stored entries in reverse so per-entry `push_front`
-    /// composes to original-FIFO order at the queue front (same discipline
-    /// as `requeue_preserve_timestamps` at line 453).
-    fn recover_steer_events_for_expired_channel(&mut self, channel_id: Uuid) {
-        let released = self.resolve_delivered_steers(channel_id, 0);
-        if released > 0 {
-            tracing::warn!(
-                channel_id = %channel_id,
-                released,
-                "in-flight expiry released delivered steer event(s) — \
-                 turn never reported a result"
-            );
-        }
-        let Some(entries) = self.withheld_native_steer.remove(&channel_id) else {
-            return;
-        };
-        let n = entries.len();
-        let queue = self.queues.entry(channel_id).or_default();
-        for qe in entries.into_iter().rev() {
+        for qe in releasing.into_iter().rev() {
             queue.push_front(qe);
         }
         while queue.len() > MAX_PENDING_PER_CHANNEL {
@@ -904,15 +907,32 @@ impl EventQueue {
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
-                "withheld-steer recovery overflow — dropped newest event to enforce cap"
+                "steer settlement overflow — dropped newest event to enforce cap"
             );
         }
-        tracing::warn!(
-            channel_id = %channel_id,
-            recovered = n,
-            "in-flight expiry recovered withheld steer event(s) — \
-             steer ack never arrived; normal dispatch will deliver"
-        );
+        released
+    }
+
+    /// Settle an expired in-flight channel's steer events as if its turn
+    /// produced nothing.
+    ///
+    /// Called from the `in_flight_deadline` expiry blocks in `flush_next` and
+    /// `has_flushable_work`. An expired channel never reaches terminal
+    /// classification, so nothing else would settle its steer tables: a
+    /// withheld event whose ack never arrived (read loop hung, watcher never
+    /// posted) and a delivered event whose turn is gone are both recovered
+    /// rather than logged and dropped. Epoch 0 is the honest verdict — nothing
+    /// that turn may have emitted after the delivery is observable any more.
+    fn recover_steer_events_for_expired_channel(&mut self, channel_id: Uuid) {
+        let released = self.settle_turn_steers(channel_id, 0);
+        if released > 0 {
+            tracing::warn!(
+                channel_id = %channel_id,
+                released,
+                "in-flight expiry released steer event(s) — turn never reported a result; \
+                 normal dispatch will deliver"
+            );
+        }
     }
 
     /// Compact expired metadata entries to prevent unbounded map growth.
@@ -2952,6 +2972,178 @@ mod tests {
         );
     }
 
+    // ── Retry serialization preserves the whole batch ───────────────────────
+    //
+    // A merged re-prompt carries the events an interrupted turn was already
+    // working on in `cancelled_events`. Retry has to put BOTH buckets back:
+    // restoring only `events` drops the interrupted work, and when that work
+    // is a response-required mention the retry then "succeeds" silently with
+    // the mention gone for good.
+
+    /// Build the merged batch a cancel produces: `cancelled` was interrupted,
+    /// `new` arrived during the turn and triggered the merge.
+    fn merged_batch(ch: Uuid, cancelled: QueuedEvent, new: QueuedEvent) -> FlushBatch {
+        let to_batch_event = |qe: QueuedEvent| BatchEvent {
+            event: qe.event,
+            prompt_tag: qe.prompt_tag,
+            received_at: qe.received_at,
+            requires_response: qe.requires_response,
+        };
+        FlushBatch {
+            channel_id: ch,
+            events: vec![to_batch_event(new)],
+            cancelled_events: vec![to_batch_event(cancelled)],
+            cancel_reason: Some(CancelReason::Steer),
+        }
+    }
+
+    /// The defect trace: an interrupted mention merged with newer passive
+    /// traffic. If retry keeps only `events`, the retry batch is passive-only,
+    /// its next silent turn is legitimately successful, and the mention is
+    /// lost with no error anywhere.
+    #[test]
+    fn test_requeue_preserves_cancelled_response_required_mention() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let mention = make_queued_at(ch, "@agent please answer", Duration::from_secs(2));
+        let mut passive = make_queued_at(ch, "passive chatter", Duration::from_secs(1));
+        passive.requires_response = false;
+        let mention_id = mention.event.id.to_hex();
+        let mention_at = mention.received_at;
+        let passive_id = passive.event.id.to_hex();
+        let passive_at = passive.received_at;
+
+        q.requeue(merged_batch(ch, mention, passive));
+
+        let restored: Vec<(String, bool, Instant)> = q
+            .queues
+            .get(&ch)
+            .expect("both buckets must be restored")
+            .iter()
+            .map(|qe| (qe.event.id.to_hex(), qe.requires_response, qe.received_at))
+            .collect();
+        assert_eq!(
+            restored,
+            vec![
+                (mention_id, true, mention_at),
+                (passive_id, false, passive_at),
+            ],
+            "the cancelled mention must survive retry, keep its response-required \
+             bit and timestamp, and stay ahead of the newer passive event"
+        );
+    }
+
+    /// The reverse merge direction: the newer event is the mention and the
+    /// interrupted one is passive. The passive event is prior prompt content —
+    /// dropping it silently truncates what the agent is re-prompted with.
+    #[test]
+    fn test_requeue_preserves_both_buckets_in_reverse_merge_direction() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let mut passive = make_queued_at(ch, "passive chatter", Duration::from_secs(2));
+        passive.requires_response = false;
+        let mention = make_queued_at(ch, "@agent please answer", Duration::from_secs(1));
+        let passive_id = passive.event.id.to_hex();
+        let mention_id = mention.event.id.to_hex();
+
+        q.requeue(merged_batch(ch, passive, mention));
+
+        let restored: Vec<(String, bool)> = q
+            .queues
+            .get(&ch)
+            .expect("both buckets must be restored")
+            .iter()
+            .map(|qe| (qe.event.id.to_hex(), qe.requires_response))
+            .collect();
+        assert_eq!(
+            restored,
+            vec![(passive_id, false), (mention_id, true)],
+            "the interrupted passive event must survive alongside the mention"
+        );
+    }
+
+    /// `requeue_preserve_timestamps` (pool-exhausted / no-agent reinsertion,
+    /// and the panic-recovery path via `requeue`) shares the same
+    /// whole-batch rule.
+    #[test]
+    fn test_requeue_preserve_timestamps_preserves_cancelled_events() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let cancelled = make_queued_at(ch, "interrupted", Duration::from_secs(2));
+        let new = make_queued_at(ch, "new", Duration::from_secs(1));
+        let cancelled_id = cancelled.event.id.to_hex();
+        let new_id = new.event.id.to_hex();
+
+        q.requeue_preserve_timestamps(merged_batch(ch, cancelled, new));
+
+        let restored: Vec<String> = q
+            .queues
+            .get(&ch)
+            .expect("both buckets must be restored")
+            .iter()
+            .map(|qe| qe.event.id.to_hex())
+            .collect();
+        assert_eq!(restored, vec![cancelled_id, new_id]);
+    }
+
+    /// Reinserting a merged batch into a channel already at the cap must not
+    /// grow the queue past it — the extra bucket is not an exemption.
+    #[test]
+    fn test_requeue_merged_batch_enforces_per_channel_cap() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let cancelled = make_queued_at(ch, "interrupted", Duration::from_secs(2));
+        let new = make_queued_at(ch, "new", Duration::from_secs(1));
+        let cancelled_id = cancelled.event.id.to_hex();
+        for i in 0..MAX_PENDING_PER_CHANNEL {
+            q.push(make_queued(ch, &format!("filler {i}")));
+        }
+
+        q.requeue(merged_batch(ch, cancelled, new));
+
+        assert_eq!(
+            pending_count(&q),
+            MAX_PENDING_PER_CHANNEL,
+            "the cap holds across both buckets"
+        );
+        assert_eq!(
+            q.queues
+                .get(&ch)
+                .unwrap()
+                .front()
+                .unwrap()
+                .event
+                .id
+                .to_hex(),
+            cancelled_id,
+            "the oldest restored event stays at the front"
+        );
+    }
+
+    /// Both buckets count toward the retry budget's dead-letter log and the
+    /// batch handed back to the caller keeps everything it was prompted with,
+    /// so the failure notice is anchored on the real content.
+    #[test]
+    fn test_dead_lettered_merged_batch_returns_both_buckets() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let cancelled = make_queued_at(ch, "interrupted", Duration::from_secs(2));
+        let new = make_queued_at(ch, "new", Duration::from_secs(1));
+        q.set_retry_count_for_test(ch, MAX_RETRIES);
+
+        let dead = q
+            .requeue(merged_batch(ch, cancelled, new))
+            .expect("retry budget is exhausted");
+
+        assert_eq!(dead.events.len(), 1);
+        assert_eq!(dead.cancelled_events.len(), 1);
+        assert_eq!(
+            pending_count(&q),
+            0,
+            "a dead-lettered batch is not requeued"
+        );
+    }
+
     #[test]
     fn test_has_flushable_work() {
         let mut q = EventQueue::new(DedupMode::Queue);
@@ -4645,7 +4837,7 @@ mod tests {
     //
     // A `Success` ack means the agent *has* the event, not that it answered
     // it. `record_delivered_steer` parks it with the turn's output epoch at
-    // acceptance; `resolve_delivered_steers` settles it against the epoch at
+    // acceptance; `settle_turn_steers` settles it against the epoch at
     // termination. Output must arrive strictly after delivery to count.
 
     /// Build a delivered-steer scenario: `content` is pushed, withheld, then
@@ -4677,7 +4869,7 @@ mod tests {
         let event_id = deliver_steer(&mut q, ch, make_queued(ch, "mid-turn mention"), 0);
 
         assert_eq!(
-            q.resolve_delivered_steers(ch, 0),
+            q.settle_turn_steers(ch, 0),
             1,
             "a silent turn never answered the steered mention"
         );
@@ -4697,7 +4889,7 @@ mod tests {
         let event_id = deliver_steer(&mut q, ch, make_queued(ch, "mid-turn mention"), 2);
 
         assert_eq!(
-            q.resolve_delivered_steers(ch, 2),
+            q.settle_turn_steers(ch, 2),
             1,
             "output produced before the steer does not answer it"
         );
@@ -4715,7 +4907,7 @@ mod tests {
         deliver_steer(&mut q, ch, make_queued(ch, "mid-turn mention"), 2);
 
         assert_eq!(
-            q.resolve_delivered_steers(ch, 3),
+            q.settle_turn_steers(ch, 3),
             0,
             "the agent spoke after the steer landed"
         );
@@ -4738,7 +4930,7 @@ mod tests {
         deliver_steer(&mut q, ch, qe, 0);
 
         assert_eq!(
-            q.resolve_delivered_steers(ch, 0),
+            q.settle_turn_steers(ch, 0),
             0,
             "nobody asked the agent anything, so silence is correct"
         );
@@ -4759,7 +4951,7 @@ mod tests {
         let e1_id = deliver_steer(&mut q, ch, e1, 0);
         let e2_id = deliver_steer(&mut q, ch, e2, 0);
 
-        assert_eq!(q.resolve_delivered_steers(ch, 0), 2);
+        assert_eq!(q.settle_turn_steers(ch, 0), 2);
 
         let released: Vec<(String, Instant)> = q
             .queues
@@ -4787,7 +4979,7 @@ mod tests {
         }
         assert_eq!(pending_count(&q), MAX_PENDING_PER_CHANNEL);
 
-        assert_eq!(q.resolve_delivered_steers(ch, 0), 1);
+        assert_eq!(q.settle_turn_steers(ch, 0), 1);
 
         assert_eq!(
             pending_count(&q),
@@ -4810,7 +5002,7 @@ mod tests {
 
         q.record_delivered_steer(ch, "not-an-event-id", 0);
 
-        assert_eq!(q.resolve_delivered_steers(ch, 0), 0);
+        assert_eq!(q.settle_turn_steers(ch, 0), 0);
         assert_eq!(pending_count(&q), 0);
     }
 
@@ -4846,11 +5038,154 @@ mod tests {
         q.drain_channel(ch);
 
         assert_eq!(
-            q.resolve_delivered_steers(ch, 0),
+            q.settle_turn_steers(ch, 0),
             0,
             "a removed channel's ledger must be empty"
         );
         assert_eq!(pending_count(&q), 0);
+    }
+
+    // ── Late steer acks lose the race with their own turn's result ──────────
+    //
+    // The ack watcher and the prompt result travel on different channels, and
+    // the main loop polls results first, so a `Success` for a turn can be
+    // processed after that turn has already terminated. Terminal settlement
+    // therefore covers the withheld table too, and the late ack — whatever it
+    // says — must find nothing left to act on.
+
+    /// Withhold an event, then settle its turn before the ack arrives. The
+    /// event's delivery state is unknown, so it is released for normal
+    /// dispatch rather than left in a table no turn will ever judge.
+    #[test]
+    fn test_settle_releases_withheld_event_whose_ack_never_arrived() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let qe = make_queued(ch, "mid-turn mention");
+        let event_id = qe.event.id.to_hex();
+        q.push(qe);
+        assert!(q.mark_native_steer_pending(ch, &event_id));
+
+        assert_eq!(
+            q.settle_turn_steers(ch, 1),
+            1,
+            "delivery is unknown, so the event must be released"
+        );
+
+        let batch = q.flush_next().expect("released event must be dispatchable");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].event.id.to_hex(), event_id);
+    }
+
+    /// Passive traffic is released too when its ack is late: unlike a
+    /// *delivered* passive event (known to have reached the agent, so silence
+    /// is a valid answer), an unacked one may never have arrived at all.
+    #[test]
+    fn test_settle_releases_withheld_passive_event() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let mut qe = make_queued(ch, "passive chatter");
+        qe.requires_response = false;
+        let event_id = qe.event.id.to_hex();
+        q.push(qe);
+        assert!(q.mark_native_steer_pending(ch, &event_id));
+
+        assert_eq!(q.settle_turn_steers(ch, 0), 1);
+        assert_eq!(pending_count(&q), 1);
+    }
+
+    /// Thufir's exact ordering regression, at the queue boundary: the turn
+    /// settles first, then the late `Success` ack runs. The event must be
+    /// queued exactly once and held by neither table.
+    #[test]
+    fn test_late_success_ack_after_settlement_is_a_no_op() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let qe = make_queued(ch, "mid-turn mention");
+        let event_id = qe.event.id.to_hex();
+        q.push(qe);
+        assert!(q.mark_native_steer_pending(ch, &event_id));
+        assert_eq!(q.settle_turn_steers(ch, 0), 1);
+
+        assert!(
+            !q.record_delivered_steer(ch, &event_id, 0),
+            "a late ack must report that the event is already settled"
+        );
+
+        assert_eq!(pending_count(&q), 1, "released exactly once");
+        assert!(q.withheld_native_steer.is_empty());
+        assert!(q.delivered_native_steer.is_empty());
+    }
+
+    /// The same for the release-shaped acks (`Err`, `PromptCompletedNeutral`):
+    /// no second copy, and the `false` return is what stops the caller from
+    /// firing a cancel+merge fallback at an unrelated turn.
+    #[test]
+    fn test_late_release_ack_after_settlement_is_a_no_op() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let qe = make_queued(ch, "mid-turn mention");
+        let event_id = qe.event.id.to_hex();
+        q.push(qe);
+        assert!(q.mark_native_steer_pending(ch, &event_id));
+        assert_eq!(q.settle_turn_steers(ch, 0), 1);
+
+        assert!(
+            !q.release_native_steer(ch, &event_id),
+            "a late release ack must report that the event is already settled"
+        );
+
+        assert_eq!(pending_count(&q), 1, "released exactly once");
+    }
+
+    /// A settlement that spans both tables restores arrival order across them,
+    /// not table order — the withheld event here is the older one.
+    #[test]
+    fn test_settle_orders_released_events_across_both_tables_by_arrival() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let older = make_queued_at(ch, "older withheld", Duration::from_millis(30));
+        let newer = make_queued_at(ch, "newer delivered", Duration::from_millis(20));
+        let older_id = older.event.id.to_hex();
+        // Deliver first: `deliver_steer` asserts the withheld table is empty,
+        // which is exactly the state before the older event is withheld.
+        let newer_id = deliver_steer(&mut q, ch, newer, 0);
+        q.push(older);
+        assert!(q.mark_native_steer_pending(ch, &older_id));
+
+        assert_eq!(q.settle_turn_steers(ch, 0), 2);
+
+        let released: Vec<String> = q
+            .queues
+            .get(&ch)
+            .expect("queue restored")
+            .iter()
+            .map(|qe| qe.event.id.to_hex())
+            .collect();
+        assert_eq!(released, vec![older_id, newer_id]);
+    }
+
+    /// An answered delivered event is still retired when the same settlement
+    /// releases an unacked one — the two tables are judged by their own rules.
+    #[test]
+    fn test_settle_retires_answered_delivery_while_releasing_withheld() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        deliver_steer(&mut q, ch, make_queued(ch, "answered"), 1);
+        let withheld = make_queued(ch, "unacked");
+        let withheld_id = withheld.event.id.to_hex();
+        q.push(withheld);
+        assert!(q.mark_native_steer_pending(ch, &withheld_id));
+
+        assert_eq!(q.settle_turn_steers(ch, 2), 1);
+
+        let released: Vec<String> = q
+            .queues
+            .get(&ch)
+            .expect("queue restored")
+            .iter()
+            .map(|qe| qe.event.id.to_hex())
+            .collect();
+        assert_eq!(released, vec![withheld_id]);
     }
 
     // ── format_prompt: agent_canvas ─────────────────────────────────────────

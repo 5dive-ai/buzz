@@ -41,7 +41,6 @@ import {
 import {
   ONBOARDING_PRIMARY_CTA_CLASS,
   ONBOARDING_SECONDARY_CTA_CLASS,
-  ONBOARDING_SECURITY_ICON_CLASS,
 } from "./OnboardingChrome";
 
 /** Word-count bounds mirroring `key_backup.rs` (Rust clamps regardless). */
@@ -321,7 +320,8 @@ function PassphraseGeneratorPopover({
           aria-label="Generate a password"
           className={cn(
             "absolute right-9 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground",
-            securityTheme && ONBOARDING_SECURITY_ICON_CLASS,
+            securityTheme &&
+              "text-black/55 hover:bg-black/5 hover:text-black/80",
           )}
           data-testid="backup-passphrase-generate"
           disabled={disabled}
@@ -608,7 +608,7 @@ export function EncryptedBackupCreator({
           className={cn(
             "font-mono",
             variant === "spotlight"
-              ? "h-14 rounded-2xl border-foreground/15 bg-white px-20 text-center text-lg text-black/80 shadow-none placeholder:text-black/55"
+              ? "h-14 rounded-2xl border-black/20 bg-white px-20 text-center text-lg text-black/80 shadow-none placeholder:text-black/55 focus-visible:ring-black/35"
               : "h-10 bg-background pr-19",
           )}
           data-testid="backup-passphrase-input"
@@ -669,7 +669,8 @@ export function EncryptedBackupCreator({
           }
           className={cn(
             "absolute right-1 top-1/2 h-8 w-8 -translate-y-1/2 text-muted-foreground hover:text-foreground",
-            variant === "spotlight" && ONBOARDING_SECURITY_ICON_CLASS,
+            variant === "spotlight" &&
+              "text-black/55 hover:bg-black/5 hover:text-black/80",
           )}
           data-testid="backup-passphrase-reveal-toggle"
           disabled={state.downloadPending}

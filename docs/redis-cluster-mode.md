@@ -87,8 +87,9 @@ profile `bb-public-operations-ro`).
   window spanning the onset).
 - Whole-instance CPU ~4%, memory 0.09%, replication lag <1ms. Vertical
   scaling is dead: same-family bigger instances have identical single-core
-  speed; r8g (Graviton4) buys ~25–30% single-thread ≈ 1.4 days at the fitted
-  3.45-day doubling (1.33x → Td·log₂(1.33)).
+  speed; r8g (Graviton4) buys ~25–30% single-thread ≈ 1.1–1.3 days at the
+  fitted 3.45-day doubling (1.25–1.30x → Td·log₂(M); vendor range, not
+  benchmarked by anyone in this effort).
 - **Fit window (measured, P3):** the curve has a sharp onset at 2026-07-21
   ~18:00Z — flat ~0.55% for the preceding five days, then exponential within
   one 15-min bin (subscribed channels 74→1303 in four hours at a pinned
@@ -775,8 +776,9 @@ REDIS_CLUSTER_PRODUCTION_PRIOR_ART.md`, `…_OPEN_SOURCE_PRIOR_ART.md`,
   against the band, not the point** — and N=4 buys **+2.3d pre-P2 / +3.1d
   post-P2** (N=8 post-P2: +4.3d). Any one-time capacity gain of factor M
   buys exactly `Td·log₂(M)` days, so no N reachable this week buys two
-  doublings, and every available lever — sharding, r8g (+1.4d), presence
-  reduction, all stacked (~5.1d; 4.9d interaction-aware) — is smaller than the migration's own
+  doublings, and every available lever — sharding, r8g (+1.3d at the
+  optimistic 1.30x edge), presence
+  reduction, all stacked (~5.0d; 4.8d interaction-aware) — is smaller than the migration's own
   duration estimate (14d aggressive / 21d likely / 35d conservative; soft,
   LOC-derived, not a bottom-up plan). **Shard count is therefore not a
   runway purchase, and the honest case for cluster mode is optionality,

@@ -83,6 +83,13 @@ profile `bb-public-operations-ro`).
   scaling is dead: same-family bigger instances have identical single-core
   speed; r8g (Graviton4) buys ~25–30% single-thread ≈ 1.5 days at the current
   doubling rate.
+- **Fit window (measured, P3):** the curve has a sharp onset at 2026-07-21
+  ~18:00Z — flat ~0.55% for the preceding five days, then exponential within
+  one 15-min bin (subscribed channels 74→1303 in four hours at a pinned
+  connection count). Growth fits must start after the onset or they mix two
+  regimes. `curr_connections` moves in pool-config plateaus (40.0 → 74.9 →
+  ~280) and must not be read as demand. The onset is unattributed; confirming
+  what reached bb-public at 18:00Z needs deploy-history access.
 
 ## System Model
 
@@ -622,11 +629,15 @@ keep CPU <80% during resharding — resharding is compute-intensive, and doing
 it while the engine core saturates is the worst time. The countdown clock is
 the argument for starting G1 now, not for heroics at 90%.
 
-**Fallback (curve outruns the plan):** replica read offload
-(`buzz-001-002` idles at 7%) buys roughly one doubling. Note the coupling: in
-cluster mode, replica reads lean on exactly the replica-repair path fixed in
-redis-rs #2120/#2223, so the version floor is a prerequisite for the fallback
-too, not just hygiene.
+**Fallback (curve outruns the plan):** replica read offload. Downgraded but
+not dead (P3, measured 2026-07-30): the replica is **not idle** — its 7.8%
+engine CPU is its own write-apply + propagation load, unsheddable, on its own
+exponential (doubling ~3.8d; saturates alone in ~14 days serving zero reads).
+Offload still buys primary time, but the destination is a node ~6 days behind
+the primary on the same clock — size against its remaining headroom, not
+"93% free". Note the coupling: in cluster mode, replica reads lean on exactly
+the replica-repair path fixed in redis-rs #2120/#2223, so the version floor
+is a prerequisite for the fallback too, not just hygiene.
 
 ## Conformance (test matrix, gate G2)
 
@@ -733,9 +744,22 @@ REDIS_CLUSTER_PRODUCTION_PRIOR_ART.md`, `…_OPEN_SOURCE_PRIOR_ART.md`,
   in (2026-07-30): keyed-command growth is uniform (no hot path in the
   command mix), and the hottest-shard imbalance factor is ~1.5x fair share
   at 4 shards (see §Sharded Pub/Sub Conversion) — do not size by
-  `current/N`. Caveat: per-family `rate x latency` accounts for well under a
-  quarter of measured engine CPU, so the decomposition is not a complete
-  cost model; D1 stays open.
+  `current/N`. The earlier caveat that per-family `rate x latency` explains
+  under a quarter of engine CPU is now resolved by measurement (P3,
+  replica-subtraction natural experiment: the never-read replica carries
+  7.8pp of the primary's 19.5pp): **~40% of primary engine CPU is
+  write-apply + publish propagation; ~60% is client-facing** (reads, Lua,
+  connection I/O, subscriber delivery) and divides only as connections and
+  subscriptions redistribute across shards. One dependency inside the 40%:
+  write-apply partitions by key unconditionally, but by A4 the propagation
+  component confines to the owning shard **only after P2 lands** — with
+  classic pub/sub, every node processes every publish. So the ~40% is the
+  shardable fraction *with* P2, an upper bound without it. Two further
+  cautions from the same measurement set: engine CPU cannot be split
+  pub/sub-vs-keyed by regression (rates collinear at r=0.997; subsampled
+  shares swing 4%→37%), and the apparent sublinearity of CPU vs. rate is a
+  ~1.1% fixed baseline, not economies of scale — do not project on the
+  exponent. D1 stays open pending the P2/imbalance-adjusted arithmetic.
 - **D2 — Pattern subscribers stay classic.** Accepted in design; re-opens
   only if G0 shows their volume is non-trivial. **Measured 2026-07-30: D2
   holds.** All publishers are lifecycle/admin-rate (code trace, verified
@@ -763,4 +787,4 @@ REDIS_CLUSTER_PRODUCTION_PRIOR_ART.md`, `…_OPEN_SOURCE_PRIOR_ART.md`,
 | Sharded pub/sub necessity | Documented fact | Axiom A4 (Valkey cluster spec) |
 | Sharded pub/sub at scale | **No prior art** | Buzz-specific load/reconnect gate in G2 |
 | Shard count | **Open** | G0 profile (D1) |
-| Timeline | ~8–10 days of runway at current doubling | G1 starts now; fallback = replica offload |
+| Timeline | ~7 days to 80% on the primary (fitted, post-onset window) | G1 starts now; fallback = replica offload (degraded — replica not idle, ~14d to its own saturation) |

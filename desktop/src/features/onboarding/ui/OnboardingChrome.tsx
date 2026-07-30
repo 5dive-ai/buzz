@@ -11,11 +11,10 @@ export const TOTAL_ONBOARDING_PAGES = 7;
 const ONBOARDING_CTA_SHAPE = "h-[2.375rem] rounded-full px-6";
 
 /**
- * Primary-CTA styling for the in-step onboarding pages: the shared pill with a
- * light-blue label (`--buzz-onboarding-cta-label`, available on any
- * `.buzz-onboarding-neutral-theme` subtree).
+ * Primary-CTA styling for the in-step onboarding pages: an inverted white pill
+ * with dark text that stays legible across every onboarding surface.
  */
-export const ONBOARDING_PRIMARY_CTA_CLASS = `${ONBOARDING_CTA_SHAPE} text-[var(--buzz-onboarding-cta-label)]`;
+export const ONBOARDING_PRIMARY_CTA_CLASS = `${ONBOARDING_CTA_SHAPE} bg-white text-black/80 hover:bg-white/90 hover:text-black`;
 
 /**
  * Primary-CTA styling for the landing screen only: the shared pill with the

@@ -504,7 +504,11 @@ deleted, so the protocol no longer carries it (§The protocol).
 
 ## Sharded Pub/Sub Conversion (prerequisite P2)
 
-By A4, shard count does not touch the ~400x pub/sub term; conversion does.
+By A4, shard count does not touch the pub/sub term; conversion does. It is
+the fastest-growing command family (x12.4 over the fitted 9-day window; the
+kickoff "~400x" was a coarser 14-day eyeball — cite the fitted number) and
+the only one whose per-op cost is rising (1.18x/9d, tracking channel count
+x12.7).
 
 - **Exact event topics** (`buzz:<community>:channel:<uuid>`,
   `buzz:<community>:global`) convert to `SSUBSCRIBE`/`SPUBLISH`. The existing
@@ -513,6 +517,20 @@ By A4, shard count does not touch the ~400x pub/sub term; conversion does.
   topic names — each topic hashing to its own slot is what spreads
   propagation cost across shards; a `{community}` tag would recreate the hot
   node per community.
+- **The effective unit of spread is per-community, not per-channel**
+  (measured, G0 profile 2026-07-30): 87.8% of publish volume targets
+  `buzz:<community>:global` (presence kind 20001 = 60.8%, agent observer
+  frames kind 24200 = 27.0%); only typing and channel messages use
+  per-channel topics. Slot spreading still works — no community exceeded
+  ~4% of publish volume — but it is sub-linear: CRC16 simulation over real
+  topic names and measured weights puts the hottest shard at ~1.5x its fair
+  share at 4 shards (p95), growing with shard count. D1's arithmetic must
+  size for the hottest shard, not `current/N`.
+- **Conversion payoff is bounded by measured amplification, not worst-case
+  broadcast**: cross-pod deliveries run ~5.3 pod-deliveries per publish on a
+  15-pod fleet (dynamic interest subscription already avoids full broadcast),
+  so P2 buys back at most that flowing cost. Real but bounded; see
+  `RESEARCH/BB_PUBLIC_REDIS_G0_PROFILE.md` for receipts.
 - **The two pattern subscribers stay classic** (Decision D2, argued in-thread
   and accepted): enumerating concrete channels would require a new
   subscribe-before-reachable / unsubscribe-after-last protocol with discovery
@@ -711,9 +729,19 @@ REDIS_CLUSTER_PRODUCTION_PRIOR_ART.md`, `…_OPEN_SOURCE_PRIOR_ART.md`,
 ## Open Decisions
 
 - **D1 — Shard count.** Blocked on G0's shardable/broadcast ratio. The spec
-  deliberately refuses a number until the ratio exists.
+  deliberately refuses a number until the ratio exists. First G0 inputs are
+  in (2026-07-30): keyed-command growth is uniform (no hot path in the
+  command mix), and the hottest-shard imbalance factor is ~1.5x fair share
+  at 4 shards (see §Sharded Pub/Sub Conversion) — do not size by
+  `current/N`. Caveat: per-family `rate x latency` accounts for well under a
+  quarter of measured engine CPU, so the decomposition is not a complete
+  cost model; D1 stays open.
 - **D2 — Pattern subscribers stay classic.** Accepted in design; re-opens
-  only if G0 shows their volume is non-trivial.
+  only if G0 shows their volume is non-trivial. **Measured 2026-07-30: D2
+  holds.** All publishers are lifecycle/admin-rate (code trace, verified
+  independently); the events-stored ceiling (131/s fleet-summed) sits ~10x
+  under the total pub/sub term. Per-pattern publish counters land with G2
+  per-shard telemetry.
 - **D3 — Command-pool protocol (RESP2 vs RESP3).** Test-backed decision at
   G2; the split architecture makes it independent of the subscription
   client's hard RESP3 requirement.

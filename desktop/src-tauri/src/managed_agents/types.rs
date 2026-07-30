@@ -462,13 +462,13 @@ pub struct RelayMeshConfig {
 pub struct ManagedAgentProcess {
     pub child: Child,
     pub log_path: PathBuf,
-    /// Digest of the effective spawn config at launch (see
-    /// `spawn_hash::spawn_config_hash`). Runtime-only — never persisted. The
-    /// summary builder recomputes the hash from current disk state and flags
-    /// `needs_restart` on mismatch. Agents adopted via a persisted
-    /// `runtime_pid` have no `ManagedAgentProcess` entry, so their spawn
-    /// config is unknown and the badge stays off.
-    pub spawn_config_hash: u64,
+    /// The effective spawn config this process was launched with (see
+    /// `spawn_snapshot::SpawnConfigSnapshot`). Runtime-only — never persisted.
+    /// The summary builder recomputes a prospective snapshot from current disk
+    /// state and reports each differing field via
+    /// `ManagedAgentSummary::restart_diff`. Agents adopted via a persisted
+    /// `runtime_pid` have none, so their config is unknown and no badge fires.
+    pub spawn_config: super::spawn_snapshot::SpawnConfigSnapshot,
     /// Whether this process was spawned in setup-listener mode (i.e.
     /// `BUZZ_ACP_SETUP_PAYLOAD` was set at launch because the agent was
     /// `NotReady`). Runtime-only — never persisted. Used by
@@ -543,11 +543,16 @@ pub struct ManagedAgentSummary {
     pub persona_orphaned: bool,
     /// `true` when the running process was spawned with a config that no
     /// longer matches what a spawn would use today — a plain restart would
-    /// change what runs. Complements `persona_out_of_date`: the badge means
-    /// "a restart would change what runs"; out-of-date means "a respawn
-    /// would." Always `false` for stopped agents and for processes adopted
-    /// via a persisted `runtime_pid` (their spawn config is unknown).
+    /// change what runs. Complements `persona_out_of_date`: this means "a
+    /// restart would change what runs"; out-of-date means "a respawn would."
+    /// Derived from `restart_diff` alone, so it is lit exactly when there is
+    /// something to show — never for a stopped agent, an orphan, or a
+    /// `runtime_pid`-adopted process (its spawn config is unknown).
     pub needs_restart: bool,
+    /// Each field whose effective spawn value drifted since launch, redacted
+    /// for display (see `spawn_snapshot::diff`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_diff: Vec<super::spawn_snapshot::RestartDiffEntry>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_vars: BTreeMap<String, String>,
     pub backend: BackendKind,

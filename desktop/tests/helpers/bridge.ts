@@ -298,6 +298,7 @@ type MockBridgeOptions = {
     description: string | null;
     imageDataUrl: string | null;
     imageDomain: string | null;
+    faviconDataUrl?: string | null;
   } | null;
   linkPreviewMetadataDelayMs?: number;
   searchProfiles?: MockSearchProfileSeed[];

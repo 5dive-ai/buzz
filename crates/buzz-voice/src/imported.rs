@@ -9,6 +9,10 @@ use std::{
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use symphonia::core::{
+    audio::SampleBuffer, codecs::DecoderOptions, errors::Error as SymphoniaError,
+    formats::FormatOptions, io::MediaSourceStream, meta::MetadataOptions, probe::Hint,
+};
 
 const MAX_SOURCE_BYTES: u64 = 25 * 1024 * 1024;
 const MIN_SAMPLE_RATE: u32 = 8_000;
@@ -112,13 +116,22 @@ impl PocketVoiceLibrary {
 
     pub fn import_path(&self, source: &Path) -> Result<ImportedVoice, String> {
         let metadata = fs::metadata(source)
-            .map_err(|error| format!("could not inspect selected WAV: {error}"))?;
+            .map_err(|error| format!("could not inspect selected audio: {error}"))?;
         if metadata.len() > MAX_SOURCE_BYTES {
-            return Err("Voice WAV must be 25 MB or smaller".to_string());
+            return Err("Voice audio must be 25 MB or smaller".to_string());
         }
-        let source_bytes =
-            fs::read(source).map_err(|error| format!("could not read selected WAV: {error}"))?;
-        let samples = decode_wav(&source_bytes)?;
+        let extension = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| "Voice audio must have a supported file extension".to_string())?;
+        let samples = if extension == "wav" {
+            let source_bytes = fs::read(source)
+                .map_err(|error| format!("could not read selected audio: {error}"))?;
+            decode_wav(&source_bytes)?
+        } else {
+            decode_media(source, &extension)?
+        };
         let canonical_samples = resample_linear(&samples.samples, samples.sample_rate);
         let canonical = encode_pcm16_wav(&canonical_samples, CANONICAL_SAMPLE_RATE);
         let hash = hex::encode(Sha256::digest(&canonical));
@@ -300,12 +313,12 @@ fn is_regular_file_without_symlink(path: &Path) -> bool {
 }
 
 #[derive(Debug)]
-struct DecodedWav {
+struct DecodedAudio {
     sample_rate: u32,
     samples: Vec<f32>,
 }
 
-fn decode_wav(bytes: &[u8]) -> Result<DecodedWav, String> {
+fn decode_wav(bytes: &[u8]) -> Result<DecodedAudio, String> {
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err("Selected file is not a valid RIFF/WAVE file".to_string());
     }
@@ -343,14 +356,17 @@ fn decode_wav(bytes: &[u8]) -> Result<DecodedWav, String> {
     let sample_rate = u32::from_le_bytes(format[4..8].try_into().unwrap_or([0; 4]));
     let block_align = u16::from_le_bytes(format[12..14].try_into().unwrap_or([0; 2])) as usize;
     let bits = u16::from_le_bytes(format[14..16].try_into().unwrap_or([0; 2]));
-    if channels != 1 {
-        return Err("Voice WAV must be mono".to_string());
+    if channels == 0 || channels > 8 {
+        return Err("Voice WAV must contain between 1 and 8 channels".to_string());
     }
     if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
         return Err("Voice WAV sample rate must be between 8 and 96 kHz".to_string());
     }
     let bytes_per_sample = usize::from(bits.div_ceil(8));
-    if block_align != bytes_per_sample || block_align == 0 || data.len() % block_align != 0 {
+    if block_align != bytes_per_sample * usize::from(channels)
+        || block_align == 0
+        || data.len() % block_align != 0
+    {
         return Err("Voice WAV has invalid sample alignment".to_string());
     }
     if !matches!((encoding, bits), (1, 8 | 16 | 24 | 32) | (3, 32)) {
@@ -363,43 +379,146 @@ fn decode_wav(bytes: &[u8]) -> Result<DecodedWav, String> {
     }
 
     let mut samples = Vec::with_capacity(frames);
-    for chunk in data.chunks_exact(block_align) {
-        let sample = match (encoding, bits) {
-            (1, 8) => (f32::from(chunk[0]) - 128.0) / 128.0,
-            (1, 16) => f32::from(i16::from_le_bytes([chunk[0], chunk[1]])) / 32768.0,
-            (1, 24) => {
-                let raw = i32::from_le_bytes([
-                    chunk[0],
-                    chunk[1],
-                    chunk[2],
-                    if chunk[2] & 0x80 == 0 { 0 } else { 0xff },
-                ]);
-                raw as f32 / 8_388_608.0
+    for frame in data.chunks_exact(block_align) {
+        let mut mono = 0.0_f32;
+        for chunk in frame.chunks_exact(bytes_per_sample) {
+            let sample = match (encoding, bits) {
+                (1, 8) => (f32::from(chunk[0]) - 128.0) / 128.0,
+                (1, 16) => f32::from(i16::from_le_bytes([chunk[0], chunk[1]])) / 32768.0,
+                (1, 24) => {
+                    let raw = i32::from_le_bytes([
+                        chunk[0],
+                        chunk[1],
+                        chunk[2],
+                        if chunk[2] & 0x80 == 0 { 0 } else { 0xff },
+                    ]);
+                    raw as f32 / 8_388_608.0
+                }
+                (1, 32) => {
+                    i32::from_le_bytes(chunk.try_into().map_err(|_| "invalid PCM sample")?) as f32
+                        / 2_147_483_648.0
+                }
+                (3, 32) => f32::from_le_bytes(
+                    chunk
+                        .try_into()
+                        .map_err(|_| "invalid floating-point sample")?,
+                ),
+                _ => unreachable!(),
+            };
+            if !sample.is_finite() {
+                return Err("Voice WAV contains non-finite samples".to_string());
             }
-            (1, 32) => {
-                i32::from_le_bytes(chunk.try_into().map_err(|_| "invalid PCM sample")?) as f32
-                    / 2_147_483_648.0
-            }
-            (3, 32) => f32::from_le_bytes(
-                chunk
-                    .try_into()
-                    .map_err(|_| "invalid floating-point sample")?,
-            ),
-            _ => unreachable!(),
-        };
-        if !sample.is_finite() {
-            return Err("Voice WAV contains non-finite samples".to_string());
+            mono += sample;
         }
-        samples.push(sample.clamp(-1.0, 1.0));
+        samples.push((mono / f32::from(channels)).clamp(-1.0, 1.0));
     }
     let stats = PcmStats::analyze(&samples, sample_rate);
     if !stats.is_non_silent() {
         return Err("Voice WAV is silent or too quiet to clone".to_string());
     }
-    Ok(DecodedWav {
+    Ok(DecodedAudio {
         sample_rate,
         samples,
     })
+}
+
+fn decode_media(source: &Path, extension: &str) -> Result<DecodedAudio, String> {
+    let supported = ["m4a", "mp3", "flac", "ogg", "oga", "aif", "aiff"];
+    if !supported.contains(&extension) {
+        return Err(format!(
+            "Unsupported voice audio format .{extension}. Choose WAV, M4A, MP3, FLAC, OGG, or AIFF"
+        ));
+    }
+
+    let file = fs::File::open(source)
+        .map_err(|error| format!("could not read selected audio: {error}"))?;
+    let media = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension(extension);
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            media,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|error| format!("could not recognize selected audio: {error}"))?;
+    let mut format = probed.format;
+    let track = format
+        .default_track()
+        .ok_or_else(|| "Selected audio has no decodable track".to_string())?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|error| format!("could not initialize audio decoder: {error}"))?;
+    let mut sample_rate = None;
+    let mut samples = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::ResetRequired) => {
+                return Err("Selected audio changes format mid-stream".to_string());
+            }
+            Err(SymphoniaError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(error) => return Err(format!("could not read selected audio: {error}")),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(error) => return Err(format!("could not decode selected audio: {error}")),
+        };
+        let spec = *decoded.spec();
+        if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&spec.rate) {
+            return Err("Voice audio sample rate must be between 8 and 96 kHz".to_string());
+        }
+        if sample_rate.is_some_and(|rate| rate != spec.rate) {
+            return Err("Selected audio changes sample rate mid-stream".to_string());
+        }
+        sample_rate = Some(spec.rate);
+        let channels = spec.channels.count();
+        if channels == 0 || channels > 8 {
+            return Err("Voice audio must contain between 1 and 8 channels".to_string());
+        }
+        let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        buffer.copy_interleaved_ref(decoded);
+        for frame in buffer.samples().chunks_exact(channels) {
+            let mono = frame.iter().copied().sum::<f32>() / channels as f32;
+            if !mono.is_finite() {
+                return Err("Voice audio contains non-finite samples".to_string());
+            }
+            samples.push(mono.clamp(-1.0, 1.0));
+        }
+        if samples.len() as f64 > MAX_DURATION_SECONDS * f64::from(spec.rate) {
+            return Err("Voice audio must be between 2 and 30 seconds long".to_string());
+        }
+    }
+
+    let sample_rate =
+        sample_rate.ok_or_else(|| "Selected audio contains no samples".to_string())?;
+    validate_decoded_audio(&samples, sample_rate)?;
+    Ok(DecodedAudio {
+        sample_rate,
+        samples,
+    })
+}
+
+fn validate_decoded_audio(samples: &[f32], sample_rate: u32) -> Result<(), String> {
+    let stats = PcmStats::analyze(samples, sample_rate);
+    if !(MIN_DURATION_SECONDS..=MAX_DURATION_SECONDS).contains(&stats.duration_seconds) {
+        return Err("Voice audio must be between 2 and 30 seconds long".to_string());
+    }
+    if !stats.is_non_silent() {
+        return Err("Voice audio is silent or too quiet to clone".to_string());
+    }
+    Ok(())
 }
 
 fn resample_linear(samples: &[f32], source_rate: u32) -> Vec<f32> {
@@ -457,6 +576,24 @@ mod tests {
         encode_pcm16_wav(&samples, sample_rate)
     }
 
+    fn stereo_fixture(sample_rate: u32, seconds: usize, amplitude: f32) -> Vec<u8> {
+        let mono = fixture(sample_rate, seconds, amplitude);
+        let mono_data = &mono[44..];
+        let mut stereo_data = Vec::with_capacity(mono_data.len() * 2);
+        for sample in mono_data.chunks_exact(2) {
+            stereo_data.extend_from_slice(sample);
+            stereo_data.extend_from_slice(sample);
+        }
+        let mut stereo = mono[..44].to_vec();
+        stereo[4..8].copy_from_slice(&(36 + stereo_data.len() as u32).to_le_bytes());
+        stereo[22..24].copy_from_slice(&2_u16.to_le_bytes());
+        stereo[28..32].copy_from_slice(&(sample_rate * 4).to_le_bytes());
+        stereo[32..34].copy_from_slice(&4_u16.to_le_bytes());
+        stereo[40..44].copy_from_slice(&(stereo_data.len() as u32).to_le_bytes());
+        stereo.extend_from_slice(&stereo_data);
+        stereo
+    }
+
     #[test]
     fn imports_persists_reloads_and_deletes_canonical_voice() {
         let temp = tempfile::tempdir().expect("temp voice workspace");
@@ -493,6 +630,52 @@ mod tests {
     }
 
     #[test]
+    fn common_stereo_audio_is_downmixed_to_canonical_mono() {
+        let temp = tempfile::tempdir().expect("temp voice workspace");
+        let source = temp.path().join("stereo.wav");
+        fs::write(&source, stereo_fixture(44_100, 2, 0.5)).expect("write stereo");
+        let library = PocketVoiceLibrary::new(temp.path().join("library"));
+
+        let imported = library.import_path(&source).expect("import stereo");
+        let stored = library
+            .resolve_file(&imported)
+            .expect("resolve stored voice");
+        let decoded = decode_wav(&fs::read(stored).expect("read stored voice"))
+            .expect("decode canonical voice");
+        assert_eq!(decoded.sample_rate, CANONICAL_SAMPLE_RATE);
+        assert_eq!(decoded.samples.len(), CANONICAL_SAMPLE_RATE as usize * 2);
+    }
+
+    #[test]
+    #[ignore = "requires BUZZ_VOICE_IMPORT_TEST_DIR with common-format fixtures"]
+    fn imports_common_audio_format_fixtures() {
+        let fixtures =
+            PathBuf::from(std::env::var("BUZZ_VOICE_IMPORT_TEST_DIR").expect("fixture directory"));
+        let temp = tempfile::tempdir().expect("temp voice workspace");
+        let library = PocketVoiceLibrary::new(temp.path().join("library"));
+
+        for file_name in [
+            "voice.wav",
+            "voice.m4a",
+            "voice.mp3",
+            "voice.flac",
+            "voice.ogg",
+            "voice.aiff",
+        ] {
+            let imported = library
+                .import_path(&fixtures.join(file_name))
+                .unwrap_or_else(|error| panic!("import {file_name}: {error}"));
+            let stored = library
+                .resolve_file(&imported)
+                .unwrap_or_else(|error| panic!("resolve {file_name}: {error}"));
+            let decoded = decode_wav(&fs::read(stored).expect("read canonical voice"))
+                .expect("decode canonical voice");
+            assert_eq!(decoded.sample_rate, CANONICAL_SAMPLE_RATE);
+            assert!(decoded.samples.len() >= CANONICAL_SAMPLE_RATE as usize * 2);
+        }
+    }
+
+    #[test]
     fn invalid_unsupported_and_silent_files_do_not_mutate_registry() {
         let temp = tempfile::tempdir().expect("temp voice workspace");
         let library = PocketVoiceLibrary::new(temp.path().join("library"));
@@ -511,14 +694,12 @@ mod tests {
             .expect_err("silence rejected")
             .contains("silent"));
 
-        let mut stereo = fixture(32_000, 2, 0.5);
-        stereo[22..24].copy_from_slice(&2_u16.to_le_bytes());
-        let stereo_path = temp.path().join("stereo.wav");
-        fs::write(&stereo_path, stereo).expect("write stereo");
+        let unsupported_container = temp.path().join("voice.txt");
+        fs::write(&unsupported_container, b"not audio").expect("write unsupported container");
         assert!(library
-            .import_path(&stereo_path)
-            .expect_err("stereo rejected")
-            .contains("mono"));
+            .import_path(&unsupported_container)
+            .expect_err("container rejected")
+            .contains("Unsupported voice audio format"));
 
         let mut unsupported = fixture(32_000, 2, 0.5);
         unsupported[20..22].copy_from_slice(&6_u16.to_le_bytes());

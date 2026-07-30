@@ -30,7 +30,10 @@ pub async fn pick_and_import(app: &AppHandle) -> Result<Option<ImportedVoice>, S
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .add_filter("WAV audio", &["wav"])
+        .add_filter(
+            "Audio",
+            &["wav", "m4a", "mp3", "flac", "ogg", "oga", "aif", "aiff"],
+        )
         .pick_file(move |path| {
             let _ = sender.send(path);
         });

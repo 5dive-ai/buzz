@@ -353,6 +353,9 @@ test("link preview image geometry stays stable while loading", async ({
     }));
 
     await expect(card).toHaveAttribute("data-image-state", "image");
+    await expect(
+      card.locator("[data-link-preview-hostname-favicon]"),
+    ).toHaveAttribute("src", /data:image\/png;base64/);
     if (process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR) {
       await waitForAnimations(page);
       await card.screenshot({

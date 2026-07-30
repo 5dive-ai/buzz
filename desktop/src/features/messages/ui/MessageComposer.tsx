@@ -838,13 +838,11 @@ function MessageComposerImpl({
       disabled ||
       media.isUploading ||
       mentionSendFlow.isPreparingMentionSend ||
-      dictation.isSendBlocked ||
       (isContentEmpty && media.pendingImeta.length === 0),
     [
       disabled,
       media.isUploading,
       mentionSendFlow.isPreparingMentionSend,
-      dictation.isSendBlocked,
       isContentEmpty,
       media.pendingImeta.length,
     ],

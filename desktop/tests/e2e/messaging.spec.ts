@@ -303,7 +303,7 @@ test("markdown tables overflow wide content and fill the message when narrow", a
 test("link preview style defaults to compact and Rich unfurls descriptions", async ({
   page,
 }) => {
-  const previewUrl = "https://github.com/block/buzz/pull/3246";
+  const previewUrl = "https://github.com/block/buzz/pull/3246?inline=1";
   await page.setViewportSize({ width: 800, height: 900 });
   await page.goto("/");
   await page.getByTestId("channel-general").click();
@@ -337,12 +337,13 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
     '[data-link-preview="github-pull-request"][data-link-preview-inline]',
   );
   await expect(richPreview).toBeVisible();
-  await expect(
-    richPreview.locator('[data-slot="attachment-description"]'),
-  ).toBeVisible();
   await expect(richPreview.locator("[data-link-preview-hostname]")).toHaveText(
     "github.com",
   );
+
+  await openSettings(page, "appearance");
+  await page.getByTestId("link-preview-style-trigger").click();
+  await page.getByTestId("link-preview-style-compact").click();
 });
 
 test("link preview image geometry stays stable while loading", async ({

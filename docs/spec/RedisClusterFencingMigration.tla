@@ -343,4 +343,58 @@ Inv_LeaseGenGrounded ==
   /\ (oldOwner /= None) => (oldLeaseGen > 0 /\ oldLeaseGen <= oldGen)
   /\ (newOwner /= None) => (newLeaseGen > 0 /\ newLeaseGen <= newGen)
 
+(***************************************************************************)
+(* Drain-reachability probe (spec S:B2 defense; found in review round 2).  *)
+(*                                                                         *)
+(* The safety model above lets ExpireOld/ExpireNew fire unguarded — the    *)
+(* adversarial worst case for SAFETY (leases may vanish at any moment).    *)
+(* But for DRAIN it is the friendly best case: an old-key lease whose      *)
+(* owner is alive and renewing never expires (renew is PEXPIRE — the exact *)
+(* premise B2 falsified), so unguarded expiry lets the C-gate's            *)
+(* oldOwner = None conjunct be discharged by luck. Consequence: deleting   *)
+(* MigrateB from Next leaves every safety invariant green — the model      *)
+(* could not tell the B2 fix from its absence (found by Dawn, round 2).    *)
+(*                                                                         *)
+(* This probe closes that hole. DrainInit is the stall state: fleet fully  *)
+(* on B, backfill done, one live B-pod still owning an old-key lease.      *)
+(* DrainNext is Next WITHOUT spontaneous expiry — faithful to a lease      *)
+(* whose owner never crashes. Probe_NotC is checked as an "invariant"      *)
+(* with INVERTED verdict semantics: TLC reporting Probe_NotC VIOLATED      *)
+(* proves phase C is REACHABLE from the stall state (pass); TLC GREEN      *)
+(* means the migration deadlocks at the C-gate forever (fail). Run with    *)
+(* RedisClusterFencingMigrationDrain.cfg. Mutant M10 (drop MigrateB from   *)
+(* DrainNext = round-1 behavior, B renews the old key instead of           *)
+(* migrating) must leave this probe green — proving MigrateB is the only   *)
+(* mechanism that discharges the gate without luck.                        *)
+(***************************************************************************)
+
+DrainInit ==
+  /\ phase = 2
+  /\ ver = [p \in Pods |-> 2]
+  /\ oldOwner = CHOOSE p \in Pods : TRUE
+  /\ oldLeaseGen = 1
+  /\ newOwner = None /\ newLeaseGen = 0
+  /\ oldGen = 1 /\ newGen = 1
+  /\ backfilled = TRUE
+  /\ mode = 0
+  /\ lastIssued = 1
+  /\ monoOk = TRUE
+
+DrainNext ==
+  \/ AdvancePhase
+  \/ RollbackPhase
+  \/ Backfill
+  \/ EnterCompatible
+  \/ RevertCompatible
+  \/ EnableCluster
+  \/ \E p \in Pods : UpgradePod(p) \/ DowngradePod(p)
+                     \/ AcquireO(p) \/ AcquireA(p) \/ AcquireB(p)
+                     \/ AcquireC(p)
+                     \/ MigrateB(p)  \* the B2 mechanism under test (M10)
+
+DrainSpec == DrainInit /\ [][DrainNext]_vars
+
+\* INVERTED verdict: a violation is the PASS (C reachable by participation).
+Probe_NotC == phase /= 3
+
 =============================================================================

@@ -364,6 +364,17 @@ costs):
    - No phase rollback while in `compatible`; revert the mode to
      `disabled` first (the mode doors and phase machinery never move in
      the same step).
+   - **Rolling back B→A drops every session B has already migrated —
+     prefer forward-fix.** An A-pod's renew addresses the *old* key
+     (§Per-phase operation table), so a lease `MigrateB` moved to the new
+     key is renewed by nobody after the downgrade: it dies within one TTL
+     and the renewer treats the loss as fatal (session torn down, verified
+     live against `spawn_lease_renewer_with_interval`'s `Lost` handling).
+     Safety is unaffected — A's union check sees the new-key lease and
+     refuses to fork — but rollback from B is **not free**, and an
+     operator reaching for it should expect to shed exactly the sessions
+     the migration had already carried forward. (Liveness, so outside the
+     safety model's scope; found and reproduced live by review round 2.)
 5. **Pre-G3 checklist:** compute `CLUSTER KEYSLOT` on both members of a
    real hash-tagged pair and require equality **before** entering
    compatible — a mis-tagged pair is invisible in disabled mode (slot
@@ -421,6 +432,11 @@ $ java -cp tla2tools.jar tlc2.TLC RedisClusterFencingMigration.tla \
     -config RedisClusterFencingMigration.cfg -deadlock
 Model checking completed. No error has been found.
 12636 states generated, 3637 distinct states found.
+
+$ java -cp tla2tools.jar tlc2.TLC RedisClusterFencingMigration.tla \
+    -config RedisClusterFencingMigrationDrain.cfg -deadlock
+Error: Invariant Probe_NotC is violated.   # INVERTED verdict: this is PASS
+93 states generated, 44 distinct states found.
 ```
 
 (`-deadlock` disables deadlock reporting because the model has *intended*
@@ -431,8 +447,9 @@ writers; a fourth adds no qualitatively new interleaving. Bounded check,
 mutation-shown non-vacuous — the standard claim for a TLC-checked safety
 spec.)
 
-**Every invariant is non-vacuous by mutation** (9 mutants, each run in
-isolation, all killed):
+**Every invariant is non-vacuous by mutation** (10 mutants, each run in
+isolation, each distinguished from the true model — M1–M9 by a violated
+safety invariant, M10 by the drain probe's inverted verdict):
 
 | Mutation | Models the real bug | Trips |
 |---|---|---|
@@ -445,6 +462,24 @@ isolation, all killed):
 | M7: rollback into O drops the reverse max-merge | O re-issues generations B already issued | `Inv_Monotonic` |
 | M8: rollback allowed past a running downgrade | skipped-phase rollback: O and B pods coexist | `Inv_SingleAuthority` |
 | M9: compatible entered without fleet fully on C | A/B cross-slot scripts meet live slot rules | `Inv_SlotRulesSafe` |
+| M10: `MigrateB` deleted (round-1 behavior: B renews old-key leases instead of migrating) | migration stalls at the C-gate forever | `Probe_NotC` **stays green** (inverted verdict — see below) |
+
+M10 needs a word, because it defends a fix the safety invariants cannot
+see. The safety model lets leases expire spontaneously (`ExpireOld`
+unguarded) — correct as the adversarial worst case for safety, but for
+*drain* it is the friendly best case: it lets the C-gate's
+`oldOwner = None` be discharged by luck, so deleting `MigrateB` from
+`Next` leaves all five safety invariants green (found by review round 2).
+The **drain-reachability probe** (`DrainSpec` +
+`RedisClusterFencingMigrationDrain.cfg`) closes the hole: it starts TLC in
+the stall state (fleet fully on B, backfilled, one live B-pod owning an
+old-key lease), removes spontaneous expiry (faithful to a lease whose
+owner is alive and renewing — renew is `PEXPIRE`), and checks
+`Probe_NotC == phase /= 3` with **inverted verdict semantics**: TLC
+reporting the "invariant" *violated* proves C is *reachable* (pass, 93/44
+states); TLC green means the migration deadlocks at the gate forever.
+With `MigrateB`: violated (C reachable). M10 (without it): green — the
+exact round-1 bug, now permanently visible to the model.
 
 M4 is the operationally scary one: it is exactly "someone deploys the final
 script version early because everything looks green." M6–M8 are the price

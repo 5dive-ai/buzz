@@ -1415,12 +1415,19 @@ impl Db {
             INSERT INTO communities (host)
             VALUES ($1)
             ON CONFLICT (lower(host)) DO UPDATE SET host = communities.host
+            WHERE communities.deletion_state = 'active'
+              AND communities.deleted_at IS NULL
             RETURNING id, host, (xmax = 0) AS created
             "#,
         )
         .bind(normalized_host)
-        .fetch_one(&self.pool)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            DbError::AccessDenied(format!(
+                "community host {normalized_host:?} is permanently tombstoned"
+            ))
+        })?;
 
         let id: Uuid = row.try_get("id")?;
         let host: String = row.try_get("host")?;
@@ -1501,6 +1508,8 @@ impl Db {
                   AND lower(rm.pubkey) = lower($2)
                   AND rm.role = 'owner'
                   AND c.archived_at IS NULL
+                  AND c.deletion_state = 'active'
+                  AND c.deleted_at IS NULL
                 "#,
             )
             .bind(normalized_host)
@@ -1540,6 +1549,8 @@ impl Db {
                  AND lower(rm.pubkey) = lower($2)
                  AND rm.role = 'owner'
                  AND lower(c.host) <> lower($3)
+                 AND c.deletion_state = 'active'
+                 AND c.deleted_at IS NULL
                RETURNING c.id, c.host, c.archived_at"#,
         )
         .bind(normalized_host)
@@ -1572,6 +1583,8 @@ impl Db {
                  AND rm.community_id = c.id
                  AND lower(rm.pubkey) = lower($2)
                  AND rm.role = 'owner'
+                 AND c.deletion_state = 'active'
+                 AND c.deleted_at IS NULL
                RETURNING c.id, c.host"#,
         )
         .bind(normalized_host)

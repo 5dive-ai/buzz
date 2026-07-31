@@ -3,6 +3,7 @@ import type { LucideIcon } from "lucide-react";
 import {
   Activity,
   Archive,
+  BarChart3,
   ChevronRight,
   Info,
   RefreshCw,
@@ -292,8 +293,11 @@ export function ProfileInfoTabContent({
   isArchived,
   onOpenActivity,
   onOpenInstance,
+  onOpenUsage,
   pubkey,
   showActivityIngress,
+  showUsageIngress,
+  usageIngressTrailing,
 }: {
   activeTurns: ActiveTurnSummary[];
   activityAgent: ProfileActivityAgent | null;
@@ -304,8 +308,11 @@ export function ProfileInfoTabContent({
   isArchived: boolean;
   onOpenActivity: (channelId?: string | null) => void;
   onOpenInstance: (pubkey: string) => void;
+  onOpenUsage: () => void;
   pubkey: string | null;
   showActivityIngress: boolean;
+  showUsageIngress: boolean;
+  usageIngressTrailing: string | undefined;
 }) {
   const infoFields: ProfileField[] = isArchived
     ? [
@@ -325,7 +332,12 @@ export function ProfileInfoTabContent({
   const showLiveActivityEmbed =
     showActivityIngress && (feedScope.isLive || feedScope.hasFeedContent);
 
-  if (!hasInfoFields && !showActivityIngress && !hasInstances) {
+  if (
+    !hasInfoFields &&
+    !showActivityIngress &&
+    !hasInstances &&
+    !showUsageIngress
+  ) {
     return null;
   }
 
@@ -350,6 +362,15 @@ export function ProfileInfoTabContent({
             trailing="View"
           />
         )
+      ) : null}
+      {showUsageIngress ? (
+        <ProfileIngressRow
+          icon={BarChart3}
+          label="Usage"
+          onClick={onOpenUsage}
+          testId={`user-profile-view-usage-${pubkey}`}
+          trailing={usageIngressTrailing}
+        />
       ) : null}
       {hasInfoFields ? <ProfileFieldGroup fields={infoFields} /> : null}
       {hasInstances ? (

@@ -1,12 +1,10 @@
 //! Proves `load_skill` and `AGENTS.md` hints survive the goose swap.
 //!
 //! Both were briefly lost in the port. `load_skill` is registered as a goose
-//! *frontend* tool, which means goose advertises it to the model but refuses to
-//! dispatch it — it returns "Frontend tool execution required" and waits for
-//! the embedder to call `handle_tool_result`
-//! (`goose/src/agents/agent.rs:1167`). If that wiring is wrong the turn does
-//! not fail, it **hangs forever**, so the timeout in `await_response` is the
-//! real assertion here.
+//! *platform* extension backed by an `McpClientTrait` (the shape Maple uses),
+//! so goose dispatches it on its ordinary tool path. Goose namespaces such
+//! tools as `{extension}__{tool}`, which the system prompt has to match — a
+//! prompt naming a tool that is not in the tool list is a silent failure.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -96,13 +94,13 @@ fn spawn_provider() -> (String, mpsc::Receiver<(String, Vec<String>)>) {
 
             call_count += 1;
             let sse = if call_count == 1 {
-                // Ask for the skill. If our frontend-tool plumbing is broken,
+                // Ask for the skill by its namespaced name.
                 // goose never resolves this and the turn hangs.
                 let c = json!({
                     "id":"c","object":"chat.completion.chunk","created":1,"model":"fake-model",
                     "choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{
                         "index":0,"id":"call_1","type":"function",
-                        "function":{"name":"load_skill","arguments":"{\"name\":\"widget-maker\"}"}
+                        "function":{"name":"buzz__load_skill","arguments":"{\"name\":\"widget-maker\"}"}
                     }]},"finish_reason":null}]
                 });
                 let d = json!({
@@ -233,7 +231,7 @@ fn agents_md_and_skill_index_reach_the_model_and_load_skill_resolves() {
         .unwrap_or_else(|| panic!("session/new failed: {r}"))
         .to_string();
 
-    // The turn only returns if load_skill was served. A broken frontend-tool
+    // The turn only returns if load_skill was dispatched. A broken tool
     // path hangs here rather than erroring.
     let r = h.call(
         "session/prompt",
@@ -266,7 +264,7 @@ fn agents_md_and_skill_index_reach_the_model_and_load_skill_resolves() {
         "skill BODY was inlined — the point of load_skill is that it is not:\n{first}"
     );
     assert!(
-        tool_lists[0].iter().any(|t| t == "load_skill"),
+        tool_lists[0].iter().any(|t| t == "buzz__load_skill"),
         "load_skill not advertised: {:?}",
         tool_lists[0]
     );

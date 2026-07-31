@@ -241,9 +241,15 @@ fn build_hints_section_impl(cwd: &Path, home: Option<&Path>) -> (String, Vec<Ski
         for skill in &skills {
             out.push_str(&format!("- {}: {}\n", skill.name, skill.description));
         }
-        out.push_str(
-            "\nUse the `load_skill` tool to read the full content of a skill before using it.\n",
-        );
+        // Goose namespaces platform-extension tools as `{extension}__{tool}`
+        // (`extension_manager.rs:1415`), so name the tool the way the model
+        // actually sees it -- otherwise the prompt advertises a tool that does
+        // not exist in its tool list.
+        out.push_str(&format!(
+            "\nUse the `{}__{}` tool to read the full content of a skill before using it.\n",
+            crate::builtin_client::BUILTIN_EXTENSION_NAME,
+            crate::builtin::LOAD_SKILL_TOOL,
+        ));
     }
 
     (out, skills)

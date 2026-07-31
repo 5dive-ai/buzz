@@ -20,9 +20,9 @@
 //! * **`builtin.rs` / `load_skill`.** `Agent::with_config` loads zero
 //!   extensions and `build_agent` only adds the `mcpServers` the harness
 //!   declares, so goose's `skills` platform extension is never loaded. Instead
-//!   `build_agent` registers `load_skill` as a goose *frontend* extension and
-//!   [`serve_frontend_tool`] answers the calls in-process (goose yields a
-//!   `FrontendToolRequest` and blocks the stream until we respond).
+//!   `build_agent` registers `load_skill` as a goose *platform* extension
+//!   backed by an `McpClientTrait` (see [`crate::builtin_client`]), so goose
+//!   dispatches it on its ordinary tool path.
 //! * **`AGENTS.md` hints / skill index.** Goose's loader keys off
 //!   `GOOSE_HINTS_FILENAME` (`.goosehints`); the old code walked the directory
 //!   chain for `AGENTS.md` plus `~/AGENTS.md`. Every repo here ships the
@@ -140,7 +140,6 @@ pub async fn run_turn(
     wire_tx: &WireSender,
     cancel: CancellationToken,
     hook_extension: Option<&str>,
-    skills: &[crate::hints::SkillEntry],
 ) -> (Result<StopReason, AgentError>, TurnTokens) {
     let mut tokens = TurnTokens::default();
     let mut next_message = Message::user().with_text(prompt_to_text(&prompt));
@@ -161,7 +160,6 @@ pub async fn run_turn(
             &cancel,
             &mut tokens,
             hook_extension,
-            skills,
         )
         .await
         {
@@ -226,7 +224,6 @@ async fn drive_stream(
     cancel: &CancellationToken,
     tokens: &mut TurnTokens,
     hook_extension: Option<&str>,
-    skills: &[crate::hints::SkillEntry],
 ) -> Result<StopReason, AgentError> {
     let session_config = SessionConfig {
         id: session_id.to_string(),
@@ -308,7 +305,6 @@ async fn drive_stream(
                             &mut compacted,
                             &mut reflections,
                             &mut open_tool_calls,
-                            skills,
                         )
                         .await
                         {
@@ -397,7 +393,6 @@ async fn handle_event(
     compacted: &mut bool,
     reflections: &mut usize,
     open_tool_calls: &mut Vec<String>,
-    skills: &[crate::hints::SkillEntry],
 ) -> Option<StopReason> {
     match event {
         AgentEvent::Message(msg) => {
@@ -406,17 +401,6 @@ async fn handle_event(
 
                 if let MessageContent::ToolRequest(req) = content {
                     open_tool_calls.push(req.id.clone());
-                }
-
-                // Frontend tool calls (`load_skill`) never arrive as
-                // `ToolRequest`: goose strips them from the normal flow
-                // (`reply_parts.rs` `categorize_tools`) and yields this
-                // dedicated variant instead, then blocks the reply stream on
-                // `tool_result_rx` until we answer. Answer it or the turn
-                // hangs forever.
-                if let MessageContent::FrontendToolRequest(req) = content {
-                    open_tool_calls.push(req.id.clone());
-                    serve_frontend_tool(req, agent, skills).await;
                 }
 
                 if let MessageContent::ToolResponse(resp) = content {
@@ -583,68 +567,6 @@ async fn emit_content(content: &MessageContent, session_id: &str, wire_tx: &Wire
 
         _ => {}
     }
-}
-
-/// Serve a goose *frontend* tool call.
-///
-/// Goose never dispatches frontend tools itself. `handle_frontend_tool_request`
-/// (`goose/src/agents/tool_execution.rs:175`) yields the
-/// `FrontendToolRequest` message we are handling right now and then **blocks
-/// the reply stream** on `tool_result_rx.recv()` until the embedder calls
-/// `agent.handle_tool_result(id, ..)`. That has two consequences:
-///
-/// * every `FrontendToolRequest` event MUST be answered — returning without
-///   sending a result hangs the turn forever, so even an unrecognised tool
-///   name gets an error result rather than silence;
-/// * exactly one answer per event — a stray extra send would be picked up by
-///   the recv of the *next* frontend call and mis-pair results.
-async fn serve_frontend_tool(
-    req: &goose_provider_types::conversation::message::FrontendToolRequest,
-    agent: &Arc<Agent>,
-    skills: &[crate::hints::SkillEntry],
-) {
-    let result = match &req.tool_call {
-        Ok(call) if call.name == crate::builtin::LOAD_SKILL_TOOL => {
-            let args = call
-                .arguments
-                .clone()
-                .map(serde_json::Value::Object)
-                .unwrap_or(serde_json::Value::Null);
-            crate::builtin::call_load_skill(&args, skills).await
-        }
-        // Only `load_skill` is registered, so this arm is unreachable today —
-        // but goose is already blocked waiting for this id, so answer anyway.
-        Ok(call) => crate::builtin::error_result(&format!(
-            "unknown frontend tool {:?}; only {} is served in-process",
-            call.name,
-            crate::builtin::LOAD_SKILL_TOOL
-        )),
-        // An Err here means goose did NOT block on the result channel — its
-        // yield only happens inside the `Ok` branch (`tool_execution.rs:181`).
-        // Sending would leave a stray result in the queue that mis-pairs the
-        // NEXT frontend call (the recv trusts the id coming off the channel).
-        Err(e) => {
-            tracing::warn!("unparseable frontend tool call {}: {e}", req.id);
-            return;
-        }
-    };
-
-    let content: Vec<rmcp::model::Content> = result
-        .content
-        .iter()
-        .map(|c| rmcp::model::Content::text(c.as_text_lossy()))
-        .collect();
-
-    agent
-        .handle_tool_result(
-            req.id.clone(),
-            Ok(if result.is_error {
-                rmcp::model::CallToolResult::error(content)
-            } else {
-                rmcp::model::CallToolResult::success(content)
-            }),
-        )
-        .await;
 }
 
 #[cfg(test)]

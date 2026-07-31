@@ -97,6 +97,7 @@ test("writeStoredReadState prunes all three keys consistently", () => {
       [staleThread, stale],
       [freshThread, nowSeconds],
     ]),
+    new Map(),
   );
 
   const state = JSON.parse(
@@ -128,12 +129,18 @@ test("writeStoredReadState round-trips through readStoredReadState", () => {
     new Map([["channel-9", nowSeconds]]),
     new Set(["channel-9"]),
     new Map([["channel-9", nowSeconds]]),
+    new Map([["channel-9", { s: 3, c: 1, b: nowSeconds }]]),
   );
 
   const stored = readStoredReadState(pubkey);
   assert.equal(stored.contexts.get("channel-9"), nowSeconds);
   assert.equal(stored.publishableContextIds.has("channel-9"), true);
   assert.equal(stored.contextSourceCreatedAt.get("channel-9"), nowSeconds);
+  const reg = stored.overrideRegisters.get("channel-9");
+  assert.ok(reg, "overrideRegisters must round-trip");
+  assert.equal(reg.s, 3, "register S must round-trip");
+  assert.equal(reg.c, 1, "register C must round-trip");
+  assert.equal(reg.b, nowSeconds, "register B must round-trip");
 });
 
 test("writeStoredReadState survives a throwing localStorage.setItem", () => {
@@ -150,6 +157,7 @@ test("writeStoredReadState survives a throwing localStorage.setItem", () => {
       new Map([["channel-1", nowSeconds]]),
       new Set(["channel-1"]),
       new Map([["channel-1", nowSeconds]]),
+      new Map(),
     );
   });
 });

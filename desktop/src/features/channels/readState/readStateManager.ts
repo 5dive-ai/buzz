@@ -1,6 +1,7 @@
 import { nip44EncryptToSelf, signRelayEvent } from "@/shared/api/tauri";
 import type { RelayClient } from "@/shared/api/relayClientSession";
 import type { RelayEvent } from "@/shared/api/types";
+import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import { KIND_READ_STATE } from "@/shared/constants/kinds";
 import {
   READ_STATE_D_TAG_PREFIX,
@@ -12,6 +13,8 @@ import {
   isOverrideKey,
   encodeOverrideGroup,
   isOverrideActive,
+  escapeFrontierKey,
+  unescapeFrontierKey,
   localExtraSlotIdsKey,
   type ReadStateBlob,
   type OverrideRegister,
@@ -21,20 +24,19 @@ import {
   parseReadStateEvent,
   mergeReadStateEventsStructured,
   type MergedReadState,
+  type ParsedReadStateEvent,
 } from "@/features/channels/readState/readStateSnapshot";
 import {
   readStoredReadState,
   writeStoredReadState,
 } from "@/features/channels/readState/readStateStorage";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
-import { truncatePubkey } from "@/shared/lib/pubkey";
 
 const CLIENT_ID_KEY_PREFIX = "buzz.nip-rs.client-id";
 const SLOT_ID_KEY_PREFIX = "buzz.nip-rs.slot-id";
 const DEBOUNCE_MS = 5_000;
-// Full-state fetch limit; sub-limit response confirms completeness (no truncation).
-const READ_STATE_FULL_FETCH_LIMIT = 5_000;
-type OwnBlobEntry = { blob: ReadStateBlob; createdAt: number };
+// Full-state fetch limit per query band (NIP-RS spec: MUST be ≥ L=2; SHOULD be substantially larger).
+const READ_STATE_FULL_FETCH_LIMIT = 500;
 
 export type MarkResult =
   | { success: true }
@@ -62,14 +64,6 @@ function getOrCreatePersisted(key: string, generator: () => string): string {
   return value;
 }
 
-function clientIdKey(pubkey: string): string {
-  return `${CLIENT_ID_KEY_PREFIX}:${pubkey}`;
-}
-
-function slotIdKey(pubkey: string): string {
-  return `${SLOT_ID_KEY_PREFIX}:${pubkey}`;
-}
-
 function loadExtraSlotIds(pubkey: string): string[] {
   try {
     const raw = localStorage.getItem(localExtraSlotIdsKey(pubkey));
@@ -95,10 +89,7 @@ export type ApplyRemoteContextResult = "unchanged" | "advanced";
 
 export type ContextParentResolver = (contextId: string) => string | null;
 
-/**
- * NIP-RS Hierarchical Frontier: `effective(ctx) = max(merged[ctx], effective(parent(ctx)))`.
- * Thread→channel relationship derived from event graph via `parentResolver`.
- */
+/** NIP-RS Hierarchical Frontier: `effective(ctx) = max(merged[ctx], effective(parent(ctx)))`. */
 export function resolveEffectiveTimestamp(args: {
   effectiveState: Map<string, number>;
   contextId: string;
@@ -139,22 +130,15 @@ export function applyRemoteContextTimestamp(args: {
   return result;
 }
 
-/**
- * Result of a `splitContextsIntoBudgetedSlots` call.
- */
+/** Result of `splitContextsIntoBudgetedSlots`. */
 export interface SlotSplitResult {
   /** Contexts record for each slot (primary slot first). */
   slots: Array<Record<string, number>>;
-  /** Extra slot IDs beyond the first. Length is `slots.length - 1`. */
+  /** Extra slot IDs beyond the first. */
   extraSlotIds: string[];
 }
 
-/**
- * Partition `channelEntries` across slots so each slot fits within `maxBytes`.
- * Override-bearing groups are pinned to slot 0; remaining keys distributed round-robin.
- * Returns `{ slots, extraSlotIds }` or null when maxSlots is insufficient.
- * Exported for unit testing; callers should prefer `splitContextsIntoSlots()`.
- */
+/** Partition `channelEntries` across slots, override groups pinned to slot 0. Exported for testing. */
 export function splitContextsIntoBudgetedSlots(args: {
   channelEntries: [string, number][];
   threadMsgEntries: [string, number][];
@@ -178,14 +162,14 @@ export function splitContextsIntoBudgetedSlots(args: {
   const blobFor = (c: Record<string, number>) =>
     JSON.stringify({ v: 1, client_id: clientId, contexts: c });
 
-  const overrideSuffixes = new Set<string>();
+  const overrideRawIds = new Set<string>();
   for (const [key] of channelEntries) {
-    if (isOverrideKey(key)) overrideSuffixes.add(key.slice(5)); // all ov_?: prefixes are 5 chars
+    if (isOverrideKey(key)) overrideRawIds.add(key.slice(5));
   }
   const pinnedEntries: [string, number][] = [];
   const roundRobinEntries: [string, number][] = [];
   for (const [key, ts] of channelEntries) {
-    if (isOverrideKey(key) || overrideSuffixes.has(key)) {
+    if (isOverrideKey(key) || overrideRawIds.has(unescapeFrontierKey(key))) {
       pinnedEntries.push([key, ts]);
     } else {
       roundRobinEntries.push([key, ts]);
@@ -282,16 +266,17 @@ export class ReadStateManager {
   private parentResolver: ContextParentResolver | null = null;
   /** Override registers keyed by raw context ID. */
   private overrideRegisters = new Map<string, OverrideRegister>();
-  /** False until initial full-state fetch returns sub-limit (no truncation). Gated ops blocked while false. */
+  /** False until full-state fenced load completes; gated ops blocked while false. */
   private isLoadComplete = false;
 
   constructor(pubkey: string, relayClient: RelayClient) {
     this.pubkey = pubkey;
     this.relayClient = relayClient;
-    this.clientId = getOrCreatePersisted(clientIdKey(pubkey), () =>
-      crypto.randomUUID(),
+    this.clientId = getOrCreatePersisted(
+      `${CLIENT_ID_KEY_PREFIX}:${pubkey}`,
+      () => crypto.randomUUID(),
     );
-    this.slotId = getOrCreatePersisted(slotIdKey(pubkey), () =>
+    this.slotId = getOrCreatePersisted(`${SLOT_ID_KEY_PREFIX}:${pubkey}`, () =>
       generateHex(16),
     );
     this.extraSlotIds = loadExtraSlotIds(pubkey);
@@ -299,9 +284,6 @@ export class ReadStateManager {
 
   async initialize(): Promise<void> {
     if (this.initialized || this.destroyed) return;
-    console.debug(
-      `[ReadStateManager] initialize pubkey=${truncatePubkey(this.pubkey)} clientId=${this.clientId.substring(0, 8)}… slotId=${this.slotId}`,
-    );
 
     this.hydrateFromLocalStorage();
     await this.fetchAndMerge();
@@ -317,9 +299,6 @@ export class ReadStateManager {
     }
 
     this.initialized = true;
-    console.debug(
-      `[ReadStateManager] initialize complete maxFetchedCreatedAt=${this.maxFetchedCreatedAt} contexts=${this.effectiveState.size}`,
-    );
     this.notifyListeners();
   }
 
@@ -365,18 +344,14 @@ export class ReadStateManager {
   }
 
   /**
-   * The context's OWN merged read marker, WITHOUT the hierarchical parent term.
-   * Use this for background-channel threads (getEffectiveTimestamp folds in
-   * parentResolver which maps threads to the active channel).
+   * The context's OWN merged read marker, without the hierarchical parent term.
+   * Use for background-channel threads (getEffectiveTimestamp includes parentResolver).
    */
   getOwnTimestamp(contextId: string): number | null {
     return this.effectiveState.get(contextId) ?? null;
   }
 
-  /**
-   * Inject the thread→channel parent resolver (NIP-RS.md:136-139).
-   * The hierarchical max in getEffectiveTimestamp is a no-op until this is set.
-   */
+  /** Inject the thread→channel parent resolver (NIP-RS.md:136-139). */
   setContextParentResolver(resolver: ContextParentResolver | null): void {
     this.parentResolver = resolver;
   }
@@ -403,34 +378,117 @@ export class ReadStateManager {
   }
 
   private async fetchAndMerge(): Promise<void> {
-    let events: RelayEvent[];
+    const L = 2; // NIP-RS floor (spec: MUST be ≥ L; §Full-State Load NIP-RS.md:321-377)
+    const n = READ_STATE_FULL_FETCH_LIMIT;
+    const baseFilter = {
+      kinds: [KIND_READ_STATE],
+      authors: [this.pubkey],
+      limit: n, // no tag constraint — spec prohibits it for full-state load
+    };
+
+    const fenceEvents: RelayEvent[] = [];
+    let fenceLapsed = false;
+    let unsubFence: (() => void) | null = null;
     try {
-      events = await this.relayClient.fetchEvents({
-        kinds: [KIND_READ_STATE],
-        authors: [this.pubkey],
-        "#t": ["read-state"],
-        // No `since` — a finite window can exclude the sole tombstone carrier.
-        limit: READ_STATE_FULL_FETCH_LIMIT,
+      unsubFence = await this.relayClient.subscribeLive(baseFilter, (ev) => {
+        fenceEvents.push(ev);
       });
-    } catch (error) {
-      console.debug("[ReadStateManager] fetchAndMerge failed:", error);
+    } catch {
+      fenceLapsed = true;
+    }
+
+    if (fenceLapsed || this.destroyed) {
+      unsubFence?.();
+      console.warn("[ReadStateManager] fetchAndMerge: fence failed");
       return;
     }
 
-    // Truncation guard: at-limit response may be incomplete; block gated ops.
-    this.isLoadComplete = events.length < READ_STATE_FULL_FETCH_LIMIT;
-    if (!this.isLoadComplete) {
+    let C = 0; // max events seen in one band
+    let until: number | undefined;
+    let allEvents: RelayEvent[] = [];
+    let loadComplete = false;
+
+    while (!this.destroyed) {
+      const filter: RelaySubscriptionFilter = {
+        ...baseFilter,
+        ...(until !== undefined ? { until } : {}),
+      };
+
+      let bandEvents: RelayEvent[];
+      try {
+        bandEvents = await this.relayClient.fetchEvents(filter);
+      } catch {
+        fenceLapsed = true;
+        break;
+      }
+
+      if (this.destroyed) break;
+
+      if (bandEvents.length === 0) {
+        loadComplete = true;
+        break;
+      }
+
+      if (bandEvents.length > C) C = bandEvents.length;
+      allEvents = allEvents.concat(bandEvents);
+      let T = bandEvents[0].created_at;
+      for (const ev of bandEvents) {
+        if (ev.created_at < T) T = ev.created_at;
+      }
+
+      let pinnedEvents: RelayEvent[];
+      try {
+        pinnedEvents = await this.relayClient.fetchEvents({
+          ...baseFilter,
+          since: T,
+          until: T,
+        });
+      } catch {
+        fenceLapsed = true;
+        break;
+      }
+
+      if (this.destroyed) break;
+
+      allEvents = allEvents.concat(pinnedEvents);
+      if (pinnedEvents.length > C) C = pinnedEvents.length;
+
+      if (pinnedEvents.length >= Math.max(C, L)) {
+        // pinned window at or above cap → potentially incomplete
+        break;
+      }
+
+      if (T === 0) {
+        loadComplete = true;
+        break;
+      }
+      until = T - 1;
+    }
+
+    unsubFence?.();
+
+    if (fenceLapsed || this.destroyed) {
       console.warn(
-        `[ReadStateManager] fetchAndMerge: ${events.length} events (== limit) — gated ops blocked`,
+        "[ReadStateManager] fetchAndMerge: fence lapsed — incomplete",
+      );
+      return;
+    }
+
+    allEvents = allEvents.concat(fenceEvents);
+    this.isLoadComplete = loadComplete;
+    if (!loadComplete) {
+      console.warn(
+        "[ReadStateManager] fetchAndMerge: load incomplete — gated ops blocked",
       );
     }
-    await this.mergeEvents(events);
+
+    await this.ingest(allEvents);
     this.persistLocalState();
     this.notifyListeners();
   }
 
-  private async mergeEvents(events: RelayEvent[]): Promise<void> {
-    // Structured merge via slice-1 protocol layer.
+  /** Shared ingest: initial load, live delivery, read-before-write. One decrypt/parse per event. */
+  private async ingest(events: RelayEvent[]): Promise<void> {
     const merged: MergedReadState = await mergeReadStateEventsStructured(
       events,
       this.pubkey,
@@ -440,7 +498,7 @@ export class ReadStateManager {
         effectiveState: this.effectiveState,
         contextSourceCreatedAt: this.contextSourceCreatedAt,
         contextId: rawCtx,
-        eventCreatedAt: 0, // per-event timestamps updated in the loop below
+        eventCreatedAt: 0,
         timestamp: ts,
       });
       if (result !== "unchanged") {
@@ -462,9 +520,16 @@ export class ReadStateManager {
       );
       this.publishableContextIds.add(rawCtx);
     }
-    const ownBlobsBySlot = new Map<string, OwnBlobEntry>();
+
+    const ownBlobsBySlot = new Map<
+      string,
+      { blob: ReadStateBlob; createdAt: number }
+    >();
     for (const event of events) {
-      const parsed = await parseReadStateEvent(event, this.pubkey);
+      const parsed: ParsedReadStateEvent | null = await parseReadStateEvent(
+        event,
+        this.pubkey,
+      );
       if (!parsed) continue;
 
       this.maxFetchedCreatedAt = Math.max(
@@ -482,16 +547,18 @@ export class ReadStateManager {
         parsed.blob.client_id !== this.clientId
       ) {
         this.slotId = generateHex(16);
-        setLocalStorageItemWithRecovery(slotIdKey(this.pubkey), this.slotId);
+        setLocalStorageItemWithRecovery(
+          `${SLOT_ID_KEY_PREFIX}:${this.pubkey}`,
+          this.slotId,
+        );
       }
       if (parsed.blob.client_id === this.clientId) {
         const existing = ownBlobsBySlot.get(parsed.dTag);
-        if (!existing || parsed.createdAt > existing.createdAt) {
+        if (!existing || parsed.createdAt > existing.createdAt)
           ownBlobsBySlot.set(parsed.dTag, {
             blob: parsed.blob,
             createdAt: parsed.createdAt,
           });
-        }
       }
     }
 
@@ -515,7 +582,6 @@ export class ReadStateManager {
         {
           kinds: [KIND_READ_STATE],
           authors: [this.pubkey],
-          "#t": ["read-state"],
           limit: READ_STATE_FETCH_LIMIT,
         },
         (event: RelayEvent) => {
@@ -527,53 +593,28 @@ export class ReadStateManager {
         return;
       }
       this.unsubscribeLive = unsub;
-      console.debug("[ReadStateManager] live subscription established");
-    } catch (error) {
-      console.debug("[ReadStateManager] live subscription FAILED:", error);
+    } catch {
+      // Live subscription is best-effort; missed events will be caught on reconnect.
     }
   }
 
   private async handleIncomingEvent(event: RelayEvent): Promise<void> {
     if (event.pubkey !== this.pubkey || this.destroyed) return;
-    console.debug(
-      `[ReadStateManager] incoming event=${event.id.substring(0, 8)}… created_at=${event.created_at}`,
-    );
 
-    const parsed = await parseReadStateEvent(event, this.pubkey);
-    if (!parsed) return;
+    const prevSize = this.effectiveState.size;
+    const prevRegSize = this.overrideRegisters.size;
+    await this.ingest([event]);
 
-    this.maxFetchedCreatedAt = Math.max(
-      this.maxFetchedCreatedAt,
-      parsed.createdAt,
-    );
-    const { blob } = parsed;
-    let anyAdvanced = false;
-    for (const [ctx, ts] of Object.entries(blob.contexts)) {
-      const result = applyRemoteContextTimestamp({
-        effectiveState: this.effectiveState,
-        contextSourceCreatedAt: this.contextSourceCreatedAt,
-        contextId: ctx,
-        timestamp: ts,
-        eventCreatedAt: parsed.createdAt,
-      });
-      if (result === "advanced") {
-        this.pendingSyncedAdvances.add(ctx);
-        anyAdvanced = true;
-      }
-      if (!this.publishableContextIds.has(ctx)) {
-        this.publishableContextIds.add(ctx);
-        anyAdvanced = true;
-      }
-    }
-    console.debug(
-      `[ReadStateManager] incoming result anyAdvanced=${anyAdvanced} clientId=${blob.client_id.substring(0, 8)}…`,
-    );
+    const anyAdvanced =
+      this.effectiveState.size !== prevSize ||
+      this.overrideRegisters.size !== prevRegSize ||
+      this.pendingSyncedAdvances.size > 0;
 
     if (anyAdvanced) {
       this.persistLocalState();
       this.notifyListeners();
-      // Another client instance: schedule re-publish so our blob converges.
-      if (blob.client_id !== this.clientId) this.schedulePublish();
+      const parsed = await parseReadStateEvent(event, this.pubkey);
+      if (parsed?.blob.client_id !== this.clientId) this.schedulePublish();
     }
   }
 
@@ -588,12 +629,15 @@ export class ReadStateManager {
   }
 
   private async publish(): Promise<void> {
-    console.debug(`[ReadStateManager] publish starting slotId=${this.slotId}`);
-    if (!this.isLoadComplete) {
-      console.debug("[ReadStateManager] publish blocked: isLoadComplete=false");
+    if (!this.isLoadComplete) return;
+    // Read-before-write: MUST NOT canonicalize on failure (NIP-RS.md:408-429).
+    if (!(await this.fetchOwnBlobBeforePublish())) {
+      console.warn(
+        "[ReadStateManager] publish aborted: read-before-write failed",
+      );
       return;
     }
-    await this.fetchOwnBlobBeforePublish();
+
     const contexts = this.currentContexts();
 
     if (contexts === null) {
@@ -611,7 +655,7 @@ export class ReadStateManager {
     await this.publishOneSlot(this.slotId, contexts);
   }
 
-  /** Publish a single slot's blob. Updates lastPublishedContexts and maxFetchedCreatedAt on success. */
+  /** Publish a single slot's blob. Updates lastPublishedContexts on success. */
   private async publishOneSlot(
     slotId: string,
     contexts: Record<string, number>,
@@ -619,10 +663,6 @@ export class ReadStateManager {
     const blob: ReadStateBlob = { v: 1, client_id: this.clientId, contexts };
     try {
       const ciphertext = await nip44EncryptToSelf(JSON.stringify(blob));
-      const tags: string[][] = [
-        ["d", `read-state:${slotId}`],
-        ["t", "read-state"],
-      ];
       const createdAt = Math.max(
         Math.floor(Date.now() / 1_000),
         this.maxFetchedCreatedAt + 1,
@@ -631,15 +671,15 @@ export class ReadStateManager {
         kind: KIND_READ_STATE,
         content: ciphertext,
         createdAt,
-        tags,
+        tags: [
+          ["d", `read-state:${slotId}`],
+          ["t", "read-state"],
+        ],
       });
       await this.relayClient.publishEvent(
         event,
         "Timed out publishing read state.",
         "Failed to publish read state.",
-      );
-      console.debug(
-        `[ReadStateManager] publish accepted slotId=${slotId} createdAt=${createdAt}`,
       );
       for (const key of Object.keys(contexts)) {
         if (this.lastPublishedContexts[key] !== contexts[key])
@@ -656,15 +696,11 @@ export class ReadStateManager {
     }
   }
 
-  /**
-   * Multi-slot publish path. Partitions channel keys across slots and publishes
-   * each independently. Skips if nothing changed since last publish.
-   */
+  /** Multi-slot publish. Skips if nothing changed since last publish. */
   private async publishSplitSlots(): Promise<void> {
     const slots = this.splitContextsIntoSlots();
     if (slots === null) return;
 
-    // No-op suppression: skip if nothing changed.
     const unionContexts: Record<string, number> = {};
     for (const { contexts } of slots) {
       for (const [key, ts] of Object.entries(contexts)) {
@@ -674,24 +710,15 @@ export class ReadStateManager {
     }
     if (this.isIdenticalToLastPublished(unionContexts)) return;
 
-    // Reset before multi-slot publish to rebuild as union of all slots.
     this.lastPublishedContexts = {};
     for (const { slotId, contexts } of slots) {
       await this.publishOneSlot(slotId, contexts);
     }
   }
 
-  /**
-   * Publish NIP-09 kind:5 delete events for all extra slot blobs, then clear
-   * extraSlotIds. Gated on isLoadComplete.
-   */
+  /** Delete stale extra-slot blobs. Gated on isLoadComplete. */
   private async deleteExtraSlots(): Promise<void> {
-    if (!this.isLoadComplete) {
-      console.debug(
-        "[ReadStateManager] deleteExtraSlots blocked: isLoadComplete=false",
-      );
-      return;
-    }
+    if (!this.isLoadComplete) return;
     for (const slotId of this.extraSlotIds) {
       try {
         const aTagValue = `${KIND_READ_STATE}:${this.pubkey}:${READ_STATE_D_TAG_PREFIX}${slotId}`;
@@ -705,22 +732,19 @@ export class ReadStateManager {
           "Timed out deleting extra read-state slot.",
           "Failed to delete extra read-state slot.",
         );
-        console.debug(`[ReadStateManager] deleted extra slot slotId=${slotId}`);
-      } catch (error) {
-        console.debug(
-          `[ReadStateManager] deleteExtraSlots failed for slotId=${slotId}:`,
-          error,
-        );
-        // Non-fatal: stale blob will expire from relay within the horizon window.
+      } catch {
+        // Non-fatal: stale blob expires within the relay's horizon window.
       }
     }
     this.extraSlotIds = [];
     saveExtraSlotIds(this.pubkey, []);
   }
 
-  private async fetchOwnBlobBeforePublish(): Promise<void> {
-    const allSlotIds = [this.slotId, ...this.extraSlotIds];
-    const dTags = allSlotIds.map((id) => `${READ_STATE_D_TAG_PREFIX}${id}`);
+  /** Read-before-write: fetch own coordinate blobs. Returns false on fetch failure. */
+  private async fetchOwnBlobBeforePublish(): Promise<boolean> {
+    const dTags = [this.slotId, ...this.extraSlotIds].map(
+      (id) => `${READ_STATE_D_TAG_PREFIX}${id}`,
+    );
     try {
       const events = await this.relayClient.fetchEvents({
         kinds: [KIND_READ_STATE],
@@ -728,13 +752,11 @@ export class ReadStateManager {
         "#d": dTags,
         limit: READ_STATE_FETCH_LIMIT,
       });
-      await this.mergeEvents(events);
+      await this.ingest(events);
       this.persistLocalState();
-    } catch (error) {
-      console.debug(
-        "[ReadStateManager] fetchOwnBlobBeforePublish failed:",
-        error,
-      );
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -753,50 +775,36 @@ export class ReadStateManager {
   private currentContexts(): Record<string, number> | null {
     const contexts: Record<string, number> = {};
     for (const [ctx, ts] of this.effectiveState) {
-      if (this.publishableContextIds.has(ctx)) contexts[ctx] = ts;
+      if (this.publishableContextIds.has(ctx))
+        contexts[escapeFrontierKey(ctx)] = ts;
     }
 
-    // Include ov_s/c/b wire entries for any context with an active or tombstoned register.
     for (const [rawCtx, reg] of this.overrideRegisters) {
       if (!this.publishableContextIds.has(rawCtx)) continue;
-      const effectiveFrontier = this.resolveOwnEffectiveFrontier(rawCtx);
+      const effectiveFrontier = this.effectiveState.get(rawCtx) ?? 0;
       const wireEntries = encodeOverrideGroup(rawCtx, reg, effectiveFrontier);
       for (const [key, val] of Object.entries(wireEntries)) contexts[key] = val;
     }
 
-    // Evict oldest msg: then thread: entries until blob fits 32 KB.
-    // Channel keys and ov_* entries are never evicted.
     const { evicted, fitsAfterTrim } = trimContextsToBudget(
       contexts,
       this.clientId,
       READ_STATE_MAX_PLAINTEXT_BYTES,
     );
-    if (evicted > 0) {
+    if (evicted > 0)
       console.warn(
         `[ReadStateManager] currentContexts trimmed ${evicted} entries`,
       );
-    }
-    if (!fitsAfterTrim) {
-      console.warn(
-        "[ReadStateManager] currentContexts: budget exceeded — will split",
-      );
-      return null;
-    }
+    if (!fitsAfterTrim) return null;
     return contexts;
   }
 
-  /**
-   * Partition the full publishable contexts across multiple slots when channel
-   * keys alone exceed READ_STATE_MAX_PLAINTEXT_BYTES. Override-bearing context
-   * groups are pinned to slot 0. Returns null when even READ_STATE_MAX_SLOTS
-   * slots can't accommodate all channel keys.
-   */
+  /** Partition publishable contexts across multiple slots. Override groups pinned to slot 0. */
   private splitContextsIntoSlots(): Array<{
     slotId: string;
     contexts: Record<string, number>;
   }> | null {
-    // Separate channel keys from thread/msg entries. Override wire entries
-    // (ov_s:, ov_c:, ov_b:) go in channelEntries for pinning to slot 0.
+    // ov_s/ov_c/ov_b entries go in channelEntries for slot-0 pinning.
     const channelEntries: [string, number][] = [];
     const threadMsgEntries: [string, number][] = [];
     for (const [ctx, ts] of this.effectiveState) {
@@ -804,13 +812,12 @@ export class ReadStateManager {
       if (ctx.startsWith(MSG_PREFIX) || ctx.startsWith(THREAD_PREFIX)) {
         threadMsgEntries.push([ctx, ts]);
       } else {
-        channelEntries.push([ctx, ts]);
+        channelEntries.push([escapeFrontierKey(ctx), ts]);
       }
     }
-    // Append override wire entries for publishable contexts.
     for (const [rawCtx, reg] of this.overrideRegisters) {
       if (!this.publishableContextIds.has(rawCtx)) continue;
-      const effectiveFrontier = this.resolveOwnEffectiveFrontier(rawCtx);
+      const effectiveFrontier = this.effectiveState.get(rawCtx) ?? 0;
       for (const [key, val] of Object.entries(
         encodeOverrideGroup(rawCtx, reg, effectiveFrontier),
       )) {
@@ -829,12 +836,7 @@ export class ReadStateManager {
       slotIdGenerator: () => generateHex(16),
     });
 
-    if (result === null) {
-      console.error(
-        `[ReadStateManager] splitContextsIntoSlots: ${channelEntries.length} channel keys exceed ${READ_STATE_MAX_SLOTS}-slot budget`,
-      );
-      return null;
-    }
+    if (result === null) return null;
 
     // Persist any newly allocated extra slot IDs.
     const newExtraSlotIds = [...allSlotIds.slice(1), ...result.extraSlotIds];
@@ -850,13 +852,8 @@ export class ReadStateManager {
     }));
   }
 
-  /** Resolve the effective frontier for `rawCtxId` from own state only (no parentResolver). */
-  private resolveOwnEffectiveFrontier(rawCtxId: string): number {
-    return this.effectiveState.get(rawCtxId) ?? 0;
-  }
-
-  /** Resolve the effective frontier for `channelId` including the parent resolver. */
-  private resolveChannelFrontier(channelId: string): number {
+  /** Effective frontier including parent resolver for `channelId`. */
+  private channelFrontier(channelId: string): number {
     return (
       resolveEffectiveTimestamp({
         effectiveState: this.effectiveState,
@@ -866,25 +863,18 @@ export class ReadStateManager {
     );
   }
 
-  /**
-   * Return the liveness status of the manual-unread override for `channelId`,
-   * or `null` when no override register exists.
-   */
+  /** @returns Liveness of the manual-unread override for `channelId`, or null if no register. */
   getOverrideLiveness(channelId: string): OverrideLiveness | null {
     const reg = this.overrideRegisters.get(channelId);
     if (!reg) return null;
-    const effectiveFrontier = this.resolveChannelFrontier(channelId);
+    const effectiveFrontier = this.channelFrontier(channelId);
     return {
       active: isOverrideActive(reg, effectiveFrontier),
       frontier: effectiveFrontier,
     };
   }
 
-  /**
-   * Mark a channel as manually unread. Bumps S to `max(S,C)+1`, sets B to the
-   * effective frontier. Refuses with `load_incomplete`, `uint32_overflow`, or
-   * `budget_exhausted` when applicable.
-   */
+  /** Mark `channelId` unread: S→max(S,C)+1, B→effective frontier. */
   markChannelUnread(channelId: string): MarkResult {
     if (!this.isLoadComplete)
       return { success: false, reason: "load_incomplete" };
@@ -894,7 +884,7 @@ export class ReadStateManager {
     const b = existing?.b ?? 0;
     const newS = Math.max(s, c) + 1;
     if (newS > 0xffffffff) return { success: false, reason: "uint32_overflow" };
-    const effectiveFrontier = this.resolveChannelFrontier(channelId);
+    const effectiveFrontier = this.channelFrontier(channelId);
     const newReg: OverrideRegister = {
       s: newS,
       c,
@@ -911,15 +901,12 @@ export class ReadStateManager {
     return { success: true };
   }
 
-  /**
-   * Mark a channel as read. Bumps C to `max(S,C)+1` (clear-wins).
-   * Refuses with `already_inactive` when no active override exists.
-   */
+  /** Mark `channelId` read: C→max(S,C)+1 (clear-wins). Refuses if no active override. */
   markChannelRead(channelId: string): MarkResult {
     if (!this.isLoadComplete)
       return { success: false, reason: "load_incomplete" };
     const reg = this.overrideRegisters.get(channelId);
-    const effectiveFrontier = this.resolveChannelFrontier(channelId);
+    const effectiveFrontier = this.channelFrontier(channelId);
     if (!reg || !isOverrideActive(reg, effectiveFrontier)) {
       return { success: false, reason: "already_inactive" };
     }
@@ -941,22 +928,22 @@ export class ReadStateManager {
     return { success: true };
   }
 
-  /**
-   * Trial budget check: temporarily apply `reg` for `rawCtxId` and call
-   * `currentContexts()`. Returns null if budget is exhausted after trim.
-   */
+  /** Trial budget check with candidate register applied. Returns null when budget exhausted. */
   private currentContextsWithOverride(
     rawCtxId: string,
     reg: OverrideRegister,
   ): Record<string, number> | null {
     const prev = this.overrideRegisters.get(rawCtxId);
+    const wasPublishable = this.publishableContextIds.has(rawCtxId);
     this.overrideRegisters.set(rawCtxId, reg);
+    this.publishableContextIds.add(rawCtxId);
     const result = this.currentContexts();
     if (prev === undefined) {
       this.overrideRegisters.delete(rawCtxId);
     } else {
       this.overrideRegisters.set(rawCtxId, prev);
     }
+    if (!wasPublishable) this.publishableContextIds.delete(rawCtxId);
     return result;
   }
 
@@ -968,6 +955,19 @@ export class ReadStateManager {
       this.publishableContextIds.add(contextId);
     for (const [contextId, createdAt] of stored.contextSourceCreatedAt)
       this.contextSourceCreatedAt.set(contextId, createdAt);
+    for (const [rawCtx, reg] of stored.overrideRegisters) {
+      const ex = this.overrideRegisters.get(rawCtx);
+      this.overrideRegisters.set(
+        rawCtx,
+        ex
+          ? {
+              s: Math.max(ex.s, reg.s),
+              c: Math.max(ex.c, reg.c),
+              b: Math.max(ex.b, reg.b),
+            }
+          : reg,
+      );
+    }
     this.persistLocalState();
   }
 
@@ -977,6 +977,7 @@ export class ReadStateManager {
       this.effectiveState,
       this.publishableContextIds,
       this.contextSourceCreatedAt,
+      this.overrideRegisters,
     );
   }
 

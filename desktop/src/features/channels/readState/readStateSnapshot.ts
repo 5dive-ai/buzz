@@ -3,7 +3,12 @@ import type { RelayEvent } from "@/shared/api/types";
 import {
   isValidBlob,
   isValidReadStateDTag,
+  mergeOverrideRegisters,
+  OV_B_PREFIX,
+  OV_C_PREFIX,
+  OV_S_PREFIX,
   sanitizeContexts,
+  type OverrideRegister,
   type ReadStateBlob,
 } from "@/features/channels/readState/readStateFormat";
 
@@ -52,6 +57,73 @@ export async function parseReadStateEvent(
     );
     return null;
   }
+}
+
+/**
+ * Extract all override registers from a sanitized contexts map.
+ *
+ * Returns a Map from raw context ID to `OverrideRegister`.  A tombstone floor
+ * (`ov_c:` only) is returned as `{ s: 0, c: <floor>, b: 0 }` — the same
+ * shape as a dead register, which is correct: the floor's sole purpose is to
+ * block counter reuse, and the liveness predicate evaluates to false for it.
+ *
+ * This is the read-side counterpart of `encodeOverrideGroup`: it reconstructs
+ * the register from the flat integer map that `sanitizeContexts` produced.
+ * The input MUST already have been through `sanitizeContexts` (so partial
+ * groups are absent — they were rejected at validation time).
+ */
+export function extractOverrideRegisters(
+  contexts: ReadonlyMap<string, number> | Record<string, number>,
+): Map<string, OverrideRegister> {
+  // Collect s/c/b values per context suffix.
+  const sVals = new Map<string, number>();
+  const cVals = new Map<string, number>();
+  const bVals = new Map<string, number>();
+
+  const iterate =
+    contexts instanceof Map
+      ? [...contexts.entries()]
+      : Object.entries(contexts);
+
+  for (const [key, value] of iterate) {
+    if (key.startsWith(OV_S_PREFIX))
+      sVals.set(key.slice(OV_S_PREFIX.length), value);
+    else if (key.startsWith(OV_C_PREFIX))
+      cVals.set(key.slice(OV_C_PREFIX.length), value);
+    else if (key.startsWith(OV_B_PREFIX))
+      bVals.set(key.slice(OV_B_PREFIX.length), value);
+  }
+
+  const result = new Map<string, OverrideRegister>();
+  const ctxSet = new Set([...sVals.keys(), ...cVals.keys(), ...bVals.keys()]);
+  for (const ctx of ctxSet) {
+    result.set(ctx, {
+      s: sVals.get(ctx) ?? 0,
+      c: cVals.get(ctx) ?? 0,
+      b: bVals.get(ctx) ?? 0,
+    });
+  }
+  return result;
+}
+
+/**
+ * Merge override registers from multiple sanitized contexts maps.
+ *
+ * Applies componentwise `max()` across all sources for each context suffix,
+ * returning a single Map from raw context ID to merged `OverrideRegister`.
+ * This is the register-level analogue of the frontier `max()` merge.
+ */
+export function mergeOverrideRegisterMaps(
+  ...maps: Array<Map<string, OverrideRegister>>
+): Map<string, OverrideRegister> {
+  const result = new Map<string, OverrideRegister>();
+  for (const source of maps) {
+    for (const [ctx, reg] of source) {
+      const existing = result.get(ctx);
+      result.set(ctx, existing ? mergeOverrideRegisters(existing, reg) : reg);
+    }
+  }
+  return result;
 }
 
 export async function mergeReadStateEvents(

@@ -1,15 +1,14 @@
 import { makeRootIdStore } from "@/features/channels/unreadRootIdStore";
-import {
-  forcedUnreadStore,
-  type ForcedUnreadMap,
-} from "@/features/channels/forcedUnreadStore";
 import { DM_NOTIFIABLE_EVENT_KINDS } from "@/features/channels/isDmNotifiableKind";
 import { mergeReadStateEventsStructured } from "@/features/channels/readState/readStateSnapshot";
 import {
   isOverrideActive,
   maxReadAt,
   msgContextKey,
+  type OverrideRegister,
 } from "@/features/channels/readState/readStateFormat";
+import { readStoredReadState } from "@/features/channels/readState/readStateStorage";
+import { deduplicateByCoordinate } from "@/features/channels/readState/readStateFencedLoader";
 import {
   getThreadReference,
   isBroadcastReply,
@@ -87,7 +86,6 @@ const METADATA_LIMIT = 1000;
 const UNREAD_EXISTENCE_LIMIT = 50;
 const MENTION_COUNT_LIMIT = 100;
 const READ_STATE_FETCH_LIMIT = 500;
-const READ_STATE_HORIZON_SECONDS = 7 * 24 * 60 * 60;
 
 export type CommunityUnreadObserverResult = {
   hasUnread: boolean;
@@ -160,16 +158,26 @@ export async function fetchCommunityUnread(args: {
   decryptReadState?: (ciphertext: string) => Promise<string>;
   decryptMutes?: (ciphertext: string) => Promise<string>;
   readThreadRelationships?: (pubkey: string) => ThreadRelationships;
-  readForcedUnread?: (pubkey: string) => ForcedUnreadMap;
+  /** Authoritative source (a): persisted override register projection. Defaults
+   *  to `readStoredReadState(pubkey).overrideRegisters`. Inject for tests. */
+  readStoredRegisters?: (
+    pubkey: string,
+  ) => ReadonlyMap<string, OverrideRegister>;
 }): Promise<CommunityUnreadObserverResult> {
   const { client, pubkey } = args;
   const normalizedPubkey = pubkey.toLowerCase();
-  const nowSeconds = args.nowSeconds ?? Math.floor(Date.now() / 1_000);
   const decryptMutes = args.decryptMutes ?? nip44DecryptFromSelf;
   const readRelationships =
     args.readThreadRelationships ?? defaultReadThreadRelationships;
-  const readForcedUnread =
-    args.readForcedUnread ?? ((pk) => forcedUnreadStore.read(pk));
+  const getStoredRegisters =
+    args.readStoredRegisters ??
+    ((pk: string) => {
+      try {
+        return readStoredReadState(pk).overrideRegisters;
+      } catch {
+        return new Map<string, OverrideRegister>();
+      }
+    });
 
   const channels = await fetchObservedChannels(client, pubkey);
   if (channels.length === 0) {
@@ -177,11 +185,11 @@ export async function fetchCommunityUnread(args: {
   }
 
   const [readStateEvents, mutesEvents] = await Promise.all([
+    // Override state is exempt from finite-horizon fetching: a register may be
+    // older than seven days and must not be missed. Tag-free, no `since` filter.
     client.fetchEvents({
       kinds: [KIND_READ_STATE],
       authors: [pubkey],
-      "#t": ["read-state"],
-      since: nowSeconds - READ_STATE_HORIZON_SECONDS,
       limit: READ_STATE_FETCH_LIMIT,
     }),
     client.fetchEvents({
@@ -192,11 +200,33 @@ export async function fetchCommunityUnread(args: {
     }),
   ]);
 
+  // Authoritative source (b): coordinate-deduped registers decoded from fetched
+  // events. deduplicateByCoordinate retains greatest created_at, lowest id.
   const readState = await mergeReadStateEventsStructured(
-    readStateEvents,
+    deduplicateByCoordinate(readStateEvents),
     pubkey,
     args.decryptReadState,
   );
+
+  // Authoritative source (a): persisted full-state projection from the manager's
+  // last complete load. Merge with source (b): max() per field, so a register
+  // present in only one source is retained.
+  const storedRegisters = getStoredRegisters(normalizedPubkey);
+  const mergedOverrides = new Map<string, OverrideRegister>(
+    readState.overrides,
+  );
+  for (const [rawCtx, stored] of storedRegisters) {
+    const fetched = mergedOverrides.get(rawCtx);
+    if (!fetched) {
+      mergedOverrides.set(rawCtx, stored);
+    } else {
+      mergedOverrides.set(rawCtx, {
+        s: Math.max(fetched.s, stored.s),
+        c: Math.max(fetched.c, stored.c),
+        b: Math.max(fetched.b, stored.b),
+      });
+    }
+  }
 
   let mutedIds = new Set<string>();
   if (mutesEvents.length > 0) {
@@ -218,11 +248,6 @@ export async function fetchCommunityUnread(args: {
     mutedRootIds,
   } = readRelationships(normalizedPubkey);
 
-  // Channels manually marked unread on this device — local cache of the NIP-RS
-  // override layer. Used only as a fast path; the authoritative verdict is the
-  // structured override register evaluated against the merged frontier.
-  const forcedUnreadMap = readForcedUnread(normalizedPubkey);
-
   let hasUnread = false;
   let mentionCount = 0;
 
@@ -232,26 +257,13 @@ export async function fetchCommunityUnread(args: {
     // Compute readAt from the merged frontiers.
     const readAt = readState.frontiers.get(channel.id) ?? null;
 
-    // Forced-unread: evaluate the structured override register using the same
-    // override_active(S, C, B, F) predicate as the active-community path. The
-    // local cache entry is a hint only — the register is the authoritative source.
+    // Override liveness: evaluate the merged authoritative register.
+    // "No register in fetched events" is ambiguity, not absence — the local
+    // cache is NOT a fallback verdict source here.
     if (!hasUnread) {
-      const reg = readState.overrides.get(channel.id);
+      const reg = mergedOverrides.get(channel.id);
       if (reg !== undefined && isOverrideActive(reg, readAt ?? 0)) {
         hasUnread = true;
-      } else if (
-        reg === undefined &&
-        Object.hasOwn(forcedUnreadMap, channel.id)
-      ) {
-        // No register in fetched events: fall back to the local cache as a best-
-        // effort hint (override event may not have reached the relay yet).
-        const markerAtWhenForced = forcedUnreadMap[channel.id];
-        if (
-          readAt === null ||
-          (markerAtWhenForced !== null && readAt <= markerAtWhenForced)
-        ) {
-          hasUnread = true;
-        }
       }
     }
 

@@ -26,6 +26,26 @@ import { isConversationalUnreadKind } from "@/shared/constants/kinds";
 
 import { useWelcomeInitialUnreadSuppression } from "./useWelcomeInitialUnreadSuppression";
 
+/**
+ * Pure helper: apply the mark-unread divider overlay.
+ *
+ * Calls `markFn(channelId)` and, if it returns true (accepted), adds the
+ * channel to the `overlay` set. Returns the same boolean so callers can gate
+ * any additional side-effects on success.
+ *
+ * Extracted for testability: `handleMarkUnread` calls this instead of
+ * inlining the same two-step logic.
+ */
+export function applyMarkUnreadDividerOverlay(
+  channelId: string,
+  markFn: (id: string) => boolean,
+  overlay: Set<string>,
+): boolean {
+  const accepted = markFn(channelId);
+  if (accepted) overlay.add(channelId);
+  return accepted;
+}
+
 type UseChannelUnreadStateOptions = {
   activeChannelId: string | null;
   timelineMessages: TimelineMessage[];
@@ -36,7 +56,7 @@ type UseChannelUnreadStateOptions = {
   openThreadMessages?: MainTimelineEntry[];
   getChannelReadAt: (channelId: string) => number | null;
   getMessageReadAt: (messageId: string) => number | null;
-  markChannelUnread: (channelId: string) => void;
+  markChannelUnread: (channelId: string) => boolean;
   markMessageRead: (messageId: string, timestamp: number) => void;
   isThreadMuted: (rootId: string) => boolean;
   readStateVersion: number;
@@ -404,19 +424,11 @@ export function useChannelUnreadState({
 
   const handleMarkUnread = React.useCallback(() => {
     if (!activeChannelId) return;
-    // Call the manager first — the sidebar dot is driven by liveness, not the
-    // session overlay. Only update the session overlay after the manager call
-    // so a refused mark-unread does not spuriously suppress the timeline marker.
-    markChannelUnread(activeChannelId);
-    // The `forcedUnreadRef` overlay here gates the timeline "New" divider
-    // suppression (see computeChannelUnreadMarker above). We must not set it
-    // before the manager call or on refusal. Since `markChannelUnread` has a
-    // void return type at this boundary, we rely on readStateVersion bumping
-    // on success (manager subscribe fires → outer hook re-renders → liveness
-    // is now active). The overlay is intentionally NOT set here — the divider
-    // suppression is driven by liveness via isActiveChannelForcedUnread only
-    // when the sidebar dot confirms active override state. Setting the overlay
-    // unconditionally would suppress the divider even on a refused call.
+    applyMarkUnreadDividerOverlay(
+      activeChannelId,
+      markChannelUnread,
+      forcedUnreadRef.current,
+    );
     forceUnreadRender();
   }, [activeChannelId, markChannelUnread]);
 

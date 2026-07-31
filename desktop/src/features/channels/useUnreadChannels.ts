@@ -149,15 +149,12 @@ export function useUnreadChannels(
   } = options;
   const activeChannelId = activeChannel?.id ?? null;
   const normalizedPubkey = pubkey?.toLowerCase() ?? null;
-  // Scoped relay key for activity storage; empty string when relay not yet known
-  // so rows from an unknown relay never load into the wrong community.
+  // Scoped relay key; empty string when relay not yet known.
   const normalizedRelayUrl = relayUrlOption
     ? normalizeRelayUrl(relayUrlOption)
     : "";
-  // Single identity for the in-memory thread-activity buffer — computed once
-  // per render and used at reset, both writers, and the return fence. The
-  // helper returns "" when either value is absent, which never matches a valid
-  // loaded scope, so the fence returns [] until the buffer is seeded.
+  // Activity scope key: "" when pubkey/relay absent (never matches a valid
+  // loaded scope, so the fence returns [] until the buffer is seeded).
   const currentActivityScope = activityScopeKey(
     normalizedPubkey,
     normalizedRelayUrl,
@@ -176,14 +173,19 @@ export function useUnreadChannels(
     markChannelRead: markChannelOverrideRead,
     getOverrideLiveness,
   } = useReadState(pubkey, relayClient);
-  // Stable object wrapping the three override APIs.
   const overrideApis = React.useMemo<OverrideAPIs>(
     () => ({
+      isReadStateReady,
       markChannelUnread: markChannelOverrideUnread,
       markChannelRead: markChannelOverrideRead,
       getOverrideLiveness,
     }),
-    [getOverrideLiveness, markChannelOverrideRead, markChannelOverrideUnread],
+    [
+      getOverrideLiveness,
+      isReadStateReady,
+      markChannelOverrideRead,
+      markChannelOverrideUnread,
+    ],
   );
 
   // Observed "latest external trigger event" per channel — derived relay evidence
@@ -335,13 +337,11 @@ export function useUnreadChannels(
     [markContextRead, overrideApis, pubkey],
   );
 
-  // Manually mark a channel unread (right-click → "mark unread"). Publishes a
-  // NIP-RS override event to the relay (S bump + B set), then updates the
-  // local cache. Shows a toast on failure (budget exhaustion, counter overflow,
-  // or incomplete load).
+  // Manually mark a channel unread (right-click). Returns true when the manager
+  // accepted (use to gate session-local UI overlays on success only).
   const markChannelUnread = React.useCallback(
-    (channelId: string) => {
-      if (!applyOverrideUnread(channelId, overrideApis)) return;
+    (channelId: string): boolean => {
+      if (!applyOverrideUnread(channelId, overrideApis)) return false;
       if (
         persistForcedUnread(
           channelId,
@@ -351,6 +351,7 @@ export function useUnreadChannels(
         )
       )
         bumpLatestVersion();
+      return true;
     },
     [getOwnTimestamp, overrideApis, pubkey],
   );

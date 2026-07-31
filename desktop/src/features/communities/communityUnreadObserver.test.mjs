@@ -641,7 +641,7 @@ test("fetchCommunityUnread threaded reply whose root is in mutedRootIds → hasU
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
 });
 
-// ── Forced-unread persistence gate tests ─────────────────────────────────
+// ── Override register authoritative source tests ──────────────────────────
 
 // A relay that serves one channel (CHANNEL_ID) as a member channel,
 // with no read state and no incoming events.
@@ -727,8 +727,12 @@ function quietRelayWithReadState(readAtSeconds) {
   ]);
 }
 
-test("fetchCommunityUnread forced-unread channel lights rail dot (hasUnread:true)", async () => {
+test("fetchCommunityUnread stored active register lights rail (hasUnread:true)", async () => {
+  // Authoritative source (a): stored register is active (S=1,C=0,B=0 with F=0).
+  // The fetch returns no override events — stored register is the authority.
   const relay = quietRelay();
+  // Active register: S=1, C=0, B=0 (baseline), frontier=0 → override_active = true
+  const storedRegisters = new Map([[CHANNEL_ID, { s: 1, c: 0, b: 0 }]]);
 
   const result = await fetchCommunityUnread({
     client: relay,
@@ -737,20 +741,18 @@ test("fetchCommunityUnread forced-unread channel lights rail dot (hasUnread:true
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    // Forced-unread map: CHANNEL_ID forced when marker was null (no prior read)
-    readForcedUnread: () => ({ [CHANNEL_ID]: null }),
+    readStoredRegisters: () => storedRegisters,
   });
 
   assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
 });
 
-test("fetchCommunityUnread forced-unread channel not in member list → hasUnread:false", async () => {
-  // The channel is marked forced-unread but the user is not a member of ANY
-  // channel — forced-unread is not consulted when the channel set is empty.
-  const relay = relayFor([
-    // 1. member events — empty
-    () => [],
-  ]);
+test("fetchCommunityUnread stored tombstoned register does NOT light rail (hasUnread:false)", async () => {
+  // Authoritative source (a): stored register is tombstoned (S=1,C=1 → S=C, inactive).
+  // Local cache cannot contradict this — must not light the dot.
+  const relay = quietRelay();
+  // Tombstoned: S=1, C=1, B=0 → override_active = false (S > C fails: 1 > 1 = false)
+  const storedRegisters = new Map([[CHANNEL_ID, { s: 1, c: 1, b: 0 }]]);
 
   const result = await fetchCommunityUnread({
     client: relay,
@@ -759,13 +761,38 @@ test("fetchCommunityUnread forced-unread channel not in member list → hasUnrea
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    readForcedUnread: () => ({ [CHANNEL_ID]: null }),
+    readStoredRegisters: () => storedRegisters,
   });
 
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
 });
 
-test("fetchCommunityUnread forced-unread channel that is also muted → hasUnread:false", async () => {
+test("fetchCommunityUnread old active register beyond horizon still lights rail", async () => {
+  // An active register that is older than the 7-day horizon must still light
+  // the rail. The fetch is tag-free and has no `since`, so it returns no
+  // events here, but the stored projection (authoritative source a) is used.
+  const relay = quietRelay();
+  const VERY_OLD_FRONTIER = 1; // far beyond any 7-day horizon
+  // S=1, C=0, B=VERY_OLD_FRONTIER, and frontier=VERY_OLD_FRONTIER → active
+  const storedRegisters = new Map([
+    [CHANNEL_ID, { s: 1, c: 0, b: VERY_OLD_FRONTIER }],
+  ]);
+
+  const result = await fetchCommunityUnread({
+    client: relay,
+    pubkey: PUBKEY,
+    nowSeconds: 100 + 7 * 24 * 3600 + 1, // past the old 7-day cutoff
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships(),
+    readStoredRegisters: () => storedRegisters,
+  });
+
+  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+});
+
+test("fetchCommunityUnread no stored register and empty fetch → falls through to relay gate", async () => {
+  // No stored registers, no override event fetched, but a real unread event exists.
   const relay = relayFor([
     // 1. member events
     () => [
@@ -787,16 +814,20 @@ test("fetchCommunityUnread forced-unread channel that is also muted → hasUnrea
     ],
     // 3. visibility
     () => [],
-    // 4. read-state (parallel with mutes)
+    // 4. read-state — empty
     () => [],
-    // 5. mutes — CHANNEL_ID is muted
+    // 5. mutes
+    () => [],
+    // 6. unread events — one real unread
     () => [
       event({
-        pubkey: PUBKEY,
-        content: mutesContent([CHANNEL_ID]),
+        id: "real-unread".padEnd(64, "0"),
+        created_at: 20,
+        tags: [["h", CHANNEL_ID]],
       }),
     ],
-    // No per-channel fetches expected — muted channel is skipped
+    // 7. mention events
+    () => [],
   ]);
 
   const result = await fetchCommunityUnread({
@@ -806,15 +837,33 @@ test("fetchCommunityUnread forced-unread channel that is also muted → hasUnrea
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    // CHANNEL_ID is both forced-unread AND muted — mute wins
-    readForcedUnread: () => ({ [CHANNEL_ID]: null }),
+    readStoredRegisters: () => new Map(), // no stored registers
+  });
+
+  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+});
+
+test("fetchCommunityUnread channel not in member list → hasUnread:false", async () => {
+  // No members — register lookup is never reached.
+  const relay = relayFor([
+    () => [], // member events empty
+  ]);
+
+  const result = await fetchCommunityUnread({
+    client: relay,
+    pubkey: PUBKEY,
+    nowSeconds: 100,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships(),
+    readStoredRegisters: () => new Map([[CHANNEL_ID, { s: 1, c: 0, b: 0 }]]),
   });
 
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
 });
 
-test("fetchCommunityUnread readForcedUnread returns empty map → falls through to relay gate", async () => {
-  // No forced-unread, but there IS a real unread event → hasUnread:true via relay
+test("fetchCommunityUnread active register muted channel → hasUnread:false", async () => {
+  // Override is active, but the channel is muted — mute wins.
   const relay = relayFor([
     // 1. member events
     () => [
@@ -838,18 +887,14 @@ test("fetchCommunityUnread readForcedUnread returns empty map → falls through 
     () => [],
     // 4. read-state
     () => [],
-    // 5. mutes
-    () => [],
-    // 6. unread events
+    // 5. mutes — CHANNEL_ID is muted
     () => [
       event({
-        id: "real-unread".padEnd(64, "0"),
-        created_at: 20,
-        tags: [["h", CHANNEL_ID]],
+        pubkey: PUBKEY,
+        content: mutesContent([CHANNEL_ID]),
       }),
     ],
-    // 7. mention events
-    () => [],
+    // No per-channel fetches expected — muted channel is skipped
   ]);
 
   const result = await fetchCommunityUnread({
@@ -859,33 +904,19 @@ test("fetchCommunityUnread readForcedUnread returns empty map → falls through 
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    readForcedUnread: () => ({}), // empty — no forced-unread
-  });
-
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
-});
-
-test("fetchCommunityUnread forced-unread + synced marker advanced PAST baseline → hasUnread:false", async () => {
-  // markerAtWhenForced = 50, observed readAt = 100 (100 > 50 → cross-device read wins)
-  const relay = quietRelayWithReadState(100);
-
-  const result = await fetchCommunityUnread({
-    client: relay,
-    pubkey: PUBKEY,
-    nowSeconds: 200,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
-    readThreadRelationships: readRelationships(),
-    // Forced at marker=50; synced marker is now 100 — covers the force
-    readForcedUnread: () => ({ [CHANNEL_ID]: 50 }),
+    // Active register, but channel is muted — mute wins
+    readStoredRegisters: () => new Map([[CHANNEL_ID, { s: 1, c: 0, b: 0 }]]),
   });
 
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
 });
 
-test("fetchCommunityUnread forced-unread + synced marker NOT advanced past baseline → hasUnread:true", async () => {
-  // markerAtWhenForced = 100, observed readAt = 100 (equal → force still stands)
+test("fetchCommunityUnread frontier advance deactivates stored register → hasUnread:false", async () => {
+  // Register: S=1, C=0, B=50 (active only when F<=50).
+  // Fetched frontier: 100 > 50 → override_active = false.
   const relay = quietRelayWithReadState(100);
+  // B=50 means active only when F<=50; fetched frontier is 100 → inactive
+  const storedRegisters = new Map([[CHANNEL_ID, { s: 1, c: 0, b: 50 }]]);
 
   const result = await fetchCommunityUnread({
     client: relay,
@@ -894,27 +925,7 @@ test("fetchCommunityUnread forced-unread + synced marker NOT advanced past basel
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    // Forced at marker=100; synced marker is still 100 — no newer read
-    readForcedUnread: () => ({ [CHANNEL_ID]: 100 }),
-  });
-
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
-});
-
-test("fetchCommunityUnread forced-unread with null baseline + synced marker present → hasUnread:false", async () => {
-  // markerAtWhenForced = null (no marker at force-time), but readAt = 50 now
-  // A cross-device read appeared after the force → do NOT light the dot
-  const relay = quietRelayWithReadState(50);
-
-  const result = await fetchCommunityUnread({
-    client: relay,
-    pubkey: PUBKEY,
-    nowSeconds: 200,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
-    readThreadRelationships: readRelationships(),
-    // Forced when no marker existed; a cross-device read has since appeared
-    readForcedUnread: () => ({ [CHANNEL_ID]: null }),
+    readStoredRegisters: () => storedRegisters,
   });
 
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });

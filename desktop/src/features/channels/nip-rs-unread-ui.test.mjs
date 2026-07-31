@@ -29,6 +29,7 @@ import {
 } from "./readStateOverride.ts";
 import { forcedUnreadStore } from "./forcedUnreadStore.ts";
 import { resolveChannelReadMarker } from "./useUnreadChannels.ts";
+import { applyMarkUnreadDividerOverlay } from "./ui/useChannelUnreadState.ts";
 
 // ── localStorage mock ────────────────────────────────────────────────────────
 
@@ -138,83 +139,138 @@ test("applyOverrideUnread_load_incomplete_returns_false", () => {
 });
 
 // ── Tests: applyOverrideRead ─────────────────────────────────────────────────
+//
+// New semantics (NIP-RS:537-539):
+//   1. !isReadStateReady → fail closed (overrideStillActive)
+//   2. isReadStateReady + null liveness → known absence (overrideCleared, no C-bump)
+//   3. isReadStateReady + register exists → ALWAYS attempt C-bump, then re-check
 
-test("applyOverrideRead_null_liveness_pre_init_returns_overrideStillActive", () => {
-  // null ≠ inactive: pre-init must fail closed
-  const result = applyOverrideRead("ch-1", {
-    markChannelUnread: () => ({ success: true }),
-    markChannelRead: () => {
-      throw new Error("should not be called");
-    },
-    getOverrideLiveness: () => null,
-  });
-  assert.equal(result, "overrideStillActive");
-});
-
-test("applyOverrideRead_inactive_liveness_returns_overrideCleared_without_c_bump", () => {
-  // Frontier advance made override inactive; no C-bump needed
-  let bumpCalled = false;
-  const result = applyOverrideRead("ch-1", {
-    markChannelUnread: () => ({ success: true }),
-    markChannelRead: () => {
-      bumpCalled = true;
-      return { success: true };
-    },
-    getOverrideLiveness: () => ({ active: false, frontier: 200 }),
-  });
-  assert.equal(result, "overrideCleared");
-  assert.equal(bumpCalled, false, "C-bump not called when already inactive");
-});
-
-test("applyOverrideRead_active_liveness_success_then_inactive_returns_overrideCleared", () => {
-  // Active → C-bump succeeds → re-read shows inactive
-  let callCount = 0;
-  const result = applyOverrideRead("ch-1", {
+// Helper: builds a minimal OverrideAPIs object with sensible defaults.
+function makeApis(overrides = {}) {
+  return {
+    isReadStateReady: true,
     markChannelUnread: () => ({ success: true }),
     markChannelRead: () => ({ success: true }),
-    getOverrideLiveness: () => {
-      callCount++;
-      // First call (pre-bump check): active. Second call (post-bump): inactive.
-      return callCount === 1
-        ? { active: true, frontier: 50 }
-        : { active: false, frontier: 50 };
-    },
-  });
+    getOverrideLiveness: () => null,
+    ...overrides,
+  };
+}
+
+test("applyOverrideRead_manager_not_ready_fails_closed_overrideStillActive", () => {
+  // Step 1: !isReadStateReady → fail closed without calling manager.
+  let bumped = false;
+  const result = applyOverrideRead(
+    "ch-1",
+    makeApis({
+      isReadStateReady: false,
+      markChannelRead: () => {
+        bumped = true;
+        return { success: true };
+      },
+      getOverrideLiveness: () => ({ active: true, frontier: 50 }),
+    }),
+  );
+  assert.equal(result, "overrideStillActive");
+  assert.equal(bumped, false, "C-bump must not fire when manager not ready");
+});
+
+test("applyOverrideRead_ready_null_liveness_no_register_overrideCleared", () => {
+  // Step 2: ready + null liveness = known no-register → cleared, no C-bump.
+  let bumped = false;
+  const result = applyOverrideRead(
+    "ch-1",
+    makeApis({
+      isReadStateReady: true,
+      markChannelRead: () => {
+        bumped = true;
+        return { success: true };
+      },
+      getOverrideLiveness: () => null,
+    }),
+  );
+  assert.equal(result, "overrideCleared");
+  assert.equal(bumped, false, "no C-bump when no register exists");
+});
+
+test("applyOverrideRead_inactive_register_cbump_attempted_then_clears", () => {
+  // Step 3 with inactive register: C-bump must be attempted (NIP-RS:537-539).
+  // After the bump, post-call liveness is still inactive → overrideCleared.
+  let bumped = false;
+  const result = applyOverrideRead(
+    "ch-1",
+    makeApis({
+      isReadStateReady: true,
+      markChannelRead: () => {
+        bumped = true;
+        return { success: true };
+      },
+      getOverrideLiveness: () => ({ active: false, frontier: 200 }),
+    }),
+  );
+  assert.equal(result, "overrideCleared");
+  assert.equal(bumped, true, "C-bump attempted even when already inactive");
+});
+
+test("applyOverrideRead_active_liveness_success_then_inactive_overrideCleared", () => {
+  // Active register → C-bump succeeds → re-read shows inactive → cleared.
+  let callCount = 0;
+  const result = applyOverrideRead(
+    "ch-1",
+    makeApis({
+      isReadStateReady: true,
+      markChannelRead: () => ({ success: true }),
+      getOverrideLiveness: () => {
+        callCount++;
+        return callCount === 1
+          ? { active: true, frontier: 50 }
+          : { active: false, frontier: 50 };
+      },
+    }),
+  );
   assert.equal(result, "overrideCleared");
 });
 
-test("applyOverrideRead_active_liveness_uint32_overflow_returns_overrideStillActive", () => {
-  // Active → C-bump refuses → re-read still active → overrideStillActive
-  let _callCount = 0;
-  const result = applyOverrideRead("ch-1", {
-    markChannelUnread: () => ({ success: true }),
-    markChannelRead: () => ({ success: false, reason: "uint32_overflow" }),
-    getOverrideLiveness: () => {
-      _callCount++;
-      return { active: true, frontier: 50 };
-    },
-  });
+test("applyOverrideRead_active_liveness_load_incomplete_overrideStillActive", () => {
+  // Active → C-bump refuses (load_incomplete) → liveness still active → retained.
+  const result = applyOverrideRead(
+    "ch-1",
+    makeApis({
+      isReadStateReady: true,
+      markChannelRead: () => ({ success: false, reason: "load_incomplete" }),
+      getOverrideLiveness: () => ({ active: true, frontier: 50 }),
+    }),
+  );
   assert.equal(result, "overrideStillActive");
 });
 
-test("applyOverrideRead_active_liveness_load_incomplete_returns_overrideStillActive", () => {
-  // Active → C-bump refuses (load_incomplete) → overrideStillActive
-  const result = applyOverrideRead("ch-1", {
-    markChannelUnread: () => ({ success: true }),
-    markChannelRead: () => ({ success: false, reason: "load_incomplete" }),
-    getOverrideLiveness: () => ({ active: true, frontier: 50 }),
-  });
-  assert.equal(result, "overrideStillActive");
+test("applyOverrideRead_already_inactive_race_overrideCleared", () => {
+  // already_inactive race: cleared by another device → silent success.
+  const result = applyOverrideRead(
+    "ch-1",
+    makeApis({
+      isReadStateReady: true,
+      markChannelRead: () => ({ success: false, reason: "already_inactive" }),
+      getOverrideLiveness: () => ({ active: true, frontier: 50 }),
+    }),
+  );
+  assert.equal(result, "overrideCleared");
 });
 
-test("applyOverrideRead_already_inactive_race_returns_overrideCleared", () => {
-  // already_inactive: cleared by another device between liveness check and
-  // clear call — treat as silent success.
-  const result = applyOverrideRead("ch-1", {
-    markChannelUnread: () => ({ success: true }),
-    markChannelRead: () => ({ success: false, reason: "already_inactive" }),
-    getOverrideLiveness: () => ({ active: true, frontier: 50 }),
-  });
+test("applyOverrideRead_post_call_null_liveness_treated_as_cleared", () => {
+  // Post-bump liveness is null (register deleted remotely) → overrideCleared.
+  let callCount = 0;
+  const result = applyOverrideRead(
+    "ch-1",
+    makeApis({
+      isReadStateReady: true,
+      markChannelRead: () => ({ success: true }),
+      getOverrideLiveness: () => {
+        callCount++;
+        // Pre-call: active register. Post-call: register gone (null).
+        return callCount === 1 ? { active: true, frontier: 50 } : null;
+      },
+    }),
+  );
   assert.equal(result, "overrideCleared");
 });
 
@@ -372,6 +428,37 @@ test("applyOverrideUnread_refusal_caller_must_not_mutate_overlay", () => {
   );
 });
 
+// ── Tests: applyMarkUnreadDividerOverlay (active-channel handleMarkUnread) ────
+//
+// This is the extracted production transition from handleMarkUnread in
+// useChannelUnreadState. Tests verify: success adds to overlay, refusal does not.
+
+test("applyMarkUnreadDividerOverlay_success_adds_to_overlay_returns_true", () => {
+  const overlay = new Set();
+  const result = applyMarkUnreadDividerOverlay(
+    "ch-active",
+    () => true, // markFn returns true = accepted
+    overlay,
+  );
+  assert.equal(result, true, "returns true on acceptance");
+  assert.equal(overlay.has("ch-active"), true, "adds to overlay on success");
+});
+
+test("applyMarkUnreadDividerOverlay_refusal_does_not_add_to_overlay_returns_false", () => {
+  const overlay = new Set();
+  const result = applyMarkUnreadDividerOverlay(
+    "ch-refused",
+    () => false, // markFn returns false = refused
+    overlay,
+  );
+  assert.equal(result, false, "returns false on refusal");
+  assert.equal(
+    overlay.has("ch-refused"),
+    false,
+    "overlay not mutated on refusal",
+  );
+});
+
 // ── Tests: markAllChannelsRead partial refusal pattern ────────────────────────
 //
 // Witnesses that per-channel gating in markAllChannelsRead correctly clears
@@ -387,6 +474,7 @@ test("applyOverrideRead_partial_refusal_pattern_clears_only_inactive", () => {
   };
   let clearCallCount = 0;
   const apis = {
+    isReadStateReady: true,
     markChannelUnread: () => ({ success: true }),
     markChannelRead: (id) => {
       clearCallCount++;

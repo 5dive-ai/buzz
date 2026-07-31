@@ -42,6 +42,7 @@ export function overrideErrorMessage(
 
 /** Slice-2 override APIs from ReadStateManager, proxied through useReadState. */
 export type OverrideAPIs = {
+  isReadStateReady: boolean;
   markChannelUnread: (channelId: string) => MarkResult;
   markChannelRead: (channelId: string) => MarkResult;
   getOverrideLiveness: (channelId: string) => OverrideLiveness | null;
@@ -68,13 +69,13 @@ export function applyOverrideUnread(
 /**
  * Outcome of the explicit mark-read transition for one channel.
  *
- * `overrideCleared` — the NIP-RS override is now known inactive (either it was
- *   already inactive, or the C-bump succeeded and the resulting liveness is
- *   inactive). Callers should clear local presentation.
+ * `overrideCleared` — the NIP-RS override is now known inactive (no register
+ *   exists, the frontier deactivated it, or the C-bump succeeded). Callers
+ *   should clear local presentation.
  *
- * `overrideStillActive` — the C-bump was refused (or returned a result where
- *   liveness remains active / unknown). Callers must NOT clear local unread
- *   presentation; the spec MUST at NIP-RS:537-539 requires success only when
+ * `overrideStillActive` — the manager is unavailable (fail-closed) or the
+ *   C-bump was refused and liveness remains active. Callers MUST NOT clear
+ *   local unread presentation; NIP-RS:537-539 requires success only when
  *   resulting override_active == false.
  */
 export type OverrideReadOutcome = "overrideCleared" | "overrideStillActive";
@@ -83,47 +84,48 @@ export type OverrideReadOutcome = "overrideCleared" | "overrideStillActive";
  * Attempt to clear the NIP-RS override for `channelId` as part of an explicit
  * mark-read transition. Models the transition as a single outcome:
  *
- *   1. If liveness is null (pre-init): fail-closed — return overrideStillActive
- *      without calling the manager (null ≠ inactive).
- *   2. If liveness is inactive: return overrideCleared immediately (no C-bump
- *      needed; the frontier advance already made override_active == false).
- *   3. If liveness is active: call markChannelRead, then re-read liveness.
- *      - If resulting liveness is inactive (or already_inactive race): cleared.
- *      - If the manager refused for any reason that keeps liveness active:
- *        show a toast and return overrideStillActive.
- *
- * Special edge (permitted by spec): if the caller's frontier advance made
- * F > B, liveness is already inactive before the C-bump — this is detected at
- * step 2, so no error toast fires in that case.
+ *   1. Manager unavailable (!isReadStateReady): fail-closed —
+ *      return overrideStillActive (manager unavailable ≠ no register).
+ *   2. liveness === null (ready but no register): return overrideCleared
+ *      (known absence; no C-bump needed).
+ *   3. liveness exists (active or inactive): always call markChannelRead —
+ *      spec NIP-RS:537-539 requires the C-bump even when the frontier already
+ *      deactivated the override. Then re-read liveness.
+ *      a. Resulting liveness inactive (or already_inactive race): cleared.
+ *      b. uint32 refusal AND F > B (frontier already deactivated): cleared,
+ *         no error toast (representable C-bump was not possible, frontier
+ *         already provides the inactive verdict).
+ *      c. Other refusal keeping liveness active: show toast, overrideStillActive.
  */
 export function applyOverrideRead(
   channelId: string,
   apis: OverrideAPIs,
 ): OverrideReadOutcome {
+  // Step 1: manager unavailable → fail closed.
+  if (!apis.isReadStateReady) return "overrideStillActive";
+
   const liveness = apis.getOverrideLiveness(channelId);
 
-  // Pre-init: null ≠ inactive. Fail closed.
-  if (liveness === null) return "overrideStillActive";
+  // Step 2: ready but no register at all → known absence, cleared.
+  if (liveness === null) return "overrideCleared";
 
-  // Already inactive (frontier advance made F > B, or never active).
-  if (!liveness.active) return "overrideCleared";
-
-  // Active override: attempt the C-bump.
+  // Step 3: register exists — always attempt the C-bump (NIP-RS:537-539).
   const result = apis.markChannelRead(channelId);
 
   if (!result.success && result.reason === "already_inactive") {
-    // Race condition: cleared by another device between our liveness check and
-    // the clear call. Silent success.
+    // Race: cleared by another device between our check and the call.
     return "overrideCleared";
   }
 
   // Re-read liveness after the attempt.
   const afterLiveness = apis.getOverrideLiveness(channelId);
-  if (afterLiveness !== null && !afterLiveness.active) {
+  // Covers: successful C-bump (inactive after), F>B deactivation (inactive after),
+  // and uint32 refusal where F>B already deactivated the register.
+  if (afterLiveness === null || !afterLiveness.active) {
     return "overrideCleared";
   }
 
-  // Refused and still active (or unknown post-call liveness).
+  // Refused and still active.
   if (!result.success) {
     const msg = overrideErrorMessage("read", result.reason);
     if (msg) toast.error(msg);

@@ -14,7 +14,7 @@ type AppShellContextValue = {
     readAt: string | null | undefined,
     options?: { topLevelOnly?: boolean },
   ) => void;
-  markChannelUnread: (channelId: string) => void;
+  markChannelUnread: (channelId: string) => boolean;
   openBrowseChannels: () => void;
   openCreateChannel: () => void;
   openChannelManagement: (channelId?: string) => void;
@@ -56,7 +56,7 @@ type AppShellContextValue = {
 const AppShellContext = React.createContext<AppShellContextValue>({
   markAllChannelsRead: () => {},
   markChannelRead: () => {},
-  markChannelUnread: () => {},
+  markChannelUnread: () => false,
   openBrowseChannels: () => {},
   openCreateChannel: () => {},
   openChannelManagement: () => {},

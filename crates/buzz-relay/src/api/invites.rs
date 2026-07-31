@@ -406,6 +406,9 @@ pub async fn claim_invite(
                     member = %claimer_hex,
                     "relay member added via v2 invite"
                 );
+                // Drop any cached negative membership so the new member is
+                // admitted immediately, not after cache TTL.
+                state.invalidate_relay_membership(&tenant, &claimer_hex);
                 // NIP-43 side effects only on Joined, never on other outcomes.
                 if let Err(e) = publish_nip43_member_added(&tenant, &state, &claimer_hex).await {
                     tracing::warn!(
@@ -484,6 +487,9 @@ pub async fn claim_invite(
             member = %claimer_hex,
             "relay member added via invite"
         );
+        // Drop any cached negative membership so the new member is admitted
+        // immediately, not after cache TTL.
+        state.invalidate_relay_membership(&tenant, &claimer_hex);
         if let Err(e) = publish_nip43_member_added(&tenant, &state, &claimer_hex).await {
             tracing::warn!("failed to publish NIP-43 member-added delta after claim: {e}");
         }

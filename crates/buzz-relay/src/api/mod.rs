@@ -70,8 +70,7 @@ pub mod relay_members {
 
         let pubkey_hex = hex::encode(pubkey_bytes);
         let is_member = state
-            .db
-            .is_relay_member(community, &pubkey_hex)
+            .is_relay_member_cached(community, &pubkey_hex)
             .await
             .map_err(|e| format!("relay membership check failed: {e}"))?;
         if is_member {
@@ -87,8 +86,7 @@ pub mod relay_members {
                     Ok(owner_pubkey) => {
                         let owner_hex = owner_pubkey.to_hex();
                         let owner_is_member = state
-                            .db
-                            .is_relay_member(community, &owner_hex)
+                            .is_relay_member_cached(community, &owner_hex)
                             .await
                             .map_err(|e| format!("relay membership check (owner) failed: {e}"))?;
                         if owner_is_member {

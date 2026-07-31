@@ -76,6 +76,13 @@ pub enum CacheInvalidation {
     /// Drop all membership / accessible / visibility caches. Mirrors
     /// `invalidate_channel_deleted`.
     ChannelDeleted,
+    /// Drop one pubkey's relay-membership entry. Mirrors
+    /// `invalidate_relay_membership` (invite claim, admin add/remove,
+    /// self-leave).
+    RelayMembership {
+        /// Affected member's pubkey bytes.
+        pubkey: Vec<u8>,
+    },
 }
 
 /// A cache invalidation received from a community-scoped Redis channel.
@@ -224,6 +231,18 @@ mod tests {
         let msg = CacheInvalidation::Membership {
             channel_id: Uuid::from_u128(0x1234),
             pubkey: vec![1, 2, 3, 4],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CacheInvalidation>(&json).unwrap(),
+            msg
+        );
+    }
+
+    #[test]
+    fn relay_membership_roundtrips_through_json() {
+        let msg = CacheInvalidation::RelayMembership {
+            pubkey: vec![5, 6, 7, 8],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(

@@ -1981,6 +1981,9 @@ async fn ingest_event_inner(
         }
 
         // Publish NIP-43 announcements — fire-and-forget.
+        // Drop the cached positive membership so the leave takes effect
+        // fleet-wide now, not after cache TTL.
+        state.invalidate_relay_membership(tenant, &sender_hex);
         if let Err(e) =
             crate::handlers::side_effects::publish_nip43_member_removed(tenant, state, &sender_hex)
                 .await

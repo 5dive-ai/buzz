@@ -297,6 +297,9 @@ async fn execute_relay_admin_command(
             // Only publish NIP-43 announcements when the row was actually inserted —
             // skip on no-op re-adds to avoid spurious kind:8000 events.
             if was_inserted {
+                // Drop any cached negative membership so the new member is
+                // admitted immediately, not after cache TTL.
+                state.invalidate_relay_membership(tenant, &target_hex);
                 if let Err(e) = publish_nip43_member_added(tenant, state, &target_hex).await {
                     warn!(error = %e, "failed to publish NIP-43 member added event");
                 }
@@ -356,6 +359,10 @@ async fn execute_relay_admin_command(
                 target = %target_hex,
                 "relay member removed"
             );
+
+            // Drop the cached positive membership so removal takes effect
+            // fleet-wide now, not after cache TTL.
+            state.invalidate_relay_membership(tenant, &target_hex);
 
             if let Err(e) = publish_nip43_member_removed(tenant, state, &target_hex).await {
                 warn!(error = %e, "failed to publish NIP-43 member removed event");

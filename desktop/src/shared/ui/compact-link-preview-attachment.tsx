@@ -69,7 +69,7 @@ export function CompactLinkPreviewAttachment({
         ) : null}
         <AttachmentContent className={reserveImage ? "px-2 py-2" : undefined}>
           <a
-            className="relative z-20 flex w-fit max-w-full min-w-0 items-center gap-1.5 text-xs font-normal leading-4 text-muted-foreground/70 hover:underline"
+            className="relative z-20 flex w-fit max-w-full min-w-0 items-center gap-1.5 text-xs font-normal leading-4 text-muted-foreground/70 group-hover/attachment:underline"
             data-link-preview-hostname=""
             href={preview.href}
             rel="noreferrer"
@@ -86,7 +86,7 @@ export function CompactLinkPreviewAttachment({
             ) : null}
             <span className="truncate">{hostname}</span>
           </a>
-          <AttachmentTitle className="line-clamp-2 whitespace-normal">
+          <AttachmentTitle className="line-clamp-2 whitespace-normal group-hover/attachment:underline">
             {preview.title}
           </AttachmentTitle>
           {preview.description ? (

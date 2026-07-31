@@ -500,6 +500,10 @@ test("link preview no-image layout keeps compact height", async ({ page }) => {
       card.locator('[data-slot="attachment-description"]'),
     ).toHaveText("Open-source collaboration for the Buzz app.");
     await expect(card).toHaveCSS("border-left-width", "3px");
+    const title = card.locator('[data-slot="attachment-title"]');
+    await card.hover();
+    await expect(hostnameLink).toHaveCSS("text-decoration-line", "underline");
+    await expect(title).toHaveCSS("text-decoration-line", "underline");
     const resolved = await card.evaluate((element) => ({
       height: element.getBoundingClientRect().height,
       textLeft: element

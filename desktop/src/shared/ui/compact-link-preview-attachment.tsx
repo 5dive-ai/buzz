@@ -152,7 +152,7 @@ export function CompactLinkPreviewAttachment({
       <Attachment
         className={cn(
           "w-full border-0 bg-transparent no-underline shadow-none hover:border-transparent hover:bg-transparent",
-          reserveImage && "h-20 min-h-20 max-h-20 gap-0 p-0",
+          reserveImage && "h-22 min-h-22 max-h-22 gap-0 p-0",
         )}
         data-image-state={preview.imageState}
         data-link-preview={preview.kind}
@@ -161,7 +161,7 @@ export function CompactLinkPreviewAttachment({
         {reserveImage ? (
           <AttachmentMedia
             aria-hidden={showImage ? undefined : "true"}
-            className="aspect-auto h-full min-h-0 w-28 min-w-28 max-w-28 self-stretch rounded-xl bg-muted sm:w-32 sm:min-w-32 sm:max-w-32"
+            className="aspect-auto h-full min-h-0 w-30 min-w-30 max-w-30 self-stretch rounded-xl bg-muted sm:w-34 sm:min-w-34 sm:max-w-34"
             data-link-preview-thumbnail=""
             variant="image"
           >
@@ -183,9 +183,9 @@ export function CompactLinkPreviewAttachment({
             <LinkPreviewLogo preview={preview} />
           </AttachmentMedia>
         )}
-        <AttachmentContent className={reserveImage ? "px-3 py-2.5" : undefined}>
+        <AttachmentContent className={reserveImage ? "px-2 py-2" : undefined}>
           <div
-            className="flex min-w-0 items-center gap-1.5 text-xs font-normal leading-4 text-muted-foreground"
+            className="flex min-w-0 items-center gap-1.5 text-xs font-normal leading-4 text-muted-foreground/70"
             data-link-preview-hostname=""
           >
             {reserveImage && preview.faviconDataUrl ? (
@@ -201,19 +201,13 @@ export function CompactLinkPreviewAttachment({
               {reserveImage ? hostname : preview.provider}
             </span>
           </div>
-          <AttachmentTitle
-            className={
-              reserveImage
-                ? preview.description
-                  ? "truncate"
-                  : "line-clamp-2 whitespace-normal"
-                : undefined
-            }
-          >
+          <AttachmentTitle className="line-clamp-2 whitespace-normal">
             {preview.title}
           </AttachmentTitle>
           {reserveImage && preview.description ? (
-            <AttachmentDescription>{preview.description}</AttachmentDescription>
+            <AttachmentDescription className="text-muted-foreground/70">
+              {preview.description}
+            </AttachmentDescription>
           ) : null}
         </AttachmentContent>
         <AttachmentTrigger asChild>

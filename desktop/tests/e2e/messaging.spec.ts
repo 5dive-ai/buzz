@@ -428,15 +428,15 @@ test("link preview image geometry stays stable while loading", async ({
     }));
 
     expect(pending.width).toBe(width < 640 ? 325 : 384);
-    expect(pending.height).toBe(80);
-    expect(pending.textInset).toBe(12);
-    expect(pending.thumbnailHeight).toBe(80);
+    expect(pending.height).toBe(88);
+    expect(pending.textInset).toBe(8);
+    expect(pending.thumbnailHeight).toBe(88);
     expect(loaded.height).toBe(pending.height);
     expect(loaded.textLeft).toBe(pending.textLeft);
     expect(loaded.thumbnailHeight).toBe(pending.thumbnailHeight);
     expect(loaded.thumbnailWidth).toBe(pending.thumbnailWidth);
-    expect(loaded.thumbnailWidth).toBe(width < 640 ? 112 : 128);
-    expect(loaded.titleClass).toContain("truncate");
+    expect(loaded.thumbnailWidth).toBe(width < 640 ? 120 : 136);
+    expect(loaded.titleClass).toContain("line-clamp-2");
     expect(loaded.description).toBe(
       "A polished, stable preview for shared links.",
     );

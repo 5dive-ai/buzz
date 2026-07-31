@@ -1,0 +1,49 @@
+# Treatment cell paired with tb-cobol-sonnet-haiku.yaml. Identical staffing,
+# endpoints, prices, and budget; the only two differences are the intervention:
+#   1. the -criteria personas, which add the acceptance-criteria rules (write
+#      the task's stated conditions into `todo`, then show the command and its
+#      literal output for each before finishing), and
+#   2. todo_enforcement: true, which turns on buzz-dev-mcp's _Stop hook so an
+#      agent cannot end its turn while a todo item is still open.
+# Run this against the control on the same task set to read the effect. Keep
+# every other field byte-identical to the control or the comparison is
+# confounded.
+schema_version: "1"
+condition: tb-cobol-sonnet46-2haiku45-criteria
+todo_enforcement: true
+roster:
+  - id: orch
+    kind: orchestrator
+    role: lead
+    count: 1
+    endpoint: claude-sonnet-4-6
+    model_revision: claude-sonnet-4-6
+    prompt:
+      path: personas/orchestrator-tb-criteria.md
+      sha256: b208b077d9758f1343d14c6a4a2fae8bfad5625905d43f085d209f3a55d463ea
+    generation:
+      max_output_tokens: 4096
+      context_window_tokens: 200000
+  - id: worker
+    kind: worker
+    role: implementer
+    count: 2
+    endpoint: claude-haiku-4-5
+    model_revision: claude-haiku-4-5
+    prompt:
+      path: personas/worker-tb-criteria.md
+      sha256: 2df5fad04298ad85dd3e661e69668b7e660d95fa1a30fb33d62282d784746d97
+    generation:
+      max_output_tokens: 4096
+      context_window_tokens: 200000
+prices:
+  claude-sonnet-4-6:
+    input_per_million_usd: 3
+    cached_input_per_million_usd: 0.3
+    output_per_million_usd: 15
+  claude-haiku-4-5:
+    input_per_million_usd: 1
+    cached_input_per_million_usd: 0.1
+    output_per_million_usd: 5
+trial_budget:
+  timeout_seconds: 900

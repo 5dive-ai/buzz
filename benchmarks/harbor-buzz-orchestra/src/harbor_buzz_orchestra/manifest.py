@@ -92,6 +92,13 @@ class ExperimentManifest(StrictModel):
     roster: tuple[AgentClass, ...] = Field(min_length=1)
     prices: dict[str, Price]
     trial_budget: TrialBudget
+    # Enable buzz-dev-mcp's _Stop/_PostCompact lifecycle hooks, which make the
+    # `todo` tool binding instead of advisory: _Stop refuses end_turn while any
+    # item is open, and _PostCompact re-injects the list after a context
+    # handoff. Off by default, matching buzz-agent's own default (hook_servers
+    # is HookServers::None when MCP_HOOK_SERVERS is unset), so this stays an
+    # opt-in experimental condition rather than a silent change to every cell.
+    todo_enforcement: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")

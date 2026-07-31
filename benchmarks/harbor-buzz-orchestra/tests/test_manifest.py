@@ -27,6 +27,15 @@ def test_hash_changes_when_staffing_changes(manifest_data):
     assert ExperimentManifest.load(changed).sha256 != first.sha256
 
 
+def test_todo_enforcement_defaults_off_and_changes_condition_identity(manifest_data):
+    control = ExperimentManifest.load(manifest_data)
+    assert control.todo_enforcement is False
+    treatment = ExperimentManifest.load({**manifest_data, "todo_enforcement": True})
+    assert treatment.todo_enforcement is True
+    # The flag is part of the condition, so the two arms hash differently.
+    assert treatment.sha256 != control.sha256
+
+
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [

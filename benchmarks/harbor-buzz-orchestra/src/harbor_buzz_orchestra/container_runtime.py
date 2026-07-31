@@ -38,6 +38,11 @@ FORWARDER = f"{REMOTE_BIN}/relay-forwarder"
 FORWARDER_LOG = f"{REMOTE_LOGS}/relay-forwarder.log"
 # How many done-poll iterations between in-container liveness probes.
 LIVENESS_EVERY = 10
+# How many times _Stop may refuse end_turn before the agent is allowed to
+# finish anyway, when todo_enforcement is on. buzz-agent's own default is 3;
+# trials run against a hard wall clock and 13% of observed failures were
+# AgentTimeoutError, so the benchmark buys fewer retries than production.
+TODO_STOP_MAX_REJECTIONS = 2
 
 
 class RuntimeLaunchError(RuntimeError):
@@ -150,6 +155,7 @@ class BuzzContainerRuntime:
                         credential=credential,
                         agent_class=classes[credential.agent_id],
                         trial_dir=trial_dir,
+                        todo_enforcement=manifest.todo_enforcement,
                     )
                 )
             await self._wait_for_agents_ready(
@@ -176,6 +182,7 @@ class BuzzContainerRuntime:
                 "completion_message": final_message["content"],
                 "agent_runtime": "in-container",
                 "agent_hints_enabled": False,
+                "agent_todo_enforcement": manifest.todo_enforcement,
                 "task_seed": "user-identity-prompt",
                 "agent_max_rounds": {
                     credential.agent_id: (
@@ -296,6 +303,7 @@ class BuzzContainerRuntime:
         credential: AgentCredential,
         agent_class: AgentClass,
         trial_dir: Path,
+        todo_enforcement: bool = False,
     ) -> _Agent:
         if not credential.llm_endpoint:
             raise RuntimeLaunchError("credential llm_endpoint must not be empty")
@@ -324,6 +332,7 @@ class BuzzContainerRuntime:
             agent_class=agent_class,
             endpoint=endpoint,
             remote_prompt=remote_prompt,
+            todo_enforcement=todo_enforcement,
         )
         command = (
             f"{shlex.quote(f'{REMOTE_BIN}/buzz-acp')} </dev/null "
@@ -347,9 +356,10 @@ class BuzzContainerRuntime:
         agent_class: AgentClass,
         endpoint: EndpointLaunchConfig,
         remote_prompt: str,
+        todo_enforcement: bool = False,
     ) -> dict[str, str]:
         """The desktop-launch environment: real acp/agent/dev-mcp wiring."""
-        return {
+        env = {
             **endpoint.env,
             "BUZZ_RELAY_URL": trial.relay_ws_url,
             "BUZZ_PRIVATE_KEY": credential.nostr_secret_key,
@@ -381,6 +391,15 @@ class BuzzContainerRuntime:
             "BUZZ_AGENT_NO_HINTS": "1",
             endpoint.api_key_env: credential.llm_api_key,
         }
+        if todo_enforcement:
+            # buzz-dev-mcp already exposes the `todo` tool in every cell, but
+            # its _Stop/_PostCompact hooks are never called unless a server is
+            # named here, which leaves the todo list advisory: an agent can
+            # open items and still end its turn. "*" enables hooks for every
+            # attached MCP server.
+            env["MCP_HOOK_SERVERS"] = "*"
+            env["BUZZ_AGENT_STOP_MAX_REJECTIONS"] = str(TODO_STOP_MAX_REJECTIONS)
+        return env
 
     # -- lifecycle -------------------------------------------------------------
 

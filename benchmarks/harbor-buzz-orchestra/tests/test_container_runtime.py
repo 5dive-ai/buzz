@@ -290,6 +290,37 @@ async def test_launch_wires_the_desktop_environment(tmp_path, configured, expect
     )
 
 
+@pytest.mark.parametrize(
+    ("todo_enforcement", "expected_hooks"), [(False, None), (True, "*")]
+)
+async def test_todo_enforcement_gates_the_mcp_lifecycle_hooks(
+    tmp_path, todo_enforcement, expected_hooks
+):
+    manifest = write_manifest(tmp_path)
+    orch = credential("orch-1", "orchestrator", "orch-model")
+    trial = trial_handle((orch,))
+    environment = Environment(
+        responses={"buzz-acp": ExecResult(stdout="4242\n", stderr="", return_code=0)}
+    )
+    await runtime(tmp_path)._launch_agent(
+        environment=environment,
+        trial=trial,
+        credential=orch,
+        agent_class=manifest.roster[0],
+        trial_dir=tmp_path,
+        todo_enforcement=todo_enforcement,
+    )
+    _, env = environment.commands[-1]
+    # buzz-dev-mcp is attached either way, so the `todo` tool is callable in
+    # both arms; only the _Stop/_PostCompact enforcement is gated.
+    assert env["BUZZ_ACP_MCP_COMMAND"] == f"{REMOTE_BIN}/buzz-dev-mcp"
+    assert env.get("MCP_HOOK_SERVERS") == expected_hooks
+    if todo_enforcement:
+        assert env["BUZZ_AGENT_STOP_MAX_REJECTIONS"] == "2"
+    else:
+        assert "BUZZ_AGENT_STOP_MAX_REJECTIONS" not in env
+
+
 def test_runtime_rejects_unbounded_agent_rounds(tmp_path):
     with pytest.raises(ValueError, match="positive"):
         runtime(tmp_path, max_agent_rounds=0)

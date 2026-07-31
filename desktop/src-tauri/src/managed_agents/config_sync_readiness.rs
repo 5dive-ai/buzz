@@ -202,6 +202,33 @@ pub fn force_claim_in_progress() -> ReadinessClaim {
     ReadinessClaim::new(gen)
 }
 
+/// Force-claim then resolve: acquires a preempting [`ReadinessClaim`] BEFORE
+/// invoking `resolver`. If `resolver` succeeds, returns `Ok((claim, value))`.
+/// If `resolver` fails, the claim is dropped (RAII → `Unready`) and the error
+/// is returned.
+///
+/// Both `apply_workspace` and `import_identity` route through this helper to
+/// guarantee that a transient scope-resolution failure always leaves the latch
+/// `Unready` (retryable by the flush loop) rather than preserving a stale
+/// `Ready(old_path)` that would reject every flush retry claim for the session.
+///
+/// The production callers supply `active_retention_scope` as `resolver`; tests
+/// can supply `|| Err(...)` to prove that a resolver failure drops the claim
+/// and leaves the latch `Unready`.
+pub fn force_claim_and_resolve<T, E, F>(resolver: F) -> Result<(ReadinessClaim, T), E>
+where
+    F: FnOnce() -> Result<T, E>,
+{
+    let claim = force_claim_in_progress();
+    match resolver() {
+        Ok(value) => Ok((claim, value)),
+        Err(e) => {
+            drop(claim); // RAII → Unready
+            Err(e)
+        }
+    }
+}
+
 /// Reset to `Unready` unconditionally.
 ///
 /// Use for test cleanup and exceptional reset paths only. Normal transitions
@@ -465,15 +492,18 @@ mod tests {
         assert_eq!(readiness_state(), Some(ReadinessState::Unready));
     }
 
-    // ── (i) force-claim before scope resolution: scope failure → Unready ─────
+    // ── (i) force_claim_and_resolve: resolver failure leaves latch Unready ───
     //
-    // Covers the Thufir IMPORTANT#1 fix: `force_claim_in_progress` runs BEFORE
-    // `active_retention_scope`. If scope resolution fails, the claim drops via
-    // RAII and the latch lands `Unready`. Without this fix, the stale
-    // `Ready(old_path)` would survive and `claim_in_progress` would reject every
-    // flush retry for the session (it only accepts from `Unready`).
+    // Covers the Thufir IMPORTANT#1 fix: both swap paths (`apply_workspace`
+    // and `import_identity`) route through `force_claim_and_resolve`, which
+    // acquires `force_claim_in_progress` BEFORE invoking the resolver. If the
+    // resolver fails, the claim drops via RAII and the latch lands `Unready`.
     //
-    // Scenario: scope A Ready → swap → scope resolution fails →
+    // Mutation-sensitive: if `force_claim_and_resolve` is rewritten to invoke
+    // the resolver BEFORE acquiring the claim, the stale `Ready(A)` survives
+    // (nothing preempts it) and the assert below fails.
+    //
+    // Scenario: scope A Ready → force_claim_and_resolve with failing resolver →
     //   Unready (via RAII drop) → retry from flush loop wins claim →
     //   full transition runs for scope B → Ready(B).
     #[test]
@@ -488,20 +518,18 @@ mod tests {
         claim_a.complete(path_a.clone());
         assert!(is_ready_for(&path_a), "scope A must be Ready before swap");
 
-        // Force-claim BEFORE scope resolution (the fix). Simulated scope
-        // resolution failure: drop the claim without calling complete().
-        {
-            let _claim = force_claim_in_progress();
-            // Scope resolution fails here — _claim drops via RAII.
-        }
+        // Both swap commands call force_claim_and_resolve; supply a failing
+        // resolver to simulate a transient scope-resolution error.
+        let result = force_claim_and_resolve::<(), &str, _>(|| Err("transient scope failure"));
+        assert!(result.is_err(), "failing resolver must return Err");
         assert_eq!(
             readiness_state(),
             Some(ReadinessState::Unready),
-            "scope failure after force_claim must leave latch Unready, not Ready(old_path)"
+            "resolver failure must leave latch Unready, not Ready(old_path)"
         );
         assert!(
             !is_ready_for(&path_a),
-            "stale Ready(A) must not survive after force-claim + drop"
+            "stale Ready(A) must not survive after force_claim_and_resolve + resolver failure"
         );
 
         // The flush loop's Unready arm can now claim and run the full

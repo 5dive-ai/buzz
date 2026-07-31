@@ -394,14 +394,15 @@ pub async fn import_identity(
         // change on key swap — `scoped_retention_db_path` hashes the owner
         // pubkey — so the reconcile below is necessary to queue the new
         // owner's disk projections for the new scope.
+        //
+        // Both swap paths route through `force_claim_and_resolve` so the
+        // claim-before-resolve ordering is a named production seam rather than
+        // an inline convention at each call site.
         {
-            let claim =
-                crate::managed_agents::config_sync_readiness::force_claim_in_progress();
-            match crate::managed_agents::retention::active_retention_scope(
-                &app_handle,
-                &state,
-            ) {
-                Ok(scope) => {
+            match crate::managed_agents::config_sync_readiness::force_claim_and_resolve(|| {
+                crate::managed_agents::retention::active_retention_scope(&app_handle, &state)
+            }) {
+                Ok((claim, scope)) => {
                     crate::event_sync::spawn_event_sync_with_held_claim(
                         app_handle.clone(),
                         scope.owner_keys,
@@ -411,10 +412,9 @@ pub async fn import_identity(
                 }
                 Err(e) => {
                     eprintln!("buzz-desktop: import-identity: scope unavailable, config barrier skipped: {e}");
-                    // Claim drops here via RAII → latch becomes Unready; the
-                    // flush loop will retry with the full transition once scope
-                    // resolves.
-                    drop(claim);
+                    // force_claim_and_resolve already dropped the claim →
+                    // latch is Unready; the flush loop will retry with the
+                    // full transition once scope resolves.
                 }
             }
         }

@@ -221,9 +221,14 @@ pub async fn apply_workspace(
     // `flush_active_pending_events` to refuse every retry claim for the session.
     // Dropping the claim on failure leaves the latch Unready so the flush loop
     // can claim and run the full transition once scope resolution recovers.
-    let claim = crate::managed_agents::config_sync_readiness::force_claim_in_progress();
-    match crate::managed_agents::retention::active_retention_scope(&restore_app, &state) {
-        Ok(scope) => {
+    //
+    // Both swap paths (apply_workspace and import_identity) route through
+    // `force_claim_and_resolve` so the claim-before-resolve ordering is a named
+    // production seam rather than an inline convention at each call site.
+    match crate::managed_agents::config_sync_readiness::force_claim_and_resolve(|| {
+        crate::managed_agents::retention::active_retention_scope(&restore_app, &state)
+    }) {
+        Ok((claim, scope)) => {
             // Adopt whatever the pre-scoping release left queued in the global
             // retention database BEFORE the scoped reconcile and flush run, so
             // stranded tombstones and archive requests publish on this boot
@@ -238,9 +243,9 @@ pub async fn apply_workspace(
         }
         Err(error) => {
             eprintln!("buzz-desktop: scoped event-sync unavailable after workspace apply: {error}");
-            // Claim drops here via RAII → latch becomes Unready; the flush
-            // loop will retry with the full transition once scope resolves.
-            drop(claim);
+            // force_claim_and_resolve already dropped the claim → latch is
+            // Unready; the flush loop will retry with the full transition once
+            // scope resolves.
         }
     }
 

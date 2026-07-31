@@ -271,8 +271,14 @@ async fn run_boot_barrier_for_scope(
 /// the guard can only mirror the `if stale_claim.is_current()` conditional
 /// manually — which stays green even when the production guard is removed.
 ///
-/// Caller must hold `managed_agents_store_lock` around this call so the
-/// generation cannot change between the currency check and the write.
+/// Caller holds `managed_agents_store_lock`, which serializes store
+/// observation and writes within this call. It does NOT prevent the readiness
+/// generation from changing: `force_claim_in_progress` takes only the
+/// separate readiness mutex, so a concurrent force-claim can advance the
+/// generation at any point. Post-check preemption is safe because the new
+/// generation is set to `InProgress` and its own barrier — or a full flush
+/// retry — supplies the authoritative gate writes; this barrier returns
+/// `Abandoned` without writing.
 pub(crate) fn enforce_decision_pass(
     claim: &super::config_sync_readiness::ReadinessClaim,
     conn: &rusqlite::Connection,

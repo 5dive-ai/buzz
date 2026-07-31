@@ -28,31 +28,6 @@ use super::{
 };
 use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
 
-/// Reconcile `managed-agents.json` into kind:30177 events in the retention
-/// store. Boot-time entry point, called from `event_sync::run_event_sync`
-/// after the persona and team legs.
-pub(crate) fn reconcile_agents_to_events(
-    app: &tauri::AppHandle,
-    keys: &nostr::Keys,
-    db_path: &Path,
-) -> Result<(), String> {
-    let base_dir = super::managed_agents_base_dir(app)?;
-
-    match reconcile_agents_in_dir_at(&base_dir, keys, db_path) {
-        Ok(0) => Ok(()),
-        Ok(reconciled) => {
-            eprintln!(
-                "buzz-desktop: agent-event-reconcile: {reconciled} agents reconciled to retention"
-            );
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("buzz-desktop: agent-event-reconcile: {e}");
-            Err(e)
-        }
-    }
-}
-
 /// Core reconcile logic, decoupled from the Tauri `AppHandle` for testing.
 ///
 /// Reads `managed-agents.json` raw — no keyring hydration: the published
@@ -64,23 +39,9 @@ pub(crate) fn reconcile_agents_to_events(
 /// never churns `pending_sync`.
 ///
 /// Returns the number of agents (re)written to the retention store.
-#[cfg(test)]
-pub(crate) fn reconcile_agents_in_dir(base_dir: &Path, keys: &nostr::Keys) -> Result<u32, String> {
-    reconcile_agents_in_dir_at(base_dir, keys, &base_dir.join("retention.db"))
-}
-
-/// Test seam with an explicit `db_path`. Used by `event_sync::run_event_sync_in_dir`
-/// so tests can pass a controlled (including failing) db_path to all three reconcile legs.
-#[cfg(test)]
-pub(crate) fn reconcile_agents_in_dir_at_test(
-    base_dir: &Path,
-    keys: &nostr::Keys,
-    db_path: &Path,
-) -> Result<u32, String> {
-    reconcile_agents_in_dir_at(base_dir, keys, db_path)
-}
-
-fn reconcile_agents_in_dir_at(
+/// Called from [`crate::event_sync::run_event_sync_impl`] (production) and
+/// from tests via [`reconcile_agents_in_dir`].
+pub(crate) fn reconcile_agents_in_dir_at(
     base_dir: &Path,
     keys: &nostr::Keys,
     db_path: &Path,
@@ -170,6 +131,13 @@ pub(crate) fn retain_agent_record(
     )
     .map_err(|e| format!("failed to retain '{}': {e}", record.name))?;
     Ok(true)
+}
+
+/// Convenience test wrapper: `reconcile_agents_in_dir_at` with the default
+/// retention db path (`base_dir/retention.db`).
+#[cfg(test)]
+pub(crate) fn reconcile_agents_in_dir(base_dir: &Path, keys: &nostr::Keys) -> Result<u32, String> {
+    reconcile_agents_in_dir_at(base_dir, keys, &base_dir.join("retention.db"))
 }
 
 #[cfg(test)]

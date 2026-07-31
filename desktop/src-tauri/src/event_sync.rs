@@ -23,9 +23,35 @@ pub fn run_event_sync(
     owner_keys: &nostr::Keys,
     db_path: &Path,
 ) -> Result<(), String> {
-    migrate_personas_to_events(app, owner_keys, db_path)?;
-    migrate_teams_to_events(app, owner_keys, db_path)?;
-    crate::managed_agents::reconcile::reconcile_agents_to_events(app, owner_keys, db_path)?;
+    run_event_sync_impl(
+        || crate::managed_agents::managed_agents_base_dir(app),
+        owner_keys,
+        db_path,
+    )
+}
+
+/// Shared implementation entered through an injectable base-directory resolver.
+///
+/// Both the production entry ([`run_event_sync`]) and the test seam route
+/// through this function. The resolver closure is called ONCE; on `Err` the
+/// error propagates without running any reconcile leg — this is the single
+/// mutation point that protects against a swallowed base-directory failure.
+///
+/// Mutation-sensitive: replacing the `?` on the resolver call with a
+/// `let Ok(base_dir) = ... else { return Ok(()) }` swallow leaves any
+/// test that injects a failing resolver incorrectly green.
+pub(crate) fn run_event_sync_impl<F>(
+    base_dir_fn: F,
+    owner_keys: &nostr::Keys,
+    db_path: &Path,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<std::path::PathBuf, String>,
+{
+    let base_dir = base_dir_fn()?;
+    migrate_personas_to_events_in_dir(&base_dir, owner_keys, db_path)?;
+    migrate_teams_to_events_in_dir(&base_dir, owner_keys, db_path)?;
+    crate::managed_agents::reconcile::reconcile_agents_in_dir_at(&base_dir, owner_keys, db_path)?;
     Ok(())
 }
 
@@ -112,16 +138,12 @@ pub fn spawn_event_sync_with_held_claim(
 /// `pending_sync = 1` for later relay publish. Migration succeeds on local
 /// write, not relay acknowledgment. Every retained row is a real signed
 /// event — there is no placeholder path.
-pub fn migrate_personas_to_events(
-    app: &tauri::AppHandle,
+fn migrate_personas_to_events_in_dir(
+    base_dir: &Path,
     keys: &nostr::Keys,
     db_path: &Path,
 ) -> Result<(), String> {
-    use crate::managed_agents::managed_agents_base_dir;
-
-    let base_dir = managed_agents_base_dir(app)?;
-
-    match migrate_personas_in_dir_at(&base_dir, keys, db_path) {
+    match migrate_personas_in_dir_at(base_dir, keys, db_path) {
         Ok(0) => Ok(()),
         Ok(migrated) => {
             eprintln!(
@@ -256,7 +278,7 @@ fn migrate_personas_in_dir_at(
 
 /// Reconcile `teams.json` into kind:30176 team events in the retention store.
 ///
-/// Mirrors [`migrate_personas_to_events`] for teams: it picks up team metadata
+/// Mirrors [`migrate_personas_to_events_in_dir`] for teams: it picks up team metadata
 /// edits (name/description/persona_ids) made on disk between launches and
 /// queues them for relay publish. Managed agents (kind:30177) are deliberately
 /// NOT reconciled here — they have no pack/dir source and are backfilled from
@@ -264,16 +286,12 @@ fn migrate_personas_in_dir_at(
 ///
 /// Must run after the persisted identity is resolved (it signs each event with
 /// the owner's keys).
-pub fn migrate_teams_to_events(
-    app: &tauri::AppHandle,
+fn migrate_teams_to_events_in_dir(
+    base_dir: &Path,
     keys: &nostr::Keys,
     db_path: &Path,
 ) -> Result<(), String> {
-    use crate::managed_agents::managed_agents_base_dir;
-
-    let base_dir = managed_agents_base_dir(app)?;
-
-    match migrate_teams_in_dir_at(&base_dir, keys, db_path) {
+    match migrate_teams_in_dir_at(base_dir, keys, db_path) {
         Ok(0) => Ok(()),
         Ok(migrated) => {
             eprintln!("buzz-desktop: team-event-migration: {migrated} teams migrated to retention");
@@ -370,27 +388,6 @@ fn migrate_teams_in_dir_at(
     }
 
     Ok(migrated)
-}
-
-/// Test seam: `run_event_sync` with an explicit `base_dir` instead of an
-/// `AppHandle`. Lets tests drive all three reconcile legs and the propagation
-/// of their `Result`s without a running Tauri application.
-///
-/// Used by `test_base_dir_failure_propagates_through_run_event_sync` to prove
-/// that a failing leg returns `Err`, the claim does NOT certify `Ready`, and
-/// a subsequent full retry enqueues the row.
-#[cfg(test)]
-pub(crate) fn run_event_sync_in_dir(
-    base_dir: &Path,
-    owner_keys: &nostr::Keys,
-    db_path: &Path,
-) -> Result<(), String> {
-    migrate_personas_in_dir_at(base_dir, owner_keys, db_path)?;
-    migrate_teams_in_dir_at(base_dir, owner_keys, db_path)?;
-    crate::managed_agents::reconcile::reconcile_agents_in_dir_at_test(
-        base_dir, owner_keys, db_path,
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]

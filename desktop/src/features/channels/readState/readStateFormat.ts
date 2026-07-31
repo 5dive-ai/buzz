@@ -199,9 +199,10 @@ export function encodeOverrideGroup(
 /**
  * Structured result of parsing a `contexts` map.
  *
- * `frontiers` — Map from **raw** context ID (unescaped) to merged frontier
- *   value.  Keys are never `ov_*` or `esc:` prefixed: all escaping is stripped
- *   at decode time so the same raw ID is used in both maps.
+ * `frontiers` — Map from **raw** context ID to merged frontier value.
+ *   Wire escaping (`esc:` prefix) is removed at decode time, so the same raw
+ *   context ID is used in both maps.  Raw IDs may themselves begin with
+ *   reserved prefixes such as `ov_*` or `esc:` — that is not an error.
  *
  * `overrides` — Map from **raw** context ID to validated `OverrideRegister`.
  *   Keyed by the same raw IDs as `frontiers`, so `isOverrideActive` can safely
@@ -216,43 +217,49 @@ export interface ParsedContexts {
  * A validated override group ready for merge.
  * `kind === "live"` → three-key group with all counters present.
  * `kind === "floor"` → tombstone, only `c` is meaningful (s=0, b=0).
- *
- * Used internally by `parseContexts` and `sanitizeContexts`.
  */
 export type ValidatedOverrideGroup =
   | { kind: "live"; reg: OverrideRegister }
   | { kind: "floor"; c: number };
 
+// ---------------------------------------------------------------------------
+// Internal single decode path — the only place validation logic lives
+// ---------------------------------------------------------------------------
+
 /**
- * Parse and validate a raw `contexts` object from a decoded blob into
- * separate frontier and override namespaces.
+ * Decode and validate a raw `contexts` object in one pass.
  *
- * This is the single structured decode path for the override layer.  It
- * applies group-first validation (spec `:114`) before any per-entry
- * processing:
+ * Returns three projections of the same validated data:
  *
- * 1. Collect all `ov_*` entries by suffix into candidate groups.
- * 2. Validate each group as a whole: complete live (S+C+B) or tombstone
- *    floor (C-only).  Any other shape (partial group, invalid value in any
- *    sibling) silently drops the whole group; the frontier entry for `<ctx>`
- *    is retained.
- * 3. Apply the 256-byte UTF-8 key-length check to EVERY wire key — both
- *    frontier keys and override sibling keys.  An invalid sibling rejects
- *    its entire group; an invalid frontier key discards only that entry.
- * 4. Unescape frontier wire keys (`esc:…` → raw ctx) so both maps share
- *    the same key domain.
+ * - `wire`      — flat `Record<string, number>` with `ov_*` keys preserved
+ *                 in wire form (for `ReadStateBlob.contexts` backward compat).
+ *                 Escaped frontier keys are stored as-is (e.g. `esc:ov_s:x`).
+ * - `frontiers` — `Map<rawCtx, number>` — frontier keys unescaped; same raw
+ *                 domain as `overrides`.
+ * - `overrides` — `Map<rawCtx, OverrideRegister>` — registers keyed by the
+ *                 raw context suffix (after the `ov_*:` prefix).
  *
- * The result contains no `ov_*` or `esc:*` keys in `frontiers`.
- * Slices 2–3 use this type; existing callers use `sanitizeContexts` which
- * wraps this function.
+ * Validation rules (spec NIP-RS §Content Validation):
+ * 1. Bucket all `ov_*` entries by suffix.
+ * 2. Validate each suffix as a whole group: complete live (S+C+B) or
+ *    tombstone floor (C-only).  Any other shape drops the entire group;
+ *    the frontier entry for that suffix is retained.
+ * 3. Check 256-byte UTF-8 length on EVERY wire key — frontier and override
+ *    siblings alike.  One oversized sibling drops its whole group; an
+ *    oversized frontier key drops only that entry.
+ * 4. Unescape frontier wire keys (`esc:…` → raw ctx) for `frontiers`.
  */
-export function parseContexts(raw: Record<string, unknown>): ParsedContexts {
+function decodeContexts(raw: Record<string, unknown>): {
+  wire: Record<string, number>;
+  frontiers: Map<string, number>;
+  overrides: Map<string, OverrideRegister>;
+} {
   const enc = new TextEncoder();
   const isUint32 = (v: unknown): v is number =>
     typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 4294967295;
 
   // ── Pass 1: bucket override candidates by suffix ─────────────────────────
-  const sWire = new Map<string, string>(); // suffix → wire key (for byte-length check)
+  const sWire = new Map<string, string>(); // suffix → wire key (byte-length check)
   const cWire = new Map<string, string>();
   const bWire = new Map<string, string>();
   const sVal = new Map<string, unknown>();
@@ -280,6 +287,7 @@ export function parseContexts(raw: Record<string, unknown>): ParsedContexts {
 
   // ── Pass 2: validate each suffix as a group ───────────────────────────────
   const overrides = new Map<string, OverrideRegister>();
+  const wire: Record<string, number> = {};
   const suffixes = new Set([...sWire.keys(), ...cWire.keys(), ...bWire.keys()]);
 
   for (const suffix of suffixes) {
@@ -292,10 +300,11 @@ export function parseContexts(raw: Record<string, unknown>): ParsedContexts {
 
     if (!hasS && hasC && !hasB) {
       // Tombstone floor: only ov_c: present.
-      const wireKey = cWire.get(suffix) ?? "";
-      if (enc.encode(wireKey).length > 256) continue; // key too long → drop group
+      const cwk = cWire.get(suffix) ?? "";
+      if (enc.encode(cwk).length > 256) continue; // key too long → drop group
       if (!isUint32(cv)) continue;
       overrides.set(suffix, { s: 0, c: cv, b: 0 });
+      wire[cwk] = cv;
     } else if (hasS && hasC && hasB) {
       // Complete live group: all three sibling wire keys must be ≤ 256 bytes.
       const swk = sWire.get(suffix) ?? "";
@@ -309,17 +318,22 @@ export function parseContexts(raw: Record<string, unknown>): ParsedContexts {
         continue; // any sibling key too long → drop group
       if (!isUint32(sv) || !isUint32(cv) || !isUint32(bv)) continue;
       overrides.set(suffix, { s: sv, c: cv, b: bv });
+      wire[swk] = sv;
+      wire[cwk] = cv;
+      wire[bwk] = bv;
     }
     // Any other shape (B-only, S-only, S+B, C+B, S+C): silently dropped.
-    // The frontier entry for `suffix` may still appear in frontierEntries.
+    // The frontier entry for `suffix` is retained in frontierEntries.
   }
 
-  // ── Pass 3: validate and unescape frontier entries ────────────────────────
+  // ── Pass 3: validate frontier entries, unescape for structured map ────────
   const frontiers = new Map<string, number>();
   for (const [wireKey, value] of frontierEntries) {
     if (enc.encode(wireKey).length > 256) continue;
     if (!isUint32(value)) continue;
-    // Strip exactly one leading `esc:` to recover the raw context ID.
+    // Flat wire map preserves the wire key (esc:… stays as-is for the manager).
+    wire[wireKey] = value;
+    // Structured frontiers map uses the raw context ID.
     const rawCtx = unescapeFrontierKey(wireKey);
     // max-merge in case a malformed blob has both escaped and unescaped forms.
     const existing = frontiers.get(rawCtx);
@@ -328,92 +342,20 @@ export function parseContexts(raw: Record<string, unknown>): ParsedContexts {
     }
   }
 
-  return { frontiers, overrides };
+  return { wire, frontiers, overrides };
 }
 
 /**
- * Partition the raw contexts map into validated override groups and
- * non-override entries.
+ * Parse and validate a raw `contexts` object from a decoded blob into
+ * separate frontier and override namespaces.
  *
- * This internal helper is used by `sanitizeContexts` to produce the flat
- * `Record<string, number>` stored in `ReadStateBlob.contexts` for backward
- * compatibility with `readStateManager`.  New callers (slices 2–3) should
- * use `parseContexts` directly for the structured result.
- *
- * Override key-length enforcement mirrors `parseContexts`: an invalid sibling
- * wire key rejects the entire group while retaining the frontier entry.
- *
- * @returns
- *   `overrides`   — Map from raw context suffix to `ValidatedOverrideGroup`.
- *   `nonOverride` — Raw contexts map with all `ov_*` keys removed.
+ * This is the structured decode entry point for slices 2–3.  It delegates
+ * to the internal `decodeContexts` core and returns the structured projection.
+ * See `decodeContexts` for the full validation spec.
  */
-function partitionOverrideGroups(contexts: Record<string, unknown>): {
-  overrides: Map<string, ValidatedOverrideGroup>;
-  nonOverride: Record<string, unknown>;
-} {
-  const enc = new TextEncoder();
-  const isUint32 = (v: unknown): v is number =>
-    typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 4294967295;
-
-  const sWire = new Map<string, string>();
-  const cWire = new Map<string, string>();
-  const bWire = new Map<string, string>();
-  const sVal = new Map<string, unknown>();
-  const cVal = new Map<string, unknown>();
-  const bVal = new Map<string, unknown>();
-  const nonOverride: Record<string, unknown> = {};
-
-  for (const [key, value] of Object.entries(contexts)) {
-    if (key.startsWith(OV_S_PREFIX)) {
-      const suffix = key.slice(OV_S_PREFIX.length);
-      sWire.set(suffix, key);
-      sVal.set(suffix, value);
-    } else if (key.startsWith(OV_C_PREFIX)) {
-      const suffix = key.slice(OV_C_PREFIX.length);
-      cWire.set(suffix, key);
-      cVal.set(suffix, value);
-    } else if (key.startsWith(OV_B_PREFIX)) {
-      const suffix = key.slice(OV_B_PREFIX.length);
-      bWire.set(suffix, key);
-      bVal.set(suffix, value);
-    } else {
-      nonOverride[key] = value;
-    }
-  }
-
-  const suffixes = new Set([...sWire.keys(), ...cWire.keys(), ...bWire.keys()]);
-  const overrides = new Map<string, ValidatedOverrideGroup>();
-
-  for (const suffix of suffixes) {
-    const hasS = sWire.has(suffix);
-    const hasC = cWire.has(suffix);
-    const hasB = bWire.has(suffix);
-    const sv = sVal.get(suffix);
-    const cv = cVal.get(suffix);
-    const bv = bVal.get(suffix);
-
-    if (!hasS && hasC && !hasB) {
-      const wireKey = cWire.get(suffix) ?? "";
-      if (enc.encode(wireKey).length > 256) continue;
-      if (!isUint32(cv)) continue;
-      overrides.set(suffix, { kind: "floor", c: cv });
-    } else if (hasS && hasC && hasB) {
-      const swk = sWire.get(suffix) ?? "";
-      const cwk = cWire.get(suffix) ?? "";
-      const bwk = bWire.get(suffix) ?? "";
-      if (
-        enc.encode(swk).length > 256 ||
-        enc.encode(cwk).length > 256 ||
-        enc.encode(bwk).length > 256
-      )
-        continue;
-      if (!isUint32(sv) || !isUint32(cv) || !isUint32(bv)) continue;
-      overrides.set(suffix, { kind: "live", reg: { s: sv, c: cv, b: bv } });
-    }
-    // Any other shape: silently dropped; frontier entry retained in nonOverride.
-  }
-
-  return { overrides, nonOverride };
+export function parseContexts(raw: Record<string, unknown>): ParsedContexts {
+  const { frontiers, overrides } = decodeContexts(raw);
+  return { frontiers, overrides };
 }
 
 // ---------------------------------------------------------------------------
@@ -491,35 +433,14 @@ export function isValidBlob(obj: unknown): obj is ReadStateBlob {
  * Escaped frontier keys (`esc:…`) are stored as-is in the flat map (the
  * structured path via `parseContexts` applies unescaping; this flat path
  * preserves the wire form for the manager).
+ *
+ * Thin projection of the internal `decodeContexts` core — validation logic
+ * lives exactly once.
  */
 export function sanitizeContexts(
   contexts: Record<string, unknown>,
 ): Record<string, number> {
-  const enc = new TextEncoder();
-  // Step 1: partition override groups from the rest (group-first validation).
-  const { overrides, nonOverride } = partitionOverrideGroups(contexts);
-
-  // Step 2: sanitize non-override entries with the standard per-entry rules.
-  const result: Record<string, number> = {};
-  for (const [key, value] of Object.entries(nonOverride)) {
-    if (enc.encode(key).length > 256) continue;
-    if (typeof value !== "number" || !Number.isInteger(value)) continue;
-    if (value < 0 || value > 4294967295) continue;
-    result[key] = value;
-  }
-
-  // Step 3: fold validated override groups back as integer entries.
-  for (const [ctx, group] of overrides) {
-    if (group.kind === "floor") {
-      result[`${OV_C_PREFIX}${ctx}`] = group.c;
-    } else {
-      result[`${OV_S_PREFIX}${ctx}`] = group.reg.s;
-      result[`${OV_C_PREFIX}${ctx}`] = group.reg.c;
-      result[`${OV_B_PREFIX}${ctx}`] = group.reg.b;
-    }
-  }
-
-  return result;
+  return decodeContexts(contexts).wire;
 }
 
 export function isValidReadStateDTag(

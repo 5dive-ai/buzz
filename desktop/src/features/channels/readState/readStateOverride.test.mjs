@@ -15,7 +15,69 @@ import {
   unescapeFrontierKey,
 } from "./readStateFormat.ts";
 
-import { mergeOverrideRegisterMaps } from "./readStateSnapshot.ts";
+import {
+  computeOverrideLiveness,
+  mergeOverrideRegisterMaps,
+  mergeReadStateEventsStructured,
+  parseReadStateEvent,
+} from "./readStateSnapshot.ts";
+
+// ---------------------------------------------------------------------------
+// Helpers for event-level integration tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a minimal fake RelayEvent whose content decrypts to a ReadStateBlob
+ * JSON string.  The decrypt function is provided by the caller so no real
+ * NIP-44 crypto is needed in tests.
+ */
+function makeEvent(pubkey, dTagSlot, blobContexts) {
+  const blob = { v: 1, client_id: "test-client", contexts: blobContexts };
+  const plaintext = JSON.stringify(blob);
+  return {
+    event: {
+      id: "a".repeat(64),
+      pubkey,
+      created_at: 1_000_000,
+      kind: 30078,
+      tags: [
+        ["d", `read-state:${dTagSlot}`],
+        ["t", "read-state"],
+      ],
+      content: plaintext,
+      sig: "b".repeat(128),
+    },
+    // decrypt ignores ciphertext, just returns the plaintext for this fake event
+    decrypt: async () => plaintext,
+  };
+}
+
+/**
+ * Drive a single fake event through parseReadStateEvent.
+ */
+async function parseFakeEvent(pubkey, dTagSlot, blobContexts) {
+  const { event, decrypt } = makeEvent(pubkey, dTagSlot, blobContexts);
+  return parseReadStateEvent(event, pubkey, decrypt);
+}
+
+/**
+ * Drive a list of fake events through mergeReadStateEventsStructured.
+ * Each item is { dTagSlot, blobContexts }.
+ */
+async function mergeFakeEvents(pubkey, specs) {
+  const events = [];
+  const decryptMap = new Map();
+
+  for (const { dTagSlot, blobContexts } of specs) {
+    const { event, decrypt } = makeEvent(pubkey, dTagSlot, blobContexts);
+    events.push(event);
+    decryptMap.set(event.content, decrypt);
+  }
+
+  // single decrypt that dispatches by content
+  const decrypt = (ciphertext) => decryptMap.get(ciphertext)(ciphertext);
+  return mergeReadStateEventsStructured(events, pubkey, decrypt);
+}
 
 // ---------------------------------------------------------------------------
 // escapeFrontierKey / unescapeFrontierKey
@@ -824,4 +886,296 @@ test("roundTrip_escapedRawCtx_survivesEncodeAndParse", () => {
   const f = frontiers.get(rawCtx) ?? 0;
   // s=1, c=0, b=10, f=8 → S>0 ∧ F(8)<=B(10) ∧ S(1)>C(0) → active
   assert.equal(isOverrideActive(ov, f), true);
+});
+
+// ---------------------------------------------------------------------------
+// Exact 256/257-byte boundary for live AND floor shapes (multibyte UTF-8)
+// ---------------------------------------------------------------------------
+//
+// Thufir pass-2 finding: multibyte cases covered only the floor shape and
+// skipped the exact 256/257-byte boundary.  These tests use 2-byte UTF-8
+// chars ('é' = 0xC3 0xA9) to verify byte-counting at the exact limit.
+//
+// For ov_c: (5 bytes), the suffix must be at most 251 bytes.
+//   - 'é' × 125 = 250 bytes → wire key 255 bytes → accepted
+//   - 'é' × 126 = 252 bytes → wire key 257 bytes → rejected
+//   - 'é' ×   1 at 251 bytes remainder = 251 bytes — we can't hit exactly 256
+//     with 2-byte chars alone (256-5=251, odd for 2-byte chars), so we combine:
+//   - 'é' × 125 + 'a' × 1 = 251 bytes → wire key 256 bytes → accepted (exact boundary)
+//   - 'é' × 125 + 'a' × 2 = 252 bytes → wire key 257 bytes → rejected (one over)
+
+test("parseContexts_tombstoneFloor_multibyte_exactly256Bytes_accepted", () => {
+  // 'é' × 125 = 250 bytes, + 'a' = 251 bytes suffix → wire key exactly 256 bytes.
+  const suffix = "\u00e9".repeat(125) + "a";
+  const raw = {
+    [suffix]: 0,
+    [`${OV_C_PREFIX}${suffix}`]: 7,
+  };
+  const { overrides } = parseContexts(raw);
+  assert.deepEqual(overrides.get(suffix), { s: 0, c: 7, b: 0 });
+});
+
+test("parseContexts_tombstoneFloor_multibyte_exactly257Bytes_dropped", () => {
+  // 'é' × 125 = 250 bytes, + 'aa' = 252 bytes suffix → wire key exactly 257 bytes.
+  const suffix = "\u00e9".repeat(125) + "aa";
+  const raw = {
+    [suffix]: 0,
+    [`${OV_C_PREFIX}${suffix}`]: 7,
+  };
+  const { overrides } = parseContexts(raw);
+  assert.equal(overrides.has(suffix), false);
+});
+
+test("parseContexts_liveGroup_multibyte_exactly256Bytes_accepted", () => {
+  // Same suffix construction: 'é' × 125 + 'a' = 251 bytes → ov_s: wire key 256 bytes.
+  const suffix = "\u00e9".repeat(125) + "a";
+  const raw = {
+    [suffix]: 10,
+    [`${OV_S_PREFIX}${suffix}`]: 2,
+    [`${OV_C_PREFIX}${suffix}`]: 1,
+    [`${OV_B_PREFIX}${suffix}`]: 9,
+  };
+  const { overrides } = parseContexts(raw);
+  assert.deepEqual(overrides.get(suffix), { s: 2, c: 1, b: 9 });
+});
+
+test("parseContexts_liveGroup_multibyte_exactly257Bytes_dropped", () => {
+  // 'é' × 125 + 'aa' = 252 bytes → ov_s: wire key 257 bytes → group dropped.
+  const suffix = "\u00e9".repeat(125) + "aa";
+  const raw = {
+    [suffix]: 10,
+    [`${OV_S_PREFIX}${suffix}`]: 2,
+    [`${OV_C_PREFIX}${suffix}`]: 1,
+    [`${OV_B_PREFIX}${suffix}`]: 9,
+  };
+  const { overrides } = parseContexts(raw);
+  assert.equal(overrides.has(suffix), false);
+});
+
+// ---------------------------------------------------------------------------
+// Event-level integration tests via parseReadStateEvent + mergeReadStateEventsStructured
+// ---------------------------------------------------------------------------
+
+test("parseReadStateEvent_singleEvent_frontierAndOverrideBothPresent", async () => {
+  const pubkey = "c".repeat(64);
+  const parsed = await parseFakeEvent(pubkey, "slot1", {
+    "ch:alpha": 5000,
+    "ov_s:ch:alpha": 2,
+    "ov_c:ch:alpha": 1,
+    "ov_b:ch:alpha": 4800,
+  });
+
+  assert.ok(parsed !== null);
+  assert.equal(parsed.contexts.frontiers.get("ch:alpha"), 5000);
+  assert.deepEqual(parsed.contexts.overrides.get("ch:alpha"), {
+    s: 2,
+    c: 1,
+    b: 4800,
+  });
+});
+
+test("mergeReadStateEventsStructured_twoBlobs_mergesBothFrontiersAndRegisters", async () => {
+  const pubkey = "d".repeat(64);
+  // Blob 1: ch:alpha frontier=5000, register s=2/c=1/b=4800
+  // Blob 2: ch:alpha frontier=6000, register s=3/c=1/b=5500 (higher frontier, higher S+B)
+  const merged = await mergeFakeEvents(pubkey, [
+    {
+      dTagSlot: "slot1",
+      blobContexts: {
+        "ch:alpha": 5000,
+        "ov_s:ch:alpha": 2,
+        "ov_c:ch:alpha": 1,
+        "ov_b:ch:alpha": 4800,
+      },
+    },
+    {
+      dTagSlot: "slot2",
+      blobContexts: {
+        "ch:alpha": 6000,
+        "ov_s:ch:alpha": 3,
+        "ov_c:ch:alpha": 1,
+        "ov_b:ch:alpha": 5500,
+      },
+    },
+  ]);
+
+  // Frontier: max(5000, 6000) = 6000
+  assert.equal(merged.frontiers.get("ch:alpha"), 6000);
+  // Register: componentwise max(s=2,3)=3, max(c=1,1)=1, max(b=4800,5500)=5500
+  assert.deepEqual(merged.overrides.get("ch:alpha"), { s: 3, c: 1, b: 5500 });
+});
+
+test("mergeReadStateEventsStructured_twoBlobs_livenessProperly_evaluated", async () => {
+  const pubkey = "e".repeat(64);
+  // Blob 1: ch:beta frontier=100, register s=1/c=0/b=90 (live: F(100)>B(90)? no, F=100>B=90 → inactive)
+  // Blob 2: ch:beta frontier=80,  register s=1/c=0/b=95 (adds: B=95 > F from blob2, but merges)
+  // After merge: frontier=max(100,80)=100, register s=1/c=0/b=max(90,95)=95
+  // Liveness: S(1)>0, F(100)>B(95) → inactive (frontier exceeded baseline)
+  const merged = await mergeFakeEvents(pubkey, [
+    {
+      dTagSlot: "slot1",
+      blobContexts: {
+        "ch:beta": 100,
+        "ov_s:ch:beta": 1,
+        "ov_c:ch:beta": 0,
+        "ov_b:ch:beta": 90,
+      },
+    },
+    {
+      dTagSlot: "slot2",
+      blobContexts: {
+        "ch:beta": 80,
+        "ov_s:ch:beta": 1,
+        "ov_c:ch:beta": 0,
+        "ov_b:ch:beta": 95,
+      },
+    },
+  ]);
+
+  assert.equal(merged.frontiers.get("ch:beta"), 100);
+  assert.deepEqual(merged.overrides.get("ch:beta"), { s: 1, c: 0, b: 95 });
+
+  const liveness = computeOverrideLiveness(merged, "ch:beta");
+  // F(100) > B(95) → inactive
+  assert.equal(liveness.active, false);
+  assert.equal(liveness.frontier, 100);
+});
+
+test("mergeReadStateEventsStructured_twoBlobs_livenessActive_afterMerge", async () => {
+  const pubkey = "f".repeat(64);
+  // Blob 1: ch:gamma frontier=50, register s=1/c=0/b=60 (live in blob1: F(50)<=B(60))
+  // Blob 2: ch:gamma frontier=55, tombstone floor ov_c=1 only (adds c=max(0,1)=1)
+  // After merge: frontier=max(50,55)=55, register s=1/c=1/b=60
+  // Liveness: S(1)>0, F(55)<=B(60), but S(1)>C(1)? NO: S==C tie → clear-wins → inactive
+  // To make it active: blob2 has floor ov_c=0, so no C increase
+  // Adjust: blob2 gives frontier=55, no override keys → c stays 0
+  // After merge: frontier=55, s=1/c=0/b=60
+  // Liveness: S(1)>0, F(55)<=B(60), S(1)>C(0) → active
+  const merged = await mergeFakeEvents(pubkey, [
+    {
+      dTagSlot: "slot1",
+      blobContexts: {
+        "ch:gamma": 50,
+        "ov_s:ch:gamma": 1,
+        "ov_c:ch:gamma": 0,
+        "ov_b:ch:gamma": 60,
+      },
+    },
+    {
+      dTagSlot: "slot2",
+      blobContexts: {
+        "ch:gamma": 55, // just the frontier, no override keys
+      },
+    },
+  ]);
+
+  assert.equal(merged.frontiers.get("ch:gamma"), 55);
+  assert.deepEqual(merged.overrides.get("ch:gamma"), { s: 1, c: 0, b: 60 });
+
+  const liveness = computeOverrideLiveness(merged, "ch:gamma");
+  // S(1)>0, F(55)<=B(60), S(1)>C(0) → active
+  assert.equal(liveness.active, true);
+  assert.equal(liveness.frontier, 55);
+});
+
+test("mergeReadStateEventsStructured_unknownPubkey_returnsEmpty", async () => {
+  const pubkey = "aa".repeat(32);
+  const wrongPubkey = "bb".repeat(32);
+  const { event, decrypt } = makeEvent(pubkey, "slot1", { "ch:x": 100 });
+  // Pass event but query with wrong pubkey — parseReadStateEvent returns null for each
+  const merged = await mergeReadStateEventsStructured(
+    [event],
+    wrongPubkey,
+    decrypt,
+  );
+  assert.equal(merged.frontiers.size, 0);
+  assert.equal(merged.overrides.size, 0);
+});
+
+// ── Complete collision witness through event-level merge path ────────────────
+//
+// Wire layout:
+//   raw ctx `ov_s:evil`  → frontier at esc:ov_s:evil=7; register via ov_s:ov_s:evil/ov_c:ov_s:evil/ov_b:ov_s:evil
+//   raw ctx `evil`       → frontier at evil=100; register via ov_s:evil/ov_c:evil/ov_b:evil
+//
+// Both reside in a single blob (slot1).  A second blob (slot2) adds higher
+// frontier/register values for `evil` to exercise cross-event merge.
+// After merge both contexts remain in their own namespaces.
+
+test("mergeReadStateEventsStructured_fullCollisionWitness_distinctNamespaces", async () => {
+  const pubkey = "ab".repeat(32);
+
+  const merged = await mergeFakeEvents(pubkey, [
+    {
+      dTagSlot: "slot1",
+      blobContexts: {
+        // raw ctx `ov_s:evil`: frontier published escaped; register uses raw suffix
+        "esc:ov_s:evil": 7,
+        "ov_s:ov_s:evil": 1,
+        "ov_c:ov_s:evil": 0,
+        "ov_b:ov_s:evil": 6,
+        // raw ctx `evil`: plain frontier + plain register
+        evil: 100,
+        "ov_s:evil": 3,
+        "ov_c:evil": 1,
+        "ov_b:evil": 90,
+      },
+    },
+    {
+      dTagSlot: "slot2",
+      blobContexts: {
+        // second device advances `evil` frontier and register
+        evil: 120,
+        "ov_s:evil": 4,
+        "ov_c:evil": 2,
+        "ov_b:evil": 110,
+      },
+    },
+  ]);
+
+  // frontier for raw ctx `ov_s:evil` = 7 (from esc:ov_s:evil, unescaped at decode)
+  assert.equal(
+    merged.frontiers.get("ov_s:evil"),
+    7,
+    "frontier for ctx ov_s:evil must be 7",
+  );
+
+  // frontier for raw ctx `evil` = max(100, 120) = 120
+  assert.equal(
+    merged.frontiers.get("evil"),
+    120,
+    "frontier for ctx evil must be 120",
+  );
+
+  // register for raw ctx `ov_s:evil` (suffix `ov_s:evil` from `ov_s:ov_s:evil`)
+  assert.deepEqual(
+    merged.overrides.get("ov_s:evil"),
+    { s: 1, c: 0, b: 6 },
+    "override for ctx ov_s:evil",
+  );
+
+  // register for raw ctx `evil` (suffix `evil` from `ov_s:evil` etc.)
+  // merged componentwise: s=max(3,4)=4, c=max(1,2)=2, b=max(90,110)=110
+  assert.deepEqual(
+    merged.overrides.get("evil"),
+    { s: 4, c: 2, b: 110 },
+    "override for ctx evil must be merged max across both blobs",
+  );
+
+  // Liveness for `ov_s:evil`: F(7), s=1, c=0, b=6 → F(7)>B(6) → inactive
+  const ovsEvilLiveness = computeOverrideLiveness(merged, "ov_s:evil");
+  assert.equal(
+    ovsEvilLiveness.active,
+    false,
+    "ov_s:evil: F(7)>B(6) → inactive",
+  );
+  assert.equal(ovsEvilLiveness.frontier, 7);
+
+  // Liveness for `evil`: F(120), s=4, c=2, b=110 → F(120)>B(110) → inactive
+  const evilLiveness = computeOverrideLiveness(merged, "evil");
+  assert.equal(evilLiveness.active, false, "evil: F(120)>B(110) → inactive");
+  assert.equal(evilLiveness.frontier, 120);
+
+  // Wire keys never polluted: no `esc:` key survives in frontiers map
+  assert.equal(merged.frontiers.has("esc:ov_s:evil"), false);
 });

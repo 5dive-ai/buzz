@@ -1,11 +1,13 @@
 import { nip44DecryptFromSelf } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
 import {
+  isOverrideActive,
   isValidBlob,
   isValidReadStateDTag,
   mergeOverrideRegisters,
   parseContexts,
   sanitizeContexts,
+  type OverrideLiveness,
   type OverrideRegister,
   type ParsedContexts,
   type ReadStateBlob,
@@ -19,6 +21,17 @@ export type ParsedReadStateEvent = {
   /** Structured decode: frontiers keyed by raw ctx ID, overrides by raw ctx ID. */
   contexts: ParsedContexts;
   createdAt: number;
+};
+
+/**
+ * The fully merged read-state across all events for a pubkey.
+ * Both maps are keyed by raw context ID (unescaped).
+ */
+export type MergedReadState = {
+  /** Componentwise max of all frontier values across events. */
+  frontiers: Map<string, number>;
+  /** Componentwise max of all override registers across events. */
+  overrides: Map<string, OverrideRegister>;
 };
 
 export async function parseReadStateEvent(
@@ -67,8 +80,8 @@ export async function parseReadStateEvent(
  *
  * Applies componentwise `max()` across all sources for each context suffix,
  * returning a single Map from raw context ID to merged `OverrideRegister`.
- * Slices 2–3 call this after collecting `ParsedReadStateEvent.contexts.overrides`
- * maps from each parsed event.
+ * Used internally by `mergeReadStateEventsStructured`; also exported for
+ * callers that collect registers independently.
  */
 export function mergeOverrideRegisterMaps(
   ...maps: Array<ReadonlyMap<string, OverrideRegister>>
@@ -83,28 +96,71 @@ export function mergeOverrideRegisterMaps(
   return result;
 }
 
-export async function mergeReadStateEvents(
+/**
+ * Merge N parsed read-state events into a single structured result.
+ *
+ * Returns merged `{ frontiers, overrides }` — both maps keyed by raw context
+ * ID — using `mergeOverrideRegisterMaps` internally for the register join.
+ * This is the primary entry point for slices 2–3; the frontier-only
+ * `mergeReadStateEvents` is a thin legacy wrapper over this function.
+ */
+export async function mergeReadStateEventsStructured(
   events: RelayEvent[],
   pubkey: string,
   decrypt?: ReadStateDecrypt,
-): Promise<Map<string, number>> {
+): Promise<MergedReadState> {
+  const overrideMaps: Array<ReadonlyMap<string, OverrideRegister>> = [];
   const frontiers = new Map<string, number>();
 
   for (const event of events) {
     const parsed = await parseReadStateEvent(event, pubkey, decrypt);
     if (!parsed) continue;
 
-    // Use the structured frontiers (keyed by raw ctx ID, unescaped) rather
-    // than the flat blob.contexts, which retains wire keys for readStateManager.
     for (const [rawCtx, ts] of parsed.contexts.frontiers) {
       const current = frontiers.get(rawCtx) ?? 0;
-      if (ts > current) {
-        frontiers.set(rawCtx, ts);
-      }
+      if (ts > current) frontiers.set(rawCtx, ts);
     }
+
+    overrideMaps.push(parsed.contexts.overrides);
   }
 
-  return frontiers;
+  return { frontiers, overrides: mergeOverrideRegisterMaps(...overrideMaps) };
+}
+
+/**
+ * Evaluate override liveness for one context after merging.
+ *
+ * Returns `OverrideLiveness` — the `active` predicate plus the effective
+ * frontier used — so the caller does not have to apply `isOverrideActive`
+ * manually.  Call after `mergeReadStateEventsStructured`.
+ *
+ * @param merged   Result of `mergeReadStateEventsStructured`.
+ * @param rawCtxId Raw (unescaped) context ID to evaluate.
+ */
+export function computeOverrideLiveness(
+  merged: MergedReadState,
+  rawCtxId: string,
+): OverrideLiveness {
+  const frontier = merged.frontiers.get(rawCtxId) ?? 0;
+  const reg = merged.overrides.get(rawCtxId);
+  const active = reg !== undefined && isOverrideActive(reg, frontier);
+  return { active, frontier };
+}
+
+/**
+ * Merge N read-state events into a frontier map (legacy wrapper).
+ *
+ * Thin wrapper over `mergeReadStateEventsStructured` that returns only the
+ * merged frontiers — byte-identical behavior for `communityUnreadObserver`
+ * and other existing callers that do not need override state.
+ */
+export async function mergeReadStateEvents(
+  events: RelayEvent[],
+  pubkey: string,
+  decrypt?: ReadStateDecrypt,
+): Promise<Map<string, number>> {
+  const merged = await mergeReadStateEventsStructured(events, pubkey, decrypt);
+  return merged.frontiers;
 }
 
 export function getSnapshotReadTimestamp(

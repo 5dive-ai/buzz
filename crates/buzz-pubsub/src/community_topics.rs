@@ -1,0 +1,693 @@
+//! Level-triggered subscription state for community-scoped Redis pub/sub
+//! channel families (cache invalidation, connection control).
+//!
+//! ElastiCache Serverless rejects `PSUBSCRIBE`, so these families can no longer
+//! ride a single `buzz:*:...` wildcard. Each pod instead subscribes to the exact
+//! per-community channels it currently needs. Two sets carry that:
+//!
+//! * **desired** — owned by whoever holds the interest (live sockets for
+//!   connection control; local cache residency for cache invalidation),
+//!   supplied as a closure and recomputed from scratch on every reconcile. This
+//!   module never caches it, so a queued command can never be applied against a
+//!   stale view.
+//! * **established** — the communities Redis has acknowledged a `SUBSCRIBE` for
+//!   on the *current* connection. A community enters only after the ack returns,
+//!   and the whole set is cleared when the connection ends.
+//!
+//! Reconciliation is level-triggered: the subscriber task diffs desired against
+//! established on connect, on a wake, and on a fixed tick. A coalesced or lost
+//! wake therefore costs latency, never convergence — and the tick is the
+//! automatic restore path that any cleared state needs. A healthy subscription
+//! must never sit marked unestablished waiting on an unrelated external event.
+
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use buzz_core::CommunityId;
+use futures_util::StreamExt;
+use tokio::sync::Notify;
+
+/// Initial reconnect backoff (1 second).
+const BACKOFF_INITIAL_SECS: u64 = 1;
+/// Maximum reconnect backoff (30 seconds).
+const BACKOFF_MAX_SECS: u64 = 30;
+/// Upper bound on how long desired and established can diverge without a wake.
+/// This is the unconditional convergence path, so it must never be disabled.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Communities whose channel this pod wants subscribed, recomputed on demand.
+pub type DesiredCommunities = Arc<dyn Fn() -> HashSet<CommunityId> + Send + Sync>;
+
+/// Subscription state for one community-scoped channel family, shared between
+/// the subscriber task and the interest holders that read it.
+pub struct CommunityTopics {
+    /// Log label, e.g. `cache-invalidation`.
+    name: &'static str,
+    /// Communities Redis has acknowledged on the live connection. Written only
+    /// by the subscriber task, after an ack.
+    established: RwLock<HashSet<CommunityId>>,
+    /// Latency shortcut: producers signal new interest instead of waiting for
+    /// the next tick. Coalescing and loss are both harmless.
+    wake: Notify,
+}
+
+impl CommunityTopics {
+    /// Creates empty subscription state for a named channel family.
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            established: RwLock::new(HashSet::new()),
+            wake: Notify::new(),
+        }
+    }
+
+    /// Log label for this channel family.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Whether Redis has acknowledged this community's subscription on the
+    /// current connection. This is the gate for anything that must not become
+    /// readable before its invalidation topic is established.
+    pub fn is_established(&self, community: CommunityId) -> bool {
+        self.established
+            .read()
+            .expect("community topics lock poisoned")
+            .contains(&community)
+    }
+
+    /// Number of established communities, for the connect log line and for
+    /// tests asserting how much of a desired set has been acked.
+    pub fn established_count(&self) -> usize {
+        self.established
+            .read()
+            .expect("community topics lock poisoned")
+            .len()
+    }
+
+    /// Ask the subscriber task to reconcile now rather than at the next tick.
+    pub fn wake(&self) {
+        self.wake.notify_one();
+    }
+
+    /// Waits for a [`Self::wake`]. The wait side of the same signal, public so
+    /// interest holders in other crates can assert they really nudge the
+    /// reconciler; the subscriber loop below is its production caller.
+    ///
+    /// One permit is stored, so a wake raised before the wait still completes.
+    pub async fn wake_notified(&self) {
+        self.wake.notified().await;
+    }
+
+    /// Marks `community` established, standing in for a Redis ack.
+    ///
+    /// Test seam only: in production the subscriber records establishment, and
+    /// only after `SUBSCRIBE` returns. It is public because the gate's consumers
+    /// live in another crate and have to be able to exercise both sides of it.
+    #[doc(hidden)]
+    pub fn insert_established_for_test(&self, community: CommunityId) {
+        self.insert_established(community);
+    }
+
+    fn snapshot(&self) -> HashSet<CommunityId> {
+        self.established
+            .read()
+            .expect("community topics lock poisoned")
+            .clone()
+    }
+
+    fn insert_established(&self, community: CommunityId) {
+        self.established
+            .write()
+            .expect("community topics lock poisoned")
+            .insert(community);
+    }
+
+    fn remove_established(&self, community: CommunityId) {
+        self.established
+            .write()
+            .expect("community topics lock poisoned")
+            .remove(&community);
+    }
+
+    fn clear_established(&self) {
+        self.established
+            .write()
+            .expect("community topics lock poisoned")
+            .clear();
+    }
+}
+
+/// The per-family parts of a community-scoped subscriber: channel naming,
+/// channel parsing, and payload decode plus local delivery.
+pub(crate) trait CommunityChannelFamily: Send + 'static {
+    /// Exact Redis channel for one community. Never a pattern.
+    fn channel(&self, community: CommunityId) -> String;
+    /// Recover the community from a received channel name.
+    fn parse_channel(&self, channel: &str) -> Option<CommunityId>;
+    /// Decode one payload and hand it to local consumers.
+    fn deliver(&self, community: CommunityId, payload: &str);
+}
+
+/// Runs a community-scoped subscriber with automatic reconnection.
+///
+/// Never returns — spawn it in a background task. Reconnects with exponential
+/// backoff (1s → 2s → 4s → … → 30s max), rebuilding the exact subscription set
+/// from `desired` on every connect.
+pub(crate) async fn run_community_subscriber<F: CommunityChannelFamily>(
+    redis_url: String,
+    family: F,
+    topics: Arc<CommunityTopics>,
+    desired: DesiredCommunities,
+) {
+    let name = topics.name();
+    let mut backoff_secs = BACKOFF_INITIAL_SECS;
+
+    loop {
+        let outcome = connect_and_serve(&redis_url, &family, &topics, &desired).await;
+        // The connection is gone, so nothing is subscribed any more. Clearing
+        // here (not only on the next connect) is what stops dependent state
+        // from being treated as protected during the backoff.
+        topics.clear_established();
+
+        match outcome {
+            Ok(()) => {
+                backoff_secs = BACKOFF_INITIAL_SECS;
+                tracing::warn!(
+                    "Redis {name} stream ended (clean disconnect) — reconnecting in {backoff_secs}s"
+                );
+            }
+            Err(e) => {
+                tracing::error!("Redis {name} error: {e} — reconnecting in {backoff_secs}s");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
+
+        tracing::info!("Attempting to reconnect to Redis {name}...");
+    }
+}
+
+async fn connect_and_serve<F: CommunityChannelFamily>(
+    redis_url: &str,
+    family: &F,
+    topics: &CommunityTopics,
+    desired: &DesiredCommunities,
+) -> Result<(), redis::RedisError> {
+    let name = topics.name();
+    let client = redis::Client::open(redis_url)?;
+    let conn = client.get_async_pubsub().await?;
+    let (mut sink, mut stream) = conn.split();
+
+    // A fresh connection has nothing subscribed, whatever the previous one had.
+    topics.clear_established();
+    reconcile(&mut sink, family, topics, desired).await?;
+
+    tracing::info!(
+        established = topics.established_count(),
+        "Redis {name} subscriber connected with exact per-community subscriptions"
+    );
+
+    let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = topics.wake.notified() => {
+                reconcile(&mut sink, family, topics, desired).await?;
+            }
+            _ = ticker.tick() => {
+                reconcile(&mut sink, family, topics, desired).await?;
+            }
+            msg = stream.next() => {
+                let Some(msg) = msg else {
+                    // Stream returned None — Redis connection closed.
+                    return Ok(());
+                };
+
+                let channel = msg.get_channel_name();
+                let Some(community_id) = family.parse_channel(channel) else {
+                    tracing::warn!("Received {name} message on unexpected channel: {channel}");
+                    continue;
+                };
+
+                let payload: String = match msg.get_payload() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("Failed to get {name} payload: {e}");
+                        continue;
+                    }
+                };
+
+                family.deliver(community_id, &payload);
+            }
+        }
+    }
+}
+
+/// Bring the live connection's subscriptions in line with current desire.
+///
+/// `desired` is read here, inside the subscriber task, immediately before each
+/// command — so an unsubscribe can never be applied against a stale view of
+/// interest that has since been renewed.
+async fn reconcile<F: CommunityChannelFamily>(
+    sink: &mut redis::aio::PubSubSink,
+    family: &F,
+    topics: &CommunityTopics,
+    desired: &DesiredCommunities,
+) -> Result<(), redis::RedisError> {
+    let want = desired();
+    let have = topics.snapshot();
+
+    for community in want.difference(&have) {
+        // `subscribe` awaits Redis's reply, so this returning `Ok` *is* the
+        // acknowledgement. Only then does the community count as established.
+        sink.subscribe(&family.channel(*community)).await?;
+        topics.insert_established(*community);
+    }
+
+    for community in have.difference(&want) {
+        // Withdraw establishment before the unsubscribe, never after: a reader
+        // that consults `is_established` between the two would otherwise cache
+        // an entry this connection is about to stop protecting.
+        topics.remove_established(*community);
+        sink.unsubscribe(&family.channel(*community)).await?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn community(id: u128) -> CommunityId {
+        CommunityId::from_uuid(Uuid::from_u128(id))
+    }
+
+    #[test]
+    fn nothing_is_established_before_an_ack() {
+        let topics = CommunityTopics::new("test");
+        assert!(!topics.is_established(community(1)));
+        assert_eq!(topics.established_count(), 0);
+    }
+
+    #[test]
+    fn established_is_cleared_wholesale_on_disconnect() {
+        let topics = CommunityTopics::new("test");
+        topics.insert_established(community(1));
+        topics.insert_established(community(2));
+        assert_eq!(topics.established_count(), 2);
+
+        topics.clear_established();
+
+        assert!(!topics.is_established(community(1)));
+        assert!(!topics.is_established(community(2)));
+    }
+
+    #[test]
+    fn removing_one_community_leaves_the_others_established() {
+        let topics = CommunityTopics::new("test");
+        topics.insert_established(community(1));
+        topics.insert_established(community(2));
+
+        topics.remove_established(community(1));
+
+        assert!(!topics.is_established(community(1)));
+        assert!(topics.is_established(community(2)));
+    }
+
+    #[tokio::test]
+    async fn a_wake_raised_before_the_wait_is_not_lost() {
+        let topics = CommunityTopics::new("test");
+        topics.wake();
+
+        // Notify stores one permit, so a wake that arrives before the subscriber
+        // reaches its select still reconciles immediately. Convergence does not
+        // depend on this — the tick covers a lost wake — but latency does.
+        tokio::time::timeout(Duration::from_millis(50), topics.wake.notified())
+            .await
+            .expect("a wake raised before the wait must still complete");
+    }
+}
+
+/// Redis-backed reconciliation tests.
+///
+/// These are `#[ignore]`d because they need a live server, and CI selects them
+/// explicitly (`--run-ignored all` over `package(buzz-pubsub)`). They route
+/// through `test_util::test_redis_url()`, so `REDIS_URL` points them at either
+/// standalone Redis or a cluster-mode server; when it is set but unreachable
+/// they must **fail**, never self-skip — a suite that quietly passes when the
+/// server is missing is exactly the fake-green class this lane is guarding
+/// against.
+#[cfg(test)]
+mod redis_tests {
+    use super::*;
+    use crate::cache_invalidation::{
+        cache_invalidation_channel_for, run_cache_invalidation_subscriber, CacheInvalidation,
+        ScopedCacheInvalidation,
+    };
+    use crate::test_util::{await_established, await_unestablished, test_redis_url};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::broadcast;
+    use uuid::Uuid;
+
+    /// A mutable desired set a test can steer, plus the closure over it.
+    fn steerable() -> (Arc<StdMutex<HashSet<CommunityId>>>, DesiredCommunities) {
+        let cell = Arc::new(StdMutex::new(HashSet::new()));
+        let reader = Arc::clone(&cell);
+        (
+            cell,
+            Arc::new(move || reader.lock().expect("desired lock poisoned").clone()),
+        )
+    }
+
+    fn set_desired(cell: &Arc<StdMutex<HashSet<CommunityId>>>, want: &[CommunityId]) {
+        *cell.lock().expect("desired lock poisoned") = want.iter().copied().collect();
+    }
+
+    /// Distinct communities per test run: these tests share one Redis, and a
+    /// fixed id would let a previous run's channel traffic bleed in.
+    fn fresh(n: usize) -> Vec<CommunityId> {
+        (0..n)
+            .map(|_| CommunityId::from_uuid(Uuid::new_v4()))
+            .collect()
+    }
+
+    /// A plain connection for issuing commands. Panics if the server named by
+    /// `REDIS_URL` is unreachable — these tests must fail loudly rather than
+    /// self-skip when their dependency is missing.
+    async fn control_conn() -> redis::aio::MultiplexedConnection {
+        redis::Client::open(test_redis_url())
+            .expect("redis client")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("REDIS_URL must be reachable for the ignored Redis suite")
+    }
+
+    /// Publishes `invalidation` on `community`'s exact channel.
+    ///
+    /// The return of `PUBLISH` is deliberately ignored: it counts *pattern*
+    /// matches as well as exact ones, so any unrelated `PSUBSCRIBE buzz:*`
+    /// client on the same server inflates it. Subscription state is asserted
+    /// with [`exact_subscribers`] instead, and delivery by actually receiving.
+    async fn publish(community: CommunityId, invalidation: &CacheInvalidation) {
+        let _: i64 = redis::cmd("PUBLISH")
+            .arg(cache_invalidation_channel_for(community))
+            .arg(serde_json::to_string(invalidation).expect("serialize"))
+            .query_async(&mut control_conn().await)
+            .await
+            .expect("PUBLISH");
+    }
+
+    /// Exact (non-pattern) subscriber count for `community`'s channel.
+    ///
+    /// `PUBSUB NUMSUB` ignores pattern subscribers, which is exactly the
+    /// distinction this lane turns on: it proves an exact `SUBSCRIBE` is in
+    /// place, and cannot be satisfied by a leftover wildcard. Combined with a
+    /// per-run random community id, no other client on a shared server can
+    /// contribute to this count.
+    async fn exact_subscribers(community: CommunityId) -> i64 {
+        let channel = cache_invalidation_channel_for(community);
+        let (_, count): (String, i64) = redis::cmd("PUBSUB")
+            .arg("NUMSUB")
+            .arg(&channel)
+            .query_async(&mut control_conn().await)
+            .await
+            .expect("PUBSUB NUMSUB");
+        count
+    }
+
+    /// Client ids that currently hold `n` exact subscriptions and no patterns.
+    ///
+    /// Used to single out one subscriber's own connection for a targeted sever.
+    /// The tests in this module run in parallel inside one binary, so several
+    /// clients have exact subscriptions at any moment; the caller disambiguates
+    /// by diffing this before and after its own subscriber connects, and by
+    /// choosing an `n` no other test in the crate uses.
+    async fn clients_with_exact_subs(
+        conn: &mut redis::aio::MultiplexedConnection,
+        n: usize,
+    ) -> HashSet<i64> {
+        let list: String = redis::cmd("CLIENT")
+            .arg("LIST")
+            .query_async(conn)
+            .await
+            .expect("CLIENT LIST");
+        list.lines()
+            .filter(|line| line.contains(" psub=0 ") && line.contains(&format!(" sub={n} ")))
+            .filter_map(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("id="))
+                    .and_then(|id| id.parse().ok())
+            })
+            .collect()
+    }
+
+    fn membership(seed: u128) -> CacheInvalidation {
+        CacheInvalidation::Membership {
+            channel_id: Uuid::from_u128(seed),
+            pubkey: vec![(seed & 0xff) as u8; 32],
+        }
+    }
+
+    /// Spawns a cache-invalidation subscriber over `desired` and returns its
+    /// topics handle plus a receiver of delivered invalidations.
+    fn spawn_subscriber(
+        desired: DesiredCommunities,
+    ) -> (
+        Arc<CommunityTopics>,
+        broadcast::Receiver<ScopedCacheInvalidation>,
+    ) {
+        let topics = Arc::new(CommunityTopics::new(
+            crate::cache_invalidation::CACHE_INVALIDATION_NAME,
+        ));
+        let (tx, rx) = broadcast::channel(4096);
+        let spawn_topics = Arc::clone(&topics);
+        tokio::spawn(async move {
+            run_cache_invalidation_subscriber(test_redis_url(), tx, spawn_topics, desired).await
+        });
+        (topics, rx)
+    }
+
+    /// The core replacement claim: 100 exact `SUBSCRIBE`s on ONE RESP2
+    /// connection route every `(channel, payload)` pair byte-exactly to the
+    /// community it was published on.
+    ///
+    /// This is what `PSUBSCRIBE buzz:*:cache-invalidate` used to do in one
+    /// command. A wildcard cannot be used on ElastiCache Serverless, so the
+    /// property that has to hold now is that N exact subscriptions on a single
+    /// connection are equivalent — including that no message is delivered under
+    /// the wrong community label, which is the failure that would silently
+    /// cross-wire tenants.
+    #[tokio::test]
+    #[ignore = "requires Redis"]
+    async fn hundred_exact_subscriptions_route_every_payload_to_its_own_community() {
+        let communities = fresh(100);
+        let (cell, desired) = steerable();
+        set_desired(&cell, &communities);
+        let (topics, mut rx) = spawn_subscriber(desired);
+        await_established(&topics, &communities, "100 exact subscriptions").await;
+        assert_eq!(topics.established_count(), 100);
+
+        // One distinguishable payload per community, all on one connection.
+        let mut expected = HashMap::new();
+        for (i, community) in communities.iter().enumerate() {
+            let invalidation = membership(0x1000 + i as u128);
+            assert_eq!(
+                exact_subscribers(*community).await,
+                1,
+                "exactly one exact SUBSCRIBE should hold {community}'s channel"
+            );
+            publish(*community, &invalidation).await;
+            expected.insert(*community, invalidation);
+        }
+
+        let mut seen: HashMap<CommunityId, CacheInvalidation> = HashMap::new();
+        while seen.len() < communities.len() {
+            let scoped = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("timed out before all 100 payloads arrived")
+                .expect("broadcast closed");
+            assert!(
+                seen.insert(scoped.community_id, scoped.invalidation)
+                    .is_none(),
+                "community {} delivered twice",
+                scoped.community_id
+            );
+        }
+        assert_eq!(
+            seen, expected,
+            "payload must arrive under its own community"
+        );
+    }
+
+    /// Reconciliation is level-triggered in BOTH directions: growing the
+    /// desired set subscribes, shrinking it unsubscribes, and the communities
+    /// that stayed desired keep working across the change.
+    ///
+    /// The `subscriber_count == 0` assertion is the real teeth. Establishment
+    /// bookkeeping saying "unsubscribed" proves nothing on its own; Redis
+    /// reporting no subscriber for the channel proves the `UNSUBSCRIBE` was
+    /// actually issued.
+    #[tokio::test]
+    #[ignore = "requires Redis"]
+    async fn unsubscribing_a_subset_leaves_the_rest_routing() {
+        let c = fresh(3);
+        let (cell, desired) = steerable();
+        set_desired(&cell, &c);
+        let (topics, mut rx) = spawn_subscriber(desired);
+        await_established(&topics, &c, "initial three").await;
+
+        // Drop the middle one. No explicit command: only the desired set moves.
+        set_desired(&cell, &[c[0], c[2]]);
+        topics.wake();
+        await_unestablished(&topics, c[1], "the withdrawn community").await;
+
+        assert_eq!(
+            exact_subscribers(c[1]).await,
+            0,
+            "Redis must report no exact subscriber for the unsubscribed channel"
+        );
+        assert!(topics.is_established(c[0]) && topics.is_established(c[2]));
+
+        // The retained communities still route, and the withdrawn one's publish
+        // does not arrive — checked by identity, not by absence of traffic.
+        let kept = membership(0x2002);
+        assert_eq!(exact_subscribers(c[2]).await, 1);
+        publish(c[2], &kept).await;
+        let scoped = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out on retained community")
+            .expect("broadcast closed");
+        assert_eq!(scoped.community_id, c[2]);
+        assert_eq!(scoped.invalidation, kept);
+
+        // And re-adding it converges again with no command, closing the loop.
+        set_desired(&cell, &c);
+        topics.wake();
+        await_established(&topics, &c, "re-added community").await;
+        assert_eq!(exact_subscribers(c[1]).await, 1);
+    }
+
+    /// Convergence must not depend on the wake: with wakes deliberately never
+    /// issued, the periodic reconcile alone has to subscribe a newly desired
+    /// community.
+    ///
+    /// This is the restore-path property. A cleared or missing subscription
+    /// that only recovers when some external event fires is the bug class I want
+    /// structurally excluded, so the tick is asserted in isolation.
+    #[tokio::test]
+    #[ignore = "requires Redis"]
+    async fn the_periodic_reconcile_converges_without_any_wake() {
+        let c = fresh(1);
+        let (cell, desired) = steerable();
+        let (topics, _rx) = spawn_subscriber(desired);
+        // Subscriber is up with an empty desired set.
+        await_established(&topics, &[], "empty start").await;
+
+        set_desired(&cell, &c);
+        // Deliberately no `topics.wake()`.
+        await_established(&topics, &c, "tick-only convergence").await;
+        assert_eq!(exact_subscribers(c[0]).await, 1);
+    }
+
+    /// Sever the connection under the subscriber and it must rebuild the whole
+    /// desired set on reconnect — and, before that, report nothing established,
+    /// so the cache gate cannot treat entries as protected during the gap.
+    ///
+    /// `CLIENT KILL` is the sever: it is a real server-side disconnect, not a
+    /// simulated error return, so the reconnect path runs for the same reason it
+    /// would in production.
+    #[tokio::test]
+    #[ignore = "requires Redis"]
+    async fn a_severed_connection_rebuilds_the_entire_desired_set() {
+        // Five communities: a subscription count no other test in this crate
+        // uses, so this subscriber's connection is identifiable in CLIENT LIST
+        // even with the rest of the suite running in parallel.
+        const SEVER_TEST_COMMUNITIES: usize = 5;
+        let c = fresh(SEVER_TEST_COMMUNITIES);
+        let mut conn = control_conn().await;
+        let before = clients_with_exact_subs(&mut conn, SEVER_TEST_COMMUNITIES).await;
+
+        let (cell, desired) = steerable();
+        set_desired(&cell, &c);
+        let (topics, _rx) = spawn_subscriber(desired);
+        await_established(&topics, &c, "pre-sever").await;
+
+        // Sever ONLY this subscriber, by id. `CLIENT KILL TYPE pubsub` would
+        // also kill every other pub/sub client on the server — a concurrent
+        // test here, or an unrelated process sharing the dev Redis.
+        let after = clients_with_exact_subs(&mut conn, SEVER_TEST_COMMUNITIES).await;
+        let new_clients: Vec<i64> = after.difference(&before).copied().collect();
+        assert_eq!(
+            new_clients.len(),
+            1,
+            "expected exactly one new {SEVER_TEST_COMMUNITIES}-subscription client to be ours, got {new_clients:?}"
+        );
+        let killed: i64 = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(new_clients[0])
+            .query_async(&mut conn)
+            .await
+            .expect("CLIENT KILL ID");
+        assert_eq!(killed, 1, "expected to sever exactly our own subscriber");
+
+        // The sever must be observable as lost establishment, not papered over:
+        // the gate has to read closed while the connection is gone.
+        await_unestablished(&topics, c[0], "establishment during the reconnect gap").await;
+
+        // Rebuilt from `desired`, not from a remembered active set: all five are
+        // back, and each channel really has an exact subscriber again.
+        await_established(&topics, &c, "post-sever rebuild").await;
+        for community in &c {
+            assert_eq!(
+                exact_subscribers(*community).await,
+                1,
+                "channel for {community} must be re-subscribed after the sever"
+            );
+        }
+    }
+
+    /// The establishment gate's precondition: while nothing is established,
+    /// `is_established` is false for a community the pod desires, and it flips
+    /// to true only once Redis has acked.
+    ///
+    /// This is the stale-authz window. The relay consults exactly this to decide
+    /// whether caching an authorization decision is safe, so "unestablished
+    /// while disconnected" has to be observable rather than merely intended.
+    #[tokio::test]
+    #[ignore = "requires Redis"]
+    async fn a_desired_community_is_unestablished_until_redis_acks() {
+        let c = fresh(1);
+        let (cell, desired) = steerable();
+        set_desired(&cell, &c);
+
+        let topics = Arc::new(CommunityTopics::new(
+            crate::cache_invalidation::CACHE_INVALIDATION_NAME,
+        ));
+        // Desired, but no subscriber running: nothing can have been acked, so
+        // the gate must read closed even though interest exists.
+        assert!(
+            !topics.is_established(c[0]),
+            "desire alone must not open the cache gate"
+        );
+
+        let (tx, _rx) = broadcast::channel(16);
+        let spawn_topics = Arc::clone(&topics);
+        tokio::spawn(async move {
+            run_cache_invalidation_subscriber(test_redis_url(), tx, spawn_topics, desired).await
+        });
+        await_established(&topics, &c, "gate opens on ack").await;
+
+        // And it closes again for a community that leaves the desired set.
+        set_desired(&cell, &[]);
+        topics.wake();
+        await_unestablished(&topics, c[0], "gate closes on withdrawal").await;
+    }
+}

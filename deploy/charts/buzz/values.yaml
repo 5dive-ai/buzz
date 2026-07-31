@@ -113,6 +113,9 @@ relay:
   # local development or fully public communities — desktop, mobile, and CLI
   # clients all attach read auth.
   requireMediaGetAuth: true
+  # Media payload write migration: legacy -> dual -> sharded. The upgrade-safe
+  # default is legacy, so installing a new release never starts duplicate writes.
+  mediaKeyLayout: legacy
   allowNipOaAuth: true
   pubkeyAllowlist: false
   corsOrigins: []

@@ -104,7 +104,6 @@ const LazySettingsScreen = React.lazy(async () => {
   const module = await import("@/features/settings/ui/SettingsScreen");
   return { default: module.SettingsScreen };
 });
-
 export function AppShell() {
   useWebviewZoomShortcuts();
   useTauriWindowDrag();
@@ -152,7 +151,6 @@ export function AppShell() {
     selectedChannelId,
     selectedView,
   });
-  // Settings lives in history so back returns to the previous app entry.
   const settingsOpen = location.pathname === "/settings";
   useVoiceDictationShortcut(settingsOpen);
   const locationSearchSection = (location.search as { section?: unknown })

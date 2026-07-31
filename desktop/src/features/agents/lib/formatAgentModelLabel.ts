@@ -1,11 +1,11 @@
-import { DATABRICKS_MODEL_NAMES } from "./databricksModelNames";
+import { DATABRICKS_MODEL_NAMES } from "../ui/modelCapabilities";
 
 /**
  * Resolves a human-readable label for a model, following the three-tier
  * precedence documented in AGENTS.md:
  *
  *   1. Nonblank discovered/API name (e.g. from AgentModelInfo.name)
- *   2. Registry lookup by ID (models.dev-seeded Databricks table)
+ *   2. Registry lookup by ID (generated registry_label table from model-capabilities manifest)
  *   3. Raw ID unchanged
  *
  * Returns the empty string when both id and discoveredName are blank.

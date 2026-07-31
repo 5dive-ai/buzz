@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronUp, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 
 import type { ResolvedLinkPreview } from "@/shared/lib/useResolvedLinkPreviews";
 import { cn } from "@/shared/lib/cn";
@@ -49,38 +49,16 @@ function TweetPreview({
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
 }) {
-  const [descriptionExpanded, setDescriptionExpanded] = useState(false);
-  const [descriptionOverflows, setDescriptionOverflows] = useState(false);
-  const [imageExpanded, setImageExpanded] = useState(true);
-  const descriptionRef = useRef<HTMLDivElement>(null);
+  const [contentExpanded, setContentExpanded] = useState(true);
   const reserveImage = preview.imageState !== "none";
   const showImage = preview.imageState === "image";
+  const hasExpandableContent = Boolean(preview.description) || reserveImage;
   const hostname = getHostname(preview);
-
-  useEffect(() => {
-    if (!preview.description) return;
-
-    const description = descriptionRef.current;
-    if (!description || descriptionExpanded) return;
-
-    const measure = () => {
-      setDescriptionOverflows(
-        description.scrollHeight > description.clientHeight + 1,
-      );
-    };
-    const frame = requestAnimationFrame(measure);
-    const observer = new ResizeObserver(measure);
-    observer.observe(description);
-    return () => {
-      cancelAnimationFrame(frame);
-      observer.disconnect();
-    };
-  }, [descriptionExpanded, preview.description]);
 
   return (
     <div
       className={cn(
-        "relative w-[26rem] max-w-full shrink-0 border-l-[3px] border-border pl-3",
+        "relative w-lg max-w-full shrink-0 border-l-[3px] border-border py-1 pl-3",
         className,
       )}
       data-image-state={preview.imageState}
@@ -94,80 +72,59 @@ function TweetPreview({
         {hostname}
       </div>
       <a
-        className="mt-0.5 block truncate text-sm font-semibold leading-5 text-foreground hover:underline"
+        className="mt-0.5 line-clamp-2 whitespace-normal text-sm font-semibold leading-5 text-foreground hover:underline"
         href={preview.href}
         rel="noreferrer"
         target="_blank"
       >
         {preview.title}
       </a>
-      {preview.description ? (
-        <>
-          <div
-            className={cn(
-              "mt-1 whitespace-normal text-sm leading-5 text-foreground",
-              !descriptionExpanded && "line-clamp-5",
-            )}
-            data-slot="attachment-description"
-            ref={descriptionRef}
-          >
-            {preview.description}
-          </div>
-          {descriptionOverflows ? (
-            <button
-              aria-expanded={descriptionExpanded}
-              className="mt-1 text-xs font-medium leading-4 text-muted-foreground hover:text-foreground"
-              onClick={() => setDescriptionExpanded((expanded) => !expanded)}
-              type="button"
-            >
-              {descriptionExpanded ? "Show less" : "Show more"}
-            </button>
-          ) : null}
-        </>
-      ) : null}
-      {reserveImage ? (
-        <div className="mt-2">
-          {imageExpanded ? (
-            <a
-              aria-label={`Open tweet: ${preview.title}`}
-              className="block overflow-hidden rounded-xl bg-muted"
-              href={preview.href}
-              rel="noreferrer"
-              target="_blank"
-            >
-              <div
-                className="aspect-video w-full"
-                data-link-preview-thumbnail=""
-              >
-                {showImage ? (
-                  <img
-                    alt={`Preview from ${preview.imageDomain}`}
-                    className="h-full w-full object-cover"
-                    src={preview.imageDataUrl ?? undefined}
-                  />
-                ) : (
-                  <div
-                    className="h-full w-full animate-pulse bg-muted-foreground/10"
-                    data-link-preview-skeleton=""
-                  />
-                )}
-              </div>
-            </a>
-          ) : null}
-          <button
-            aria-expanded={imageExpanded}
-            className="mt-1 flex items-center gap-1 text-xs leading-4 text-muted-foreground hover:text-foreground"
-            onClick={() => setImageExpanded((expanded) => !expanded)}
-            type="button"
-          >
-            {imageExpanded ? (
-              <ChevronUp aria-hidden="true" className="size-3" />
-            ) : (
-              <ChevronDown aria-hidden="true" className="size-3" />
-            )}
-            {imageExpanded ? "Hide image" : "Show image"}
-          </button>
+      {contentExpanded && preview.description ? (
+        <div
+          className="mt-1 whitespace-normal text-sm leading-5 text-foreground"
+          data-slot="attachment-description"
+        >
+          {preview.description}
         </div>
+      ) : null}
+      {contentExpanded && reserveImage ? (
+        <a
+          aria-label={`Open tweet: ${preview.title}`}
+          className="mt-2 block w-full max-w-75 overflow-hidden rounded-xl bg-muted"
+          href={preview.href}
+          rel="noreferrer"
+          target="_blank"
+        >
+          <div className="aspect-video w-full" data-link-preview-thumbnail="">
+            {showImage ? (
+              <img
+                alt={`Preview from ${preview.imageDomain}`}
+                className="h-full w-full object-cover"
+                src={preview.imageDataUrl ?? undefined}
+              />
+            ) : (
+              <div
+                className="h-full w-full animate-pulse bg-muted-foreground/10"
+                data-link-preview-skeleton=""
+              />
+            )}
+          </div>
+        </a>
+      ) : null}
+      {hasExpandableContent ? (
+        <button
+          aria-expanded={contentExpanded}
+          className="mt-1 flex items-center gap-1 text-xs leading-4 text-muted-foreground hover:text-foreground"
+          onClick={() => setContentExpanded((expanded) => !expanded)}
+          type="button"
+        >
+          {contentExpanded ? (
+            <ChevronUp aria-hidden="true" className="size-3" />
+          ) : (
+            <ChevronDown aria-hidden="true" className="size-3" />
+          )}
+          {contentExpanded ? "Show less" : "Show more"}
+        </button>
       ) : null}
       {onRemove ? (
         <Button
@@ -195,7 +152,7 @@ export function RichLinkPreviewAttachment({
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
 }) {
-  const [imageExpanded, setImageExpanded] = useState(true);
+  const [contentExpanded, setContentExpanded] = useState(true);
 
   if (isTweetPreview(preview)) {
     return (
@@ -209,19 +166,22 @@ export function RichLinkPreviewAttachment({
 
   const reserveImage = preview.imageState !== "none";
   const showImage = preview.imageState === "image";
+  const hasExpandableContent = Boolean(preview.description) || reserveImage;
   const hostname = getHostname(preview);
 
   return (
     <div
       className={cn(
-        "relative w-[26rem] max-w-full shrink-0 border-l-[3px] border-border pl-3",
+        "relative w-lg max-w-full shrink-0 border-l-[3px] border-border py-1 pl-3",
         className,
       )}
       data-image-state={preview.imageState}
       data-link-preview={preview.kind}
       data-link-preview-inline=""
     >
-      <div className={cn(reserveImage && "min-h-[3.875rem]")}>
+      <div
+        className={cn(contentExpanded && reserveImage && "min-h-[3.875rem]")}
+      >
         <div
           className="flex items-center gap-1.5 text-xs leading-4 text-muted-foreground"
           data-link-preview-identity=""
@@ -236,64 +196,58 @@ export function RichLinkPreviewAttachment({
           rel="noreferrer"
           target="_blank"
         >
-          <span
-            className={preview.description ? "line-clamp-1" : "line-clamp-2"}
-          >
-            {preview.title}
-          </span>
+          <span className="line-clamp-2">{preview.title}</span>
         </a>
-        {preview.description ? (
+        {contentExpanded && preview.description ? (
           <div
-            className="mt-1 line-clamp-2 whitespace-normal text-sm leading-5 text-muted-foreground"
+            className="mt-1 whitespace-normal text-sm leading-5 text-muted-foreground"
             data-slot="attachment-description"
           >
             {preview.description}
           </div>
         ) : null}
       </div>
-      {reserveImage ? (
-        <div className="mt-2">
-          {imageExpanded ? (
-            <a
-              aria-label={`Open preview image from ${hostname}`}
-              className="block overflow-hidden rounded-xl bg-muted"
-              href={preview.href}
-              rel="noreferrer"
-              target="_blank"
-            >
-              <div
-                className="aspect-[1.91/1] w-full"
-                data-link-preview-thumbnail=""
-              >
-                {showImage ? (
-                  <img
-                    alt={`Preview from ${preview.imageDomain}`}
-                    className="h-full w-full object-cover"
-                    src={preview.imageDataUrl ?? undefined}
-                  />
-                ) : (
-                  <div
-                    className="h-full w-full animate-pulse bg-muted-foreground/10"
-                    data-link-preview-skeleton=""
-                  />
-                )}
-              </div>
-            </a>
-          ) : null}
-          <button
-            aria-expanded={imageExpanded}
-            className="mt-1 flex items-center gap-1 text-xs leading-4 text-muted-foreground hover:text-foreground"
-            onClick={() => setImageExpanded((expanded) => !expanded)}
-            type="button"
+      {contentExpanded && reserveImage ? (
+        <a
+          aria-label={`Open preview image from ${hostname}`}
+          className="mt-2 block w-full max-w-75 overflow-hidden rounded-xl bg-muted"
+          href={preview.href}
+          rel="noreferrer"
+          target="_blank"
+        >
+          <div
+            className="aspect-[1.91/1] w-full"
+            data-link-preview-thumbnail=""
           >
-            {imageExpanded ? (
-              <ChevronUp aria-hidden="true" className="size-3" />
+            {showImage ? (
+              <img
+                alt={`Preview from ${preview.imageDomain}`}
+                className="h-full w-full object-cover"
+                src={preview.imageDataUrl ?? undefined}
+              />
             ) : (
-              <ChevronDown aria-hidden="true" className="size-3" />
+              <div
+                className="h-full w-full animate-pulse bg-muted-foreground/10"
+                data-link-preview-skeleton=""
+              />
             )}
-            {imageExpanded ? "Hide image" : "Show image"}
-          </button>
-        </div>
+          </div>
+        </a>
+      ) : null}
+      {hasExpandableContent ? (
+        <button
+          aria-expanded={contentExpanded}
+          className="mt-1 flex items-center gap-1 text-xs leading-4 text-muted-foreground hover:text-foreground"
+          onClick={() => setContentExpanded((expanded) => !expanded)}
+          type="button"
+        >
+          {contentExpanded ? (
+            <ChevronUp aria-hidden="true" className="size-3" />
+          ) : (
+            <ChevronDown aria-hidden="true" className="size-3" />
+          )}
+          {contentExpanded ? "Show less" : "Show more"}
+        </button>
       ) : null}
       {onRemove ? (
         <Button

@@ -213,15 +213,6 @@ export interface ParsedContexts {
   readonly overrides: ReadonlyMap<string, OverrideRegister>;
 }
 
-/**
- * A validated override group ready for merge.
- * `kind === "live"` → three-key group with all counters present.
- * `kind === "floor"` → tombstone, only `c` is meaningful (s=0, b=0).
- */
-export type ValidatedOverrideGroup =
-  | { kind: "live"; reg: OverrideRegister }
-  | { kind: "floor"; c: number };
-
 // ---------------------------------------------------------------------------
 // Internal single decode path — the only place validation logic lives
 // ---------------------------------------------------------------------------
@@ -231,9 +222,12 @@ export type ValidatedOverrideGroup =
  *
  * Returns three projections of the same validated data:
  *
- * - `wire`      — flat `Record<string, number>` with `ov_*` keys preserved
- *                 in wire form (for `ReadStateBlob.contexts` backward compat).
+ * - `wire`      — null-prototype `Record<string, number>` with `ov_*` keys
+ *                 preserved in wire form (for `ReadStateBlob.contexts` compat).
  *                 Escaped frontier keys are stored as-is (e.g. `esc:ov_s:x`).
+ *                 Built with `Object.create(null)` so that context IDs that
+ *                 collide with `Object.prototype` properties (e.g. `__proto__`)
+ *                 survive as own-property entries in both projections.
  * - `frontiers` — `Map<rawCtx, number>` — frontier keys unescaped; same raw
  *                 domain as `overrides`.
  * - `overrides` — `Map<rawCtx, OverrideRegister>` — registers keyed by the
@@ -248,8 +242,11 @@ export type ValidatedOverrideGroup =
  *    siblings alike.  One oversized sibling drops its whole group; an
  *    oversized frontier key drops only that entry.
  * 4. Unescape frontier wire keys (`esc:…` → raw ctx) for `frontiers`.
+ *
+ * Exported so `parseReadStateEvent` can call once and derive both
+ * `blob.contexts` and the structured `ParsedContexts` from one result.
  */
-function decodeContexts(raw: Record<string, unknown>): {
+export function decodeContexts(raw: Record<string, unknown>): {
   wire: Record<string, number>;
   frontiers: Map<string, number>;
   overrides: Map<string, OverrideRegister>;
@@ -287,7 +284,13 @@ function decodeContexts(raw: Record<string, unknown>): {
 
   // ── Pass 2: validate each suffix as a group ───────────────────────────────
   const overrides = new Map<string, OverrideRegister>();
-  const wire: Record<string, number> = {};
+  // Use a null-prototype object so context IDs that coincide with
+  // Object.prototype property names (e.g. `__proto__`, `toString`) survive
+  // as own-property entries rather than silently colliding.
+  const wire: Record<string, number> = Object.create(null) as Record<
+    string,
+    number
+  >;
   const suffixes = new Set([...sWire.keys(), ...cWire.keys(), ...bWire.keys()]);
 
   for (const suffix of suffixes) {
@@ -443,12 +446,15 @@ export function sanitizeContexts(
   return decodeContexts(contexts).wire;
 }
 
+// Exactly 32 lowercase hexadecimal characters as required by NIP-RS :55/:68.
+const READ_STATE_SLOT_ID_PATTERN = /^[0-9a-f]{32}$/;
+
 export function isValidReadStateDTag(
   value: string | undefined,
 ): value is string {
   if (!value?.startsWith(READ_STATE_D_TAG_PREFIX)) return false;
   const slotId = value.slice(READ_STATE_D_TAG_PREFIX.length);
-  return slotId.length > 0 && slotId.length <= 64 && isAscii(slotId);
+  return READ_STATE_SLOT_ID_PATTERN.test(slotId);
 }
 
 export function localExtraSlotIdsKey(pubkey: string): string {
@@ -462,13 +468,4 @@ export function localIsoToUnixSeconds(value: unknown): number | null {
 
   const ms = Date.parse(value);
   return Number.isNaN(ms) ? null : Math.floor(ms / 1_000);
-}
-
-function isAscii(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    if (value.charCodeAt(index) > 0x7f) {
-      return false;
-    }
-  }
-  return true;
 }

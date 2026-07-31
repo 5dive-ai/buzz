@@ -1,12 +1,11 @@
 import { nip44DecryptFromSelf } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
 import {
+  decodeContexts,
   isOverrideActive,
   isValidBlob,
   isValidReadStateDTag,
   mergeOverrideRegisters,
-  parseContexts,
-  sanitizeContexts,
   type OverrideLiveness,
   type OverrideRegister,
   type ParsedContexts,
@@ -55,15 +54,15 @@ export async function parseReadStateEvent(
     const plaintext = await decrypt(event.content);
     const parsed = JSON.parse(plaintext);
     if (!isValidBlob(parsed)) return null;
-    const sanitized = sanitizeContexts(parsed.contexts);
+    const { wire, frontiers, overrides } = decodeContexts(parsed.contexts);
     return {
       dTag,
       blob: {
         v: 1,
         client_id: parsed.client_id,
-        contexts: sanitized,
+        contexts: wire,
       },
-      contexts: parseContexts(parsed.contexts),
+      contexts: { frontiers, overrides },
       createdAt: event.created_at,
     };
   } catch (error) {
@@ -134,17 +133,27 @@ export async function mergeReadStateEventsStructured(
  * frontier used — so the caller does not have to apply `isOverrideActive`
  * manually.  Call after `mergeReadStateEventsStructured`.
  *
- * @param merged   Result of `mergeReadStateEventsStructured`.
- * @param rawCtxId Raw (unescaped) context ID to evaluate.
+ * @param merged          Result of `mergeReadStateEventsStructured`.
+ * @param rawCtxId        Raw (unescaped) context ID to evaluate.
+ * @param effectiveFrontier
+ *   The merged **effective** frontier for `rawCtxId`, after applying the
+ *   hierarchical parent rule from NIP-RS `:169–196`/`:510–514`:
+ *   ```
+ *   effective(ctx) = max(merged[ctx], effective(parent(ctx)))
+ *   ```
+ *   For a channel context the effective frontier equals its own merged value.
+ *   For a thread or message context the caller must fold in the parent channel
+ *   frontier before passing the value here.  The caller owns this computation
+ *   because only the caller knows the context hierarchy.
  */
 export function computeOverrideLiveness(
   merged: MergedReadState,
   rawCtxId: string,
+  effectiveFrontier: number,
 ): OverrideLiveness {
-  const frontier = merged.frontiers.get(rawCtxId) ?? 0;
   const reg = merged.overrides.get(rawCtxId);
-  const active = reg !== undefined && isOverrideActive(reg, frontier);
-  return { active, frontier };
+  const active = reg !== undefined && isOverrideActive(reg, effectiveFrontier);
+  return { active, frontier: effectiveFrontier };
 }
 
 /**

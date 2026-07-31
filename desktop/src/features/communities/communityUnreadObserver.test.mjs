@@ -230,7 +230,7 @@ test("fetchCommunityUnread ignores self-authored and read thread/message events"
         pubkey: PUBKEY,
         created_at: 80,
         tags: [
-          ["d", "read-state:test"],
+          ["d", "read-state:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"],
           ["t", "read-state"],
         ],
         content: JSON.stringify({
@@ -708,7 +708,7 @@ function quietRelayWithReadState(readAtSeconds) {
         pubkey: PUBKEY,
         created_at: 200,
         tags: [
-          ["d", "read-state:test"],
+          ["d", "read-state:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"],
           ["t", "read-state"],
         ],
         content: JSON.stringify({

@@ -6,6 +6,7 @@ import {
   escapeFrontierKey,
   isOverrideActive,
   isOverrideKey,
+  isValidReadStateDTag,
   mergeOverrideRegisters,
   OV_B_PREFIX,
   OV_C_PREFIX,
@@ -25,6 +26,10 @@ import {
 // ---------------------------------------------------------------------------
 // Helpers for event-level integration tests
 // ---------------------------------------------------------------------------
+
+// Valid 32-lowercase-hex slot IDs per NIP-RS spec :55/:68.
+const SLOT_A = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+const SLOT_B = "1234567890abcdef1234567890abcdef";
 
 /**
  * Build a minimal fake RelayEvent whose content decrypts to a ReadStateBlob
@@ -958,7 +963,7 @@ test("parseContexts_liveGroup_multibyte_exactly257Bytes_dropped", () => {
 
 test("parseReadStateEvent_singleEvent_frontierAndOverrideBothPresent", async () => {
   const pubkey = "c".repeat(64);
-  const parsed = await parseFakeEvent(pubkey, "slot1", {
+  const parsed = await parseFakeEvent(pubkey, SLOT_A, {
     "ch:alpha": 5000,
     "ov_s:ch:alpha": 2,
     "ov_c:ch:alpha": 1,
@@ -980,7 +985,7 @@ test("mergeReadStateEventsStructured_twoBlobs_mergesBothFrontiersAndRegisters", 
   // Blob 2: ch:alpha frontier=6000, register s=3/c=1/b=5500 (higher frontier, higher S+B)
   const merged = await mergeFakeEvents(pubkey, [
     {
-      dTagSlot: "slot1",
+      dTagSlot: SLOT_A,
       blobContexts: {
         "ch:alpha": 5000,
         "ov_s:ch:alpha": 2,
@@ -989,7 +994,7 @@ test("mergeReadStateEventsStructured_twoBlobs_mergesBothFrontiersAndRegisters", 
       },
     },
     {
-      dTagSlot: "slot2",
+      dTagSlot: SLOT_B,
       blobContexts: {
         "ch:alpha": 6000,
         "ov_s:ch:alpha": 3,
@@ -1013,7 +1018,7 @@ test("mergeReadStateEventsStructured_twoBlobs_livenessProperly_evaluated", async
   // Liveness: S(1)>0, F(100)>B(95) → inactive (frontier exceeded baseline)
   const merged = await mergeFakeEvents(pubkey, [
     {
-      dTagSlot: "slot1",
+      dTagSlot: SLOT_A,
       blobContexts: {
         "ch:beta": 100,
         "ov_s:ch:beta": 1,
@@ -1022,7 +1027,7 @@ test("mergeReadStateEventsStructured_twoBlobs_livenessProperly_evaluated", async
       },
     },
     {
-      dTagSlot: "slot2",
+      dTagSlot: SLOT_B,
       blobContexts: {
         "ch:beta": 80,
         "ov_s:ch:beta": 1,
@@ -1035,7 +1040,11 @@ test("mergeReadStateEventsStructured_twoBlobs_livenessProperly_evaluated", async
   assert.equal(merged.frontiers.get("ch:beta"), 100);
   assert.deepEqual(merged.overrides.get("ch:beta"), { s: 1, c: 0, b: 95 });
 
-  const liveness = computeOverrideLiveness(merged, "ch:beta");
+  const liveness = computeOverrideLiveness(
+    merged,
+    "ch:beta",
+    merged.frontiers.get("ch:beta") ?? 0,
+  );
   // F(100) > B(95) → inactive
   assert.equal(liveness.active, false);
   assert.equal(liveness.frontier, 100);
@@ -1053,7 +1062,7 @@ test("mergeReadStateEventsStructured_twoBlobs_livenessActive_afterMerge", async 
   // Liveness: S(1)>0, F(55)<=B(60), S(1)>C(0) → active
   const merged = await mergeFakeEvents(pubkey, [
     {
-      dTagSlot: "slot1",
+      dTagSlot: SLOT_A,
       blobContexts: {
         "ch:gamma": 50,
         "ov_s:ch:gamma": 1,
@@ -1062,7 +1071,7 @@ test("mergeReadStateEventsStructured_twoBlobs_livenessActive_afterMerge", async 
       },
     },
     {
-      dTagSlot: "slot2",
+      dTagSlot: SLOT_B,
       blobContexts: {
         "ch:gamma": 55, // just the frontier, no override keys
       },
@@ -1072,7 +1081,11 @@ test("mergeReadStateEventsStructured_twoBlobs_livenessActive_afterMerge", async 
   assert.equal(merged.frontiers.get("ch:gamma"), 55);
   assert.deepEqual(merged.overrides.get("ch:gamma"), { s: 1, c: 0, b: 60 });
 
-  const liveness = computeOverrideLiveness(merged, "ch:gamma");
+  const liveness = computeOverrideLiveness(
+    merged,
+    "ch:gamma",
+    merged.frontiers.get("ch:gamma") ?? 0,
+  );
   // S(1)>0, F(55)<=B(60), S(1)>C(0) → active
   assert.equal(liveness.active, true);
   assert.equal(liveness.frontier, 55);
@@ -1081,7 +1094,7 @@ test("mergeReadStateEventsStructured_twoBlobs_livenessActive_afterMerge", async 
 test("mergeReadStateEventsStructured_unknownPubkey_returnsEmpty", async () => {
   const pubkey = "aa".repeat(32);
   const wrongPubkey = "bb".repeat(32);
-  const { event, decrypt } = makeEvent(pubkey, "slot1", { "ch:x": 100 });
+  const { event, decrypt } = makeEvent(pubkey, SLOT_A, { "ch:x": 100 });
   // Pass event but query with wrong pubkey — parseReadStateEvent returns null for each
   const merged = await mergeReadStateEventsStructured(
     [event],
@@ -1107,7 +1120,7 @@ test("mergeReadStateEventsStructured_fullCollisionWitness_distinctNamespaces", a
 
   const merged = await mergeFakeEvents(pubkey, [
     {
-      dTagSlot: "slot1",
+      dTagSlot: SLOT_A,
       blobContexts: {
         // raw ctx `ov_s:evil`: frontier published escaped; register uses raw suffix
         "esc:ov_s:evil": 7,
@@ -1122,7 +1135,7 @@ test("mergeReadStateEventsStructured_fullCollisionWitness_distinctNamespaces", a
       },
     },
     {
-      dTagSlot: "slot2",
+      dTagSlot: SLOT_B,
       blobContexts: {
         // second device advances `evil` frontier and register
         evil: 120,
@@ -1163,7 +1176,11 @@ test("mergeReadStateEventsStructured_fullCollisionWitness_distinctNamespaces", a
   );
 
   // Liveness for `ov_s:evil`: F(7), s=1, c=0, b=6 → F(7)>B(6) → inactive
-  const ovsEvilLiveness = computeOverrideLiveness(merged, "ov_s:evil");
+  const ovsEvilLiveness = computeOverrideLiveness(
+    merged,
+    "ov_s:evil",
+    merged.frontiers.get("ov_s:evil") ?? 0,
+  );
   assert.equal(
     ovsEvilLiveness.active,
     false,
@@ -1172,10 +1189,177 @@ test("mergeReadStateEventsStructured_fullCollisionWitness_distinctNamespaces", a
   assert.equal(ovsEvilLiveness.frontier, 7);
 
   // Liveness for `evil`: F(120), s=4, c=2, b=110 → F(120)>B(110) → inactive
-  const evilLiveness = computeOverrideLiveness(merged, "evil");
+  const evilLiveness = computeOverrideLiveness(
+    merged,
+    "evil",
+    merged.frontiers.get("evil") ?? 0,
+  );
   assert.equal(evilLiveness.active, false, "evil: F(120)>B(110) → inactive");
   assert.equal(evilLiveness.frontier, 120);
 
   // Wire keys never polluted: no `esc:` key survives in frontiers map
   assert.equal(merged.frontiers.has("esc:ov_s:evil"), false);
+});
+
+// ---------------------------------------------------------------------------
+// isValidReadStateDTag — spec-conformant d-tag validation (NIP-RS :55/:68)
+// ---------------------------------------------------------------------------
+
+test("isValidReadStateDTag_valid32HexSlot_returnsTrue", () => {
+  assert.equal(
+    isValidReadStateDTag("read-state:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"),
+    true,
+  );
+});
+
+test("isValidReadStateDTag_uppercaseHex_returnsFalse", () => {
+  // Uppercase letters are NOT valid — spec requires [0-9a-f]{32} only.
+  assert.equal(
+    isValidReadStateDTag("read-state:A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6"),
+    false,
+  );
+});
+
+test("isValidReadStateDTag_nonHexChars_returnsFalse", () => {
+  // 'g' and 'z' are not hexadecimal.
+  assert.equal(
+    isValidReadStateDTag("read-state:gggggggggggggggggggggggggggggggg"),
+    false,
+  );
+});
+
+test("isValidReadStateDTag_31HexChars_returnsFalse", () => {
+  // One char short — must be exactly 32.
+  assert.equal(isValidReadStateDTag("read-state:" + "a".repeat(31)), false);
+});
+
+test("isValidReadStateDTag_33HexChars_returnsFalse", () => {
+  // One char over — must be exactly 32.
+  assert.equal(isValidReadStateDTag("read-state:" + "a".repeat(33)), false);
+});
+
+test("isValidReadStateDTag_missingPrefix_returnsFalse", () => {
+  assert.equal(isValidReadStateDTag("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"), false);
+});
+
+test("isValidReadStateDTag_emptySlot_returnsFalse", () => {
+  assert.equal(isValidReadStateDTag("read-state:"), false);
+});
+
+test("isValidReadStateDTag_undefined_returnsFalse", () => {
+  assert.equal(isValidReadStateDTag(undefined), false);
+});
+
+test("isValidReadStateDTag_legacySlot1_returnsFalse", () => {
+  // Non-conforming opaque slot names that were used in test fixtures before
+  // this fix must now be correctly rejected.
+  assert.equal(isValidReadStateDTag("read-state:slot1"), false);
+});
+
+// ---------------------------------------------------------------------------
+// decodeContexts — __proto__ context ID survives in both projections
+// ---------------------------------------------------------------------------
+
+test("decodeContexts_protoContextId_survivesBothProjections", () => {
+  // JSON.parse produces an object whose `__proto__` key is handled as a
+  // regular property by V8's JSON parser (it sets the value but does NOT
+  // change the prototype chain).  Without a null-prototype `wire` dict,
+  // assigning `wire[wireKey] = value` where wireKey === "__proto__" is a
+  // no-op (it modifies Object.prototype, not the object itself), so the
+  // flat projection silently loses the context while the `frontiers` Map
+  // retains it — the two claimed-equivalent views disagree.
+  //
+  // With `Object.create(null)` for `wire`, the assignment becomes an
+  // own-property write and both projections agree.
+  const raw = JSON.parse('{"__proto__":7,"normal":8}');
+
+  // Structured projection via parseContexts.
+  const { frontiers } = parseContexts(raw);
+
+  // Flat projection via sanitizeContexts.
+  const wire = sanitizeContexts(raw);
+
+  // frontiers Map must contain __proto__ with value 7.
+  assert.equal(frontiers.get("__proto__"), 7, "__proto__ must be in frontiers");
+  assert.equal(frontiers.get("normal"), 8, "normal must be in frontiers");
+
+  // wire must have __proto__ as an own property with value 7 — NOT inherited.
+  assert.equal(
+    Object.hasOwn(wire, "__proto__"),
+    true,
+    "__proto__ must be an own property of wire",
+  );
+  assert.equal(wire.__proto__, 7, "__proto__ wire value must be 7");
+  assert.equal(wire.normal, 8, "normal wire value must be 8");
+});
+
+// ---------------------------------------------------------------------------
+// computeOverrideLiveness — hierarchical effective-frontier witness
+// (NIP-RS :169-196/:510-514)
+// ---------------------------------------------------------------------------
+
+test("computeOverrideLiveness_hierarchicalFrontier_overrideBecomesInactive", async () => {
+  // Wire state:
+  //   channel ctx: frontier=100
+  //   thread ctx:  frontier=50, register s=1/c=0/b=60
+  //
+  // Thread own frontier: 50 → override would be active (F(50)<=B(60), S(1)>C(0)).
+  // Effective frontier applying hierarchical rule:
+  //   effective(thread) = max(merged[thread], merged[channel]) = max(50, 100) = 100
+  // With F_eff=100 > B(60) → override is INACTIVE.
+  //
+  // A caller that reads merged.frontiers.get("thread") and passes only 50
+  // would incorrectly see the override as active.  This test verifies that
+  // passing the correct effective frontier (100) gives the right answer.
+  const pubkey = "e1".repeat(32);
+  const channelCtx = "aabbccdd-channel-uuid";
+  const threadCtx =
+    "thread:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+  const merged = await mergeFakeEvents(pubkey, [
+    {
+      dTagSlot: SLOT_A,
+      blobContexts: {
+        [channelCtx]: 100,
+        [threadCtx]: 50,
+        [`ov_s:${threadCtx}`]: 1,
+        [`ov_c:${threadCtx}`]: 0,
+        [`ov_b:${threadCtx}`]: 60,
+      },
+    },
+  ]);
+
+  assert.equal(merged.frontiers.get(channelCtx), 100);
+  assert.equal(merged.frontiers.get(threadCtx), 50);
+  assert.deepEqual(merged.overrides.get(threadCtx), { s: 1, c: 0, b: 60 });
+
+  // Own frontier only — this would INCORRECTLY show active.
+  const ownFrontierLiveness = computeOverrideLiveness(
+    merged,
+    threadCtx,
+    merged.frontiers.get(threadCtx) ?? 0,
+  );
+  assert.equal(
+    ownFrontierLiveness.active,
+    true,
+    "with own frontier F(50)<=B(60) the override looks active",
+  );
+
+  // Hierarchical effective frontier — correct answer is INACTIVE.
+  const channelFrontier = merged.frontiers.get(channelCtx) ?? 0;
+  const threadFrontier = merged.frontiers.get(threadCtx) ?? 0;
+  const effectiveFrontier = Math.max(threadFrontier, channelFrontier);
+  assert.equal(effectiveFrontier, 100);
+
+  const hierarchicalLiveness = computeOverrideLiveness(
+    merged,
+    threadCtx,
+    effectiveFrontier,
+  );
+  assert.equal(
+    hierarchicalLiveness.active,
+    false,
+    "with effective frontier F(100)>B(60) the override is correctly inactive",
+  );
+  assert.equal(hierarchicalLiveness.frontier, 100);
 });

@@ -170,27 +170,77 @@ if grep -q "$retired_entitlement_key" "$runner_entitlements"; then
 else
   pass "Runner omits the invalid App Attest entitlement key"
 fi
-team_map=$(awk '
-  /\/\* (Debug|Release|Profile) \*\/ = \{/ {
-    config = $3
+signing_map=$(awk '
+  NR == FNR {
+    if (/Build configuration list for PBXNativeTarget "/) {
+      split($0, fields, "\"")
+      target = fields[2]
+      in_target_list = 1
+      next
+    }
+    if (in_target_list && /buildConfigurations = \(/) {
+      in_configurations = 1
+      next
+    }
+    if (in_configurations && /\);/) {
+      in_configurations = 0
+      in_target_list = 0
+      next
+    }
+    if (in_configurations && /\/\* (Debug|Release|Profile) \*\//) {
+      targets[$1] = target
+    }
+    next
   }
-  /DEVELOPMENT_TEAM =/ {
-    team = $3
-    gsub(/;/, "", team)
-    print config, team
+
+  !in_build_configuration && /\/\* (Debug|Release|Profile) \*\/ = \{/ {
+    in_build_configuration = 1
+    configuration_id = $1
+    configuration = $3
+    base_configuration = "NONE"
+    team = ""
+    entitlements = "NONE"
+    depth = 0
   }
-' "$pbxproj" | sort)
-expected_team_map=$(printf '%s\n' \
-  'Debug JMTDPW9CG3' \
-  'Debug JMTDPW9CG3' \
-  'Profile EYF346PHUG' \
-  'Profile EYF346PHUG' \
-  'Release EYF346PHUG' \
-  'Release EYF346PHUG')
-if [[ "$team_map" == "$expected_team_map" ]]; then
-  pass "Runner and NotificationService use dogfood for Debug and production for Release/Profile"
+
+  in_build_configuration {
+    if (/baseConfigurationReference =/) {
+      base_configuration = $0
+      sub(/^.*\/\* /, "", base_configuration)
+      sub(/ \*\/.*$/, "", base_configuration)
+    }
+    if (/DEVELOPMENT_TEAM =/) {
+      team = $0
+      sub(/^.*= */, "", team)
+      sub(/;.*/, "", team)
+    }
+    if (/CODE_SIGN_ENTITLEMENTS =/) {
+      entitlements = $0
+      sub(/^.*= */, "", entitlements)
+      sub(/;.*/, "", entitlements)
+    }
+
+    depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+    if (depth == 0) {
+      if (team != "") {
+        target_name = configuration_id in targets ? targets[configuration_id] : "UNMAPPED:" configuration_id
+        print target_name, configuration, base_configuration, team, entitlements
+      }
+      in_build_configuration = 0
+    }
+  }
+' "$pbxproj" "$pbxproj" | sort)
+expected_signing_map=$(printf '%s\n' \
+  'NotificationService Debug Debug.xcconfig JMTDPW9CG3 NotificationService/NotificationService.entitlements' \
+  'NotificationService Profile Release.xcconfig EYF346PHUG NotificationService/NotificationService.entitlements' \
+  'NotificationService Release Release.xcconfig EYF346PHUG NotificationService/NotificationService.entitlements' \
+  'Runner Debug Debug.xcconfig JMTDPW9CG3 Runner/Runner.entitlements' \
+  'Runner Profile Release.xcconfig EYF346PHUG Runner/Runner.entitlements' \
+  'Runner Release Release.xcconfig EYF346PHUG Runner/Runner.entitlements')
+if [[ "$signing_map" == "$expected_signing_map" ]]; then
+  pass "Runner and NotificationService signing settings match each build configuration"
 else
-  fail "unexpected iOS development-team map: $team_map"
+  fail "unexpected iOS signing map: $signing_map"
 fi
 grep -q '<string>$(APP_DISPLAY_NAME)</string>' "$plist" \
   && pass "Info.plist display name resolves from build settings" \

@@ -1,3 +1,4 @@
+import * as React from "react";
 import type { ChannelSuggestion } from "@/features/messages/lib/useChannelLinks";
 import type { useChannelLinks } from "@/features/messages/lib/useChannelLinks";
 import type { EmojiSuggestion } from "@/features/messages/lib/useEmojiAutocomplete";
@@ -9,6 +10,18 @@ import {
   MentionAutocomplete,
   type MentionSuggestion,
 } from "./MentionAutocomplete";
+
+export function useComposerScrollToBottom(
+  composerScrollRef: React.RefObject<HTMLDivElement | null>,
+) {
+  return React.useCallback(() => {
+    window.requestAnimationFrame(() => {
+      const scrollElement = composerScrollRef.current;
+      if (!scrollElement) return;
+      scrollElement.scrollTop = scrollElement.scrollHeight;
+    });
+  }, [composerScrollRef]);
+}
 
 export function MessageComposerAutocompletes({
   applyChannelInsert,

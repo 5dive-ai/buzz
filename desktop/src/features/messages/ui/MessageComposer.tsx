@@ -57,8 +57,8 @@ import { useDraftPersistLifecycle } from "./useDraftPersistSnapshot";
 import {
   MessageComposerAutocompletes,
   MessageComposerUploadError,
+  useComposerScrollToBottom,
 } from "./MessageComposerOverlays";
-import { useComposerScrollToBottom } from "./useComposerScrollToBottom";
 
 import type { MessageComposerProps } from "./MessageComposer.types";
 

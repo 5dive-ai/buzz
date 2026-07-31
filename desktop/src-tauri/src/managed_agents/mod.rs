@@ -5,6 +5,7 @@ pub(crate) mod agent_snapshot_envelope;
 pub(crate) mod canonical_projection;
 pub(crate) mod config_barrier;
 pub(crate) mod config_sync;
+pub(crate) mod config_sync_readiness;
 pub(crate) mod decision;
 pub(crate) mod head_lookup;
 pub(crate) mod team_snapshot;

@@ -600,9 +600,18 @@ pub fn normalize_effort_for_databricks_v2(
     raw_model: &str,
 ) -> ThinkingEffort {
     use crate::generated_model_capabilities::{resolve_model_capabilities, NormalizationPolicy};
-    match resolve_model_capabilities("databricks_v2", raw_model).normalization_policy {
-        NormalizationPolicy::OpenAiStandard => normalize_effort_for_openai_route(effort, raw_model),
+    let cap = resolve_model_capabilities("databricks_v2", raw_model);
+    match cap.normalization_policy {
+        NormalizationPolicy::OpenAiStandard => {
+            // Resolve against the generated `supported_efforts` — this is the axis that
+            // carries exact-record corrections (e.g. databricks-gpt-5-5 → [low,medium,high]).
+            // Uses the same clamping/peer-fallback semantics as the old hand-table lookup.
+            resolve_openai_effort(raw_model, effort, cap.supported_efforts.as_ref())
+        }
         NormalizationPolicy::OpenAiClampMaxToXHigh => {
+            // Only `max` is out-of-range; all other values pass through if supported.
+            // Resolve against supported_efforts so that unsupported values are clamped
+            // consistently (not just `max`).
             if effort == ThinkingEffort::Max {
                 tracing::warn!(
                     requested = "max",
@@ -612,7 +621,7 @@ pub fn normalize_effort_for_databricks_v2(
                 );
                 ThinkingEffort::XHigh
             } else {
-                effort
+                resolve_openai_effort(raw_model, effort, cap.supported_efforts.as_ref())
             }
         }
         NormalizationPolicy::None => effort,
@@ -2866,6 +2875,59 @@ mod tests {
                 entry.provider, entry.model,
             );
         }
+    }
+
+    // ---- normalize_effort_for_databricks_v2 regression tests (F1 corrections) ----
+    // These pin the exact behavior Paul's pre-review probes checked. The key invariant:
+    // normalize_effort_for_databricks_v2 must resolve against the generated supported_efforts
+    // (which carries exact-record F1 corrections), NOT the old hand table.
+
+    #[test]
+    fn normalize_effort_for_databricks_v2_gpt_5_5_xhigh_clamps_to_high() {
+        // F1 correction: databricks-gpt-5-5 generated supported_efforts = [low, medium, high].
+        // XHigh is outside the supported set → nearest supported is High.
+        assert_eq!(
+            normalize_effort_for_databricks_v2(ThinkingEffort::XHigh, "databricks-gpt-5-5"),
+            ThinkingEffort::High,
+            "databricks-gpt-5-5 XHigh must clamp to High (F1 correction: supported=[low,medium,high])"
+        );
+    }
+
+    #[test]
+    fn normalize_effort_for_databricks_v2_gpt_5_5_none_clamps_to_low() {
+        // F1 correction: databricks-gpt-5-5 supported_efforts = [low, medium, high].
+        // None is outside the set → nearest supported is Low.
+        assert_eq!(
+            normalize_effort_for_databricks_v2(ThinkingEffort::None, "databricks-gpt-5-5"),
+            ThinkingEffort::Low,
+            "databricks-gpt-5-5 None must clamp to Low (F1 correction: supported=[low,medium,high])"
+        );
+    }
+
+    #[test]
+    fn normalize_effort_for_databricks_v2_gpt_5_5_in_range_passes_through() {
+        // Values within the corrected set must pass through unchanged.
+        for effort in [
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::High,
+        ] {
+            assert_eq!(
+                normalize_effort_for_databricks_v2(effort, "databricks-gpt-5-5"),
+                effort,
+                "databricks-gpt-5-5 {effort:?} is in supported set, must pass through"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_effort_for_databricks_v2_gpt_5_6_sol_max_passes_through() {
+        // databricks-gpt-5-6-sol F1 adoption: [low, medium, high, max] — max is supported.
+        assert_eq!(
+            normalize_effort_for_databricks_v2(ThinkingEffort::Max, "databricks-gpt-5-6-sol"),
+            ThinkingEffort::Max,
+            "databricks-gpt-5-6-sol Max must pass through (F1: supported includes max)"
+        );
     }
 
     /// Phase-2 differential: new generated effort config matches old hand-coded helper

@@ -112,3 +112,12 @@ impl AppAttestPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn development_bypass_stays_a_non_default_feature() {
+        assert!(include_str!("../Cargo.toml")
+            .contains("[features]\ndefault = []\ndev-app-attest-bypass = []"));
+    }
+}

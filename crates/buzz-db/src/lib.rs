@@ -2229,6 +2229,28 @@ impl Db {
         .await
     }
 
+    /// Adds a channel member and optional corporate identity binding atomically.
+    pub async fn add_member_with_identity(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+        role: channel::MemberRole,
+        invited_by: Option<&[u8]>,
+        identity: Option<&identity_binding::IdentityBindingInput<'_>>,
+    ) -> Result<channel::ChannelAdmissionOutcome> {
+        channel::add_member_with_identity(
+            &self.pool,
+            community_id,
+            channel_id,
+            pubkey,
+            role,
+            invited_by,
+            identity,
+        )
+        .await
+    }
+
     /// Removes a member from a channel.
     pub async fn remove_member(
         &self,

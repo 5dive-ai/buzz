@@ -656,7 +656,15 @@ pub async fn finalize_atomic_corporate_identity_result(
 ) -> Result<CorporateIdentityDecision, CorporateIdentityError> {
     let result = match proof {
         CorporateIdentityProof::NotRequired => Ok(CorporateIdentityDecision::NotRequired),
-        CorporateIdentityProof::Delegated { .. } => Err(CorporateIdentityError::DelegationDenied),
+        CorporateIdentityProof::Delegated {
+            owner_pubkey,
+            owner_issuer,
+            owner_uid,
+        } => Ok(CorporateIdentityDecision::Delegated {
+            owner_pubkey,
+            owner_issuer,
+            owner_uid,
+        }),
         CorporateIdentityProof::Direct { claims, source } => {
             let binding = committed_binding.ok_or_else(|| {
                 buzz_db::DbError::InvalidData(

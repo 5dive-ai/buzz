@@ -75,6 +75,15 @@ assert route['spec']['parentRefs']
 assert 'push.buzz.xyz' in route['spec']['hostnames']
 PY
 
+# Legacy token-auth values must fail rather than silently selecting the default
+# certificate Secret.
+if helm template push deploy/charts/buzz-push-gateway \
+  --set apnsKey.secretName=legacy-apns-secret \
+  --set apnsKey.secretKey=legacy-provider.p8 >/dev/null 2>&1; then
+  echo 'expected legacy apnsKey values to fail schema validation' >&2
+  exit 1
+fi
+
 # Enabling a route without a Gateway attachment must fail schema validation.
 if helm template push deploy/charts/buzz-push-gateway --set httpRoute.enabled=true >/dev/null 2>&1; then
   echo 'expected httpRoute.enabled=true without parentRefs to fail' >&2

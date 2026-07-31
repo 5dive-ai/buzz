@@ -368,8 +368,21 @@ impl PubSubManager {
 
 #[cfg(test)]
 pub(crate) mod test_util {
+    /// The Redis endpoint under test. Honours `REDIS_URL` so the same
+    /// `--ignored` suite can be pointed at standalone Redis (the CI default) or
+    /// at a single-shard cluster-mode server, which is what enforces
+    /// `CROSSSLOT` locally.
+    ///
+    /// Every test that opens a connection must route through this — a
+    /// hardcoded URL alongside an env-var-driven one makes the pool and the
+    /// pub/sub client talk to *different servers*, which fails as a timeout and
+    /// reads like a cluster incompatibility.
+    pub fn test_redis_url() -> String {
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+    }
+
     pub fn make_test_pool() -> deadpool_redis::Pool {
-        let cfg = deadpool_redis::Config::from_url("redis://127.0.0.1:6379");
+        let cfg = deadpool_redis::Config::from_url(test_redis_url());
         cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))
             .expect("Failed to create Redis pool")
     }
@@ -378,7 +391,7 @@ pub(crate) mod test_util {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::make_test_pool;
+    use crate::test_util::{make_test_pool, test_redis_url};
     use buzz_core::{CommunityId, TenantContext};
     use nostr::{EventBuilder, Keys, Kind};
     use uuid::Uuid;
@@ -386,7 +399,7 @@ mod tests {
     async fn make_manager() -> Arc<PubSubManager> {
         let pool = make_test_pool();
         Arc::new(
-            PubSubManager::new("redis://127.0.0.1:6379", pool)
+            PubSubManager::new(&test_redis_url(), pool)
                 .await
                 .expect("Failed to create PubSubManager"),
         )
@@ -513,7 +526,7 @@ mod tests {
         let pool = make_test_pool();
         let manager = Arc::new(
             PubSubManager::with_config(
-                PubSubConfig::new("redis://127.0.0.1:6379")
+                PubSubConfig::new(test_redis_url())
                     .with_unsubscribe_debounce(Duration::from_millis(25)),
                 pool,
             )
@@ -593,8 +606,7 @@ mod tests {
     async fn retain_release_refcounts_and_debounces_last_release() {
         let pool = make_test_pool();
         let manager = PubSubManager::with_config(
-            PubSubConfig::new("redis://127.0.0.1:6379")
-                .with_unsubscribe_debounce(Duration::from_millis(1)),
+            PubSubConfig::new(test_redis_url()).with_unsubscribe_debounce(Duration::from_millis(1)),
             pool,
         )
         .await

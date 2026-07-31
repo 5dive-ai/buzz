@@ -353,6 +353,7 @@ jobs:
           cargo nextest archive \
             --cargo-profile ci \
             -p buzz-db \
+            -p buzz-pubsub \
             -p buzz-relay \
             -p buzz-test-client \
             --lib \
@@ -684,6 +685,22 @@ jobs:
           done
           cat /tmp/buzz-relay.log
           exit 1
+      - name: Redis compatibility tests (standalone)
+        # buzz-pubsub's Redis-backed tests are #[ignore]d, so nothing ran them
+        # in CI before. They assert the cluster-safe command shapes required by
+        # ElastiCache Serverless (single-key GETs for bulk presence, exact
+        # SUBSCRIBE) *and* that those shapes still behave on standard Redis —
+        # which is the compatibility half of the guarantee, and the half a
+        # serverless-only rig cannot check. Points at the standalone Redis this
+        # job already runs; a cluster-mode service container is deliberately not
+        # added here.
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'package(buzz-pubsub)' \
+            --run-ignored all
+        env:
+          REDIS_URL: redis://localhost:6379
       - name: Invite security tests
         run: |
           cargo nextest run \

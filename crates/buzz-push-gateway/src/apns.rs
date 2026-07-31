@@ -183,6 +183,7 @@ impl PushTransport for ApnsTransport {
         profile: AppProfile,
         endpoint: &str,
     ) -> DeliveryOutcome {
+        crate::metrics::record_apns_send_attempt();
         let response = self.send_response(attempt, profile, endpoint).await;
         let response = match response {
             Ok(response) => response,

@@ -52,6 +52,13 @@ fn outcome_label(outcome: DeliveryOutcome) -> &'static str {
     }
 }
 
+/// Record entry into the concrete APNs HTTP send seam. This counter is kept
+/// separate from terminal outcomes so a control scrape can distinguish
+/// "transport never reached" from "APNs send returned an error".
+pub fn record_apns_send_attempt() {
+    metrics::counter!("push_gateway_apns_send_attempts_total").increment(1);
+}
+
 /// Record the terminal APNs outcome and its send round-trip latency.
 pub fn record_apns_delivery(outcome: DeliveryOutcome, seconds: f64) {
     metrics::counter!("push_gateway_apns_deliveries_total", "outcome" => outcome_label(outcome))
@@ -152,6 +159,7 @@ mod tests {
     fn recorder_renders_sanitized_bounded_series() {
         let handle = install().expect("recorder installs exactly once per test process");
 
+        record_apns_send_attempt();
         record_apns_delivery(DeliveryOutcome::Accepted, 0.012);
         record_apns_delivery(
             DeliveryOutcome::InvalidEndpoint {
@@ -172,6 +180,7 @@ mod tests {
 
         // All expected series are present.
         for needle in [
+            "push_gateway_apns_send_attempts_total",
             "push_gateway_apns_deliveries_total",
             "push_gateway_apns_delivery_seconds",
             "push_gateway_admissions_total",

@@ -1,5 +1,4 @@
-#!/bin/sh
-// 2>/dev/null; LOADER="$(cd "$(dirname "$0")" && pwd)/ts-esm-loader.mjs"; exec node --experimental-strip-types --loader "$LOADER" "$0" "$@"
+#!/usr/bin/env node
 /**
  * Phase-2 differential harness — compare old buzzAgentConfig.ts effort logic with
  * the new generated modelCapabilities.ts interpreter over:
@@ -10,14 +9,8 @@
  * Equality is required except for entries in the committed allowlist of intentional
  * F1 corrections (models.dev provider-capability reconciliations).
  *
- * Usage: node scripts/run-differential.mjs [--verbose]
+ * Usage: node --experimental-strip-types scripts/run-differential.mjs [--verbose]
  * Exits 0 on all-pass (modulo allowlist), 1 on unexpected divergence or unexercised allowlist entry.
- *
- * NOTE: The shebang bootstraps --experimental-strip-types and a custom ESM loader
- * (ts-esm-loader.mjs) that resolves extensionless relative TS imports. This is
- * required because buzzAgentConfig.ts (Phase 2b) imports modelCapabilities via a
- * bare specifier ("./modelCapabilities") that Node's strip-types runner cannot
- * otherwise resolve.
  */
 
 import { readFileSync } from "node:fs";
@@ -38,7 +31,7 @@ const { resolveModelCapabilities: resolveNew } = await import(
 );
 
 // OLD: buzzAgentConfig.ts effort config
-const { getProviderEffortConfig: getOldEffortConfig } = await import(
+const { getProviderEffortConfig_oldHandTable: getOldEffortConfig } = await import(
   join(repoRoot, "desktop", "src", "features", "agents", "ui", "buzzAgentConfig.ts")
 );
 

@@ -4226,15 +4226,17 @@ mod tests {
 
     // ---- DatabricksV2 route-aware effort normalization (body-level assertions) ----
     //
-    // The DBv2 `complete()` dispatch applies `normalize_effort_for_openai_route` /
-    // `normalize_effort_for_anthropic_route` before calling body builders. These tests
-    // verify the body shape that results from the already-normalized effort values — i.e.,
-    // they confirm the body builders correctly serialize the values the dispatch passes them.
+    // These tests verify the body shape produced by the body builders when passed
+    // a pre-normalized effort value. The effort is pre-normalized here via the old
+    // helper (normalize_effort_for_openai_route) to produce the expected clamped value,
+    // mirroring what normalize_effort_for_databricks_v2 would return for these models
+    // (OpenAiStandard policy → delegates to normalize_effort_for_openai_route).
 
     #[test]
     fn dbv2_openai_route_max_effort_clamped_to_xhigh_in_responses_body() {
-        // DBv2 GPT-5.5 route: max → clamped to xhigh by normalize_effort_for_openai_route
-        // before reaching responses_body. gpt-5.5 supports xhigh so the final value is xhigh.
+        // DBv2 GPT-5.5 route: max → clamped to xhigh (OpenAiStandard policy).
+        // Pre-normalize via normalize_effort_for_openai_route (same as what
+        // normalize_effort_for_databricks_v2 delegates to for OpenAiStandard).
         let clamped =
             crate::config::normalize_effort_for_openai_route(ThinkingEffort::Max, "gpt-5.5");
         let body = responses_body(

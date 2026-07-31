@@ -18,7 +18,6 @@ function invokeRawBinary(cmd: string, payload: Uint8Array): Promise<unknown> {
 
 interface UseLocalDictationOptions {
   disabled?: boolean;
-  onRecordingStart?: () => void;
   onTranscriptText: (text: string) => void;
 }
 
@@ -71,7 +70,6 @@ const SESSION_HEADER_BYTES = 8;
  */
 export function useLocalDictation({
   disabled = false,
-  onRecordingStart,
   onTranscriptText,
 }: UseLocalDictationOptions) {
   const [isRecording, setIsRecording] = useState(false);
@@ -91,7 +89,6 @@ export function useLocalDictation({
   const flushChainRef = useRef<Promise<void>>(Promise.resolve());
   const unlistenTranscriptRef = useRef<UnlistenFn | null>(null);
   const unlistenStateRef = useRef<UnlistenFn | null>(null);
-  const onRecordingStartRef = useRef(onRecordingStart);
   const onTranscriptTextRef = useRef(onTranscriptText);
   // Native session ID — set after `start_dictation` returns. Transcript and
   // state events include this ID so we can definitively ignore stale events
@@ -101,7 +98,6 @@ export function useLocalDictation({
   // awaiting async setup. The start resumes and bails before activating.
   const startAbortedRef = useRef(false);
 
-  onRecordingStartRef.current = onRecordingStart;
   onTranscriptTextRef.current = onTranscriptText;
 
   const isEnabled = !disabled && isAvailable;
@@ -307,7 +303,6 @@ export function useLocalDictation({
     flushChainRef.current = Promise.resolve();
 
     setIsStarting(true);
-    onRecordingStartRef.current?.();
 
     try {
       // 1. Start the native STT engine — returns the session ID used to tag events.

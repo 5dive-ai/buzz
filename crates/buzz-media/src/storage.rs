@@ -177,6 +177,27 @@ impl MediaStorage {
         }
     }
 
+    /// Resolve a media payload to its new-first, legacy-fallback object key.
+    ///
+    /// Only an actual not-found result advances to the legacy candidate. Any
+    /// authorization, transport, throttling, or service error is returned so
+    /// the compatibility path cannot mask an unhealthy object store.
+    pub async fn resolve_read_key(
+        &self,
+        ctx: &TenantContext,
+        payload_name: &str,
+    ) -> Result<String, MediaError> {
+        let candidates =
+            crate::keys::read_candidates(ctx, payload_name).map_err(|_| MediaError::NotFound)?;
+        match self.head_with_metadata(&candidates.sharded).await? {
+            Some(_) => Ok(candidates.sharded),
+            None => match self.head_with_metadata(&candidates.legacy).await? {
+                Some(_) => Ok(candidates.legacy),
+                None => Err(MediaError::NotFound),
+            },
+        }
+    }
+
     /// Build the community-scoped sidecar key for a given sha256 (bare hash).
     ///
     /// Raw media bytes remain shared content-addressed CAS (`{sha}.{ext}`), but

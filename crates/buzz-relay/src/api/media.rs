@@ -658,7 +658,13 @@ pub(crate) async fn serve_blob_for_tenant(
         "attachment"
     };
 
-    let key = resolve_s3_key(&state.media_storage, tenant, sha256_ext).await?;
+    let key = state
+        .media_storage
+        .resolve_read_key(
+            tenant,
+            &resolve_payload_name(&state.media_storage, tenant, sha256_ext).await?,
+        )
+        .await?;
 
     // Parse optional Range header.
     let range_header = req_headers
@@ -826,7 +832,13 @@ pub async fn head_blob(
         sidecar_mime
     };
 
-    let key = resolve_s3_key(&state.media_storage, &tenant, &sha256_ext).await?;
+    let key = state
+        .media_storage
+        .resolve_read_key(
+            &tenant,
+            &resolve_payload_name(&state.media_storage, &tenant, &sha256_ext).await?,
+        )
+        .await?;
     match state.media_storage.head_with_metadata(&key).await? {
         Some(meta) => {
             let size_str = meta.size.to_string();
@@ -852,7 +864,7 @@ pub async fn head_blob(
 ///
 /// Sidecar-derived extensions are validated as safe tokens to prevent
 /// object-key confusion if sidecar data is ever tampered with.
-async fn resolve_s3_key(
+async fn resolve_payload_name(
     storage: &buzz_media::MediaStorage,
     tenant: &TenantContext,
     sha256_ext: &str,

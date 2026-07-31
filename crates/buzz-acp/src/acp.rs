@@ -26,7 +26,6 @@ const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 /// an agent that may process untrusted channel messages.
 const CLAUDE_PARENT_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
-    "HOME",
     "USER",
     "LOGNAME",
     "SHELL",
@@ -45,9 +44,6 @@ const CLAUDE_PARENT_ENV_ALLOWLIST: &[&str] = &[
     "SYSTEMROOT",
     "COMSPEC",
     "PATHEXT",
-    "USERPROFILE",
-    "LOCALAPPDATA",
-    "APPDATA",
     "PROGRAMDATA",
     "PROGRAMFILES",
     "PROGRAMFILES(X86)",
@@ -264,6 +260,10 @@ pub struct AcpClient {
     /// Claude's ACP adapter otherwise loads the host user's settings and MCP
     /// servers. This flag adds the adapter-specific session isolation metadata.
     is_claude_adapter: bool,
+    /// Disposable profile used by Claude adapters. Keeping the directory alive
+    /// for the child lifetime prevents Claude and tools it launches from falling
+    /// back to the operator's home, config, cache, or application-data paths.
+    _claude_profile: Option<tempfile::TempDir>,
 }
 
 fn build_session_new_params(
@@ -566,11 +566,18 @@ impl AcpClient {
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
 
-        if is_claude_adapter {
+        let claude_profile = if is_claude_adapter {
             let preserved =
                 std::env::vars_os().filter(|(key, _)| claude_parent_env_is_allowed(key));
             cmd.env_clear().envs(preserved);
-        }
+            Some(
+                tempfile::Builder::new()
+                    .prefix("buzz-claude-profile-")
+                    .tempdir()?,
+            )
+        } else {
+            None
+        };
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
         // For non-Claude adapters, operator precedence wins: skip injection if
@@ -619,6 +626,30 @@ impl AcpClient {
             cmd.env("CODEX_CONFIG", merged);
         }
 
+        if let Some(profile) = &claude_profile {
+            let root = profile.path();
+            let config = root.join(".config");
+            let cache = root.join(".cache");
+            let data = root.join(".local").join("share");
+            let claude = root.join(".claude");
+            let app_data = root.join("AppData").join("Roaming");
+            let local_app_data = root.join("AppData").join("Local");
+            for directory in [&config, &cache, &data, &claude, &app_data, &local_app_data] {
+                std::fs::create_dir_all(directory)?;
+            }
+
+            // Apply these last. Persona configuration must not redirect a
+            // Claude process back to the operator's profile directories.
+            cmd.env("HOME", root)
+                .env("USERPROFILE", root)
+                .env("XDG_CONFIG_HOME", config)
+                .env("XDG_CACHE_HOME", cache)
+                .env("XDG_DATA_HOME", data)
+                .env("CLAUDE_CONFIG_DIR", claude)
+                .env("APPDATA", app_data)
+                .env("LOCALAPPDATA", local_app_data);
+        }
+
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
         // to the harness's own process group on Unix.
         // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
@@ -657,6 +688,7 @@ impl AcpClient {
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             is_claude_adapter,
+            _claude_profile: claude_profile,
         })
     }
 
@@ -3031,6 +3063,10 @@ mod tests {
             "NOSTR_PRIVATE_KEY",
             "BUZZ_PRIVATE_KEY",
             "ANTHROPIC_API_KEY",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
         ] {
             assert!(
                 !super::claude_parent_env_is_allowed(std::ffi::OsStr::new(key)),
@@ -3038,13 +3074,7 @@ mod tests {
             );
         }
 
-        for key in [
-            "PATH",
-            "HOME",
-            "TMPDIR",
-            "SystemRoot",
-            "CLAUDE_CODE_EXECUTABLE",
-        ] {
+        for key in ["PATH", "TMPDIR", "SystemRoot", "CLAUDE_CODE_EXECUTABLE"] {
             assert!(
                 super::claude_parent_env_is_allowed(std::ffi::OsStr::new(key)),
                 "{key} is required for ordinary process startup"
@@ -3065,6 +3095,33 @@ mod tests {
             .await,
             "configured"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_spawn_uses_disposable_profile() {
+        let operator_home = std::env::var("HOME").expect("test process has HOME");
+        let observed = spawn_named_and_read_child_env("claude-agent-acp", "HOME", &[]).await;
+
+        assert_ne!(observed, operator_home);
+        assert!(
+            !std::path::Path::new(&observed).exists(),
+            "isolated profile must be removed when the Claude process is dropped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_persona_cannot_restore_operator_profile() {
+        let configured = "/operator/profile/that/must/not/be/inherited";
+        let observed = spawn_named_and_read_child_env(
+            "claude-agent-acp",
+            "HOME",
+            &[("HOME".into(), configured.into())],
+        )
+        .await;
+
+        assert_ne!(observed, configured);
     }
 
     /// Buzz-owned Hermes processes get the configured-MCP isolation default,

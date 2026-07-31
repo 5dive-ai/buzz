@@ -151,6 +151,48 @@ fn default_protocol_version() -> u8 {
     1
 }
 
+/// Remove a denied private admission and release only the exact owner lease
+/// that this connection acquired. The room is sealed while it is still the
+/// manager-visible instance, so a remote registration that already holds its
+/// `Arc` cannot enter between the peer removal and the Redis release.
+async fn cleanup_failed_private_audio_admission(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    channel_id: Uuid,
+    room: &Arc<crate::audio::room::Room>,
+    peer_id: Uuid,
+    acquired_lease: &mut Option<crate::audio::join::HuddleLease>,
+) {
+    let directory = state
+        .mesh()
+        .map(|mesh| &mesh.directory as &dyn crate::audio::join::HuddleDirectory);
+    match crate::audio::join::cleanup_failed_admission_lease(
+        directory,
+        acquired_lease,
+        &state.audio_rooms,
+        tenant.community(),
+        channel_id,
+        room,
+        peer_id,
+    )
+    .await
+    {
+        Ok(Some(crate::audio::join::HuddleReleaseOutcome::Released)) | Ok(None) => {}
+        Ok(Some(crate::audio::join::HuddleReleaseOutcome::NotOwner)) => {
+            debug!(
+                channel_id = %channel_id,
+                "failed audio admission lease already moved; stale cleanup left current owner intact"
+            );
+        }
+        Err(e) => {
+            warn!(
+                channel_id = %channel_id,
+                "failed audio admission could not release huddle owner lease: {e}"
+            );
+        }
+    }
+}
+
 async fn handle_audio_connection(
     socket: WebSocket,
     state: Arc<AppState>,
@@ -672,10 +714,15 @@ async fn handle_active_audio_connection(
                     )
                     .await;
                 }
-                room.remove_peer(peer_id);
-                state
-                    .audio_rooms
-                    .cleanup_if_empty(tenant.community(), channel_id);
+                cleanup_failed_private_audio_admission(
+                    &state,
+                    &tenant,
+                    channel_id,
+                    &room,
+                    peer_id,
+                    &mut acquired_lease,
+                )
+                .await;
                 return;
             }
         };
@@ -709,10 +756,15 @@ async fn handle_active_audio_connection(
                         )
                         .await;
                     }
-                    room.remove_peer(peer_id);
-                    state
-                        .audio_rooms
-                        .cleanup_if_empty(tenant.community(), channel_id);
+                    cleanup_failed_private_audio_admission(
+                        &state,
+                        &tenant,
+                        channel_id,
+                        &room,
+                        peer_id,
+                        &mut acquired_lease,
+                    )
+                    .await;
                     return;
                 }
             };

@@ -24,6 +24,13 @@
 | `BUZZ_PUSH_GRANT_KEYS` | Capability AEAD keyring, `id:base64-32-bytes[,predecessor...]`; current key first. |
 | `BUZZ_PUSH_TOKEN_KEYS` | Independent token-custody AEAD keyring in the same format. Never reuse grant keys. |
 
+Each gateway deployment represents exactly one Apple team and bundle-id pair:
+`BUZZ_PUSH_APP_ATTEST_APP_ID` and `BUZZ_PUSH_APNS_TOPIC` are scalar startup
+settings, and the mounted APNs certificate must match that topic. Dogfood
+(`JMTDPW9CG3` / `xyz.block.buzz.dogfood.mobile`) and production
+(`EYF346PHUG` / `xyz.block.buzz.mobile`) therefore require separate gateway
+deployments with their own matching settings and credentials.
+
 Optional endpoint quota policy variables are `BUZZ_PUSH_ENDPOINT_QUOTA_WINDOW_SECONDS` (default `10`, max `86400`) and `BUZZ_PUSH_ENDPOINT_QUOTA_MAX_DELIVERIES` (default `10`, max `10000`). These are Buzz policy hypotheses, not Apple-published limits; tune under load while retaining a hard ceiling.
 
 ## Secret and key rotation rules

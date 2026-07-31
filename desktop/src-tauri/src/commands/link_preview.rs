@@ -20,6 +20,7 @@ const PREVIEW_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 const PREVIEW_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REDIRECTS: usize = 3;
 const MAX_METADATA_CHARS: usize = 180;
+const MAX_METADATA_DESCRIPTION_CHARS: usize = 280;
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -402,7 +403,7 @@ fn extract_link_preview_metadata(html: &str) -> Option<LinkPreviewMetadata> {
         .and_then(|value| normalize_metadata_text(&value));
     let description = extract_meta_content(html, "property", "og:description")
         .or_else(|| extract_meta_content(html, "name", "twitter:description"))
-        .and_then(|value| normalize_metadata_text(&value));
+        .and_then(|value| normalize_metadata_description(&value));
 
     Some(LinkPreviewMetadata {
         title,
@@ -503,6 +504,27 @@ fn normalize_metadata_text(raw: &str) -> Option<String> {
     Some(normalized.chars().take(MAX_METADATA_CHARS).collect())
 }
 
+fn normalize_metadata_description(raw: &str) -> Option<String> {
+    let decoded = decode_html_entities(raw)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let normalized = decoded
+        .split('\n')
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let normalized = normalized.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(
+        normalized
+            .chars()
+            .take(MAX_METADATA_DESCRIPTION_CHARS)
+            .collect(),
+    )
+}
+
 fn decode_html_entities(value: &str) -> String {
     let mut decoded = value
         .replace("&amp;", "&")
@@ -537,6 +559,7 @@ mod tests {
     use super::{
         declares_animation, extract_favicon_url, extract_image_url, extract_link_preview_metadata,
         is_html_response, read_bytes_prefix, sanitize_image, LinkPreviewMetadata,
+        MAX_METADATA_DESCRIPTION_CHARS,
     };
     use axum::{body::Body, http::Response, routing::get, Router};
     use base64::Engine as _;
@@ -588,6 +611,28 @@ mod tests {
                 .map(|metadata| metadata.title),
             Some("Plain title".to_string())
         );
+    }
+
+    #[test]
+    fn metadata_preserves_description_line_breaks() {
+        let html = r#"<meta property="og:title" content="Tweet title">
+          <meta property="og:description" content="First paragraph.&#10;&#10;Agents:&#10;- One&#10;- Two">"#;
+        assert_eq!(
+            extract_link_preview_metadata(html).and_then(|metadata| metadata.description),
+            Some("First paragraph.\n\nAgents:\n- One\n- Two".to_string())
+        );
+    }
+
+    #[test]
+    fn metadata_description_supports_standard_x_posts() {
+        let description = "x".repeat(MAX_METADATA_DESCRIPTION_CHARS + 1);
+        let html = format!(
+            r#"<meta property="og:title" content="Long post"><meta property="og:description" content="{description}">"#
+        );
+        let extracted = extract_link_preview_metadata(&html)
+            .and_then(|metadata| metadata.description)
+            .unwrap();
+        assert_eq!(extracted.chars().count(), MAX_METADATA_DESCRIPTION_CHARS);
     }
 
     #[test]

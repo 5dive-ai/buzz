@@ -171,7 +171,7 @@ function TweetPreview({
       </a>
       {contentExpanded && preview.description ? (
         <LinkPreviewDescription
-          className="text-muted-foreground/70"
+          className="text-foreground"
           description={preview.description}
         />
       ) : null}
@@ -271,7 +271,7 @@ export function RichLinkPreviewAttachment({
         </a>
         {contentExpanded && preview.description ? (
           <LinkPreviewDescription
-            className="text-muted-foreground/70"
+            className="text-muted-foreground"
             description={preview.description}
           />
         ) : null}

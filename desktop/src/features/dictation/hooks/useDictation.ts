@@ -1,5 +1,5 @@
-import { useCallback, useRef } from "react";
-import { replaceTrailingTranscribedText } from "../lib/voiceInput";
+import { useCallback } from "react";
+import { appendTranscribedText } from "../lib/voiceInput";
 import { useLocalDictation } from "./useLocalDictation";
 
 interface UseDictationOptions {
@@ -16,30 +16,15 @@ export function useDictation({
   getText,
   setText,
 }: UseDictationOptions) {
-  const lastTranscriptRef = useRef("");
-
   const handleTranscript = useCallback(
     (transcript: string) => {
-      const previous = lastTranscriptRef.current;
-      const latest = getText();
-      const merged = replaceTrailingTranscribedText(
-        latest,
-        previous,
-        transcript,
-      );
-      setText(merged);
-      // Each native flush is an independent segment, so the next transcript
-      // appends instead of replacing this one.
-      lastTranscriptRef.current = "";
+      setText(appendTranscribedText(getText(), transcript));
     },
     [getText, setText],
   );
 
   const dictation = useLocalDictation({
     disabled,
-    onRecordingStart: () => {
-      lastTranscriptRef.current = "";
-    },
     onTranscriptText: handleTranscript,
   });
 

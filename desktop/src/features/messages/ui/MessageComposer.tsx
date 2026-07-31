@@ -274,7 +274,7 @@ function MessageComposerImpl({
     isUploadingRef,
     setComposerContent,
     setEditorContent: richText.setContent,
-    draftKey: effectiveDraftKey,
+    draftKey: `${effectiveDraftKey}\0${editTarget?.id ?? ""}\0${replyTarget?.id ?? ""}`,
     composerRef: composerScrollRef,
     submitMessageRef,
   });

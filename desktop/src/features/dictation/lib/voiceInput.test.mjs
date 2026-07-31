@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  appendTranscribedText,
   getDictationSendDecision,
-  replaceTrailingTranscribedText,
   shouldAutoSubmitDictation,
 } from "./voiceInput.ts";
 
@@ -71,46 +71,16 @@ test("dictation auto-submit waits until capture and transcription settle", () =>
   );
 });
 
-// ── replaceTrailingTranscribedText ──────────────────────────────────────────
+// ── appendTranscribedText ───────────────────────────────────────────────────
 
-test("replaceTrailingTranscribedText_appendsWhenNoPrevious", () => {
-  assert.equal(
-    replaceTrailingTranscribedText("Hello", "", "world"),
-    "Hello world",
-  );
+test("appendTranscribedText_appendsToExistingText", () => {
+  assert.equal(appendTranscribedText("Hello", "world"), "Hello world");
 });
 
-test("replaceTrailingTranscribedText_appendsToEmptyBase", () => {
-  assert.equal(replaceTrailingTranscribedText("", "", "hello"), "hello");
+test("appendTranscribedText_appendsToEmptyBase", () => {
+  assert.equal(appendTranscribedText("", "hello"), "hello");
 });
 
-test("replaceTrailingTranscribedText_replacesTrailingInterim", () => {
-  // Interim "hello wor" is refined to "hello world".
-  assert.equal(
-    replaceTrailingTranscribedText("hello wor", "hello wor", "hello world"),
-    "hello world",
-  );
-});
-
-test("replaceTrailingTranscribedText_preservesTextTypedBeforeDictation", () => {
-  // User typed "Note: " then dictated; the manual prefix must survive.
-  assert.equal(
-    replaceTrailingTranscribedText("Note: hi", "hi", "hi there"),
-    "Note: hi there",
-  );
-});
-
-test("replaceTrailingTranscribedText_appendsWhenPreviousNoLongerMatches", () => {
-  // If the previous transcript isn't the trailing text anymore, append.
-  assert.equal(
-    replaceTrailingTranscribedText("edited text", "old", "new"),
-    "edited text new",
-  );
-});
-
-test("replaceTrailingTranscribedText_noDoubleSpaceBeforePunctuation", () => {
-  assert.equal(
-    replaceTrailingTranscribedText("Hello", "", ", world"),
-    "Hello, world",
-  );
+test("appendTranscribedText_avoidsSpaceBeforePunctuation", () => {
+  assert.equal(appendTranscribedText("Hello", ", world"), "Hello, world");
 });

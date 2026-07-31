@@ -276,6 +276,7 @@ test-unit:
     #!/usr/bin/env bash
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
+        cargo nextest run -p buzz-voice --lib
         cargo nextest run -p buzz-cli
         # buzz-db migrator/lint tests: pure SQL-parsing unit tests (no infra).
         # They guard the embedded-migrator invariant (exactly the consolidated
@@ -725,7 +726,7 @@ bump-relay-version version:
     cargo update -p buzz-relay
     echo "Bumped buzz-relay to {{ version }} and regenerated Cargo.lock"
 
-# Open or update the desktop release PR (signed desktop app)
+# Open or update the desktop release PR from an immutable origin/main snapshot
 release-desktop *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -735,7 +736,7 @@ release-desktop *ARGS:
     else
         VERSION="$ARG"
     fi
-    just _release-pr desktop "$VERSION"
+    scripts/prepare-desktop-release.sh "$VERSION"
 
 # Open or update the relay release PR (ghcr.io/block/buzz image)
 release-relay *ARGS:

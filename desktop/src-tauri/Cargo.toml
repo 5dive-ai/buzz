@@ -2,7 +2,7 @@
 
 [package]
 name = "buzz-desktop"
-version = "0.5.2"
+version = "0.5.3"
 description = "Buzz desktop app"
 authors = ["you"]
 edition = "2021"
@@ -86,7 +86,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
-nostr = { version = "0.44", features = ["nip44"] }
+nostr = { version = "0.44", features = ["nip44", "nip49"] }
+# OS-entropy source for backup passphrase generation (already in the tree as a
+# transitive dependency; pinned here for direct use).
+getrandom = "0.2"
 zeroize = "1"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
@@ -95,6 +98,7 @@ buzz_core_pkg = { package = "buzz-core", path = "../../crates/buzz-core" }
 buzz_persona_pkg = { package = "buzz-persona", path = "../../crates/buzz-persona" }
 buzz_sdk_pkg = { package = "buzz-sdk", path = "../../crates/buzz-sdk" }
 buzz_agent_pkg = { package = "buzz-agent", path = "../../crates/buzz-agent" }
+buzz_voice_pkg = { package = "buzz-voice", path = "../../crates/buzz-voice" }
 iroh = { version = "1.0.2", optional = true }
 mesh-llm-sdk = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.74.0", package = "mesh-llm-sdk", default-features = false, features = ["client", "serving"], optional = true }
 mesh-llm-host-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.74.0", package = "mesh-llm-host-runtime", default-features = false, features = ["dynamic-native-runtime"], optional = true }

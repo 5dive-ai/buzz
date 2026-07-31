@@ -24,53 +24,6 @@
 /** channelId → NIP-RS read marker (unix seconds) at force-time, or null */
 export type ForcedUnreadMap = Record<string, number | null>;
 
-// ---------------------------------------------------------------------------
-// NIP-RS override mark-result types (shared with useUnreadChannels)
-// ---------------------------------------------------------------------------
-
-/**
- * Result returned by ReadStateManager.markChannelOverrideUnread /
- * markChannelOverrideRead (slice 2). `success: false` carries a reason code
- * that is mapped to a user-visible toast by overrideErrorMessage below.
- */
-export type MarkOverrideResult =
-  | { success: true }
-  | {
-      success: false;
-      reason:
-        | "uint32_overflow"
-        | "budget_exhausted"
-        | "load_incomplete"
-        | "already_inactive";
-    };
-
-/** Override liveness for one channel — returned by getOverrideLiveness. */
-export type OverrideLiveness = { active: boolean; frontier: number };
-
-/**
- * User-visible error message for a failed NIP-RS override operation.
- * Returns null for silent failure reasons (already_inactive race condition).
- */
-export function overrideErrorMessage(
-  op: "unread" | "read",
-  reason: string,
-): string | null {
-  if (reason === "budget_exhausted")
-    return "Could not mark unread: override budget exhausted. Clear some channels first.";
-  if (reason === "uint32_overflow")
-    return op === "unread"
-      ? "Could not mark unread: counter limit reached for this channel."
-      : "Could not clear unread override: counter limit reached.";
-  if (reason === "load_incomplete")
-    return op === "unread"
-      ? "Could not mark unread: read state is still loading. Try again shortly."
-      : "Could not clear unread override: read state is still loading.";
-  if (reason === "already_inactive") return null;
-  return op === "unread"
-    ? "Could not mark unread."
-    : "Could not clear unread override.";
-}
-
 const STORAGE_PREFIX = "buzz-forced-unread.v1";
 const storageKey = (pubkey: string) => `${STORAGE_PREFIX}:${pubkey}`;
 

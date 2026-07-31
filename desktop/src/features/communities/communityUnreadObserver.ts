@@ -4,8 +4,9 @@ import {
   type ForcedUnreadMap,
 } from "@/features/channels/forcedUnreadStore";
 import { DM_NOTIFIABLE_EVENT_KINDS } from "@/features/channels/isDmNotifiableKind";
-import { mergeReadStateEvents } from "@/features/channels/readState/readStateSnapshot";
+import { mergeReadStateEventsStructured } from "@/features/channels/readState/readStateSnapshot";
 import {
+  isOverrideActive,
   maxReadAt,
   msgContextKey,
 } from "@/features/channels/readState/readStateFormat";
@@ -191,7 +192,7 @@ export async function fetchCommunityUnread(args: {
     }),
   ]);
 
-  const readState = await mergeReadStateEvents(
+  const readState = await mergeReadStateEventsStructured(
     readStateEvents,
     pubkey,
     args.decryptReadState,
@@ -217,9 +218,9 @@ export async function fetchCommunityUnread(args: {
     mutedRootIds,
   } = readRelationships(normalizedPubkey);
 
-  // Channels manually marked unread on this device. Stored as a record of
-  // { channelId: markerAtWhenForced } so the observer can gate the dot on
-  // whether a cross-device read has since advanced past the stored baseline.
+  // Channels manually marked unread on this device — local cache of the NIP-RS
+  // override layer. Used only as a fast path; the authoritative verdict is the
+  // structured override register evaluated against the merged frontier.
   const forcedUnreadMap = readForcedUnread(normalizedPubkey);
 
   let hasUnread = false;
@@ -228,22 +229,29 @@ export async function fetchCommunityUnread(args: {
   for (const channel of channels) {
     if (mutedIds.has(channel.id)) continue;
 
-    // Compute readAt first so the forced-unread gate can compare against it.
-    const readAt = readState.get(channel.id) ?? null;
+    // Compute readAt from the merged frontiers.
+    const readAt = readState.frontiers.get(channel.id) ?? null;
 
-    // Forced-unread lights the dot without a relay fetch, but only if the
-    // synced read marker has NOT advanced past the stored baseline. This
-    // prevents stale forced-unread from lighting the rail after a cross-device
-    // read has covered the channel (the drain path in useUnreadChannels only
-    // runs while the community is active, so the store may not be pruned for
-    // inactive communities).
-    if (!hasUnread && Object.hasOwn(forcedUnreadMap, channel.id)) {
-      const markerAtWhenForced = forcedUnreadMap[channel.id];
-      if (
-        readAt === null ||
-        (markerAtWhenForced !== null && readAt <= markerAtWhenForced)
-      ) {
+    // Forced-unread: evaluate the structured override register using the same
+    // override_active(S, C, B, F) predicate as the active-community path. The
+    // local cache entry is a hint only — the register is the authoritative source.
+    if (!hasUnread) {
+      const reg = readState.overrides.get(channel.id);
+      if (reg !== undefined && isOverrideActive(reg, readAt ?? 0)) {
         hasUnread = true;
+      } else if (
+        reg === undefined &&
+        Object.hasOwn(forcedUnreadMap, channel.id)
+      ) {
+        // No register in fetched events: fall back to the local cache as a best-
+        // effort hint (override event may not have reached the relay yet).
+        const markerAtWhenForced = forcedUnreadMap[channel.id];
+        if (
+          readAt === null ||
+          (markerAtWhenForced !== null && readAt <= markerAtWhenForced)
+        ) {
+          hasUnread = true;
+        }
       }
     }
 
@@ -274,7 +282,12 @@ export async function fetchCommunityUnread(args: {
     if (!hasUnread) {
       hasUnread = unreadEvents.some(
         (event) =>
-          isUnreadExternalEvent(event, readState, readAt, normalizedPubkey) &&
+          isUnreadExternalEvent(
+            event,
+            readState.frontiers,
+            readAt,
+            normalizedPubkey,
+          ) &&
           shouldNotifyForEvent(event, normalizedPubkey, {
             participatedRootIds,
             followedRootIds,
@@ -287,7 +300,12 @@ export async function fetchCommunityUnread(args: {
     }
 
     mentionCount += mentionEvents.filter((event) =>
-      isUnreadExternalEvent(event, readState, readAt, normalizedPubkey),
+      isUnreadExternalEvent(
+        event,
+        readState.frontiers,
+        readAt,
+        normalizedPubkey,
+      ),
     ).length;
   }
 

@@ -176,10 +176,7 @@ export function useUnreadChannels(
     markChannelRead: markChannelOverrideRead,
     getOverrideLiveness,
   } = useReadState(pubkey, relayClient);
-  // Stable object wrapping the three override APIs — only changes when the
-  // underlying functions change (identity rotation). Passed to
-  // applyOverrideRead/applyOverrideUnread so those helpers don't require
-  // per-hunk dep updates when new APIs are added.
+  // Stable object wrapping the three override APIs.
   const overrideApis = React.useMemo<OverrideAPIs>(
     () => ({
       markChannelUnread: markChannelOverrideUnread,
@@ -305,15 +302,8 @@ export function useUnreadChannels(
       readAt: string | null | undefined,
       { topLevelOnly = false }: { topLevelOnly?: boolean } = {},
     ) => {
-      if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
-        delete forcedUnreadRef.current[channelId];
-        if (pubkey) {
-          forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
-        }
-        bumpLatestVersion();
-      }
-      // If a NIP-RS override is active, clear it via the manager (C bump).
-      applyOverrideRead(channelId, overrideApis);
+      // Frontier advance first (spec order: advance → C-bump → inspect liveness).
+      // The advance may make F > B, so applyOverrideRead sees an inactive override.
       const observedLatest = topLevelOnly
         ? undefined
         : latestByChannelRef.current.get(channelId);
@@ -321,14 +311,22 @@ export function useUnreadChannels(
         readAt,
         observedLatest,
       );
-      if (markAt === null) return;
-      markContextRead(channelId, markAt);
-      // Clear observed-latest refs when the read marker covers them so the
-      // unread memo sees `latest === undefined` until a genuinely new event
-      // arrives. Without this, `latest > readAt` resolves to `T > T` (false)
-      // but the channel lingers in the set when advanceContext's monotonic
-      // guard suppresses the readStateVersion bump.
-      if (clearObserved) {
+      if (markAt !== null) {
+        markContextRead(channelId, markAt);
+      }
+      // C-bump; clear local presentation only when liveness is confirmed inactive.
+      // null ≠ inactive — pre-init fails closed.
+      const outcome = applyOverrideRead(channelId, overrideApis);
+      if (outcome === "overrideCleared") {
+        if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
+          delete forcedUnreadRef.current[channelId];
+          if (pubkey) {
+            forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+          }
+          bumpLatestVersion();
+        }
+      }
+      if (markAt !== null && clearObserved) {
         latestByChannelRef.current.delete(channelId);
         observedUnreadEventsByChannelRef.current.delete(channelId);
         bumpLatestVersion();
@@ -842,7 +840,9 @@ export function useUnreadChannels(
       for (const channel of channels) {
         if (channel.id === activeChannelId) continue;
 
-        if (Object.hasOwn(forcedUnreadRef.current, channel.id)) {
+        // Manager liveness is authoritative (isReadStateReady). Use
+        // getOverrideLiveness, not forcedUnreadRef which may be stale.
+        if (getOverrideLiveness(channel.id)?.active === true) {
           // Forced-unread is dot tier only — not high-priority.
           unread.add(channel.id);
           counts.set(channel.id, 1);
@@ -951,14 +951,16 @@ export function useUnreadChannels(
 
   const markAllChannelsRead = React.useCallback(() => {
     for (const channelId of unreadChannelIdsRef.current) {
-      delete forcedUnreadRef.current[channelId];
-      applyOverrideRead(channelId, overrideApis);
+      // Frontier advance first, then C-bump; gate local clear on confirmed liveness.
       const unixSeconds =
         latestByChannelRef.current.get(channelId) ??
         getEffectiveTimestamp(channelId) ??
         null;
       if (unixSeconds !== null) {
         markContextRead(channelId, unixSeconds);
+      }
+      if (applyOverrideRead(channelId, overrideApis) === "overrideCleared") {
+        delete forcedUnreadRef.current[channelId];
       }
       latestByChannelRef.current.delete(channelId);
       observedUnreadEventsByChannelRef.current.delete(channelId);

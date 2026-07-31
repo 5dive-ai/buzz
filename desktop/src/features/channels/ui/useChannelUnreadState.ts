@@ -404,11 +404,20 @@ export function useChannelUnreadState({
 
   const handleMarkUnread = React.useCallback(() => {
     if (!activeChannelId) return;
-    // Mirror the deliberate mark-unread locally so the timeline marker is
-    // suppressed (see forcedUnreadRef above). Re-render so the memo re-runs.
-    forcedUnreadRef.current.add(activeChannelId);
-    forceUnreadRender();
+    // Call the manager first — the sidebar dot is driven by liveness, not the
+    // session overlay. Only update the session overlay after the manager call
+    // so a refused mark-unread does not spuriously suppress the timeline marker.
     markChannelUnread(activeChannelId);
+    // The `forcedUnreadRef` overlay here gates the timeline "New" divider
+    // suppression (see computeChannelUnreadMarker above). We must not set it
+    // before the manager call or on refusal. Since `markChannelUnread` has a
+    // void return type at this boundary, we rely on readStateVersion bumping
+    // on success (manager subscribe fires → outer hook re-renders → liveness
+    // is now active). The overlay is intentionally NOT set here — the divider
+    // suppression is driven by liveness via isActiveChannelForcedUnread only
+    // when the sidebar dot confirms active override state. Setting the overlay
+    // unconditionally would suppress the divider even on a refused call.
+    forceUnreadRender();
   }, [activeChannelId, markChannelUnread]);
 
   // Mark a message's directly-revealed children read (LP4 v3 open-at-level):

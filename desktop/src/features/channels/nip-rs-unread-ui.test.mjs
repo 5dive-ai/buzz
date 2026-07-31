@@ -69,27 +69,27 @@ function makeIsolatedStorage() {
 
 test("overrideErrorMessage_budget_exhausted_unread_contains_budget_keyword", () => {
   const msg = overrideErrorMessage("unread", "budget_exhausted");
-  assert.ok(msg !== null && msg.includes("budget exhausted"), `got: ${msg}`);
+  assert.ok(msg?.includes("budget exhausted"), `got: ${msg}`);
 });
 
 test("overrideErrorMessage_uint32_overflow_unread_contains_counter_keyword", () => {
   const msg = overrideErrorMessage("unread", "uint32_overflow");
-  assert.ok(msg !== null && msg.includes("counter limit"), `got: ${msg}`);
+  assert.ok(msg?.includes("counter limit"), `got: ${msg}`);
 });
 
 test("overrideErrorMessage_uint32_overflow_read_contains_counter_keyword", () => {
   const msg = overrideErrorMessage("read", "uint32_overflow");
-  assert.ok(msg !== null && msg.includes("counter limit"), `got: ${msg}`);
+  assert.ok(msg?.includes("counter limit"), `got: ${msg}`);
 });
 
 test("overrideErrorMessage_load_incomplete_unread_contains_loading_keyword", () => {
   const msg = overrideErrorMessage("unread", "load_incomplete");
-  assert.ok(msg !== null && msg.includes("still loading"), `got: ${msg}`);
+  assert.ok(msg?.includes("still loading"), `got: ${msg}`);
 });
 
 test("overrideErrorMessage_load_incomplete_read_contains_loading_keyword", () => {
   const msg = overrideErrorMessage("read", "load_incomplete");
-  assert.ok(msg !== null && msg.includes("still loading"), `got: ${msg}`);
+  assert.ok(msg?.includes("still loading"), `got: ${msg}`);
 });
 
 test("overrideErrorMessage_already_inactive_returns_null_both_ops", () => {
@@ -185,12 +185,12 @@ test("applyOverrideRead_active_liveness_success_then_inactive_returns_overrideCl
 
 test("applyOverrideRead_active_liveness_uint32_overflow_returns_overrideStillActive", () => {
   // Active → C-bump refuses → re-read still active → overrideStillActive
-  let callCount = 0;
+  let _callCount = 0;
   const result = applyOverrideRead("ch-1", {
     markChannelUnread: () => ({ success: true }),
     markChannelRead: () => ({ success: false, reason: "uint32_overflow" }),
     getOverrideLiveness: () => {
-      callCount++;
+      _callCount++;
       return { active: true, frontier: 50 };
     },
   });
@@ -340,4 +340,83 @@ test("forced_unread_store_write_and_read_round_trips", () => {
   } finally {
     restore();
   }
+});
+
+// ── Tests: refusal-does-not-mutate-overlay (active-channel path) ─────────────
+//
+// Witnesses the requirement that a refused mark-unread does NOT update the
+// caller's local state. applyOverrideUnread returns false on any manager
+// refusal; callers gate cache writes on that return value. This covers the
+// active-channel session-overlay scenario (useChannelUnreadState.handleMarkUnread)
+// where the overlay must NOT be set before or on a refused call.
+
+test("applyOverrideUnread_refusal_caller_must_not_mutate_overlay", () => {
+  const _toasts = [];
+  const apis = {
+    markChannelUnread: () => ({ success: false, reason: "budget_exhausted" }),
+    markChannelRead: () => ({ success: true }),
+    getOverrideLiveness: () => null,
+  };
+  // Simulate caller logic: only update local state when applyOverrideUnread
+  // returns true. On false, the overlay map must remain unmodified.
+  const overlayMap = {};
+  const result = applyOverrideUnread("ch-overlay", apis);
+  if (result) {
+    overlayMap["ch-overlay"] = true; // would be set on success
+  }
+  assert.equal(result, false, "refusal returns false");
+  assert.equal(
+    Object.hasOwn(overlayMap, "ch-overlay"),
+    false,
+    "overlay not mutated on refusal",
+  );
+});
+
+// ── Tests: markAllChannelsRead partial refusal pattern ────────────────────────
+//
+// Witnesses that per-channel gating in markAllChannelsRead correctly clears
+// only channels whose override is confirmed inactive. Channels where the
+// C-bump refuses and liveness remains active must keep their local state.
+
+test("applyOverrideRead_partial_refusal_pattern_clears_only_inactive", () => {
+  // ch-cleared: liveness inactive after successful C-bump → cleared
+  // ch-stuck: liveness active and C-bump refuses → stays unread
+  const livenessMap = {
+    "ch-cleared": { active: true, frontier: 100 },
+    "ch-stuck": { active: true, frontier: 100 },
+  };
+  let clearCallCount = 0;
+  const apis = {
+    markChannelUnread: () => ({ success: true }),
+    markChannelRead: (id) => {
+      clearCallCount++;
+      if (id === "ch-cleared") {
+        livenessMap["ch-cleared"] = { active: false, frontier: 101 };
+        return { success: true };
+      }
+      // ch-stuck: refuse with overflow; liveness stays active
+      return { success: false, reason: "uint32_overflow" };
+    },
+    getOverrideLiveness: (id) => livenessMap[id] ?? null,
+  };
+
+  // Simulate the per-channel loop in markAllChannelsRead
+  const forcedMap = { "ch-cleared": 99, "ch-stuck": 99 };
+  for (const channelId of ["ch-cleared", "ch-stuck"]) {
+    if (applyOverrideRead(channelId, apis) === "overrideCleared") {
+      delete forcedMap[channelId];
+    }
+  }
+
+  assert.equal(
+    Object.hasOwn(forcedMap, "ch-cleared"),
+    false,
+    "cleared channel removed from map",
+  );
+  assert.equal(
+    Object.hasOwn(forcedMap, "ch-stuck"),
+    true,
+    "stuck channel remains in map",
+  );
+  assert.equal(clearCallCount, 2, "C-bump attempted for both channels");
 });

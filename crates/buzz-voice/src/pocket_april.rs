@@ -677,9 +677,8 @@ where
             }
             // Prepared token counts are monotonic in prefix length, so once a
             // candidate overflows the limit no longer candidate can fit. Stop
-            // scanning instead of tokenizing every remaining boundary: that
-            // kept this loop superlinear in prompt length, and the cost landed
-            // before the first chunk reached synthesis.
+            // scanning to bound tokenizer work before the first chunk reaches
+            // synthesis.
             if token_count(&text[start..end])? > max_tokens {
                 break;
             }
@@ -1093,7 +1092,7 @@ mod tests {
         // end-of-text makes tokenizer input grow superlinearly in prompt
         // length, and that cost is paid before the first chunk reaches
         // synthesis, taxing time-to-first-audio on long prompts.
-        let sentence = "The relay finished its migration and the channel list refreshed. ";
+        let sentence = "The relay is ready and the channel list refreshed. ";
         let tokenized_bytes = |repeats: usize| -> usize {
             let text = sentence.repeat(repeats).trim_end().to_string();
             let total = std::cell::Cell::new(0_usize);

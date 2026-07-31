@@ -61,6 +61,7 @@ import {
 } from "./markdown/CodeBlock";
 import { FileCard } from "./markdown/FileCard";
 import { InlineEmojiPopover } from "./markdown/InlineEmojiPopover";
+import { createLinkPreviewImageLightbox } from "./markdown/LinkPreviewImageLightbox";
 import { MarkdownInput } from "./markdown/MarkdownInput";
 import {
   MediaContextMenu,
@@ -93,6 +94,7 @@ import {
   IMAGE_LIGHTBOX_WHEEL_ZOOM_SPEED,
   IMAGE_LIGHTBOX_ZOOM_STEP,
   IMAGE_LIGHTBOX_ZOOM_TRANSITION_MS,
+  getImageLightboxFocusableElements,
   imageLightboxBasisBoxForItem,
   imageLightboxBoxFromRect,
   imageLightboxCornerRadiiFromElement,
@@ -144,28 +146,6 @@ type ImageBlockProps = {
 type WebKitGestureLikeEvent = Event & {
   scale?: number;
 };
-
-function getImageLightboxFocusableElements(
-  container: HTMLElement,
-): HTMLElement[] {
-  return Array.from(
-    container.querySelectorAll<HTMLElement>(
-      [
-        "a[href]",
-        "button:not(:disabled)",
-        "input:not(:disabled)",
-        "select:not(:disabled)",
-        "textarea:not(:disabled)",
-        "[tabindex]:not([tabindex='-1'])",
-      ].join(","),
-    ),
-  ).filter(
-    (element) =>
-      !element.hasAttribute("disabled") &&
-      element.getAttribute("aria-hidden") !== "true" &&
-      element.getClientRects().length > 0,
-  );
-}
 
 function ImageZoomOverlay({
   alt,
@@ -994,6 +974,9 @@ function ImageZoomOverlay({
     document.body,
   );
 }
+
+const LinkPreviewImageLightbox =
+  createLinkPreviewImageLightbox(ImageZoomOverlay);
 
 /**
  * Inline image embed with click-to-zoom lightbox and right-click download.
@@ -1973,6 +1956,7 @@ function MarkdownInner({
             </AttachmentGroup>
           ) : null}
           <LinkPreviewList
+            ImageLightbox={LinkPreviewImageLightbox}
             key={messageId}
             onRemoveForEveryone={onRemoveLinkPreviewsForEveryone}
             previews={resolvedLinkPreviews}

@@ -1,10 +1,20 @@
 import { ChevronDown, ChevronUp, X } from "lucide-react";
+import type { ComponentType, ReactNode } from "react";
 import { useState } from "react";
 
 import type { ResolvedLinkPreview } from "@/shared/lib/useResolvedLinkPreviews";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
-import { SimpleImageLightbox } from "@/shared/ui/SimpleImageLightbox";
+
+export type LinkPreviewImageLightboxProps = {
+  alt: string;
+  children: ReactNode;
+  className?: string;
+  src: string;
+};
+
+export type LinkPreviewImageLightboxComponent =
+  ComponentType<LinkPreviewImageLightboxProps>;
 
 function LinkPreviewIdentity({ preview }: { preview: ResolvedLinkPreview }) {
   if (preview.faviconDataUrl) {
@@ -44,13 +54,14 @@ function isTweetPreview(preview: ResolvedLinkPreview): boolean {
 function LinkPreviewImage({
   aspectClassName,
   className,
+  ImageLightbox,
   preview,
 }: {
   aspectClassName: string;
   className?: string;
+  ImageLightbox: LinkPreviewImageLightboxComponent;
   preview: ResolvedLinkPreview;
 }) {
-  const [lightboxOpen, setLightboxOpen] = useState(false);
   const imageSrc =
     preview.imageState === "image" ? preview.imageDataUrl : undefined;
   const alt = `Preview from ${preview.imageDomain}`;
@@ -73,32 +84,22 @@ function LinkPreviewImage({
   }
 
   return (
-    <>
-      <button
-        aria-label={`Open ${alt.toLowerCase()} in lightbox`}
-        className={cn(
-          "block cursor-zoom-in overflow-hidden rounded-xl bg-muted",
-          className,
-        )}
+    <ImageLightbox
+      alt={alt}
+      className={cn("block overflow-hidden rounded-xl bg-muted", className)}
+      src={imageSrc}
+    >
+      <div
+        className={cn("w-full", aspectClassName)}
         data-link-preview-thumbnail=""
-        onClick={() => setLightboxOpen(true)}
-        type="button"
       >
-        <div className={cn("w-full", aspectClassName)}>
-          <img
-            alt={alt}
-            className="h-full w-full object-cover"
-            src={imageSrc}
-          />
-        </div>
-      </button>
-      <SimpleImageLightbox
-        alt={alt}
-        onOpenChange={setLightboxOpen}
-        open={lightboxOpen}
-        src={imageSrc}
-      />
-    </>
+        <img
+          alt={alt}
+          className="h-full w-full rounded-xl object-cover"
+          src={imageSrc}
+        />
+      </div>
+    </ImageLightbox>
   );
 }
 
@@ -125,10 +126,12 @@ function LinkPreviewDescription({
 
 function TweetPreview({
   className,
+  ImageLightbox,
   onRemove,
   preview,
 }: {
   className?: string;
+  ImageLightbox: LinkPreviewImageLightboxComponent;
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
 }) {
@@ -171,6 +174,7 @@ function TweetPreview({
         <LinkPreviewImage
           aspectClassName="aspect-video"
           className="mt-2 w-full max-w-75"
+          ImageLightbox={ImageLightbox}
           preview={preview}
         />
       ) : null}
@@ -208,10 +212,12 @@ function TweetPreview({
 
 export function RichLinkPreviewAttachment({
   className,
+  ImageLightbox,
   onRemove,
   preview,
 }: {
   className?: string;
+  ImageLightbox: LinkPreviewImageLightboxComponent;
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
 }) {
@@ -221,6 +227,7 @@ export function RichLinkPreviewAttachment({
     return (
       <TweetPreview
         className={className}
+        ImageLightbox={ImageLightbox}
         onRemove={onRemove}
         preview={preview}
       />
@@ -271,6 +278,7 @@ export function RichLinkPreviewAttachment({
         <LinkPreviewImage
           aspectClassName="aspect-[1.91/1]"
           className="mt-2 w-full max-w-75"
+          ImageLightbox={ImageLightbox}
           preview={preview}
         />
       ) : null}

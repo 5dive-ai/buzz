@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { useLinkPreviewStyle } from "@/shared/lib/linkPreviewStylePreference";
 import type { ResolvedLinkPreview } from "@/shared/lib/useResolvedLinkPreviews";
 import {
   AlertDialog,
@@ -14,30 +15,40 @@ import {
 import { AttachmentGroup } from "@/shared/ui/attachment";
 import { Button } from "@/shared/ui/button";
 import { LinkPreviewAttachment } from "@/shared/ui/link-preview-attachment";
+import type { LinkPreviewImageLightboxComponent } from "@/shared/ui/rich-link-preview-attachment";
 
 export function LinkPreviewList({
+  ImageLightbox,
   onRemoveForEveryone,
   previews,
 }: {
+  ImageLightbox: LinkPreviewImageLightboxComponent;
   onRemoveForEveryone?: () => Promise<void>;
   previews: ResolvedLinkPreview[];
 }) {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [removed, setRemoved] = useState(false);
+  const style = useLinkPreviewStyle();
   if (removed || previews.length === 0) return null;
 
   const previewNoun = previews.length === 1 ? "preview" : "previews";
+  const removeButtonIndex = style === "compact" ? previews.length - 1 : 0;
   return (
     <>
       <AttachmentGroup
-        className="max-w-full flex-col items-start overflow-visible pb-0"
+        className={
+          style === "compact"
+            ? "max-w-full flex-row flex-wrap items-start overflow-visible pb-0"
+            : "max-w-full flex-col items-start overflow-visible pb-0"
+        }
         data-link-preview-list=""
       >
         {previews.map((preview, index) => (
           <LinkPreviewAttachment
             key={preview.href}
+            ImageLightbox={ImageLightbox}
             onRemove={
-              onRemoveForEveryone && index === 0
+              onRemoveForEveryone && index === removeButtonIndex
                 ? () => setDialogOpen(true)
                 : undefined
             }

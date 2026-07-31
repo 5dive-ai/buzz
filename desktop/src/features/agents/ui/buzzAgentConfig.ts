@@ -6,6 +6,7 @@
  * is preserved as getProviderEffortConfig_oldHandTable() for the differential
  * harness only — nothing user-facing imports the _old shim. Phase 3 retires it.
  */
+import { canonicalizeProvider } from "../lib/formatAgentModelLabel.ts";
 import { resolveModelCapabilities } from "./modelCapabilities.ts";
 
 /** Env var key for the thinking/effort level sent to the LLM. */
@@ -80,7 +81,10 @@ export function getProviderEffortConfig(
   providerId: string,
   model?: string,
 ): ProviderEffortConfig {
-  const cap = resolveModelCapabilities(providerId.toLowerCase(), model ?? "");
+  const cap = resolveModelCapabilities(
+    canonicalizeProvider(providerId),
+    model ?? "",
+  );
   return {
     validValues: cap.supportedEfforts,
     defaultValue: cap.defaultEffort,

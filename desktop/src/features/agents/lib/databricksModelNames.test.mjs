@@ -6,6 +6,7 @@ import { DATABRICKS_MODEL_NAMES } from "./databricksModelNames.ts";
 import {
   resolveModelLabel,
   formatAgentModelLabel,
+  canonicalizeProvider,
 } from "./formatAgentModelLabel.ts";
 
 // ---------------------------------------------------------------------------
@@ -201,4 +202,77 @@ test("ModelPicker — discovered rows render through resolveModelLabel", () => {
     /<DropdownMenuRadioItem[\s\S]*?\{resolveModelLabel\(model\.id, model\.name, agent\.provider\)\}/,
     "dropdown rows must resolve labels through resolveModelLabel with provider, not raw model.name/model.id",
   );
+});
+
+// ---------------------------------------------------------------------------
+// P3-B: provider-scoped label resolution (Thufir pass-2 finding 2)
+// ---------------------------------------------------------------------------
+
+test("resolveModelLabel — provider-scoped miss returns raw ID, not Databricks registry name", () => {
+  // "databricks-gemini-3-pro" is in DATABRICKS_MODEL_NAMES as "Gemini 3 Pro Preview".
+  // When provider="anthropic", the generated lookup misses → must return raw ID.
+  const result = resolveModelLabel(
+    "databricks-gemini-3-pro",
+    null,
+    "anthropic",
+  );
+  assert.notEqual(
+    result,
+    "Gemini 3 Pro Preview",
+    "must not leak Databricks registry label",
+  );
+  assert.equal(result, "databricks-gemini-3-pro");
+});
+
+test("resolveModelLabel — openai provider scoped miss returns raw ID", () => {
+  const result = resolveModelLabel("databricks-gemini-3-pro", null, "openai");
+  assert.equal(result, "databricks-gemini-3-pro");
+});
+
+test("resolveModelLabel — providerless call still returns unscoped registry label", () => {
+  // No provider: the unscoped DATABRICKS_MODEL_NAMES map is reachable.
+  const result = resolveModelLabel("databricks-gemini-3-pro", null, undefined);
+  // The unscoped map should have a curated name for this ID.
+  assert.ok(
+    DATABRICKS_MODEL_NAMES.has("databricks-gemini-3-pro"),
+    "databricks-gemini-3-pro must be in DATABRICKS_MODEL_NAMES for this test to be valid",
+  );
+  assert.equal(result, DATABRICKS_MODEL_NAMES.get("databricks-gemini-3-pro"));
+  assert.notEqual(result, "databricks-gemini-3-pro");
+});
+
+test("resolveModelLabel — null provider treated as providerless (uses unscoped registry)", () => {
+  const result = resolveModelLabel("databricks-gemini-3-pro", null, null);
+  assert.equal(result, DATABRICKS_MODEL_NAMES.get("databricks-gemini-3-pro"));
+});
+
+test("resolveModelLabel — provider case-insensitivity: 'Anthropic' same as 'anthropic'", () => {
+  const lower = resolveModelLabel("databricks-gemini-3-pro", null, "anthropic");
+  const upper = resolveModelLabel("databricks-gemini-3-pro", null, "Anthropic");
+  assert.equal(lower, upper);
+  assert.equal(lower, "databricks-gemini-3-pro");
+});
+
+// ---------------------------------------------------------------------------
+// P3-B: canonicalizeProvider — alias normalization
+// ---------------------------------------------------------------------------
+
+test("canonicalizeProvider — databricks-v2 (hyphen) maps to databricks_v2 (underscore)", () => {
+  assert.equal(canonicalizeProvider("databricks-v2"), "databricks_v2");
+});
+
+test("canonicalizeProvider — uppercase DATABRICKS-V2 also normalizes to databricks_v2", () => {
+  assert.equal(canonicalizeProvider("DATABRICKS-V2"), "databricks_v2");
+});
+
+test("canonicalizeProvider — databricks_v2 passes through unchanged", () => {
+  assert.equal(canonicalizeProvider("databricks_v2"), "databricks_v2");
+});
+
+test("canonicalizeProvider — anthropic lowercases and trims", () => {
+  assert.equal(canonicalizeProvider("  Anthropic  "), "anthropic");
+});
+
+test("canonicalizeProvider — unknown alias passes through lowercased", () => {
+  assert.equal(canonicalizeProvider("OpenAI"), "openai");
 });

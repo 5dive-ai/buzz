@@ -4,12 +4,38 @@ import {
 } from "../ui/modelCapabilities.ts";
 
 /**
+ * Known provider-id aliases that must be normalized before generated lookups.
+ * The UI and Rust persist "databricks-v2" (hyphen form) but the manifest
+ * registers records under "databricks_v2" (underscore form).
+ */
+const PROVIDER_ALIASES: Readonly<Record<string, string>> = {
+  "databricks-v2": "databricks_v2",
+};
+
+/**
+ * Normalizes a provider id to the canonical form expected by the generated
+ * manifest: lowercases, trims, and applies the known alias table.
+ *
+ * Used as the single canonicalization point before every generated lookup
+ * in both resolveModelLabel() and getProviderEffortConfig().
+ */
+export function canonicalizeProvider(provider: string): string {
+  const normalized = provider.trim().toLowerCase();
+  return PROVIDER_ALIASES[normalized] ?? normalized;
+}
+
+/**
  * Resolves a human-readable label for a model, following the three-tier
  * precedence documented in AGENTS.md:
  *
  *   1. Nonblank discovered/API name (e.g. from AgentModelInfo.name)
- *   2. Registry lookup by ID — provider-qualified exact record first (when
- *      `provider` is supplied), then unscoped DATABRICKS_MODEL_NAMES map
+ *   2. Registry lookup by ID:
+ *      - When `provider` is supplied: provider-qualified exact record only.
+ *        If the generated lookup returns no registryLabel, return the raw ID.
+ *        The unscoped DATABRICKS_MODEL_NAMES registry is NOT consulted for a
+ *        known provider — this prevents Databricks names from leaking through
+ *        anthropic/openai provider contexts.
+ *      - When `provider` is absent/null: unscoped DATABRICKS_MODEL_NAMES map.
  *   3. Raw ID unchanged
  *
  * Returns the empty string when both id and discoveredName are blank.
@@ -25,17 +51,17 @@ export function resolveModelLabel(
   const trimmedId = id.trim();
   if (!trimmedId) return "";
   // Provider-qualified exact record (registry_label tier, provider-scoped).
-  if (provider) {
-    const trimmedProvider = provider.trim();
-    if (trimmedProvider) {
-      const registryLabel = resolveModelCapabilities(
-        trimmedProvider,
-        trimmedId,
-      ).registryLabel;
-      if (registryLabel) return registryLabel;
-    }
+  // When a provider is known, do NOT fall through to the unscoped registry —
+  // return the raw ID directly on a miss (P3-B contract).
+  if (provider?.trim()) {
+    const canonical = canonicalizeProvider(provider);
+    const registryLabel = resolveModelCapabilities(
+      canonical,
+      trimmedId,
+    ).registryLabel;
+    return registryLabel ?? trimmedId;
   }
-  // Unscoped registry map (handles legacy/provider-unknown persisted IDs).
+  // Providerless path only: unscoped registry map for legacy/inherited IDs.
   return DATABRICKS_MODEL_NAMES.get(trimmedId) ?? trimmedId;
 }
 

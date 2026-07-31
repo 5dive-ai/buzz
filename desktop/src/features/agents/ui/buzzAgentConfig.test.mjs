@@ -621,3 +621,28 @@ test("effort none is invalid for anthropic manual-budget (should trigger auto-cl
     "none must not be in manual-budget set",
   );
 });
+
+// ---------------------------------------------------------------------------
+// getProviderEffortConfig — databricks-v2 hyphen alias (P3-B regression)
+// ---------------------------------------------------------------------------
+
+test("databricks-v2 hyphen alias canonicalizes to databricks_v2 underscore records", () => {
+  // The persisted alias "databricks-v2" must hit the same canonical records as "databricks_v2".
+  const hyphen = getProviderEffortConfig("databricks-v2", "databricks-gpt-5-5");
+  const underscore = getProviderEffortConfig(
+    "databricks_v2",
+    "databricks-gpt-5-5",
+  );
+  assert.deepEqual([...hyphen.validValues], [...underscore.validValues]);
+  assert.equal(hyphen.defaultValue, underscore.defaultValue);
+});
+
+test("databricks-v2 hyphen alias with databricks-gpt-5-5 returns [low,medium,high]", () => {
+  // Regression: without canonicalization this returned the all-7 unknown-provider fallback.
+  const { validValues, defaultValue } = getProviderEffortConfig(
+    "databricks-v2",
+    "databricks-gpt-5-5",
+  );
+  assert.deepEqual([...validValues], ["low", "medium", "high"]);
+  assert.equal(defaultValue, "medium");
+});

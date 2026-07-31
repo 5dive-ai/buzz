@@ -355,13 +355,35 @@ fn parse_operator_api_origin(raw: &str) -> Result<String, ConfigError> {
 
 const DEFAULT_PUSH_GATEWAY_DELIVERY_URL: &str = "https://push.buzz.xyz/v1/deliveries/apns";
 
+fn is_debug_loopback_push_gateway_url(url: &url::Url) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        if url.scheme() != "http" {
+            return false;
+        }
+
+        match url.host() {
+            Some(url::Host::Domain(host)) => host == "localhost",
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = url;
+        false
+    }
+}
+
 fn parse_push_gateway_delivery_url(raw: &str) -> Result<url::Url, ConfigError> {
     let url = url::Url::parse(raw.trim()).map_err(|e| {
         ConfigError::InvalidValue(format!(
             "BUZZ_PUSH_GATEWAY_DELIVERY_URL is not a valid URL: {e}"
         ))
     })?;
-    if url.scheme() != "https"
+    if (url.scheme() != "https" && !is_debug_loopback_push_gateway_url(&url))
         || url.host().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -370,7 +392,7 @@ fn parse_push_gateway_delivery_url(raw: &str) -> Result<url::Url, ConfigError> {
         || url.fragment().is_some()
     {
         return Err(ConfigError::InvalidValue(
-            "BUZZ_PUSH_GATEWAY_DELIVERY_URL must be an exact HTTPS /v1/deliveries/apns URL without credentials, query, or fragment"
+            "BUZZ_PUSH_GATEWAY_DELIVERY_URL must be an exact HTTPS /v1/deliveries/apns URL without credentials, query, or fragment (Debug builds also allow exact loopback HTTP URLs)"
                 .to_string(),
         ));
     }
@@ -1446,6 +1468,9 @@ mod tests {
         assert!(parse_push_gateway_delivery_url("https://push.example/v1/deliveries/apns").is_ok());
         for invalid in [
             "http://push.example/v1/deliveries/apns",
+            "http://localhost.example/v1/deliveries/apns",
+            "http://localhost@push.example/v1/deliveries/apns",
+            "http://192.168.1.10/v1/deliveries/apns",
             "https://push.example/v1/deliveries/apns/",
             "https://push.example/v1/deliveries/apns?token=x",
             "https://user@push.example/v1/deliveries/apns",
@@ -1454,6 +1479,22 @@ mod tests {
                 parse_push_gateway_delivery_url(invalid).is_err(),
                 "{invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn push_gateway_http_loopback_is_debug_only() {
+        for url in [
+            "http://localhost:8080/v1/deliveries/apns",
+            "http://127.0.0.1:8080/v1/deliveries/apns",
+            "http://[::1]:8080/v1/deliveries/apns",
+        ] {
+            let result = parse_push_gateway_delivery_url(url);
+            if cfg!(debug_assertions) {
+                assert!(result.is_ok(), "{url}: {result:?}");
+            } else {
+                assert!(result.is_err(), "{url}");
+            }
         }
     }
 

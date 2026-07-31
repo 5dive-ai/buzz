@@ -281,6 +281,10 @@ impl AprilPocketTts {
         )
     }
 
+    pub(crate) fn group_playback_prompt(&self, prepared: &AprilPreparedPrompt) -> Vec<String> {
+        split_first_sentence_for_playback(&prepared.text)
+    }
+
     pub(crate) fn synth_chunk_streaming<F>(
         &mut self,
         prepared: &AprilPreparedPrompt,
@@ -741,6 +745,45 @@ where
     Ok(chunks)
 }
 
+fn split_first_sentence_for_playback(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    for (offset, ch) in text.char_indices() {
+        let end = offset + ch.len_utf8();
+        let at_word_end =
+            end == text.len() || text[end..].chars().next().is_some_and(char::is_whitespace);
+        if !at_word_end
+            || natural_boundary(&text[..end], end == text.len()) != TextBoundary::Sentence
+        {
+            continue;
+        }
+
+        let mut next_start = end;
+        while text[next_start..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
+            next_start += text[next_start..]
+                .chars()
+                .next()
+                .expect("checked above")
+                .len_utf8();
+        }
+        if next_start == text.len() {
+            return vec![text.to_string()];
+        }
+        return vec![
+            text[..next_start].to_string(),
+            text[next_start..].to_string(),
+        ];
+    }
+
+    vec![text.to_string()]
+}
+
 fn natural_boundary(candidate: &str, is_end_of_text: bool) -> TextBoundary {
     if is_end_of_text {
         return TextBoundary::Sentence;
@@ -1011,6 +1054,32 @@ mod tests {
         let text = "One two. Three four. Five six.";
         let chunks = split_at_natural_boundaries(text, 4, true, whitespace_token_count).unwrap();
         assert_eq!(chunks, ["One two. ", "Three four. Five six."]);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn playback_grouping_keeps_only_the_first_sentence_separate() {
+        let text = "One two. Three four. Five six.";
+        let chunks = split_first_sentence_for_playback(text);
+
+        assert_eq!(chunks, ["One two. ", "Three four. Five six."]);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn playback_grouping_keeps_an_oversized_sentence_whole() {
+        let text = "One two three four five six seven eight.";
+        let chunks = split_first_sentence_for_playback(text);
+
+        assert_eq!(chunks, [text]);
+    }
+
+    #[test]
+    fn playback_grouping_does_not_split_at_abbreviations() {
+        let text = "Dr. Smith waits. Then leaves.";
+        let chunks = split_first_sentence_for_playback(text);
+
+        assert_eq!(chunks, ["Dr. Smith waits. ", "Then leaves."]);
         assert_eq!(chunks.concat(), text);
     }
 

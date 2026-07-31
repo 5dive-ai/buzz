@@ -640,11 +640,10 @@ fn tts_worker(
             continue;
         }
 
-        // The shared Pocket engine keeps a fitting first sentence separate for
-        // low time-to-first-audio, then packs later text at natural boundaries
-        // using the April tokenizer's exact 50-token limit. Decoder streaming
-        // starts playback within each resulting unit.
-        let chunks = match engine.split_text_into_chunks(&text) {
+        // The shared Pocket engine keeps the first sentence separate for low
+        // time-to-first-audio. Model-safe 50-token splits remain internal to a
+        // playback unit so they do not introduce extra fades or pauses.
+        let chunks = match engine.split_text_into_playback_chunks(&text) {
             Ok(chunks) => chunks,
             Err(error) => {
                 eprintln!(

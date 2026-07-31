@@ -119,6 +119,23 @@ impl PocketTts {
             .split_playback_prompt(&prepared)
     }
 
+    /// Group prepared text into playback units.
+    ///
+    /// A leading sentence remains separate so playback can begin promptly.
+    /// The remaining prompt stays in one playback unit; synthesis applies the
+    /// model's 50-token split internally without introducing playback pauses at
+    /// those model-only boundaries.
+    pub fn split_text_into_playback_chunks(&self, text: &str) -> Result<Vec<String>, String> {
+        let Some(prepared) = prepare_april_prompt(text) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| "Pocket TTS engine lock poisoned".to_string())?
+            .group_playback_prompt(&prepared))
+    }
+
     /// Synthesize text with the supplied reference voice.
     ///
     /// Pocket detects language from text and this model uses one synthesis

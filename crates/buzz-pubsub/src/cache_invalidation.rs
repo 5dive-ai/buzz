@@ -78,7 +78,7 @@ pub enum CacheInvalidation {
     ChannelDeleted,
     /// Drop one pubkey's relay-membership entry. Mirrors
     /// `invalidate_relay_membership` (invite claim, admin add/remove,
-    /// self-leave).
+    /// self-leave, ownership transfer).
     RelayMembership {
         /// Affected member's pubkey bytes.
         pubkey: Vec<u8>,

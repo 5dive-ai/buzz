@@ -68,7 +68,6 @@ pub mod relay_members {
             return Ok(MembershipDecision::OpenRelay);
         }
 
-        let pubkey_hex = hex::encode(pubkey_bytes);
         let is_member = state
             .is_relay_member_cached(community, pubkey_bytes)
             .await
@@ -79,6 +78,7 @@ pub mod relay_members {
 
         if state.config.allow_nip_oa_auth {
             if let Some(tag_json) = auth_tag_header {
+                let pubkey_hex = hex::encode(pubkey_bytes);
                 let agent_pubkey = nostr::PublicKey::from_slice(pubkey_bytes)
                     .map_err(|e| format!("invalid agent pubkey for NIP-OA check: {e}"))?;
 

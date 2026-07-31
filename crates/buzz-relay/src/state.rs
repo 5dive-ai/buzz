@@ -546,7 +546,7 @@ pub struct AppState {
     /// Relay membership cache: (community_id, pubkey_bytes) → is_relay_member.
     /// Short TTL (10s) — checked on every authenticated HTTP request and WS
     /// AUTH, so this keeps the hot auth path off the writer pool. Invalidated
-    /// on invite claim, admin add/remove, and self-leave.
+    /// on invite claim, admin add/remove, self-leave, and ownership transfer.
     pub relay_membership_cache: Arc<moka::sync::Cache<(CommunityId, Vec<u8>), bool>>,
     /// Accessible channel IDs cache: (community_id, pubkey_bytes) → channel UUIDs.
     /// Short TTL (10s) — invalidated on membership or channel visibility changes.

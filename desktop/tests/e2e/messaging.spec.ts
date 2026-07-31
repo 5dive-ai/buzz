@@ -516,7 +516,7 @@ test("link preview no-image layout keeps compact height", async ({ page }) => {
   }
 });
 
-test("supported link previews keep the message link visible", async ({
+test("supported Compact link previews keep the message link visible with square outer corners", async ({
   page,
 }) => {
   const previewUrl = "https://github.com/block/sprout/pull/1334";
@@ -534,8 +534,7 @@ test("supported link previews keep the message link visible", async ({
   ).toBeVisible();
   const previewCard = row.locator('[data-link-preview="github-pull-request"]');
   await expect(previewCard).toBeVisible();
-  await expectCornerRadiusPx(previewCard, 16);
-  await expectSmoothCorners(previewCard);
+  await expectCornerRadiusPx(previewCard, 0);
 });
 
 test("send multiple messages in sequence", async ({ page }) => {

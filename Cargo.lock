@@ -1093,6 +1093,7 @@ dependencies = [
  "image",
  "imagesize",
  "infer",
+ "metrics",
  "mp4",
  "nostr 0.44.7",
  "rust-s3",

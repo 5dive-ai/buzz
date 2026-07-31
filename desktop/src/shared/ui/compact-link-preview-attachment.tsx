@@ -148,10 +148,10 @@ export function CompactLinkPreviewAttachment({
   const hostname = getHostname(preview);
 
   return (
-    <div className={cn("relative w-[22.5rem] max-w-full shrink-0", className)}>
+    <div className={cn("relative w-96 max-w-full shrink-0", className)}>
       <Attachment
         className={cn(
-          "w-full no-underline shadow-none",
+          "w-full border-0 bg-transparent no-underline shadow-none hover:border-transparent hover:bg-transparent",
           reserveImage && "h-20 min-h-20 max-h-20 gap-0 p-0",
         )}
         data-image-state={preview.imageState}
@@ -161,7 +161,7 @@ export function CompactLinkPreviewAttachment({
         {reserveImage ? (
           <AttachmentMedia
             aria-hidden={showImage ? undefined : "true"}
-            className="aspect-auto h-full min-h-0 w-28 min-w-28 max-w-28 self-stretch rounded-none bg-muted sm:w-32 sm:min-w-32 sm:max-w-32"
+            className="aspect-auto h-full min-h-0 w-28 min-w-28 max-w-28 self-stretch rounded-xl bg-muted sm:w-32 sm:min-w-32 sm:max-w-32"
             data-link-preview-thumbnail=""
             variant="image"
           >

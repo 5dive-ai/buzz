@@ -1,5 +1,6 @@
 import { expect, test, type Locator } from "@playwright/test";
 
+import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 import { expectCornerRadiusPx, expectSmoothCorners } from "../helpers/css";
 import { openSettings } from "../helpers/settings";
@@ -369,6 +370,7 @@ test("link preview image geometry stays stable while loading", async ({
     await expect(card).toBeVisible();
     await expect(card.locator("[data-link-preview-thumbnail]")).toBeVisible();
     if (process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR) {
+      await waitForAnimations(page);
       await card.screenshot({
         animations: "disabled",
         path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/${width}-pending.png`,
@@ -425,10 +427,10 @@ test("link preview image geometry stays stable while loading", async ({
         ?.getBoundingClientRect().width,
     }));
 
-    expect(pending.width).toBe(width < 640 ? 325 : 360);
+    expect(pending.width).toBe(width < 640 ? 325 : 384);
     expect(pending.height).toBe(80);
     expect(pending.textInset).toBe(12);
-    expect(pending.thumbnailHeight).toBe(78);
+    expect(pending.thumbnailHeight).toBe(80);
     expect(loaded.height).toBe(pending.height);
     expect(loaded.textLeft).toBe(pending.textLeft);
     expect(loaded.thumbnailHeight).toBe(pending.thumbnailHeight);

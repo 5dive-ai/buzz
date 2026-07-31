@@ -2,10 +2,29 @@
 name: desktop-screenshot
 description: >
   Capture desktop app screenshots and post them to GitHub PRs with immutable URLs.
-version: 1
+version: 2
 ---
 
 # Desktop Screenshot Skill
+
+## CRITICAL: Screenshots Are Disposable Artifacts, Not Tests
+
+Screenshots captured for a PR, review, chat, or demo belong under ignored
+`test-results/` (or another temporary directory). **Do not create or modify a
+committed Playwright spec just to capture evidence.** Use the standalone
+`just desktop-screenshot` helper below; if the desired state needs custom setup
+that the helper cannot express, use a temporary untracked script and delete it
+after capture.
+
+A committed Playwright test must assert behavior independently of any image it
+writes. A plain `page.screenshot()` or `locator.screenshot()` does not validate
+pixels and is not regression coverage. Do not leave such calls in tests as PR
+or chat artifacts. Visual regression testing is a separate, deliberate change:
+use a reviewed `toHaveScreenshot()` baseline and account for its CI stability
+and maintenance cost.
+
+Before committing screenshot work, inspect `git diff -- desktop/tests` and
+remove capture-only specs and incidental `.screenshot()` calls.
 
 ## CRITICAL: How to Host Screenshots for PRs
 

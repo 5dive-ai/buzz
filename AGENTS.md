@@ -217,6 +217,14 @@ See [TESTING.md](TESTING.md) for the full multi-agent E2E guide.
 
 ### PR Screenshots
 
+> **Screenshots for PRs, reviews, chats, and demos are disposable artifacts, not
+> tests.** Save them under ignored `test-results/` and use the standalone
+> `just desktop-screenshot` helper. Do not create or modify a committed
+> Playwright spec merely to capture evidence, and do not leave `.screenshot()`
+> calls behind: they do not assert pixels or provide regression coverage. A
+> committed visual-regression test must deliberately use a reviewed
+> `toHaveScreenshot()` baseline.
+>
 > **Do NOT use `buzz upload`, the relay media endpoint, or any third-party
 > image host for PR screenshots.** Relay media URLs fail through GitHub's camo
 > proxy. Always use `scripts/post-screenshots.sh` for PNGs before linking them

@@ -89,7 +89,7 @@ export function LinkPreviewControls({
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" side="right">
           <DropdownMenuSub>
-            <DropdownMenuSubTrigger>Link display</DropdownMenuSubTrigger>
+            <DropdownMenuSubTrigger>Display</DropdownMenuSubTrigger>
             <DropdownMenuSubContent>
               <DropdownMenuRadioGroup
                 onValueChange={handleStyleChange}

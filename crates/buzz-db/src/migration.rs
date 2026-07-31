@@ -352,6 +352,7 @@ mod tests {
             "community_deletion_approvals",
             "community_deletion_checkpoints",
             "community_deletion_retention_exceptions",
+            "community_serving_write_leases",
             "community_deletion_executor_heartbeats",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
@@ -956,6 +957,7 @@ mod tests {
         assert!(deletion.contains("CREATE TABLE community_deletion_approvals"));
         assert!(deletion.contains("CREATE TABLE community_deletion_checkpoints"));
         assert!(deletion.contains("CREATE TABLE community_deletion_retention_exceptions"));
+        assert!(deletion.contains("CREATE TABLE community_serving_write_leases"));
         assert!(deletion.contains("CREATE TABLE community_deletion_executor_heartbeats"));
         assert!(deletion.contains("CREATE FUNCTION enforce_community_write_fence"));
         assert!(deletion.contains("CREATE FUNCTION enforce_community_tombstone"));

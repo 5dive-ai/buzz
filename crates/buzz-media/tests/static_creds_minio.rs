@@ -35,6 +35,7 @@ fn minio_config() -> MediaConfig {
             .unwrap_or_else(|_| "path".to_string())
             .parse()
             .expect("BUZZ_S3_ADDRESSING_STYLE must be path or virtual"),
+        key_layout: buzz_media::MediaKeyLayout::Legacy,
         max_image_bytes: 50 * 1024 * 1024,
         max_gif_bytes: 10 * 1024 * 1024,
         max_video_bytes: 524_288_000,

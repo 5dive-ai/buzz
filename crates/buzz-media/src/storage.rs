@@ -5,7 +5,7 @@ use std::pin::Pin;
 
 use buzz_core::tenant::{CommunityId, TenantContext};
 
-use crate::config::{MediaConfig, S3AddressingStyle};
+use crate::config::{MediaConfig, MediaKeyLayout, S3AddressingStyle};
 use crate::error::MediaError;
 use bytes::Bytes;
 use s3::creds::Credentials;
@@ -18,6 +18,7 @@ pub type ByteStream = Pin<Box<dyn futures_core::Stream<Item = Result<Bytes, Medi
 /// S3-compatible object storage client.
 pub struct MediaStorage {
     bucket: Box<Bucket>,
+    key_layout: MediaKeyLayout,
 }
 
 impl MediaStorage {
@@ -66,7 +67,10 @@ impl MediaStorage {
             S3AddressingStyle::Path => bucket.with_path_style(),
             S3AddressingStyle::Virtual => bucket,
         };
-        Ok(Self { bucket })
+        Ok(Self {
+            bucket,
+            key_layout: config.key_layout,
+        })
     }
 
     /// Store an object from a byte slice.
@@ -102,6 +106,88 @@ impl MediaStorage {
             .put_object_stream_with_content_type(&mut reader, key, content_type)
             .await?;
         Ok(())
+    }
+
+    /// Store a media payload according to the configured migration layout.
+    ///
+    /// Dual mode writes the sharded primary first and the legacy compatibility
+    /// copy second. Callers publish sidecars only after this returns success.
+    pub async fn put_payload(
+        &self,
+        ctx: &TenantContext,
+        sha256: &str,
+        ext: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<String, MediaError> {
+        let legacy = crate::keys::legacy_blob_key(sha256, ext)
+            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+        let sharded = crate::keys::sharded_blob_key(ctx.community(), sha256, ext)
+            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+        match self.key_layout {
+            MediaKeyLayout::Legacy => self.put(&legacy, bytes, content_type).await?,
+            MediaKeyLayout::Dual => {
+                self.put(&sharded, bytes, content_type).await?;
+                self.put(&legacy, bytes, content_type).await?;
+            }
+            MediaKeyLayout::Sharded => self.put(&sharded, bytes, content_type).await?,
+        }
+        Ok(match self.key_layout {
+            MediaKeyLayout::Legacy => legacy,
+            MediaKeyLayout::Dual | MediaKeyLayout::Sharded => sharded,
+        })
+    }
+
+    /// Stream a media payload from disk according to the configured layout.
+    pub async fn put_payload_file(
+        &self,
+        ctx: &TenantContext,
+        sha256: &str,
+        ext: &str,
+        path: &Path,
+        content_type: &str,
+    ) -> Result<String, MediaError> {
+        let legacy = crate::keys::legacy_blob_key(sha256, ext)
+            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+        let sharded = crate::keys::sharded_blob_key(ctx.community(), sha256, ext)
+            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+        match self.key_layout {
+            MediaKeyLayout::Legacy => self.put_file(&legacy, path, content_type).await?,
+            MediaKeyLayout::Dual => {
+                self.put_file(&sharded, path, content_type).await?;
+                self.put_file(&legacy, path, content_type).await?;
+            }
+            MediaKeyLayout::Sharded => self.put_file(&sharded, path, content_type).await?,
+        }
+        Ok(match self.key_layout {
+            MediaKeyLayout::Legacy => legacy,
+            MediaKeyLayout::Dual | MediaKeyLayout::Sharded => sharded,
+        })
+    }
+
+    /// Store a thumbnail according to the configured migration layout.
+    pub async fn put_thumbnail(
+        &self,
+        ctx: &TenantContext,
+        sha256: &str,
+        bytes: &[u8],
+    ) -> Result<String, MediaError> {
+        let legacy = crate::keys::legacy_thumb_key(sha256)
+            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+        let sharded = crate::keys::sharded_thumb_key(ctx.community(), sha256)
+            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+        match self.key_layout {
+            MediaKeyLayout::Legacy => self.put(&legacy, bytes, "image/jpeg").await?,
+            MediaKeyLayout::Dual => {
+                self.put(&sharded, bytes, "image/jpeg").await?;
+                self.put(&legacy, bytes, "image/jpeg").await?;
+            }
+            MediaKeyLayout::Sharded => self.put(&sharded, bytes, "image/jpeg").await?,
+        }
+        Ok(match self.key_layout {
+            MediaKeyLayout::Legacy => legacy,
+            MediaKeyLayout::Dual | MediaKeyLayout::Sharded => sharded,
+        })
     }
 
     /// Retrieve an object's bytes.
@@ -360,6 +446,7 @@ mod tests {
             s3_bucket: "buzz-media".to_string(),
             s3_region: "us-west-2".to_string(),
             s3_addressing_style: S3AddressingStyle::Path,
+            key_layout: crate::config::MediaKeyLayout::Legacy,
             max_image_bytes: 50 * 1024 * 1024,
             max_gif_bytes: 10 * 1024 * 1024,
             max_video_bytes: 524_288_000,

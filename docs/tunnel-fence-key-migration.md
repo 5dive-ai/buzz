@@ -19,7 +19,54 @@ rollout cannot activate new-format writers while old writers still run.
    legacy `buzz:*:tunnel:*:generation` key and its exact string value. Transfer
    those non-expiring generation keys, under the same legacy key names, to the
    cluster-enforcing target endpoint. Do **not** copy lease keys: all expiring
-   leases must remain drained and must not be resurrected on the target.
+   leases must remain drained and must not be resurrected on the target. One
+   executable procedure is below; run it from a controlled host with
+   `redis-cli` access to both endpoints:
+
+   ```bash
+   set -euo pipefail
+   : "${SOURCE_REDIS_URL:?set the drained source Redis URL}"
+   : "${TARGET_REDIS_URL:?set the target Redis URL}"
+
+   work=$(mktemp -d)
+   trap 'rm -rf "$work"' EXIT
+
+   manifest() {
+     endpoint=$1
+     output=$2
+     redis-cli -u "$endpoint" --scan \
+       --pattern 'buzz:*:tunnel:*:generation' \
+       | LC_ALL=C sort -u \
+       | while IFS= read -r key; do
+           value=$(redis-cli -u "$endpoint" --raw GET "$key")
+           test -n "$value"
+           printf '%s\t%s\n' "$key" "$value"
+         done >"$output"
+   }
+
+   # Never overwrite initialized tagged state without operator reconciliation.
+   test -z "$(redis-cli -u "$TARGET_REDIS_URL" --scan \
+     --pattern 'buzz:{*}:*:tunnel:generation' | head -n 1)"
+
+   manifest "$SOURCE_REDIS_URL" "$work/source-before"
+   while IFS=$'\t' read -r key value; do
+     redis-cli -u "$TARGET_REDIS_URL" SET "$key" "$value" >/dev/null
+   done <"$work/source-before"
+
+   # Writers remain stopped while these final manifests are produced.
+   manifest "$SOURCE_REDIS_URL" "$work/source-after"
+   manifest "$TARGET_REDIS_URL" "$work/target-after"
+   cmp "$work/source-before" "$work/source-after"
+   cmp "$work/source-after" "$work/target-after"
+
+   # Neither legacy nor tagged leases may exist on the target.
+   test -z "$(redis-cli -u "$TARGET_REDIS_URL" --scan \
+     --pattern 'buzz:*:tunnel:*:lease' | head -n 1)"
+   test -z "$(redis-cli -u "$TARGET_REDIS_URL" --scan \
+     --pattern 'buzz:{*}:*:tunnel:lease' | head -n 1)"
+   ```
+
+   Treat any non-zero exit as a failed transfer; do not continue to scale-up.
 
    Before starting any relay, rescan both endpoints and verify that the complete
    source and target legacy-generation key sets are identical and that every

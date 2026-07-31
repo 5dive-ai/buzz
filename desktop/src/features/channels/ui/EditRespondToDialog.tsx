@@ -4,6 +4,7 @@ import {
   useAgentAccessOwnerOnlyQuery,
   useUpdateManagedAgentMutation,
 } from "@/features/agents/hooks";
+import { runLocationForBackend } from "@/features/agents/lib/agentAccessWarning";
 import {
   CreateAgentRespondToField,
   INTERNAL_AGENT_ACCESS_DISABLED_REASON,
@@ -65,9 +66,9 @@ export function EditRespondToDialog({
     <Dialog onOpenChange={onOpenChange} open={open}>
       <DialogContent className="max-w-md">
         <DialogHeader>
-          <DialogTitle>Edit respond-to</DialogTitle>
+          <DialogTitle>Manage agent access</DialogTitle>
           <DialogDescription>
-            Choose who {agent?.name ?? "this agent"} responds to.
+            Choose who can send instructions to {agent?.name ?? "this agent"}.
           </DialogDescription>
         </DialogHeader>
         <CreateAgentRespondToField
@@ -80,6 +81,7 @@ export function EditRespondToDialog({
           onAllowlistChange={setRespondToAllowlist}
           onModeChange={setRespondTo}
           ownerPubkey={currentPubkey}
+          runLocation={runLocationForBackend(agent?.backend)}
         />
         {updateMutation.error instanceof Error ? (
           <p className="text-sm text-destructive">
@@ -103,7 +105,7 @@ export function EditRespondToDialog({
             size="sm"
             type="button"
           >
-            {updateMutation.isPending ? "Saving..." : "Save"}
+            {updateMutation.isPending ? "Saving..." : "Save access"}
           </Button>
         </div>
       </DialogContent>

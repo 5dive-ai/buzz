@@ -1,7 +1,6 @@
 import * as React from "react";
 import { ChevronDown } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-
 import { toast } from "sonner";
 
 import {
@@ -84,6 +83,13 @@ import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
+import { showAgentProfileSyncWarning } from "./agentProfileSyncWarning";
+import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
+import {
+  ADD_CUSTOM_HARNESS_OPTION,
+  runtimeDropdownAction,
+  usePendingHarnessSelection,
+} from "./addCustomHarness";
 
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
   duration: 0.18,
@@ -102,8 +108,7 @@ export function AgentInstanceEditDialog({
   /** Optional field to scroll/focus when the dialog opens from a card deep-link. */
   initialFocus?: EditAgentFocusTarget;
   open: boolean;
-  /** Present only when the linked definition is editable (non-built-in,
-   * resolved). Caller closes this dialog and enters definition-edit. */
+  /** Present only when the linked definition is editable (non-built-in, resolved). Caller closes this dialog and enters definition-edit. */
   onEditLinkedPersona?: () => void;
   onOpenChange: (open: boolean) => void;
   onUpdated?: (agent: ManagedAgent) => void;
@@ -159,6 +164,7 @@ export function AgentInstanceEditDialog({
   const [avatarUrl, setAvatarUrl] = React.useState(agent.avatarUrl ?? "");
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
     React.useState(false);
+  const [isAddHarnessOpen, setIsAddHarnessOpen] = React.useState(false);
   const shouldReduceMotion = useReducedMotion();
 
   // Runtime selector: defaults to "custom" until the dialog opens and the
@@ -193,6 +199,7 @@ export function AgentInstanceEditDialog({
       setAvatarUrl(agent.avatarUrl ?? "");
       setShowAdvancedFields(false);
       setIsAvatarUploadPending(false);
+      setIsAddHarnessOpen(false);
       runtimeTouched.current = false;
       const matched =
         runtimes.find((r) => r.command?.trim() === agent.agentCommand.trim()) ??
@@ -246,6 +253,7 @@ export function AgentInstanceEditDialog({
         value: selectedRuntimeId,
       });
     }
+    options.push(ADD_CUSTOM_HARNESS_OPTION);
     return options;
   }, [sortedRuntimes, selectedRuntimeId]);
 
@@ -489,8 +497,12 @@ export function AgentInstanceEditDialog({
   }
 
   function handleRuntimeDropdownChange(nextValue: string) {
-    const nextRuntimeId =
-      nextValue === NO_RUNTIME_DROPDOWN_VALUE ? "" : nextValue;
+    const action = runtimeDropdownAction(nextValue);
+    if (action.kind === "add-custom-harness") {
+      setIsAddHarnessOpen(true);
+      return;
+    }
+    const nextRuntimeId = action.runtimeId;
     const previousRuntimeId = selectedRuntimeId;
     const nextRuntime = runtimes.find((r) => r.id === nextRuntimeId);
 
@@ -536,6 +548,16 @@ export function AgentInstanceEditDialog({
       }),
     );
   }
+
+  // Routed through the normal change handler so a harness registered inline
+  // pins its command and resets model/provider like a hand-picked one. Scoped
+  // to `open` so a pending id can't outlive the dialog that started the
+  // registration.
+  const selectSavedHarness = usePendingHarnessSelection(
+    runtimes,
+    handleRuntimeDropdownChange,
+    open,
+  );
 
   function handleProviderDropdownChange(nextValue: string) {
     const nextProvider =
@@ -660,30 +682,36 @@ export function AgentInstanceEditDialog({
           parsedParallelism > 0 && parsedParallelism !== agent.parallelism
             ? parsedParallelism
             : undefined,
-        // Use tri-state: send null to clear, value to set, omit if unchanged.
+        // Linked instances defer model/provider/systemPrompt to the definition.
         systemPrompt:
-          (systemPrompt.trim() || null) !== agent.systemPrompt
-            ? systemPrompt.trim() || null
-            : undefined,
+          linkedPersona != null
+            ? undefined
+            : (systemPrompt.trim() || null) !== agent.systemPrompt
+              ? systemPrompt.trim() || null
+              : undefined,
         model:
-          normalizedModel !== (agent.model ?? null)
-            ? normalizedModel
-            : undefined,
+          linkedPersona != null
+            ? undefined
+            : normalizedModel !== (agent.model ?? null)
+              ? normalizedModel
+              : undefined,
         // Tri-state provider persistence keyed on providerRuntimeCapability:
         //   "capable"  → persist: value if changed, omit if unchanged.
         //   "locked"   → clear: send null if provider was set, else omit.
         //   "unknown"  → omit always (never send null for a transient state).
         // llmProviderFieldVisible is for UX visibility only; not used here.
         provider:
-          providerRuntimeCapability === "capable"
-            ? normalizedSubmitProvider !== (agent.provider ?? null)
-              ? normalizedSubmitProvider
-              : undefined
-            : providerRuntimeCapability === "locked"
-              ? (agent.provider ?? null) !== null
-                ? null
+          linkedPersona != null
+            ? undefined
+            : providerRuntimeCapability === "capable"
+              ? normalizedSubmitProvider !== (agent.provider ?? null)
+                ? normalizedSubmitProvider
                 : undefined
-              : undefined, // "unknown" → omit always
+              : providerRuntimeCapability === "locked"
+                ? (agent.provider ?? null) !== null
+                  ? null
+                  : undefined
+                : undefined, // "unknown" → omit always
         envVars: envVarsEqual(submitEnvVars, agent.envVars)
           ? undefined
           : submitEnvVars,
@@ -710,6 +738,7 @@ export function AgentInstanceEditDialog({
           autoRestartOnConfigChange,
         );
       }
+      showAgentProfileSyncWarning(result.agent.name, result.profileSyncError);
       handleOpenChange(false);
       onUpdated?.(result.agent);
       // The auto-restart policy deliberately never fires for a stopped or
@@ -948,6 +977,11 @@ export function AgentInstanceEditDialog({
                   </span>
                 </p>
               ) : null}
+              <AddCustomHarnessDialog
+                onOpenChange={setIsAddHarnessOpen}
+                onSaved={selectSavedHarness}
+                open={isAddHarnessOpen}
+              />
             </div>
             {selectedRuntimeId === "custom" && !inheritHarness ? (
               <div className="space-y-1.5">

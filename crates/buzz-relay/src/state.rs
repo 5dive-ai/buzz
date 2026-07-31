@@ -176,43 +176,77 @@ impl CacheResidency {
         }
     }
 
-    /// Records that this pod is resolving authorization for `community` and
-    /// reports whether the result may be cached.
+    /// Records that this pod is resolving authorization for `community` and, if
+    /// the invalidation topic is established, runs `insert` to place the entry
+    /// in its cache.
     ///
-    /// Recording and gating are one call on purpose. Residency *is* the desired
-    /// set, so a community that is only gated and never recorded would never be
-    /// subscribed, never become established, and never pass the gate — the
-    /// authorization caches would stay off for the life of the pod. Folding the
-    /// two makes that ordering unrepresentable.
+    /// Recording, gating and inserting are one call on purpose, for two
+    /// separate reasons this lane found the hard way.
+    ///
+    /// **Recording with gating.** Residency *is* the desired set, so a community
+    /// that is only gated and never recorded would never be subscribed, never
+    /// become established, and never pass the gate — the authorization caches
+    /// would stay off for the life of the pod. Folding the two makes that
+    /// ordering unrepresentable.
+    ///
+    /// **Gating with inserting.** The residency window must cover the whole life
+    /// of every entry it protects. A gate that only returned a `bool` left the
+    /// caller to insert afterwards, so the moka entry's TTL started *after* the
+    /// residency deadline it was measured against — under-covering the entry by
+    /// the call gap, and by an unbounded amount if the thread is preempted in
+    /// between: residency could lapse, the reconciler withdraw and
+    /// `UNSUBSCRIBE`, and the resumed caller still land an entry readable for a
+    /// full TTL with nothing behind it. Equal TTL constants do not nest when the
+    /// clocks start in the wrong order.
     ///
     /// The first call for a community therefore returns `false` (nothing is
     /// acked yet) while still asking for the subscription; once the reconciler
-    /// establishes it, subsequent calls return `true`. A `false` means the pod
-    /// reads through to the DB — degraded, not stale.
+    /// establishes it, subsequent calls insert and return `true`. A `false`
+    /// means the pod reads through to the DB — degraded, not stale.
     ///
     /// Gating **inserts only** is deliberate: gating reads would discard a live,
     /// still-invalidatable cache on every reconnect and turn a pub/sub blip into
     /// a DB stampede.
     ///
-    /// **The order of the two statements below is load-bearing.** Residency is
-    /// recorded *before* establishment is read, and the reconciler withdraws
-    /// establishment while re-reading residency under the matching write lock
-    /// (`CommunityTopics::withdraw_undesired`). Those two facts together are
-    /// what stop an admitted entry from outliving its subscription: whichever
-    /// side wins the lock, either this renewal is visible to the withdrawal
-    /// decision (so the subscription survives) or the withdrawal already
-    /// happened (so `is_established` is false and nothing is admitted). Reading
-    /// establishment first, or withdrawing outside the lock, reopens the gap.
-    #[must_use]
-    pub fn admit(&self, community: CommunityId) -> bool {
-        let deadline = Instant::now() + self.ttl;
-        if self.resident.insert(community, deadline).is_none() {
+    /// **The three steps below are ordered, and each ordering is load-bearing.**
+    ///
+    /// 1. Residency is recorded *before* establishment is read, and the
+    ///    reconciler withdraws establishment while re-reading residency under
+    ///    the matching write lock (`CommunityTopics::withdraw_undesired`,
+    ///    private to `buzz-pubsub`).
+    ///    Whichever side wins the lock, either this renewal is visible to the
+    ///    withdrawal decision (so the subscription survives) or the withdrawal
+    ///    already happened (so nothing is admitted).
+    /// 2. `insert` runs *inside* [`CommunityTopics::with_established`], so no
+    ///    withdrawal can interleave between the gate and the entry landing.
+    /// 3. The residency deadline is re-stamped *after* `insert` returns and
+    ///    still inside that critical section, so it is based at or after the
+    ///    entry's own clock start and therefore outlives it.
+    ///
+    /// `insert` must not call back into [`CommunityTopics`] (the read lock is
+    /// held); the three production callers do a single moka insert, which does
+    /// not.
+    pub fn admit_and_insert(&self, community: CommunityId, insert: impl FnOnce()) -> bool {
+        // Step 1: residency before the establishment read; see the ordering note.
+        if self
+            .resident
+            .insert(community, Instant::now() + self.ttl)
+            .is_none()
+        {
             // Newly resident: shorten the wait for the subscribe. Convergence
             // does not depend on this — the reconcile tick is the guarantee.
             self.topics.wake();
         }
-        // Must follow the residency write above; see the ordering note.
-        let admitted = self.topics.is_established(community);
+        let admitted = self.topics.with_established(community, |established| {
+            if established {
+                // Step 2: the entry lands while withdrawal is excluded.
+                insert();
+                // Step 3: residency restarts at or after the entry's clock, so
+                // the entry can never outlive the subscription protecting it.
+                self.resident.insert(community, Instant::now() + self.ttl);
+            }
+            established
+        });
         if !admitted {
             metrics::counter!("buzz_authz_cache_insert_skipped_total").increment(1);
         }
@@ -227,6 +261,26 @@ impl CacheResidency {
         let now = Instant::now();
         self.resident.retain(|_, deadline| *deadline > now);
         self.resident.iter().map(|entry| *entry.key()).collect()
+    }
+
+    /// The deadline currently protecting `community`, if it is resident.
+    ///
+    /// Test seam: the nesting relation between a residency window and the cache
+    /// entry it protects is only checkable against the actual deadline. A test
+    /// comparing TTL *constants* passes while the clocks start in the wrong
+    /// order, which is exactly the bug this seam exists to catch.
+    #[doc(hidden)]
+    pub fn deadline_for_test(&self, community: CommunityId) -> Option<Instant> {
+        self.resident.get(&community).map(|entry| *entry.value())
+    }
+
+    /// Forces every residency to lapse now.
+    ///
+    /// Test seam: lets a test reach the post-expiry state deterministically
+    /// instead of sleeping out a real TTL.
+    #[doc(hidden)]
+    pub fn expire_all_for_test(&self) {
+        self.resident.clear();
     }
 }
 
@@ -939,7 +993,8 @@ impl AppState {
     /// Check channel membership with a 10-second cache. Falls back to DB on miss.
     ///
     /// The result is cached only while this pod's cache-invalidation channel
-    /// for `community_id` is established — see [`CacheResidency::admit`].
+    /// for `community_id` is established — see
+    /// [`CacheResidency::admit_and_insert`].
     /// Ungated, a pod could cache an authorization decision it would never hear
     /// the invalidation for, and serve it for the whole TTL.
     pub async fn is_member_cached(
@@ -955,9 +1010,9 @@ impl AppState {
         }
         metrics::counter!("buzz_membership_cache_misses_total").increment(1);
         let result = self.db.is_member(community_id, channel_id, pubkey).await?;
-        if self.cache_residency.admit(community_id) {
+        self.cache_residency.admit_and_insert(community_id, || {
             self.membership_cache.insert(key, result);
-        }
+        });
         Ok(result)
     }
 
@@ -1221,9 +1276,9 @@ impl AppState {
             .db
             .get_accessible_channel_ids(community_id, pubkey)
             .await?;
-        if self.cache_residency.admit(community_id) {
+        self.cache_residency.admit_and_insert(community_id, || {
             self.accessible_channels_cache.insert(key, result.clone());
-        }
+        });
         Ok(result)
     }
 
@@ -1271,10 +1326,10 @@ impl AppState {
             // costs liveness rather than confidentiality — a stale `private`
             // is over-restrictive, not a leak — but a private->open flip going
             // unheard for the full TTL is still a real delivery bug.
-            if self.cache_residency.admit(community_id) {
+            self.cache_residency.admit_and_insert(community_id, || {
                 self.channel_visibility_cache
                     .insert((community_id, channel_id), visibility.clone());
-            }
+            });
         }
         Ok(visibility)
     }
@@ -2066,31 +2121,105 @@ mod tests {
         }
     }
 
-    /// Residency drives the cache-invalidation desired set, so it must cover a
-    /// community for at least as long as an entry cached under it can be read.
+    /// Residency must cover an entry for at least as long as that entry can be
+    /// read — which is a statement about *nested lifetimes*, not about equal
+    /// constants.
+    ///
+    /// This test previously asserted `AUTHZ_CACHE_TTL == AUTHZ_CACHE_TTL` and
+    /// was green while the bug was live: `admit` stamped the residency deadline
+    /// and returned, and the caller started moka's identical TTL afterwards, so
+    /// the windows had the same length and the wrong offset. Equal durations do
+    /// not nest when their clocks start in the wrong order. It now asserts the
+    /// relation that actually matters: the residency deadline is taken *after*
+    /// the insert it protects.
     #[test]
     fn residency_outlives_the_entry_it_protects() {
-        // The two are the same constant by construction; asserting the relation
-        // is what fails the build if a future change gives the caches a longer
-        // TTL than residency, which would silently reopen the stale-authz gap.
         let topics = Arc::new(CommunityTopics::new("test"));
         let residency = CacheResidency::new(Arc::clone(&topics), AUTHZ_CACHE_TTL);
         let community = CommunityId::from_uuid(Uuid::from_u128(0xa));
+        topics.insert_established_for_test(community);
 
-        let _ = residency.admit(community);
-        assert_eq!(
-            residency.resident_communities(),
-            HashSet::from([community]),
-            "a just-resolved community is resident"
+        // Stand in for the cache entry: record when its own TTL clock starts.
+        let inserted_at = Arc::new(std::sync::Mutex::new(None));
+        let recorder = Arc::clone(&inserted_at);
+        assert!(residency.admit_and_insert(community, move || {
+            *recorder.lock().unwrap() = Some(Instant::now());
+        }));
+        let inserted_at = inserted_at.lock().unwrap().expect("insert ran");
+
+        let deadline = residency.deadline_for_test(community).expect("resident");
+        assert!(
+            deadline >= inserted_at + AUTHZ_CACHE_TTL,
+            "the residency window must start at or after the entry's own clock, \
+             or the subscription can be withdrawn while the entry is still readable"
         );
 
         // A residency shorter than the cache TTL is the bug; prove the tracker
         // reports lapse purely on its own clock by using a zero-length window.
         let expired = CacheResidency::new(topics, Duration::ZERO);
-        let _ = expired.admit(community);
+        expired.admit_and_insert(community, || {});
         assert!(
             expired.resident_communities().is_empty(),
             "residency must lapse on its own timer, with no external event"
+        );
+    }
+
+    /// The lifetime boundary of the same invariant: an entry cannot land after
+    /// its subscription has been withdrawn, because the insert runs while
+    /// withdrawal is structurally excluded.
+    ///
+    /// This is Wren's round-2 blocker, asserted without threads. From inside
+    /// the insert closure — the exact point where the old code had already
+    /// returned and left the caller unprotected — residency is lapsed, which is
+    /// the state that used to permit an unprotected entry, and a withdrawal is
+    /// then attempted. `try_withdraw_undesired_for_test` reports `WouldBlock`,
+    /// proving the reconciler cannot unsubscribe while this entry is landing.
+    /// After the call returns the same withdrawal both *acquires* the lock (so
+    /// the exclusion is scoped to the insert, not a lock this test wedged) and
+    /// withdraws nothing (so step 3's re-stamp put the entry back under cover).
+    ///
+    /// An earlier draft did this with a parked thread and a 50ms sleep. On
+    /// correct code that is deterministic, but its *mutation bite* was
+    /// scheduler-dependent — a late-scheduled withdrawer makes the unlocked
+    /// mutation pass. Wren caught that pre-push; a probabilistic detector is
+    /// not a deterministic test. This shape fails on every run under the
+    /// unlocked mutation.
+    #[test]
+    fn no_entry_can_land_after_its_subscription_is_withdrawn() {
+        let topics = Arc::new(CommunityTopics::new("test"));
+        let residency = Arc::new(CacheResidency::new(Arc::clone(&topics), AUTHZ_CACHE_TTL));
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xa));
+        topics.insert_established_for_test(community);
+
+        // Exactly the closure main.rs hands the cache-invalidation subscriber.
+        let for_closure = Arc::clone(&residency);
+        let desired: buzz_pubsub::community_topics::DesiredCommunities =
+            Arc::new(move || for_closure.resident_communities());
+
+        let lapse = Arc::clone(&residency);
+        let topics_for_insert = Arc::clone(&topics);
+        let desired_for_insert = Arc::clone(&desired);
+        let admitted = residency.admit_and_insert(community, move || {
+            // The delayed-caller state: residency has lapsed, so a reconciler
+            // reaching the withdrawal decision now *would* unsubscribe.
+            lapse.expire_all_for_test();
+            assert!(
+                topics_for_insert
+                    .try_withdraw_undesired_for_test(&desired_for_insert)
+                    .is_none(),
+                "the reconciler must not be able to withdraw while an admitted \
+                 entry is still landing — that gap is the stale-authz hole"
+            );
+        });
+
+        assert!(admitted, "an established community is admitted");
+        let after = topics
+            .try_withdraw_undesired_for_test(&desired)
+            .expect("the exclusion must end with the insert, or the reconciler stalls");
+        assert!(
+            after.is_empty(),
+            "the entry landed inside a residency window re-stamped around it, so \
+             the very next withdrawal must leave its subscription alone"
         );
     }
 
@@ -2098,8 +2227,8 @@ mod tests {
     /// one call, so a community this pod reads becomes desired *before* it is
     /// admitted, and is admitted as soon as the reconciler acks.
     ///
-    /// Split into a `may_cache` gate plus a separate `touch`, only an admitted
-    /// community would ever be recorded — nothing would enter the desired set,
+    /// Split into a separate gate and record, only an admitted community would
+    /// ever be recorded — nothing would enter the desired set,
     /// nothing would be subscribed, and the authorization caches would stay off
     /// for the life of the pod. This test is the deadlock detector, so it
     /// asserts the *first* call is both refused and residency-forming.
@@ -2109,9 +2238,15 @@ mod tests {
         let residency = CacheResidency::new(Arc::clone(&topics), AUTHZ_CACHE_TTL);
         let community = CommunityId::from_uuid(Uuid::from_u128(0xa));
 
+        let inserted = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&inserted);
         assert!(
-            !residency.admit(community),
+            !residency.admit_and_insert(community, move || flag.store(true, Ordering::SeqCst)),
             "nothing is cacheable before Redis acks the invalidation channel"
+        );
+        assert!(
+            !inserted.load(Ordering::SeqCst),
+            "a refused admission must not run the insert"
         );
         assert_eq!(
             residency.resident_communities(),
@@ -2122,17 +2257,22 @@ mod tests {
 
         // Stand in for the reconciler acking the SUBSCRIBE it was just asked for.
         topics.insert_established_for_test(community);
+        let flag = Arc::clone(&inserted);
         assert!(
-            residency.admit(community),
+            residency.admit_and_insert(community, move || flag.store(true, Ordering::SeqCst)),
             "an acked community must be admitted"
+        );
+        assert!(
+            inserted.load(Ordering::SeqCst),
+            "an admitted community must actually get its entry inserted"
         );
     }
 
-    /// The cross-crate half of the ordering invariant: a community `admit()`
-    /// just made resident must survive a withdrawal decision taken concurrently
-    /// by the reconciler.
+    /// The cross-crate half of the ordering invariant: a community
+    /// `admit_and_insert()` just made resident must survive a withdrawal
+    /// decision taken concurrently by the reconciler.
     ///
-    /// `admit` records residency *before* reading establishment, and the
+    /// `admit_and_insert` records residency *before* reading establishment, and the
     /// reconciler re-reads residency under the write lock, so a renewal that got
     /// its residency in cannot be unsubscribed. This test pairs the two real
     /// call sites — the relay's residency closure and the pubsub withdrawal —
@@ -2150,14 +2290,17 @@ mod tests {
 
         // Established and resident: the steady state.
         topics.insert_established_for_test(community);
-        assert!(residency.admit(community));
+        assert!(residency.admit_and_insert(community, || {}));
 
         // Reconciler asks whether to withdraw. Residency is live, so it must not.
         assert!(
             topics.withdraw_undesired_for_test(&desired).is_empty(),
             "a resident community must never be unsubscribed"
         );
-        assert!(residency.admit(community), "and it stays admissible");
+        assert!(
+            residency.admit_and_insert(community, || {}),
+            "and it stays admissible"
+        );
     }
 
     /// A newly resident community wakes the cache-invalidation subscriber, so
@@ -2168,7 +2311,7 @@ mod tests {
         let residency = CacheResidency::new(Arc::clone(&topics), AUTHZ_CACHE_TTL);
         let community = CommunityId::from_uuid(Uuid::from_u128(0xa));
 
-        let _ = residency.admit(community);
+        residency.admit_and_insert(community, || {});
 
         tokio::time::timeout(Duration::from_millis(500), topics.wake_notified())
             .await

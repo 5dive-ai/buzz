@@ -9,9 +9,9 @@
 //!   connection control; local cache residency for cache invalidation),
 //!   supplied as a closure and recomputed from scratch on every reconcile. This
 //!   module never caches it. Crucially, the *withdrawal* direction re-reads it
-//!   under the same lock that removes establishment (see
-//!   [`CommunityTopics::withdraw_undesired`]), so interest renewed after the
-//!   diff was computed cannot have its subscription pulled out from under it.
+//!   under the same lock that removes establishment (`withdraw_undesired`), so
+//!   interest renewed after the diff was computed cannot have its subscription
+//!   pulled out from under it.
 //! * **established** — the communities Redis has acknowledged a `SUBSCRIBE` for
 //!   on the *current* connection. A community enters only after the ack returns,
 //!   and the whole set is cleared when the connection ends.
@@ -70,13 +70,41 @@ impl CommunityTopics {
     }
 
     /// Whether Redis has acknowledged this community's subscription on the
-    /// current connection. This is the gate for anything that must not become
-    /// readable before its invalidation topic is established.
+    /// current connection.
+    ///
+    /// This is an *observation*, not a gate: it is true only until the lock is
+    /// released. Anything that must not become readable without a live
+    /// invalidation topic has to run inside [`Self::with_established`].
     pub fn is_established(&self, community: CommunityId) -> bool {
         self.established
             .read()
             .expect("community topics lock poisoned")
             .contains(&community)
+    }
+
+    /// Runs `f` with this community's establishment state, holding it against
+    /// withdrawal for the whole call.
+    ///
+    /// This is the gate for state whose readability depends on the
+    /// subscription — in the relay, an authorization cache insert. Withdrawal
+    /// takes the matching write lock (`withdraw_undesired`), so the two cannot
+    /// interleave: either `f` completes and the withdrawal decision that
+    /// follows re-reads desire and sees whatever interest `f` recorded, or the
+    /// withdrawal already happened and `f` is told `false`. Reading
+    /// establishment and then acting on it in a second step reopens that gap,
+    /// however small the gap looks.
+    ///
+    /// `f` must not call back into this `CommunityTopics`: the read lock is
+    /// held, so a nested write would deadlock and a nested read can too if a
+    /// writer is already queued. It may touch state the `desired` closure
+    /// reads — that closure only ever runs under the write lock, which excludes
+    /// this one, so there is no lock cycle.
+    pub fn with_established<R>(&self, community: CommunityId, f: impl FnOnce(bool) -> R) -> R {
+        let established = self
+            .established
+            .read()
+            .expect("community topics lock poisoned");
+        f(established.contains(&community))
     }
 
     /// Number of established communities, for the connect log line and for
@@ -118,7 +146,8 @@ impl CommunityTopics {
     ///
     /// This is the ordering invariant the establishment gate rests on, and the
     /// reason the decision cannot be made from a snapshot taken earlier in the
-    /// reconcile. Interest renewal ([`CacheResidency::admit`] in the relay)
+    /// reconcile. Interest renewal (`CacheResidency::admit_and_insert` in the
+    /// relay)
     /// records residency and *then* reads establishment under the read lock;
     /// this method re-reads residency under the matching write lock. Mutual
     /// exclusion makes the two orderings the only possibilities:
@@ -141,6 +170,15 @@ impl CommunityTopics {
             .established
             .write()
             .expect("community topics lock poisoned");
+        Self::withdraw_locked(&mut established, desired)
+    }
+
+    /// The withdrawal decision itself, given the write lock. Shared so the
+    /// non-blocking test twin below cannot drift away from the real path.
+    fn withdraw_locked(
+        established: &mut HashSet<CommunityId>,
+        desired: &DesiredCommunities,
+    ) -> Vec<CommunityId> {
         let want = desired();
         let withdrawn: Vec<CommunityId> = established.difference(&want).copied().collect();
         for community in &withdrawn {
@@ -149,11 +187,33 @@ impl CommunityTopics {
         withdrawn
     }
 
-    /// Test seam for [`Self::withdraw_undesired`], whose invariant is shared with
+    /// Test seam for `withdraw_undesired`, whose invariant is shared with
     /// the cache-residency gate in another crate.
     #[doc(hidden)]
     pub fn withdraw_undesired_for_test(&self, desired: &DesiredCommunities) -> Vec<CommunityId> {
         self.withdraw_undesired(desired)
+    }
+
+    /// Non-blocking `withdraw_undesired`: `None` when the establishment lock is
+    /// held elsewhere.
+    ///
+    /// Test seam for the exclusion itself. A test can call this from inside a
+    /// [`Self::with_established`] closure and assert `None` — structural proof
+    /// that no withdrawal can interleave with a gated insert, with no threads
+    /// and no scheduler dependence. Asserting that through a parked thread
+    /// makes the *mutation bite* probabilistic even though the passing case is
+    /// deterministic.
+    #[doc(hidden)]
+    pub fn try_withdraw_undesired_for_test(
+        &self,
+        desired: &DesiredCommunities,
+    ) -> Option<Vec<CommunityId>> {
+        let mut established = match self.established.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(e) => panic!("community topics lock poisoned: {e}"),
+        };
+        Some(Self::withdraw_locked(&mut established, desired))
     }
 
     fn snapshot(&self) -> HashSet<CommunityId> {
@@ -504,6 +564,42 @@ mod tests {
              never admitted against an establishment bit that is being removed"
         );
         assert!(!topics.is_established(c));
+    }
+
+    /// `with_established` must exclude withdrawal for the whole closure, not
+    /// just for the establishment read.
+    ///
+    /// This is the lock half of the lifetime invariant, and it is asserted
+    /// *structurally*: from inside the closure, `try_write()` must report
+    /// `WouldBlock`. No threads, no sleeps, no scheduler. Under a mutation that
+    /// releases the lock before calling `f`, `try_write()` succeeds and this
+    /// fails on every run — which is what a deterministic mutation kill means.
+    /// An earlier draft signalled a withdrawal thread and slept 50ms to "give
+    /// it every chance"; that is deterministic on correct code but its
+    /// *mutation bite* depends on the scheduler, so it could pass vacuously.
+    /// Wren caught it pre-push.
+    #[test]
+    fn with_established_holds_the_gate_for_the_whole_closure() {
+        let topics = CommunityTopics::new("test");
+        let c = community(1);
+        topics.insert_established(c);
+
+        let established = topics.with_established(c, |established| {
+            assert!(
+                matches!(
+                    topics.established.try_write(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "withdrawal must be excluded for the whole closure; a gate that \
+                 releases the lock before the caller acts is the round-2 bug"
+            );
+            established
+        });
+
+        assert!(established);
+        // And the exclusion ends with the closure, or the reconciler would
+        // never be able to withdraw anything.
+        assert!(topics.established.try_write().is_ok());
     }
 }
 

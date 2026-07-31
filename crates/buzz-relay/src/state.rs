@@ -193,6 +193,16 @@ impl CacheResidency {
     /// Gating **inserts only** is deliberate: gating reads would discard a live,
     /// still-invalidatable cache on every reconnect and turn a pub/sub blip into
     /// a DB stampede.
+    ///
+    /// **The order of the two statements below is load-bearing.** Residency is
+    /// recorded *before* establishment is read, and the reconciler withdraws
+    /// establishment while re-reading residency under the matching write lock
+    /// (`CommunityTopics::withdraw_undesired`). Those two facts together are
+    /// what stop an admitted entry from outliving its subscription: whichever
+    /// side wins the lock, either this renewal is visible to the withdrawal
+    /// decision (so the subscription survives) or the withdrawal already
+    /// happened (so `is_established` is false and nothing is admitted). Reading
+    /// establishment first, or withdrawing outside the lock, reopens the gap.
     #[must_use]
     pub fn admit(&self, community: CommunityId) -> bool {
         let deadline = Instant::now() + self.ttl;
@@ -201,6 +211,7 @@ impl CacheResidency {
             // does not depend on this — the reconcile tick is the guarantee.
             self.topics.wake();
         }
+        // Must follow the residency write above; see the ordering note.
         let admitted = self.topics.is_established(community);
         if !admitted {
             metrics::counter!("buzz_authz_cache_insert_skipped_total").increment(1);
@@ -928,7 +939,7 @@ impl AppState {
     /// Check channel membership with a 10-second cache. Falls back to DB on miss.
     ///
     /// The result is cached only while this pod's cache-invalidation channel
-    /// for `community_id` is established — see [`CacheResidency::may_cache`].
+    /// for `community_id` is established — see [`CacheResidency::admit`].
     /// Ungated, a pod could cache an authorization decision it would never hear
     /// the invalidation for, and serve it for the whole TTL.
     pub async fn is_member_cached(
@@ -2115,6 +2126,38 @@ mod tests {
             residency.admit(community),
             "an acked community must be admitted"
         );
+    }
+
+    /// The cross-crate half of the ordering invariant: a community `admit()`
+    /// just made resident must survive a withdrawal decision taken concurrently
+    /// by the reconciler.
+    ///
+    /// `admit` records residency *before* reading establishment, and the
+    /// reconciler re-reads residency under the write lock, so a renewal that got
+    /// its residency in cannot be unsubscribed. This test pairs the two real
+    /// call sites — the relay's residency closure and the pubsub withdrawal —
+    /// because each is correct alone and only the pairing carries the property.
+    #[test]
+    fn admitted_residency_is_visible_to_a_concurrent_withdrawal() {
+        let topics = Arc::new(CommunityTopics::new("test"));
+        let residency = Arc::new(CacheResidency::new(Arc::clone(&topics), AUTHZ_CACHE_TTL));
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xa));
+
+        // Exactly the closure main.rs hands the cache-invalidation subscriber.
+        let for_closure = Arc::clone(&residency);
+        let desired: buzz_pubsub::community_topics::DesiredCommunities =
+            Arc::new(move || for_closure.resident_communities());
+
+        // Established and resident: the steady state.
+        topics.insert_established_for_test(community);
+        assert!(residency.admit(community));
+
+        // Reconciler asks whether to withdraw. Residency is live, so it must not.
+        assert!(
+            topics.withdraw_undesired_for_test(&desired).is_empty(),
+            "a resident community must never be unsubscribed"
+        );
+        assert!(residency.admit(community), "and it stays admissible");
     }
 
     /// A newly resident community wakes the cache-invalidation subscriber, so

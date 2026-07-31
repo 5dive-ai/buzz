@@ -8,8 +8,10 @@
 //! * **desired** — owned by whoever holds the interest (live sockets for
 //!   connection control; local cache residency for cache invalidation),
 //!   supplied as a closure and recomputed from scratch on every reconcile. This
-//!   module never caches it, so a queued command can never be applied against a
-//!   stale view.
+//!   module never caches it. Crucially, the *withdrawal* direction re-reads it
+//!   under the same lock that removes establishment (see
+//!   [`CommunityTopics::withdraw_undesired`]), so interest renewed after the
+//!   diff was computed cannot have its subscription pulled out from under it.
 //! * **established** — the communities Redis has acknowledged a `SUBSCRIBE` for
 //!   on the *current* connection. A community enters only after the ack returns,
 //!   and the whole set is cleared when the connection ends.
@@ -110,6 +112,50 @@ impl CommunityTopics {
         self.insert_established(community);
     }
 
+    /// Re-reads `desired` and withdraws establishment for everything it no
+    /// longer names, **atomically**, returning the communities whose channel the
+    /// caller must now `UNSUBSCRIBE`.
+    ///
+    /// This is the ordering invariant the establishment gate rests on, and the
+    /// reason the decision cannot be made from a snapshot taken earlier in the
+    /// reconcile. Interest renewal ([`CacheResidency::admit`] in the relay)
+    /// records residency and *then* reads establishment under the read lock;
+    /// this method re-reads residency under the matching write lock. Mutual
+    /// exclusion makes the two orderings the only possibilities:
+    ///
+    /// * renewal's establishment read precedes this critical section — then this
+    ///   `desired()` call happens after the renewal recorded interest, sees the
+    ///   community, and does not withdraw it. The admitted entry stays covered.
+    /// * renewal's establishment read follows this critical section — then the
+    ///   withdrawal already happened, the read returns false, and nothing is
+    ///   admitted in the first place.
+    ///
+    /// So an entry admitted against establishment is never left readable behind
+    /// a withdrawn subscription. A `desired()` re-read *outside* the lock would
+    /// not give this: renewal could still land between the check and the removal.
+    ///
+    /// `desired` must not acquire this lock, or this would deadlock. Both
+    /// production closures read only their own registry.
+    pub(crate) fn withdraw_undesired(&self, desired: &DesiredCommunities) -> Vec<CommunityId> {
+        let mut established = self
+            .established
+            .write()
+            .expect("community topics lock poisoned");
+        let want = desired();
+        let withdrawn: Vec<CommunityId> = established.difference(&want).copied().collect();
+        for community in &withdrawn {
+            established.remove(community);
+        }
+        withdrawn
+    }
+
+    /// Test seam for [`Self::withdraw_undesired`], whose invariant is shared with
+    /// the cache-residency gate in another crate.
+    #[doc(hidden)]
+    pub fn withdraw_undesired_for_test(&self, desired: &DesiredCommunities) -> Vec<CommunityId> {
+        self.withdraw_undesired(desired)
+    }
+
     fn snapshot(&self) -> HashSet<CommunityId> {
         self.established
             .read()
@@ -122,13 +168,6 @@ impl CommunityTopics {
             .write()
             .expect("community topics lock poisoned")
             .insert(community);
-    }
-
-    fn remove_established(&self, community: CommunityId) {
-        self.established
-            .write()
-            .expect("community topics lock poisoned")
-            .remove(&community);
     }
 
     fn clear_established(&self) {
@@ -155,6 +194,17 @@ pub(crate) trait CommunityChannelFamily: Send + 'static {
 /// Never returns — spawn it in a background task. Reconnects with exponential
 /// backoff (1s → 2s → 4s → … → 30s max), rebuilding the exact subscription set
 /// from `desired` on every connect.
+///
+/// The withdrawal ordering below is enforced for **both** families, not just
+/// cache invalidation, because it lives in the shared reconciler. Cache
+/// invalidation is what makes it a correctness requirement — a lost invalidation
+/// leaves a readable authorization entry with nothing behind it. Connection
+/// control's exposure is milder: a `disconnect` command lost in an unsubscribe
+/// gap leaves a socket open that a ban has already closed elsewhere, and the DB
+/// ban row still refuses that pubkey's next authorization, so the miss costs one
+/// stale socket rather than a wrong access decision. The invariant is applied
+/// uniformly anyway: one reconciler is less to get wrong than two, and nothing
+/// here is per-family.
 pub(crate) async fn run_community_subscriber<F: CommunityChannelFamily>(
     redis_url: String,
     family: F,
@@ -249,9 +299,20 @@ async fn connect_and_serve<F: CommunityChannelFamily>(
 
 /// Bring the live connection's subscriptions in line with current desire.
 ///
-/// `desired` is read here, inside the subscriber task, immediately before each
-/// command — so an unsubscribe can never be applied against a stale view of
-/// interest that has since been renewed.
+/// The two directions are deliberately asymmetric, because only one of them can
+/// break an invariant:
+///
+/// * **Subscribing** from the pass's initial `desired()` read is safe. Holding a
+///   subscription nobody wants any more costs one idle channel until the next
+///   pass withdraws it; it can never make an entry readable without coverage.
+/// * **Unsubscribing** must not be decided from that same read. Between the read
+///   and the command, interest can be renewed and an insert admitted against the
+///   still-present establishment bit — and a pub/sub message lost in the
+///   resulting gap is lost permanently, because pub/sub has no replay. The tick
+///   restores *state*; nothing restores a dropped invalidation. So withdrawal
+///   re-reads desire under the establishment write lock, via
+///   [`CommunityTopics::withdraw_undesired`], and only the communities that
+///   round-trip out of that critical section are unsubscribed.
 async fn reconcile<F: CommunityChannelFamily>(
     sink: &mut redis::aio::PubSubSink,
     family: &F,
@@ -268,12 +329,12 @@ async fn reconcile<F: CommunityChannelFamily>(
         topics.insert_established(*community);
     }
 
-    for community in have.difference(&want) {
-        // Withdraw establishment before the unsubscribe, never after: a reader
-        // that consults `is_established` between the two would otherwise cache
-        // an entry this connection is about to stop protecting.
-        topics.remove_established(*community);
-        sink.unsubscribe(&family.channel(*community)).await?;
+    // Establishment is withdrawn inside the lock, so a reader that admits an
+    // entry either observed the bit before the withdrawal (and its renewed
+    // interest was seen here, keeping the subscription) or observes it after
+    // (and admits nothing).
+    for community in topics.withdraw_undesired(desired) {
+        sink.unsubscribe(&family.channel(community)).await?;
     }
 
     Ok(())
@@ -314,7 +375,9 @@ mod tests {
         topics.insert_established(community(1));
         topics.insert_established(community(2));
 
-        topics.remove_established(community(1));
+        let keep = community(2);
+        let desired: DesiredCommunities = Arc::new(move || HashSet::from([keep]));
+        assert_eq!(topics.withdraw_undesired(&desired), vec![community(1)]);
 
         assert!(!topics.is_established(community(1)));
         assert!(topics.is_established(community(2)));
@@ -331,6 +394,116 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), topics.wake.notified())
             .await
             .expect("a wake raised before the wait must still complete");
+    }
+
+    /// Withdrawal must decide from desire read *inside* its own critical
+    /// section, not from a snapshot taken earlier in the reconcile pass.
+    ///
+    /// This is the race Wren found in review. The subscribe loop awaits Redis
+    /// round-trips, so an arbitrary amount of time passes between the pass's
+    /// `desired()` read and the withdrawal — long enough for interest to be
+    /// renewed and a cache entry admitted against the still-present
+    /// establishment bit. Here the stale view says "withdraw c", live desire says
+    /// "keep c", and the assertion is that live desire wins.
+    #[test]
+    fn withdrawal_reads_live_desire_not_the_passs_stale_view() {
+        let topics = CommunityTopics::new("test");
+        let c = community(1);
+        topics.insert_established(c);
+
+        // The pass's initial read saw an empty desired set (c not wanted). By
+        // the time withdrawal runs, interest has been renewed.
+        let desired: DesiredCommunities = Arc::new(move || HashSet::from([c]));
+
+        assert!(
+            topics.withdraw_undesired(&desired).is_empty(),
+            "a community desired at withdrawal time must not be unsubscribed"
+        );
+        assert!(
+            topics.is_established(c),
+            "renewed interest must keep its establishment bit"
+        );
+    }
+
+    /// The other direction of the same call: still-undesired communities are
+    /// withdrawn, and establishment is dropped before the caller unsubscribes.
+    #[test]
+    fn withdrawal_still_removes_communities_nobody_wants() {
+        let topics = CommunityTopics::new("test");
+        let (kept, dropped) = (community(1), community(2));
+        topics.insert_established(kept);
+        topics.insert_established(dropped);
+
+        let desired: DesiredCommunities = Arc::new(move || HashSet::from([kept]));
+
+        assert_eq!(topics.withdraw_undesired(&desired), vec![dropped]);
+        assert!(
+            !topics.is_established(dropped),
+            "establishment must be gone before the UNSUBSCRIBE is issued"
+        );
+        assert!(topics.is_established(kept));
+    }
+
+    /// The invariant itself, forced deterministically: a renewal that observes
+    /// establishment can never have its subscription withdrawn by a
+    /// concurrently-running reconcile.
+    ///
+    /// The `desired` closure parks *inside* the withdrawal critical section and
+    /// releases the renewal thread from there, so the renewal's
+    /// `is_established` read is guaranteed to happen while withdrawal holds the
+    /// write lock. That is the interleaving a sleep-based test only reaches by
+    /// luck. The reader must then observe `false` (withdrawal won the lock and
+    /// this admission is correctly refused) — never `true` while the community
+    /// also ends up unsubscribed, which is the stale-authz hole.
+    #[test]
+    fn a_renewal_racing_withdrawal_never_sees_establishment_it_loses() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let topics = Arc::new(CommunityTopics::new("test"));
+        let c = community(1);
+        topics.insert_established(c);
+
+        // Signals the renewal thread that withdrawal now holds the write lock.
+        let (in_section_tx, in_section_rx) = mpsc::channel::<()>();
+        // Set by the renewal thread once its establishment read has returned.
+        let renewal_read = Arc::new(AtomicBool::new(false));
+        let read_result = Arc::new(AtomicBool::new(false));
+
+        let renewal_topics = Arc::clone(&topics);
+        let renewal_read_flag = Arc::clone(&renewal_read);
+        let renewal_result = Arc::clone(&read_result);
+        let renewal = std::thread::spawn(move || {
+            in_section_rx
+                .recv()
+                .expect("withdrawal must signal from inside its critical section");
+            // Blocks until withdrawal releases the write lock.
+            let admitted = renewal_topics.is_established(c);
+            renewal_result.store(admitted, Ordering::SeqCst);
+            renewal_read_flag.store(true, Ordering::SeqCst);
+        });
+
+        // Desire says "nobody wants c" — but hands the renewal thread its cue
+        // first, from inside the lock.
+        let desired: DesiredCommunities = Arc::new(move || {
+            in_section_tx.send(()).expect("renewal thread alive");
+            // Give the renewal thread every chance to reach its read while the
+            // write lock is still held; RwLock write exclusion is what makes
+            // the outcome deterministic regardless of how far it gets.
+            std::thread::sleep(Duration::from_millis(50));
+            HashSet::new()
+        });
+
+        assert_eq!(topics.withdraw_undesired(&desired), vec![c]);
+        renewal.join().expect("renewal thread panicked");
+
+        assert!(renewal_read.load(Ordering::SeqCst));
+        assert!(
+            !read_result.load(Ordering::SeqCst),
+            "a renewal whose interest was not seen by withdrawal must be refused, \
+             never admitted against an establishment bit that is being removed"
+        );
+        assert!(!topics.is_established(c));
     }
 }
 
@@ -689,5 +862,89 @@ mod redis_tests {
         set_desired(&cell, &[]);
         topics.wake();
         await_unestablished(&topics, c[0], "gate closes on withdrawal").await;
+    }
+
+    /// End-to-end against live Redis: interest renewed *during* a reconcile pass
+    /// must not lose its exact subscription.
+    ///
+    /// The unit test above proves the lock discipline in isolation; this proves
+    /// the property survives the real `reconcile` path, where awaited Redis
+    /// round-trips sit between the pass's desire read and the withdrawal.
+    ///
+    /// The closure is a phase machine keyed on read count, which is what makes
+    /// the interleaving deterministic: once the race is armed, the pass's *first*
+    /// read reports the community undesired (so a stale-snapshot reconciler would
+    /// queue an `UNSUBSCRIBE`), and every read after it reports the community
+    /// desired again (the renewal). Correct code re-reads inside the withdrawal
+    /// critical section, sees the renewal, and keeps the subscription. Verified
+    /// to bite: reinstating the `have.difference(&want)` withdrawal fails this
+    /// test on the `PUBSUB NUMSUB` assertion.
+    #[tokio::test]
+    #[ignore = "requires Redis"]
+    async fn interest_renewed_mid_reconcile_keeps_its_exact_subscription() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let c = fresh(1)[0];
+        let armed = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+
+        let closure_armed = Arc::clone(&armed);
+        let closure_reads = Arc::clone(&reads);
+        let racing: DesiredCommunities = Arc::new(move || {
+            if !closure_armed.load(Ordering::SeqCst) {
+                return HashSet::from([c]);
+            }
+            // First read after arming: interest looks gone. Every later read
+            // (crucially, the one inside the withdrawal lock) sees it renewed.
+            if closure_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                HashSet::new()
+            } else {
+                HashSet::from([c])
+            }
+        });
+
+        let (topics, _rx) = spawn_subscriber(racing);
+        await_established(&topics, &[c], "pre-race establishment").await;
+        assert_eq!(exact_subscribers(c).await, 1);
+
+        armed.store(true, Ordering::SeqCst);
+        topics.wake();
+
+        // The discriminator, and why this bites where a coarser wait did not:
+        // correct code reads desire TWICE in one pass (the pass read, then the
+        // withdrawal read inside the lock), microseconds apart. A stale-snapshot
+        // reconciler reads once, unsubscribes, and only reads again at the next
+        // tick — a whole `RECONCILE_INTERVAL` later, by which point it has
+        // re-subscribed and a naive end-state assertion passes vacuously.
+        //
+        // So: poll far faster than the tick, require the second read inside a
+        // window well below it, and assert establishment never drops along the
+        // way. The transient loss is the bug; the repaired end state is not proof.
+        let window = RECONCILE_INTERVAL / 4;
+        let deadline = std::time::Instant::now() + window;
+        while reads.load(Ordering::SeqCst) < 2 {
+            assert!(
+                topics.is_established(c),
+                "establishment was withdrawn for renewed interest — an \
+                 invalidation published now would be lost, and the later tick \
+                 that re-subscribes cannot bring it back"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "withdrawal did not re-read desire within its own pass ({window:?}); \
+                 a second read this late means it decided from the stale snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        assert!(
+            topics.is_established(c),
+            "renewed interest must not lose establishment"
+        );
+        assert_eq!(
+            exact_subscribers(c).await,
+            1,
+            "renewed interest must still hold an exact SUBSCRIBE in Redis"
+        );
     }
 }

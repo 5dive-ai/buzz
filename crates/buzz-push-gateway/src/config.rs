@@ -30,9 +30,7 @@ pub struct Config {
     /// Independent token-custody keyring. These keys MUST NOT be reused for
     /// externally presented delivery capabilities.
     pub token_keys: Vec<KeyConfig>,
-    pub apns_key_path: PathBuf,
-    pub apns_key_id: String,
-    pub apns_team_id: String,
+    pub apns_cert_path: PathBuf,
     pub apns_topic: String,
 }
 #[derive(Debug, Error)]
@@ -176,9 +174,7 @@ impl Config {
             app_attest_root_cert_path: req(e, "BUZZ_PUSH_APP_ATTEST_ROOT_CERT_PATH")?.into(),
             grant_keys,
             token_keys,
-            apns_key_path: req(e, "BUZZ_PUSH_APNS_KEY_PATH")?.into(),
-            apns_key_id: req(e, "BUZZ_PUSH_APNS_KEY_ID")?.to_owned(),
-            apns_team_id: req(e, "BUZZ_PUSH_APNS_TEAM_ID")?.to_owned(),
+            apns_cert_path: req(e, "BUZZ_PUSH_APNS_CERT_PATH")?.into(),
             apns_topic: req(e, "BUZZ_PUSH_APNS_TOPIC")?.to_owned(),
         })
     }
@@ -220,18 +216,31 @@ mod tests {
             ),
             (
                 "DATABASE_URL".into(),
-                "postgres://buzz:test@localhost/buzz".into(),
+                "postgres://buzz:test@localhost/buzz".into(), // sadscan:disable np.postgres.1
             ),
             ("BUZZ_PUSH_APP_ATTEST_APP_ID".into(), "TEAM.app".into()),
             (
                 "BUZZ_PUSH_APP_ATTEST_ROOT_CERT_PATH".into(),
                 "/apple-root.pem".into(),
             ),
-            ("BUZZ_PUSH_APNS_KEY_PATH".into(), "/key.p8".into()),
-            ("BUZZ_PUSH_APNS_KEY_ID".into(), "key".into()),
-            ("BUZZ_PUSH_APNS_TEAM_ID".into(), "team".into()),
+            ("BUZZ_PUSH_APNS_CERT_PATH".into(), "/identity.pem".into()),
             ("BUZZ_PUSH_APNS_TOPIC".into(), "app".into()),
         ])
+    }
+
+    #[test]
+    fn certificate_path_and_topic_are_both_required() {
+        let config = Config::from_map(&base()).unwrap();
+        assert_eq!(config.apns_cert_path, PathBuf::from("/identity.pem"));
+        assert_eq!(config.apns_topic, "app");
+
+        for variable in ["BUZZ_PUSH_APNS_CERT_PATH", "BUZZ_PUSH_APNS_TOPIC"] {
+            let mut env = base();
+            env.remove(variable);
+            assert!(
+                matches!(Config::from_map(&env), Err(ConfigError::Missing(key)) if key == variable)
+            );
+        }
     }
 
     #[test]

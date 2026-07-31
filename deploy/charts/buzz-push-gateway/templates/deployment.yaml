@@ -50,7 +50,7 @@ spec:
         - name: app-attest-root
           secret: { secretName: {{ .Values.appAttestRoot.secretName }}, items: [{ key: {{ .Values.appAttestRoot.secretKey }}, path: root.pem }] }
         - name: apns-cert
-          secret: { secretName: {{ .Values.apnsCert.secretName }}, items: [{ key: {{ .Values.apnsCert.secretKey }}, path: identity.pem }] }
+          secret: { secretName: {{ .Values.apnsCert.secretName }}, defaultMode: 0400, items: [{ key: {{ .Values.apnsCert.secretKey }}, path: identity.pem }] }
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}

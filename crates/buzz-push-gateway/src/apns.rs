@@ -237,8 +237,14 @@ mod tests {
     };
     use std::sync::{Arc, Mutex};
 
-    // Self-signed test-only identity. It is not an Apple credential.
+    // Self-signed test-only identity material. None of these are Apple credentials.
     const TEST_IDENTITY_PEM: &[u8] = include_bytes!("../tests/fixtures/apns-test-identity.pem");
+    const TEST_CERT_ONLY_PEM: &[u8] = include_bytes!("../tests/fixtures/apns-test-cert-only.pem");
+    const TEST_KEY_ONLY_PEM: &[u8] = include_bytes!("../tests/fixtures/apns-test-key-only.pem");
+    const TEST_ENCRYPTED_IDENTITY_PEM: &[u8] =
+        include_bytes!("../tests/fixtures/apns-test-encrypted-identity.pem");
+    const TEST_MISMATCHED_IDENTITY_PEM: &[u8] =
+        include_bytes!("../tests/fixtures/apns-test-mismatched-identity.pem");
 
     #[derive(Default)]
     struct CapturedRequest {
@@ -351,9 +357,40 @@ mod tests {
     }
 
     #[test]
+    fn empty_certificate_identity_fails_as_a_credential_error() {
+        assert_credential_error(b"");
+    }
+
+    #[test]
     fn malformed_certificate_identity_fails_as_a_credential_error() {
+        assert_credential_error(b"not a PEM identity");
+    }
+
+    #[test]
+    fn certificate_without_private_key_fails_as_a_credential_error() {
+        assert_credential_error(TEST_CERT_ONLY_PEM);
+    }
+
+    #[test]
+    fn private_key_without_certificate_fails_as_a_credential_error() {
+        assert_credential_error(TEST_KEY_ONLY_PEM);
+    }
+
+    #[test]
+    fn encrypted_private_key_fails_as_a_credential_error() {
+        assert_credential_error(TEST_ENCRYPTED_IDENTITY_PEM);
+    }
+
+    #[test]
+    fn mismatched_private_key_fails_as_a_credential_error() {
+        // reqwest parses both PEM blocks, then rejects the mismatched pair while
+        // building the TLS client. This locks the ClientBuilder error mapping.
+        assert_credential_error(TEST_MISMATCHED_IDENTITY_PEM);
+    }
+
+    fn assert_credential_error(identity_pem: &[u8]) {
         assert!(matches!(
-            ApnsTransport::certificate(b"not a PEM identity", "app.topic".to_owned()),
+            ApnsTransport::certificate(identity_pem, "app.topic".to_owned()),
             Err(ApnsError::Credential)
         ));
     }

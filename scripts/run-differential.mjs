@@ -1,4 +1,5 @@
-#!/usr/bin/env node
+#!/bin/sh
+// 2>/dev/null; LOADER="$(cd "$(dirname "$0")" && pwd)/ts-esm-loader.mjs"; exec node --experimental-strip-types --loader "$LOADER" "$0" "$@"
 /**
  * Phase-2 differential harness — compare old buzzAgentConfig.ts effort logic with
  * the new generated modelCapabilities.ts interpreter over:
@@ -9,8 +10,14 @@
  * Equality is required except for entries in the committed allowlist of intentional
  * F1 corrections (models.dev provider-capability reconciliations).
  *
- * Usage: node --experimental-strip-types scripts/run-differential.mjs [--verbose]
- * Exits 0 on all-pass (modulo allowlist), 1 on unexpected divergence.
+ * Usage: node scripts/run-differential.mjs [--verbose]
+ * Exits 0 on all-pass (modulo allowlist), 1 on unexpected divergence or unexercised allowlist entry.
+ *
+ * NOTE: The shebang bootstraps --experimental-strip-types and a custom ESM loader
+ * (ts-esm-loader.mjs) that resolves extensionless relative TS imports. This is
+ * required because buzzAgentConfig.ts (Phase 2b) imports modelCapabilities via a
+ * bare specifier ("./modelCapabilities") that Node's strip-types runner cannot
+ * otherwise resolve.
  */
 
 import { readFileSync } from "node:fs";
@@ -72,13 +79,22 @@ const ALLOWLIST = [
   },
 ];
 
+// Track which allowlist entries are actually exercised (suppressed a divergence).
+// Keyed as "provider:raw_model_id:axis".
+const allowlistHits = new Set();
+
 function isAllowlisted(provider, rawModelId, axis) {
-  return ALLOWLIST.some(
+  const entry = ALLOWLIST.find(
     (e) =>
       e.provider === provider &&
       e.raw_model_id === rawModelId &&
       e.axes.includes(axis),
   );
+  if (entry) {
+    allowlistHits.add(`${provider}:${rawModelId}:${axis}`);
+    return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +146,6 @@ function compareEffortAxes(provider, model) {
 
 let totalChecks = 0;
 let totalDivergences = 0;
-let totalAllowlisted = 0;
 
 function runCheck(label, provider, model) {
   totalChecks++;
@@ -188,12 +203,42 @@ for (const ep of catalogFixture.endpoints ?? []) {
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
+
+// Count total allowlist axis slots expected to be hit
+const totalAllowlistSlots = ALLOWLIST.reduce((n, e) => n + e.axes.length, 0);
+const allowlistHitCount = allowlistHits.size;
+
+// Detect stale allowlist entries (declared but never actually suppressed a divergence)
+const staleEntries = [];
+for (const entry of ALLOWLIST) {
+  for (const axis of entry.axes) {
+    const key = `${entry.provider}:${entry.raw_model_id}:${axis}`;
+    if (!allowlistHits.has(key)) {
+      staleEntries.push({ ...entry, axis });
+    }
+  }
+}
+
 console.log(
-  `\nDifferential: ${totalChecks} checks, ${totalDivergences} unexpected divergences, ${totalAllowlisted} allowlisted`,
+  `\nDifferential: ${totalChecks} checks, ${totalDivergences} unexpected divergences, ${allowlistHitCount}/${totalAllowlistSlots} allowlist slots exercised`,
 );
+
+if (staleEntries.length > 0) {
+  for (const e of staleEntries) {
+    console.error(
+      `STALE_ALLOWLIST  provider=${e.provider} model=${e.raw_model_id} axis=${e.axis} — entry never fired; remove or update it`,
+    );
+  }
+}
+
 if (totalDivergences > 0) {
   console.error(
     `FAIL: ${totalDivergences} unexpected divergence(s) — see output above`,
+  );
+  process.exit(1);
+} else if (staleEntries.length > 0) {
+  console.error(
+    `FAIL: ${staleEntries.length} stale allowlist entry(ies) — entries that never suppress a divergence mask future regressions`,
   );
   process.exit(1);
 } else {

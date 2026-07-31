@@ -1,10 +1,10 @@
-import { ChevronDown, ChevronUp, X } from "lucide-react";
+import { ChevronDown, ChevronUp } from "lucide-react";
 import type { ComponentType, ReactNode } from "react";
 import { useState } from "react";
 
 import type { ResolvedLinkPreview } from "@/shared/lib/useResolvedLinkPreviews";
 import { cn } from "@/shared/lib/cn";
-import { Button } from "@/shared/ui/button";
+import { LinkPreviewControls } from "@/shared/ui/link-preview-controls";
 
 export type LinkPreviewImageLightboxProps = {
   alt: string;
@@ -129,11 +129,13 @@ function TweetPreview({
   ImageLightbox,
   onRemove,
   preview,
+  showControls,
 }: {
   className?: string;
   ImageLightbox: LinkPreviewImageLightboxComponent;
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
+  showControls: boolean;
 }) {
   const [contentExpanded, setContentExpanded] = useState(true);
   const reserveImage = preview.imageState !== "none";
@@ -173,7 +175,7 @@ function TweetPreview({
       {contentExpanded && reserveImage ? (
         <LinkPreviewImage
           aspectClassName="aspect-video"
-          className="mt-2 w-full max-w-75"
+          className="mt-2 w-full max-w-96"
           ImageLightbox={ImageLightbox}
           preview={preview}
         />
@@ -193,18 +195,8 @@ function TweetPreview({
           {contentExpanded ? "Show less" : "Show more"}
         </button>
       ) : null}
-      {onRemove ? (
-        <Button
-          aria-label="Remove previews for everyone"
-          className="absolute left-full top-0 z-20 ml-1 h-5 w-5 rounded-full text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover/message:opacity-100"
-          onClick={onRemove}
-          size="icon-xs"
-          title="Remove previews for everyone"
-          type="button"
-          variant="ghost"
-        >
-          <X aria-hidden="true" />
-        </Button>
+      {showControls ? (
+        <LinkPreviewControls onRemove={onRemove} placement="left" />
       ) : null}
     </div>
   );
@@ -215,11 +207,13 @@ export function RichLinkPreviewAttachment({
   ImageLightbox,
   onRemove,
   preview,
+  showControls = false,
 }: {
   className?: string;
   ImageLightbox: LinkPreviewImageLightboxComponent;
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
+  showControls?: boolean;
 }) {
   const [contentExpanded, setContentExpanded] = useState(true);
 
@@ -230,6 +224,7 @@ export function RichLinkPreviewAttachment({
         ImageLightbox={ImageLightbox}
         onRemove={onRemove}
         preview={preview}
+        showControls={showControls}
       />
     );
   }
@@ -277,7 +272,7 @@ export function RichLinkPreviewAttachment({
       {contentExpanded && reserveImage ? (
         <LinkPreviewImage
           aspectClassName="aspect-[1.91/1]"
-          className="mt-2 w-full max-w-75"
+          className="mt-2 w-full max-w-96"
           ImageLightbox={ImageLightbox}
           preview={preview}
         />
@@ -297,18 +292,8 @@ export function RichLinkPreviewAttachment({
           {contentExpanded ? "Show less" : "Show more"}
         </button>
       ) : null}
-      {onRemove ? (
-        <Button
-          aria-label="Remove previews for everyone"
-          className="absolute left-full top-0 z-20 ml-1 h-5 w-5 rounded-full text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover/message:opacity-100"
-          onClick={onRemove}
-          size="icon-xs"
-          title="Remove previews for everyone"
-          type="button"
-          variant="ghost"
-        >
-          <X aria-hidden="true" />
-        </Button>
+      {showControls ? (
+        <LinkPreviewControls onRemove={onRemove} placement="left" />
       ) : null}
     </div>
   );

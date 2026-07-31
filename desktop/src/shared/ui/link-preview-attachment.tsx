@@ -11,11 +11,13 @@ export function LinkPreviewAttachment({
   ImageLightbox,
   onRemove,
   preview,
+  showControls,
 }: {
   className?: string;
   ImageLightbox: LinkPreviewImageLightboxComponent;
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
+  showControls?: boolean;
 }) {
   const style = useLinkPreviewStyle();
   if (style === "rich") {
@@ -25,6 +27,7 @@ export function LinkPreviewAttachment({
         ImageLightbox={ImageLightbox}
         onRemove={onRemove}
         preview={preview}
+        showControls={showControls}
       />
     );
   }
@@ -34,6 +37,7 @@ export function LinkPreviewAttachment({
       className={className}
       onRemove={onRemove}
       preview={preview}
+      showControls={showControls}
     />
   );
 }

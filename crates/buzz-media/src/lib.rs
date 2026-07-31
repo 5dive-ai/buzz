@@ -6,6 +6,7 @@ pub mod auth;
 pub mod bucket_index;
 pub mod config;
 pub mod error;
+pub mod keys;
 pub mod storage;
 pub mod thumbnail;
 pub mod types;
@@ -19,6 +20,10 @@ pub use bucket_index::{
 };
 pub use config::{MediaConfig, S3AddressingStyle};
 pub use error::MediaError;
+pub use keys::{
+    legacy_blob_key, legacy_thumb_key, read_candidates, sharded_blob_key, sharded_thumb_key,
+    MediaKeyError, MediaReadCandidates,
+};
 pub use storage::{BlobHeadMeta, BlobMeta, ByteStream, MediaStorage};
 pub use types::BlobDescriptor;
 pub use upload::{process_file_upload, process_upload, process_video_upload};

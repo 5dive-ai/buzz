@@ -656,17 +656,12 @@ async fn deliver(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> 
     // fence. The detached task completes disposition bookkeeping.
     let delivery = tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let mut outcome = transport.send(attempt, profile, &endpoint).await;
-        if outcome == DeliveryOutcome::RefreshCredential {
-            crate::metrics::record_credential_refresh();
-            transport.refresh_credential();
-            outcome = transport.send(attempt, profile, &endpoint).await;
-        }
+        let outcome = transport.send(attempt, profile, &endpoint).await;
         crate::metrics::record_apns_delivery(outcome, started.elapsed().as_secs_f64());
         let disposition = match outcome {
-            DeliveryOutcome::Retry { .. }
-            | DeliveryOutcome::ConfigurationFault
-            | DeliveryOutcome::RefreshCredential => DeliveryDisposition::Retryable,
+            DeliveryOutcome::Retry { .. } | DeliveryOutcome::ConfigurationFault => {
+                DeliveryDisposition::Retryable
+            }
             DeliveryOutcome::Accepted
             | DeliveryOutcome::InvalidEndpoint { .. }
             | DeliveryOutcome::PermanentRequestFault => DeliveryDisposition::Terminal,
@@ -704,7 +699,7 @@ async fn deliver(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> 
             }),
         )
             .into_response(),
-        DeliveryOutcome::ConfigurationFault | DeliveryOutcome::RefreshCredential => {
+        DeliveryOutcome::ConfigurationFault => {
             error(StatusCode::SERVICE_UNAVAILABLE, "configuration_fault")
         }
         DeliveryOutcome::PermanentRequestFault => error(StatusCode::BAD_REQUEST, "invalid_request"),

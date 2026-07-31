@@ -24,8 +24,6 @@ pub enum DeliveryOutcome {
         /// Retry-After delay in seconds, clamped by the transport.
         retry_after_seconds: Option<i64>,
     },
-    /// Refresh a transport credential, then retry once within normal attempt bounds.
-    RefreshCredential,
     /// Provider credential/profile configuration is unhealthy; do not invalidate endpoints.
     ConfigurationFault,
     /// The locally-generated request is permanently invalid.
@@ -82,8 +80,6 @@ pub trait PushTransport: Send + Sync {
         profile: AppProfile,
         endpoint: &str,
     ) -> DeliveryOutcome;
-    /// Refresh a transport credential after a refreshable provider outcome.
-    fn refresh_credential(&self);
 }
 
 /// Direct HTTP/2 APNs transport using a client certificate identity.
@@ -218,10 +214,6 @@ impl PushTransport for ApnsTransport {
             },
             outcome => outcome,
         }
-    }
-
-    fn refresh_credential(&self) {
-        panic!("certificate-authenticated APNs transport has no refreshable credential")
     }
 }
 
@@ -393,16 +385,6 @@ mod tests {
             ApnsTransport::certificate(identity_pem, "app.topic".to_owned()),
             Err(ApnsError::Credential)
         ));
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "certificate-authenticated APNs transport has no refreshable credential"
-    )]
-    fn certificate_transport_fails_loudly_if_refresh_is_requested() {
-        let transport =
-            ApnsTransport::certificate(TEST_IDENTITY_PEM, "app.topic".to_owned()).unwrap();
-        transport.refresh_credential();
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 use super::{validate_respond_to_allowlist, AgentDefinition, ManagedAgentRecord, RespondTo};
 
+pub(crate) type RespondToEnv = (Vec<(&'static str, String)>, Vec<&'static str>);
+
 /// Internal packaging sets `BUZZ_BUILD_INTERNAL`; OSS/custom builds do not.
 pub(crate) fn internal_build() -> bool {
     option_env!("BUZZ_DESKTOP_BUILD_INTERNAL").is_some()
@@ -13,6 +15,64 @@ pub(crate) fn owner_only() -> bool {
 
 pub(crate) fn owner_only_with_policy(internal: bool) -> bool {
     internal
+}
+
+/// Project effective access at a behavioral boundary. This is independent of
+/// persistence normalization so stale or hand-edited records cannot widen an
+/// internal agent's access when they are deployed or published.
+pub(crate) fn projected_access_with_policy(
+    record: &ManagedAgentRecord,
+    internal: bool,
+) -> (RespondTo, Vec<String>) {
+    if owner_only_with_policy(internal) {
+        (RespondTo::OwnerOnly, Vec::new())
+    } else {
+        (record.respond_to, record.respond_to_allowlist.clone())
+    }
+}
+
+/// Build the inbound-author access environment for a launched agent. The
+/// explicit policy input keeps internal-build enforcement testable without
+/// weakening the production caller's compile-time decision.
+pub(crate) fn build_respond_to_env_with_policy(
+    record: &ManagedAgentRecord,
+    owner_hex: Option<&str>,
+    enforced_owner_only: bool,
+) -> Result<RespondToEnv, String> {
+    let respond_to = if enforced_owner_only {
+        RespondTo::OwnerOnly
+    } else {
+        record.respond_to
+    };
+    let normalized = if enforced_owner_only {
+        Vec::new()
+    } else {
+        validate_respond_to_allowlist(&record.respond_to_allowlist)?
+    };
+    if respond_to == RespondTo::Allowlist && normalized.is_empty() {
+        return Err(
+            "respond-to mode 'allowlist' requires at least one pubkey in the allowlist".to_string(),
+        );
+    }
+
+    let mut set = vec![("BUZZ_ACP_RESPOND_TO", respond_to.as_str().to_string())];
+    let mut remove = Vec::new();
+    if respond_to == RespondTo::Allowlist {
+        set.push(("BUZZ_ACP_RESPOND_TO_ALLOWLIST", normalized.join(",")));
+    } else {
+        remove.push("BUZZ_ACP_RESPOND_TO_ALLOWLIST");
+    }
+
+    if record.auth_tag.is_none() {
+        if let Some(owner) = owner_hex {
+            set.push(("BUZZ_ACP_AGENT_OWNER", owner.to_string()));
+        } else {
+            remove.push("BUZZ_ACP_AGENT_OWNER");
+        }
+    } else {
+        remove.push("BUZZ_ACP_AGENT_OWNER");
+    }
+    Ok((set, remove))
 }
 
 /// Normalize a persisted/projected instance for the current distribution.

@@ -340,6 +340,14 @@ fn event_d_tag(event: &nostr::Event) -> Result<String, String> {
 /// `persona_from_event` sets `id = d_tag`, an in-app persona reuses its d-tag as
 /// the id and a re-received event stays idempotent (no duplicate row).
 fn apply_inbound_persona(personas: &mut Vec<AgentDefinition>, inbound: AgentDefinition) {
+    apply_inbound_persona_with_policy(personas, inbound, crate::managed_agents::internal_build());
+}
+
+fn apply_inbound_persona_with_policy(
+    personas: &mut Vec<AgentDefinition>,
+    inbound: AgentDefinition,
+    internal: bool,
+) {
     let d_tag = persona_d_tag(&inbound);
     match personas
         .iter_mut()
@@ -357,12 +365,17 @@ fn apply_inbound_persona(personas: &mut Vec<AgentDefinition>, inbound: AgentDefi
             local.respond_to_allowlist = inbound.respond_to_allowlist;
             local.parallelism = inbound.parallelism;
             local.shared = inbound.shared;
-            crate::managed_agents::normalize_definition_access(local);
+            crate::managed_agents::access_policy::normalize_definition_access_with_policy(
+                local, internal,
+            );
             local.updated_at = inbound.updated_at;
         }
         None => {
             let mut inbound = inbound;
-            crate::managed_agents::normalize_definition_access(&mut inbound);
+            crate::managed_agents::access_policy::normalize_definition_access_with_policy(
+                &mut inbound,
+                internal,
+            );
             personas.push(inbound);
         }
     }

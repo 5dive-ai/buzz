@@ -398,6 +398,18 @@ fn legacy_avatar_empty_when_nothing_resolves() {
 
 // ── Provider deploy payload completeness ─────────────────────────────────────
 
+fn deploy_payload_for_policy(record: &ManagedAgentRecord, internal: bool) -> serde_json::Value {
+    deploy_payload_json(
+        record,
+        "wss://relay.example".to_string(),
+        Some("gpt-x".to_string()),
+        Some("openai".to_string()),
+        None,
+        std::collections::BTreeMap::new(),
+        internal,
+    )
+}
+
 /// Regression (PR #1667 review, Thufir): the provider deploy payload must
 /// carry every behavioral field the local spawn path applies — a field
 /// missing here silently strips it from provider-backed agents.
@@ -429,14 +441,7 @@ fn deploy_payload_carries_the_full_behavioral_quad() {
     ))
     .expect("sample record");
 
-    let payload = deploy_payload_json(
-        &record,
-        "wss://relay.example".to_string(),
-        Some("gpt-x".to_string()),
-        Some("openai".to_string()),
-        None,
-        std::collections::BTreeMap::new(),
-    );
+    let payload = deploy_payload_for_policy(&record, false);
 
     assert_eq!(payload["parallelism"], 4);
     assert_eq!(payload["respond_to"], "allowlist");
@@ -444,4 +449,29 @@ fn deploy_payload_carries_the_full_behavioral_quad() {
     assert_eq!(payload["model"], "gpt-x");
     assert_eq!(payload["provider"], "openai");
     assert_eq!(payload["relay_url"], "wss://relay.example");
+}
+
+#[test]
+fn internal_deploy_payload_clamps_stale_access() {
+    use crate::managed_agents::{BackendKind, RespondTo};
+
+    let mut record = bare_agent_record(None, None, None);
+    record.backend = BackendKind::Provider {
+        id: "provider".to_string(),
+        config: serde_json::json!({}),
+    };
+    record.respond_to = RespondTo::Anyone;
+    record.respond_to_allowlist = vec!["a".repeat(64)];
+
+    let payload = deploy_payload_for_policy(&record, true);
+
+    assert_eq!(
+        payload["respond_to"], "owner-only",
+        "internal deploy payload widened stale access"
+    );
+    assert_eq!(
+        payload["respond_to_allowlist"],
+        serde_json::json!([]),
+        "internal deploy payload retained a stale allowlist"
+    );
 }

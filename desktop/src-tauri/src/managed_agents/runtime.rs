@@ -16,10 +16,9 @@ use crate::{
 
 mod path;
 pub(in crate::managed_agents) use path::build_augmented_path;
-pub(crate) use path::{
-    build_respond_to_env_with_policy, compose_path_entries, should_skip_claude_executable,
-    should_use_inherited, RespondToEnv,
-};
+pub(crate) use path::{compose_path_entries, should_skip_claude_executable, should_use_inherited};
+
+pub(crate) use super::access_policy::{build_respond_to_env_with_policy, RespondToEnv};
 
 mod metadata;
 pub(crate) use metadata::{
@@ -127,6 +126,13 @@ pub(crate) fn resolve_workspace_pair_key(
     let effective_relay =
         crate::relay::effective_agent_relay_url(record_relay_url, workspace_relay_url);
     ManagedAgentRuntimeKey::new(pubkey.to_string(), &effective_relay).ok()
+}
+
+fn summary_access_with_policy(
+    record: &ManagedAgentRecord,
+    internal: bool,
+) -> (super::types::RespondTo, Vec<String>) {
+    super::projected_access_with_policy(record, internal)
 }
 
 pub fn build_managed_agent_summary(
@@ -296,7 +302,8 @@ pub fn build_managed_agent_summary(
         .unwrap_or("")
         .to_string();
 
-    let owner_only = super::owner_only();
+    let (respond_to, respond_to_allowlist) =
+        summary_access_with_policy(record, super::internal_build());
     Ok(ManagedAgentSummary {
         pubkey: record.pubkey.clone(),
         name: record.name.clone(),
@@ -336,16 +343,8 @@ pub fn build_managed_agent_summary(
         start_on_app_launch: record.start_on_app_launch,
         auto_restart_on_config_change: record.auto_restart_on_config_change,
         log_path,
-        respond_to: if owner_only {
-            super::types::RespondTo::OwnerOnly
-        } else {
-            record.respond_to
-        },
-        respond_to_allowlist: if owner_only {
-            Vec::new()
-        } else {
-            record.respond_to_allowlist.clone()
-        },
+        respond_to,
+        respond_to_allowlist,
     })
 }
 
@@ -993,6 +992,9 @@ pub fn start_managed_agent_process(
     runtimes.insert(key, ManagedAgentPairRuntime::starting(process));
     Ok(())
 }
+
+#[cfg(test)]
+mod test_fixtures;
 
 #[cfg(test)]
 mod tests;

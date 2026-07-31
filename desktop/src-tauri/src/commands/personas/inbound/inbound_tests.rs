@@ -4,7 +4,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
-const UUID: &str = "11111111-2222-3333-4444-555555555555";
+const UUID: &str = "11111111-2222-3333-4444-555555555555"; // sadscan:disable sq.pii.cc.visa
 
 /// A local in-app persona: `source_team_persona_slug` is None, so its d-tag
 /// IS its UUID id. Carries env_vars + source_team that must survive a patch.
@@ -149,6 +149,27 @@ fn no_local_match_inserts_inbound_reusing_d_tag_as_id() {
     // Re-receiving the inserted record must still be idempotent.
     apply_inbound_persona(&mut personas, inbound_for(other, "New"));
     assert_eq!(personas.len(), 2, "re-receive of inserted record no-ops");
+}
+
+#[test]
+fn internal_policy_clamps_inbound_persona_insert() {
+    let d_tag = "99999999-8888-7777-6666-555555555555";
+    let mut inbound = inbound_for(d_tag, "New");
+    inbound.respond_to = Some("anyone".to_string());
+    inbound.respond_to_allowlist = vec!["a".repeat(64)];
+    let mut personas = Vec::new();
+
+    apply_inbound_persona_with_policy(&mut personas, inbound, true);
+
+    let inserted = personas.first().expect("inbound persona inserted");
+    assert_eq!(
+        inserted.respond_to, None,
+        "internal inbound persona insert retained stale access"
+    );
+    assert!(
+        inserted.respond_to_allowlist.is_empty(),
+        "internal inbound persona insert retained a stale allowlist"
+    );
 }
 
 // ── Managed-agent (30177) inbound ────────────────────────────────────────

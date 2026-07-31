@@ -99,6 +99,7 @@ pub(super) fn build_deploy_payload(
         effective_provider,
         effective_prompt,
         merged_env,
+        crate::managed_agents::internal_build(),
     ))
 }
 
@@ -112,7 +113,10 @@ pub(super) fn deploy_payload_json(
     effective_provider: Option<String>,
     effective_prompt: Option<String>,
     merged_env: std::collections::BTreeMap<String, String>,
+    internal: bool,
 ) -> serde_json::Value {
+    let (respond_to, respond_to_allowlist) =
+        crate::managed_agents::projected_access_with_policy(record, internal);
     serde_json::json!({
         "name": &record.name,
         "relay_url": relay_url,
@@ -127,8 +131,8 @@ pub(super) fn deploy_payload_json(
         "idle_timeout_seconds": record.idle_timeout_seconds,
         "max_turn_duration_seconds": record.max_turn_duration_seconds,
         "parallelism": record.parallelism,
-        "respond_to": record.respond_to,
-        "respond_to_allowlist": &record.respond_to_allowlist,
+        "respond_to": respond_to,
+        "respond_to_allowlist": respond_to_allowlist,
         "env_vars": merged_env,
     })
 }

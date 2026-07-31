@@ -68,6 +68,13 @@ pub struct ManagedAgentEventContent {
 /// operational start/stop produces an identical projection and never
 /// republishes.
 pub fn agent_event_content(record: &ManagedAgentRecord) -> ManagedAgentEventContent {
+    agent_event_content_with_policy(record, super::internal_build())
+}
+
+pub(crate) fn agent_event_content_with_policy(
+    record: &ManagedAgentRecord,
+    internal: bool,
+) -> ManagedAgentEventContent {
     // Slimmed projection (NIP-AP "Slimming: kind:30177"): definition-linked
     // instances resolve prompt/model/provider/source_version through their
     // kind:30175 definition, so those fields are omitted from the wire.
@@ -77,6 +84,7 @@ pub fn agent_event_content(record: &ManagedAgentRecord) -> ManagedAgentEventCont
     // restore path. This branch retires once every record is
     // definition-backed (B5 backfill).
     let definition_linked = record.persona_id.is_some();
+    let (respond_to, respond_to_allowlist) = super::projected_access_with_policy(record, internal);
     ManagedAgentEventContent {
         name: record.name.clone(),
         persona_id: record.persona_id.clone(),
@@ -101,8 +109,8 @@ pub fn agent_event_content(record: &ManagedAgentRecord) -> ManagedAgentEventCont
             record.persona_source_version.clone()
         },
         parallelism: record.parallelism,
-        respond_to: record.respond_to,
-        respond_to_allowlist: record.respond_to_allowlist.clone(),
+        respond_to,
+        respond_to_allowlist,
     }
 }
 
@@ -299,6 +307,29 @@ mod tests {
         assert!(
             !json.contains("system_prompt"),
             "definition-linked projection must omit system_prompt"
+        );
+    }
+
+    #[test]
+    fn public_projection_preserves_configured_access() {
+        let projection = agent_event_content_with_policy(&sample_agent(), false);
+
+        assert_eq!(projection.respond_to, RespondTo::Allowlist);
+        assert_eq!(projection.respond_to_allowlist, vec!["79be667e"]);
+    }
+
+    #[test]
+    fn internal_projection_clamps_stale_access() {
+        let projection = agent_event_content_with_policy(&sample_agent(), true);
+
+        assert_eq!(
+            projection.respond_to,
+            RespondTo::OwnerOnly,
+            "internal kind:30177 projection widened stale access"
+        );
+        assert!(
+            projection.respond_to_allowlist.is_empty(),
+            "internal kind:30177 projection retained a stale allowlist"
         );
     }
 

@@ -448,17 +448,17 @@ export class RelayClient {
 
   subscribeToReconnects(listener: () => void) {
     this.reconnectListeners.add(listener);
-
     return () => {
       this.reconnectListeners.delete(listener);
     };
   }
-
+  getConnectionGeneration(): number {
+    return this.connectionGeneration;
+  }
   /** Current connection state — synchronous read. */
   getConnectionState(): ConnectionState {
     return this.connectionStateEmitter.get();
   }
-
   /**
    * Subscribe to connection-state transitions. The listener is invoked
    * immediately with the current state so callers don't need a separate

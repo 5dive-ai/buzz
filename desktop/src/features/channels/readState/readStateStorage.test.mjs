@@ -143,7 +143,7 @@ test("writeStoredReadState round-trips through readStoredReadState", () => {
   assert.equal(reg.b, nowSeconds, "register B must round-trip");
 });
 
-test("writeStoredReadState survives a throwing localStorage.setItem", () => {
+test("writeStoredReadState_survives_throwing_localStorage_and_returns_false", () => {
   const ls = installLocalStorage();
   ls.setItem = () => {
     throw new Error("QuotaExceededError");
@@ -151,8 +151,9 @@ test("writeStoredReadState survives a throwing localStorage.setItem", () => {
   const pubkey = "d".repeat(64);
   const nowSeconds = Math.floor(Date.now() / 1_000);
 
+  let result;
   assert.doesNotThrow(() => {
-    writeStoredReadState(
+    result = writeStoredReadState(
       pubkey,
       new Map([["channel-1", nowSeconds]]),
       new Set(["channel-1"]),
@@ -160,4 +161,9 @@ test("writeStoredReadState survives a throwing localStorage.setItem", () => {
       new Map(),
     );
   });
+  assert.equal(
+    result,
+    false,
+    "writeStoredReadState must return false on quota failure",
+  );
 });

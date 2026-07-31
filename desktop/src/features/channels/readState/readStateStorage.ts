@@ -190,7 +190,7 @@ export function writeStoredReadState(
   publishableContextIds: ReadonlySet<string>,
   contextSourceCreatedAt: ReadonlyMap<string, number>,
   overrideRegisters: ReadonlyMap<string, OverrideRegister>,
-): void {
+): boolean {
   const pruned = pruneStaleContexts(contexts, Math.floor(Date.now() / 1_000));
 
   const state: Record<string, string> = {};
@@ -198,11 +198,11 @@ export function writeStoredReadState(
     state[contextId] = new Date(timestamp * 1_000).toISOString();
   }
 
-  setLocalStorageItemWithRecovery(
+  const ok1 = setLocalStorageItemWithRecovery(
     localReadStateKey(pubkey),
     JSON.stringify(state),
   );
-  setLocalStorageItemWithRecovery(
+  const ok2 = setLocalStorageItemWithRecovery(
     localPublishableContextKey(pubkey),
     JSON.stringify([...publishableContextIds].filter((id) => pruned.has(id))),
   );
@@ -213,7 +213,7 @@ export function writeStoredReadState(
       sourceState[contextId] = createdAt;
     }
   }
-  setLocalStorageItemWithRecovery(
+  const ok3 = setLocalStorageItemWithRecovery(
     localSourceCreatedAtKey(pubkey),
     JSON.stringify(sourceState),
   );
@@ -223,8 +223,10 @@ export function writeStoredReadState(
   for (const [rawCtx, reg] of overrideRegisters) {
     regState[rawCtx] = { s: reg.s, c: reg.c, b: reg.b };
   }
-  setLocalStorageItemWithRecovery(
+  const ok4 = setLocalStorageItemWithRecovery(
     localOverrideRegistersKey(pubkey),
     JSON.stringify(regState),
   );
+
+  return ok1 && ok2 && ok3 && ok4;
 }

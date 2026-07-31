@@ -758,6 +758,8 @@ test("fetchAndMerge_emptyRelay_setsLoadComplete", async () => {
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
     subscribeLive: async (_filter, _handler) => {
       subscribeCallCount++;
       return () => {};
@@ -800,6 +802,8 @@ test("fetchAndMerge_singleEvent_completesAfterPinnedWindowDischarge", async () =
       return [event];
     },
     publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
     subscribeLive: async (_filter, _handler) => () => {},
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
@@ -832,6 +836,8 @@ test("fetchAndMerge_pinnedWindowAtCap_setsLoadIncomplete", async () => {
       return events;
     },
     publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
     subscribeLive: async (_filter, _handler) => () => {},
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
@@ -851,6 +857,8 @@ test("fetchAndMerge_fenceFails_setsLoadIncomplete", async () => {
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
     subscribeLive: async () => {
       throw new Error("connection refused");
     },
@@ -883,6 +891,8 @@ test("fetchAndMerge_incompleteLoad_blocksGatedOperations", async () => {
     publishEvent: async () => {
       publishCalls++;
     },
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
     subscribeLive: async (_f, _h) => () => {},
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
@@ -946,6 +956,8 @@ test("fetchAndMerge_retryClears_incomplete", async () => {
       return [];
     },
     publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
     subscribeLive: async (_f, _h) => () => {},
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
@@ -964,49 +976,133 @@ test("fetchAndMerge_retryClears_incomplete", async () => {
 
 // ── Test 3: live events go through structured ingest ──────────────────────────
 test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
-  // A live push carrying ov_s/c/b keys must update overrideRegisters via
-  // the shared ingest path (not raw blob.contexts iteration).
+  // Construct a fake event whose content decrypts to a NIP-RS blob with an
+  // override register.  Use a __TAURI_INTERNALS__ mock so parseReadStateEvent
+  // can decrypt without a real NIP-44 key.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "aa".repeat(32);
   const rawCtx = `live-channel-${"x".repeat(51)}`;
+  const channelFrontier = 100;
+  // Build a blob where the register (S=3, C=1, B=50) is ACTIVE: S > C, S > frontier.
+  // encode: ov_s:<ctx>=3, ov_c:<ctx>=1, ov_b:<ctx>=50, <ctx>=<frontier>
+  const blobContexts = {
+    [rawCtx]: channelFrontier,
+    [`ov_s:${rawCtx}`]: 3,
+    [`ov_c:${rawCtx}`]: 1,
+    [`ov_b:${rawCtx}`]: 50,
+  };
+  const plaintext = JSON.stringify({
+    v: 1,
+    client_id: "other-device",
+    contexts: blobContexts,
+  });
 
-  // Craft a valid-looking NIP-RS event with an override register.
-  // We need parseReadStateEvent to accept it, which requires nip44DecryptFromSelf.
-  // Instead of fighting the crypto layer, call ingest() directly — the public
-  // path used by both handleIncomingEvent and the initial load.
+  // Install Tauri IPC mock so nip44_decrypt_from_self returns our plaintext.
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command, args) => {
+      if (command === "nip44_decrypt_from_self") {
+        if (args.ciphertext === "FAKE_CIPHER") return plaintext;
+        throw new Error("unknown ciphertext");
+      }
+      throw new Error(`Unexpected Tauri command: ${command}`);
+    },
+  };
+
+  let liveHandler = null;
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
-    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async (_filter, handler) => {
+      liveHandler = handler;
+      return () => {};
+    },
   };
-  const mgr = new ReadStateManager(pubkey, fakeRelay);
-  mgr.isLoadComplete = true;
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    await mgr.initialize();
 
-  // Simulate a live override update by calling ingest() with a pre-merged state.
-  // mergeReadStateEventsStructured will return empty maps for unparseable events,
-  // so we instead exercise the register merge path via the public mark API and
-  // verify it survives a "live delivery" of the same register via componentwise merge.
-  const markResult = mgr.markChannelUnread(rawCtx);
-  assert.equal(markResult.success, true, "markChannelUnread must succeed");
-  const reg1 = mgr.overrideRegisters.get(rawCtx);
-  assert.ok(reg1, "override register must exist after markChannelUnread");
-  assert.equal(reg1.s, 1, "S must be 1 after first mark-unread");
+    // Build fake NIP-RS event.
+    const fakeEvent = {
+      id: "b".repeat(64),
+      pubkey,
+      created_at: 2_000_000,
+      kind: 30078,
+      tags: [
+        ["d", "read-state:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"],
+        ["t", "read-state"],
+      ],
+      content: "FAKE_CIPHER",
+      sig: "s".repeat(128),
+    };
 
-  // A "remote" device with higher S — simulate via ingest with a fake event
-  // carrying a higher S.  We verify the componentwise max is applied.
-  // We inject directly into overrideRegisters as if a remote event arrived:
-  const higherReg = { s: 5, c: 2, b: 0 };
-  const prevReg = mgr.overrideRegisters.get(rawCtx);
-  // componentwise-merge manually (mirrors what ingest does).
-  mgr.overrideRegisters.set(rawCtx, {
-    s: Math.max(prevReg.s, higherReg.s),
-    c: Math.max(prevReg.c, higherReg.c),
-    b: Math.max(prevReg.b, higherReg.b),
-  });
-  const mergedReg = mgr.overrideRegisters.get(rawCtx);
-  assert.equal(mergedReg.s, 5, "componentwise max must take remote S=5");
-  assert.equal(mergedReg.c, 2, "componentwise max must take remote C=2");
-  mgr.destroy();
+    // Deliver via the live subscription callback (same path as relay push).
+    assert.ok(liveHandler !== null, "live subscription must be established");
+    liveHandler(fakeEvent); // void-wrapped; wait for async completion
+    await new Promise((r) => setTimeout(r, 50));
+
+    // The override register must now reflect the ingested remote values.
+    const reg = mgr.overrideRegisters.get(rawCtx);
+    assert.ok(reg, "override register must exist after live delivery");
+    assert.equal(reg.s, 3, "S must be 3 from live event");
+    assert.equal(reg.c, 1, "C must be 1 from live event");
+    assert.equal(reg.b, 50, "B must be 50 from live event");
+
+    // ── existing-key live clear (higher C defeating S) ───────────────────
+    // A follow-up event with S=3, C=4 (C > S → inactive/tombstone).
+    const blobClear = {
+      [rawCtx]: channelFrontier,
+      [`ov_c:${rawCtx}`]: 4, // tombstone floor: max(S=3,C=1)+1=4
+    };
+    const ptClear = JSON.stringify({
+      v: 1,
+      client_id: "other-device-2",
+      contexts: blobClear,
+    });
+    const fakeEventClear = {
+      id: "c".repeat(64),
+      pubkey,
+      created_at: 2_000_001,
+      kind: 30078,
+      tags: [
+        ["d", "read-state:b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"],
+        ["t", "read-state"],
+      ],
+      content: "FAKE_CIPHER_2",
+      sig: "s".repeat(128),
+    };
+    globalThis.window.__TAURI_INTERNALS__.invoke = async (command, args) => {
+      if (command === "nip44_decrypt_from_self") {
+        if (args.ciphertext === "FAKE_CIPHER_2") return ptClear;
+        if (args.ciphertext === "FAKE_CIPHER") return plaintext;
+        throw new Error("unknown ciphertext");
+      }
+      throw new Error(`Unexpected Tauri command: ${command}`);
+    };
+    liveHandler(fakeEventClear); // void-wrapped; wait for async completion
+    await new Promise((r) => setTimeout(r, 50));
+    const regAfterClear = mgr.overrideRegisters.get(rawCtx);
+    assert.ok(regAfterClear, "register must still exist after clear event");
+    // tombstone floor: only ov_c:ctx=4 is present → S=0, C=4, B=0 merged via componentwise max
+    // after merge with prior (S=3, C=1, B=50): S=3, C=4, B=50 — override_active = S <= C = inactive
+    assert.equal(
+      regAfterClear.c,
+      4,
+      "C must be 4 (tombstone floor from clear event)",
+    );
+    const liveness = mgr.getOverrideLiveness(rawCtx);
+    assert.ok(liveness !== null, "liveness must be available");
+    assert.equal(
+      liveness.active,
+      false,
+      "override must be inactive after clear",
+    );
+
+    mgr.destroy();
+  } finally {
+    delete globalThis.window.__TAURI_INTERNALS__;
+  }
 });
 
 // ── Test 4: fetch-before-write failure → zero publishes ──────────────────────
@@ -1023,6 +1119,8 @@ test("publish_fetchOwnBlobFails_doesNotPublish", async () => {
     publishEvent: async () => {
       publishCalls++;
     },
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
     subscribeLive: async (_f, _h) => () => {},
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
@@ -1047,6 +1145,8 @@ test("overrideRegister_survivesRestartBeforeDebounce", () => {
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
     subscribeLive: async (_f, _h) => () => {},
   };
   const mgr1 = new ReadStateManager(pubkey, fakeRelay);
@@ -1072,17 +1172,19 @@ test("overrideRegister_survivesRestartBeforeDebounce", () => {
 });
 
 // ── Test 6: durability — tombstone floor survives restart with fetch failure ──
-test("overrideRegister_tombstoneFloorSurvivesRestartWithFetchFailure", () => {
+test("overrideRegister_tombstoneFloorSurvivesRestartWithFetchFailure", async () => {
   const ls = makeLocalStorage();
   globalThis.window.localStorage = ls;
   const pubkey = "dd".repeat(32);
-  const fakeRelay = {
+  const goodRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
     subscribeLive: async (_f, _h) => () => {},
   };
   // Establish a mark-read tombstone floor: S=1, C=max(S,C)+1=2 (clear-wins → inactive).
-  const mgr1 = new ReadStateManager(pubkey, fakeRelay);
+  const mgr1 = new ReadStateManager(pubkey, goodRelay);
   mgr1.isLoadComplete = true;
   mgr1.effectiveState.set("tombstone-ch", 500);
   mgr1.publishableContextIds.add("tombstone-ch");
@@ -1094,26 +1196,36 @@ test("overrideRegister_tombstoneFloorSurvivesRestartWithFetchFailure", () => {
   assert.equal(tomb.c, 2); // max(S=1,C=0)+1 = 2
   mgr1.destroy();
 
-  // New manager: hydrate, fetch fails → tombstone must still be present.
+  // New manager: initialize() with a relay that throws on fetchEvents.
+  // Tombstone must still be present even after failed fetch.
   globalThis.window.localStorage = ls;
-  const mgr2 = new ReadStateManager(pubkey, fakeRelay);
-  mgr2.hydrateFromLocalStorage();
+  const failRelay = {
+    fetchEvents: async () => {
+      throw new Error("network unavailable");
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async () => {
+      throw new Error("network unavailable");
+    },
+  };
+  const mgr2 = new ReadStateManager(pubkey, failRelay);
+  await mgr2.initialize(); // fetch fails, but hydration must have run first
   const reg = mgr2.overrideRegisters.get("tombstone-ch");
-  assert.ok(reg, "tombstone register must survive restart");
+  assert.ok(reg, "tombstone register must survive restart with fetch failure");
   assert.equal(reg.s, 1, "S must be preserved");
   assert.equal(reg.c, 2, "C must be preserved (tombstone floor: max(1,0)+1=2)");
   mgr2.destroy();
 });
 
-// ── Test 7: budget planner — near-limit new target that splits must allow ─────
+// ── Test 7: budget planner ────────────────────────────────────────────────────
 test("markChannelUnread_visibleRefusal_atBudgetExhaustionAndUint32Max", () => {
   const mgr = makeManager();
   // Simulate completed load so mark operations are not blocked by load_incomplete.
   mgr.isLoadComplete = true;
 
   // ── uint32 max refusal ────────────────────────────────────────────────────
-  // Inject a register where S is already at uint32 max and S == C (so
-  // max(S,C)+1 would overflow).
   const UINT32_MAX = 0xffffffff;
   const overflowCtx = "overflow-channel";
   mgr.overrideRegisters.set(overflowCtx, {
@@ -1132,47 +1244,208 @@ test("markChannelUnread_visibleRefusal_atBudgetExhaustionAndUint32Max", () => {
     "markChannelUnread must refuse with uint32_overflow when S is at max",
   );
 
-  // ── budget exhaustion refusal — primary slot with no frontier-only fallback ─
-  // We need a state where even a multi-slot split cannot fit the new override group.
-  // The simplest approach: use a manager with maxSlots=1 via currentContexts()
-  // being non-null but the escaping probe causing overflow.
-  // Easier: fill the primary slot past 32 KiB with override groups (which are
-  // NOT prunable) so the planner truly cannot fit.
-  const freshMgr = makeManager("e".repeat(64));
-  freshMgr.isLoadComplete = true;
-
-  // Fill with override-bearing entries (ov_* + frontier each ~80 bytes).
-  // 300 override groups × ~80 bytes ≈ 24 KB; add enough plain channels to push over 32 KB.
-  for (let i = 0; i < 200; i++) {
-    const ctx = `ch-${i.toString().padStart(64, "0")}`;
-    freshMgr.overrideRegisters.set(ctx, { s: 1, c: 0, b: 0 });
-    freshMgr.effectiveState.set(ctx, 1000 + i);
-    freshMgr.publishableContextIds.add(ctx);
+  // ── multi-slot success: 700 frontier-only channels → split planner must succeed ─
+  // Thufir's deterministic witness: 700 plain frontier channels overflow a single slot
+  // but the splitter can spread them across ≤ 8 slots. A new override group in the
+  // primary must succeed because the pure candidate planner tries the split path.
+  const splitMgr = makeManager("f".repeat(64));
+  splitMgr.isLoadComplete = true;
+  for (let i = 0; i < 700; i++) {
+    const ctx = `frontier-ch-${i.toString().padStart(60, "0")}`;
+    splitMgr.effectiveState.set(ctx, 1000 + i);
+    splitMgr.publishableContextIds.add(ctx);
   }
+  const splitCtx = `new-override-ctx-${"n".repeat(48)}`;
+  const splitResult = splitMgr.markChannelUnread(splitCtx);
+  assert.equal(
+    splitResult.success,
+    true,
+    "700 frontier-only channels must allow a new override via multi-slot split",
+  );
+  assert.ok(
+    splitMgr.overrideRegisters.has(splitCtx),
+    "override register must be committed on split success",
+  );
+  splitMgr.destroy();
 
-  const budgetCtx = `budget-new-ctx-${"z".repeat(49)}`;
-  // The new context has no existing override register.
-  // With 200 existing override groups (non-evictable), the primary slot is full.
-  const budgetResult = freshMgr.markChannelUnread(budgetCtx);
-  // If it succeeds (split path absorbed the new group), that is also correct.
-  // The key invariant: on budget_exhausted, state must not be mutated.
-  if (
-    budgetResult.success === false &&
-    budgetResult.reason === "budget_exhausted"
-  ) {
-    // Verify state is unchanged.
-    assert.ok(
-      !freshMgr.overrideRegisters.has(budgetCtx),
-      "failed budget check must not mutate overrideRegisters",
-    );
+  // ── near-limit refusal: all 8 slots insufficient → budget_exhausted, no mutation ─
+  // Pack so many non-evictable override groups that even 8 slots cannot accommodate
+  // the new entry. Each override group contributes ov_s+ov_c+ov_b+frontier ≈ 4 keys
+  // × ~75 bytes each + JSON overhead.  200 groups × 4 keys ≈ 300 bytes each ≈ 60 KB
+  // per slot if split across 8 → ~7.5 KB per slot, which fits. We need them to NOT fit.
+  // Easiest: fill primary to near-capacity with 250 big-key override groups so even
+  // splitting all 8 slots still cannot carry the new group in primary (which must
+  // hold ALL override groups per spec, so they all go in slot 0).
+  const fullMgr = makeManager("aa".repeat(32));
+  fullMgr.isLoadComplete = true;
+  // 250 override groups with long context IDs ≈ 250 × (4 keys × ~100 bytes) = 100 KB
+  // → exceeds READ_STATE_MAX_PLAINTEXT_BYTES (32 KB) even in slot 0 alone.
+  for (let i = 0; i < 250; i++) {
+    const ctx = `ov-ch-${i.toString().padStart(60, "0")}`;
+    fullMgr.overrideRegisters.set(ctx, { s: 1, c: 0, b: 0 });
+    fullMgr.effectiveState.set(ctx, 1000 + i);
+    fullMgr.publishableContextIds.add(ctx);
   }
-  // Either outcome (success via split, or budget_exhausted with no mutation) is valid.
-  freshMgr.destroy();
+  const nearCtx = `near-limit-ctx-${"z".repeat(49)}`;
+  const nearResult = fullMgr.markChannelUnread(nearCtx);
+  assert.equal(
+    nearResult.success,
+    false,
+    "near-limit manager with 250 non-evictable override groups must refuse",
+  );
+  assert.equal(nearResult.reason, "budget_exhausted");
+  assert.ok(
+    !fullMgr.overrideRegisters.has(nearCtx),
+    "budget_exhausted must not mutate overrideRegisters",
+  );
+  fullMgr.destroy();
 
   // Verify the uint32_overflow register was not mutated in the original mgr.
   const reg = mgr.overrideRegisters.get(overflowCtx);
   assert.ok(reg, "overflow channel register must still exist");
   assert.equal(reg.s, UINT32_MAX, "overflow register S must be unchanged");
 
+  mgr.destroy();
+});
+
+// ── Test 8: persistence failure fails the mark ───────────────────────────────
+test("markChannelUnread_storageFailure_returnsStorageFailed", () => {
+  // Use a throwing localStorage to simulate quota failure.
+  const throwingLS = makeLocalStorage();
+  const originalSetItem = throwingLS.setItem.bind(throwingLS);
+  // Allow initial writes (ClientId, slotId), then fail on override writes.
+  let writeCount = 0;
+  throwingLS.setItem = (key, value) => {
+    writeCount++;
+    if (writeCount > 2) throw new Error("QuotaExceededError");
+    originalSetItem(key, value);
+  };
+  globalThis.window.localStorage = throwingLS;
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeLive: () => () => {},
+  };
+  const mgr = new ReadStateManager("st".repeat(32), fakeRelay);
+  mgr.isLoadComplete = true;
+  mgr.effectiveState.set("storage-test-ch", 1000);
+
+  const result = mgr.markChannelUnread("storage-test-ch");
+  assert.equal(
+    result.success,
+    false,
+    "markChannelUnread must fail when localStorage throws",
+  );
+  assert.equal(result.reason, "storage_failed");
+  mgr.destroy();
+});
+
+// ── Test 9: inactive existing register still gets C-bump on markChannelRead ───
+test("markChannelRead_inactiveExistingRegister_performsCBump", () => {
+  const mgr = makeManager();
+  mgr.isLoadComplete = true;
+  // Inject an inactive register: S=1, C=2 (clear-wins: C > S → inactive).
+  const ctx = "inactive-ch";
+  mgr.overrideRegisters.set(ctx, { s: 1, c: 2, b: 0 });
+  mgr.publishableContextIds.add(ctx);
+  mgr.effectiveState.set(ctx, 100);
+
+  // Verify it is indeed inactive.
+  const livenessBefore = mgr.getOverrideLiveness(ctx);
+  assert.ok(livenessBefore !== null, "register must exist");
+  assert.equal(livenessBefore.active, false, "register must be inactive");
+
+  // markChannelRead must still perform the C-bump (spec NIP-RS.md:537-539).
+  const result = mgr.markChannelRead(ctx);
+  assert.equal(
+    result.success,
+    true,
+    "markChannelRead must succeed on inactive register",
+  );
+
+  const reg = mgr.overrideRegisters.get(ctx);
+  assert.ok(reg, "register must still exist after markChannelRead");
+  // newC = max(S=1, C=2) + 1 = 3
+  assert.equal(
+    reg.c,
+    3,
+    "C must be bumped to max(S,C)+1=3 even when already inactive",
+  );
+  assert.equal(reg.s, 1, "S must be unchanged");
+  mgr.destroy();
+});
+
+// ── Test 10: coordinate dedupe — newer version wins, older version dropped ────
+test("deduplicateByCoordinate_newerVersionWins_olderDropped", async () => {
+  const { deduplicateByCoordinate } = await import(
+    "./readStateFencedLoader.ts"
+  );
+  const pubkey = "de".repeat(32);
+  const dTag = "read-state:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+  const older = {
+    id: "b".repeat(64),
+    pubkey,
+    created_at: 1_000,
+    kind: 30078,
+    tags: [["d", dTag]],
+    content: "older",
+    sig: "s".repeat(128),
+  };
+  const newer = {
+    id: "a".repeat(64), // lower id — for tie-break test below
+    pubkey,
+    created_at: 2_000,
+    kind: 30078,
+    tags: [["d", dTag]],
+    content: "newer",
+    sig: "s".repeat(128),
+  };
+  const deduped = deduplicateByCoordinate([older, newer]);
+  assert.equal(deduped.length, 1, "dedup must yield one event");
+  assert.equal(deduped[0].content, "newer", "newer created_at must win");
+
+  // Tie-break: same created_at, lower id wins.
+  const tie1 = { ...older, created_at: 3_000, id: "c".repeat(64) };
+  const tie2 = { ...newer, created_at: 3_000, id: "a".repeat(64) };
+  const tieDuped = deduplicateByCoordinate([tie1, tie2]);
+  assert.equal(tieDuped.length, 1, "tie-break dedup must yield one event");
+  assert.equal(tieDuped[0].id, "a".repeat(64), "lower id must win on tie");
+});
+
+// ── Test 11: lapse mid-enumeration → incomplete ───────────────────────────────
+test("fetchAndMerge_lapseMidEnumeration_setsLoadIncomplete", async () => {
+  // Simulate a reconnect (generation change) after the first band is fetched.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "ef".repeat(32);
+  const event = makeFakeEvent(pubkey, 1000);
+  let generation = 0;
+  let reconnectCb = null;
+  const fakeRelay = {
+    fetchEvents: async (filter) => {
+      if (filter.since !== undefined) {
+        // Pinned window: simulate a reconnect BEFORE returning.
+        generation++;
+        reconnectCb?.(); // fire reconnect listener
+        return [event];
+      }
+      return [event]; // initial band
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: (cb) => {
+      reconnectCb = cb;
+      return () => {
+        reconnectCb = null;
+      };
+    },
+    getConnectionGeneration: () => generation,
+    subscribeLive: async (_f, _h) => () => {},
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    false,
+    "lapse during enumeration must produce incomplete load",
+  );
   mgr.destroy();
 });

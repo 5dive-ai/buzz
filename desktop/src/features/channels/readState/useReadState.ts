@@ -2,13 +2,20 @@ import * as React from "react";
 import {
   ReadStateManager,
   type ContextParentResolver,
+  type MarkResult,
 } from "@/features/channels/readState/readStateManager";
+import type { OverrideLiveness } from "@/features/channels/readState/readStateFormat";
 import type { RelayClient } from "@/shared/api/relayClientSession";
 
 const noopGetTimestamp = () => null;
 const noopMarkRead = () => {};
 const noopDrainAdvances = (): ReadonlySet<string> => new Set<string>();
 const noopSetResolver = () => {};
+const noopMarkOverride = (): MarkResult => ({
+  success: false,
+  reason: "load_incomplete",
+});
+const noopGetOverrideLiveness = (): OverrideLiveness | null => null;
 
 /**
  * React hook that creates and manages a ReadStateManager instance.
@@ -93,6 +100,35 @@ export function useReadState(
     [],
   );
 
+  // Override APIs for the NIP-RS manual-unread layer (slice 3 seam).
+  const markChannelUnread = React.useCallback(
+    (channelId: string): MarkResult => {
+      return (
+        managerRef.current?.markChannelUnread(channelId) ?? {
+          success: false,
+          reason: "load_incomplete",
+        }
+      );
+    },
+    [],
+  );
+
+  const markChannelRead = React.useCallback((channelId: string): MarkResult => {
+    return (
+      managerRef.current?.markChannelRead(channelId) ?? {
+        success: false,
+        reason: "load_incomplete",
+      }
+    );
+  }, []);
+
+  const getOverrideLiveness = React.useCallback(
+    (channelId: string): OverrideLiveness | null => {
+      return managerRef.current?.getOverrideLiveness(channelId) ?? null;
+    },
+    [],
+  );
+
   const isReady = Boolean(
     pubkey && relayClient && initializedPubkey === pubkey,
   );
@@ -107,6 +143,9 @@ export function useReadState(
       setContextParentResolver: noopSetResolver,
       readStateVersion: 0,
       getOwnTimestamp: noopGetTimestamp,
+      markChannelUnread: noopMarkOverride,
+      markChannelRead: noopMarkOverride,
+      getOverrideLiveness: noopGetOverrideLiveness,
     };
   }
 
@@ -119,5 +158,8 @@ export function useReadState(
     setContextParentResolver,
     readStateVersion,
     getOwnTimestamp,
+    markChannelUnread,
+    markChannelRead,
+    getOverrideLiveness,
   };
 }

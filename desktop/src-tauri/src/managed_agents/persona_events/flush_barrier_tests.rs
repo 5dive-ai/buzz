@@ -212,8 +212,8 @@ fn test_barrier_failure_resets_to_unready_for_retry() {
 // Scenario (reproduced deterministically using the process-global latch):
 //
 // 1. `spawn_event_sync` claims `InProgress` before reconcile starts.
-// 2. A flush tick fires and calls `claim_in_progress` (simulating
-//    run_boot_barrier's CAS entry). It is rejected — InProgress is taken.
+// 2. A flush tick fires and calls `claim_in_progress` (simulating the flush
+//    loop's CAS entry). It is rejected — InProgress is taken.
 // 3. Reconcile runs and retains a new row (publish_blocked=false).
 // 4. `run_boot_barrier_after_claim` runs the barrier: gates the stale row,
 //    then marks Ready.

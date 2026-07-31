@@ -376,8 +376,16 @@ pub async fn import_identity(
 
         // Enqueue the new owner's disk projections and run the boot barrier.
         // Without this, config publication silently stops until the next
-        // restart: the flush loop checks `is_ready_for(db_path)` against the
-        // OLD owner's scope, and the new owner's scope was never certified.
+        // restart: the flush loop checks `readiness_state()` against the
+        // active scope's db_path, and the new owner's scope was never certified.
+        //
+        // Force-claim BEFORE scope resolution: if resolution fails transiently,
+        // the stale Ready(old_path) latch must not survive — it would cause
+        // `flush_active_pending_events` to refuse every retry claim for the
+        // session (claim_in_progress rejects from any Ready state, including
+        // the wrong old-path one). Dropping the claim on failure leaves the
+        // latch Unready so the flush loop can retry with the full transition
+        // once scope resolution recovers.
         //
         // Mirrors `apply_workspace`'s force-claim sequence. The legacy-
         // migration step is skipped here: a stranded legacy row for the
@@ -387,13 +395,13 @@ pub async fn import_identity(
         // pubkey — so the reconcile below is necessary to queue the new
         // owner's disk projections for the new scope.
         {
+            let claim =
+                crate::managed_agents::config_sync_readiness::force_claim_in_progress();
             match crate::managed_agents::retention::active_retention_scope(
                 &app_handle,
                 &state,
             ) {
                 Ok(scope) => {
-                    let claim =
-                        crate::managed_agents::config_sync_readiness::force_claim_in_progress();
                     crate::event_sync::spawn_event_sync_with_held_claim(
                         app_handle.clone(),
                         scope.owner_keys,
@@ -403,6 +411,10 @@ pub async fn import_identity(
                 }
                 Err(e) => {
                     eprintln!("buzz-desktop: import-identity: scope unavailable, config barrier skipped: {e}");
+                    // Claim drops here via RAII → latch becomes Unready; the
+                    // flush loop will retry with the full transition once scope
+                    // resolves.
+                    drop(claim);
                 }
             }
         }

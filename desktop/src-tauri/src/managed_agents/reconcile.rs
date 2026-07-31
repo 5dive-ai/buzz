@@ -36,9 +36,7 @@ pub(crate) fn reconcile_agents_to_events(
     keys: &nostr::Keys,
     db_path: &Path,
 ) -> Result<(), String> {
-    let Ok(base_dir) = super::managed_agents_base_dir(app) else {
-        return Ok(());
-    };
+    let base_dir = super::managed_agents_base_dir(app)?;
 
     match reconcile_agents_in_dir_at(&base_dir, keys, db_path) {
         Ok(0) => Ok(()),
@@ -69,6 +67,17 @@ pub(crate) fn reconcile_agents_to_events(
 #[cfg(test)]
 pub(crate) fn reconcile_agents_in_dir(base_dir: &Path, keys: &nostr::Keys) -> Result<u32, String> {
     reconcile_agents_in_dir_at(base_dir, keys, &base_dir.join("retention.db"))
+}
+
+/// Test seam with an explicit `db_path`. Used by `event_sync::run_event_sync_in_dir`
+/// so tests can pass a controlled (including failing) db_path to all three reconcile legs.
+#[cfg(test)]
+pub(crate) fn reconcile_agents_in_dir_at_test(
+    base_dir: &Path,
+    keys: &nostr::Keys,
+    db_path: &Path,
+) -> Result<u32, String> {
+    reconcile_agents_in_dir_at(base_dir, keys, db_path)
 }
 
 fn reconcile_agents_in_dir_at(

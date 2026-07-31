@@ -251,9 +251,14 @@ async fn run_boot_barrier_for_scope(
     // Phase 4 — generation-gate the enforcement phase.
     //
     // `enforce_decision_pass` checks `claim.is_current()` while
-    // `managed_agents_store_lock` is held (i.e., right here), so the
-    // generation cannot change between the check and the `run_decision_pass`
-    // write below. A preempted barrier returns `Abandoned` without writing.
+    // `managed_agents_store_lock` is held (i.e., right here). Note: the store
+    // lock does NOT freeze the readiness generation — `force_claim_in_progress`
+    // takes only the separate readiness mutex, so it can advance the generation
+    // during this interval. The real invariant is: a force-claim that preempts
+    // after the check sets `InProgress` on the new generation and will run its
+    // own barrier (or a full flush retry will) to supply the final gate writes.
+    // A preempted barrier returns `Abandoned` without writing, which is safe
+    // because the new owner's barrier is the authoritative one.
     enforce_decision_pass(claim, &conn, &owner_pubkey, &states)
 }
 

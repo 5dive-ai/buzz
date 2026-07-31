@@ -381,3 +381,85 @@ fn test_reconcile_failure_retry_with_full_transition_certifies_and_enqueues() {
 
     config_sync_readiness::mark_unready(); // cleanup
 }
+
+// ── Base-dir failure propagates through run_event_sync ────────────────────────
+//
+// Thufir IMPORTANT#2 coverage: all three reconcile wrappers formerly returned
+// `Ok(())` when `managed_agents_base_dir` failed (via `let Ok(...) else { return Ok(()) }`).
+// The fix replaces that with `let base_dir = ...?`, making the failure propagate.
+//
+// This test drives `run_event_sync_in_dir` (the AppHandle-free seam) with a
+// `db_path` pointing inside a non-existent directory so SQLite cannot open it,
+// forcing the first leg to return `Err`. Proves:
+//   1. `run_event_sync_in_dir` returns `Err` — a real reconcile failure, not a
+//      manual `drop(claim)`.
+//   2. The claim does NOT call `complete` when the leg fails — scope stays
+//      `Unready` (claim drops via RAII when the caller observes `Err`).
+//   3. A subsequent full retry with a valid `db_path` enqueues the row.
+#[test]
+fn test_base_dir_failure_propagates_through_run_event_sync() {
+    use crate::managed_agents::{
+        config_sync_readiness::{self, ReadinessState},
+        retention::{get_retained_event, open_retention_db},
+    };
+    use buzz_core_pkg::kind::KIND_PERSONA;
+
+    config_sync_readiness::mark_unready();
+
+    let keys = nostr::Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let base = tempfile::tempdir().unwrap();
+    write_base_personas(base.path(), &one_persona());
+
+    // A db_path inside a non-existent directory — SQLite cannot open it.
+    let bad_db_path = base.path().join("nonexistent_subdir").join("retention.db");
+    // A valid db_path for the successful retry.
+    let good_db_path = base.path().join("retention.db");
+
+    // Step 1: claim InProgress, run reconcile with bad db_path — leg fails.
+    // The claim must NOT be completed (scope stays Unready via RAII drop).
+    {
+        let claim = config_sync_readiness::claim_in_progress().expect("must claim from Unready");
+
+        let result = run_event_sync_in_dir(base.path(), &keys, &bad_db_path);
+        assert!(
+            result.is_err(),
+            "run_event_sync_in_dir must return Err when a reconcile leg fails"
+        );
+
+        // Observe the error: claim drops here without complete() → Unready.
+        let _ = result;
+        drop(claim);
+    }
+    assert_eq!(
+        config_sync_readiness::readiness_state(),
+        Some(ReadinessState::Unready),
+        "a failed reconcile leg must leave scope Unready (not Ready)"
+    );
+
+    // Step 2: retry — full transition with valid db_path. The row must be queued.
+    {
+        let claim = config_sync_readiness::claim_in_progress()
+            .expect("Unready scope must allow retry claim");
+
+        run_event_sync_in_dir(base.path(), &keys, &good_db_path)
+            .expect("full retry with valid db_path must succeed");
+
+        claim.complete(good_db_path.clone());
+    }
+    assert!(
+        config_sync_readiness::is_ready_for(&good_db_path),
+        "full retry must certify Ready"
+    );
+
+    let conn = open_retention_db(&good_db_path).expect("open db");
+    let row = get_retained_event(&conn, KIND_PERSONA, &pubkey, "code-reviewer")
+        .expect("db query")
+        .expect("row must exist after successful retry");
+    assert!(
+        row.pending_sync,
+        "disk edit must be pending after successful full retry"
+    );
+
+    config_sync_readiness::mark_unready(); // cleanup
+}

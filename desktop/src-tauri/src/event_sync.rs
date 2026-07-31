@@ -119,9 +119,7 @@ pub fn migrate_personas_to_events(
 ) -> Result<(), String> {
     use crate::managed_agents::managed_agents_base_dir;
 
-    let Ok(base_dir) = managed_agents_base_dir(app) else {
-        return Ok(());
-    };
+    let base_dir = managed_agents_base_dir(app)?;
 
     match migrate_personas_in_dir_at(&base_dir, keys, db_path) {
         Ok(0) => Ok(()),
@@ -273,9 +271,7 @@ pub fn migrate_teams_to_events(
 ) -> Result<(), String> {
     use crate::managed_agents::managed_agents_base_dir;
 
-    let Ok(base_dir) = managed_agents_base_dir(app) else {
-        return Ok(());
-    };
+    let base_dir = managed_agents_base_dir(app)?;
 
     match migrate_teams_in_dir_at(&base_dir, keys, db_path) {
         Ok(0) => Ok(()),
@@ -374,6 +370,27 @@ fn migrate_teams_in_dir_at(
     }
 
     Ok(migrated)
+}
+
+/// Test seam: `run_event_sync` with an explicit `base_dir` instead of an
+/// `AppHandle`. Lets tests drive all three reconcile legs and the propagation
+/// of their `Result`s without a running Tauri application.
+///
+/// Used by `test_base_dir_failure_propagates_through_run_event_sync` to prove
+/// that a failing leg returns `Err`, the claim does NOT certify `Ready`, and
+/// a subsequent full retry enqueues the row.
+#[cfg(test)]
+pub(crate) fn run_event_sync_in_dir(
+    base_dir: &Path,
+    owner_keys: &nostr::Keys,
+    db_path: &Path,
+) -> Result<(), String> {
+    migrate_personas_in_dir_at(base_dir, owner_keys, db_path)?;
+    migrate_teams_in_dir_at(base_dir, owner_keys, db_path)?;
+    crate::managed_agents::reconcile::reconcile_agents_in_dir_at_test(
+        base_dir, owner_keys, db_path,
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

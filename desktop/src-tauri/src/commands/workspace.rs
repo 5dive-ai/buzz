@@ -215,15 +215,15 @@ pub async fn apply_workspace(
     // Backfill this exact relay+owner scope only after the workspace has been
     // applied. Running at process boot would target the fallback relay and
     // collapse every community into one pending-event store.
+    //
+    // Force-claim BEFORE scope resolution: if resolution fails transiently,
+    // the stale Ready(old_path) latch must not survive — it would cause
+    // `flush_active_pending_events` to refuse every retry claim for the session.
+    // Dropping the claim on failure leaves the latch Unready so the flush loop
+    // can claim and run the full transition once scope resolution recovers.
+    let claim = crate::managed_agents::config_sync_readiness::force_claim_in_progress();
     match crate::managed_agents::retention::active_retention_scope(&restore_app, &state) {
         Ok(scope) => {
-            // Preempt the readiness latch from any state (including a prior
-            // scope's Ready) and hold InProgress across the entire sequence:
-            // legacy migration → reconcile → barrier. This closes the window
-            // between the old mark_unready() and spawn_event_sync's inner CAS,
-            // during which the flush loop could win the claim and certify
-            // readiness against pre-migration, pre-reconcile database state.
-            let claim = crate::managed_agents::config_sync_readiness::force_claim_in_progress();
             // Adopt whatever the pre-scoping release left queued in the global
             // retention database BEFORE the scoped reconcile and flush run, so
             // stranded tombstones and archive requests publish on this boot
@@ -238,6 +238,9 @@ pub async fn apply_workspace(
         }
         Err(error) => {
             eprintln!("buzz-desktop: scoped event-sync unavailable after workspace apply: {error}");
+            // Claim drops here via RAII → latch becomes Unready; the flush
+            // loop will retry with the full transition once scope resolves.
+            drop(claim);
         }
     }
 

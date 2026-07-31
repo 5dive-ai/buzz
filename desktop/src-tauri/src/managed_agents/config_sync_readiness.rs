@@ -464,4 +464,56 @@ mod tests {
         drop(force_claim);
         assert_eq!(readiness_state(), Some(ReadinessState::Unready));
     }
+
+    // ── (i) force-claim before scope resolution: scope failure → Unready ─────
+    //
+    // Covers the Thufir IMPORTANT#1 fix: `force_claim_in_progress` runs BEFORE
+    // `active_retention_scope`. If scope resolution fails, the claim drops via
+    // RAII and the latch lands `Unready`. Without this fix, the stale
+    // `Ready(old_path)` would survive and `claim_in_progress` would reject every
+    // flush retry for the session (it only accepts from `Unready`).
+    //
+    // Scenario: scope A Ready → swap → scope resolution fails →
+    //   Unready (via RAII drop) → retry from flush loop wins claim →
+    //   full transition runs for scope B → Ready(B).
+    #[test]
+    fn test_scope_resolution_failure_after_force_claim_leaves_latch_unready_and_retryable() {
+        mark_unready();
+
+        let path_a = PathBuf::from("/scope/a.db");
+        let path_b = PathBuf::from("/scope/b.db");
+
+        // Scope A is Ready before the swap.
+        let claim_a = claim_in_progress().unwrap();
+        claim_a.complete(path_a.clone());
+        assert!(is_ready_for(&path_a), "scope A must be Ready before swap");
+
+        // Force-claim BEFORE scope resolution (the fix). Simulated scope
+        // resolution failure: drop the claim without calling complete().
+        {
+            let _claim = force_claim_in_progress();
+            // Scope resolution fails here — _claim drops via RAII.
+        }
+        assert_eq!(
+            readiness_state(),
+            Some(ReadinessState::Unready),
+            "scope failure after force_claim must leave latch Unready, not Ready(old_path)"
+        );
+        assert!(
+            !is_ready_for(&path_a),
+            "stale Ready(A) must not survive after force-claim + drop"
+        );
+
+        // The flush loop's Unready arm can now claim and run the full
+        // transition for scope B.
+        let retry_claim = claim_in_progress();
+        assert!(
+            retry_claim.is_some(),
+            "Unready latch must accept retry claim for scope B"
+        );
+        retry_claim.unwrap().complete(path_b.clone());
+        assert!(is_ready_for(&path_b), "full retry must certify Ready(B)");
+
+        mark_unready(); // cleanup
+    }
 }

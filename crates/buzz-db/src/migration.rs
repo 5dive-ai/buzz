@@ -348,6 +348,11 @@ mod tests {
             "push_gateway_delivery_request_replays",
             "product_feedback",
             "replica_heartbeat",
+            "community_deletion_requests",
+            "community_deletion_approvals",
+            "community_deletion_checkpoints",
+            "community_deletion_retention_exceptions",
+            "community_deletion_executor_heartbeats",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -919,6 +924,7 @@ mod tests {
         assert!(heartbeat.contains("epoch"));
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
+<<<<<<< HEAD
 
         // Channel-id lookup index (0027): serves the tenant-independent
         // `channels` lookups that carry no community_id predicate, which no
@@ -940,6 +946,23 @@ mod tests {
             desired_schema.contains("idx_channels_id_live"),
             "desired-state schema must carry the channel-id lookup index",
         );
+||||||| parent of d04e4b503 (feat: add durable community deletion worker)
+=======
+
+        // Durable whole-community deletion control plane and universal DB fence.
+        assert_eq!(migrations[26].version, 27);
+        let deletion = migrations[26].sql.as_str();
+        assert!(deletion.contains("CREATE TABLE community_deletion_requests"));
+        assert!(deletion.contains("CREATE TABLE community_deletion_approvals"));
+        assert!(deletion.contains("CREATE TABLE community_deletion_checkpoints"));
+        assert!(deletion.contains("CREATE TABLE community_deletion_retention_exceptions"));
+        assert!(deletion.contains("CREATE TABLE community_deletion_executor_heartbeats"));
+        assert!(deletion.contains("CREATE FUNCTION enforce_community_write_fence"));
+        assert!(deletion.contains("CREATE FUNCTION enforce_community_tombstone"));
+        assert!(deletion.contains("community tombstones are permanent"));
+        assert!(deletion.contains("_operator_global_tables"));
+        assert!(deletion.contains("'submitted', 'inventoried', 'approved', 'fenced', 'drained'"));
+>>>>>>> d04e4b503 (feat: add durable community deletion worker)
     }
 
     #[test]

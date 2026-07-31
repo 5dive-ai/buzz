@@ -69,11 +69,15 @@ struct PersistedPlaybackSettings {
     speed: f32,
 }
 
-/// Load the global playback speed during app setup.
-pub fn load_playback_speed(app: &AppHandle, control: &PlaybackSpeedControl) -> Result<(), String> {
-    let path = settings_path(app)?;
-    let speed = load_from_path(&path)?;
-    control.set(speed)
+/// Load the global playback speed during app setup. Logs and keeps the 1x
+/// default if no valid persisted setting exists.
+pub fn load_playback_speed(app: &AppHandle, control: &PlaybackSpeedControl) {
+    let result = settings_path(app)
+        .and_then(|path| load_from_path(&path))
+        .and_then(|speed| control.set(speed));
+    if let Err(error) = result {
+        eprintln!("buzz-desktop: failed to load TTS playback speed; using 1x: {error}");
+    }
 }
 
 /// Return the globally configured generated-speech playback speed.

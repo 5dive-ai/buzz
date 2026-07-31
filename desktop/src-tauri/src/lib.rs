@@ -4,9 +4,13 @@ mod archive;
 mod builderlab;
 mod commands;
 mod deep_link;
+mod egress_guard;
 mod event_sync;
 mod events;
 mod huddle;
+mod identity_storage;
+mod key_backup;
+mod linux_media;
 mod managed_agents;
 mod media_proxy;
 #[cfg(feature = "mesh-llm")]
@@ -28,6 +32,8 @@ mod reset;
 mod secret_store;
 mod shutdown;
 mod templates;
+#[cfg(target_os = "macos")]
+mod tray_menu;
 mod util;
 #[cfg(target_os = "linux")]
 pub mod webkit_rendering;
@@ -41,7 +47,6 @@ use deep_link::{
 use huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
 };
-use huddle::playback_speed::{get_tts_playback_speed, load_playback_speed, set_tts_playback_speed};
 use huddle::reconnect::reconnect_huddle_audio;
 use huddle::{
     add_agent_to_huddle, check_pipeline_hotstart, confirm_huddle_active, download_voice_models,
@@ -64,10 +69,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-#[cfg(target_os = "macos")]
-use tauri::Listener;
 use tauri::{Emitter, Manager, RunEvent};
+#[cfg(target_os = "macos")]
+use tauri::{Listener, WindowEvent};
 use tauri_plugin_window_state::StateFlags;
+#[cfg(target_os = "macos")]
+use tray_menu::show_main_window;
 
 #[cfg(target_os = "macos")]
 const INITIAL_RENDER_READY_EVENT: &str = "initial-render-ready";
@@ -195,6 +202,11 @@ pub fn run() {
                     if webview.label() != "main" {
                         return;
                     }
+
+                    // Linux/WebKitGTK needs media-stream settings and a
+                    // permission-request handler for getUserMedia; no-op
+                    // on macOS/Windows.
+                    linux_media::enable_media_capture(&webview);
 
                     // macOS applies the restored geometry asynchronously. Wait
                     // for several identical outer bounds and for React to
@@ -361,6 +373,8 @@ pub fn run() {
         .manage(commands::pairing::PairingHandle::new())
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            #[cfg(target_os = "macos")]
+            tray_menu::init(&app_handle)?;
 
             // ── Phase 2: boot-time sentinel wipe ──────────────────────────────
             // Must run before migrations and identity resolution so the wipe
@@ -403,9 +417,7 @@ pub fn run() {
             // that will be lost on restart, as that silently breaks channel
             // memberships, DMs, and relay identity.
             let state = app_handle.state::<AppState>();
-            if let Err(error) = load_playback_speed(&app_handle, &state.tts_playback_speed) {
-                eprintln!("buzz-desktop: failed to load TTS playback speed; using 1x: {error}");
-            }
+            huddle::playback_speed::load_playback_speed(&app_handle, &state.tts_playback_speed);
             if let Err(e) = resolve_persisted_identity(&app_handle, &state) {
                 eprintln!("buzz-desktop: fatal: identity resolution failed: {e}");
                 std::process::exit(1);
@@ -673,6 +685,10 @@ pub fn run() {
             title_bar_double_click,
             get_identity,
             get_nsec,
+            generate_backup_passphrase,
+            create_ncryptsec_backup,
+            verify_ncryptsec_backup,
+            save_ncryptsec_copy,
             import_identity,
             persist_current_identity,
             get_profile,
@@ -878,6 +894,8 @@ pub fn run() {
             huddle::tts_settings::list_voice_registry,
             huddle::tts_settings::set_pocket_voice,
             huddle::tts_settings::preview_pocket_voice,
+            huddle::tts_settings::import_pocket_voice,
+            huddle::tts_settings::delete_pocket_voice,
             speak_agent_message,
             add_agent_to_huddle,
             check_pipeline_hotstart,
@@ -889,8 +907,8 @@ pub fn run() {
             list_audio_output_devices,
             set_audio_output_device,
             get_audio_output_device,
-            get_tts_playback_speed,
-            set_tts_playback_speed,
+            huddle::playback_speed::get_tts_playback_speed,
+            huddle::playback_speed::set_tts_playback_speed,
             start_pairing,
             confirm_pairing_sas,
             cancel_pairing,
@@ -917,6 +935,14 @@ pub fn run() {
             archive::read_unindexed_observer_rows,
             is_auto_update_supported,
             set_window_vibrancy,
+            #[cfg(target_os = "macos")]
+            tray_menu::clear_tray_agent_activity,
+            #[cfg(target_os = "macos")]
+            tray_menu::requeue_tray_actions,
+            #[cfg(target_os = "macos")]
+            tray_menu::take_tray_actions,
+            #[cfg(target_os = "macos")]
+            tray_menu::update_tray_agent_activity,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -929,6 +955,22 @@ pub fn run() {
     let run_shutdown_done = Arc::clone(&shutdown_done);
     let restart_requested = Arc::new(AtomicBool::new(false));
     app.run(move |app_handle, event| match event {
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => show_main_window(app_handle),
+        #[cfg(target_os = "macos")]
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { api, .. },
+            ..
+        } if label == "main" => {
+            // Keep the webview alive so Buzz can be reopened from its tray menu.
+            api.prevent_close();
+            if let Some(window) = app_handle.get_webview_window("main") {
+                if let Err(error) = window.hide() {
+                    eprintln!("buzz-desktop: failed to hide main window: {error}");
+                }
+            }
+        }
         RunEvent::ExitRequested { code, .. } => {
             if is_restart_request(code) {
                 restart_requested.store(true, Ordering::SeqCst);

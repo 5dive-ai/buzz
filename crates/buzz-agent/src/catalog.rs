@@ -47,8 +47,10 @@ pub struct ModelEntry {
 /// Known Databricks AI Gateway v2 models — used as a fallback when the
 /// `api/ai-gateway/v2/endpoints` call returns an empty list.
 /// Mirrors goose's `DATABRICKS_V2_KNOWN_MODELS`.
-pub const DATABRICKS_V2_KNOWN_MODELS: &[&str] =
-    &["databricks-gpt-5-5", "databricks-claude-opus-4-7"];
+///
+/// Phase 2 cutover: this is now a re-export of the generated constant in
+/// `generated_model_capabilities`. Phase 3 removes the old hand-maintained list.
+pub use crate::generated_model_capabilities::DATABRICKS_V2_KNOWN_MODELS;
 
 /// Returns the discovery-failure fallback catalog for a Databricks provider.
 ///

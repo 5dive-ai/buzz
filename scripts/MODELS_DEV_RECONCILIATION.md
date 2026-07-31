@@ -1,7 +1,7 @@
 # models.dev Reasoning Options Reconciliation Table
 
-**Source queried**: https://models.dev/api.json (2026-07-31)  
-**Payload SHA-256**: `d5a4974cd69f19b0f67713acaa6bb3b16e920defdc07ecbdf6b0a936181bb0e0`  
+**Source queried**: https://models.dev/api.json (2026-07-31)<br>
+**Payload SHA-256**: `d5a4974cd69f19b0f67713acaa6bb3b16e920defdc07ecbdf6b0a936181bb0e0`<br>
 **Policy (plan v4 §Behavior policy)**: models.dev `reasoning_options` become exact overrides.
 Each divergence from the current family rule result is reconciled here: either (a) adopted as an
 intentional correction or (b) rejected with a curation note.
@@ -23,8 +23,8 @@ advertises only `[low, medium, high]` in its `reasoning_options`. The family rul
 `xhigh` are derived from the upstream OpenAI GPT-5.4 spec, which this Databricks endpoint does
 not expose. Provider-advertised wins per plan F1 policy.
 
-**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-gpt-5-4-mini"].reasoning_options = [{"type":"effort","values":["low","medium","high"]}]`  
-**Snapshot**: `scripts/catalog-sample-fixture.json` key `"databricks-gpt-5-4-mini"`  
+**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-gpt-5-4-mini"].reasoning_options = [{"type":"effort","values":["low","medium","high"]}]`<br>
+**Snapshot**: `scripts/catalog-sample-fixture.json` key `"databricks-gpt-5-4-mini"`<br>
 **Test vector**: `resolver-exact-raw-id-hit` in `scripts/normative-corpus.json`
 
 ---
@@ -38,7 +38,7 @@ not expose. Provider-advertised wins per plan F1 policy.
 **Rationale**: Same as `databricks-gpt-5-4-mini`. The nano variant exposes the same restricted
 effort set. Provider-advertised wins.
 
-**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-gpt-5-4-nano"].reasoning_options = [{"type":"effort","values":["low","medium","high"]}]`  
+**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-gpt-5-4-nano"].reasoning_options = [{"type":"effort","values":["low","medium","high"]}]`<br>
 **Snapshot**: `scripts/catalog-sample-fixture.json` key `"databricks-gpt-5-4-nano"`
 
 ---
@@ -54,7 +54,7 @@ effort set. Provider-advertised wins.
 derived from the upstream OpenAI GPT-5.6 spec, which this Databricks endpoint does not expose.
 Provider-advertised wins per plan F1 policy.
 
-**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-gpt-5-6-sol"].reasoning_options = [{"type":"effort","values":["low","medium","high","max"]}]`  
+**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-gpt-5-6-sol"].reasoning_options = [{"type":"effort","values":["low","medium","high","max"]}]`<br>
 **Snapshot**: `scripts/catalog-sample-fixture.json` key `"databricks-gpt-5-6-sol"`
 
 ---
@@ -70,7 +70,7 @@ Provider-advertised wins per plan F1 policy.
 derived from the upstream OpenAI GPT-5.5 spec, which this Databricks endpoint does not expose.
 Provider-advertised wins per plan F1 policy.
 
-**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-gpt-5-5"].reasoning_options = [{"type":"effort","values":["low","medium","high"]}]`  
+**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-gpt-5-5"].reasoning_options = [{"type":"effort","values":["low","medium","high"]}]`<br>
 **Snapshot**: `scripts/catalog-sample-fixture.json` key `"databricks-gpt-5-5"`
 
 ---
@@ -86,7 +86,7 @@ a different capability axis (extended thinking token budget), not an effort-leve
 There is no effort divergence to reconcile. The effort capabilities for this model come from the
 `anthropic-adaptive-xhigh-opus-4-7` family rule (Anthropic extended-thinking support table).
 
-**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-claude-opus-4-7"].reasoning_options = [{"type":"budget_tokens","min":1024}]`  
+**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-claude-opus-4-7"].reasoning_options = [{"type":"budget_tokens","min":1024}]`<br>
 **Snapshot**: `scripts/catalog-sample-fixture.json` key `"databricks-claude-opus-4-7"`
 
 ---

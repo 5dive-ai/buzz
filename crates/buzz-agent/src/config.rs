@@ -2738,6 +2738,69 @@ mod tests {
         }
     }
 
+    /// Phase-2 differential: new generated effort config matches old hand-coded helper
+    /// for every entry in effortTable.fixture.json. This gate ensures Phase 2 cutover
+    /// is behavior-preserving except where the allowlist explicitly covers a correction.
+    #[test]
+    fn effort_table_fixture_differential_old_vs_new() {
+        use crate::generated_model_capabilities::resolve_model_capabilities;
+
+        // Intentional corrections: models where the generated capability deliberately
+        // diverges from the old implementation. Each entry must cite its source.
+        //
+        // "databricks_v2/databricks-gpt-5-5": Phase 1 ADOPT — models.dev payload
+        //   d5a4974c advertises [low,medium,high]; old code returns [none,low,medium,high,xhigh].
+        //   Provider-advertised wins per plan F1.
+        // "databricks_v2/databricks-gpt-5-4-mini": Phase 1 ADOPT — models.dev advertises
+        //   [low,medium,high]; old code returns [none,low,medium,high,xhigh].
+        // "databricks_v2/databricks-gpt-5-4-nano": Phase 1 ADOPT — same as mini.
+        // "databricks_v2/databricks-gpt-5-6-sol": Phase 1 ADOPT — models.dev advertises
+        //   [low,medium,high,max]; old code returns [none,low,medium,high,xhigh,max].
+        let allowlist: &[(&str, &str)] = &[
+            ("databricks_v2", "databricks-gpt-5-5"),
+            ("databricks_v2", "databricks-gpt-5-4-mini"),
+            ("databricks_v2", "databricks-gpt-5-4-nano"),
+            ("databricks_v2", "databricks-gpt-5-6-sol"),
+        ];
+
+        let fixture_json =
+            include_str!("../../../desktop/src/features/agents/ui/effortTable.fixture.json");
+        let entries: Vec<FixtureEntry> =
+            serde_json::from_str(fixture_json).expect("fixture must be valid JSON");
+
+        for entry in &entries {
+            let label = entry.note.as_deref().unwrap_or(entry.model.as_str());
+            let in_allowlist = allowlist
+                .iter()
+                .any(|(p, m)| *p == entry.provider && *m == entry.model);
+
+            let old_result = valid_effort_values_for_provider_model(&entry.provider, &entry.model);
+
+            // Build new result from generated module.
+            let cap = resolve_model_capabilities(&entry.provider, &entry.model);
+            let new_values: Vec<&'static str> = cap
+                .supported_efforts
+                .iter()
+                .map(|e| e.openai_effort_str())
+                .collect();
+            let new_default: Option<&'static str> =
+                cap.default_effort.map(|e| e.openai_effort_str());
+            let new_result = (new_values, new_default);
+
+            if in_allowlist {
+                // Intentional divergence — skip equality check.
+                continue;
+            }
+
+            assert_eq!(
+                old_result, new_result,
+                "effort differential divergence for fixture entry \"{label}\" \
+                 (provider={}, model={}): old={old_result:?} new={new_result:?}",
+                entry.provider, entry.model,
+            );
+        }
+    }
+
     #[test]
     fn resolve_provider_openrouter_with_key() {
         assert_eq!(

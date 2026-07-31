@@ -1095,25 +1095,24 @@ fn is_responses_required_error(body: &str) -> bool {
         || b.contains("use the responses api")
 }
 
-/// OpenAI-family code names that appear as their own segment in a Databricks v2
-/// endpoint name (the GPT-5 launch aliases). The `gpt` family itself is matched
-/// separately by segment prefix so `gpt`, `gpt5`, and the `gpt` of a split
-/// `gpt-5` all qualify.
-const DATABRICKS_V2_OPENAI_CODE_NAMES: &[&str] = &["sol", "luna", "terra"];
+/// OpenAI-family code names used by the OLD segment-based route classifier.
+/// Preserved for the Phase-2 differential harness and Phase-3 cleanup.
+/// Production routing now delegates to `resolve_model_capabilities` (see
+/// `databricks_v2_route_for_model` below).
+#[cfg(test)]
+const _OLD_DATABRICKS_V2_OPENAI_CODE_NAMES: &[&str] = &["sol", "luna", "terra"];
 
-/// Anthropic (Claude) family and release code names that appear as their own
-/// segment in a Databricks v2 endpoint name — the `claude` prefix, the family
-/// names (`opus`, `sonnet`, `haiku`), and the release code names (`mythos`,
-/// `fable`). Getting a Claude model onto the Anthropic Messages route is what
-/// lets it carry a `cache_control` breakpoint; an endpoint that matches none of
-/// these falls through to the MLflow (OpenAI-wire) path, where Anthropic prompt
-/// caching is structurally impossible and the discount is silently lost.
-const DATABRICKS_V2_CLAUDE_NAMES: &[&str] =
+/// Anthropic (Claude) family and release code names used by the OLD classifier.
+/// Preserved for the Phase-2 differential harness and Phase-3 cleanup.
+#[cfg(test)]
+const _OLD_DATABRICKS_V2_CLAUDE_NAMES: &[&str] =
     &["claude", "opus", "sonnet", "haiku", "mythos", "fable"];
 
 /// Split a Databricks v2 endpoint name into its lowercase alphanumeric segments,
 /// breaking on any non-alphanumeric delimiter (`-`, `_`, `.`, `/`, …). E.g.
 /// `Databricks-Claude-Opus-5` -> `["databricks", "claude", "opus", "5"]`.
+/// Used by the old classifier (differential harness). Phase 3 removes this.
+#[cfg(test)]
 fn model_name_segments(model: &str) -> Vec<String> {
     model
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -1122,29 +1121,45 @@ fn model_name_segments(model: &str) -> Vec<String> {
         .collect()
 }
 
-fn databricks_v2_route_for_model(model: &str) -> DatabricksV2Route {
-    // The v2 catalog exposes no family field, so the wire format is inferred
-    // from the endpoint name. Discovery deliberately keeps arbitrary custom
-    // aliases, so we match whole name *segments* rather than raw substrings: a
-    // substring test would misroute unrelated names — `consolidated-llama`
-    // (`sol`), `terraform-coder` (`terra`), `corpus-reranker`/`octopus-model`
-    // (`opus`) — onto a wire whose request shape their backend can't parse,
-    // turning a caching optimization into a hard request/parse failure. Segment
-    // matching still accepts real prefixed names like `goose-opus-5`.
+/// OLD segment-based route classifier — preserved for the Phase-2 differential
+/// harness. Production routing now delegates to `databricks_v2_route_for_model`.
+/// Phase 3 removes this function.
+#[cfg(test)]
+fn _old_databricks_v2_route_for_model(model: &str) -> DatabricksV2Route {
     let segments = model_name_segments(model);
     let has_named_segment =
         |names: &[&str]| segments.iter().any(|seg| names.contains(&seg.as_str()));
-    // `gpt` family: any segment beginning with `gpt` — covers `gpt`, `gpt5`, and
-    // the `gpt` segment of a split `gpt-5`, without matching mid-word.
     let is_gpt_family = segments.iter().any(|seg| seg.starts_with("gpt"));
-    // OpenAI is checked before Claude so a name carrying both markers resolves
-    // to the OpenAI wire (preserving the prior `gpt-5`-first precedence).
-    if is_gpt_family || has_named_segment(DATABRICKS_V2_OPENAI_CODE_NAMES) {
+    if is_gpt_family || has_named_segment(_OLD_DATABRICKS_V2_OPENAI_CODE_NAMES) {
         DatabricksV2Route::OpenAiResponses
-    } else if has_named_segment(DATABRICKS_V2_CLAUDE_NAMES) {
+    } else if has_named_segment(_OLD_DATABRICKS_V2_CLAUDE_NAMES) {
         DatabricksV2Route::AnthropicMessages
     } else {
         DatabricksV2Route::MlflowChatCompletions
+    }
+}
+
+/// Returns the Databricks v2 wire route for a model name.
+///
+/// Phase 2 cutover: delegates to `resolve_model_capabilities` from the generated
+/// capability module. The generated resolver uses the same segment-based matching
+/// logic, now derived from the manifest single source of truth.
+///
+/// `RouteUnknown` (blank model) and `NotApplicable` (non-DBv2 provider) are not
+/// reachable here — this function is only called for DBv2 requests with an
+/// effective model string — both map to `MlflowChatCompletions` as a safe fallback.
+fn databricks_v2_route_for_model(model: &str) -> DatabricksV2Route {
+    use crate::generated_model_capabilities::{
+        resolve_model_capabilities, DatabricksV2Route as GenRoute,
+    };
+    match resolve_model_capabilities("databricks_v2", model).databricks_v2_wire_route {
+        GenRoute::OpenAiResponses => DatabricksV2Route::OpenAiResponses,
+        GenRoute::AnthropicMessages => DatabricksV2Route::AnthropicMessages,
+        // RouteUnknown (blank model) and NotApplicable (non-DBv2) are structurally
+        // unreachable from this call site; fall through to the mlflow path.
+        GenRoute::MlflowChatCompletions | GenRoute::RouteUnknown | GenRoute::NotApplicable => {
+            DatabricksV2Route::MlflowChatCompletions
+        }
     }
 }
 
@@ -3332,6 +3347,51 @@ mod tests {
             let got = databricks_v2_route_for_model(model);
             assert_eq!(got, route, "model={model}");
             assert_eq!(databricks_v2_path(got), path, "model={model}");
+        }
+    }
+
+    /// Phase-2 differential: new generated route matches old segment-based route
+    /// for all models in the existing test suite. Documents where they agree and
+    /// flags unexpected divergence. Any intentional divergence must be added to
+    /// the allowlist in this test.
+    #[test]
+    fn databricks_v2_route_differential_old_vs_new() {
+        // Models where old and new are intentionally expected to differ.
+        // (Empty: the generated manifest uses identical segment logic.)
+        let allowlist: &[&str] = &[];
+
+        for model in [
+            "databricks-gpt-5-5",
+            "gpt-4o",
+            "gpt5",
+            "databricks-gpt-5-6-luna",
+            "databricks-gpt-5-6-sol",
+            "databricks-terra",
+            "databricks-claude-opus-4-7",
+            "goose-opus-5",
+            "databricks-sonnet-5",
+            "databricks-haiku-4-5",
+            "databricks-mythos-5",
+            "databricks-fable-5",
+            "Databricks-Claude-Opus-5",
+            "custom-tool-model",
+            "databricks-gemini-3-pro",
+            "consolidated-llama",
+            "terraform-coder",
+            "corpus-reranker",
+            "octopus-model",
+            "",
+        ] {
+            let old_route = _old_databricks_v2_route_for_model(model);
+            let new_route = databricks_v2_route_for_model(model);
+            if allowlist.contains(&model) {
+                // Intentional divergence — just document, don't assert equality.
+                continue;
+            }
+            assert_eq!(
+                old_route, new_route,
+                "route divergence for model={model:?}: old={old_route:?} new={new_route:?}"
+            );
         }
     }
 

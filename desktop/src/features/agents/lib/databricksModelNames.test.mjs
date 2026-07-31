@@ -198,7 +198,7 @@ test("ModelPicker — discovered rows render through resolveModelLabel", () => {
 
   assert.match(
     source,
-    /<DropdownMenuRadioItem[\s\S]*?\{resolveModelLabel\(model\.id, model\.name\)\}/,
-    "dropdown rows must resolve labels through resolveModelLabel, not raw model.name/model.id",
+    /<DropdownMenuRadioItem[\s\S]*?\{resolveModelLabel\(model\.id, model\.name, agent\.provider\)\}/,
+    "dropdown rows must resolve labels through resolveModelLabel with provider, not raw model.name/model.id",
   );
 });

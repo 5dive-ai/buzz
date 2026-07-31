@@ -84,9 +84,9 @@ export function ModelPicker({
 
   const currentValue = agent.model ?? modelsData?.agentDefaultModel ?? "";
   const displayLabel = agent.model
-    ? resolveModelLabel(agent.model)
+    ? resolveModelLabel(agent.model, null, agent.provider)
     : modelsData?.agentDefaultModel
-      ? `${resolveModelLabel(modelsData.agentDefaultModel)} (default)`
+      ? `${resolveModelLabel(modelsData.agentDefaultModel, null, agent.provider)} (default)`
       : hasRequestedModels && loading
         ? "Loading..."
         : "Auto";
@@ -223,7 +223,7 @@ export function ModelPicker({
               {agent.model ? (
                 <>
                   <p className="font-medium text-foreground">
-                    {resolveModelLabel(agent.model)}
+                    {resolveModelLabel(agent.model, null, agent.provider)}
                   </p>
                   <p className="mt-0.5 text-xs">
                     This runtime does not support switching models.
@@ -240,7 +240,7 @@ export function ModelPicker({
             >
               {modelsData.models.map((model) => (
                 <DropdownMenuRadioItem key={model.id} value={model.id}>
-                  {resolveModelLabel(model.id, model.name)}
+                  {resolveModelLabel(model.id, model.name, agent.provider)}
                 </DropdownMenuRadioItem>
               ))}
             </DropdownMenuRadioGroup>

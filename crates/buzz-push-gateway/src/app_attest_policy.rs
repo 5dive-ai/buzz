@@ -3,6 +3,23 @@
 use crate::app_attest::{
     AppAttestError, AppAttestVerifier, VerifiedAssertion, VerifiedAttestation,
 };
+#[cfg(feature = "dev-app-attest-bypass")]
+#[derive(Clone)]
+pub struct DevelopmentAppAttestPolicy {
+    _private: (),
+}
+
+#[cfg(feature = "dev-app-attest-bypass")]
+pub struct DevelopmentAppAttestBypass {
+    _private: (),
+}
+
+#[cfg(feature = "dev-app-attest-bypass")]
+impl DevelopmentAppAttestBypass {
+    pub(crate) fn enabled() -> Self {
+        Self { _private: () }
+    }
+}
 
 #[cfg_attr(
     not(feature = "dev-app-attest-bypass"),
@@ -20,7 +37,7 @@ let _ = AppAttestPolicy::Development;
 pub enum AppAttestPolicy {
     Apple(AppAttestVerifier),
     #[cfg(feature = "dev-app-attest-bypass")]
-    Development,
+    Development(DevelopmentAppAttestPolicy),
 }
 
 impl AppAttestPolicy {
@@ -29,8 +46,23 @@ impl AppAttestPolicy {
     }
 
     #[cfg(feature = "dev-app-attest-bypass")]
-    pub fn development() -> Self {
-        Self::Development
+    pub fn from_config(
+        bypass: Option<DevelopmentAppAttestBypass>,
+        apple: AppAttestVerifier,
+    ) -> Self {
+        if bypass.is_some() {
+            tracing::warn!(
+                "DEVELOPMENT APP ATTEST BYPASS ACTIVE; Apple attestation and assertion verification are disabled"
+            );
+            Self::development()
+        } else {
+            Self::apple(apple)
+        }
+    }
+
+    #[cfg(feature = "dev-app-attest-bypass")]
+    fn development() -> Self {
+        Self::Development(DevelopmentAppAttestPolicy { _private: () })
     }
 
     pub fn verify_attestation(
@@ -44,7 +76,7 @@ impl AppAttestPolicy {
                 verifier.verify_attestation(attestation_b64, key_id_b64, client_data)
             }
             #[cfg(feature = "dev-app-attest-bypass")]
-            Self::Development => {
+            Self::Development(_) => {
                 crate::dev_app_attest::verify_attestation(attestation_b64, key_id_b64, client_data)
             }
         }
@@ -69,7 +101,7 @@ impl AppAttestPolicy {
                 stored_challenge,
             ),
             #[cfg(feature = "dev-app-attest-bypass")]
-            Self::Development => crate::dev_app_attest::verify_assertion(
+            Self::Development(_) => crate::dev_app_attest::verify_assertion(
                 assertion_b64,
                 client_data,
                 public_key,

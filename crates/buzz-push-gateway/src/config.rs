@@ -1,3 +1,5 @@
+#[cfg(feature = "dev-app-attest-bypass")]
+use crate::app_attest_policy::DevelopmentAppAttestBypass;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::{
     collections::{HashMap, HashSet},
@@ -76,6 +78,12 @@ fn parse_keyring(
     Ok(keys)
 }
 impl Config {
+    #[cfg(feature = "dev-app-attest-bypass")]
+    pub fn dev_app_attest_bypass(&self) -> Option<DevelopmentAppAttestBypass> {
+        self.dev_app_attest_bypass
+            .then(DevelopmentAppAttestBypass::enabled)
+    }
+
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_map(&std::env::vars().collect())
     }
@@ -206,6 +214,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "dev-app-attest-bypass")]
+    use crate::app_attest_policy::AppAttestPolicy;
 
     fn base() -> HashMap<String, String> {
         HashMap::from([
@@ -440,6 +450,34 @@ mod tests {
             "buzz-ios-sandbox".into(),
         );
         assert!(Config::from_map(&env).unwrap().dev_app_attest_bypass);
+    }
+
+    #[cfg(feature = "dev-app-attest-bypass")]
+    #[test]
+    fn dev_app_attest_bypass_selects_development_policy_from_validated_config() {
+        let mut env = base();
+        env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+        env.insert(
+            "BUZZ_PUSH_ENABLED_PROFILES".into(),
+            "buzz-ios-sandbox".into(),
+        );
+        let config = Config::from_map(&env).unwrap();
+        let apple = crate::app_attest::AppAttestVerifier::for_policy_test();
+
+        let policy = AppAttestPolicy::from_config(config.dev_app_attest_bypass(), apple);
+
+        assert!(matches!(policy, AppAttestPolicy::Development(_)));
+    }
+
+    #[cfg(feature = "dev-app-attest-bypass")]
+    #[test]
+    fn disabled_bypass_selects_apple_policy() {
+        let config = Config::from_map(&base()).unwrap();
+        let apple = crate::app_attest::AppAttestVerifier::for_policy_test();
+
+        let policy = AppAttestPolicy::from_config(config.dev_app_attest_bypass(), apple);
+
+        assert!(matches!(policy, AppAttestPolicy::Apple(_)));
     }
 
     #[test]

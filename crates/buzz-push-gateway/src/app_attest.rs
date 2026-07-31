@@ -45,6 +45,14 @@ impl AppAttestVerifier {
             apple_root_cert_pem,
         })
     }
+    #[cfg(all(test, feature = "dev-app-attest-bypass"))]
+    pub(crate) fn for_policy_test() -> Self {
+        Self {
+            app_id: "policy-test".to_owned(),
+            apple_root_cert_pem: Vec::new(),
+        }
+    }
+
     /// `client_data` is the exact canonical enrollment transcript represented by
     /// the challenge string passed to `attestKey`; callers must include every
     /// authority-bearing enrollment field in it.

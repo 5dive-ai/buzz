@@ -35,6 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let c = Config::from_env()?;
+    #[cfg(feature = "dev-app-attest-bypass")]
+    let dev_app_attest_bypass = c.dev_app_attest_bypass();
     let metrics_handle = buzz_push_gateway::metrics::install()?;
     let transport = Arc::new(ApnsTransport::certificate(
         &fs::read(&c.apns_cert_path)?,
@@ -76,17 +78,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    let apple_app_attest =
-        AppAttestVerifier::new(c.app_attest_app_id, fs::read(&c.app_attest_root_cert_path)?)?;
+    let apple_app_attest = AppAttestVerifier::new(
+        c.app_attest_app_id.clone(),
+        fs::read(&c.app_attest_root_cert_path)?,
+    )?;
     #[cfg(feature = "dev-app-attest-bypass")]
-    let app_attest = if c.dev_app_attest_bypass {
-        tracing::warn!(
-            "DEVELOPMENT APP ATTEST BYPASS ACTIVE; Apple attestation and assertion verification are disabled"
-        );
-        Arc::new(AppAttestPolicy::development())
-    } else {
-        Arc::new(AppAttestPolicy::apple(apple_app_attest))
-    };
+    let app_attest = Arc::new(AppAttestPolicy::from_config(
+        dev_app_attest_bypass,
+        apple_app_attest,
+    ));
     #[cfg(not(feature = "dev-app-attest-bypass"))]
     let app_attest = Arc::new(AppAttestPolicy::apple(apple_app_attest));
     let accepting = Arc::new(AtomicBool::new(true));

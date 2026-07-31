@@ -66,11 +66,7 @@ import {
   MODEL_DISCOVERY_LOADING_VALUE,
   usePersonaModelDiscovery,
 } from "./usePersonaModelDiscovery";
-import {
-  useAgentAccessOwnerOnlyQuery,
-  useBakedBuildEnvKeysQuery,
-  useRuntimeFileConfigQuery,
-} from "../hooks";
+import { useBakedBuildEnvKeysQuery, useRuntimeFileConfigQuery } from "../hooks";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AgentHarnessField } from "./AgentHarnessField";
@@ -429,9 +425,6 @@ export function AgentDefinitionDialog({
     setModel(nextPair.model);
   }
   const { data: bakedEnvKeys } = useBakedBuildEnvKeysQuery({ enabled: open });
-  const { data: agentAccessOwnerOnly } = useAgentAccessOwnerOnlyQuery({
-    enabled: open,
-  });
   const localModeGate = React.useMemo(
     () =>
       computeLocalModeGate({
@@ -1025,7 +1018,6 @@ export function AgentDefinitionDialog({
                       hiddenEnvKeys={
                         topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []
                       }
-                      agentAccessOwnerOnly={agentAccessOwnerOnly === true}
                       inheritedEnvVars={inheritedEnvVarsForAdvanced}
                       model={model}
                       modelTuningRuntimeId={runtime}

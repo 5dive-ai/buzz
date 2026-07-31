@@ -2,6 +2,51 @@
 
 use std::path::PathBuf;
 
+use super::super::{ManagedAgentRecord, RespondTo};
+
+pub(crate) type RespondToEnv = (Vec<(&'static str, String)>, Vec<&'static str>);
+
+pub(crate) fn build_respond_to_env_with_policy(
+    record: &ManagedAgentRecord,
+    owner_hex: Option<&str>,
+    enforced_owner_only: bool,
+) -> Result<RespondToEnv, String> {
+    let respond_to = if enforced_owner_only {
+        RespondTo::OwnerOnly
+    } else {
+        record.respond_to
+    };
+    let normalized = if enforced_owner_only {
+        Vec::new()
+    } else {
+        super::super::validate_respond_to_allowlist(&record.respond_to_allowlist)?
+    };
+    if respond_to == RespondTo::Allowlist && normalized.is_empty() {
+        return Err(
+            "respond-to mode 'allowlist' requires at least one pubkey in the allowlist".to_string(),
+        );
+    }
+
+    let mut set = vec![("BUZZ_ACP_RESPOND_TO", respond_to.as_str().to_string())];
+    let mut remove = Vec::new();
+    if respond_to == RespondTo::Allowlist {
+        set.push(("BUZZ_ACP_RESPOND_TO_ALLOWLIST", normalized.join(",")));
+    } else {
+        remove.push("BUZZ_ACP_RESPOND_TO_ALLOWLIST");
+    }
+
+    if record.auth_tag.is_none() {
+        if let Some(owner) = owner_hex {
+            set.push(("BUZZ_ACP_AGENT_OWNER", owner.to_string()));
+        } else {
+            remove.push("BUZZ_ACP_AGENT_OWNER");
+        }
+    } else {
+        remove.push("BUZZ_ACP_AGENT_OWNER");
+    }
+    Ok((set, remove))
+}
+
 /// Return `true` when `path` is a Windows batch shim (`.cmd` or `.bat`,
 /// case-insensitive) that cannot be passed directly to `CreateProcess`.
 ///

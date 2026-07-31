@@ -73,7 +73,7 @@ const RESPOND_TO_OPTIONS: PersonaDropdownOption[] = [
 ];
 
 export const INTERNAL_AGENT_ACCESS_DISABLED_REASON =
-  "This build limits local agents to messages from you, so the access level cannot be changed.";
+  "This build limits agents to messages from you, so the access level cannot be changed.";
 
 export function CreateAgentRespondToField({
   mode,

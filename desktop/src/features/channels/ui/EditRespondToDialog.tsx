@@ -34,8 +34,7 @@ export function EditRespondToDialog({
   const { data: agentAccessOwnerOnly } = useAgentAccessOwnerOnlyQuery({
     enabled: open,
   });
-  const accessLocked =
-    agentAccessOwnerOnly === true && agent?.backend.type === "local";
+  const accessLocked = agentAccessOwnerOnly === true;
   const [respondTo, setRespondTo] = React.useState<RespondToMode>("owner-only");
   const [respondToAllowlist, setRespondToAllowlist] = React.useState<string[]>(
     [],

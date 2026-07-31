@@ -1,3 +1,4 @@
+import { useAgentAccessOwnerOnlyQuery } from "../hooks";
 import { Input } from "@/shared/ui/input";
 import { cn } from "@/shared/lib/cn";
 import { EnvVarsEditor, type EnvVarsValue } from "./EnvVarsEditor";
@@ -29,7 +30,6 @@ export function PersonaAdvancedFields({
   requiredEnvKeys = [],
   fileSatisfiedEnvKeys = [],
   hiddenEnvKeys = [],
-  agentAccessOwnerOnly = false,
 }: {
   behaviorDraft: PersonaBehaviorDraft;
   disabled: boolean;
@@ -50,8 +50,8 @@ export function PersonaAdvancedFields({
   requiredEnvKeys?: readonly string[];
   fileSatisfiedEnvKeys?: readonly string[];
   hiddenEnvKeys?: readonly string[];
-  agentAccessOwnerOnly?: boolean;
 }) {
+  const { data: agentAccessOwnerOnly = false } = useAgentAccessOwnerOnlyQuery();
   const respondToMode = agentAccessOwnerOnly
     ? "owner-only"
     : (behaviorDraft.respondTo ?? "owner-only");

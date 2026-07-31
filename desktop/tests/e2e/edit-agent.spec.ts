@@ -89,7 +89,7 @@ test.describe("agent definition dialog", () => {
     await page.goto("/");
     await page.getByTestId("open-agents-view").click();
     await page.getByTestId("new-agent-card").click();
-    await page.getByRole("menuitem", { name: "Create from scratch" }).click();
+    await page.getByRole("menuitem", { name: "Create agent" }).click();
 
     const dialog = page.getByRole("dialog");
     await dialog.getByRole("button", { name: "Advanced", exact: true }).click();
@@ -102,7 +102,7 @@ test.describe("agent definition dialog", () => {
     await expect(
       dialog.getByTestId("agent-respond-to-disabled-reason"),
     ).toHaveText(
-      "This build limits local agents to messages from you, so the access level cannot be changed.",
+      "This build limits agents to messages from you, so the access level cannot be changed.",
     );
   });
 });
@@ -136,7 +136,7 @@ test.describe("edit agent dialog", () => {
     await expect(
       page.getByTestId("agent-respond-to-disabled-reason"),
     ).toHaveText(
-      "This build limits local agents to messages from you, so the access level cannot be changed.",
+      "This build limits agents to messages from you, so the access level cannot be changed.",
     );
   });
 

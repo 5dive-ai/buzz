@@ -266,7 +266,7 @@ export function welcomeTeammateHasExpectedAccess(
   leadPubkey: string,
   agentAccessOwnerOnly: boolean,
 ) {
-  if (agentAccessOwnerOnly && teammate.backend.type === "local") {
+  if (agentAccessOwnerOnly) {
     return (
       teammate.respondTo === "owner-only" &&
       teammate.respondToAllowlist.length === 0

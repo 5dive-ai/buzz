@@ -586,7 +586,6 @@ pub async fn create_managed_agent(
 
     let (requested_respond_to, respond_to_allowlist) =
         crate::managed_agents::resolve_create_access(
-            &input.backend,
             input.respond_to,
             &input.respond_to_allowlist,
         )?;

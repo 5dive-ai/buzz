@@ -1042,21 +1042,16 @@ export async function getRuntimeFileConfig(
 /**
  * Return the key names of all non-empty baked build env vars.
  *
- * Internal (Block) builds bake provider credentials into the binary at compile
- * time. This returns the *key names only* — never the values — so dialogs can
+ * Internal (Block) builds bake provider credentials into the binary. This returns
+ * only the key names, never the values, so dialogs can
  * treat them as satisfied without exposing secrets to the frontend.
  *
- * OSS builds return an empty array (no baked env).
  */
 export async function getBakedBuildEnvKeys(): Promise<string[]> {
   return invokeTauri<string[]>("get_baked_build_env_keys");
 }
-
-/** Return whether this build forces managed-agent access to owner-only. */
-export async function getAgentAccessOwnerOnly(): Promise<boolean> {
-  return invokeTauri<boolean>("agent_access_owner_only");
-}
-
+export const getAgentAccessOwnerOnly = () =>
+  invokeTauri<boolean>("agent_access_owner_only");
 /**
  * A single baked build env entry.
  *

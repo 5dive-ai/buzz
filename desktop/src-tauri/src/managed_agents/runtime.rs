@@ -16,9 +16,10 @@ use crate::{
 
 mod path;
 pub(in crate::managed_agents) use path::build_augmented_path;
-pub(crate) use path::compose_path_entries;
-pub(crate) use path::should_skip_claude_executable;
-pub(crate) use path::should_use_inherited;
+pub(crate) use path::{
+    build_respond_to_env_with_policy, compose_path_entries, should_skip_claude_executable,
+    should_use_inherited, RespondToEnv,
+};
 
 mod metadata;
 pub(crate) use metadata::{
@@ -32,8 +33,6 @@ pub use stop::{stop_managed_agent_process, stop_managed_agent_workspace_pair};
 
 mod sweep;
 pub(crate) use sweep::sweep_untracked_bundle_harnesses;
-
-type RespondToEnv = (Vec<(&'static str, String)>, Vec<&'static str>);
 
 mod process;
 #[cfg(test)]
@@ -297,6 +296,7 @@ pub fn build_managed_agent_summary(
         .unwrap_or("")
         .to_string();
 
+    let owner_only = super::owner_only();
     Ok(ManagedAgentSummary {
         pubkey: record.pubkey.clone(),
         name: record.name.clone(),
@@ -336,12 +336,12 @@ pub fn build_managed_agent_summary(
         start_on_app_launch: record.start_on_app_launch,
         auto_restart_on_config_change: record.auto_restart_on_config_change,
         log_path,
-        respond_to: if super::owner_only_for_backend(&record.backend) {
+        respond_to: if owner_only {
             super::types::RespondTo::OwnerOnly
         } else {
             record.respond_to
         },
-        respond_to_allowlist: if super::owner_only_for_backend(&record.backend) {
+        respond_to_allowlist: if owner_only {
             Vec::new()
         } else {
             record.respond_to_allowlist.clone()
@@ -389,63 +389,7 @@ pub(crate) fn build_respond_to_env(
     record: &ManagedAgentRecord,
     owner_hex: Option<&str>,
 ) -> Result<RespondToEnv, String> {
-    build_respond_to_env_with_policy(
-        record,
-        owner_hex,
-        super::owner_only_for_backend(&record.backend),
-    )
-}
-
-fn build_respond_to_env_with_policy(
-    record: &ManagedAgentRecord,
-    owner_hex: Option<&str>,
-    enforced_owner_only: bool,
-) -> Result<RespondToEnv, String> {
-    let respond_to = if enforced_owner_only {
-        super::types::RespondTo::OwnerOnly
-    } else {
-        record.respond_to
-    };
-
-    // Defensive re-validation: an on-disk record could have been hand-edited.
-    let normalized = if enforced_owner_only {
-        Vec::new()
-    } else {
-        super::types::validate_respond_to_allowlist(&record.respond_to_allowlist)?
-    };
-    if respond_to == super::types::RespondTo::Allowlist && normalized.is_empty() {
-        return Err(
-            "respond-to mode 'allowlist' requires at least one pubkey in the allowlist".to_string(),
-        );
-    }
-
-    let mut set: Vec<(&'static str, String)> = Vec::new();
-    let mut remove: Vec<&'static str> = Vec::new();
-
-    set.push(("BUZZ_ACP_RESPOND_TO", respond_to.as_str().to_string()));
-
-    if respond_to == super::types::RespondTo::Allowlist {
-        set.push(("BUZZ_ACP_RESPOND_TO_ALLOWLIST", normalized.join(",")));
-    } else {
-        remove.push("BUZZ_ACP_RESPOND_TO_ALLOWLIST");
-    }
-
-    // Legacy fallback: agents created before NIP-OA lack `auth_tag`. Without
-    // it the harness can't resolve the owner, and owner-dependent gate modes
-    // would drop every event. Forwarding the workspace owner pubkey via
-    // BUZZ_ACP_AGENT_OWNER keeps those records functional. Modern records
-    // (`auth_tag = Some(...)`) use `BUZZ_AUTH_TAG` as before.
-    if record.auth_tag.is_none() {
-        if let Some(owner) = owner_hex {
-            set.push(("BUZZ_ACP_AGENT_OWNER", owner.to_string()));
-        } else {
-            remove.push("BUZZ_ACP_AGENT_OWNER");
-        }
-    } else {
-        remove.push("BUZZ_ACP_AGENT_OWNER");
-    }
-
-    Ok((set, remove))
+    build_respond_to_env_with_policy(record, owner_hex, super::owner_only())
 }
 
 pub(crate) fn configure_runtime_cli(

@@ -390,23 +390,12 @@ test("internal local Welcome teammates accept enforced owner-only access", () =>
   assert.equal(welcomeTeammateHasExpectedAccess(teammate, PUB_B, false), false);
 });
 
-test("provider Welcome teammates still require the lead allowlist", () => {
+test("internal provider Welcome teammates accept enforced owner-only access", () => {
   const teammate = makeAgent({
     backend: { type: "provider", id: "remote", config: {} },
     respondTo: "owner-only",
     respondToAllowlist: [],
   });
-  assert.equal(welcomeTeammateHasExpectedAccess(teammate, PUB_B, true), false);
-  assert.equal(
-    welcomeTeammateHasExpectedAccess(
-      {
-        ...teammate,
-        respondTo: "allowlist",
-        respondToAllowlist: [PUB_B],
-      },
-      PUB_B,
-      true,
-    ),
-    true,
-  );
+  assert.equal(welcomeTeammateHasExpectedAccess(teammate, PUB_B, true), true);
+  assert.equal(welcomeTeammateHasExpectedAccess(teammate, PUB_B, false), false);
 });

@@ -125,6 +125,8 @@ pub struct UploadEventFacts<'a> {
     pub sha256: &'a str,
     /// Canonical extension.
     pub ext: &'a str,
+    /// Exact object key containing the payload bytes.
+    pub blob_key: &'a str,
     /// Sniffed MIME type.
     pub mime: &'a str,
     /// Uploaded byte size.
@@ -158,10 +160,7 @@ pub async fn record_upload_event(
         event_id: event_id.clone(),
         sha256: facts.sha256.to_string(),
         ext: facts.ext.to_string(),
-        blob_key: Some(
-            crate::keys::legacy_blob_key(facts.sha256, facts.ext)
-                .map_err(|e| crate::error::MediaError::StorageError(e.to_string()))?,
-        ),
+        blob_key: Some(facts.blob_key.to_string()),
         mime_type: facts.mime.to_string(),
         size: facts.size,
         uploaded_at: facts.uploaded_at,

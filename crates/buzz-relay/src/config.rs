@@ -733,6 +733,15 @@ impl Config {
                 ));
             }
         };
+        let media_key_layout = match std::env::var("BUZZ_MEDIA_KEY_LAYOUT") {
+            Ok(value) => value.parse().map_err(ConfigError::InvalidValue)?,
+            Err(std::env::VarError::NotPresent) => buzz_media::MediaKeyLayout::default(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::InvalidValue(
+                    "BUZZ_MEDIA_KEY_LAYOUT must be valid Unicode".to_string(),
+                ));
+            }
+        };
         let media = buzz_media::MediaConfig {
             s3_endpoint: std::env::var("BUZZ_S3_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:9000".to_string()),
@@ -745,6 +754,7 @@ impl Config {
                 .or_else(|_| std::env::var("AWS_REGION"))
                 .unwrap_or_else(|_| "us-east-1".to_string()),
             s3_addressing_style,
+            key_layout: media_key_layout,
             max_image_bytes: std::env::var("BUZZ_MAX_IMAGE_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())

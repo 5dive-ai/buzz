@@ -33,6 +33,34 @@ impl FromStr for S3AddressingStyle {
     }
 }
 
+/// Payload object-key layout used for new media writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaKeyLayout {
+    /// Write only the pre-migration flat key.
+    #[default]
+    Legacy,
+    /// Write the sharded key first, then a flat compatibility copy.
+    Dual,
+    /// Write only the hash-leading, community-scoped key.
+    Sharded,
+}
+
+impl FromStr for MediaKeyLayout {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "dual" => Ok(Self::Dual),
+            "sharded" => Ok(Self::Sharded),
+            _ => Err(format!(
+                "BUZZ_MEDIA_KEY_LAYOUT must be 'legacy', 'dual', or 'sharded', got {value:?}"
+            )),
+        }
+    }
+}
+
 fn default_max_video_bytes() -> u64 {
     524_288_000 // 500 MB
 }
@@ -67,6 +95,9 @@ pub struct MediaConfig {
     /// S3 URL addressing style. Defaults to path style for MinIO compatibility.
     #[serde(default)]
     pub s3_addressing_style: S3AddressingStyle,
+    /// Object-key layout for new media payload writes. Defaults to legacy.
+    #[serde(default)]
+    pub key_layout: MediaKeyLayout,
     /// Maximum upload size for images (bytes). Default: 50 MB.
     pub max_image_bytes: u64,
     /// Maximum upload size for animated GIFs (bytes). Default: 10 MB.
@@ -159,7 +190,7 @@ impl MediaConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaConfig, S3AddressingStyle};
+    use super::{MediaConfig, MediaKeyLayout, S3AddressingStyle};
     use std::str::FromStr;
 
     fn valid_config() -> MediaConfig {
@@ -170,6 +201,7 @@ mod tests {
             s3_bucket: "buzz-media".to_string(),
             s3_region: "us-east-1".to_string(),
             s3_addressing_style: S3AddressingStyle::Path,
+            key_layout: MediaKeyLayout::Legacy,
             max_image_bytes: 1,
             max_gif_bytes: 1,
             max_video_bytes: 1,
@@ -208,6 +240,15 @@ mod tests {
                 "unexpected error for {invalid:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn media_key_layout_parses_and_defaults_to_legacy() {
+        assert_eq!(MediaKeyLayout::default(), MediaKeyLayout::Legacy);
+        assert_eq!("legacy".parse(), Ok(MediaKeyLayout::Legacy));
+        assert_eq!("dual".parse(), Ok(MediaKeyLayout::Dual));
+        assert_eq!("sharded".parse(), Ok(MediaKeyLayout::Sharded));
+        assert!("new".parse::<MediaKeyLayout>().is_err());
     }
 
     #[test]

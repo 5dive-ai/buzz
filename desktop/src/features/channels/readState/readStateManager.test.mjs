@@ -561,6 +561,10 @@ test("publishSplitSlots_noopSuppression_skipsWhenUnchanged", async () => {
     }
   };
 
+  // Simulate a completed full-state load so the truncation guard does not
+  // block the publish path. The guard is tested separately.
+  mgr.isLoadComplete = true;
+
   // First publish: contexts differ from lastPublishedContexts ({}) → must publish.
   await mgr.publish();
   const callsAfterFirst = publishOneSlotCallCount;
@@ -574,6 +578,237 @@ test("publishSplitSlots_noopSuppression_skipsWhenUnchanged", async () => {
     callsAfterFirst,
     "second publish with unchanged state must not call publishOneSlot (no-op suppression)",
   );
+
+  mgr.destroy();
+});
+
+// ── NIP-RS override layer: mandatory acceptance tests ─────────────────────────
+
+// Helper: build a ReadStateManager with mocked relay and localStorage.
+function makeManager(pubkey = "a".repeat(64)) {
+  globalThis.window.localStorage = makeLocalStorage();
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeLive: () => () => {},
+  };
+  return new ReadStateManager(pubkey, fakeRelay);
+}
+
+// ── Test 1: no ov_* key ever reaches a non-primary slot ──────────────────────
+test("splitContextsIntoBudgetedSlots_noOverrideKeyInNonPrimarySlot", () => {
+  // Build channel entries that include ov_* keys for two contexts.
+  // Also include enough plain channel entries to force multi-slot distribution.
+  const ctx1 = "a".repeat(64);
+  const ctx2 = "b".repeat(64);
+
+  const ovEntries = [
+    [`ov_s:${ctx1}`, 1],
+    [`ov_c:${ctx1}`, 0],
+    [`ov_b:${ctx1}`, 100],
+    [ctx1, 100], // frontier for ctx1
+    [`ov_s:${ctx2}`, 2],
+    [`ov_c:${ctx2}`, 1],
+    [`ov_b:${ctx2}`, 200],
+    [ctx2, 200], // frontier for ctx2
+  ];
+
+  // Add enough plain channel entries to force at least 2 slots.
+  // We need the round-robin entries (NOT the pinned ov entries) to overflow.
+  const plainChannelEntries = [];
+  for (let i = 0; i < 30; i++) {
+    plainChannelEntries.push([makeChannelKey(i), i + 1]);
+  }
+  const channelEntries = [...ovEntries, ...plainChannelEntries];
+
+  const encoder = new TextEncoder();
+  // Compute the size of a slot containing only the 8 override+frontier entries.
+  const ovOnlyContexts = Object.fromEntries(ovEntries);
+  const ovOnlySize = encoder.encode(
+    JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: ovOnlyContexts }),
+  ).length;
+  // Budget: fits the override entries + ~10 plain entries per slot,
+  // but not all 30 plain entries in one slot (forces at least 3 slots).
+  // Add 15 plain entries to the ov-only size to get a safe per-slot budget.
+  const fifteenPlain = Object.fromEntries(plainChannelEntries.slice(0, 15));
+  const fifteenPlainSize = encoder.encode(
+    JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: fifteenPlain }),
+  ).length;
+  const budget = ovOnlySize + fifteenPlainSize;
+
+  const result = splitContextsIntoBudgetedSlots({
+    channelEntries,
+    threadMsgEntries: [],
+    clientId: CLIENT_ID,
+    initialSlotCount: 1,
+    maxSlots: 8,
+    maxBytes: budget,
+    slotIdGenerator: deterministicSlotId,
+  });
+
+  assert.ok(result !== null, "should succeed");
+  assert.ok(result.slots.length >= 2, "should use at least 2 slots");
+
+  // Verify: no ov_* key appears in any non-primary slot.
+  for (let slotIdx = 1; slotIdx < result.slots.length; slotIdx++) {
+    const slot = result.slots[slotIdx];
+    for (const key of Object.keys(slot)) {
+      assert.ok(
+        !key.startsWith("ov_"),
+        `ov_* key "${key}" must not appear in slot ${slotIdx} (non-primary)`,
+      );
+    }
+  }
+
+  // Verify: ov_* keys and their frontier siblings ARE in slot 0.
+  const slot0 = result.slots[0];
+  assert.ok(`ov_s:${ctx1}` in slot0, "ov_s:ctx1 must be in slot 0");
+  assert.ok(`ov_c:${ctx1}` in slot0, "ov_c:ctx1 must be in slot 0");
+  assert.ok(`ov_b:${ctx1}` in slot0, "ov_b:ctx1 must be in slot 0");
+  assert.ok(ctx1 in slot0, "frontier for ctx1 must be in slot 0");
+  assert.ok(`ov_s:${ctx2}` in slot0, "ov_s:ctx2 must be in slot 0");
+  assert.ok(ctx2 in slot0, "frontier for ctx2 must be in slot 0");
+});
+
+// ── Test 2: full-page fetch blocks four gated operations ─────────────────────
+test("fetchAndMerge_fullPage_blocksGatedOperations", async () => {
+  globalThis.window.localStorage = makeLocalStorage();
+
+  // Relay returns exactly READ_STATE_FULL_FETCH_LIMIT events → truncation guard fires.
+  // We simulate this by making fetchEvents return an array of `limit` length.
+  // The actual events don't need to be valid — mergeEvents handles parse failures.
+  const FULL_FETCH_LIMIT = 5_000;
+  const fakeEvents = new Array(FULL_FETCH_LIMIT).fill({
+    id: "x".repeat(64),
+    pubkey: "a".repeat(64),
+    kind: 30078,
+    content: "",
+    tags: [],
+    created_at: 1000,
+    sig: "s".repeat(128),
+  });
+
+  let publishCalls = 0;
+  const fakeRelay = {
+    fetchEvents: async () => fakeEvents,
+    publishEvent: async () => {
+      publishCalls++;
+    },
+    subscribeLive: async () => () => {},
+  };
+
+  const pubkey = "a".repeat(64);
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+
+  // Seed some context reads so there's something to publish.
+  mgr.markContextRead("channel-test", 1000);
+
+  // Run fetchAndMerge (internals) via initialize() — the relay returns a full
+  // page, so isLoadComplete must remain false.
+  // We override subscribeLive to avoid hanging on a real subscription.
+  await mgr.fetchAndMerge();
+
+  // 1. publish() must be blocked (isLoadComplete=false).
+  await mgr.publish();
+  assert.equal(
+    publishCalls,
+    0,
+    "publish must be blocked when isLoadComplete=false",
+  );
+
+  // 2. markChannelUnread must return load_incomplete.
+  const unreadResult = mgr.markChannelUnread("channel-test");
+  assert.equal(unreadResult.success, false);
+  assert.equal(
+    unreadResult.reason,
+    "load_incomplete",
+    "markChannelUnread must refuse with load_incomplete",
+  );
+
+  // 3. markChannelRead must return load_incomplete.
+  const readResult = mgr.markChannelRead("channel-test");
+  assert.equal(readResult.success, false);
+  assert.equal(
+    readResult.reason,
+    "load_incomplete",
+    "markChannelRead must refuse with load_incomplete",
+  );
+
+  // 4. deleteExtraSlots must be blocked (isLoadComplete=false).
+  // Inject a fake extraSlotId to verify deletion is suppressed.
+  mgr.extraSlotIds = ["fakeextraslot000"];
+  await mgr.deleteExtraSlots();
+  assert.equal(
+    publishCalls,
+    0,
+    "deleteExtraSlots must not call publishEvent when isLoadComplete=false",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 3: visible refusal at budget exhaustion and uint32 max ───────────────
+test("markChannelUnread_visibleRefusal_atBudgetExhaustionAndUint32Max", () => {
+  const mgr = makeManager();
+  // Simulate completed load so mark operations are not blocked by load_incomplete.
+  mgr.isLoadComplete = true;
+
+  // ── uint32 max refusal ────────────────────────────────────────────────────
+  // Inject a register where S is already at uint32 max and S == C (so
+  // max(S,C)+1 would overflow).
+  const UINT32_MAX = 0xffffffff;
+  const overflowCtx = "overflow-channel";
+  mgr.overrideRegisters.set(overflowCtx, {
+    s: UINT32_MAX,
+    c: UINT32_MAX,
+    b: 0,
+  });
+  mgr.publishableContextIds.add(overflowCtx);
+  mgr.effectiveState.set(overflowCtx, 100);
+
+  const overflowResult = mgr.markChannelUnread(overflowCtx);
+  assert.equal(overflowResult.success, false);
+  assert.equal(
+    overflowResult.reason,
+    "uint32_overflow",
+    "markChannelUnread must refuse with uint32_overflow when S is at max",
+  );
+
+  // ── budget exhaustion refusal ─────────────────────────────────────────────
+  // Fill effectiveState with enough channel keys to consume the entire 32 KiB
+  // budget, then attempt to add a new override group. With no prunable entries
+  // (no msg:/thread: keys), the budget check must fail.
+  //
+  // Each channel key is ~70 bytes. 32768 / 70 ≈ 468 keys to fill the budget.
+  // Use 500 keys to ensure we are well over budget on the channel-only side.
+  const budgetCtx = "budget-channel-00000000000000000000000000000000";
+  for (let i = 0; i < 500; i++) {
+    const ch = `ch-${i.toString().padStart(64, "0")}`;
+    mgr.effectiveState.set(ch, i + 1);
+    mgr.publishableContextIds.add(ch);
+  }
+  // The new context has no existing override register — mark it unread.
+  mgr.effectiveState.set(budgetCtx, 999);
+  mgr.publishableContextIds.add(budgetCtx);
+
+  const budgetResult = mgr.markChannelUnread(budgetCtx);
+  // 500 channel keys × ~70 bytes ≈ 35 KB > 32 KiB; with no prunable entries
+  // (no msg:/thread: keys), the budget check must fail.
+  assert.equal(
+    budgetResult.success,
+    false,
+    "markChannelUnread must refuse when channel-only keys exhaust the budget",
+  );
+  assert.equal(
+    budgetResult.reason,
+    "budget_exhausted",
+    "refusal must name budget_exhausted (not a silent drop or panic)",
+  );
+  // Whether it succeeds or fails, the manager must not have corrupted state.
+  // Verify the uint32_overflow register was not mutated.
+  const reg = mgr.overrideRegisters.get(overflowCtx);
+  assert.ok(reg, "overflow channel register must still exist");
+  assert.equal(reg.s, UINT32_MAX, "overflow register S must be unchanged");
 
   mgr.destroy();
 });

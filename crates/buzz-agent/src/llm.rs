@@ -9,8 +9,9 @@ use tokio::time::Instant;
 
 use crate::auth::{PkceOAuthConfig, PkceOAuthTokenSource, StaticTokenSource, TokenSource};
 use crate::config::{
-    is_openai_host, normalize_effort_for_anthropic_route, normalize_effort_for_openai_route,
-    Config, OpenAiApi, Provider, ThinkingEffort,
+    anthropic_thinking_config_for_databricks_v2, is_openai_host,
+    normalize_effort_for_anthropic_route, normalize_effort_for_databricks_v2,
+    normalize_effort_for_openai_route, Config, OpenAiApi, Provider, ThinkingEffort,
 };
 use crate::types::{
     AgentError, HistoryItem, LlmResponse, ProviderStop, ToolCall, ToolDef, ToolResultContent,
@@ -195,9 +196,9 @@ impl Llm {
             Provider::DatabricksV2 => {
                 self.databricks_v2_request(cfg, effective_model, |route| match route {
                     DatabricksV2Route::OpenAiResponses => {
-                        // OpenAI Responses path: normalize effort against the per-model table.
-                        let e =
-                            effort.map(|ef| normalize_effort_for_openai_route(ef, effective_model));
+                        // OpenAI Responses path: normalize effort via manifest normalization_policy.
+                        let e = effort
+                            .map(|ef| normalize_effort_for_databricks_v2(ef, effective_model));
                         (
                             responses_body(cfg, system_prompt, history, tools, effective_model, e),
                             parse_responses as OpenAiParse,
@@ -212,9 +213,9 @@ impl Llm {
                         )
                     }
                     DatabricksV2Route::MlflowChatCompletions => {
-                        // MLflow Chat path (OpenAI-shaped): normalize effort against the per-model table.
-                        let e =
-                            effort.map(|ef| normalize_effort_for_openai_route(ef, effective_model));
+                        // MLflow Chat path (OpenAI-shaped): normalize effort via manifest.
+                        let e = effort
+                            .map(|ef| normalize_effort_for_databricks_v2(ef, effective_model));
                         (
                             openai_body(cfg, system_prompt, history, tools, effective_model, e),
                             parse_openai as OpenAiParse,
@@ -800,7 +801,7 @@ fn anthropic_body(
         "system": system_value, "messages": messages });
     if let Some(e) = effort {
         let (thinking, output_config) =
-            crate::config::anthropic_thinking_config(effective_model, e, cfg.max_output_tokens);
+            anthropic_thinking_config_for_databricks_v2(effective_model, e, cfg.max_output_tokens);
         if let Some(t) = thinking {
             body["thinking"] = t;
         }
@@ -3350,49 +3351,315 @@ mod tests {
         }
     }
 
-    /// Phase-2 differential: new generated route matches old segment-based route
-    /// for all models in the existing test suite. Documents where they agree and
-    /// flags unexpected divergence. Any intentional divergence must be added to
-    /// the allowlist in this test.
+    /// Phase-2 comprehensive differential: old hand-coded logic vs generated capability module,
+    /// covering all three normative input sets (effortTable.fixture.json, normative-corpus.json,
+    /// catalog-sample-fixture.json) and all axes the old Rust code owned:
+    ///   - supported_efforts / default_effort
+    ///   - databricks_v2_wire_route (databricks_v2 entries only)
+    ///   - thinking_mode (Anthropic and Anthropic-routed DatabricksV2 entries)
+    ///
+    /// Allowlist is axis-scoped: each entry covers (provider, raw_model_id, axis).
+    /// Any declared allowlist entry that never suppresses a divergence is a stale entry
+    /// and causes the test to FAIL (mirrors JS harness semantics).
     #[test]
-    fn databricks_v2_route_differential_old_vs_new() {
-        // Models where old and new are intentionally expected to differ.
-        // (Empty: the generated manifest uses identical segment logic.)
-        let allowlist: &[&str] = &[];
+    fn comprehensive_differential_old_vs_new_all_inputs() {
+        use crate::config::{
+            is_adaptive_thinking_model_for_test, is_manual_budget_model_for_test,
+            strip_catalog_prefix as config_strip_catalog_prefix,
+            valid_effort_values_for_provider_model_for_test,
+        };
+        use crate::generated_model_capabilities::{
+            resolve_model_capabilities, DatabricksV2Route as GenRoute,
+            ThinkingMode as GenThinkingMode,
+        };
+        use std::collections::HashSet;
 
-        for model in [
-            "databricks-gpt-5-5",
-            "gpt-4o",
-            "gpt5",
-            "databricks-gpt-5-6-luna",
-            "databricks-gpt-5-6-sol",
-            "databricks-terra",
-            "databricks-claude-opus-4-7",
-            "goose-opus-5",
-            "databricks-sonnet-5",
-            "databricks-haiku-4-5",
-            "databricks-mythos-5",
-            "databricks-fable-5",
-            "Databricks-Claude-Opus-5",
-            "custom-tool-model",
-            "databricks-gemini-3-pro",
-            "consolidated-llama",
-            "terraform-coder",
-            "corpus-reranker",
-            "octopus-model",
-            "",
-        ] {
-            let old_route = _old_databricks_v2_route_for_model(model);
-            let new_route = databricks_v2_route_for_model(model);
-            if allowlist.contains(&model) {
-                // Intentional divergence — just document, don't assert equality.
+        // -----------------------------------------------------------------------
+        // Axis-scoped allowlist: (provider, raw_model_id, axis)
+        // Each entry documents an intentional divergence from the old hand tables.
+        // -----------------------------------------------------------------------
+        #[derive(Debug)]
+        struct AllowlistEntry {
+            provider: &'static str,
+            raw_model_id: &'static str,
+            axis: &'static str,
+            reason: &'static str,
+        }
+        let allowlist: &[AllowlistEntry] = &[
+            // Phase 1 ADOPT: models.dev payload d5a4974c advertises [low,medium,high];
+            // old code returns [none,low,medium,high,xhigh].
+            AllowlistEntry {
+                provider: "databricks_v2",
+                raw_model_id: "databricks-gpt-5-5",
+                axis: "supported_efforts",
+                reason: "Phase 1 ADOPT: models.dev [low,medium,high]; old [none,low,medium,high,xhigh]",
+            },
+            AllowlistEntry {
+                provider: "databricks_v2",
+                raw_model_id: "databricks-gpt-5-4-mini",
+                axis: "supported_efforts",
+                reason: "Phase 1 ADOPT: models.dev [low,medium,high]; old [none,low,medium,high,xhigh]",
+            },
+            AllowlistEntry {
+                provider: "databricks_v2",
+                raw_model_id: "databricks-gpt-5-4-nano",
+                axis: "supported_efforts",
+                reason: "Phase 1 ADOPT: models.dev [low,medium,high]; old [none,low,medium,high,xhigh]",
+            },
+            AllowlistEntry {
+                provider: "databricks_v2",
+                raw_model_id: "databricks-gpt-5-6-sol",
+                axis: "supported_efforts",
+                reason: "Phase 1 ADOPT: models.dev [low,medium,high,max]; old [none,low,medium,high,xhigh,max]",
+            },
+            // Phase 1 correction: 'opus' is a named DBv2 segment → anthropic-messages route.
+            // Old config.rs effort table (pre-segment logic) classified goose-opus-5 as MLflow;
+            // old llm.rs segment classifier already routed it to AnthropicMessages. The
+            // manifest adopts the llm.rs (correct) view. Effort axis diverges because the old
+            // config.rs table assumed MLflow (openai-shaped), not Anthropic adaptive.
+            AllowlistEntry {
+                provider: "databricks_v2",
+                raw_model_id: "goose-opus-5",
+                axis: "supported_efforts",
+                reason: "Phase 1 F1: old config.rs rated it MLflow; manifest adopts anthropic adaptive",
+            },
+            AllowlistEntry {
+                provider: "databricks_v2",
+                raw_model_id: "goose-opus-5",
+                axis: "default_effort",
+                reason: "Phase 1 F1: old config.rs had no default for this model; manifest adopts anthropic adaptive High",
+            },
+            // Blank Anthropic model: manifest assumes adaptive (forward-compatible default);
+            // old is_adaptive_thinking_model("") and is_manual_budget_model("") both return false
+            // → OmitFields. The manifest's stance (adaptive fallback for blank provider) is
+            // intentional and matches the corpus expectation.
+            AllowlistEntry {
+                provider: "anthropic",
+                raw_model_id: "",
+                axis: "thinking_mode",
+                reason: "Manifest adopts adaptive fallback for blank Anthropic model; old code returns OmitFields",
+            },
+        ];
+
+        // Track which allowlist entries are actually exercised.
+        let mut allowlist_hits: HashSet<(&str, &str, &str)> = HashSet::new();
+        let mut divergences: Vec<String> = Vec::new();
+
+        let is_allowlisted = |provider: &str,
+                              model: &str,
+                              axis: &str,
+                              hits: &mut HashSet<(&str, &str, &str)>| {
+            for entry in allowlist {
+                if entry.provider == provider && entry.raw_model_id == model && entry.axis == axis {
+                    hits.insert((entry.provider, entry.raw_model_id, entry.axis));
+                    return true;
+                }
+            }
+            false
+        };
+
+        // -----------------------------------------------------------------------
+        // Derive "old" thinking_mode from hand-coded classifiers
+        // -----------------------------------------------------------------------
+        let old_thinking_mode = |provider: &str, raw_model: &str, old_route: DatabricksV2Route| {
+            let is_anthropic_route = provider == "anthropic"
+                || (provider == "databricks_v2"
+                    && old_route == DatabricksV2Route::AnthropicMessages);
+            if !is_anthropic_route {
+                return GenThinkingMode::None;
+            }
+            let model = config_strip_catalog_prefix(raw_model);
+            if is_manual_budget_model_for_test(model) {
+                GenThinkingMode::ManualBudget
+            } else if is_adaptive_thinking_model_for_test(model) {
+                GenThinkingMode::Adaptive
+            } else {
+                GenThinkingMode::OmitFields
+            }
+        };
+
+        // -----------------------------------------------------------------------
+        // Per-entry check function
+        // -----------------------------------------------------------------------
+        let mut check = |label: &str,
+                         provider: &str,
+                         raw_model: &str,
+                         hits: &mut HashSet<(&str, &str, &str)>| {
+            let new_cap = resolve_model_capabilities(provider, raw_model);
+            let (old_efforts, old_default) =
+                valid_effort_values_for_provider_model_for_test(provider, raw_model);
+
+            // --- supported_efforts ---
+            let new_efforts: Vec<&'static str> = new_cap
+                .supported_efforts
+                .iter()
+                .map(|e| e.openai_effort_str())
+                .collect();
+            if new_efforts != old_efforts {
+                if !is_allowlisted(provider, raw_model, "supported_efforts", hits) {
+                    divergences.push(format!(
+                        "DIVERGE supported_efforts [{label}] provider={provider} model={raw_model:?}: old={old_efforts:?} new={new_efforts:?}"
+                    ));
+                }
+            }
+
+            // --- default_effort ---
+            let new_default: Option<&'static str> =
+                new_cap.default_effort.map(|e| e.openai_effort_str());
+            if new_default != old_default {
+                if !is_allowlisted(provider, raw_model, "default_effort", hits) {
+                    divergences.push(format!(
+                        "DIVERGE default_effort [{label}] provider={provider} model={raw_model:?}: old={old_default:?} new={new_default:?}"
+                    ));
+                }
+            }
+
+            // --- databricks_v2_wire_route (databricks_v2 only) ---
+            if provider == "databricks_v2" {
+                let old_route = _old_databricks_v2_route_for_model(raw_model);
+                let new_route_gen = &new_cap.databricks_v2_wire_route;
+                let new_route = match new_route_gen {
+                    GenRoute::OpenAiResponses => DatabricksV2Route::OpenAiResponses,
+                    GenRoute::AnthropicMessages => DatabricksV2Route::AnthropicMessages,
+                    GenRoute::MlflowChatCompletions
+                    | GenRoute::RouteUnknown
+                    | GenRoute::NotApplicable => DatabricksV2Route::MlflowChatCompletions,
+                };
+                if new_route != old_route {
+                    if !is_allowlisted(provider, raw_model, "databricks_v2_wire_route", hits) {
+                        divergences.push(format!(
+                            "DIVERGE databricks_v2_wire_route [{label}] model={raw_model:?}: old={old_route:?} new={new_route:?}"
+                        ));
+                    }
+                }
+
+                // --- thinking_mode (databricks_v2 Anthropic-routed models) ---
+                let old_route_for_thinking = _old_databricks_v2_route_for_model(raw_model);
+                let old_tm = old_thinking_mode(provider, raw_model, old_route_for_thinking);
+                if new_cap.thinking_mode != old_tm {
+                    if !is_allowlisted(provider, raw_model, "thinking_mode", hits) {
+                        divergences.push(format!(
+                            "DIVERGE thinking_mode [{label}] provider={provider} model={raw_model:?}: old={old_tm:?} new={:?}",
+                            new_cap.thinking_mode
+                        ));
+                    }
+                }
+            } else if provider == "anthropic" {
+                // thinking_mode for pure Anthropic
+                let old_tm =
+                    old_thinking_mode(provider, raw_model, DatabricksV2Route::AnthropicMessages);
+                if new_cap.thinking_mode != old_tm {
+                    if !is_allowlisted(provider, raw_model, "thinking_mode", hits) {
+                        divergences.push(format!(
+                            "DIVERGE thinking_mode [{label}] provider={provider} model={raw_model:?}: old={old_tm:?} new={:?}",
+                            new_cap.thinking_mode
+                        ));
+                    }
+                }
+            }
+        };
+
+        // -----------------------------------------------------------------------
+        // Input set 1: effortTable.fixture.json (36 entries)
+        // -----------------------------------------------------------------------
+        #[derive(serde::Deserialize)]
+        struct FixtureEntry {
+            note: Option<String>,
+            provider: String,
+            model: String,
+        }
+        let fixture_json =
+            include_str!("../../../desktop/src/features/agents/ui/effortTable.fixture.json");
+        let fixture: Vec<FixtureEntry> =
+            serde_json::from_str(fixture_json).expect("fixture must be valid JSON");
+        for entry in &fixture {
+            let label = format!("fixture:{}", entry.note.as_deref().unwrap_or(&entry.model));
+            check(&label, &entry.provider, &entry.model, &mut allowlist_hits);
+        }
+
+        // -----------------------------------------------------------------------
+        // Input set 2: normative-corpus.json (45 entries)
+        // -----------------------------------------------------------------------
+        #[derive(serde::Deserialize)]
+        struct CorpusEntry {
+            // Group-header entries carry a `_group` string field; test-vector
+            // entries do not. We skip group headers (provider/raw_model_id absent).
+            #[serde(rename = "_group")]
+            group: Option<String>,
+            id: Option<String>,
+            provider: Option<String>,
+            raw_model_id: Option<String>,
+        }
+        let corpus_json = include_str!("../../../scripts/normative-corpus.json");
+        let corpus: Vec<CorpusEntry> =
+            serde_json::from_str(corpus_json).expect("corpus must be valid JSON");
+        for entry in &corpus {
+            if entry.group.is_some() {
+                // Group-header row — skip.
                 continue;
             }
-            assert_eq!(
-                old_route, new_route,
-                "route divergence for model={model:?}: old={old_route:?} new={new_route:?}"
-            );
+            let (Some(provider), Some(model)) = (&entry.provider, &entry.raw_model_id) else {
+                continue;
+            };
+            let label = format!("corpus:{}", entry.id.as_deref().unwrap_or(model.as_str()));
+            check(&label, provider, model, &mut allowlist_hits);
         }
+
+        // -----------------------------------------------------------------------
+        // Input set 3: catalog-sample-fixture.json (databricks_v2 only)
+        // -----------------------------------------------------------------------
+        #[derive(serde::Deserialize)]
+        struct CatalogEntry {
+            name: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct CatalogFixture {
+            endpoints: Vec<CatalogEntry>,
+        }
+        let catalog_json = include_str!("../../../scripts/catalog-sample-fixture.json");
+        let catalog: CatalogFixture =
+            serde_json::from_str(catalog_json).expect("catalog fixture must be valid JSON");
+        for entry in &catalog.endpoints {
+            let label = format!("catalog:{}", entry.name);
+            check(&label, "databricks_v2", &entry.name, &mut allowlist_hits);
+        }
+
+        // -----------------------------------------------------------------------
+        // Stale allowlist entries — any declared entry that never fired is a bug
+        // -----------------------------------------------------------------------
+        let mut stale: Vec<String> = Vec::new();
+        for entry in allowlist {
+            if !allowlist_hits.contains(&(entry.provider, entry.raw_model_id, entry.axis)) {
+                stale.push(format!(
+                    "STALE_ALLOWLIST provider={} model={} axis={} reason={}",
+                    entry.provider, entry.raw_model_id, entry.axis, entry.reason
+                ));
+            }
+        }
+
+        let mut failures = divergences.clone();
+        failures.extend(stale);
+
+        assert!(
+            failures.is_empty(),
+            "Comprehensive differential found {} failure(s):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+
+        // Report summary (visible with --nocapture).
+        let total_entries = fixture.len()
+            + corpus
+                .iter()
+                .filter(|e| e.group.is_none() && e.provider.is_some())
+                .count()
+            + catalog.endpoints.len();
+        println!(
+            "Comprehensive differential: {} input entries, {} allowlist slots exercised/{}, 0 unexpected divergences",
+            total_entries,
+            allowlist_hits.len(),
+            allowlist.len(),
+        );
     }
 
     #[test]

@@ -86,7 +86,7 @@ impl ThinkingEffort {
 /// - `llama-3`                    → `llama-3` (no family token, returned unchanged)
 ///
 /// If no family token is present the name is returned unchanged.
-fn strip_catalog_prefix(model: &str) -> &str {
+pub(crate) fn strip_catalog_prefix(model: &str) -> &str {
     const FAMILY_TOKENS: &[&str] = &["claude-", "gpt-"];
     let lower = model.to_ascii_lowercase();
     let first_idx = FAMILY_TOKENS.iter().filter_map(|tok| lower.find(tok)).min();
@@ -573,6 +573,110 @@ pub fn normalize_effort_for_anthropic_route(effort: ThinkingEffort) -> Option<Th
             None
         }
         other => Some(other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generated-backed production helpers (Phase 2 cutover)
+//
+// These delegate to `resolve_model_capabilities` for the `databricks_v2`
+// provider and fall back to the hand-coded helpers for all other providers.
+// Phase 3 will expand coverage and retire the old helpers entirely.
+// ---------------------------------------------------------------------------
+
+/// Normalize the effort value for a DatabricksV2 request.
+///
+/// Reads `normalization_policy` from the generated capability record for this
+/// raw model ID (provider = "databricks_v2") and applies it:
+/// - `OpenAiStandard`      → per-family table lookup (GPT-5.x, etc.)
+/// - `OpenAiClampMaxToXHigh` → clamp max → xhigh, pass others unchanged
+/// - `None`                → pass effort through unchanged (Anthropic path)
+///
+/// This is the production authority for DatabricksV2 effort normalization.
+/// The old `normalize_effort_for_openai_route` remains the authority for
+/// pure OpenAI and legacy Databricks providers (unchanged).
+pub fn normalize_effort_for_databricks_v2(
+    effort: ThinkingEffort,
+    raw_model: &str,
+) -> ThinkingEffort {
+    use crate::generated_model_capabilities::{resolve_model_capabilities, NormalizationPolicy};
+    match resolve_model_capabilities("databricks_v2", raw_model).normalization_policy {
+        NormalizationPolicy::OpenAiStandard => normalize_effort_for_openai_route(effort, raw_model),
+        NormalizationPolicy::OpenAiClampMaxToXHigh => {
+            if effort == ThinkingEffort::Max {
+                tracing::warn!(
+                    requested = "max",
+                    resolved = "xhigh",
+                    model = raw_model,
+                    "BUZZ_AGENT_THINKING_EFFORT=max not confirmed for this DatabricksV2 model; clamping to xhigh"
+                );
+                ThinkingEffort::XHigh
+            } else {
+                effort
+            }
+        }
+        NormalizationPolicy::None => effort,
+    }
+}
+
+/// Build the Anthropic thinking/effort request fields for a DatabricksV2 model.
+///
+/// Reads `thinking_mode` from the generated capability record for the raw
+/// model ID (provider = "databricks_v2") and applies it:
+/// - `ManualBudget` → `thinking:{type:"enabled", budget_tokens}` shape
+/// - `Adaptive`     → `thinking:{type:"adaptive"} + output_config:{effort}`
+/// - `OmitFields` / `None` / `NotApplicable` → omit both fields
+///
+/// Falls back to the hand-coded `anthropic_thinking_config` for models not
+/// present in the manifest (same behaviour as before Phase 2).
+///
+/// This is the production authority for DatabricksV2 Anthropic thinking.
+pub fn anthropic_thinking_config_for_databricks_v2(
+    raw_model: &str,
+    effort: ThinkingEffort,
+    max_output_tokens: u32,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    use crate::generated_model_capabilities::{resolve_model_capabilities, ThinkingMode};
+    use serde_json::json;
+
+    match resolve_model_capabilities("databricks_v2", raw_model).thinking_mode {
+        ThinkingMode::ManualBudget => {
+            // Manual-budget shape (claude-3*, claude-opus-4-5): budget_tokens clamped
+            // to fit within max_output_tokens.
+            const MIN_ANSWER_TOKENS: u32 = 1024;
+            let level_budget = effort.anthropic_budget_tokens();
+            let headroom = max_output_tokens.saturating_sub(MIN_ANSWER_TOKENS);
+            let budget = level_budget.min(headroom);
+            if budget < MIN_ANSWER_TOKENS {
+                tracing::warn!(
+                    max_output_tokens,
+                    level_budget,
+                    headroom,
+                    model = raw_model,
+                    "BUZZ_AGENT_THINKING_EFFORT: max_output_tokens too small to fit thinking budget + answer headroom; omitting thinking fields"
+                );
+                return (None, None);
+            }
+            (
+                Some(json!({ "type": "enabled", "budget_tokens": budget })),
+                None,
+            )
+        }
+        ThinkingMode::Adaptive => {
+            // Adaptive shape (opus-4-6+, sonnet-4-6+, etc.): clamp effort to model cap.
+            // Use the existing per-model clamper — strip prefix before matching.
+            let model = strip_catalog_prefix(raw_model);
+            let clamped = clamp_adaptive_effort(model, effort);
+            (
+                Some(json!({ "type": "adaptive" })),
+                Some(json!({ "effort": clamped.anthropic_effort_str() })),
+            )
+        }
+        ThinkingMode::OmitFields | ThinkingMode::None | ThinkingMode::NotApplicable => {
+            // Unknown Anthropic model, non-Anthropic-routed, or not applicable:
+            // omit thinking fields rather than guess.
+            (None, None)
+        }
     }
 }
 
@@ -1137,6 +1241,32 @@ fn parse_hook_servers(raw: Option<&str>) -> HookServers {
         return HookServers::All;
     }
     HookServers::Only(names)
+}
+
+// ---------------------------------------------------------------------------
+// Test-only re-exports: let llm.rs tests call private classifiers without
+// duplicating them. These wrappers are cfg(test)-only and intentionally thin.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) fn is_manual_budget_model_for_test(model: &str) -> bool {
+    is_manual_budget_model(model)
+}
+
+#[cfg(test)]
+pub(crate) fn is_adaptive_thinking_model_for_test(model: &str) -> bool {
+    is_adaptive_thinking_model(model)
+}
+
+/// Mirror of the `tests::valid_effort_values_for_provider_model` helper in config's
+/// own test module, promoted to a module-level cfg(test) function so llm.rs tests
+/// can call it without re-implementing the logic.
+#[cfg(test)]
+pub(crate) fn valid_effort_values_for_provider_model_for_test(
+    provider: &str,
+    model: &str,
+) -> (Vec<&'static str>, Option<&'static str>) {
+    tests::valid_effort_values_for_provider_model(provider, model)
 }
 
 #[cfg(test)]
@@ -2592,7 +2722,7 @@ mod tests {
     /// Returns `(valid_values, default_value)` where `default_value` is `None`
     /// for Anthropic manual-budget models (TS `defaultValue: null`), otherwise
     /// `Some("medium")` or `Some("high")`.
-    fn valid_effort_values_for_provider_model(
+    pub(super) fn valid_effort_values_for_provider_model(
         provider: &str,
         model: &str,
     ) -> (Vec<&'static str>, Option<&'static str>) {

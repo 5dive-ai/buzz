@@ -172,10 +172,18 @@ impl Config {
             .unwrap_or("0.0.0.0:8081")
             .parse::<SocketAddr>()
             .map_err(|_| ConfigError::Invalid("BUZZ_PUSH_HEALTH_ADDR"))?;
+        let dev_app_attest_bypass_requested =
+            match e.get("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS").map(String::as_str) {
+                None | Some("0") => false,
+                Some("1") => true,
+                Some(_) => return Err(ConfigError::Invalid("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS")),
+            };
+        #[cfg(not(feature = "dev-app-attest-bypass"))]
+        if dev_app_attest_bypass_requested {
+            return Err(ConfigError::Invalid("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS"));
+        }
         #[cfg(feature = "dev-app-attest-bypass")]
-        let dev_app_attest_bypass = e
-            .get("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS")
-            .is_some_and(|value| value == "true");
+        let dev_app_attest_bypass = dev_app_attest_bypass_requested;
         #[cfg(feature = "dev-app-attest-bypass")]
         if dev_app_attest_bypass
             && (!bind_addr.ip().is_loopback() || !health_addr.ip().is_loopback())
@@ -216,6 +224,8 @@ mod tests {
     use super::*;
     #[cfg(feature = "dev-app-attest-bypass")]
     use crate::app_attest_policy::AppAttestPolicy;
+    #[cfg(feature = "dev-app-attest-bypass")]
+    use sha2::Digest as _;
 
     fn base() -> HashMap<String, String> {
         HashMap::from([
@@ -334,36 +344,42 @@ mod tests {
         assert_eq!(config.health_addr, "0.0.0.0:8081".parse().unwrap());
     }
 
-    #[cfg(feature = "dev-app-attest-bypass")]
     #[test]
-    fn dev_app_attest_bypass_is_off_when_absent_or_exactly_false() {
+    fn dev_app_attest_bypass_flag_is_strict_and_feature_gated() {
         let absent = Config::from_map(&base()).unwrap();
+        #[cfg(feature = "dev-app-attest-bypass")]
         assert!(!absent.dev_app_attest_bypass);
+        #[cfg(not(feature = "dev-app-attest-bypass"))]
+        let _ = absent;
 
-        let mut explicit_false = base();
-        explicit_false.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "false".into());
-        let explicit_false = Config::from_map(&explicit_false).unwrap();
-        assert!(!explicit_false.dev_app_attest_bypass);
-    }
+        let mut disabled = base();
+        disabled.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "0".into());
+        let disabled = Config::from_map(&disabled).unwrap();
+        #[cfg(feature = "dev-app-attest-bypass")]
+        assert!(!disabled.dev_app_attest_bypass);
+        #[cfg(not(feature = "dev-app-attest-bypass"))]
+        let _ = disabled;
 
-    #[cfg(feature = "dev-app-attest-bypass")]
-    #[test]
-    fn dev_app_attest_bypass_selects_apple_for_every_value_other_than_exact_true() {
-        for value in [
-            None,
-            Some(""),
-            Some("false"),
-            Some("TRUE"),
-            Some("1"),
-            Some("yes"),
-            Some(" true"),
-        ] {
+        for value in ["", "false", "true", "TRUE", "yes", " 1"] {
             let mut env = base();
-            if let Some(value) = value {
-                env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), value.into());
-            }
-            let config = Config::from_map(&env).unwrap();
-            assert!(!config.dev_app_attest_bypass, "enabled for {value:?}");
+            env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), value.into());
+            assert!(
+                matches!(
+                    Config::from_map(&env),
+                    Err(ConfigError::Invalid("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS"))
+                ),
+                "accepted non-canonical value {value:?}"
+            );
+        }
+
+        #[cfg(not(feature = "dev-app-attest-bypass"))]
+        {
+            let mut enabled = base();
+            enabled.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "1".into());
+            assert!(matches!(
+                Config::from_map(&enabled),
+                Err(ConfigError::Invalid("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS"))
+            ));
         }
     }
 
@@ -375,7 +391,7 @@ mod tests {
             ("BUZZ_PUSH_HEALTH_ADDR", "[::]:8081"),
         ] {
             let mut env = base();
-            env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+            env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "1".into());
             env.insert(
                 "BUZZ_PUSH_ENABLED_PROFILES".into(),
                 "buzz-ios-sandbox".into(),
@@ -389,7 +405,7 @@ mod tests {
     #[test]
     fn non_loopback_bind_is_rejected_before_loopback_equivalent_is_accepted() {
         let mut non_loopback = base();
-        non_loopback.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+        non_loopback.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "1".into());
         non_loopback.insert(
             "BUZZ_PUSH_ENABLED_PROFILES".into(),
             "buzz-ios-sandbox".into(),
@@ -413,7 +429,7 @@ mod tests {
             "buzz-ios-sandbox,buzz-ios-production",
         ] {
             let mut env = base();
-            env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+            env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "1".into());
             env.insert("BUZZ_PUSH_ENABLED_PROFILES".into(), profiles.into());
             assert!(
                 Config::from_map(&env).is_err(),
@@ -424,9 +440,9 @@ mod tests {
 
     #[cfg(feature = "dev-app-attest-bypass")]
     #[test]
-    fn dev_app_attest_bypass_accepts_explicit_true_for_loopback_sandbox() {
+    fn dev_app_attest_bypass_accepts_explicit_one_for_loopback_sandbox() {
         let mut env = base();
-        env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+        env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "1".into());
         env.insert(
             "BUZZ_PUSH_ENABLED_PROFILES".into(),
             "buzz-ios-sandbox".into(),
@@ -438,7 +454,7 @@ mod tests {
     #[test]
     fn second_profile_is_rejected_before_sandbox_only_is_accepted() {
         let mut env = base();
-        env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+        env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "1".into());
         env.insert(
             "BUZZ_PUSH_ENABLED_PROFILES".into(),
             "buzz-ios-sandbox,buzz-ios-production".into(),
@@ -456,7 +472,7 @@ mod tests {
     #[test]
     fn dev_app_attest_bypass_selects_development_policy_from_validated_config() {
         let mut env = base();
-        env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "true".into());
+        env.insert("BUZZ_PUSH_DEV_APP_ATTEST_BYPASS".into(), "1".into());
         env.insert(
             "BUZZ_PUSH_ENABLED_PROFILES".into(),
             "buzz-ios-sandbox".into(),
@@ -471,13 +487,23 @@ mod tests {
 
     #[cfg(feature = "dev-app-attest-bypass")]
     #[test]
-    fn disabled_bypass_selects_apple_policy() {
+    fn bypass_unset_keeps_sentinel_on_the_apple_verifier() {
         let config = Config::from_map(&base()).unwrap();
-        let apple = crate::app_attest::AppAttestVerifier::for_policy_test();
+        let policy = AppAttestPolicy::from_config(
+            config.dev_app_attest_bypass(),
+            crate::app_attest::AppAttestVerifier::for_policy_test(),
+        );
+        let mut sentinel = b"buzz-dev-app-attest-v1:".to_vec();
+        sentinel.extend_from_slice(&[1; 32]);
+        let key_id = sha2::Sha256::digest(&sentinel);
 
-        let policy = AppAttestPolicy::from_config(config.dev_app_attest_bypass(), apple);
-
-        assert!(matches!(policy, AppAttestPolicy::Apple(_)));
+        assert!(policy
+            .verify_attestation(
+                &STANDARD.encode(sentinel),
+                &STANDARD.encode(key_id),
+                b"canonical enrollment transcript",
+            )
+            .is_err());
     }
 
     #[test]

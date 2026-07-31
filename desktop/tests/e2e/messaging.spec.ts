@@ -146,9 +146,17 @@ test.beforeEach(async ({ page }, testInfo) => {
               },
               linkPreviewMetadataDelayMs: 800,
             }
-          : testInfo.title.includes("link preview no-image collapse")
+          : testInfo.title.includes("link preview no-image layout")
             ? {
-                linkPreviewMetadata: null,
+                linkPreviewMetadata: {
+                  title: "Buzz",
+                  siteName: "GitHub",
+                  description: "Open-source collaboration for the Buzz app.",
+                  imageDataUrl: null,
+                  imageDomain: null,
+                  faviconDataUrl:
+                    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                },
                 linkPreviewMetadataDelayMs: 2_000,
               }
             : undefined;
@@ -312,9 +320,11 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   await page.getByTestId("send-message").click();
 
   const row = page.getByTestId("message-row").last();
-  await expect(
-    row.locator('[data-link-preview="github-pull-request"]'),
-  ).toHaveCSS("border-top-left-radius", "16px");
+  const compactPreview = row.locator(
+    '[data-link-preview="github-pull-request"]',
+  );
+  await expect(compactPreview).toHaveCSS("border-top-left-radius", "0px");
+  await expect(compactPreview).toHaveCSS("border-left-width", "3px");
 
   await openSettings(page, "appearance");
   await expect(page.getByTestId("link-preview-style-trigger")).toHaveText(
@@ -338,9 +348,9 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
     '[data-link-preview="github-pull-request"][data-link-preview-inline]',
   );
   await expect(richPreview).toBeVisible();
-  await expect(richPreview.locator("[data-link-preview-hostname]")).toHaveText(
-    "github.com",
-  );
+  const richHostname = richPreview.locator("[data-link-preview-hostname]");
+  await expect(richHostname).toHaveText("github.com");
+  await expect(richHostname).toHaveAttribute("href", previewUrl);
 
   await openSettings(page, "appearance");
   await page.getByTestId("link-preview-style-trigger").click();
@@ -428,9 +438,9 @@ test("link preview image geometry stays stable while loading", async ({
     }));
 
     expect(pending.width).toBe(width < 640 ? 325 : 384);
-    expect(pending.height).toBe(88);
+    expect(pending.height).toBe(84);
     expect(pending.textInset).toBe(8);
-    expect(pending.thumbnailHeight).toBe(88);
+    expect(pending.thumbnailHeight).toBe(84);
     expect(loaded.height).toBe(pending.height);
     expect(loaded.textLeft).toBe(pending.textLeft);
     expect(loaded.thumbnailHeight).toBe(pending.thumbnailHeight);
@@ -443,9 +453,7 @@ test("link preview image geometry stays stable while loading", async ({
   }
 });
 
-test("link preview no-image collapse restores the compact card", async ({
-  page,
-}) => {
+test("link preview no-image layout keeps compact height", async ({ page }) => {
   const previewUrl = "https://github.com/block/buzz/pull/3246?inline=none";
 
   for (const width of [800, 420]) {
@@ -468,7 +476,7 @@ test("link preview no-image collapse restores the compact card", async ({
       .poll(() =>
         card.evaluate((element) => element.getBoundingClientRect().height),
       )
-      .toBe(80);
+      .toBe(84);
     const pending = await card.evaluate((element) => ({
       height: element.getBoundingClientRect().height,
       textLeft: element
@@ -478,16 +486,29 @@ test("link preview no-image collapse restores the compact card", async ({
 
     await expect(card).toHaveAttribute("data-image-state", "none");
     await expect(card.locator("[data-link-preview-thumbnail]")).toHaveCount(0);
-    await expect(card.locator(".link-preview-media")).toBeVisible();
-    const collapsed = await card.evaluate((element) => ({
+    await expect(card.locator('[data-slot="attachment-media"]')).toHaveCount(0);
+    const hostnameLink = card.locator("[data-link-preview-hostname]");
+    await expect(hostnameLink).toHaveText("github.com");
+    await expect(hostnameLink).toHaveAttribute(
+      "href",
+      `${previewUrl}&viewport=${width}`,
+    );
+    await expect(
+      card.locator("[data-link-preview-hostname-favicon]"),
+    ).toHaveAttribute("src", /data:image\/png;base64/);
+    await expect(
+      card.locator('[data-slot="attachment-description"]'),
+    ).toHaveText("Open-source collaboration for the Buzz app.");
+    await expect(card).toHaveCSS("border-left-width", "3px");
+    const resolved = await card.evaluate((element) => ({
       height: element.getBoundingClientRect().height,
       textLeft: element
         .querySelector('[data-slot="attachment-content"]')
         ?.getBoundingClientRect().left,
     }));
 
-    expect(collapsed.height).toBeLessThan(pending.height);
-    expect(collapsed.textLeft).toBeLessThan(pending.textLeft ?? 0);
+    expect(resolved.height).toBe(pending.height);
+    expect(resolved.textLeft).toBeLessThan(pending.textLeft ?? 0);
   }
 });
 

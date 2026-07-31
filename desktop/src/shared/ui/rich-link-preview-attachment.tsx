@@ -152,12 +152,15 @@ function TweetPreview({
       data-link-preview={preview.kind}
       data-tweet-preview=""
     >
-      <div
-        className="text-xs leading-4 text-muted-foreground"
+      <a
+        className="block w-fit max-w-full truncate text-xs leading-4 text-muted-foreground/70 hover:underline"
         data-link-preview-hostname=""
+        href={preview.href}
+        rel="noreferrer"
+        target="_blank"
       >
         {hostname}
-      </div>
+      </a>
       <a
         className="mt-0.5 line-clamp-2 whitespace-normal text-sm font-semibold leading-5 text-foreground hover:underline"
         href={preview.href}
@@ -168,7 +171,7 @@ function TweetPreview({
       </a>
       {contentExpanded && preview.description ? (
         <LinkPreviewDescription
-          className="text-foreground"
+          className="text-muted-foreground/70"
           description={preview.description}
         />
       ) : null}
@@ -246,13 +249,17 @@ export function RichLinkPreviewAttachment({
       <div
         className={cn(contentExpanded && reserveImage && "min-h-[3.875rem]")}
       >
-        <div
-          className="flex items-center gap-1.5 text-xs leading-4 text-muted-foreground"
+        <a
+          className="flex w-fit max-w-full items-center gap-1.5 text-xs leading-4 text-muted-foreground/70 hover:underline"
           data-link-preview-identity=""
+          data-link-preview-hostname=""
+          href={preview.href}
+          rel="noreferrer"
+          target="_blank"
         >
           <LinkPreviewIdentity preview={preview} />
-          <span data-link-preview-hostname="">{hostname}</span>
-        </div>
+          <span className="truncate">{hostname}</span>
+        </a>
         <a
           aria-label={`Open ${preview.provider} ${preview.typeLabel}: ${preview.title}`}
           className="mt-0.5 block text-sm font-semibold leading-5 text-foreground hover:underline"
@@ -264,7 +271,7 @@ export function RichLinkPreviewAttachment({
         </a>
         {contentExpanded && preview.description ? (
           <LinkPreviewDescription
-            className="text-muted-foreground"
+            className="text-muted-foreground/70"
             description={preview.description}
           />
         ) : null}

@@ -1,14 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   getTtsPlaybackSpeed,
   setTtsPlaybackSpeed,
 } from "@/shared/api/ttsPlayback";
 import { Button } from "@/shared/ui/button";
-import {
-  applyLoadedPlaybackSpeed,
-  cancelPlaybackSpeedPersistence,
-  commitPlaybackSpeed,
-} from "./playbackSpeedPersistence";
+import { createPlaybackSpeedPersistence } from "./playbackSpeedPersistence";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 
 const DEFAULT_SPEED = 1;
@@ -17,40 +13,31 @@ const SLIDER_MAX_SPEED = 2;
 const INPUT_MIN_SPEED = 0.25;
 const INPUT_MAX_SPEED = 4;
 const SPEED_STEP = 0.05;
+const playbackSpeedPersistence = createPlaybackSpeedPersistence(
+  setTtsPlaybackSpeed,
+  DEFAULT_SPEED,
+);
 
 export function SpeechPlaybackSettings() {
   const [speed, setSpeed] = useState(DEFAULT_SPEED);
   const [speedInput, setSpeedInput] = useState(String(DEFAULT_SPEED));
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const active = useRef(true);
-  const confirmedSpeed = useRef(DEFAULT_SPEED);
-  const desiredSpeed = useRef(DEFAULT_SPEED);
-  const flushPromise = useRef<Promise<void> | null>(null);
-  const hasLocalIntent = useRef(false);
-
   const setDisplayedSpeed = useCallback((nextSpeed: number) => {
     setSpeed(nextSpeed);
     setSpeedInput(String(nextSpeed));
   }, []);
 
   useEffect(() => {
-    active.current = true;
     let loadActive = true;
+    const unsubscribe = playbackSpeedPersistence.subscribe({
+      setError,
+      setSpeed: setDisplayedSpeed,
+    });
     getTtsPlaybackSpeed()
       .then((savedSpeed) => {
         if (loadActive) {
-          applyLoadedPlaybackSpeed(
-            {
-              active,
-              confirmedSpeed,
-              desiredSpeed,
-              flushPromise,
-              hasLocalIntent,
-            },
-            { setSpeed: setDisplayedSpeed },
-            savedSpeed,
-          );
+          playbackSpeedPersistence.applyLoaded(savedSpeed);
         }
       })
       .catch((cause) => {
@@ -61,28 +48,12 @@ export function SpeechPlaybackSettings() {
       });
     return () => {
       loadActive = false;
-      cancelPlaybackSpeedPersistence({
-        active,
-        confirmedSpeed,
-        desiredSpeed,
-        flushPromise,
-        hasLocalIntent,
-      });
+      unsubscribe();
     };
   }, [setDisplayedSpeed]);
 
   const commitSpeed = (nextSpeed: number) => {
-    commitPlaybackSpeed(
-      {
-        active,
-        confirmedSpeed,
-        desiredSpeed,
-        flushPromise,
-        hasLocalIntent,
-      },
-      { persist: setTtsPlaybackSpeed, setError, setSpeed: setDisplayedSpeed },
-      nextSpeed,
-    );
+    playbackSpeedPersistence.commit(nextSpeed);
   };
 
   const commitTypedSpeed = () => {

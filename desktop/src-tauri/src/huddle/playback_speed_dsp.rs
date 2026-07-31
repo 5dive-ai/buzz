@@ -71,6 +71,28 @@ pub fn process_complete_chunk(
     Ok(output[0][start..end].to_vec())
 }
 
+/// Pitch-preserve one complete playback chunk across its model-unit splits.
+///
+/// Pocket may divide a natural synthesis chunk into multiple model-valid
+/// units. Joining those units before processing keeps one stretcher timeline
+/// across the hidden boundaries instead of resetting the DSP at each unit.
+pub fn process_complete_playback_chunk(
+    model_units: &[Vec<f32>],
+    speed: f32,
+    sample_rate: u32,
+) -> Result<Vec<f32>, String> {
+    let sample_count = model_units.iter().try_fold(0_usize, |total, unit| {
+        total
+            .checked_add(unit.len())
+            .ok_or_else(|| "audio chunk is too large to process".to_string())
+    })?;
+    let mut samples = Vec::with_capacity(sample_count);
+    for unit in model_units {
+        samples.extend_from_slice(unit);
+    }
+    process_complete_chunk(&samples, speed, sample_rate)
+}
+
 /// Return Signalsmith's compensated output lookahead for descriptive reporting.
 #[allow(dead_code)]
 pub(crate) fn compensated_output_latency_samples(sample_rate: u32) -> usize {

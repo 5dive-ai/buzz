@@ -21,7 +21,9 @@ use crate::app_state::AppState;
 
 #[path = "playback_speed_dsp.rs"]
 mod playback_speed_dsp;
+#[cfg(test)]
 pub(crate) use playback_speed_dsp::process_complete_chunk;
+pub(crate) use playback_speed_dsp::process_complete_playback_chunk;
 use playback_speed_dsp::{validate_speed, DEFAULT_PLAYBACK_SPEED};
 
 const SETTINGS_FILE: &str = "tts-playback-settings.json";

@@ -606,7 +606,7 @@ test("splitContextsIntoBudgetedSlots_noOverrideKeyInNonPrimarySlot", () => {
     [`ov_s:${ctx1}`, 1],
     [`ov_c:${ctx1}`, 0],
     [`ov_b:${ctx1}`, 100],
-    [ctx1, 100], // frontier for ctx1
+    [ctx1, 100], // frontier for ctx1 (normal, no escape needed)
     [`ov_s:${ctx2}`, 2],
     [`ov_c:${ctx2}`, 1],
     [`ov_b:${ctx2}`, 200],
@@ -670,92 +670,562 @@ test("splitContextsIntoBudgetedSlots_noOverrideKeyInNonPrimarySlot", () => {
   assert.ok(ctx2 in slot0, "frontier for ctx2 must be in slot 0");
 });
 
-// ── Test 2: full-page fetch blocks four gated operations ─────────────────────
-test("fetchAndMerge_fullPage_blocksGatedOperations", async () => {
-  globalThis.window.localStorage = makeLocalStorage();
+// ── Test 1b: reserved esc: raw ID — unescape-before-group rule ───────────────
+test("splitContextsIntoBudgetedSlots_escapedFrontierKeyStaysWithItsOverrideGroup", () => {
+  // A context whose raw ID starts with "ov_" must be escaped to "esc:ov_s:evil"
+  // as a frontier wire key.  The ov_* siblings are keyed by the RAW suffix
+  // "ov_s:evil".  The splitter must unescape "esc:ov_s:evil" → "ov_s:evil"
+  // and recognise it as belonging to the same group as ov_s:ov_s:evil etc.
+  const rawCtx = "ov_s:evil";
+  const wireKey = `esc:${rawCtx}`; // what currentContexts() emits
 
-  // Relay returns exactly READ_STATE_FULL_FETCH_LIMIT events → truncation guard fires.
-  // We simulate this by making fetchEvents return an array of `limit` length.
-  // The actual events don't need to be valid — mergeEvents handles parse failures.
-  const FULL_FETCH_LIMIT = 5_000;
-  const fakeEvents = new Array(FULL_FETCH_LIMIT).fill({
-    id: "x".repeat(64),
-    pubkey: "a".repeat(64),
+  const channelEntries = [
+    [`ov_s:${rawCtx}`, 1], // ov_s:ov_s:evil
+    [`ov_c:${rawCtx}`, 0], // ov_c:ov_s:evil
+    [`ov_b:${rawCtx}`, 50], // ov_b:ov_s:evil
+    [wireKey, 50], // esc:ov_s:evil  (escaped frontier)
+  ];
+  // Add plain entries to force multi-slot so the splitter actually partitions.
+  const plain = [];
+  for (let i = 0; i < 20; i++) plain.push([makeChannelKey(i), i + 1]);
+  const allEntries = [...channelEntries, ...plain];
+
+  const encoder = new TextEncoder();
+  // Budget: fits the override group + 5 plain entries, not all 20.
+  const groupOnly = Object.fromEntries(channelEntries);
+  const fivePlain = Object.fromEntries(plain.slice(0, 5));
+  const budget =
+    encoder.encode(
+      JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: groupOnly }),
+    ).length +
+    encoder.encode(
+      JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: fivePlain }),
+    ).length;
+
+  const result = splitContextsIntoBudgetedSlots({
+    channelEntries: allEntries,
+    threadMsgEntries: [],
+    clientId: CLIENT_ID,
+    initialSlotCount: 1,
+    maxSlots: 8,
+    maxBytes: budget,
+    slotIdGenerator: deterministicSlotId,
+  });
+
+  assert.ok(result !== null, "should succeed");
+  assert.ok(result.slots.length >= 2, "should split");
+  const slot0 = result.slots[0];
+  // The escaped frontier key and all three ov_* siblings must be in slot 0.
+  assert.ok(
+    wireKey in slot0,
+    `${wireKey} (escaped frontier) must be in slot 0`,
+  );
+  assert.ok(`ov_s:${rawCtx}` in slot0, "ov_s: sibling must be in slot 0");
+  assert.ok(`ov_c:${rawCtx}` in slot0, "ov_c: sibling must be in slot 0");
+  assert.ok(`ov_b:${rawCtx}` in slot0, "ov_b: sibling must be in slot 0");
+  // No ov_* or esc: entry in non-primary slots.
+  for (let i = 1; i < result.slots.length; i++) {
+    for (const key of Object.keys(result.slots[i])) {
+      assert.ok(
+        !key.startsWith("ov_") && !key.startsWith("esc:"),
+        `reserved key "${key}" must not appear in slot ${i}`,
+      );
+    }
+  }
+});
+
+// ── Test 2: NIP-RS fenced enumeration — complete, continuation, pinned window,
+//    short-cap, fence-lapse witnesses ──────────────────────────────────────────
+
+// Helper to build a minimal valid-looking relay event for the pubkey.
+function makeFakeEvent(pubkey, createdAt) {
+  return {
+    id: `${createdAt.toString(16).padStart(8, "0")}${"0".repeat(56)}`,
+    pubkey,
     kind: 30078,
     content: "",
     tags: [],
-    created_at: 1000,
+    created_at: createdAt,
     sig: "s".repeat(128),
-  });
+  };
+}
 
+test("fetchAndMerge_emptyRelay_setsLoadComplete", async () => {
+  // A relay with no events should produce an empty first band → complete.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "a".repeat(64);
+  let subscribeCallCount = 0;
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async (_filter, _handler) => {
+      subscribeCallCount++;
+      return () => {};
+    },
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    true,
+    "empty relay must produce complete load",
+  );
+  // fence subscription must have been established (and then unsubscribed by fetchAndMerge).
+  assert.equal(
+    subscribeCallCount,
+    1,
+    "fence subscription must be set up exactly once",
+  );
+  mgr.destroy();
+});
+
+test("fetchAndMerge_singleEvent_completesAfterPinnedWindowDischarge", async () => {
+  // Single event at T=1000: band delivers 1 event, C=1, L=2 → max(C,L)=2.
+  // Pinned window {since:1000, until:1000} returns 1 event → 1 < max(1,2)=2 → discharged.
+  // Continuation {until:999} returns 0 → complete.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "b".repeat(64);
+  const event = makeFakeEvent(pubkey, 1000);
+  const fakeRelay = {
+    fetchEvents: async (filter) => {
+      if (filter.since !== undefined && filter.until !== undefined) {
+        // Pinned window query — return the same event.
+        return [event];
+      }
+      if (filter.until !== undefined && filter.until < 1000) {
+        // Continuation below T — empty.
+        return [];
+      }
+      // Initial band.
+      return [event];
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async (_filter, _handler) => () => {},
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    true,
+    "single-event relay must produce complete load after pinned-window discharge",
+  );
+  mgr.destroy();
+});
+
+test("fetchAndMerge_pinnedWindowAtCap_setsLoadIncomplete", async () => {
+  // Pinned window returns max(C, L) events → potentially incomplete.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "c".repeat(64);
+  // Three events all at the same second T=2000.
+  const events = [
+    makeFakeEvent(pubkey, 2000),
+    makeFakeEvent(pubkey, 2000),
+    makeFakeEvent(pubkey, 2000),
+  ];
+  const fakeRelay = {
+    fetchEvents: async (filter) => {
+      if (filter.since !== undefined && filter.until !== undefined) {
+        // Pinned window: return 3 events; C=3, max(C,L)=3 → incomplete.
+        return events;
+      }
+      // Initial band: 3 events, C=3.
+      return events;
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async (_filter, _handler) => () => {},
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    false,
+    "pinned window returning ≥ max(C,L) must produce incomplete load",
+  );
+  mgr.destroy();
+});
+
+test("fetchAndMerge_fenceFails_setsLoadIncomplete", async () => {
+  // subscribeLive throws → fence cannot be established → load is incomplete.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "d".repeat(64);
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async () => {
+      throw new Error("connection refused");
+    },
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    false,
+    "fence failure must produce incomplete load",
+  );
+  mgr.destroy();
+});
+
+test("fetchAndMerge_incompleteLoad_blocksGatedOperations", async () => {
+  // Pinned window returns ≥ max(C,L) → incomplete → four gated ops refuse.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "e".repeat(64);
+  const events = [
+    makeFakeEvent(pubkey, 1000),
+    makeFakeEvent(pubkey, 1000),
+    makeFakeEvent(pubkey, 1000),
+  ];
   let publishCalls = 0;
   const fakeRelay = {
-    fetchEvents: async () => fakeEvents,
+    fetchEvents: async (filter) => {
+      if (filter.since !== undefined) return events; // pinned window
+      return events; // band
+    },
     publishEvent: async () => {
       publishCalls++;
     },
-    subscribeLive: async () => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async (_f, _h) => () => {},
   };
-
-  const pubkey = "a".repeat(64);
   const mgr = new ReadStateManager(pubkey, fakeRelay);
-
-  // Seed some context reads so there's something to publish.
-  mgr.markContextRead("channel-test", 1000);
-
-  // Run fetchAndMerge (internals) via initialize() — the relay returns a full
-  // page, so isLoadComplete must remain false.
-  // We override subscribeLive to avoid hanging on a real subscription.
+  mgr.markContextRead("ch", 1000);
   await mgr.fetchAndMerge();
 
-  // 1. publish() must be blocked (isLoadComplete=false).
+  assert.equal(mgr.isLoadComplete, false, "precondition: load is incomplete");
+
+  // 1. publish() must be blocked.
+  // Replace fetchOwnBlobBeforePublish to avoid second relay call.
+  mgr.fetchOwnBlobBeforePublish = async () => true;
   await mgr.publish();
-  assert.equal(
-    publishCalls,
-    0,
-    "publish must be blocked when isLoadComplete=false",
-  );
+  assert.equal(publishCalls, 0, "publish must be blocked when load incomplete");
 
   // 2. markChannelUnread must return load_incomplete.
-  const unreadResult = mgr.markChannelUnread("channel-test");
-  assert.equal(unreadResult.success, false);
-  assert.equal(
-    unreadResult.reason,
-    "load_incomplete",
-    "markChannelUnread must refuse with load_incomplete",
-  );
+  const ur = mgr.markChannelUnread("ch");
+  assert.equal(ur.success, false);
+  assert.equal(ur.reason, "load_incomplete");
 
   // 3. markChannelRead must return load_incomplete.
-  const readResult = mgr.markChannelRead("channel-test");
-  assert.equal(readResult.success, false);
-  assert.equal(
-    readResult.reason,
-    "load_incomplete",
-    "markChannelRead must refuse with load_incomplete",
-  );
+  const rr = mgr.markChannelRead("ch");
+  assert.equal(rr.success, false);
+  assert.equal(rr.reason, "load_incomplete");
 
-  // 4. deleteExtraSlots must be blocked (isLoadComplete=false).
-  // Inject a fake extraSlotId to verify deletion is suppressed.
-  mgr.extraSlotIds = ["fakeextraslot000"];
+  // 4. deleteExtraSlots must be blocked.
+  mgr.extraSlotIds = ["fakeextraslot0000000000000000000"];
   await mgr.deleteExtraSlots();
   assert.equal(
     publishCalls,
     0,
-    "deleteExtraSlots must not call publishEvent when isLoadComplete=false",
+    "deleteExtraSlots must not publish when load incomplete",
   );
 
   mgr.destroy();
 });
 
-// ── Test 3: visible refusal at budget exhaustion and uint32 max ───────────────
+// ── Test 2b: retry path — a second fetchAndMerge can clear incomplete ─────────
+test("fetchAndMerge_retryClears_incomplete", async () => {
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "f".repeat(64);
+  let callRound = 0;
+  const fakeRelay = {
+    fetchEvents: async (filter) => {
+      callRound++;
+      if (callRound <= 3) {
+        // First attempt: pinned window fires at round 2, returns cap-many events.
+        if (filter.since !== undefined) {
+          return [
+            makeFakeEvent(pubkey, 1000),
+            makeFakeEvent(pubkey, 1000),
+            makeFakeEvent(pubkey, 1000),
+          ];
+        }
+        return [
+          makeFakeEvent(pubkey, 1000),
+          makeFakeEvent(pubkey, 1000),
+          makeFakeEvent(pubkey, 1000),
+        ];
+      }
+      // Retry: empty relay → complete.
+      return [];
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async (_f, _h) => () => {},
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(mgr.isLoadComplete, false, "first load must be incomplete");
+
+  callRound = 999; // reset to "retry" leg
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    true,
+    "retry with empty relay must set complete",
+  );
+  mgr.destroy();
+});
+
+// ── Test 3: live events go through structured ingest ──────────────────────────
+test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
+  // Construct a fake event whose content decrypts to a NIP-RS blob with an
+  // override register.  Use a __TAURI_INTERNALS__ mock so parseReadStateEvent
+  // can decrypt without a real NIP-44 key.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "aa".repeat(32);
+  const rawCtx = `live-channel-${"x".repeat(51)}`;
+  const channelFrontier = 100;
+  // Build a blob where the register (S=3, C=1, B=50) is ACTIVE: S > C, S > frontier.
+  // encode: ov_s:<ctx>=3, ov_c:<ctx>=1, ov_b:<ctx>=50, <ctx>=<frontier>
+  const blobContexts = {
+    [rawCtx]: channelFrontier,
+    [`ov_s:${rawCtx}`]: 3,
+    [`ov_c:${rawCtx}`]: 1,
+    [`ov_b:${rawCtx}`]: 50,
+  };
+  const plaintext = JSON.stringify({
+    v: 1,
+    client_id: "other-device",
+    contexts: blobContexts,
+  });
+
+  // Install Tauri IPC mock so nip44_decrypt_from_self returns our plaintext.
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command, args) => {
+      if (command === "nip44_decrypt_from_self") {
+        if (args.ciphertext === "FAKE_CIPHER") return plaintext;
+        throw new Error("unknown ciphertext");
+      }
+      throw new Error(`Unexpected Tauri command: ${command}`);
+    },
+  };
+
+  let liveHandler = null;
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async (_filter, handler) => {
+      liveHandler = handler;
+      return () => {};
+    },
+  };
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    await mgr.initialize();
+
+    // Build fake NIP-RS event.
+    const fakeEvent = {
+      id: "b".repeat(64),
+      pubkey,
+      created_at: 2_000_000,
+      kind: 30078,
+      tags: [
+        ["d", "read-state:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"],
+        ["t", "read-state"],
+      ],
+      content: "FAKE_CIPHER",
+      sig: "s".repeat(128),
+    };
+
+    // Deliver via the live subscription callback (same path as relay push).
+    assert.ok(liveHandler !== null, "live subscription must be established");
+    liveHandler(fakeEvent); // void-wrapped; wait for async completion
+    await new Promise((r) => setTimeout(r, 50));
+
+    // The override register must now reflect the ingested remote values.
+    const reg = mgr.overrideRegisters.get(rawCtx);
+    assert.ok(reg, "override register must exist after live delivery");
+    assert.equal(reg.s, 3, "S must be 3 from live event");
+    assert.equal(reg.c, 1, "C must be 1 from live event");
+    assert.equal(reg.b, 50, "B must be 50 from live event");
+
+    // ── existing-key live clear (higher C defeating S) ───────────────────
+    // A follow-up event with S=3, C=4 (C > S → inactive/tombstone).
+    const blobClear = {
+      [rawCtx]: channelFrontier,
+      [`ov_c:${rawCtx}`]: 4, // tombstone floor: max(S=3,C=1)+1=4
+    };
+    const ptClear = JSON.stringify({
+      v: 1,
+      client_id: "other-device-2",
+      contexts: blobClear,
+    });
+    const fakeEventClear = {
+      id: "c".repeat(64),
+      pubkey,
+      created_at: 2_000_001,
+      kind: 30078,
+      tags: [
+        ["d", "read-state:b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"],
+        ["t", "read-state"],
+      ],
+      content: "FAKE_CIPHER_2",
+      sig: "s".repeat(128),
+    };
+    globalThis.window.__TAURI_INTERNALS__.invoke = async (command, args) => {
+      if (command === "nip44_decrypt_from_self") {
+        if (args.ciphertext === "FAKE_CIPHER_2") return ptClear;
+        if (args.ciphertext === "FAKE_CIPHER") return plaintext;
+        throw new Error("unknown ciphertext");
+      }
+      throw new Error(`Unexpected Tauri command: ${command}`);
+    };
+    liveHandler(fakeEventClear); // void-wrapped; wait for async completion
+    await new Promise((r) => setTimeout(r, 50));
+    const regAfterClear = mgr.overrideRegisters.get(rawCtx);
+    assert.ok(regAfterClear, "register must still exist after clear event");
+    // tombstone floor: only ov_c:ctx=4 is present → S=0, C=4, B=0 merged via componentwise max
+    // after merge with prior (S=3, C=1, B=50): S=3, C=4, B=50 — override_active = S <= C = inactive
+    assert.equal(
+      regAfterClear.c,
+      4,
+      "C must be 4 (tombstone floor from clear event)",
+    );
+    const liveness = mgr.getOverrideLiveness(rawCtx);
+    assert.ok(liveness !== null, "liveness must be available");
+    assert.equal(
+      liveness.active,
+      false,
+      "override must be inactive after clear",
+    );
+
+    mgr.destroy();
+  } finally {
+    delete globalThis.window.__TAURI_INTERNALS__;
+  }
+});
+
+// ── Test 4: fetch-before-write failure → zero publishes ──────────────────────
+test("publish_fetchOwnBlobFails_doesNotPublish", async () => {
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "bb".repeat(32);
+  let publishCalls = 0;
+  const fakeRelay = {
+    fetchEvents: async (filter) => {
+      // Own-blob fetch (has #d filter) → fail.
+      if (filter["#d"]) throw new Error("relay unreachable");
+      return [];
+    },
+    publishEvent: async () => {
+      publishCalls++;
+    },
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async (_f, _h) => () => {},
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.isLoadComplete = true;
+  mgr.markContextRead("ch", 1000);
+  await mgr.publish();
+  assert.equal(
+    publishCalls,
+    0,
+    "publish must not call publishEvent when fetchOwnBlobBeforePublish fails",
+  );
+  mgr.destroy();
+});
+
+// ── Test 5: durability — register survives restart before debounce ────────────
+test("overrideRegister_survivesRestartBeforeDebounce", () => {
+  // markChannelUnread persists the register via persistLocalState.
+  // A new ReadStateManager constructed from the same localStorage must see it.
+  const ls = makeLocalStorage();
+  globalThis.window.localStorage = ls;
+  const pubkey = "cc".repeat(32);
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async (_f, _h) => () => {},
+  };
+  const mgr1 = new ReadStateManager(pubkey, fakeRelay);
+  mgr1.isLoadComplete = true;
+  mgr1.effectiveState.set("restart-ch", 1000);
+  mgr1.publishableContextIds.add("restart-ch");
+  const result = mgr1.markChannelUnread("restart-ch");
+  assert.equal(result.success, true, "mark-unread must succeed");
+  mgr1.destroy();
+
+  // Construct a new manager on the same localStorage — no relay fetch yet.
+  globalThis.window.localStorage = ls;
+  const mgr2 = new ReadStateManager(pubkey, fakeRelay);
+  mgr2.hydrateFromLocalStorage();
+  const liveness = mgr2.getOverrideLiveness("restart-ch");
+  assert.ok(liveness !== null, "register must be hydrated after restart");
+  assert.equal(
+    liveness.active,
+    true,
+    "override must still be active after restart",
+  );
+  mgr2.destroy();
+});
+
+// ── Test 6: durability — tombstone floor survives restart with fetch failure ──
+test("overrideRegister_tombstoneFloorSurvivesRestartWithFetchFailure", async () => {
+  const ls = makeLocalStorage();
+  globalThis.window.localStorage = ls;
+  const pubkey = "dd".repeat(32);
+  const goodRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async (_f, _h) => () => {},
+  };
+  // Establish a mark-read tombstone floor: S=1, C=max(S,C)+1=2 (clear-wins → inactive).
+  const mgr1 = new ReadStateManager(pubkey, goodRelay);
+  mgr1.isLoadComplete = true;
+  mgr1.effectiveState.set("tombstone-ch", 500);
+  mgr1.publishableContextIds.add("tombstone-ch");
+  mgr1.markChannelUnread("tombstone-ch"); // S→max(0,0)+1=1, C=0, B→frontier
+  mgr1.markChannelRead("tombstone-ch"); // C→max(1,0)+1=2 (clear-wins)
+  const tomb = mgr1.overrideRegisters.get("tombstone-ch");
+  assert.ok(tomb, "tombstone register must exist");
+  assert.equal(tomb.s, 1);
+  assert.equal(tomb.c, 2); // max(S=1,C=0)+1 = 2
+  mgr1.destroy();
+
+  // New manager: initialize() with a relay that throws on fetchEvents.
+  // Tombstone must still be present even after failed fetch.
+  globalThis.window.localStorage = ls;
+  const failRelay = {
+    fetchEvents: async () => {
+      throw new Error("network unavailable");
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeLive: async () => {
+      throw new Error("network unavailable");
+    },
+  };
+  const mgr2 = new ReadStateManager(pubkey, failRelay);
+  await mgr2.initialize(); // fetch fails, but hydration must have run first
+  const reg = mgr2.overrideRegisters.get("tombstone-ch");
+  assert.ok(reg, "tombstone register must survive restart with fetch failure");
+  assert.equal(reg.s, 1, "S must be preserved");
+  assert.equal(reg.c, 2, "C must be preserved (tombstone floor: max(1,0)+1=2)");
+  mgr2.destroy();
+});
+
+// ── Test 7: budget planner ────────────────────────────────────────────────────
 test("markChannelUnread_visibleRefusal_atBudgetExhaustionAndUint32Max", () => {
   const mgr = makeManager();
   // Simulate completed load so mark operations are not blocked by load_incomplete.
   mgr.isLoadComplete = true;
 
   // ── uint32 max refusal ────────────────────────────────────────────────────
-  // Inject a register where S is already at uint32 max and S == C (so
-  // max(S,C)+1 would overflow).
   const UINT32_MAX = 0xffffffff;
   const overflowCtx = "overflow-channel";
   mgr.overrideRegisters.set(overflowCtx, {
@@ -774,41 +1244,208 @@ test("markChannelUnread_visibleRefusal_atBudgetExhaustionAndUint32Max", () => {
     "markChannelUnread must refuse with uint32_overflow when S is at max",
   );
 
-  // ── budget exhaustion refusal ─────────────────────────────────────────────
-  // Fill effectiveState with enough channel keys to consume the entire 32 KiB
-  // budget, then attempt to add a new override group. With no prunable entries
-  // (no msg:/thread: keys), the budget check must fail.
-  //
-  // Each channel key is ~70 bytes. 32768 / 70 ≈ 468 keys to fill the budget.
-  // Use 500 keys to ensure we are well over budget on the channel-only side.
-  const budgetCtx = "budget-channel-00000000000000000000000000000000";
-  for (let i = 0; i < 500; i++) {
-    const ch = `ch-${i.toString().padStart(64, "0")}`;
-    mgr.effectiveState.set(ch, i + 1);
-    mgr.publishableContextIds.add(ch);
+  // ── multi-slot success: 700 frontier-only channels → split planner must succeed ─
+  // Thufir's deterministic witness: 700 plain frontier channels overflow a single slot
+  // but the splitter can spread them across ≤ 8 slots. A new override group in the
+  // primary must succeed because the pure candidate planner tries the split path.
+  const splitMgr = makeManager("f".repeat(64));
+  splitMgr.isLoadComplete = true;
+  for (let i = 0; i < 700; i++) {
+    const ctx = `frontier-ch-${i.toString().padStart(60, "0")}`;
+    splitMgr.effectiveState.set(ctx, 1000 + i);
+    splitMgr.publishableContextIds.add(ctx);
   }
-  // The new context has no existing override register — mark it unread.
-  mgr.effectiveState.set(budgetCtx, 999);
-  mgr.publishableContextIds.add(budgetCtx);
+  const splitCtx = `new-override-ctx-${"n".repeat(48)}`;
+  const splitResult = splitMgr.markChannelUnread(splitCtx);
+  assert.equal(
+    splitResult.success,
+    true,
+    "700 frontier-only channels must allow a new override via multi-slot split",
+  );
+  assert.ok(
+    splitMgr.overrideRegisters.has(splitCtx),
+    "override register must be committed on split success",
+  );
+  splitMgr.destroy();
 
-  const budgetResult = mgr.markChannelUnread(budgetCtx);
-  // 500 channel keys × ~70 bytes ≈ 35 KB > 32 KiB; with no prunable entries
-  // (no msg:/thread: keys), the budget check must fail.
+  // ── near-limit refusal: all 8 slots insufficient → budget_exhausted, no mutation ─
+  // Pack so many non-evictable override groups that even 8 slots cannot accommodate
+  // the new entry. Each override group contributes ov_s+ov_c+ov_b+frontier ≈ 4 keys
+  // × ~75 bytes each + JSON overhead.  200 groups × 4 keys ≈ 300 bytes each ≈ 60 KB
+  // per slot if split across 8 → ~7.5 KB per slot, which fits. We need them to NOT fit.
+  // Easiest: fill primary to near-capacity with 250 big-key override groups so even
+  // splitting all 8 slots still cannot carry the new group in primary (which must
+  // hold ALL override groups per spec, so they all go in slot 0).
+  const fullMgr = makeManager("aa".repeat(32));
+  fullMgr.isLoadComplete = true;
+  // 250 override groups with long context IDs ≈ 250 × (4 keys × ~100 bytes) = 100 KB
+  // → exceeds READ_STATE_MAX_PLAINTEXT_BYTES (32 KB) even in slot 0 alone.
+  for (let i = 0; i < 250; i++) {
+    const ctx = `ov-ch-${i.toString().padStart(60, "0")}`;
+    fullMgr.overrideRegisters.set(ctx, { s: 1, c: 0, b: 0 });
+    fullMgr.effectiveState.set(ctx, 1000 + i);
+    fullMgr.publishableContextIds.add(ctx);
+  }
+  const nearCtx = `near-limit-ctx-${"z".repeat(49)}`;
+  const nearResult = fullMgr.markChannelUnread(nearCtx);
   assert.equal(
-    budgetResult.success,
+    nearResult.success,
     false,
-    "markChannelUnread must refuse when channel-only keys exhaust the budget",
+    "near-limit manager with 250 non-evictable override groups must refuse",
   );
-  assert.equal(
-    budgetResult.reason,
-    "budget_exhausted",
-    "refusal must name budget_exhausted (not a silent drop or panic)",
+  assert.equal(nearResult.reason, "budget_exhausted");
+  assert.ok(
+    !fullMgr.overrideRegisters.has(nearCtx),
+    "budget_exhausted must not mutate overrideRegisters",
   );
-  // Whether it succeeds or fails, the manager must not have corrupted state.
-  // Verify the uint32_overflow register was not mutated.
+  fullMgr.destroy();
+
+  // Verify the uint32_overflow register was not mutated in the original mgr.
   const reg = mgr.overrideRegisters.get(overflowCtx);
   assert.ok(reg, "overflow channel register must still exist");
   assert.equal(reg.s, UINT32_MAX, "overflow register S must be unchanged");
 
+  mgr.destroy();
+});
+
+// ── Test 8: persistence failure fails the mark ───────────────────────────────
+test("markChannelUnread_storageFailure_returnsStorageFailed", () => {
+  // Use a throwing localStorage to simulate quota failure.
+  const throwingLS = makeLocalStorage();
+  const originalSetItem = throwingLS.setItem.bind(throwingLS);
+  // Allow initial writes (ClientId, slotId), then fail on override writes.
+  let writeCount = 0;
+  throwingLS.setItem = (key, value) => {
+    writeCount++;
+    if (writeCount > 2) throw new Error("QuotaExceededError");
+    originalSetItem(key, value);
+  };
+  globalThis.window.localStorage = throwingLS;
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeLive: () => () => {},
+  };
+  const mgr = new ReadStateManager("st".repeat(32), fakeRelay);
+  mgr.isLoadComplete = true;
+  mgr.effectiveState.set("storage-test-ch", 1000);
+
+  const result = mgr.markChannelUnread("storage-test-ch");
+  assert.equal(
+    result.success,
+    false,
+    "markChannelUnread must fail when localStorage throws",
+  );
+  assert.equal(result.reason, "storage_failed");
+  mgr.destroy();
+});
+
+// ── Test 9: inactive existing register still gets C-bump on markChannelRead ───
+test("markChannelRead_inactiveExistingRegister_performsCBump", () => {
+  const mgr = makeManager();
+  mgr.isLoadComplete = true;
+  // Inject an inactive register: S=1, C=2 (clear-wins: C > S → inactive).
+  const ctx = "inactive-ch";
+  mgr.overrideRegisters.set(ctx, { s: 1, c: 2, b: 0 });
+  mgr.publishableContextIds.add(ctx);
+  mgr.effectiveState.set(ctx, 100);
+
+  // Verify it is indeed inactive.
+  const livenessBefore = mgr.getOverrideLiveness(ctx);
+  assert.ok(livenessBefore !== null, "register must exist");
+  assert.equal(livenessBefore.active, false, "register must be inactive");
+
+  // markChannelRead must still perform the C-bump (spec NIP-RS.md:537-539).
+  const result = mgr.markChannelRead(ctx);
+  assert.equal(
+    result.success,
+    true,
+    "markChannelRead must succeed on inactive register",
+  );
+
+  const reg = mgr.overrideRegisters.get(ctx);
+  assert.ok(reg, "register must still exist after markChannelRead");
+  // newC = max(S=1, C=2) + 1 = 3
+  assert.equal(
+    reg.c,
+    3,
+    "C must be bumped to max(S,C)+1=3 even when already inactive",
+  );
+  assert.equal(reg.s, 1, "S must be unchanged");
+  mgr.destroy();
+});
+
+// ── Test 10: coordinate dedupe — newer version wins, older version dropped ────
+test("deduplicateByCoordinate_newerVersionWins_olderDropped", async () => {
+  const { deduplicateByCoordinate } = await import(
+    "./readStateFencedLoader.ts"
+  );
+  const pubkey = "de".repeat(32);
+  const dTag = "read-state:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+  const older = {
+    id: "b".repeat(64),
+    pubkey,
+    created_at: 1_000,
+    kind: 30078,
+    tags: [["d", dTag]],
+    content: "older",
+    sig: "s".repeat(128),
+  };
+  const newer = {
+    id: "a".repeat(64), // lower id — for tie-break test below
+    pubkey,
+    created_at: 2_000,
+    kind: 30078,
+    tags: [["d", dTag]],
+    content: "newer",
+    sig: "s".repeat(128),
+  };
+  const deduped = deduplicateByCoordinate([older, newer]);
+  assert.equal(deduped.length, 1, "dedup must yield one event");
+  assert.equal(deduped[0].content, "newer", "newer created_at must win");
+
+  // Tie-break: same created_at, lower id wins.
+  const tie1 = { ...older, created_at: 3_000, id: "c".repeat(64) };
+  const tie2 = { ...newer, created_at: 3_000, id: "a".repeat(64) };
+  const tieDuped = deduplicateByCoordinate([tie1, tie2]);
+  assert.equal(tieDuped.length, 1, "tie-break dedup must yield one event");
+  assert.equal(tieDuped[0].id, "a".repeat(64), "lower id must win on tie");
+});
+
+// ── Test 11: lapse mid-enumeration → incomplete ───────────────────────────────
+test("fetchAndMerge_lapseMidEnumeration_setsLoadIncomplete", async () => {
+  // Simulate a reconnect (generation change) after the first band is fetched.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "ef".repeat(32);
+  const event = makeFakeEvent(pubkey, 1000);
+  let generation = 0;
+  let reconnectCb = null;
+  const fakeRelay = {
+    fetchEvents: async (filter) => {
+      if (filter.since !== undefined) {
+        // Pinned window: simulate a reconnect BEFORE returning.
+        generation++;
+        reconnectCb?.(); // fire reconnect listener
+        return [event];
+      }
+      return [event]; // initial band
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: (cb) => {
+      reconnectCb = cb;
+      return () => {
+        reconnectCb = null;
+      };
+    },
+    getConnectionGeneration: () => generation,
+    subscribeLive: async (_f, _h) => () => {},
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    false,
+    "lapse during enumeration must produce incomplete load",
+  );
   mgr.destroy();
 });

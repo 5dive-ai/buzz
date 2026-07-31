@@ -439,6 +439,10 @@ pub async fn transfer_community(
             .map_err(|e| internal_error(&format!("lookup community host: {e}")))?
         {
             let tenant = TenantContext::resolved(community, host);
+            // The step-4 upsert can insert a brand-new member row; drop any
+            // cached negative entry so the incoming owner is admitted
+            // immediately, not after cache TTL.
+            state.invalidate_relay_membership(&tenant, &new_owner_pubkey);
             if let Err(error) =
                 crate::handlers::side_effects::publish_nip43_membership_list(&tenant, &state).await
             {

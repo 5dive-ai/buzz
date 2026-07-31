@@ -750,11 +750,13 @@ impl AppState {
                     .support_invalidation_closures()
                     .build(),
             ),
+            // No `support_invalidation_closures()`: this cache is only ever
+            // dropped by exact key, and the flag adds an is-invalidated check
+            // to every read on the hottest cache in the relay.
             relay_membership_cache: Arc::new(
                 moka::sync::Cache::builder()
                     .max_capacity(100_000)
                     .time_to_live(std::time::Duration::from_secs(10))
-                    .support_invalidation_closures()
                     .build(),
             ),
             accessible_channels_cache: Arc::new(
@@ -865,33 +867,38 @@ impl AppState {
     pub async fn is_relay_member_cached(
         &self,
         community_id: CommunityId,
-        pubkey_hex: &str,
+        pubkey: &[u8],
     ) -> Result<bool, buzz_db::DbError> {
-        let key = (community_id, pubkey_hex.as_bytes().to_vec());
+        let key = (community_id, pubkey.to_vec());
         if let Some(cached) = self.relay_membership_cache.get(&key) {
             metrics::counter!("buzz_relay_membership_cache_hits_total").increment(1);
             return Ok(cached);
         }
         metrics::counter!("buzz_relay_membership_cache_misses_total").increment(1);
-        let result = self.db.is_relay_member(community_id, pubkey_hex).await?;
+        let result = self
+            .db
+            .is_relay_member(community_id, &hex::encode(pubkey))
+            .await?;
         self.relay_membership_cache.insert(key, result);
         Ok(result)
     }
 
     /// Invalidate one pubkey's relay-membership entry after a membership
-    /// change (invite claim, admin add/remove, self-leave).
+    /// change (invite claim, admin add/remove, self-leave, ownership
+    /// transfer).
     ///
     /// Local drop plus fire-and-forget cross-pod publish, same contract as
     /// [`invalidate_membership`]: a dropped publish degrades to the 10s TTL,
     /// never a permanent leak.
     pub fn invalidate_relay_membership(&self, tenant: &TenantContext, pubkey_hex: &str) {
-        self.invalidate_relay_membership_local(tenant.community(), pubkey_hex.as_bytes());
-        self.spawn_cache_invalidation(
-            tenant,
-            CacheInvalidation::RelayMembership {
-                pubkey: pubkey_hex.as_bytes().to_vec(),
-            },
-        );
+        let Ok(pubkey) = hex::decode(pubkey_hex) else {
+            // Every callsite passes validated 64-char hex; a non-hex input
+            // can't have a cache entry (keys are raw bytes), so nothing to drop.
+            debug_assert!(false, "invalidate_relay_membership: non-hex pubkey");
+            return;
+        };
+        self.invalidate_relay_membership_local(tenant.community(), &pubkey);
+        self.spawn_cache_invalidation(tenant, CacheInvalidation::RelayMembership { pubkey });
     }
 
     /// Local-only relay-membership drop. The cross-pod consumer calls this
@@ -1548,71 +1555,83 @@ mod tests {
         let state = test_state().await;
         let community_a = CommunityId::from_uuid(Uuid::from_u128(0xAAAA));
         let community_b = CommunityId::from_uuid(Uuid::from_u128(0xBBBB));
-        let member_hex = "aa".repeat(32);
-        let other_hex = "bb".repeat(32);
+        let member = vec![0xAAu8; 32];
+        let other = vec![0xBBu8; 32];
 
         // Seed as the cached method would after DB reads.
         state
             .relay_membership_cache
-            .insert((community_a, member_hex.as_bytes().to_vec()), true);
+            .insert((community_a, member.clone()), true);
         state
             .relay_membership_cache
-            .insert((community_a, other_hex.as_bytes().to_vec()), false);
+            .insert((community_a, other.clone()), false);
         state
             .relay_membership_cache
-            .insert((community_b, member_hex.as_bytes().to_vec()), true);
+            .insert((community_b, member.clone()), true);
 
         // A cached entry is served without touching the DB: the lazy test
         // pool points at nothing, so a DB fallback would error, not return.
         assert!(state
-            .is_relay_member_cached(community_a, &member_hex)
+            .is_relay_member_cached(community_a, &member)
             .await
             .expect("cache hit must not touch the DB"),);
         // Negative entries are cached and served the same way.
         assert!(!state
-            .is_relay_member_cached(community_a, &other_hex)
+            .is_relay_member_cached(community_a, &other)
             .await
             .expect("negative cache hit must not touch the DB"),);
 
         // Invalidation drops exactly the (community, pubkey) entry: same
         // pubkey in another community and other pubkeys are untouched.
-        state.invalidate_relay_membership_local(community_a, member_hex.as_bytes());
+        state.invalidate_relay_membership_local(community_a, &member);
         assert_eq!(
             state
                 .relay_membership_cache
-                .get(&(community_a, member_hex.as_bytes().to_vec())),
+                .get(&(community_a, member.clone())),
             None,
             "invalidated entry must be dropped"
         );
         assert_eq!(
             state
                 .relay_membership_cache
-                .get(&(community_b, member_hex.as_bytes().to_vec())),
+                .get(&(community_b, member.clone())),
             Some(true),
             "same pubkey in another community must survive"
         );
         assert_eq!(
-            state
-                .relay_membership_cache
-                .get(&(community_a, other_hex.as_bytes().to_vec())),
+            state.relay_membership_cache.get(&(community_a, other)),
             Some(false),
             "other pubkeys in the same community must survive"
+        );
+
+        // The mutation-flow entry point takes the hex string every handler
+        // holds and must decode it to the raw-byte cache key. This is the
+        // seam every invalidation callsite goes through.
+        state
+            .relay_membership_cache
+            .insert((community_a, member.clone()), true);
+        let tenant_a = buzz_core::TenantContext::resolved(community_a, "a.test.example");
+        state.invalidate_relay_membership(&tenant_a, &hex::encode(&member));
+        assert_eq!(
+            state
+                .relay_membership_cache
+                .get(&(community_a, member.clone())),
+            None,
+            "hex-keyed invalidation must drop the raw-byte entry"
         );
 
         // The cross-pod path applies the same local drop.
         state
             .relay_membership_cache
-            .insert((community_a, member_hex.as_bytes().to_vec()), true);
+            .insert((community_a, member.clone()), true);
         state.apply_cache_invalidation(
             community_a,
             buzz_pubsub::cache_invalidation::CacheInvalidation::RelayMembership {
-                pubkey: member_hex.as_bytes().to_vec(),
+                pubkey: member.clone(),
             },
         );
         assert_eq!(
-            state
-                .relay_membership_cache
-                .get(&(community_a, member_hex.as_bytes().to_vec())),
+            state.relay_membership_cache.get(&(community_a, member)),
             None,
             "cross-pod drop must clear the entry"
         );

@@ -1121,6 +1121,16 @@ mod tests {
         assert!(url.contains("/invite/"), "unexpected url: {url}");
 
         // Claim on a closed relay by a pubkey that is not yet a member.
+        //
+        // Wiring guard: seed a cached negative membership for the joiner
+        // first, exactly what a pre-join auth check would have left behind.
+        // The claim handler must call invalidate_relay_membership, or the
+        // joiner stays locked out until cache TTL — deleting that callsite
+        // must fail here.
+        state.relay_membership_cache.insert(
+            (community_id, joiner.public_key().to_bytes().to_vec()),
+            false,
+        );
         let claim_body = serde_json::json!({ "code": code }).to_string();
         let response = post_json(
             state.clone(),
@@ -1134,6 +1144,13 @@ mod tests {
         let json = read_json(response).await;
         assert_eq!(json.get("status").and_then(Value::as_str), Some("joined"));
         assert_eq!(json.get("role").and_then(Value::as_str), Some("member"));
+        assert_eq!(
+            state
+                .relay_membership_cache
+                .get(&(community_id, joiner.public_key().to_bytes().to_vec())),
+            None,
+            "claim must invalidate the joiner's cached membership entry"
+        );
 
         let member = state
             .db

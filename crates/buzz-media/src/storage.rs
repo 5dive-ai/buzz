@@ -187,14 +187,64 @@ impl MediaStorage {
         ctx: &TenantContext,
         payload_name: &str,
     ) -> Result<String, MediaError> {
-        let candidates =
-            crate::keys::read_candidates(ctx, payload_name).map_err(|_| MediaError::NotFound)?;
-        match self.head_with_metadata(&candidates.sharded).await? {
-            Some(_) => Ok(candidates.sharded),
-            None => match self.head_with_metadata(&candidates.legacy).await? {
-                Some(_) => Ok(candidates.legacy),
-                None => Err(MediaError::NotFound),
-            },
+        let candidates = match crate::keys::read_candidates(ctx, payload_name) {
+            Ok(candidates) => candidates,
+            Err(_) => {
+                metrics::counter!(
+                    "buzz_media_s3_read_resolutions_total",
+                    "result" => "missing"
+                )
+                .increment(1);
+                return Err(MediaError::NotFound);
+            }
+        };
+
+        match self.head_with_metadata(&candidates.sharded).await {
+            Ok(Some(_)) => {
+                metrics::counter!(
+                    "buzz_media_s3_read_resolutions_total",
+                    "result" => "sharded"
+                )
+                .increment(1);
+                Ok(candidates.sharded)
+            }
+            Ok(None) => {
+                metrics::counter!("buzz_media_s3_read_fallbacks_total").increment(1);
+                match self.head_with_metadata(&candidates.legacy).await {
+                    Ok(Some(_)) => {
+                        metrics::counter!(
+                            "buzz_media_s3_read_resolutions_total",
+                            "result" => "legacy"
+                        )
+                        .increment(1);
+                        Ok(candidates.legacy)
+                    }
+                    Ok(None) => {
+                        metrics::counter!(
+                            "buzz_media_s3_read_resolutions_total",
+                            "result" => "missing"
+                        )
+                        .increment(1);
+                        Err(MediaError::NotFound)
+                    }
+                    Err(error) => {
+                        metrics::counter!(
+                            "buzz_media_s3_read_resolutions_total",
+                            "result" => "storage_error"
+                        )
+                        .increment(1);
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => {
+                metrics::counter!(
+                    "buzz_media_s3_read_resolutions_total",
+                    "result" => "storage_error"
+                )
+                .increment(1);
+                Err(error)
+            }
         }
     }
 

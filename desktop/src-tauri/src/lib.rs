@@ -495,9 +495,7 @@ pub fn run() {
                 });
             }
 
-            // Start the localhost media streaming proxy. Uses the shared HTTP
-            // client so VPN tunnelling applies. The port is stored in AppState
-            // and exposed to the frontend via the `get_media_proxy_port` command.
+            // Start the localhost media proxy with the shared VPN-aware HTTP client.
             let proxy_client = state.http_client.clone();
             let proxy_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {

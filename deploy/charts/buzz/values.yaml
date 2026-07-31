@@ -117,6 +117,15 @@ relay:
   drainJitterMs: 0
   requireAuthToken: true
   requireRelayMembership: true
+  # Authenticated media reads: relay GET/HEAD /media/* requires Blossom
+  # kind 24242 t=get plus relay membership. Enabled by default so private
+  # attachments are never publicly readable by URL/hash. Only set false for
+  # local development or fully public communities — desktop, mobile, and CLI
+  # clients all attach read auth.
+  requireMediaGetAuth: true
+  # Media payload write migration: legacy -> dual -> sharded. The upgrade-safe
+  # default is legacy, so installing a new release never starts duplicate writes.
+  mediaKeyLayout: legacy
   allowNipOaAuth: true
   pubkeyAllowlist: false
   corsOrigins: []

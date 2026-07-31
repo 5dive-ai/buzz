@@ -94,6 +94,25 @@ disables that probe through `relay.extraEnv`, `/_readiness` does not test object
 storage; configuration is still parsed strictly, but reachability and addressing
 errors surface on the first storage operation.
 
+## Media object-key migration
+
+Media writes stay on the flat legacy layout after an upgrade unless the operator
+explicitly advances `BUZZ_MEDIA_KEY_LAYOUT` (or Helm
+`relay.mediaKeyLayout`). The supported stages are:
+
+1. `legacy` (default): write only existing flat keys. Deploy this release first
+   so every relay can read both layouts; upgrading alone does **not** double-write.
+2. `dual`: after all readers are compatible, write the sharded key and a flat
+   rollback copy. Monitor `buzz_media_s3_read_resolutions_total`,
+   `buzz_media_s3_read_fallbacks_total`, and the storage duplicate-layout gauges.
+3. `sharded`: after backfill/reconciliation and a full rollback window, stop
+   writing flat copies. Keep compatibility readers deployed while legacy objects
+   are migrated and verified.
+
+Do not roll `sharded` writers back to a Buzz version that predates sharded reads.
+Returning from `sharded` to `dual` does not retroactively recreate legacy copies;
+run and verify the backfill before relying on old-version rollback.
+
 ## Relay Pod extensions
 
 The chart exposes narrow extension points for init containers, volumes, relay

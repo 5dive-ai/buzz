@@ -102,6 +102,27 @@ function LinkPreviewImage({
   );
 }
 
+function LinkPreviewDescription({
+  className,
+  description,
+}: {
+  className?: string;
+  description: string;
+}) {
+  return (
+    <div
+      className={cn("mt-1 space-y-2 text-sm leading-5", className)}
+      data-slot="attachment-description"
+    >
+      {description.split(/\n{2,}/).map((paragraph) => (
+        <p className="whitespace-pre-line" key={paragraph}>
+          {paragraph}
+        </p>
+      ))}
+    </div>
+  );
+}
+
 function TweetPreview({
   className,
   onRemove,
@@ -141,12 +162,10 @@ function TweetPreview({
         {preview.title}
       </a>
       {contentExpanded && preview.description ? (
-        <div
-          className="mt-1 whitespace-normal text-sm leading-5 text-foreground"
-          data-slot="attachment-description"
-        >
-          {preview.description}
-        </div>
+        <LinkPreviewDescription
+          className="text-foreground"
+          description={preview.description}
+        />
       ) : null}
       {contentExpanded && reserveImage ? (
         <LinkPreviewImage
@@ -209,7 +228,6 @@ export function RichLinkPreviewAttachment({
   }
 
   const reserveImage = preview.imageState !== "none";
-  const showImage = preview.imageState === "image";
   const hasExpandableContent = Boolean(preview.description) || reserveImage;
   const hostname = getHostname(preview);
 
@@ -243,40 +261,18 @@ export function RichLinkPreviewAttachment({
           <span className="line-clamp-2">{preview.title}</span>
         </a>
         {contentExpanded && preview.description ? (
-          <div
-            className="mt-1 whitespace-normal text-sm leading-5 text-muted-foreground"
-            data-slot="attachment-description"
-          >
-            {preview.description}
-          </div>
+          <LinkPreviewDescription
+            className="text-muted-foreground"
+            description={preview.description}
+          />
         ) : null}
       </div>
       {contentExpanded && reserveImage ? (
-        <a
-          aria-label={`Open preview image from ${hostname}`}
-          className="mt-2 block w-full max-w-75 overflow-hidden rounded-xl bg-muted"
-          href={preview.href}
-          rel="noreferrer"
-          target="_blank"
-        >
-          <div
-            className="aspect-[1.91/1] w-full"
-            data-link-preview-thumbnail=""
-          >
-            {showImage ? (
-              <img
-                alt={`Preview from ${preview.imageDomain}`}
-                className="h-full w-full object-cover"
-                src={preview.imageDataUrl ?? undefined}
-              />
-            ) : (
-              <div
-                className="h-full w-full animate-pulse bg-muted-foreground/10"
-                data-link-preview-skeleton=""
-              />
-            )}
-          </div>
-        </a>
+        <LinkPreviewImage
+          aspectClassName="aspect-[1.91/1]"
+          className="mt-2 w-full max-w-75"
+          preview={preview}
+        />
       ) : null}
       {hasExpandableContent ? (
         <button

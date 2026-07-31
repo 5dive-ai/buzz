@@ -354,36 +354,53 @@ fn parse_operator_api_origin(raw: &str) -> Result<String, ConfigError> {
 }
 
 const DEFAULT_PUSH_GATEWAY_DELIVERY_URL: &str = "https://push.buzz.xyz/v1/deliveries/apns";
+const DEV_PUSH_GATEWAY_LOOPBACK_HTTP_ENV: &str = "BUZZ_PUSH_DEV_LOOPBACK_HTTP";
 
-fn is_debug_loopback_push_gateway_url(url: &url::Url) -> bool {
+fn parse_dev_push_gateway_loopback_http(raw: Option<&str>) -> Result<bool, ConfigError> {
+    match raw {
+        None | Some("0") => Ok(false),
+        Some("1") if cfg!(debug_assertions) => Ok(true),
+        Some("1") => Err(ConfigError::InvalidValue(format!(
+            "{DEV_PUSH_GATEWAY_LOOPBACK_HTTP_ENV}=1 is unavailable outside Debug builds"
+        ))),
+        Some(_) => Err(ConfigError::InvalidValue(format!(
+            "{DEV_PUSH_GATEWAY_LOOPBACK_HTTP_ENV} must be exactly 0 or 1"
+        ))),
+    }
+}
+
+fn is_debug_loopback_push_gateway_url(url: &url::Url, allow_loopback_http: bool) -> bool {
     #[cfg(debug_assertions)]
     {
-        if url.scheme() != "http" {
+        if !allow_loopback_http || url.scheme() != "http" {
             return false;
         }
 
         match url.host() {
             Some(url::Host::Domain(host)) => host == "localhost",
-            Some(url::Host::Ipv4(address)) => address.is_loopback(),
-            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            Some(url::Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(address)) => address == std::net::Ipv6Addr::LOCALHOST,
             None => false,
         }
     }
 
     #[cfg(not(debug_assertions))]
     {
-        let _ = url;
+        let _ = (url, allow_loopback_http);
         false
     }
 }
 
-fn parse_push_gateway_delivery_url(raw: &str) -> Result<url::Url, ConfigError> {
+fn parse_push_gateway_delivery_url(
+    raw: &str,
+    allow_loopback_http: bool,
+) -> Result<url::Url, ConfigError> {
     let url = url::Url::parse(raw.trim()).map_err(|e| {
         ConfigError::InvalidValue(format!(
             "BUZZ_PUSH_GATEWAY_DELIVERY_URL is not a valid URL: {e}"
         ))
     })?;
-    if (url.scheme() != "https" && !is_debug_loopback_push_gateway_url(&url))
+    if (url.scheme() != "https" && !is_debug_loopback_push_gateway_url(&url, allow_loopback_http))
         || url.host().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -392,7 +409,7 @@ fn parse_push_gateway_delivery_url(raw: &str) -> Result<url::Url, ConfigError> {
         || url.fragment().is_some()
     {
         return Err(ConfigError::InvalidValue(
-            "BUZZ_PUSH_GATEWAY_DELIVERY_URL must be an exact HTTPS /v1/deliveries/apns URL without credentials, query, or fragment (Debug builds also allow exact loopback HTTP URLs)"
+            "BUZZ_PUSH_GATEWAY_DELIVERY_URL must be an exact HTTPS /v1/deliveries/apns URL without credentials, query, or fragment (explicitly gated Debug builds also allow exact loopback HTTP URLs)"
                 .to_string(),
         ));
     }
@@ -831,13 +848,31 @@ impl Config {
                 "BUZZ_PUSH_EXECUTOR_KEY_ID must contain 1..=64 bytes".to_string(),
             ));
         }
+        let dev_push_gateway_loopback_http = parse_dev_push_gateway_loopback_http(
+            std::env::var(DEV_PUSH_GATEWAY_LOOPBACK_HTTP_ENV)
+                .ok()
+                .as_deref(),
+        )?;
         let push_gateway_delivery_url = match std::env::var("BUZZ_PUSH_GATEWAY_DELIVERY_URL") {
             Ok(raw) if raw.trim().is_empty() => None,
-            Ok(raw) => Some(parse_push_gateway_delivery_url(&raw)?),
+            Ok(raw) => Some(parse_push_gateway_delivery_url(
+                &raw,
+                dev_push_gateway_loopback_http,
+            )?),
             Err(_) => Some(parse_push_gateway_delivery_url(
                 DEFAULT_PUSH_GATEWAY_DELIVERY_URL,
+                dev_push_gateway_loopback_http,
             )?),
         };
+        if dev_push_gateway_loopback_http
+            && push_gateway_delivery_url
+                .as_ref()
+                .is_some_and(|url| url.scheme() == "http")
+        {
+            warn!(
+                "DEVELOPMENT ONLY: relay push delivery permits plaintext HTTP to an exact loopback gateway"
+            );
+        }
         let push_gateway_timeout_millis = match std::env::var("BUZZ_PUSH_GATEWAY_TIMEOUT_MS") {
             Ok(raw) => raw
                 .parse::<u64>()
@@ -1465,36 +1500,63 @@ mod tests {
 
     #[test]
     fn push_gateway_url_is_exact_and_fail_closed() {
-        assert!(parse_push_gateway_delivery_url("https://push.example/v1/deliveries/apns").is_ok());
+        assert!(
+            parse_push_gateway_delivery_url("https://push.example/v1/deliveries/apns", false)
+                .is_ok()
+        );
         for invalid in [
             "http://push.example/v1/deliveries/apns",
             "http://localhost.example/v1/deliveries/apns",
             "http://localhost@push.example/v1/deliveries/apns",
+            "http://127.0.0.2/v1/deliveries/apns",
             "http://192.168.1.10/v1/deliveries/apns",
             "https://push.example/v1/deliveries/apns/",
             "https://push.example/v1/deliveries/apns?token=x",
             "https://user@push.example/v1/deliveries/apns",
         ] {
             assert!(
-                parse_push_gateway_delivery_url(invalid).is_err(),
+                parse_push_gateway_delivery_url(invalid, true).is_err(),
                 "{invalid}"
             );
         }
+        assert!(
+            parse_push_gateway_delivery_url("http://localhost:8080/v1/deliveries/apns", false,)
+                .is_err(),
+            "loopback HTTP must default off"
+        );
     }
 
     #[test]
-    fn push_gateway_http_loopback_is_debug_only() {
+    fn push_gateway_http_loopback_requires_debug_gate() {
         for url in [
             "http://localhost:8080/v1/deliveries/apns",
             "http://127.0.0.1:8080/v1/deliveries/apns",
             "http://[::1]:8080/v1/deliveries/apns",
         ] {
-            let result = parse_push_gateway_delivery_url(url);
+            let result = parse_push_gateway_delivery_url(url, true);
             if cfg!(debug_assertions) {
                 assert!(result.is_ok(), "{url}: {result:?}");
             } else {
                 assert!(result.is_err(), "{url}");
             }
+        }
+    }
+
+    #[test]
+    fn push_gateway_http_loopback_flag_is_strict_and_debug_only() {
+        assert!(!parse_dev_push_gateway_loopback_http(None).unwrap());
+        assert!(!parse_dev_push_gateway_loopback_http(Some("0")).unwrap());
+        for invalid in ["", "true", "on", "01", " 1"] {
+            assert!(
+                parse_dev_push_gateway_loopback_http(Some(invalid)).is_err(),
+                "{invalid:?}"
+            );
+        }
+        let enabled = parse_dev_push_gateway_loopback_http(Some("1"));
+        if cfg!(debug_assertions) {
+            assert!(enabled.unwrap());
+        } else {
+            assert!(enabled.is_err());
         }
     }
 

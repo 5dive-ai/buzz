@@ -1,9 +1,11 @@
 /**
  * Source-of-truth constants for buzz-agent model-tuning configuration knobs.
  *
- * Values must stay in sync with `crates/buzz-agent/src/config.rs`
- * `parse_thinking_effort` — that function is the authoritative list.
+ * Phase 2b: getProviderEffortConfigFromManifest() is the new generated-manifest
+ * path. getProviderEffortConfig() (legacy hand-tables) stays live for the
+ * differential harness until Phase 3 retires it.
  */
+import { resolveModelCapabilities } from "./modelCapabilities";
 
 /** Env var key for the thinking/effort level sent to the LLM. */
 export const BUZZ_AGENT_THINKING_EFFORT = "BUZZ_AGENT_THINKING_EFFORT";
@@ -306,4 +308,31 @@ function openaiConfig(m: string): ProviderEffortConfig {
  */
 export function isBuzzAgentRuntime(runtimeId: string): boolean {
   return runtimeId === "buzz-agent";
+}
+
+// ---------------------------------------------------------------------------
+// Generated-manifest path (Phase 2b) — thin lookup over resolveModelCapabilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the valid thinking-effort values and semantic default for the
+ * given provider and model, resolved from the generated model-capabilities
+ * manifest (modelCapabilities.ts).
+ *
+ * This is the Phase 2b replacement path for getProviderEffortConfig().
+ * Both paths are live until Phase 3 retires getProviderEffortConfig().
+ *
+ * The manifest's `supportedEfforts` maps to `validValues`; `defaultEffort`
+ * (which may be null for manual-budget models — "Inherit" is the natural
+ * default) maps to `defaultValue`.
+ */
+export function getProviderEffortConfigFromManifest(
+  providerId: string,
+  model?: string,
+): ProviderEffortConfig {
+  const cap = resolveModelCapabilities(providerId, model ?? "");
+  return {
+    validValues: cap.supportedEfforts,
+    defaultValue: cap.defaultEffort,
+  };
 }

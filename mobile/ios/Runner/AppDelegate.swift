@@ -19,6 +19,9 @@ import UserNotifications
   private var appGroupIdentifier: String? {
     Bundle.main.object(forInfoDictionaryKey: "BuzzAppGroupIdentifier") as? String
   }
+  private var qrScannerChannel: FlutterMethodChannel?
+  private var inlinePhotoPickerSupportChannel: FlutterMethodChannel?
+  private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
 
   override func application(
     _ application: UIApplication,
@@ -37,17 +40,17 @@ import UserNotifications
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    let messenger = engineBridge.applicationRegistrar.messenger()
     mediaUploadChannel = FlutterMethodChannel(
       name: "buzz/media_upload",
-      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+      binaryMessenger: messenger
     )
     mediaUploadChannel?.setMethodCallHandler { [weak self] call, result in
       self?.handleMediaUploadMethodCall(call, result: result)
     }
-
     pushChannel = FlutterMethodChannel(
       name: "buzz/push",
-      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+      binaryMessenger: messenger
     )
     pushChannel?.setMethodCallHandler { [weak self] call, result in
       self?.handlePushMethodCall(call, result: result)
@@ -55,6 +58,98 @@ import UserNotifications
     apnsRegistrationBuffer.attach { [weak self] update in
       self?.pushChannel?.invokeMethod(update.method, arguments: update.arguments)
     }
+    qrScannerChannel = FlutterMethodChannel(
+      name: "buzz/qr_scanner",
+      binaryMessenger: messenger
+    )
+    qrScannerChannel?.setMethodCallHandler { call, result in
+      Self.handleQrScannerMethodCall(call, result: result)
+    }
+    inlinePhotoPickerSupportChannel = FlutterMethodChannel(
+      name: "buzz/inline_photo_picker",
+      binaryMessenger: messenger
+    )
+    inlinePhotoPickerSupportChannel?.setMethodCallHandler { call, result in
+      guard call.method == "isSupported" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      if #available(iOS 17.0, *) {
+        result(true)
+      } else {
+        result(false)
+      }
+    }
+
+    if let inlinePhotoPickerRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzInlinePhotoPicker"
+    ) {
+      inlinePhotoPickerRegistrar.register(
+        InlinePhotoPickerFactory(
+          messenger: messenger,
+          parentViewController: inlinePhotoPickerRegistrar.viewController
+        ),
+        withId: "buzz/inline_photo_picker"
+      )
+    }
+
+    let nativeAttachmentRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzNativeAttachmentPopover"
+    )
+    nativeAttachmentPopoverCoordinator = NativeAttachmentPopoverCoordinator(
+      messenger: messenger,
+      parentViewController: nativeAttachmentRegistrar?.viewController
+    )
+  }
+
+  private static func handleQrScannerMethodCall(
+    _ call: FlutterMethodCall,
+    result: @escaping FlutterResult
+  ) {
+    switch call.method {
+    case "usesDynamicIslandQrScannerPortal":
+      result(
+        UIDevice.current.userInterfaceIdiom == .phone
+          && usesDynamicIslandQrScannerPortal(
+            safeAreaTopInset: activeWindowSafeAreaTopInset()
+          )
+      )
+    case "setDynamicIslandScannerStatusBarHidden":
+      guard let hidden = call.arguments as? Bool else {
+        result(
+          FlutterError(
+            code: "invalid_arguments",
+            message: "Expected a Bool status-bar visibility value.",
+            details: nil
+          )
+        )
+        return
+      }
+      UIApplication.shared.setStatusBarHidden(hidden, with: .fade)
+      result(nil)
+    case "performDynamicIslandQrScanSuccessHaptic":
+      let generator = UINotificationFeedbackGenerator()
+      generator.prepare()
+      generator.notificationOccurred(.success)
+      result(nil)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  static func usesDynamicIslandQrScannerPortal(
+    safeAreaTopInset: CGFloat
+  ) -> Bool {
+    safeAreaTopInset > 50
+  }
+
+  private static func activeWindowSafeAreaTopInset() -> CGFloat {
+    UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .filter { $0.activationState == .foregroundActive }
+      .flatMap(\.windows)
+      .first(where: \.isKeyWindow)?
+      .safeAreaInsets.top ?? 0
   }
 
   override func application(

@@ -790,15 +790,14 @@ fn tts_worker(
                         }
                     };
                 let mut playback_audio = PlaybackChunkAudio::new();
-                debug_assert!(playback_audio
-                    .push(
-                        samples,
-                        chunk_index,
-                        &mut first_append,
-                        silence_buf_len,
-                        player.empty(),
-                    )
-                    .is_none());
+                let completed_audio = playback_audio.push(
+                    samples,
+                    chunk_index,
+                    &mut first_append,
+                    silence_buf_len,
+                    player.empty(),
+                );
+                debug_assert!(completed_audio.is_none());
                 if let Some(prepared) =
                     playback_audio.finish(&mut first_append, silence_buf_len, player.empty())
                 {

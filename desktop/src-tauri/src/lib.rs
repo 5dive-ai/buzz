@@ -300,9 +300,14 @@ pub fn run() {
                         if let Ok(hs) = state.huddle_state.lock() {
                             hs.ptt_active
                                 .store(true, std::sync::atomic::Ordering::Release);
-                            // Only cancel TTS if it's actually playing — avoids
-                            // a stale cancel flag that drops the next queued message.
-                            if hs.tts_active.load(std::sync::atomic::Ordering::Acquire) {
+                            // Cancel queued playback and in-flight synthesis.
+                            // The synthesizing flag keeps barge-in armed during
+                            // silent decoder gaps without leaving a stale cancel
+                            // flag after the utterance finishes.
+                            if huddle::tts::is_tts_interruptible(
+                                hs.tts_active.as_ref(),
+                                hs.tts_synthesizing.as_ref(),
+                            ) {
                                 hs.tts_cancel
                                     .store(true, std::sync::atomic::Ordering::Release);
                             }

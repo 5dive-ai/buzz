@@ -932,7 +932,7 @@ fn release_tts_active_if_drained(player_empty: bool, tts_active: &AtomicBool) {
     }
 }
 
-pub(super) fn is_tts_interruptible(tts_active: &AtomicBool, tts_synthesizing: &AtomicBool) -> bool {
+pub(crate) fn is_tts_interruptible(tts_active: &AtomicBool, tts_synthesizing: &AtomicBool) -> bool {
     tts_active.load(Ordering::Acquire) || tts_synthesizing.load(Ordering::Acquire)
 }
 

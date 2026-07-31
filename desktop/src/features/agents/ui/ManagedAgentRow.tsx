@@ -411,7 +411,9 @@ function RuntimeBlock({
       {runtimeSource || agent.model ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
           {runtimeSource ? <span>{runtimeSource}</span> : null}
-          {agent.model ? <span>{resolveModelLabel(agent.model)}</span> : null}
+          {agent.model ? (
+            <span>{resolveModelLabel(agent.model, null, agent.provider)}</span>
+          ) : null}
         </div>
       ) : null}
     </div>

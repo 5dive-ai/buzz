@@ -612,7 +612,13 @@ export function UserProfilePopover({
                 <InfoBadge>{runtimeLabel(relayAgent.agentType)}</InfoBadge>
               ) : null}
               {managedAgent?.model ? (
-                <InfoBadge>{resolveModelLabel(managedAgent.model)}</InfoBadge>
+                <InfoBadge>
+                  {resolveModelLabel(
+                    managedAgent.model,
+                    null,
+                    managedAgent.provider,
+                  )}
+                </InfoBadge>
               ) : null}
               {managedAgent?.acpCommand ? (
                 <InfoBadge>ACP: {managedAgent.acpCommand}</InfoBadge>

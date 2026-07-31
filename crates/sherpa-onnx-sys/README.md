@@ -5,8 +5,27 @@
 </div>
 
 Buzz carries the crates.io 1.13.4 FFI sources and locally patches the build
-script to link caller-supplied official iOS and Android libraries through
+script to link caller-prepared official iOS and Android libraries through
 `SHERPA_ONNX_LIB_DIR`. Desktop archive selection remains unchanged.
+
+The application that produces the final native library owns archive download,
+checksum verification, slice selection, and packaging. It must select the
+`static` feature for iOS and the `shared` feature for Android. Because Cargo
+does not propagate `[patch.crates-io]` from dependencies, that application's
+workspace root must also patch `sherpa-onnx-sys` to this package.
+
+`SHERPA_ONNX_LIB_DIR` points to the selected target's normalized link
+directory, not the root of the downloaded archive:
+
+- iOS contains `libsherpa-onnx.a` and `libonnxruntime.a`. A consumer can
+  extract the matching binaries from the official sherpa and ONNX Runtime
+  XCFramework slices.
+- Android contains `libsherpa-onnx-c-api.so` and `libonnxruntime.so` from
+  the matching official ABI directory.
+
+The consumer remains responsible for embedding those libraries and the
+platform C++ runtime in its Xcode or Gradle product. Buzz Desktop's independent
+Tauri workspace is a desktop consumer and does not select these mobile modes.
 
  ### Supported functions
 

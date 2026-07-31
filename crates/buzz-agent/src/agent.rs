@@ -90,6 +90,14 @@ const CANCEL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 pub struct TurnTokens {
     pub input: Option<u64>,
     pub output: Option<u64>,
+    /// Cache reads+writes. A *subset* of `input`, not an addition to it --
+    /// goose documents `cache_read_input_tokens`/`cache_write_input_tokens` as
+    /// already counted in `input_tokens` (`token_usage.rs:72-78`). buzz-acp
+    /// reads this as `accumulatedCachedInputTokens` for pricing (#3463).
+    pub cached_input: Option<u64>,
+    /// Provider-reported total, when it reports one. buzz-acp treats a missing
+    /// total as unknown rather than zero (#3593).
+    pub total: Option<u64>,
 }
 
 impl TurnTokens {
@@ -438,6 +446,14 @@ async fn handle_event(
             if let Some(o) = u.output_tokens {
                 tokens.output = Some(tokens.output.unwrap_or(0) + o.max(0) as u64);
             }
+            let cached = u.cache_read_input_tokens.unwrap_or(0).max(0) as u64
+                + u.cache_write_input_tokens.unwrap_or(0).max(0) as u64;
+            if u.cache_read_input_tokens.is_some() || u.cache_write_input_tokens.is_some() {
+                tokens.cached_input = Some(tokens.cached_input.unwrap_or(0) + cached);
+            }
+            if let Some(t) = u.total_tokens {
+                tokens.total = Some(tokens.total.unwrap_or(0) + t.max(0) as u64);
+            }
             None
         }
 
@@ -613,12 +629,12 @@ mod tests {
         assert!(!TurnTokens::default().observed());
         assert!(TurnTokens {
             input: Some(1),
-            output: None
+            ..Default::default()
         }
         .observed());
         assert!(TurnTokens {
-            input: None,
-            output: Some(1)
+            output: Some(1),
+            ..Default::default()
         }
         .observed());
     }

@@ -77,6 +77,12 @@ struct Session {
     hook_extension: Option<String>,
     accumulated_input_tokens: u64,
     accumulated_output_tokens: u64,
+    /// Subset of `accumulated_input_tokens`, published as
+    /// `accumulatedCachedInputTokens` for buzz-acp pricing (#3463).
+    accumulated_cached_input_tokens: u64,
+    /// Session-cumulative provider total. `None` once any turn fails to report
+    /// one -- buzz-acp must not read a missing total as zero (#3593).
+    accumulated_total_tokens: Option<u64>,
 }
 
 pub struct App {
@@ -499,6 +505,8 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
                 hook_extension,
                 accumulated_input_tokens: 0,
                 accumulated_output_tokens: 0,
+                accumulated_cached_input_tokens: 0,
+                accumulated_total_tokens: Some(0),
             },
         );
     }
@@ -675,7 +683,21 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             s.accumulated_output_tokens = s
                 .accumulated_output_tokens
                 .saturating_add(tokens.output.unwrap_or(0));
-            (s.accumulated_input_tokens, s.accumulated_output_tokens)
+            s.accumulated_cached_input_tokens = s
+                .accumulated_cached_input_tokens
+                .saturating_add(tokens.cached_input.unwrap_or(0));
+            // Sticky-unknown: one turn without a provider total poisons the
+            // session cumulative, so we omit the field rather than under-report.
+            s.accumulated_total_tokens = match (s.accumulated_total_tokens, tokens.total) {
+                (Some(acc), Some(t)) => Some(acc.saturating_add(t)),
+                _ => None,
+            };
+            (
+                s.accumulated_input_tokens,
+                s.accumulated_output_tokens,
+                s.accumulated_cached_input_tokens,
+                s.accumulated_total_tokens,
+            )
         })
     };
 
@@ -694,7 +716,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
     // flight; the response triggers take_turn_usage(). Reversing these
     // produces zero kind-44200 events, silently.
     if tokens.observed() {
-        if let Some((acc_in, acc_out)) = accumulated {
+        if let Some((acc_in, acc_out, acc_cached, acc_total)) = accumulated {
             let model = {
                 let sessions = app.sessions.lock().await;
                 sessions
@@ -709,17 +731,25 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             };
             wire::send(
                 wire_tx,
-                goose_session_update(
-                    &p.session_id,
-                    json!({
+                goose_session_update(&p.session_id, {
+                    let mut u = json!({
                         "sessionUpdate": "usage_update",
                         "used": acc_in.saturating_add(acc_out),
                         "contextLimit": 0u64,
                         "accumulatedInputTokens": acc_in,
                         "accumulatedOutputTokens": acc_out,
+                        // A subset of accumulatedInputTokens, not an
+                        // addition to it (#3463).
+                        "accumulatedCachedInputTokens": acc_cached,
                         "model": model,
-                    }),
-                ),
+                    });
+                    // Only when exactly known; absent means "unknown",
+                    // which buzz-acp distinguishes from zero (#3593).
+                    if let Some(total) = acc_total {
+                        u["accumulatedTotalTokens"] = json!(total);
+                    }
+                    u
+                }),
             )
             .await;
         }

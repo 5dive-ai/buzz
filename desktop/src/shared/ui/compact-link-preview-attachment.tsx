@@ -1,8 +1,7 @@
-import { Globe, X } from "lucide-react";
+import { Globe } from "lucide-react";
 
 import type { ResolvedLinkPreview } from "@/shared/lib/useResolvedLinkPreviews";
 import { cn } from "@/shared/lib/cn";
-import { Button } from "@/shared/ui/button";
 import {
   Attachment,
   AttachmentContent,
@@ -11,6 +10,7 @@ import {
   AttachmentTitle,
   AttachmentTrigger,
 } from "@/shared/ui/attachment";
+import { LinkPreviewControls } from "@/shared/ui/link-preview-controls";
 
 function LinearLogo({ className }: { className?: string }) {
   return (
@@ -136,10 +136,12 @@ export function CompactLinkPreviewAttachment({
   className,
   onRemove,
   preview,
+  showControls = false,
 }: {
   className?: string;
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
+  showControls?: boolean;
 }) {
   const reserveImage = preview.imageState !== "none";
   const showImage = preview.imageState === "image";
@@ -227,18 +229,8 @@ export function CompactLinkPreviewAttachment({
           </a>
         </AttachmentTrigger>
       </Attachment>
-      {onRemove ? (
-        <Button
-          aria-label="Remove previews for everyone"
-          className="absolute left-full top-0 z-20 ml-1 h-5 w-5 rounded-full text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover/message:opacity-100"
-          onClick={onRemove}
-          size="icon-xs"
-          title="Remove previews for everyone"
-          type="button"
-          variant="ghost"
-        >
-          <X aria-hidden="true" />
-        </Button>
+      {showControls ? (
+        <LinkPreviewControls onRemove={onRemove} placement="left" />
       ) : null}
     </div>
   );

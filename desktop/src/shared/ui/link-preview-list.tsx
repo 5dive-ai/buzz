@@ -32,7 +32,7 @@ export function LinkPreviewList({
   if (removed || previews.length === 0) return null;
 
   const previewNoun = previews.length === 1 ? "preview" : "previews";
-  const removeButtonIndex = style === "compact" ? previews.length - 1 : 0;
+  const controlsIndex = 0;
   return (
     <>
       <AttachmentGroup
@@ -48,11 +48,12 @@ export function LinkPreviewList({
             key={preview.href}
             ImageLightbox={ImageLightbox}
             onRemove={
-              onRemoveForEveryone && index === removeButtonIndex
+              onRemoveForEveryone && index === controlsIndex
                 ? () => setDialogOpen(true)
                 : undefined
             }
             preview={preview}
+            showControls={index === controlsIndex}
           />
         ))}
       </AttachmentGroup>

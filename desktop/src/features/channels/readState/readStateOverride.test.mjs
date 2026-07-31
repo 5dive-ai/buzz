@@ -10,15 +10,12 @@ import {
   OV_B_PREFIX,
   OV_C_PREFIX,
   OV_S_PREFIX,
-  partitionOverrideGroups,
+  parseContexts,
   sanitizeContexts,
   unescapeFrontierKey,
 } from "./readStateFormat.ts";
 
-import {
-  extractOverrideRegisters,
-  mergeOverrideRegisterMaps,
-} from "./readStateSnapshot.ts";
+import { mergeOverrideRegisterMaps } from "./readStateSnapshot.ts";
 
 // ---------------------------------------------------------------------------
 // escapeFrontierKey / unescapeFrontierKey
@@ -130,6 +127,24 @@ test("isOverrideActive_tombstoneFloor_returnsFalse", () => {
   assert.equal(isOverrideActive({ s: 0, c: 5, b: 0 }, 0), false);
 });
 
+test("isOverrideActive_uint32Max_liveOverride_returnsTrue", () => {
+  // Boundary: S at uint32 max, C one less, B at max, F at zero
+  const UINT32_MAX = 4294967295;
+  assert.equal(
+    isOverrideActive({ s: UINT32_MAX, c: UINT32_MAX - 1, b: UINT32_MAX }, 0),
+    true,
+  );
+});
+
+test("isOverrideActive_uint32Max_zeroFrontier_tile_returnsFalse", () => {
+  // S == C at max → clear-wins
+  const UINT32_MAX = 4294967295;
+  assert.equal(
+    isOverrideActive({ s: UINT32_MAX, c: UINT32_MAX, b: 1 }, 0),
+    false,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // mergeOverrideRegisters — componentwise max()
 // ---------------------------------------------------------------------------
@@ -159,6 +174,29 @@ test("mergeOverrideRegisters_associative", () => {
     mergeOverrideRegisters(mergeOverrideRegisters(a, b), c),
     mergeOverrideRegisters(a, mergeOverrideRegisters(b, c)),
   );
+});
+
+test("mergeOverrideRegisters_zeroBoundary_idempotent", () => {
+  const zero = { s: 0, c: 0, b: 0 };
+  assert.deepEqual(mergeOverrideRegisters(zero, zero), zero);
+});
+
+test("mergeOverrideRegisters_uint32Max_idempotent", () => {
+  const UINT32_MAX = 4294967295;
+  const max = { s: UINT32_MAX, c: UINT32_MAX, b: UINT32_MAX };
+  assert.deepEqual(mergeOverrideRegisters(max, max), max);
+});
+
+test("mergeOverrideRegisters_uint32Max_commutative", () => {
+  const UINT32_MAX = 4294967295;
+  const a = { s: UINT32_MAX, c: 0, b: UINT32_MAX };
+  const b = { s: 0, c: UINT32_MAX, b: 0 };
+  assert.deepEqual(mergeOverrideRegisters(a, b), mergeOverrideRegisters(b, a));
+  assert.deepEqual(mergeOverrideRegisters(a, b), {
+    s: UINT32_MAX,
+    c: UINT32_MAX,
+    b: UINT32_MAX,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -204,116 +242,373 @@ test("encodeOverrideGroup_tombstoneFloorShape_returnsOnlyOvC", () => {
 });
 
 // ---------------------------------------------------------------------------
-// partitionOverrideGroups — group-first validation
+// parseContexts — structured decode (group-first validation, unescape, 256-byte)
 // ---------------------------------------------------------------------------
 
-test("partitionOverrideGroups_liveGroup_validates", () => {
+// ── accepted shapes ─────────────────────────────────────────────────────────
+
+test("parseContexts_liveGroup_populatesBothMaps", () => {
   const raw = {
     "channel:x": 1000,
     "ov_s:channel:x": 1,
     "ov_c:channel:x": 0,
     "ov_b:channel:x": 900,
   };
-  const { overrides, nonOverride } = partitionOverrideGroups(raw);
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("channel:x"), 1000);
+  assert.deepEqual(overrides.get("channel:x"), { s: 1, c: 0, b: 900 });
   assert.equal(overrides.size, 1);
-  const group = overrides.get("channel:x");
-  assert.equal(group?.kind, "live");
-  assert.deepEqual(group?.reg, { s: 1, c: 0, b: 900 });
-  assert.deepEqual(nonOverride, { "channel:x": 1000 });
+  // No ov_* keys in frontiers
+  assert.equal(frontiers.has("ov_s:channel:x"), false);
 });
 
-test("partitionOverrideGroups_tombstoneFloor_validates", () => {
+test("parseContexts_tombstoneFloor_populatesBothMaps", () => {
   const raw = {
     "channel:x": 1000,
     "ov_c:channel:x": 5,
   };
-  const { overrides, nonOverride } = partitionOverrideGroups(raw);
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("channel:x"), 1000);
+  assert.deepEqual(overrides.get("channel:x"), { s: 0, c: 5, b: 0 });
   assert.equal(overrides.size, 1);
-  const group = overrides.get("channel:x");
-  assert.equal(group?.kind, "floor");
-  assert.equal(group?.c, 5);
-  assert.deepEqual(nonOverride, { "channel:x": 1000 });
 });
 
-test("partitionOverrideGroups_partialGroup_droppedFrontierRetained", () => {
-  // Only ov_s without ov_c and ov_b → partial group → rejected
+test("parseContexts_normalFrontierOnly_noOverrides", () => {
   const raw = {
-    "channel:x": 1000,
-    "ov_s:channel:x": 1,
+    "ch:normal": 5000,
+    "msg:abc": 3000,
+    "thread:def": 2000,
   };
-  const { overrides, nonOverride } = partitionOverrideGroups(raw);
-  assert.equal(overrides.size, 0); // group rejected
-  assert.deepEqual(nonOverride, { "channel:x": 1000 }); // frontier retained
-});
-
-test("partitionOverrideGroups_sConly_droppedFrontierRetained", () => {
-  // ov_s + ov_c but no ov_b → partial group
-  const raw = {
-    "channel:x": 1000,
-    "ov_s:channel:x": 1,
-    "ov_c:channel:x": 0,
-  };
-  const { overrides, nonOverride } = partitionOverrideGroups(raw);
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:normal"), 5000);
+  assert.equal(frontiers.get("msg:abc"), 3000);
+  assert.equal(frontiers.get("thread:def"), 2000);
   assert.equal(overrides.size, 0);
-  assert.deepEqual(nonOverride, { "channel:x": 1000 });
 });
 
-test("partitionOverrideGroups_invalidValue_groupDropped", () => {
-  // ov_s has non-integer value → invalid → whole group dropped
-  const raw = {
-    "channel:x": 1000,
-    "ov_s:channel:x": "not-a-number",
-    "ov_c:channel:x": 0,
-    "ov_b:channel:x": 900,
-  };
-  const { overrides, nonOverride } = partitionOverrideGroups(raw);
+test("parseContexts_escapedFrontierKey_unescapedInFrontiers", () => {
+  // Wire key esc:ov_s:evil → raw ctx ov_s:evil
+  const raw = { "esc:ov_s:evil": 777 };
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ov_s:evil"), 777);
+  assert.equal(frontiers.has("esc:ov_s:evil"), false);
   assert.equal(overrides.size, 0);
-  assert.deepEqual(nonOverride, { "channel:x": 1000 });
 });
 
-test("partitionOverrideGroups_negativeValue_groupDropped", () => {
+test("parseContexts_doubleEscapedFrontierKey_stripsOneEsc", () => {
+  // Wire key esc:esc:foo → raw ctx esc:foo
+  const raw = { "esc:esc:foo": 888 };
+  const { frontiers } = parseContexts(raw);
+  assert.equal(frontiers.get("esc:foo"), 888);
+  assert.equal(frontiers.has("esc:esc:foo"), false);
+});
+
+// ── partial-group rejection matrix (every illegal subset) ───────────────────
+
+test("parseContexts_sOnly_droppedFrontierRetained", () => {
+  const raw = { "ch:x": 100, "ov_s:ch:x": 1 };
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), 100);
+  assert.equal(overrides.has("ch:x"), false);
+});
+
+test("parseContexts_bOnly_droppedFrontierRetained", () => {
+  const raw = { "ch:x": 100, "ov_b:ch:x": 50 };
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), 100);
+  assert.equal(overrides.has("ch:x"), false);
+});
+
+test("parseContexts_sConly_droppedFrontierRetained", () => {
+  const raw = { "ch:x": 100, "ov_s:ch:x": 1, "ov_c:ch:x": 0 };
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), 100);
+  assert.equal(overrides.has("ch:x"), false);
+});
+
+test("parseContexts_sBonly_droppedFrontierRetained", () => {
+  const raw = { "ch:x": 100, "ov_s:ch:x": 1, "ov_b:ch:x": 50 };
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), 100);
+  assert.equal(overrides.has("ch:x"), false);
+});
+
+test("parseContexts_cBonly_droppedFrontierRetained", () => {
+  const raw = { "ch:x": 100, "ov_c:ch:x": 2, "ov_b:ch:x": 50 };
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), 100);
+  assert.equal(overrides.has("ch:x"), false);
+});
+
+// ── invalid sibling at each position ────────────────────────────────────────
+
+test("parseContexts_invalidS_liveGroupDropped", () => {
   const raw = {
-    "channel:x": 1000,
-    "ov_s:channel:x": -1,
-    "ov_c:channel:x": 0,
-    "ov_b:channel:x": 900,
+    "ch:x": 100,
+    "ov_s:ch:x": "not-a-number",
+    "ov_c:ch:x": 0,
+    "ov_b:ch:x": 50,
   };
-  const { overrides, nonOverride } = partitionOverrideGroups(raw);
-  assert.equal(overrides.size, 0);
-  assert.deepEqual(nonOverride, { "channel:x": 1000 });
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), 100);
+  assert.equal(overrides.has("ch:x"), false);
 });
 
-test("partitionOverrideGroups_ovCInvalidValue_tombstoneDropped", () => {
-  // Tombstone floor with non-integer c
+test("parseContexts_invalidC_liveGroupDropped", () => {
   const raw = {
-    "channel:x": 1000,
-    "ov_c:channel:x": 1.5,
+    "ch:x": 100,
+    "ov_s:ch:x": 1,
+    "ov_c:ch:x": 1.5,
+    "ov_b:ch:x": 50,
   };
-  const { overrides, nonOverride } = partitionOverrideGroups(raw);
-  assert.equal(overrides.size, 0);
-  assert.deepEqual(nonOverride, { "channel:x": 1000 });
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), 100);
+  assert.equal(overrides.has("ch:x"), false);
 });
 
-test("partitionOverrideGroups_multipleContexts_allValidated", () => {
+test("parseContexts_invalidB_liveGroupDropped", () => {
+  const raw = { "ch:x": 100, "ov_s:ch:x": 1, "ov_c:ch:x": 0, "ov_b:ch:x": -1 };
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), 100);
+  assert.equal(overrides.has("ch:x"), false);
+});
+
+test("parseContexts_uint32Overflow_liveGroupDropped", () => {
+  const raw = {
+    "ch:x": 100,
+    "ov_s:ch:x": 4294967296,
+    "ov_c:ch:x": 0,
+    "ov_b:ch:x": 50,
+  };
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), 100);
+  assert.equal(overrides.has("ch:x"), false);
+});
+
+test("parseContexts_invalidC_tombstoneDropped", () => {
+  const raw = { "ch:x": 100, "ov_c:ch:x": -5 };
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), 100);
+  assert.equal(overrides.has("ch:x"), false);
+});
+
+// ── uint32 boundary values accepted ─────────────────────────────────────────
+
+test("parseContexts_uint32Zero_acceptedInLiveGroup", () => {
+  const raw = { "ch:x": 0, "ov_s:ch:x": 0, "ov_c:ch:x": 0, "ov_b:ch:x": 0 };
+  const { overrides } = parseContexts(raw);
+  assert.deepEqual(overrides.get("ch:x"), { s: 0, c: 0, b: 0 });
+});
+
+test("parseContexts_uint32Max_acceptedInLiveGroup", () => {
+  const UINT32_MAX = 4294967295;
+  const raw = {
+    "ch:x": UINT32_MAX,
+    "ov_s:ch:x": UINT32_MAX,
+    "ov_c:ch:x": UINT32_MAX,
+    "ov_b:ch:x": UINT32_MAX,
+  };
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(frontiers.get("ch:x"), UINT32_MAX);
+  assert.deepEqual(overrides.get("ch:x"), {
+    s: UINT32_MAX,
+    c: UINT32_MAX,
+    b: UINT32_MAX,
+  });
+});
+
+test("parseContexts_uint32Max_acceptedInTombstone", () => {
+  const UINT32_MAX = 4294967295;
+  const raw = { "ch:x": 0, "ov_c:ch:x": UINT32_MAX };
+  const { overrides } = parseContexts(raw);
+  assert.deepEqual(overrides.get("ch:x"), { s: 0, c: UINT32_MAX, b: 0 });
+});
+
+// ── 256-byte key-length enforcement ─────────────────────────────────────────
+
+// Build a string of exactly N UTF-8 bytes (ASCII, so length == byte count).
+function asciiOfBytes(n) {
+  return "a".repeat(n);
+}
+
+test("parseContexts_frontierKey256Bytes_accepted", () => {
+  // ov_s: prefix is 5 bytes; a 251-byte suffix yields a 256-byte wire key.
+  const suffix251 = asciiOfBytes(251);
+  const raw = { [suffix251]: 42 };
+  const { frontiers } = parseContexts(raw);
+  assert.equal(frontiers.get(suffix251), 42);
+});
+
+test("parseContexts_frontierKey257Bytes_dropped", () => {
+  const suffix257 = asciiOfBytes(257);
+  const raw = { [suffix257]: 42 }; // 257 bytes — exceeds 256
+  const { frontiers } = parseContexts(raw);
+  assert.equal(frontiers.has(suffix257), false);
+});
+
+test("parseContexts_liveGroupSiblingKey256Bytes_accepted", () => {
+  // ov_s: is 5 bytes; suffix of 251 bytes → wire key exactly 256 bytes.
+  const suffix251 = asciiOfBytes(251);
+  const raw = {
+    [suffix251]: 10,
+    [`${OV_S_PREFIX}${suffix251}`]: 1,
+    [`${OV_C_PREFIX}${suffix251}`]: 0,
+    [`${OV_B_PREFIX}${suffix251}`]: 9,
+  };
+  const { overrides } = parseContexts(raw);
+  assert.deepEqual(overrides.get(suffix251), { s: 1, c: 0, b: 9 });
+});
+
+test("parseContexts_liveGroupSiblingKey257Bytes_groupDropped", () => {
+  // ov_s: is 5 bytes; suffix of 252 bytes → wire key 257 bytes — drops group.
+  const suffix252 = asciiOfBytes(252);
+  const raw = {
+    [suffix252]: 10, // frontier key also 252 bytes — also dropped
+    [`${OV_S_PREFIX}${suffix252}`]: 1,
+    [`${OV_C_PREFIX}${suffix252}`]: 0,
+    [`${OV_B_PREFIX}${suffix252}`]: 9,
+  };
+  const { overrides } = parseContexts(raw);
+  assert.equal(overrides.has(suffix252), false);
+});
+
+test("parseContexts_tombstoneFloorKey256Bytes_accepted", () => {
+  // ov_c: is 5 bytes; suffix of 251 bytes → wire key exactly 256 bytes.
+  const suffix251 = asciiOfBytes(251);
+  const raw = {
+    [suffix251]: 0,
+    [`${OV_C_PREFIX}${suffix251}`]: 3,
+  };
+  const { overrides } = parseContexts(raw);
+  assert.deepEqual(overrides.get(suffix251), { s: 0, c: 3, b: 0 });
+});
+
+test("parseContexts_tombstoneFloorKey257Bytes_groupDropped", () => {
+  // ov_c: is 5 bytes; suffix of 252 bytes → wire key 257 bytes — drops group.
+  const suffix252 = asciiOfBytes(252);
+  const raw = {
+    [suffix252]: 0,
+    [`${OV_C_PREFIX}${suffix252}`]: 3,
+  };
+  const { overrides } = parseContexts(raw);
+  assert.equal(overrides.has(suffix252), false);
+});
+
+test("parseContexts_multibyteSuffix_keyLengthCheckedInBytes", () => {
+  // A 2-byte UTF-8 char (e.g. 'é') counts as 2 bytes toward the 256 limit.
+  // suffix of 127 × 'é' = 254 bytes; ov_c: (5) + 254 = 259 → over limit.
+  const multiSuffix = "\u00e9".repeat(127); // 127 × 2 bytes = 254 bytes
+  const raw = {
+    [multiSuffix]: 0,
+    [`${OV_C_PREFIX}${multiSuffix}`]: 7,
+  };
+  const { overrides } = parseContexts(raw);
+  assert.equal(overrides.has(multiSuffix), false);
+});
+
+test("parseContexts_multibyteSuffix_justUnder256_accepted", () => {
+  // 'é' × 125 = 250 bytes; ov_c: (5) + 250 = 255 → under limit.
+  const multiSuffix = "\u00e9".repeat(125); // 125 × 2 = 250 bytes
+  const raw = {
+    [multiSuffix]: 0,
+    [`${OV_C_PREFIX}${multiSuffix}`]: 7,
+  };
+  const { overrides } = parseContexts(raw);
+  assert.deepEqual(overrides.get(multiSuffix), { s: 0, c: 7, b: 0 });
+});
+
+// ── reserved-ID collision witness (Thufir finding 1) ────────────────────────
+
+test("parseContexts_reservedIdCollision_frontierAndOverrideUseDistinctNamespaces", () => {
+  // Raw context `ov_s:evil` has its frontier published under `esc:ov_s:evil`
+  // (as a publisher-aware client would do).  It also has a live register for
+  // raw context `ov_s:evil` (suffix = `evil` for the ov_* keys).
+  // Raw context `evil` independently has its own frontier and override.
+  const raw = {
+    "esc:ov_s:evil": 7, // frontier for raw ctx `ov_s:evil`
+    "ov_s:evil": 3, // set counter for raw ctx `evil`
+    "ov_c:evil": 1,
+    "ov_b:evil": 6,
+    evil: 100, // frontier for raw ctx `evil`
+    "ov_s:regular": 2, // set counter for raw ctx `regular`
+    "ov_c:regular": 0,
+    "ov_b:regular": 50,
+    regular: 40,
+  };
+  const { frontiers, overrides } = parseContexts(raw);
+
+  // frontier for raw ctx `ov_s:evil` must be 7 (unescaped from `esc:ov_s:evil`)
+  assert.equal(
+    frontiers.get("ov_s:evil"),
+    7,
+    "frontier for ctx ov_s:evil must be 7",
+  );
+  // frontier for raw ctx `evil` must be 100
+  assert.equal(frontiers.get("evil"), 100, "frontier for ctx evil must be 100");
+  // override for raw ctx `evil` comes from `ov_s:evil`/`ov_c:evil`/`ov_b:evil` (suffix=`evil`)
+  assert.deepEqual(
+    overrides.get("evil"),
+    { s: 3, c: 1, b: 6 },
+    "override for ctx evil",
+  );
+  // override for raw ctx `regular`
+  assert.deepEqual(
+    overrides.get("regular"),
+    { s: 2, c: 0, b: 50 },
+    "override for ctx regular",
+  );
+  // No `ov_s:evil` in frontiers as an override key — but `ov_s:evil` IS a raw ctx ID with frontier 7
+  assert.equal(
+    frontiers.get("ov_s:evil"),
+    7,
+    "ov_s:evil raw ctx has frontier 7",
+  );
+  // No `esc:ov_s:evil` in frontiers (was unescaped)
+  assert.equal(
+    frontiers.has("esc:ov_s:evil"),
+    false,
+    "escaped wire key must not appear in frontiers",
+  );
+  // liveness evaluation uses consistent namespaces
+  const evilReg = overrides.get("evil");
+  const evilFrontier = frontiers.get("evil") ?? 0;
+  // s=3, c=1, b=6, f=100 → F(100) > B(6) → inactive
+  assert.equal(
+    isOverrideActive(evilReg, evilFrontier),
+    false,
+    "evil override inactive because frontier(100) > baseline(6)",
+  );
+
+  const regularReg = overrides.get("regular");
+  const regularFrontier = frontiers.get("regular") ?? 0;
+  // s=2, c=0, b=50, f=40 → S>0 ∧ F(40)<=B(50) ∧ S(2)>C(0) → active
+  assert.equal(
+    isOverrideActive(regularReg, regularFrontier),
+    true,
+    "regular override active: F(40) <= B(50), S(2) > C(0)",
+  );
+});
+
+// ── multiple contexts in one blob ────────────────────────────────────────────
+
+test("parseContexts_multipleContexts_allProcessedCorrectly", () => {
   const raw = {
     "ch:a": 100,
     "ov_s:ch:a": 1,
     "ov_c:ch:a": 0,
     "ov_b:ch:a": 90,
     "ch:b": 200,
-    "ov_c:ch:b": 3, // tombstone floor for ch:b
+    "ov_c:ch:b": 3, // tombstone floor
     "ch:c": 300,
     "ov_s:ch:c": 1, // partial — only s, no c/b → rejected
   };
-  const { overrides, nonOverride } = partitionOverrideGroups(raw);
-  assert.equal(overrides.size, 2); // ch:a and ch:b, ch:c rejected
-  assert.equal(overrides.get("ch:a")?.kind, "live");
-  assert.equal(overrides.get("ch:b")?.kind, "floor");
+  const { frontiers, overrides } = parseContexts(raw);
+  assert.equal(overrides.get("ch:a")?.s, 1);
+  assert.deepEqual(overrides.get("ch:b"), { s: 0, c: 3, b: 0 });
   assert.equal(overrides.has("ch:c"), false);
-  // Frontier entries all retained
-  assert.equal(nonOverride["ch:a"], 100);
-  assert.equal(nonOverride["ch:b"], 200);
-  assert.equal(nonOverride["ch:c"], 300);
+  assert.equal(frontiers.get("ch:a"), 100);
+  assert.equal(frontiers.get("ch:b"), 200);
+  assert.equal(frontiers.get("ch:c"), 300);
 });
 
 // ---------------------------------------------------------------------------
@@ -357,6 +652,27 @@ test("sanitizeContexts_partialGroup_droppedFrontierRetained", () => {
   assert.equal(result[`${OV_S_PREFIX}channel:x`], undefined);
 });
 
+test("sanitizeContexts_liveGroupSiblingKeyTooLong_groupDropped", () => {
+  // ov_s: (5 bytes) + suffix of 252 bytes = 257 bytes wire key → drop group
+  const suffix252 = asciiOfBytes(252);
+  const raw = {
+    [suffix252]: 10,
+    [`${OV_S_PREFIX}${suffix252}`]: 1,
+    [`${OV_C_PREFIX}${suffix252}`]: 0,
+    [`${OV_B_PREFIX}${suffix252}`]: 9,
+  };
+  const result = sanitizeContexts(raw);
+  assert.equal(result[`${OV_S_PREFIX}${suffix252}`], undefined);
+  assert.equal(result[`${OV_C_PREFIX}${suffix252}`], undefined);
+});
+
+test("sanitizeContexts_tombstoneKeyTooLong_groupDropped", () => {
+  const suffix252 = asciiOfBytes(252);
+  const raw = { [suffix252]: 0, [`${OV_C_PREFIX}${suffix252}`]: 3 };
+  const result = sanitizeContexts(raw);
+  assert.equal(result[`${OV_C_PREFIX}${suffix252}`], undefined);
+});
+
 test("sanitizeContexts_normalEntriesUnaffected", () => {
   const raw = {
     "ch:normal": 5000,
@@ -380,54 +696,10 @@ test("sanitizeContexts_invalidFrontierEntry_dropped", () => {
 });
 
 test("sanitizeContexts_escapedFrontierKey_passesThrough", () => {
-  // esc: prefixed frontier keys must pass through unchanged
+  // esc: prefixed frontier keys must pass through unchanged in the flat map
   const raw = { "esc:ov_s:suspicious-ctx": 1000 };
   const result = sanitizeContexts(raw);
   assert.equal(result["esc:ov_s:suspicious-ctx"], 1000);
-});
-
-// ---------------------------------------------------------------------------
-// extractOverrideRegisters — from sanitized flat map
-// ---------------------------------------------------------------------------
-
-test("extractOverrideRegisters_liveGroup_reconstructsRegister", () => {
-  const contexts = new Map([
-    ["channel:x", 1000],
-    [`${OV_S_PREFIX}channel:x`, 2],
-    [`${OV_C_PREFIX}channel:x`, 1],
-    [`${OV_B_PREFIX}channel:x`, 900],
-  ]);
-  const regs = extractOverrideRegisters(contexts);
-  assert.equal(regs.size, 1);
-  assert.deepEqual(regs.get("channel:x"), { s: 2, c: 1, b: 900 });
-});
-
-test("extractOverrideRegisters_tombstoneFloor_reconstructsRegister", () => {
-  const contexts = new Map([
-    ["channel:x", 1000],
-    [`${OV_C_PREFIX}channel:x`, 5],
-  ]);
-  const regs = extractOverrideRegisters(contexts);
-  assert.equal(regs.size, 1);
-  // Floor shape: s=0, c=5, b=0
-  assert.deepEqual(regs.get("channel:x"), { s: 0, c: 5, b: 0 });
-});
-
-test("extractOverrideRegisters_noOverrideKeys_returnsEmptyMap", () => {
-  const contexts = new Map([["channel:x", 1000]]);
-  const regs = extractOverrideRegisters(contexts);
-  assert.equal(regs.size, 0);
-});
-
-test("extractOverrideRegisters_acceptsPlainRecord", () => {
-  const contexts = {
-    "channel:x": 1000,
-    [`${OV_S_PREFIX}channel:x`]: 1,
-    [`${OV_C_PREFIX}channel:x`]: 0,
-    [`${OV_B_PREFIX}channel:x`]: 900,
-  };
-  const regs = extractOverrideRegisters(contexts);
-  assert.deepEqual(regs.get("channel:x"), { s: 1, c: 0, b: 900 });
 });
 
 // ---------------------------------------------------------------------------
@@ -469,51 +741,87 @@ test("mergeOverrideRegisterMaps_threeWayMerge_takesGlobalMax", () => {
   assert.deepEqual(merged.get("ctx"), { s: 5, c: 3, b: 30 });
 });
 
+test("mergeOverrideRegisterMaps_uint32Max_commutative", () => {
+  const UINT32_MAX = 4294967295;
+  const a = new Map([["ctx", { s: UINT32_MAX, c: 0, b: UINT32_MAX }]]);
+  const b = new Map([["ctx", { s: 0, c: UINT32_MAX, b: 0 }]]);
+  const ab = mergeOverrideRegisterMaps(a, b);
+  const ba = mergeOverrideRegisterMaps(b, a);
+  assert.deepEqual(ab.get("ctx"), ba.get("ctx"));
+  assert.deepEqual(ab.get("ctx"), {
+    s: UINT32_MAX,
+    c: UINT32_MAX,
+    b: UINT32_MAX,
+  });
+});
+
 // ---------------------------------------------------------------------------
-// Round-trip: encode → sanitize → extract produces original register
+// Round-trip: encodeOverrideGroup → parseContexts produces original register
 // ---------------------------------------------------------------------------
 
-test("roundTrip_liveRegister_survivesEncodeAndExtract", () => {
+test("roundTrip_liveRegister_survivesEncodeAndParse", () => {
   const reg = { s: 2, c: 1, b: 100 };
   const frontier = 50;
   const rawCtx = "channel-uuid-1234";
 
-  // Encode (as a publisher would)
   const patch = encodeOverrideGroup(rawCtx, reg, frontier);
-  // Simulate inclusion in a blob's contexts map (add frontier entry too)
   const rawContexts = { [rawCtx]: frontier, ...patch };
-  // Sanitize (as a receiver would)
-  const sanitized = sanitizeContexts(rawContexts);
-  // Extract registers
-  const regs = extractOverrideRegisters(sanitized);
+  const { frontiers, overrides } = parseContexts(rawContexts);
 
-  assert.deepEqual(regs.get(rawCtx), reg);
+  assert.equal(frontiers.get(rawCtx), frontier);
+  assert.deepEqual(overrides.get(rawCtx), reg);
 });
 
-test("roundTrip_tombstoneFloor_survivesEncodeAndExtract", () => {
-  // A dead register compacts to tombstone floor on encode
-  const reg = { s: 0, c: 5, b: 0 }; // already a floor shape
+test("roundTrip_tombstoneFloor_survivesEncodeAndParse", () => {
+  const reg = { s: 0, c: 5, b: 0 };
   const frontier = 0;
   const rawCtx = "channel-uuid-5678";
 
   const patch = encodeOverrideGroup(rawCtx, reg, frontier);
   const rawContexts = { [rawCtx]: frontier, ...patch };
-  const sanitized = sanitizeContexts(rawContexts);
-  const regs = extractOverrideRegisters(sanitized);
+  const { frontiers, overrides } = parseContexts(rawContexts);
 
-  // Floor is s=0, c=5, b=0
-  assert.deepEqual(regs.get(rawCtx), { s: 0, c: 5, b: 0 });
+  assert.equal(frontiers.get(rawCtx), frontier);
+  assert.deepEqual(overrides.get(rawCtx), { s: 0, c: 5, b: 0 });
 });
 
 test("roundTrip_virginRegister_omittedFromWire", () => {
   const reg = { s: 0, c: 0, b: 0 };
-  const frontier = 0;
   const rawCtx = "channel-uuid-virgin";
 
+  const patch = encodeOverrideGroup(rawCtx, reg, 0);
+  assert.deepEqual(patch, {});
+  const rawContexts = { [rawCtx]: 0 };
+  const { frontiers, overrides } = parseContexts(rawContexts);
+  assert.equal(frontiers.get(rawCtx), 0);
+  assert.equal(overrides.has(rawCtx), false);
+});
+
+test("roundTrip_escapedRawCtx_survivesEncodeAndParse", () => {
+  // A raw context ID that starts with ov_: publisher escapes frontier key.
+  // encodeOverrideGroup does NOT escape the raw ctx suffix in ov_* keys —
+  // the spec says ov_* keys use the raw suffix.  The frontier key is
+  // published escaped (esc:ov_s:raw) by the publisher — simulate that here.
+  const rawCtx = "ov_s:tricky";
+  const reg = { s: 1, c: 0, b: 10 };
+  const frontier = 8;
+
+  // Publisher encodes: override keys use raw suffix, frontier key is escaped.
   const patch = encodeOverrideGroup(rawCtx, reg, frontier);
-  assert.deepEqual(patch, {}); // nothing emitted
-  const rawContexts = { [rawCtx]: frontier };
-  const sanitized = sanitizeContexts(rawContexts);
-  const regs = extractOverrideRegisters(sanitized);
-  assert.equal(regs.has(rawCtx), false);
+  // patch has ov_s:ov_s:tricky, ov_c:ov_s:tricky, ov_b:ov_s:tricky
+  const rawContexts = {
+    [`esc:${rawCtx}`]: frontier, // frontier published escaped
+    ...patch,
+  };
+  const { frontiers, overrides } = parseContexts(rawContexts);
+
+  // After unescape: frontier keyed by raw ctx `ov_s:tricky`
+  assert.equal(frontiers.get(rawCtx), frontier);
+  // Override keyed by suffix after `ov_s:` → `ov_s:tricky`
+  assert.deepEqual(overrides.get(rawCtx), reg);
+  // liveness evaluation uses the same raw key for both
+  const ov = overrides.get(rawCtx);
+  const f = frontiers.get(rawCtx) ?? 0;
+  // s=1, c=0, b=10, f=8 → S>0 ∧ F(8)<=B(10) ∧ S(1)>C(0) → active
+  assert.equal(isOverrideActive(ov, f), true);
 });

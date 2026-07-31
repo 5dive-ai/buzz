@@ -4,11 +4,10 @@ import {
   isValidBlob,
   isValidReadStateDTag,
   mergeOverrideRegisters,
-  OV_B_PREFIX,
-  OV_C_PREFIX,
-  OV_S_PREFIX,
+  parseContexts,
   sanitizeContexts,
   type OverrideRegister,
+  type ParsedContexts,
   type ReadStateBlob,
 } from "@/features/channels/readState/readStateFormat";
 
@@ -17,6 +16,8 @@ export type ReadStateDecrypt = (ciphertext: string) => Promise<string>;
 export type ParsedReadStateEvent = {
   dTag: string;
   blob: ReadStateBlob;
+  /** Structured decode: frontiers keyed by raw ctx ID, overrides by raw ctx ID. */
+  contexts: ParsedContexts;
   createdAt: number;
 };
 
@@ -41,13 +42,15 @@ export async function parseReadStateEvent(
     const plaintext = await decrypt(event.content);
     const parsed = JSON.parse(plaintext);
     if (!isValidBlob(parsed)) return null;
+    const sanitized = sanitizeContexts(parsed.contexts);
     return {
       dTag,
       blob: {
         v: 1,
         client_id: parsed.client_id,
-        contexts: sanitizeContexts(parsed.contexts),
+        contexts: sanitized,
       },
+      contexts: parseContexts(parsed.contexts),
       createdAt: event.created_at,
     };
   } catch (error) {
@@ -60,61 +63,15 @@ export async function parseReadStateEvent(
 }
 
 /**
- * Extract all override registers from a sanitized contexts map.
- *
- * Returns a Map from raw context ID to `OverrideRegister`.  A tombstone floor
- * (`ov_c:` only) is returned as `{ s: 0, c: <floor>, b: 0 }` — the same
- * shape as a dead register, which is correct: the floor's sole purpose is to
- * block counter reuse, and the liveness predicate evaluates to false for it.
- *
- * This is the read-side counterpart of `encodeOverrideGroup`: it reconstructs
- * the register from the flat integer map that `sanitizeContexts` produced.
- * The input MUST already have been through `sanitizeContexts` (so partial
- * groups are absent — they were rejected at validation time).
- */
-export function extractOverrideRegisters(
-  contexts: ReadonlyMap<string, number> | Record<string, number>,
-): Map<string, OverrideRegister> {
-  // Collect s/c/b values per context suffix.
-  const sVals = new Map<string, number>();
-  const cVals = new Map<string, number>();
-  const bVals = new Map<string, number>();
-
-  const iterate =
-    contexts instanceof Map
-      ? [...contexts.entries()]
-      : Object.entries(contexts);
-
-  for (const [key, value] of iterate) {
-    if (key.startsWith(OV_S_PREFIX))
-      sVals.set(key.slice(OV_S_PREFIX.length), value);
-    else if (key.startsWith(OV_C_PREFIX))
-      cVals.set(key.slice(OV_C_PREFIX.length), value);
-    else if (key.startsWith(OV_B_PREFIX))
-      bVals.set(key.slice(OV_B_PREFIX.length), value);
-  }
-
-  const result = new Map<string, OverrideRegister>();
-  const ctxSet = new Set([...sVals.keys(), ...cVals.keys(), ...bVals.keys()]);
-  for (const ctx of ctxSet) {
-    result.set(ctx, {
-      s: sVals.get(ctx) ?? 0,
-      c: cVals.get(ctx) ?? 0,
-      b: bVals.get(ctx) ?? 0,
-    });
-  }
-  return result;
-}
-
-/**
- * Merge override registers from multiple sanitized contexts maps.
+ * Merge override registers from multiple register maps.
  *
  * Applies componentwise `max()` across all sources for each context suffix,
  * returning a single Map from raw context ID to merged `OverrideRegister`.
- * This is the register-level analogue of the frontier `max()` merge.
+ * Slices 2–3 call this after collecting `ParsedReadStateEvent.contexts.overrides`
+ * maps from each parsed event.
  */
 export function mergeOverrideRegisterMaps(
-  ...maps: Array<Map<string, OverrideRegister>>
+  ...maps: Array<ReadonlyMap<string, OverrideRegister>>
 ): Map<string, OverrideRegister> {
   const result = new Map<string, OverrideRegister>();
   for (const source of maps) {
@@ -131,21 +88,23 @@ export async function mergeReadStateEvents(
   pubkey: string,
   decrypt?: ReadStateDecrypt,
 ): Promise<Map<string, number>> {
-  const contexts = new Map<string, number>();
+  const frontiers = new Map<string, number>();
 
   for (const event of events) {
     const parsed = await parseReadStateEvent(event, pubkey, decrypt);
     if (!parsed) continue;
 
-    for (const [contextId, timestamp] of Object.entries(parsed.blob.contexts)) {
-      const current = contexts.get(contextId) ?? 0;
-      if (timestamp > current) {
-        contexts.set(contextId, timestamp);
+    // Use the structured frontiers (keyed by raw ctx ID, unescaped) rather
+    // than the flat blob.contexts, which retains wire keys for readStateManager.
+    for (const [rawCtx, ts] of parsed.contexts.frontiers) {
+      const current = frontiers.get(rawCtx) ?? 0;
+      if (ts > current) {
+        frontiers.set(rawCtx, ts);
       }
     }
   }
 
-  return contexts;
+  return frontiers;
 }
 
 export function getSnapshotReadTimestamp(

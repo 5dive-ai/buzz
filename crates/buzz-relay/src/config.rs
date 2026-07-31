@@ -25,12 +25,34 @@ pub enum ConfigError {
 }
 
 /// Deny-by-default read-only deployment-admin configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdminConfig {
     /// Exact admin HTTP authority.
     pub host: String,
+    /// HTTP Basic username presented by deployment administrators.
+    pub username: String,
+    /// SHA-256 of the expected `username:password` bytes.
+    pub credential_digest: [u8; 32],
     /// Optional admin SPA bundle directory.
     pub web_dir: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Debug for AdminConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdminConfig")
+            .field("host", &self.host)
+            .field("username", &self.username)
+            .field("credential_digest", &"[REDACTED]")
+            .field("web_dir", &self.web_dir)
+            .finish()
+    }
+}
+
+impl AdminConfig {
+    pub(crate) fn credential_digest(username: &str, password: &str) -> [u8; 32] {
+        Sha256::digest(format!("{username}:{password}").as_bytes()).into()
+    }
 }
 
 /// Relay-hosted policy content presented on join surfaces.
@@ -883,6 +905,36 @@ impl Config {
                         "BUZZ_ADMIN_HOST must be an exact authority".to_string(),
                     ));
                 }
+                let username = std::env::var("BUZZ_ADMIN_USERNAME")
+                    .ok()
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "admin".to_string());
+                if username.len() > 128
+                    || username.contains(':')
+                    || username.chars().any(char::is_control)
+                {
+                    return Err(ConfigError::InvalidValue(
+                        "BUZZ_ADMIN_USERNAME must be at most 128 characters and contain no colon or control characters"
+                            .to_string(),
+                    ));
+                }
+                let password = std::env::var("BUZZ_ADMIN_PASSWORD")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        ConfigError::InvalidValue(
+                            "BUZZ_ADMIN_PASSWORD is required when BUZZ_ADMIN_HOST is set"
+                                .to_string(),
+                        )
+                    })?;
+                if !(16..=1024).contains(&password.len()) || password.chars().any(char::is_control)
+                {
+                    return Err(ConfigError::InvalidValue(
+                        "BUZZ_ADMIN_PASSWORD must be 16 to 1024 bytes and contain no control characters"
+                            .to_string(),
+                    ));
+                }
                 let web_dir = std::env::var("BUZZ_ADMIN_WEB_DIR")
                     .ok()
                     .map(|value| std::path::PathBuf::from(value.trim()))
@@ -895,7 +947,12 @@ impl Config {
                         )));
                     }
                 }
-                Some(AdminConfig { host, web_dir })
+                Some(AdminConfig {
+                    credential_digest: AdminConfig::credential_digest(&username, &password),
+                    host,
+                    username,
+                    web_dir,
+                })
             }
         };
 
@@ -1051,6 +1108,46 @@ mod tests {
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+    }
+
+    #[test]
+    fn admin_host_requires_a_strong_credential() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        const NAMES: [&str; 4] = [
+            "BUZZ_ADMIN_HOST",
+            "BUZZ_ADMIN_USERNAME",
+            "BUZZ_ADMIN_PASSWORD",
+            "BUZZ_ADMIN_WEB_DIR",
+        ];
+        let previous = NAMES.map(|name| std::env::var_os(name));
+        for name in NAMES {
+            std::env::remove_var(name);
+        }
+
+        std::env::set_var("BUZZ_ADMIN_HOST", "admin.example");
+        let missing = Config::from_env().expect_err("password must be required");
+        assert!(missing
+            .to_string()
+            .contains("BUZZ_ADMIN_PASSWORD is required"));
+
+        std::env::set_var("BUZZ_ADMIN_PASSWORD", "too-short");
+        let short = Config::from_env().expect_err("short password must be rejected");
+        assert!(short.to_string().contains("16 to 1024 bytes"));
+
+        std::env::set_var("BUZZ_ADMIN_USERNAME", "operator");
+        std::env::set_var("BUZZ_ADMIN_PASSWORD", "correct horse battery staple");
+        let config = Config::from_env().expect("valid admin credential");
+        let admin = config.admin.expect("admin config");
+        assert_eq!(admin.username, "operator");
+        assert!(!format!("{admin:?}").contains("correct horse battery staple"));
+
+        for (name, value) in NAMES.into_iter().zip(previous) {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
     }
 
     #[test]

@@ -161,6 +161,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 let path = req.uri().path();
                 let admin_host = api::admin::is_admin_host(&state, req.headers());
                 if admin_host {
+                    if let Err(response) = api::admin::authorize_request(&state, req.headers()) {
+                        return Ok(response);
+                    }
                     if let (Some(index), Some(files)) = (admin_index, admin_files) {
                         if path.starts_with("/assets/") {
                             return files.oneshot(req).await.map(IntoResponse::into_response);
@@ -271,6 +274,9 @@ async fn nip11_or_ws_handler(
     // Short-circuit the exact admin authority here and never let it serve the
     // public web bundle, NIP-11 document, or WebSocket endpoint.
     if api::admin::is_admin_host(&state, &headers) {
+        if let Err(response) = api::admin::authorize_request(&state, &headers) {
+            return response;
+        }
         if !accept.contains("text/html") {
             return StatusCode::NOT_FOUND.into_response();
         }

@@ -3,19 +3,26 @@
 Buzz can expose a private, deployment-wide read-only dashboard from the existing
 relay process. It shows open moderation reports and recent product feedback.
 
-Configure `BUZZ_ADMIN_HOST` to activate the dashboard. A private ingress limits
-access to the operator VPN or approved source IPs.
+Configure `BUZZ_ADMIN_HOST` and a strong password to activate the dashboard. A
+private ingress should also limit access to the operator VPN or approved source
+IPs.
 
 Required configuration:
 
 ```text
 BUZZ_ADMIN_HOST=admin.example.com
+BUZZ_ADMIN_USERNAME=admin
+BUZZ_ADMIN_PASSWORD=<random password with at least 16 bytes>
 BUZZ_ADMIN_WEB_DIR=/srv/buzz/admin-web
 ```
 
-The relay requires the configured admin host and matching browser origin.
-Requests and responses are bounded and uncached. The deployment routes admin
-traffic through the private ingress.
+The relay requires HTTP Basic credentials before it serves the dashboard, its
+assets, any admin API, or an attachment. `BUZZ_ADMIN_USERNAME` defaults to
+`admin`; the password has no default,
+must be at least 16 bytes, and is retained by the relay only as a digest. The
+configured host and matching browser origin remain defense-in-depth checks.
+Requests and responses are bounded and uncached. Use HTTPS so the credentials
+are not exposed in transit, and route admin traffic through the private ingress.
 
 When the UI runs in a separate pod, proxy `/api/admin/v1/*` to the relay while
 preserving the admin `Host` header. A `NetworkPolicy` grants the admin pod access
@@ -62,8 +69,8 @@ content retains attachment disposition. Successful reads produce a structured
 trace containing feedback ID, community ID, and attachment hash, but no feedback
 body or attachment URL.
 
-The human trust boundary remains the private admin ingress. VPN/source-IP
-admission is not per-operator identity. Anyone admitted to the dashboard can
-read attachments for feedback records they can access. Per-person attribution
-or revocation requires authenticated operator identity at ingress/application
-level; this endpoint deliberately does not claim to provide it.
+The deployment credential identifies administrators as a group, not as
+individual people. Anyone with that credential can read attachments for
+feedback records they can access. Rotate the password when an administrator
+loses access. Per-person attribution requires identity-aware authentication at
+the ingress or application layer.

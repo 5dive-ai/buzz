@@ -403,8 +403,14 @@ admin: bootstrap _ensure-migrations
     [[ -d node_modules ]] || pnpm install
     pnpm -C admin-web build
     export BUZZ_ADMIN_HOST="${BUZZ_ADMIN_HOST:-admin.localhost:3000}"
+    export BUZZ_ADMIN_USERNAME="${BUZZ_ADMIN_USERNAME:-admin}"
+    if [[ -z "${BUZZ_ADMIN_PASSWORD:-}" ]]; then
+        export BUZZ_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+    fi
     export BUZZ_ADMIN_WEB_DIR="${BUZZ_ADMIN_WEB_DIR:-{{justfile_directory()}}/admin-web/dist}"
     echo "Admin dashboard: http://${BUZZ_ADMIN_HOST}/reports"
+    echo "Admin username: ${BUZZ_ADMIN_USERNAME}"
+    echo "Admin password: ${BUZZ_ADMIN_PASSWORD}"
     cargo run -p buzz-relay
 
 # Seed deterministic reports and product feedback for local admin dashboard review

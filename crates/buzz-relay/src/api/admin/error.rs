@@ -10,6 +10,7 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: &'static str,
+    challenge_basic: bool,
 }
 
 #[derive(Serialize)]
@@ -31,6 +32,16 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code,
             message,
+            challenge_basic: false,
+        }
+    }
+
+    pub fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: "admin credentials are required",
+            challenge_basic: true,
         }
     }
 
@@ -39,6 +50,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             code: "forbidden",
             message: "request is not authorized",
+            challenge_basic: false,
         }
     }
 
@@ -47,6 +59,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "not_found",
             message: "record was not found",
+            challenge_basic: false,
         }
     }
 
@@ -55,13 +68,14 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_error",
             message: "request failed",
+            challenge_basic: false,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(ErrorEnvelope {
                 error: ErrorBody {
@@ -71,7 +85,16 @@ impl IntoResponse for ApiError {
                 },
             }),
         )
-            .into_response()
+            .into_response();
+        if self.challenge_basic {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static(
+                    "Basic realm=\"buzz-admin\", charset=\"UTF-8\"",
+                ),
+            );
+        }
+        response
     }
 }
 

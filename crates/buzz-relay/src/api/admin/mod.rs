@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -22,6 +22,13 @@ use uuid::Uuid;
 
 pub(crate) fn is_admin_host(state: &crate::state::AppState, headers: &HeaderMap) -> bool {
     auth::is_admin_host(state, headers)
+}
+
+pub(crate) fn authorize_request(
+    state: &crate::state::AppState,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    authorize(state, headers).map_err(|error| error.into_response())
 }
 
 /// Build the read-only deployment-admin routes.
@@ -337,6 +344,11 @@ mod tests {
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.admin = Some(crate::config::AdminConfig {
             host: "admin.example".to_string(),
+            username: "operator".to_string(),
+            credential_digest: crate::config::AdminConfig::credential_digest(
+                "operator",
+                "correct horse battery staple",
+            ),
             web_dir: None,
         });
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
@@ -374,6 +386,13 @@ mod tests {
 
     const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
+    fn admin_authorization() -> String {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode("operator:correct horse battery staple");
+        format!("Basic {encoded}")
+    }
+
     #[tokio::test]
     async fn report_detail_requires_admin_host_before_database_access() {
         let response = router(test_state().await)
@@ -396,12 +415,35 @@ mod tests {
                 Request::builder()
                     .uri(format!("/reports/{}", Uuid::nil()))
                     .header(header::HOST, "admin.example")
+                    .header(header::AUTHORIZATION, admin_authorization())
                     .body(Body::empty())
                     .expect("request"),
             )
             .await
             .expect("response");
         assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn report_detail_requires_admin_credentials_before_database_access() {
+        let response = router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/reports/{}", Uuid::nil()))
+                    .header(header::HOST, "admin.example")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Basic realm=\"buzz-admin\", charset=\"UTF-8\"")
+        );
     }
 
     #[tokio::test]
@@ -426,6 +468,7 @@ mod tests {
                 Request::builder()
                     .uri(format!("/feedback/{}/attachments/{HASH}", Uuid::nil()))
                     .header(header::HOST, "admin.example")
+                    .header(header::AUTHORIZATION, admin_authorization())
                     .body(Body::empty())
                     .expect("request"),
             )

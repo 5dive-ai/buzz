@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { ResolvedLinkPreview } from "@/shared/lib/useResolvedLinkPreviews";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
+import { SimpleImageLightbox } from "@/shared/ui/SimpleImageLightbox";
 
 function LinkPreviewIdentity({ preview }: { preview: ResolvedLinkPreview }) {
   if (preview.faviconDataUrl) {
@@ -40,6 +41,67 @@ function isTweetPreview(preview: ResolvedLinkPreview): boolean {
   }
 }
 
+function LinkPreviewImage({
+  aspectClassName,
+  className,
+  preview,
+}: {
+  aspectClassName: string;
+  className?: string;
+  preview: ResolvedLinkPreview;
+}) {
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  const imageSrc =
+    preview.imageState === "image" ? preview.imageDataUrl : undefined;
+  const alt = `Preview from ${preview.imageDomain}`;
+
+  if (!imageSrc) {
+    return (
+      <div
+        className={cn("overflow-hidden rounded-xl bg-muted", className)}
+        data-link-preview-thumbnail=""
+      >
+        <div
+          className={cn(
+            "w-full animate-pulse bg-muted-foreground/10",
+            aspectClassName,
+          )}
+          data-link-preview-skeleton=""
+        />
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <button
+        aria-label={`Open ${alt.toLowerCase()} in lightbox`}
+        className={cn(
+          "block cursor-zoom-in overflow-hidden rounded-xl bg-muted",
+          className,
+        )}
+        data-link-preview-thumbnail=""
+        onClick={() => setLightboxOpen(true)}
+        type="button"
+      >
+        <div className={cn("w-full", aspectClassName)}>
+          <img
+            alt={alt}
+            className="h-full w-full object-cover"
+            src={imageSrc}
+          />
+        </div>
+      </button>
+      <SimpleImageLightbox
+        alt={alt}
+        onOpenChange={setLightboxOpen}
+        open={lightboxOpen}
+        src={imageSrc}
+      />
+    </>
+  );
+}
+
 function TweetPreview({
   className,
   onRemove,
@@ -51,7 +113,6 @@ function TweetPreview({
 }) {
   const [contentExpanded, setContentExpanded] = useState(true);
   const reserveImage = preview.imageState !== "none";
-  const showImage = preview.imageState === "image";
   const hasExpandableContent = Boolean(preview.description) || reserveImage;
   const hostname = getHostname(preview);
 
@@ -88,28 +149,11 @@ function TweetPreview({
         </div>
       ) : null}
       {contentExpanded && reserveImage ? (
-        <a
-          aria-label={`Open tweet: ${preview.title}`}
-          className="mt-2 block w-full max-w-75 overflow-hidden rounded-xl bg-muted"
-          href={preview.href}
-          rel="noreferrer"
-          target="_blank"
-        >
-          <div className="aspect-video w-full" data-link-preview-thumbnail="">
-            {showImage ? (
-              <img
-                alt={`Preview from ${preview.imageDomain}`}
-                className="h-full w-full object-cover"
-                src={preview.imageDataUrl ?? undefined}
-              />
-            ) : (
-              <div
-                className="h-full w-full animate-pulse bg-muted-foreground/10"
-                data-link-preview-skeleton=""
-              />
-            )}
-          </div>
-        </a>
+        <LinkPreviewImage
+          aspectClassName="aspect-video"
+          className="mt-2 w-full max-w-75"
+          preview={preview}
+        />
       ) : null}
       {hasExpandableContent ? (
         <button

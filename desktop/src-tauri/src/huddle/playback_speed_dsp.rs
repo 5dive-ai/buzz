@@ -76,6 +76,8 @@ pub fn process_complete_chunk(
 /// Pocket may divide a natural synthesis chunk into multiple model-valid
 /// units. Joining those units before processing keeps one stretcher timeline
 /// across the hidden boundaries instead of resetting the DSP at each unit.
+// This file is also compiled directly by the single-buffer diagnostic example.
+#[allow(dead_code)]
 pub fn process_complete_playback_chunk(
     model_units: &[Vec<f32>],
     speed: f32,

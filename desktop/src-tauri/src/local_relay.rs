@@ -64,6 +64,13 @@ impl LocalRelayRuntime {
         &self.url
     }
 
+    fn is_running(&mut self) -> Result<bool, String> {
+        self.child
+            .try_wait()
+            .map(|status| status.is_none())
+            .map_err(|error| format!("inspect local relay: {error}"))
+    }
+
     fn stop(&mut self) {
         // The relay handles SIGTERM with a WebSocket drain. It is our child, so
         // waiting here prevents a restart from inheriting a stale listener.
@@ -157,19 +164,27 @@ pub(crate) fn ensure_started(
     requested_port: Option<u16>,
 ) -> Result<String, String> {
     let mut runtime = runtime.lock().map_err(|error| error.to_string())?;
-    if let Some(running) = runtime.as_ref() {
+    if let Some(running) = runtime.as_mut() {
         let same_port = requested_port.is_none_or(|port| running.url == local_relay_url(port));
         let same_owner = running.owner_pubkey == keys.public_key().to_hex();
-        if same_port && same_owner {
+        let is_running = running.is_running()?;
+        if same_port && same_owner && is_running {
             return Ok(running.url().to_string());
         }
         if !same_owner {
             // An onboarding identity import changed the owner. Its local relay
             // must use a separate identity-scoped nest, not retain the prior
-            // identity's private sidecar.
+            // identity's private sidecar. `try_wait` above already reaped an
+            // exited child, so never signal its potentially recycled PID.
             if let Some(mut previous) = runtime.take() {
-                previous.stop();
+                if is_running {
+                    previous.stop();
+                }
             }
+        } else if !is_running {
+            // `try_wait` reaped the crashed child. Drop its stale handle so the
+            // replacement below receives a fresh loopback port and child.
+            runtime.take();
         } else {
             return Err("a different local relay port is already running".to_string());
         }
@@ -262,6 +277,7 @@ mod tests {
         collections::HashMap,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
+        process::{Command, Stdio},
     };
 
     #[test]
@@ -279,6 +295,45 @@ mod tests {
         assert!(!is_local_relay_url("ws://127.0.0.1:4317"));
         assert!(!is_local_relay_url("ws://localhost:4317"));
         assert!(!is_local_relay_url("wss://127.0.0.1:4317"));
+    }
+
+    #[test]
+    fn exited_relay_is_not_running() {
+        let child = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start test child");
+        let mut runtime = super::LocalRelayRuntime {
+            child,
+            url: "ws://127.0.0.1:4317".to_string(),
+            owner_pubkey: "owner".to_string(),
+        };
+
+        runtime.child.wait().expect("wait for test child");
+        assert!(!runtime.is_running().expect("inspect exited child"));
+    }
+
+    #[test]
+    fn relay_service_key_is_durable_and_distinct_from_owner_identity() {
+        let directory = tempfile::tempdir().expect("temp data dir");
+        let owner = nostr::Keys::generate();
+        let first = load_or_create_relay_keys(directory.path()).expect("create service key");
+        let second = load_or_create_relay_keys(directory.path()).expect("reload service key");
+
+        assert_ne!(first.public_key(), owner.public_key());
+        assert_eq!(first.public_key(), second.public_key());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(directory.path().join("relay-service.key"))
+                .expect("service key metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]

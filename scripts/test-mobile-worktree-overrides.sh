@@ -206,6 +206,31 @@ for key in BUNDLE_IDENTIFIER BUZZ_KEYCHAIN_ACCESS_GROUP BUZZ_IOS_PUSH_ENVIRONMEN
   assert_single_xcconfig_declaration "$release_xcconfig" "$key" "Release"
 done
 
+# SWIFT_ACTIVE_COMPILATION_CONDITIONS is checked separately from the closed
+# identity census above. This is a tracked-source assertion only; resolved Xcode
+# build settings are intentionally outside this Linux-compatible test.
+assert_xcconfig_value "$debug_xcconfig" \
+  '^SWIFT_ACTIVE_COMPILATION_CONDITIONS = \$\(inherited\) DEBUG$' \
+  "Debug Swift compilation conditions inherit DEBUG"
+
+debug_swift_condition_count=$(grep -cE \
+  '^[[:space:]]*SWIFT_ACTIVE_COMPILATION_CONDITIONS([[:space:]]*\[[^]]*\])*[[:space:]]*=' \
+  "$debug_xcconfig" || true)
+if [[ "$debug_swift_condition_count" -eq 1 ]]; then
+  pass "Debug SWIFT_ACTIVE_COMPILATION_CONDITIONS has one tracked declaration site"
+else
+  fail "Debug SWIFT_ACTIVE_COMPILATION_CONDITIONS has $debug_swift_condition_count tracked declaration sites; expected exactly one"
+fi
+
+release_swift_condition_count=$(grep -cE \
+  '^[[:space:]]*SWIFT_ACTIVE_COMPILATION_CONDITIONS([[:space:]]*\[[^]]*\])*[[:space:]]*=' \
+  "$release_xcconfig" || true)
+if [[ "$release_swift_condition_count" -eq 0 ]]; then
+  pass "Release SWIFT_ACTIVE_COMPILATION_CONDITIONS has no tracked declaration sites"
+else
+  fail "Release SWIFT_ACTIVE_COMPILATION_CONDITIONS has $release_swift_condition_count tracked declaration sites; expected zero"
+fi
+
 # Split the retired identifiers so the regression test does not match itself.
 retired_bundle_id='com.buzz.buzz'"Mobile"
 if git -C "$repo_root" grep -q -F "$retired_bundle_id"; then

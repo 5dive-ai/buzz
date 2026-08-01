@@ -78,33 +78,15 @@ pub(super) fn tombstone_managed_agent_pending(
     state: &AppState,
     agent_pubkey: &str,
 ) {
-    use crate::managed_agents::{
-        agent_events::build_agent_delete,
-        retention::{
-            delete_retained_event, open_retention_db, retain_user_intent_event,
-            tombstone_retention_d_tag, RetainedEvent,
-        },
-    };
-    use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
-
-    const KIND_DELETE: u32 = 5;
+    use crate::managed_agents::retention::open_retention_db;
 
     let result = (|| -> Result<(), String> {
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        let owner_pubkey = scope.owner_keys.public_key().to_hex();
-        let event = build_agent_delete(agent_pubkey, &owner_pubkey)?
-            .sign_with_keys(&scope.owner_keys)
-            .map_err(|e| format!("failed to sign managed-agent tombstone: {e}"))?;
         let conn = open_retention_db(&scope.db_path)?;
-        delete_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, agent_pubkey)?;
-        retain_user_intent_event(
+        crate::managed_agents::reconcile::tombstone_agent_pending_inner(
             &conn,
-            &RetainedEvent::pending(
-                KIND_DELETE,
-                owner_pubkey,
-                tombstone_retention_d_tag(KIND_MANAGED_AGENT, agent_pubkey),
-                &event,
-            ),
+            &scope.owner_keys,
+            agent_pubkey,
         )
     })();
     if let Err(e) = result {

@@ -166,5 +166,44 @@ pub(crate) fn reconcile_agents_in_dir(base_dir: &Path, keys: &nostr::Keys) -> Re
     reconcile_agents_in_dir_at(base_dir, keys, &base_dir.join("retention.db"))
 }
 
+/// AppHandle-free core of the agent tombstone flow. Extracted as a seam so the
+/// retention logic is independently testable without a running Tauri app.
+///
+/// Deletes the pending agent row at `(30177, owner, agent_pubkey)` and retains
+/// a user-intent kind:5 tombstone at `(5, owner, tombstone_d_tag)`. The
+/// user-intent write unconditionally clears `publish_blocked` so a tombstone
+/// always propagates in-session, even if the coordinate was previously parked.
+pub(crate) fn tombstone_agent_pending_inner(
+    conn: &rusqlite::Connection,
+    keys: &nostr::Keys,
+    agent_pubkey: &str,
+) -> Result<(), String> {
+    use super::{
+        agent_events::build_agent_delete,
+        retention::{
+            delete_retained_event, retain_user_intent_event, tombstone_retention_d_tag,
+            RetainedEvent,
+        },
+    };
+    use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
+
+    const KIND_DELETE: u32 = 5;
+
+    let owner_pubkey = keys.public_key().to_hex();
+    let event = build_agent_delete(agent_pubkey, &owner_pubkey)?
+        .sign_with_keys(keys)
+        .map_err(|e| format!("failed to sign managed-agent tombstone: {e}"))?;
+    delete_retained_event(conn, KIND_MANAGED_AGENT, &owner_pubkey, agent_pubkey)?;
+    retain_user_intent_event(
+        conn,
+        &RetainedEvent::pending(
+            KIND_DELETE,
+            owner_pubkey,
+            tombstone_retention_d_tag(KIND_MANAGED_AGENT, agent_pubkey),
+            &event,
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests;

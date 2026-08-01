@@ -7,9 +7,10 @@ import 'package:buzz/shared/relay/relay.dart';
 
 /// Tests for [ChannelsNotifier] in the pure-Nostr world.
 ///
-/// The provider performs a two-step WS query:
+/// The provider performs a three-step WS query:
 ///   1. kind:39002 memberships tagged `#p:<my-pubkey>`
 ///   2. kind:39000 metadata for those channel ids
+///   3. unfiltered kind:39000 metadata for discoverable open channels
 /// then layers per-channel live subscriptions on the `#h` tag.
 ///
 /// Tests stub out the relay session by overriding [relaySessionProvider] with
@@ -51,6 +52,59 @@ void main() {
       }
     },
   );
+
+  test(
+    'discovers open channels for a user with zero channel memberships',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: const [],
+        metadata: [
+          _meta(id: _channelA, name: 'general'),
+          _meta(id: _channelB, name: 'staff', visibility: 'private'),
+          _meta(id: _channelD, name: 'DM', channelType: 'dm'),
+        ],
+      );
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
+
+      final channels = await container.read(channelsProvider.future);
+
+      expect(channels, hasLength(1));
+      expect(channels.single.id, _channelA);
+      expect(channels.single.isMember, isFalse);
+      expect(channels.map((channel) => channel.id), isNot(contains(_channelB)));
+      expect(channels.map((channel) => channel.id), isNot(contains(_channelD)));
+      expect(
+        session.historyFilters.any(
+          (filter) =>
+              filter.kinds.length == 1 &&
+              filter.kinds.single == 39000 &&
+              !filter.tags.containsKey('#d'),
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test('deduplicates joined channels from open-channel discovery', () async {
+    final session = _FakeRelaySession(
+      memberships: [_membership(_channelA, myPk)],
+      metadata: [
+        _meta(id: _channelA, name: 'general'),
+        _meta(id: _channelB, name: 'random'),
+      ],
+    );
+    final container = _buildContainer(session: session);
+    addTearDown(container.dispose);
+
+    final channels = await container.read(channelsProvider.future);
+
+    expect(channels.map((channel) => channel.id), [_channelA, _channelB]);
+    expect(channels.first.isMember, isTrue);
+    expect(channels.last.isMember, isFalse);
+    expect(session.subscribeFilters, hasLength(1));
+    expect(session.subscribeFilters.single.tags['#h'], [_channelA]);
+  });
 
   test('live channel events update channel lastMessageAt', () async {
     final session = _FakeRelaySession(
@@ -331,27 +385,32 @@ void main() {
     },
   );
 
-  test('initial fetch issues membership + metadata queries', () async {
-    final session = _FakeRelaySession(
-      memberships: [_membership(_channelA, myPk)],
-      metadata: [_meta(id: _channelA, name: 'general')],
-    );
-    final container = _buildContainer(session: session);
-    addTearDown(container.dispose);
+  test(
+    'initial fetch issues membership + member + discovery metadata queries',
+    () async {
+      final session = _FakeRelaySession(
+        memberships: [_membership(_channelA, myPk)],
+        metadata: [_meta(id: _channelA, name: 'general')],
+      );
+      final container = _buildContainer(session: session);
+      addTearDown(container.dispose);
 
-    await container.read(channelsProvider.future);
+      await container.read(channelsProvider.future);
 
-    // Two history fetches for channel loading, plus one per non-DM channel
-    // for high-priority event backfill.
-    expect(session.historyFilters.length, greaterThanOrEqualTo(2));
-    expect(session.historyFilters[0].kinds, [39002]);
-    expect(session.historyFilters[0].tags['#p'], [myPk]);
-    expect(session.historyFilters[1].kinds, [39000]);
-    expect(session.historyFilters[1].tags['#d'], [_channelA]);
+      // Membership, joined-channel metadata, and unfiltered discovery history
+      // fetches, plus any message and member-count lookups.
+      expect(session.historyFilters.length, greaterThanOrEqualTo(3));
+      expect(session.historyFilters[0].kinds, [39002]);
+      expect(session.historyFilters[0].tags['#p'], [myPk]);
+      expect(session.historyFilters[1].kinds, [39000]);
+      expect(session.historyFilters[1].tags['#d'], [_channelA]);
+      expect(session.historyFilters[2].kinds, [39000]);
+      expect(session.historyFilters[2].tags, isEmpty);
 
-    // And one live subscription on the resulting channel.
-    expect(session.subscribeFilters, hasLength(1));
-  });
+      // And one live subscription on the resulting joined channel.
+      expect(session.subscribeFilters, hasLength(1));
+    },
+  );
 }
 
 const _channelA = '11111111-1111-4111-8111-111111111111';
@@ -392,6 +451,7 @@ NostrEvent _meta({
   required String id,
   required String name,
   String channelType = 'stream',
+  String visibility = 'open',
   int createdAt = 1,
   int? ttlSeconds,
   bool archived = false,
@@ -404,7 +464,7 @@ NostrEvent _meta({
     ['d', id],
     ['name', name],
     ['t', channelType],
-    ['public'],
+    [visibility == 'private' ? 'private' : 'public'],
     if (ttlSeconds != null) ['ttl', '$ttlSeconds'],
     if (archived) ['archived', 'true'],
   ],
@@ -470,8 +530,12 @@ class _FakeRelaySession extends RelaySessionNotifier {
       return hiddenDmEvents;
     }
     if (filter.kinds.contains(39000)) {
-      // Metadata query — return all metadata events whose `d` tag matches.
-      final ids = (filter.tags['#d'] ?? const <String>[]).toSet();
+      // A tagged query models the member-metadata lookup. An unfiltered query
+      // models the relay's discovery response, including unexpected private/DM
+      // rows so tests verify the provider rejects them rather than trusting the
+      // fake to pre-filter them.
+      final ids = filter.tags['#d']?.toSet();
+      if (ids == null) return List.of(metadata);
       return metadata.where((e) => ids.contains(e.getTagValue('d'))).toList();
     }
     return const [];

@@ -23,21 +23,22 @@ final class BuzzPushTranscriptTests: XCTestCase {
         let vectors: [Vector]
     }
 
-    static let fixture: Fixture = {
-        // Tests/BuzzPushKitTests/… → repo root is five levels up from this file's dir.
-        let here = URL(fileURLWithPath: #filePath)
-        let repoRoot = here
-            .deletingLastPathComponent() // BuzzPushKitTests
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // BuzzPushKit
-            .deletingLastPathComponent() // ios
-            .deletingLastPathComponent() // mobile
-            .deletingLastPathComponent() // repo root
-        let path = repoRoot
-            .appendingPathComponent("crates/buzz-push-gateway/tests/vectors/app_attest_transcripts.json")
-        let data = try! Data(contentsOf: path)
-        return try! JSONDecoder().decode(Fixture.self, from: data)
-    }()
+    static func fixture(
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> Fixture {
+        let path = try XCTUnwrap(
+            Bundle.module.url(
+                forResource: "app_attest_transcripts",
+                withExtension: "json"
+            ),
+            "missing bundled gateway transcript fixture app_attest_transcripts.json in \(Bundle.module.bundleURL.path)",
+            file: file,
+            line: line
+        )
+        let data = try Data(contentsOf: path)
+        return try JSONDecoder().decode(Fixture.self, from: data)
+    }
 
     // Deterministic inputs mirroring the fixture's `inputs` block.
     static let challengeId = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
@@ -52,7 +53,7 @@ final class BuzzPushTranscriptTests: XCTestCase {
 
     private func assertMatchesVector(_ name: String, _ bytes: Data,
                                      file: StaticString = #filePath, line: UInt = #line) throws {
-        guard let vector = Self.fixture.vectors.first(where: { $0.name == name }) else {
+        guard let vector = try Self.fixture(file: file, line: line).vectors.first(where: { $0.name == name }) else {
             XCTFail("missing fixture vector \(name)", file: file, line: line)
             return
         }
@@ -123,9 +124,9 @@ final class BuzzPushTranscriptTests: XCTestCase {
         ))
     }
 
-    func testAllFixtureVectorsCovered() {
+    func testAllFixtureVectorsCovered() throws {
         XCTAssertEqual(
-            Set(Self.fixture.vectors.map(\.name)),
+            Set(try Self.fixture().vectors.map(\.name)),
             ["enroll", "delegate", "rotate_endpoint", "revoke_delegation", "revoke_installation"],
             "fixture gained or lost a vector; add/remove the matching known-answer test"
         )

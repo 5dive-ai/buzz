@@ -470,13 +470,14 @@
     }
 
     private static func fixture() throws -> Fixture {
-      let here = URL(fileURLWithPath: #filePath)
-      let repoRoot = (0..<6).reduce(here) { value, _ in value.deletingLastPathComponent() }
-      let data = try Data(
-        contentsOf: repoRoot.appendingPathComponent(
-          "crates/buzz-push-gateway/tests/vectors/app_attest_transcripts.json"
-        )
+      let path = try XCTUnwrap(
+        Bundle.module.url(
+          forResource: "app_attest_transcripts",
+          withExtension: "json"
+        ),
+        "missing bundled gateway transcript fixture app_attest_transcripts.json in \(Bundle.module.bundleURL.path)"
       )
+      let data = try Data(contentsOf: path)
       return try JSONDecoder().decode(Fixture.self, from: data)
     }
 

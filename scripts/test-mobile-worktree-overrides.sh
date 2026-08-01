@@ -154,6 +154,58 @@ grep -q '^BUNDLE_IDENTIFIER = xyz\.block\.buzz\.mobile$' "$release_xcconfig" \
 grep -q '^APP_DISPLAY_NAME = Buzz$' "$release_xcconfig" \
   && pass "Release.xcconfig keeps the production display name" \
   || fail "Release.xcconfig must keep APP_DISPLAY_NAME = Buzz"
+
+# These checks assert declarations in the two tracked xcconfigs only. They do
+# not prove resolved build settings. The later gitignored includes
+# (WorktreeOverrides.xcconfig and AppOverrides.xcconfig) can override these
+# declarations and are explicitly outside this tracked-source assertion. The
+# value check and declaration census are complementary: xcconfig is last-wins,
+# while the census deliberately flags even a harmless duplicate declaration so
+# a human reviews the changed declaration surface.
+assert_xcconfig_value() {
+  # $1: file, $2: anchored value regex, $3: pass/failure description
+  if grep -qE "$2" "$1"; then
+    pass "$3"
+  else
+    fail "$3"
+  fi
+}
+
+assert_single_xcconfig_declaration() {
+  # $1: file, $2: key, $3: configuration label
+  local count
+  count=$(grep -cE "^[[:space:]]*$2([[:space:]]*\[[^]]*\])*[[:space:]]*=" "$1" || true)
+  if [[ "$count" -eq 1 ]]; then
+    pass "$3 $2 has one tracked declaration site"
+  else
+    fail "$3 $2 has $count tracked declaration sites; expected exactly one"
+  fi
+}
+
+assert_xcconfig_value "$debug_xcconfig" \
+  '^BUZZ_IOS_PUSH_ENVIRONMENT = development$' \
+  "Debug push environment is declared as development"
+assert_xcconfig_value "$debug_xcconfig" \
+  '^BUZZ_APP_ATTEST_ENVIRONMENT = development$' \
+  "Debug App Attest environment is declared as development"
+assert_xcconfig_value "$debug_xcconfig" \
+  '^BUZZ_APP_GROUP_IDENTIFIER = group\.\$\(BUNDLE_IDENTIFIER\)$' \
+  "Debug App Group is declared as derived from the bundle identifier"
+assert_xcconfig_value "$release_xcconfig" \
+  '^BUZZ_IOS_PUSH_ENVIRONMENT = production$' \
+  "Release push environment is declared as production"
+assert_xcconfig_value "$release_xcconfig" \
+  '^BUZZ_APP_ATTEST_ENVIRONMENT = production$' \
+  "Release App Attest environment is declared as production"
+assert_xcconfig_value "$release_xcconfig" \
+  '^BUZZ_APP_GROUP_IDENTIFIER = group\.\$\(BUNDLE_IDENTIFIER\)$' \
+  "Release App Group is declared as derived from the bundle identifier"
+
+for key in BUNDLE_IDENTIFIER BUZZ_KEYCHAIN_ACCESS_GROUP BUZZ_IOS_PUSH_ENVIRONMENT BUZZ_APP_ATTEST_ENVIRONMENT BUZZ_APP_GROUP_IDENTIFIER; do
+  assert_single_xcconfig_declaration "$debug_xcconfig" "$key" "Debug"
+  assert_single_xcconfig_declaration "$release_xcconfig" "$key" "Release"
+done
+
 # Split the retired identifiers so the regression test does not match itself.
 retired_bundle_id='com.buzz.buzz'"Mobile"
 if git -C "$repo_root" grep -q -F "$retired_bundle_id"; then

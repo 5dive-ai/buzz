@@ -164,8 +164,8 @@ impl DenialLimiter {
         self.prune(now);
         let author_key = (channel_id, author.to_string());
 
-        // Match OwnerCache's simple bounded-map policy. The channel cap remains
-        // the volume bound if a many-author burst clears the author map.
+        // Match OwnerCache's simple bounded-map policy. The channel map keeps
+        // its own cap when a many-author burst clears the author map.
         if self.by_author.len() >= MAX_TRACKED_DENIAL_KEYS {
             self.by_author.clear();
         }

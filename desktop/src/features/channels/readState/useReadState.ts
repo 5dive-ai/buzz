@@ -3,6 +3,7 @@ import {
   ReadStateManager,
   type ContextParentResolver,
   type MarkResult,
+  type ReadStateProjection,
 } from "@/features/channels/readState/readStateManager";
 import type { OverrideLiveness } from "@/features/channels/readState/readStateFormat";
 import type { RelayClient } from "@/shared/api/relayClientSession";
@@ -16,6 +17,7 @@ const noopMarkOverride = (): MarkResult => ({
   reason: "load_incomplete",
 });
 const noopGetOverrideLiveness = (): OverrideLiveness | null => null;
+const noopGetProjection = (): ReadStateProjection | null => null;
 
 /**
  * React hook that creates and manages a ReadStateManager instance.
@@ -129,14 +131,25 @@ export function useReadState(
     [],
   );
 
+  const getProjection = React.useCallback((): ReadStateProjection | null => {
+    return managerRef.current?.getProjection() ?? null;
+  }, []);
+
   const isReady = Boolean(
     pubkey && relayClient && initializedPubkey === pubkey,
   );
+
+  // loadComplete is true only when the manager's full-state enumeration has
+  // terminated with a complete verdict. Distinct from isReady (initialized):
+  // a manager can be initialized with an incomplete load.
+  const isLoadComplete =
+    isReady && (managerRef.current?.getProjection().loadComplete ?? false);
 
   if (!pubkey || !relayClient) {
     return {
       getEffectiveTimestamp: noopGetTimestamp,
       isReady: false,
+      isLoadComplete: false,
       markContextRead: noopMarkRead,
       seedContextRead: noopMarkRead,
       drainSyncedAdvances: noopDrainAdvances,
@@ -146,12 +159,14 @@ export function useReadState(
       markChannelUnread: noopMarkOverride,
       markChannelRead: noopMarkOverride,
       getOverrideLiveness: noopGetOverrideLiveness,
+      getProjection: noopGetProjection,
     };
   }
 
   return {
     getEffectiveTimestamp,
     isReady,
+    isLoadComplete,
     markContextRead,
     seedContextRead,
     drainSyncedAdvances,
@@ -161,5 +176,6 @@ export function useReadState(
     markChannelUnread,
     markChannelRead,
     getOverrideLiveness,
+    getProjection,
   };
 }

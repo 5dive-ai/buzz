@@ -7,8 +7,8 @@ import {
   msgContextKey,
   type OverrideRegister,
 } from "@/features/channels/readState/readStateFormat";
-import { readStoredReadState } from "@/features/channels/readState/readStateStorage";
 import { deduplicateByCoordinate } from "@/features/channels/readState/readStateFencedLoader";
+import type { ReadStateProjection } from "@/features/channels/readState/readStateManager";
 import {
   getThreadReference,
   isBroadcastReply,
@@ -158,26 +158,22 @@ export async function fetchCommunityUnread(args: {
   decryptReadState?: (ciphertext: string) => Promise<string>;
   decryptMutes?: (ciphertext: string) => Promise<string>;
   readThreadRelationships?: (pubkey: string) => ThreadRelationships;
-  /** Authoritative source (a): persisted override register projection. Defaults
-   *  to `readStoredReadState(pubkey).overrideRegisters`. Inject for tests. */
-  readStoredRegisters?: (
-    pubkey: string,
-  ) => ReadonlyMap<string, OverrideRegister>;
+  /** Coherent manager projection for override evaluation. When provided and
+   *  `loadComplete` is true, the projection's `overrides` and `frontiers` are
+   *  the authoritative source — the fetched registers are still used for
+   *  frontier-only readAt, but override liveness is decided solely from the
+   *  projection (no per-field max join with fetched registers).
+   *
+   *  When null or `loadComplete` is false, use fetched coordinate-deduped
+   *  registers only — do not fall back to a partial stored view whose
+   *  per-field merge can resurrect a superseded register. */
+  getProjection?: () => ReadStateProjection | null;
 }): Promise<CommunityUnreadObserverResult> {
   const { client, pubkey } = args;
   const normalizedPubkey = pubkey.toLowerCase();
   const decryptMutes = args.decryptMutes ?? nip44DecryptFromSelf;
   const readRelationships =
     args.readThreadRelationships ?? defaultReadThreadRelationships;
-  const getStoredRegisters =
-    args.readStoredRegisters ??
-    ((pk: string) => {
-      try {
-        return readStoredReadState(pk).overrideRegisters;
-      } catch {
-        return new Map<string, OverrideRegister>();
-      }
-    });
 
   const channels = await fetchObservedChannels(client, pubkey);
   if (channels.length === 0) {
@@ -208,25 +204,48 @@ export async function fetchCommunityUnread(args: {
     args.decryptReadState,
   );
 
-  // Authoritative source (a): persisted full-state projection from the manager's
-  // last complete load. Merge with source (b): max() per field, so a register
-  // present in only one source is retained.
-  const storedRegisters = getStoredRegisters(normalizedPubkey);
-  const mergedOverrides = new Map<string, OverrideRegister>(
-    readState.overrides,
-  );
-  for (const [rawCtx, stored] of storedRegisters) {
-    const fetched = mergedOverrides.get(rawCtx);
-    if (!fetched) {
-      mergedOverrides.set(rawCtx, stored);
-    } else {
-      mergedOverrides.set(rawCtx, {
-        s: Math.max(fetched.s, stored.s),
-        c: Math.max(fetched.c, stored.c),
-        b: Math.max(fetched.b, stored.b),
-      });
+  // Override liveness source: the manager projection when complete, otherwise
+  // the fetched state only. Never per-field max the two — a projection register
+  // and a fetched register for the same coordinate are NOT concurrent CRDT
+  // replicas; the fetched register may be a newer tombstone superseding a stale
+  // projection entry, and joining them per-field would resurrect the dead one.
+  //
+  // When the projection is complete (loadComplete=true) it is the most
+  // authoritative source because it includes committed local override actions.
+  // Use projection.overrides as the sole override verdict source. For frontiers,
+  // take max(projection, fetched) per channel so a locally-committed frontier
+  // advance is honoured even if the relay hasn't seen it yet.
+  //
+  // When no complete projection is available, use fetched-deduped state alone.
+  const projection = args.getProjection?.() ?? null;
+  const completeProjection = projection?.loadComplete ? projection : null;
+
+  const authoritative: ReadonlyMap<string, OverrideRegister> =
+    completeProjection !== null
+      ? completeProjection.overrides
+      : readState.overrides;
+
+  // Effective frontier: max of fetched and (when available) projection frontier.
+  const effectiveFrontier = (channelId: string): number | null => {
+    const fetched = readState.frontiers.get(channelId) ?? null;
+    if (completeProjection === null) return fetched;
+    const projected = completeProjection.frontiers.get(channelId) ?? null;
+    if (fetched === null) return projected;
+    if (projected === null) return fetched;
+    return Math.max(fetched, projected);
+  };
+
+  // Build a unified frontier map (fetched + projection max) for per-event
+  // msg/thread context lookups inside isUnreadExternalEvent.
+  const effectiveFrontierMap: ReadonlyMap<string, number> = (() => {
+    if (completeProjection === null) return readState.frontiers;
+    const merged = new Map<string, number>(readState.frontiers);
+    for (const [ctx, pf] of completeProjection.frontiers) {
+      const existing = merged.get(ctx);
+      merged.set(ctx, existing !== undefined ? Math.max(existing, pf) : pf);
     }
-  }
+    return merged;
+  })();
 
   let mutedIds = new Set<string>();
   if (mutesEvents.length > 0) {
@@ -254,14 +273,14 @@ export async function fetchCommunityUnread(args: {
   for (const channel of channels) {
     if (mutedIds.has(channel.id)) continue;
 
-    // Compute readAt from the merged frontiers.
-    const readAt = readState.frontiers.get(channel.id) ?? null;
+    // Compute readAt from effective frontiers (max of fetched + projection).
+    const readAt = effectiveFrontier(channel.id);
 
-    // Override liveness: evaluate the merged authoritative register.
-    // "No register in fetched events" is ambiguity, not absence — the local
-    // cache is NOT a fallback verdict source here.
+    // Override liveness: evaluate the authoritative register against the
+    // effective frontier. Uses projection.overrides when complete (no
+    // per-field max with fetched); fetched-deduped otherwise.
     if (!hasUnread) {
-      const reg = mergedOverrides.get(channel.id);
+      const reg = authoritative.get(channel.id);
       if (reg !== undefined && isOverrideActive(reg, readAt ?? 0)) {
         hasUnread = true;
       }
@@ -296,7 +315,7 @@ export async function fetchCommunityUnread(args: {
         (event) =>
           isUnreadExternalEvent(
             event,
-            readState.frontiers,
+            effectiveFrontierMap,
             readAt,
             normalizedPubkey,
           ) &&
@@ -314,7 +333,7 @@ export async function fetchCommunityUnread(args: {
     mentionCount += mentionEvents.filter((event) =>
       isUnreadExternalEvent(
         event,
-        readState.frontiers,
+        effectiveFrontierMap,
         readAt,
         normalizedPubkey,
       ),

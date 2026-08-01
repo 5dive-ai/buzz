@@ -160,10 +160,10 @@ export function useUnreadChannels(
     normalizedRelayUrl,
   );
 
-  // Slice-2 override APIs — now first-class on useReadState's return.
   const {
     getEffectiveTimestamp,
     isReady: isReadStateReady,
+    isLoadComplete,
     markContextRead,
     drainSyncedAdvances,
     setContextParentResolver,
@@ -175,14 +175,14 @@ export function useUnreadChannels(
   } = useReadState(pubkey, relayClient);
   const overrideApis = React.useMemo<OverrideAPIs>(
     () => ({
-      isReadStateReady,
+      isReadStateReady: isLoadComplete, // loadComplete, not initialized — null after incomplete load ≠ known absent
       markChannelUnread: markChannelOverrideUnread,
       markChannelRead: markChannelOverrideRead,
       getOverrideLiveness,
     }),
     [
       getOverrideLiveness,
-      isReadStateReady,
+      isLoadComplete,
       markChannelOverrideRead,
       markChannelOverrideUnread,
     ],
@@ -962,9 +962,9 @@ export function useUnreadChannels(
       }
       if (applyOverrideRead(channelId, overrideApis) === "overrideCleared") {
         delete forcedUnreadRef.current[channelId];
+        latestByChannelRef.current.delete(channelId);
+        observedUnreadEventsByChannelRef.current.delete(channelId);
       }
-      latestByChannelRef.current.delete(channelId);
-      observedUnreadEventsByChannelRef.current.delete(channelId);
     }
     if (pubkey) {
       forcedUnreadStore.write(pubkey, forcedUnreadRef.current);

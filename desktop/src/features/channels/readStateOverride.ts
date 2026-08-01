@@ -42,6 +42,10 @@ export function overrideErrorMessage(
 
 /** Slice-2 override APIs from ReadStateManager, proxied through useReadState. */
 export type OverrideAPIs = {
+  /** True only when the manager's full-state load is complete (loadComplete).
+   *  A manager that finished initializing with an incomplete load must NOT be
+   *  treated as ready — null liveness after an incomplete load means "not found
+   *  in a partial view", not "known absent register". */
   isReadStateReady: boolean;
   markChannelUnread: (channelId: string) => MarkResult;
   markChannelRead: (channelId: string) => MarkResult;
@@ -84,10 +88,11 @@ export type OverrideReadOutcome = "overrideCleared" | "overrideStillActive";
  * Attempt to clear the NIP-RS override for `channelId` as part of an explicit
  * mark-read transition. Models the transition as a single outcome:
  *
- *   1. Manager unavailable (!isReadStateReady): fail-closed —
- *      return overrideStillActive (manager unavailable ≠ no register).
- *   2. liveness === null (ready but no register): return overrideCleared
- *      (known absence; no C-bump needed).
+ *   1. Load not complete (!isReadStateReady): fail-closed —
+ *      return overrideStillActive (null liveness after an incomplete load is
+ *      ambiguous, not known absence).
+ *   2. liveness === null (load complete, no register): return overrideCleared
+ *      (known absence after a complete load; no C-bump needed).
  *   3. liveness exists (active or inactive): always call markChannelRead —
  *      spec NIP-RS:537-539 requires the C-bump even when the frontier already
  *      deactivated the override. Then re-read liveness.
@@ -106,7 +111,7 @@ export function applyOverrideRead(
 
   const liveness = apis.getOverrideLiveness(channelId);
 
-  // Step 2: ready but no register at all → known absence, cleared.
+  // Step 2: load complete but no register at all → known absence, cleared.
   if (liveness === null) return "overrideCleared";
 
   // Step 3: register exists — always attempt the C-bump (NIP-RS:537-539).

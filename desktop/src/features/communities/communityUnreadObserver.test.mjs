@@ -728,11 +728,11 @@ function quietRelayWithReadState(readAtSeconds) {
 }
 
 test("fetchCommunityUnread stored active register lights rail (hasUnread:true)", async () => {
-  // Authoritative source (a): stored register is active (S=1,C=0,B=0 with F=0).
-  // The fetch returns no override events — stored register is the authority.
+  // Authoritative source: complete projection with active register (S=1,C=0,B=0 with F=0).
+  // The fetch returns no override events — projection is the authority.
   const relay = quietRelay();
   // Active register: S=1, C=0, B=0 (baseline), frontier=0 → override_active = true
-  const storedRegisters = new Map([[CHANNEL_ID, { s: 1, c: 0, b: 0 }]]);
+  const overrides = new Map([[CHANNEL_ID, { s: 1, c: 0, b: 0 }]]);
 
   const result = await fetchCommunityUnread({
     client: relay,
@@ -741,18 +741,22 @@ test("fetchCommunityUnread stored active register lights rail (hasUnread:true)",
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    readStoredRegisters: () => storedRegisters,
+    getProjection: () => ({
+      loadComplete: true,
+      frontiers: new Map(),
+      overrides,
+    }),
   });
 
   assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread stored tombstoned register does NOT light rail (hasUnread:false)", async () => {
-  // Authoritative source (a): stored register is tombstoned (S=1,C=1 → S=C, inactive).
-  // Local cache cannot contradict this — must not light the dot.
+  // Authoritative source: complete projection with tombstoned register (S=1,C=1 → inactive).
+  // Must not light the dot.
   const relay = quietRelay();
   // Tombstoned: S=1, C=1, B=0 → override_active = false (S > C fails: 1 > 1 = false)
-  const storedRegisters = new Map([[CHANNEL_ID, { s: 1, c: 1, b: 0 }]]);
+  const overrides = new Map([[CHANNEL_ID, { s: 1, c: 1, b: 0 }]]);
 
   const result = await fetchCommunityUnread({
     client: relay,
@@ -761,7 +765,11 @@ test("fetchCommunityUnread stored tombstoned register does NOT light rail (hasUn
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    readStoredRegisters: () => storedRegisters,
+    getProjection: () => ({
+      loadComplete: true,
+      frontiers: new Map(),
+      overrides,
+    }),
   });
 
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
@@ -770,11 +778,11 @@ test("fetchCommunityUnread stored tombstoned register does NOT light rail (hasUn
 test("fetchCommunityUnread old active register beyond horizon still lights rail", async () => {
   // An active register that is older than the 7-day horizon must still light
   // the rail. The fetch is tag-free and has no `since`, so it returns no
-  // events here, but the stored projection (authoritative source a) is used.
+  // events here, but the complete projection is the authority.
   const relay = quietRelay();
   const VERY_OLD_FRONTIER = 1; // far beyond any 7-day horizon
   // S=1, C=0, B=VERY_OLD_FRONTIER, and frontier=VERY_OLD_FRONTIER → active
-  const storedRegisters = new Map([
+  const overrides = new Map([
     [CHANNEL_ID, { s: 1, c: 0, b: VERY_OLD_FRONTIER }],
   ]);
 
@@ -785,7 +793,11 @@ test("fetchCommunityUnread old active register beyond horizon still lights rail"
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    readStoredRegisters: () => storedRegisters,
+    getProjection: () => ({
+      loadComplete: true,
+      frontiers: new Map(),
+      overrides,
+    }),
   });
 
   assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
@@ -837,7 +849,7 @@ test("fetchCommunityUnread no stored register and empty fetch → falls through 
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    readStoredRegisters: () => new Map(), // no stored registers
+    // No projection — no override registers; falls through to relay evidence gate
   });
 
   assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
@@ -856,7 +868,11 @@ test("fetchCommunityUnread channel not in member list → hasUnread:false", asyn
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    readStoredRegisters: () => new Map([[CHANNEL_ID, { s: 1, c: 0, b: 0 }]]),
+    getProjection: () => ({
+      loadComplete: true,
+      frontiers: new Map(),
+      overrides: new Map([[CHANNEL_ID, { s: 1, c: 0, b: 0 }]]),
+    }),
   });
 
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
@@ -905,7 +921,11 @@ test("fetchCommunityUnread active register muted channel → hasUnread:false", a
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
     // Active register, but channel is muted — mute wins
-    readStoredRegisters: () => new Map([[CHANNEL_ID, { s: 1, c: 0, b: 0 }]]),
+    getProjection: () => ({
+      loadComplete: true,
+      frontiers: new Map(),
+      overrides: new Map([[CHANNEL_ID, { s: 1, c: 0, b: 0 }]]),
+    }),
   });
 
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
@@ -916,7 +936,7 @@ test("fetchCommunityUnread frontier advance deactivates stored register → hasU
   // Fetched frontier: 100 > 50 → override_active = false.
   const relay = quietRelayWithReadState(100);
   // B=50 means active only when F<=50; fetched frontier is 100 → inactive
-  const storedRegisters = new Map([[CHANNEL_ID, { s: 1, c: 0, b: 50 }]]);
+  const overrides = new Map([[CHANNEL_ID, { s: 1, c: 0, b: 50 }]]);
 
   const result = await fetchCommunityUnread({
     client: relay,
@@ -925,7 +945,117 @@ test("fetchCommunityUnread frontier advance deactivates stored register → hasU
     decryptReadState: async (v) => v,
     decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
-    readStoredRegisters: () => storedRegisters,
+    getProjection: () => ({
+      loadComplete: true,
+      frontiers: new Map(),
+      overrides,
+    }),
+  });
+
+  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+});
+
+// ── Adversarial witness tests ─────────────────────────────────────────────────
+//
+// These witnesses verify that the rail's override evaluation cannot resurrect
+// a superseded register or produce a false verdict from a torn/partial state.
+
+test("fetchCommunityUnread adversarial-1: stale live register + fetched tombstone → dark when no complete projection", async () => {
+  // The OLD per-field max join would: max(stale_live, tombstone) = live (resurrection).
+  // Without a complete projection, the fetched coordinate-deduped tombstone is
+  // authoritative; the register is inactive and the rail must remain dark.
+  //
+  // Setup: fetched event carries tombstone (S=0,C=4,B=0) for CHANNEL_ID.
+  const SLOT = "a".repeat(32); // valid 32-hex slot
+  const relay = relayFor([
+    // 1. member events
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["p", PUBKEY],
+        ],
+      }),
+    ],
+    // 2. metadata
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["t", "stream"],
+        ],
+      }),
+    ],
+    // 3. visibility
+    () => [],
+    // 4. read-state: tombstone event (S=0, C=4, B=0 → inactive, S not > C)
+    () => [
+      event({
+        pubkey: PUBKEY,
+        created_at: 300,
+        tags: [
+          ["d", `read-state:${SLOT}`],
+          ["t", "read-state"],
+        ],
+        // Contexts blob: channel has tombstone register (ov_s=0 absent means S=0, ov_c=4)
+        content: JSON.stringify({
+          v: 1,
+          client_id: "client",
+          contexts: {
+            [CHANNEL_ID]: 50,
+            [`ov_c:${CHANNEL_ID}`]: 4,
+          },
+        }),
+      }),
+    ],
+    // 5. mutes
+    () => [],
+    // 6. unread events — none (the override is inactive, no message events either)
+    () => [],
+    // 7. mention events
+    () => [],
+  ]);
+
+  // No complete projection — use fetched-only (no stored merge).
+  // Previously this would be called with readStoredRegisters returning a stale
+  // live register (S=5,C=0,B=100), which when max-joined with fetched tombstone
+  // (S=0,C=4,B=0) produced (S=5,C=4,B=100) → active (resurrection).
+  // New behavior: fetched state alone → (S=0,C=4,B=0) → inactive → dark.
+  const result = await fetchCommunityUnread({
+    client: relay,
+    pubkey: PUBKEY,
+    nowSeconds: 400,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships(),
+    // No getProjection: fetched-deduped is the sole authority.
+  });
+
+  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+});
+
+test("fetchCommunityUnread adversarial-2: projection with frontier deactivates register → dark", async () => {
+  // CRITICAL 2 fix: the rail now reads projection.frontiers, not only fetched frontiers.
+  // A register (S=5,C=0,B=100) with projection frontier F=101 must evaluate as
+  // inactive (101 > 100) — previously the frontier was not in the stored projection,
+  // so it defaulted to F=0 and the register appeared active.
+  //
+  // The fetched relay state returns empty read-state (frontier not in fetched events).
+  // The projection has the committed frontier F=101 from a successful mark-read.
+  const relay = quietRelay(); // no read-state events fetched
+
+  const overrides = new Map([[CHANNEL_ID, { s: 5, c: 0, b: 100 }]]);
+  // projection.frontiers has F=101 for CHANNEL_ID → deactivates the register
+  const frontiers = new Map([[CHANNEL_ID, 101]]);
+
+  const result = await fetchCommunityUnread({
+    client: relay,
+    pubkey: PUBKEY,
+    nowSeconds: 200,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships(),
+    getProjection: () => ({ loadComplete: true, frontiers, overrides }),
   });
 
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });

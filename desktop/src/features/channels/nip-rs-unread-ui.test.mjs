@@ -508,3 +508,123 @@ test("applyOverrideRead_partial_refusal_pattern_clears_only_inactive", () => {
   );
   assert.equal(clearCallCount, 2, "C-bump attempted for both channels");
 });
+
+// ── Adversarial witnesses (pass-3 closures) ───────────────────────────────────
+
+test("adversarial-3: incomplete_load_null_liveness_not_known_absent_overrideStillActive", () => {
+  // IMPORTANT: isReadStateReady = false (load incomplete) + null getOverrideLiveness
+  // must NOT be treated as known register absence. The old bug: isReadStateReady was
+  // set on initialization (not load-complete), so a partially-loaded manager reported
+  // null liveness which was silently treated as "no register" and the local hint was
+  // cleared. With isReadStateReady now meaning loadComplete, this path is fail-closed.
+  //
+  // This test drives applyOverrideRead with isReadStateReady=false (semantically:
+  // load is not complete) and null liveness — must return overrideStillActive.
+  let markCalled = false;
+  const result = applyOverrideRead(
+    "ch-1",
+    makeApis({
+      isReadStateReady: false, // load not complete
+      markChannelRead: () => {
+        markCalled = true;
+        return { success: false, reason: "load_incomplete" };
+      },
+      getOverrideLiveness: () => null, // null from incomplete load ≠ known absent
+    }),
+  );
+  assert.equal(
+    result,
+    "overrideStillActive",
+    "incomplete load must fail closed",
+  );
+  assert.equal(
+    markCalled,
+    false,
+    "must not call manager when load not complete",
+  );
+});
+
+test("adversarial-4: markAllChannelsRead_confirmed_active_refusal_keeps_evidence", () => {
+  // IMPORTANT: markAllChannelsRead must NOT clear latestByChannelRef or
+  // observedUnreadEventsByChannelRef when the override read is refused and
+  // liveness remains active. Evidence must be preserved so the UI can still
+  // represent the failed channel's unread state.
+  //
+  // This test uses applyOverrideRead directly to simulate the per-channel loop
+  // in markAllChannelsRead and verifies that refused channels keep their evidence
+  // while cleared channels discard theirs.
+  const livenessMap = {
+    "ch-cleared": { active: true, frontier: 100 },
+    "ch-refused": { active: true, frontier: 100 }, // uint32_overflow refusal
+  };
+
+  const apis = {
+    isReadStateReady: true,
+    markChannelUnread: () => ({ success: true }),
+    markChannelRead: (id) => {
+      if (id === "ch-cleared") {
+        livenessMap["ch-cleared"] = { active: false, frontier: 101 };
+        return { success: true };
+      }
+      // ch-refused: refuse; liveness stays active
+      return { success: false, reason: "uint32_overflow" };
+    },
+    getOverrideLiveness: (id) => livenessMap[id] ?? null,
+  };
+
+  // latestByChannel and observedEvents are the evidence maps.
+  const latestByChannel = new Map([
+    ["ch-cleared", 200],
+    ["ch-refused", 200],
+  ]);
+  const observedEvents = new Map([
+    ["ch-cleared", new Map([["ev1", { kind: 9, createdAt: 200 }]])],
+    ["ch-refused", new Map([["ev2", { kind: 9, createdAt: 200 }]])],
+  ]);
+  const forcedMap = { "ch-cleared": 99, "ch-refused": 99 };
+
+  // Simulate the production per-channel loop in markAllChannelsRead.
+  for (const channelId of ["ch-cleared", "ch-refused"]) {
+    const outcome = applyOverrideRead(channelId, apis);
+    if (outcome === "overrideCleared") {
+      delete forcedMap[channelId];
+      latestByChannel.delete(channelId);
+      observedEvents.delete(channelId);
+    }
+    // On overrideStillActive: do NOT touch latestByChannel or observedEvents.
+  }
+
+  // ch-cleared: override confirmed inactive → evidence discarded.
+  assert.equal(
+    latestByChannel.has("ch-cleared"),
+    false,
+    "cleared channel: latestByChannel removed",
+  );
+  assert.equal(
+    observedEvents.has("ch-cleared"),
+    false,
+    "cleared channel: observedEvents removed",
+  );
+  assert.equal(
+    Object.hasOwn(forcedMap, "ch-cleared"),
+    false,
+    "cleared channel: forcedMap entry removed",
+  );
+
+  // ch-refused: override still active → evidence preserved.
+  assert.equal(
+    latestByChannel.has("ch-refused"),
+    true,
+    "refused channel: latestByChannel preserved",
+  );
+  assert.equal(
+    observedEvents.has("ch-refused"),
+    true,
+    "refused channel: observedEvents preserved",
+  );
+  assert.equal(
+    Object.hasOwn(forcedMap, "ch-refused"),
+    true,
+    "refused channel: forcedMap entry preserved",
+  );
+});

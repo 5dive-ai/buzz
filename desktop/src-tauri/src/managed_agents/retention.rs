@@ -316,6 +316,24 @@ pub fn retain_event(conn: &Connection, event: &RetainedEvent) -> Result<(), Stri
     Ok(())
 }
 
+/// Upsert a user-intent persona event, then clear `publish_blocked`.
+///
+/// The distinction from [`retain_event`] is critical: this is the path for
+/// events authored by a local user interaction (create, update, share toggle,
+/// delete tombstone). User intent MUST reopen a gated coordinate, because the
+/// gate was set against a prior observation, not against the user's current
+/// action. A reconcile-created retain uses [`retain_event`] and deliberately
+/// does NOT clear the gate — the gate exists to stop the laundering path, and
+/// the laundering path is exactly reconcile.
+pub fn retain_user_intent_event(conn: &Connection, event: &RetainedEvent) -> Result<(), String> {
+    retain_event(conn, event)?;
+    // Always clear the gate for user intent, even if `retain_event`'s
+    // newer-or-equal guard left the row unchanged (same-second re-save).
+    // The gate must reflect the user's current decision, not a stale boot
+    // observation.
+    set_publish_blocked(conn, event.kind, &event.pubkey, &event.d_tag, false)
+}
+
 /// Outcome of an inbound retain — whether the local store now reflects the
 /// inbound event, so the caller knows whether to patch `personas.json`.
 ///
@@ -591,6 +609,34 @@ fn parse_tombstone_retention_d_tag(key: &str) -> Option<(u32, String)> {
     Some((kind.parse().ok()?, d_tag.to_string()))
 }
 
+/// Clear the `pending_sync` flag for an event the relay just confirmed,
+/// and atomically stamp the accepted event as this coordinate's baseline.
+///
+/// Compare-and-clear: only clears the row if its `created_at` and `content`
+/// still match what was published. A concurrent edit that upserted a newer
+/// version at the same coordinate between the flush loop's read and this call
+/// leaves `pending_sync` set, so the newer edit publishes on the next pass
+/// instead of being silently dropped.
+///
+/// Stamping the baseline here is the fix for the one-edit-later revert vector:
+/// after device A publishes v2 and this function runs, the baseline says v2, so
+/// a later boot with head=v3 sees disk==baseline and stays silent — the
+/// laundering path cannot mismatch against a baseline it just updated.
+#[allow(clippy::too_many_arguments)] // 8 params mirror the atomic (mark-synced + stamp-baseline) operation; grouping them into a struct adds indirection for no gain
+pub fn mark_synced_and_stamp_baseline(
+    conn: &Connection,
+    kind: u32,
+    pubkey: &str,
+    d_tag: &str,
+    created_at: i64,
+    content: &str,
+    event_id: &str,
+    shared: bool,
+) -> Result<(), String> {
+    mark_synced(conn, kind, pubkey, d_tag, created_at, content)?;
+    set_baseline_full(conn, kind, pubkey, d_tag, event_id, content, shared)
+}
+
 /// Clear the `pending_sync` flag for an event the relay just confirmed.
 ///
 /// Compare-and-clear: only clears the row if its `created_at` and `content`
@@ -670,34 +716,89 @@ pub fn set_publish_blocked(
 }
 
 /// The baseline recorded for a coordinate: what this install last agreed was
+/// published there, including the `shared` tag state.
+///
+/// Read as a unit because all three columns are only meaningful together.
+/// `None` means the baseline was never established.
+pub fn get_baseline_full(
+    conn: &Connection,
+    kind: u32,
+    pubkey: &str,
+    d_tag: &str,
+) -> Result<Option<(String, String, bool)>, String> {
+    conn.query_row(
+        "SELECT baseline_event_id, baseline_content, baseline_shared
+         FROM persona_baselines
+         WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
+        params![kind, pubkey, d_tag],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i32>(2)? != 0,
+            ))
+        },
+    )
+    .optional()
+    .map_err(|e| format!("failed to get baseline: {e}"))
+}
+
+/// The baseline recorded for a coordinate: what this install last agreed was
 /// published there.
 ///
 /// Read as a unit because the two columns are only meaningful together — an
 /// id without content cannot be compared, and content without an id has no
 /// provenance. `None` means the baseline was never established.
+#[allow(dead_code)]
 pub fn get_baseline(
     conn: &Connection,
     kind: u32,
     pubkey: &str,
     d_tag: &str,
 ) -> Result<Option<(String, String)>, String> {
-    conn.query_row(
-        "SELECT baseline_event_id, baseline_content
-         FROM persona_events
-         WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
-        params![kind, pubkey, d_tag],
-        |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
-        },
+    get_baseline_full(conn, kind, pubkey, d_tag)
+        .map(|opt| opt.map(|(id, content, _shared)| (id, content)))
+}
+
+/// Record what this install now agrees is published at a coordinate,
+/// including the `shared` tag state from the event's tags.
+///
+/// Only the boot decision pass and the publish-confirmation path call this:
+/// a baseline is a claim about the RELAY's state, so it may only be stamped
+/// from an event that is actually on the relay — never from local disk
+/// content that has not been published.
+///
+/// Uses INSERT OR REPLACE so the baseline survives across live-row deletions:
+/// the provenance lives in `persona_baselines`, which `delete_retained_event`
+/// does NOT touch.
+pub fn set_baseline_full(
+    conn: &Connection,
+    kind: u32,
+    pubkey: &str,
+    d_tag: &str,
+    baseline_event_id: &str,
+    baseline_content: &str,
+    baseline_shared: bool,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO persona_baselines
+             (kind, pubkey, d_tag, baseline_event_id, baseline_content, baseline_shared)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET
+             baseline_event_id = excluded.baseline_event_id,
+             baseline_content = excluded.baseline_content,
+             baseline_shared = excluded.baseline_shared",
+        params![
+            kind,
+            pubkey,
+            d_tag,
+            baseline_event_id,
+            baseline_content,
+            i32::from(baseline_shared),
+        ],
     )
-    .optional()
-    .map_err(|e| format!("failed to get baseline: {e}"))
-    // Both halves must be present: a row carrying only one is not a usable
-    // baseline and is treated as if none was recorded.
-    .map(|row| row.and_then(|(id, content)| Some((id?, content?))))
+    .map_err(|e| format!("failed to set baseline: {e}"))?;
+    Ok(())
 }
 
 /// Record what this install now agrees is published at a coordinate.
@@ -706,6 +807,7 @@ pub fn get_baseline(
 /// baseline is a claim about the RELAY's state, so it may only be stamped from
 /// an event that is actually on the relay — never from local disk content that
 /// has not been published.
+#[allow(dead_code)]
 pub fn set_baseline(
     conn: &Connection,
     kind: u32,
@@ -714,15 +816,15 @@ pub fn set_baseline(
     baseline_event_id: &str,
     baseline_content: &str,
 ) -> Result<(), String> {
-    conn.execute(
-        "UPDATE persona_events
-         SET baseline_event_id = ?4, baseline_content = ?5
-         WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
-        params![kind, pubkey, d_tag, baseline_event_id, baseline_content],
+    set_baseline_full(
+        conn,
+        kind,
+        pubkey,
+        d_tag,
+        baseline_event_id,
+        baseline_content,
+        false,
     )
-    .map_err(|e| format!("failed to set baseline: {e}"))?;
-
-    Ok(())
 }
 
 /// Delete a retained event by its coordinate.

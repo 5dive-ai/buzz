@@ -279,6 +279,13 @@ async fn run_boot_barrier_for_scope(
 /// generation is set to `InProgress` and its own barrier — or a full flush
 /// retry — supplies the authoritative gate writes; this barrier returns
 /// `Abandoned` without writing.
+///
+/// Returns `Abandoned` (dropping the claim) if any gate was driven by
+/// incomplete evidence (lookup or scan failure). The 30s flush retry will
+/// re-run the full transition once the relay is reachable again. This is the
+/// fail-closed path for a wifi-race boot: all coordinates defer, but the scope
+/// does NOT advance to `Ready`, so the retry machinery fires instead of the
+/// session staying muted forever.
 pub(crate) fn enforce_decision_pass(
     claim: &super::config_sync_readiness::ReadinessClaim,
     conn: &rusqlite::Connection,
@@ -293,7 +300,19 @@ pub(crate) fn enforce_decision_pass(
         return Ok(BarrierOutcome::Abandoned);
     }
 
-    run_decision_pass(conn, owner_pubkey, states)?;
+    let (_plan, has_uncertain_gates) = run_decision_pass(conn, owner_pubkey, states)?;
+
+    if has_uncertain_gates {
+        tracing::warn!(
+            target: "buzz::config_sync",
+            "boot barrier: some coordinates deferred due to lookup/scan failures; \
+             scope stays closed for retry (wifi-race or offline boot)"
+        );
+        // Return Abandoned so the caller drops the claim → latch resets to
+        // Unready → the 30s flush retry re-runs the full transition.
+        return Ok(BarrierOutcome::Abandoned);
+    }
+
     Ok(BarrierOutcome::Success)
 }
 

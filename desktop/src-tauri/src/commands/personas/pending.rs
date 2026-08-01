@@ -12,6 +12,7 @@ use crate::managed_agents::{
 
 pub(super) struct PreparedPersonaPublication {
     pub scope: RetentionScope,
+    #[allow(dead_code)] // event is retained in the DB; the flush loop publishes it
     pub event: nostr::Event,
     pub retained: RetainedEvent,
     pub persona: AgentDefinition,
@@ -153,7 +154,9 @@ pub(super) fn prepare_persona_publication_at(
 ) -> Result<(nostr::Event, RetainedEvent, AgentDefinition), String> {
     use crate::managed_agents::{
         persona_events::{build_persona_event, monotonic_created_at, persona_d_tag},
-        retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
+        retention::{
+            get_retained_event, open_retention_db, retain_user_intent_event, RetainedEvent,
+        },
     };
     use buzz_core_pkg::kind::KIND_PERSONA;
 
@@ -171,7 +174,9 @@ pub(super) fn prepare_persona_publication_at(
         .sign_with_keys(keys)
         .map_err(|e| format!("failed to sign persona event: {e}"))?;
     let retained = RetainedEvent::pending(KIND_PERSONA, pubkey, d_tag, &event);
-    retain_event(&conn, &retained)?;
+    // User intent: must clear publish_blocked so an edit to a parked/suppressed
+    // coordinate takes effect in the current session, not just the next boot.
+    retain_user_intent_event(&conn, &retained)?;
     Ok((event, retained, scoped_persona))
 }
 
@@ -195,8 +200,8 @@ pub(in crate::commands) fn tombstone_persona_pending(
     use crate::managed_agents::{
         persona_events::build_persona_delete,
         retention::{
-            delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
-            RetainedEvent,
+            delete_retained_event, open_retention_db, retain_user_intent_event,
+            tombstone_retention_d_tag, RetainedEvent,
         },
     };
     use buzz_core_pkg::kind::KIND_PERSONA;
@@ -211,9 +216,13 @@ pub(in crate::commands) fn tombstone_persona_pending(
             .map_err(|e| format!("failed to sign persona tombstone: {e}"))?;
         let conn = open_retention_db(&scope.db_path)?;
         // Purge the persona row first so an unpublished edit can never resurrect
-        // it after the tombstone publishes.
+        // it after the tombstone publishes. The persona_baselines entry is NOT
+        // deleted — it must survive so the next boot sees baseline=Present + queued
+        // deletion → Gate C arbitration, not baseline=None → park-forever.
         delete_retained_event(&conn, KIND_PERSONA, &pubkey, d_tag)?;
-        retain_event(
+        // Tombstone is user intent: clear publish_blocked so an offline delete that
+        // gets parked on a prior boot can propagate in the current session.
+        retain_user_intent_event(
             &conn,
             &RetainedEvent::pending(
                 KIND_DELETE,

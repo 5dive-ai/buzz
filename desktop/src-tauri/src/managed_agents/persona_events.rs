@@ -316,15 +316,15 @@ pub async fn flush_active_pending_events(
     flush_pending_events_at(&scope.db_path, state, &scope.relay_url, &scope.owner_keys).await
 }
 
-async fn flush_pending_events_at(
+pub(crate) async fn flush_pending_events_at(
     db_path: &std::path::Path,
     state: &AppState,
     relay_url: &str,
     owner_keys: &nostr::Keys,
 ) -> Result<u32, String> {
     use crate::managed_agents::retention::{
-        deferred_behind_failed_tombstone, get_pending_sync, get_retained_event, mark_synced,
-        open_retention_db,
+        deferred_behind_failed_tombstone, get_pending_sync, get_retained_event,
+        mark_synced_and_stamp_baseline, open_retention_db,
     };
     use nostr::JsonUtil;
 
@@ -406,13 +406,15 @@ async fn flush_pending_events_at(
         }
 
         let conn = open_retention_db(db_path)?;
-        mark_synced(
+        mark_synced_and_stamp_baseline(
             &conn,
             current.kind,
             &current.pubkey,
             &current.d_tag,
             current.created_at,
             &current.content,
+            &event.id.to_hex(),
+            buzz_core_pkg::kind::event_is_shared(&event),
         )?;
         flushed += 1;
     }

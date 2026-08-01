@@ -1,36 +1,48 @@
 //! Additive schema migration for the retention store.
 //!
 //! Three columns were added after the original seven-column
-//! `persona_events` table shipped, so an upgraded install has to grow its
-//! table in place:
+//! `persona_events` table shipped, and one new table (`persona_baselines`)
+//! was added later:
 //!
 //! - `event_id` — the NIP-01 id of the row's own `raw_event`. Ordering has to
 //!   match the relay's NIP-33 comparator, which breaks an equal `created_at`
 //!   by lowest event id; without a real column every compare would have to
 //!   reparse `raw_event`.
-//! - `baseline_event_id` / `baseline_content` — provenance for the record
-//!   currently on disk: which event last wrote it and what that event
-//!   published. This is what lets the boot pass tell "the user edited this
-//!   locally" from "this store never learned about the newer relay head",
-//!   instead of inferring intent from a content diff.
 //! - `publish_blocked` — the publication gate. A pending row is normally
 //!   published by the flush loop; a row the boot pass suppressed must stay
 //!   retained but unpublished, and there is no other state that expresses
 //!   "durable, but must not go out."
+//! - `persona_baselines` — coordinate-keyed baseline provenance table. Stores
+//!   the full canonical projection (event_id, content, shared) for what this
+//!   install last agreed was published at each coordinate. Lives in its own
+//!   table so that deleting the live row never destroys its provenance: an
+//!   offline delete that misses the relay can still present a baseline on the
+//!   next boot and reach gate C's timestamp arbitration rather than parking
+//!   forever.
+//!
+//! The earlier `baseline_event_id` / `baseline_content` columns on
+//! `persona_events` are superseded by `persona_baselines`. Existing data is
+//! migrated upward; the old columns are left in place for schema hygiene (SQLite
+//! does not support `DROP COLUMN` on older versions) but are never read after
+//! migration.
 //!
 //! # Crash and concurrency safety
 //!
 //! A cheap read-only probe decides whether anything is missing, and only then
 //! does the migration open a `BEGIN EXCLUSIVE` transaction, re-probe inside
-//! it, and apply the `ALTER TABLE`s together with the `event_id` backfill.
+//! it, and apply the changes together with the `event_id` backfill.
 //! Serializing on the write lock is what makes two processes opening the same
 //! database at once safe: the loser waits, re-probes, and finds nothing to do.
-//! A crash mid-migration rolls back the whole transaction, so a column can
-//! never exist with its backfill half-applied.
+//! A crash mid-migration rolls back the whole transaction, so no column or
+//! table can exist with its backfill half-applied.
 
 use rusqlite::{Connection, TransactionBehavior};
 
 /// Columns added after the initial `persona_events` shape.
+///
+/// `baseline_event_id` and `baseline_content` are retained for schema
+/// hygiene (SQLite ≤ 3.35 does not support `DROP COLUMN`) but are superseded
+/// by the `persona_baselines` table and are never read after migration.
 const ADDED_COLUMNS: [(&str, &str); 4] = [
     ("event_id", "TEXT"),
     ("baseline_event_id", "TEXT"),
@@ -38,13 +50,28 @@ const ADDED_COLUMNS: [(&str, &str); 4] = [
     ("publish_blocked", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
-/// Bring `persona_events` up to the current column set.
+/// Whether the `persona_baselines` table needs to be created.
+fn baselines_table_missing(conn: &Connection) -> Result<bool, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='persona_baselines'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("failed to probe persona_baselines table: {e}"))?;
+    Ok(count == 0)
+}
+
+/// Bring `persona_events` up to the current column set and ensure
+/// `persona_baselines` exists.
 ///
 /// A no-op on a database created by the current `CREATE TABLE` (and on any
 /// database already migrated), so it stays on the cheap path for every open
 /// after the first.
 pub(super) fn migrate(conn: &mut Connection) -> Result<(), String> {
-    if missing_columns(conn)?.is_empty() {
+    let missing_cols = missing_columns(conn)?;
+    let missing_table = baselines_table_missing(conn)?;
+    if missing_cols.is_empty() && !missing_table {
         return Ok(());
     }
 
@@ -62,6 +89,33 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<(), String> {
             .map_err(|e| format!("failed to add retention column {column}: {e}"))?;
     }
     backfill_event_ids(&transaction)?;
+
+    if baselines_table_missing(&transaction)? {
+        transaction
+            .execute_batch(
+                "CREATE TABLE persona_baselines (
+                    kind INTEGER NOT NULL,
+                    pubkey TEXT NOT NULL,
+                    d_tag TEXT NOT NULL,
+                    baseline_event_id TEXT NOT NULL,
+                    baseline_content TEXT NOT NULL,
+                    baseline_shared INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (kind, pubkey, d_tag)
+                );",
+            )
+            .map_err(|e| format!("failed to create persona_baselines table: {e}"))?;
+        // Migrate existing baseline data from the old columns into the new table.
+        // `shared` was never stored in the old columns, so it defaults to 0.
+        transaction
+            .execute_batch(
+                "INSERT OR IGNORE INTO persona_baselines
+                    (kind, pubkey, d_tag, baseline_event_id, baseline_content, baseline_shared)
+                 SELECT kind, pubkey, d_tag, baseline_event_id, baseline_content, 0
+                 FROM persona_events
+                 WHERE baseline_event_id IS NOT NULL AND baseline_content IS NOT NULL;",
+            )
+            .map_err(|e| format!("failed to migrate baseline data: {e}"))?;
+    }
 
     transaction
         .commit()

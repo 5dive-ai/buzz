@@ -308,8 +308,10 @@ pub fn decide(observation: &Observation) -> Resolution {
         // genuine post-baseline intent, and the only cell that publishes an
         // edit. It still needs a completed lookup, because publishing means
         // re-signing PAST the head and a lookup that did not complete cannot
-        // say what the head is. Deferring costs one boot; the row keeps its
-        // pending flag and publishes on the next pass that can see the relay.
+        // say what the head is. Deferring costs one barrier pass; the row
+        // keeps its pending flag and publishes on the next full transition
+        // (the 30s flush retry re-runs reconcile+barrier when the latch is
+        // Unready, so the retry is automatic once the relay is reachable).
         return Resolution::keep(match observation.head {
             HeadState::LookupFailed => Decision::Defer,
             _ => Decision::PublishLocalEdit,

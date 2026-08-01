@@ -772,3 +772,228 @@ async fn test_stale_flush_barrier_complete_cannot_publish_after_force_claim() {
 
     config_sync_readiness::mark_unready(); // cleanup
 }
+
+// ── (d) peon-P1#3: lookup-failure pass must leave latch Unready ──────────
+//
+// A pass with `HeadState::LookupFailed` must return `Abandoned` (not
+// `Success`) from `enforce_decision_pass`, so the latch stays Unready and
+// the 30s retry re-runs the full transition once the relay is reachable.
+// A later pass with successful lookups must recover to Ready.
+//
+// Mutation-sensitive: removing the `has_uncertain_gates` check causes the
+// first call to return `Success`, breaking the Unready assertion.
+#[test]
+fn test_lookup_failure_pass_leaves_latch_unready_and_later_successful_pass_recovers() {
+    use crate::managed_agents::{
+        config_barrier::{enforce_decision_pass, BarrierOutcome},
+        config_sync::CoordinateState,
+        decision::{HeadState, TombstoneEvidence},
+        head_lookup::Coordinate,
+        retention::open_retention_db,
+    };
+    use nostr::{EventBuilder, JsonUtil, Kind, Tag};
+
+    config_sync_readiness::mark_unready();
+
+    let keys = nostr::Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let d_tag = "lookup-fail-test";
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("retention.db");
+
+    // Retain a pending row (no baseline, simulates first-boot stale build).
+    {
+        let conn = open_retention_db(&db_path).expect("open db");
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_PERSONA as u16),
+            r#"{"system_prompt":"old"}"#.to_string(),
+        )
+        .tags(vec![Tag::parse(["d", d_tag]).unwrap()])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        retain_event(
+            &conn,
+            &RetainedEvent {
+                kind: KIND_PERSONA,
+                pubkey: pubkey.clone(),
+                d_tag: d_tag.to_string(),
+                content: event.content.to_string(),
+                created_at: event.created_at.as_secs() as i64,
+                raw_event: event.as_json(),
+                event_id: None,
+                pending_sync: true,
+                publish_blocked: false,
+            },
+        )
+        .expect("retain");
+    }
+
+    // Claim InProgress — simulates what the flush loop or boot barrier does.
+    let claim = config_sync_readiness::claim_in_progress().expect("claim");
+
+    // State with a failed head lookup (relay unreachable at boot).
+    let failed_states = vec![CoordinateState {
+        coordinate: Coordinate {
+            kind: KIND_PERSONA,
+            d_tag: d_tag.to_string(),
+        },
+        observation: crate::managed_agents::config_sync::local_state(
+            &open_retention_db(&db_path).expect("db"),
+            &pubkey,
+            &Coordinate {
+                kind: KIND_PERSONA,
+                d_tag: d_tag.to_string(),
+            },
+            None, // no disk projection for simplicity
+            HeadState::LookupFailed,
+            TombstoneEvidence::NotFound,
+        )
+        .expect("local_state"),
+    }];
+
+    let outcome = enforce_decision_pass(
+        &claim,
+        &open_retention_db(&db_path).expect("db"),
+        &pubkey,
+        &failed_states,
+    )
+    .expect("enforce");
+
+    assert_eq!(
+        outcome,
+        BarrierOutcome::Abandoned,
+        "a pass with LookupFailed gates must return Abandoned (claim dropped)"
+    );
+    drop(claim); // RAII resets latch to Unready
+    assert!(
+        !config_sync_readiness::is_ready_for(&db_path),
+        "latch must be Unready after lookup-failure pass"
+    );
+
+    // Second attempt with successful lookups (relay returned Absent).
+    let claim2 = config_sync_readiness::claim_in_progress().expect("second claim");
+    let successful_states = vec![CoordinateState {
+        coordinate: Coordinate {
+            kind: KIND_PERSONA,
+            d_tag: d_tag.to_string(),
+        },
+        observation: crate::managed_agents::config_sync::local_state(
+            &open_retention_db(&db_path).expect("db"),
+            &pubkey,
+            &Coordinate {
+                kind: KIND_PERSONA,
+                d_tag: d_tag.to_string(),
+            },
+            None,
+            HeadState::Absent, // relay confirmed absent — real lookup
+            TombstoneEvidence::NotFound,
+        )
+        .expect("local_state"),
+    }];
+
+    let outcome2 = enforce_decision_pass(
+        &claim2,
+        &open_retention_db(&db_path).expect("db"),
+        &pubkey,
+        &successful_states,
+    )
+    .expect("enforce2");
+
+    assert_eq!(
+        outcome2,
+        BarrierOutcome::Success,
+        "a pass with successful lookups must certify Ready"
+    );
+    claim2.complete(db_path.clone()); // advance latch to Ready
+    assert!(
+        config_sync_readiness::is_ready_for(&db_path),
+        "latch must be Ready after successful pass"
+    );
+
+    config_sync_readiness::mark_unready(); // cleanup
+}
+
+// ── (e) peon-P2#2: gated row must not bypass publish_blocked ─────────────
+//
+// `flush_pending_events_at` re-reads `publish_blocked` per-row before
+// submitting. A row with `publish_blocked = true` must be skipped → 0 flushed.
+//
+// Mutation-sensitive: removing the `if current.publish_blocked { continue; }`
+// guard causes flushed == 1. Also sensitive to the routing change: if
+// `publish_prepared_persona_via_flush` reverted to `submit_signed_event_at_with_keys`
+// it would bypass this guard entirely.
+#[tokio::test]
+async fn test_share_toggle_on_gated_row_does_not_reach_relay() {
+    use crate::managed_agents::persona_events::flush_pending_events_at;
+
+    config_sync_readiness::mark_unready();
+
+    let keys = nostr::Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let d_tag = "share-gate-test";
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("retention.db");
+    let relay_url = spawn_stub_relay().await;
+
+    // Simulate the boot pass: retain a row and gate it (publish_blocked = true).
+    // This is the state the old direct-submit path would have bypassed: the boot
+    // pass decided to park this coordinate, but the share-toggle came in anyway.
+    {
+        let conn = open_retention_db(&db_path).expect("open db");
+        let event = nostr::EventBuilder::new(
+            nostr::Kind::Custom(KIND_PERSONA as u16),
+            r#"{"system_prompt":"gated"}"#.to_string(),
+        )
+        .tags(vec![nostr::Tag::parse(["d", d_tag]).unwrap()])
+        .sign_with_keys(&keys)
+        .expect("sign");
+        retain_event(
+            &conn,
+            &RetainedEvent {
+                kind: KIND_PERSONA,
+                pubkey: pubkey.clone(),
+                d_tag: d_tag.to_string(),
+                content: event.content.clone().to_string(),
+                created_at: event.created_at.as_secs() as i64,
+                raw_event: {
+                    use nostr::JsonUtil;
+                    event.as_json()
+                },
+                event_id: None,
+                pending_sync: true,
+                publish_blocked: false,
+            },
+        )
+        .expect("retain");
+        // Boot barrier gated this coordinate.
+        set_publish_blocked(&conn, KIND_PERSONA, &pubkey, d_tag, true).expect("gate");
+    }
+
+    let state = build_app_state();
+    *state.keys.lock().unwrap() = keys.clone();
+    *state.relay_url_override.lock().unwrap() = Some(relay_url.clone());
+
+    // The gated row must be skipped → 0 flushed.
+    let flushed = flush_pending_events_at(&db_path, &state, &relay_url, &keys)
+        .await
+        .expect("flush");
+    assert_eq!(
+        flushed, 0,
+        "flush must not publish a gated row (publish_blocked=true)"
+    );
+
+    let conn = open_retention_db(&db_path).expect("reopen db");
+    let row = get_retained_event(&conn, KIND_PERSONA, &pubkey, d_tag)
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.pending_sync,
+        "row must stay pending when publish_blocked"
+    );
+    assert!(
+        row.publish_blocked,
+        "gate must still be set after failed flush"
+    );
+
+    config_sync_readiness::mark_unready(); // cleanup
+}

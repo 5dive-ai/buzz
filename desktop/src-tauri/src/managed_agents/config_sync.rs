@@ -25,7 +25,7 @@ use super::{
     canonical_projection::CanonicalProjection,
     decision::{Decision, Head, HeadState, Observation, Resolution, TombstoneEvidence},
     head_lookup::Coordinate,
-    retention::{get_baseline, get_retained_event, RetainedEvent},
+    retention::{get_baseline_full, get_retained_event, RetainedEvent},
 };
 use rusqlite::Connection;
 
@@ -68,7 +68,7 @@ pub fn local_state(
         disk,
         queued: queued_projection(row.as_ref()),
         head,
-        baseline: baseline_projection(conn, owner_pubkey, coordinate, row.as_ref())?,
+        baseline: baseline_projection(conn, owner_pubkey, coordinate)?,
         queued_deletion_at: tombstone_row
             .as_ref()
             .filter(|row| row.pending_sync)
@@ -95,38 +95,22 @@ fn queued_projection(row: Option<&RetainedEvent>) -> Option<CanonicalProjection>
 /// The baseline projection for a coordinate, or `None` when this install has
 /// no provenance for it.
 ///
-/// The stored baseline is the CONTENT that was published; the `shared` half of
-/// the projection is recovered from the baseline event's own tags via the
-/// retained row, so a baseline comparison sees the same two fields a head
-/// comparison does.
+/// Read from the `persona_baselines` table, which stores the full canonical
+/// projection including `shared`. The baseline survives live-row deletion,
+/// so an offline delete can still present a baseline on the next boot and
+/// reach gate C's timestamp arbitration rather than parking forever.
 fn baseline_projection(
     conn: &Connection,
     owner_pubkey: &str,
     coordinate: &Coordinate,
-    row: Option<&RetainedEvent>,
 ) -> Result<Option<CanonicalProjection>, String> {
-    let Some((baseline_event_id, baseline_content)) =
-        get_baseline(conn, coordinate.kind, owner_pubkey, &coordinate.d_tag)?
+    let Some((_, content, shared)) =
+        get_baseline_full(conn, coordinate.kind, owner_pubkey, &coordinate.d_tag)?
     else {
         return Ok(None);
     };
 
-    // Recover `shared` from the retained event when the row still holds the
-    // baseline event; otherwise the tag state is unknown and the baseline is
-    // only usable for kinds that never carry one.
-    let shared = row
-        .filter(|row| row.event_id.as_deref() == Some(baseline_event_id.as_str()))
-        .and_then(|row| {
-            use nostr::JsonUtil;
-            nostr::Event::from_json(&row.raw_event).ok()
-        })
-        .map(|event| CanonicalProjection::from_event(&event).shared)
-        .unwrap_or(false);
-
-    Ok(Some(CanonicalProjection {
-        content: baseline_content,
-        shared,
-    }))
+    Ok(Some(CanonicalProjection { content, shared }))
 }
 
 /// Resolve every gathered coordinate, pairing each resolution with its target.
@@ -284,14 +268,41 @@ fn stamp_baseline_from_head(
     coordinate: &Coordinate,
     head: &Head,
 ) -> Result<(), String> {
-    super::retention::set_baseline(
+    super::retention::set_baseline_full(
         conn,
         coordinate.kind,
         owner_pubkey,
         &coordinate.d_tag,
         &head.event_id,
         &head.projection.content,
+        head.projection.shared,
     )
+}
+
+/// Whether a decision was driven by incomplete evidence (lookup or scan failure)
+/// rather than by a successful read.
+///
+/// A pass that contains any uncertain decision must not certify the scope
+/// `Ready`: the coordinate that deferred due to failure would stay muted for
+/// the entire session if the latch advanced to `Ready`. Dropping the claim
+/// instead lets the 30s flush retry re-run the full transition once the
+/// network recovers.
+///
+/// Succesful parks (`LookupFailed`-free) are NOT uncertain — a completed
+/// lookup that returned `Absent` or a completed scan that returned `NotFound`
+/// produced a genuine decision. Only a decision driven by a lookup or scan
+/// that did not complete is uncertain.
+fn decision_is_uncertain(resolution: &Resolution, observation: &Observation) -> bool {
+    use crate::managed_agents::decision::TombstoneEvidence;
+    match &resolution.decision {
+        // Defer is the only decision the table emits when a lookup or scan
+        // failed to complete. Any other decision came from completed reads.
+        Decision::Defer => {
+            matches!(&observation.head, HeadState::LookupFailed)
+                || observation.tombstone == TombstoneEvidence::ScanIncomplete
+        }
+        _ => false,
+    }
 }
 
 /// Run the boot decision pass for a set of coordinates and enforce the result.
@@ -308,14 +319,18 @@ fn stamp_baseline_from_head(
 /// deliberately not applied, because adopting remote content over a local
 /// record is the resolution path (V3.6) and is user-driven by design.
 ///
-/// Returns the plan it enforced, so the caller can act on the non-gate half of
-/// each resolution and log a summary.
+/// Returns the plan it enforced and whether any gate was driven by uncertain
+/// evidence (lookup/scan failure). The caller uses the uncertainty flag to
+/// decide whether the barrier should certify the scope `Ready` — a pass with
+/// uncertain gates must not certify, so a later retry can see the relay once
+/// it becomes reachable.
 pub fn run_decision_pass(
     conn: &Connection,
     owner_pubkey: &str,
     states: &[CoordinateState],
-) -> Result<Vec<(Coordinate, Resolution)>, String> {
+) -> Result<(Vec<(Coordinate, Resolution)>, bool), String> {
     let plan = plan(states);
+    let mut has_uncertain_gates = false;
 
     for (state, (coordinate, resolution)) in states.iter().zip(plan.iter()) {
         apply_gate(
@@ -325,6 +340,10 @@ pub fn run_decision_pass(
             &state.observation,
             resolution,
         )?;
+
+        if decision_is_uncertain(resolution, &state.observation) {
+            has_uncertain_gates = true;
+        }
 
         // A vacuous queued publish is dropped rather than gated. Gating would
         // hold it forever: it can never become publishable, because it says
@@ -363,11 +382,14 @@ pub fn run_decision_pass(
         coordinates = plan.len(),
         blocked,
         cleared,
+        uncertain = has_uncertain_gates,
         "config-sync decision pass complete"
     );
 
-    Ok(plan)
+    Ok((plan, has_uncertain_gates))
 }
 
+#[cfg(test)]
+mod regression_tests;
 #[cfg(test)]
 mod tests;

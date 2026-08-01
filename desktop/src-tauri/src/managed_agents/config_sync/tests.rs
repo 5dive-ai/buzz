@@ -585,7 +585,7 @@ fn observe(conn: &Connection, head: HeadState, disk: Option<CanonicalProjection>
 /// Run the real pass over one coordinate and report what the flush loop would
 /// then publish.
 fn run_pass(conn: &Connection, observation: &Observation) -> (Decision, usize) {
-    let plan = run_decision_pass(
+    let (plan, _) = run_decision_pass(
         conn,
         OWNER,
         &[CoordinateState {

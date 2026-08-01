@@ -4,7 +4,7 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         load_personas,
-        retention::{mark_synced, open_retention_db},
+        retention::{get_retained_event, open_retention_db},
         AgentDefinition,
     },
 };
@@ -60,7 +60,7 @@ pub async fn set_persona_shared(
     .map_err(|e| format!("spawn_blocking failed: {e}"))??;
 
     let state = app.state::<AppState>();
-    publish_prepared_persona(&state, prepared).await
+    publish_prepared_persona_via_flush(&state, prepared).await
 }
 
 /// Save a persona edit AND publish its catalog head, returning the same
@@ -69,8 +69,8 @@ pub async fn set_persona_shared(
 /// The "save and publish" affordance in the edit dialog promises the change
 /// reaches the catalog on save. Plain `update_persona` only enqueues
 /// best-effort, so the UI could not report whether the relay accepted it. This
-/// takes the identical input and reuses the strict preparation path, then awaits
-/// the relay exactly like the share toggle does — a rejection or an unreachable
+/// takes the identical input and reuses the strict preparation path, then
+/// routes through the single gated publisher — a rejection or an unreachable
 /// relay stays durably queued for the flush loop and is reported as `queued`.
 #[tauri::command]
 pub async fn update_persona_and_publish(
@@ -87,44 +87,73 @@ pub async fn update_persona_and_publish(
         .await?;
 
     let state = app.state::<AppState>();
-    publish_prepared_persona(&state, prepared).await
+    publish_prepared_persona_via_flush(&state, prepared).await
 }
 
-async fn publish_prepared_persona(
+/// Retain the prepared event (already done by `prepare_persona_publication`
+/// as user intent, gate cleared) then trigger a flush pass and await the
+/// relay outcome.
+///
+/// This is the single publish path — it goes through the gated flush loop,
+/// which checks `publish_blocked` and the readiness latch. Routing here
+/// instead of submitting directly ensures:
+///
+/// 1. A parked/suppressed coordinate cannot bypass its own gate.
+/// 2. Baseline provenance is stamped on relay acceptance (via
+///    `mark_synced_and_stamp_baseline` inside the flush loop).
+/// 3. The `Queued` report means the row is retained and will flush on the
+///    next sweep — not "could not even enqueue."
+async fn publish_prepared_persona_via_flush(
     state: &AppState,
     prepared: PreparedPersonaPublication,
 ) -> Result<SetPersonaSharedResult, String> {
-    let api_base_url = crate::relay::relay_http_base_url(&prepared.scope.relay_url);
-    let publish_result = crate::relay::submit_signed_event_at_with_keys(
-        &prepared.event,
+    use crate::managed_agents::persona_events::flush_pending_events_at;
+
+    // Run a targeted flush for this scope. The event is already retained as
+    // user intent (publish_blocked = 0), so it will be in the pending queue.
+    let flushed = flush_pending_events_at(
+        &prepared.scope.db_path,
         state,
-        &api_base_url,
+        &prepared.scope.relay_url,
         &prepared.scope.owner_keys,
     )
-    .await;
+    .await
+    .unwrap_or(0);
 
-    match publish_result {
-        Ok(_) => {
-            let conn = open_retention_db(&prepared.scope.db_path)?;
-            mark_synced(
-                &conn,
-                prepared.retained.kind,
-                &prepared.retained.pubkey,
-                &prepared.retained.d_tag,
-                prepared.retained.created_at,
-                &prepared.retained.content,
-            )?;
-            Ok(SetPersonaSharedResult {
-                persona: prepared.persona,
-                publication_status: PersonaSharePublicationStatus::Published,
-                relay_message: None,
-            })
-        }
-        Err(error) => Ok(SetPersonaSharedResult {
+    // Determine whether the specific row published: re-read pending_sync.
+    // If flushed > 0 and the row is no longer pending, it published.
+    // If the relay rejected/was unreachable, pending_sync stays 1.
+    let conn = open_retention_db(&prepared.scope.db_path)?;
+    let row = get_retained_event(
+        &conn,
+        prepared.retained.kind,
+        &prepared.retained.pubkey,
+        &prepared.retained.d_tag,
+    )?;
+
+    let published = row.as_ref().is_some_and(|r| {
+        // The row published if pending_sync is now 0 AND it still carries the
+        // same content (a newer edit would also have pending_sync=0 only if it
+        // too published, which is fine — we just report what actually happened).
+        !r.pending_sync
+            && r.created_at == prepared.retained.created_at
+            && r.content == prepared.retained.content
+    }) || flushed > 0 && row.as_ref().is_none_or(|r| !r.pending_sync);
+
+    if published {
+        Ok(SetPersonaSharedResult {
+            persona: prepared.persona,
+            publication_status: PersonaSharePublicationStatus::Published,
+            relay_message: None,
+        })
+    } else {
+        Ok(SetPersonaSharedResult {
             persona: prepared.persona,
             publication_status: PersonaSharePublicationStatus::Queued,
-            relay_message: Some(error),
-        }),
+            relay_message: Some(
+                "event queued for publication; relay unreachable or not yet ready".to_string(),
+            ),
+        })
     }
 }
 
@@ -218,7 +247,9 @@ mod tests {
         let prepared = prepared(&db_path, spawn_relay(false).await, keys, Some(true));
         let state = build_app_state();
 
-        let result = publish_prepared_persona(&state, prepared).await.unwrap();
+        let result = publish_prepared_persona_via_flush(&state, prepared)
+            .await
+            .unwrap();
 
         assert_eq!(
             result.publication_status,
@@ -227,7 +258,7 @@ mod tests {
         assert!(result
             .relay_message
             .as_deref()
-            .is_some_and(|message| message.contains("relay rejected event")));
+            .is_some_and(|message| message.contains("queued")));
         assert!(
             get_retained_event(
                 &open_retention_db(&db_path).unwrap(),
@@ -253,7 +284,9 @@ mod tests {
         let prepared = prepared(&db_path, relay_url, keys, Some(true));
         let state = build_app_state();
 
-        let result = publish_prepared_persona(&state, prepared).await.unwrap();
+        let result = publish_prepared_persona_via_flush(&state, prepared)
+            .await
+            .unwrap();
 
         assert_eq!(
             result.publication_status,
@@ -262,7 +295,7 @@ mod tests {
         assert!(result
             .relay_message
             .as_deref()
-            .is_some_and(|message| message.starts_with("relay unreachable:")));
+            .is_some_and(|message| message.contains("queued")));
         assert!(
             get_retained_event(
                 &open_retention_db(&db_path).unwrap(),
@@ -285,7 +318,9 @@ mod tests {
         let prepared = prepared(&db_path, spawn_relay(true).await, keys, Some(true));
         let state = build_app_state();
 
-        let result = publish_prepared_persona(&state, prepared).await.unwrap();
+        let result = publish_prepared_persona_via_flush(&state, prepared)
+            .await
+            .unwrap();
 
         assert_eq!(
             result.publication_status,
@@ -318,7 +353,9 @@ mod tests {
         let prepared = prepared(&db_path, spawn_relay(true).await, keys, None);
         let state = build_app_state();
 
-        let result = publish_prepared_persona(&state, prepared).await.unwrap();
+        let result = publish_prepared_persona_via_flush(&state, prepared)
+            .await
+            .unwrap();
 
         assert_eq!(
             result.publication_status,
@@ -351,7 +388,9 @@ mod tests {
         let prepared = prepared(&db_path, spawn_relay(false).await, keys, None);
         let state = build_app_state();
 
-        let result = publish_prepared_persona(&state, prepared).await.unwrap();
+        let result = publish_prepared_persona_via_flush(&state, prepared)
+            .await
+            .unwrap();
 
         assert_eq!(
             result.publication_status,
@@ -360,7 +399,7 @@ mod tests {
         assert!(result
             .relay_message
             .as_deref()
-            .is_some_and(|message| message.contains("relay rejected event")));
+            .is_some_and(|message| message.contains("queued")));
         assert!(
             get_retained_event(
                 &open_retention_db(&db_path).unwrap(),

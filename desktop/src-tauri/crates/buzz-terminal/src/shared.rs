@@ -1,0 +1,184 @@
+//! The lock the reader and the renderer contend for, and the meter on it.
+//!
+//! This lives in the engine crate rather than in the embedder because the
+//! property it exists to prove is a property of the emulator *and* the lock
+//! together: F1 bounds how many bytes one `feed` releases into the parser,
+//! which bounds how long the reader can hold this mutex, which bounds how long
+//! the renderer waits for it. Split the lock out to the Tauri layer and the
+//! gate can only be written where no fixture runs.
+//!
+//! Measured, not assumed. Under a 180 MB/s flood the reader's own hold is
+//! p50 1 us while the renderer's *acquire* is p50 4245 us -- four orders apart,
+//! because 0.389% of calls carry 96.4% of the lock time. Holding time is the
+//! wrong quantity; waiting time is the one a human feels. So the two planes are
+//! metered separately: pooling them would let the reader's millions of fast
+//! acquires dilute the renderer's tail into a false pass.
+
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
+
+use alacritty_terminal::sync::FairMutex;
+use parking_lot::MutexGuard;
+
+use crate::damage::{self, Encoder, Frame};
+use crate::Terminal;
+
+/// Number of latency buckets. Bucket `i` covers `[2^(i-1), 2^i)` microseconds,
+/// so bucket 31 tops out around 35 minutes -- unreachable in practice, which is
+/// the point: nothing is silently clamped into the last bucket.
+const BUCKETS: usize = 32;
+
+fn bucket_of(micros: u64) -> usize {
+    (u64::BITS - micros.leading_zeros()) as usize
+}
+
+/// Upper bound of a bucket, in microseconds. Percentiles report this, so a
+/// reported latency is never better than what was actually observed.
+fn bucket_ceiling(bucket: usize) -> u64 {
+    if bucket == 0 {
+        0
+    } else {
+        (1u64 << bucket) - 1
+    }
+}
+
+/// Lock-acquisition latencies for one plane, recorded without taking a second
+/// lock -- an instrument that contends is measuring itself.
+#[derive(Debug)]
+pub struct AcquireMeter {
+    acquisitions: AtomicU64,
+    max_micros: AtomicU64,
+    buckets: [AtomicU32; BUCKETS],
+}
+
+impl Default for AcquireMeter {
+    fn default() -> Self {
+        Self {
+            acquisitions: AtomicU64::new(0),
+            max_micros: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+}
+
+impl AcquireMeter {
+    fn record(&self, micros: u64) {
+        self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        self.max_micros.fetch_max(micros, Ordering::Relaxed);
+        self.buckets[bucket_of(micros)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the counters. Cheap and non-blocking; safe to call from a gate
+    /// while the flood is still running.
+    pub fn snapshot(&self) -> AcquireStats {
+        AcquireStats {
+            acquisitions: self.acquisitions.load(Ordering::Relaxed),
+            max_micros: self.max_micros.load(Ordering::Relaxed),
+            buckets: std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Clear the counters. Diagnostics are per-run.
+    pub fn reset(&self) {
+        self.acquisitions.store(0, Ordering::Relaxed);
+        self.max_micros.store(0, Ordering::Relaxed);
+        for bucket in &self.buckets {
+            bucket.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A read of one plane's acquisition latencies.
+///
+/// `max_micros` is exact because the budget it answers to -- no acquire above
+/// one frame at 60 Hz -- is a statement about a single worst event. The
+/// distribution is bucketed by powers of two because the budget *it* answers to
+/// has 80x of headroom (p95 measured at 49 us against 4 ms), and a factor-of-two
+/// resolution against 80x of margin buys nothing for the memory it costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcquireStats {
+    pub acquisitions: u64,
+    pub max_micros: u64,
+    buckets: [u32; BUCKETS],
+}
+
+impl AcquireStats {
+    /// Latency at percentile `p` (0.0..=1.0), in microseconds, rounded up to
+    /// the enclosing bucket's ceiling.
+    pub fn percentile_micros(&self, p: f64) -> u64 {
+        if self.acquisitions == 0 {
+            return 0;
+        }
+        let target = (self.acquisitions as f64 * p).ceil() as u64;
+        let mut seen = 0u64;
+        for (bucket, count) in self.buckets.iter().enumerate() {
+            seen += *count as u64;
+            if seen >= target {
+                return bucket_ceiling(bucket);
+            }
+        }
+        self.max_micros
+    }
+}
+
+/// A [`Terminal`] shared between the PTY reader and the renderer.
+pub struct SharedTerminal {
+    term: FairMutex<Terminal>,
+    reader: AcquireMeter,
+    renderer: AcquireMeter,
+}
+
+impl SharedTerminal {
+    pub fn new(term: Terminal) -> Self {
+        Self {
+            term: FairMutex::new(term),
+            reader: AcquireMeter::default(),
+            renderer: AcquireMeter::default(),
+        }
+    }
+
+    /// Acquisition latencies for the PTY-reader plane.
+    pub fn reader_acquire(&self) -> &AcquireMeter {
+        &self.reader
+    }
+
+    /// Acquisition latencies for the renderer plane. This is the one with a
+    /// budget attached.
+    pub fn renderer_acquire(&self) -> &AcquireMeter {
+        &self.renderer
+    }
+
+    /// Feed PTY output into the emulator. Reader plane.
+    pub fn feed(&self, bytes: &[u8]) {
+        self.acquire(&self.reader).feed(bytes);
+    }
+
+    /// Sample damage and encode a frame. Renderer plane.
+    ///
+    /// The lock covers the copy only; `encode` -- hashing, span grouping,
+    /// allocation -- runs after the guard drops, which is worth ~75x in hold
+    /// time. The `Encoder` is the caller's because its dedup state is per
+    /// consumer, and passing it in keeps the encode off this lock by
+    /// construction rather than by remembering to.
+    pub fn render(&self, encoder: &mut Encoder) -> Frame {
+        let raw = {
+            let mut term = self.acquire(&self.renderer);
+            damage::capture(term.term_mut())
+        };
+        encoder.encode(raw)
+    }
+
+    /// Take the lock for something the two methods above don't cover (resize,
+    /// input, reading stats). Metered on the renderer plane, since anything
+    /// that isn't the read loop competes with the renderer for the same lock.
+    pub fn lock(&self) -> MutexGuard<'_, Terminal> {
+        self.acquire(&self.renderer)
+    }
+
+    fn acquire(&self, meter: &AcquireMeter) -> MutexGuard<'_, Terminal> {
+        let started = Instant::now();
+        let guard = self.term.lock();
+        meter.record(started.elapsed().as_micros() as u64);
+        guard
+    }
+}

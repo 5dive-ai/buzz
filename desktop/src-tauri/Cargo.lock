@@ -99,6 +99,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "alacritty_terminal"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bda177466b9524d59f1b12f0dd30b68696788e9992a7e959021c4a0ed96fcf59"
+dependencies = [
+ "base64 0.22.1",
+ "bitflags 2.13.0",
+ "home",
+ "libc",
+ "log",
+ "miow",
+ "parking_lot",
+ "piper",
+ "polling",
+ "regex-automata",
+ "rustix 1.1.4",
+ "rustix-openpty",
+ "signal-hook 0.4.4",
+ "unicode-width 0.2.2",
+ "vte 0.15.0",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1175,6 +1199,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-terminal"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "parking_lot",
+]
+
+[[package]]
 name = "buzz-voice"
 version = "0.1.0"
 dependencies = [
@@ -1882,7 +1914,7 @@ dependencies = [
  "mio",
  "parking_lot",
  "rustix 0.38.44",
- "signal-hook",
+ "signal-hook 0.3.18",
  "signal-hook-mio",
  "winapi",
 ]
@@ -1900,7 +1932,7 @@ dependencies = [
  "mio",
  "parking_lot",
  "rustix 1.1.4",
- "signal-hook",
+ "signal-hook 0.3.18",
  "signal-hook-mio",
  "winapi",
 ]
@@ -2066,6 +2098,12 @@ checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
 dependencies = [
  "cmov",
 ]
+
+[[package]]
+name = "cursor-icon"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "curve25519-dalek"
@@ -5586,6 +5624,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "miow"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "model-artifact"
 version = "0.74.0"
 source = "git+https://github.com/Mesh-LLM/mesh-llm.git?tag=v0.74.0#e60b2fe43aa05271569fbeff2a457133aef456a1"
@@ -8662,6 +8709,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustix-openpty"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1de16c7c59892b870a6336f185dc10943517f1327447096bbb7bb32cd85e2393"
+dependencies = [
+ "errno",
+ "libc",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "rustls"
 version = "0.23.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9356,6 +9414,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-mio"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9363,7 +9431,7 @@ checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
 dependencies = [
  "libc",
  "mio",
- "signal-hook",
+ "signal-hook 0.3.18",
 ]
 
 [[package]]
@@ -9719,7 +9787,7 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a8f8038e7e7969abb3f1b7c2a811225e9296da208539e0f79c5251d6cac0025"
 dependencies = [
- "vte",
+ "vte 0.14.1",
 ]
 
 [[package]]
@@ -10581,7 +10649,7 @@ dependencies = [
  "bitflags 2.13.0",
  "parking_lot",
  "rustix 1.1.4",
- "signal-hook",
+ "signal-hook 0.3.18",
  "windows-sys 0.61.2",
 ]
 
@@ -10632,7 +10700,7 @@ dependencies = [
  "pest_derive",
  "phf 0.11.3",
  "sha2 0.10.9",
- "signal-hook",
+ "signal-hook 0.3.18",
  "siphasher",
  "terminfo",
  "termios",
@@ -11758,6 +11826,19 @@ version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "231fdcd7ef3037e8330d8e17e61011a2c244126acc0a982f4040ac3f9f0bc077"
 dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "bitflags 2.13.0",
+ "cursor-icon",
+ "log",
  "memchr",
 ]
 

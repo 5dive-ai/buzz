@@ -1,4 +1,9 @@
 [workspace]
+# Explicit: membership must NOT be inferred from the path-dependency edge below.
+# With a bare `[workspace]` and no `members`, `cargo test/check --workspace`
+# expands to a set that excludes this crate, and its gates pass green-and-empty
+# over a real defect. Verified: Sami Arm A/D, Dawn `.scratch/armA`.
+members = ["crates/buzz-terminal"]
 
 [package]
 name = "buzz-desktop"

@@ -170,27 +170,82 @@ if grep -q "$retired_entitlement_key" "$runner_entitlements"; then
 else
   pass "Runner omits the invalid App Attest entitlement key"
 fi
+
+duplicate_pbx_object_ids=$(awk '
+  # This bounded source-level smoke check recognizes the current two-tab
+  # object-key spellings. It is not a general OpenStep uniqueness check:
+  # measured exclusions include a comment before the key, a presentation
+  # comment spanning lines, and one-tab indentation (jb_b1/jb_b2/jb_b6).
+  # The macOS semantic check below owns their resolved build consequences.
+  function decomment(s,   head, tailpart) {
+    while (match(s, /\/\*/)) {
+      head = substr(s, 1, RSTART - 1)
+      tailpart = substr(s, RSTART + 2)
+      if (!match(tailpart, /\*\//)) return head " "
+      s = head " " substr(tailpart, RSTART + RLENGTH)
+    }
+    return s
+  }
+
+  /^\t\t/ {
+    line = decomment($0)
+    if (match(line, /^\t\t"?[[:alnum:]]+"?[[:space:]]*=/)) {
+      object_id = substr(line, RSTART, RLENGTH)
+      sub(/^\t\t"?/, "", object_id)
+      sub(/"?[[:space:]]*=$/, "", object_id)
+      if (++object_id_count[object_id] == 2) print object_id
+    }
+  }
+' "$pbxproj" | sort)
+if [[ -n "$duplicate_pbx_object_ids" ]]; then
+  fail "recognized iOS project object identifiers repeat: $(printf '%s\n' "$duplicate_pbx_object_ids" | paste -sd ' ' -)"
+else
+  pass "recognized iOS project object identifiers do not repeat"
+fi
+
 signing_map=$(awk '
+  # PBX comments are separators, not text: strip them before parsing any
+  # object so a comment cannot hide a duplicate key from the ambiguity count.
+  function decomment(s,   head, tailpart) {
+    while (match(s, /\/\*/)) {
+      head = substr(s, 1, RSTART - 1)
+      tailpart = substr(s, RSTART + 2)
+      if (!match(tailpart, /\*\//)) { return head " " }
+      s = head " " substr(tailpart, RSTART + RLENGTH)
+    }
+    return s
+  }
+
   FNR == 1 { pass++ }
 
   # Pass 1 indexes xcconfig paths and follows each PBXNativeTarget to its
   # actual configuration-list object. Target names come from object fields,
   # not presentation comments.
   pass == 1 {
-    if (/isa = PBXFileReference/ && /\.xcconfig/) {
-      declaration = $0
-      if (match(declaration, /= \{isa = PBXFileReference;/)) {
+    if (/isa[[:space:]]*=[[:space:]]*PBXFileReference/ && /\.xcconfig/) {
+      declaration = decomment($0)
+      if (match(declaration, /=[[:space:]]*\{[[:space:]]*isa[[:space:]]*=[[:space:]]*PBXFileReference[[:space:]]*;/)) {
         declaration = substr(declaration, RSTART + RLENGTH)
       } else {
         declaration = ""
       }
       sub(/\}.*/, "", declaration)
       xcconfig_path = "MISSING_PATH"
-      if (match(declaration, /(^|;)[[:space:]]*path = [^;]+/)) {
-        xcconfig_path = substr(declaration, RSTART, RLENGTH)
-        sub(/^;?[[:space:]]*path = /, "", xcconfig_path)
-        gsub(/"/, "", xcconfig_path)
+      rest = declaration
+      path_matches = 0
+      while (match(rest, /(^|;)[[:space:]]*path[[:space:]]*=[[:space:]]*[^;]+/)) {
+        candidate = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RSTART + RLENGTH)
+        sub(/^;?[[:space:]]*path[[:space:]]*=[[:space:]]*/, "", candidate)
+        gsub(/"/, "", candidate)
+        sub(/[[:space:]]+$/, "", candidate)
+        path_matches++
+        xcconfig_path = candidate
       }
+      # More than one `path =` in one object means a decoy (a quoted value or
+      # an embedded comment) is shadowing the real key. Never guess which one
+      # the build uses: fail the row loudly instead.
+      if (path_matches > 1) xcconfig_path = "AMBIGUOUS_PATH"
       xcconfig_paths[$1] = xcconfig_path
     }
 

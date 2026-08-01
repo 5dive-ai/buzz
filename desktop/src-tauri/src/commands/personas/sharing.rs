@@ -4,7 +4,7 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         load_personas,
-        retention::{get_retained_event, open_retention_db},
+        retention::{get_baseline, get_retained_event, open_retention_db},
         AgentDefinition,
     },
 };
@@ -92,26 +92,51 @@ pub async fn update_persona_and_publish(
 
 /// Retain the prepared event (already done by `prepare_persona_publication`
 /// as user intent, gate cleared) then trigger a flush pass and await the
-/// relay outcome.
+/// relay outcome for this specific scope.
 ///
-/// This is the single publish path — it goes through the gated flush loop,
-/// which checks `publish_blocked` and the readiness latch. Routing here
-/// instead of submitting directly ensures:
+/// Readiness is checked BEFORE flushing: if the scope is `Unready` or
+/// `InProgress`, the row stays pending and `Queued` is returned — the boot
+/// reconcile+barrier transition will complete readiness and the flush loop
+/// will publish the row once the scope is `Ready`. This must NOT be
+/// short-circuited by re-resolving the active scope: the command already
+/// captured a coherent `RetentionScope` and a workspace switch mid-flight
+/// must not redirect the publish to a different database.
 ///
-/// 1. A parked/suppressed coordinate cannot bypass its own gate.
-/// 2. Baseline provenance is stamped on relay acceptance (via
-///    `mark_synced_and_stamp_baseline` inside the flush loop).
-/// 3. The `Queued` report means the row is retained and will flush on the
-///    next sweep — not "could not even enqueue."
+/// When the scope IS ready, a targeted `flush_pending_events_at` is run
+/// for exactly this scope's `db_path`. The row was retained as user intent
+/// (publish_blocked = 0), so it will be in the pending queue.
 async fn publish_prepared_persona_via_flush(
     state: &AppState,
     prepared: PreparedPersonaPublication,
 ) -> Result<SetPersonaSharedResult, String> {
-    use crate::managed_agents::persona_events::flush_pending_events_at;
+    use crate::managed_agents::{
+        config_sync_readiness::{self, ReadinessState},
+        persona_events::flush_pending_events_at,
+    };
+
+    // Check readiness for the PREPARED scope's database, not the currently
+    // active scope (a workspace switch mid-flight must not redirect the
+    // publish to a different db_path).
+    let ready = matches!(
+        config_sync_readiness::readiness_state(),
+        Some(ReadinessState::Ready(ref p)) if *p == prepared.scope.db_path
+    );
+    if !ready {
+        // Not yet ready — row is durably retained as user intent and will
+        // flush once the boot barrier completes. Report Queued.
+        return Ok(SetPersonaSharedResult {
+            persona: prepared.persona,
+            publication_status: PersonaSharePublicationStatus::Queued,
+            relay_message: Some(
+                "event queued for publication; boot barrier not yet complete for this scope"
+                    .to_string(),
+            ),
+        });
+    }
 
     // Run a targeted flush for this scope. The event is already retained as
     // user intent (publish_blocked = 0), so it will be in the pending queue.
-    let flushed = flush_pending_events_at(
+    flush_pending_events_at(
         &prepared.scope.db_path,
         state,
         &prepared.scope.relay_url,
@@ -120,10 +145,18 @@ async fn publish_prepared_persona_via_flush(
     .await
     .unwrap_or(0);
 
-    // Determine whether the specific row published: re-read pending_sync.
-    // If flushed > 0 and the row is no longer pending, it published.
-    // If the relay rejected/was unreachable, pending_sync stays 1.
+    // Determine whether the specific row published: re-read the retained row.
+    // The row published if its pending_sync is now 0 AND the baseline at this
+    // coordinate was stamped with the expected event_id (set atomically by
+    // mark_synced_and_stamp_baseline on relay acceptance). This is
+    // per-coordinate — another row flushing cannot produce a false-positive.
     let conn = open_retention_db(&prepared.scope.db_path)?;
+    let baseline = get_baseline(
+        &conn,
+        prepared.retained.kind,
+        &prepared.retained.pubkey,
+        &prepared.retained.d_tag,
+    )?;
     let row = get_retained_event(
         &conn,
         prepared.retained.kind,
@@ -131,14 +164,13 @@ async fn publish_prepared_persona_via_flush(
         &prepared.retained.d_tag,
     )?;
 
-    let published = row.as_ref().is_some_and(|r| {
-        // The row published if pending_sync is now 0 AND it still carries the
-        // same content (a newer edit would also have pending_sync=0 only if it
-        // too published, which is fine — we just report what actually happened).
+    let published = baseline.as_ref().is_some_and(|(baseline_event_id, _)| {
+        *baseline_event_id == prepared.retained.event_id.as_deref().unwrap_or("")
+    }) || row.as_ref().is_some_and(|r| {
         !r.pending_sync
             && r.created_at == prepared.retained.created_at
             && r.content == prepared.retained.content
-    }) || flushed > 0 && row.as_ref().is_none_or(|r| !r.pending_sync);
+    });
 
     if published {
         Ok(SetPersonaSharedResult {
@@ -240,12 +272,17 @@ mod tests {
 
     #[tokio::test]
     async fn relay_rejection_stays_durably_queued() {
+        use crate::managed_agents::config_sync_readiness;
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("retention.db");
         let keys = nostr::Keys::generate();
         let owner = keys.public_key().to_hex();
         let prepared = prepared(&db_path, spawn_relay(false).await, keys, Some(true));
         let state = build_app_state();
+
+        // Mark this scope Ready so Queued is driven by relay rejection, not latch.
+        let claim = config_sync_readiness::claim_in_progress().unwrap();
+        claim.complete(db_path.clone());
 
         let result = publish_prepared_persona_via_flush(&state, prepared)
             .await
@@ -274,6 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_relay_stays_durably_queued() {
+        use crate::managed_agents::config_sync_readiness;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_url = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
@@ -283,6 +321,10 @@ mod tests {
         let owner = keys.public_key().to_hex();
         let prepared = prepared(&db_path, relay_url, keys, Some(true));
         let state = build_app_state();
+
+        // Mark this scope Ready so Queued is driven by relay unavailability, not latch.
+        let claim = config_sync_readiness::claim_in_progress().unwrap();
+        claim.complete(db_path.clone());
 
         let result = publish_prepared_persona_via_flush(&state, prepared)
             .await
@@ -311,12 +353,17 @@ mod tests {
 
     #[tokio::test]
     async fn relay_acceptance_marks_the_scoped_head_synced() {
+        use crate::managed_agents::config_sync_readiness;
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("retention.db");
         let keys = nostr::Keys::generate();
         let owner = keys.public_key().to_hex();
         let prepared = prepared(&db_path, spawn_relay(true).await, keys, Some(true));
         let state = build_app_state();
+
+        // Mark this scope Ready so the readiness gate permits the flush.
+        let claim = config_sync_readiness::claim_in_progress().unwrap();
+        claim.complete(db_path.clone());
 
         let result = publish_prepared_persona_via_flush(&state, prepared)
             .await
@@ -344,6 +391,7 @@ mod tests {
     /// head already says, and it reports the relay outcome to the caller.
     #[tokio::test]
     async fn test_update_and_publish_acceptance_publishes_the_edit_at_the_current_share_state() {
+        use crate::managed_agents::config_sync_readiness;
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("retention.db");
         let keys = nostr::Keys::generate();
@@ -352,6 +400,10 @@ mod tests {
         prepare_persona_publication_at(&db_path, &keys, &persona(), Some(true)).unwrap();
         let prepared = prepared(&db_path, spawn_relay(true).await, keys, None);
         let state = build_app_state();
+
+        // Mark this scope Ready so the readiness gate permits the flush.
+        let claim = config_sync_readiness::claim_in_progress().unwrap();
+        claim.complete(db_path.clone());
 
         let result = publish_prepared_persona_via_flush(&state, prepared)
             .await
@@ -380,6 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_and_publish_relay_rejection_reports_queued_not_failure() {
+        use crate::managed_agents::config_sync_readiness;
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("retention.db");
         let keys = nostr::Keys::generate();
@@ -387,6 +440,10 @@ mod tests {
         prepare_persona_publication_at(&db_path, &keys, &persona(), Some(true)).unwrap();
         let prepared = prepared(&db_path, spawn_relay(false).await, keys, None);
         let state = build_app_state();
+
+        // Mark this scope Ready so Queued is driven by relay rejection, not latch.
+        let claim = config_sync_readiness::claim_in_progress().unwrap();
+        claim.complete(db_path.clone());
 
         let result = publish_prepared_persona_via_flush(&state, prepared)
             .await
@@ -426,5 +483,90 @@ mod tests {
             .expect_err("a directory cannot be opened as the retention database");
 
         assert!(error.contains("failed to open retention db"));
+    }
+
+    /// `publish_prepared_persona_via_flush` must enforce the readiness latch:
+    /// when the scope is `Unready` or `InProgress`, the row stays pending and
+    /// the caller receives `Queued` — no relay request is made. This covers the
+    /// Thufir pass-1 IMPORTANT finding: the old helper skipped the latch entirely
+    /// (it called `flush_pending_events_at` directly).
+    ///
+    /// Mutation-sensitive: removing the readiness check from
+    /// `publish_prepared_persona_via_flush` lets `flush_pending_events_at` run
+    /// regardless of latch state, which — when an accepting relay is present —
+    /// would return `Published` and leave `pending_sync = 0`. Both the
+    /// `Queued` assertion and the `pending_sync` assertion would then fail,
+    /// catching the regression.
+    #[tokio::test]
+    async fn test_publish_via_flush_blocked_when_latch_not_ready() {
+        use crate::managed_agents::config_sync_readiness;
+
+        // Thread-isolated latch (test builds use thread_local!).
+        config_sync_readiness::mark_unready();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retention.db");
+        let keys = nostr::Keys::generate();
+        let owner = keys.public_key().to_hex();
+        // Use an accepting relay so the test would catch a bypass.
+        let relay_url = spawn_relay(true).await;
+        let state = build_app_state();
+
+        // ── Unready ─────────────────────────────────────────────────────────
+        let result = publish_prepared_persona_via_flush(
+            &state,
+            prepared(&db_path, relay_url.clone(), keys.clone(), Some(true)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.publication_status,
+            PersonaSharePublicationStatus::Queued,
+            "must report Queued when latch is Unready"
+        );
+        assert!(
+            get_retained_event(
+                &open_retention_db(&db_path).unwrap(),
+                buzz_core_pkg::kind::KIND_PERSONA,
+                &owner,
+                "catalog-reviewer"
+            )
+            .unwrap()
+            .unwrap()
+            .pending_sync,
+            "row must stay pending when latch is Unready"
+        );
+
+        // ── InProgress ───────────────────────────────────────────────────────
+        // Simulate the boot barrier claiming the latch (InProgress).
+        let _claim =
+            config_sync_readiness::claim_in_progress().expect("claim must succeed from Unready");
+
+        let result2 = publish_prepared_persona_via_flush(
+            &state,
+            prepared(&db_path, relay_url, keys, Some(true)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result2.publication_status,
+            PersonaSharePublicationStatus::Queued,
+            "must report Queued when latch is InProgress"
+        );
+        assert!(
+            get_retained_event(
+                &open_retention_db(&db_path).unwrap(),
+                buzz_core_pkg::kind::KIND_PERSONA,
+                &owner,
+                "catalog-reviewer"
+            )
+            .unwrap()
+            .unwrap()
+            .pending_sync,
+            "row must stay pending when latch is InProgress"
+        );
+
+        // Cleanup: drop the claim so the latch resets to Unready.
+        config_sync_readiness::mark_unready();
     }
 }

@@ -324,7 +324,7 @@ fn rename_re_retains_identity_record_with_new_name() {
     let pubkey = "9".repeat(64);
     let mut record = sample_record(&pubkey, "Fizz");
 
-    assert!(retain_agent_record(&conn, &keys, &record).unwrap());
+    assert!(retain_agent_record(&conn, &keys, &record, false).unwrap());
     let first = get_retained_event(&conn, KIND_MANAGED_AGENT, &owner, &pubkey)
         .unwrap()
         .unwrap();
@@ -341,7 +341,7 @@ fn rename_re_retains_identity_record_with_new_name() {
 
     record.name = "Spark".to_string();
     assert!(
-        retain_agent_record(&conn, &keys, &record).unwrap(),
+        retain_agent_record(&conn, &keys, &record, false).unwrap(),
         "a renamed record must re-retain its identity record"
     );
 
@@ -374,7 +374,7 @@ fn retain_agent_record_is_noop_when_unchanged() {
     let pubkey = "8".repeat(64);
     let record = sample_record(&pubkey, "steady-agent");
 
-    assert!(retain_agent_record(&conn, &keys, &record).unwrap());
+    assert!(retain_agent_record(&conn, &keys, &record, false).unwrap());
     let row = get_retained_event(
         &conn,
         KIND_MANAGED_AGENT,
@@ -394,7 +394,7 @@ fn retain_agent_record_is_noop_when_unchanged() {
     .unwrap();
 
     assert!(
-        !retain_agent_record(&conn, &keys, &record).unwrap(),
+        !retain_agent_record(&conn, &keys, &record, false).unwrap(),
         "an unchanged projection must not re-retain"
     );
     assert!(

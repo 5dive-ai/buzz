@@ -40,7 +40,9 @@ fn trim_optional(value: Option<String>) -> Option<String> {
 pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &TeamRecord) {
     use crate::managed_agents::{
         persona_events::monotonic_created_at,
-        retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
+        retention::{
+            get_retained_event, open_retention_db, retain_user_intent_event, RetainedEvent,
+        },
         team_events::build_team_event,
     };
     use buzz_core_pkg::kind::KIND_TEAM;
@@ -56,7 +58,9 @@ pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &Team
             .custom_created_at(monotonic_created_at(prior))
             .sign_with_keys(&scope.owner_keys)
             .map_err(|e| format!("failed to sign team event: {e}"))?;
-        retain_event(
+        // User-intent: clears any stale publish_blocked so an edit to a parked
+        // team coordinate takes effect in-session.
+        retain_user_intent_event(
             &conn,
             &RetainedEvent::pending(KIND_TEAM, pubkey, team.id.clone(), &event),
         )
@@ -78,8 +82,8 @@ pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &Team
 fn tombstone_team_pending(app: &AppHandle, state: &AppState, d_tag: &str) {
     use crate::managed_agents::{
         retention::{
-            delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
-            RetainedEvent,
+            delete_retained_event, open_retention_db, retain_user_intent_event,
+            tombstone_retention_d_tag, RetainedEvent,
         },
         team_events::build_team_delete,
     };
@@ -95,7 +99,7 @@ fn tombstone_team_pending(app: &AppHandle, state: &AppState, d_tag: &str) {
             .map_err(|e| format!("failed to sign team tombstone: {e}"))?;
         let conn = open_retention_db(&scope.db_path)?;
         delete_retained_event(&conn, KIND_TEAM, &pubkey, d_tag)?;
-        retain_event(
+        retain_user_intent_event(
             &conn,
             &RetainedEvent::pending(
                 KIND_DELETE,

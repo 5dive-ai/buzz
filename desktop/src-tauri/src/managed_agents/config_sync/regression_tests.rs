@@ -1,4 +1,5 @@
-//! Regression tests for am#1, peon-P1#1/P1#2, am#2/peon-P2#1.
+//! Regression tests for am#1, peon-P1#1/P1#2, am#2/peon-P2#1,
+//! and Thufir pass-1 findings.
 //!
 //! Kept separate from `tests.rs` to respect the 1000-line ceiling on new files.
 
@@ -8,13 +9,15 @@ use super::*;
 use crate::managed_agents::{
     decision::{Decision, HeadState, TombstoneEvidence},
     persona_events::build_persona_event,
+    reconcile::retain_agent_record,
     retention::{
         delete_retained_event, get_baseline, get_retained_event, is_publish_blocked,
         mark_synced_and_stamp_baseline, open_retention_db, retain_event, retain_user_intent_event,
         set_baseline, set_publish_blocked, tombstone_retention_d_tag, RetainedEvent,
     },
+    ManagedAgentRecord,
 };
-use buzz_core_pkg::kind::{KIND_DELETION, KIND_PERSONA};
+use buzz_core_pkg::kind::{KIND_DELETION, KIND_MANAGED_AGENT, KIND_PERSONA};
 use rusqlite::Connection;
 
 const OWNER: &str = "ownerpubkeyhex";
@@ -386,4 +389,218 @@ fn test_user_edit_reopens_gated_row_but_reconcile_retain_does_not() {
         is_publish_blocked(&conn, KIND_PERSONA, OWNER, D_TAG).unwrap(),
         "reconcile retain must NOT clear publish_blocked"
     );
+}
+
+// ── (c-ext) Thufir pass-1 finding #2: retain_agent_record user-intent clears
+// the gate; boot-reconcile (user_intent=false) does NOT.
+//
+// Mutation-sensitive: passing `false` (reconcile mode) to both calls would
+// leave the gate set after the first assert succeeds (reconcile doesn't clear
+// it) and would cause the second assert to pass trivially — but the assert on
+// the gate being CLEAR after user_intent=true would fail because nothing
+// cleared it, catching the regression. Conversely, passing `true` to both
+// would make the reconcile call incorrectly clear the gate, failing the final
+// "reconcile must NOT clear" assertion.
+#[test]
+fn test_retain_agent_record_user_intent_clears_gate_but_reconcile_does_not() {
+    let conn = test_db();
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+    let record = make_sample_agent_record();
+
+    // Seed the row as blocked (simulates what the boot barrier would have set).
+    retain_agent_record(&conn, &keys, &record, false).unwrap();
+    set_publish_blocked(&conn, KIND_MANAGED_AGENT, &owner, &record.pubkey, true).unwrap();
+    assert!(
+        is_publish_blocked(&conn, KIND_MANAGED_AGENT, &owner, &record.pubkey).unwrap(),
+        "precondition: gate must be set"
+    );
+
+    // Interactive save (user_intent = true) must reopen the gate.
+    retain_agent_record(&conn, &keys, &record, true).unwrap();
+    assert!(
+        !is_publish_blocked(&conn, KIND_MANAGED_AGENT, &owner, &record.pubkey).unwrap(),
+        "user-intent retain_agent_record must clear publish_blocked"
+    );
+
+    // Re-gate to simulate a fresh boot decision.
+    set_publish_blocked(&conn, KIND_MANAGED_AGENT, &owner, &record.pubkey, true).unwrap();
+
+    // Boot reconcile (user_intent = false) must NOT clear it.
+    retain_agent_record(&conn, &keys, &record, false).unwrap();
+    assert!(
+        is_publish_blocked(&conn, KIND_MANAGED_AGENT, &owner, &record.pubkey).unwrap(),
+        "reconcile retain_agent_record must NOT clear publish_blocked"
+    );
+}
+
+// ── (c-ext2) Thufir pass-1 finding #2: non-persona tombstone (kind:5 for
+// a managed-agent coordinate) via retain_user_intent_event clears the gate;
+// bare retain_event does NOT.
+//
+// Mutation-sensitive: the production paths in `tombstone_managed_agent_pending`
+// and `tombstone_team_pending` now call `retain_user_intent_event`; if they
+// were accidentally reverted to `retain_event`, the first assertion would fail.
+#[test]
+fn test_non_persona_tombstone_user_intent_clears_gate() {
+    use nostr::JsonUtil;
+    let conn = test_db();
+    const KIND_DELETE: u32 = 5;
+    let tombstone_d = tombstone_retention_d_tag(KIND_MANAGED_AGENT, "agent-abc123");
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+
+    let event = nostr::EventBuilder::new(nostr::Kind::Custom(KIND_DELETE as u16), "{}".to_string())
+        .sign_with_keys(&keys)
+        .unwrap();
+
+    // Gate a placeholder row at the tombstone coordinate.
+    retain_event(
+        &conn,
+        &RetainedEvent {
+            kind: KIND_DELETE,
+            pubkey: owner.clone(),
+            d_tag: tombstone_d.clone(),
+            content: "{}".to_string(),
+            created_at: event.created_at.as_secs() as i64,
+            raw_event: event.as_json(),
+            event_id: Some(event.id.to_hex()),
+            pending_sync: false,
+            publish_blocked: false,
+        },
+    )
+    .unwrap();
+    set_publish_blocked(&conn, KIND_DELETE, &owner, &tombstone_d, true).unwrap();
+    assert!(
+        is_publish_blocked(&conn, KIND_DELETE, &owner, &tombstone_d).unwrap(),
+        "precondition: gate must be set"
+    );
+
+    // User-intent tombstone retain must clear the gate.
+    let event2 =
+        nostr::EventBuilder::new(nostr::Kind::Custom(KIND_DELETE as u16), "{}".to_string())
+            .sign_with_keys(&keys)
+            .unwrap();
+    retain_user_intent_event(
+        &conn,
+        &RetainedEvent {
+            kind: KIND_DELETE,
+            pubkey: owner.clone(),
+            d_tag: tombstone_d.clone(),
+            content: "{}".to_string(),
+            created_at: event2.created_at.as_secs() as i64 + 1,
+            raw_event: event2.as_json(),
+            event_id: Some(event2.id.to_hex()),
+            pending_sync: true,
+            publish_blocked: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        !is_publish_blocked(&conn, KIND_DELETE, &owner, &tombstone_d).unwrap(),
+        "user-intent tombstone retain must clear publish_blocked"
+    );
+}
+
+// ── (f) Thufir pass-1 finding: mark_synced_and_stamp_baseline atomically
+// clears pending AND stamps the baseline in a single transaction.
+//
+// Mutation-sensitive: if the function is split back into two independent
+// autocommit statements, the test still passes on the happy path — but the
+// invariant that "pending_sync = 0 iff baseline is stamped" becomes testable
+// by verifying both columns together. If only one statement ran, one of the
+// two final assertions would fail, catching the regression.
+#[test]
+fn test_mark_synced_and_stamp_baseline_atomic_both_written_on_success() {
+    let conn = test_db();
+    const D_TAG: &str = "atomic-test";
+
+    let event = signed_persona("atomic-prompt");
+    let event_id = event.id.to_hex();
+    let content = event.content.to_string();
+    let created_at = event.created_at.as_secs() as i64;
+
+    retain_event(
+        &conn,
+        &RetainedEvent {
+            kind: KIND_PERSONA,
+            pubkey: OWNER.to_string(),
+            d_tag: D_TAG.to_string(),
+            content: content.clone(),
+            created_at,
+            raw_event: {
+                use nostr::JsonUtil;
+                event.as_json()
+            },
+            event_id: Some(event_id.clone()),
+            pending_sync: true,
+            publish_blocked: false,
+        },
+    )
+    .unwrap();
+
+    // No baseline before the call.
+    assert!(
+        get_baseline(&conn, KIND_PERSONA, OWNER, D_TAG)
+            .unwrap()
+            .is_none(),
+        "no baseline before mark_synced_and_stamp_baseline"
+    );
+
+    mark_synced_and_stamp_baseline(
+        &conn,
+        KIND_PERSONA,
+        OWNER,
+        D_TAG,
+        created_at,
+        &content,
+        &event_id,
+        false,
+    )
+    .unwrap();
+
+    // Both effects must have landed atomically.
+    let row = get_retained_event(&conn, KIND_PERSONA, OWNER, D_TAG)
+        .unwrap()
+        .expect("row must still exist");
+    assert!(
+        !row.pending_sync,
+        "pending_sync must be cleared by mark_synced_and_stamp_baseline"
+    );
+
+    let baseline = get_baseline(&conn, KIND_PERSONA, OWNER, D_TAG)
+        .unwrap()
+        .expect("baseline must be stamped by mark_synced_and_stamp_baseline");
+    assert_eq!(
+        baseline.0, event_id,
+        "baseline event_id must match the published event"
+    );
+    assert_eq!(
+        baseline.1, content,
+        "baseline content must match the published content"
+    );
+}
+
+/// Helper shared by the agent-record tests in this module.
+pub(super) fn make_sample_agent_record() -> ManagedAgentRecord {
+    serde_json::from_str(
+        r#"{
+            "pubkey": "abababababababababababababababababababababababababababababababababab",
+            "name": "regression-test-agent",
+            "relay_url": "wss://localhost:3000",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "system_prompt": "You are a regression-test agent.",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "last_exit_code": null,
+            "last_error": null
+        }"#,
+    )
+    .unwrap()
 }

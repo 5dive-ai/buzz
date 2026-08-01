@@ -756,7 +756,9 @@ fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgent
     use crate::managed_agents::{
         agent_events::{agent_event_content, build_agent_event},
         persona_events::monotonic_created_at,
-        retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
+        retention::{
+            get_retained_event, open_retention_db, retain_user_intent_event, RetainedEvent,
+        },
     };
     use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
 
@@ -779,7 +781,10 @@ fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgent
                 .map_err(|e| format!("failed to sign agent event: {e}"))?;
             (owner_pubkey, event)
         };
-        retain_event(
+        // User-intent: a snapshot import is an explicit user action — clear
+        // any stale publish_blocked gate so the imported agent publishes
+        // immediately rather than waiting for the next boot decision pass.
+        retain_user_intent_event(
             &conn,
             &RetainedEvent::pending(
                 KIND_MANAGED_AGENT,

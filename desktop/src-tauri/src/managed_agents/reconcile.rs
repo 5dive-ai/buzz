@@ -23,7 +23,10 @@ use std::path::Path;
 use super::{
     agent_events::build_agent_event,
     persona_events::monotonic_created_at,
-    retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
+    retention::{
+        get_retained_event, open_retention_db, retain_event, retain_user_intent_event,
+        RetainedEvent,
+    },
     ManagedAgentRecord,
 };
 use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
@@ -75,7 +78,7 @@ pub(crate) fn reconcile_agents_in_dir_at(
             continue;
         }
 
-        if retain_agent_record(&conn, keys, record)? {
+        if retain_agent_record(&conn, keys, record, false)? {
             reconciled += 1;
         }
     }
@@ -93,10 +96,17 @@ pub(crate) fn reconcile_agents_in_dir_at(
 /// (`retain_managed_agent_pending`, persona-rename propagation). Every
 /// mutation of an agent's published identity must go through it so the
 /// retained record can never silently drift from `managed-agents.json`.
+///
+/// `user_intent` must be `true` when the caller is an interactive user action
+/// (create, update, delete tombstone). A `true` value unconditionally clears
+/// `publish_blocked` on the retained row so that a previously-parked coordinate
+/// is reopened in-session. Boot-time reconcile callers pass `false` to leave
+/// the gate unchanged — the laundering path is exactly reconcile.
 pub(crate) fn retain_agent_record(
     conn: &rusqlite::Connection,
     keys: &nostr::Keys,
     record: &ManagedAgentRecord,
+    user_intent: bool,
 ) -> Result<bool, String> {
     let owner_pubkey = keys.public_key().to_hex();
     let existing = get_retained_event(conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
@@ -117,18 +127,34 @@ pub(crate) fn retain_agent_record(
 
     let content = event.content.clone();
     if existing.as_ref().is_some_and(|row| row.content == content) {
+        // Content is unchanged — no publish churn. If this is a user-intent
+        // call, still clear any stale gate: the user re-confirmed the same
+        // content intentionally, which is a gate-clearing action regardless.
+        if user_intent {
+            use crate::managed_agents::retention::set_publish_blocked;
+            set_publish_blocked(
+                conn,
+                KIND_MANAGED_AGENT,
+                &owner_pubkey,
+                &record.pubkey,
+                false,
+            )
+            .map_err(|e| format!("failed to clear gate for '{}': {e}", record.name))?;
+        }
         return Ok(false);
     }
 
-    retain_event(
-        conn,
-        &RetainedEvent::pending(
-            KIND_MANAGED_AGENT,
-            owner_pubkey,
-            record.pubkey.clone(),
-            &event,
-        ),
-    )
+    let retained = RetainedEvent::pending(
+        KIND_MANAGED_AGENT,
+        owner_pubkey,
+        record.pubkey.clone(),
+        &event,
+    );
+    if user_intent {
+        retain_user_intent_event(conn, &retained)
+    } else {
+        retain_event(conn, &retained)
+    }
     .map_err(|e| format!("failed to retain '{}': {e}", record.name))?;
     Ok(true)
 }

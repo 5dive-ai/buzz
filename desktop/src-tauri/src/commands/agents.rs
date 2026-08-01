@@ -51,8 +51,11 @@ pub(super) fn retain_managed_agent_pending(
         let conn = open_retention_db(&scope.db_path)?;
         // Shared engine with the boot-time reconcile: projection content diff
         // (no republish for runtime-only churn) + monotonic created_at bump
-        // past the retained head (NIP-AP step 3).
-        retain_agent_record(&conn, &scope.owner_keys, record).map(|_| ())
+        // past the retained head (NIP-AP step 3). User-intent=true clears any
+        // stale publish_blocked gate so an edit to a parked agent takes
+        // effect in-session (the gate was set against a prior boot observation,
+        // not the user's current action).
+        retain_agent_record(&conn, &scope.owner_keys, record, true).map(|_| ())
     })();
     if let Err(e) = result {
         eprintln!("buzz-desktop: agent-retain: {e}");
@@ -78,8 +81,8 @@ pub(super) fn tombstone_managed_agent_pending(
     use crate::managed_agents::{
         agent_events::build_agent_delete,
         retention::{
-            delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
-            RetainedEvent,
+            delete_retained_event, open_retention_db, retain_user_intent_event,
+            tombstone_retention_d_tag, RetainedEvent,
         },
     };
     use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
@@ -94,7 +97,7 @@ pub(super) fn tombstone_managed_agent_pending(
             .map_err(|e| format!("failed to sign managed-agent tombstone: {e}"))?;
         let conn = open_retention_db(&scope.db_path)?;
         delete_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, agent_pubkey)?;
-        retain_event(
+        retain_user_intent_event(
             &conn,
             &RetainedEvent::pending(
                 KIND_DELETE,

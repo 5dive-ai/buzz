@@ -612,11 +612,21 @@ fn parse_tombstone_retention_d_tag(key: &str) -> Option<(u32, String)> {
 /// Clear the `pending_sync` flag for an event the relay just confirmed,
 /// and atomically stamp the accepted event as this coordinate's baseline.
 ///
-/// Compare-and-clear: only clears the row if its `created_at` and `content`
-/// still match what was published. A concurrent edit that upserted a newer
-/// version at the same coordinate between the flush loop's read and this call
-/// leaves `pending_sync` set, so the newer edit publishes on the next pass
-/// instead of being silently dropped.
+/// Both writes execute inside a single SQLite transaction so a crash or error
+/// between them cannot produce a state where `pending_sync` was cleared but
+/// the baseline was not stamped (the hole that allows the one-edit-later revert
+/// vector to resurface). The transaction is committed only when both statements
+/// succeed; on any error the transaction rolls back automatically via
+/// `unchecked_transaction`'s RAII Drop.
+///
+/// Compare-and-clear: the `mark_synced` statement only updates the row when
+/// its `created_at` and `content` still match what was published. A concurrent
+/// edit that upserted a newer version at the same coordinate between the flush
+/// loop's read and this call leaves `pending_sync` set, so the newer edit
+/// publishes on the next pass instead of being silently dropped. The baseline
+/// is only stamped when `mark_synced` affected the intended row (rows_changed
+/// == 1), preventing a spurious baseline write when the concurrent-edit guard
+/// already refused the sync.
 ///
 /// Stamping the baseline here is the fix for the one-edit-later revert vector:
 /// after device A publishes v2 and this function runs, the baseline says v2, so
@@ -633,8 +643,33 @@ pub fn mark_synced_and_stamp_baseline(
     event_id: &str,
     shared: bool,
 ) -> Result<(), String> {
-    mark_synced(conn, kind, pubkey, d_tag, created_at, content)?;
-    set_baseline_full(conn, kind, pubkey, d_tag, event_id, content, shared)
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("failed to begin mark-synced-and-stamp-baseline transaction: {e}"))?;
+    let rows_changed = tx
+        .execute(
+            "UPDATE persona_events SET pending_sync = 0
+             WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3
+               AND created_at = ?4 AND content = ?5",
+            params![kind, pubkey, d_tag, created_at, content],
+        )
+        .map_err(|e| format!("failed to mark event synced: {e}"))?;
+    if rows_changed == 1 {
+        // The compare-and-clear matched — stamp the baseline in the same tx.
+        tx.execute(
+            "INSERT INTO persona_baselines
+                 (kind, pubkey, d_tag, baseline_event_id, baseline_content, baseline_shared)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (kind, pubkey, d_tag) DO UPDATE SET
+                 baseline_event_id = excluded.baseline_event_id,
+                 baseline_content = excluded.baseline_content,
+                 baseline_shared = excluded.baseline_shared",
+            params![kind, pubkey, d_tag, event_id, content, i32::from(shared)],
+        )
+        .map_err(|e| format!("failed to stamp baseline: {e}"))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("failed to commit mark-synced-and-stamp-baseline: {e}"))
 }
 
 /// Clear the `pending_sync` flag for an event the relay just confirmed.
@@ -644,6 +679,11 @@ pub fn mark_synced_and_stamp_baseline(
 /// version at the same coordinate between the flush loop's read and this call
 /// leaves `pending_sync` set, so the newer edit publishes on the next pass
 /// instead of being silently dropped.
+///
+/// Production publication uses `mark_synced_and_stamp_baseline` which wraps
+/// this logic inside a transaction; this function remains available for tests
+/// that need the mark-only behaviour.
+#[allow(dead_code)]
 pub fn mark_synced(
     conn: &Connection,
     kind: u32,

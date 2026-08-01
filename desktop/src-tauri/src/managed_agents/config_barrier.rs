@@ -140,11 +140,14 @@ async fn run_boot_barrier_enforcing(
 /// retained because it is cheap and keeps the invariant obvious.
 ///
 /// Scoped to rows with no baseline because those are precisely the unprovable
-/// ones: a legacy row queued before the baseline column existed, and a row
+/// ones: a legacy row queued before the baseline table existed, and a row
 /// queued by a second store whose retention database has never agreed to
 /// anything at that coordinate. A row WITH a baseline is left alone — its
 /// arbitration is decidable, and closing its gate here would stall an ordinary
 /// edit behind a scan it does not need.
+///
+/// Baseline provenance lives in `persona_baselines` (keyed by coordinate),
+/// not in the `persona_events` live row, so the check joins there.
 ///
 /// Returns how many rows it withheld.
 fn quarantine_unprovable_pending(
@@ -153,7 +156,13 @@ fn quarantine_unprovable_pending(
 ) -> Result<usize, String> {
     conn.execute(
         "UPDATE persona_events SET publish_blocked = 1
-         WHERE pending_sync = 1 AND pubkey = ?1 AND baseline_event_id IS NULL",
+         WHERE pending_sync = 1 AND pubkey = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM persona_baselines
+               WHERE persona_baselines.kind    = persona_events.kind
+                 AND persona_baselines.pubkey  = persona_events.pubkey
+                 AND persona_baselines.d_tag   = persona_events.d_tag
+           )",
         rusqlite::params![owner_pubkey],
     )
     .map_err(|error| format!("failed to quarantine unprovable pending rows: {error}"))

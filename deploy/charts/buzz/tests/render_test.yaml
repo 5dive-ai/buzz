@@ -23,6 +23,10 @@ tests:
           value: Deployment
         template: templates/deployment.yaml
       - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: relay
+        template: templates/deployment.yaml
+      - equal:
           path: kind
           value: ServiceAccount
         template: templates/serviceaccount.yaml

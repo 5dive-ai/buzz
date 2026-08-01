@@ -5,6 +5,7 @@ metadata:
   name: {{ include "buzz.fullname" . }}
   labels:
     {{- include "buzz.labels" . | nindent 4 }}
+    app.kubernetes.io/component: relay
 spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}

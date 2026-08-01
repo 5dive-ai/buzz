@@ -2187,6 +2187,81 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_opus_endpoint_keeps_xhigh_through_the_anthropic_clamp() {
+        // The harness passes the Databricks *serving-endpoint name* as the model,
+        // so this prefixed string is what actually reaches the clamp. An
+        // unsupported level is clamped down with only a log warning, which for a
+        // graded sweep means the A3x cell silently running at `high` -- a null
+        // result that reads as a finding. Pinned so a change to the support table
+        // cannot quietly rewrite what that cell measured.
+        let model = strip_catalog_prefix("databricks-claude-opus-5");
+        assert_eq!(model, "claude-opus-5");
+        assert_eq!(
+            clamp_adaptive_effort(model, ThinkingEffort::XHigh),
+            ThinkingEffort::XHigh
+        );
+        // ...and xhigh is a real 4x more thinking than the medium default, which
+        // is the mechanism the A3-vs-A3x cost delta is meant to price.
+        assert_eq!(ThinkingEffort::Medium.anthropic_budget_tokens(), 8_192);
+        assert_eq!(ThinkingEffort::XHigh.anthropic_budget_tokens(), 32_768);
+    }
+
+    #[test]
+    fn benchmark_sol_endpoint_is_not_subject_to_the_anthropic_clamp() {
+        // Regression guard on a wrong assumption, kept because it is an easy one
+        // to make twice: `clamp_adaptive_effort` consults *only*
+        // `anthropic_model_supports_xhigh`, so it downgrades xhigh for every
+        // non-Anthropic model -- including sol. That is harmless solely because
+        // sol never reaches it: the clamp is called from
+        // `anthropic_thinking_config`, and sol takes the OpenAI Responses path,
+        // where `openai_effort_str` is emitted verbatim (llm.rs:1015).
+        //
+        // If the clamp ever moves onto the shared path, this pair of asserts is
+        // what turns that into a test failure instead of a silently downgraded
+        // A2x sweep.
+        let model = strip_catalog_prefix("databricks-gpt-5-6-sol");
+        assert_eq!(model, "gpt-5-6-sol");
+        assert_eq!(
+            clamp_adaptive_effort(model, ThinkingEffort::XHigh),
+            ThinkingEffort::High,
+            "the anthropic clamp does downgrade sol -- sol must not be routed through it"
+        );
+        assert_eq!(ThinkingEffort::XHigh.openai_effort_str(), "xhigh");
+        assert!(
+            openai_efforts_for_model("gpt-5-6-sol")
+                .expect("sol resolves to the gpt-5.6 family")
+                .contains(&ThinkingEffort::XHigh),
+            "the gpt-5.6 capability table must list xhigh"
+        );
+    }
+
+    #[test]
+    fn benchmark_effort_wave_endpoints_resolve_high_on_the_openai_route() {
+        // The A1h/B1h/A5h/B3h cells run direct against api.openai.com rather
+        // than through the Databricks gateway, so their endpoint strings are
+        // bare model ids with a dot -- `gpt-5.6-luna`, not
+        // `databricks-gpt-5-6-luna`. Both spellings have to land in the same
+        // capability family, and `terra` is new enough that nothing else in the
+        // tree mentions it.
+        //
+        // The failure this pins is silent: an unrecognised model falls out of
+        // the family match, `high` gets clamped, and four 89-task sweeps report
+        // a null that is plumbing rather than a finding.
+        for model in ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"] {
+            let efforts = openai_efforts_for_model(model)
+                .unwrap_or_else(|| panic!("{model} must resolve to the gpt-5.6 effort table"));
+            assert!(
+                efforts.contains(&ThinkingEffort::High),
+                "{model} must support the `high` level the effort wave pins"
+            );
+        }
+        // Dotted ids are already bare, so the catalog strip must leave them
+        // alone rather than slicing at the first `gpt-` token.
+        assert_eq!(strip_catalog_prefix("gpt-5.6-terra"), "gpt-5.6-terra");
+        assert_eq!(ThinkingEffort::High.openai_effort_str(), "high");
+    }
+
+    #[test]
     fn anthropic_thinking_config_fable_5_xhigh_emits_xhigh() {
         let (thinking, output_config) =
             anthropic_thinking_config("claude-fable-5", ThinkingEffort::XHigh, 32_768);

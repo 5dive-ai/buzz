@@ -14,6 +14,7 @@ mod initial_window;
 mod key_backup;
 mod link_preview_tags;
 mod linux_media;
+mod local_relay;
 #[cfg(target_os = "macos")]
 mod macos_notifications;
 mod managed_agents;

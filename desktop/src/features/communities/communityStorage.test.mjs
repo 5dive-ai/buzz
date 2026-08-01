@@ -4,6 +4,9 @@ import test from "node:test";
 import {
   clearCommunityStorage,
   initFirstCommunity,
+  isLocalCommunityRelayUrl,
+  LOCAL_COMMUNITY_NAME,
+  LOCAL_COMMUNITY_RELAY_URL,
   loadCommunities,
   loadCommunityDiscoveryAfterLeave,
   markCommunityDiscoveryAfterLeave,

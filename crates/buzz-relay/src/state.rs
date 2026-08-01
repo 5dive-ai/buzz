@@ -2341,3 +2341,332 @@ mod tests {
         assert!(registry.bound_communities().is_empty());
     }
 }
+
+/// Redis-backed composed drill for the cache-residency gate.
+///
+/// `#[ignore]`d because it needs a live server. **It is selected by name in
+/// `.github/workflows/ci.yml`**: the step that runs the reconciler's own Redis
+/// suite selects `package(buzz-pubsub)`, which does not reach this crate, so a
+/// drill added here without its own selector would pass locally and gate
+/// nothing. Whoever moves or renames this module must move the selector too.
+///
+/// The unit tests above assert each half of the invariant in isolation, against
+/// `insert_established_for_test`. This module asserts the composition against a
+/// real Redis connection that really goes away — which is the only place the
+/// suppression can be observed for the reason production would observe it.
+#[cfg(test)]
+mod redis_tests {
+    use super::*;
+    use buzz_pubsub::community_topics::DesiredCommunities;
+
+    /// Communities this drill makes resident.
+    ///
+    /// Doubles as the fingerprint that singles out this subscriber's own Redis
+    /// connection for a targeted `CLIENT KILL`: seven exact subscriptions on one
+    /// pub/sub connection is a count no other test in the workspace holds.
+    const DRILL_COMMUNITIES: usize = 7;
+
+    fn test_redis_url() -> String {
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+    }
+
+    /// A plain connection for issuing `CLIENT` commands. Panics when `REDIS_URL`
+    /// is unreachable: a Redis test that self-skips its own dependency is
+    /// exactly the fake-green this lane exists to remove.
+    async fn control_conn() -> redis::aio::MultiplexedConnection {
+        redis::Client::open(test_redis_url())
+            .expect("redis client")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("REDIS_URL must be reachable for the ignored Redis suite")
+    }
+
+    /// Client ids holding exactly `n` exact subscriptions and no patterns.
+    ///
+    /// Test-private twin of `clients_with_exact_subs` in
+    /// `buzz-pubsub/src/community_topics.rs`; duplicated rather than exported
+    /// because a `pub` cross-crate seam whose only consumer is one test is
+    /// production API invented for coverage. `psub=0` is also the standing proof
+    /// that this subscriber holds no wildcard — the command ElastiCache
+    /// Serverless rejects.
+    async fn clients_with_exact_subs(
+        conn: &mut redis::aio::MultiplexedConnection,
+        n: usize,
+    ) -> HashSet<i64> {
+        let list: String = redis::cmd("CLIENT")
+            .arg("LIST")
+            .query_async(conn)
+            .await
+            .expect("CLIENT LIST");
+        list.lines()
+            .filter(|line| line.contains(" psub=0 ") && line.contains(&format!(" sub={n} ")))
+            .filter_map(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("id="))
+                    .and_then(|id| id.parse().ok())
+            })
+            .collect()
+    }
+
+    /// Polls `cond` until it holds or `within` elapses. Every wait here is on an
+    /// observable state change rather than a guessed sleep: a fixed sleep either
+    /// flakes under load or passes vacuously when the thing it waited for never
+    /// happened.
+    ///
+    /// The bound is a parameter because one of the waits below is a
+    /// *discriminator*, not just a convergence check — see the sever step.
+    async fn wait_for(cond: impl Fn() -> bool, within: Duration, what: &str) {
+        let deadline = Instant::now() + within;
+        loop {
+            if cond() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {within:?} waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The composed invariant this whole lane exists to protect: while a
+    /// community's invalidation topic is not established, this pod must not
+    /// cache an authorization decision under it — and it must resume caching on
+    /// its own once the topic comes back.
+    ///
+    /// Each half is unit-tested above against `insert_established_for_test`.
+    /// Neither half proves the property, because the dangerous state is not
+    /// "the bit is false", it is "the bit is false *because the connection is
+    /// gone*, and a caller is resolving authorization right now". So this drill
+    /// composes them against live Redis:
+    ///
+    /// 1. **Bootstrap** — the first admission is refused yet still records
+    ///    residency, so the community becomes desired and gets subscribed. A
+    ///    gate that recorded only on success would leave the caches off for the
+    ///    life of the pod, and would pass every isolated test.
+    /// 2. **Open gate** — once acked, the entry lands, and a real published
+    ///    invalidation really arrives. Establishment bookkeeping is not evidence
+    ///    that a channel routes.
+    /// 3. **Sever** — `CLIENT KILL ID` on this subscriber's own connection. A
+    ///    real server-side disconnect, so the reconnect path runs for the reason
+    ///    it runs in production, not because a test injected an error.
+    /// 4. **Suppression** — during the gap the admission is refused and the
+    ///    insert does not run. This is the silent-stale-authz hole: an entry
+    ///    admitted here would stay readable for a full TTL with nothing able to
+    ///    drop it, and no error anywhere. Degraded (read through to the DB) is
+    ///    the correct outcome; stale is not.
+    /// 5. **Resume** — recovery is driven only by residency and the reconciler's
+    ///    own tick. Nothing in this test republishes, re-registers, or pokes the
+    ///    subscriber, because any cleared state that needs an external event to
+    ///    come back is a pod that never caches again.
+    #[tokio::test]
+    #[ignore = "requires Redis"]
+    async fn a_severed_invalidation_topic_suppresses_caching_until_it_is_rebuilt() {
+        // Fresh ids per run: this drill shares one Redis with the rest of the
+        // suite, and a fixed community would let another run's traffic bleed in.
+        let communities: Vec<CommunityId> = (0..DRILL_COMMUNITIES)
+            .map(|_| CommunityId::from_uuid(Uuid::new_v4()))
+            .collect();
+        let gated = communities[0];
+
+        let mut conn = control_conn().await;
+        let before = clients_with_exact_subs(&mut conn, DRILL_COMMUNITIES).await;
+
+        // Exactly the objects main.rs wires together for the real relay: the
+        // production `PubSubManager`, its own cache-invalidation topics, and a
+        // `CacheResidency` over them at the production TTL.
+        let pool = deadpool_redis::Config::from_url(test_redis_url())
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            PubSubManager::new(&test_redis_url(), pool)
+                .await
+                .expect("pubsub manager"),
+        );
+        let topics = Arc::clone(pubsub.cache_invalidation_topics());
+        let residency = Arc::new(CacheResidency::new(Arc::clone(&topics), AUTHZ_CACHE_TTL));
+        let mut invalidations = pubsub.subscribe_cache_invalidations();
+
+        // Step 1: bootstrap. Refused, but residency-forming.
+        let inserts = Arc::new(AtomicU64::new(0));
+        for community in &communities {
+            let counter = Arc::clone(&inserts);
+            assert!(
+                !residency.admit_and_insert(*community, move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }),
+                "nothing is cacheable before Redis acks the invalidation channel"
+            );
+        }
+        assert_eq!(
+            inserts.load(Ordering::SeqCst),
+            0,
+            "a refused admission must not run its insert"
+        );
+
+        // The production closure from main.rs: residency read live, never
+        // snapshotted, so the subscriber is level-triggered off it.
+        let residency_for_closure = Arc::clone(&residency);
+        let desired: DesiredCommunities =
+            Arc::new(move || residency_for_closure.resident_communities());
+        let pubsub_for_cache = Arc::clone(&pubsub);
+        tokio::spawn(async move {
+            pubsub_for_cache
+                .run_cache_invalidation_subscriber(desired)
+                .await
+        });
+
+        let all_established = {
+            let topics = Arc::clone(&topics);
+            let communities = communities.clone();
+            move || communities.iter().all(|c| topics.is_established(*c))
+        };
+        wait_for(
+            &all_established,
+            Duration::from_secs(15),
+            "the drill's exact subscriptions to be acked",
+        )
+        .await;
+
+        // Step 2: the gate is open, so the entry lands.
+        let counter = Arc::clone(&inserts);
+        assert!(
+            residency.admit_and_insert(gated, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            "an acked community must be admitted"
+        );
+        assert_eq!(
+            inserts.load(Ordering::SeqCst),
+            1,
+            "an admitted community must actually get its entry inserted"
+        );
+
+        // ...and the channel it was admitted against really routes.
+        let ctx = TenantContext::resolved(gated, "drill.example");
+        let sent = CacheInvalidation::Membership {
+            channel_id: Uuid::new_v4(),
+            pubkey: vec![0x7a; 32],
+        };
+        pubsub
+            .publish_cache_invalidation(&ctx, &sent)
+            .await
+            .expect("publish before the sever");
+        let received = tokio::time::timeout(Duration::from_secs(5), invalidations.recv())
+            .await
+            .expect("timed out waiting for the pre-sever invalidation")
+            .expect("broadcast closed");
+        assert_eq!(received.community_id, gated);
+        assert_eq!(received.invalidation, sent);
+
+        // Step 3: sever ONLY this subscriber, by id. `CLIENT KILL TYPE pubsub`
+        // would also kill every other pub/sub client on the server — a
+        // concurrent test, or an unrelated process sharing the dev Redis.
+        let after = clients_with_exact_subs(&mut conn, DRILL_COMMUNITIES).await;
+        let ours: Vec<i64> = after.difference(&before).copied().collect();
+        assert_eq!(
+            ours.len(),
+            1,
+            "expected exactly one new {DRILL_COMMUNITIES}-subscription client to be ours, got {ours:?}"
+        );
+        let killed: i64 = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(ours[0])
+            .query_async(&mut conn)
+            .await
+            .expect("CLIENT KILL ID");
+        assert_eq!(killed, 1, "expected to sever exactly our own subscriber");
+
+        // Step 4: the suppression. The sever must be observable as lost
+        // establishment first — a gap that reads "established" is the hole.
+        //
+        // The bound here is the discriminator, and it is deliberately far below
+        // the reconnect backoff (`BACKOFF_INITIAL_SECS` = 1s). `connect_and_serve`
+        // *also* clears establishment on its next connect, so a generous timeout
+        // would be satisfied by that later clear and would pass even if the
+        // reconnect-gap clear were deleted — the assertion would hold for the
+        // wrong reason. Requiring the gate to close within 500ms of the sever
+        // can only be met by the clear that runs when the connection drops, which
+        // is the one that protects the gap.
+        let gate_closed = {
+            let topics = Arc::clone(&topics);
+            move || !topics.is_established(gated)
+        };
+        wait_for(
+            &gate_closed,
+            Duration::from_millis(500),
+            "the sever itself to close the cache gate, before any reconnect could",
+        )
+        .await;
+
+        let before_gap = inserts.load(Ordering::SeqCst);
+        let counter = Arc::clone(&inserts);
+        assert!(
+            !residency.admit_and_insert(gated, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            "a community whose invalidation topic is severed must not be cacheable: \
+             an entry admitted here stays readable for a full TTL with nothing able \
+             to drop it, and nothing anywhere reports an error"
+        );
+        assert_eq!(
+            inserts.load(Ordering::SeqCst),
+            before_gap,
+            "the suppressed admission must not have run its insert"
+        );
+
+        // Step 5: resume, driven only by residency and the reconciler's tick.
+        //
+        // Only `gated` is asserted back, and that is the correct claim rather
+        // than a weaker one: the suppressed admission above re-stamped *its*
+        // residency, so `gated` is still desired. The other six were last
+        // touched at bootstrap, so they age out after `AUTHZ_CACHE_TTL` and the
+        // level-triggered reconciler is right not to re-subscribe them. Waiting
+        // on all seven here would assert a property the design deliberately does
+        // not have, and would pass or fail on whether reconnect beat a 10s TTL.
+        let gate_open = {
+            let topics = Arc::clone(&topics);
+            move || topics.is_established(gated)
+        };
+        wait_for(
+            &gate_open,
+            Duration::from_secs(15),
+            "the reconnected subscriber to rebuild the still-resident subscription",
+        )
+        .await;
+
+        let counter = Arc::clone(&inserts);
+        assert!(
+            residency.admit_and_insert(gated, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            "caching must resume once the invalidation topic is re-established"
+        );
+        assert_eq!(
+            inserts.load(Ordering::SeqCst),
+            before_gap + 1,
+            "the resumed admission must run its insert"
+        );
+
+        // And the rebuilt subscription carries traffic. Re-establishment
+        // bookkeeping is not evidence that Redis will deliver again.
+        let resumed = CacheInvalidation::Membership {
+            channel_id: Uuid::new_v4(),
+            pubkey: vec![0x8b; 32],
+        };
+        pubsub
+            .publish_cache_invalidation(&ctx, &resumed)
+            .await
+            .expect("publish after the rebuild");
+        let received = tokio::time::timeout(Duration::from_secs(5), invalidations.recv())
+            .await
+            .expect("timed out waiting for the post-rebuild invalidation")
+            .expect("broadcast closed");
+        assert_eq!(received.community_id, gated);
+        assert_eq!(
+            received.invalidation, resumed,
+            "the rebuilt subscription must deliver, not just report itself acked"
+        );
+    }
+}

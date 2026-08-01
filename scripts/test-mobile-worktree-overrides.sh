@@ -171,36 +171,104 @@ else
   pass "Runner omits the invalid App Attest entitlement key"
 fi
 signing_map=$(awk '
-  NR == FNR {
+  FNR == 1 { pass++ }
+
+  # Pass 1 indexes xcconfig paths and follows each PBXNativeTarget to its
+  # actual configuration-list object. Target names come from object fields,
+  # not presentation comments.
+  pass == 1 {
     if (/isa = PBXFileReference/ && /\.xcconfig/) {
-      xcconfig_path = $0
-      sub(/^.*path = /, "", xcconfig_path)
-      sub(/;.*$/, "", xcconfig_path)
+      declaration = $0
+      if (match(declaration, /= \{isa = PBXFileReference;/)) {
+        declaration = substr(declaration, RSTART + RLENGTH)
+      } else {
+        declaration = ""
+      }
+      sub(/\}.*/, "", declaration)
+      xcconfig_path = "MISSING_PATH"
+      if (match(declaration, /(^|;)[[:space:]]*path = [^;]+/)) {
+        xcconfig_path = substr(declaration, RSTART, RLENGTH)
+        sub(/^;?[[:space:]]*path = /, "", xcconfig_path)
+        gsub(/"/, "", xcconfig_path)
+      }
       xcconfig_paths[$1] = xcconfig_path
+    }
+
+    if (/\/\* Begin PBXNativeTarget section \*\//) {
+      in_native_targets = 1
       next
     }
-    if (/Build configuration list for PBXNativeTarget "/) {
-      split($0, fields, "\"")
-      target = fields[2]
-      in_target_list = 1
+    if (/\/\* End PBXNativeTarget section \*\//) {
+      in_native_targets = 0
       next
     }
-    if (in_target_list && /buildConfigurations = \(/) {
-      in_configurations = 1
+    if (!in_native_targets) next
+
+    if (/^\t\t[^[:space:]]+ .* = \{$/) {
+      native_target_id = $1
+      native_target_name = ""
+      native_target_list = ""
       next
     }
-    if (in_configurations && /\);/) {
-      in_configurations = 0
-      in_target_list = 0
+    if (native_target_id != "" && /^\t\t\tname = /) {
+      native_target_name = $0
+      sub(/^.*= */, "", native_target_name)
+      sub(/;.*/, "", native_target_name)
+      gsub(/"/, "", native_target_name)
       next
     }
-    if (in_configurations && /\/\* (Debug|Release|Profile) \*\//) {
-      if ($1 in targets) targets[$1] = "DUPLICATE:" targets[$1] "+" target
-      else targets[$1] = target
+    if (native_target_id != "" && /^\t\t\tbuildConfigurationList = /) {
+      native_target_list = $3
+      next
+    }
+    if (native_target_id != "" && /^\t\t\};/) {
+      if (native_target_list != "") {
+        if (native_target_name == "") native_target_name = "UNNAMED:" native_target_id
+        if (native_target_list in list_owners) {
+          list_owners[native_target_list] = "DUPLICATE:" list_owners[native_target_list] "+" native_target_name
+        } else {
+          list_owners[native_target_list] = native_target_name
+        }
+      }
+      native_target_id = ""
     }
     next
   }
 
+  # Pass 2 maps build-configuration object IDs through only those lists that
+  # real native targets own. PBXProject and other unowned lists are ignored.
+  pass == 2 {
+    if (/\/\* Begin XCConfigurationList section \*\//) {
+      in_configuration_lists = 1
+      next
+    }
+    if (/\/\* End XCConfigurationList section \*\//) {
+      in_configuration_lists = 0
+      next
+    }
+    if (!in_configuration_lists) next
+
+    if (/^\t\t[^[:space:]]+ .* = \{$/) {
+      configuration_list_id = $1
+      configuration_list_owner = configuration_list_id in list_owners ? list_owners[configuration_list_id] : ""
+      next
+    }
+    if (/buildConfigurations = \(/) {
+      in_list_configurations = 1
+      next
+    }
+    if (in_list_configurations && /\);/) {
+      in_list_configurations = 0
+      next
+    }
+    if (in_list_configurations && $1 ~ /^[[:alnum:]]+$/ && configuration_list_owner != "") {
+      if ($1 in targets) targets[$1] = "DUPLICATE:" targets[$1] "+" configuration_list_owner
+      else targets[$1] = configuration_list_owner
+    }
+    next
+  }
+
+  # Pass 3 emits one row for each team-bearing build configuration.
   !in_build_configuration && /\/\* (Debug|Release|Profile) \*\/ = \{/ {
     in_build_configuration = 1
     configuration_id = $1
@@ -235,7 +303,7 @@ signing_map=$(awk '
       in_build_configuration = 0
     }
   }
-' "$pbxproj" "$pbxproj" | sort)
+' "$pbxproj" "$pbxproj" "$pbxproj" | sort)
 expected_signing_map=$(printf '%s\n' \
   'NotificationService Debug Flutter/Debug.xcconfig JMTDPW9CG3 NotificationService/NotificationService.entitlements' \
   'NotificationService Profile Flutter/Release.xcconfig EYF346PHUG NotificationService/NotificationService.entitlements' \

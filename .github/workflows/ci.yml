@@ -73,6 +73,7 @@ jobs:
               - 'scripts/test-mobile-release-contract.sh'
               - 'scripts/test-mobile-release-candidate-publisher.sh'
               - 'scripts/test-mobile-worktree-overrides.sh'
+              - 'scripts/test-ios-pbxproj-semantics.py'
               - '.github/workflows/mobile-release-candidate.yml'
               - '.github/workflows/ci.yml'
       - name: Release workflow source contract
@@ -873,6 +874,8 @@ jobs:
         run: swift build --package-path mobile/ios/BuzzPushKit
       - name: Test
         run: swift test --package-path mobile/ios/BuzzPushKit
+      - name: Validate iOS project semantics
+        run: python3 scripts/test-ios-pbxproj-semantics.py
 
   security:
     name: Security

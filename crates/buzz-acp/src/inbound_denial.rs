@@ -123,17 +123,20 @@ impl DenialLimiter {
         }
     }
 
-    /// Return whether both limits currently permit a denial, without changing
-    /// limiter state.
+    /// Return whether both rate limits and both bookkeeping capacities permit a
+    /// denial, without changing limiter state. A new key is denied while its
+    /// map is full. This keeps existing cooldowns and channel caps intact until
+    /// normal window pruning frees capacity.
     #[must_use]
     pub(crate) fn allows(&mut self, channel_id: Uuid, author: &str) -> bool {
         self.allows_at(channel_id, author, Instant::now())
     }
 
-    /// Record a denial after [`Self::allows`] returned `true` and the pure
-    /// classifier selected `DropAndDeny`.
+    /// Attempt to record a denial after the pure classifier selected
+    /// `DropAndDeny`. Capacity is rechecked so an unexpected state change fails
+    /// closed rather than overrunning a bookkeeping map.
     pub(crate) fn record(&mut self, channel_id: Uuid, author: &str) {
-        self.record_at(channel_id, author, Instant::now());
+        let _ = self.try_record_at(channel_id, author, Instant::now());
     }
 
     fn prune(&mut self, now: Instant) {
@@ -153,42 +156,33 @@ impl DenialLimiter {
     fn allows_at(&mut self, channel_id: Uuid, author: &str, now: Instant) -> bool {
         self.prune(now);
         let author_key = (channel_id, author.to_string());
-        !self.by_author.contains_key(&author_key)
-            && self
-                .by_channel
-                .get(&channel_id)
-                .is_none_or(|sent_at| sent_at.len() < DENIALS_PER_CHANNEL_PER_WINDOW)
+        let author_allowed = !self.by_author.contains_key(&author_key)
+            && self.by_author.len() < MAX_TRACKED_DENIAL_KEYS;
+        let channel_allowed = self
+            .by_channel
+            .get(&channel_id)
+            .is_some_and(|sent_at| sent_at.len() < DENIALS_PER_CHANNEL_PER_WINDOW)
+            || (!self.by_channel.contains_key(&channel_id)
+                && self.by_channel.len() < MAX_TRACKED_DENIAL_KEYS);
+        author_allowed && channel_allowed
     }
 
-    fn record_at(&mut self, channel_id: Uuid, author: &str, now: Instant) {
-        self.prune(now);
+    fn try_record_at(&mut self, channel_id: Uuid, author: &str, now: Instant) -> bool {
+        if !self.allows_at(channel_id, author, now) {
+            return false;
+        }
         let author_key = (channel_id, author.to_string());
-
-        // Match OwnerCache's simple bounded-map policy. The channel map keeps
-        // its own cap when a many-author burst clears the author map.
-        if self.by_author.len() >= MAX_TRACKED_DENIAL_KEYS {
-            self.by_author.clear();
-        }
-        if !self.by_channel.contains_key(&channel_id)
-            && self.by_channel.len() >= MAX_TRACKED_DENIAL_KEYS
-        {
-            self.by_channel.clear();
-        }
-
         self.by_author.insert(author_key, now);
         self.by_channel
             .entry(channel_id)
             .or_default()
             .push_back(now);
+        true
     }
 
     #[cfg(test)]
     fn try_acquire_at(&mut self, channel_id: Uuid, author: &str, now: Instant) -> bool {
-        if !self.allows_at(channel_id, author, now) {
-            return false;
-        }
-        self.record_at(channel_id, author, now);
-        true
+        self.try_record_at(channel_id, author, now)
     }
 }
 
@@ -315,6 +309,74 @@ mod tests {
             "a fourth distinct author must still be blocked by the per-channel cap"
         );
         assert!(limiter.try_acquire_at(channel_id, "four", started + DENIAL_WINDOW));
+    }
+
+    #[test]
+    fn channel_capacity_never_repeals_an_existing_channel_cap() {
+        let victim = Uuid::new_v4();
+        let started = Instant::now();
+        let mut limiter = DenialLimiter::new();
+
+        limiter.by_channel.insert(
+            victim,
+            VecDeque::from(vec![started; DENIALS_PER_CHANNEL_PER_WINDOW]),
+        );
+        for filler_index in 0..(MAX_TRACKED_DENIAL_KEYS - 1) {
+            limiter.by_channel.insert(
+                Uuid::from_u128(filler_index as u128 + 1),
+                VecDeque::from([started]),
+            );
+        }
+        assert_eq!(limiter.by_channel.len(), MAX_TRACKED_DENIAL_KEYS);
+
+        let overflow_channel = Uuid::from_u128(MAX_TRACKED_DENIAL_KEYS as u128 + 1);
+        assert!(
+            !limiter.try_acquire_at(overflow_channel, "overflow-author", started),
+            "a channel beyond bookkeeping capacity must fail closed"
+        );
+        for attempt in 0..64 {
+            assert!(
+                !limiter.try_acquire_at(victim, &format!("retry-{attempt}"), started),
+                "the victim channel cap must survive the capacity boundary"
+            );
+        }
+        assert_eq!(limiter.by_channel.len(), MAX_TRACKED_DENIAL_KEYS);
+        assert_eq!(
+            limiter.by_channel.get(&victim).map(VecDeque::len),
+            Some(DENIALS_PER_CHANNEL_PER_WINDOW)
+        );
+    }
+
+    #[test]
+    fn full_author_map_fails_closed_without_erasing_existing_cooldowns() {
+        let started = Instant::now();
+        let mut limiter = DenialLimiter::new();
+
+        for index in 0..MAX_TRACKED_DENIAL_KEYS {
+            limiter.by_author.insert(
+                (
+                    Uuid::from_u128(index as u128 + 1),
+                    format!("author-{index}"),
+                ),
+                started,
+            );
+        }
+        let existing_key = limiter.by_author.keys().next().cloned().unwrap();
+        let new_channel = Uuid::new_v4();
+
+        assert!(!limiter.allows_at(new_channel, "new-author", started));
+        assert!(!limiter.try_acquire_at(new_channel, "new-author", started));
+        assert_eq!(limiter.by_author.len(), MAX_TRACKED_DENIAL_KEYS);
+        assert!(limiter.by_author.contains_key(&existing_key));
+    }
+
+    #[test]
+    fn nobody_mode_suppresses_denial_for_an_otherwise_qualifying_message() {
+        let event = signed_event(&Keys::generate(), 9, "@agent please answer", vec![]);
+        assert!(
+            !event_allows_denial(&event, 9, false),
+            "respond-to=nobody must stay silent"
+        );
     }
 
     #[tokio::test]

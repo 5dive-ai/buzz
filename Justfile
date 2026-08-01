@@ -200,7 +200,7 @@ desktop-tauri-check: _ensure-sidecar-stubs
 
 # Run desktop Tauri Rust unit tests
 desktop-tauri-test: _ensure-sidecar-stubs
-    cd desktop/src-tauri && cargo test
+    cd desktop/src-tauri && cargo test --workspace
 
 # Verify compiled-flag behavior under both compile states (clean + internal).
 # Runs the observer_archive focused test twice with independently supplied

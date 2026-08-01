@@ -171,25 +171,24 @@ export async function createFencedSubscription(
   };
   if (deps.connectionGeneration() !== generation) return lapseAndReturn();
   deps.subscriptions.set(subId, fencedSub);
-  try {
-    await deps.sendReq(subId, filter);
-  } catch {
-    return lapseAndReturn();
-  }
-  if (deps.connectionGeneration() !== generation || fencedSub.lapsed)
-    return lapseAndReturn();
 
   // ── Establishment timeout ───────────────────────────────────────────────
+  // Install the timeout and wrapped resolver BEFORE sending REQ so that EOSE
+  // delivered synchronously during sendReq() (e.g. from a fake or fast relay)
+  // cancels the timer correctly and never lapses an already-established fence.
+  //
   // A relay that stays alive but never delivers this subscription's EOSE must
   // not hang initialize() forever.  The timeout lapses the fence exactly like
   // a CLOSED or reconnect — it NEVER counts as establishment.
   const timeoutMs =
     deps.establishmentTimeoutMs ?? FENCED_ESTABLISHMENT_TIMEOUT_MS;
   let establishmentTimer: ReturnType<typeof setTimeout> | null = null;
+  let alreadyEstablished = false;
 
   // Wrap resolveEstablished so the timer is cancelled on normal EOSE.
   const originalResolve = fencedSub.resolveEstablished;
   fencedSub.resolveEstablished = () => {
+    alreadyEstablished = true;
     if (establishmentTimer !== null) {
       clearTimeout(establishmentTimer);
       establishmentTimer = null;
@@ -201,13 +200,25 @@ export async function createFencedSubscription(
 
   establishmentTimer = setTimeout(() => {
     establishmentTimer = null;
-    // Only lapse if the fence hasn't already been resolved (EOSE or prior lapse).
-    if (!fencedSub.lapsed && deps.subscriptions.get(subId) === fencedSub) {
+    // Only lapse if EOSE has not already established the fence.
+    if (
+      !alreadyEstablished &&
+      !fencedSub.lapsed &&
+      deps.subscriptions.get(subId) === fencedSub
+    ) {
       fencedSub.lapsed = true;
       fencedSub.resolveEstablished();
       deps.subscriptions.delete(subId);
     }
   }, timeoutMs);
+
+  try {
+    await deps.sendReq(subId, filter);
+  } catch {
+    return lapseAndReturn();
+  }
+  if (deps.connectionGeneration() !== generation || fencedSub.lapsed)
+    return lapseAndReturn();
 
   return buildFenceHandle(fencedSub, established, async () => {
     if (establishmentTimer !== null) {

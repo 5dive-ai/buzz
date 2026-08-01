@@ -258,6 +258,11 @@ export function writeStoredReadState(
     JSON.stringify(overrideState),
   );
 
+  // If the commit-point write failed, return immediately — do NOT write any
+  // ancillary keys.  The caller will roll back all in-memory and slot state.
+  // "v2 false ⇒ nothing durable anywhere" is the contract.
+  if (!ok4) return false;
+
   // Ancillary writes: frontier cache, publishable set, source timestamps.
   // Best-effort — failures do not fail the action.
   setLocalStorageItemWithRecovery(

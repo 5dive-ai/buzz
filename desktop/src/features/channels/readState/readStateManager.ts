@@ -413,8 +413,7 @@ export class ReadStateManager {
       canonicalChanged: false,
     };
 
-    // Snapshot canonical forms before frontier merge: a frontier advance alone
-    // can flip live→tombstone without touching (S,C,B).
+    // Snapshot canonical forms before frontier merge (a frontier advance can flip live→tombstone).
     const prevCanonicalByCtx = new Map<string, string>();
     for (const rawCtx of merged.frontiers.keys()) {
       const reg = this.overrideRegisters.get(rawCtx);
@@ -440,7 +439,6 @@ export class ReadStateManager {
       }
     }
 
-    // Check whether any frontier advance changed a register's canonical form.
     for (const [rawCtx, prevCanon] of prevCanonicalByCtx) {
       const reg = this.overrideRegisters.get(rawCtx);
       if (reg !== undefined) {
@@ -830,10 +828,8 @@ export class ReadStateManager {
     const wasPublishable = this.publishableContextIds.has(rawCtxId);
     this.overrideRegisters.set(rawCtxId, reg);
     this.publishableContextIds.add(rawCtxId);
-
     const single = this.currentContexts();
     const fits = single !== null || this.splitContextsIntoSlots() !== null;
-
     if (prev === undefined) {
       this.overrideRegisters.delete(rawCtxId);
     } else {
@@ -843,13 +839,16 @@ export class ReadStateManager {
     return fits;
   }
 
-  /** Restore extra slot IDs to a previous snapshot (used on action rollback). Only writes storage when the IDs actually changed. */
+  /** Restore extra slot IDs (action rollback). If prior was empty, removes the key (absent → absent). */
   private restoreExtraSlotIds(prev: string[]): void {
     const changed =
       prev.length !== this.extraSlotIds.length ||
       prev.some((id, i) => id !== this.extraSlotIds[i]);
     this.extraSlotIds = prev;
-    if (changed) saveExtraSlotIds(this.pubkey, this.extraSlotIds);
+    if (changed)
+      prev.length === 0
+        ? localStorage.removeItem(localExtraSlotIdsKey(this.pubkey))
+        : saveExtraSlotIds(this.pubkey, this.extraSlotIds);
   }
 
   markChannelUnread(channelId: string): MarkResult {
@@ -938,6 +937,7 @@ export class ReadStateManager {
       this.overrideRegisters.set(ctx, merged);
       if (e.f > 0 && !this.effectiveState.has(ctx))
         this.effectiveState.set(ctx, e.f);
+      this.publishableContextIds.add(ctx); // v2 entry is inherently publishable
     }
     this.persistLocalState();
   }

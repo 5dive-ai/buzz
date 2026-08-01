@@ -1934,6 +1934,51 @@ test("createFencedSubscription_eoseEstablishes_notLapsed", async () => {
   await handle.unsubscribe();
 });
 
+// ── Test 14b: createFencedSubscription — EOSE during sendReq cancels timer ────
+test("createFencedSubscription_eoseDuringSend_timerCancelledAndStaysUnlapsed", async () => {
+  // Thufir's mandated EOSE-during-send witness: if EOSE is delivered while the
+  // sendReq() promise is still resolving (e.g. synchronous delivery), the
+  // establishment timer must be cancelled immediately and the fence must remain
+  // unlapsed past the original timeout window.
+  const subscriptions = new Map();
+  const timeoutMs = 12; // short so the test can observe no late lapse
+  const deps = {
+    connectionGeneration: () => 0,
+    subscriptions,
+    sendReq: async (subId) => {
+      // Synchronously fire EOSE before sendReq() returns — races the timer.
+      const sub = subscriptions.get(subId);
+      if (sub && sub.mode === "fenced") {
+        sub.resolveEstablished(); // fires EOSE handler: cancels timer, sets alreadyEstablished
+      }
+    },
+    closeSub: async () => {},
+    establishmentTimeoutMs: timeoutMs,
+  };
+  const handle = await createFencedSubscription(
+    deps,
+    { kinds: [30078], limit: 500 },
+    () => {},
+  );
+  // EOSE already fired during sendReq — established resolves with lapsed=false.
+  await handle.established;
+  assert.equal(
+    handle.lapsed,
+    false,
+    "EOSE during sendReq must establish fence with lapsed=false",
+  );
+
+  // Wait well past the timeout to confirm the timer does NOT fire and lapse
+  // an already-established fence.
+  await new Promise((r) => setTimeout(r, timeoutMs * 3));
+  assert.equal(
+    handle.lapsed,
+    false,
+    "timer must not lapse an already-established fence after EOSE-during-send",
+  );
+  await handle.unsubscribe();
+});
+
 // ── Test 15: createFencedSubscription — CLOSED lapses before EOSE ────────────
 test("createFencedSubscription_closedBeforeEose_lapses", async () => {
   // Drive the real primitive: CLOSED sets lapsed=true and resolves established.
@@ -2109,7 +2154,8 @@ test("fetchAndMerge_establishmentTimeout_setsLoadIncomplete", async () => {
 test("markChannelUnread_earlyWriteFails_v2Succeeds_outcomeAndRestartAgree", () => {
   // Thufir's mandated witness: the v2 write is the commit point. If the v2
   // write succeeds, the action succeeds regardless of ancillary write failures.
-  // A reconstructed manager must see the committed action.
+  // A reconstructed manager must see the committed action, and the context must
+  // be publishable so it reaches the relay (serialized primary not empty).
   //
   // New write order in writeStoredReadState: v2 (ok4) first, then ancillary
   // writes (ok1/ok2/ok3). Writes during manager construction: ClientId (1),
@@ -2118,12 +2164,14 @@ test("markChannelUnread_earlyWriteFails_v2Succeeds_outcomeAndRestartAgree", () =
   const throwingLS = makeLocalStorage();
   const originalSetItem = throwingLS.setItem.bind(throwingLS);
   let writeCount = 0;
+  let blockAncillary = false;
   throwingLS.setItem = (key, value) => {
     writeCount++;
-    if (writeCount > 3) throw new Error("QuotaExceededError");
+    if (blockAncillary && writeCount > 3) throw new Error("QuotaExceededError");
     originalSetItem(key, value);
   };
   globalThis.window.localStorage = throwingLS;
+
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
@@ -2132,11 +2180,16 @@ test("markChannelUnread_earlyWriteFails_v2Succeeds_outcomeAndRestartAgree", () =
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
   };
-  const mgr = new ReadStateManager("ea".repeat(32), fakeRelay);
+  const pubkey = "ea".repeat(32);
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.isLoadComplete = true;
   mgr.effectiveState.set("committed-ch", 1000);
 
+  // Enable ancillary-write failure before the mark call.
+  blockAncillary = true;
   const result = mgr.markChannelUnread("committed-ch");
+  blockAncillary = false;
+
   // Write #3 (v2) succeeded → action must succeed.
   assert.equal(
     result.success,
@@ -2145,7 +2198,7 @@ test("markChannelUnread_earlyWriteFails_v2Succeeds_outcomeAndRestartAgree", () =
   );
 
   // v2 key must contain the committed register.
-  const v2Key = `buzz.nip-rs.override-state.v2:${"ea".repeat(32)}`;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const stored = throwingLS.getItem(v2Key);
   assert.ok(stored !== null, "v2 key must be present after committed action");
   const parsed = JSON.parse(stored);
@@ -2154,14 +2207,47 @@ test("markChannelUnread_earlyWriteFails_v2Succeeds_outcomeAndRestartAgree", () =
     "v2 record must contain the committed channel register for coherent restart",
   );
 
+  // Reconstruct a real manager from the same storage — simulates restart.
+  // The v2 entry is inherently publishable so hydrateFromLocalStorage must
+  // add it to publishableContextIds without the ancillary key.
+  writeCount = 0; // reset counter so reconstruction writes go through
+  const mgr2 = new ReadStateManager(pubkey, fakeRelay);
+  mgr2.hydrateFromLocalStorage(); // simulate the init-time hydration step
+  mgr2.isLoadComplete = true;
+
+  // publishableContextIds must contain the committed context — hydration from
+  // v2 must not require the ancillary publishable key.
+  assert.ok(
+    mgr2.publishableContextIds.has("committed-ch"),
+    "reconstructed manager must mark the v2-committed context as publishable",
+  );
+
+  // currentContexts() must include the register so the committed action is
+  // serialized and can be published to the relay.
+  const contexts2 = mgr2.currentContexts();
+  assert.ok(
+    contexts2 !== null,
+    "reconstructed manager currentContexts must not be null",
+  );
+  const hasEntry = Object.keys(contexts2 ?? {}).some(
+    (k) => k.startsWith("committed-ch") || k.includes("committed-ch"),
+  );
+  assert.ok(
+    hasEntry,
+    "reconstructed manager serialized primary must include the committed register/frontier",
+  );
+
   mgr.destroy();
+  mgr2.destroy();
 });
 
 // ── Test 21: v2-write-fails → storage_failed, slot IDs unchanged ─────────────
 test("markChannelUnread_v2WriteFails_slotIdsUnchanged", () => {
   // When the v2 write (commit point) fails, the action must return storage_failed
   // AND extra slot IDs must not persist (neither in memory nor in the
-  // extra-slot-ids key).
+  // extra-slot-ids key).  Uses 700 channel contexts to force split planning
+  // (splitContextsIntoSlots allocates an extra slot), matching Thufir's exact
+  // 700-frontier witness.
   const throwingLS = makeLocalStorage();
   const originalSetItem = throwingLS.setItem.bind(throwingLS);
   let blockV2 = false;
@@ -2185,6 +2271,15 @@ test("markChannelUnread_v2WriteFails_slotIdsUnchanged", () => {
   const pubkey = "eb".repeat(32);
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.isLoadComplete = true;
+
+  // Populate 700 publishable channel contexts so the split planner is forced
+  // to allocate an extra slot (exceeds READ_STATE_MAX_PLAINTEXT_BYTES per slot).
+  for (let i = 0; i < 700; i++) {
+    const ctx = `channel-id-${String(i).padStart(5, "0")}-${"x".repeat(30)}`;
+    mgr.effectiveState.set(ctx, 1_700_000_000 + i);
+    mgr.publishableContextIds.add(ctx);
+  }
+  // Also add the target channel for the mark call.
   mgr.effectiveState.set("slot-test-ch", 1000);
 
   const prevExtraSlotIdsMem = mgr.extraSlotIds.slice();
@@ -2210,12 +2305,14 @@ test("markChannelUnread_v2WriteFails_slotIdsUnchanged", () => {
     "extraSlotIds in memory must be rolled back on v2 write failure",
   );
 
-  // Persisted slot IDs must be unchanged.
+  // Persisted slot IDs must be storage-identical to before the action —
+  // including absent-vs-present: if the key was absent before, it must still
+  // be absent (not `[]`).
   const afterExtraSlotIdsStored = throwingLS.getItem(extraSlotKey);
   assert.equal(
     afterExtraSlotIdsStored,
     prevExtraSlotIdsStored,
-    "buzz.nip-rs.extra-slot-ids must not persist on a failed v2 write",
+    "buzz.nip-rs.extra-slot-ids must be storage-identical after a failed v2 write (absent=absent, not written as [])",
   );
 
   // v2 key must not contain the failed register.

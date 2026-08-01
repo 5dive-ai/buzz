@@ -22,6 +22,7 @@ import {
   type ForcedUnreadMap,
 } from "@/features/channels/forcedUnreadStore";
 import {
+  applyMarkAllReadTransition,
   applyOverrideRead,
   applyOverrideUnread,
   persistForcedUnread,
@@ -172,6 +173,7 @@ export function useUnreadChannels(
     markChannelUnread: markChannelOverrideUnread,
     markChannelRead: markChannelOverrideRead,
     getOverrideLiveness,
+    getProjection,
   } = useReadState(pubkey, relayClient);
   const overrideApis = React.useMemo<OverrideAPIs>(
     () => ({
@@ -952,7 +954,6 @@ export function useUnreadChannels(
 
   const markAllChannelsRead = React.useCallback(() => {
     for (const channelId of unreadChannelIdsRef.current) {
-      // Frontier advance first, then C-bump; gate local clear on confirmed liveness.
       const unixSeconds =
         latestByChannelRef.current.get(channelId) ??
         getEffectiveTimestamp(channelId) ??
@@ -960,11 +961,11 @@ export function useUnreadChannels(
       if (unixSeconds !== null) {
         markContextRead(channelId, unixSeconds);
       }
-      if (applyOverrideRead(channelId, overrideApis) === "overrideCleared") {
-        delete forcedUnreadRef.current[channelId];
-        latestByChannelRef.current.delete(channelId);
-        observedUnreadEventsByChannelRef.current.delete(channelId);
-      }
+      applyMarkAllReadTransition(channelId, overrideApis, {
+        forcedUnread: forcedUnreadRef.current,
+        latestByChannel: latestByChannelRef.current,
+        observedUnreadEvents: observedUnreadEventsByChannelRef.current,
+      });
     }
     if (pubkey) {
       forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
@@ -998,10 +999,8 @@ export function useUnreadChannels(
     markAllChannelsRead,
     markChannelRead,
     markChannelUnread,
-    // Exposed so other surfaces (e.g. Home) can project per-item read state
-    // off the same NIP-RS read marker without instantiating a second
-    // ReadStateManager. readStateVersion is the invalidation signal callers
-    // should include in memo deps.
+    // Exposed for surfaces projecting per-item read state (Home) off the shared
+    // NIP-RS marker without a second ReadStateManager; readStateVersion = invalidation signal.
     getEffectiveTimestamp,
     getOwnTimestamp,
     readStateVersion,
@@ -1017,5 +1016,6 @@ export function useUnreadChannels(
     mutedRootIds: mutedRootIdsRef.current as ReadonlySet<string>,
     muteThread,
     unmuteThread,
+    getProjection,
   };
 }

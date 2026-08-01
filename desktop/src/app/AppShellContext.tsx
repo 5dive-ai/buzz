@@ -1,5 +1,6 @@
 import * as React from "react";
 import type { ContextParentResolver } from "@/features/channels/readState/readStateManager";
+import type { ReadStateProjection } from "@/features/channels/readState/readStateManager";
 import type { ThreadActivityItem } from "@/features/channels/useUnreadChannels";
 import type { FeedItemState } from "@/features/home/useFeedItemState";
 import type { FeedItem } from "@/shared/api/types";
@@ -51,6 +52,9 @@ type AppShellContextValue = {
   // that render under AppShell (channel, home, projects, pulse, agents).
   // Used by config-nudge cards to deep-link to Settings → Agents.
   onOpenSettings: ((section: SettingsSection) => void) | null;
+  // Manager projection accessor for community rail polls — re-read per poll,
+  // never cached across notification boundaries.
+  getProjection: () => ReadStateProjection | null;
 };
 
 const AppShellContext = React.createContext<AppShellContextValue>({
@@ -83,6 +87,7 @@ const AppShellContext = React.createContext<AppShellContextValue>({
     unreadSet: EMPTY_SET,
   },
   onOpenSettings: null,
+  getProjection: () => null,
 });
 
 export function AppShellProvider({

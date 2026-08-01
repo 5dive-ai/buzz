@@ -1060,3 +1060,86 @@ test("fetchCommunityUnread adversarial-2: projection with frontier deactivates r
 
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
 });
+
+test("fetchCommunityUnread adversarial-5: stale_complete_projection_yieldsTo_fresher_fetched_tombstone", async () => {
+  // CRITICAL 2 ordering fix: `loadComplete` establishes enumeration completeness,
+  // NOT temporal ordering. A complete projection with a live register
+  // (S=5,C=0,B=100,F=50) must yield to a fresher fetched tombstone (S=0,C=4,B=0)
+  // for the same channel. Without the fetchedTombstoneChannels guard, the projection
+  // overrides authoritative map (S=5,C=0,B=100) would produce hasUnread:true;
+  // with the guard, the fetched tombstone wins and the rail stays dark.
+  //
+  // Wire: fetched event has ov_c:CHANNEL_ID=4 but no ov_s: → decoded as {s:0,c:4,b:0}.
+  // fetchedTombstoneChannels includes CHANNEL_ID (s===0). Override liveness check is
+  // skipped for that channel even though authoritative (projection) has s=5.
+  const SLOT = "a".repeat(32); // valid 32-hex slot
+  const relay = relayFor([
+    // 1. member events
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["p", PUBKEY],
+        ],
+      }),
+    ],
+    // 2. metadata events
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["t", "stream"],
+        ],
+      }),
+    ],
+    // 3. visibility events
+    () => [],
+    // 4. read-state: tombstone wire format (ov_c present, ov_s absent → s=0,c=4,b=0)
+    //    Frontier F=50 is also present so the projection frontier is not strictly
+    //    newer — only the tombstone vs live-register ordering is under test.
+    () => [
+      event({
+        pubkey: PUBKEY,
+        created_at: 400,
+        tags: [
+          ["d", `read-state:${SLOT}`],
+          ["t", "read-state"],
+        ],
+        content: JSON.stringify({
+          v: 1,
+          client_id: "client",
+          contexts: {
+            [CHANNEL_ID]: 50,
+            [`ov_c:${CHANNEL_ID}`]: 4,
+            // ov_s: intentionally absent → tombstone (s=0)
+          },
+        }),
+      }),
+    ],
+    // 5. mutes
+    () => [],
+    // 6. unread events — none
+    () => [],
+    // 7. mention events — none
+    () => [],
+  ]);
+
+  // Complete projection: live register S=5,C=0,B=100 and frontier F=50.
+  // F=50 ≤ B=100, S=5 > C=0 → isOverrideActive would return true WITHOUT the guard.
+  const overrides = new Map([[CHANNEL_ID, { s: 5, c: 0, b: 100 }]]);
+  const frontiers = new Map([[CHANNEL_ID, 50]]);
+
+  const result = await fetchCommunityUnread({
+    client: relay,
+    pubkey: PUBKEY,
+    nowSeconds: 500,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships(),
+    getProjection: () => ({ loadComplete: true, frontiers, overrides }),
+  });
+
+  // Fetched tombstone (s=0) is authoritative; projection's stale live register must not
+  // resurrect unread when the relay has confirmed a clear.
+  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+});

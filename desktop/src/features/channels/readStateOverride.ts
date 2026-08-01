@@ -13,6 +13,7 @@ import {
   forcedUnreadStore,
   type ForcedUnreadMap,
 } from "@/features/channels/forcedUnreadStore";
+import type { ObservedUnreadEvent } from "@/features/channels/unreadChannelCounts";
 
 export type { MarkResult, OverrideLiveness };
 
@@ -157,4 +158,37 @@ export function persistForcedUnread(
   forcedMap[channelId] = newTs;
   if (pubkey) forcedUnreadStore.write(pubkey, forcedMap);
   return true;
+}
+
+/**
+ * Per-channel evidence maps that `markAllChannelsRead` mutates.
+ * Extracted so the per-channel transition can be tested without the full hook.
+ */
+export type MarkAllEvidenceMaps = {
+  forcedUnread: ForcedUnreadMap;
+  latestByChannel: Map<string, number>;
+  observedUnreadEvents: Map<string, Map<string, ObservedUnreadEvent>>;
+};
+
+/**
+ * Apply the per-channel mark-all-read transition for a single channel ID.
+ *
+ * Calls `applyOverrideRead` to attempt the NIP-RS C-bump. On `overrideCleared`,
+ * removes the channel's entry from all three evidence maps. On
+ * `overrideStillActive` (refused or load incomplete), all maps are left
+ * intact — the caller must NOT wipe evidence for channels whose clear was
+ * refused. Returns the outcome for caller use.
+ */
+export function applyMarkAllReadTransition(
+  channelId: string,
+  apis: OverrideAPIs,
+  maps: MarkAllEvidenceMaps,
+): OverrideReadOutcome {
+  const outcome = applyOverrideRead(channelId, apis);
+  if (outcome === "overrideCleared") {
+    delete maps.forcedUnread[channelId];
+    maps.latestByChannel.delete(channelId);
+    maps.observedUnreadEvents.delete(channelId);
+  }
+  return outcome;
 }

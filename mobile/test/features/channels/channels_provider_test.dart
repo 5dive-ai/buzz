@@ -86,6 +86,52 @@ void main() {
     },
   );
 
+  test('paginates open-channel discovery with a composite cursor', () async {
+    final firstPage = List.generate(
+      500,
+      (index) => _meta(
+        id: '${index.toString().padLeft(8, '0')}-0000-4000-8000-000000000000',
+        name: 'channel-$index',
+        createdAt: 10,
+      ),
+    );
+    final lastPageEvent = _meta(
+      id: '99999999-9999-4999-8999-999999999999',
+      name: 'last-page',
+      createdAt: 9,
+    );
+    final session = _FakeRelaySession(
+      memberships: const [],
+      metadataPages: [
+        firstPage,
+        [lastPageEvent],
+      ],
+    );
+    final container = _buildContainer(session: session);
+    addTearDown(container.dispose);
+
+    final channels = await container.read(channelsProvider.future);
+
+    expect(channels, hasLength(501));
+    expect(
+      channels.map((channel) => channel.id),
+      contains(lastPageEvent.getTagValue('d')),
+    );
+    final discoveryFilters = session.historyFilters
+        .where(
+          (filter) =>
+              filter.kinds.length == 1 &&
+              filter.kinds.single == 39000 &&
+              !filter.tags.containsKey('#d'),
+        )
+        .toList();
+    expect(discoveryFilters, hasLength(2));
+    expect(discoveryFilters.first.until, isNull);
+    expect(discoveryFilters.first.extensions, isEmpty);
+    expect(discoveryFilters.last.until, firstPage.last.createdAt);
+    expect(discoveryFilters.last.extensions['before_id'], firstPage.last.id);
+  });
+
   test('deduplicates joined channels from open-channel discovery', () async {
     final session = _FakeRelaySession(
       memberships: [_membership(_channelA, myPk)],
@@ -488,15 +534,18 @@ ProviderContainer _buildContainer({required _FakeRelaySession session}) {
 class _FakeRelaySession extends RelaySessionNotifier {
   _FakeRelaySession({
     required this.memberships,
-    required this.metadata,
+    this.metadata = const [],
+    this.metadataPages,
     this.hiddenDmEvents = const [],
     this.membershipFailures = 0,
   });
 
   List<NostrEvent> memberships;
   List<NostrEvent> metadata;
+  final List<List<NostrEvent>>? metadataPages;
   final List<NostrEvent> hiddenDmEvents;
   int membershipFailures;
+  int _metadataPageIndex = 0;
 
   final List<NostrFilter> historyFilters = [];
   final List<NostrFilter> subscribeFilters = [];
@@ -535,7 +584,14 @@ class _FakeRelaySession extends RelaySessionNotifier {
       // rows so tests verify the provider rejects them rather than trusting the
       // fake to pre-filter them.
       final ids = filter.tags['#d']?.toSet();
-      if (ids == null) return List.of(metadata);
+      if (ids == null) {
+        final pages = metadataPages;
+        if (pages != null) {
+          if (_metadataPageIndex >= pages.length) return const [];
+          return List.of(pages[_metadataPageIndex++]);
+        }
+        return List.of(metadata);
+      }
       return metadata.where((e) => ids.contains(e.getTagValue('d'))).toList();
     }
     return const [];

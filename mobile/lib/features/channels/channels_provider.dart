@@ -160,9 +160,29 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
     // Step 3: discover relay-visible open channels without fabricating
     // membership. The relay withholds private and DM metadata from this query,
     // while the client-side checks below keep that trust boundary explicit.
-    final discoverableMetas = await session.fetchHistory(
-      const NostrFilter(kinds: [39000], limit: 500),
-    );
+    // Page with the relay's composite cursor so tied timestamps cannot skip
+    // channels and communities larger than one relay page remain complete.
+    final discoverableMetas = <NostrEvent>[];
+    {
+      int? until;
+      String? beforeId;
+      const pageSize = 500;
+      while (true) {
+        final page = await session.fetchHistory(
+          NostrFilter(
+            kinds: const [39000],
+            limit: pageSize,
+            until: until,
+            extensions: {'before_id': ?beforeId},
+          ),
+        );
+        discoverableMetas.addAll(page);
+        if (page.length < pageSize) break;
+        final last = page.last;
+        until = last.createdAt;
+        beforeId = last.id;
+      }
+    }
 
     // Merge and dedupe by `d` tag (channel id). Kind:39000 is
     // parameterized-replaceable, but stale revisions from before the relay's

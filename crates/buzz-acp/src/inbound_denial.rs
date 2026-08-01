@@ -30,7 +30,6 @@ pub(crate) enum GateOutcome {
 ///
 /// Keeping all four inputs as values makes every branch directly testable. The
 /// caller must publish only for [`GateOutcome::DropAndDeny`].
-#[must_use]
 pub(crate) fn classify_inbound(
     allowed: bool,
     mentioned: bool,
@@ -155,10 +154,10 @@ impl DenialLimiter {
         self.prune(now);
         let author_key = (channel_id, author.to_string());
         !self.by_author.contains_key(&author_key)
-            && !self
+            && self
                 .by_channel
                 .get(&channel_id)
-                .is_some_and(|sent_at| sent_at.len() >= DENIALS_PER_CHANNEL_PER_WINDOW)
+                .is_none_or(|sent_at| sent_at.len() < DENIALS_PER_CHANNEL_PER_WINDOW)
     }
 
     fn record_at(&mut self, channel_id: Uuid, author: &str, now: Instant) {

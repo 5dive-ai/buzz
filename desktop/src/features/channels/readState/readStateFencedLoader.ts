@@ -8,8 +8,8 @@
  * - ANY lapse (before EOSE, mid-enumeration, post-enumeration) forces
  *   `complete: false` regardless of query results.
  * - Descending `until` cursor with pinned-window check (NIP-RS.md:350-352).
- * - `T === 0` completes after an empty continuation at `until: 0`; if non-empty
- *   those events are collected and the load terminates incomplete (spec :352).
+ * - `T === 0` terminates complete after the pinned window is discharged —
+ *   no lower standard timestamp exists, so history is fully exhausted.
  * - Coordinate deduplicated by `d` tag (greatest `created_at`, lowest id).
  * - Returns the deduped parsed records directly so the caller can process them
  *   once for merge, metadata, conflict rotation, and `maxFetchedCreatedAt`.
@@ -122,21 +122,12 @@ export async function fencedEnumerationLoad(
     }
 
     if (T === 0) {
-      // T=0: since no event can have created_at < 0, an empty `until:0`
-      // continuation proves the enumeration is exhausted (spec :352).
-      if (fence.lapsed) break;
-      let cont: RelayEvent[];
-      try {
-        cont = await relay.fetchEvents({ ...baseFilter, until: 0 });
-      } catch {
-        break;
-      }
-      if (fence.lapsed) break;
-      if (cont.length === 0) {
-        complete = true;
-      } else {
-        for (const ev of cont) bandEvents.push(ev);
-      }
+      // T=0: the pinned window was just discharged (pinned.length < max(C,L)).
+      // No event can have created_at < 0, so the history is fully exhausted —
+      // terminate complete directly.  An `until:0` continuation would be an
+      // inclusive re-fetch of the same second-zero events and cannot prove
+      // anything additional (spec :352).
+      complete = true;
       break;
     }
 

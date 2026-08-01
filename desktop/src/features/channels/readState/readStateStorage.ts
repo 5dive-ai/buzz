@@ -240,29 +240,12 @@ export function writeStoredReadState(
     state[contextId] = new Date(timestamp * 1_000).toISOString();
   }
 
-  const ok1 = setLocalStorageItemWithRecovery(
-    localReadStateKey(pubkey),
-    JSON.stringify(state),
-  );
-  const ok2 = setLocalStorageItemWithRecovery(
-    localPublishableContextKey(pubkey),
-    JSON.stringify([...publishableContextIds].filter((id) => pruned.has(id))),
-  );
-
-  const sourceState: Record<string, number> = {};
-  for (const [contextId, createdAt] of contextSourceCreatedAt) {
-    if (pruned.has(contextId)) {
-      sourceState[contextId] = createdAt;
-    }
-  }
-  const ok3 = setLocalStorageItemWithRecovery(
-    localSourceCreatedAtKey(pubkey),
-    JSON.stringify(sourceState),
-  );
-
   // Persist override registers atomically with their frontier timestamps (v2).
   // Registers and frontiers in one JSON blob — a single write ensures they are
   // never torn: a register cannot be present without its associated frontier.
+  // This is the ACTION COMMIT POINT: if ok4 is true the action is durably
+  // committed; ancillary frontier/cache write failures (ok1-ok3) do not fail
+  // the action.  If ok4 is false, the caller must roll back ALL state.
   const overrideState: Record<
     string,
     { s: number; c: number; b: number; f: number }
@@ -275,5 +258,28 @@ export function writeStoredReadState(
     JSON.stringify(overrideState),
   );
 
-  return ok1 && ok2 && ok3 && ok4;
+  // Ancillary writes: frontier cache, publishable set, source timestamps.
+  // Best-effort — failures do not fail the action.
+  setLocalStorageItemWithRecovery(
+    localReadStateKey(pubkey),
+    JSON.stringify(state),
+  );
+  setLocalStorageItemWithRecovery(
+    localPublishableContextKey(pubkey),
+    JSON.stringify([...publishableContextIds].filter((id) => pruned.has(id))),
+  );
+
+  const sourceState: Record<string, number> = {};
+  for (const [contextId, createdAt] of contextSourceCreatedAt) {
+    if (pruned.has(contextId)) {
+      sourceState[contextId] = createdAt;
+    }
+  }
+  setLocalStorageItemWithRecovery(
+    localSourceCreatedAtKey(pubkey),
+    JSON.stringify(sourceState),
+  );
+
+  // The commit point: only the v2 override write determines action success.
+  return ok4;
 }

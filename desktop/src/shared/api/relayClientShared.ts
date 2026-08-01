@@ -121,13 +121,21 @@ export function buildFenceHandle(
 }
 
 /**
+ * Millis to wait for EOSE after the REQ is sent.  If the relay keeps the
+ * socket alive but never sends this subscription's EOSE, the fence lapses and
+ * the load concludes `complete: false`.  Reconnect / `retryLoad` owns recovery.
+ * Must NEVER count as establishment.
+ */
+export const FENCED_ESTABLISHMENT_TIMEOUT_MS = 30_000;
+
+/**
  * Core of `RelayClient.subscribeFenced()` extracted for testability.
  *
  * Registers a fenced subscription, sends REQ, and returns a `FenceHandle`
  * whose `established` resolves ONLY on EOSE — never on a fallback timer or
- * CLOSED. Any lapse (generation mismatch, send failure, `resetConnection`)
- * sets `lapsed = true` and resolves `established` so no caller suspends
- * forever.
+ * CLOSED. Any lapse (generation mismatch, send failure, `resetConnection`,
+ * or establishment timeout) sets `lapsed = true` and resolves `established`
+ * so no caller suspends forever.
  */
 export async function createFencedSubscription(
   deps: {
@@ -135,6 +143,8 @@ export async function createFencedSubscription(
     subscriptions: Map<string, RelaySubscription>;
     sendReq: (subId: string, filter: RelaySubscriptionFilter) => Promise<void>;
     closeSub: (subId: string) => Promise<void>;
+    /** Override the establishment timeout (ms). Defaults to FENCED_ESTABLISHMENT_TIMEOUT_MS. */
+    establishmentTimeoutMs?: number;
   },
   filter: RelaySubscriptionFilter,
   onEvent: (event: RelayEvent) => void,
@@ -168,7 +178,42 @@ export async function createFencedSubscription(
   }
   if (deps.connectionGeneration() !== generation || fencedSub.lapsed)
     return lapseAndReturn();
+
+  // ── Establishment timeout ───────────────────────────────────────────────
+  // A relay that stays alive but never delivers this subscription's EOSE must
+  // not hang initialize() forever.  The timeout lapses the fence exactly like
+  // a CLOSED or reconnect — it NEVER counts as establishment.
+  const timeoutMs =
+    deps.establishmentTimeoutMs ?? FENCED_ESTABLISHMENT_TIMEOUT_MS;
+  let establishmentTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Wrap resolveEstablished so the timer is cancelled on normal EOSE.
+  const originalResolve = fencedSub.resolveEstablished;
+  fencedSub.resolveEstablished = () => {
+    if (establishmentTimer !== null) {
+      clearTimeout(establishmentTimer);
+      establishmentTimer = null;
+    }
+    originalResolve();
+  };
+  // Also patch the closed reference so the promise resolves via the wrapper.
+  resolveEstablished = fencedSub.resolveEstablished;
+
+  establishmentTimer = setTimeout(() => {
+    establishmentTimer = null;
+    // Only lapse if the fence hasn't already been resolved (EOSE or prior lapse).
+    if (!fencedSub.lapsed && deps.subscriptions.get(subId) === fencedSub) {
+      fencedSub.lapsed = true;
+      fencedSub.resolveEstablished();
+      deps.subscriptions.delete(subId);
+    }
+  }, timeoutMs);
+
   return buildFenceHandle(fencedSub, established, async () => {
+    if (establishmentTimer !== null) {
+      clearTimeout(establishmentTimer);
+      establishmentTimer = null;
+    }
     if (deps.subscriptions.get(subId) !== fencedSub) return;
     deps.subscriptions.delete(subId);
     await deps.closeSub(subId);

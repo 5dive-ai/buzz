@@ -413,9 +413,8 @@ export class ReadStateManager {
       canonicalChanged: false,
     };
 
-    // ── Frontier merge ────────────────────────────────────────────────────
-    // Snapshot canonical forms for any register whose frontier might change:
-    // a frontier advance alone can flip live→tombstone without touching (S,C,B).
+    // Snapshot canonical forms before frontier merge: a frontier advance alone
+    // can flip live→tombstone without touching (S,C,B).
     const prevCanonicalByCtx = new Map<string, string>();
     for (const rawCtx of merged.frontiers.keys()) {
       const reg = this.overrideRegisters.get(rawCtx);
@@ -441,7 +440,7 @@ export class ReadStateManager {
       }
     }
 
-    // Check whether any frontier advance changed an affected register's canonical form.
+    // Check whether any frontier advance changed a register's canonical form.
     for (const [rawCtx, prevCanon] of prevCanonicalByCtx) {
       const reg = this.overrideRegisters.get(rawCtx);
       if (reg !== undefined) {
@@ -450,7 +449,7 @@ export class ReadStateManager {
       }
     }
 
-    // ── Override register merge — compare component-by-component ─────────
+    // ── Override register merge ───────────────────────────────────────────
     for (const [rawCtx, reg] of merged.overrides) {
       const ex = this.overrideRegisters.get(rawCtx);
       const m: OverrideRegister = ex
@@ -488,8 +487,7 @@ export class ReadStateManager {
         if (parsed.createdAt > src)
           this.contextSourceCreatedAt.set(rawCtx, parsed.createdAt);
       }
-      // Slot-conflict rotation: if our slot coordinate carries another client's
-      // client_id, rotate to a new slot ID (spec MUST NOT, NIP-RS.md:55-64,402-406).
+      // Slot-conflict rotation (spec MUST NOT, NIP-RS.md:55-64,402-406).
       if (
         parsed.dTag === `read-state:${this.slotId}` &&
         parsed.blob.client_id !== this.clientId
@@ -500,8 +498,8 @@ export class ReadStateManager {
           this.slotId,
         );
       }
-      // Own-blob metadata: union lastPublishedContexts and mark publishable.
       if (parsed.blob.client_id === this.clientId) {
+        // Own-blob: union lastPublishedContexts and mark publishable.
         const unionContexts: Record<string, number> = {
           ...this.lastPublishedContexts,
         };
@@ -778,13 +776,11 @@ export class ReadStateManager {
     }
     for (const [rawCtx, reg] of this.overrideRegisters) {
       if (!this.publishableContextIds.has(rawCtx)) continue;
-      // Use channelFrontier — same resolver as getOverrideLiveness.
       const frontier = this.channelFrontier(rawCtx);
       for (const [key, val] of Object.entries(
         encodeOverrideGroup(rawCtx, reg, frontier),
-      )) {
+      ))
         channelEntries.push([key, val]);
-      }
     }
     const allSlotIds = [this.slotId, ...this.extraSlotIds];
     const result = splitContextsIntoBudgetedSlots({
@@ -819,7 +815,7 @@ export class ReadStateManager {
     };
   }
 
-  /** Return a coherent snapshot (completeness + frontiers + overrides). UI consumes via getProjection(). */
+  /** Coherent snapshot of completeness + frontiers + overrides. Maps are live read-only views — re-read on manager notifications; clone for snapshot semantics. */
   getProjection(): ReadStateProjection {
     return {
       loadComplete: this.isLoadComplete,
@@ -828,18 +824,16 @@ export class ReadStateManager {
     };
   }
 
-  /** Pure candidate planner: trials candidate against single- and multi-slot paths. Side-effect-free. */
+  /** Candidate planner: trials candidate against single- and multi-slot paths. May mutate extraSlotIds as a side effect — caller must snapshot and restore on failure. */
   private tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean {
     const prev = this.overrideRegisters.get(rawCtxId);
     const wasPublishable = this.publishableContextIds.has(rawCtxId);
     this.overrideRegisters.set(rawCtxId, reg);
     this.publishableContextIds.add(rawCtxId);
 
-    // Try single-slot first; fall back to split planner.
     const single = this.currentContexts();
     const fits = single !== null || this.splitContextsIntoSlots() !== null;
 
-    // Restore state.
     if (prev === undefined) {
       this.overrideRegisters.delete(rawCtxId);
     } else {
@@ -847,6 +841,15 @@ export class ReadStateManager {
     }
     if (!wasPublishable) this.publishableContextIds.delete(rawCtxId);
     return fits;
+  }
+
+  /** Restore extra slot IDs to a previous snapshot (used on action rollback). Only writes storage when the IDs actually changed. */
+  private restoreExtraSlotIds(prev: string[]): void {
+    const changed =
+      prev.length !== this.extraSlotIds.length ||
+      prev.some((id, i) => id !== this.extraSlotIds[i]);
+    this.extraSlotIds = prev;
+    if (changed) saveExtraSlotIds(this.pubkey, this.extraSlotIds);
   }
 
   markChannelUnread(channelId: string): MarkResult {
@@ -863,19 +866,21 @@ export class ReadStateManager {
       c,
       b: Math.max(b, this.channelFrontier(channelId)),
     };
+    // Snapshot extraSlotIds before the probe (probe mutates it via splitContextsIntoSlots).
+    const prevExtraSlotIds = this.extraSlotIds.slice();
     if (!this.tryCandidatePlan(channelId, newReg)) {
+      this.restoreExtraSlotIds(prevExtraSlotIds);
       return { success: false, reason: "budget_exhausted" };
     }
-    // Snapshot before mutation for Contract 3 rollback.
     const prevReg = this.overrideRegisters.get(channelId);
     const wasPublishable = this.publishableContextIds.has(channelId);
     this.overrideRegisters.set(channelId, newReg);
     this.publishableContextIds.add(channelId);
     if (!this.persistLocalState()) {
-      // Rollback: restore pre-mutation state.
       if (prevReg === undefined) this.overrideRegisters.delete(channelId);
       else this.overrideRegisters.set(channelId, prevReg);
       if (!wasPublishable) this.publishableContextIds.delete(channelId);
+      this.restoreExtraSlotIds(prevExtraSlotIds);
       return { success: false, reason: "storage_failed" };
     }
     this.notifyListeners();
@@ -888,11 +893,8 @@ export class ReadStateManager {
       return { success: false, reason: "load_incomplete" };
     const reg = this.overrideRegisters.get(channelId);
     const effectiveFrontier = this.channelFrontier(channelId);
-    // No register at all — nothing to clear.
     if (!reg) return { success: false, reason: "already_inactive" };
-    // Register exists: always attempt C-bump (spec NIP-RS.md:537-539 — explicit
-    // read advances monotone frontier AND increments C; frontier-only deactivation
-    // is the success fallback when increment would overflow, not a skip condition).
+    // Always attempt C-bump (spec NIP-RS.md:537-539).
     const newC = Math.max(reg.s, reg.c) + 1;
     if (newC > 0xffffffff) return { success: false, reason: "uint32_overflow" };
     const newReg: OverrideRegister = { s: reg.s, c: newC, b: reg.b };
@@ -902,12 +904,11 @@ export class ReadStateManager {
       );
       return { success: false, reason: "already_inactive" };
     }
-    // Snapshot before mutation for Contract 3 rollback.
     const wasPublishable = this.publishableContextIds.has(channelId);
     this.overrideRegisters.set(channelId, newReg);
     this.publishableContextIds.add(channelId);
     if (!this.persistLocalState()) {
-      // Rollback: restore pre-mutation state.
+      // v2 write failed — roll back.
       this.overrideRegisters.set(channelId, reg);
       if (!wasPublishable) this.publishableContextIds.delete(channelId);
       return { success: false, reason: "storage_failed" };
@@ -941,7 +942,7 @@ export class ReadStateManager {
     this.persistLocalState();
   }
 
-  /** Persist local state. Returns false if any write failed (mark-action must fail). */
+  /** Persist local state. Returns false only if the v2 override write failed (commit point). */
   private persistLocalState(): boolean {
     const entries = new Map(
       [...this.overrideRegisters].map(([ctx, r]) => [

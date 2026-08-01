@@ -124,9 +124,11 @@ impl DenialLimiter {
     }
 
     /// Return whether both rate limits and both bookkeeping capacities permit a
-    /// denial, without changing limiter state. A new key is denied while its
-    /// map is full. This keeps existing cooldowns and channel caps intact until
-    /// normal window pruning frees capacity.
+    /// denial, without changing limiter state. Existing cooldown timestamps and
+    /// channel deques are never evicted. While either map is full, every new key
+    /// is refused, including a new author in an existing channel with room. The
+    /// ten-minute pruning window eventually removes expired state and resumes
+    /// denial service.
     #[must_use]
     pub(crate) fn allows(&mut self, channel_id: Uuid, author: &str) -> bool {
         self.allows_at(channel_id, author, Instant::now())
@@ -134,7 +136,9 @@ impl DenialLimiter {
 
     /// Attempt to record a denial after the pure classifier selected
     /// `DropAndDeny`. Capacity is rechecked so an unexpected state change fails
-    /// closed rather than overrunning a bookkeeping map.
+    /// closed rather than overrunning a bookkeeping map. The event loop has no
+    /// await between its allowance check and this call, so the recheck cannot
+    /// currently disagree before the caller publishes.
     pub(crate) fn record(&mut self, channel_id: Uuid, author: &str) {
         let _ = self.try_record_at(channel_id, author, Instant::now());
     }

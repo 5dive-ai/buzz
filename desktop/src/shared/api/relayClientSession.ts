@@ -14,7 +14,9 @@ import {
 } from "@/shared/constants/kinds";
 import {
   getTextPayload,
+  createFencedSubscription,
   type ConnectionState,
+  type FenceHandle,
   type PendingEvent,
   type RelaySubscription,
   type RelaySubscriptionFilter,
@@ -145,7 +147,10 @@ export class RelayClient {
     }
 
     for (const [subId, sub] of this.subscriptions) {
-      if (sub.mode !== "live") {
+      if (sub.mode === "fenced") {
+        sub.lapsed = true;
+        sub.resolveEstablished();
+      } else if (sub.mode !== "live") {
         window.clearTimeout(sub.timeout);
         sub.reject(error);
       } else {
@@ -413,6 +418,25 @@ export class RelayClient {
     return this.subscribe(filter, onEvent);
   }
 
+  /** @see `createFencedSubscription` in relayClientShared for contract. */
+  async subscribeFenced(
+    filter: RelaySubscriptionFilter,
+    onEvent: (event: RelayEvent) => void,
+  ): Promise<FenceHandle> {
+    await this.ensureConnected();
+    const deps = {
+      connectionGeneration: () => this.connectionGeneration,
+      subscriptions: this.subscriptions,
+      sendReq: (id: string, f: RelaySubscriptionFilter) =>
+        this.sendRawWithReconnectRetry(
+          ["REQ", id, f],
+          "Failed to establish fenced subscription.",
+        ),
+      closeSub: (id: string) => this.closeSubscription(id),
+    };
+    return createFencedSubscription(deps, filter, onEvent);
+  }
+
   async subscribeToChannelMentionEvents(
     channelId: string,
     pubkey: string,
@@ -425,10 +449,7 @@ export class RelayClient {
   }
 
   async preconnect() {
-    // Explicit re-engagement. If the session went terminal (auth rejection)
-    // the caller is asking us to try again, so clear the latch. A manual
-    // reconnect also bypasses the current delay once; ordinary operations do
-    // not, so background traffic cannot continuously defeat backoff.
+    // Re-engage after terminal state; bypasses current delay once.
     this.terminal = false;
     this.keepAliveRequested = true;
     if (this.reconnectTimeout !== null) {
@@ -459,22 +480,14 @@ export class RelayClient {
   getConnectionState(): ConnectionState {
     return this.connectionStateEmitter.get();
   }
-  /**
-   * Subscribe to connection-state transitions. The listener is invoked
-   * immediately with the current state so callers don't need a separate
-   * `getConnectionState()` call to seed their UI.
-   */
+  /** Subscribe to connection-state transitions; listener fires immediately with current state. */
   subscribeToConnectionState(listener: (state: ConnectionState) => void) {
     return this.connectionStateEmitter.subscribe(listener);
   }
 
   private async ensureConnected() {
     if (shouldRefuseConnect({ terminal: this.terminal })) {
-      // Session is terminal (e.g. relay rejected auth). Refuse to connect
-      // until an explicit re-engagement (disconnect()/preconnect()) clears
-      // the flag. Without this, the reconnect timer's catch handler — and
-      // the retry wrappers in publishEvent / sendRawWithReconnectRetry —
-      // would race the terminal "disconnected" state back to "reconnecting".
+      // Terminal after auth rejection — refuse until preconnect() re-engages.
       throw new Error("Relay session is terminal; cannot reconnect.");
     }
 
@@ -491,9 +504,7 @@ export class RelayClient {
         hasPendingReconnect: this.reconnectTimeout !== null,
       })
     ) {
-      // The reconnect coordinator owns outage pacing. Query, publish, and
-      // subscription callers must wait for its scheduled attempt instead of
-      // clearing the timer and creating an immediate reconnect storm.
+      // Reconnect coordinator owns pacing; wait rather than creating a storm.
       return this.waitForScheduledReconnect();
     }
 
@@ -633,23 +644,16 @@ export class RelayClient {
   }
 
   private async sendRaw(payload: unknown[]) {
-    if (this.wsId === null) {
-      throw new Error("Relay socket is not connected.");
-    }
-
+    if (this.wsId === null) throw new Error("Relay socket is not connected.");
     await invoke("plugin:websocket|send", {
       id: this.wsId,
-      message: {
-        type: "Text",
-        data: JSON.stringify(payload),
-      },
+      message: { type: "Text", data: JSON.stringify(payload) },
     });
   }
 
   private normalizeRelayError(error: unknown, fallbackMessage: string) {
     return error instanceof Error ? error : new Error(fallbackMessage);
   }
-
   private recoverFromSocketFailure(
     error: unknown,
     fallbackMessage: string,
@@ -670,7 +674,6 @@ export class RelayClient {
         error,
         fallbackMessage,
       );
-
       try {
         await this.ensureConnected();
         await this.sendRaw(payload);
@@ -684,11 +687,7 @@ export class RelayClient {
   }
 
   private async closeSubscription(subId: string) {
-    if (this.wsId === null) {
-      return;
-    }
-
-    await this.sendRaw(["CLOSE", subId]);
+    if (this.wsId !== null) await this.sendRaw(["CLOSE", subId]);
   }
 
   async publishEvent(
@@ -819,8 +818,7 @@ export class RelayClient {
 
     if (type === "NOTICE" && typeof rest[0] === "string") {
       const notice: string = rest[0];
-      // Relay back-pressure signal — activate the gate so pending operations
-      // back off until the window expires.
+      // Relay rate-limit notice — activate backoff gate.
       if (notice.startsWith("rate-limited:")) {
         activateRateLimit(parseRateLimitHint(notice));
       }
@@ -968,9 +966,7 @@ export class RelayClient {
       return;
     }
 
-    // Apply ±25% jitter so a fleet of clients reconnecting simultaneously
-    // spreads their AUTH storms across a 50% window instead of all hitting
-    // the relay at the same instant.
+    // Apply ±25% jitter to spread reconnect storms.
     const jitter = this.reconnectDelayMs * (0.75 + Math.random() * 0.5);
     const delay = Math.min(jitter, RECONNECT_MAX_DELAY_MS);
     this.reconnectDelayMs = Math.min(
@@ -1011,12 +1007,7 @@ export class RelayClient {
     }
   }
 
-  private resetConnection(
-    error: Error,
-    options?: {
-      reconnect?: boolean;
-    },
-  ) {
+  private resetConnection(error: Error, options?: { reconnect?: boolean }) {
     this.onMessageChannel = null;
     this.stallWatchdog.stop();
     this.connectionGeneration++;
@@ -1062,6 +1053,12 @@ export class RelayClient {
     }
 
     for (const [subId, subscription] of this.subscriptions) {
+      if (subscription.mode === "fenced") {
+        subscription.lapsed = true;
+        subscription.resolveEstablished();
+        this.subscriptions.delete(subId);
+        continue;
+      }
       if (subscription.mode !== "live") {
         window.clearTimeout(subscription.timeout);
         subscription.reject(error);

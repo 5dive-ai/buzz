@@ -9,6 +9,8 @@ import {
   trimContextsToBudget,
 } from "./readStateManager.ts";
 
+import { createFencedSubscription } from "../../../shared/api/relayClientShared.ts";
+
 // ── ReadStateManager integration helpers ─────────────────────────────────────
 // Provide browser globals required by ReadStateManager (localStorage,
 // window.setTimeout/clearTimeout). Each test that uses ReadStateManager
@@ -45,6 +47,48 @@ function makeLocalStorage() {
     get: () => globalThis.window.localStorage,
     configurable: true,
   });
+}
+
+/**
+ * Build a FenceHandle-shaped fake for use in test relay objects.
+ *
+ * @param {object} opts
+ * @param {boolean}  opts.eose      — if true, `established` resolves immediately (EOSE received).
+ * @param {boolean}  opts.lapsesAfterEose — if true, `lapsed` becomes true after established resolves.
+ * @param {boolean}  opts.lapseBeforeEose — if true, sets lapsed=true and resolves established together.
+ * @param {(ev: object) => void} [opts.captureHandler] — called with the onEvent handler so tests can deliver events.
+ */
+function makeFenceHandle({
+  eose = true,
+  lapsesAfterEose = false,
+  lapseBeforeEose = false,
+} = {}) {
+  let lapsed = lapseBeforeEose;
+  let resolveEstablished;
+  const established = new Promise((r) => {
+    resolveEstablished = r;
+  });
+
+  if (lapseBeforeEose) {
+    // Lapsed before EOSE: resolve immediately with lapsed=true.
+    resolveEstablished();
+  } else if (eose) {
+    resolveEstablished();
+    if (lapsesAfterEose) lapsed = true;
+  }
+  // If neither, `established` never resolves (hung fence — caller will lapse via reconnect).
+
+  return {
+    established,
+    get lapsed() {
+      return lapsed;
+    },
+    unsubscribe: async () => {},
+    /** For tests that need to trigger a lapse mid-enumeration. */
+    _lapse() {
+      lapsed = true;
+    },
+  };
 }
 
 const threadKey = `thread:${"a".repeat(64)}`;
@@ -528,7 +572,11 @@ test("publishSplitSlots_noopSuppression_skipsWhenUnchanged", async () => {
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
-    subscribeLive: () => () => {},
+    subscribeFenced: async (_filter, _onEvent) =>
+      makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
   };
 
   const pubkey = "b".repeat(64);
@@ -585,12 +633,18 @@ test("publishSplitSlots_noopSuppression_skipsWhenUnchanged", async () => {
 // ── NIP-RS override layer: mandatory acceptance tests ─────────────────────────
 
 // Helper: build a ReadStateManager with mocked relay and localStorage.
+// subscribeFenced returns an immediately-established fence (happy path).
+// subscribeLive is still wired for the live subscription path.
 function makeManager(pubkey = "a".repeat(64)) {
   globalThis.window.localStorage = makeLocalStorage();
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
-    subscribeLive: () => () => {},
+    subscribeFenced: async (_filter, _onEvent) =>
+      makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
   };
   return new ReadStateManager(pubkey, fakeRelay);
 }
@@ -734,8 +788,9 @@ test("splitContextsIntoBudgetedSlots_escapedFrontierKeyStaysWithItsOverrideGroup
   }
 });
 
-// ── Test 2: NIP-RS fenced enumeration — complete, continuation, pinned window,
-//    short-cap, fence-lapse witnesses ──────────────────────────────────────────
+// ── Test 2: NIP-RS fenced enumeration — EOSE, lapse, epoch-zero, retry ────────
+// All fetchAndMerge tests use subscribeFenced returning a proper FenceHandle so
+// the loader only declares complete after an EOSE-established fence.
 
 // Helper to build a minimal valid-looking relay event for the pubkey.
 function makeFakeEvent(pubkey, createdAt) {
@@ -750,19 +805,20 @@ function makeFakeEvent(pubkey, createdAt) {
   };
 }
 
+// ── 2a: empty relay + EOSE → complete ────────────────────────────────────────
 test("fetchAndMerge_emptyRelay_setsLoadComplete", async () => {
-  // A relay with no events should produce an empty first band → complete.
+  // A relay with no events + EOSE-established fence → empty first band → complete.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "a".repeat(64);
-  let subscribeCallCount = 0;
+  let subscribeFencedCallCount = 0;
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
-    subscribeLive: async (_filter, _handler) => {
-      subscribeCallCount++;
-      return () => {};
+    subscribeFenced: async (_filter, _onEvent) => {
+      subscribeFencedCallCount++;
+      return makeFenceHandle({ eose: true });
     },
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
@@ -770,41 +826,110 @@ test("fetchAndMerge_emptyRelay_setsLoadComplete", async () => {
   assert.equal(
     mgr.isLoadComplete,
     true,
-    "empty relay must produce complete load",
+    "empty relay with EOSE-established fence must produce complete load",
   );
-  // fence subscription must have been established (and then unsubscribed by fetchAndMerge).
   assert.equal(
-    subscribeCallCount,
+    subscribeFencedCallCount,
     1,
-    "fence subscription must be set up exactly once",
+    "subscribeFenced must be called exactly once for the fence",
   );
   mgr.destroy();
 });
 
+// ── 2b: lapse before EOSE → incomplete (250 ms fallback does NOT count) ───────
+test("fetchAndMerge_lapseBeforeEose_setsLoadIncomplete", async () => {
+  // The fence lapses (lapsed=true) before EOSE resolves — this is the case
+  // the old subscribeLive 250 ms fallback would have falsely treated as complete.
+  // With a proper fence, lapse before EOSE must force complete:false.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "a1".repeat(32);
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_filter, _onEvent) =>
+      makeFenceHandle({ eose: false, lapseBeforeEose: true }),
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    false,
+    "lapse before EOSE (e.g. 250 ms fallback path) must produce incomplete load",
+  );
+  mgr.destroy();
+});
+
+// ── 2c: terminal-CLOSED → lapse → incomplete ─────────────────────────────────
+test("fetchAndMerge_terminalClosed_setsLoadIncomplete", async () => {
+  // Relay sends CLOSED before EOSE: fence.lapsed=true, established resolves.
+  // CLOSED does NOT count as EOSE — load must be incomplete.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "a2".repeat(32);
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_filter, _onEvent) =>
+      makeFenceHandle({ eose: false, lapseBeforeEose: true }),
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    false,
+    "terminal CLOSED (fence lapse before EOSE) must produce incomplete load",
+  );
+  mgr.destroy();
+});
+
+// ── 2d: reconnect during post-empty barrier → lapse after tentative complete ──
+test("fetchAndMerge_lapseAfterEmptyBand_forcesIncomplete", async () => {
+  // Empty first band → loader sets complete=true tentatively; fence lapses
+  // after EOSE (simulates mid-load reconnect). Final fence.lapsed check must
+  // override and force complete:false.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "a3".repeat(32);
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_filter, _onEvent) =>
+      makeFenceHandle({ eose: true, lapsesAfterEose: true }),
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    false,
+    "lapse after tentative complete must override and force incomplete",
+  );
+  mgr.destroy();
+});
+
+// ── 2e: single event completes after pinned-window discharge ──────────────────
 test("fetchAndMerge_singleEvent_completesAfterPinnedWindowDischarge", async () => {
-  // Single event at T=1000: band delivers 1 event, C=1, L=2 → max(C,L)=2.
-  // Pinned window {since:1000, until:1000} returns 1 event → 1 < max(1,2)=2 → discharged.
+  // Single event at T=1000: band=1, C=1, L=2 → max(C,L)=2.
+  // Pinned window {since:1000, until:1000} returns 1 event → 1 < 2 → discharged.
   // Continuation {until:999} returns 0 → complete.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "b".repeat(64);
   const event = makeFakeEvent(pubkey, 1000);
   const fakeRelay = {
     fetchEvents: async (filter) => {
-      if (filter.since !== undefined && filter.until !== undefined) {
-        // Pinned window query — return the same event.
-        return [event];
-      }
-      if (filter.until !== undefined && filter.until < 1000) {
-        // Continuation below T — empty.
-        return [];
-      }
-      // Initial band.
-      return [event];
+      if (filter.since !== undefined && filter.until !== undefined)
+        return [event]; // pinned
+      if (filter.until !== undefined && filter.until < 1000) return []; // continuation
+      return [event]; // initial band
     },
     publishEvent: async () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
-    subscribeLive: async (_filter, _handler) => () => {},
+    subscribeFenced: async (_filter, _onEvent) =>
+      makeFenceHandle({ eose: true }),
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
@@ -816,11 +941,10 @@ test("fetchAndMerge_singleEvent_completesAfterPinnedWindowDischarge", async () =
   mgr.destroy();
 });
 
+// ── 2f: pinned-window-at-cap → incomplete ────────────────────────────────────
 test("fetchAndMerge_pinnedWindowAtCap_setsLoadIncomplete", async () => {
-  // Pinned window returns max(C, L) events → potentially incomplete.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "c".repeat(64);
-  // Three events all at the same second T=2000.
   const events = [
     makeFakeEvent(pubkey, 2000),
     makeFakeEvent(pubkey, 2000),
@@ -828,17 +952,14 @@ test("fetchAndMerge_pinnedWindowAtCap_setsLoadIncomplete", async () => {
   ];
   const fakeRelay = {
     fetchEvents: async (filter) => {
-      if (filter.since !== undefined && filter.until !== undefined) {
-        // Pinned window: return 3 events; C=3, max(C,L)=3 → incomplete.
-        return events;
-      }
-      // Initial band: 3 events, C=3.
+      if (filter.since !== undefined) return events; // pinned window returns cap-many
       return events;
     },
     publishEvent: async () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
-    subscribeLive: async (_filter, _handler) => () => {},
+    subscribeFenced: async (_filter, _handler) =>
+      makeFenceHandle({ eose: true }),
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
@@ -850,8 +971,52 @@ test("fetchAndMerge_pinnedWindowAtCap_setsLoadIncomplete", async () => {
   mgr.destroy();
 });
 
+// ── 2g: epoch-zero termination ───────────────────────────────────────────────
+test("fetchAndMerge_epochZero_completesAfterPinnedWindowDischarged", async () => {
+  // T=0: an event at created_at=0 → T=0. Once the pinned window is discharged,
+  // no event can have created_at < 0, so the load terminates complete directly.
+  // The loader must NOT issue an `until:0` continuation (which is inclusive
+  // and would re-fetch the same epoch-zero event, making completion unprovable).
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "a4".repeat(32);
+  const event = makeFakeEvent(pubkey, 0); // created_at=0
+  let continuationCalled = false;
+  const fakeRelay = {
+    fetchEvents: async (filter) => {
+      // Pinned window: {since:0, until:0} → 1 event, 1 < max(1,2)=2 → discharged.
+      if (filter.since !== undefined && filter.until !== undefined)
+        return [event];
+      // Any `until:0` without `since` would be the old continuation path —
+      // it must NOT be issued; flag it if it is.
+      if (filter.until === 0 && filter.since === undefined) {
+        continuationCalled = true;
+        return [event]; // a conforming relay returns the event (inclusive filter)
+      }
+      return [event]; // initial band
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_filter, _onEvent) =>
+      makeFenceHandle({ eose: true }),
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+  assert.equal(
+    mgr.isLoadComplete,
+    true,
+    "T=0 pinned-window-discharged must produce complete load directly",
+  );
+  assert.equal(
+    continuationCalled,
+    false,
+    "loader must NOT issue until:0 continuation after epoch-zero pinned-window discharge",
+  );
+  mgr.destroy();
+});
+
+// ── 2h: subscribeFenced throws → fence fails → incomplete ────────────────────
 test("fetchAndMerge_fenceFails_setsLoadIncomplete", async () => {
-  // subscribeLive throws → fence cannot be established → load is incomplete.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d".repeat(64);
   const fakeRelay = {
@@ -859,7 +1024,7 @@ test("fetchAndMerge_fenceFails_setsLoadIncomplete", async () => {
     publishEvent: async () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
-    subscribeLive: async () => {
+    subscribeFenced: async () => {
       throw new Error("connection refused");
     },
   };
@@ -868,13 +1033,13 @@ test("fetchAndMerge_fenceFails_setsLoadIncomplete", async () => {
   assert.equal(
     mgr.isLoadComplete,
     false,
-    "fence failure must produce incomplete load",
+    "subscribeFenced failure must produce incomplete load",
   );
   mgr.destroy();
 });
 
+// ── 2i: incomplete load blocks gated operations ───────────────────────────────
 test("fetchAndMerge_incompleteLoad_blocksGatedOperations", async () => {
-  // Pinned window returns ≥ max(C,L) → incomplete → four gated ops refuse.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "e".repeat(64);
   const events = [
@@ -893,6 +1058,7 @@ test("fetchAndMerge_incompleteLoad_blocksGatedOperations", async () => {
     },
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
     subscribeLive: async (_f, _h) => () => {},
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
@@ -901,23 +1067,18 @@ test("fetchAndMerge_incompleteLoad_blocksGatedOperations", async () => {
 
   assert.equal(mgr.isLoadComplete, false, "precondition: load is incomplete");
 
-  // 1. publish() must be blocked.
-  // Replace fetchOwnBlobBeforePublish to avoid second relay call.
   mgr.fetchOwnBlobBeforePublish = async () => true;
   await mgr.publish();
   assert.equal(publishCalls, 0, "publish must be blocked when load incomplete");
 
-  // 2. markChannelUnread must return load_incomplete.
   const ur = mgr.markChannelUnread("ch");
   assert.equal(ur.success, false);
   assert.equal(ur.reason, "load_incomplete");
 
-  // 3. markChannelRead must return load_incomplete.
   const rr = mgr.markChannelRead("ch");
   assert.equal(rr.success, false);
   assert.equal(rr.reason, "load_incomplete");
 
-  // 4. deleteExtraSlots must be blocked.
   mgr.extraSlotIds = ["fakeextraslot0000000000000000000"];
   await mgr.deleteExtraSlots();
   assert.equal(
@@ -929,7 +1090,67 @@ test("fetchAndMerge_incompleteLoad_blocksGatedOperations", async () => {
   mgr.destroy();
 });
 
-// ── Test 2b: retry path — a second fetchAndMerge can clear incomplete ─────────
+// ── 2j: production retry path fires on reconnect ─────────────────────────────
+test("retryLoad_firesOnReconnect_andClearsIncomplete", async () => {
+  // startLiveSubscription wires retryLoad() via subscribeToReconnects.
+  // (1) reconnect listener registered; (2) firing it re-runs fetchAndMerge.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "a5".repeat(32);
+  let reconnectCb = null;
+  let callRound = 0;
+  const fakeRelay = {
+    fetchEvents: async (filter) => {
+      callRound++;
+      if (callRound <= 3) {
+        if (filter.since !== undefined)
+          return [
+            makeFakeEvent(pubkey, 1000),
+            makeFakeEvent(pubkey, 1000),
+            makeFakeEvent(pubkey, 1000),
+          ];
+        return [
+          makeFakeEvent(pubkey, 1000),
+          makeFakeEvent(pubkey, 1000),
+          makeFakeEvent(pubkey, 1000),
+        ];
+      }
+      return [];
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: (cb) => {
+      reconnectCb = cb;
+      return () => {
+        reconnectCb = null;
+      };
+    },
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.initialize();
+  assert.equal(
+    mgr.isLoadComplete,
+    false,
+    "precondition: first load is incomplete",
+  );
+  assert.ok(
+    reconnectCb !== null,
+    "subscribeToReconnects listener must be registered",
+  );
+
+  callRound = 999;
+  reconnectCb();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(
+    mgr.isLoadComplete,
+    true,
+    "reconnect-triggered retry must clear incomplete when relay is now empty",
+  );
+  mgr.destroy();
+});
+
+// ── 2k: direct retry clears incomplete ───────────────────────────────────────
 test("fetchAndMerge_retryClears_incomplete", async () => {
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "f".repeat(64);
@@ -938,33 +1159,31 @@ test("fetchAndMerge_retryClears_incomplete", async () => {
     fetchEvents: async (filter) => {
       callRound++;
       if (callRound <= 3) {
-        // First attempt: pinned window fires at round 2, returns cap-many events.
-        if (filter.since !== undefined) {
+        if (filter.since !== undefined)
           return [
             makeFakeEvent(pubkey, 1000),
             makeFakeEvent(pubkey, 1000),
             makeFakeEvent(pubkey, 1000),
           ];
-        }
         return [
           makeFakeEvent(pubkey, 1000),
           makeFakeEvent(pubkey, 1000),
           makeFakeEvent(pubkey, 1000),
         ];
       }
-      // Retry: empty relay → complete.
       return [];
     },
     publishEvent: async () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
     subscribeLive: async (_f, _h) => () => {},
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
   assert.equal(mgr.isLoadComplete, false, "first load must be incomplete");
 
-  callRound = 999; // reset to "retry" leg
+  callRound = 999;
   await mgr.fetchAndMerge();
   assert.equal(
     mgr.isLoadComplete,
@@ -983,13 +1202,15 @@ test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
   const pubkey = "aa".repeat(32);
   const rawCtx = `live-channel-${"x".repeat(51)}`;
   const channelFrontier = 100;
-  // Build a blob where the register (S=3, C=1, B=50) is ACTIVE: S > C, S > frontier.
-  // encode: ov_s:<ctx>=3, ov_c:<ctx>=1, ov_b:<ctx>=50, <ctx>=<frontier>
+  // Build a blob where the register (S=3, C=1, B=50) is ACTIVE:
+  // isOverrideActive = S>0 && F<=B && S>C. B=50, frontier=100 → F>B → INACTIVE.
+  // Corrected: to make this active we need B >= F, e.g. B=100 with F=100 (boundary).
+  // Using B=100 so the register is genuinely active: 3>0, 100<=100, 3>1 → active.
   const blobContexts = {
     [rawCtx]: channelFrontier,
     [`ov_s:${rawCtx}`]: 3,
     [`ov_c:${rawCtx}`]: 1,
-    [`ov_b:${rawCtx}`]: 50,
+    [`ov_b:${rawCtx}`]: 100, // B=100 >= F=100 → active
   };
   const plaintext = JSON.stringify({
     v: 1,
@@ -1014,6 +1235,8 @@ test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
     publishEvent: async () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
+    subscribeFenced: async (_filter, _onEvent) =>
+      makeFenceHandle({ eose: true }),
     subscribeLive: async (_filter, handler) => {
       liveHandler = handler;
       return () => {};
@@ -1038,16 +1261,40 @@ test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
     };
 
     // Deliver via the live subscription callback (same path as relay push).
+    // Track decrypt count: each live event must decrypt exactly once.
+    let decryptCount = 0;
+    const origInvoke = globalThis.window.__TAURI_INTERNALS__.invoke;
+    globalThis.window.__TAURI_INTERNALS__.invoke = async (command, args) => {
+      if (command === "nip44_decrypt_from_self") decryptCount++;
+      return origInvoke(command, args);
+    };
     assert.ok(liveHandler !== null, "live subscription must be established");
     liveHandler(fakeEvent); // void-wrapped; wait for async completion
     await new Promise((r) => setTimeout(r, 50));
+    assert.equal(
+      decryptCount,
+      1,
+      "live event must decrypt exactly once (no double-parse)",
+    );
 
     // The override register must now reflect the ingested remote values.
     const reg = mgr.overrideRegisters.get(rawCtx);
     assert.ok(reg, "override register must exist after live delivery");
     assert.equal(reg.s, 3, "S must be 3 from live event");
     assert.equal(reg.c, 1, "C must be 1 from live event");
-    assert.equal(reg.b, 50, "B must be 50 from live event");
+    assert.equal(reg.b, 100, "B must be 100 from live event");
+
+    // Verify the register is genuinely active: isOverrideActive(S=3,C=1,B=100,F=100).
+    const livenessActive = mgr.getOverrideLiveness(rawCtx);
+    assert.ok(
+      livenessActive !== null,
+      "liveness must be available after live delivery",
+    );
+    assert.equal(
+      livenessActive.active,
+      true,
+      "register must be active (B=100 >= F=100, S>C)",
+    );
 
     // ── existing-key live clear (higher C defeating S) ───────────────────
     // A follow-up event with S=3, C=4 (C > S → inactive/tombstone).
@@ -1085,7 +1332,7 @@ test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
     const regAfterClear = mgr.overrideRegisters.get(rawCtx);
     assert.ok(regAfterClear, "register must still exist after clear event");
     // tombstone floor: only ov_c:ctx=4 is present → S=0, C=4, B=0 merged via componentwise max
-    // after merge with prior (S=3, C=1, B=50): S=3, C=4, B=50 — override_active = S <= C = inactive
+    // after merge with prior (S=3, C=1, B=100): S=3, C=4, B=100 — override_active = S <= C = inactive
     assert.equal(
       regAfterClear.c,
       4,
@@ -1121,6 +1368,7 @@ test("publish_fetchOwnBlobFails_doesNotPublish", async () => {
     },
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
     subscribeLive: async (_f, _h) => () => {},
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
@@ -1147,6 +1395,7 @@ test("overrideRegister_survivesRestartBeforeDebounce", () => {
     publishEvent: async () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
     subscribeLive: async (_f, _h) => () => {},
   };
   const mgr1 = new ReadStateManager(pubkey, fakeRelay);
@@ -1181,6 +1430,7 @@ test("overrideRegister_tombstoneFloorSurvivesRestartWithFetchFailure", async () 
     publishEvent: async () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
     subscribeLive: async (_f, _h) => () => {},
   };
   // Establish a mark-read tombstone floor: S=1, C=max(S,C)+1=2 (clear-wins → inactive).
@@ -1206,6 +1456,9 @@ test("overrideRegister_tombstoneFloorSurvivesRestartWithFetchFailure", async () 
     publishEvent: async () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
+    subscribeFenced: async () => {
+      throw new Error("network unavailable");
+    },
     subscribeLive: async () => {
       throw new Error("network unavailable");
     },
@@ -1308,7 +1561,7 @@ test("markChannelUnread_visibleRefusal_atBudgetExhaustionAndUint32Max", () => {
   mgr.destroy();
 });
 
-// ── Test 8: persistence failure fails the mark ───────────────────────────────
+// ── Test 8: persistence failure — storage_failed + rollback + coherent restart ─
 test("markChannelUnread_storageFailure_returnsStorageFailed", () => {
   // Use a throwing localStorage to simulate quota failure.
   const throwingLS = makeLocalStorage();
@@ -1324,11 +1577,18 @@ test("markChannelUnread_storageFailure_returnsStorageFailed", () => {
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
-    subscribeLive: () => () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
   };
   const mgr = new ReadStateManager("st".repeat(32), fakeRelay);
   mgr.isLoadComplete = true;
   mgr.effectiveState.set("storage-test-ch", 1000);
+
+  // Snapshot pre-mutation state for rollback verification.
+  const regBefore = mgr.overrideRegisters.get("storage-test-ch");
+  const wasPublishableBefore = mgr.publishableContextIds.has("storage-test-ch");
 
   const result = mgr.markChannelUnread("storage-test-ch");
   assert.equal(
@@ -1337,7 +1597,32 @@ test("markChannelUnread_storageFailure_returnsStorageFailed", () => {
     "markChannelUnread must fail when localStorage throws",
   );
   assert.equal(result.reason, "storage_failed");
+
+  // Contract 3 rollback: manager state must be unchanged after storage_failed.
+  const regAfter = mgr.overrideRegisters.get("storage-test-ch");
+  assert.deepEqual(
+    regAfter,
+    regBefore,
+    "overrideRegisters must be rolled back after storage failure",
+  );
+  assert.equal(
+    mgr.publishableContextIds.has("storage-test-ch"),
+    wasPublishableBefore,
+    "publishableContextIds must be rolled back after storage failure",
+  );
+
+  // Coherent restart: a new manager on the same (throwing) storage must see no
+  // orphaned register — the failed write must not have partially persisted.
+  const mgr2 = new ReadStateManager("st".repeat(32), fakeRelay);
+  mgr2.hydrateFromLocalStorage();
+  const regOnRestart = mgr2.overrideRegisters.get("storage-test-ch");
+  assert.equal(
+    regOnRestart,
+    undefined,
+    "a failed mark must not persist any register (coherent restart)",
+  );
   mgr.destroy();
+  mgr2.destroy();
 });
 
 // ── Test 9: inactive existing register still gets C-bump on markChannelRead ───
@@ -1414,30 +1699,27 @@ test("deduplicateByCoordinate_newerVersionWins_olderDropped", async () => {
 
 // ── Test 11: lapse mid-enumeration → incomplete ───────────────────────────────
 test("fetchAndMerge_lapseMidEnumeration_setsLoadIncomplete", async () => {
-  // Simulate a reconnect (generation change) after the first band is fetched.
+  // Simulate a connection lapse after the first band is fetched but before
+  // the pinned window returns. The fence.lapsed flag is set mid-enumeration.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "ef".repeat(32);
   const event = makeFakeEvent(pubkey, 1000);
-  let generation = 0;
-  let reconnectCb = null;
+
+  // Build a fence that starts unlapsed but lapses when the pinned window fires.
+  const fence = makeFenceHandle({ eose: true });
   const fakeRelay = {
     fetchEvents: async (filter) => {
       if (filter.since !== undefined) {
-        // Pinned window: simulate a reconnect BEFORE returning.
-        generation++;
-        reconnectCb?.(); // fire reconnect listener
+        // Pinned window: trigger lapse mid-enumeration.
+        fence._lapse();
         return [event];
       }
       return [event]; // initial band
     },
     publishEvent: async () => {},
-    subscribeToReconnects: (cb) => {
-      reconnectCb = cb;
-      return () => {
-        reconnectCb = null;
-      };
-    },
-    getConnectionGeneration: () => generation,
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_filter, _onEvent) => fence,
     subscribeLive: async (_f, _h) => () => {},
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
@@ -1448,4 +1730,740 @@ test("fetchAndMerge_lapseMidEnumeration_setsLoadIncomplete", async () => {
     "lapse during enumeration must produce incomplete load",
   );
   mgr.destroy();
+});
+
+// ── Test 12: foreign client_id at initial load triggers slot rotation ─────────
+test("fetchAndMerge_foreignClientId_rotatesSlotAndUpdatesMetadata", async () => {
+  // If a fetched event carries our slot coordinate but a different client_id,
+  // the manager must rotate slotId and record maxFetchedCreatedAt.
+  // Also validates read-before-write path: fetchOwnBlobBeforePublish runs the
+  // same parsed-record metadata path (Contract 2).
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "a6".repeat(32);
+
+  // Install Tauri IPC mock.
+  const slotId = "deadbeefdeadbeef0123456789abcdef"; // will be the initial slotId
+  const foreignClientId = "other-client-uuid-9999";
+  const blob = JSON.stringify({
+    v: 1,
+    client_id: foreignClientId,
+    contexts: { "ch-conflict": 500 },
+  });
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command, args) => {
+      if (command === "nip44_decrypt_from_self") {
+        if (args.ciphertext === "CONFLICT_CIPHER") return blob;
+        return JSON.stringify({
+          v: 1,
+          client_id: foreignClientId,
+          contexts: {},
+        });
+      }
+      throw new Error(`Unexpected: ${command}`);
+    },
+  };
+
+  // Build a fetched event at our slot coordinate but with foreign client_id.
+  const conflictEvent = {
+    id: "f0".repeat(32),
+    pubkey,
+    created_at: 12345,
+    kind: 30078,
+    tags: [
+      ["d", `read-state:${slotId}`],
+      ["t", "read-state"],
+    ],
+    content: "CONFLICT_CIPHER",
+    sig: "s".repeat(128),
+  };
+
+  const fakeRelay = {
+    // Respect `until` so the loader terminates: once `until` drops below the
+    // event's created_at the relay returns empty, ending the enumeration.
+    fetchEvents: async (filter) => {
+      if (filter.until !== undefined && conflictEvent.created_at > filter.until)
+        return [];
+      return [conflictEvent];
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+  };
+
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    // Pre-seed the manager's slotId to match the conflict event's d-tag.
+    mgr.slotId = slotId;
+    await mgr.fetchAndMerge();
+
+    // Slot rotation: slotId must differ from the conflicting coordinate.
+    assert.notEqual(
+      mgr.slotId,
+      slotId,
+      "slotId must rotate when fetched event carries foreign client_id at our coordinate",
+    );
+
+    // maxFetchedCreatedAt must reflect the fetched event's created_at.
+    assert.equal(
+      mgr.maxFetchedCreatedAt,
+      12345,
+      "maxFetchedCreatedAt must be updated from fetched event created_at",
+    );
+  } finally {
+    delete globalThis.window.__TAURI_INTERNALS__;
+  }
+});
+
+// ── Test 13: frontier-only advance schedules canonical convergence ─────────────
+test("ingest_frontierAdvanceFlipsRegister_schedulesCanonicalConvergence", async () => {
+  // A frontier advance that flips an override register from live→tombstone must
+  // set canonicalChanged=true and trigger schedulePublish (debounce timer set).
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "a7".repeat(32);
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.isLoadComplete = true;
+
+  // Seed an active register: S=5, C=0, B=10, F=5.
+  // isOverrideActive(S=5,C=0,B=10,F=5) = 5>0 && 5<=10 && 5>0 → active.
+  const ctx = "convergence-ch";
+  mgr.overrideRegisters.set(ctx, { s: 5, c: 0, b: 10 });
+  mgr.effectiveState.set(ctx, 5);
+  mgr.publishableContextIds.add(ctx);
+
+  // Verify it's active before the frontier advance.
+  const before = mgr.getOverrideLiveness(ctx);
+  assert.ok(before?.active, "register must be active before frontier advance");
+
+  // Deliver a frontier advance F=11 (> B=10) → register becomes dead.
+  // Simulate via a live event that carries only the frontier for this ctx.
+  // Build a minimal fake event that encodes just the frontier key.
+  const frontierBlob = JSON.stringify({
+    v: 1,
+    client_id: "peer-device",
+    contexts: { [ctx]: 11 }, // frontier advance → F=11 > B=10 → inactive
+  });
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command, _args) => {
+      if (command === "nip44_decrypt_from_self") return frontierBlob;
+      throw new Error(`Unexpected: ${command}`);
+    },
+  };
+
+  try {
+    // Fire the live subscription callback directly.
+    const fakeEvent = {
+      id: "cc".repeat(32),
+      pubkey,
+      created_at: 9999,
+      kind: 30078,
+      tags: [
+        ["d", "read-state:cc99aa00112233445566778899aabbcc"],
+        ["t", "read-state"],
+      ],
+      content: "FRONTIER_CIPHER",
+      sig: "s".repeat(128),
+    };
+
+    // Access the private handleIncomingEvent via the test helper path.
+    await mgr.handleIncomingEvent(fakeEvent);
+
+    // Register must now be inactive.
+    const after = mgr.getOverrideLiveness(ctx);
+    assert.ok(after !== null, "liveness must still be available");
+    assert.equal(
+      after.active,
+      false,
+      "frontier advance past B must flip register to inactive",
+    );
+
+    // debounceTimer must be set (schedulePublish was called for convergence).
+    assert.ok(
+      mgr.debounceTimer !== null,
+      "frontier-only canonical deactivation must schedule a convergence publish",
+    );
+  } finally {
+    delete globalThis.window.__TAURI_INTERNALS__;
+    mgr.destroy();
+  }
+});
+
+// ── Test 14: createFencedSubscription — EOSE establishes the fence ────────────
+test("createFencedSubscription_eoseEstablishes_notLapsed", async () => {
+  // Drive the real primitive: EOSE resolves established with lapsed=false.
+  const subscriptions = new Map();
+  let _capturedSubId = null;
+  let capturedFencedSub = null;
+  const deps = {
+    connectionGeneration: () => 0,
+    subscriptions,
+    sendReq: async (subId) => {
+      _capturedSubId = subId;
+      capturedFencedSub = subscriptions.get(subId);
+    },
+    closeSub: async () => {},
+    establishmentTimeoutMs: 5_000, // long enough; won't fire in test
+  };
+  const handle = await createFencedSubscription(
+    deps,
+    { kinds: [30078], limit: 500 },
+    () => {},
+  );
+  assert.ok(!handle.lapsed, "fence must not be lapsed before EOSE");
+  assert.ok(capturedFencedSub, "fenced sub must be registered");
+
+  // Simulate EOSE arriving.
+  capturedFencedSub.resolveEstablished();
+  await handle.established;
+
+  assert.equal(
+    handle.lapsed,
+    false,
+    "EOSE must establish fence with lapsed=false",
+  );
+  await handle.unsubscribe();
+});
+
+// ── Test 14b: createFencedSubscription — EOSE during sendReq cancels timer ────
+test("createFencedSubscription_eoseDuringSend_timerCancelledAndStaysUnlapsed", async () => {
+  // Thufir's mandated EOSE-during-send witness: if EOSE is delivered while the
+  // sendReq() promise is still resolving (e.g. synchronous delivery), the
+  // establishment timer must be cancelled immediately and the fence must remain
+  // unlapsed past the original timeout window.
+  const subscriptions = new Map();
+  const timeoutMs = 12; // short so the test can observe no late lapse
+  const deps = {
+    connectionGeneration: () => 0,
+    subscriptions,
+    sendReq: async (subId) => {
+      // Synchronously fire EOSE before sendReq() returns — races the timer.
+      const sub = subscriptions.get(subId);
+      if (sub && sub.mode === "fenced") {
+        sub.resolveEstablished(); // fires EOSE handler: cancels timer, sets alreadyEstablished
+      }
+    },
+    closeSub: async () => {},
+    establishmentTimeoutMs: timeoutMs,
+  };
+  const handle = await createFencedSubscription(
+    deps,
+    { kinds: [30078], limit: 500 },
+    () => {},
+  );
+  // EOSE already fired during sendReq — established resolves with lapsed=false.
+  await handle.established;
+  assert.equal(
+    handle.lapsed,
+    false,
+    "EOSE during sendReq must establish fence with lapsed=false",
+  );
+
+  // Wait well past the timeout to confirm the timer does NOT fire and lapse
+  // an already-established fence.
+  await new Promise((r) => setTimeout(r, timeoutMs * 3));
+  assert.equal(
+    handle.lapsed,
+    false,
+    "timer must not lapse an already-established fence after EOSE-during-send",
+  );
+  await handle.unsubscribe();
+});
+
+// ── Test 15: createFencedSubscription — CLOSED lapses before EOSE ────────────
+test("createFencedSubscription_closedBeforeEose_lapses", async () => {
+  // Drive the real primitive: CLOSED sets lapsed=true and resolves established.
+  const subscriptions = new Map();
+  const deps = {
+    connectionGeneration: () => 0,
+    subscriptions,
+    sendReq: async (subId) => {
+      // Simulate CLOSED immediately after REQ (before EOSE).
+      const sub = subscriptions.get(subId);
+      if (sub && sub.mode === "fenced") {
+        sub.lapsed = true;
+        sub.resolveEstablished();
+        subscriptions.delete(subId);
+      }
+    },
+    closeSub: async () => {},
+    establishmentTimeoutMs: 5_000,
+  };
+  const handle = await createFencedSubscription(
+    deps,
+    { kinds: [30078], limit: 500 },
+    () => {},
+  );
+  await handle.established;
+  assert.equal(handle.lapsed, true, "CLOSED before EOSE must set lapsed=true");
+});
+
+// ── Test 16: createFencedSubscription — resetConnection lapses all fences ─────
+test("createFencedSubscription_resetConnection_lapses", async () => {
+  // Drive the real primitive: simulated resetConnection sets lapsed on all
+  // pending fenced subscriptions and resolves their established promises.
+  const subscriptions = new Map();
+  const deps = {
+    connectionGeneration: () => 0,
+    subscriptions,
+    sendReq: async () => {}, // REQ sent; EOSE never arrives
+    closeSub: async () => {},
+    establishmentTimeoutMs: 5_000,
+  };
+  const handle = await createFencedSubscription(
+    deps,
+    { kinds: [30078], limit: 500 },
+    () => {},
+  );
+  assert.equal(handle.lapsed, false, "fence must not be lapsed before reset");
+
+  // Simulate resetConnection: mark all fenced subs as lapsed.
+  for (const [subId, sub] of subscriptions) {
+    if (sub.mode === "fenced") {
+      sub.lapsed = true;
+      sub.resolveEstablished();
+      subscriptions.delete(subId);
+    }
+  }
+
+  await handle.established;
+  assert.equal(
+    handle.lapsed,
+    true,
+    "resetConnection must set lapsed=true on pending fence",
+  );
+});
+
+// ── Test 17: createFencedSubscription — establishment timeout lapses fence ────
+test("createFencedSubscription_establishmentTimeout_lapses", async () => {
+  // A relay that keeps the socket alive but never sends EOSE must lapse the
+  // fence after the establishment timeout — never hang forever.
+  const subscriptions = new Map();
+  const deps = {
+    connectionGeneration: () => 0,
+    subscriptions,
+    sendReq: async () => {}, // REQ sent; EOSE never arrives
+    closeSub: async () => {},
+    establishmentTimeoutMs: 10, // fast for test
+  };
+  const handle = await createFencedSubscription(
+    deps,
+    { kinds: [30078], limit: 500 },
+    () => {},
+  );
+  assert.equal(
+    handle.lapsed,
+    false,
+    "fence must not be lapsed immediately after REQ",
+  );
+
+  // Wait for the timeout to fire.
+  await handle.established;
+
+  assert.equal(
+    handle.lapsed,
+    true,
+    "establishment timeout must lapse the fence",
+  );
+  assert.equal(
+    subscriptions.size,
+    0,
+    "timed-out fence must be removed from subscriptions map",
+  );
+});
+
+// ── Test 18: createFencedSubscription — timeout does NOT count as establishment
+test("createFencedSubscription_timeout_doesNotCountAsEstablishment", async () => {
+  // Even though established resolves after the timeout, lapsed must be true —
+  // the timeout NEVER counts as EOSE-based establishment.
+  const subscriptions = new Map();
+  const deps = {
+    connectionGeneration: () => 0,
+    subscriptions,
+    sendReq: async () => {},
+    closeSub: async () => {},
+    establishmentTimeoutMs: 10,
+  };
+  const handle = await createFencedSubscription(
+    deps,
+    { kinds: [30078], limit: 500 },
+    () => {},
+  );
+  await handle.established; // timeout fires here
+  assert.equal(
+    handle.lapsed,
+    true,
+    "establishment timeout must never count as successful establishment",
+  );
+});
+
+// ── Test 19: establishment timeout → no-EOSE relay produces incomplete load ───
+test("fetchAndMerge_establishmentTimeout_setsLoadIncomplete", async () => {
+  // Thufir's exact witness: a relay that stays alive but never sends EOSE must
+  // cause the load to conclude complete:false, not hang initialize() forever.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "b0".repeat(32);
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    // subscribeFenced delegates to the real createFencedSubscription with a
+    // fast establishment timeout so the test runs quickly.
+    subscribeFenced: async (filter, onEvent) => {
+      const subscriptions = new Map();
+      const deps = {
+        connectionGeneration: () => 0,
+        subscriptions,
+        sendReq: async () => {}, // REQ sent; EOSE never arrives
+        closeSub: async () => {},
+        establishmentTimeoutMs: 20, // fast for test
+      };
+      return createFencedSubscription(deps, filter, onEvent);
+    },
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  const raceMs = 500; // generous but bounded
+  const result = await Promise.race([
+    mgr.fetchAndMerge().then(() => "settled"),
+    new Promise((r) => setTimeout(() => r("timeout"), raceMs)),
+  ]);
+  assert.equal(
+    result,
+    "settled",
+    `fetchAndMerge must settle within ${raceMs}ms when EOSE never arrives (no-EOSE relay must not hang initialize)`,
+  );
+  assert.equal(
+    mgr.isLoadComplete,
+    false,
+    "no-EOSE relay with establishment timeout must produce incomplete load",
+  );
+  mgr.destroy();
+});
+
+// ── Test 20: early-write-fails / v2-succeeds → outcome + restart agree ────────
+test("markChannelUnread_earlyWriteFails_v2Succeeds_outcomeAndRestartAgree", () => {
+  // Thufir's mandated witness: the v2 write is the commit point. If the v2
+  // write succeeds, the action succeeds regardless of ancillary write failures.
+  // A reconstructed manager must see the committed action, and the context must
+  // be publishable so it reaches the relay (serialized primary not empty).
+  //
+  // New write order in writeStoredReadState: v2 (ok4) first, then ancillary
+  // writes (ok1/ok2/ok3). Writes during manager construction: ClientId (1),
+  // SlotId (2). First mark write = v2 override write (3) → let it through.
+  // Ancillary writes follow (4+) → throw to prove they don't affect outcome.
+  const throwingLS = makeLocalStorage();
+  const originalSetItem = throwingLS.setItem.bind(throwingLS);
+  let writeCount = 0;
+  let blockAncillary = false;
+  throwingLS.setItem = (key, value) => {
+    writeCount++;
+    if (blockAncillary && writeCount > 3) throw new Error("QuotaExceededError");
+    originalSetItem(key, value);
+  };
+  globalThis.window.localStorage = throwingLS;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+  const pubkey = "ea".repeat(32);
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.isLoadComplete = true;
+  mgr.effectiveState.set("committed-ch", 1000);
+
+  // Enable ancillary-write failure before the mark call.
+  blockAncillary = true;
+  const result = mgr.markChannelUnread("committed-ch");
+  blockAncillary = false;
+
+  // Write #3 (v2) succeeded → action must succeed.
+  assert.equal(
+    result.success,
+    true,
+    "markChannelUnread must succeed when v2 write succeeds even if ancillary writes fail",
+  );
+
+  // v2 key must contain the committed register.
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const stored = throwingLS.getItem(v2Key);
+  assert.ok(stored !== null, "v2 key must be present after committed action");
+  const parsed = JSON.parse(stored);
+  assert.ok(
+    "committed-ch" in parsed,
+    "v2 record must contain the committed channel register for coherent restart",
+  );
+
+  // Reconstruct a real manager from the same storage — simulates restart.
+  // The v2 entry is inherently publishable so hydrateFromLocalStorage must
+  // add it to publishableContextIds without the ancillary key.
+  writeCount = 0; // reset counter so reconstruction writes go through
+  const mgr2 = new ReadStateManager(pubkey, fakeRelay);
+  mgr2.hydrateFromLocalStorage(); // simulate the init-time hydration step
+  mgr2.isLoadComplete = true;
+
+  // publishableContextIds must contain the committed context — hydration from
+  // v2 must not require the ancillary publishable key.
+  assert.ok(
+    mgr2.publishableContextIds.has("committed-ch"),
+    "reconstructed manager must mark the v2-committed context as publishable",
+  );
+
+  // currentContexts() must include the register so the committed action is
+  // serialized and can be published to the relay.
+  const contexts2 = mgr2.currentContexts();
+  assert.ok(
+    contexts2 !== null,
+    "reconstructed manager currentContexts must not be null",
+  );
+  const hasEntry = Object.keys(contexts2 ?? {}).some(
+    (k) => k.startsWith("committed-ch") || k.includes("committed-ch"),
+  );
+  assert.ok(
+    hasEntry,
+    "reconstructed manager serialized primary must include the committed register/frontier",
+  );
+
+  mgr.destroy();
+  mgr2.destroy();
+});
+
+// ── Test 21: v2-write-fails → storage_failed, slot IDs unchanged ─────────────
+test("markChannelUnread_v2WriteFails_slotIdsUnchanged", () => {
+  // When the v2 write (commit point) fails, the action must return storage_failed
+  // AND extra slot IDs must not persist (neither in memory nor in the
+  // extra-slot-ids key).  Uses 700 channel contexts to force split planning
+  // (splitContextsIntoSlots allocates an extra slot), matching Thufir's exact
+  // 700-frontier witness.
+  const throwingLS = makeLocalStorage();
+  const originalSetItem = throwingLS.setItem.bind(throwingLS);
+  let blockV2 = false;
+  throwingLS.setItem = (key, value) => {
+    if (blockV2 && key.startsWith("buzz.nip-rs.override-state.v2:")) {
+      throw new Error("QuotaExceededError");
+    }
+    originalSetItem(key, value);
+  };
+  globalThis.window.localStorage = throwingLS;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const pubkey = "eb".repeat(32);
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.isLoadComplete = true;
+
+  // Populate 700 publishable channel contexts so the split planner is forced
+  // to allocate an extra slot (exceeds READ_STATE_MAX_PLAINTEXT_BYTES per slot).
+  for (let i = 0; i < 700; i++) {
+    const ctx = `channel-id-${String(i).padStart(5, "0")}-${"x".repeat(30)}`;
+    mgr.effectiveState.set(ctx, 1_700_000_000 + i);
+    mgr.publishableContextIds.add(ctx);
+  }
+  // Also add the target channel for the mark call.
+  mgr.effectiveState.set("slot-test-ch", 1000);
+
+  const prevExtraSlotIdsMem = mgr.extraSlotIds.slice();
+  const extraSlotKey = `buzz.nip-rs.extra-slot-ids:${pubkey}`;
+  const prevExtraSlotIdsStored = throwingLS.getItem(extraSlotKey);
+
+  // Block v2 writes.
+  blockV2 = true;
+  const result = mgr.markChannelUnread("slot-test-ch");
+  blockV2 = false;
+
+  assert.equal(
+    result.success,
+    false,
+    "markChannelUnread must fail when v2 write fails",
+  );
+  assert.equal(result.reason, "storage_failed");
+
+  // Memory slot IDs must be unchanged.
+  assert.deepEqual(
+    mgr.extraSlotIds,
+    prevExtraSlotIdsMem,
+    "extraSlotIds in memory must be rolled back on v2 write failure",
+  );
+
+  // Persisted slot IDs must be storage-identical to before the action —
+  // including absent-vs-present: if the key was absent before, it must still
+  // be absent (not `[]`).
+  const afterExtraSlotIdsStored = throwingLS.getItem(extraSlotKey);
+  assert.equal(
+    afterExtraSlotIdsStored,
+    prevExtraSlotIdsStored,
+    "buzz.nip-rs.extra-slot-ids must be storage-identical after a failed v2 write (absent=absent, not written as [])",
+  );
+
+  // v2 key must not contain the failed register.
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const v2Stored = throwingLS.getItem(v2Key);
+  const v2Parsed = v2Stored ? JSON.parse(v2Stored) : {};
+  assert.equal(
+    "slot-test-ch" in v2Parsed,
+    false,
+    "v2 record must not contain the rolled-back channel register after failed action",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 22b: stale ancillary frontier suppressed by authoritative v2 frontier ─
+test("hydrateFromLocalStorage_staleAncillaryFrontier_v2FrontierWins", () => {
+  // Thufir's exact policy-edge witness: when a v2-success/ancillary-failure
+  // commit leaves the ordinary frontier key stale, hydration must apply
+  // max(existing, e.f) — not skip the update when the key is present.
+  //
+  // Setup:  ordinary frontier key  = 50  (stale)
+  //         v2 override entry       = {s:5, c:0, b:100, f:101}
+  // isOverrideActive(S=5,C=0,B=100, frontier=50)  = 50<=100 → ACTIVE  (wrong)
+  // isOverrideActive(S=5,C=0,B=100, frontier=101) = 101>100 → INACTIVE (correct)
+  // The test asserts the reconstructed manager uses frontier=101 so the
+  // register is inactive and serializes as a tombstone (ov_c: only, no ov_s:).
+  const ls = makeLocalStorage();
+  globalThis.window.localStorage = ls;
+
+  const pubkey = "ec".repeat(32);
+  const ctx = "stale-frontier-ch";
+
+  // Seed the stale ancillary frontier (epoch-seconds → ISO timestamp).
+  const staleFrontierKey = `buzz.channel-read-state.v2:${pubkey}`;
+  ls.setItem(
+    staleFrontierKey,
+    JSON.stringify({ [ctx]: new Date(50 * 1_000).toISOString() }),
+  );
+
+  // Seed the v2 override key with the authoritative frontier f=101.
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  ls.setItem(v2Key, JSON.stringify({ [ctx]: { s: 5, c: 0, b: 100, f: 101 } }));
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.hydrateFromLocalStorage();
+
+  // v2 is authoritative: effectiveState must hold 101, not the stale 50.
+  assert.equal(
+    mgr.effectiveState.get(ctx),
+    101,
+    "hydration must apply max(staleAncillary=50, v2.f=101) → 101",
+  );
+
+  // With frontier=101 > B=100, the register is INACTIVE (tombstone).
+  // currentContexts() must serialize only ov_c: for this channel — no ov_s:.
+  mgr.isLoadComplete = true;
+  const contexts = mgr.currentContexts();
+  assert.ok(contexts !== null, "currentContexts must not be null");
+  const ovSKey = `ov_s:${ctx}`;
+  const ovCKey = `ov_c:${ctx}`;
+  assert.equal(
+    ovSKey in contexts,
+    false,
+    "inactive override must NOT serialize ov_s: (would mark channel active/unread)",
+  );
+  assert.ok(
+    ovCKey in contexts,
+    "inactive override must serialize ov_c: tombstone floor",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 22: fetchOwnBlobBeforePublish processes foreign client_id ────────────
+test("fetchOwnBlobBeforePublish_foreignClientId_rotatesSlotAndUpdatesMetadata", async () => {
+  // Thufir's mandated witness: fetchOwnBlobBeforePublish must run the same
+  // parsed-record metadata path — a foreign client_id at our coordinate must
+  // trigger slot rotation and maxFetchedCreatedAt update via that path.
+  // This is distinct from the fetchAndMerge path (test 12) — covers
+  // read-before-write semantics.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "b1".repeat(32);
+  const slotId = "aabbccddeeff00112233445566778899";
+  const foreignClientId = "foreign-client-read-before-write";
+  const blob = JSON.stringify({
+    v: 1,
+    client_id: foreignClientId,
+    contexts: {},
+  });
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command, _args) => {
+      if (command === "nip44_decrypt_from_self") return blob;
+      throw new Error(`Unexpected: ${command}`);
+    },
+  };
+
+  const blobEvent = {
+    id: "f1".repeat(32),
+    pubkey,
+    created_at: 55555,
+    kind: 30078,
+    tags: [
+      ["d", `read-state:${slotId}`],
+      ["t", "read-state"],
+    ],
+    content: "BLOB_CIPHER",
+    sig: "s".repeat(128),
+  };
+
+  const fakeRelay = {
+    fetchEvents: async () => [blobEvent],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+  };
+
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    mgr.slotId = slotId;
+    mgr.isLoadComplete = true;
+
+    // Call fetchOwnBlobBeforePublish directly to test the read-before-write path.
+    await mgr.fetchOwnBlobBeforePublish();
+
+    // Slot must have rotated because the blob carried a foreign client_id at
+    // our coordinate.
+    assert.notEqual(
+      mgr.slotId,
+      slotId,
+      "fetchOwnBlobBeforePublish must rotate slotId for foreign client_id at our coordinate",
+    );
+
+    // maxFetchedCreatedAt must reflect the blob event's created_at.
+    assert.equal(
+      mgr.maxFetchedCreatedAt,
+      55555,
+      "fetchOwnBlobBeforePublish must update maxFetchedCreatedAt from the fetched event",
+    );
+  } finally {
+    delete globalThis.window.__TAURI_INTERNALS__;
+  }
 });

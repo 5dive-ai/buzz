@@ -447,7 +447,6 @@ export class ReadStateManager {
       }
     }
 
-    // ── Override register merge ───────────────────────────────────────────
     for (const [rawCtx, reg] of merged.overrides) {
       const ex = this.overrideRegisters.get(rawCtx);
       const m: OverrideRegister = ex
@@ -522,7 +521,6 @@ export class ReadStateManager {
   }
 
   private async startLiveSubscription(): Promise<void> {
-    // Wire retryLoad on reconnects so incomplete init doesn't brick the manager.
     const unsubReconnect = this.relayClient.subscribeToReconnects(() => {
       if (this.destroyed) return;
       void this.retryLoad();
@@ -555,7 +553,6 @@ export class ReadStateManager {
 
   private async handleIncomingEvent(event: RelayEvent): Promise<void> {
     if (event.pubkey !== this.pubkey || this.destroyed) return;
-    // Parse once: use the result for both ingest and the convergence client_id check.
     const parsed = await parseReadStateEvent(event, this.pubkey);
     if (!parsed) return;
     const delta = await this.ingestParsedEvents([parsed]);
@@ -935,8 +932,11 @@ export class ReadStateManager {
           }
         : { s: e.s, c: e.c, b: e.b };
       this.overrideRegisters.set(ctx, merged);
-      if (e.f > 0 && !this.effectiveState.has(ctx))
-        this.effectiveState.set(ctx, e.f);
+      if (e.f > 0)
+        this.effectiveState.set(
+          ctx,
+          Math.max(this.effectiveState.get(ctx) ?? 0, e.f),
+        );
       this.publishableContextIds.add(ctx); // v2 entry is inherently publishable
     }
     this.persistLocalState();

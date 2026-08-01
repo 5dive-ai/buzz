@@ -2328,6 +2328,74 @@ test("markChannelUnread_v2WriteFails_slotIdsUnchanged", () => {
   mgr.destroy();
 });
 
+// ── Test 22b: stale ancillary frontier suppressed by authoritative v2 frontier ─
+test("hydrateFromLocalStorage_staleAncillaryFrontier_v2FrontierWins", () => {
+  // Thufir's exact policy-edge witness: when a v2-success/ancillary-failure
+  // commit leaves the ordinary frontier key stale, hydration must apply
+  // max(existing, e.f) — not skip the update when the key is present.
+  //
+  // Setup:  ordinary frontier key  = 50  (stale)
+  //         v2 override entry       = {s:5, c:0, b:100, f:101}
+  // isOverrideActive(S=5,C=0,B=100, frontier=50)  = 50<=100 → ACTIVE  (wrong)
+  // isOverrideActive(S=5,C=0,B=100, frontier=101) = 101>100 → INACTIVE (correct)
+  // The test asserts the reconstructed manager uses frontier=101 so the
+  // register is inactive and serializes as a tombstone (ov_c: only, no ov_s:).
+  const ls = makeLocalStorage();
+  globalThis.window.localStorage = ls;
+
+  const pubkey = "ec".repeat(32);
+  const ctx = "stale-frontier-ch";
+
+  // Seed the stale ancillary frontier (epoch-seconds → ISO timestamp).
+  const staleFrontierKey = `buzz.channel-read-state.v2:${pubkey}`;
+  ls.setItem(
+    staleFrontierKey,
+    JSON.stringify({ [ctx]: new Date(50 * 1_000).toISOString() }),
+  );
+
+  // Seed the v2 override key with the authoritative frontier f=101.
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  ls.setItem(v2Key, JSON.stringify({ [ctx]: { s: 5, c: 0, b: 100, f: 101 } }));
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.hydrateFromLocalStorage();
+
+  // v2 is authoritative: effectiveState must hold 101, not the stale 50.
+  assert.equal(
+    mgr.effectiveState.get(ctx),
+    101,
+    "hydration must apply max(staleAncillary=50, v2.f=101) → 101",
+  );
+
+  // With frontier=101 > B=100, the register is INACTIVE (tombstone).
+  // currentContexts() must serialize only ov_c: for this channel — no ov_s:.
+  mgr.isLoadComplete = true;
+  const contexts = mgr.currentContexts();
+  assert.ok(contexts !== null, "currentContexts must not be null");
+  const ovSKey = `ov_s:${ctx}`;
+  const ovCKey = `ov_c:${ctx}`;
+  assert.equal(
+    ovSKey in contexts,
+    false,
+    "inactive override must NOT serialize ov_s: (would mark channel active/unread)",
+  );
+  assert.ok(
+    ovCKey in contexts,
+    "inactive override must serialize ov_c: tombstone floor",
+  );
+
+  mgr.destroy();
+});
+
 // ── Test 22: fetchOwnBlobBeforePublish processes foreign client_id ────────────
 test("fetchOwnBlobBeforePublish_foreignClientId_rotatesSlotAndUpdatesMetadata", async () => {
   // Thufir's mandated witness: fetchOwnBlobBeforePublish must run the same

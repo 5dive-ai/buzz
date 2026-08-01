@@ -172,6 +172,13 @@ else
 fi
 signing_map=$(awk '
   NR == FNR {
+    if (/isa = PBXFileReference/ && /\.xcconfig/) {
+      xcconfig_path = $0
+      sub(/^.*path = /, "", xcconfig_path)
+      sub(/;.*$/, "", xcconfig_path)
+      xcconfig_paths[$1] = xcconfig_path
+      next
+    }
     if (/Build configuration list for PBXNativeTarget "/) {
       split($0, fields, "\"")
       target = fields[2]
@@ -188,7 +195,8 @@ signing_map=$(awk '
       next
     }
     if (in_configurations && /\/\* (Debug|Release|Profile) \*\//) {
-      targets[$1] = target
+      if ($1 in targets) targets[$1] = "DUPLICATE:" targets[$1] "+" target
+      else targets[$1] = target
     }
     next
   }
@@ -205,9 +213,7 @@ signing_map=$(awk '
 
   in_build_configuration {
     if (/baseConfigurationReference =/) {
-      base_configuration = $0
-      sub(/^.*\/\* /, "", base_configuration)
-      sub(/ \*\/.*$/, "", base_configuration)
+      base_configuration = $3 in xcconfig_paths ? xcconfig_paths[$3] : "UNRESOLVED:" $3
     }
     if (/DEVELOPMENT_TEAM =/) {
       team = $0
@@ -231,12 +237,12 @@ signing_map=$(awk '
   }
 ' "$pbxproj" "$pbxproj" | sort)
 expected_signing_map=$(printf '%s\n' \
-  'NotificationService Debug Debug.xcconfig JMTDPW9CG3 NotificationService/NotificationService.entitlements' \
-  'NotificationService Profile Release.xcconfig EYF346PHUG NotificationService/NotificationService.entitlements' \
-  'NotificationService Release Release.xcconfig EYF346PHUG NotificationService/NotificationService.entitlements' \
-  'Runner Debug Debug.xcconfig JMTDPW9CG3 Runner/Runner.entitlements' \
-  'Runner Profile Release.xcconfig EYF346PHUG Runner/Runner.entitlements' \
-  'Runner Release Release.xcconfig EYF346PHUG Runner/Runner.entitlements')
+  'NotificationService Debug Flutter/Debug.xcconfig JMTDPW9CG3 NotificationService/NotificationService.entitlements' \
+  'NotificationService Profile Flutter/Release.xcconfig EYF346PHUG NotificationService/NotificationService.entitlements' \
+  'NotificationService Release Flutter/Release.xcconfig EYF346PHUG NotificationService/NotificationService.entitlements' \
+  'Runner Debug Flutter/Debug.xcconfig JMTDPW9CG3 Runner/Runner.entitlements' \
+  'Runner Profile Flutter/Release.xcconfig EYF346PHUG Runner/Runner.entitlements' \
+  'Runner Release Flutter/Release.xcconfig EYF346PHUG Runner/Runner.entitlements')
 if [[ "$signing_map" == "$expected_signing_map" ]]; then
   pass "Runner and NotificationService signing settings match each build configuration"
 else

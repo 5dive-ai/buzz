@@ -16,7 +16,7 @@ export type StoredReadState = {
   contexts: Map<string, number>;
   publishableContextIds: Set<string>;
   contextSourceCreatedAt: Map<string, number>;
-  overrideRegisters: Map<string, OverrideRegister>;
+  overrideRegisters: Map<string, StoredOverrideEntry>;
 };
 
 function mergeLocalStorageKey(
@@ -102,7 +102,7 @@ export function readStoredReadState(pubkey: string): StoredReadState {
     contexts,
     publishableContextIds: readPublishableContextIds(pubkey),
     contextSourceCreatedAt: readContextSourceCreatedAt(pubkey),
-    overrideRegisters: readOverrideRegisters(pubkey),
+    overrideRegisters: readOverrideState(pubkey),
   };
 }
 
@@ -112,23 +112,65 @@ function isPrunableContextKey(contextId: string): boolean {
   );
 }
 
-// Key for persisted override registers (raw context ID → OverrideRegister triple).
-function localOverrideRegistersKey(pubkey: string): string {
+// Key for persisted override state: registers + their frontier timestamps in one atomic write.
+// v2 stores {s, c, b, f} per context where f = the last known effective frontier.
+function localOverrideStateKey(pubkey: string): string {
+  return `buzz.nip-rs.override-state.v2:${pubkey}`;
+}
+
+// Legacy key retained for migration reads only — never written to after v2 migration.
+function localOverrideRegistersKeyLegacy(pubkey: string): string {
   return `buzz.nip-rs.override-registers.v1:${pubkey}`;
 }
 
-function readOverrideRegisters(pubkey: string): Map<string, OverrideRegister> {
-  const result = new Map<string, OverrideRegister>();
-  const raw = localStorage.getItem(localOverrideRegistersKey(pubkey));
-  if (!raw) return result;
+export type StoredOverrideEntry = OverrideRegister & { f: number };
+
+function readOverrideState(pubkey: string): Map<string, StoredOverrideEntry> {
+  const result = new Map<string, StoredOverrideEntry>();
+  const raw = localStorage.getItem(localOverrideStateKey(pubkey));
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (isPlainRecord(parsed)) {
+        for (const [rawCtx, value] of Object.entries(parsed)) {
+          if (!isPlainRecord(value)) continue;
+          const { s, c, b, f } = value;
+          if (
+            typeof s === "number" &&
+            Number.isInteger(s) &&
+            s >= 0 &&
+            s <= 0xffffffff &&
+            typeof c === "number" &&
+            Number.isInteger(c) &&
+            c >= 0 &&
+            c <= 0xffffffff &&
+            typeof b === "number" &&
+            Number.isInteger(b) &&
+            b >= 0 &&
+            typeof f === "number" &&
+            Number.isInteger(f) &&
+            f >= 0
+          ) {
+            result.set(rawCtx, { s, c, b, f });
+          }
+        }
+      }
+    } catch {
+      // Corrupt storage — return empty; repopulated on next ingest.
+    }
+    return result;
+  }
+  // Migration: read from legacy v1 key if v2 key absent.
+  const legacyRaw = localStorage.getItem(
+    localOverrideRegistersKeyLegacy(pubkey),
+  );
+  if (!legacyRaw) return result;
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = JSON.parse(legacyRaw);
     if (!isPlainRecord(parsed)) return result;
     for (const [rawCtx, value] of Object.entries(parsed)) {
       if (!isPlainRecord(value)) continue;
-      const s = value.s;
-      const c = value.c;
-      const b = value.b;
+      const { s, c, b } = value;
       if (
         typeof s === "number" &&
         Number.isInteger(s) &&
@@ -142,11 +184,11 @@ function readOverrideRegisters(pubkey: string): Map<string, OverrideRegister> {
         Number.isInteger(b) &&
         b >= 0
       ) {
-        result.set(rawCtx, { s, c, b });
+        result.set(rawCtx, { s, c, b, f: 0 }); // frontier unknown from legacy key
       }
     }
   } catch {
-    // Corrupt storage — return empty map; will be repopulated on next ingest.
+    // Corrupt legacy storage — ignore.
   }
   return result;
 }
@@ -189,7 +231,7 @@ export function writeStoredReadState(
   contexts: ReadonlyMap<string, number>,
   publishableContextIds: ReadonlySet<string>,
   contextSourceCreatedAt: ReadonlyMap<string, number>,
-  overrideRegisters: ReadonlyMap<string, OverrideRegister>,
+  overrideRegisters: ReadonlyMap<string, StoredOverrideEntry>,
 ): boolean {
   const pruned = pruneStaleContexts(contexts, Math.floor(Date.now() / 1_000));
 
@@ -218,14 +260,19 @@ export function writeStoredReadState(
     JSON.stringify(sourceState),
   );
 
-  // Persist override registers atomically with frontier state.
-  const regState: Record<string, { s: number; c: number; b: number }> = {};
-  for (const [rawCtx, reg] of overrideRegisters) {
-    regState[rawCtx] = { s: reg.s, c: reg.c, b: reg.b };
+  // Persist override registers atomically with their frontier timestamps (v2).
+  // Registers and frontiers in one JSON blob — a single write ensures they are
+  // never torn: a register cannot be present without its associated frontier.
+  const overrideState: Record<
+    string,
+    { s: number; c: number; b: number; f: number }
+  > = {};
+  for (const [rawCtx, entry] of overrideRegisters) {
+    overrideState[rawCtx] = { s: entry.s, c: entry.c, b: entry.b, f: entry.f };
   }
   const ok4 = setLocalStorageItemWithRecovery(
-    localOverrideRegistersKey(pubkey),
-    JSON.stringify(regState),
+    localOverrideStateKey(pubkey),
+    JSON.stringify(overrideState),
   );
 
   return ok1 && ok2 && ok3 && ok4;

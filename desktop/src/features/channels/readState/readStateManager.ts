@@ -21,7 +21,7 @@ import {
 } from "@/features/channels/readState/readStateFormat";
 import {
   parseReadStateEvent,
-  mergeReadStateEventsStructured,
+  mergeOverrideRegisterMaps,
   type MergedReadState,
   type ParsedReadStateEvent,
 } from "@/features/channels/readState/readStateSnapshot";
@@ -98,6 +98,13 @@ function saveExtraSlotIds(pubkey: string, ids: string[]): void {
 export type ApplyRemoteContextResult = "unchanged" | "advanced";
 
 export type ContextParentResolver = (contextId: string) => string | null;
+
+/** Coherent projection (completeness + frontiers + overrides) for UI consumption via `getProjection()`. */
+export type ReadStateProjection = {
+  loadComplete: boolean;
+  frontiers: ReadonlyMap<string, number>;
+  overrides: ReadonlyMap<string, OverrideRegister>;
+};
 
 /** NIP-RS Hierarchical Frontier: `effective(ctx) = max(merged[ctx], effective(parent(ctx)))`. */
 export function resolveEffectiveTimestamp(args: {
@@ -381,12 +388,13 @@ export class ReadStateManager {
     const result = await fencedEnumerationLoad(this.relayClient, this.pubkey);
     if (this.destroyed) return;
     this.isLoadComplete = result.complete;
-    if (!result.complete) {
+    if (!result.complete)
       console.warn(
         "[ReadStateManager] fetchAndMerge: load incomplete — gated ops blocked",
       );
-    }
-    await this.ingest(result.merged);
+    this.processLoadedParsedEvents(result.events);
+    const merged = mergeParsedEvents(result.events);
+    await this.ingest(merged);
     this.persistLocalState();
     this.notifyListeners();
   }
@@ -398,12 +406,7 @@ export class ReadStateManager {
     await this.fetchAndMerge();
   }
 
-  /**
-   * Shared ingest: accept a pre-merged MergedReadState (from fencedEnumerationLoad,
-   * live delivery, or read-before-write). Returns an explicit semantic delta.
-   * Persist/notify on every register change; schedule convergence only on
-   * canonical-to-canonical difference.
-   */
+  /** Shared ingest: accept pre-merged state and return semantic delta (changed contexts, canonical flip). */
   private async ingest(merged: MergedReadState): Promise<IngestDelta> {
     const delta: IngestDelta = {
       changedContexts: new Set(),
@@ -411,6 +414,18 @@ export class ReadStateManager {
     };
 
     // ── Frontier merge ────────────────────────────────────────────────────
+    // Snapshot canonical forms for any register whose frontier might change:
+    // a frontier advance alone can flip live→tombstone without touching (S,C,B).
+    const prevCanonicalByCtx = new Map<string, string>();
+    for (const rawCtx of merged.frontiers.keys()) {
+      const reg = this.overrideRegisters.get(rawCtx);
+      if (reg !== undefined)
+        prevCanonicalByCtx.set(
+          rawCtx,
+          canonicalKey(reg, this.channelFrontier(rawCtx)),
+        );
+    }
+
     for (const [rawCtx, ts] of merged.frontiers) {
       const result = applyRemoteContextTimestamp({
         effectiveState: this.effectiveState,
@@ -426,48 +441,44 @@ export class ReadStateManager {
       }
     }
 
+    // Check whether any frontier advance changed an affected register's canonical form.
+    for (const [rawCtx, prevCanon] of prevCanonicalByCtx) {
+      const reg = this.overrideRegisters.get(rawCtx);
+      if (reg !== undefined) {
+        const newCanon = canonicalKey(reg, this.channelFrontier(rawCtx));
+        if (newCanon !== prevCanon) delta.canonicalChanged = true;
+      }
+    }
+
     // ── Override register merge — compare component-by-component ─────────
     for (const [rawCtx, reg] of merged.overrides) {
       const ex = this.overrideRegisters.get(rawCtx);
-      const merged2 = ex
+      const m: OverrideRegister = ex
         ? {
             s: Math.max(ex.s, reg.s),
             c: Math.max(ex.c, reg.c),
             b: Math.max(ex.b, reg.b),
           }
         : reg;
-      const changed =
-        !ex || merged2.s !== ex.s || merged2.c !== ex.c || merged2.b !== ex.b;
+      const changed = !ex || m.s !== ex.s || m.c !== ex.c || m.b !== ex.b;
       if (changed) {
-        this.overrideRegisters.set(rawCtx, merged2);
+        this.overrideRegisters.set(rawCtx, m);
         delta.changedContexts.add(rawCtx);
         this.publishableContextIds.add(rawCtx);
-        // Canonical change: existing register had a different canonical form.
         const prevCanon = ex
           ? canonicalKey(ex, this.channelFrontier(rawCtx))
           : null;
-        const newCanon = canonicalKey(merged2, this.channelFrontier(rawCtx));
-        if (prevCanon !== newCanon) delta.canonicalChanged = true;
+        if (prevCanon !== canonicalKey(m, this.channelFrontier(rawCtx)))
+          delta.canonicalChanged = true;
       }
     }
 
     return delta;
   }
 
-  /**
-   * Ingest from raw relay events (live delivery path). Deduplicates by
-   * coordinate, then delegates to the MergedReadState ingest path.
-   * Returns an explicit delta for change detection.
-   */
-  private async ingestEvents(events: RelayEvent[]): Promise<IngestDelta> {
-    const deduped = deduplicateByCoordinate(events);
-    // Track maxFetchedCreatedAt and own-blob metadata from the raw events.
-    for (const event of events) {
-      const parsed: ParsedReadStateEvent | null = await parseReadStateEvent(
-        event,
-        this.pubkey,
-      );
-      if (!parsed) continue;
+  /** Process already-parsed events for metadata, conflict rotation, and maxFetchedCreatedAt. */
+  private processLoadedParsedEvents(events: ParsedReadStateEvent[]): void {
+    for (const parsed of events) {
       this.maxFetchedCreatedAt = Math.max(
         this.maxFetchedCreatedAt,
         parsed.createdAt,
@@ -477,6 +488,8 @@ export class ReadStateManager {
         if (parsed.createdAt > src)
           this.contextSourceCreatedAt.set(rawCtx, parsed.createdAt);
       }
+      // Slot-conflict rotation: if our slot coordinate carries another client's
+      // client_id, rotate to a new slot ID (spec MUST NOT, NIP-RS.md:55-64,402-406).
       if (
         parsed.dTag === `read-state:${this.slotId}` &&
         parsed.blob.client_id !== this.clientId
@@ -487,6 +500,7 @@ export class ReadStateManager {
           this.slotId,
         );
       }
+      // Own-blob metadata: union lastPublishedContexts and mark publishable.
       if (parsed.blob.client_id === this.clientId) {
         const unionContexts: Record<string, number> = {
           ...this.lastPublishedContexts,
@@ -500,11 +514,23 @@ export class ReadStateManager {
         this.lastPublishedContexts = unionContexts;
       }
     }
-    const merged = await mergeReadStateEventsStructured(deduped, this.pubkey);
+  }
+
+  /** Ingest parsed events: process metadata then merge into frontier/override maps. */
+  private async ingestParsedEvents(
+    events: ParsedReadStateEvent[],
+  ): Promise<IngestDelta> {
+    this.processLoadedParsedEvents(events);
+    const merged = mergeParsedEvents(events);
     return this.ingest(merged);
   }
 
   private async startLiveSubscription(): Promise<void> {
+    // Wire retryLoad on reconnects so incomplete init doesn't brick the manager.
+    const unsubReconnect = this.relayClient.subscribeToReconnects(() => {
+      if (this.destroyed) return;
+      void this.retryLoad();
+    });
     try {
       const unsub = await this.relayClient.subscribeLive(
         {
@@ -518,22 +544,29 @@ export class ReadStateManager {
       );
       if (this.destroyed) {
         unsub();
+        unsubReconnect();
         return;
       }
-      this.unsubscribeLive = unsub;
+      this.unsubscribeLive = () => {
+        unsub();
+        unsubReconnect();
+      };
     } catch {
+      unsubReconnect();
       // Live subscription is best-effort; missed events will be caught on reconnect.
     }
   }
 
   private async handleIncomingEvent(event: RelayEvent): Promise<void> {
     if (event.pubkey !== this.pubkey || this.destroyed) return;
-    const delta = await this.ingestEvents([event]);
+    // Parse once: use the result for both ingest and the convergence client_id check.
+    const parsed = await parseReadStateEvent(event, this.pubkey);
+    if (!parsed) return;
+    const delta = await this.ingestParsedEvents([parsed]);
     if (delta.changedContexts.size > 0 || this.pendingSyncedAdvances.size > 0) {
       this.persistLocalState();
       this.notifyListeners();
-      const parsed = await parseReadStateEvent(event, this.pubkey);
-      if (parsed?.blob.client_id !== this.clientId && delta.canonicalChanged) {
+      if (delta.canonicalChanged && parsed.blob.client_id !== this.clientId) {
         this.schedulePublish();
       }
     }
@@ -659,7 +692,14 @@ export class ReadStateManager {
         limit: READ_STATE_FETCH_LIMIT,
       });
       const deduped = deduplicateByCoordinate(events);
-      const merged = await mergeReadStateEventsStructured(deduped, this.pubkey);
+      // Parse once: use same path as full-state load (Contract 2 — metadata/conflict).
+      const parsed: ParsedReadStateEvent[] = [];
+      for (const ev of deduped) {
+        const p = await parseReadStateEvent(ev, this.pubkey);
+        if (p) parsed.push(p);
+      }
+      this.processLoadedParsedEvents(parsed);
+      const merged = mergeParsedEvents(parsed);
       await this.ingest(merged);
       this.persistLocalState();
       return true;
@@ -779,12 +819,16 @@ export class ReadStateManager {
     };
   }
 
-  /**
-   * Pure candidate planner: trials the candidate register against BOTH
-   * single-slot and multi-slot paths. Refuses only when the override-bearing
-   * primary cannot fit even after splitting to maxSlots. Side-effect-free
-   * (restores state on return). Used by both mark trials and actual publish.
-   */
+  /** Return a coherent snapshot (completeness + frontiers + overrides). UI consumes via getProjection(). */
+  getProjection(): ReadStateProjection {
+    return {
+      loadComplete: this.isLoadComplete,
+      frontiers: this.effectiveState,
+      overrides: this.overrideRegisters,
+    };
+  }
+
+  /** Pure candidate planner: trials candidate against single- and multi-slot paths. Side-effect-free. */
   private tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean {
     const prev = this.overrideRegisters.get(rawCtxId);
     const wasPublishable = this.publishableContextIds.has(rawCtxId);
@@ -822,10 +866,18 @@ export class ReadStateManager {
     if (!this.tryCandidatePlan(channelId, newReg)) {
       return { success: false, reason: "budget_exhausted" };
     }
+    // Snapshot before mutation for Contract 3 rollback.
+    const prevReg = this.overrideRegisters.get(channelId);
+    const wasPublishable = this.publishableContextIds.has(channelId);
     this.overrideRegisters.set(channelId, newReg);
     this.publishableContextIds.add(channelId);
-    if (!this.persistLocalState())
+    if (!this.persistLocalState()) {
+      // Rollback: restore pre-mutation state.
+      if (prevReg === undefined) this.overrideRegisters.delete(channelId);
+      else this.overrideRegisters.set(channelId, prevReg);
+      if (!wasPublishable) this.publishableContextIds.delete(channelId);
       return { success: false, reason: "storage_failed" };
+    }
     this.notifyListeners();
     this.schedulePublish();
     return { success: true };
@@ -850,10 +902,16 @@ export class ReadStateManager {
       );
       return { success: false, reason: "already_inactive" };
     }
+    // Snapshot before mutation for Contract 3 rollback.
+    const wasPublishable = this.publishableContextIds.has(channelId);
     this.overrideRegisters.set(channelId, newReg);
     this.publishableContextIds.add(channelId);
-    if (!this.persistLocalState())
+    if (!this.persistLocalState()) {
+      // Rollback: restore pre-mutation state.
+      this.overrideRegisters.set(channelId, reg);
+      if (!wasPublishable) this.publishableContextIds.delete(channelId);
       return { success: false, reason: "storage_failed" };
+    }
     this.notifyListeners();
     this.schedulePublish();
     return { success: true };
@@ -867,30 +925,36 @@ export class ReadStateManager {
       this.publishableContextIds.add(contextId);
     for (const [contextId, createdAt] of stored.contextSourceCreatedAt)
       this.contextSourceCreatedAt.set(contextId, createdAt);
-    for (const [rawCtx, reg] of stored.overrideRegisters) {
-      const ex = this.overrideRegisters.get(rawCtx);
-      this.overrideRegisters.set(
-        rawCtx,
-        ex
-          ? {
-              s: Math.max(ex.s, reg.s),
-              c: Math.max(ex.c, reg.c),
-              b: Math.max(ex.b, reg.b),
-            }
-          : reg,
-      );
+    for (const [ctx, e] of stored.overrideRegisters) {
+      const ex = this.overrideRegisters.get(ctx);
+      const merged = ex
+        ? {
+            s: Math.max(ex.s, e.s),
+            c: Math.max(ex.c, e.c),
+            b: Math.max(ex.b, e.b),
+          }
+        : { s: e.s, c: e.c, b: e.b };
+      this.overrideRegisters.set(ctx, merged);
+      if (e.f > 0 && !this.effectiveState.has(ctx))
+        this.effectiveState.set(ctx, e.f);
     }
     this.persistLocalState();
   }
 
   /** Persist local state. Returns false if any write failed (mark-action must fail). */
   private persistLocalState(): boolean {
+    const entries = new Map(
+      [...this.overrideRegisters].map(([ctx, r]) => [
+        ctx,
+        { s: r.s, c: r.c, b: r.b, f: this.channelFrontier(ctx) },
+      ]),
+    );
     return writeStoredReadState(
       this.pubkey,
       this.effectiveState,
       this.publishableContextIds,
       this.contextSourceCreatedAt,
-      this.overrideRegisters,
+      entries,
     );
   }
 
@@ -917,4 +981,18 @@ function canonicalKey(reg: OverrideRegister, frontier: number): string {
   if (active) return `live:${reg.s},${reg.c},${reg.b}`;
   const floor = Math.max(reg.s, reg.c);
   return floor > 0 ? `dead:${floor}` : "virgin";
+}
+
+/** Build MergedReadState from pre-parsed events — no second decrypt. */
+function mergeParsedEvents(events: ParsedReadStateEvent[]): MergedReadState {
+  const frontiers = new Map<string, number>();
+  const overrideMaps: Array<ReadonlyMap<string, OverrideRegister>> = [];
+  for (const p of events) {
+    for (const [rawCtx, ts] of p.contexts.frontiers) {
+      const current = frontiers.get(rawCtx) ?? 0;
+      if (ts > current) frontiers.set(rawCtx, ts);
+    }
+    overrideMaps.push(p.contexts.overrides);
+  }
+  return { frontiers, overrides: mergeOverrideRegisterMaps(...overrideMaps) };
 }

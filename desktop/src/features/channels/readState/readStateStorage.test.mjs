@@ -129,7 +129,7 @@ test("writeStoredReadState round-trips through readStoredReadState", () => {
     new Map([["channel-9", nowSeconds]]),
     new Set(["channel-9"]),
     new Map([["channel-9", nowSeconds]]),
-    new Map([["channel-9", { s: 3, c: 1, b: nowSeconds }]]),
+    new Map([["channel-9", { s: 3, c: 1, b: nowSeconds, f: nowSeconds }]]),
   );
 
   const stored = readStoredReadState(pubkey);

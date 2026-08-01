@@ -67,6 +67,8 @@ import {
   ProfileSummaryView,
 } from "@/features/profile/ui/UserProfilePanelSections";
 import { AgentConfigurationFocusedView } from "@/features/profile/ui/UserProfilePanelAgentDetails";
+import { AgentUsageFocusedView } from "@/features/agent-usage/ui/AgentUsageFocusedView";
+import { useUsageIngress } from "@/features/agent-usage/hooks";
 import { UserProfileAgentSettingsMenuSlot } from "@/features/profile/ui/UserProfileAgentActions";
 import { useProfileAgentDeletion } from "@/features/profile/ui/UserProfilePanelDeletion";
 import { useProfileFieldBuckets } from "@/features/profile/ui/UserProfilePanelFields";
@@ -338,6 +340,8 @@ export function UserProfilePanel({
     viewerIsOwner &&
     Boolean(effectivePubkey) &&
     canOpenAgentActivity(effectivePubkey);
+  const canViewUsage = viewerIsOwner && isBot && Boolean(effectivePubkey);
+  const usageIngressTrailing = useUsageIngress(effectivePubkey, canViewUsage);
   const canOpenAgentLogs =
     isOwner === true && managedAgent?.backend.type === "local";
   const canInstantiateAgent =
@@ -787,6 +791,8 @@ export function UserProfilePanel({
           canInstantiateAgent={canInstantiateAgent}
           canOpenAgentLogs={canOpenAgentLogs}
           canViewActivity={canViewActivity}
+          canViewUsage={canViewUsage}
+          usageIngressTrailing={usageIngressTrailing}
           callerChannelId={callerChannelId}
           channelCount={profileChannels.length}
           channelIdToName={channelIdToName}
@@ -822,6 +828,7 @@ export function UserProfilePanel({
           onOpenChannel={handleOpenChannel}
           onOpenDiagnostics={() => setView("diagnostics")}
           onOpenInstructions={() => setView("instructions")}
+          onOpenUsage={() => setView("usage")}
           onTabChange={setTab}
           onOpenDm={onOpenDm}
           presenceStatus={presenceStatus}
@@ -837,6 +844,13 @@ export function UserProfilePanel({
         <MemoryFocusedView
           agentPubkey={effectivePubkey}
           viewerIsOwner={viewerIsOwner}
+        />
+      ) : null}
+      {view === "usage" && effectivePubkey ? (
+        <AgentUsageFocusedView
+          agentPubkey={effectivePubkey}
+          canViewUsage={canViewUsage}
+          onIneligible={() => setView("summary", { replace: true })}
         />
       ) : null}
       {view === "info" ? (

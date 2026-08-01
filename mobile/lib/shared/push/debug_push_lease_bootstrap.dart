@@ -57,7 +57,7 @@ class DebugPushLeaseBootstrap extends HookConsumerWidget {
     SignedEventRelay relay,
   ) async {
     final descriptor = await fetchBuzzPushLeaseDescriptor(config.baseUrl);
-    final grant = await enrollBuzzDevPush(config.wsUrl);
+    final grant = await enrollBuzzDevPush(config.wsUrl, Env.pushGatewayUrl);
     if (grant.relayOrigin != descriptor.origin) {
       throw StateError(
         'Endpoint grant origin ${grant.relayOrigin} does not match descriptor origin ${descriptor.origin}',

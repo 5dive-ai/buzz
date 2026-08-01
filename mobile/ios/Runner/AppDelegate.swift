@@ -252,12 +252,13 @@ import UserNotifications
       guard let arguments = call.arguments as? [String: Any],
         let relayText = arguments["relayUrl"] as? String,
         let relayURL = URL(string: relayText),
-        let gatewayURL = URL(string: "http://localhost:8080")
+        let gatewayText = arguments["gatewayUrl"] as? String,
+        let gatewayURL = URL(string: gatewayText)
       else {
         result(
           FlutterError(
             code: "invalid_arguments",
-            message: "Development push enrollment requires relayUrl.",
+            message: "Development push enrollment requires relayUrl and gatewayUrl.",
             details: nil
           )
         )

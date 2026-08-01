@@ -83,7 +83,10 @@ Future<List<BuzzPushEndpointGrant>> readBuzzPushEndpointGrants() async {
   }
 }
 
-Future<BuzzPushEndpointGrant> enrollBuzzDevPush(String relayUrl) async {
+Future<BuzzPushEndpointGrant> enrollBuzzDevPush(
+  String relayUrl,
+  String gatewayUrl,
+) async {
   if (!kDebugMode) {
     throw UnsupportedError(
       'Development push enrollment is unavailable outside debug builds.',
@@ -91,7 +94,7 @@ Future<BuzzPushEndpointGrant> enrollBuzzDevPush(String relayUrl) async {
   }
   final raw = await _channel.invokeMapMethod<dynamic, dynamic>(
     'devEnrollPush',
-    {'relayUrl': relayUrl},
+    {'relayUrl': relayUrl, 'gatewayUrl': gatewayUrl},
   );
   if (raw == null) {
     throw StateError('Native development push enrollment returned no grant.');

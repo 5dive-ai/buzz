@@ -1,4 +1,5 @@
 import 'package:buzz/shared/push/push_bridge.dart';
+import 'package:buzz/shared/relay/relay_provider.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -63,16 +64,17 @@ void main() {
   });
 
   test(
-    'debug enrollment invokes native driver then refreshes grants',
+    'debug enrollment carries the configured relay and gateway URLs',
     () async {
       debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
       final methods = <String>[];
+      final enrollmentArguments = <Object?>[];
       final messenger =
           TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
       messenger.setMockMethodCallHandler(_channel, (call) async {
         methods.add(call.method);
         if (call.method == 'devEnrollPush') {
-          expect(call.arguments, {'relayUrl': 'wss://relay.example/'});
+          enrollmentArguments.add(call.arguments);
           return _grantMap('new-grant');
         }
         if (call.method == 'endpointGrants') {
@@ -81,13 +83,40 @@ void main() {
         fail('Unexpected method ${call.method}');
       });
 
-      final grant = await enrollBuzzDevPush('wss://relay.example/');
+      final firstGrant = await enrollBuzzDevPush(
+        'wss://relay.example/',
+        'https://gateway-one.example/',
+      );
+      final secondGrant = await enrollBuzzDevPush(
+        'wss://relay.example/',
+        'https://gateway-two.example/',
+      );
 
-      expect(grant.endpointGrant, 'new-grant');
-      expect(methods, ['devEnrollPush', 'endpointGrants']);
+      expect(firstGrant.endpointGrant, 'new-grant');
+      expect(secondGrant.endpointGrant, 'new-grant');
+      expect(enrollmentArguments, [
+        {
+          'relayUrl': 'wss://relay.example/',
+          'gatewayUrl': 'https://gateway-one.example/',
+        },
+        {
+          'relayUrl': 'wss://relay.example/',
+          'gatewayUrl': 'https://gateway-two.example/',
+        },
+      ]);
+      expect(methods, [
+        'devEnrollPush',
+        'endpointGrants',
+        'devEnrollPush',
+        'endpointGrants',
+      ]);
       expect(pushEndpointGrants.value.single.endpointGrant, 'new-grant');
     },
   );
+
+  test('development push gateway uses the localhost compiled default', () {
+    expect(Env.pushGatewayUrl, 'http://localhost:8080');
+  });
 
   test('persists the acknowledged push lease generation', () async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;

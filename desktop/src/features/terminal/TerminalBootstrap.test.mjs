@@ -130,7 +130,7 @@ test("mounted bootstrap passes GUI context and ACKs only after consuming a frame
   const { ThemeProvider } = await import("@/shared/theme/ThemeProvider");
   const { TerminalBootstrap } = await import("./TerminalBootstrap.tsx");
 
-  render(
+  const view = render(
     createElement(
       StrictMode,
       null,
@@ -205,6 +205,7 @@ test("mounted bootstrap passes GUI context and ACKs only after consuming a frame
     calls.filter(({ command }) => command === "terminal_ack").length,
     1,
   );
+  view.unmount();
 });
 test("resize during in-flight catch-up keeps the newest viewport ready", async () => {
   const { createElement } = await import("react");
@@ -260,5 +261,60 @@ test("resize during in-flight catch-up keeps the newest viewport ready", async (
   );
   assert.ok(readyCalls.length > 0, "vacuity guard: no readiness published");
   assert.equal(readyCalls.at(-1).args.viewport.columns, 200);
+  view.unmount();
+});
+
+test("opening a tab keeps terminal ownership while its attachment is pending", async () => {
+  const { createElement } = await import("react");
+  const { act, fireEvent, render, waitFor } = await import(
+    "@testing-library/react"
+  );
+  const { ThemeProvider } = await import("@/shared/theme/ThemeProvider");
+  const { TerminalBootstrap } = await import("./TerminalBootstrap.tsx");
+
+  const view = render(
+    createElement(
+      ThemeProvider,
+      null,
+      createElement("div", {
+        className: "buzz-huddle-app-surface",
+        tabIndex: -1,
+      }),
+      createElement(TerminalBootstrap, {
+        channelId: "channel-1",
+        channelName: "general",
+        npub: "npub1owner",
+        relayUrl: "wss://relay.example",
+        threadId: null,
+      }),
+    ),
+  );
+  await waitFor(() =>
+    assert.ok(calls.some(({ command }) => command === "terminal_attach")),
+  );
+  await act(async () => {
+    await Promise.resolve();
+  });
+  const substrate = view.container.querySelector(".buzz-terminal-substrate");
+  const chord = { bubbles: true, code: "KeyJ", metaKey: true };
+  act(() => {
+    window.dispatchEvent(new KeyboardEvent("keydown", chord));
+    window.dispatchEvent(new KeyboardEvent("keyup", chord));
+  });
+  await waitFor(() =>
+    assert.equal(substrate.dataset.terminalOwner, "terminal"),
+  );
+
+  attachResolver = () => {};
+  fireEvent.click(view.getByLabelText("New Buzz Term tab"));
+  await waitFor(() => assert.equal(typeof attachResolver, "function"));
+  assert.equal(
+    substrate.dataset.terminalOwner,
+    "terminal",
+    "an attaching session must not force the substrate back to Buzz",
+  );
+  assert.equal(view.getAllByRole("tab").length, 2);
+
+  await act(async () => attachResolver());
   view.unmount();
 });

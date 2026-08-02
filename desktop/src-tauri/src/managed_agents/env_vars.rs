@@ -77,6 +77,10 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     "BUZZ_ACP_RESPOND_TO",
     "BUZZ_ACP_RESPOND_TO_ALLOWLIST",
     "BUZZ_ACP_AGENT_OWNER",
+    // Remote lifetime/presence policy: user env must not disable the
+    // desktop/provider-owned bounds while the saved record still promises them.
+    "BUZZ_ACP_EXIT_AFTER_INACTIVITY",
+    "BUZZ_ACP_NO_PRESENCE",
     // Readiness handoff: desktop is the ONLY readiness source. A saved or
     // ambient env var must not be able to forge setup mode (NotReady) on a
     // Ready agent or suppress it (empty/stale payload) on a NotReady one.

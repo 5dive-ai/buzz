@@ -158,6 +158,7 @@ impl Terminal {
     }
 
     /// Whether the tail is at its cap and the reader must stop reading.
+    /// Not yet consumed in production -- see [`reader::Feeder::tail_full`].
     pub fn tail_full(&self) -> bool {
         self.feeder.tail_full()
     }

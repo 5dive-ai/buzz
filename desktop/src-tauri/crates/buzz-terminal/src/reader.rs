@@ -111,6 +111,15 @@ impl Feeder {
     /// latch is a state the fence owns and could fail to clear, which is
     /// exactly how a paused reader strands a child mid-teardown; a reader that
     /// simply stops asking resumes by default.
+    ///
+    /// **Not yet consumed in production.** The runtime reader pumps
+    /// [`Feeder::drain`] to completion after every read, so the tail cannot
+    /// currently grow to the cap and nothing needs to ask. This signal exists
+    /// for the reader that stops pumping -- it is the queue bound, and the
+    /// pump loop is the only reason the queue bound is not load-bearing
+    /// today. Stated rather than left to be inferred from an empty
+    /// call-graph: an unused signal that looks wired is worse than one that
+    /// says it isn't.
     pub fn tail_full(&self) -> bool {
         self.pending_bytes() >= TAIL_CAP
     }

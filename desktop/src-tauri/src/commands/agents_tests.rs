@@ -431,6 +431,10 @@ fn deploy_payload_matches_the_shared_full_launch_fixture() {
         "auth_tag": "tag-1",
         "acp_command": "buzz-acp",
         "agent_command": "goose",
+        "runtime": "goose",
+        "model": "gpt-5",
+        "provider": "openai",
+        "env_vars": {"USER_KEY": "user-value"},
         "agent_args": [],
         "mcp_command": "",
         "turn_timeout_seconds": 300,
@@ -444,15 +448,12 @@ fn deploy_payload_matches_the_shared_full_launch_fixture() {
         "updated_at": "2026-01-01T00:00:00Z"
     }))
     .expect("fixture source record");
-    let descriptor = crate::managed_agents::readiness::EffectiveHarnessDescriptor {
-        command: "goose".into(),
-        args: vec!["run".into(), "--session".into()],
-        env: std::collections::BTreeMap::from([
-            ("GOOSE_MODEL".into(), "gpt-5".into()),
-            ("GOOSE_PROVIDER".into(), "openai".into()),
-            ("USER_KEY".into(), "user-value".into()),
-        ]),
-    };
+    let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
+        &record,
+        &[],
+        &crate::managed_agents::GlobalAgentConfig::default(),
+    )
+    .expect("resolve fixture source record descriptor");
     let launch = super::deploy::build_launch_block(
         &record,
         &descriptor,

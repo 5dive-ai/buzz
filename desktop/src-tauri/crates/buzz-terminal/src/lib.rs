@@ -9,6 +9,7 @@ pub mod context;
 pub mod damage;
 pub mod env_fence;
 pub mod fences;
+pub mod lifecycle;
 pub mod listener;
 pub mod path;
 pub mod reader;
@@ -19,6 +20,8 @@ pub mod shell;
 mod context_tests;
 #[cfg(test)]
 mod env_fence_tests;
+#[cfg(test)]
+mod lifecycle_tests;
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Osc52, Term};

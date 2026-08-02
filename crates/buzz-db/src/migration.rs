@@ -1025,34 +1025,20 @@ mod tests {
         assert!(heartbeat.contains("epoch"));
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
-<<<<<<< HEAD
 
-        // Channel-id lookup index (0027): serves the tenant-independent
-        // `channels` lookups that carry no community_id predicate, which no
-        // community_id-leading index can satisfy. Covering + partial so the
-        // planner can go index-only; asserted NOT UNIQUE because `id` alone is
-        // not unique in this table (the same channel id may exist under more
-        // than one community), so a unique index would encode a false
-        // constraint and fail to build on such a database.
+
+        // Channel-id lookup index (0027): serves tenant-independent channel lookups.
         assert_eq!(migrations[26].version, 27);
         let channel_id_index = migrations[26].sql.as_str();
         assert!(channel_id_index.contains("idx_channels_id_live"));
         assert!(channel_id_index.contains("INCLUDE (community_id)"));
         assert!(channel_id_index.contains("WHERE deleted_at IS NULL"));
-        assert!(
-            !channel_id_index.contains("CREATE UNIQUE INDEX"),
-            "channels.id is not unique across communities — index must not be UNIQUE",
-        );
-        assert!(
-            desired_schema.contains("idx_channels_id_live"),
-            "desired-state schema must carry the channel-id lookup index",
-        );
-||||||| parent of d04e4b503 (feat: add durable community deletion worker)
-=======
+        assert!(!channel_id_index.contains("CREATE UNIQUE INDEX"));
+        assert!(desired_schema.contains("idx_channels_id_live"));
 
         // Durable whole-community deletion control plane and universal DB fence.
-        assert_eq!(migrations[26].version, 27);
-        let deletion = migrations[26].sql.as_str();
+        assert_eq!(migrations[27].version, 28);
+        let deletion = migrations[27].sql.as_str();
         assert!(deletion.contains("CREATE TABLE community_deletion_requests"));
         assert!(deletion.contains("CREATE TABLE community_deletion_approvals"));
         assert!(deletion.contains("CREATE TABLE community_deletion_checkpoints"));
@@ -1069,7 +1055,10 @@ mod tests {
         assert!(deletion.contains("'active', 'quiescing', 'fenced', 'tombstone'"));
         assert!(deletion.contains("_operator_global_tables"));
         assert!(deletion.contains("'submitted', 'inventoried', 'approved', 'fenced', 'drained'"));
->>>>>>> d04e4b503 (feat: add durable community deletion worker)
+        assert!(deletion.contains("UNIQUE (id, community_id, inventory_digest)"));
+        assert!(deletion.contains("FOREIGN KEY (request_id, community_id, inventory_digest)"));
+        assert!(deletion.contains("prevent_community_deletion_request_retargeting"));
+        assert!(deletion.contains("prevent_community_deletion_approval_removal"));
     }
 
     #[test]
@@ -1077,7 +1066,7 @@ mod tests {
         let violations = migrations_missing_community_write_fence_attachment();
         assert!(
             violations.is_empty(),
-            "migrations after 0027 must explicitly attach every new community write fence:\n{}",
+            "migrations after 0028 must explicitly attach every new community write fence:\n{}",
             violations.join("\n")
         );
     }

@@ -78,7 +78,7 @@ fn flood(shared: &SharedTerminal, stop: &AtomicBool) {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            shared.feed(chunk);
+            shared.feed_fully(chunk);
         }
     }
 }

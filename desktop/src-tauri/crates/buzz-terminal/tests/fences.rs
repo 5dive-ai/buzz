@@ -23,12 +23,12 @@ fn size() -> Size {
 }
 
 fn feed_synchronized(term: &mut Terminal, payload: &[u8], close: bool) {
-    term.feed(b"\x1b[?2026h");
+    term.feed_fully(b"\x1b[?2026h");
     for chunk in payload.chunks(CHUNK) {
-        term.feed(chunk);
+        term.feed_fully(chunk);
     }
     if close {
-        term.feed(b"\x1b[?2026l");
+        term.feed_fully(b"\x1b[?2026l");
     }
 }
 
@@ -107,9 +107,9 @@ fn g1_sync_abort_bounds_all_hostile_shapes() {
 #[test]
 fn g2_hostile_unsynchronized_osc_resets_parser() {
     let (mut term, _) = Terminal::new(size(), Fences::ALL);
-    term.feed(b"\x1b]0;");
+    term.feed_fully(b"\x1b]0;");
     for chunk in repeated(b"A", OSC_BUDGET * 4).chunks(CHUNK) {
-        term.feed(chunk);
+        term.feed_fully(chunk);
     }
     assert!(term.stats().osc_resets > 0, "F2 never rebuilt the parser");
 }

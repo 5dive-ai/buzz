@@ -593,14 +593,21 @@ fn ris_is_priced_for_both_grids_and_the_scrollback_it_walks() {
             observed.push((label, scrollback, term.stats().completed_work));
         }
     }
-    for (label, scrollback, work) in observed {
-        assert_eq!(
-            work,
-            2 * cells + (scrollback * columns) as u64,
-            "{label}, scrollback {scrollback}: RIS must be priced on \
-             configured depth, which is the same on both grids",
-        );
-    }
+    // One comparison over the whole vector, not a loop of comparisons.
+    // Collecting first stops an arm from being *skipped*; asserting the
+    // vectors is what stops a failure from being *truncated* to the first
+    // mismatch. Otherwise the alt-screen receipt still never prints, which
+    // was the point of collecting.
+    let expected: Vec<_> = observed
+        .iter()
+        .map(|&(label, scrollback, _)| {
+            (label, scrollback, 2 * cells + (scrollback * columns) as u64)
+        })
+        .collect();
+    assert_eq!(
+        observed, expected,
+        "RIS must be priced on configured depth, identically on both grids",
+    );
 }
 
 /// CBT is charged for exactly the cells it scans -- an equality, in both
@@ -982,10 +989,12 @@ fn a_scrollback_change_reprices_the_densest_atom_and_the_slicing() {
     // which is the fence working -- but none of them is the discriminator:
     // they separate only when the two depths straddle the slice floor, and
     // `completed_work` separates at every positive depth gap.
-    let debt = |from: Size, to: Size| {
-        let (mut term, _a) = Terminal::new(from, Fences::ALL);
-        term.resize(deep);
-        term.resize(to);
+    //
+    // Every comparison is against the fresh control's own field, never a
+    // literal: a constant or geometry change must move both sides together,
+    // or the fixture starts asserting the arithmetic of the day it was
+    // written.
+    let measure = |term: &mut Terminal| {
         term.reset_stats();
         let mut drains = 1;
         let mut more = term.feed(&b"\x1bc".repeat(200));
@@ -1003,39 +1012,74 @@ fn a_scrollback_change_reprices_the_densest_atom_and_the_slicing() {
             term.stats().completed_work,
         )
     };
-    let shrunk = debt(shallow, shallow);
-    let fresh = run(shallow, None);
 
-    assert_eq!(shrunk.3, 200, "no unit may be lost on the way down either");
+    // The terminal under test stays alive past its measurement, so the
+    // geometry arm below runs on the feeder that actually shrank rather than
+    // on a lookalike that only ever grew.
+    let (mut shrunk_term, _a) = Terminal::new(shallow, Fences::ALL);
+    shrunk_term.resize(deep);
+    shrunk_term.resize(shallow);
+    let shrunk = measure(&mut shrunk_term);
+
+    let (mut fresh_term, _a) = Terminal::new(shallow, Fences::ALL);
+    let fresh = measure(&mut fresh_term);
+
+    assert_eq!(
+        shrunk.3, fresh.3,
+        "no unit may be lost on the way down either"
+    );
     assert!(
-        shrunk.4 > fresh.1,
+        shrunk.4 > fresh.4,
         "a feeder that has been deep must still price deep after shrinking: \
          {} against a fresh shallow {}. Equality here is the signature of a \
          feeder that dropped the debt, which is indistinguishable from one \
          that never had it",
         shrunk.4,
+        fresh.4,
+    );
+    assert!(
+        shrunk.0 <= fresh.0,
+        "narrower slices retire fewer atoms per drain: {} against {}",
+        shrunk.0,
+        fresh.0,
+    );
+    assert!(
+        shrunk.1 >= fresh.1,
+        "and leave more pending after the first call: {} against {}",
+        shrunk.1,
         fresh.1,
     );
     assert!(
-        shrunk.0 <= 12,
-        "narrower slices retire fewer atoms per drain"
+        shrunk.2 >= fresh.2,
+        "and take more drains to finish: {} against {}",
+        shrunk.2,
+        fresh.2,
     );
-    assert!(shrunk.2 >= fresh.2, "and take more drains to do it");
 
-    // A later resize on a different axis must not disturb the third one --    // A later resize on a different axis must not disturb the third one --
-    // the split was permanent, with columns and lines tracking correctly
-    // while a stale depth persisted forever.
-    term.resize(Size {
-        columns: deep.columns * 2,
-        ..deep
+    // The debt survives a later resize on a different axis. Two things make
+    // this arm bite, and it was inert without either:
+    //
+    // * It runs on the terminal that actually went shallow -> deep ->
+    //   shallow. A lookalike that only ever grew passes it while an
+    //   implementation that retains on shrink and drops on the next geometry
+    //   change fails.
+    // * The resize carries the *shallow* depth. Passing the debt's own value
+    //   back in means `max(debt, new)` and a plain assignment agree, so the
+    //   arm cannot tell them apart -- which is how it survived a mutant that
+    //   retained only when columns and lines were unchanged.
+    shrunk_term.resize(Size {
+        columns: shallow.columns * 2,
+        screen_lines: shallow.screen_lines,
+        scrollback: shallow.scrollback,
     });
-    term.reset_stats();
-    term.feed_fully(b"c");
+    shrunk_term.reset_stats();
+    shrunk_term.feed_fully(b"\x1bc");
     assert_eq!(
-        term.stats().completed_work,
-        2 * (deep.columns * 2 * deep.screen_lines) as u64
-            + (deep.scrollback * deep.columns * 2) as u64,
-        "a columns resize must keep the scrollback it was already given",
+        shrunk_term.stats().completed_work,
+        2 * (shallow.columns * 2 * shallow.screen_lines) as u64
+            + (deep.scrollback * shallow.columns * 2) as u64,
+        "a columns resize must keep the deep scrollback debt, not fall back \
+         to the current shallow depth",
     );
 }
 

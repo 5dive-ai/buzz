@@ -505,7 +505,34 @@ fn every_amplifiable_escape_is_priced_exactly() {
             ("scroll_up N=1", "\u{1b}[1S".into(), c),
             ("scroll_up N=5", "\u{1b}[5S".into(), 5 * c),
             ("scroll_up N=huge", "\u{1b}[65535S".into(), lines as u64 * c),
+            ("scroll_down N=1", "\u{1b}[1T".into(), c),
+            ("scroll_down N=4", "\u{1b}[4T".into(), 4 * c),
+            (
+                "scroll_down N=huge",
+                "\u{1b}[65535T".into(),
+                lines as u64 * c,
+            ),
             ("delete_lines N=3", "\u{1b}[3M".into(), 3 * c),
+            (
+                "delete_lines N=huge",
+                "\u{1b}[65535M".into(),
+                lines as u64 * c,
+            ),
+            ("insert_lines N=1", "\u{1b}[1L".into(), c),
+            ("insert_lines N=6", "\u{1b}[6L".into(), 6 * c),
+            (
+                "insert_lines N=huge",
+                "\u{1b}[65535L".into(),
+                lines as u64 * c,
+            ),
+            ("put_tab N=1", "\t".into(), c),
+            ("fwd_tabs N=1", "\u{1b}[1I".into(), c),
+            ("fwd_tabs N=huge", "\u{1b}[65535I".into(), c),
+            ("insert_blank N=huge", "\u{1b}[65535@".into(), c),
+            ("clear_line ESC[0K", "\u{1b}[0K".into(), c),
+            ("clear_line ESC[1K", "\u{1b}[1K".into(), c),
+            ("clear_screen ESC[0J", "\u{1b}[0J".into(), cells),
+            ("clear_screen ESC[1J", "\u{1b}[1J".into(), cells),
             ("sgr", "\u{1b}[m".into(), 1),
             ("goto", "\u{1b}[1;1H".into(), 1),
         ];
@@ -943,41 +970,59 @@ fn a_scrollback_change_reprices_the_densest_atom_and_the_slicing() {
         2 * cells + (deep.scrollback * deep.columns) as u64,
     );
 
-    // Shrinking is asserted *directionally*, never by equality. A decrease
-    // leaves the feeder charging the old deep price -- a 50x over-charge,
-    // which is the safe direction -- and demanding equality with a shallow
-    // control would forbid that conservative behaviour and force an exact
-    // new-depth claim this seam does not make. Red for an over-charge and red
-    // for an under-charge look identical to an equality; they are opposites
-    // to the product.
-    // Establish a debt first: shallow -> deep -> shallow. Resizing straight
-    // down from the constructor value would leave a feeder indistinguishable
-    // from one built shallow, which is also the signature of a feeder that
-    // never updated at all -- so that arm cannot tell a repair from the bug.
-    let (mut shrunk_term, _a) = Terminal::new(shallow, Fences::ALL);
-    shrunk_term.resize(deep);
-    shrunk_term.resize(shallow);
-    shrunk_term.reset_stats();
-    shrunk_term.feed_fully(b"\x1bc");
-    let shrunk_work = shrunk_term.stats().completed_work;
+    // Shrinking retains the debt, and the fixture proves retention rather
+    // than merely permitting it.
+    //
+    // `>= fresh` alone is the predicate three of us proposed and all three
+    // withdrew: a feeder that dropped the debt reads *exactly* equal to a
+    // fresh shallow one, so `>=` passes on the unrepaired state. Strictness
+    // on the pricing field is what rejects it. The scheduling fields are
+    // asserted directionally with per-field signs -- `first_units` inverts,
+    // because a narrower slice retires fewer atoms per un-preemptable drain,
+    // which is the fence working -- but none of them is the discriminator:
+    // they separate only when the two depths straddle the slice floor, and
+    // `completed_work` separates at every positive depth gap.
+    let debt = |from: Size, to: Size| {
+        let (mut term, _a) = Terminal::new(from, Fences::ALL);
+        term.resize(deep);
+        term.resize(to);
+        term.reset_stats();
+        let mut drains = 1;
+        let mut more = term.feed(&b"\x1bc".repeat(200));
+        let first_units = term.stats().completed_units;
+        let first_pending = term.pending_bytes();
+        while more {
+            more = term.drain();
+            drains += 1;
+        }
+        (
+            first_units,
+            first_pending,
+            drains,
+            term.stats().completed_units,
+            term.stats().completed_work,
+        )
+    };
+    let shrunk = debt(shallow, shallow);
+    let fresh = run(shallow, None);
 
-    let (mut fresh, _a) = Terminal::new(shallow, Fences::ALL);
-    fresh.reset_stats();
-    fresh.feed_fully(b"\x1bc");
-
-    // Directional, never equality. Shrinking may leave the feeder pricing at
-    // the depth it once had -- an over-charge, the safe direction -- and
-    // demanding equality with a shallow control would forbid that and force
-    // an exactness claim this seam does not make. The two failures look
-    // identical to an equality and are opposites to the product.
+    assert_eq!(shrunk.3, 200, "no unit may be lost on the way down either");
     assert!(
-        shrunk_work >= fresh.stats().completed_work,
-        "a shrunk feeder may be conservative but never cheaper than one \
-         built shallow: {shrunk_work} against {}",
-        fresh.stats().completed_work,
+        shrunk.4 > fresh.1,
+        "a feeder that has been deep must still price deep after shrinking: \
+         {} against a fresh shallow {}. Equality here is the signature of a \
+         feeder that dropped the debt, which is indistinguishable from one \
+         that never had it",
+        shrunk.4,
+        fresh.1,
     );
+    assert!(
+        shrunk.0 <= 12,
+        "narrower slices retire fewer atoms per drain"
+    );
+    assert!(shrunk.2 >= fresh.2, "and take more drains to do it");
 
-    // A later resize on a different axis must not disturb the third one --
+    // A later resize on a different axis must not disturb the third one --    // A later resize on a different axis must not disturb the third one --
     // the split was permanent, with columns and lines tracking correctly
     // while a stale depth persisted forever.
     term.resize(Size {
@@ -1078,17 +1123,28 @@ fn extreme_dimensions_saturate_instead_of_wrapping() {
     // ends; only a sweep catches a non-monotone middle, and a wrap *is* a
     // non-monotone middle -- it makes the worst grid look cheap and hands it
     // the widest slice of all.
-    let mut previous = usize::MAX;
-    for exponent in 0..60 {
-        let scrollback = 1usize << exponent;
-        let width = slice_bytes(200, 50, scrollback);
-        assert!(
-            width <= previous,
-            "slice widened from {previous} to {width} at scrollback \
-             2^{exponent}: more expensive grid, more generous slice",
-        );
-        assert!(width >= MIN_SLICE);
-        previous = width;
+    // Every axis independently: a wrap on any one of the three products is a
+    // non-monotone middle on that axis alone, and sweeping only scrollback
+    // would miss a truncating `columns * lines`.
+    for (axis, at) in [
+        (
+            "scrollback",
+            (|n| slice_bytes(200, 50, n)) as fn(usize) -> usize,
+        ),
+        ("columns", |n| slice_bytes(n.max(1), 50, 0)),
+        ("lines", |n| slice_bytes(200, n.max(1), 0)),
+    ] {
+        let mut previous = usize::MAX;
+        for exponent in 0..60 {
+            let width = at(1usize << exponent);
+            assert!(
+                width <= previous,
+                "slice widened from {previous} to {width} at {axis} \
+                 2^{exponent}: more expensive grid, more generous slice",
+            );
+            assert!(width >= MIN_SLICE);
+            previous = width;
+        }
     }
 
     // Just past 32 bits on one axis: large enough that a narrowing cast

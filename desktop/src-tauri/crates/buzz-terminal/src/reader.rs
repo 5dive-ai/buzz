@@ -37,9 +37,19 @@ pub struct Feeder {
     /// yet dispatched. Governs how the next slice is metered -- see
     /// [`crate::fences::slice_bytes_remaining`].
     mid_escape: bool,
-    /// Configured scrollback depth. Updated by [`Feeder::resize`] with the
-    /// rest of the geometry: it is most of RIS's charge, so a stale value
-    /// misprices the densest atom and the slice derived from it.
+    /// Deepest scrollback this feeder has ever been configured for.
+    ///
+    /// A high-water mark rather than the current depth, and the difference is
+    /// not conservatism for its own sake -- the rows are still there. Upstream
+    /// frees history lazily: `Storage::shrink_lines` truncates only once the
+    /// buffer exceeds the new length by `MAX_CACHE_SIZE`, so immediately after
+    /// a decrease the grid still owns rows that a reset must walk. Pricing at
+    /// the new depth would charge for a grid that does not exist yet.
+    ///
+    /// Never lowered, so it needs no clearing transition and cannot go stale
+    /// in the unsafe direction. The cost is that a session which shrinks its
+    /// scrollback keeps paying the deep price for the rest of its life; the
+    /// alternative is a bound that is wrong immediately after every shrink.
     scrollback: usize,
 }
 
@@ -71,7 +81,9 @@ impl Feeder {
     pub fn resize(&mut self, size: crate::Size) {
         self.columns = size.columns;
         self.lines = size.screen_lines;
-        self.scrollback = size.scrollback;
+        // Grows only. See the field: a decrease does not immediately free the
+        // rows a reset has to walk.
+        self.scrollback = self.scrollback.max(size.scrollback);
     }
 
     pub fn stats(&self) -> FenceStats {

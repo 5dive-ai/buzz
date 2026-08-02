@@ -13,6 +13,8 @@ let channel;
 let resizeCallback;
 let canvasWidth = 840;
 let attachResolver = null;
+let deferResizes = false;
+const pendingResizes = [];
 
 before(async () => {
   Object.assign(globalThis, {
@@ -84,10 +86,14 @@ before(async () => {
           : Promise.resolve(response);
       }
       if (command === "terminal_resize") {
-        return Promise.resolve({
+        const value = {
           columns: args.columns,
           generation: args.columns,
           screenLines: args.rows,
+        };
+        if (!deferResizes) return Promise.resolve(value);
+        return new Promise((resolve) => {
+          pendingResizes.push(() => resolve(value));
         });
       }
       return Promise.resolve();
@@ -108,6 +114,8 @@ afterEach(() => {
   calls.length = 0;
   canvasWidth = 840;
   attachResolver = null;
+  deferResizes = false;
+  pendingResizes.length = 0;
 });
 
 function emit(message, index = 0) {
@@ -187,22 +195,24 @@ test("mounted bootstrap passes GUI context and ACKs only after consuming a frame
     },
   );
 
+  // IPC redelivery produces a newly deserialized object, so replay a distinct
+  // object to exercise sequence-based deduplication rather than object identity.
   await act(async () => {
-    emit(frameMessage, 1);
+    emit(structuredClone(frameMessage), 1);
   });
   assert.equal(
     calls.filter(({ command }) => command === "terminal_ack").length,
     1,
   );
 });
-
-test("resize during attach declares only the newest viewport ready", async () => {
+test("resize during in-flight catch-up keeps the newest viewport ready", async () => {
   const { createElement } = await import("react");
   const { act, render, waitFor } = await import("@testing-library/react");
   const { ThemeProvider } = await import("@/shared/theme/ThemeProvider");
   const { TerminalBootstrap } = await import("./TerminalBootstrap.tsx");
 
   attachResolver = () => {};
+  deferResizes = true;
   const view = render(
     createElement(
       ThemeProvider,
@@ -225,19 +235,29 @@ test("resize during attach declares only the newest viewport ready", async () =>
   canvasWidth = 1_008;
   act(() => resizeCallback());
   await act(async () => attachResolver());
-  await waitFor(() =>
-    assert.ok(
-      calls.some(({ command }) => command === "terminal_viewport_ready"),
-    ),
-  );
+  await waitFor(() => assert.equal(pendingResizes.length, 1));
+
+  canvasWidth = 1_680;
+  await act(async () => {
+    resizeCallback();
+  });
+
+  // Resolve newest-first so an unchained catch-up resize would publish stale
+  // readiness after the newer viewport.
+  for (let i = 0; i < 10 && pendingResizes.length > 0; i += 1) {
+    await act(async () => {
+      pendingResizes.pop()();
+      await Promise.resolve();
+    });
+  }
+  await act(async () => {
+    await Promise.resolve();
+  });
 
   const readyCalls = calls.filter(
     ({ command }) => command === "terminal_viewport_ready",
   );
-  assert.equal(readyCalls.at(-1).args.viewport.columns, 120);
-  assert.equal(
-    readyCalls.every(({ args }) => args.viewport.columns === 120),
-    true,
-  );
+  assert.ok(readyCalls.length > 0, "vacuity guard: no readiness published");
+  assert.equal(readyCalls.at(-1).args.viewport.columns, 200);
   view.unmount();
 });

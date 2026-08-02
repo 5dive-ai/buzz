@@ -176,6 +176,101 @@ esac"#,
 }
 
 #[cfg(unix)]
+fn replacement_provider() -> &'static str {
+    r#"#!/bin/sh
+set -eu
+read request
+case "$request" in
+  *\"op\":\"info\"*) printf '%s\n' '{"ok":true,"name":"replacement","version":"9.9.9","protocol_version":1,"description":"replacement provider","config_schema":{}}' ;;
+  *\"op\":\"deploy\"*) printf '%s\n' '{"ok":true,"agent_id":"replacement-bytes-ran"}' ;;
+esac
+"#
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_deploy_uses_staged_bytes_after_same_inode_source_rewrite() {
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("provider");
+    let replacement = directory.path().join("replacement");
+    std::fs::write(&replacement, replacement_provider()).unwrap();
+    let body = format!(
+        r#"read request
+case "$request" in
+  *\"op\":\"info\"*)
+    cat '{}' > '{}'
+    chmod 700 '{}'
+    printf '%s\n' '{{"ok":true,"name":"original","version":"1.0.0","protocol_version":1,"description":"original provider","config_schema":{{}}}}'
+    ;;
+  *\"op\":\"deploy\"*) printf '%s\n' '{{"ok":true,"agent_id":"original-staged-bytes"}}' ;;
+esac"#,
+        replacement.display(),
+        provider.display(),
+        provider.display(),
+    );
+    write_test_provider(&provider, &body);
+    let inode_before = std::fs::metadata(&provider).unwrap().ino();
+
+    let id = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
+        .expect("deploy from immutable staged copy");
+
+    assert_eq!(id, "original-staged-bytes");
+    assert_eq!(
+        std::fs::metadata(&provider).unwrap().ino(),
+        inode_before,
+        "test must rewrite the source binary in place"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&provider).unwrap(),
+        replacement_provider(),
+        "source pathname must contain replacement bytes before deploy"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_deploy_uses_staged_bytes_after_source_pathname_replacement() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let provider = directory.path().join("provider");
+    let replacement = directory.path().join("replacement");
+    std::fs::write(&replacement, replacement_provider()).unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let body = format!(
+        r#"read request
+case "$request" in
+  *\"op\":\"info\"*)
+    mv '{}' '{}'
+    printf '%s\n' '{{"ok":true,"name":"original","version":"1.0.0","protocol_version":1,"description":"original provider","config_schema":{{}}}}'
+    ;;
+  *\"op\":\"deploy\"*) printf '%s\n' '{{"ok":true,"agent_id":"original-staged-bytes"}}' ;;
+esac"#,
+        replacement.display(),
+        provider.display(),
+    );
+    write_test_provider(&provider, &body);
+    let inode_before = std::fs::metadata(&provider).unwrap().ino();
+
+    let id = provider_deploy(&provider, &serde_json::json!({}), &serde_json::json!({}))
+        .expect("deploy from immutable staged copy");
+
+    assert_eq!(id, "original-staged-bytes");
+    assert_ne!(
+        std::fs::metadata(&provider).unwrap().ino(),
+        inode_before,
+        "test must replace the source pathname with a different inode"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&provider).unwrap(),
+        replacement_provider(),
+        "source pathname must contain replacement bytes before deploy"
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn provider_deploy_refuses_mismatch_before_sending_agent_secret() {
     let directory = tempfile::tempdir().unwrap();

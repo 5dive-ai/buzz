@@ -14,7 +14,8 @@
  * theme's real hues, so the three stops come from there.
  *
  * Thresholds: contrast 4.5 is WCAG 2.2 SC 1.4.3 (body text). Chroma 16,
- * hue 12 and sRGB 45 are HOUSE thresholds with no external standard — sized by
+ * hue 12 (CIEDE2000 dH', equal-L*) and sRGB 45 are HOUSE thresholds with no
+ * external standard — sized by
  * sweep and stable across 8-25 chroma x 8-20 hue.
  *
  * Validated by terminalBannerColor.test.mjs: all 62 shipped themes pass every
@@ -135,7 +136,11 @@ const FIELD_EDGE = 1.04; // at the rim — all but gone
 const BEVEL_HI = 2.9; // lit edge
 const BEVEL_LO = 1.55; // shadowed edge; the ratio gap IS the bevel
 const CHROMA_MIN = 16; // Lab C*: below this a "hue" is a grey
-const HUE_MIN = 12; // hue-only CIEDE2000 between adjacent stops
+// UNIT: CIEDE2000 dH' with both colours forced to a shared L*. NOT raw LCh
+// hue-angle degrees, which run ~1.5-3x larger on the same stops (red 13.0 vs
+// 19.3, kanagawa-dragon 25.1 vs 75.3) because S_H weights by chroma and hue.
+// Quoting a degrees figure next to this threshold compares different units.
+const HUE_MIN = 12;
 const SRGB_MIN = 45; // min pairwise sRGB distance, conjoined with HUE_MIN
 
 /** Euclidean sRGB distance. Guards near-coincident stops that differ in hue
@@ -222,7 +227,8 @@ const lift = (c: string, bg: string, floor: number) =>
  * #a0a0a0 scores 165 while being one hue. Hue alone admits stops that differ
  * in angle but barely in appearance.
  *
- * Thresholds: hue 12 and sRGB 45 are HOUSE thresholds with no external
+ * Thresholds: hue 12 (CIEDE2000 dH', equal-L*) and sRGB 45 are HOUSE
+ * thresholds with no external
  * standard, sized by sweep. The contrast floor 4.5 is WCAG 2.2 SC 1.4.3.
  */
 export function stopsAreDistinct(s: [string, string, string]): boolean {

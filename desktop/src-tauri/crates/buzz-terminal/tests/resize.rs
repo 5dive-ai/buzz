@@ -49,8 +49,8 @@ fn resize_forces_a_full_frame_at_the_new_width() {
 
     let first = shared.render(&mut encoder);
     assert!(first.full, "first frame after a fresh Term must be full");
-    assert_eq!(first.columns, 40);
-    assert_eq!(first.generation, 0);
+    assert_eq!(first.viewport.columns, 40);
+    assert_eq!(first.viewport.generation, 0);
 
     // Nothing changed: dedup suppresses everything. Without this the next
     // assertion could pass simply because every frame is full.
@@ -62,19 +62,24 @@ fn resize_forces_a_full_frame_at_the_new_width() {
         idle.rows.len()
     );
 
-    shared.resize(size(20));
+    let applied = shared.resize(size(20));
+    assert_eq!(
+        applied.columns, 20,
+        "resize did not report the grid it applied"
+    );
+    assert_eq!(
+        applied.generation, 1,
+        "generation must advance across a resize"
+    );
+
     let after = shared.render(&mut encoder);
     assert!(
         after.full,
         "a resize must invalidate the renderer's cached rows"
     );
     assert_eq!(
-        after.columns, 20,
-        "frame does not describe the new viewport"
-    );
-    assert_eq!(
-        after.generation, 1,
-        "generation must advance across a resize"
+        after.viewport, applied,
+        "frame's viewport disagrees with the one resize reported applying"
     );
     assert_eq!(after.rows.len(), 10, "full frame must carry every line");
     let row0: String = after.rows[0]
@@ -98,12 +103,14 @@ fn identical_resize_is_inert() {
     shared.feed(b"hello");
     shared.render(&mut encoder);
 
-    shared.resize(size(40));
-    let after = shared.render(&mut encoder);
+    let applied = shared.resize(size(40));
     assert_eq!(
-        after.generation, 0,
+        applied.generation, 0,
         "a same-size resize advanced the generation"
     );
+
+    let after = shared.render(&mut encoder);
+    assert_eq!(after.viewport, applied);
     assert!(
         !after.full,
         "a same-size resize forced a needless full repaint"
@@ -138,7 +145,7 @@ fn full_frame_after_height_resize_republishes_unchanged_rows() {
         after.full,
         "a resize must invalidate the renderer's cached rows"
     );
-    assert_eq!(after.screen_lines, 20);
+    assert_eq!(after.viewport.screen_lines, 20);
     assert_eq!(
         after.rows.len(),
         20,
@@ -146,4 +153,44 @@ fn full_frame_after_height_resize_republishes_unchanged_rows() {
          was simultaneously told to discard, leaving them blank",
         after.rows.len()
     );
+}
+
+/// A frame is stamped with the grid it was **captured on**, and a later resize
+/// does not retroactively re-label it.
+///
+/// This is the cross-transport race in the integration lane: frame delivery and
+/// the resize call are separate paths, so a generation-N frame can arrive after
+/// generation N+1 has been applied. Rejecting it requires the stamp to be
+/// capture-time truth.
+///
+/// Note what is and is not proven here. That an owned `Frame` cannot mutate is
+/// guaranteed by the language, so asserting it against a copy of itself would
+/// be tautological. What this asserts is that `capture()` stamps the viewport
+/// as it was **at capture**, against explicit expected values -- a `capture()`
+/// that read the viewport a moment later, or a `Frame` that carried a handle
+/// back to the terminal, would fail here.
+#[test]
+fn a_frame_is_stamped_with_the_grid_it_was_captured_on() {
+    let (shared, _actions) = shared(grid(40, 10));
+    let mut encoder = Encoder::new();
+    shared.feed(b"\x1b[2J\x1b[Hhello world");
+
+    let in_flight = shared.render(&mut encoder);
+    assert_eq!(in_flight.viewport.generation, 0);
+    assert_eq!(in_flight.viewport.columns, 40);
+
+    let applied = shared.resize(grid(20, 10));
+    assert_eq!(applied.generation, 1);
+    assert_eq!(applied.columns, 20);
+
+    // The held frame still describes the pre-resize grid, so a consumer can
+    // compare the two and discard it rather than paint 40-column rows onto a
+    // 20-column grid.
+    assert_eq!(
+        in_flight.viewport.columns, 40,
+        "a frame captured before the resize describes the post-resize grid; \
+         a stale frame arriving late would be indistinguishable from a fresh one"
+    );
+    assert_eq!(in_flight.viewport.generation, 0);
+    assert_ne!(in_flight.viewport, applied);
 }

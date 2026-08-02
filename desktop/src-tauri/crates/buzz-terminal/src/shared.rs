@@ -170,8 +170,8 @@ impl SharedTerminal {
 
     /// Apply a coalesced resize. Renderer plane: this competes with the
     /// renderer for the same lock and can hold it for milliseconds.
-    pub fn resize(&self, size: crate::Size) {
-        self.acquire(&self.renderer).resize(size);
+    pub fn resize(&self, size: crate::Size) -> crate::Viewport {
+        self.acquire(&self.renderer).resize(size)
     }
 
     /// Take the lock for something the methods above don't cover (input,

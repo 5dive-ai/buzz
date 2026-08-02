@@ -93,16 +93,12 @@ pub struct Frame {
     pub cursor: CursorFrame,
     /// Whether the renderer should discard what it has and repaint.
     pub full: bool,
-    /// The viewport this frame describes. A change means the grid was resized
+    /// The grid this frame describes. A change means the terminal was resized
     /// and row indices refer to a different geometry than the previous frame's.
     /// Carried so the consumer can detect that from the frame itself instead of
-    /// trusting that no resize overtook it in flight.
-    pub generation: u64,
-    /// Grid dimensions this frame was captured at, so a full frame is
-    /// self-describing rather than only meaningful against a size the consumer
-    /// happens to remember.
-    pub columns: usize,
-    pub screen_lines: usize,
+    /// trusting that no resize overtook it in flight -- across a transport, a
+    /// frame captured before a resize can arrive after it.
+    pub viewport: crate::Viewport,
 }
 
 impl Frame {
@@ -117,15 +113,13 @@ pub struct RawFrame {
     rows: Vec<(usize, Vec<Cell>)>,
     cursor: CursorFrame,
     full: bool,
-    generation: u64,
-    columns: usize,
-    screen_lines: usize,
+    viewport: crate::Viewport,
 }
 
 /// Copy the damaged rows out of the terminal. **Runs under the lock; does no
 /// encoding.** Keep this function boring — everything added here is lock hold.
 pub fn capture(terminal: &mut crate::Terminal) -> RawFrame {
-    let generation = terminal.generation();
+    let viewport = terminal.viewport();
     let term = terminal.term_mut();
     let columns = term.columns();
     let screen_lines = term.screen_lines();
@@ -161,9 +155,7 @@ pub fn capture(terminal: &mut crate::Terminal) -> RawFrame {
         rows,
         cursor,
         full,
-        generation,
-        columns,
-        screen_lines,
+        viewport,
     }
 }
 
@@ -205,9 +197,7 @@ impl Encoder {
             rows,
             cursor: raw.cursor,
             full: raw.full,
-            generation: raw.generation,
-            columns: raw.columns,
-            screen_lines: raw.screen_lines,
+            viewport: raw.viewport,
         }
     }
 }

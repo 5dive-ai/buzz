@@ -22,10 +22,29 @@ use buzz_terminal::{SharedTerminal, Size, Terminal};
 
 /// One frame at 60 Hz. No acquire may exceed this: a single wait this long is
 /// a dropped frame regardless of how good the distribution looks.
+///
+/// Unlike the p95 below, this bound **cannot be protected by headroom**, and
+/// that asymmetry is why this test is `#[ignore]`d and run only in release on
+/// an idle host. A quantile discards its worst samples by construction, so it
+/// degrades gracefully as a machine gets noisy; a maximum over `FRAMES` samples
+/// is a single observation, and any one scheduler preemption exceeds it. There
+/// is no budget that makes the max arm robust to contention -- the tail it
+/// catches belongs to the scheduler, not to this code.
+///
+/// Measured on one 16-core host at `FRAMES = 200`: at load average ~6 the gate
+/// passes; at ~31 it fails with p95 65535 us / max 164889 us. A run at ambient
+/// load produced p95 1023 us -- 4x *inside* budget -- while max alone blew at
+/// 38150 us.
+///
+/// So the repair for a flake here is to fix the host, never to raise this
+/// number. Raising it is the one change that silently removes the only assert
+/// that catches the user-visible failure: a hitch is a max-event, and a
+/// p95-only gate passes a run containing a 38 ms stall.
 const FRAME_MICROS: u64 = 16_667;
 
 /// p95 budget. Measured at 127 us with F1 on -- 31x of headroom, which is the
-/// margin that lets this run on a loaded CI runner without becoming a coin flip.
+/// margin that lets *this* arm tolerate a loaded machine without becoming a
+/// coin flip. The reasoning covers the quantile only; see `FRAME_MICROS`.
 const P95_MICROS: u64 = 4_000;
 
 /// Frames sampled per arm. Counted rather than timed: sample count under a

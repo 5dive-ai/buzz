@@ -1,5 +1,5 @@
-export const REVEAL_DURATION_MS = 720;
-export const CONCEAL_DURATION_MS = 420;
+export const REVEAL_DURATION_MS = 360;
+export const CONCEAL_DURATION_MS = 210;
 export const FADE_EASING = "cubic-bezier(.2,.8,.2,1)";
 
 type Direction = "reveal" | "conceal";
@@ -78,11 +78,11 @@ export class FadeController {
     void animation.finished
       .then(() => {
         if (this.#animation === animation && this.#token === token) {
-          this.settle(next);
+          this.#surface.style.willChange = "auto";
         }
       })
       .catch(() => {
-        // Reversal/cancellation rejects `finished`; the newer token owns state.
+        // Reversal/cancellation rejects `finished`; the live timeline owns state.
       });
     return next;
   }

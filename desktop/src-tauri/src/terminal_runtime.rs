@@ -5,14 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use buzz_terminal::context::{context_vars, GuiContext};
-use buzz_terminal::damage::Style;
+use buzz_terminal::damage::{Frame, Style};
 use buzz_terminal::{Fences, SharedTerminal, Size, Terminal, Viewport};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use uuid::Uuid;
 
-use crate::terminal_transport::{FramePublisher, Publication, SubscriptionId};
+use crate::terminal_transport::{FramePublisher, OfferError, Publication, SubscriptionId};
 
 const MAX_LIVE_SESSIONS: usize = 20;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -316,6 +316,20 @@ fn pty_size(columns: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> Pty
     }
 }
 
+fn offer_capture(
+    publisher: &Mutex<FramePublisher>,
+    frame: Frame,
+    snapshot: impl FnOnce() -> Frame,
+) -> Option<Publication> {
+    let offered = publisher.lock().ok()?.offer(frame);
+    match offered {
+        Ok(publication) => publication,
+        Err(OfferError::PendingFrameMustBeSnapshot) => {
+            publisher.lock().ok()?.offer(snapshot()).ok().flatten()
+        }
+    }
+}
+
 #[tauri::command]
 pub(crate) fn terminal_attach(
     request: AttachRequest,
@@ -473,10 +487,9 @@ pub(crate) fn terminal_attach(
             if frame.is_empty() {
                 continue;
             }
-            let publication = reader_publisher
-                .lock()
-                .ok()
-                .and_then(|mut publisher| publisher.offer(frame).ok().flatten());
+            let publication = offer_capture(&reader_publisher, frame, || {
+                reader_terminal.snapshot(&mut snapshot_encoder)
+            });
             if let Some(publication) = publication {
                 let subscription = publication.subscription_id;
                 let result = wire_publication(publication).and_then(|mut message| {
@@ -718,6 +731,67 @@ mod tests {
             bg: 2,
             flags: 3,
         }
+    }
+
+    fn marker_frame(marker: usize, full: bool) -> Frame {
+        Frame {
+            rows: vec![RowFrame {
+                line: marker,
+                spans: Vec::new(),
+            }],
+            cursor: CursorFrame {
+                line: 0,
+                column: 0,
+                visible: true,
+            },
+            full,
+            viewport: Viewport {
+                generation: 0,
+                columns: 80,
+                screen_lines: 24,
+            },
+        }
+    }
+
+    fn assert_post_snapshot_capture_survives_attach(mut publisher: FramePublisher) {
+        assert!(!publisher.requires_snapshot());
+        let bootstrap = marker_frame(1, true);
+        let post_snapshot_incremental = marker_frame(42, false);
+        let subscription = SubscriptionId::new();
+        publisher.attach(subscription, bootstrap).unwrap();
+        let publisher = Mutex::new(publisher);
+
+        assert_eq!(
+            offer_capture(&publisher, post_snapshot_incremental, || marker_frame(
+                42, true
+            )),
+            None
+        );
+
+        let successor = publisher
+            .lock()
+            .unwrap()
+            .acknowledge(subscription, 1)
+            .expect("post-snapshot PTY output was lost");
+        assert_eq!(successor.frame.rows[0].line, 42);
+        assert!(successor.frame.full);
+    }
+
+    #[test]
+    fn initial_attach_retains_output_captured_after_its_bootstrap_snapshot() {
+        let viewport = marker_frame(0, true).viewport;
+        let publisher = FramePublisher::new(viewport);
+        assert_post_snapshot_capture_survives_attach(publisher);
+    }
+
+    #[test]
+    fn reattach_retains_output_captured_after_its_bootstrap_snapshot() {
+        let viewport = marker_frame(0, true).viewport;
+        let mut publisher = FramePublisher::new(viewport);
+        let old = SubscriptionId::new();
+        publisher.attach(old, marker_frame(0, true)).unwrap();
+        assert!(publisher.acknowledge(old, 1).is_none());
+        assert_post_snapshot_capture_survives_attach(publisher);
     }
 
     #[test]

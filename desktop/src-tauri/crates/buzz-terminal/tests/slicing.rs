@@ -1,6 +1,15 @@
 //! The work-denominated slicing seam: what bounds one lock hold, what bounds
 //! the queue behind it, and what proves the work was actually done.
 //!
+//! **This is half a suite.** The adversarial resize and overflow cases live
+//! in `slicing_adversarial.rs`, split out for the file-size ratchet; the two
+//! files are one set of contracts. A mutation check scoped with
+//! `--test slicing` covers 20 of 76 package tests and can report a confident
+//! pass while the killing fixture sits in the sibling file. Dropping the
+//! scrollback debt does exactly that, then dies under the package.
+//!
+//! Mutation checks run the package, never a file: `cargo test -p buzz-terminal`.
+//!
 //! Every assertion here is an **exact** expected value, never a `> 0`. A fix
 //! that bounds the lock by *dropping* work instead of deferring it reports a
 //! beautiful latency and a perfect screen-content receipt -- DECALN fills the

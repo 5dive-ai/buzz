@@ -1,4 +1,13 @@
 //! Adversarial slicing cases for resize debt, oversized atoms, and arithmetic extremes.
+//!
+//! **This is half a suite.** The remaining work-bound cases live in
+//! `slicing.rs`; the two files are one set of contracts split only for the
+//! file-size ratchet. A mutation check scoped with `--test slicing_adversarial`
+//! covers 4 of 76 package tests and can report a confident pass while the
+//! killing fixture sits in the sibling file. Sizing from the whole budget does
+//! exactly that, then dies under the package.
+//!
+//! Mutation checks run the package, never a file: `cargo test -p buzz-terminal`.
 
 use buzz_terminal::fences::{
     max_atom_work, max_drain_work, slice_bytes_remaining, Fences, WORK_BUDGET,

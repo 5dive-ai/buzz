@@ -75,10 +75,8 @@ use tauri::{Listener, WindowEvent};
 use tauri_plugin_window_state::StateFlags;
 #[cfg(target_os = "macos")]
 use tray_menu::show_main_window;
-
 #[cfg(target_os = "macos")]
 const INITIAL_RENDER_READY_EVENT: &str = "initial-render-ready";
-
 fn reveal_initial_window<R: tauri::Runtime>(window: &tauri::Window<R>) {
     if let Err(error) = window.show() {
         eprintln!("buzz-desktop: failed to reveal main window: {error}");
@@ -88,7 +86,6 @@ fn reveal_initial_window<R: tauri::Runtime>(window: &tauri::Window<R>) {
         eprintln!("buzz-desktop: failed to focus main window: {error}");
     }
 }
-
 #[cfg(target_os = "macos")]
 fn set_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
     // The window remains transparent at runtime for vibrancy. Use an opaque
@@ -98,7 +95,6 @@ fn set_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
         eprintln!("buzz-desktop: failed to set initial window backing: {error}");
     }
 }
-
 #[cfg(target_os = "macos")]
 async fn clear_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<R>) {
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -106,15 +102,12 @@ async fn clear_initial_window_backing<R: tauri::Runtime>(window: &tauri::Window<
         eprintln!("buzz-desktop: failed to clear initial window backing: {error}");
     }
 }
-
 #[cfg(target_os = "macos")]
 async fn wait_for_stable_initial_window_geometry<R: tauri::Runtime>(window: &tauri::Window<R>) {
     const MAX_POLLS: usize = 120;
     const REQUIRED_STABLE_POLLS: usize = 4;
-
     let mut previous_bounds = None;
     let mut stable_polls = 0;
-
     for _ in 0..MAX_POLLS {
         // Accept whatever geometry the window-state plugin restores — maximized
         // or a normal saved size. macOS applies the restore asynchronously, so
@@ -126,7 +119,6 @@ async fn wait_for_stable_initial_window_geometry<R: tauri::Runtime>(window: &tau
             (Ok(position), Ok(size)) => Some((position.x, position.y, size.width, size.height)),
             _ => None,
         };
-
         if bounds.is_some() && bounds == previous_bounds {
             stable_polls += 1;
             if stable_polls >= REQUIRED_STABLE_POLLS {
@@ -136,13 +128,10 @@ async fn wait_for_stable_initial_window_geometry<R: tauri::Runtime>(window: &tau
             stable_polls = 0;
         }
         previous_bounds = bounds;
-
         tokio::time::sleep(std::time::Duration::from_millis(16)).await;
     }
-
     eprintln!("buzz-desktop: initial window geometry did not settle before reveal timeout");
 }
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // mesh-llm's async chains (model download, node start/join) overflow
@@ -172,7 +161,6 @@ pub fn run() {
             eprintln!("buzz-mesh: failed to build big-stack tokio runtime, using default: {error}");
         }
     }
-
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // Focus the existing window when a duplicate instance launches.

@@ -19,9 +19,15 @@ pub mod units;
 
 #[cfg(test)]
 mod context_tests;
-#[cfg(test)]
+// `--all-targets` compiles `#[cfg(test)]` modules, so a Windows `cargo check`
+// builds these two -- and they drive real PTYs, `libc::kill`, and unix
+// permission bits, which do not exist there. Gating the *modules* rather than
+// their contents keeps the unix-only shape honest: the code under test is
+// itself `#[cfg(unix)]`, so a Windows build has nothing to assert against.
+// `context_tests` is pure string logic and stays portable.
+#[cfg(all(test, unix))]
 mod env_fence_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod lifecycle_tests;
 
 use alacritty_terminal::grid::Dimensions;

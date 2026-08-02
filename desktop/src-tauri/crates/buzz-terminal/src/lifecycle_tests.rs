@@ -430,7 +430,17 @@ fn reader_drains_through_termination_and_reap() {
     let pid = child.process_id().expect("pid") as i32;
 
     let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let reader = RecordingReader::spawn(&pair, pid, order.clone());
+    let stop_at: StopClock = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let reader = RecordingReader::spawn(&pair, pid, order.clone(), stop_at.clone());
+    // Release the slave, exactly as the runtime does after spawning
+    // (`terminal_runtime.rs:441`). Not hygiene: a PTY master does not reach
+    // EOF while *any* process holds the slave open, and this test is one --
+    // so with the slave retained the reader parks in `read()` forever after
+    // the child is reaped, and every wait on it burns its whole bound. Linux
+    // honours that rule strictly; Darwin ends the read when the session
+    // leader exits, so the retained slave was invisible on the platform this
+    // was written on and failed only in CI.
+    drop(pair.slave);
 
     // Establish that this is a live draining reader, not a quiet fixture.
     assert!(
@@ -441,7 +451,15 @@ fn reader_drains_through_termination_and_reap() {
 
     let started = Instant::now();
     let outcome = shutdown_draining(&mut child, Box::new(reader)).expect("shutdown");
-    let elapsed = started.elapsed();
+    // `stop` runs the instant `shutdown` returns, so this is the child's half
+    // of the window and nothing else. Timing the whole call would fold reader
+    // teardown into an assertion whose message is about child termination --
+    // which is exactly how a stalled reader once read as a wedged child.
+    let elapsed = stop_at
+        .lock()
+        .unwrap()
+        .expect("stop was never called")
+        .duration_since(started);
 
     assert_eq!(
         outcome,
@@ -479,13 +497,19 @@ struct RecordingReader {
     total: std::sync::Arc<std::sync::atomic::AtomicU64>,
     handle: std::thread::JoinHandle<()>,
     order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    /// When `stop` was called -- i.e. the instant `shutdown` returned.
+    stop_at: StopClock,
 }
+
+/// Shared slot for the instant the reader was asked to stop.
+type StopClock = std::sync::Arc<std::sync::Mutex<Option<Instant>>>;
 
 impl RecordingReader {
     fn spawn(
         pair: &PtyPair,
         pid: i32,
         order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        stop_at: StopClock,
     ) -> Self {
         let mut reader = pair.master.try_clone_reader().expect("reader");
         let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -505,6 +529,7 @@ impl RecordingReader {
             total,
             handle,
             order,
+            stop_at,
         }
     }
 
@@ -519,6 +544,7 @@ impl DrainingReader for RecordingReader {
     }
 
     fn stop(&self) {
+        *self.stop_at.lock().unwrap() = Some(Instant::now());
         assert!(
             !pid_alive(self.pid),
             "reader stop must not be requested before the child is reaped"
@@ -536,9 +562,20 @@ impl DrainingReader for RecordingReader {
         // indistinguishable from a broken test. Waiting to a deadline and
         // abandoning the thread converts the hang into an assertion failure
         // the harness can report.
-        if !poll_until(|| self.handle.is_finished()) {
-            return;
-        }
+        //
+        // The deadline must *assert*, not return. A silent abandon is
+        // indistinguishable from a clean join, and that is not hypothetical:
+        // it is how a 10 s stall in this fixture masqueraded as a
+        // child-termination failure in the caller's timing assertion. The
+        // caller's clock covers `shutdown()` only, so this is the sole gate
+        // on reader teardown -- with a wedged reader, `shutdown()` still
+        // returns in ~58 ms and every other assertion here passes.
+        assert!(
+            poll_until(|| self.handle.is_finished()),
+            "reader thread never finished within {BOUND:?} after the child was \
+             reaped: the master never reached EOF, so output was not being \
+             drained through termination"
+        );
         let _ = self.handle.join();
     }
 }

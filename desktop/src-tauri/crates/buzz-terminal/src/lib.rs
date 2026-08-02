@@ -19,6 +19,22 @@ pub use fences::{FenceStats, Fences};
 pub use listener::{Action, Listener};
 pub use shared::{AcquireMeter, AcquireStats, SharedTerminal};
 
+/// Which grid a frame or a resize refers to.
+///
+/// Generation and dimensions travel together as one value because they answer
+/// one question -- "is this the grid I am currently showing?" -- and a consumer
+/// that compares them field by field can compare two of the three and be wrong
+/// on a resize that changes only the one it skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Viewport {
+    /// Advances on every *applied* resize. A same-size resize is inert and
+    /// does not advance it, so an unchanged `ResizeObserver` tick cannot look
+    /// like a discontinuity.
+    pub generation: u64,
+    pub columns: usize,
+    pub screen_lines: usize,
+}
+
 /// Terminal dimensions in cells, plus how much scrollback to retain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
@@ -109,12 +125,15 @@ impl Terminal {
         self.size
     }
 
-    /// Which viewport the grid currently has, incremented on every applied
-    /// resize. Stamped onto each [`damage::Frame`] so a consumer can tell that
-    /// a frame describes a *different* grid than the one it last drew, without
-    /// having to infer it from message ordering.
-    pub fn generation(&self) -> u64 {
-        self.generation
+    /// The grid as it stands now. Stamped onto each [`damage::Frame`] so a
+    /// consumer can tell that a frame describes a *different* grid than the one
+    /// it last drew, without having to infer it from message ordering.
+    pub fn viewport(&self) -> Viewport {
+        Viewport {
+            generation: self.generation,
+            columns: self.size.columns,
+            screen_lines: self.size.screen_lines,
+        }
     }
 
     /// Apply a new viewport.
@@ -130,13 +149,21 @@ impl Terminal {
     /// keeps the encoder's per-line hashes from suppressing reflowed content.
     /// The generation bump is belt-and-braces on top of that: it lets the
     /// consumer *verify* it received the discontinuity rather than assume it.
-    pub fn resize(&mut self, size: Size) {
+    ///
+    /// Returns the viewport that is now in effect, which is not necessarily the
+    /// one requested: a same-size call is inert and returns the current
+    /// generation unchanged. Returning it here rather than making the caller
+    /// ask afterwards matters across a transport -- a follow-up query races the
+    /// next resize, so the answer could describe a grid that had already been
+    /// replaced by the time it was read.
+    pub fn resize(&mut self, size: Size) -> Viewport {
         if size == self.size {
-            return;
+            return self.viewport();
         }
         self.term.resize(size);
         self.size = size;
         self.generation += 1;
+        self.viewport()
     }
 
     pub fn term(&self) -> &Term<Listener> {

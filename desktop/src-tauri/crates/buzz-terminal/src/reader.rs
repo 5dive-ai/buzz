@@ -172,8 +172,9 @@ impl Feeder {
     /// per count when it finds no stop.
     ///
     /// What *is* bounded is the number of atoms per slice, and that bound
-    /// holds from the first byte of a cold feeder: [`slice_bytes`] is derived
-    /// from the densest work-per-byte upstream can produce on this grid, so
+    /// holds from the first byte of a cold feeder:
+    /// [`slice_bytes_remaining`] is derived from the densest work-per-byte
+    /// upstream can produce on this grid, so
     /// no slice can contain more than one budget's worth of callbacks no
     /// matter what the payload is or what the feeder has seen before.
     ///

@@ -161,6 +161,11 @@ impl Terminal {
     }
 
     /// Whether the tail is at its cap and the reader must stop reading.
+    ///
+    /// There is no production consumer today, deliberately: the desktop
+    /// runtime pumps `drain()` to completion after every read, so the tail is
+    /// empty between iterations. A future reader that defers pumping must
+    /// consult this signal before accepting more PTY bytes.
     pub fn tail_full(&self) -> bool {
         self.feeder.tail_full()
     }

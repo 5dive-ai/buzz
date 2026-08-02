@@ -203,6 +203,15 @@ fn wire_publication(publication: Publication) -> Result<FrameMessage> {
     })
 }
 
+fn feed_and_drain(terminal: &SharedTerminal, bytes: &[u8]) -> bool {
+    let mut more = terminal.feed(bytes);
+    let deferred = more;
+    while more && !terminal.is_closing() {
+        more = terminal.drain();
+    }
+    deferred
+}
+
 struct ReaderThread {
     handle: Option<JoinHandle<()>>,
     terminal: Arc<SharedTerminal>,
@@ -502,10 +511,7 @@ pub(crate) fn terminal_attach(
             if reader_terminal.is_closing() {
                 continue;
             }
-            let mut more = reader_terminal.feed(&buffer[..count]);
-            while more && !reader_terminal.is_closing() {
-                more = reader_terminal.drain();
-            }
+            let _ = feed_and_drain(&reader_terminal, &buffer[..count]);
             if reader_terminal.is_closing() {
                 continue;
             }
@@ -813,6 +819,22 @@ mod tests {
             .expect("post-snapshot PTY output was lost");
         assert_eq!(successor.frame.rows[0].line, 42);
         assert!(successor.frame.full);
+    }
+
+    #[test]
+    fn reader_pumps_a_deferred_tail_without_an_external_event() {
+        let (terminal, _actions) = Terminal::new(Size::default(), Fences::ALL);
+        let terminal = SharedTerminal::new(terminal);
+        let payload = "\u{1b}c".repeat(2_102_714);
+
+        assert!(
+            feed_and_drain(&terminal, payload.as_bytes()),
+            "fixture must defer parser work before the runtime pumps it"
+        );
+
+        let terminal = terminal.lock();
+        assert_eq!(terminal.pending_bytes(), 0);
+        assert_eq!(terminal.stats().completed_units, 2_102_714);
     }
 
     #[test]

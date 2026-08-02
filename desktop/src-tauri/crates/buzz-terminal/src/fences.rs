@@ -130,8 +130,8 @@ pub fn max_atom_work(columns: usize, lines: usize, scrollback: usize) -> u64 {
 /// fixtures caught it:
 ///
 /// * The budget is checked *between* slices, so a drain overshoots by up to
-///   one whole slice -- not one atom. [`slice_bytes`] keeps that under one
-///   budget wherever its derivation is unclamped.
+///   one whole slice -- not one atom. [`slice_bytes_remaining`] keeps that
+///   under one budget wherever its derivation is unclamped.
 /// * A callback already running cannot be preempted. RIS at the default 10k
 ///   scrollback is worth 16x the whole budget on its own, so on such a grid
 ///   the floor binds and the overshoot is a few of those atoms. No scheduler

@@ -7,8 +7,8 @@
 use alacritty_terminal::vte::ansi::{Handler, Processor, StdSyncHandler};
 
 use crate::fences::{
-    slice_bytes, FenceStats, Fences, MAX_SLICE, OSC_BUDGET, SYNC_CAP, TAIL_CAP, TAIL_RESUME,
-    WORK_BUDGET,
+    slice_bytes_remaining, FenceStats, Fences, MAX_SLICE, OSC_BUDGET, SYNC_CAP, TAIL_CAP,
+    TAIL_RESUME, WORK_BUDGET,
 };
 use crate::units::{Counting, CursorColumn};
 
@@ -33,8 +33,13 @@ pub struct Feeder {
     /// callback for as long as it is wrong.
     columns: usize,
     lines: usize,
-    /// Configured scrollback depth. Fixed for the life of the feeder: it is a
-    /// config value, not grid state, and `resize` does not change it.
+    /// Whether the parser is part-way through an escape sequence that has not
+    /// yet dispatched. Governs how the next slice is metered -- see
+    /// [`crate::fences::slice_bytes_remaining`].
+    mid_escape: bool,
+    /// Configured scrollback depth. Updated by [`Feeder::resize`] with the
+    /// rest of the geometry: it is most of RIS's charge, so a stale value
+    /// misprices the densest atom and the slice derived from it.
     scrollback: usize,
 }
 
@@ -47,16 +52,26 @@ impl Feeder {
             since_reset: 0,
             pending: Vec::new(),
             pending_at: 0,
+            mid_escape: false,
             columns,
             lines,
             scrollback,
         }
     }
 
-    /// Track a viewport change, so the cost weights describe the current grid.
-    pub fn resize(&mut self, columns: usize, lines: usize) {
-        self.columns = columns;
-        self.lines = lines;
+    /// Track a geometry change, so the cost weights describe the current grid.
+    ///
+    /// Takes the whole [`crate::Size`] rather than a column/line pair on
+    /// purpose. Scrollback is as load-bearing as the other two -- it is most
+    /// of RIS's price and therefore most of the slice derivation -- and a
+    /// signature that accepted only the dimensions let a caller change the
+    /// depth on the `Term` while the feeder kept charging the construction
+    /// value. One argument, one ownership boundary, no way to update two of
+    /// three.
+    pub fn resize(&mut self, size: crate::Size) {
+        self.columns = size.columns;
+        self.lines = size.screen_lines;
+        self.scrollback = size.scrollback;
     }
 
     pub fn stats(&self) -> FenceStats {
@@ -158,14 +173,60 @@ impl Feeder {
         // self. A stack buffer keeps that from allocating; the copy is a
         // memcpy against a parse two orders of magnitude more expensive.
         let mut buf = [0u8; MAX_SLICE];
-        let width = slice_bytes(self.columns, self.lines, self.scrollback);
-        let mut spent = 0;
+        let mut spent: u64 = 0;
         while self.pending_at < self.pending.len() {
+            // Size each slice against what is *left* of the budget, and
+            // against what is actually in front of the parser. A slice can
+            // only be as expensive as the callbacks it contains, and only an
+            // escape can buy grid-sized work in two bytes -- so a plain run
+            // is sliced against the plain-byte cost and stops at the next
+            // `ESC`, which then gets a slice metered against the worst atom.
+            // The drain therefore returns on the atom that crosses the
+            // budget, not at the end of a slice that ran several more.
+            //
+            // Where one atom is worth more than the entire budget -- RIS at
+            // any real scrollback depth -- that escape gets a one-byte slice.
+            // That is the honest consequence of the law: nothing wider can
+            // promise to stop after the crossing atom when a single atom
+            // always crosses.
+            // A slice is never wider than MAX_SLICE, so the scan for the next
+            // escape stops there too: searching the whole tail would be
+            // O(tail) per slice and O(tail^2) per drain, which measured as a
+            // 7x throughput *regression* on plain text -- a bound that costs
+            // more than the thing it bounds.
+            let horizon = (self.pending_at + MAX_SLICE).min(self.pending.len());
+            let next_escape = if self.mid_escape {
+                // Already inside a sequence whose callback has not fired. Its
+                // remaining bytes are *not* plain text -- `ESC` then `c` is a
+                // grid reset -- so they keep the escape's metering. Without
+                // this the byte after a lone `ESC` is priced as a character
+                // and the atom rides into a wide slice with whatever follows
+                // it, which is the post-atom overrun by another door.
+                0
+            } else {
+                self.pending[self.pending_at..horizon]
+                    .iter()
+                    .position(|&b| b == 0x1b)
+                    .unwrap_or(horizon - self.pending_at)
+            };
+            let width = slice_bytes_remaining(
+                self.columns,
+                self.lines,
+                self.scrollback,
+                spent,
+                next_escape,
+            );
             let end = (self.pending_at + width).min(self.pending.len());
             let len = end - self.pending_at;
             buf[..len].copy_from_slice(&self.pending[self.pending_at..end]);
             self.pending_at = end;
-            spent += self.advance_slice(handler, &buf[..len]);
+            let cost = self.advance_slice(handler, &buf[..len]);
+            // A slice that contained an escape but dispatched nothing left the
+            // parser mid-sequence. Work is the signal because it is the thing
+            // being budgeted: a sequence that has not yet cost anything has
+            // not yet run.
+            self.mid_escape = (self.mid_escape || buf[..len].contains(&0x1b)) && cost == 0;
+            spent = spent.saturating_add(cost);
             if spent >= WORK_BUDGET {
                 break;
             }
@@ -184,14 +245,15 @@ impl Feeder {
 
     /// Parse one slice, applying both fences to it. Returns the work it cost.
     fn advance_slice<H: Handler + CursorColumn>(&mut self, handler: &mut H, bytes: &[u8]) -> u64 {
-        let mut spent = 0;
+        let mut spent: u64 = 0;
         let sync_before = self.parser.sync_bytes_count();
         {
             let mut counting = Counting::new(handler, self.columns, self.lines, self.scrollback);
             self.parser.advance(&mut counting, bytes);
-            self.stats.completed_units += counting.units();
-            self.stats.completed_work += counting.work();
-            spent += counting.work();
+            self.stats.completed_units =
+                self.stats.completed_units.saturating_add(counting.units());
+            self.stats.completed_work = self.stats.completed_work.saturating_add(counting.work());
+            spent = spent.saturating_add(counting.work());
         }
         let sync_after = self.parser.sync_bytes_count();
 
@@ -229,9 +291,11 @@ impl Feeder {
                 let mut counting =
                     Counting::new(handler, self.columns, self.lines, self.scrollback);
                 self.parser.stop_sync(&mut counting);
-                self.stats.completed_units += counting.units();
-                self.stats.completed_work += counting.work();
-                spent += counting.work();
+                self.stats.completed_units =
+                    self.stats.completed_units.saturating_add(counting.units());
+                self.stats.completed_work =
+                    self.stats.completed_work.saturating_add(counting.work());
+                spent = spent.saturating_add(counting.work());
             }
             self.stats.sync_aborts += 1;
             self.note_release(released);

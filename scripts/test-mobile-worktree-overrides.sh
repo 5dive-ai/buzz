@@ -171,15 +171,30 @@ assert_xcconfig_value() {
   fi
 }
 
+assert_xcconfig_declaration_count() {
+  # $1: file, $2: key, $3: expected count, $4: configuration label
+  local file="$1" key="$2" expected="$3" label="$4" count
+  count=$(grep -cE "^[[:space:]]*$key([[:space:]]*\[[^]]*\])*[[:space:]]*=" "$file" || true)
+  if [[ "$count" -eq "$expected" ]]; then
+    if [[ "$expected" -eq 0 ]]; then
+      pass "$label $key has no tracked declaration sites"
+    elif [[ "$expected" -eq 1 ]]; then
+      pass "$label $key has one tracked declaration site"
+    else
+      pass "$label $key has $count tracked declaration sites"
+    fi
+  elif [[ "$expected" -eq 0 ]]; then
+    fail "$label $key has $count tracked declaration sites; expected zero"
+  elif [[ "$expected" -eq 1 ]]; then
+    fail "$label $key has $count tracked declaration sites; expected exactly one"
+  else
+    fail "$label $key has $count tracked declaration sites; expected $expected"
+  fi
+}
+
 assert_single_xcconfig_declaration() {
   # $1: file, $2: key, $3: configuration label
-  local count
-  count=$(grep -cE "^[[:space:]]*$2([[:space:]]*\[[^]]*\])*[[:space:]]*=" "$1" || true)
-  if [[ "$count" -eq 1 ]]; then
-    pass "$3 $2 has one tracked declaration site"
-  else
-    fail "$3 $2 has $count tracked declaration sites; expected exactly one"
-  fi
+  assert_xcconfig_declaration_count "$1" "$2" 1 "$3"
 }
 
 assert_xcconfig_value "$debug_xcconfig" \
@@ -191,6 +206,9 @@ assert_xcconfig_value "$debug_xcconfig" \
 assert_xcconfig_value "$debug_xcconfig" \
   '^BUZZ_APP_GROUP_IDENTIFIER = group\.\$\(BUNDLE_IDENTIFIER\)$' \
   "Debug App Group is declared as derived from the bundle identifier"
+assert_xcconfig_value "$debug_xcconfig" \
+  '^BUZZ_KEYCHAIN_ACCESS_GROUP = \$\(BUNDLE_IDENTIFIER\)$' \
+  "Debug Keychain access group is declared as the bundle identifier"
 assert_xcconfig_value "$release_xcconfig" \
   '^BUZZ_IOS_PUSH_ENVIRONMENT = production$' \
   "Release push environment is declared as production"
@@ -200,11 +218,32 @@ assert_xcconfig_value "$release_xcconfig" \
 assert_xcconfig_value "$release_xcconfig" \
   '^BUZZ_APP_GROUP_IDENTIFIER = group\.\$\(BUNDLE_IDENTIFIER\)$' \
   "Release App Group is declared as derived from the bundle identifier"
+assert_xcconfig_value "$release_xcconfig" \
+  '^BUZZ_KEYCHAIN_ACCESS_GROUP = \$\(BUNDLE_IDENTIFIER\)$' \
+  "Release Keychain access group is declared as the bundle identifier"
+assert_xcconfig_value "$release_xcconfig" \
+  '^CODE_SIGN_STYLE = Automatic$' \
+  "Release code signing style is declared as automatic"
+assert_xcconfig_value "$release_xcconfig" \
+  '^CODE_SIGN_IDENTITY = iPhone Developer$' \
+  "Release code signing identity is declared as iPhone Developer"
 
 for key in BUNDLE_IDENTIFIER BUZZ_KEYCHAIN_ACCESS_GROUP BUZZ_IOS_PUSH_ENVIRONMENT BUZZ_APP_ATTEST_ENVIRONMENT BUZZ_APP_GROUP_IDENTIFIER; do
   assert_single_xcconfig_declaration "$debug_xcconfig" "$key" "Debug"
   assert_single_xcconfig_declaration "$release_xcconfig" "$key" "Release"
 done
+
+for key in CODE_SIGN_STYLE CODE_SIGN_IDENTITY; do
+  assert_xcconfig_declaration_count "$debug_xcconfig" "$key" 0 "Debug"
+  assert_single_xcconfig_declaration "$release_xcconfig" "$key" "Release"
+done
+
+assert_xcconfig_declaration_count \
+  "$debug_xcconfig" PROVISIONING_PROFILE_SPECIFIER 0 "Debug"
+assert_xcconfig_declaration_count \
+  "$release_xcconfig" PROVISIONING_PROFILE_SPECIFIER 0 "Release"
+assert_single_xcconfig_declaration "$debug_xcconfig" APP_DISPLAY_NAME "Debug"
+assert_single_xcconfig_declaration "$release_xcconfig" APP_DISPLAY_NAME "Release"
 
 # SWIFT_ACTIVE_COMPILATION_CONDITIONS is checked separately from the closed
 # identity census above. This is a tracked-source assertion only; resolved Xcode

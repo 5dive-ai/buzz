@@ -14,6 +14,13 @@ import {
 } from "./terminalState";
 import { type TerminalFrame, TerminalGrid } from "./terminalRenderer";
 
+export type TerminalViewportSize = {
+  columns: number;
+  rows: number;
+  pixelWidth: number;
+  pixelHeight: number;
+};
+
 export type TerminalSessionTab = {
   id: string;
   title: string;
@@ -25,9 +32,13 @@ type TerminalSubstrateProps = {
   appSurfaceRef?: React.RefObject<HTMLDivElement | null>;
   channelName: string | null;
   frame?: TerminalFrame;
+  sessionFrames?: readonly { sessionId: string; frame: TerminalFrame }[];
   sessions: readonly TerminalSessionTab[];
   bracketedPaste: boolean;
   focusReportingEnabled: boolean;
+  enabled?: boolean;
+  onFrameConsumed?: (frame: TerminalFrame) => void;
+  onViewportSize?: (size: TerminalViewportSize) => void;
   onInput: (text: string) => void;
   onScroll: (deltaPx: number) => void;
   onTerminalFocusChange: (focused: boolean) => void;
@@ -85,9 +96,13 @@ export function TerminalSubstrate({
   appSurfaceRef,
   channelName,
   frame,
+  sessionFrames,
   sessions,
   bracketedPaste,
   focusReportingEnabled,
+  enabled = true,
+  onFrameConsumed,
+  onViewportSize,
   onInput,
   onScroll,
   onTerminalFocusChange,
@@ -100,12 +115,21 @@ export function TerminalSubstrate({
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
   const fadeRef = React.useRef<FadeController | null>(null);
   const handoffRef = React.useRef(INITIAL_HANDOFF_STATE);
+  const gridsRef = React.useRef(new Map<string, TerminalGrid>());
+  const appliedFramesRef = React.useRef(new WeakSet<TerminalFrame>());
   const gridRef = React.useRef<TerminalGrid | null>(null);
   const paintedPaletteRef = React.useRef(terminalPalette);
   const previousFocusRef = React.useRef<HTMLElement | null>(null);
   const reportedFocusRef = React.useRef<boolean | null>(null);
   const scrollBySessionRef = React.useRef(new Map<string, number>());
   const activeSession = sessions.find((session) => session.active);
+  const activeSessionId = activeSession?.id ?? null;
+  const frames = React.useMemo(
+    () =>
+      sessionFrames ??
+      (activeSessionId && frame ? [{ sessionId: activeSessionId, frame }] : []),
+    [activeSessionId, frame, sessionFrames],
+  );
   const [owner, setOwner] = React.useState<"buzz" | "terminal">("buzz");
   const [welcome, setWelcome] = React.useState<WelcomeState>({
     visible: true,
@@ -159,6 +183,38 @@ export function TerminalSubstrate({
     setWelcome((current) => ({ ...current, visible: false }));
     onInput(text);
   });
+  const consumeFrame = React.useEffectEvent((nextFrame: TerminalFrame) => {
+    onFrameConsumed?.(nextFrame);
+  });
+  const reportViewportSize = React.useEffectEvent(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !onViewportSize) return;
+    const bounds = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const pixelWidth = Math.max(1, Math.round(bounds.width * dpr));
+    const pixelHeight = Math.max(1, Math.round(bounds.height * dpr));
+    onViewportSize({
+      columns: Math.max(1, Math.floor(bounds.width / 8.4)),
+      rows: Math.max(1, Math.floor(bounds.height / CELL_HEIGHT)),
+      pixelWidth,
+      pixelHeight,
+    });
+  });
+
+  React.useEffect(() => {
+    if (!enabled) forceBuzzFallback();
+  }, [enabled]);
+
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !onViewportSize) return;
+    reportViewportSize();
+    const ResizeObserverConstructor = window.ResizeObserver;
+    if (!ResizeObserverConstructor) return;
+    const observer = new ResizeObserverConstructor(reportViewportSize);
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, [onViewportSize]);
 
   React.useEffect(() => {
     if (!focusReportingEnabled) {
@@ -185,7 +241,7 @@ export function TerminalSubstrate({
     if (!appSurface) return;
     fadeRef.current = new FadeController(appSurface);
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (!isToggleChord(event)) return;
+      if (!enabled || !isToggleChord(event)) return;
       if (event.isComposing) {
         handoffRef.current = reduceHandoff(handoffRef.current, {
           type: "focus-lost",
@@ -201,7 +257,7 @@ export function TerminalSubstrate({
       handoffRef.current = result.state;
     };
     const handleKeyUp = (event: KeyboardEvent) => {
-      if (!isToggleChord(event)) return;
+      if (!enabled || !isToggleChord(event)) return;
       event.preventDefault();
       event.stopImmediatePropagation();
       if (event.isComposing) return;
@@ -232,27 +288,37 @@ export function TerminalSubstrate({
       window.removeEventListener("blur", cancelChord);
       document.removeEventListener("visibilitychange", cancelChord);
     };
-  }, [getAppSurface]);
+  }, [enabled, getAppSurface]);
 
   React.useEffect(() => {
-    if (frame) {
-      setWelcome((current) =>
-        updateWelcomeForOutput(
-          { ...current, reserved: welcomeRect(frame) },
-          frameDamageRects(frame),
-        ),
-      );
-      const current = gridRef.current;
-      if (!current) gridRef.current = new TerminalGrid(frame.viewport);
-      else if (
-        current.viewport.generation !== frame.viewport.generation ||
-        current.viewport.columns !== frame.viewport.columns ||
-        current.viewport.screenLines !== frame.viewport.screenLines
+    for (const delivered of frames) {
+      if (appliedFramesRef.current.has(delivered.frame)) continue;
+      appliedFramesRef.current.add(delivered.frame);
+      let grid = gridsRef.current.get(delivered.sessionId);
+      if (!grid) {
+        grid = new TerminalGrid(delivered.frame.viewport);
+        gridsRef.current.set(delivered.sessionId, grid);
+      } else if (
+        grid.viewport.generation !== delivered.frame.viewport.generation ||
+        grid.viewport.columns !== delivered.frame.viewport.columns ||
+        grid.viewport.screenLines !== delivered.frame.viewport.screenLines
       ) {
-        current.resize(frame.viewport);
+        grid.resize(delivered.frame.viewport);
       }
-      gridRef.current?.apply(frame);
+      grid.apply(delivered.frame);
+      consumeFrame(delivered.frame);
+      if (delivered.sessionId === activeSessionId) {
+        setWelcome((current) =>
+          updateWelcomeForOutput(
+            { ...current, reserved: welcomeRect(delivered.frame) },
+            frameDamageRects(delivered.frame),
+          ),
+        );
+      }
     }
+    gridRef.current = activeSessionId
+      ? (gridsRef.current.get(activeSessionId) ?? null)
+      : null;
 
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -296,7 +362,7 @@ export function TerminalSubstrate({
       },
       terminalPalette,
     );
-  }, [frame, terminalPalette]);
+  }, [activeSessionId, frames, terminalPalette]);
 
   return (
     <section

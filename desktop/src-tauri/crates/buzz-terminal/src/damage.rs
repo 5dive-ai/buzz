@@ -207,6 +207,58 @@ pub fn capture(terminal: &mut crate::Terminal) -> RawFrame {
     }
 }
 
+/// Copy the **entire visible viewport**, leaving damage untouched.
+///
+/// This exists for subscribers that arrive mid-stream: attach, reattach, and
+/// the successor side of a resize. Damage only describes what changed since
+/// the last capture, so a newcomer that starts from [`capture`] sees whatever
+/// happened to change next -- often just the cursor's line -- painted onto a
+/// blank screen. Upstream's `mark_fully_damaged` is private, so an embedder
+/// cannot ask for a full frame that way.
+///
+/// **It must not consume damage, and that is the load-bearing property.** The
+/// incumbent subscriber's next [`capture`] has to still see its rows. If this
+/// called `damage()`/`reset_damage()` it would steal them, and the incumbent
+/// would freeze on stale content while a newcomer's full-frame test passed.
+/// The absence of those two calls below is the mechanism; `snapshot_test.rs`
+/// is the proof.
+///
+/// **Runs under the lock; does no encoding.** Costs a full grid copy rather
+/// than a damaged-rows copy, so it belongs on attach, not in the frame loop.
+pub fn capture_all(terminal: &mut crate::Terminal) -> RawFrame {
+    let viewport = terminal.viewport();
+    let term = terminal.term_mut();
+    let columns = term.columns();
+    let screen_lines = term.screen_lines();
+    let cursor_point = term.grid().cursor.point;
+    let visible = term
+        .mode()
+        .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
+
+    let grid = term.grid();
+    let mut rows = Vec::with_capacity(screen_lines);
+    for line in 0..screen_lines {
+        let row = &grid[Line(line as i32)];
+        rows.push((line, row[..Column(columns)].to_vec()));
+    }
+    let cursor = CursorFrame {
+        line: cursor_point.line.0.max(0) as usize,
+        column: cursor_point.column.0,
+        visible,
+    };
+
+    // No `damage()` and no `reset_damage()`: see the note above.
+    RawFrame {
+        rows,
+        cursor,
+        // A snapshot *is* a repaint, and marking it full also resets the
+        // consumer's `Encoder` hashes, so its dedup state describes the grid it
+        // was actually given rather than a predecessor's.
+        full: true,
+        viewport,
+    }
+}
+
 /// Suppresses rows whose content did not actually change.
 #[derive(Default)]
 pub struct Encoder {

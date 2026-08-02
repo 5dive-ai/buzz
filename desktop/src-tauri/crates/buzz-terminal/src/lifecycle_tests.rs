@@ -409,10 +409,10 @@ fn tempdir(name: &str) -> std::path::PathBuf {
 /// Mari's noisy-child discriminator: the reader must still be draining
 /// **while** the child is being terminated and reaped.
 ///
-/// The property is an ordering, and an ordering cannot be observed from the
-/// outcome -- both orders end with a dead child and a stopped reader. So the
-/// reader records *when* it read, relative to the moment close begins, and the
-/// assertion is on bytes drained after that moment.
+/// The portable contract is structural: `stop` must not be requested until
+/// the child has been reaped. The recording reader checks the child PID at the
+/// `stop` call, while the continuously noisy PTY makes the test exercise a
+/// reader that is genuinely active rather than a quiet no-op.
 ///
 /// The child is deliberately noisy: it floods the PTY continuously, so a
 /// master that stops being read fills its kernel buffer within milliseconds
@@ -427,20 +427,18 @@ fn reader_drains_through_termination_and_reap() {
     // process dies, so there is always more output pending than the buffer
     // holds.
     let mut child = spawn_noisy(&pair);
+    let pid = child.process_id().expect("pid") as i32;
 
-    let after_close = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let closing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let reader = RecordingReader::spawn(&pair, after_close.clone(), closing.clone(), order.clone());
+    let reader = RecordingReader::spawn(&pair, pid, order.clone());
 
-    // Let the child get well ahead of the reader before we touch anything.
+    // Establish that this is a live draining reader, not a quiet fixture.
     assert!(
-        poll_until(|| after_close.load(Ordering::Relaxed) == 0 && reader.total_bytes() > 4096),
+        poll_until(|| reader.total_bytes() > 4096),
         "test setup: the child is not producing enough output to fill the pty \
          buffer, so this cannot distinguish drain order"
     );
 
-    closing.store(true, Ordering::Relaxed);
     let started = Instant::now();
     let outcome = shutdown_draining(&mut child, Box::new(reader)).expect("shutdown");
     let elapsed = started.elapsed();
@@ -450,11 +448,6 @@ fn reader_drains_through_termination_and_reap() {
         Shutdown::Terminated,
         "a `yes` pipeline dies on SIGTERM; SIGKILL here means it was wedged in \
          a tty write against an undrained master"
-    );
-    assert!(
-        after_close.load(Ordering::Relaxed) > 0,
-        "the reader drained nothing after close began -- it was joined before \
-         termination, which is the ordering the drain law forbids"
     );
     assert!(
         elapsed < TERM_GRACE,
@@ -482,6 +475,7 @@ fn spawn_noisy(pair: &PtyPair) -> Box<dyn Child + Send + Sync> {
 
 /// A [`DrainingReader`] that records how much it read after close began.
 struct RecordingReader {
+    pid: i32,
     total: std::sync::Arc<std::sync::atomic::AtomicU64>,
     handle: std::thread::JoinHandle<()>,
     order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
@@ -490,8 +484,7 @@ struct RecordingReader {
 impl RecordingReader {
     fn spawn(
         pair: &PtyPair,
-        after_close: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        closing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        pid: i32,
         order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     ) -> Self {
         let mut reader = pair.master.try_clone_reader().expect("reader");
@@ -505,12 +498,10 @@ impl RecordingReader {
                     break;
                 }
                 counter.fetch_add(n as u64, Ordering::Relaxed);
-                if closing.load(Ordering::Relaxed) {
-                    after_close.fetch_add(n as u64, Ordering::Relaxed);
-                }
             }
         });
         Self {
+            pid,
             total,
             handle,
             order,
@@ -528,6 +519,10 @@ impl DrainingReader for RecordingReader {
     }
 
     fn stop(&self) {
+        assert!(
+            !pid_alive(self.pid),
+            "reader stop must not be requested before the child is reaped"
+        );
         self.order.lock().unwrap().push("stop");
     }
 

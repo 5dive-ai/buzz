@@ -247,6 +247,7 @@ mod tests {
                 column: 0,
                 visible: true,
             },
+            cursor_changed: true,
             full,
             viewport,
         }

@@ -1073,6 +1073,7 @@ dependencies = [
  "buzz-media",
  "buzz-persona",
  "buzz-sdk",
+ "buzz-terminal",
  "buzz-voice",
  "bytes",
  "bzip2 0.6.1",

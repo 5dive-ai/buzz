@@ -345,6 +345,24 @@ mod tests {
     }
 
     #[test]
+    fn production_and_sandbox_profiles_parse_together_without_bypass() {
+        let mut env = base();
+        env.insert(
+            "BUZZ_PUSH_ENABLED_PROFILES".into(),
+            "buzz-ios-production,buzz-ios-sandbox".into(),
+        );
+
+        let config = Config::from_map(&env).unwrap();
+        assert_eq!(config.enabled_profiles.len(), 2);
+        assert!(config
+            .enabled_profiles
+            .contains(&crate::model::AppProfile::BuzzIosProduction));
+        assert!(config
+            .enabled_profiles
+            .contains(&crate::model::AppProfile::BuzzIosSandbox));
+    }
+
+    #[test]
     fn dev_app_attest_bypass_flag_is_strict_and_feature_gated() {
         let absent = Config::from_map(&base()).unwrap();
         #[cfg(feature = "dev-app-attest-bypass")]

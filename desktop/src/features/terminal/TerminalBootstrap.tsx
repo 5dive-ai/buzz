@@ -209,7 +209,7 @@ export function TerminalBootstrap({
     <TerminalSubstrate
       bracketedPaste={active?.frame?.bracketedPaste ?? false}
       channelName={channelName}
-      enabled={available && Boolean(active?.connection)}
+      enabled={available && Boolean(active)}
       focusReportingEnabled={active?.frame?.focusReporting ?? false}
       frame={active?.frame}
       sessionFrames={sessions.flatMap((session) =>

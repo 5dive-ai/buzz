@@ -7,11 +7,29 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../../shared/community/community.dart';
+import '../../shared/community/community_icon_provider.dart';
+import '../../shared/community/community_provider.dart';
 import '../../shared/theme/theme.dart';
+import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/mobile_tab_footer_backdrop.dart';
+import '../../shared/widgets/skeleton.dart';
 import '../activity/activity_page.dart';
+import '../channels/channel.dart';
+import '../channels/channel_detail_page.dart';
+import '../channels/channel_management_provider.dart';
 import '../channels/channels_page.dart';
+import '../channels/channels_provider.dart';
+import '../channels/dm_channel_labels.dart';
+import '../profile/profile_avatar.dart';
+import '../profile/profile_provider.dart';
+import '../profile/user_cache_provider.dart';
+import '../profile/user_profile.dart';
+import '../profile/user_status_provider.dart';
 import '../search/search_page.dart';
+
+part 'home_page/wide_navigation.dart';
+part 'home_page/wide_navigation_skeletons.dart';
 
 class HomePage extends HookConsumerWidget {
   const HomePage({required this.settingsPageBuilder, super.key});
@@ -27,8 +45,23 @@ class HomePage extends HookConsumerWidget {
   static const double _tabBarHorizontalMargin = Grid.gutter;
   static const double _tabDestinationHorizontalPadding = Grid.sm;
   static const double _tabIconSize = 22;
+  static const double _wideNavigationIconSize = 20;
+  static const double _wideNavigationDmAvatarSize = 24;
   static const double _fabClearance = _tabBarHeight + _tabBarBottomGap;
   static const Duration _tabIconWeightDuration = Duration(milliseconds: 120);
+  static const double _wideNavigationBreakpoint = 840;
+  static const double _wideNavigationWidth = 280;
+  static const double _wideContentInset = Grid.half + Grid.quarter;
+  static const double _wideContentRadius = 24;
+  static const double _wideNavigationPrimaryRowHeight = 52;
+  static const double _wideNavigationChannelRowHeight = 48;
+  static const double _wideNavigationLabelGap = Grid.twelve - Grid.quarter;
+  static const double _wideNavigationDmLabelGap =
+      _wideNavigationLabelGap - Grid.quarter;
+  static const double _wideNavigationIdentityAvatarInset =
+      Grid.xs + Grid.half - (Grid.quarter / 2);
+  static const double _wideNavigationIdentityLabelGap =
+      Grid.half + (Grid.quarter / 2);
 
   static const _destinations = [
     _HomeDestination(
@@ -50,18 +83,63 @@ class HomePage extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final tabIndex = useState(0);
+    final isWide =
+        MediaQuery.sizeOf(context).width >= HomePage._wideNavigationBreakpoint;
+    // On iPad, the persistent sidebar replaces the phone's Home tab. Start at
+    // Inbox, which is the first top-level destination in that layout.
+    final tabIndex = useState(isWide ? 1 : 0);
+    final selectedChannel = useState<Channel?>(null);
+    final pendingCommunityId = useState<String?>(null);
+    final activeCommunityId = ref.watch(activeCommunityProvider).value?.id;
+    final channelsAsync = ref.watch(channelsProvider);
+    final hasActivatedPendingCommunity =
+        pendingCommunityId.value != null &&
+        activeCommunityId == pendingCommunityId.value;
+    useEffect(
+      () {
+        if (!hasActivatedPendingCommunity || channelsAsync.isLoading) {
+          return null;
+        }
+
+        final timer = Timer(const Duration(milliseconds: 250), () {
+          pendingCommunityId.value = null;
+        });
+        return timer.cancel;
+      },
+      [
+        pendingCommunityId.value,
+        hasActivatedPendingCommunity,
+        channelsAsync.isLoading,
+      ],
+    );
+    final isCommunitySwitching = pendingCommunityId.value != null;
     final systemBottomInset = MediaQuery.paddingOf(context).bottom;
     final navigationBarWidth = _floatingTabBarWidth(
       MediaQuery.sizeOf(context).width,
       _destinations.length,
     );
+    final useSidebarLayout = isWide;
 
     final pages = [
-      ChannelsPage(settingsPageBuilder: settingsPageBuilder),
+      if (isWide && selectedChannel.value != null)
+        _WideChannelContent(channel: selectedChannel.value!)
+      else
+        ChannelsPage(settingsPageBuilder: settingsPageBuilder),
       const ActivityPage(),
       const SearchPage(),
     ];
+    // The phone's Home destination is represented by index zero. On a tablet,
+    // that destination only exists while a channel is selected; otherwise
+    // returning from a nested route must land back in Inbox rather than reveal
+    // the phone's ChannelsPage inside the desktop-style workspace.
+    final wideFallbackToInbox =
+        isWide && selectedChannel.value == null && tabIndex.value == 0;
+    final wideContentIndex = wideFallbackToInbox ? 1 : tabIndex.value;
+    final wideSidebarSelection = selectedChannel.value != null
+        ? null
+        : wideFallbackToInbox
+        ? 1
+        : tabIndex.value;
 
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -73,46 +151,182 @@ class HomePage extends HookConsumerWidget {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            Positioned.fill(child: ColoredBox(color: context.colors.surface)),
             Positioned.fill(
-              child: MediaQuery(
-                data: _mediaQueryWithFloatingTabBarClearance(
-                  context,
-                  HomePage._fabClearance,
-                ),
-                child: IndexedStack(index: tabIndex.value, children: pages),
-              ),
-            ),
-            Align(
-              alignment: Alignment.bottomCenter,
-              child: IgnorePointer(
-                child: MobileTabFooterBackdrop(
-                  height: mobileTabFooterBackdropHeight(context),
-                ),
-              ),
+              child: useSidebarLayout
+                  ? DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: context.appColors.topSectionGradient == null
+                            ? context.colors.surfaceContainerLowest
+                            : null,
+                        gradient: context.appColors.topSectionGradient,
+                      ),
+                    )
+                  : ColoredBox(color: context.colors.surface),
             ),
             Positioned.fill(
-              child: ChannelQuickActionsLauncher(
-                visible: tabIndex.value == 0,
-                navigationBarHeight: HomePage._tabBarHeight,
-                navigationBarBottomGap: HomePage._tabBarBottomGap,
-                navigationBarWidth: navigationBarWidth,
-                systemBottomInset: systemBottomInset,
-                rightInset: Grid.sm,
+              child: useSidebarLayout
+                  ? Row(
+                      children: [
+                        _WideNavigationSidebar(
+                          selectedIndex: wideSidebarSelection,
+                          onDestinationSelected: (index) {
+                            final hadSelectedChannel =
+                                selectedChannel.value != null;
+                            if (index == tabIndex.value &&
+                                !(hadSelectedChannel && index != 0)) {
+                              return;
+                            }
+                            // Search and Inbox replace a selected channel in
+                            // the tablet workspace, so they must also clear
+                            // the channel selection that owns the sidebar
+                            // highlight.
+                            selectedChannel.value = null;
+                            unawaited(HapticFeedback.selectionClick());
+                            tabIndex.value = index;
+                          },
+                          onChannelSelected: (channel) {
+                            selectedChannel.value = channel;
+                            if (tabIndex.value != 0) {
+                              unawaited(HapticFeedback.selectionClick());
+                            }
+                            tabIndex.value = 0;
+                          },
+                          selectedChannelId: selectedChannel.value?.id,
+                          onProfileSelected: () => unawaited(
+                            Navigator.of(context).push(
+                              MaterialPageRoute<void>(
+                                builder: settingsPageBuilder,
+                              ),
+                            ),
+                          ),
+                          isCommunitySwitching: isCommunitySwitching,
+                          onCommunitySwitchStart: (communityId) {
+                            pendingCommunityId.value = communityId;
+                          },
+                          destinations: _destinations,
+                        ),
+                        Expanded(
+                          child: Padding(
+                            key: const Key('wide-navigation-content-inset'),
+                            padding: const EdgeInsets.only(
+                              top: HomePage._wideContentInset,
+                              right: HomePage._wideContentInset,
+                              bottom: HomePage._wideContentInset,
+                            ),
+                            child: DecoratedBox(
+                              key: const Key('wide-navigation-content-surface'),
+                              decoration: BoxDecoration(
+                                color: context.colors.surface,
+                                borderRadius: BorderRadius.circular(
+                                  HomePage._wideContentRadius,
+                                ),
+                                // Matches desktop's Buzz content surface: a
+                                // hairline on the upper-left edge plus a very
+                                // soft lift into the exposed gradient.
+                                boxShadow:
+                                    context.theme.brightness == Brightness.light
+                                    ? [
+                                        BoxShadow(
+                                          color: context.colors.outlineVariant
+                                              .withValues(alpha: 0.45),
+                                          offset: const Offset(-1, -1),
+                                        ),
+                                        BoxShadow(
+                                          color: Colors.black.withValues(
+                                            alpha: 0.07,
+                                          ),
+                                          blurRadius: 4,
+                                        ),
+                                      ]
+                                    : null,
+                              ),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(
+                                  HomePage._wideContentRadius,
+                                ),
+                                child: MediaQuery(
+                                  // The desktop-like canvas is inset below the
+                                  // system top edge. Remove that same amount
+                                  // from the workspace's top safe padding so
+                                  // its titles stay aligned with the sidebar
+                                  // community switcher.
+                                  data: MediaQuery.of(context).copyWith(
+                                    padding: MediaQuery.paddingOf(context)
+                                        .copyWith(
+                                          top:
+                                              (MediaQuery.paddingOf(
+                                                        context,
+                                                      ).top -
+                                                      HomePage
+                                                          ._wideContentInset)
+                                                  .clamp(0, double.infinity),
+                                        ),
+                                  ),
+                                  child: SkeletonReveal(
+                                    loading: isCommunitySwitching,
+                                    skeleton: const _WideCommunityContentSkeleton(
+                                      key: Key(
+                                        'wide-community-switch-content-skeleton',
+                                      ),
+                                    ),
+                                    content: IndexedStack(
+                                      index: wideContentIndex,
+                                      children: pages,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
+                  : MediaQuery(
+                      data: _mediaQueryWithFloatingTabBarClearance(
+                        context,
+                        HomePage._fabClearance,
+                      ),
+                      child: IndexedStack(
+                        index: tabIndex.value,
+                        children: pages,
+                      ),
+                    ),
+            ),
+            if (!useSidebarLayout)
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: IgnorePointer(
+                  child: MobileTabFooterBackdrop(
+                    height: mobileTabFooterBackdropHeight(context),
+                  ),
+                ),
               ),
+            Positioned.fill(
+              child: useSidebarLayout
+                  ? const SizedBox.shrink()
+                  : ChannelQuickActionsLauncher(
+                      visible: tabIndex.value == 0,
+                      navigationBarHeight: HomePage._tabBarHeight,
+                      navigationBarBottomGap: HomePage._tabBarBottomGap,
+                      navigationBarWidth: navigationBarWidth,
+                      systemBottomInset: systemBottomInset,
+                      rightInset: Grid.sm,
+                    ),
             ),
           ],
         ),
       ),
-      bottomNavigationBar: _FloatingTabBar(
-        selectedIndex: tabIndex.value,
-        onDestinationSelected: (i) {
-          if (i == tabIndex.value) return;
-          unawaited(HapticFeedback.selectionClick());
-          tabIndex.value = i;
-        },
-        destinations: _destinations,
-      ),
+      bottomNavigationBar: useSidebarLayout
+          ? null
+          : _FloatingTabBar(
+              selectedIndex: tabIndex.value,
+              onDestinationSelected: (i) {
+                if (i == tabIndex.value) return;
+                unawaited(HapticFeedback.selectionClick());
+                tabIndex.value = i;
+              },
+              destinations: _destinations,
+            ),
     );
   }
 }
@@ -196,6 +410,7 @@ class _FloatingTabBar extends StatelessWidget {
     );
 
     return SafeArea(
+      key: const Key('floating-tab-bar'),
       minimum: const EdgeInsets.fromLTRB(
         HomePage._tabBarHorizontalMargin,
         0,

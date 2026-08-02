@@ -315,6 +315,42 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
     _handleLiveEvent(event, authoritative: false);
   }
 
+  /// Applies a just-signed auxiliary event, such as a reaction or deletion,
+  /// before its relay echo arrives. Thread queries intentionally contain only
+  /// message content, so they rely on this channel stream for their reaction
+  /// state as well.
+  void addLocalAuxEvent(NostrEvent event) {
+    if (!EventKind.channelAuxEventKinds.contains(event.kind)) {
+      throw ArgumentError.value(
+        event.kind,
+        'event.kind',
+        'Expected a channel auxiliary event.',
+      );
+    }
+    _handleLiveEvent(event, authoritative: false);
+  }
+
+  /// Removes an optimistic auxiliary event when its publish is rejected.
+  void removeLocalAuxEvent(String eventId) {
+    final nextAux = _windowStore.liveAux
+        .where((event) => event.id != eventId)
+        .toList();
+    if (nextAux.length != _windowStore.liveAux.length) {
+      _windowStore = ChannelWindowStore(
+        pages: _windowStore.pages,
+        liveOverlay: _windowStore.liveOverlay,
+        liveAux: nextAux,
+        liveThreadSummaries: _windowStore.liveThreadSummaries,
+      );
+    }
+
+    final current = state.value ?? _lastKnownMessages ?? const <NostrEvent>[];
+    final next = current.where((event) => event.id != eventId).toList();
+    if (next.length == current.length) return;
+    _lastKnownMessages = next;
+    state = AsyncData(next);
+  }
+
   /// Releases rollback ownership after the publish future succeeds. The
   /// optimistic row (and any thread overlay) remains visible until relay data
   /// replaces it, because OK and EVENT delivery are unordered.

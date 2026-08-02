@@ -27,6 +27,7 @@ import '../profile/user_cache_provider.dart';
 import '../profile/user_profile.dart';
 import 'activity_provider.dart';
 import 'compose_drafts_provider.dart';
+import 'feed_item.dart';
 import 'inbox_item.dart';
 import 'inbox_local_state_provider.dart';
 import 'inbox_read_state.dart';
@@ -36,6 +37,10 @@ part 'activity_page/header_actions.dart';
 part 'activity_page/inbox_row.dart';
 part 'activity_page/lists.dart';
 part 'activity_page/status_views.dart';
+
+const _wideInboxBreakpoint = 1000.0;
+const _wideInboxMinListWidth = 300.0;
+const _wideInboxMaxListWidth = 400.0;
 
 /// Conversation-oriented Activity inbox.
 ///
@@ -54,6 +59,9 @@ class ActivityPage extends HookConsumerWidget {
     final channelsAsync = ref.watch(channelsProvider);
     final filter = useState(InboxFilter.all);
     final unreadOnly = useState(false);
+    final selectedItemId = useState<String?>(null);
+    final isWideInbox =
+        MediaQuery.sizeOf(context).width >= _wideInboxBreakpoint;
     final headerTitleStyle = context.textTheme.titleMedium?.copyWith(
       fontSize: 22,
       fontWeight: FontWeight.w600,
@@ -87,6 +95,21 @@ class ActivityPage extends HookConsumerWidget {
             (!unreadOnly.value || !isDone(item)))
           item,
     ];
+    final visibleItemIdsKey = visibleItems
+        .map((item) => item.id)
+        .join('\u0000');
+    useEffect(() {
+      if (!isWideInbox || visibleItems.isEmpty) return null;
+      final hasSelectedItem = visibleItems.any(
+        (item) => item.id == selectedItemId.value,
+      );
+      if (!hasSelectedItem) selectedItemId.value = visibleItems.first.id;
+      return null;
+    }, [isWideInbox, visibleItemIdsKey]);
+    final selectedItem = visibleItems.cast<InboxItem?>().firstWhere(
+      (item) => item?.id == selectedItemId.value,
+      orElse: () => null,
+    );
 
     // Preload sender profiles for visible rows.
     final preloadPubkeys = {
@@ -163,6 +186,12 @@ class ActivityPage extends HookConsumerWidget {
       final threadRootId = isBroadcastReply(target.tags)
           ? null
           : thread.parentId;
+
+      if (isWideInbox) {
+        selectedItemId.value = item.id;
+        markItemRead(item);
+        return;
+      }
 
       Navigator.of(context).push(
         MaterialPageRoute<void>(
@@ -280,6 +309,7 @@ class ActivityPage extends HookConsumerWidget {
                   channel: channel,
                   currentPubkey: myPk,
                   isDone: isDone(item),
+                  selected: isWideInbox && item.id == selectedItemId.value,
                   onTap: () => openItem(item),
                   onMarkRead: () => markItemRead(item),
                   onMarkUnread: () => markItemUnread(item),
@@ -291,24 +321,27 @@ class ActivityPage extends HookConsumerWidget {
       );
     }
 
-    return FrostedScaffold(
+    Widget inboxListPane(String title) => FrostedScaffold(
       backgroundColor: Colors.transparent,
       appBar: FrostedAppBar(
         gradient: context.appColors.topSectionGradient,
         automaticallyImplyLeading: false,
-        title: const Text('Activity'),
+        title: Text(title),
         titleStyle: headerTitleStyle,
         actions: [
           _FilterMenuButton(
             filter: filter.value,
             dueReminderCount: dueReminderCount,
             draftCount: drafts.length,
-            onChanged: (f) => filter.value = f,
+            onChanged: (nextFilter) {
+              selectedItemId.value = null;
+              filter.value = nextFilter;
+            },
           ),
           _InboxOptionsButton(
             unreadOnly: unreadOnly.value,
             unreadCount: unreadVisibleCount,
-            onUnreadOnlyChanged: (v) => unreadOnly.value = v,
+            onUnreadOnlyChanged: (value) => unreadOnly.value = value,
             onMarkAllRead: () {
               for (final item in visibleItems) {
                 if (!isDone(item)) markItemRead(item);
@@ -324,6 +357,124 @@ class ActivityPage extends HookConsumerWidget {
             top: frostedAppBarHeight(context, titleStyle: headerTitleStyle),
           ),
           child: body,
+        ),
+      ),
+    );
+
+    if (isWideInbox) {
+      FeedItem? detailTarget(InboxItem? inboxItem) {
+        if (inboxItem == null) return null;
+        return inboxItem.deepLinkTarget(
+          resolveInboxItemReadAt(inboxItem, markerOf: markerOf),
+        );
+      }
+
+      final selectedTarget = detailTarget(selectedItem);
+      final selectedChannelId = selectedTarget?.channelId;
+      final selectedChannel = selectedChannelId == null
+          ? null
+          : channelById[selectedChannelId];
+      final selectedThread = selectedTarget == null
+          ? null
+          : isBroadcastReply(selectedTarget.tags)
+          ? null
+          : threadReferenceOf(selectedTarget.tags).parentId;
+
+      return LayoutBuilder(
+        builder: (context, constraints) {
+          final listWidth = (constraints.maxWidth / 3)
+              .clamp(_wideInboxMinListWidth, _wideInboxMaxListWidth)
+              .toDouble();
+          return Row(
+            children: [
+              SizedBox(
+                key: const Key('wide-activity-inbox-list'),
+                width: listWidth,
+                child: inboxListPane('Inbox'),
+              ),
+              VerticalDivider(width: 1, color: context.colors.outlineVariant),
+              Expanded(
+                child: _WideActivityDetail(
+                  item: selectedItem,
+                  channel: selectedChannel,
+                  initialMessageId: selectedTarget?.id,
+                  initialThreadRootId: selectedThread,
+                ),
+              ),
+            ],
+          );
+        },
+      );
+    }
+
+    return inboxListPane('Activity');
+  }
+}
+
+class _WideActivityDetail extends StatelessWidget {
+  final InboxItem? item;
+  final Channel? channel;
+  final String? initialMessageId;
+  final String? initialThreadRootId;
+
+  const _WideActivityDetail({
+    required this.item,
+    required this.channel,
+    required this.initialMessageId,
+    required this.initialThreadRootId,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (item == null || channel == null || initialMessageId == null) {
+      return const _WideActivityEmptyDetail();
+    }
+
+    return Navigator(
+      key: ValueKey('wide-activity-detail-${item!.id}'),
+      onGenerateRoute: (_) => MaterialPageRoute<void>(
+        builder: (_) => ChannelDetailPage(
+          channel: channel!,
+          initialMessageId: initialMessageId,
+          initialThreadRootId: initialThreadRootId,
+        ),
+      ),
+    );
+  }
+}
+
+class _WideActivityEmptyDetail extends StatelessWidget {
+  const _WideActivityEmptyDetail();
+
+  @override
+  Widget build(BuildContext context) {
+    return ColoredBox(
+      color: context.colors.surface,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              LucideIcons.inbox,
+              color: context.colors.onSurfaceVariant,
+              size: 32,
+            ),
+            const SizedBox(height: Grid.sm),
+            Text(
+              'Select an inbox item',
+              style: context.textTheme.titleMedium?.copyWith(
+                color: context.colors.onSurface,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: Grid.xxs),
+            Text(
+              'Its conversation will open here.',
+              style: context.textTheme.bodyMedium?.copyWith(
+                color: context.colors.onSurfaceVariant,
+              ),
+            ),
+          ],
         ),
       ),
     );

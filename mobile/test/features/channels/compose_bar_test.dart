@@ -1402,6 +1402,42 @@ void main() {
       }
     });
 
+    testWidgets('uses a taller camera surface on tablet-width layouts', (
+      tester,
+    ) async {
+      final previousPlatform = debugDefaultTargetPlatformOverride;
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      tester.view.physicalSize = const Size(1180, 820);
+      tester.view.devicePixelRatio = 1;
+
+      try {
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: _testUploadService(nostr.Keys.generate().nsec),
+            onSend:
+                (
+                  content,
+                  mentionPubkeys, {
+                  mediaTags = const <List<String>>[],
+                }) async {},
+          ),
+        );
+
+        await _openAttachmentMenu(tester);
+        await tester.tap(find.text('Camera'));
+        await tester.pump(const Duration(milliseconds: 320));
+
+        expect(
+          tester.getSize(find.byKey(const ValueKey('camera-preview'))).height,
+          640,
+        );
+      } finally {
+        debugDefaultTargetPlatformOverride = previousPlatform;
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      }
+    });
+
     testWidgets('photo picker errors keep the action visible at large text', (
       tester,
     ) async {

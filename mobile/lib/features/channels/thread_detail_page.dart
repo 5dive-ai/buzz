@@ -596,6 +596,7 @@ class _ThreadMessage extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final isTabletLayout = MediaQuery.sizeOf(context).width >= 840;
     final pk = message.pubkey.toLowerCase();
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
@@ -634,7 +635,12 @@ class _ThreadMessage extends ConsumerWidget {
     );
 
     return Padding(
-      padding: EdgeInsets.only(top: showAuthor ? Grid.xs : 0),
+      // In the tablet's wider thread pane, the first author header follows a
+      // day divider. Halve that handoff gap so the timestamp sits with the
+      // message rather than floating below the divider.
+      padding: EdgeInsets.only(
+        top: showAuthor ? (isTabletLayout ? Grid.half : Grid.xs) : 0,
+      ),
       child: DecoratedBox(
         key: ValueKey('thread-message-${message.id}'),
         decoration: BoxDecoration(
@@ -791,8 +797,12 @@ class _ThreadMessage extends ConsumerWidget {
                           ReactionRow(
                             messageId: message.id,
                             reactions: message.reactions,
-                            onToggle: (emoji) =>
-                                toggleReaction(ref, message, emoji),
+                            onToggle: (emoji) => toggleReaction(
+                              ref,
+                              message,
+                              emoji,
+                              channelId: channelId,
+                            ),
                             showAddButton:
                                 isMember &&
                                 !isArchived &&
@@ -801,6 +811,7 @@ class _ThreadMessage extends ConsumerWidget {
                               context: context,
                               ref: ref,
                               message: message,
+                              channelId: channelId,
                             ),
                           ),
                         ],

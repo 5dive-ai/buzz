@@ -2085,6 +2085,45 @@ void main() {
   });
 
   group('Deep-link navigation', () {
+    testWidgets(
+      'waits for thread hydration before opening an Inbox deep link',
+      (tester) async {
+        final root = _textMsg(
+          id: 'root',
+          pubkey: 'alice',
+          content: 'Thread root',
+          createdAt: 1000,
+        );
+        final reply = _textMsg(
+          id: 'reply',
+          pubkey: 'bob',
+          content: 'Deep-linked reply',
+          createdAt: 1100,
+          extraTags: const [
+            ['e', 'root', '', 'reply'],
+          ],
+        );
+        final completer = Completer<List<NostrEvent>>();
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [root, reply],
+            initialMessageId: 'reply',
+            initialThreadRootId: 'root',
+            pendingThreadReplies: {'root': completer.future},
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.byType(ThreadDetailPage), findsNothing);
+
+        completer.complete([reply]);
+        await tester.pumpAndSettle();
+
+        expect(find.byType(ThreadDetailPage), findsOneWidget);
+      },
+    );
+
     testWidgets('opens a nested reply in its direct-parent thread', (
       tester,
     ) async {
@@ -2496,6 +2535,63 @@ void main() {
       expect(find.byKey(const ValueKey('reaction-pill-👍')), findsOneWidget);
     });
 
+    testWidgets(
+      'a thread reaction keeps its channel for optimistic rendering',
+      (tester) async {
+        final rootEvent = _textMsg(
+          id: 'thread-root',
+          pubkey: 'alice',
+          content: 'Thread root',
+          createdAt: 1000,
+        );
+        String? reactionTargetId;
+        String? reactionEmoji;
+        String? reactionChannelId;
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [
+              rootEvent,
+              _reaction(id: 'reaction-1', targetId: 'thread-root'),
+            ],
+            createChannelActions: (ref) => _FakeChannelActions(
+              ref,
+              onAddReaction: (eventId, emoji, channelId) {
+                reactionTargetId = eventId;
+                reactionEmoji = emoji;
+                reactionChannelId = channelId;
+              },
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final threadHead = formatTimeline([
+          rootEvent,
+          _reaction(id: 'reaction-1', targetId: 'thread-root'),
+        ]).single;
+        Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+          MaterialPageRoute<void>(
+            builder: (_) => ThreadDetailPage(
+              threadHead: threadHead,
+              allMessages: [threadHead],
+              channelId: _channelId,
+              currentPubkey: 'self',
+              isMember: true,
+              isArchived: false,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.byKey(const ValueKey('reaction-pill-👍')));
+
+        expect(reactionTargetId, 'thread-root');
+        expect(reactionEmoji, '👍');
+        expect(reactionChannelId, _channelId);
+      },
+    );
+
     testWidgets('a live deletion does not restore the routed thread head', (
       tester,
     ) async {
@@ -2771,8 +2867,10 @@ class _FakeChannelsNotifier extends ChannelsNotifier {
 
 class _FakeChannelActions extends ChannelActions {
   final Future<void> Function(String channelId)? onJoinChannel;
+  final void Function(String eventId, String emoji, String? channelId)?
+  onAddReaction;
 
-  _FakeChannelActions(Ref ref, {this.onJoinChannel})
+  _FakeChannelActions(Ref ref, {this.onJoinChannel, this.onAddReaction})
     : super(
         ref: ref,
         session: ref.read(relaySessionProvider.notifier),
@@ -2791,6 +2889,15 @@ class _FakeChannelActions extends ChannelActions {
   @override
   Future<void> leaveChannel(String channelId) async {
     return;
+  }
+
+  @override
+  Future<void> addReaction(
+    String eventId,
+    String emoji, {
+    String? channelId,
+  }) async {
+    onAddReaction?.call(eventId, emoji, channelId);
   }
 }
 

@@ -237,11 +237,7 @@ class ChannelsPage extends HookConsumerWidget {
         leading: _CommunityIndicator(
           onTap: () {
             ref.invalidate(communityIconProvider);
-            showModalBottomSheet<void>(
-              context: context,
-              showDragHandle: true,
-              builder: (_) => const _CommunitySwitcherSheet(),
-            );
+            unawaited(showCommunitySwitcherSheet(context));
           },
         ),
         title: const SizedBox.shrink(),

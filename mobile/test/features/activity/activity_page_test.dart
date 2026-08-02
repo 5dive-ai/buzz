@@ -182,6 +182,33 @@ void main() {
     expect(find.byTooltip('Back'), findsNothing);
   });
 
+  testWidgets('uses a persistent inbox list and detail pane on wide iPad', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1180, 820);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    await tester.pumpWidget(await buildTestable());
+    await tester.pump();
+
+    final inboxList = find.byKey(const Key('wide-activity-inbox-list'));
+    expect(inboxList, findsOneWidget);
+    expect(tester.getSize(inboxList).width, closeTo(1180 / 3, 0.1));
+    expect(find.text('Inbox'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('inbox-row-m1')));
+    await tester.pump();
+
+    expect(
+      find.byKey(const ValueKey('wide-activity-detail-m1')),
+      findsOneWidget,
+    );
+  });
+
   testWidgets('keeps bottom clearance for the floating tab bar', (
     tester,
   ) async {

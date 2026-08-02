@@ -1,5 +1,15 @@
 part of '../channels_page.dart';
 
+/// Opens the community switcher from either the compact channel header or the
+/// expanded iPad sidebar identity row.
+Future<void> showCommunitySwitcherSheet(BuildContext context) {
+  return showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    builder: (_) => const _CommunitySwitcherSheet(),
+  );
+}
+
 class _CommunitySwitcherSheet extends HookConsumerWidget {
   const _CommunitySwitcherSheet();
 

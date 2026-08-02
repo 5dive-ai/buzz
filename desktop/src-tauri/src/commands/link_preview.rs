@@ -14,10 +14,7 @@ use url::Url;
 #[path = "link_preview_rate_limit.rs"]
 mod rate_limit;
 
-use rate_limit::{
-    image_host_cooldown_remaining, retry_after_duration, set_image_host_cooldown,
-    MAX_IMAGE_RETRY_AFTER,
-};
+use rate_limit::{image_host_cooldown_remaining, retry_after_duration, set_image_host_cooldown};
 
 const MAX_PREVIEW_FETCH_BYTES: usize = 256 * 1024;
 const MAX_IMAGE_FETCH_BYTES: usize = 2 * 1024 * 1024;
@@ -651,11 +648,12 @@ fn decode_html_entities(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::rate_limit::MAX_IMAGE_RETRY_AFTER;
     use super::{
         apply_image_result, declares_animation, extract_favicon_url, extract_image_url,
         extract_link_preview_metadata, is_html_response, read_bytes_prefix, retry_after_duration,
         sanitize_image, ImageFetchError, LinkPreviewImageFetchState, LinkPreviewMetadata,
-        MAX_IMAGE_RETRY_AFTER, MAX_METADATA_DESCRIPTION_CHARS,
+        MAX_METADATA_DESCRIPTION_CHARS,
     };
     use axum::{body::Body, http::Response, routing::get, Router};
     use base64::Engine as _;

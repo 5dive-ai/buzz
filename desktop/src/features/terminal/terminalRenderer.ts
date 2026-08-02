@@ -116,6 +116,7 @@ export class TerminalGrid {
   #rows: RetainedRow[];
   #dirty = new Set<number>();
   #cursor: TerminalCursor = { line: 0, column: 0, visible: false };
+  #cursorPainted = true;
 
   constructor(viewport: TerminalViewport) {
     this.#viewport = viewport;
@@ -159,6 +160,12 @@ export class TerminalGrid {
     for (let line = 0; line < this.#viewport.screenLines; line++) {
       this.#dirty.add(line);
     }
+  }
+
+  setCursorPainted(painted: boolean): void {
+    if (this.#cursorPainted === painted) return;
+    this.#cursorPainted = painted;
+    this.#dirty.add(this.#cursor.line);
   }
 
   paint(
@@ -210,7 +217,7 @@ export class TerminalGrid {
         }
       }
     }
-    if (this.#cursor.visible) {
+    if (this.#cursor.visible && this.#cursorPainted) {
       context.fillStyle = palette.cursor;
       context.fillRect(
         this.#cursor.column * metrics.width,

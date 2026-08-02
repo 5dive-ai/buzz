@@ -139,6 +139,11 @@ pub struct CursorFrame {
 pub struct Frame {
     pub rows: Vec<RowFrame>,
     pub cursor: CursorFrame,
+    /// Whether the cursor plane changed since this encoder's previous frame.
+    /// Cursor movement can be the only visible effect of input (for example,
+    /// echoing a space over an already blank cell), so it independently makes
+    /// an incremental frame publishable.
+    pub cursor_changed: bool,
     /// Whether the renderer should discard what it has and repaint.
     pub full: bool,
     /// The grid this frame describes. A change means the terminal was resized
@@ -152,7 +157,7 @@ pub struct Frame {
 impl Frame {
     /// True when there is nothing for the renderer to do.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() && !self.full
+        self.rows.is_empty() && !self.cursor_changed && !self.full
     }
 }
 
@@ -263,6 +268,7 @@ pub fn capture_all(terminal: &mut crate::Terminal) -> RawFrame {
 #[derive(Default)]
 pub struct Encoder {
     hashes: Vec<u64>,
+    cursor: Option<CursorFrame>,
 }
 
 impl Encoder {
@@ -293,9 +299,12 @@ impl Encoder {
                 spans: spans(&cells),
             });
         }
+        let cursor_changed = self.cursor != Some(raw.cursor);
+        self.cursor = Some(raw.cursor);
         Frame {
             rows,
             cursor: raw.cursor,
+            cursor_changed,
             full: raw.full,
             viewport: raw.viewport,
         }

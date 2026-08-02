@@ -134,3 +134,34 @@ test("stale viewport frames are rejected without mutating retained rows", () => 
     false,
   );
 });
+
+test("cursor visibility can blink without a new terminal frame", () => {
+  const grid = new TerminalGrid({ generation: 0, columns: 4, screenLines: 1 });
+  grid.apply({
+    viewport: grid.viewport,
+    full: true,
+    cursor: { line: 0, column: 2, visible: true },
+    rows: [],
+  });
+
+  const visible = context();
+  grid.paint(visible, metrics, palette);
+  assert.ok(visible.fills.some((fill) => fill[0] === 20 && fill[2] === 1.2));
+
+  grid.setCursorPainted(false);
+  const hidden = context();
+  grid.paint(hidden, metrics, palette);
+  assert.equal(
+    hidden.fills.some((fill) => fill[0] === 20 && fill[2] === 1.2),
+    false,
+  );
+  assert.ok(
+    hidden.fills.some((fill) => fill[0] === 0 && fill[2] === 40),
+    "hiding the cursor must repaint its row to erase the old caret",
+  );
+
+  grid.setCursorPainted(true);
+  const restored = context();
+  grid.paint(restored, metrics, palette);
+  assert.ok(restored.fills.some((fill) => fill[0] === 20 && fill[2] === 1.2));
+});

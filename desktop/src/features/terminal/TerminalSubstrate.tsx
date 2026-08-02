@@ -113,6 +113,11 @@ export function TerminalSubstrate({
   const [owner, setOwner] = React.useState<"buzz" | "terminal">("buzz");
   const [viewport, setViewport] = React.useState({ columns: 1, rows: 1 });
   const [welcomeVisible, setWelcomeVisible] = React.useState(true);
+  const [cursorPainted, setCursorPainted] = React.useState(true);
+  const [cursorReset, setCursorReset] = React.useState(0);
+  const [reducedMotion, setReducedMotion] = React.useState(
+    () => window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+  );
   const shortcutLabel = /Mac|iPhone|iPad/.test(navigator.platform)
     ? "⌘J"
     : "CTRL+J";
@@ -169,6 +174,8 @@ export function TerminalSubstrate({
   const sendInput = React.useEffectEvent((text: string) => {
     if (!text) return;
     setWelcomeVisible(false);
+    setCursorPainted(true);
+    setCursorReset((current) => current + 1);
     onInput(text);
   });
   const consumeFrame = React.useEffectEvent((nextFrame: TerminalFrame) => {
@@ -194,6 +201,26 @@ export function TerminalSubstrate({
   React.useEffect(() => {
     if (!enabled) forceBuzzFallback();
   }, [enabled]);
+
+  React.useEffect(() => {
+    const preference = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setReducedMotion(preference.matches);
+    preference.addEventListener("change", update);
+    return () => preference.removeEventListener("change", update);
+  }, []);
+
+  // Input activity is intentionally an effect trigger: restarting this timer is
+  // what resets the blink phase even when the cursor is already painted.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: cursorReset restarts the timer by design.
+  React.useEffect(() => {
+    setCursorPainted(true);
+    if (owner !== "terminal" || reducedMotion) return;
+    const timer = window.setInterval(
+      () => setCursorPainted((painted) => !painted),
+      500,
+    );
+    return () => window.clearInterval(timer);
+  }, [cursorReset, owner, reducedMotion]);
 
   React.useEffect(() => {
     const canvas = canvasRef.current;
@@ -359,8 +386,9 @@ export function TerminalSubstrate({
       context.fillStyle = terminalPalette.background;
       context.fillRect(0, 0, bounds.width, bounds.height);
     }
+    gridRef.current?.setCursorPainted(cursorPainted);
     gridRef.current?.paint(context, TERMINAL_CELL_METRICS, terminalPalette);
-  }, [activeSessionId, frames, terminalPalette]);
+  }, [activeSessionId, cursorPainted, frames, terminalPalette]);
 
   return (
     <section

@@ -11,6 +11,7 @@ let render;
 let waitFor;
 let ThemeProvider;
 let TerminalSubstrate;
+let reducedMotion = false;
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -26,7 +27,9 @@ before(async () => {
     IS_REACT_ACT_ENVIRONMENT: true,
   });
   dom.window.matchMedia = () => ({
-    matches: false,
+    get matches() {
+      return reducedMotion;
+    },
     addEventListener() {},
     removeEventListener() {},
   });
@@ -49,6 +52,7 @@ before(async () => {
 after(() => dom.window.close());
 beforeEach(() => {
   cleanup?.();
+  reducedMotion = false;
   dom.window.localStorage.clear();
   dom.window.HTMLCanvasElement.prototype.getBoundingClientRect = () => ({
     bottom: 782,
@@ -311,4 +315,67 @@ test("canvas failure atomically restores Buzz ownership", async () => {
   await waitFor(() =>
     assert.equal(substrate.dataset.terminalOwner, "terminal"),
   );
+});
+
+test("cursor blink runs only while the terminal owns input and resets on input", async () => {
+  const originalSetInterval = window.setInterval;
+  const originalClearInterval = window.clearInterval;
+  const callbacks = new Map();
+  let nextTimer = 1;
+  window.setInterval = (callback) => {
+    const timer = nextTimer++;
+    callbacks.set(timer, callback);
+    return timer;
+  };
+  window.clearInterval = (timer) => callbacks.delete(timer);
+  try {
+    const subject = fixture({ frame: VISIBLE_FRAME });
+    await ready(subject.view);
+    assert.equal(callbacks.size, 0, "Buzz ownership must pause blinking");
+
+    toggleChord();
+    await waitFor(() => assert.equal(callbacks.size, 1));
+    const firstTimer = [...callbacks.keys()][0];
+    act(() => callbacks.get(firstTimer)());
+
+    fireEvent.input(subject.view.getByLabelText("Terminal input"), {
+      target: { value: "a" },
+    });
+    await waitFor(() => {
+      assert.deepEqual(subject.calls.input, ["a"]);
+      assert.equal(callbacks.size, 1);
+      assert.equal(callbacks.has(firstTimer), false);
+    });
+
+    toggleChord();
+    await waitFor(() => assert.equal(callbacks.size, 0));
+  } finally {
+    window.setInterval = originalSetInterval;
+    window.clearInterval = originalClearInterval;
+  }
+});
+
+test("reduced motion keeps the terminal cursor solid", async () => {
+  reducedMotion = true;
+  const originalSetInterval = window.setInterval;
+  let intervals = 0;
+  window.setInterval = () => {
+    intervals += 1;
+    return 1;
+  };
+  try {
+    const subject = fixture({ frame: VISIBLE_FRAME });
+    await ready(subject.view);
+    toggleChord();
+    await waitFor(() =>
+      assert.equal(
+        subject.view.container.querySelector(".buzz-terminal-substrate").dataset
+          .terminalOwner,
+        "terminal",
+      ),
+    );
+    assert.equal(intervals, 0);
+  } finally {
+    window.setInterval = originalSetInterval;
+  }
 });

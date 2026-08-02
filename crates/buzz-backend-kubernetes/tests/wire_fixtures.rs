@@ -133,3 +133,82 @@ fn the_full_desktop_payload_is_accepted() {
         "the full payload was rejected before reaching the cluster: {error}"
     );
 }
+
+/// Sami's pre-registered respond-to matrix, driven through the built binary.
+///
+/// `build_env` runs at `main.rs:124`, `client::connect` at `:132`, so under a
+/// kubeconfig that cannot exist the error string *is* the ordering assertion:
+/// "kubeconfig" means the gate passed and we reached the cluster, anything
+/// else means we refused before writing a Secret. A test asserting only
+/// `ok: false` would pass on the connection error and prove nothing.
+///
+/// The cases are applied to the real full-launch request so each one differs
+/// from a known-good deploy in exactly the field under test.
+#[test]
+fn the_respond_to_gate_matches_the_harness_acceptance_surface() {
+    let key_a = "a".repeat(64);
+    let padded_upper = format!("  {}  ", "A".repeat(64));
+    // (name, respond_to, allowlist, must reach the cluster)
+    let cases: Vec<(&str, &str, Option<Vec<String>>, bool)> = vec![
+        ("allowlist + []", "allowlist", Some(vec![]), false),
+        ("allowlist + absent", "allowlist", None, false),
+        (
+            "allowlist + junk",
+            "allowlist",
+            Some(vec!["beefcafe".into()]),
+            false,
+        ),
+        ("unparseable mode", "npub1abc", None, false),
+        ("padded mode", " allowlist ", None, false),
+        (
+            "allowlist + two valid",
+            "allowlist",
+            Some(vec![key_a.clone(), "b".repeat(64)]),
+            true,
+        ),
+        (
+            "owner-only + junk list",
+            "owner-only",
+            Some(vec!["beefcafe".into()]),
+            true,
+        ),
+        (
+            "allowlist + padded upper",
+            "allowlist",
+            Some(vec![padded_upper]),
+            true,
+        ),
+        ("nobody", "nobody", None, true),
+        ("anyone", "anyone", None, true),
+    ];
+
+    let base: serde_json::Value =
+        serde_json::from_str(&read("deploy-full-launch.request.json")).unwrap();
+
+    for (name, mode, allowlist, reaches_cluster) in cases {
+        let mut request = base.clone();
+        let agent = &mut request["agent"];
+        agent["respond_to"] = serde_json::json!(mode);
+        agent["respond_to_allowlist"] = match &allowlist {
+            Some(list) => serde_json::json!(list),
+            None => serde_json::Value::Null,
+        };
+
+        let (stdout, code) = run(&request.to_string());
+        assert_eq!(code, 0, "{name}: provider did not exit cleanly");
+        let response: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let error = response["error"].as_str().unwrap_or_default();
+        let reached = error.contains("kubeconfig");
+
+        assert_eq!(
+            reached, reaches_cluster,
+            "{name}: expected reaches_cluster={reaches_cluster}, got error: {error}"
+        );
+        if !reaches_cluster {
+            assert!(
+                error.contains("deploy refused"),
+                "{name}: refused, but not by the gate: {error}"
+            );
+        }
+    }
+}

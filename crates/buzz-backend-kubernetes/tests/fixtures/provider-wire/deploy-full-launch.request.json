@@ -11,8 +11,7 @@
     "idle_timeout_seconds": null,
     "launch": {
       "args": [
-        "run",
-        "--session"
+        "acp"
       ],
       "command": "goose",
       "env": {

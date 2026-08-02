@@ -333,7 +333,7 @@ fn a_resize_mid_tail_reprices_the_remainder() {
 /// byte count cannot bound a lock hold: `ESC c` is two bytes and resets both
 /// grids plus scrollback.
 ///
-/// Kills: replacing `slice_bytes` with a constant, or deriving it from
+/// Kills: replacing `slice_bytes_remaining` with a constant, or deriving it from
 /// `cells` while the worst atom is larger than `cells`. Measured: 256 bytes
 /// of DECALN is 1.6 ms at 200x50 and ~14 ms at 1600x50, so no one constant
 /// serves both.
@@ -1152,7 +1152,7 @@ fn extreme_dimensions_saturate_instead_of_wrapping() {
 
     // The *direction* is the assertion, not merely the absence of a panic.
     // A wrapping build does not produce a slightly-wrong bound, it produces a
-    // tiny one -- and `slice_bytes` divides the budget by it, so an
+    // tiny one -- and `slice_bytes_remaining` divides the budget by it, so an
     // undercharged atom yields an *oversized* slice exactly when the atom is
     // most expensive. Wrapping inverts the fence. So: the widest possible
     // atom must give the narrowest possible slice.

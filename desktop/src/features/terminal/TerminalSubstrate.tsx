@@ -5,9 +5,12 @@ import { cn } from "@/shared/lib/cn";
 import { FadeController } from "./fadeController";
 import {
   INITIAL_HANDOFF_STATE,
+  accumulateScrollLines,
   encodePaste,
   encodeTerminalKey,
   reduceHandoff,
+  updateWelcomeForOutput,
+  type WelcomeState,
 } from "./terminalState";
 import { type TerminalFrame, TerminalGrid } from "./terminalRenderer";
 
@@ -42,6 +45,42 @@ function isToggleChord(event: KeyboardEvent): boolean {
   );
 }
 
+const CELL_HEIGHT = 17;
+const WELCOME_COLUMNS = 25;
+const WELCOME_LINES = 4;
+
+function welcomeRect(frame: TerminalFrame) {
+  const top = Math.max(
+    0,
+    Math.floor(frame.viewport.screenLines * 0.42 - WELCOME_LINES / 2),
+  );
+  const left = Math.max(
+    0,
+    Math.floor((frame.viewport.columns - WELCOME_COLUMNS) / 2),
+  );
+  return {
+    top,
+    left,
+    bottom: top + WELCOME_LINES,
+    right: left + WELCOME_COLUMNS,
+  };
+}
+
+function frameDamageRects(frame: TerminalFrame) {
+  return frame.rows
+    .filter((row) =>
+      row.spans.some((span) =>
+        span.clusters.some((cluster) => cluster.text.trim().length > 0),
+      ),
+    )
+    .map((row) => ({
+      top: row.line,
+      left: 0,
+      bottom: row.line + 1,
+      right: frame.viewport.columns,
+    }));
+}
+
 export function TerminalSubstrate({
   appSurfaceRef,
   channelName,
@@ -65,7 +104,13 @@ export function TerminalSubstrate({
   const paintedPaletteRef = React.useRef(terminalPalette);
   const previousFocusRef = React.useRef<HTMLElement | null>(null);
   const reportedFocusRef = React.useRef<boolean | null>(null);
+  const scrollBySessionRef = React.useRef(new Map<string, number>());
+  const activeSession = sessions.find((session) => session.active);
   const [owner, setOwner] = React.useState<"buzz" | "terminal">("buzz");
+  const [welcome, setWelcome] = React.useState<WelcomeState>({
+    visible: true,
+    reserved: null,
+  });
   const shortcutLabel = /Mac|iPhone|iPad/.test(navigator.platform)
     ? "⌘J"
     : "CTRL+J";
@@ -103,6 +148,18 @@ export function TerminalSubstrate({
     setOwner(next);
   });
 
+  const forceBuzzFallback = React.useEffectEvent(() => {
+    handoffRef.current = { ...INITIAL_HANDOFF_STATE };
+    commitOwner("buzz");
+    fadeRef.current?.settle("conceal");
+  });
+
+  const sendInput = React.useEffectEvent((text: string) => {
+    if (!text) return;
+    setWelcome((current) => ({ ...current, visible: false }));
+    onInput(text);
+  });
+
   React.useEffect(() => {
     if (!focusReportingEnabled) {
       reportedFocusRef.current = null;
@@ -129,6 +186,12 @@ export function TerminalSubstrate({
     fadeRef.current = new FadeController(appSurface);
     const handleKeyDown = (event: KeyboardEvent) => {
       if (!isToggleChord(event)) return;
+      if (event.isComposing) {
+        handoffRef.current = reduceHandoff(handoffRef.current, {
+          type: "focus-lost",
+        }).state;
+        return;
+      }
       event.preventDefault();
       event.stopImmediatePropagation();
       const result = reduceHandoff(handoffRef.current, {
@@ -173,6 +236,12 @@ export function TerminalSubstrate({
 
   React.useEffect(() => {
     if (frame) {
+      setWelcome((current) =>
+        updateWelcomeForOutput(
+          { ...current, reserved: welcomeRect(frame) },
+          frameDamageRects(frame),
+        ),
+      );
       const current = gridRef.current;
       if (!current) gridRef.current = new TerminalGrid(frame.viewport);
       else if (
@@ -186,11 +255,14 @@ export function TerminalSubstrate({
     }
 
     const canvas = canvasRef.current;
-    if (!canvas || !terminalPalette) return;
+    if (!canvas) return;
+    if (!terminalPalette) {
+      forceBuzzFallback();
+      return;
+    }
     const context = canvas.getContext("2d", { alpha: false });
     if (!context) {
-      commitOwner("buzz");
-      fadeRef.current?.settle("conceal");
+      forceBuzzFallback();
       return;
     }
     const dpr = window.devicePixelRatio || 1;
@@ -234,7 +306,21 @@ export function TerminalSubstrate({
       style={terminalStyle}
       onWheel={(event) => {
         event.preventDefault();
-        onScroll(event.deltaY);
+        const sessionId = activeSession?.id;
+        if (!sessionId) return;
+        const deltaPx =
+          event.deltaMode === 1
+            ? event.deltaY * CELL_HEIGHT
+            : event.deltaMode === 2
+              ? event.deltaY * event.currentTarget.clientHeight
+              : event.deltaY;
+        const result = accumulateScrollLines(
+          { remainderPx: scrollBySessionRef.current.get(sessionId) ?? 0 },
+          deltaPx,
+          CELL_HEIGHT,
+        );
+        scrollBySessionRef.current.set(sessionId, result.state.remainderPx);
+        if (result.lines !== 0) onScroll(result.lines);
       }}
     >
       <div className="buzz-terminal-contract-bar">
@@ -289,7 +375,7 @@ export function TerminalSubstrate({
       </div>
       <div className="buzz-terminal-viewport">
         <canvas ref={canvasRef} />
-        {!frame ? (
+        {welcome.visible ? (
           <div className="buzz-terminal-welcome" aria-hidden="true">
             <pre>{`┌─╲  BUZZ SUBSTRATE  ╱─┐
 │   B U Z Z    /\\_/\\  │
@@ -302,10 +388,13 @@ export function TerminalSubstrate({
           autoCapitalize="off"
           autoComplete="off"
           className="buzz-terminal-input"
-          onCompositionEnd={() => {
+          onCompositionEnd={(event) => {
             handoffRef.current = reduceHandoff(handoffRef.current, {
               type: "composition-end",
             }).state;
+            const committed = event.currentTarget.value;
+            event.currentTarget.value = "";
+            sendInput(committed);
           }}
           onCompositionStart={() => {
             handoffRef.current = reduceHandoff(handoffRef.current, {
@@ -313,10 +402,10 @@ export function TerminalSubstrate({
             }).state;
           }}
           onInput={(event) => {
-            if (event.currentTarget.value) {
-              onInput(event.currentTarget.value);
-              event.currentTarget.value = "";
-            }
+            if (handoffRef.current.composing) return;
+            const committed = event.currentTarget.value;
+            event.currentTarget.value = "";
+            sendInput(committed);
           }}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) {
@@ -327,12 +416,12 @@ export function TerminalSubstrate({
             const encoded = encodeTerminalKey(event);
             if (encoded) {
               event.preventDefault();
-              onInput(encoded);
+              sendInput(encoded);
             }
           }}
           onPaste={(event) => {
             event.preventDefault();
-            onInput(
+            sendInput(
               encodePaste(
                 event.clipboardData.getData("text/plain"),
                 bracketedPaste,

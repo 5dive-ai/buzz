@@ -114,8 +114,12 @@ void main() {
     },
   );
 
-  test('development push gateway uses the localhost compiled default', () {
-    expect(Env.pushGatewayUrl, 'http://localhost:8080');
+  test('development push gateway matches the compiled configuration', () {
+    const expectedGateway = String.fromEnvironment(
+      'BUZZ_PUSH_GATEWAY_URL',
+      defaultValue: 'http://localhost:8080',
+    );
+    expect(Env.pushGatewayUrl, expectedGateway);
   });
 
   test('persists the acknowledged push lease generation', () async {

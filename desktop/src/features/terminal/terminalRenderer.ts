@@ -44,6 +44,14 @@ export type CellMetrics = {
   boldFont: string;
 };
 
+export const TERMINAL_CELL_METRICS = {
+  width: 8.4,
+  height: 17,
+  baseline: 13,
+  font: '14px "JetBrains Mono", monospace',
+  boldFont: '700 14px "JetBrains Mono", monospace',
+} as const satisfies CellMetrics;
+
 type RetainedRow = readonly TerminalSpan[];
 
 export type PaintContext = Pick<

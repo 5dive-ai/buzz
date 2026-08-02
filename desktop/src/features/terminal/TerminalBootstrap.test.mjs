@@ -60,6 +60,7 @@ before(async () => {
     toJSON() {},
   });
   dom.window.HTMLCanvasElement.prototype.getContext = () => ({
+    clearRect() {},
     fillRect() {},
     fillStyle: "",
     fillText() {},

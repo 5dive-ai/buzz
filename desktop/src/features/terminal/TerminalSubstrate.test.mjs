@@ -136,7 +136,7 @@ test("mounted IME paths neither toggle nor emit preedit text", async () => {
   assert.deepEqual(calls.input, ["か"]);
 });
 
-test("welcome survives non-intersecting frame and dismisses on input or intersecting damage", async () => {
+test("first active PTY output dismisses the welcome overlay", async () => {
   const baseFrame = {
     cursor: { column: 0, line: 0, visible: false },
     full: false,
@@ -164,17 +164,8 @@ test("welcome survives non-intersecting frame and dismisses on input or intersec
   };
   const { view } = fixture({ frame: baseFrame });
   await ready(view);
-  assert.ok(view.container.querySelector(".buzz-terminal-welcome"));
-  toggleChord();
-  const input = view.getByLabelText("Terminal input");
-  fireEvent.input(input, { target: { value: "x" } });
-  await waitFor(
-    () =>
-      assert.equal(
-        view.container.querySelector(".buzz-terminal-welcome"),
-        null,
-      ),
-    { timeout: 1_000 },
+  await waitFor(() =>
+    assert.equal(view.container.querySelector(".buzz-terminal-welcome"), null),
   );
 
   cleanup();

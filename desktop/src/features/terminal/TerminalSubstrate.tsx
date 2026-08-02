@@ -9,10 +9,14 @@ import {
   encodePaste,
   encodeTerminalKey,
   reduceHandoff,
-  updateWelcomeForOutput,
-  type WelcomeState,
 } from "./terminalState";
-import { type TerminalFrame, TerminalGrid } from "./terminalRenderer";
+import { buildTerminalBanner } from "./terminalBanner";
+import { paintTerminalBanner } from "./terminalBannerPainter";
+import {
+  TERMINAL_CELL_METRICS,
+  type TerminalFrame,
+  TerminalGrid,
+} from "./terminalRenderer";
 
 export type TerminalViewportSize = {
   columns: number;
@@ -56,38 +60,12 @@ function isToggleChord(event: KeyboardEvent): boolean {
   );
 }
 
-const CELL_HEIGHT = 17;
-const WELCOME_COLUMNS = 25;
-const WELCOME_LINES = 4;
+const { width: CELL_WIDTH, height: CELL_HEIGHT } = TERMINAL_CELL_METRICS;
 
-function welcomeRect(frame: TerminalFrame) {
-  const top = Math.max(
-    0,
-    Math.floor(frame.viewport.screenLines * 0.42 - WELCOME_LINES / 2),
-  );
-  const left = Math.max(
-    0,
-    Math.floor((frame.viewport.columns - WELCOME_COLUMNS) / 2),
-  );
-  return {
-    top,
-    left,
-    bottom: top + WELCOME_LINES,
-    right: left + WELCOME_COLUMNS,
-  };
-}
-
-function frameDamageRects(frame: TerminalFrame) {
-  return frame.rows.flatMap((row) =>
-    row.spans.flatMap((span) =>
-      span.clusters
-        .filter((cluster) => cluster.text.trim().length > 0)
-        .map((cluster) => ({
-          top: row.line,
-          left: cluster.column,
-          bottom: row.line + 1,
-          right: cluster.column + cluster.width,
-        })),
+function hasVisibleOutput(frame: TerminalFrame): boolean {
+  return frame.rows.some((row) =>
+    row.spans.some((span) =>
+      span.clusters.some((cluster) => cluster.text.trim().length > 0),
     ),
   );
 }
@@ -112,6 +90,7 @@ export function TerminalSubstrate({
 }: TerminalSubstrateProps) {
   const { terminalPalette } = useTheme();
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
+  const bannerCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
   const fadeRef = React.useRef<FadeController | null>(null);
   const handoffRef = React.useRef(INITIAL_HANDOFF_STATE);
@@ -131,10 +110,8 @@ export function TerminalSubstrate({
     [activeSessionId, frame, sessionFrames],
   );
   const [owner, setOwner] = React.useState<"buzz" | "terminal">("buzz");
-  const [welcome, setWelcome] = React.useState<WelcomeState>({
-    visible: true,
-    reserved: null,
-  });
+  const [viewport, setViewport] = React.useState({ columns: 1, rows: 1 });
+  const [welcomeVisible, setWelcomeVisible] = React.useState(true);
   const shortcutLabel = /Mac|iPhone|iPad/.test(navigator.platform)
     ? "⌘J"
     : "CTRL+J";
@@ -143,6 +120,15 @@ export function TerminalSubstrate({
       appSurfaceRef?.current ??
       document.querySelector<HTMLDivElement>(".buzz-huddle-app-surface"),
     [appSurfaceRef],
+  );
+  const banner = React.useMemo(
+    () =>
+      buildTerminalBanner(
+        viewport.columns,
+        viewport.rows,
+        CELL_HEIGHT / CELL_WIDTH,
+      ),
+    [viewport.columns, viewport.rows],
   );
   const terminalStyle = terminalPalette
     ? ({
@@ -180,7 +166,7 @@ export function TerminalSubstrate({
 
   const sendInput = React.useEffectEvent((text: string) => {
     if (!text) return;
-    setWelcome((current) => ({ ...current, visible: false }));
+    setWelcomeVisible(false);
     onInput(text);
   });
   const consumeFrame = React.useEffectEvent((nextFrame: TerminalFrame) => {
@@ -188,17 +174,19 @@ export function TerminalSubstrate({
   });
   const reportViewportSize = React.useEffectEvent(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !onViewportSize) return;
+    if (!canvas) return;
     const bounds = canvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
     const pixelWidth = Math.max(1, Math.round(bounds.width * dpr));
     const pixelHeight = Math.max(1, Math.round(bounds.height * dpr));
-    onViewportSize({
-      columns: Math.max(1, Math.floor(bounds.width / 8.4)),
-      rows: Math.max(1, Math.floor(bounds.height / CELL_HEIGHT)),
-      pixelWidth,
-      pixelHeight,
-    });
+    const columns = Math.max(1, Math.floor(bounds.width / CELL_WIDTH));
+    const rows = Math.max(1, Math.floor(bounds.height / CELL_HEIGHT));
+    setViewport((current) =>
+      current.columns === columns && current.rows === rows
+        ? current
+        : { columns, rows },
+    );
+    onViewportSize?.({ columns, rows, pixelWidth, pixelHeight });
   });
 
   React.useEffect(() => {
@@ -207,14 +195,14 @@ export function TerminalSubstrate({
 
   React.useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !onViewportSize) return;
+    if (!canvas) return;
     reportViewportSize();
     const ResizeObserverConstructor = window.ResizeObserver;
     if (!ResizeObserverConstructor) return;
     const observer = new ResizeObserverConstructor(reportViewportSize);
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, [onViewportSize]);
+  }, []);
 
   React.useEffect(() => {
     if (!focusReportingEnabled) {
@@ -291,6 +279,21 @@ export function TerminalSubstrate({
   }, [enabled, getAppSurface]);
 
   React.useEffect(() => {
+    const canvas = bannerCanvasRef.current;
+    if (!canvas || !banner || !terminalPalette || !welcomeVisible) return;
+    if (
+      !paintTerminalBanner(
+        canvas,
+        banner,
+        terminalPalette,
+        window.devicePixelRatio || 1,
+      )
+    ) {
+      setWelcomeVisible(false);
+    }
+  }, [banner, terminalPalette, welcomeVisible]);
+
+  React.useEffect(() => {
     for (const delivered of frames) {
       if (appliedFramesRef.current.has(delivered.frame)) continue;
       appliedFramesRef.current.add(delivered.frame);
@@ -307,13 +310,12 @@ export function TerminalSubstrate({
       }
       grid.apply(delivered.frame);
       consumeFrame(delivered.frame);
-      if (delivered.sessionId === activeSessionId) {
-        setWelcome((current) =>
-          updateWelcomeForOutput(
-            { ...current, reserved: welcomeRect(delivered.frame) },
-            frameDamageRects(delivered.frame),
-          ),
-        );
+      if (
+        delivered.sessionId === activeSessionId &&
+        hasVisibleOutput(delivered.frame)
+      ) {
+        // Policy: first visible output from the active PTY removes the overlay.
+        setWelcomeVisible(false);
       }
     }
     gridRef.current = activeSessionId
@@ -351,22 +353,12 @@ export function TerminalSubstrate({
       context.fillStyle = terminalPalette.background;
       context.fillRect(0, 0, bounds.width, bounds.height);
     }
-    gridRef.current?.paint(
-      context,
-      {
-        width: 8.4,
-        height: 17,
-        baseline: 13,
-        font: '14px "JetBrains Mono", monospace',
-        boldFont: '700 14px "JetBrains Mono", monospace',
-      },
-      terminalPalette,
-    );
+    gridRef.current?.paint(context, TERMINAL_CELL_METRICS, terminalPalette);
   }, [activeSessionId, frames, terminalPalette]);
 
   return (
     <section
-      aria-label="Local terminal"
+      aria-label="Buzz Term"
       className="buzz-terminal-substrate"
       data-terminal-owner={owner}
       style={terminalStyle}
@@ -425,7 +417,7 @@ export function TerminalSubstrate({
             </div>
           ))}
           <button
-            aria-label="New terminal tab"
+            aria-label="New Buzz Term tab"
             className="buzz-terminal-new-tab"
             onClick={onNewSession}
             type="button"
@@ -441,13 +433,8 @@ export function TerminalSubstrate({
       </div>
       <div className="buzz-terminal-viewport">
         <canvas ref={canvasRef} />
-        {welcome.visible ? (
-          <div className="buzz-terminal-welcome" aria-hidden="true">
-            <pre>{`┌─╲  BUZZ SUBSTRATE  ╱─┐
-│   B U Z Z    /\\_/\\  │
-│   LOCAL PTY ( o.o )  │
-└────────────── > ^ < ─┘`}</pre>
-          </div>
+        {welcomeVisible && banner ? (
+          <canvas className="buzz-terminal-welcome" ref={bannerCanvasRef} />
         ) : null}
         <textarea
           aria-label="Terminal input"
@@ -497,7 +484,7 @@ export function TerminalSubstrate({
         />
       </div>
       <div aria-live="polite" className="sr-only">
-        {owner === "terminal" ? "Terminal mode" : "Buzz mode"}
+        {owner === "terminal" ? "Buzz Term mode" : "Buzz mode"}
       </div>
     </section>
   );

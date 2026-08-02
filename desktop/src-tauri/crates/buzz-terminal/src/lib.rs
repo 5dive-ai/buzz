@@ -161,6 +161,8 @@ impl Terminal {
     }
 
     /// Whether the tail is at its cap and the reader must stop reading.
+    /// See [`reader::Feeder::tail_full`] for why production deliberately has
+    /// no consumer yet.
     ///
     /// There is no production consumer today, deliberately: the desktop
     /// runtime pumps `drain()` to completion after every read, so the tail is

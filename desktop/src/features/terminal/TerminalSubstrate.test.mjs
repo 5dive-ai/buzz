@@ -131,6 +131,8 @@ test("mounted IME paths neither toggle nor emit preedit text", async () => {
   fireEvent.input(input, { target: { value: "か" } });
   assert.deepEqual(calls.input, []);
   fireEvent.compositionEnd(input, { data: "か" });
+  assert.deepEqual(calls.input, []);
+  fireEvent.input(input, { target: { value: "か" } });
   assert.deepEqual(calls.input, ["か"]);
 });
 
@@ -148,6 +150,15 @@ test("welcome survives non-intersecting frame and dismisses on input or intersec
           },
         ],
       },
+      {
+        line: 8,
+        spans: [
+          {
+            style: { fg: 0, bg: 0, flags: 0 },
+            clusters: [{ column: 70, text: "x", width: 1 }],
+          },
+        ],
+      },
     ],
     viewport: { columns: 80, generation: 1, screenLines: 24 },
   };
@@ -157,8 +168,13 @@ test("welcome survives non-intersecting frame and dismisses on input or intersec
   toggleChord();
   const input = view.getByLabelText("Terminal input");
   fireEvent.input(input, { target: { value: "x" } });
-  await waitFor(() =>
-    assert.equal(view.container.querySelector(".buzz-terminal-welcome"), null),
+  await waitFor(
+    () =>
+      assert.equal(
+        view.container.querySelector(".buzz-terminal-welcome"),
+        null,
+      ),
+    { timeout: 1_000 },
   );
 
   cleanup();
@@ -171,7 +187,7 @@ test("welcome survives non-intersecting frame and dismisses on input or intersec
           spans: [
             {
               style: { fg: 0, bg: 0, flags: 0 },
-              clusters: [{ column: 0, text: "x", width: 1 }],
+              clusters: [{ column: 30, text: "x", width: 1 }],
             },
           ],
         },

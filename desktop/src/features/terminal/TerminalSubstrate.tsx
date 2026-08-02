@@ -67,18 +67,18 @@ function welcomeRect(frame: TerminalFrame) {
 }
 
 function frameDamageRects(frame: TerminalFrame) {
-  return frame.rows
-    .filter((row) =>
-      row.spans.some((span) =>
-        span.clusters.some((cluster) => cluster.text.trim().length > 0),
-      ),
-    )
-    .map((row) => ({
-      top: row.line,
-      left: 0,
-      bottom: row.line + 1,
-      right: frame.viewport.columns,
-    }));
+  return frame.rows.flatMap((row) =>
+    row.spans.flatMap((span) =>
+      span.clusters
+        .filter((cluster) => cluster.text.trim().length > 0)
+        .map((cluster) => ({
+          top: row.line,
+          left: cluster.column,
+          bottom: row.line + 1,
+          right: cluster.column + cluster.width,
+        })),
+    ),
+  );
 }
 
 export function TerminalSubstrate({
@@ -388,13 +388,10 @@ export function TerminalSubstrate({
           autoCapitalize="off"
           autoComplete="off"
           className="buzz-terminal-input"
-          onCompositionEnd={(event) => {
+          onCompositionEnd={() => {
             handoffRef.current = reduceHandoff(handoffRef.current, {
               type: "composition-end",
             }).state;
-            const committed = event.currentTarget.value;
-            event.currentTarget.value = "";
-            sendInput(committed);
           }}
           onCompositionStart={() => {
             handoffRef.current = reduceHandoff(handoffRef.current, {

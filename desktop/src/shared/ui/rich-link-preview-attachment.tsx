@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronUp } from "lucide-react";
+import { ChevronDown, ChevronUp, ImageOff } from "lucide-react";
 import type { ComponentType, ReactNode } from "react";
 import { useState } from "react";
 
@@ -64,21 +64,45 @@ function LinkPreviewImage({
 }) {
   const imageSrc =
     preview.imageState === "image" ? preview.imageDataUrl : undefined;
+  const [failedImageSrc, setFailedImageSrc] = useState<string | null>(null);
+  const imageFailed = Boolean(imageSrc && failedImageSrc === imageSrc);
+  const showFallback = preview.imageState === "fallback" || imageFailed;
   const alt = `Preview from ${preview.imageDomain}`;
 
-  if (!imageSrc) {
+  if (!imageSrc || imageFailed) {
     return (
       <div
         className={cn("overflow-hidden rounded-xl bg-muted", className)}
         data-link-preview-thumbnail=""
       >
-        <div
-          className={cn(
-            "w-full animate-pulse bg-muted-foreground/10",
-            aspectClassName,
-          )}
-          data-link-preview-skeleton=""
-        />
+        {showFallback ? (
+          <div
+            aria-hidden="true"
+            className={cn(
+              "flex w-full items-center justify-center bg-muted text-muted-foreground",
+              aspectClassName,
+            )}
+            data-link-preview-image-fallback=""
+          >
+            {preview.faviconDataUrl ? (
+              <img
+                alt=""
+                className="size-10 rounded-lg object-contain opacity-70"
+                src={preview.faviconDataUrl}
+              />
+            ) : (
+              <ImageOff className="size-7 opacity-60" />
+            )}
+          </div>
+        ) : (
+          <div
+            className={cn(
+              "w-full animate-pulse bg-muted-foreground/10",
+              aspectClassName,
+            )}
+            data-link-preview-skeleton=""
+          />
+        )}
       </div>
     );
   }
@@ -96,6 +120,7 @@ function LinkPreviewImage({
         <img
           alt={alt}
           className="h-full w-full rounded-xl object-cover"
+          onError={() => setFailedImageSrc(imageSrc)}
           src={imageSrc}
         />
       </div>

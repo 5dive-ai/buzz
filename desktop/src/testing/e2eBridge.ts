@@ -336,8 +336,23 @@ type E2eConfig = {
       description: string | null;
       imageDataUrl: string | null;
       imageDomain: string | null;
+      imageFetchState?: "none" | "image" | "transient_failure" | "rejected";
+      imageRetryAfterMs?: number | null;
       faviconDataUrl?: string | null;
     } | null;
+    linkPreviewMetadataByHref?: Record<
+      string,
+      {
+        title: string;
+        siteName: string | null;
+        description: string | null;
+        imageDataUrl: string | null;
+        imageDomain: string | null;
+        imageFetchState?: "none" | "image" | "transient_failure" | "rejected";
+        imageRetryAfterMs?: number | null;
+        faviconDataUrl?: string | null;
+      } | null
+    >;
     linkPreviewMetadataDelayMs?: number;
     searchProfiles?: MockSearchProfileSeed[];
     updateAvailable?: boolean;
@@ -10966,6 +10981,11 @@ export function maybeInstallE2eTauriMocks() {
         const delayMs = activeConfig?.mock?.linkPreviewMetadataDelayMs ?? 0;
         if (delayMs > 0) {
           await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+        }
+        const href = (payload as { href?: string }).href;
+        const metadataByHref = activeConfig?.mock?.linkPreviewMetadataByHref;
+        if (href && metadataByHref && Object.hasOwn(metadataByHref, href)) {
+          return metadataByHref[href];
         }
         return activeConfig?.mock?.linkPreviewMetadata ?? null;
       }

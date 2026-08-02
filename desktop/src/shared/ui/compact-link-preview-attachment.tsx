@@ -1,3 +1,6 @@
+import { ImageOff } from "lucide-react";
+import { useState } from "react";
+
 import type { ResolvedLinkPreview } from "@/shared/lib/useResolvedLinkPreviews";
 import { cn } from "@/shared/lib/cn";
 import {
@@ -18,6 +21,30 @@ function getHostname(preview: ResolvedLinkPreview): string {
   }
 }
 
+function LinkPreviewImageFallback({
+  preview,
+}: {
+  preview: ResolvedLinkPreview;
+}) {
+  return (
+    <div
+      aria-hidden="true"
+      className="flex h-full w-full items-center justify-center bg-muted text-muted-foreground"
+      data-link-preview-image-fallback=""
+    >
+      {preview.faviconDataUrl ? (
+        <img
+          alt=""
+          className="size-7 rounded-md object-contain opacity-70"
+          src={preview.faviconDataUrl}
+        />
+      ) : (
+        <ImageOff className="size-5 opacity-60" />
+      )}
+    </div>
+  );
+}
+
 export function CompactLinkPreviewAttachment({
   className,
   onRemove,
@@ -30,7 +57,12 @@ export function CompactLinkPreviewAttachment({
   showControls?: boolean;
 }) {
   const reserveImage = preview.imageState !== "none";
-  const showImage = preview.imageState === "image";
+  const imageSrc =
+    preview.imageState === "image" ? (preview.imageDataUrl ?? null) : null;
+  const [failedImageSrc, setFailedImageSrc] = useState<string | null>(null);
+  const showImage = Boolean(imageSrc && failedImageSrc !== imageSrc);
+  const showFallback =
+    preview.imageState === "fallback" || Boolean(imageSrc && !showImage);
   const hostname = getHostname(preview);
 
   return (
@@ -57,8 +89,11 @@ export function CompactLinkPreviewAttachment({
               <img
                 alt={`Preview from ${preview.imageDomain}`}
                 className="h-full w-full object-cover"
-                src={preview.imageDataUrl ?? undefined}
+                onError={() => setFailedImageSrc(imageSrc)}
+                src={imageSrc ?? undefined}
               />
+            ) : showFallback ? (
+              <LinkPreviewImageFallback preview={preview} />
             ) : (
               <div
                 className="h-full w-full animate-pulse bg-muted-foreground/10"

@@ -11,6 +11,14 @@ use reqwest::{
 use serde::Serialize;
 use url::Url;
 
+#[path = "link_preview_rate_limit.rs"]
+mod rate_limit;
+
+use rate_limit::{
+    image_host_cooldown_remaining, retry_after_duration, set_image_host_cooldown,
+    MAX_IMAGE_RETRY_AFTER,
+};
+
 const MAX_PREVIEW_FETCH_BYTES: usize = 256 * 1024;
 const MAX_IMAGE_FETCH_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 4096;
@@ -22,6 +30,15 @@ const MAX_REDIRECTS: usize = 3;
 const MAX_METADATA_CHARS: usize = 180;
 const MAX_METADATA_DESCRIPTION_CHARS: usize = 280;
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LinkPreviewImageFetchState {
+    None,
+    Image,
+    TransientFailure,
+    Rejected,
+}
+
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkPreviewMetadata {
@@ -30,6 +47,8 @@ pub struct LinkPreviewMetadata {
     description: Option<String>,
     image_data_url: Option<String>,
     image_domain: Option<String>,
+    image_fetch_state: LinkPreviewImageFetchState,
+    image_retry_after_ms: Option<u64>,
     favicon_data_url: Option<String>,
 }
 
@@ -79,21 +98,65 @@ async fn fetch_link_preview_metadata_inner(
         let Some(mut metadata) = extract_link_preview_metadata(&body) else {
             return Ok(None);
         };
-        if let Some(image_url) = extract_image_url(&body, &url) {
-            if let Ok((data_url, domain)) = fetch_sanitized_image(image_url, false).await {
-                metadata.image_data_url = Some(data_url);
-                metadata.image_domain = Some(domain);
+        let image_url = extract_image_url(&body, &url);
+        let favicon_url = extract_favicon_url(&body, &url);
+        let (image_result, favicon_result) = tokio::join!(
+            async {
+                match image_url {
+                    Some(image_url) => Some(
+                        tokio::time::timeout(
+                            PREVIEW_FETCH_TIMEOUT,
+                            fetch_sanitized_image(image_url, false),
+                        )
+                        .await
+                        .unwrap_or(Err(ImageFetchError::Transient { retry_after: None })),
+                    ),
+                    None => None,
+                }
+            },
+            async {
+                match favicon_url {
+                    Some(favicon_url) => tokio::time::timeout(
+                        PREVIEW_FETCH_TIMEOUT,
+                        fetch_sanitized_image(favicon_url, true),
+                    )
+                    .await
+                    .ok(),
+                    None => None,
+                }
             }
-        }
-        if let Some(favicon_url) = extract_favicon_url(&body, &url) {
-            if let Ok((data_url, _)) = fetch_sanitized_image(favicon_url, true).await {
-                metadata.favicon_data_url = Some(data_url);
-            }
+        );
+
+        apply_image_result(&mut metadata, image_result);
+        if let Some(Ok((data_url, _))) = favicon_result {
+            metadata.favicon_data_url = Some(data_url);
         }
         return Ok(Some(metadata));
     }
 
     Ok(None)
+}
+
+fn apply_image_result(
+    metadata: &mut LinkPreviewMetadata,
+    image_result: Option<Result<(String, String), ImageFetchError>>,
+) {
+    match image_result {
+        Some(Ok((data_url, domain))) => {
+            metadata.image_data_url = Some(data_url);
+            metadata.image_domain = Some(domain);
+            metadata.image_fetch_state = LinkPreviewImageFetchState::Image;
+        }
+        Some(Err(ImageFetchError::Transient { retry_after })) => {
+            metadata.image_fetch_state = LinkPreviewImageFetchState::TransientFailure;
+            metadata.image_retry_after_ms =
+                retry_after.and_then(|duration| u64::try_from(duration.as_millis()).ok());
+        }
+        Some(Err(ImageFetchError::Rejected)) => {
+            metadata.image_fetch_state = LinkPreviewImageFetchState::Rejected;
+        }
+        None => {}
+    }
 }
 
 async fn validate_public_https_url(url: &Url) -> Result<(), String> {
@@ -251,30 +314,57 @@ fn extract_image_url(html: &str, page_url: &Url) -> Option<Url> {
     page_url.join(raw.trim()).ok()
 }
 
+#[derive(Debug, PartialEq)]
+enum ImageFetchError {
+    Transient { retry_after: Option<Duration> },
+    Rejected,
+}
+
 async fn fetch_sanitized_image(
     mut url: Url,
     preserve_transparency: bool,
-) -> Result<(String, String), String> {
-    validate_public_https_url(&url).await?;
+) -> Result<(String, String), ImageFetchError> {
+    validate_public_https_url(&url)
+        .await
+        .map_err(|_| ImageFetchError::Rejected)?;
     for redirect_count in 0..=MAX_REDIRECTS {
-        let response = send_pinned_request(&url, "image/jpeg,image/png,image/webp").await?;
+        if let Some(retry_after) = image_host_cooldown_remaining(&url) {
+            return Err(ImageFetchError::Transient {
+                retry_after: Some(retry_after),
+            });
+        }
+        let response = send_pinned_request(&url, "image/jpeg,image/png,image/webp")
+            .await
+            .map_err(|_| ImageFetchError::Transient { retry_after: None })?;
         if response.status().is_redirection() {
             if redirect_count == MAX_REDIRECTS {
-                return Err("link preview image redirected too many times".to_string());
+                return Err(ImageFetchError::Rejected);
             }
             let location = response
                 .headers()
                 .get(LOCATION)
                 .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| "link preview image redirect has an invalid location".to_string())?;
-            url = url
-                .join(location)
-                .map_err(|error| format!("invalid link preview image redirect: {error}"))?;
-            validate_public_https_url(&url).await?;
+                .ok_or(ImageFetchError::Rejected)?;
+            url = url.join(location).map_err(|_| ImageFetchError::Rejected)?;
+            validate_public_https_url(&url)
+                .await
+                .map_err(|_| ImageFetchError::Rejected)?;
             continue;
         }
         if !response.status().is_success() {
-            return Err("link preview image request was unsuccessful".to_string());
+            let status = response.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_EARLY
+                || status.is_server_error()
+            {
+                let retry_after = retry_after_duration(&response);
+                if let Some(retry_after) = retry_after {
+                    set_image_host_cooldown(&url, retry_after);
+                }
+                return Err(ImageFetchError::Transient { retry_after });
+            }
+            return Err(ImageFetchError::Rejected);
         }
         let declared_mime = response
             .headers()
@@ -288,29 +378,32 @@ async fn fetch_sanitized_image(
                     .trim()
                     .to_ascii_lowercase()
             })
-            .ok_or_else(|| "link preview image has no content type".to_string())?;
+            .ok_or(ImageFetchError::Rejected)?;
         if !matches!(
             declared_mime.as_str(),
             "image/jpeg" | "image/png" | "image/webp"
         ) {
-            return Err("link preview image type is unsupported".to_string());
+            return Err(ImageFetchError::Rejected);
         }
         if response
             .content_length()
             .is_some_and(|size| size > MAX_IMAGE_FETCH_BYTES as u64)
         {
-            return Err("link preview image exceeded the size limit".to_string());
+            return Err(ImageFetchError::Rejected);
         }
-        let bytes = read_limited_bytes(response, MAX_IMAGE_FETCH_BYTES).await?;
+        let bytes = read_limited_bytes(response, MAX_IMAGE_FETCH_BYTES)
+            .await
+            .map_err(|_| ImageFetchError::Rejected)?;
         let data_url = tokio::task::spawn_blocking(move || {
             sanitize_image(&bytes, &declared_mime, preserve_transparency)
         })
         .await
-        .map_err(|_| "link preview image sanitizer failed".to_string())??;
+        .map_err(|_| ImageFetchError::Rejected)?
+        .map_err(|_| ImageFetchError::Rejected)?;
         let domain = url.host_str().unwrap_or_default().to_string();
         return Ok((data_url, domain));
     }
-    Err("link preview image fetch failed".to_string())
+    Err(ImageFetchError::Rejected)
 }
 
 fn sanitize_image(
@@ -411,6 +504,8 @@ fn extract_link_preview_metadata(html: &str) -> Option<LinkPreviewMetadata> {
         description,
         image_data_url: None,
         image_domain: None,
+        image_fetch_state: LinkPreviewImageFetchState::None,
+        image_retry_after_ms: None,
         favicon_data_url: None,
     })
 }
@@ -557,9 +652,10 @@ fn decode_html_entities(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        declares_animation, extract_favicon_url, extract_image_url, extract_link_preview_metadata,
-        is_html_response, read_bytes_prefix, sanitize_image, LinkPreviewMetadata,
-        MAX_METADATA_DESCRIPTION_CHARS,
+        apply_image_result, declares_animation, extract_favicon_url, extract_image_url,
+        extract_link_preview_metadata, is_html_response, read_bytes_prefix, retry_after_duration,
+        sanitize_image, ImageFetchError, LinkPreviewImageFetchState, LinkPreviewMetadata,
+        MAX_IMAGE_RETRY_AFTER, MAX_METADATA_DESCRIPTION_CHARS,
     };
     use axum::{body::Body, http::Response, routing::get, Router};
     use base64::Engine as _;
@@ -594,9 +690,43 @@ mod tests {
                 description: Some("Safe & useful previews".to_string()),
                 image_data_url: None,
                 image_domain: None,
+                image_fetch_state: LinkPreviewImageFetchState::None,
+                image_retry_after_ms: None,
                 favicon_data_url: None,
             })
         );
+    }
+
+    #[test]
+    fn image_results_preserve_absence_and_classify_recovery() {
+        let mut metadata = extract_link_preview_metadata("<title>Preview result</title>").unwrap();
+        apply_image_result(&mut metadata, None);
+        assert_eq!(metadata.image_fetch_state, LinkPreviewImageFetchState::None);
+
+        apply_image_result(
+            &mut metadata,
+            Some(Err(ImageFetchError::Transient {
+                retry_after: Some(std::time::Duration::from_secs(15)),
+            })),
+        );
+        assert_eq!(
+            metadata.image_fetch_state,
+            LinkPreviewImageFetchState::TransientFailure
+        );
+        assert_eq!(metadata.image_retry_after_ms, Some(15_000));
+
+        apply_image_result(
+            &mut metadata,
+            Some(Ok((
+                "data:image/jpeg;base64,abc".to_string(),
+                "images.example.com".to_string(),
+            ))),
+        );
+        assert_eq!(
+            metadata.image_fetch_state,
+            LinkPreviewImageFetchState::Image
+        );
+        assert_eq!(metadata.image_domain.as_deref(), Some("images.example.com"));
     }
 
     #[test]
@@ -714,6 +844,44 @@ mod tests {
             Some("Prefix title".to_string())
         );
         assert!(extract_image_url(&html, &Url::parse("https://example.com").unwrap()).is_some());
+    }
+
+    #[tokio::test]
+    async fn image_retry_after_uses_bounded_delta_seconds() {
+        let response = test_response(
+            Router::new().route(
+                "/rate-limited",
+                get(|| async {
+                    Response::builder()
+                        .status(429)
+                        .header("retry-after", "900")
+                        .body(Body::empty())
+                        .unwrap()
+                }),
+            ),
+            "/rate-limited",
+        )
+        .await;
+        assert_eq!(
+            retry_after_duration(&response),
+            Some(std::time::Duration::from_secs(900))
+        );
+
+        let response = test_response(
+            Router::new().route(
+                "/excessive",
+                get(|| async {
+                    Response::builder()
+                        .status(429)
+                        .header("retry-after", "7200")
+                        .body(Body::empty())
+                        .unwrap()
+                }),
+            ),
+            "/excessive",
+        )
+        .await;
+        assert_eq!(retry_after_duration(&response), Some(MAX_IMAGE_RETRY_AFTER));
     }
 
     #[tokio::test]

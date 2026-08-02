@@ -1061,17 +1061,19 @@ test("fetchCommunityUnread adversarial-2: projection with frontier deactivates r
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
 });
 
-test("fetchCommunityUnread adversarial-5: stale_complete_projection_yieldsTo_fresher_fetched_tombstone", async () => {
-  // CRITICAL 2 ordering fix: `loadComplete` establishes enumeration completeness,
-  // NOT temporal ordering. A complete projection with a live register
-  // (S=5,C=0,B=100,F=50) must yield to a fresher fetched tombstone (S=0,C=4,B=0)
-  // for the same channel. Without the fetchedTombstoneChannels guard, the projection
-  // overrides authoritative map (S=5,C=0,B=100) would produce hasUnread:true;
-  // with the guard, the fetched tombstone wins and the rail stays dark.
+test("fetchCommunityUnread adversarial-5: complete_projection_live_register_not_darkened_by_stale_fetched_tombstone", async () => {
+  // A fresh local mark-unread committed into the projection (S=5,C=0,B=100,F=50)
+  // must NOT be darkened by an independently fetched tombstone (S=0,C=4,B=0).
   //
-  // Wire: fetched event has ov_c:CHANNEL_ID=4 but no ov_s: → decoded as {s:0,c:4,b:0}.
-  // fetchedTombstoneChannels includes CHANNEL_ID (s===0). Override liveness check is
-  // skipped for that channel even though authoritative (projection) has s=5.
+  // The observer cannot adjudicate cross-source ordering: the manager owns
+  // coordinate dedupe and CRDT ingest.  A categorical tombstone-wins rule would
+  // hide the user's mark-unread until the relay publish catches up (the
+  // false-negative direction), which is the more harmful failure.
+  //
+  // When the projection is complete, projection.overrides is the SOLE liveness
+  // authority.  The fetched register shape is irrelevant.  Any transient
+  // false-positive resolves when the manager ingests the tombstone via its own
+  // CRDT path.
   const SLOT = "a".repeat(32); // valid 32-hex slot
   const relay = relayFor([
     // 1. member events
@@ -1096,7 +1098,7 @@ test("fetchCommunityUnread adversarial-5: stale_complete_projection_yieldsTo_fre
     () => [],
     // 4. read-state: tombstone wire format (ov_c present, ov_s absent → s=0,c=4,b=0)
     //    Frontier F=50 is also present so the projection frontier is not strictly
-    //    newer — only the tombstone vs live-register ordering is under test.
+    //    newer — only the live-register vs concurrent-tombstone ordering is under test.
     () => [
       event({
         pubkey: PUBKEY,
@@ -1118,14 +1120,14 @@ test("fetchCommunityUnread adversarial-5: stale_complete_projection_yieldsTo_fre
     ],
     // 5. mutes
     () => [],
-    // 6. unread events — none
+    // 6. unread events — none (liveness from override register, not messages)
     () => [],
     // 7. mention events — none
     () => [],
   ]);
 
   // Complete projection: live register S=5,C=0,B=100 and frontier F=50.
-  // F=50 ≤ B=100, S=5 > C=0 → isOverrideActive would return true WITHOUT the guard.
+  // F=50 ≤ B=100, S=5 > C=0 → isOverrideActive returns true.
   const overrides = new Map([[CHANNEL_ID, { s: 5, c: 0, b: 100 }]]);
   const frontiers = new Map([[CHANNEL_ID, 50]]);
 
@@ -1139,7 +1141,85 @@ test("fetchCommunityUnread adversarial-5: stale_complete_projection_yieldsTo_fre
     getProjection: () => ({ loadComplete: true, frontiers, overrides }),
   });
 
-  // Fetched tombstone (s=0) is authoritative; projection's stale live register must not
-  // resurrect unread when the relay has confirmed a clear.
+  // Projection is the sole override authority when complete.  The fetched
+  // tombstone does not suppress the live projection register — the rail lights.
+  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+});
+
+test("fetchCommunityUnread adversarial-6: torn fetched register (ov_s+ov_c without ov_b) → rail stays dark", async () => {
+  // Integration witness: a fetched read-state event carrying an illegal partial
+  // override group — ov_s and ov_c present, ov_b ABSENT — must not light the
+  // rail.  The parser drops incomplete groups (any shape other than all-three or
+  // C-only tombstone), so the register never reaches liveness evaluation.
+  //
+  // This locks the parser → structured merge → rail path at the observer level.
+  // The readStateOverride parser-matrix tests confirm the drop at the unit level;
+  // this witness confirms the integration: a torn fetched group cannot influence
+  // fetchCommunityUnread() rail output.
+  const SLOT = "b".repeat(32); // valid 32-hex slot, distinct from other tests
+  const relay = relayFor([
+    // 1. member events
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["p", PUBKEY],
+        ],
+      }),
+    ],
+    // 2. metadata events
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["t", "stream"],
+        ],
+      }),
+    ],
+    // 3. visibility events
+    () => [],
+    // 4. read-state: torn group — ov_s + ov_c present, ov_b absent (S+C shape).
+    //    The parser treats any shape other than {S,C,B} or {C-only tombstone}
+    //    as invalid and drops the entire group.  No override register reaches
+    //    the authoritative map.  No message events follow either.
+    () => [
+      event({
+        pubkey: PUBKEY,
+        created_at: 300,
+        tags: [
+          ["d", `read-state:${SLOT}`],
+          ["t", "read-state"],
+        ],
+        content: JSON.stringify({
+          v: 1,
+          client_id: "client",
+          contexts: {
+            [`ov_s:${CHANNEL_ID}`]: 5,
+            [`ov_c:${CHANNEL_ID}`]: 0,
+            // ov_b: intentionally absent → illegal S+C partial group, dropped
+          },
+        }),
+      }),
+    ],
+    // 5. mutes
+    () => [],
+    // 6. unread events — none
+    () => [],
+    // 7. mention events — none
+    () => [],
+  ]);
+
+  const result = await fetchCommunityUnread({
+    client: relay,
+    pubkey: PUBKEY,
+    nowSeconds: 400,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships(),
+    // No getProjection — fetched-deduped is sole authority, torn group is dropped.
+  });
+
+  // Torn group is silently dropped by the parser; no override register present;
+  // no message events — rail must remain dark.
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
 });

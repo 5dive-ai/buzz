@@ -221,21 +221,18 @@ export async function fetchCommunityUnread(args: {
   const projection = args.getProjection?.() ?? null;
   const completeProjection = projection?.loadComplete ? projection : null;
 
-  // Override liveness resolution: projection wins when complete, BUT a fetched
-  // wire tombstone (s===0, c>0) for the same coordinate is treated as
-  // authoritative — it proves the relay consensus has a clear with no
-  // countering mark-unread, and the projection's live S counter may be from
-  // an uncommitted/unpublished local action that the relay hasn't confirmed.
+  // The observer must not adjudicate cross-source ordering it cannot see.
+  // The manager owns event-level coordinate dedupe and CRDT ingest; a fetched
+  // relay snapshot carries no coordinate/version provenance that would let the
+  // UI compare it against a locally-committed projection register.
   //
-  // fetchedTombstoneChannels is the set of channel IDs whose fetched register
-  // has s===0 (tombstone wire format). We skip projection liveness for those.
-  const fetchedTombstoneChannels = new Set<string>();
-  if (completeProjection !== null) {
-    for (const [ctx, reg] of readState.overrides) {
-      if (reg.s === 0) fetchedTombstoneChannels.add(ctx);
-    }
-  }
-
+  // Therefore: when a complete projection is available, projection.overrides is
+  // the SOLE override-liveness authority — no exceptions for fetched tombstone
+  // shapes. A transient false-positive (e.g. projection live register vs stale
+  // fetched tombstone) resolves when the manager ingests the tombstone through
+  // its own CRDT path. A categorical tombstone-wins rule would produce the
+  // inverse false-negative: hiding a user's fresh local mark-unread until the
+  // relay publish catches up, which is the more harmful failure.
   const authoritative: ReadonlyMap<string, OverrideRegister> =
     completeProjection !== null
       ? completeProjection.overrides
@@ -295,15 +292,9 @@ export async function fetchCommunityUnread(args: {
     // Override liveness: evaluate the authoritative register against the
     // effective frontier. Uses projection.overrides when complete (no
     // per-field max with fetched); fetched-deduped otherwise.
-    // Skip projection liveness when fetched relay has a wire tombstone (s=0)
-    // for this channel — a fresher relay tombstone is authoritative.
     if (!hasUnread) {
       const reg = authoritative.get(channel.id);
-      if (
-        reg !== undefined &&
-        !fetchedTombstoneChannels.has(channel.id) &&
-        isOverrideActive(reg, readAt ?? 0)
-      ) {
+      if (reg !== undefined && isOverrideActive(reg, readAt ?? 0)) {
         hasUnread = true;
       }
     }

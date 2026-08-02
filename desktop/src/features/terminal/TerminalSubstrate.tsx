@@ -101,6 +101,7 @@ export function TerminalSubstrate({
   const previousFocusRef = React.useRef<HTMLElement | null>(null);
   const reportedFocusRef = React.useRef<boolean | null>(null);
   const scrollBySessionRef = React.useRef(new Map<string, number>());
+  const revealedRef = React.useRef(false);
   const activeSession = sessions.find((session) => session.active);
   const activeSessionId = activeSession?.id ?? null;
   const frames = React.useMemo(
@@ -146,6 +147,7 @@ export function TerminalSubstrate({
     const appSurface = getAppSurface();
     if (!appSurface) return;
     if (next === "terminal") {
+      revealedRef.current = true;
       previousFocusRef.current =
         document.activeElement instanceof HTMLElement
           ? document.activeElement
@@ -339,9 +341,13 @@ export function TerminalSubstrate({
       consumeFrame(delivered.frame);
       if (
         delivered.sessionId === activeSessionId &&
+        revealedRef.current &&
         hasVisibleOutput(delivered.frame)
       ) {
-        // Policy: first visible output from the active PTY removes the overlay.
+        // Policy: the banner is a splash for the reveal, so spawn-time shell
+        // output must not dismiss it. Only visible output from the active PTY
+        // that arrives after the terminal has been revealed (or the first
+        // keystroke, see sendInput) removes the overlay.
         setWelcomeVisible(false);
       }
     }

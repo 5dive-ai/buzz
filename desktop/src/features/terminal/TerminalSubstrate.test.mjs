@@ -179,19 +179,53 @@ const VISIBLE_FRAME = {
 };
 
 async function expectWelcome(view, present) {
+  // Compare a boolean, never the node: an AssertionError carrying a mounted
+  // element inspects it to build its message, and `__reactFiber$` makes that
+  // walk the whole fiber graph — a failure takes ~2min to report instead of ms.
   await waitFor(() =>
-    present
-      ? assert.ok(view.container.querySelector(".buzz-terminal-welcome"))
-      : assert.equal(
-          view.container.querySelector(".buzz-terminal-welcome"),
-          null,
-        ),
+    assert.equal(
+      view.container.querySelector(".buzz-terminal-welcome") !== null,
+      present,
+    ),
   );
 }
 
-test("non-empty output from the active PTY dismisses the welcome overlay", async () => {
+async function reveal(view) {
+  const substrate = view.container.querySelector(".buzz-terminal-substrate");
+  toggleChord();
+  await waitFor(() =>
+    assert.equal(substrate.dataset.terminalOwner, "terminal"),
+  );
+}
+
+test("spawn-time output before the first reveal keeps the welcome overlay", async () => {
   const subject = fixture({ frame: EMPTY_FRAME });
   await ready(subject.view);
+  await expectWelcome(subject.view, true);
+
+  subject.rerender({ frame: VISIBLE_FRAME });
+  await expectWelcome(subject.view, true);
+
+  await reveal(subject.view);
+  await expectWelcome(subject.view, true);
+});
+
+test("the first keystroke dismisses the welcome overlay", async () => {
+  const subject = fixture({ frame: VISIBLE_FRAME });
+  await ready(subject.view);
+  await reveal(subject.view);
+  await expectWelcome(subject.view, true);
+
+  fireEvent.input(subject.view.getByLabelText("Terminal input"), {
+    target: { value: "l" },
+  });
+  await expectWelcome(subject.view, false);
+});
+
+test("non-empty output after the reveal dismisses the welcome overlay", async () => {
+  const subject = fixture({ frame: EMPTY_FRAME });
+  await ready(subject.view);
+  await reveal(subject.view);
   await expectWelcome(subject.view, true);
 
   subject.rerender({ frame: VISIBLE_FRAME });
@@ -201,6 +235,7 @@ test("non-empty output from the active PTY dismisses the welcome overlay", async
 test("empty active output keeps the welcome overlay", async () => {
   const subject = fixture({ frame: EMPTY_FRAME });
   await ready(subject.view);
+  await reveal(subject.view);
   await expectWelcome(subject.view, true);
 
   subject.rerender({
@@ -221,6 +256,7 @@ test("non-empty output from an inactive PTY keeps the welcome overlay", async ()
     ],
   });
   await ready(subject.view);
+  await reveal(subject.view);
   await expectWelcome(subject.view, true);
 
   subject.rerender({

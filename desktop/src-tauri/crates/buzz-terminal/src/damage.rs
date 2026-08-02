@@ -169,18 +169,61 @@ pub struct RawFrame {
     viewport: crate::Viewport,
 }
 
+/// The grid line a screen row reads from.
+///
+/// The grid indexes the active area from 0 and scrollback with *negative*
+/// lines, so scrolling back `n` lines means every screen row reads `n` lines
+/// higher. At the live edge the offset is zero and this is the identity, which
+/// is why the unscrolled path is unchanged rather than merely equivalent.
+fn row_of(screen_row: usize, display_offset: usize) -> Line {
+    Line(screen_row as i32 - display_offset as i32)
+}
+
+/// Where the cursor sits on screen, given how far the viewport is scrolled
+/// back.
+///
+/// The grid keeps the cursor in *active-area* coordinates, which do not move
+/// when the user scrolls; the renderer paints *screen rows*, which do. The two
+/// agree only at the live edge, so the conversion has to happen somewhere, and
+/// it happens here rather than in the renderer -- the renderer is not told the
+/// display offset, and giving it one would put this same arithmetic on the far
+/// side of a transport.
+///
+/// Scrolling far enough pushes the cursor off the bottom of the viewport, and
+/// then it is reported as not visible. Without that clamp a caret drawn at a
+/// clamped row would sit on some unrelated line of history, which reads as
+/// corruption rather than as scrollback.
+fn cursor_frame(
+    cursor_point: alacritty_terminal::index::Point,
+    display_offset: usize,
+    screen_lines: usize,
+    shown: bool,
+) -> CursorFrame {
+    let line = cursor_point.line.0.max(0) as usize + display_offset;
+    CursorFrame {
+        line: line.min(screen_lines.saturating_sub(1)),
+        column: cursor_point.column.0,
+        visible: shown && line < screen_lines,
+    }
+}
+
 /// Copy the damaged rows out of the terminal. **Runs under the lock; does no
 /// encoding.** Keep this function boring — everything added here is lock hold.
 pub fn capture(terminal: &mut crate::Terminal) -> RawFrame {
     let viewport = terminal.viewport();
+    let display_offset = terminal.display_offset();
     let term = terminal.term_mut();
     let columns = term.columns();
     let screen_lines = term.screen_lines();
     let cursor_point = term.grid().cursor.point;
-    let visible = term
+    let shown = term
         .mode()
         .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
 
+    // Upstream's partial iterator already reports **screen** rows: it offsets
+    // each damaged active-area line by the display offset and drops the ones
+    // that scrolling pushed off the bottom (`TermDamageIterator::new`). So both
+    // arms below speak the same coordinate, and `row_of` converts once.
     let (lines, full) = match term.damage() {
         TermDamage::Full => ((0..screen_lines).collect::<Vec<_>>(), true),
         TermDamage::Partial(iter) => (
@@ -194,14 +237,10 @@ pub fn capture(terminal: &mut crate::Terminal) -> RawFrame {
     let grid = term.grid();
     let mut rows = Vec::with_capacity(lines.len());
     for line in lines {
-        let row = &grid[Line(line as i32)];
+        let row = &grid[row_of(line, display_offset)];
         rows.push((line, row[..Column(columns)].to_vec()));
     }
-    let cursor = CursorFrame {
-        line: cursor_point.line.0.max(0) as usize,
-        column: cursor_point.column.0,
-        visible,
-    };
+    let cursor = cursor_frame(cursor_point, display_offset, screen_lines, shown);
 
     term.reset_damage();
     RawFrame {
@@ -232,25 +271,22 @@ pub fn capture(terminal: &mut crate::Terminal) -> RawFrame {
 /// than a damaged-rows copy, so it belongs on attach, not in the frame loop.
 pub fn capture_all(terminal: &mut crate::Terminal) -> RawFrame {
     let viewport = terminal.viewport();
+    let display_offset = terminal.display_offset();
     let term = terminal.term_mut();
     let columns = term.columns();
     let screen_lines = term.screen_lines();
     let cursor_point = term.grid().cursor.point;
-    let visible = term
+    let shown = term
         .mode()
         .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
 
     let grid = term.grid();
     let mut rows = Vec::with_capacity(screen_lines);
     for line in 0..screen_lines {
-        let row = &grid[Line(line as i32)];
+        let row = &grid[row_of(line, display_offset)];
         rows.push((line, row[..Column(columns)].to_vec()));
     }
-    let cursor = CursorFrame {
-        line: cursor_point.line.0.max(0) as usize,
-        column: cursor_point.column.0,
-        visible,
-    };
+    let cursor = cursor_frame(cursor_point, display_offset, screen_lines, shown);
 
     // No `damage()` and no `reset_damage()`: see the note above.
     RawFrame {

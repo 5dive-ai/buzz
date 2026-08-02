@@ -44,7 +44,8 @@ type TerminalSubstrateProps = {
   onFrameConsumed?: (frame: TerminalFrame) => void;
   onViewportSize?: (size: TerminalViewportSize) => void;
   onInput: (text: string) => void;
-  onScroll: (deltaPx: number) => void;
+  /** Whole cells scrolled, keeping the DOM's sign: negative goes back. */
+  onScroll: (lines: number) => void;
   onTerminalFocusChange: (focused: boolean) => void;
   onSelectSession: (id: string) => void;
   onCloseSession: (id: string) => void;

@@ -254,7 +254,7 @@ export function TerminalBootstrap({
       }}
       onInput={(text) => send(active?.connection?.input(text))}
       onNewSession={createSession}
-      onScroll={() => {}}
+      onScroll={(lines) => send(active?.connection?.scroll(lines))}
       onSelectSession={setActiveKey}
       onTerminalFocusChange={(focused) =>
         send(active?.connection?.focus(focused))

@@ -342,9 +342,6 @@ pub fn run() {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     };
 
-    #[cfg(not(buzz_updater_enabled))]
-    let builder = builder;
-
     let app = builder
         .register_asynchronous_uri_scheme_protocol("buzz-media", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
@@ -660,6 +657,7 @@ pub fn run() {
             terminal_runtime::terminal_close,
             terminal_runtime::terminal_input,
             terminal_runtime::terminal_resize,
+            terminal_runtime::terminal_scroll,
             terminal_runtime::terminal_ack,
             terminal_runtime::terminal_viewport_ready,
             terminal_runtime::terminal_focus,

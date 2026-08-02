@@ -318,3 +318,67 @@ test("opening a tab keeps terminal ownership while its attachment is pending", a
   await act(async () => attachResolver());
   view.unmount();
 });
+
+// The wheel-to-IPC path end to end. `TerminalSubstrate` already proves it
+// accumulates pixels into whole cells and `buzz-terminal` already proves which
+// way the engine goes; the seam between them is this file's business, and the
+// thing that can silently rot here is the *sign*. A negation added in the
+// bridge would leave every unit test green and scroll the terminal the wrong
+// way, so this asserts the delta reaches `terminal_scroll` unchanged: positive
+// `deltaY` -- the gesture that scrolls a page toward the bottom of the
+// document -- must arrive positive, and the backend owns the flip.
+test("wheel deltas reach terminal_scroll with the DOM sign intact", async () => {
+  const { createElement } = await import("react");
+  const { act, fireEvent, render, waitFor } = await import(
+    "@testing-library/react"
+  );
+  const { ThemeProvider } = await import("@/shared/theme/ThemeProvider");
+  const { TerminalBootstrap } = await import("./TerminalBootstrap.tsx");
+
+  const view = render(
+    createElement(
+      ThemeProvider,
+      null,
+      createElement("div", {
+        className: "buzz-huddle-app-surface",
+        tabIndex: -1,
+      }),
+      createElement(TerminalBootstrap, {
+        channelId: "channel-1",
+        channelName: "general",
+        npub: "npub1owner",
+        relayUrl: "wss://relay.example",
+        threadId: null,
+      }),
+    ),
+  );
+  await waitFor(() =>
+    assert.ok(calls.some(({ command }) => command === "terminal_attach")),
+  );
+  await act(async () => {
+    await Promise.resolve();
+  });
+  const substrate = view.container.querySelector(".buzz-terminal-substrate");
+
+  // Two cells' worth of pixels (cell height is 17), backwards.
+  await act(async () => {
+    fireEvent.wheel(substrate, { deltaMode: 0, deltaY: -34 });
+  });
+  const scrolls = () =>
+    calls.filter(({ command }) => command === "terminal_scroll");
+  await waitFor(() => assert.equal(scrolls().length, 1));
+  assert.equal(
+    scrolls()[0].args.lines,
+    -2,
+    "a backwards wheel must arrive negative; the backend owns the negation",
+  );
+  assert.equal(scrolls()[0].args.sessionId, "session-1");
+
+  await act(async () => {
+    fireEvent.wheel(substrate, { deltaMode: 0, deltaY: 34 });
+  });
+  await waitFor(() => assert.equal(scrolls().length, 2));
+  assert.equal(scrolls()[1].args.lines, 2, "and forwards must arrive positive");
+
+  view.unmount();
+});

@@ -19,6 +19,11 @@ export function paintTerminalBanner(
   if (!context) return false;
   context.setTransform(dpr, 0, 0, dpr, 0, 0);
   context.clearRect(0, 0, bounds.width, bounds.height);
+  // The overlay sits above the grid canvas, so it needs its own opaque
+  // ground: without one the shell output painted underneath shows through
+  // the gaps between banner glyphs.
+  context.fillStyle = palette.background;
+  context.fillRect(0, 0, bounds.width, bounds.height);
   context.font = TERMINAL_CELL_METRICS.font;
   context.textBaseline = "alphabetic";
 

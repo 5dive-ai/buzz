@@ -177,6 +177,21 @@ class _CameraFeed extends StatelessWidget {
     final previewSize = controller.value.previewSize;
     if (previewSize == null) return const ColoredBox(color: Colors.black);
 
+    final isTablet = MediaQuery.sizeOf(context).shortestSide >= 600;
+
+    // The tablet workspace gives the composer a tall, bounded panel instead
+    // of the phone's wide attachment surface. Let CameraPreview retain the
+    // camera's reported ratio in that panel; forcing its rotated preview size
+    // through FittedBox here makes Android stretch the feed in a narrow pane.
+    if (isTablet) {
+      return Center(
+        child: AspectRatio(
+          aspectRatio: controller.value.aspectRatio,
+          child: camera.CameraPreview(controller),
+        ),
+      );
+    }
+
     return ClipRect(
       child: FittedBox(
         fit: BoxFit.cover,

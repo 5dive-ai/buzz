@@ -224,7 +224,7 @@ impl Terminal {
             return self.viewport();
         }
         self.term.resize(size);
-        self.feeder.resize(size.columns, size.screen_lines);
+        self.feeder.resize(size);
         self.size = size;
         self.generation += 1;
         self.viewport()

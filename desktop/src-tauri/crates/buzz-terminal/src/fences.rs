@@ -75,6 +75,45 @@ pub fn slice_bytes(columns: usize, lines: usize, scrollback: usize) -> usize {
     ((WORK_BUDGET / densest) as usize).clamp(MIN_SLICE, MAX_SLICE)
 }
 
+/// Bytes to hand the parser when `spent` of the budget is already gone.
+///
+/// The scheduling rule in one place so the fixtures can assert on it rather
+/// than on a copy of the arithmetic: a slice of `N` bytes holds at most
+/// `N / atom_bytes` atoms, so `remaining / densest` bytes cannot carry a
+/// drain past the budget.
+///
+/// `next_escape` is how far the next `ESC` is from the front of the tail.
+/// This is the difference between a correct bound and an unusable one. Only
+/// an escape can buy grid-sized work in two bytes; a run of ordinary
+/// characters costs at most `columns` per byte (a wrapping line feed that
+/// scrolls), which is four orders of magnitude cheaper than RIS. Pricing
+/// plain text as though every byte might be RIS drops throughput from
+/// 181 MB/s to 69 MB/s at the default scrollback -- measured -- while
+/// bounding something that cannot happen. So a plain run is sliced against
+/// the plain-byte cost and only the escape itself is metered against the
+/// worst atom.
+pub fn slice_bytes_remaining(
+    columns: usize,
+    lines: usize,
+    scrollback: usize,
+    spent: u64,
+    next_escape: usize,
+) -> usize {
+    let remaining = WORK_BUDGET.saturating_sub(spent);
+    if next_escape > 0 {
+        // A plain run, and it stops at the escape: an escape sharing a slice
+        // with the text in front of it is how a callback runs *after* the one
+        // that crossed the budget, which is the overrun this bound exists to
+        // prevent. Worst case per plain byte is a line feed that scrolls,
+        // which resets one row: `columns`.
+        let per_byte = (columns as u64).max(1);
+        return ((remaining / per_byte) as usize).clamp(1, next_escape.min(MAX_SLICE));
+    }
+    // An escape starts here. `ESC c` is the densest at two bytes.
+    let densest = (max_atom_work(columns, lines, scrollback) / 2).max(1);
+    ((remaining / densest) as usize).clamp(1, MAX_SLICE)
+}
+
 /// Work the single worst uninterruptible callback can cost on this grid.
 ///
 /// This is the irreducible overrun past [`WORK_BUDGET`]: no scheduler outside
@@ -95,8 +134,17 @@ pub fn max_atom_work(columns: usize, lines: usize, scrollback: usize) -> u64 {
     // default 10k depth -- and it is genuinely indivisible, so it is stated
     // rather than smoothed. CBT, once terminated at its fixed point, is
     // `columns` and never competes.
-    let ris = 2 * (columns * lines) as u64 + (scrollback * columns) as u64;
-    ris.max(columns as u64)
+    //
+    // Saturating, and widened to u64 *before* multiplying. `Size` fields are
+    // unclamped `usize` with no caller bounding them, so the products here
+    // are reachable overflows: in debug that is a panic in the accounting
+    // path, and in release it wraps to a small number, which understates the
+    // bound -- an overflow that reports the parser as cheap is the worst of
+    // the three outcomes.
+    let (columns, lines, scrollback) = (columns as u64, lines as u64, scrollback as u64);
+    let both_grids = columns.saturating_mul(lines).saturating_mul(2);
+    let history = scrollback.saturating_mul(columns);
+    both_grids.saturating_add(history).max(columns)
 }
 
 /// Upper bound on the work a single [`crate::reader::Feeder::drain`] can do.
@@ -115,12 +163,11 @@ pub fn max_atom_work(columns: usize, lines: usize, scrollback: usize) -> u64 {
 ///   is why this is a function callers can read rather than an assumption
 ///   they inherit.
 pub fn max_drain_work(columns: usize, lines: usize, scrollback: usize) -> u64 {
-    let atom = max_atom_work(columns, lines, scrollback);
-    // A slice of N bytes holds at most N/2 of the densest atoms, and the
-    // budget is only consulted between slices, so a whole slice is the
-    // overshoot. Where the slice derivation is unclamped this is one budget;
-    // where MIN_SLICE binds, it is this.
-    WORK_BUDGET + (slice_bytes(columns, lines, scrollback) as u64 / 2).max(1) * atom
+    // One atom, not one slice: [`crate::reader::Feeder::drain`] sizes every
+    // slice against the *remaining* budget, so it cannot start a slice able
+    // to hold more work than is left. What it cannot do is preempt a callback
+    // that has begun, which is where this term comes from.
+    WORK_BUDGET.saturating_add(max_atom_work(columns, lines, scrollback))
 }
 
 /// Max bytes that may sit unparsed before the reader must stop reading the

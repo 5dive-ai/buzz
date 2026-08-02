@@ -10,8 +10,8 @@
 //! `> 0` is satisfied by a seam that executed exactly one unit.
 
 use buzz_terminal::fences::{
-    max_atom_work, max_drain_work, slice_bytes, Fences, MAX_SLICE, MIN_SLICE, SYNC_CAP, TAIL_CAP,
-    WORK_BUDGET,
+    max_atom_work, max_drain_work, slice_bytes, slice_bytes_remaining, Fences, MAX_SLICE,
+    MIN_SLICE, SYNC_CAP, TAIL_CAP, WORK_BUDGET,
 };
 use buzz_terminal::{Size, Terminal};
 
@@ -505,7 +505,34 @@ fn every_amplifiable_escape_is_priced_exactly() {
             ("scroll_up N=1", "\u{1b}[1S".into(), c),
             ("scroll_up N=5", "\u{1b}[5S".into(), 5 * c),
             ("scroll_up N=huge", "\u{1b}[65535S".into(), lines as u64 * c),
+            ("scroll_down N=1", "\u{1b}[1T".into(), c),
+            ("scroll_down N=4", "\u{1b}[4T".into(), 4 * c),
+            (
+                "scroll_down N=huge",
+                "\u{1b}[65535T".into(),
+                lines as u64 * c,
+            ),
             ("delete_lines N=3", "\u{1b}[3M".into(), 3 * c),
+            (
+                "delete_lines N=huge",
+                "\u{1b}[65535M".into(),
+                lines as u64 * c,
+            ),
+            ("insert_lines N=1", "\u{1b}[1L".into(), c),
+            ("insert_lines N=6", "\u{1b}[6L".into(), 6 * c),
+            (
+                "insert_lines N=huge",
+                "\u{1b}[65535L".into(),
+                lines as u64 * c,
+            ),
+            ("put_tab N=1", "\t".into(), c),
+            ("fwd_tabs N=1", "\u{1b}[1I".into(), c),
+            ("fwd_tabs N=huge", "\u{1b}[65535I".into(), c),
+            ("insert_blank N=huge", "\u{1b}[65535@".into(), c),
+            ("clear_line ESC[0K", "\u{1b}[0K".into(), c),
+            ("clear_line ESC[1K", "\u{1b}[1K".into(), c),
+            ("clear_screen ESC[0J", "\u{1b}[0J".into(), cells),
+            ("clear_screen ESC[1J", "\u{1b}[1J".into(), cells),
             ("sgr", "\u{1b}[m".into(), 1),
             ("goto", "\u{1b}[1;1H".into(), 1),
         ];
@@ -535,16 +562,21 @@ fn every_amplifiable_escape_is_priced_exactly() {
 
 /// RIS is priced with its history axis, not just its cells.
 ///
-/// Kills: charging `cells`, or charging the *active* grid's history. RIS
-/// resets both grids and walks the primary's scrollback, and `history_size()`
-/// observes only the active grid -- so a filled primary followed by
-/// `ESC[?1049h` reads as empty while the work is still paid. Configured depth
-/// is the only stateless quantity that bounds both, and this asserts the
-/// charge tracks it.
+/// Kills: charging `cells`, or dropping the history term.
+///
+/// On the alt-screen arm, honestly labelled: the active-`history_size()`
+/// mispricing it was written against is **unrepresentable in this design**,
+/// not merely untested. `Counting` holds `scrollback` as a scalar copied at
+/// construction and has no path to a live grid, so there is no way to write
+/// the mutant. The arm is kept as a regression witness -- if a `Term`
+/// reference is ever wired into the wrapper it becomes load-bearing the same
+/// day -- and both arms are evaluated before either can report, so the
+/// primary cannot short-circuit the alt.
 #[test]
 fn ris_is_priced_for_both_grids_and_the_scrollback_it_walks() {
     let (columns, lines) = (80usize, 24usize);
     let cells = (columns * lines) as u64;
+    let mut observed = vec![];
     for scrollback in [0usize, 100, 10_000] {
         for (label, prefix) in [("primary", ""), ("alt screen", "\u{1b}[?1049h")] {
             let (mut term, _a) = Terminal::new(
@@ -558,14 +590,16 @@ fn ris_is_priced_for_both_grids_and_the_scrollback_it_walks() {
             term.feed_fully(prefix.as_bytes());
             term.reset_stats();
             term.feed_fully(b"\x1bc");
-
-            assert_eq!(
-                term.stats().completed_work,
-                2 * cells + (scrollback * columns) as u64,
-                "{label}, scrollback {scrollback}: RIS must be priced on \
-                 configured depth, which is the same on both grids",
-            );
+            observed.push((label, scrollback, term.stats().completed_work));
         }
+    }
+    for (label, scrollback, work) in observed {
+        assert_eq!(
+            work,
+            2 * cells + (scrollback * columns) as u64,
+            "{label}, scrollback {scrollback}: RIS must be priced on \
+             configured depth, which is the same on both grids",
+        );
     }
 }
 
@@ -708,11 +742,15 @@ fn the_worst_atom_is_bounded_under_the_layout_that_maximises_steps() {
 
         term.feed_fully(b"\x1b[65535Z");
 
-        let spent = term.stats().completed_work;
         assert_eq!(term.stats().completed_units, 1);
-        assert!(
-            spent <= 2 * columns as u64,
-            "all-set CBT at {columns} columns charged {spent}, over 2 x columns",
+        assert_eq!(
+            term.stats().completed_work,
+            1 + (columns as u64 - 1),
+            "with a stop in every column the walk crosses each of them once, \
+             so the charge is exact: one unit for the escape plus one per \
+             column crossed. An inequality here would not catch a 2x \
+             overcharge -- which lands on 159, not 160, because the escape's \
+             own unit is charged separately and is not doubled",
         );
         assert_eq!(
             term.term().grid().cursor.point.column.0,
@@ -757,4 +795,413 @@ fn stopping_the_worst_atom_early_preserves_its_semantics() {
     );
     // Default stops every 8: a large count walks all the way to column 0.
     assert_eq!(cursor_column("\u{1b}[1;40H\u{1b}[65535Z"), 0);
+}
+
+/// A stream of atoms each worth more than the whole budget still drains, and
+/// every drain makes progress.
+///
+/// The liveness half of the bound. `max_drain_work` says how much one drain
+/// may cost; it says nothing about whether the loop terminates, and an
+/// oversized atom is exactly where a work-denominated scheduler could refuse
+/// to start one -- spending its budget checking, never advancing, and hanging
+/// the terminal with a full tail. RIS on a 10k-scrollback grid is ~16x the
+/// budget, so this is not hypothetical.
+///
+/// Kills: any yield that can decline to start work -- a `width` that reaches
+/// 0, a `remaining`-scaled slice that underflows to nothing, a guard that
+/// skips a slice deemed too expensive for what is left of the budget. Each of
+/// those is a plausible thing to reach for when an atom costs more than the
+/// whole budget, and each hangs a terminal on legitimate input.
+///
+/// Note on a mutant it does *not* kill: moving the budget check from after
+/// the slice to before it is **equivalent**, not a defect -- `spent` is zero
+/// at entry, so the first slice runs either way. Recorded because I wrote
+/// this test believing it caught that, ran the mutant, and it lived.
+#[test]
+fn atoms_larger_than_the_budget_still_make_progress() {
+    for (columns, lines, scrollback) in [(80usize, 24usize, 10_000usize), (200, 50, 10_000)] {
+        let (mut term, _a) = Terminal::new(
+            Size {
+                columns,
+                screen_lines: lines,
+                scrollback,
+            },
+            Fences::ALL,
+        );
+        let atoms = 200usize;
+        let bound = max_drain_work(columns, lines, scrollback);
+        assert!(
+            bound > WORK_BUDGET * 4,
+            "this arm is only meaningful where one atom dwarfs the budget",
+        );
+
+        let mut more = term.feed(&b"\x1bc".repeat(atoms));
+        // `feed` already drained once; seed the baseline with its work or the
+        // first delta measured below silently doubles.
+        let mut previous = term.stats().completed_work;
+        let mut worst = previous;
+        let mut calls = 1;
+        while more {
+            let before = term.pending_bytes();
+            more = term.drain();
+            assert!(
+                term.pending_bytes() < before,
+                "no progress: the tail stuck at {before} bytes",
+            );
+            let now = term.stats().completed_work;
+            worst = worst.max(now - previous);
+            previous = now;
+            calls += 1;
+            assert!(calls < 10_000, "drain did not terminate");
+        }
+
+        assert_eq!(term.stats().completed_units, atoms as u64, "lost units");
+        assert_eq!(term.pending_bytes(), 0);
+        assert!(
+            worst <= bound,
+            "{columns}x{lines}: worst drain spent {worst}, over the stated \
+             bound {bound}",
+        );
+    }
+}
+
+/// A scrollback change reprices RIS *and* the slicing derived from it.
+///
+/// Kills: updating the feeder's columns and lines on resize but not its
+/// scrollback -- and, separately, a repair that reprices the charge while
+/// leaving slice width stale. Those are different failures and neither
+/// observable sees the other: fix only the charge and the drain count stays
+/// wrong; fix only the derivation and the charge stays wrong.
+///
+/// Two properties, because one is not enough:
+///
+/// * The exact RIS charge at the new depth. Direct, and it is what a
+///   pricing-only repair passes.
+/// * Equality with a terminal *constructed* at the new depth, across work
+///   and drain count. A resized feeder that is genuinely repaired is
+///   indistinguishable from one that was born there. This is stronger than a
+///   hand-picked threshold and immune to `WORK_BUDGET`/`MIN_SLICE` moving,
+///   since both arms move together -- and the sanity arm proves the
+///   comparison is deterministic before it is used to judge anything.
+///
+/// `completed_units` is deliberately *not* the discriminator here: it reads
+/// 200 in both arms, because the same callbacks run either way and only their
+/// cost and slicing differ. It is asserted anyway as the invariant that must
+/// hold -- no unit lost or duplicated across a resize -- while carrying none
+/// of the discrimination.
+#[test]
+fn a_scrollback_change_reprices_the_densest_atom_and_the_slicing() {
+    let shallow = Size {
+        columns: 200,
+        screen_lines: 50,
+        scrollback: 100,
+    };
+    let deep = Size {
+        scrollback: 10_000,
+        ..shallow
+    };
+    let cells = (deep.columns * deep.screen_lines) as u64;
+
+    // Preconditions, asserted rather than assumed, because both are easy to
+    // break by "generalising" this fixture later:
+    //
+    // * The geometry must let the *scheduling* fields separate. They only do
+    //   when the two depths land on different slice widths, and the deep side
+    //   is always floored -- so the shallow side must not be. At 1600x50 the
+    //   visible grid alone floors every depth from 0 upward, and three of the
+    //   four observables below go silently inert.
+    // * The payload must be RIS. It is the only escape reaching the only
+    //   weight carrying a scrollback term (`units::reset_state`); DECALN and
+    //   every other atom are priced on cells or columns and are blind to
+    //   depth, so a conforming repair would show work identical to the
+    //   control and the assertions here would invert into false failures.
+    assert!(
+        slice_bytes(shallow.columns, shallow.screen_lines, shallow.scrollback) > MIN_SLICE,
+        "geometry cannot discriminate: the shallow arm is already floored",
+    );
+    assert_eq!(
+        slice_bytes(deep.columns, deep.screen_lines, deep.scrollback),
+        MIN_SLICE,
+    );
+
+    // How a terminal at `size` retires 200 RIS: work, and how many
+    // acquisitions it took. Both are feeder behaviour, not helper output.
+    let run = |size: Size, resize_from: Option<Size>| {
+        let (mut term, _a) = Terminal::new(resize_from.unwrap_or(size), Fences::ALL);
+        if resize_from.is_some() {
+            term.resize(size);
+        }
+        term.reset_stats();
+        let mut drains = 1;
+        let mut more = term.feed(&b"c".repeat(200));
+        while more {
+            more = term.drain();
+            drains += 1;
+        }
+        (
+            term.stats().completed_units,
+            term.stats().completed_work,
+            drains,
+        )
+    };
+
+    let control = run(deep, None);
+    let sanity = run(deep, None);
+    assert_eq!(
+        control, sanity,
+        "two terminals built the same way must agree before this comparison          can judge anything",
+    );
+
+    let resized = run(deep, Some(shallow));
+    assert_eq!(resized.0, 200, "no unit may be lost or duplicated");
+    assert_eq!(
+        resized, control,
+        "a feeder resized to a depth must be indistinguishable from one          constructed at it -- in charge and in how many acquisitions it took",
+    );
+
+    // The exact charge, stated rather than inferred from the equality: a
+    // repair that made both arms equally *wrong* would pass the comparison.
+    let (mut term, _a) = Terminal::new(shallow, Fences::ALL);
+    term.resize(deep);
+    term.reset_stats();
+    term.feed_fully(b"c");
+    assert_eq!(
+        term.stats().completed_work,
+        2 * cells + (deep.scrollback * deep.columns) as u64,
+    );
+
+    // Shrinking retains the debt, and the fixture proves retention rather
+    // than merely permitting it.
+    //
+    // `>= fresh` alone is the predicate three of us proposed and all three
+    // withdrew: a feeder that dropped the debt reads *exactly* equal to a
+    // fresh shallow one, so `>=` passes on the unrepaired state. Strictness
+    // on the pricing field is what rejects it. The scheduling fields are
+    // asserted directionally with per-field signs -- `first_units` inverts,
+    // because a narrower slice retires fewer atoms per un-preemptable drain,
+    // which is the fence working -- but none of them is the discriminator:
+    // they separate only when the two depths straddle the slice floor, and
+    // `completed_work` separates at every positive depth gap.
+    let debt = |from: Size, to: Size| {
+        let (mut term, _a) = Terminal::new(from, Fences::ALL);
+        term.resize(deep);
+        term.resize(to);
+        term.reset_stats();
+        let mut drains = 1;
+        let mut more = term.feed(&b"\x1bc".repeat(200));
+        let first_units = term.stats().completed_units;
+        let first_pending = term.pending_bytes();
+        while more {
+            more = term.drain();
+            drains += 1;
+        }
+        (
+            first_units,
+            first_pending,
+            drains,
+            term.stats().completed_units,
+            term.stats().completed_work,
+        )
+    };
+    let shrunk = debt(shallow, shallow);
+    let fresh = run(shallow, None);
+
+    assert_eq!(shrunk.3, 200, "no unit may be lost on the way down either");
+    assert!(
+        shrunk.4 > fresh.1,
+        "a feeder that has been deep must still price deep after shrinking: \
+         {} against a fresh shallow {}. Equality here is the signature of a \
+         feeder that dropped the debt, which is indistinguishable from one \
+         that never had it",
+        shrunk.4,
+        fresh.1,
+    );
+    assert!(
+        shrunk.0 <= 12,
+        "narrower slices retire fewer atoms per drain"
+    );
+    assert!(shrunk.2 >= fresh.2, "and take more drains to do it");
+
+    // A later resize on a different axis must not disturb the third one --    // A later resize on a different axis must not disturb the third one --
+    // the split was permanent, with columns and lines tracking correctly
+    // while a stale depth persisted forever.
+    term.resize(Size {
+        columns: deep.columns * 2,
+        ..deep
+    });
+    term.reset_stats();
+    term.feed_fully(b"c");
+    assert_eq!(
+        term.stats().completed_work,
+        2 * (deep.columns * 2 * deep.screen_lines) as u64
+            + (deep.scrollback * deep.columns * 2) as u64,
+        "a columns resize must keep the scrollback it was already given",
+    );
+}
+
+/// One oversized atom per drain -- no callback runs after the one that
+/// crosses the budget.
+///
+/// Kills: sizing slices from the *whole* budget rather than what remains of
+/// it. RIS at any real scrollback depth is worth more than an entire budget,
+/// so a slice wide enough for several callbacks runs several: measured
+/// `completed_units == 3` for `ESC c` followed by `Xmore`, where the law
+/// permits exactly one. The fix makes slice width a function of `remaining`,
+/// which is a single byte once an atom this size is in play.
+///
+/// Also asserts the tail survives it: yielding after the crossing atom is
+/// only correct if what follows is still parsed, exactly once.
+#[test]
+fn an_oversized_atom_yields_before_the_next_callback() {
+    let size = Size {
+        columns: 400,
+        screen_lines: 100,
+        scrollback: 10_000,
+    };
+    let (mut term, _a) = Terminal::new(size, Fences::ALL);
+    let ris_work =
+        2 * (size.columns * size.screen_lines) as u64 + (size.scrollback * size.columns) as u64;
+    assert!(
+        ris_work > WORK_BUDGET,
+        "this arm needs an atom bigger than the whole budget",
+    );
+
+    let more = term.feed(b"\x1bcXmore");
+
+    assert!(more, "the drain must yield with a tail");
+    assert_eq!(
+        term.stats().completed_units,
+        1,
+        "exactly the crossing atom ran: a callback after it is post-atom \
+         overrun, which is the thing the budget cannot preempt and therefore \
+         must not start",
+    );
+    assert_eq!(term.stats().completed_work, ris_work);
+
+    while term.drain() {}
+    assert_eq!(
+        term.stats().completed_units,
+        1 + 5,
+        "the five characters after it must still be parsed, exactly once",
+    );
+    assert_eq!(term.pending_bytes(), 0);
+}
+
+/// Extreme dimensions saturate rather than wrapping or panicking.
+///
+/// Kills: `columns * lines` in `usize` before the cast. `Size` is unclamped
+/// and reaches the weight path from a caller, so this product is a reachable
+/// overflow -- a debug panic inside the accounting path, or a release wrap
+/// that reports the most expensive callback in the emulator as one of the
+/// cheapest. Saturating is the only one of the three that fails safe.
+#[test]
+fn extreme_dimensions_saturate_instead_of_wrapping() {
+    let huge = usize::MAX / 2;
+    assert_eq!(max_atom_work(huge, huge, huge), u64::MAX);
+    assert_eq!(max_drain_work(huge, huge, huge), u64::MAX);
+
+    // The *direction* is the assertion, not merely the absence of a panic.
+    // A wrapping build does not produce a slightly-wrong bound, it produces a
+    // tiny one -- and `slice_bytes` divides the budget by it, so an
+    // undercharged atom yields an *oversized* slice exactly when the atom is
+    // most expensive. Wrapping inverts the fence. So: the widest possible
+    // atom must give the narrowest possible slice.
+    assert_eq!(
+        slice_bytes(huge, huge, huge),
+        MIN_SLICE,
+        "an overflowing grid must clamp to the smallest slice; a wrapped \
+         `max_atom_work` would hand back a generous one",
+    );
+    assert_eq!(
+        slice_bytes_remaining(huge, huge, huge, 0, 0),
+        1,
+        "and the escape at the front of such a grid gets a single byte",
+    );
+
+    // The property behind those endpoints, and the stronger statement: a
+    // grid that costs more may never buy a wider slice. Endpoints pin the
+    // ends; only a sweep catches a non-monotone middle, and a wrap *is* a
+    // non-monotone middle -- it makes the worst grid look cheap and hands it
+    // the widest slice of all.
+    // Every axis independently: a wrap on any one of the three products is a
+    // non-monotone middle on that axis alone, and sweeping only scrollback
+    // would miss a truncating `columns * lines`.
+    for (axis, at) in [
+        (
+            "scrollback",
+            (|n| slice_bytes(200, 50, n)) as fn(usize) -> usize,
+        ),
+        ("columns", |n| slice_bytes(n.max(1), 50, 0)),
+        ("lines", |n| slice_bytes(200, n.max(1), 0)),
+    ] {
+        let mut previous = usize::MAX;
+        for exponent in 0..60 {
+            let width = at(1usize << exponent);
+            assert!(
+                width <= previous,
+                "slice widened from {previous} to {width} at {axis} \
+                 2^{exponent}: more expensive grid, more generous slice",
+            );
+            assert!(width >= MIN_SLICE);
+            previous = width;
+        }
+    }
+
+    // Just past 32 bits on one axis: large enough that a narrowing cast
+    // shows (`1 << 32` truncates to 0 in `u32`, pricing an enormous grid at
+    // nothing), small enough that the honest answer is exact rather than
+    // saturated. Neither the extreme endpoints above nor the ordinary grids
+    // below can see this -- the endpoints saturate either way and the
+    // ordinary ones fit in 32 bits.
+    assert_eq!(max_atom_work(1 << 32, 1, 0), 2 * (1u64 << 32));
+    assert_eq!(max_atom_work(1, 1 << 32, 0), 2 * (1u64 << 32));
+    assert_eq!(max_atom_work(1, 1, 1 << 32), 2 + (1u64 << 32));
+
+    // Ordinary grids are untouched by the saturation: exact, not clamped.
+    assert_eq!(max_atom_work(80, 24, 0), 2 * 80 * 24);
+    assert_eq!(max_atom_work(80, 24, 100), 2 * 80 * 24 + 100 * 80);
+}
+
+/// An escape split across slices keeps its escape metering.
+///
+/// Kills: deciding "plain run or escape?" by looking only at the bytes ahead.
+/// After a slice ending on a lone `ESC`, the next byte is `c` -- which looks
+/// like ordinary text and is in fact a full grid reset. Meter it as text and
+/// the oversized atom rides into a wide slice with whatever follows, which is
+/// the post-atom overrun arriving through a different door. Found by the
+/// oversized-atom fixture failing after I "optimised" the plain path, which
+/// is the argument for keeping both.
+#[test]
+fn an_escape_split_across_slices_keeps_its_metering() {
+    let size = Size {
+        columns: 400,
+        screen_lines: 100,
+        scrollback: 10_000,
+    };
+    let ris_work =
+        2 * (size.columns * size.screen_lines) as u64 + (size.scrollback * size.columns) as u64;
+
+    // Deliver the escape one byte at a time, so the parser is left mid-
+    // sequence with a tail that begins on the continuation byte.
+    let (mut term, _a) = Terminal::new(size, Fences::ALL);
+    term.feed(b"\x1b");
+    assert_eq!(
+        term.stats().completed_units,
+        0,
+        "ESC alone dispatches nothing"
+    );
+
+    let more = term.feed(b"cXmore");
+
+    assert!(more, "the completed RIS must still yield with a tail");
+    assert_eq!(
+        term.stats().completed_units,
+        1,
+        "the continuation byte completed a grid reset; nothing may run after it",
+    );
+    assert_eq!(term.stats().completed_work, ris_work);
+
+    while term.drain() {}
+    assert_eq!(term.stats().completed_units, 1 + 5);
+    assert_eq!(term.pending_bytes(), 0);
 }

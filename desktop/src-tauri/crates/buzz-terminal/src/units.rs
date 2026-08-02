@@ -113,9 +113,12 @@ impl<'a, H: Handler + CursorColumn> Counting<'a, H> {
         self.work
     }
 
+    /// Cells in the grid. Saturating: `Size` is unclamped `usize`, so this
+    /// product is reachable, and a wrapped weight prices the most expensive
+    /// callbacks as the cheapest.
     #[inline]
     fn cells(&self) -> u64 {
-        self.columns * self.lines
+        self.columns.saturating_mul(self.lines)
     }
 
     /// A parameter charged at its clamped value.
@@ -132,8 +135,8 @@ impl<'a, H: Handler + CursorColumn> Counting<'a, H> {
 
     #[inline]
     fn charge(&mut self, weight: u64) {
-        self.units += 1;
-        self.work += weight;
+        self.units = self.units.saturating_add(1);
+        self.work = self.work.saturating_add(weight);
     }
 }
 
@@ -216,7 +219,8 @@ macro_rules! counting_handler {
                     // charging that one zero would leave a loop that spins
                     // without ever paying, which is precisely the mutant this
                     // pricing has to make visible.
-                    self.work += if after == before { before } else { before - after } as u64;
+                    let scanned = if after == before { before } else { before - after };
+                    self.work = self.work.saturating_add(scanned as u64);
                     if after == before {
                         // A fixed point is permanent: the scan depends only
                         // on the cursor, and the cursor did not move.
@@ -340,10 +344,10 @@ counting_handler! {
       // recorded here instead of being priced into every scroll -- charging
       // 1000x on 999 calls out of 1000 to cover the thousandth would make
       // ordinary scrolling the slow path.
-      scroll_up(n: usize) => |this| this.clamp(n, this.lines) * this.columns;
-      delete_lines(n: usize) => |this| this.clamp(n, this.lines) * this.columns;
-      scroll_down(n: usize) => |this| this.clamp(n, this.lines) * this.columns;
-      insert_blank_lines(n: usize) => |this| this.clamp(n, this.lines) * this.columns;
+      scroll_up(n: usize) => |this| this.clamp(n, this.lines).saturating_mul(this.columns);
+      delete_lines(n: usize) => |this| this.clamp(n, this.lines).saturating_mul(this.columns);
+      scroll_down(n: usize) => |this| this.clamp(n, this.lines).saturating_mul(this.columns);
+      insert_blank_lines(n: usize) => |this| this.clamp(n, this.lines).saturating_mul(this.columns);
       // O(columns): one row, `damage_line(line, 0, columns - 1)`.
       clear_line(mode: LineClearMode) => |this| this.columns;
       // O(cells): 18.7us at 200x50, doubling on both axes.
@@ -372,6 +376,7 @@ counting_handler! {
       // on its own -- 16x at the default 10k scrollback -- which is correct:
       // it is a genuinely oversized uninterruptible atom, and a budget that
       // hid that would be lying about what one drain can cost.
-      reset_state() => |this| 2 * this.cells() + this.scrollback * this.columns;
+      reset_state() => |this| this.cells().saturating_mul(2)
+          .saturating_add(this.scrollback.saturating_mul(this.columns));
   }
 }

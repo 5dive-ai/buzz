@@ -34,53 +34,29 @@ pub const OSC_BUDGET: usize = 256 << 10;
 /// spent to the last unit.
 pub const WORK_BUDGET: u64 = 250_000;
 
-/// Bounds on how many bytes are handed to the parser at once.
+/// Widest slice handed to the parser at once.
 ///
-/// The budget is checked *between* slices, so the slice is what actually
-/// bounds one lock hold, and a fixed byte count cannot do it: `ESC#8` is
-/// three bytes and costs a full grid, so 256 bytes of it is 1.6 ms at 200x50
-/// and 14 ms at 1600x50. [`slice_bytes`] therefore derives the size from the
-/// grid, and these two clamp it -- `MAX` at the throughput plateau (measured:
-/// plain-char parsing saturates by 64 bytes and is flat to 64 KiB), `MIN`
-/// where a slice stops being able to hold a whole escape sequence: 4 bytes
-/// covers `ESC#8` and `ESC c` intact, so the floor never splits the densest
-/// atoms across slices for no benefit. Measured throughput at the floor is
-/// ~74% of the plateau on plain text and ~77% on SGR, which is the price of
-/// bounding a grid whose worst atom exceeds the budget outright.
-pub const MIN_SLICE: usize = 4;
+/// The floor is 1 byte and lives in [`slice_bytes_remaining`] rather than
+/// here: on a grid whose worst atom exceeds the whole budget -- RIS at any
+/// real scrollback depth -- no wider slice can promise to stop after the
+/// callback that crosses. This cap is the other end, set at the throughput
+/// plateau: plain-char parsing saturates by 64 bytes and is flat to 64 KiB
+/// measured, so nothing above it buys anything and a larger value only
+/// coarsens the cut.
 pub const MAX_SLICE: usize = 256;
 
-/// Bytes to hand the parser at once on a `columns x lines` grid.
+/// Bytes to hand the parser next.
 ///
-/// Sized against the **densest atom the grid admits**, so the bound holds on
-/// the first byte of a cold feeder for any payload: two bytes of `ESC c` buy
-/// [`max_atom_work`], which is the most work per byte upstream offers, and
-/// `budget / (atom / 2)` is the widest slice that cannot exceed one budget.
+/// The **only** slice-sizing function, deliberately: an earlier version of
+/// this module also exported a `slice_bytes(columns, lines, scrollback)` that
+/// the scheduler stopped calling when slices became remaining-aware, and the
+/// fixtures went on asserting against it. The two disagreed exactly where the
+/// floor bound -- reporting 4 where the engine used 1 -- so the preconditions
+/// were describing a function no longer in the path. One function, one
+/// answer, and every test asserts on what `drain` actually calls.
 ///
-/// Deliberately *derived rather than learned*. An earlier version sized
-/// slices from the density of preceding slices, which is strictly worse where
-/// it matters: a fresh feeder has observed nothing, so its first slice is
-/// wide, and a first wide slice of RIS spends many budgets before anything
-/// looks. A bound that has to be taught is not a bound on the lesson.
-///
-/// [`MIN_SLICE`] floors it, and on any grid with real scrollback the floor is
-/// what binds -- RIS at the default 10k depth is worth more than the entire
-/// budget on its own, so no slice size can keep a drain inside the budget and
-/// the floor stops the arithmetic from asking for fractions of a byte. That
-/// residual is not hidden: it is exactly [`max_drain_work`], and it is the
-/// honest cost of an indivisible callback that upstream can be asked to make
-/// smaller only by not calling it.
-pub fn slice_bytes(columns: usize, lines: usize, scrollback: usize) -> usize {
-    let densest = (max_atom_work(columns, lines, scrollback) / 2).max(1);
-    ((WORK_BUDGET / densest) as usize).clamp(MIN_SLICE, MAX_SLICE)
-}
-
-/// Bytes to hand the parser when `spent` of the budget is already gone.
-///
-/// The scheduling rule in one place so the fixtures can assert on it rather
-/// than on a copy of the arithmetic: a slice of `N` bytes holds at most
-/// `N / atom_bytes` atoms, so `remaining / densest` bytes cannot carry a
-/// drain past the budget.
+/// The rule: a slice of `N` bytes holds at most `N / atom_bytes` atoms, so
+/// `remaining / densest` bytes cannot carry a drain past the budget.
 ///
 /// `next_escape` is how far the next `ESC` is from the front of the tail.
 /// This is the difference between a correct bound and an unusable one. Only

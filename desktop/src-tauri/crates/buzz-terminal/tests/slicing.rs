@@ -10,8 +10,8 @@
 //! `> 0` is satisfied by a seam that executed exactly one unit.
 
 use buzz_terminal::fences::{
-    max_atom_work, max_drain_work, slice_bytes, slice_bytes_remaining, Fences, MAX_SLICE,
-    MIN_SLICE, SYNC_CAP, TAIL_CAP, WORK_BUDGET,
+    max_atom_work, max_drain_work, slice_bytes_remaining, Fences, MAX_SLICE, SYNC_CAP, TAIL_CAP,
+    WORK_BUDGET,
 };
 use buzz_terminal::{Size, Terminal};
 
@@ -339,26 +339,26 @@ fn a_resize_mid_tail_reprices_the_remainder() {
 /// serves both.
 #[test]
 fn slice_size_shrinks_as_the_worst_atom_grows() {
-    let small = slice_bytes(80, 24, 0);
-    let large = slice_bytes(1600, 50, 0);
+    let small = slice_bytes_remaining(80, 24, 0, 0, 0);
+    let large = slice_bytes_remaining(1600, 50, 0, 0, 0);
     assert!(
         small > large,
         "a bigger grid makes each byte more expensive, so slices must shrink: \
          80x24 -> {small}, 1600x50 -> {large}",
     );
     assert!(
-        slice_bytes(200, 50, 10_000) <= slice_bytes(200, 50, 0),
+        slice_bytes_remaining(200, 50, 10_000, 0, 0) <= slice_bytes_remaining(200, 50, 0, 0, 0),
         "scrollback makes RIS more expensive, so it may only shrink slices",
     );
     for (columns, lines, scrollback) in [(80, 24, 0), (200, 50, 0), (400, 100, 0), (1600, 50, 0)] {
-        assert!((MIN_SLICE..=MAX_SLICE).contains(&slice_bytes(columns, lines, scrollback)));
+        assert!((1..=MAX_SLICE).contains(&slice_bytes_remaining(columns, lines, scrollback, 0, 0)));
         // One slice holds at most N/2 of the densest atom. Either that fits a
         // budget, or the floor binds -- and then the overshoot is stated by
         // `max_drain_work` rather than being an accident.
-        let worst = (slice_bytes(columns, lines, scrollback) as u64 / 2)
-            * max_atom_work(columns, lines, scrollback);
+        let width = slice_bytes_remaining(columns, lines, scrollback, 0, 0);
+        let worst = (width as u64 / 2) * max_atom_work(columns, lines, scrollback);
         assert!(
-            worst <= WORK_BUDGET || slice_bytes(columns, lines, scrollback) == MIN_SLICE,
+            worst <= WORK_BUDGET || width == 1,
             "{columns}x{lines}: a slice buys {worst} work against a \
              {WORK_BUDGET} budget without the MIN clamp to excuse it",
         );
@@ -923,12 +923,18 @@ fn a_scrollback_change_reprices_the_densest_atom_and_the_slicing() {
     //   depth, so a conforming repair would show work identical to the
     //   control and the assertions here would invert into false failures.
     assert!(
-        slice_bytes(shallow.columns, shallow.screen_lines, shallow.scrollback) > MIN_SLICE,
+        slice_bytes_remaining(
+            shallow.columns,
+            shallow.screen_lines,
+            shallow.scrollback,
+            0,
+            0
+        ) > 1,
         "geometry cannot discriminate: the shallow arm is already floored",
     );
     assert_eq!(
-        slice_bytes(deep.columns, deep.screen_lines, deep.scrollback),
-        MIN_SLICE,
+        slice_bytes_remaining(deep.columns, deep.screen_lines, deep.scrollback, 0, 0),
+        1,
     );
 
     // How a terminal at `size` retires 200 RIS: work, and how many
@@ -1151,8 +1157,8 @@ fn extreme_dimensions_saturate_instead_of_wrapping() {
     // most expensive. Wrapping inverts the fence. So: the widest possible
     // atom must give the narrowest possible slice.
     assert_eq!(
-        slice_bytes(huge, huge, huge),
-        MIN_SLICE,
+        slice_bytes_remaining(huge, huge, huge, 0, 0),
+        1,
         "an overflowing grid must clamp to the smallest slice; a wrapped \
          `max_atom_work` would hand back a generous one",
     );
@@ -1173,10 +1179,10 @@ fn extreme_dimensions_saturate_instead_of_wrapping() {
     for (axis, at) in [
         (
             "scrollback",
-            (|n| slice_bytes(200, 50, n)) as fn(usize) -> usize,
+            (|n| slice_bytes_remaining(200, 50, n, 0, 0)) as fn(usize) -> usize,
         ),
-        ("columns", |n| slice_bytes(n.max(1), 50, 0)),
-        ("lines", |n| slice_bytes(200, n.max(1), 0)),
+        ("columns", |n| slice_bytes_remaining(n.max(1), 50, 0, 0, 0)),
+        ("lines", |n| slice_bytes_remaining(200, n.max(1), 0, 0, 0)),
     ] {
         let mut previous = usize::MAX;
         for exponent in 0..60 {
@@ -1186,7 +1192,7 @@ fn extreme_dimensions_saturate_instead_of_wrapping() {
                 "slice widened from {previous} to {width} at {axis} \
                  2^{exponent}: more expensive grid, more generous slice",
             );
-            assert!(width >= MIN_SLICE);
+            assert!(width >= 1);
             previous = width;
         }
     }

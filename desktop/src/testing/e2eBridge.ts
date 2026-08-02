@@ -1254,6 +1254,12 @@ declare global {
     __BUZZ_E2E_RELEASE_OBSERVER_ARCHIVE_POLICY__?: () => number;
     /** Number of observer archive policy commands currently held by the seam. */
     __BUZZ_E2E_OBSERVER_ARCHIVE_POLICY_PENDING__?: number;
+    /** Hold channel reads until released. */
+    __BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__?: () => void;
+    /** Release every channel read held by the explicit E2E seam. */
+    __BUZZ_E2E_RELEASE_CHANNELS_READ__?: () => number;
+    /** Number of channel reads currently held by the seam. */
+    __BUZZ_E2E_CHANNELS_READ_PENDING__?: number;
   }
 }
 
@@ -1358,6 +1364,8 @@ type DeferredGetEvent = {
 };
 let deferredGetEventQueue: DeferredGetEvent[] = [];
 let deferredObserverArchivePolicyQueue: Array<() => void> = [];
+let deferChannelsReads = false;
+let deferredChannelsReadQueue: Array<() => void> = [];
 
 const mockDisplayNames = new Map<string, string>([
   [MOCK_IDENTITY_PUBKEY, DEFAULT_MOCK_IDENTITY.display_name],
@@ -9783,6 +9791,19 @@ export function maybeInstallE2eTauriMocks() {
     for (const resolve of queued) resolve();
     return queued.length;
   };
+  deferChannelsReads = false;
+  deferredChannelsReadQueue = [];
+  window.__BUZZ_E2E_CHANNELS_READ_PENDING__ = 0;
+  window.__BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__ = () => {
+    deferChannelsReads = true;
+  };
+  window.__BUZZ_E2E_RELEASE_CHANNELS_READ__ = () => {
+    deferChannelsReads = false;
+    const queued = deferredChannelsReadQueue.splice(0);
+    window.__BUZZ_E2E_CHANNELS_READ_PENDING__ = 0;
+    for (const resolve of queued) resolve();
+    return queued.length;
+  };
   window.__BUZZ_E2E_RELEASE_GET_EVENT__ = () => {
     const queued = deferredGetEventQueue.splice(0);
     for (const entry of queued) {
@@ -11087,6 +11108,13 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig,
         );
       case "get_channels":
+        if (deferChannelsReads) {
+          await new Promise<void>((resolve) => {
+            deferredChannelsReadQueue.push(resolve);
+            window.__BUZZ_E2E_CHANNELS_READ_PENDING__ =
+              deferredChannelsReadQueue.length;
+          });
+        }
         return handleGetChannels(activeConfig);
       case "get_feed":
         return handleGetFeed(

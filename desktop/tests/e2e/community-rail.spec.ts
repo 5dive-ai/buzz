@@ -448,14 +448,7 @@ test.describe("community rail", () => {
   test("does not repair a remembered channel until live validation succeeds", async ({
     page,
   }) => {
-    await installMockBridge(
-      page,
-      {
-        channelsReadDelayMs: 300,
-        channelsReadErrors: [null, "temporary channel read failure"],
-      },
-      { skipCommunitySeed: true },
-    );
+    await installMockBridge(page, undefined, { skipCommunitySeed: true });
     await seedCommunities(page, [COMMUNITY_A, COMMUNITY_B], COMMUNITY_A.id);
     await page.addInitScript((communityId) => {
       window.localStorage.setItem(
@@ -488,20 +481,39 @@ test.describe("community rail", () => {
         JSON.stringify(snapshot),
       );
     });
+    await page.evaluate(() => {
+      const deferNextChannelsRead = (
+        window as Window & {
+          __BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__?: () => void;
+        }
+      ).__BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__;
+      if (!deferNextChannelsRead) {
+        throw new Error("missing channel-read defer seam");
+      }
+      deferNextChannelsRead();
+    });
 
+    await page.evaluate(() => {
+      const invalidateChannels = (
+        window as Window & {
+          __BUZZ_E2E_INVALIDATE_CHANNELS__?: () => Promise<void>;
+        }
+      ).__BUZZ_E2E_INVALIDATE_CHANNELS__;
+      if (!invalidateChannels) {
+        throw new Error("missing channel invalidation seam");
+      }
+      void invalidateChannels();
+    });
+    await page.waitForFunction(
+      () =>
+        (
+          window as Window & {
+            __BUZZ_E2E_CHANNELS_READ_PENDING__?: number;
+          }
+        ).__BUZZ_E2E_CHANNELS_READ_PENDING__ === 1,
+    );
     await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
-    await expect(page).toHaveURL(/#\/channels\/general$/);
-    await expect
-      .poll(() =>
-        page.evaluate((communityId) => {
-          const raw = window.localStorage.getItem(
-            "buzz-community-destinations",
-          );
-          return raw ? JSON.parse(raw)[communityId] : null;
-        }, COMMUNITY_B.id),
-      )
-      .toEqual({ kind: "channel", channelId: "general" });
-    await page.waitForTimeout(400);
+    await expect(page).not.toHaveURL(/#\/channels\/general$/);
     await expect
       .poll(() =>
         page.evaluate((communityId) => {
@@ -513,7 +525,44 @@ test.describe("community rail", () => {
       )
       .toEqual({ kind: "channel", channelId: "general" });
 
-    await expect(page.getByTestId("channel-general")).toBeVisible();
+    await page.evaluate(() => {
+      const config = (
+        window as Window & {
+          __BUZZ_E2E__?: {
+            mock?: { channelsReadErrors?: (string | null)[] };
+          };
+        }
+      ).__BUZZ_E2E__;
+      if (!config) throw new Error("missing E2E config");
+      config.mock = {
+        ...config.mock,
+        channelsReadErrors: ["temporary channel read failure"],
+      };
+    });
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => window.__BUZZ_E2E__?.mock?.channelsReadErrors?.length ?? 0,
+        ),
+      )
+      .toBe(1);
+    const released = await page.evaluate(
+      () =>
+        (
+          window as Window & {
+            __BUZZ_E2E_RELEASE_CHANNELS_READ__?: () => number;
+          }
+        ).__BUZZ_E2E_RELEASE_CHANNELS_READ__?.() ?? 0,
+    );
+    expect(released).toBe(1);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => window.__BUZZ_E2E__?.mock?.channelsReadErrors?.length ?? 0,
+        ),
+      )
+      .toBe(0);
+
     await expect
       .poll(() =>
         page.evaluate((communityId) => {

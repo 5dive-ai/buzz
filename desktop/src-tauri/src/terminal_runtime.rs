@@ -759,6 +759,7 @@ mod tests {
                     column: 2,
                     visible: true,
                 },
+                cursor_changed: true,
                 full: true,
                 viewport: Viewport {
                     generation: 4,
@@ -788,6 +789,7 @@ mod tests {
                 column: 0,
                 visible: true,
             },
+            cursor_changed: true,
             full,
             viewport: Viewport {
                 generation: 0,

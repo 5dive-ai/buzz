@@ -71,7 +71,7 @@ export function TerminalBootstrap({
   const [sessions, setSessions] = React.useState<Session[]>([]);
   const [activeKey, setActiveKey] = React.useState<string | null>(null);
   const [available, setAvailable] = React.useState(() => isTauri());
-  const acknowledgedFramesRef = React.useRef(new Set<string>());
+  const acknowledgedSequenceRef = React.useRef(new Map<string, number>());
   const sessionsRef = React.useRef(sessions);
   sessionsRef.current = sessions;
 
@@ -147,14 +147,17 @@ export function TerminalBootstrap({
         update((session) => ({ ...session, connection }));
         if (sizeRef.current !== size) {
           const currentSize = sizeRef.current;
-          return connection
-            .resize(
-              currentSize.columns,
-              currentSize.rows,
-              currentSize.pixelWidth,
-              currentSize.pixelHeight,
-            )
-            .then((viewport) => connection.viewportReady(viewport));
+          resizeChainRef.current = resizeChainRef.current
+            .then(async () => {
+              const viewport = await connection.resize(
+                currentSize.columns,
+                currentSize.rows,
+                currentSize.pixelWidth,
+                currentSize.pixelHeight,
+              );
+              await connection.viewportReady(viewport);
+            })
+            .catch(fail);
         }
       })
       .catch((error) => {
@@ -167,15 +170,15 @@ export function TerminalBootstrap({
     if (available && context && sessions.length === 0) createSession();
   }, [available, context, createSession, sessions.length]);
 
-  React.useEffect(
-    () => () => {
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
       mountedRef.current = false;
       for (const session of sessionsRef.current) {
         void session.connection?.detach().catch(report);
       }
-    },
-    [],
-  );
+    };
+  }, []);
 
   const active = sessions.find((session) => session.key === activeKey) ?? null;
   const send = (operation: Promise<void> | undefined) => operation?.catch(fail);
@@ -232,11 +235,20 @@ export function TerminalBootstrap({
           (session) => session.delivery?.frame === frame,
         )?.delivery;
         if (!delivery) return;
-        const deliveryKey = `${delivery.frame.subscriptionId}:${delivery.frame.sequence}`;
-        if (acknowledgedFramesRef.current.has(deliveryKey)) return;
-        acknowledgedFramesRef.current.add(deliveryKey);
+        const { sequence, subscriptionId } = delivery.frame;
+        const lastAcknowledged =
+          acknowledgedSequenceRef.current.get(subscriptionId) ?? -1;
+        if (sequence <= lastAcknowledged) return;
+        acknowledgedSequenceRef.current.set(subscriptionId, sequence);
         delivery.acknowledge().catch((error) => {
-          acknowledgedFramesRef.current.delete(deliveryKey);
+          if (
+            acknowledgedSequenceRef.current.get(subscriptionId) === sequence
+          ) {
+            acknowledgedSequenceRef.current.set(
+              subscriptionId,
+              lastAcknowledged,
+            );
+          }
           fail(error);
         });
       }}

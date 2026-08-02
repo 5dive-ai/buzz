@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { after, before, test } from "node:test";
+import { after, afterEach, before, test } from "node:test";
 
 import { JSDOM } from "jsdom";
 
@@ -10,6 +10,9 @@ const callbacks = new Map();
 const calls = [];
 let nextCallback = 1;
 let channel;
+let resizeCallback;
+let canvasWidth = 840;
+let attachResolver = null;
 
 before(async () => {
   Object.assign(globalThis, {
@@ -29,6 +32,9 @@ before(async () => {
     removeEventListener() {},
   });
   dom.window.ResizeObserver = class {
+    constructor(callback) {
+      resizeCallback = callback;
+    }
     observe() {}
     disconnect() {}
   };
@@ -44,9 +50,9 @@ before(async () => {
     bottom: 408,
     height: 408,
     left: 0,
-    right: 840,
+    right: canvasWidth,
     top: 0,
-    width: 840,
+    width: canvasWidth,
     x: 0,
     y: 0,
     toJSON() {},
@@ -66,10 +72,22 @@ before(async () => {
       calls.push({ command, args });
       if (command === "terminal_attach") {
         channel = args.onFrame;
-        return Promise.resolve({
+        const response = {
           sessionId: "session-1",
           subscriptionId: "subscription-1",
           viewport: { columns: 100, generation: 0, screenLines: 24 },
+        };
+        return attachResolver
+          ? new Promise((resolve) => {
+              attachResolver = () => resolve(response);
+            })
+          : Promise.resolve(response);
+      }
+      if (command === "terminal_resize") {
+        return Promise.resolve({
+          columns: args.columns,
+          generation: args.columns,
+          screenLines: args.rows,
         });
       }
       return Promise.resolve();
@@ -86,6 +104,11 @@ before(async () => {
 });
 
 after(() => dom.window.close());
+afterEach(() => {
+  calls.length = 0;
+  canvasWidth = 840;
+  attachResolver = null;
+});
 
 function emit(message, index = 0) {
   const id = Number(channel.toJSON().slice("__CHANNEL__:".length));
@@ -93,26 +116,30 @@ function emit(message, index = 0) {
 }
 
 test("mounted bootstrap passes GUI context and ACKs only after consuming a frame", async () => {
-  const { createElement } = await import("react");
+  const { StrictMode, createElement } = await import("react");
   const { act, render, waitFor } = await import("@testing-library/react");
   const { ThemeProvider } = await import("@/shared/theme/ThemeProvider");
   const { TerminalBootstrap } = await import("./TerminalBootstrap.tsx");
 
   render(
     createElement(
-      ThemeProvider,
+      StrictMode,
       null,
-      createElement("div", {
-        className: "buzz-huddle-app-surface",
-        tabIndex: -1,
-      }),
-      createElement(TerminalBootstrap, {
-        channelId: "channel-1",
-        channelName: "general",
-        npub: "npub1owner",
-        relayUrl: "wss://relay.example",
-        threadId: "thread-1",
-      }),
+      createElement(
+        ThemeProvider,
+        null,
+        createElement("div", {
+          className: "buzz-huddle-app-surface",
+          tabIndex: -1,
+        }),
+        createElement(TerminalBootstrap, {
+          channelId: "channel-1",
+          channelName: "general",
+          npub: "npub1owner",
+          relayUrl: "wss://relay.example",
+          threadId: "thread-1",
+        }),
+      ),
     ),
   );
 
@@ -132,20 +159,21 @@ test("mounted bootstrap passes GUI context and ACKs only after consuming a frame
     threadId: "thread-1",
   });
 
+  const frameMessage = {
+    type: "frame",
+    payload: {
+      bracketedPaste: true,
+      cursor: { column: 0, line: 0, visible: true },
+      focusReporting: true,
+      full: true,
+      rows: [],
+      sequence: 7,
+      subscriptionId: "subscription-1",
+      viewport: { columns: 100, generation: 0, screenLines: 24 },
+    },
+  };
   await act(async () => {
-    emit({
-      type: "frame",
-      payload: {
-        bracketedPaste: true,
-        cursor: { column: 0, line: 0, visible: true },
-        focusReporting: true,
-        full: true,
-        rows: [],
-        sequence: 7,
-        subscriptionId: "subscription-1",
-        viewport: { columns: 100, generation: 0, screenLines: 24 },
-      },
-    });
+    emit(frameMessage);
   });
   await waitFor(() =>
     assert.ok(calls.some(({ command }) => command === "terminal_ack")),
@@ -158,4 +186,58 @@ test("mounted bootstrap passes GUI context and ACKs only after consuming a frame
       subscriptionId: "subscription-1",
     },
   );
+
+  await act(async () => {
+    emit(frameMessage, 1);
+  });
+  assert.equal(
+    calls.filter(({ command }) => command === "terminal_ack").length,
+    1,
+  );
+});
+
+test("resize during attach declares only the newest viewport ready", async () => {
+  const { createElement } = await import("react");
+  const { act, render, waitFor } = await import("@testing-library/react");
+  const { ThemeProvider } = await import("@/shared/theme/ThemeProvider");
+  const { TerminalBootstrap } = await import("./TerminalBootstrap.tsx");
+
+  attachResolver = () => {};
+  const view = render(
+    createElement(
+      ThemeProvider,
+      null,
+      createElement("div", {
+        className: "buzz-huddle-app-surface",
+        tabIndex: -1,
+      }),
+      createElement(TerminalBootstrap, {
+        channelId: "channel-1",
+        channelName: "general",
+        npub: "npub1owner",
+        relayUrl: "wss://relay.example",
+        threadId: null,
+      }),
+    ),
+  );
+  await waitFor(() => assert.equal(typeof attachResolver, "function"));
+
+  canvasWidth = 1_008;
+  act(() => resizeCallback());
+  await act(async () => attachResolver());
+  await waitFor(() =>
+    assert.ok(
+      calls.some(({ command }) => command === "terminal_viewport_ready"),
+    ),
+  );
+
+  const readyCalls = calls.filter(
+    ({ command }) => command === "terminal_viewport_ready",
+  );
+  assert.equal(readyCalls.at(-1).args.viewport.columns, 120);
+  assert.equal(
+    readyCalls.every(({ args }) => args.viewport.columns === 120),
+    true,
+  );
+  view.unmount();
 });

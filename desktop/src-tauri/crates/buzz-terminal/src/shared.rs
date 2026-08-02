@@ -163,13 +163,19 @@ impl SharedTerminal {
     pub fn render(&self, encoder: &mut Encoder) -> Frame {
         let raw = {
             let mut term = self.acquire(&self.renderer);
-            damage::capture(term.term_mut())
+            damage::capture(&mut term)
         };
         encoder.encode(raw)
     }
 
-    /// Take the lock for something the two methods above don't cover (resize,
-    /// input, reading stats). Metered on the renderer plane, since anything
+    /// Apply a coalesced resize. Renderer plane: this competes with the
+    /// renderer for the same lock and can hold it for milliseconds.
+    pub fn resize(&self, size: crate::Size) {
+        self.acquire(&self.renderer).resize(size);
+    }
+
+    /// Take the lock for something the methods above don't cover (input,
+    /// reading stats). Metered on the renderer plane, since anything
     /// that isn't the read loop competes with the renderer for the same lock.
     pub fn lock(&self) -> MutexGuard<'_, Terminal> {
         self.acquire(&self.renderer)

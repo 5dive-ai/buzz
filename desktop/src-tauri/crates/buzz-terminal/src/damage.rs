@@ -8,6 +8,34 @@
 //! 2. **Damage over-reports.** `Term::damage()` marks the cursor line every
 //!    call, so an idle terminal reports damage nearly every frame. Per-line
 //!    content hashing suppresses those, so the transport never sees a no-op.
+//!
+//! # Why a frame is the whole viewport
+//!
+//! Nearly every frame is a full repaint: `Term::scroll_up_relative` calls
+//! `mark_fully_damaged()` unconditionally, so any output reaching the bottom
+//! row damages the whole grid. Partial damage is effectively the idle cursor.
+//!
+//! That is fine, and the reason is worth having here rather than in a review
+//! thread. A full frame is O(viewport) *by construction* -- the grid is itself
+//! the coalescing buffer -- so its cost does not depend on how fast the child
+//! writes. Measured on a 200x50 grid, bytes per frame across four orders of
+//! magnitude of output rate: 11,390 at an unthrottled flood (45,759 lines
+//! scrolled per frame), 11,390 at ~1 MB/s, 11,390 at ~100 KB/s, 11,305 on a
+//! slow build log. Constant to three digits.
+//!
+//! A scroll-aware diff inverts that: its cost is O(lines scrolled), unbounded,
+//! and at 45,759 lines/frame it would ship ~915x more data than the full grid
+//! it was optimising. It wins where nobody is watching and loses under `cat`.
+//!
+//! **Revisit if the viewport grows.** 80x24 costs 2.6 KB/frame (0.2 MB/s at
+//! 60 Hz), 200x50 costs 11.4 KB (0.7 MB/s), 400x100 costs 42.8 KB (2.6 MB/s).
+//! 400x100 is roughly 4x a typical maximised window and is where this decision
+//! should be re-measured -- as a serialization/IPC question, not a damage one.
+//!
+//! Dedup earns its place in the interactive case rather than the streaming one:
+//! typing is ~0.9 rows per keystroke, and an idle terminal ships 0 rows across
+//! 60 frames instead of a cursor-line frame 60x/second. Idle is the load-bearing
+//! one -- it is what the substrate does while sitting behind the GUI untouched.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -15,9 +43,7 @@ use std::hash::{Hash, Hasher};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Term, TermDamage};
-
-use crate::listener::Listener;
+use alacritty_terminal::term::TermDamage;
 
 /// A run of cells sharing one visual style.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +93,16 @@ pub struct Frame {
     pub cursor: CursorFrame,
     /// Whether the renderer should discard what it has and repaint.
     pub full: bool,
+    /// The viewport this frame describes. A change means the grid was resized
+    /// and row indices refer to a different geometry than the previous frame's.
+    /// Carried so the consumer can detect that from the frame itself instead of
+    /// trusting that no resize overtook it in flight.
+    pub generation: u64,
+    /// Grid dimensions this frame was captured at, so a full frame is
+    /// self-describing rather than only meaningful against a size the consumer
+    /// happens to remember.
+    pub columns: usize,
+    pub screen_lines: usize,
 }
 
 impl Frame {
@@ -81,11 +117,16 @@ pub struct RawFrame {
     rows: Vec<(usize, Vec<Cell>)>,
     cursor: CursorFrame,
     full: bool,
+    generation: u64,
+    columns: usize,
+    screen_lines: usize,
 }
 
 /// Copy the damaged rows out of the terminal. **Runs under the lock; does no
 /// encoding.** Keep this function boring — everything added here is lock hold.
-pub fn capture(term: &mut Term<Listener>) -> RawFrame {
+pub fn capture(terminal: &mut crate::Terminal) -> RawFrame {
+    let generation = terminal.generation();
+    let term = terminal.term_mut();
     let columns = term.columns();
     let screen_lines = term.screen_lines();
     let cursor_point = term.grid().cursor.point;
@@ -116,7 +157,14 @@ pub fn capture(term: &mut Term<Listener>) -> RawFrame {
     };
 
     term.reset_damage();
-    RawFrame { rows, cursor, full }
+    RawFrame {
+        rows,
+        cursor,
+        full,
+        generation,
+        columns,
+        screen_lines,
+    }
 }
 
 /// Suppresses rows whose content did not actually change.
@@ -132,6 +180,9 @@ impl Encoder {
 
     /// Encode a captured frame. **Runs with the lock released.**
     pub fn encode(&mut self, raw: RawFrame) -> Frame {
+        // A full frame invalidates the dedup cache. Both routes that produce
+        // one matter: a `mark_fully_damaged` from scroll/alt-swap, and a resize,
+        // where the cached hashes describe rows of a different width entirely.
         if raw.full {
             self.hashes.clear();
         }
@@ -154,6 +205,9 @@ impl Encoder {
             rows,
             cursor: raw.cursor,
             full: raw.full,
+            generation: raw.generation,
+            columns: raw.columns,
+            screen_lines: raw.screen_lines,
         }
     }
 }

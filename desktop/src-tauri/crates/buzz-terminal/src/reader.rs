@@ -115,7 +115,7 @@ impl Feeder {
     /// **No production consumer today, and not an oversight.** The runtime
     /// reader pumps [`Feeder::drain`] to completion after every read
     /// (`terminal_runtime.rs`), so the tail is empty between iterations and
-    /// this can never go true -- measured 0 bytes high-water against 1 MiB of
+    /// this can never go true -- measured 0 bytes high-water against 8 MiB of
     /// pure RIS, the densest atom there is. It exists for a future reader
     /// that defers pumping, and such a reader **must** consult it: without
     /// the pump loop the same stream reaches [`TAIL_CAP`] in 257 reads of

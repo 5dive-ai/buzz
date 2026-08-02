@@ -143,6 +143,7 @@ fn a_snapshot_realigns_a_reused_encoders_dedup_state() {
     let mut encoder = Encoder::new();
     let before = shared.snapshot(&mut encoder);
     assert_eq!(before.viewport.columns, 20);
+    let first_generation = before.viewport.generation;
 
     let resized = shared.resize(Size {
         columns: 10,
@@ -150,6 +151,10 @@ fn a_snapshot_realigns_a_reused_encoders_dedup_state() {
         scrollback: 100,
     });
     assert_eq!(resized.columns, 10);
+    assert!(
+        resized.generation > first_generation,
+        "an applied resize advances the generation"
+    );
 
     // Same encoder, new geometry: every row must be re-sent, not suppressed
     // as unchanged against hashes taken at the old width.
@@ -158,10 +163,105 @@ fn a_snapshot_realigns_a_reused_encoders_dedup_state() {
         after.viewport.columns, 10,
         "the capture-time grid is stamped"
     );
+    // Columns alone does not identify a grid. `Viewport`'s own doc says the
+    // three fields travel together *because* a consumer comparing two of the
+    // three can be wrong -- and this fixture used to compare one. A resize
+    // that changed only `screen_lines`, or 20 -> 10 -> 20, leaves columns
+    // matching while the generation has moved. `resize.rs` asserts this on
+    // `render()` frames five times and never once on a snapshot, which is
+    // what Sami's T3 mutant walked through; Mari's reattach reads this stamp.
+    assert_eq!(
+        after.viewport, resized,
+        "a snapshot stamps the identity of the grid it actually captured"
+    );
     assert!(after.full, "a snapshot is a repaint");
     assert!(
         !after.rows.is_empty(),
         "stale hashes must not suppress rows after a resize"
+    );
+}
+
+/// A snapshot carries *every* row of the viewport, including the last one,
+/// and stamps the cursor plane truthfully.
+///
+/// Both properties are asserted here rather than in the fixtures above
+/// because of what those fixtures' helper hides: `visible_text` trims and
+/// drops empty lines, so a capture that skipped the bottom row of the screen
+/// reads identically to one that didn't whenever the content sits in the top
+/// rows -- which it does in every other fixture in this file. Sami's T2
+/// mutant (`0..screen_lines - 1`) survived all four for exactly that reason.
+/// So this fixture puts content on the last row and asserts the row *set*,
+/// not the text.
+///
+/// The cursor half is the same shape of gap: nothing checked that a snapshot's
+/// cursor was the terminal's cursor rather than a plausible default.
+#[test]
+fn a_snapshot_carries_every_row_and_the_true_cursor() {
+    let (shared, _actions) = terminal(20, 4);
+    // Write the bottom row of the screen, then park the cursor at line 4,
+    // column 6 (1-based) -- row 3, column 5 to us.
+    shared.feed(b"\x1b[4;1Hbottom\x1b[4;6H");
+
+    let mut attaching = Encoder::new();
+    let frame = shared.snapshot(&mut attaching);
+
+    let lines: Vec<usize> = frame.rows.iter().map(|row| row.line).collect();
+    assert_eq!(
+        lines,
+        vec![0, 1, 2, 3],
+        "a snapshot must carry the whole viewport, last row included"
+    );
+    assert!(
+        visible_text(&frame).contains(&"bottom".to_string()),
+        "content on the last row must reach an attaching subscriber, got {:?}",
+        visible_text(&frame)
+    );
+
+    assert_eq!(frame.cursor.line, 3, "the snapshot's cursor line is real");
+    assert_eq!(
+        frame.cursor.column, 5,
+        "the snapshot's cursor column is real"
+    );
+    assert!(frame.cursor.visible, "the cursor is shown by default");
+
+    // ...and a hidden cursor is reported hidden, so `visible` tracks the mode
+    // rather than being a constant that happens to match the default.
+    shared.feed(b"\x1b[?25l");
+    let mut second = Encoder::new();
+    assert!(
+        !shared.snapshot(&mut second).cursor.visible,
+        "DECTCEM off must reach the attaching subscriber"
+    );
+}
+
+/// Taking a snapshot is billed to the renderer plane.
+///
+/// The two planes are metered separately because pooling them lets the
+/// reader's millions of fast acquires dilute the renderer's tail into a false
+/// pass (`shared.rs` module docs). A full-grid copy is the single most
+/// expensive thing that takes this lock, so misfiling it under the reader
+/// would corrupt the very instrument the renderer's budget is judged by --
+/// and no fixture noticed until Sami's T4.
+#[test]
+fn a_snapshot_is_billed_to_the_renderer_plane() {
+    let (shared, _actions) = terminal(20, 4);
+    shared.feed(b"content");
+
+    shared.reader_acquire().reset();
+    shared.renderer_acquire().reset();
+
+    let mut attaching = Encoder::new();
+    let _ = shared.snapshot(&mut attaching);
+
+    assert_eq!(
+        shared.renderer_acquire().snapshot().acquisitions,
+        1,
+        "the snapshot's lock acquisition belongs to the renderer plane"
+    );
+    assert_eq!(
+        shared.reader_acquire().snapshot().acquisitions,
+        0,
+        "a full-grid copy must not be charged to the reader plane"
     );
 }
 

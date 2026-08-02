@@ -199,6 +199,84 @@ fn cluster_count_distinguishes_a_marked_cluster_from_a_plain_run() {
     assert!(marked.counts_are_consistent() && plain.counts_are_consistent());
 }
 
+/// The join guard has two halves: the previous cell must not have carried
+/// marks (`open`), and the current cell must not carry them (`joinable`).
+/// Every fixture above exercises only the first half -- a plain cluster
+/// following a marked one. This one exercises the second: a *marked* cluster
+/// arriving after a plain run, which is the only path on which the run in
+/// progress is handed text holding more `char`s than the one cluster its
+/// count is about to be incremented by.
+///
+/// Sami found the hole. With `joinable` dropped from the guard, a release
+/// build silently emits `Span { column: 0, text: "xyé", cluster_count: 3 }`:
+/// four chars counted as three, so the consumer's rule splits per char and
+/// places the combining mark on top of `z`.
+#[test]
+fn a_marked_cluster_after_a_plain_run_starts_its_own_span() {
+    let (spans, _actions) = render("xye\u{0301}z");
+    assert_eq!(
+        placements(&spans),
+        vec![
+            (0, "x".into()),
+            (1, "y".into()),
+            (2, "e\u{0301}".into()),
+            (3, "z".into()),
+        ],
+        "a marked cluster must not be absorbed into the run in front of it"
+    );
+}
+
+/// `cluster_count` is a `u16` and `Size.columns` is an unclamped `usize`
+/// (`lib.rs:50`) that no production caller bounds yet, so a row of uniform
+/// cells wider than `u16::MAX` reaches the join guard's overflow refusal.
+/// The guard is live code, not paranoia, and this fixture is what says so.
+///
+/// Refusing to join produces a shape the consumer already handles -- the run
+/// ends and a new span starts at the next column -- whereas wrapping produces
+/// an undecodable span, the same failure as the marked-after-plain case above.
+#[test]
+fn a_run_longer_than_u16_max_splits_rather_than_wrapping() {
+    let columns = 70_000;
+    let size = Size {
+        columns,
+        screen_lines: 1,
+        scrollback: 0,
+    };
+    let (term, _actions) = Terminal::new(size, Fences::ALL);
+    let shared = SharedTerminal::new(term);
+    // One character is enough: the rest of the row is blank cells of the same
+    // style, so the whole row is a single candidate run.
+    shared.feed(b"a");
+    let mut encoder = Encoder::new();
+    let frame = shared.render(&mut encoder);
+
+    let spans = &frame
+        .rows
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("the fed row must be present")
+        .spans;
+
+    assert!(
+        spans.iter().all(|span| span.counts_are_consistent()),
+        "an oversized run must not wrap its count: {spans:?}"
+    );
+    let counts: Vec<u16> = spans.iter().map(|span| span.cluster_count).collect();
+    let columns_at: Vec<usize> = spans.iter().map(|span| span.column).collect();
+    assert_eq!(
+        counts,
+        vec![u16::MAX, (columns - u16::MAX as usize) as u16],
+        "the run must end at the last representable count"
+    );
+    assert_eq!(
+        columns_at,
+        vec![0, u16::MAX as usize],
+        "the second span starts where the first left off"
+    );
+    let chars: usize = spans.iter().map(|span| span.text.chars().count()).sum();
+    assert_eq!(chars, columns, "no cell may be dropped by the split");
+}
+
 /// Wrapping marks the last cell of the row with `WRAPLINE` (upstream
 /// `term/mod.rs:968`). That bit records where the text happened to wrap, not
 /// how the text looks, so it must not reach the style key: if it did, the last

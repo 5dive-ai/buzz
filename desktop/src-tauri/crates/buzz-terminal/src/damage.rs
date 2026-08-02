@@ -381,7 +381,14 @@ fn spans(cells: &[Cell]) -> Vec<Span> {
         }
         open = joinable;
     }
-    debug_assert!(
+    // Enforced in release, not just in debug. This is a *wire* invariant: a
+    // span that violates it is undecodable by the rule in [`Span`], and the
+    // consumer's failure is silent misplacement of every cluster after it.
+    // A `debug_assert` here would vanish in exactly the build where that
+    // corruption ships. The cost is one pass over text already in cache --
+    // the same order as building the spans -- and it buys a loud, local
+    // failure instead of a renderer quietly drawing the wrong columns.
+    assert!(
         spans.iter().all(Span::counts_are_consistent),
         "cluster_count must be 1 or the span's char count"
     );

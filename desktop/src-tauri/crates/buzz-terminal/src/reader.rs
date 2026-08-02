@@ -115,16 +115,17 @@ impl Feeder {
     /// **No production consumer today, and not an oversight.** The runtime
     /// reader pumps [`Feeder::drain`] to completion after every read
     /// (`terminal_runtime.rs`), so the tail is empty between iterations and
-    /// this can never go true -- measured 0 bytes high-water against 1 MiB of
+    /// this can never go true -- measured 0 bytes high-water against 8 MiB of
     /// pure RIS, the densest atom there is. It exists for a future reader
     /// that defers pumping, and such a reader **must** consult it: without
-    /// the pump loop the same stream reaches [`TAIL_CAP`] in 257 reads of
-    /// 16 KiB.
+    /// the pump loop the same stream first reaches [`TAIL_CAP`] on the 257th
+    /// completed read of 16 KiB.
     ///
-    /// The numbers are here rather than "nothing calls this" because the
-    /// signal and the loop are one fact from two sides. Delete the loop and
-    /// this predicate stops being unreachable in the same instant it starts
-    /// being needed.
+    /// 8 MiB, not 1 or 4, because the counterfactual has to actually fire: a
+    /// 16 KiB read of RIS defers 16382 bytes rather than 16384, so 4 MiB
+    /// stops 512 bytes short of the cap and reports "never full" for both
+    /// arms -- a probe too small to reach its own threshold agrees with
+    /// whatever it was meant to test.
     pub fn tail_full(&self) -> bool {
         self.pending_bytes() >= TAIL_CAP
     }

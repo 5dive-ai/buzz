@@ -33,3 +33,4 @@ http-body-util = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
+tower = { workspace = true }

@@ -260,6 +260,90 @@ impl Substrate for Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Response;
+    use kube::client::Body;
+    use std::sync::{Arc, Mutex};
+    use tower::service_fn;
+
+    fn list_response(date: Option<&str>) -> Response<Body> {
+        let mut response = Response::builder().status(200);
+        if let Some(date) = date {
+            response = response.header(http::header::DATE, date);
+        }
+        response
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PodList",
+                    "metadata": {"resourceVersion": "17"},
+                    "items": [{
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {"name": "sprig"},
+                        "spec": {"containers": [{"name": "agent", "image": "example.invalid/sprig@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}
+                    }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    async fn list_through_real_request_path(
+        date: Option<&'static str>,
+    ) -> (Vec<Pod>, Option<DateTime<Utc>>, String) {
+        let observed_uri = Arc::new(Mutex::new(None));
+        let service_uri = Arc::clone(&observed_uri);
+        let service = service_fn(move |request: http::Request<Body>| {
+            let service_uri = Arc::clone(&service_uri);
+            async move {
+                *service_uri.lock().unwrap() = Some(request.uri().to_string());
+                Ok::<_, std::convert::Infallible>(list_response(date))
+            }
+        });
+        let cluster = Cluster::new(Client::new(service, "ignored"), "owned-ns");
+        let result = cluster
+            .list_with_date::<Pod>("app.kubernetes.io/managed-by=buzz-backend-kubernetes")
+            .await
+            .unwrap();
+        let uri = observed_uri.lock().unwrap().take().unwrap();
+        (result.0, result.1, uri)
+    }
+
+    /// Exercise the shipped `Request` + `Client::send` seam. A fake
+    /// reconciler would not prove that kube-rs emits a quorum list request or
+    /// that the apiserver's clock survives body decoding.
+    #[tokio::test]
+    async fn list_with_date_uses_a_quorum_request_and_returns_the_server_clock() {
+        let (pods, server_now, uri) =
+            list_through_real_request_path(Some("Sun, 02 Aug 2026 04:00:00 GMT")).await;
+
+        assert_eq!(pods.len(), 1, "fixture must contain one decoded pod");
+        assert_eq!(pods[0].metadata.name.as_deref(), Some("sprig"));
+        assert!(uri.starts_with("/api/v1/namespaces/owned-ns/pods?"));
+        assert!(
+            uri.contains("labelSelector=app.kubernetes.io%2Fmanaged-by%3Dbuzz-backend-kubernetes")
+        );
+        assert!(
+            !uri.contains("resourceVersion"),
+            "cache read leaked into {uri}"
+        );
+        assert_eq!(
+            server_now.unwrap().to_rfc3339(),
+            "2026-08-02T04:00:00+00:00"
+        );
+    }
+
+    /// Header failure is deliberately not list failure: without a trustworthy
+    /// apiserver clock the orphan sweep skips, but normal reconciliation still
+    /// receives the decoded objects.
+    #[tokio::test]
+    async fn list_with_date_keeps_items_when_the_server_clock_is_unusable() {
+        for date in [Some("not a date"), None] {
+            let (pods, server_now, _) = list_through_real_request_path(date).await;
+            assert_eq!(pods.len(), 1, "fixture must contain one decoded pod");
+            assert!(server_now.is_none(), "unexpected clock for {date:?}");
+        }
+    }
 
     /// A typed apiserver error, as kube-rs surfaces it.
     fn api(reason: &str, code: u16) -> kube::Error {

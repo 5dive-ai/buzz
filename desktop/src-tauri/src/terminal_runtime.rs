@@ -642,7 +642,17 @@ pub(crate) fn terminal_input(
             .lock()
             .map_err(|e| e.to_string())?
             .write_all(data.as_bytes())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        // Typing returns you to the live edge, as every terminal does. It has
+        // to be explicit: the grid pins a scrolled-back viewport and lets new
+        // output pile up above it, so the echo of this keystroke would land on
+        // a screen the user cannot see. Doing it here rather than in the
+        // renderer covers pasted text and encoded keys for free, and costs a
+        // comparison -- not a repaint -- when nothing was scrolled.
+        if session.terminal.scroll_to_bottom() {
+            publish_viewport(session)?;
+        }
+        Ok(())
     })
 }
 
@@ -678,6 +688,64 @@ pub(crate) fn terminal_resize(
             session.publish(publication);
         }
         Ok(viewport.into())
+    })
+}
+
+/// Republish the viewport after the *viewport itself* moved without the grid
+/// changing.
+///
+/// A snapshot, not a damage capture, and that is load-bearing twice over.
+/// `capture_all` deliberately leaves damage alone (`damage.rs`), so the
+/// full-damage flag that `scroll_display` just set survives for the reader
+/// thread's next `render()` to consume -- which is what clears *its* dedup
+/// hashes. Take the damage here instead and those hashes would go on
+/// describing the rows the renderer had before the scroll, free to suppress a
+/// row that genuinely changed underneath it.
+///
+/// The encoder is fresh and local because its only job is to encode one frame
+/// that is `full` by construction; sharing the reader's would be sharing dedup
+/// state across two coordinate systems.
+fn publish_viewport(session: &Session) -> Result<()> {
+    let mut encoder = buzz_terminal::damage::Encoder::new();
+    let publication = session
+        .publisher
+        .lock()
+        .map_err(|e| e.to_string())?
+        .offer(session.terminal.snapshot(&mut encoder))
+        .map_err(|_| "terminal scroll snapshot rejected".to_string())?;
+    if let Some(publication) = publication {
+        session.publish(publication);
+    }
+    Ok(())
+}
+
+/// Scroll the viewport through scrollback.
+///
+/// `lines` is a **DOM wheel delta in cells**: negative is the direction that
+/// scrolls a web page toward the top of the document, which must scroll the
+/// terminal into history. That is the whole reason for the negation below --
+/// and it is the reason the spec is written against `deltaY` rather than
+/// against finger direction. macOS "natural scrolling" flips the delta the OS
+/// reports, so a rule stated as "swipe up goes back" is correct for one
+/// preference setting and backwards for the other, while this one is correct
+/// for both, and matches whatever the page around the terminal does.
+///
+/// This is the only place the two sign conventions meet.
+#[tauri::command]
+pub(crate) fn terminal_scroll(
+    session_id: String,
+    lines: i32,
+    state: tauri::State<'_, TerminalSessions>,
+) -> Result<()> {
+    state.with_session(&session_id, |session| {
+        // Momentum keeps delivering events for a second or so after the
+        // fingers lift. Once history runs out the engine clamps and reports
+        // that nothing moved, so the tail costs a lock and a compare rather
+        // than a full-grid copy and a frame each.
+        if !session.terminal.scroll(-lines) {
+            return Ok(());
+        }
+        publish_viewport(session)
     })
 }
 

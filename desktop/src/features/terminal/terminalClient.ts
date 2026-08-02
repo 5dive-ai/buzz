@@ -116,6 +116,18 @@ export class TerminalConnection {
     });
   }
 
+  /**
+   * Scroll the viewport by whole cells.
+   *
+   * `lines` keeps the DOM's sign: negative is the direction that scrolls a
+   * page toward the top of the document. The backend owns the conversion to
+   * the engine's opposite convention, so this layer carries no policy about
+   * which way history is.
+   */
+  scroll(lines: number): Promise<void> {
+    return invoke("terminal_scroll", { sessionId: this.sessionId, lines });
+  }
+
   focus(focused: boolean): Promise<void> {
     return invoke("terminal_focus", { sessionId: this.sessionId, focused });
   }

@@ -229,6 +229,22 @@ impl SharedTerminal {
         encoder.encode(raw)
     }
 
+    /// Move the viewport through scrollback. Renderer plane.
+    ///
+    /// Positive moves into history; see [`crate::Terminal::scroll`]. Returns
+    /// whether it moved, so the caller can skip capture and publication for
+    /// the momentum tail that arrives after history has run out.
+    pub fn scroll(&self, lines: i32) -> bool {
+        self.acquire(&self.renderer).scroll(lines)
+    }
+
+    /// Return the viewport to the live edge. Renderer plane. Returns whether
+    /// it moved, so an unscrolled terminal costs one comparison per keystroke
+    /// and no repaint.
+    pub fn scroll_to_bottom(&self) -> bool {
+        self.acquire(&self.renderer).scroll_to_bottom()
+    }
+
     /// Apply a coalesced resize. Renderer plane: this competes with the
     /// renderer for the same lock and can hold it for milliseconds.
     pub fn resize(&self, size: crate::Size) -> crate::Viewport {

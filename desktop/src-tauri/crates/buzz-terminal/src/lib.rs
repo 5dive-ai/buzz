@@ -243,6 +243,43 @@ impl Terminal {
         self.viewport()
     }
 
+    /// Move the viewport through scrollback. **Positive moves *into* history.**
+    ///
+    /// That is upstream's sign (`Scroll::Delta`), kept rather than flipped: a
+    /// second convention in the middle of the stack is a bug waiting for the
+    /// one caller who reads the wrong doc comment. The DOM has the opposite
+    /// sense, and the embedder converts once, at the command boundary.
+    ///
+    /// Returns whether the viewport actually moved. Both ends of history clamp
+    /// silently upstream, and a caller that repaints on every request would
+    /// repaint for the whole tail of a momentum gesture after it had already
+    /// hit the top. Every scroll that *does* move is a full repaint, because
+    /// `Term::scroll_display` marks the grid fully damaged.
+    pub fn scroll(&mut self, lines: i32) -> bool {
+        self.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines))
+    }
+
+    /// Return the viewport to the live edge. Returns whether it moved.
+    ///
+    /// Output alone does not do this: once scrolled back, the grid pins the
+    /// viewport and lets new lines accumulate above it
+    /// (`Grid::scroll_up`). Coming back is therefore an explicit act, and the
+    /// embedder ties it to user input.
+    pub fn scroll_to_bottom(&mut self) -> bool {
+        self.scroll_display(alacritty_terminal::grid::Scroll::Bottom)
+    }
+
+    /// How far the viewport sits above the live edge, in lines.
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    fn scroll_display(&mut self, scroll: alacritty_terminal::grid::Scroll) -> bool {
+        let before = self.display_offset();
+        self.term.scroll_display(scroll);
+        self.display_offset() != before
+    }
+
     pub fn term(&self) -> &Term<Listener> {
         &self.term
     }

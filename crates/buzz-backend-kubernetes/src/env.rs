@@ -86,6 +86,15 @@ fn identity_component(value: &str) -> Option<&str> {
 /// `RespondTo` (kebab-case) and as `buzz-acp`'s CLI parses it.
 const RESPOND_TO_ALLOWLIST: &str = "allowlist";
 
+/// Every gate mode `buzz-acp` accepts, spelled as its `clap::ValueEnum` parses
+/// them (`config.rs:95-101`, kebab-case via `RespondTo`'s `Display`).
+///
+/// Deliberately the **harness's** four and not the desktop's three: the desktop
+/// rejects `nobody` on purpose (`managed_agents/types.rs:871-880`), but the
+/// harness starts fine with it. This guard exists to cover non-desktop callers,
+/// so inheriting a desktop-only narrowing would refuse a launch that works.
+const RESPOND_TO_MODES: [&str; 4] = ["owner-only", RESPOND_TO_ALLOWLIST, "anyone", "nobody"];
+
 /// Refuse a respond-to gate the harness will reject at config parse.
 ///
 /// The local spawn path re-validates this before spawning — "doing it here
@@ -97,13 +106,24 @@ const RESPOND_TO_ALLOWLIST: &str = "allowlist";
 /// sweep does, at `ORPHAN_SECRET_MIN_AGE_SECS`). The user-visible ending is
 /// "startup not confirmed", indistinguishable from a slow cluster.
 ///
-/// Mirrors `buzz-acp`'s own rules exactly (`config.rs:996-1004,629-641`),
+/// Mirrors `buzz-acp`'s own rules exactly (`config.rs:95-101,996-1004,629-641`),
 /// deliberately including their asymmetry: the allowlist is validated **only**
 /// in allowlist mode, and merely warned about otherwise. Validating it in
 /// every mode would refuse a deploy whose identical local spawn succeeds —
 /// and a stale list is already harmless here, since
 /// `BUZZ_ACP_RESPOND_TO_ALLOWLIST` is an authoritative key that tier 3 clears.
 fn validate_respond_to_gate(respond_to: &str, allowlist: Option<&[String]>) -> Result<(), String> {
+    // Exact, untrimmed: `clap` does not trim, so `" allowlist "` is `rc=2` at
+    // the harness — a parse failure even earlier than the config errors below.
+    if !RESPOND_TO_MODES.contains(&respond_to) {
+        return Err(format!(
+            "deploy refused: respond_to {respond_to:?} is not a mode the \
+             harness accepts (expected one of {}) — the pod would fail to \
+             parse its arguments, be replaced, and leave a Secret behind on \
+             every attempt",
+            RESPOND_TO_MODES.join(", ")
+        ));
+    }
     if respond_to != RESPOND_TO_ALLOWLIST {
         return Ok(());
     }
@@ -651,6 +671,61 @@ mod tests {
             }));
             let env = build(&agent)
                 .unwrap_or_else(|e| panic!("{mode} with a stale list must deploy: {e}"));
+            assert_eq!(env["BUZZ_ACP_RESPOND_TO"], mode);
+        }
+    }
+
+    /// `respond_to` is an opaque `String` on the wire but a `clap::ValueEnum`
+    /// at the harness, so an unrecognized mode dies at `rc=2` — before config
+    /// parsing runs at all, earlier than either refusal above. Measured
+    /// against the built binary: `invalid value 'npub1abc' for '--respond-to'`.
+    /// This is the shape our own fixture carried until it was corrected.
+    #[test]
+    fn a_mode_the_harness_cannot_parse_is_refused() {
+        for bad in ["npub1abc", "OWNER-ONLY", "owner_only", "allowlistt", "x"] {
+            let agent = payload_json(serde_json::json!({ "respond_to": bad }));
+            let err = build(&agent).unwrap_err();
+            assert!(
+                err.contains("is not a mode the harness accepts"),
+                "{bad:?} was accepted; error was: {err}"
+            );
+        }
+    }
+
+    /// `clap` does not trim its value-enum input, so a padded mode is `rc=2`
+    /// even though the same string trimmed is valid. Measured: `invalid value
+    /// ' allowlist ' for '--respond-to'`. Trimming here would accept a deploy
+    /// the harness refuses — the exact direction this guard exists to prevent.
+    #[test]
+    fn a_padded_mode_is_refused_because_clap_does_not_trim() {
+        for padded in [" allowlist ", "allowlist ", " owner-only", "\tnobody"] {
+            let agent = payload_json(serde_json::json!({
+                "respond_to": padded,
+                "respond_to_allowlist": [pubkey('a')],
+            }));
+            let err = build(&agent).unwrap_err();
+            assert!(
+                err.contains("is not a mode the harness accepts"),
+                "{padded:?} was accepted; error was: {err}"
+            );
+        }
+    }
+
+    /// Positive control for the mode check, and the reason it validates the
+    /// harness's four rather than the desktop's three: `nobody` is rejected by
+    /// `parse_wire` on purpose (`managed_agents/types.rs:871-880`) but starts
+    /// fine at the harness. A guard mirroring the desktop enum would refuse a
+    /// working launch from a non-desktop caller — the callers this guard is
+    /// for. Without this test, refusing `nobody` would pass everything above.
+    #[test]
+    fn every_mode_the_harness_accepts_is_deployable() {
+        for mode in ["owner-only", "allowlist", "anyone", "nobody"] {
+            let agent = payload_json(serde_json::json!({
+                "respond_to": mode,
+                "respond_to_allowlist": [pubkey('a')],
+            }));
+            let env = build(&agent)
+                .unwrap_or_else(|e| panic!("{mode} is valid at the harness but was refused: {e}"));
             assert_eq!(env["BUZZ_ACP_RESPOND_TO"], mode);
         }
     }

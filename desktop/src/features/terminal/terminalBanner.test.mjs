@@ -12,6 +12,50 @@ function layers(banner) {
   );
 }
 
+function frameBounds(banner) {
+  const cells = banner.cells.flatMap((row, y) =>
+    row.flatMap((cell, x) =>
+      cell.layer === "bevel_hi" || cell.layer === "bevel_lo" ? [{ x, y }] : [],
+    ),
+  );
+  return {
+    top: Math.min(...cells.map(({ y }) => y)),
+    left: Math.min(...cells.map(({ x }) => x)),
+    bottom: Math.max(...cells.map(({ y }) => y)) + 1,
+    right: Math.max(...cells.map(({ x }) => x)) + 1,
+  };
+}
+
+function headRows(banner) {
+  const cells = banner.cells.flatMap((row, y) =>
+    row.flatMap((cell, x) =>
+      cell.layer === "head" ? [{ ...cell, x, y }] : [],
+    ),
+  );
+  const left = Math.min(...cells.map(({ x }) => x));
+  const right = Math.max(...cells.map(({ x }) => x));
+  const top = Math.min(...cells.map(({ y }) => y));
+  const bottom = Math.max(...cells.map(({ y }) => y));
+  return Array.from({ length: bottom - top + 1 }, (_, row) =>
+    Array.from(
+      { length: right - left + 1 },
+      (_, column) =>
+        cells.find(({ x, y }) => x === left + column && y === top + row)
+          ?.char ?? " ",
+    )
+      .join("")
+      .trimEnd(),
+  );
+}
+
+const EXPECTED_BUZZ_TERM = [
+  "██                                             ██",
+  "██▄▄▄     ██  ██    ██████    ██████          █████      ▄███▄    ██ ▄██    ██▄██▄██",
+  "██▀▀██    ██  ██       ▄██       ▄██           ██       ██▄▄▄█    ███▀▀     ██ ██ ██",
+  "██  ██    ██  ██     ▄██▀      ▄██▀            ██       ██        ██        ██ ██ ██",
+  "██████    ▀█████    ██████    ██████            ███      ▀███▀    ██        ██ ██ ██",
+];
+
 test("builds the amended four-layer Buzz Term composite", () => {
   const banner = buildTerminalBanner(183, 69, 17 / 8.4);
   assert.ok(banner);
@@ -22,16 +66,33 @@ test("builds the amended four-layer Buzz Term composite", () => {
   assert.equal(Math.min(...sweep), 0);
   assert.equal(Math.max(...sweep), 1);
   assert.ok(head.every((cell) => cell.layer === "head"));
-  const { top, left, bottom, right } = banner.reserved;
+  const { top, left, bottom, right } = frameBounds(banner);
   assert.equal(banner.cells[top][left].layer, "bevel_hi");
   assert.equal(banner.cells[bottom - 1][right - 1].layer, "bevel_lo");
-  assert.match(
-    seen
-      .get("head")
-      .map((cell) => cell.char)
-      .join(""),
-    /█/,
-  );
+  assert.deepEqual(headRows(banner), EXPECTED_BUZZ_TERM);
+});
+
+test("requires every frame emitter independently", () => {
+  const banner = buildTerminalBanner(183, 69, 17 / 8.4);
+  assert.ok(banner);
+  const { top, left, bottom, right } = frameBounds(banner);
+
+  for (let x = left; x < right; x += 1)
+    assert.equal(banner.cells[top][x].layer, "bevel_hi", `top_row:${x}`);
+  for (let y = top + 1; y < bottom - 1; y += 1) {
+    assert.equal(banner.cells[y][left].layer, "bevel_hi", `left_rail:${y}`);
+    assert.equal(
+      banner.cells[y][right - 1].layer,
+      "bevel_lo",
+      `right_rail:${y}`,
+    );
+  }
+  for (let x = left; x < right; x += 1)
+    assert.equal(
+      banner.cells[bottom - 1][x].layer,
+      "bevel_lo",
+      `bottom_row:${x}`,
+    );
 });
 
 test("emits complete hexagons only and fades per ray", () => {
@@ -41,18 +102,6 @@ test("emits complete hexagons only and fades per ray", () => {
   assert.equal(field.length % 8, 0);
   assert.ok(field.some((cell) => cell.t < 0.1));
   assert.ok(field.some((cell) => cell.t > 0.5));
-});
-
-test("safe mode replaces ambiguous frame rails without changing geometry", () => {
-  const ink = buildTerminalBanner(183, 69, 17 / 8.4, false);
-  const safe = buildTerminalBanner(183, 69, 17 / 8.4, true);
-  assert.ok(ink && safe);
-  assert.deepEqual(ink.reserved, safe.reserved);
-  assert.ok(ink.cells.flat().some((cell) => cell.char === "▌"));
-  assert.equal(
-    safe.cells.flat().some((cell) => cell.char === "▌"),
-    false,
-  );
 });
 
 test("declines viewports too small for the complete wordmark", () => {

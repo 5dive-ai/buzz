@@ -7,7 +7,6 @@ import {
   encodePaste,
   encodeTerminalKey,
   reduceHandoff,
-  updateWelcomeForOutput,
 } from "./terminalState.ts";
 
 test("ownership changes on completed chord, never key-down or repeat", () => {
@@ -95,22 +94,4 @@ test("pixel scrolling retains fractional lines in both directions", () => {
   result = accumulateScrollLines(result.state, -12, 10);
   assert.equal(result.lines, -1);
   assert.equal(result.state.remainderPx, -1);
-});
-
-test("welcome survives an ordinary prompt outside its reserved rectangle", () => {
-  const welcome = {
-    visible: true,
-    reserved: { top: 4, left: 10, bottom: 10, right: 40 },
-  };
-  assert.equal(
-    updateWelcomeForOutput(welcome, [{ top: 0, left: 0, bottom: 1, right: 20 }])
-      .visible,
-    true,
-  );
-  assert.equal(
-    updateWelcomeForOutput(welcome, [
-      { top: 9, left: 39, bottom: 11, right: 42 },
-    ]).visible,
-    false,
-  );
 });

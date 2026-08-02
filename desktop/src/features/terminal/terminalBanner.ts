@@ -8,12 +8,6 @@ export type TerminalBannerCell = Readonly<{
 
 export type TerminalBanner = Readonly<{
   cells: readonly (readonly TerminalBannerCell[])[];
-  reserved: Readonly<{
-    top: number;
-    left: number;
-    bottom: number;
-    right: number;
-  }>;
 }>;
 
 const HEX = [
@@ -48,21 +42,26 @@ const INK_FRAME = {
   left: "▌",
   right: "▐",
 } as const;
-const SAFE_FRAME = {
-  topLeft: "▛",
-  topRight: "▜",
-  bottomLeft: "▙",
-  bottomRight: "▟",
-  top: "░",
-  bottom: "░",
-  left: "▐",
-  right: "▐",
-} as const;
 const LAYERS: readonly TerminalBannerLayer[] = [
   "field",
   "head",
   "bevel_hi",
   "bevel_lo",
+];
+type TerminalBannerEmitter =
+  | "field"
+  | "top_row"
+  | "left_rail"
+  | "right_rail"
+  | "bottom_row"
+  | "wordmark";
+const EMITTERS: readonly TerminalBannerEmitter[] = [
+  "field",
+  "top_row",
+  "left_rail",
+  "right_rail",
+  "bottom_row",
+  "wordmark",
 ];
 
 function trimRight(value: string): string {
@@ -123,7 +122,6 @@ export function buildTerminalBanner(
   columns: number,
   rows: number,
   cellAspect: number,
-  safe = false,
 ): TerminalBanner | null {
   const mark = fitWordmark(columns - 10);
   if (!mark || rows < mark.length + 6) return null;
@@ -142,15 +140,19 @@ export function buildTerminalBanner(
   const grid: TerminalBannerCell[][] = Array.from({ length: rows }, () =>
     Array.from({ length: columns }, () => ({ char: " ", t: 0 })),
   );
+  const emitted = new Set<TerminalBannerEmitter>();
   const put = (
     y: number,
     x: number,
     char: string,
     layer: TerminalBannerLayer,
     t = 0,
+    emitter?: TerminalBannerEmitter,
   ) => {
-    if (y >= 0 && y < rows && x >= 0 && x < columns)
+    if (y >= 0 && y < rows && x >= 0 && x < columns) {
       grid[y][x] = { char, layer, t };
+      if (emitter) emitted.add(emitter);
+    }
   };
 
   const halfWidth = frameWidth / 2;
@@ -190,7 +192,7 @@ export function buildTerminalBanner(
     )
       continue;
     for (const [offsetY, offsetX, char] of HEX)
-      put(hex.y + offsetY, hex.x + offsetX, char, "field", ray * ray);
+      put(hex.y + offsetY, hex.x + offsetX, char, "field", ray * ray, "field");
   }
 
   for (
@@ -206,23 +208,39 @@ export function buildTerminalBanner(
       grid[y][x] = { char: " ", t: 0 };
   }
 
-  const frame = safe ? SAFE_FRAME : INK_FRAME;
-  put(top, left, frame.topLeft, "bevel_hi");
+  const frame = INK_FRAME;
+  put(top, left, frame.topLeft, "bevel_hi", 0, "top_row");
   for (let x = 0; x < innerWidth; x += 1)
-    put(top, left + x + 1, frame.top, "bevel_hi");
-  put(top, left + frameWidth - 1, frame.topRight, "bevel_hi");
+    put(top, left + x + 1, frame.top, "bevel_hi", 0, "top_row");
+  put(top, left + frameWidth - 1, frame.topRight, "bevel_hi", 0, "top_row");
   for (let y = top + 1; y < top + frameHeight - 1; y += 1) {
-    put(y, left, frame.left, "bevel_hi");
-    put(y, left + frameWidth - 1, frame.right, "bevel_lo");
+    put(y, left, frame.left, "bevel_hi", 0, "left_rail");
+    put(y, left + frameWidth - 1, frame.right, "bevel_lo", 0, "right_rail");
   }
-  put(top + frameHeight - 1, left, frame.bottomLeft, "bevel_lo");
+  put(
+    top + frameHeight - 1,
+    left,
+    frame.bottomLeft,
+    "bevel_lo",
+    0,
+    "bottom_row",
+  );
   for (let x = 0; x < innerWidth; x += 1)
-    put(top + frameHeight - 1, left + x + 1, frame.bottom, "bevel_lo");
+    put(
+      top + frameHeight - 1,
+      left + x + 1,
+      frame.bottom,
+      "bevel_lo",
+      0,
+      "bottom_row",
+    );
   put(
     top + frameHeight - 1,
     left + frameWidth - 1,
     frame.bottomRight,
     "bevel_lo",
+    0,
+    "bottom_row",
   );
 
   const markLeft = left + Math.floor((frameWidth - width) / 2);
@@ -241,6 +259,7 @@ export function buildTerminalBanner(
       cell.char,
       "head",
       (cell.x - minX) / span,
+      "wordmark",
     );
 
   const seen = new Map<TerminalBannerLayer, number[]>();
@@ -249,16 +268,9 @@ export function buildTerminalBanner(
       if (cell.layer)
         seen.set(cell.layer, [...(seen.get(cell.layer) ?? []), cell.t]);
   if (LAYERS.some((layer) => !seen.has(layer))) return null;
+  if (EMITTERS.some((emitter) => !emitted.has(emitter))) return null;
   const sweep = seen.get("head") ?? [];
   if (Math.min(...sweep) !== 0 || Math.max(...sweep) !== 1) return null;
 
-  return {
-    cells: grid,
-    reserved: {
-      top,
-      left,
-      bottom: top + frameHeight,
-      right: left + frameWidth,
-    },
-  };
+  return { cells: grid };
 }

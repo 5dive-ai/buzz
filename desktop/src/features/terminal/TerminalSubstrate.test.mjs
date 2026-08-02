@@ -50,7 +50,19 @@ after(() => dom.window.close());
 beforeEach(() => {
   cleanup?.();
   dom.window.localStorage.clear();
+  dom.window.HTMLCanvasElement.prototype.getBoundingClientRect = () => ({
+    bottom: 782,
+    height: 782,
+    left: 0,
+    right: 940.8,
+    top: 0,
+    width: 940.8,
+    x: 0,
+    y: 0,
+    toJSON() {},
+  });
   dom.window.HTMLCanvasElement.prototype.getContext = () => ({
+    clearRect() {},
     fillRect() {},
     fillStyle: "",
     fillText() {},
@@ -81,7 +93,7 @@ function fixture(overrides = {}) {
     sessions: [{ active: true, closing: false, id: "one", title: "SHELL" }],
     ...overrides,
   };
-  const view = render(
+  const renderTree = (nextProps) =>
     createElement(
       ThemeProvider,
       null,
@@ -89,10 +101,17 @@ function fixture(overrides = {}) {
         className: "buzz-huddle-app-surface",
         tabIndex: -1,
       }),
-      createElement(TerminalSubstrate, props),
-    ),
-  );
-  return { calls, props, view };
+      createElement(TerminalSubstrate, nextProps),
+    );
+  const view = render(renderTree(props));
+  return {
+    calls,
+    props,
+    view,
+    rerender(nextOverrides) {
+      view.rerender(renderTree({ ...props, ...nextOverrides }));
+    },
+  };
 }
 
 async function ready(view) {
@@ -136,62 +155,81 @@ test("mounted IME paths neither toggle nor emit preedit text", async () => {
   assert.deepEqual(calls.input, ["か"]);
 });
 
-test("first active PTY output dismisses the welcome overlay", async () => {
-  const baseFrame = {
-    cursor: { column: 0, line: 0, visible: false },
-    full: false,
-    rows: [
-      {
-        line: 0,
-        spans: [
-          {
-            style: { fg: 0, bg: 0, flags: 0 },
-            clusters: [{ column: 0, text: "$", width: 1 }],
-          },
-        ],
-      },
-      {
-        line: 8,
-        spans: [
-          {
-            style: { fg: 0, bg: 0, flags: 0 },
-            clusters: [{ column: 70, text: "x", width: 1 }],
-          },
-        ],
-      },
-    ],
-    viewport: { columns: 80, generation: 1, screenLines: 24 },
-  };
-  const { view } = fixture({ frame: baseFrame });
-  await ready(view);
-  await waitFor(() =>
-    assert.equal(view.container.querySelector(".buzz-terminal-welcome"), null),
-  );
+const EMPTY_FRAME = {
+  cursor: { column: 0, line: 0, visible: false },
+  full: false,
+  rows: [],
+  viewport: { columns: 112, generation: 1, screenLines: 46 },
+};
 
-  cleanup();
-  const intersecting = fixture({
-    frame: {
-      ...baseFrame,
-      rows: [
+const VISIBLE_FRAME = {
+  ...EMPTY_FRAME,
+  viewport: { ...EMPTY_FRAME.viewport, generation: 2 },
+  rows: [
+    {
+      line: 0,
+      spans: [
         {
-          line: 8,
-          spans: [
-            {
-              style: { fg: 0, bg: 0, flags: 0 },
-              clusters: [{ column: 30, text: "x", width: 1 }],
-            },
-          ],
+          style: { fg: 0, bg: 0, flags: 0 },
+          clusters: [{ column: 0, text: "$", width: 1 }],
         },
       ],
     },
-  });
-  await ready(intersecting.view);
+  ],
+};
+
+async function expectWelcome(view, present) {
   await waitFor(() =>
-    assert.equal(
-      intersecting.view.container.querySelector(".buzz-terminal-welcome"),
-      null,
-    ),
+    present
+      ? assert.ok(view.container.querySelector(".buzz-terminal-welcome"))
+      : assert.equal(
+          view.container.querySelector(".buzz-terminal-welcome"),
+          null,
+        ),
   );
+}
+
+test("non-empty output from the active PTY dismisses the welcome overlay", async () => {
+  const subject = fixture({ frame: EMPTY_FRAME });
+  await ready(subject.view);
+  await expectWelcome(subject.view, true);
+
+  subject.rerender({ frame: VISIBLE_FRAME });
+  await expectWelcome(subject.view, false);
+});
+
+test("empty active output keeps the welcome overlay", async () => {
+  const subject = fixture({ frame: EMPTY_FRAME });
+  await ready(subject.view);
+  await expectWelcome(subject.view, true);
+
+  subject.rerender({
+    frame: {
+      ...EMPTY_FRAME,
+      viewport: { ...EMPTY_FRAME.viewport, generation: 2 },
+    },
+  });
+  await expectWelcome(subject.view, true);
+});
+
+test("non-empty output from an inactive PTY keeps the welcome overlay", async () => {
+  const subject = fixture({
+    sessionFrames: [{ frame: EMPTY_FRAME, sessionId: "one" }],
+    sessions: [
+      { active: true, closing: false, id: "one", title: "SHELL" },
+      { active: false, closing: false, id: "two", title: "LOG" },
+    ],
+  });
+  await ready(subject.view);
+  await expectWelcome(subject.view, true);
+
+  subject.rerender({
+    sessionFrames: [
+      { frame: EMPTY_FRAME, sessionId: "one" },
+      { frame: VISIBLE_FRAME, sessionId: "two" },
+    ],
+  });
+  await expectWelcome(subject.view, true);
 });
 
 test("mounted wheel path accumulates fractional lines per active session", async () => {

@@ -115,30 +115,3 @@ export function accumulateScrollLines(
     lines,
   };
 }
-
-export type Rect = { top: number; left: number; bottom: number; right: number };
-
-export function rectsIntersect(a: Rect, b: Rect): boolean {
-  return !(
-    a.right <= b.left ||
-    b.right <= a.left ||
-    a.bottom <= b.top ||
-    b.bottom <= a.top
-  );
-}
-
-export type WelcomeState = {
-  visible: boolean;
-  reserved: Rect | null;
-};
-
-export function updateWelcomeForOutput(
-  state: WelcomeState,
-  changed: readonly Rect[],
-): WelcomeState {
-  const reserved = state.reserved;
-  if (!state.visible || !reserved) return state;
-  return changed.some((rect) => rectsIntersect(rect, reserved))
-    ? { ...state, visible: false }
-    : state;
-}

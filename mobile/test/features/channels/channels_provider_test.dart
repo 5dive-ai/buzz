@@ -132,6 +132,65 @@ void main() {
     expect(discoveryFilters.last.extensions['before_id'], firstPage.last.id);
   });
 
+  test('stops discovery when the relay repeats a full page', () async {
+    final repeatedPage = List.generate(
+      500,
+      (index) => _meta(
+        id: 'repeated-channel-$index',
+        name: 'repeated-$index',
+        createdAt: 10,
+      ),
+    );
+    final session = _FakeRelaySession(
+      memberships: const [],
+      metadataPages: [repeatedPage],
+      repeatLastMetadataPage: true,
+      maxMetadataPageRequests: 2,
+    );
+    final container = _buildContainer(session: session);
+    addTearDown(container.dispose);
+
+    final channels = await container.read(channelsProvider.future);
+
+    expect(channels, hasLength(500));
+    final discoveryFilters = session.historyFilters
+        .where(
+          (filter) =>
+              filter.kinds.length == 1 &&
+              filter.kinds.single == 39000 &&
+              !filter.tags.containsKey('#d'),
+        )
+        .toList();
+    expect(discoveryFilters, hasLength(2));
+  });
+
+  test('fails loudly when discovery exceeds its iteration cap', () async {
+    final session = _FakeRelaySession(
+      memberships: const [],
+      metadataPageBuilder: (pageIndex) => List.generate(
+        500,
+        (eventIndex) => _meta(
+          id: 'channel-$pageIndex-$eventIndex',
+          name: 'channel-$pageIndex-$eventIndex',
+          createdAt: 1000 - pageIndex,
+        ),
+      ),
+    );
+    final container = _buildContainer(session: session);
+    addTearDown(container.dispose);
+
+    await expectLater(
+      container.read(channelsProvider.future),
+      throwsA(
+        isA<StateError>().having(
+          (error) => error.message,
+          'message',
+          contains('Channel discovery exceeded'),
+        ),
+      ),
+    );
+  });
+
   test('deduplicates joined channels from open-channel discovery', () async {
     final session = _FakeRelaySession(
       memberships: [_membership(_channelA, myPk)],
@@ -536,6 +595,9 @@ class _FakeRelaySession extends RelaySessionNotifier {
     required this.memberships,
     this.metadata = const [],
     this.metadataPages,
+    this.metadataPageBuilder,
+    this.repeatLastMetadataPage = false,
+    this.maxMetadataPageRequests,
     this.hiddenDmEvents = const [],
     this.membershipFailures = 0,
   });
@@ -543,6 +605,9 @@ class _FakeRelaySession extends RelaySessionNotifier {
   List<NostrEvent> memberships;
   List<NostrEvent> metadata;
   final List<List<NostrEvent>>? metadataPages;
+  final List<NostrEvent> Function(int pageIndex)? metadataPageBuilder;
+  final bool repeatLastMetadataPage;
+  final int? maxMetadataPageRequests;
   final List<NostrEvent> hiddenDmEvents;
   int membershipFailures;
   int _metadataPageIndex = 0;
@@ -585,10 +650,24 @@ class _FakeRelaySession extends RelaySessionNotifier {
       // fake to pre-filter them.
       final ids = filter.tags['#d']?.toSet();
       if (ids == null) {
+        final requestIndex = _metadataPageIndex++;
+        final maxRequests = maxMetadataPageRequests;
+        if (maxRequests != null && requestIndex >= maxRequests) {
+          throw StateError(
+            'Unexpected discovery page request ${requestIndex + 1}',
+          );
+        }
+        final builder = metadataPageBuilder;
+        if (builder != null) return List.of(builder(requestIndex));
         final pages = metadataPages;
         if (pages != null) {
-          if (_metadataPageIndex >= pages.length) return const [];
-          return List.of(pages[_metadataPageIndex++]);
+          if (requestIndex < pages.length) {
+            return List.of(pages[requestIndex]);
+          }
+          if (repeatLastMetadataPage && pages.isNotEmpty) {
+            return List.of(pages.last);
+          }
+          return const [];
         }
         return List.of(metadata);
       }

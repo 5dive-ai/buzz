@@ -232,7 +232,13 @@ pub const MAX_LIVE_SESSIONS: usize = 20;
 /// drained. Join the reader first and every tab close pays that, on the arm
 /// where the user is already waiting.
 pub trait DrainingReader {
-    /// Stops consuming and releases the reader. Called *after* reap.
+    /// Detach parser work and enter raw-drain mode before child termination.
+    fn begin_closing(&self);
+
+    /// Wake a reader that remains blocked after the child has been reaped.
+    fn stop(&self);
+
+    /// Releases the reader thread. Called only after [`DrainingReader::stop`].
     fn join(self: Box<Self>);
 }
 
@@ -249,11 +255,13 @@ pub fn shutdown_draining(
     child: &mut Box<dyn Child + Send + Sync>,
     reader: Box<dyn DrainingReader>,
 ) -> io::Result<Shutdown> {
+    reader.begin_closing();
     // Terminate and reap with the reader still running, so the child never
     // blocks in a tty write while we are waiting on it.
     let outcome = shutdown(child);
-    // Unconditional: the reader must be released whether or not the shutdown
-    // reported an error, or a failed close leaks the thread and its fd.
+    // Unconditional: wake and release the reader whether or not shutdown
+    // reported an error. EOF may already have ended it; stop is idempotent.
+    reader.stop();
     reader.join();
     outcome
 }

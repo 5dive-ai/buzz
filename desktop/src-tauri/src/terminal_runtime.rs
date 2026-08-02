@@ -1,6 +1,7 @@
 //! Rust-owned PTY sessions and the typed Tauri transport for Buzz Substrate.
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -202,10 +203,23 @@ fn wire_publication(publication: Publication) -> Result<FrameMessage> {
     })
 }
 
-struct ReaderThread(Option<JoinHandle<()>>);
+struct ReaderThread {
+    handle: Option<JoinHandle<()>>,
+    terminal: Arc<SharedTerminal>,
+    stopping: Arc<AtomicBool>,
+}
+
 impl buzz_terminal::lifecycle::DrainingReader for ReaderThread {
+    fn begin_closing(&self) {
+        self.terminal.begin_closing();
+    }
+
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+    }
+
     fn join(mut self: Box<Self>) {
-        if let Some(handle) = self.0.take() {
+        if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
@@ -253,7 +267,12 @@ impl Session {
         if let Ok(mut channel) = self.channel.lock() {
             *channel = None;
         }
-        // The slave closes on child reap; the reader continues draining until then.
+        // Publication is detached before the reader enters close mode; the
+        // lifecycle helper then abandons parser work and keeps raw-draining
+        // through child termination and reap.
+        if let Ok(mut publisher) = self.publisher.lock() {
+            publisher.close();
+        }
         if let Some(reader) = self.reader.take() {
             #[cfg(unix)]
             {
@@ -261,12 +280,13 @@ impl Session {
             }
             #[cfg(not(unix))]
             {
+                reader.begin_closing();
                 let _ = self.child.kill();
                 let _ = self.child.wait();
+                reader.stop();
                 reader.join();
             }
         }
-        self.master.take();
     }
 }
 
@@ -465,6 +485,8 @@ pub(crate) fn terminal_attach(
     let reader_terminal = Arc::clone(&terminal);
     let reader_publisher = Arc::clone(&publisher);
     let reader_channel = Arc::clone(&channel);
+    let reader_stopping = Arc::new(AtomicBool::new(false));
+    let thread_stopping = Arc::clone(&reader_stopping);
     let reader_handle = std::thread::spawn(move || {
         let mut buffer = [0u8; 16 * 1024];
         let mut encoder = buzz_terminal::damage::Encoder::new();
@@ -474,7 +496,19 @@ pub(crate) fn terminal_attach(
                 Ok(0) | Err(_) => break,
                 Ok(count) => count,
             };
-            reader_terminal.feed(&buffer[..count]);
+            if thread_stopping.load(Ordering::Acquire) {
+                break;
+            }
+            if reader_terminal.is_closing() {
+                continue;
+            }
+            let mut more = reader_terminal.feed(&buffer[..count]);
+            while more && !reader_terminal.is_closing() {
+                more = reader_terminal.drain();
+            }
+            if reader_terminal.is_closing() {
+                continue;
+            }
             let needs_snapshot = reader_publisher
                 .lock()
                 .map(|publisher| publisher.requires_snapshot())
@@ -527,12 +561,16 @@ pub(crate) fn terminal_attach(
         .map_err(|_| "terminal snapshot rejected".to_string())?;
     let session = Session {
         id,
-        terminal,
+        terminal: Arc::clone(&terminal),
         master: Some(pair.master),
         writer,
         pty_size: current_pty_size,
         child,
-        reader: Some(Box::new(ReaderThread(Some(reader_handle)))),
+        reader: Some(Box::new(ReaderThread {
+            handle: Some(reader_handle),
+            terminal: Arc::clone(&terminal),
+            stopping: reader_stopping,
+        })),
         publisher,
         channel,
     };

@@ -186,6 +186,11 @@ impl FramePublisher {
         }
     }
 
+    /// Permanently detach publication as the session begins closing.
+    pub(crate) fn close(&mut self) {
+        self.subscription = None;
+    }
+
     fn require_current_snapshot(&self, frame: &Frame) -> Result<(), OfferError> {
         if frame.viewport == self.applied && frame.full {
             Ok(())

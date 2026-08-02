@@ -430,7 +430,8 @@ fn reader_drains_through_termination_and_reap() {
 
     let after_close = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let closing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reader = RecordingReader::spawn(&pair, after_close.clone(), closing.clone());
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader = RecordingReader::spawn(&pair, after_close.clone(), closing.clone(), order.clone());
 
     // Let the child get well ahead of the reader before we touch anything.
     assert!(
@@ -461,6 +462,11 @@ fn reader_drains_through_termination_and_reap() {
          period: the child was blocked writing to an undrained master rather \
          than exiting on SIGTERM"
     );
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["begin_closing", "stop", "join"],
+        "reader close must begin before termination and stop/join only after reap"
+    );
 }
 
 /// Spawns a child that floods the PTY without pause.
@@ -478,6 +484,7 @@ fn spawn_noisy(pair: &PtyPair) -> Box<dyn Child + Send + Sync> {
 struct RecordingReader {
     total: std::sync::Arc<std::sync::atomic::AtomicU64>,
     handle: std::thread::JoinHandle<()>,
+    order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
 impl RecordingReader {
@@ -485,6 +492,7 @@ impl RecordingReader {
         pair: &PtyPair,
         after_close: std::sync::Arc<std::sync::atomic::AtomicU64>,
         closing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     ) -> Self {
         let mut reader = pair.master.try_clone_reader().expect("reader");
         let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -502,7 +510,11 @@ impl RecordingReader {
                 }
             }
         });
-        Self { total, handle }
+        Self {
+            total,
+            handle,
+            order,
+        }
     }
 
     fn total_bytes(&self) -> u64 {
@@ -511,7 +523,16 @@ impl RecordingReader {
 }
 
 impl DrainingReader for RecordingReader {
+    fn begin_closing(&self) {
+        self.order.lock().unwrap().push("begin_closing");
+    }
+
+    fn stop(&self) {
+        self.order.lock().unwrap().push("stop");
+    }
+
     fn join(self: Box<Self>) {
+        self.order.lock().unwrap().push("join");
         // Bounded, and that is the whole point. The read loop ends when the
         // master reports EOF, which only happens once the reaped child has
         // released the slave -- so joining *before* termination blocks

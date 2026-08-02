@@ -14,7 +14,7 @@
 //! metered separately: pooling them would let the reader's millions of fast
 //! acquires dilute the renderer's tail into a false pass.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use alacritty_terminal::sync::FairMutex;
@@ -126,6 +126,7 @@ pub struct SharedTerminal {
     term: FairMutex<Terminal>,
     reader: AcquireMeter,
     renderer: AcquireMeter,
+    closing: AtomicBool,
 }
 
 impl SharedTerminal {
@@ -134,6 +135,7 @@ impl SharedTerminal {
             term: FairMutex::new(term),
             reader: AcquireMeter::default(),
             renderer: AcquireMeter::default(),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -156,13 +158,23 @@ impl SharedTerminal {
     /// the whole buffer under one acquisition is what an unbounded hold *is*,
     /// so it is not offered here.
     pub fn feed(&self, bytes: &[u8]) -> bool {
-        self.acquire(&self.reader).feed(bytes)
+        let mut term = self.acquire(&self.reader);
+        if self.closing.load(Ordering::Acquire) {
+            false
+        } else {
+            term.feed(bytes)
+        }
     }
 
     /// Parse more of the pending tail under a fresh acquisition. Reader
     /// plane. Returns whether any remains.
     pub fn drain(&self) -> bool {
-        self.acquire(&self.reader).drain()
+        let mut term = self.acquire(&self.reader);
+        if self.closing.load(Ordering::Acquire) {
+            false
+        } else {
+            term.drain()
+        }
     }
 
     /// Feed and pump to completion, re-acquiring between slices.
@@ -171,6 +183,17 @@ impl SharedTerminal {
         while more {
             more = self.drain();
         }
+    }
+
+    /// Atomically enter close mode and discard parser work. Subsequent PTY
+    /// bytes are raw-drained by the embedder and never reach callbacks.
+    pub fn begin_closing(&self) -> usize {
+        self.closing.store(true, Ordering::Release);
+        self.acquire(&self.reader).abandon_tail()
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
     }
 
     /// Sample damage and encode a frame. Renderer plane.
@@ -234,5 +257,33 @@ impl SharedTerminal {
         let guard = self.term.lock();
         meter.record(started.elapsed().as_micros() as u64);
         guard
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Fences, Size};
+
+    #[test]
+    fn closing_abandons_tail_and_permanently_refuses_parser_callbacks() {
+        let (terminal, _actions) = Terminal::new(Size::default(), Fences::ALL);
+        let shared = SharedTerminal::new(terminal);
+        let payload = b"\x1b#8".repeat(10_000);
+
+        assert!(shared.feed(&payload), "fixture must create parser tail");
+        let before = shared.lock().stats();
+        let abandoned = shared.begin_closing();
+        assert!(abandoned > 0, "close must abandon without draining first");
+        assert!(shared.is_closing());
+
+        assert!(!shared.feed(b"parser callback after close"));
+        assert!(!shared.drain());
+        let after = shared.lock().stats();
+        assert_eq!(after.completed_units, before.completed_units);
+        assert_eq!(
+            after.abandoned_bytes,
+            before.abandoned_bytes + abandoned as u64
+        );
     }
 }

@@ -82,6 +82,52 @@ fn identity_component(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+/// The harness's `allowlist` gate mode, spelled as the desktop serializes
+/// `RespondTo` (kebab-case) and as `buzz-acp`'s CLI parses it.
+const RESPOND_TO_ALLOWLIST: &str = "allowlist";
+
+/// Refuse a respond-to gate the harness will reject at config parse.
+///
+/// The local spawn path re-validates this before spawning — "doing it here
+/// means we never spawn a doomed process" (`runtime.rs:378`) — but the deploy
+/// path projects the record's fields straight through. Without this, a gate
+/// the harness refuses becomes a pod that exits 1 at startup; `restartPolicy:
+/// Never` turns that into `Terminated` → `Delete` → recreate, and each cycle
+/// leaves a Secret the in-call path never reaps (only a later deploy's orphan
+/// sweep does, at `ORPHAN_SECRET_MIN_AGE_SECS`). The user-visible ending is
+/// "startup not confirmed", indistinguishable from a slow cluster.
+///
+/// Mirrors `buzz-acp`'s own rules exactly (`config.rs:996-1004,629-641`),
+/// deliberately including their asymmetry: the allowlist is validated **only**
+/// in allowlist mode, and merely warned about otherwise. Validating it in
+/// every mode would refuse a deploy whose identical local spawn succeeds —
+/// and a stale list is already harmless here, since
+/// `BUZZ_ACP_RESPOND_TO_ALLOWLIST` is an authoritative key that tier 3 clears.
+fn validate_respond_to_gate(respond_to: &str, allowlist: Option<&[String]>) -> Result<(), String> {
+    if respond_to != RESPOND_TO_ALLOWLIST {
+        return Ok(());
+    }
+    let entries = allowlist.unwrap_or_default();
+    if entries.is_empty() {
+        return Err(format!(
+            "deploy refused: respond_to is {RESPOND_TO_ALLOWLIST:?} but the \
+             allowlist is empty — the harness refuses this at startup, so the \
+             pod would fail, be replaced, and leave a Secret behind on every \
+             attempt"
+        ));
+    }
+    for entry in entries {
+        let trimmed = entry.trim();
+        if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "deploy refused: invalid pubkey in respond_to_allowlist: \
+                 {entry:?} (must be exactly 64 hex characters)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Inputs the provider itself supplies to the authoritative tier.
 pub struct AuthoritativeInputs<'a> {
     /// The attempt's generation token — also the Secret's name suffix, so the
@@ -201,6 +247,7 @@ pub fn build_env(
     env.insert("BUZZ_ACP_MCP_COMMAND".into(), "buzz-dev-mcp".into());
 
     if let Some(respond_to) = agent.respond_to.as_deref().filter(|s| !s.is_empty()) {
+        validate_respond_to_gate(respond_to, agent.respond_to_allowlist.as_deref())?;
         env.insert("BUZZ_ACP_RESPOND_TO".into(), respond_to.to_string());
     }
     if let Some(list) = agent
@@ -530,6 +577,81 @@ mod tests {
             "BUZZ_ACP_RESPOND_TO_ALLOWLIST",
         ] {
             assert!(!env.contains_key(absent), "{absent} survived the clear");
+        }
+    }
+
+    /// A 64-hex pubkey, the only allowlist entry shape the harness accepts.
+    fn pubkey(fill: char) -> String {
+        std::iter::repeat_n(fill, 64).collect()
+    }
+
+    /// The gate the harness refuses first (`config.rs:996-1004`). Refusing it
+    /// here is the difference between one error message and an unbounded
+    /// fail-replace loop that leaves a Secret per attempt.
+    #[test]
+    fn allowlist_mode_with_an_empty_list_is_refused() {
+        for empty in [serde_json::json!([]), serde_json::Value::Null] {
+            let agent = payload_json(serde_json::json!({
+                "respond_to": "allowlist",
+                "respond_to_allowlist": empty,
+            }));
+            let err = build(&agent).unwrap_err();
+            assert!(
+                err.contains("the allowlist is empty"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// `config.rs:629-641` — each entry must be exactly 64 hex characters.
+    /// The rejects are the distinct ways to miss that: too short, right length
+    /// but not hex, empty, and one character short of valid.
+    #[test]
+    fn an_allowlist_entry_that_is_not_64_hex_is_refused() {
+        for bad in ["abc1234", &"z".repeat(64), "", &pubkey('a')[..63]] {
+            let agent = payload_json(serde_json::json!({
+                "respond_to": "allowlist",
+                "respond_to_allowlist": [pubkey('a'), bad],
+            }));
+            let err = build(&agent).unwrap_err();
+            assert!(
+                err.contains("must be exactly 64 hex characters"),
+                "{bad:?} was accepted; error was: {err}"
+            );
+        }
+    }
+
+    /// The positive control: the guard refuses bad gates, not every gate.
+    /// Without this, a validator that refused unconditionally would pass both
+    /// tests above.
+    #[test]
+    fn a_valid_allowlist_gate_is_accepted_and_comma_joined() {
+        let agent = payload_json(serde_json::json!({
+            "respond_to": "allowlist",
+            "respond_to_allowlist": [pubkey('a'), pubkey('b')],
+        }));
+        let env = build(&agent).unwrap();
+        assert_eq!(env["BUZZ_ACP_RESPOND_TO"], "allowlist");
+        assert_eq!(
+            env["BUZZ_ACP_RESPOND_TO_ALLOWLIST"],
+            format!("{},{}", pubkey('a'), pubkey('b'))
+        );
+    }
+
+    /// The harness validates the allowlist **only** in allowlist mode and
+    /// merely warns otherwise (`config.rs:1005-1010`). A stricter provider
+    /// would refuse a deploy whose identical local spawn succeeds, so this
+    /// pins the asymmetry rather than leaving it to look like an oversight.
+    #[test]
+    fn a_junk_allowlist_is_tolerated_outside_allowlist_mode() {
+        for mode in ["owner-only", "anyone"] {
+            let agent = payload_json(serde_json::json!({
+                "respond_to": mode,
+                "respond_to_allowlist": ["not-a-pubkey"],
+            }));
+            let env = build(&agent)
+                .unwrap_or_else(|e| panic!("{mode} with a stale list must deploy: {e}"));
+            assert_eq!(env["BUZZ_ACP_RESPOND_TO"], mode);
         }
     }
 }

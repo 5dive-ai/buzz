@@ -9,8 +9,6 @@ const _attachmentMenuItemSpacing = Grid.xxs;
 const _attachmentMenuIconSize = 24.0;
 const _attachmentMenuIconSlotWidth = 28.0;
 const _attachmentExpandedHeight = 372.0;
-const _tabletAttachmentCameraMaxHeight = 640.0;
-const _tabletShortestSideBreakpoint = 600.0;
 
 @immutable
 class _AttachmentMenuLayout {
@@ -172,17 +170,7 @@ class _AttachmentSurfacePanel extends HookWidget {
     return LayoutBuilder(
       builder: (context, constraints) {
         final expandedWidth = constraints.maxWidth;
-        final isTablet =
-            MediaQuery.sizeOf(context).shortestSide >=
-            _tabletShortestSideBreakpoint;
-        final expandedHeight =
-            visibleExpandedSurface == _AttachmentSurface.camera && isTablet
-            // Use the available chat-pane width rather than a fixed landscape
-            // height. On a tablet's three-pane layout this keeps the camera
-            // preview close to square, even though the pane itself is narrower
-            // than the full device width.
-            ? math.min(expandedWidth, _tabletAttachmentCameraMaxHeight)
-            : _attachmentExpandedHeight;
+        const expandedHeight = _attachmentExpandedHeight;
         final width =
             _attachmentMenuWidth +
             ((expandedWidth - _attachmentMenuWidth) * sizeProgress);

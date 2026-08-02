@@ -1402,7 +1402,7 @@ void main() {
       }
     });
 
-    testWidgets('uses a taller camera surface on tablet-width layouts', (
+    testWidgets('keeps the mobile camera surface geometry on tablet widths', (
       tester,
     ) async {
       final previousPlatform = debugDefaultTargetPlatformOverride;
@@ -1429,7 +1429,7 @@ void main() {
 
         expect(
           tester.getSize(find.byKey(const ValueKey('camera-preview'))).height,
-          640,
+          372,
         );
       } finally {
         debugDefaultTargetPlatformOverride = previousPlatform;

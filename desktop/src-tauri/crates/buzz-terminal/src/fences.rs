@@ -21,6 +21,116 @@ pub const SYNC_CAP: usize = 64 << 10;
 /// Max parser-visible bytes chargeable before the parser is rebuilt.
 pub const OSC_BUDGET: usize = 256 << 10;
 
+/// Max cost-weighted work one [`crate::reader::Feeder::drain`] may spend
+/// before returning, in cell-equivalents.
+///
+/// Derived, not chosen: measured worst-case density across the 2-D op sweep
+/// is 16.9 ns/work (`erase_chars` at N=1, 80x24 -- the cheapest real callback,
+/// where fixed dispatch cost dominates the single cell it touches), so a
+/// 16.67 ms frame is ~988_000 work units. This is a quarter of that. The
+/// remaining three quarters are headroom for lock acquisition, the counting
+/// wrapper's own bookkeeping, and platforms slower than the one measured;
+/// 16.9 ns/work is the max of a sample, not a proven ceiling, so it is not
+/// spent to the last unit.
+pub const WORK_BUDGET: u64 = 250_000;
+
+/// Bounds on how many bytes are handed to the parser at once.
+///
+/// The budget is checked *between* slices, so the slice is what actually
+/// bounds one lock hold, and a fixed byte count cannot do it: `ESC#8` is
+/// three bytes and costs a full grid, so 256 bytes of it is 1.6 ms at 200x50
+/// and 14 ms at 1600x50. [`slice_bytes`] therefore derives the size from the
+/// grid, and these two clamp it -- `MAX` at the throughput plateau (measured:
+/// plain-char parsing saturates by 64 bytes and is flat to 64 KiB), `MIN`
+/// where a slice stops being able to hold a whole escape sequence: 4 bytes
+/// covers `ESC#8` and `ESC c` intact, so the floor never splits the densest
+/// atoms across slices for no benefit. Measured throughput at the floor is
+/// ~74% of the plateau on plain text and ~77% on SGR, which is the price of
+/// bounding a grid whose worst atom exceeds the budget outright.
+pub const MIN_SLICE: usize = 4;
+pub const MAX_SLICE: usize = 256;
+
+/// Bytes to hand the parser at once on a `columns x lines` grid.
+///
+/// Sized against the **densest atom the grid admits**, so the bound holds on
+/// the first byte of a cold feeder for any payload: two bytes of `ESC c` buy
+/// [`max_atom_work`], which is the most work per byte upstream offers, and
+/// `budget / (atom / 2)` is the widest slice that cannot exceed one budget.
+///
+/// Deliberately *derived rather than learned*. An earlier version sized
+/// slices from the density of preceding slices, which is strictly worse where
+/// it matters: a fresh feeder has observed nothing, so its first slice is
+/// wide, and a first wide slice of RIS spends many budgets before anything
+/// looks. A bound that has to be taught is not a bound on the lesson.
+///
+/// [`MIN_SLICE`] floors it, and on any grid with real scrollback the floor is
+/// what binds -- RIS at the default 10k depth is worth more than the entire
+/// budget on its own, so no slice size can keep a drain inside the budget and
+/// the floor stops the arithmetic from asking for fractions of a byte. That
+/// residual is not hidden: it is exactly [`max_drain_work`], and it is the
+/// honest cost of an indivisible callback that upstream can be asked to make
+/// smaller only by not calling it.
+pub fn slice_bytes(columns: usize, lines: usize, scrollback: usize) -> usize {
+    let densest = (max_atom_work(columns, lines, scrollback) / 2).max(1);
+    ((WORK_BUDGET / densest) as usize).clamp(MIN_SLICE, MAX_SLICE)
+}
+
+/// Work the single worst uninterruptible callback can cost on this grid.
+///
+/// This is the irreducible overrun past [`WORK_BUDGET`]: no scheduler outside
+/// the parser can cut inside a callback, so a caller converting a work budget
+/// into a time bound must add it.
+///
+/// It is `columns` because [`crate::units::Counting`] terminates CBT at its
+/// first fixed point. Upstream's own loop is `N x columns` -- 82 ms for eight
+/// bytes at 1600 columns -- and clamping `N` to `columns` only brings that to
+/// `columns^2`, which at 1600 is 2.56M work, **10x the whole budget**: the
+/// atom, not the budget, would decide the bound. Stopping at the fixed point
+/// makes it `columns`, and the budget goes back to being the thing that sets
+/// the bound. Every other callback is priced at or below `cells`, which is
+/// larger, so this term never dominates.
+pub fn max_atom_work(columns: usize, lines: usize, scrollback: usize) -> u64 {
+    // RIS: both grids plus the primary's configured scrollback. This is the
+    // largest single callback by a wide margin -- 16x the budget at the
+    // default 10k depth -- and it is genuinely indivisible, so it is stated
+    // rather than smoothed. CBT, once terminated at its fixed point, is
+    // `columns` and never competes.
+    let ris = 2 * (columns * lines) as u64 + (scrollback * columns) as u64;
+    ris.max(columns as u64)
+}
+
+/// Upper bound on the work a single [`crate::reader::Feeder::drain`] can do.
+///
+/// Two irreducible terms on top of [`WORK_BUDGET`], and it is worth being
+/// exact about which is which, because I got this wrong first and the
+/// fixtures caught it:
+///
+/// * The budget is checked *between* slices, so a drain overshoots by up to
+///   one whole slice -- not one atom. [`slice_bytes`] keeps that under one
+///   budget wherever its derivation is unclamped.
+/// * A callback already running cannot be preempted. RIS at the default 10k
+///   scrollback is worth 16x the whole budget on its own, so on such a grid
+///   the floor binds and the overshoot is a few of those atoms. No scheduler
+///   outside the parser can fix that -- what it can do is *report* it, which
+///   is why this is a function callers can read rather than an assumption
+///   they inherit.
+pub fn max_drain_work(columns: usize, lines: usize, scrollback: usize) -> u64 {
+    let atom = max_atom_work(columns, lines, scrollback);
+    // A slice of N bytes holds at most N/2 of the densest atoms, and the
+    // budget is only consulted between slices, so a whole slice is the
+    // overshoot. Where the slice derivation is unclamped this is one budget;
+    // where MIN_SLICE binds, it is this.
+    WORK_BUDGET + (slice_bytes(columns, lines, scrollback) as u64 / 2).max(1) * atom
+}
+
+/// Max bytes that may sit unparsed before the reader must stop reading the
+/// PTY. Bounds the *queue*; [`WORK_BUDGET`] bounds only the lock hold.
+pub const TAIL_CAP: usize = 4 << 20;
+
+/// Depth at which a paused reader may resume. Strictly below [`TAIL_CAP`] so
+/// the reader does not flap between full and one-byte-below-full.
+pub const TAIL_RESUME: usize = 1 << 20;
+
 /// Which fences are active. Both on in production.
 ///
 /// The mutation law requires exercising each fence with the other **disabled**,
@@ -87,6 +197,37 @@ pub struct FenceStats {
     /// Parser-visible bytes charged against the F2 budget, cumulative across
     /// resets. Includes every flush route, not just directly-advanced input.
     pub charged_bytes: u64,
+    /// Parser units completed: one per `Handler` callback dispatched, which is
+    /// one per fully-parsed escape sequence or printed character.
+    ///
+    /// Separate from `charged_bytes` because they answer different questions
+    /// and can disagree by orders of magnitude: four bytes of `ESC#8` rewrite
+    /// the whole grid, four bytes of `ESC[m` set a flag. Bytes bound memory;
+    /// units are the proxy for time. See [`crate::units`].
+    pub completed_units: u64,
+    /// Cost-weighted work completed, in cell-equivalents: an O(cells) callback
+    /// charges `columns * lines`, an O(1) callback charges 1.
+    ///
+    /// Deliberately a second number rather than a replacement for
+    /// `completed_units`. They answer different questions -- "how many things
+    /// happened" versus "how much did they cost" -- and a stream of `ESC#8`
+    /// makes them disagree by four orders of magnitude, which is the entire
+    /// reason this fence exists.
+    pub completed_work: u64,
+    /// Deepest the unparsed tail has been, in bytes. The high-water mark
+    /// rather than the current depth, because the current depth is zero again
+    /// by the time a test looks at it.
+    pub max_pending: usize,
+    /// Times the tail was at or over [`TAIL_CAP`] at the end of a drain.
+    ///
+    /// Loud on purpose. Reaching the cap means the reader kept reading past
+    /// the point it was told to stop, so the queue bound is being held by
+    /// nothing; a silent cap would make that indistinguishable from a reader
+    /// that is obeying.
+    pub tail_breaches: u64,
+    /// Bytes discarded unparsed by [`crate::reader::Feeder::abandon_tail`].
+    /// Non-zero anywhere but session close is a bug that ate output.
+    pub abandoned_bytes: u64,
 }
 
 impl FenceStats {

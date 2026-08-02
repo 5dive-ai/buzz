@@ -45,7 +45,7 @@ fn grid(columns: usize, screen_lines: usize) -> Size {
 fn resize_forces_a_full_frame_at_the_new_width() {
     let (shared, _actions) = shared(size(40));
     let mut encoder = Encoder::new();
-    shared.feed(b"\x1b[2J\x1b[Hhello world\r\nsecond line\r\n");
+    shared.feed_fully(b"\x1b[2J\x1b[Hhello world\r\nsecond line\r\n");
 
     let first = shared.render(&mut encoder);
     assert!(first.full, "first frame after a fresh Term must be full");
@@ -100,7 +100,7 @@ fn resize_forces_a_full_frame_at_the_new_width() {
 fn identical_resize_is_inert() {
     let (shared, _actions) = shared(size(40));
     let mut encoder = Encoder::new();
-    shared.feed(b"hello");
+    shared.feed_fully(b"hello");
     shared.render(&mut encoder);
 
     let applied = shared.resize(size(40));
@@ -134,7 +134,7 @@ fn identical_resize_is_inert() {
 fn full_frame_after_height_resize_republishes_unchanged_rows() {
     let (shared, _actions) = shared(grid(40, 10));
     let mut encoder = Encoder::new();
-    shared.feed(b"\x1b[2J\x1b[Hhello world\r\nsecond line");
+    shared.feed_fully(b"\x1b[2J\x1b[Hhello world\r\nsecond line");
     let first = shared.render(&mut encoder);
     assert!(first.full);
     assert_eq!(first.rows.len(), 10);
@@ -173,7 +173,7 @@ fn full_frame_after_height_resize_republishes_unchanged_rows() {
 fn a_frame_is_stamped_with_the_grid_it_was_captured_on() {
     let (shared, _actions) = shared(grid(40, 10));
     let mut encoder = Encoder::new();
-    shared.feed(b"\x1b[2J\x1b[Hhello world");
+    shared.feed_fully(b"\x1b[2J\x1b[Hhello world");
 
     let in_flight = shared.render(&mut encoder);
     assert_eq!(in_flight.viewport.generation, 0);

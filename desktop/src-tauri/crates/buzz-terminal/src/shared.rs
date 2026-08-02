@@ -149,8 +149,28 @@ impl SharedTerminal {
     }
 
     /// Feed PTY output into the emulator. Reader plane.
-    pub fn feed(&self, bytes: &[u8]) {
-        self.acquire(&self.reader).feed(bytes);
+    ///
+    /// Returns whether a tail remains: one acquisition parses one work
+    /// budget, then **drops the lock** so the renderer can have it. The
+    /// caller pumps [`SharedTerminal::drain`] until it returns false. Doing
+    /// the whole buffer under one acquisition is what an unbounded hold *is*,
+    /// so it is not offered here.
+    pub fn feed(&self, bytes: &[u8]) -> bool {
+        self.acquire(&self.reader).feed(bytes)
+    }
+
+    /// Parse more of the pending tail under a fresh acquisition. Reader
+    /// plane. Returns whether any remains.
+    pub fn drain(&self) -> bool {
+        self.acquire(&self.reader).drain()
+    }
+
+    /// Feed and pump to completion, re-acquiring between slices.
+    pub fn feed_fully(&self, bytes: &[u8]) {
+        let mut more = self.feed(bytes);
+        while more {
+            more = self.drain();
+        }
     }
 
     /// Sample damage and encode a frame. Renderer plane.

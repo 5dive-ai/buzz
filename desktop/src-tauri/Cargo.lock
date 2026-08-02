@@ -1106,6 +1106,7 @@ dependencies = [
  "opus",
  "plist",
  "png 0.18.1",
+ "portable-pty",
  "regex",
  "reqwest 0.13.4",
  "rodio",

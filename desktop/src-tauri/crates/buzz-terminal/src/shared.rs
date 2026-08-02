@@ -199,6 +199,16 @@ impl SharedTerminal {
         self.acquire(&self.renderer)
     }
 
+    /// Modes the renderer/input boundary needs to report alongside frames.
+    pub fn input_modes(&self) -> (bool, bool) {
+        let term = self.acquire(&self.renderer);
+        let mode = term.term().mode();
+        (
+            mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+            mode.contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT),
+        )
+    }
+
     fn acquire(&self, meter: &AcquireMeter) -> MutexGuard<'_, Terminal> {
         let started = Instant::now();
         let guard = self.term.lock();

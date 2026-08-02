@@ -7,6 +7,8 @@
 //! renderer confirms that it knows the applied [`Viewport`].
 
 use buzz_terminal::{damage::Frame, Viewport};
+use std::fmt;
+
 use uuid::Uuid;
 
 /// A renderer attachment. Messages from an attachment that has been replaced
@@ -17,6 +19,18 @@ pub(crate) struct SubscriptionId(Uuid);
 impl SubscriptionId {
     pub(crate) fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        Uuid::parse_str(value)
+            .map(Self)
+            .map_err(|_| "invalid terminal subscription id".to_string())
+    }
+}
+
+impl fmt::Display for SubscriptionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 

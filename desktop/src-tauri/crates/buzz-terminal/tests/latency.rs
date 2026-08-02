@@ -107,6 +107,7 @@ fn measure(fences: Fences) -> buzz_terminal::AcquireStats {
 /// measurement includes the other arm's CPU load and the control's ratio
 /// becomes a race between two floods rather than a statement about F1.
 #[test]
+#[ignore = "native performance gate; run release-mode on a known-idle host"]
 fn g3_renderer_acquire_stays_within_frame_budget() {
     let fenced = measure(Fences::ALL);
     let p95 = fenced.percentile_micros(0.95);

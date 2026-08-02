@@ -202,6 +202,12 @@ desktop-tauri-check: _ensure-sidecar-stubs
 desktop-tauri-test: _ensure-sidecar-stubs
     cd desktop/src-tauri && cargo test --workspace
 
+# Run the native terminal latency gate explicitly on a known-idle host.
+# This is intentionally excluded from shared CI: scheduler contention makes a
+# wall-clock assertion flaky, and the release profile is the shipped shape.
+desktop-terminal-performance-test:
+    cargo test --manifest-path desktop/src-tauri/crates/buzz-terminal/Cargo.toml --release --test latency g3_renderer_acquire_stays_within_frame_budget -- --ignored --exact --nocapture
+
 # Verify compiled-flag behavior under both compile states (clean + internal).
 # Runs the observer_archive focused test twice with independently supplied
 # expected values; build.rs rerun-if-env-changed triggers recompilation.

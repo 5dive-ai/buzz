@@ -4,7 +4,7 @@ import { Outlet, useLocation } from "@tanstack/react-router";
 import { deriveShellRoute } from "@/app/AppShell.helpers";
 import { AppShellProvider } from "@/app/AppShellContext";
 import * as BuzzTheme from "@/app/BuzzThemeSurfaces";
-import { AppShellOverlays } from "@/app/AppShellOverlays";
+import { AppShellOverlays, TerminalBootstrap } from "@/app/AppShellOverlays";
 import { AppTopChrome } from "@/app/AppTopChrome";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useBackForwardControls } from "@/app/navigation/useBackForwardControls";
@@ -103,7 +103,6 @@ const LazySettingsScreen = React.lazy(async () => {
   const module = await import("@/features/settings/ui/SettingsScreen");
   return { default: module.SettingsScreen };
 });
-
 export function AppShell() {
   useWebviewZoomShortcuts();
   useTauriWindowDrag();
@@ -741,6 +740,7 @@ export function AppShell() {
                 className="buzz-huddle-shell relative h-dvh overflow-hidden overscroll-none"
                 data-huddle-open={isHuddleDrawerOpen}
               >
+                <TerminalBootstrap channelName={activeChannel?.name ?? null} />
                 <div
                   className={cn(
                     "buzz-huddle-app-surface z-10 flex min-h-0 flex-row overflow-hidden bg-background",

@@ -64,6 +64,21 @@ test("locks viewport rubber-band outside conversation scrollers", async ({
       deltaY: -120,
     }),
   ).resolves.toBe(false);
+
+  // Buzz Term consumes wheel gestures as custom scrollback rather than through
+  // a native scroll container. The viewport lock must leave that vertical
+  // gesture alone so the substrate's own handler can receive it.
+  await page.evaluate(() => {
+    const terminal = document.createElement("section");
+    terminal.dataset.terminalOwner = "buzz";
+    terminal.dataset.testid = "terminal-wheel-target";
+    document.body.append(terminal);
+  });
+  await expect(
+    dispatchWheelPrevented(page, '[data-testid="terminal-wheel-target"]', {
+      deltaY: -120,
+    }),
+  ).resolves.toBe(false);
 });
 
 test("locks horizontal viewport pan everywhere", async ({ page }) => {
@@ -90,6 +105,20 @@ test("locks horizontal viewport pan everywhere", async ({ page }) => {
     // too — there is no horizontal elastic affordance.
     await expect(
       dispatchWheelPrevented(page, '[data-testid="message-timeline"]', {
+        deltaX,
+      }),
+    ).resolves.toBe(true);
+  }
+
+  await page.evaluate(() => {
+    const terminal = document.createElement("section");
+    terminal.dataset.terminalOwner = "buzz";
+    terminal.dataset.testid = "terminal-wheel-target";
+    document.body.append(terminal);
+  });
+  for (const deltaX of [-120, 120]) {
+    await expect(
+      dispatchWheelPrevented(page, '[data-testid="terminal-wheel-target"]', {
         deltaX,
       }),
     ).resolves.toBe(true);

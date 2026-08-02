@@ -80,6 +80,35 @@ impl Listener {
     }
 }
 
+/// Resolve an emulator action that can be answered without renderer state.
+///
+/// Color queries deliberately return `None`: named/indexed colors resolve
+/// against the live theme, which this crate does not own.
+pub fn reply(
+    action: Action,
+    columns: u16,
+    rows: u16,
+    cell_width: u16,
+    cell_height: u16,
+) -> Option<String> {
+    match action {
+        Action::PtyWrite(text) => Some(text),
+        Action::SizeReply { format } => Some(format(WindowSize {
+            num_lines: rows,
+            num_cols: columns,
+            cell_width,
+            cell_height,
+        })),
+        // Palette values are renderer-owned. The transport must answer these
+        // only after it has a renderer palette, never invent one here.
+        Action::ColorReply { .. }
+        | Action::Title(_)
+        | Action::ResetTitle
+        | Action::Wakeup
+        | Action::Bell => None,
+    }
+}
+
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
         let action = match event {

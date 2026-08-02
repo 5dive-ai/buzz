@@ -130,3 +130,9 @@ pub fn login_argv0(shell: &str) -> String {
     let basename = shell.rsplit('/').next().unwrap_or(shell);
     format!("-{basename}")
 }
+
+/// Resolve the command shell on Windows from `ComSpec`, falling back to cmd.
+#[cfg(windows)]
+pub fn resolve_shell(shell_env: Option<&str>) -> String {
+    shell_env.unwrap_or("cmd.exe").to_owned()
+}

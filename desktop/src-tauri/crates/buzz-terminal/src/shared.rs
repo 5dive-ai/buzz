@@ -168,6 +168,24 @@ impl SharedTerminal {
         encoder.encode(raw)
     }
 
+    /// Copy the whole viewport for a subscriber that arrived mid-stream.
+    /// Renderer plane.
+    ///
+    /// Attach, reattach, and the successor side of a resize all need the
+    /// screen as it stands, not the next thing to change on it. Crucially this
+    /// leaves damage alone, so taking a snapshot for a newcomer cannot steal
+    /// the incumbent renderer's pending rows -- see [`damage::capture_all`].
+    ///
+    /// Costs a full grid copy under the lock, so call it on attach rather than
+    /// per frame.
+    pub fn snapshot(&self, encoder: &mut Encoder) -> Frame {
+        let raw = {
+            let mut term = self.acquire(&self.renderer);
+            damage::capture_all(&mut term)
+        };
+        encoder.encode(raw)
+    }
+
     /// Apply a coalesced resize. Renderer plane: this competes with the
     /// renderer for the same lock and can hold it for milliseconds.
     pub fn resize(&self, size: crate::Size) -> crate::Viewport {
@@ -179,6 +197,16 @@ impl SharedTerminal {
     /// that isn't the read loop competes with the renderer for the same lock.
     pub fn lock(&self) -> MutexGuard<'_, Terminal> {
         self.acquire(&self.renderer)
+    }
+
+    /// Modes the renderer/input boundary needs to report alongside frames.
+    pub fn input_modes(&self) -> (bool, bool) {
+        let term = self.acquire(&self.renderer);
+        let mode = term.term().mode();
+        (
+            mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE),
+            mode.contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT),
+        )
     }
 
     fn acquire(&self, meter: &AcquireMeter) -> MutexGuard<'_, Terminal> {

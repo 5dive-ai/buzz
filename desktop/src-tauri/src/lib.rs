@@ -32,6 +32,9 @@ mod reset;
 mod secret_store;
 mod shutdown;
 mod templates;
+mod terminal_runtime;
+#[cfg_attr(not(test), allow(dead_code))]
+mod terminal_transport;
 #[cfg(target_os = "macos")]
 mod tray_menu;
 mod util;
@@ -368,6 +371,7 @@ pub fn run() {
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
         .manage(commands::pairing::PairingHandle::new())
+        .manage(terminal_runtime::TerminalSessions::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
             #[cfg(target_os = "macos")]
@@ -663,6 +667,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            terminal_runtime::terminal_attach,
+            terminal_runtime::terminal_detach,
+            terminal_runtime::terminal_close,
+            terminal_runtime::terminal_input,
+            terminal_runtime::terminal_resize,
+            terminal_runtime::terminal_ack,
+            terminal_runtime::terminal_viewport_ready,
+            terminal_runtime::terminal_focus,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
             start_builderlab_login,

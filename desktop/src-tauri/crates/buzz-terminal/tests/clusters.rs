@@ -33,7 +33,7 @@ fn render(input: &str) -> (Vec<Span>, Receiver<Action>) {
     };
     let (term, actions) = Terminal::new(size, Fences::ALL);
     let shared = SharedTerminal::new(term);
-    shared.feed(input.as_bytes());
+    shared.feed_fully(input.as_bytes());
     let mut encoder = Encoder::new();
     let frame = shared.render(&mut encoder);
     let spans = frame
@@ -246,7 +246,7 @@ fn a_run_longer_than_u16_max_splits_rather_than_wrapping() {
     let shared = SharedTerminal::new(term);
     // One character is enough: the rest of the row is blank cells of the same
     // style, so the whole row is a single candidate run.
-    shared.feed(b"a");
+    shared.feed_fully(b"a");
     let mut encoder = Encoder::new();
     let frame = shared.render(&mut encoder);
 
@@ -297,7 +297,7 @@ fn wrapping_does_not_split_a_uniform_run() {
     let shared = SharedTerminal::new(term);
     // Six narrow cells in one style: five fill row 0 and set WRAPLINE on the
     // last of them, the sixth lands on row 1.
-    shared.feed(b"abcdef");
+    shared.feed_fully(b"abcdef");
     let mut encoder = Encoder::new();
     let frame = shared.render(&mut encoder);
 
@@ -327,7 +327,7 @@ fn leading_wide_glyph_after_wrap_is_positioned_from_column_zero() {
     let shared = SharedTerminal::new(term);
     // Four narrow cells fill 0..=3, leaving one column: the wide glyph cannot
     // fit and moves to the next row.
-    shared.feed("abcd\u{4E00}".as_bytes());
+    shared.feed_fully("abcd\u{4E00}".as_bytes());
     let mut encoder = Encoder::new();
     let frame = shared.render(&mut encoder);
 

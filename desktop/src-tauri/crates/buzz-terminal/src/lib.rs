@@ -14,6 +14,7 @@ pub mod path;
 pub mod reader;
 pub mod shared;
 pub mod shell;
+pub mod units;
 
 #[cfg(test)]
 mod context_tests;
@@ -109,7 +110,12 @@ impl Terminal {
         (
             Self {
                 term,
-                feeder: reader::Feeder::new(fences),
+                feeder: reader::Feeder::new(
+                    fences,
+                    size.columns,
+                    size.screen_lines,
+                    size.scrollback,
+                ),
                 size,
                 generation: 0,
             },
@@ -118,8 +124,53 @@ impl Terminal {
     }
 
     /// Feed PTY output through the fences into the emulator.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        self.feeder.feed(&mut self.term, bytes);
+    ///
+    /// Parses what one work budget affords and returns with the rest held as
+    /// a pending tail, so one call cannot hold the terminal for an unbounded
+    /// time. **The caller must pump [`Terminal::drain`] until it returns
+    /// false**, releasing the lock between calls; that is the whole point --
+    /// the tail exists to give the renderer a chance at the lock, not to defer
+    /// work indefinitely. [`Terminal::pending_bytes`] and
+    /// [`Terminal::tail_full`] tell the reader when to stop reading the PTY.
+    pub fn feed(&mut self, bytes: &[u8]) -> bool {
+        self.feeder.feed(&mut self.term, bytes)
+    }
+
+    /// Parse more of the pending tail. Returns whether any remains.
+    pub fn drain(&mut self) -> bool {
+        self.feeder.drain(&mut self.term);
+        self.feeder.pending_bytes() > 0
+    }
+
+    /// Feed and parse to completion, without the intervening lock releases.
+    ///
+    /// For tests and for callers with no renderer contending -- it reinstates
+    /// exactly the unbounded hold [`Terminal::feed`] exists to prevent, so it
+    /// is deliberately a separate name rather than a flag on `feed`.
+    pub fn feed_fully(&mut self, bytes: &[u8]) {
+        self.feed(bytes);
+        while self.drain() {}
+    }
+
+    /// Bytes accepted but not yet parsed.
+    pub fn pending_bytes(&self) -> usize {
+        self.feeder.pending_bytes()
+    }
+
+    /// Whether the tail is at its cap and the reader must stop reading.
+    pub fn tail_full(&self) -> bool {
+        self.feeder.tail_full()
+    }
+
+    /// Whether a paused reader may resume.
+    pub fn tail_drained(&self) -> bool {
+        self.feeder.tail_drained()
+    }
+
+    /// Discard the unparsed tail. Session close only -- see
+    /// [`reader::Feeder::abandon_tail`].
+    pub fn abandon_tail(&mut self) -> usize {
+        self.feeder.abandon_tail()
     }
 
     pub fn stats(&self) -> FenceStats {
@@ -170,6 +221,7 @@ impl Terminal {
             return self.viewport();
         }
         self.term.resize(size);
+        self.feeder.resize(size.columns, size.screen_lines);
         self.size = size;
         self.generation += 1;
         self.viewport()

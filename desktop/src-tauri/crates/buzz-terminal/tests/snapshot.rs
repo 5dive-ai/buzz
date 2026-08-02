@@ -49,7 +49,7 @@ fn visible_text(frame: &buzz_terminal::damage::Frame) -> Vec<String> {
 #[test]
 fn a_late_render_shows_only_the_next_change_but_a_snapshot_shows_the_screen() {
     let (shared, _actions) = terminal(20, 4);
-    shared.feed(b"first\r\nsecond\r\nthird");
+    shared.feed_fully(b"first\r\nsecond\r\nthird");
 
     // The incumbent consumes the damage from that output.
     let mut incumbent = Encoder::new();
@@ -101,12 +101,12 @@ fn a_snapshot_does_not_steal_the_incumbents_damage() {
     // content is shorter than its replacement so the rewrite below covers it
     // completely and no tail of it survives.
     let mut incumbent = Encoder::new();
-    shared.feed(b"old");
+    shared.feed_fully(b"old");
     let _ = shared.render(&mut incumbent);
 
     // Rewrite row 0, then park the cursor on row 3. The incumbent is now owed
     // row 0, which is not the row the cursor will re-damage for free.
-    shared.feed(b"\x1b[1;1HAFTER\x1b[4;1H");
+    shared.feed_fully(b"\x1b[1;1HAFTER\x1b[4;1H");
 
     // A second subscriber attaches and snapshots first.
     let mut attaching = Encoder::new();
@@ -138,7 +138,7 @@ fn a_snapshot_does_not_steal_the_incumbents_damage() {
 #[test]
 fn a_snapshot_realigns_a_reused_encoders_dedup_state() {
     let (shared, _actions) = terminal(20, 4);
-    shared.feed(b"wide enough line");
+    shared.feed_fully(b"wide enough line");
 
     let mut encoder = Encoder::new();
     let before = shared.snapshot(&mut encoder);
@@ -200,7 +200,7 @@ fn a_snapshot_carries_every_row_and_the_true_cursor() {
     let (shared, _actions) = terminal(20, 4);
     // Write the bottom row of the screen, then park the cursor at line 4,
     // column 6 (1-based) -- row 3, column 5 to us.
-    shared.feed(b"\x1b[4;1Hbottom\x1b[4;6H");
+    shared.feed_fully(b"\x1b[4;1Hbottom\x1b[4;6H");
 
     let mut attaching = Encoder::new();
     let frame = shared.snapshot(&mut attaching);
@@ -226,7 +226,7 @@ fn a_snapshot_carries_every_row_and_the_true_cursor() {
 
     // ...and a hidden cursor is reported hidden, so `visible` tracks the mode
     // rather than being a constant that happens to match the default.
-    shared.feed(b"\x1b[?25l");
+    shared.feed_fully(b"\x1b[?25l");
     let mut second = Encoder::new();
     assert!(
         !shared.snapshot(&mut second).cursor.visible,
@@ -245,7 +245,7 @@ fn a_snapshot_carries_every_row_and_the_true_cursor() {
 #[test]
 fn a_snapshot_is_billed_to_the_renderer_plane() {
     let (shared, _actions) = terminal(20, 4);
-    shared.feed(b"content");
+    shared.feed_fully(b"content");
 
     shared.reader_acquire().reset();
     shared.renderer_acquire().reset();
@@ -271,7 +271,7 @@ fn a_snapshot_is_billed_to_the_renderer_plane() {
 #[test]
 fn snapshots_are_repeatable() {
     let (shared, _actions) = terminal(20, 4);
-    shared.feed(b"persistent");
+    shared.feed_fully(b"persistent");
 
     let mut first = Encoder::new();
     let mut second = Encoder::new();

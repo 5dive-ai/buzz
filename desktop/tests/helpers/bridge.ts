@@ -304,8 +304,23 @@ type MockBridgeOptions = {
     description: string | null;
     imageDataUrl: string | null;
     imageDomain: string | null;
+    imageFetchState?: "none" | "image" | "transient_failure" | "rejected";
+    imageRetryAfterMs?: number | null;
     faviconDataUrl?: string | null;
   } | null;
+  linkPreviewMetadataByHref?: Record<
+    string,
+    {
+      title: string;
+      siteName: string | null;
+      description: string | null;
+      imageDataUrl: string | null;
+      imageDomain: string | null;
+      imageFetchState?: "none" | "image" | "transient_failure" | "rejected";
+      imageRetryAfterMs?: number | null;
+      faviconDataUrl?: string | null;
+    } | null
+  >;
   linkPreviewMetadataDelayMs?: number;
   searchProfiles?: MockSearchProfileSeed[];
   updateAvailable?: boolean;

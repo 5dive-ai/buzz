@@ -131,35 +131,72 @@ test.beforeEach(async ({ page }, testInfo) => {
               imageDomain: "pbs.twimg.com",
             },
           }
-        : testInfo.title.includes("link preview image geometry")
+        : testInfo.title.includes("mixed link preview image outcomes")
           ? {
-              linkPreviewMetadata: {
-                title:
-                  "Ship a wider horizontal preview with a two-line title that wraps cleanly",
-                siteName: "GitHub",
-                description: "A polished, stable preview for shared links.",
-                imageDataUrl:
-                  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1600' height='120'%3E%3Crect width='1600' height='120' fill='%237c3aed'/%3E%3Ccircle cx='92' cy='60' r='48' fill='%23fff' fill-opacity='.9'/%3E%3C/svg%3E",
-                imageDomain: "opengraph.githubassets.com",
-                faviconDataUrl:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-              },
-              linkPreviewMetadataDelayMs: 800,
-            }
-          : testInfo.title.includes("link preview no-image layout")
-            ? {
-                linkPreviewMetadata: {
-                  title: "Buzz",
+              linkPreviewMetadataByHref: {
+                "https://github.com/block/buzz/pull/4001": {
+                  title: "Loaded preview image",
                   siteName: "GitHub",
-                  description: "Open-source collaboration for the Buzz app.",
+                  description: "The image request completed.",
+                  imageDataUrl:
+                    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1200' height='630'%3E%3Crect width='1200' height='630' fill='%237c3aed'/%3E%3C/svg%3E",
+                  imageDomain: "opengraph.githubassets.com",
+                  imageFetchState: "image",
+                  imageRetryAfterMs: null,
+                },
+                "https://github.com/block/buzz/pull/4002": {
+                  title: "Rate-limited preview image",
+                  siteName: "GitHub",
+                  description: "Metadata remains available during cooldown.",
                   imageDataUrl: null,
                   imageDomain: null,
-                  faviconDataUrl:
-                    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                  imageFetchState: "transient_failure",
+                  imageRetryAfterMs: 900_000,
                 },
-                linkPreviewMetadataDelayMs: 2_000,
+              },
+            }
+          : testInfo.title.includes("link preview browser image error")
+            ? {
+                linkPreviewMetadata: {
+                  title: "Invalid decoded preview image",
+                  siteName: "GitHub",
+                  description: "The browser should replace this image.",
+                  imageDataUrl: "data:image/png;base64,not-a-valid-image",
+                  imageDomain: "opengraph.githubassets.com",
+                  imageFetchState: "image",
+                  imageRetryAfterMs: null,
+                },
               }
-            : undefined;
+            : testInfo.title.includes("link preview image geometry")
+              ? {
+                  linkPreviewMetadata: {
+                    title:
+                      "Ship a wider horizontal preview with a two-line title that wraps cleanly",
+                    siteName: "GitHub",
+                    description: "A polished, stable preview for shared links.",
+                    imageDataUrl:
+                      "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1600' height='120'%3E%3Crect width='1600' height='120' fill='%237c3aed'/%3E%3Ccircle cx='92' cy='60' r='48' fill='%23fff' fill-opacity='.9'/%3E%3C/svg%3E",
+                    imageDomain: "opengraph.githubassets.com",
+                    faviconDataUrl:
+                      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                  },
+                  linkPreviewMetadataDelayMs: 800,
+                }
+              : testInfo.title.includes("link preview no-image layout")
+                ? {
+                    linkPreviewMetadata: {
+                      title: "Buzz",
+                      siteName: "GitHub",
+                      description:
+                        "Open-source collaboration for the Buzz app.",
+                      imageDataUrl: null,
+                      imageDomain: null,
+                      faviconDataUrl:
+                        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                    },
+                    linkPreviewMetadataDelayMs: 2_000,
+                  }
+                : undefined;
   await installMockBridge(page, mock);
 });
 
@@ -514,6 +551,77 @@ test("link preview no-image layout keeps compact height", async ({ page }) => {
     expect(resolved.height).toBe(pending.height);
     expect(resolved.textLeft).toBeLessThan(pending.textLeft ?? 0);
   }
+});
+
+test("mixed link preview image outcomes keep Compact and Rich fallbacks stable", async ({
+  page,
+}) => {
+  const loadedUrl = "https://github.com/block/buzz/pull/4001";
+  const rateLimitedUrl = "https://github.com/block/buzz/pull/4002";
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page
+    .getByTestId("message-input")
+    .fill(`${loadedUrl}\n${rateLimitedUrl}`);
+  await page.getByTestId("send-message").click();
+
+  const row = page.getByTestId("message-row").last();
+  const compactCards = row.locator('[data-link-preview="github-pull-request"]');
+  await expect(compactCards).toHaveCount(2);
+  await expect(compactCards.nth(0)).toHaveAttribute(
+    "data-image-state",
+    "image",
+  );
+  await expect(compactCards.nth(0).locator("img")).toBeVisible();
+  await expect(compactCards.nth(1)).toHaveAttribute(
+    "data-image-state",
+    "fallback",
+  );
+  await expect(
+    compactCards.nth(1).locator("[data-link-preview-image-fallback]"),
+  ).toBeVisible();
+
+  await openSettings(page, "appearance");
+  await page.getByTestId("link-preview-style-trigger").click();
+  await page.getByTestId("link-preview-style-rich").click();
+  await page.getByTestId("settings-back-to-app").click();
+
+  const richCards = row.locator(
+    '[data-link-preview="github-pull-request"][data-link-preview-inline]',
+  );
+  await expect(richCards).toHaveCount(2);
+  await expect(
+    richCards.nth(1).locator("[data-link-preview-image-fallback]"),
+  ).toBeVisible();
+});
+
+test("link preview browser image errors render a fallback", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page
+    .getByTestId("message-input")
+    .fill("https://github.com/block/buzz/pull/4003");
+  await page.getByTestId("send-message").click();
+
+  const row = page.getByTestId("message-row").last();
+  const compactCard = row.locator('[data-link-preview="github-pull-request"]');
+  await expect(
+    compactCard.locator("[data-link-preview-image-fallback]"),
+  ).toBeVisible();
+
+  await openSettings(page, "appearance");
+  await page.getByTestId("link-preview-style-trigger").click();
+  await page.getByTestId("link-preview-style-rich").click();
+  await page.getByTestId("settings-back-to-app").click();
+
+  const richCard = row.locator(
+    '[data-link-preview="github-pull-request"][data-link-preview-inline]',
+  );
+  await expect(
+    richCard.locator("[data-link-preview-image-fallback]"),
+  ).toBeVisible();
 });
 
 test("supported Compact link previews keep the message link visible with square outer corners", async ({

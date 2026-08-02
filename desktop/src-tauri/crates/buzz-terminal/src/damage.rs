@@ -45,7 +45,31 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::TermDamage;
 
-/// A run of cells sharing one visual style.
+/// A run of cells sharing one visual style **and one cell width**.
+///
+/// # Why the consumer can position every cluster without Unicode tables
+///
+/// The renderer must place each display cluster at its true column, and it
+/// cannot derive that from the text: no single split rule over a concatenated
+/// string is correct. A regional-indicator flag (`U+1F1FA U+1F1F8`) is two
+/// ordinary one-column cells, so it must split *per codepoint*; a keycap
+/// (`1 U+FE0F U+20E3`) is one cell holding three codepoints, so it must split
+/// *per grapheme*. Those rules disagree, and the distinction lives in the grid,
+/// not in the string.
+///
+/// So the run carries it instead. Within a span every cluster advances the same
+/// [`width`](Self::width) columns, and [`cluster_count`](Self::cluster_count)
+/// says how many clusters the text holds. The consumer's rule is arithmetic on
+/// those two numbers, with no Unicode table anywhere:
+///
+/// ```text
+/// cluster_count == 1  -> the whole text is one cluster, at `column`
+/// otherwise           -> cluster i is the i-th char, at `column + i * width`
+/// ```
+///
+/// The second case is exact because a cell carrying zerowidth marks is always
+/// emitted alone, so every cell in a multi-cluster span contributes exactly one
+/// `char`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Span {
     /// First column of the run.
@@ -54,8 +78,32 @@ pub struct Span {
     /// combining marks follow its base character, so the renderer never sees
     /// a base and its accent as separate glyphs.
     pub text: String,
+    /// Columns each cluster in this run occupies: 1, or 2 for wide glyphs.
+    ///
+    /// Uniform across the run by construction -- a width change ends the span.
+    /// This is what lets the consumer position clusters by computed origin
+    /// rather than by accumulated text advance.
+    pub width: u8,
+    /// How many display clusters [`text`](Self::text) holds.
+    ///
+    /// Without this the consumer cannot distinguish a one-cluster span carrying
+    /// combining marks from an ordinary multi-character run, and would need a
+    /// Unicode zerowidth table to guess. The grid already knows, so it says.
+    pub cluster_count: u16,
     /// Packed style: fg, bg, and attribute flags.
     pub style: Style,
+}
+
+impl Span {
+    /// The decoding invariant, stated once: a span is either a single cluster
+    /// (which may hold several `char`s, as a keycap or an accented letter
+    /// does) or one cluster per `char`.
+    ///
+    /// Exposed so consumers can assert it at a trust boundary rather than
+    /// restate it. The encoder checks it in debug builds on every frame.
+    pub fn counts_are_consistent(&self) -> bool {
+        self.cluster_count == 1 || usize::from(self.cluster_count) == self.text.chars().count()
+    }
 }
 
 /// Visual style of a span, as the renderer needs it.
@@ -219,9 +267,20 @@ fn hash_cells(cells: &[Cell]) -> u64 {
     hasher.finish()
 }
 
-/// Group a row's cells into styled runs.
+/// Group a row's cells into runs of uniform style and width.
+///
+/// A run continues only while style *and* width match, and a cell carrying
+/// zerowidth marks is always emitted alone. Both breaks exist so the consumer
+/// can compute each cluster's column as `column + i * width`; see [`Span`].
+///
+/// The width comparison is the only thing keeping widths uniform within a run:
+/// [`Style`] deliberately excludes [`GEOMETRY_FLAGS`], so a style key cannot
+/// break a run on width behind this check's back.
 fn spans(cells: &[Cell]) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
+    // Whether the run in progress may still be extended. Kept here rather than
+    // on `Span` because it is grouping bookkeeping, not part of the wire shape.
+    let mut open = false;
     for (column, cell) in cells.iter().enumerate() {
         // A wide glyph occupies two cells: the character, then a spacer. The
         // spacer carries no text of its own -- emitting its placeholder space
@@ -230,28 +289,76 @@ fn spans(cells: &[Cell]) -> Vec<Span> {
             continue;
         }
         let style = style_of(cell);
+        let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        let zerowidth = cell.zerowidth();
         let mut text = String::new();
         text.push(cell.c);
-        if let Some(zerowidth) = cell.zerowidth() {
-            text.extend(zerowidth);
+        if let Some(marks) = zerowidth {
+            text.extend(marks);
         }
+
+        // A cluster with combining marks holds more `char`s than columns, so it
+        // cannot share a run: it is the one case where "one char per cluster"
+        // stops holding.
+        let joinable = zerowidth.is_none();
         match spans.last_mut() {
-            Some(last) if last.style == style => last.text.push_str(&text),
+            // `cluster_count` is refused rather than wrapped when it would
+            // overflow: the run simply ends and a new span starts at this
+            // column, which the consumer's rule already handles.
+            Some(last)
+                if open
+                    && joinable
+                    && last.style == style
+                    && last.width == width
+                    && last.cluster_count < u16::MAX =>
+            {
+                last.text.push_str(&text);
+                last.cluster_count += 1;
+            }
             _ => spans.push(Span {
                 column,
                 text,
+                width,
+                cluster_count: 1,
                 style,
             }),
         }
+        open = joinable;
     }
+    debug_assert!(
+        spans.iter().all(Span::counts_are_consistent),
+        "cluster_count must be 1 or the span's char count"
+    );
     spans
 }
+
+/// Flags describing where a cell sits in the grid rather than how it looks.
+///
+/// `WRAPLINE` marks the last cell of a row that wrapped; the three wide-char
+/// bits mark a two-column glyph and its spacer. Neither says anything about
+/// appearance.
+///
+/// These are excluded from [`Style`] so the style key means one thing: visual
+/// attributes. Geometry travels in [`Span::width`], which is compared on its
+/// own when grouping -- if these bits stayed in the key they would break runs
+/// as a side effect and leave the width comparison untestable.
+///
+/// Composite visual aliases (`BOLD_ITALIC`, `DIM_BOLD`, `ALL_UNDERLINES`) are
+/// deliberately not masked: those are appearance.
+const GEOMETRY_FLAGS: Flags = Flags::WRAPLINE
+    .union(Flags::WIDE_CHAR)
+    .union(Flags::WIDE_CHAR_SPACER)
+    .union(Flags::LEADING_WIDE_CHAR_SPACER);
 
 fn style_of(cell: &Cell) -> Style {
     Style {
         fg: pack_color(cell.fg),
         bg: pack_color(cell.bg),
-        flags: cell.flags.bits(),
+        flags: cell.flags.difference(GEOMETRY_FLAGS).bits(),
     }
 }
 

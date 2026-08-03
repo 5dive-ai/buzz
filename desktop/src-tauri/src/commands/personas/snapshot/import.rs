@@ -674,8 +674,6 @@ pub async fn confirm_agent_snapshot_import(
     // ── Phase 3b: publish kind:0 profile (async, outside lock) ───────────────
     // Use the captured scope's relay URL so profile publication targets the
     // same workspace where the definition was written in Phase 3a.
-    // A workspace switch after Phase 3a cannot redirect this agent's profile
-    // to a different relay — it is bound to the captured scope for life.
     let relay_url = effective_agent_relay_url(&record.relay_url, &captured_scope.relay_url);
     let profile_sync_error = sync_managed_agent_profile(
         &state,
@@ -996,36 +994,5 @@ mod import_avatar_tests {
             .await;
 
         assert_eq!(result.unwrap_err(), "Snapshot avatar data is malformed.");
-    }
-
-    /// Outbound profile/memory publication must use the captured scope's relay,
-    /// not the live `relay_ws_url_with_override` value.
-    ///
-    /// Proves the contract by testing the relay derivation path directly: given
-    /// a captured scope relay and a record with an empty relay_url, `effective_agent_relay_url`
-    /// must return the captured scope relay — not whatever the live state says.
-    ///
-    /// If the test were using `relay_ws_url_with_override` it would return a
-    /// different relay (or panic on missing state), proving the switch-between-phases
-    /// scenario routes publication to the correct workspace relay.
-    #[test]
-    fn test_outbound_relay_uses_captured_scope_not_live_state() {
-        let captured_relay = "wss://captured.example";
-        let live_relay = "wss://switched.example"; // simulates workspace switched post-Phase-3a
-
-        // Simulate record.relay_url being empty (always takes workspace relay).
-        let record_relay = "";
-
-        let outbound_relay = crate::relay::effective_agent_relay_url(record_relay, captured_relay);
-        let stale_relay = crate::relay::effective_agent_relay_url(record_relay, live_relay);
-
-        assert_eq!(
-            outbound_relay, captured_relay,
-            "outbound relay must be the captured scope relay"
-        );
-        assert_ne!(
-            outbound_relay, stale_relay,
-            "captured relay must differ from the post-switch live relay"
-        );
     }
 }

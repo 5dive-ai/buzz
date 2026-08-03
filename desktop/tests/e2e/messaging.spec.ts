@@ -677,7 +677,9 @@ test("mixed link preview image outcomes keep Compact and Rich fallbacks stable",
     "data-image-state",
     "image",
   );
-  await expect(compactCards.nth(0).locator("img")).toBeVisible();
+  await expect(
+    compactCards.nth(0).locator("[data-link-preview-thumbnail]"),
+  ).toBeVisible();
   await expect(compactCards.nth(1)).toHaveAttribute("data-image-state", "none");
   await expect(
     compactCards.nth(1).locator("[data-link-preview-image-fallback]"),

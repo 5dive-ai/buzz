@@ -83,6 +83,13 @@ impl EmissionScope {
 
 const USAGE_METRICS_LOCK_KEY: i64 = 0x4255_5A5A_4D45_5452;
 
+/// Session advisory lock serializing the fleet-wide NIP-43 membership sweep.
+///
+/// The sweep is O(communities) — minutes at fleet scale — so only one replica
+/// may run it at a time; the rest skip their tick. Same detached-session
+/// leadership mechanism as the usage-metrics poller, different key.
+const NIP43_SWEEP_LOCK_KEY: i64 = 0x4255_5A5A_4E50_3433;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Install the ring CryptoProvider for rustls. Required before any rustls
@@ -527,16 +534,35 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // NIP-43: reconcile the event-backed roster for every provisioned
-    // community before opening the listener. `relay_members` is canonical;
-    // this repairs pre-snapshot communities and any publication that failed
-    // after a membership transaction committed.
+    // NIP-43: reconcile the event-backed roster for the deployment's own
+    // community before opening the listener. The fleet-wide sweep across every
+    // provisioned community deliberately does NOT run here: it is
+    // O(communities) — minutes at fleet scale — and a startup probe that
+    // SIGKILLs the pod mid-sweep restarts it from community #1 forever
+    // (permanent crashloop). The fleet sweep runs post-bind, jittered, and
+    // leader-gated in the periodic task spawned below.
     if config.require_relay_membership {
-        match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots(&state).await
-        {
-            Ok(count) => info!(count, "NIP-43 membership snapshots reconciled on startup"),
-            Err(error) => {
-                tracing::warn!(%error, "NIP-43 membership snapshot startup reconciliation failed")
+        // `deployment_community` is always Some here: startup fails fast above
+        // when membership is enforced and the community cannot be ensured.
+        if let Some(community) = deployment_community {
+            let host = buzz_relay::tenant::relay_url_authority(&config.relay_url);
+            let tenant = buzz_core::tenant::TenantContext::resolved(community, host);
+            let started_at = std::time::Instant::now();
+            info!(community = %community, "NIP-43 startup phase: reconciling deployment community snapshot");
+            match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshot(
+                &tenant, &state,
+            )
+            .await
+            {
+                Ok(repaired) => info!(
+                    community = %community,
+                    repaired,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "NIP-43 startup phase: deployment community snapshot reconciled"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "NIP-43 deployment community startup reconciliation failed")
+                }
             }
         }
 
@@ -547,24 +573,62 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(60)
             .max(1);
         tokio::spawn(async move {
+            // Jitter the first tick by a random fraction of the interval so a
+            // rolling deploy of N pods doesn't contend for the sweep lock (and
+            // hammer `communities`) simultaneously at boot. True per-process
+            // randomness — PID-derived seeds are unsafe when every pod is PID 1.
+            let jitter_secs = rand::random::<u64>() % interval_secs;
+            tokio::time::sleep(std::time::Duration::from_secs(jitter_secs)).await;
+
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-            interval.tick().await;
+            // A fleet-scale sweep takes longer than the interval; skip ticks
+            // rather than scheduling a catch-up burst behind it.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                // Per-tick leadership: hold the sweep lock only while sweeping,
+                // so a replica that dies mid-sweep releases it with its session
+                // and any peer picks up on its next tick.
+                let leader = match reconcile_state
+                    .db
+                    .try_lock_usage_metrics(NIP43_SWEEP_LOCK_KEY)
+                    .await
+                {
+                    Ok(Some(guard)) => guard,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(%error, "NIP-43 sweep leadership check failed");
+                        continue;
+                    }
+                };
+                let started_at = std::time::Instant::now();
+                info!("NIP-43 membership sweep starting (leader)");
                 match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots(
                     &reconcile_state,
                 )
                 .await
                 {
-                    Ok(count) if count > 0 => {
-                        info!(count, "NIP-43 membership snapshots repaired")
+                    Ok(count) => {
+                        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                        if count > 0 {
+                            info!(
+                                count,
+                                elapsed_ms, "NIP-43 membership sweep complete: snapshots repaired"
+                            )
+                        } else {
+                            info!(
+                                elapsed_ms,
+                                "NIP-43 membership sweep complete: nothing to repair"
+                            )
+                        }
                     }
-                    Ok(_) => {}
                     Err(error) => tracing::warn!(
                         %error,
-                        "periodic NIP-43 membership snapshot reconciliation failed"
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "NIP-43 membership sweep failed"
                     ),
                 }
+                drop(leader);
             }
         });
     }

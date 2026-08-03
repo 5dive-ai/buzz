@@ -27,8 +27,6 @@ import '../profile/profile_avatar.dart';
 import '../profile/profile_provider.dart';
 import '../profile/presence_cache_provider.dart';
 import '../profile/user_cache_provider.dart';
-import '../profile/user_profile.dart';
-import '../profile/user_status_provider.dart';
 import '../pairing/pairing_page.dart';
 import '../pairing/pairing_provider.dart';
 import 'channel.dart';

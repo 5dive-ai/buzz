@@ -608,17 +608,10 @@ class _WideNavigationProfile extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final palette = _wideSidebarPalette(context);
     final profile = ref.watch(profileProvider).value;
-    final status = ref.watch(userStatusProvider).asData?.value;
     final displayName = profile?.displayName?.trim();
     final name = displayName != null && displayName.isNotEmpty
         ? displayName
         : 'You';
-    final statusEmoji = status?.emoji ?? '';
-    final statusText = status?.text.trim() ?? '';
-    final statusLabel = [
-      if (statusEmoji.isNotEmpty) statusEmoji,
-      if (statusText.isNotEmpty) statusText,
-    ].join(' ');
 
     return SizedBox(
       key: const Key('wide-navigation-profile'),
@@ -659,17 +652,6 @@ class _WideNavigationProfile extends ConsumerWidget {
                                   fontWeight: FontWeight.w600,
                                 ),
                               ),
-                              if (statusLabel.isNotEmpty) ...[
-                                const SizedBox(height: Grid.quarter),
-                                Text(
-                                  statusLabel,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: context.textTheme.labelSmall?.copyWith(
-                                    color: palette.mutedForeground,
-                                  ),
-                                ),
-                              ],
                             ],
                           ),
                         ),
@@ -701,7 +683,7 @@ class _WideNavigationProfile extends ConsumerWidget {
 class _WideChannelDestination extends StatelessWidget {
   final Channel channel;
   final String label;
-  final UserProfile? directMessageProfile;
+  final dynamic directMessageProfile;
   final bool selected;
   final VoidCallback onTap;
 
@@ -876,7 +858,7 @@ class _WideNavigationDestination extends StatelessWidget {
 String _wideSidebarChannelLabel(
   Channel channel, {
   required String? currentPubkey,
-  required Map<String, UserProfile> profiles,
+  required Map<String, dynamic> profiles,
 }) {
   if (!channel.isDm) return channel.displayLabel();
 
@@ -899,10 +881,10 @@ String _wideSidebarChannelLabel(
   return resolveDmChannelDisplayLabel(channel, currentPubkey: currentPubkey);
 }
 
-UserProfile? _wideSidebarDirectMessageProfile(
+dynamic _wideSidebarDirectMessageProfile(
   Channel channel, {
   required String? currentPubkey,
-  required Map<String, UserProfile> profiles,
+  required Map<String, dynamic> profiles,
 }) {
   if (!channel.isDm) return null;
 

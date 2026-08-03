@@ -121,6 +121,7 @@ class ActivityPage extends HookConsumerWidget {
         (item) => item.conversationId == selectedItemId.value,
       );
       final retainsSelectedDetail =
+          unreadOnly.value &&
           selectedItemForDetail.value?.conversationId == selectedItemId.value;
       if (!hasSelectedItem && !retainsSelectedDetail) {
         selectedItemId.value = visibleItems.first.conversationId;
@@ -134,7 +135,7 @@ class ActivityPage extends HookConsumerWidget {
           (item) => item?.conversationId == selectedItemId.value,
           orElse: () => null,
         ) ??
-        selectedItemForDetail.value;
+        (unreadOnly.value ? selectedItemForDetail.value : null);
 
     // Preload sender profiles for visible rows.
     final preloadPubkeys = {
@@ -461,9 +462,11 @@ class _WideActivityDetail extends HookWidget {
       return const _WideActivityEmptyDetail();
     }
 
-    final navigatorKey = useMemoized(GlobalKey<NavigatorState>.new, [item!.id]);
+    final navigatorKey = useMemoized(GlobalKey<NavigatorState>.new, [
+      item!.conversationId,
+    ]);
     return NavigatorPopHandler(
-      key: ValueKey('wide-activity-detail-${item!.id}'),
+      key: ValueKey('wide-activity-detail-${item!.conversationId}'),
       onPopWithResult: (_) => navigatorKey.currentState?.maybePop(),
       child: Navigator(
         key: navigatorKey,

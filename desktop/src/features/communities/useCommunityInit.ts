@@ -210,13 +210,42 @@ export function useCommunityInit(
       // imported key. `loadCommunities()` strips lingering `nsec` fields from
       // legacy entries; this site refuses to apply one even if present.
       try {
-        await applyCommunity(
+        const applyResult = await applyCommunity(
           activeCommunity.relayUrl,
           undefined,
           activeCommunity.token,
           activeCommunity.reposDir,
           getOverrides().agentManagedProfiles === true,
         );
+
+        if (!applyResult.applied) {
+          // Drain failed; old scope is still active. Treat as a fatal apply
+          // error: park on the loading gate so the user can retry by switching
+          // workspaces again.
+          const reason = applyResult.degraded.join("; ");
+          console.error(
+            "[useCommunityInit] workspace apply blocked by drain failure:",
+            reason,
+          );
+          if (!cancelled) {
+            setResult({
+              isReady: false,
+              needsSetup: false,
+              appliedKey: null,
+              error: `Workspace switch failed (agents could not stop): ${reason}`,
+            });
+          }
+          return;
+        }
+
+        // Workspace applied. Log any post-commit degradation (informational —
+        // the workspace IS active; these are best-effort post-commit steps).
+        if (applyResult.degraded.length > 0) {
+          console.warn(
+            "[useCommunityInit] workspace applied with degradation:",
+            applyResult.degraded,
+          );
+        }
       } catch (error) {
         // A bad `repos_dir` no longer reaches here — `apply_workspace` treats
         // it as non-fatal (relay/keys apply, bad value not persisted, REPOS

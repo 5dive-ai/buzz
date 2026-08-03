@@ -1142,14 +1142,27 @@ export async function cancelPairing(): Promise<void> {
   await invokeTauri("cancel_pairing");
 }
 
+/**
+ * Result from `apply_workspace` / `applyCommunity`.
+ *
+ * - `applied: true`  — new scope committed; post-commit failures surface in
+ *   `degraded` (informational — workspace IS active).
+ * - `applied: false` — drain failed; old scope still active; `degraded` names
+ *   what could not be stopped or restored by compensation.
+ */
+export interface WorkspaceApplyResult {
+  applied: boolean;
+  degraded: string[];
+}
+
 export async function applyCommunity(
   relayUrl: string,
   nsec?: string,
   token?: string,
   reposDir?: string,
   agentManagedProfiles?: boolean,
-): Promise<void> {
-  await invokeTauri("apply_workspace", {
+): Promise<WorkspaceApplyResult> {
+  return invokeTauri<WorkspaceApplyResult>("apply_workspace", {
     relayUrl,
     nsec: nsec ?? null,
     token: token ?? null,

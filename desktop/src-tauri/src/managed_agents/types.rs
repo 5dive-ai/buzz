@@ -439,33 +439,9 @@ pub struct ManagedAgentRecord {
     /// deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mesh: Option<RelayMeshConfig>,
-    /// Claude Code effort level (maps to `effortLevel` in the per-agent
-    /// `settings.json`).  Written at spawn time into the projected
-    /// `settings.json`; updated on positive ACP `session/set_config_option`
-    /// ack.  `None` means no canonical effort level seeded — the owner's
-    /// personal `effortLevel` (if any) will pass through in the projection.
-    /// `#[serde(default)]` so records predating this field deserialize as
-    /// `None`.
+    /// Canonical Claude Code effort level; seeded into the per-agent `settings.json` at spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
-}
-
-/// Typed relay-mesh configuration carried on a [`ManagedAgentRecord`].
-///
-/// Feature-independent on purpose: the field is always present in the record
-/// schema so saved agents round-trip identically whether or not the `mesh-llm`
-/// feature is compiled in.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RelayMeshConfig {
-    /// The served model id this agent routes to (e.g. "Qwen3").
-    ///
-    /// `alias` because this struct crosses two boundaries with different
-    /// casing conventions: the TS create request sends camelCase
-    /// (`relayMesh: { modelRef }` — `rename_all` on the request does not
-    /// recurse into nested structs), while persisted records use snake_case.
-    /// Serialization stays `model_ref` so saved records are stable.
-    #[serde(alias = "modelRef")]
-    pub model_ref: String,
 }
 
 #[derive(Debug)]
@@ -1002,6 +978,8 @@ pub fn resolve_mint_behavioral_defaults(
 
 mod catalog_source;
 pub use catalog_source::CatalogSource;
+mod relay_mesh;
+pub use relay_mesh::RelayMeshConfig;
 mod requests;
 pub use requests::*;
 

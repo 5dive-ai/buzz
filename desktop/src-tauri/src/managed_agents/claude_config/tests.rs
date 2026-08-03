@@ -505,3 +505,310 @@ fn test_secure_storage_config_dir_is_always_empty_string() {
         "is_empty() must hold so command.env() receives the correct sentinel value"
     );
 }
+
+// ── B8: Owner MCP server inheritance tests ────────────────────────────────────
+
+/// Helper: write a JSON object to a file, creating parent dirs as needed.
+fn write_json(path: &std::path::Path, value: &serde_json::Value) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+}
+
+/// Helper: read back JSON from a file, or None if the file does not exist.
+fn read_json(path: &std::path::Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Owner user-scope MCP servers are written into the agent-root `.claude.json`.
+#[test]
+fn test_b8_merge_writes_owner_mcp_servers_to_agent_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner_mcp = dir.path().join("owner.claude.json");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let agent_file = agent_dir.join(".claude.json");
+
+    write_json(
+        &owner_mcp,
+        &serde_json::json!({
+            "mcpServers": {
+                "filesystem": {"command": "npx"},
+                "github": {"command": "gh"}
+            }
+        }),
+    );
+
+    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+
+    let result = read_json(&agent_file).expect("agent file written");
+    let servers = result["mcpServers"].as_object().expect("mcpServers object");
+    assert!(
+        servers.contains_key("filesystem"),
+        "filesystem server must appear"
+    );
+    assert!(servers.contains_key("github"), "github server must appear");
+    assert_eq!(servers.len(), 2, "exactly 2 servers");
+}
+
+/// Non-`mcpServers` keys in the agent `.claude.json` are preserved after merge.
+#[test]
+fn test_b8_merge_preserves_agent_owned_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner_mcp = dir.path().join("owner.claude.json");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let agent_file = agent_dir.join(".claude.json");
+
+    write_json(
+        &owner_mcp,
+        &serde_json::json!({ "mcpServers": { "github": {"command": "gh"} } }),
+    );
+    write_json(
+        &agent_file,
+        &serde_json::json!({ "hasCompletedOnboarding": true }),
+    );
+
+    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+
+    let result = read_json(&agent_file).expect("agent file written");
+    assert_eq!(
+        result["hasCompletedOnboarding"].as_bool(),
+        Some(true),
+        "non-mcpServers key must be preserved"
+    );
+    assert!(
+        result["mcpServers"]["github"].is_object(),
+        "merged server must be present"
+    );
+}
+
+/// Owner unreadable (distinct failure state #1): agent file is left unchanged —
+/// the prior inherited set is preserved, not destroyed.
+/// This triggers the Err path in read_owner_mcp_servers — uses a directory path
+/// which exists but cannot be read as a file.
+#[test]
+fn test_b8_owner_read_failure_preserves_prior_inherited_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let agent_file = agent_dir.join(".claude.json");
+
+    write_json(
+        &agent_file,
+        &serde_json::json!({ "mcpServers": { "filesystem": {"command": "npx"} } }),
+    );
+    let original = std::fs::read_to_string(&agent_file).unwrap();
+
+    // Use an existing DIRECTORY as the owner path — read_to_string on a directory
+    // returns an Err, triggering the "preserve prior set" code path.
+    let dir_as_file = dir.path().join("a_directory");
+    std::fs::create_dir_all(&dir_as_file).unwrap();
+    merge_agent_mcp_servers(&agent_dir, &dir_as_file, "buzz-mcp");
+
+    let after = std::fs::read_to_string(&agent_file).unwrap();
+    assert_eq!(
+        after, original,
+        "agent file must be unchanged when owner is unreadable"
+    );
+}
+
+/// Owner has no `mcpServers` key: agent file is updated with empty `mcpServers`,
+/// clearing any stale inherited set.
+#[test]
+fn test_b8_empty_owner_mcp_servers_clears_inherited_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner_mcp = dir.path().join("owner.claude.json");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let agent_file = agent_dir.join(".claude.json");
+
+    write_json(&owner_mcp, &serde_json::json!({}));
+    write_json(
+        &agent_file,
+        &serde_json::json!({ "mcpServers": { "old-server": {} } }),
+    );
+
+    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+
+    let result = read_json(&agent_file).expect("file written");
+    let servers = result["mcpServers"]
+        .as_object()
+        .expect("mcpServers present");
+    assert!(
+        servers.is_empty(),
+        "empty owner mcpServers must clear the inherited set"
+    );
+}
+
+/// Invalid agent JSON (distinct failure state #2): replaced with owner-only servers.
+/// The corrupt content must not survive — the file was replaced, not preserved.
+#[test]
+fn test_b8_invalid_agent_file_falls_back_to_owner_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner_mcp = dir.path().join("owner.claude.json");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let agent_file = agent_dir.join(".claude.json");
+
+    write_json(
+        &owner_mcp,
+        &serde_json::json!({ "mcpServers": { "github": {"command": "gh"} } }),
+    );
+    std::fs::write(&agent_file, b"not valid json {{ at all").unwrap();
+
+    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+
+    let result = read_json(&agent_file).expect("file replaced with valid JSON");
+    let servers = result["mcpServers"].as_object().expect("mcpServers object");
+    assert!(
+        servers.contains_key("github"),
+        "owner servers must appear after invalid-agent fallback"
+    );
+    let raw = std::fs::read_to_string(&agent_file).unwrap();
+    assert!(
+        !raw.contains("not valid json"),
+        "corrupt content must not survive — file replaced"
+    );
+}
+
+/// Collision filter (Thufir frozen invariant #2): inherited server with same name
+/// as the ACP-provided server is omitted — Buzz wins by construction.
+/// Case-insensitive match. Non-colliding servers pass through.
+#[test]
+fn test_b8_collision_filter_removes_acp_name_collision() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner_mcp = dir.path().join("owner.claude.json");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let agent_file = agent_dir.join(".claude.json");
+
+    write_json(
+        &owner_mcp,
+        &serde_json::json!({
+            "mcpServers": {
+                "buzz-mcp":  {"command": "buzz-mcp"},
+                "BUZZ-MCP":  {"command": "buzz-mcp"},
+                "github":    {"command": "gh"}
+            }
+        }),
+    );
+
+    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+
+    let result = read_json(&agent_file).expect("file written");
+    let servers = result["mcpServers"].as_object().expect("mcpServers object");
+    assert!(
+        !servers.contains_key("buzz-mcp"),
+        "exact-match ACP server must be filtered"
+    );
+    assert!(
+        !servers.contains_key("BUZZ-MCP"),
+        "case-variant ACP server must be filtered"
+    );
+    assert!(
+        servers.contains_key("github"),
+        "non-colliding server must pass through"
+    );
+}
+
+/// Empty ACP server name disables collision filtering — all owner servers pass through.
+#[test]
+fn test_b8_empty_acp_name_disables_collision_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner_mcp = dir.path().join("owner.claude.json");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let agent_file = agent_dir.join(".claude.json");
+
+    write_json(
+        &owner_mcp,
+        &serde_json::json!({ "mcpServers": { "filesystem": {}, "github": {} } }),
+    );
+
+    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "");
+
+    let result = read_json(&agent_file).expect("file written");
+    let servers = result["mcpServers"].as_object().expect("mcpServers object");
+    assert_eq!(
+        servers.len(),
+        2,
+        "all servers must pass through with empty ACP name"
+    );
+}
+
+/// Missing owner file (no `~/.claude.json` yet): treated as empty owner — agent
+/// file gets an empty `mcpServers` set, not a write-skip.
+#[test]
+fn test_b8_missing_owner_file_writes_empty_mcp_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner_mcp = dir.path().join("no_such_owner.claude.json"); // does not exist
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let agent_file = agent_dir.join(".claude.json");
+
+    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+
+    let result = read_json(&agent_file).expect("file written for missing owner");
+    let servers = result["mcpServers"]
+        .as_object()
+        .expect("mcpServers object present");
+    assert!(
+        servers.is_empty(),
+        "missing owner must produce empty mcpServers"
+    );
+}
+
+/// Concurrent calls to `merge_agent_mcp_servers` for the same agent root must
+/// not corrupt the file.  The atomic-rename durability primitive ensures each
+/// write is all-or-nothing; the winner produces valid JSON.
+///
+/// In production the `managed_agent_runtime_transition` mutex prevents concurrent
+/// B8 writes for the same root — this tests the file-level primitive independently.
+#[test]
+fn test_b8_serialization_no_lost_update() {
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let owner_mcp = Arc::new(dir.path().join("owner.claude.json"));
+    let agent_dir = Arc::new(dir.path().join("agent"));
+    std::fs::create_dir_all(agent_dir.as_ref()).unwrap();
+
+    write_json(
+        &owner_mcp,
+        &serde_json::json!({ "mcpServers": { "github": {} } }),
+    );
+
+    let (o1, a1) = (Arc::clone(&owner_mcp), Arc::clone(&agent_dir));
+    let (o2, a2) = (Arc::clone(&owner_mcp), Arc::clone(&agent_dir));
+    let t1 = std::thread::spawn(move || merge_agent_mcp_servers(&a1, &o1, "buzz-mcp"));
+    let t2 = std::thread::spawn(move || merge_agent_mcp_servers(&a2, &o2, "buzz-mcp"));
+    t1.join().unwrap();
+    t2.join().unwrap();
+
+    let agent_file = dir.path().join("agent").join(".claude.json");
+    let result = read_json(&agent_file).expect("file must be valid JSON after concurrent writes");
+    assert!(
+        result["mcpServers"].is_object(),
+        "mcpServers must be an object after concurrent writes"
+    );
+}
+
+/// `agent_mcp_config_path` returns a path under `<managed_root>/claude/<pubkey>/`
+/// consistent with the B1 CLAUDE_CONFIG_DIR layout.
+#[test]
+fn test_b8_agent_mcp_config_path_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let managed_root = dir.path();
+    let pubkey = "abcd1234efabcd12";
+    let path = agent_mcp_config_path(managed_root, pubkey);
+    assert!(
+        path.ends_with(std::path::Path::new(pubkey).join(".claude.json")),
+        "agent mcp path must end with <pubkey>/.claude.json; got: {path:?}"
+    );
+    assert!(
+        path.starts_with(managed_root),
+        "path must be under managed_root"
+    );
+}

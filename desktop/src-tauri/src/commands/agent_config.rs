@@ -122,6 +122,7 @@ fn resolve_config_surface(
     runtime_meta: Option<&KnownAcpRuntime>,
     session_cache: Option<&SessionConfigCache>,
     global: &GlobalAgentConfig,
+    agent_mcp_path: Option<std::path::PathBuf>,
 ) -> RuntimeConfigSurface {
     // Linked instances are definition-authoritative: clear stale materialized
     // model/provider/prompt so they can never masquerade as BuzzExplicit and
@@ -139,7 +140,13 @@ fn resolve_config_surface(
         global,
     );
 
-    read_config_surface(&record, runtime_meta, session_cache, &tiers)
+    read_config_surface(
+        &record,
+        runtime_meta,
+        session_cache,
+        &tiers,
+        agent_mcp_path.as_deref(),
+    )
 }
 
 /// Get the file-layer config for a runtime — used by the Create/Edit/Persona
@@ -310,12 +317,25 @@ pub async fn get_agent_config_surface(
     let session_cache = state.get_session_cache(&runtime_key);
     let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
 
+    // B8/#3493: for isolated local claude agents, read MCP servers from the
+    // agent-root .claude.json (the file the spawned process actually reads).
+    let agent_mcp_path = if record.backend == crate::managed_agents::BackendKind::Local
+        && runtime_meta.is_some_and(|m| m.id == "claude")
+    {
+        crate::managed_agents::storage::managed_agents_base_dir(&app)
+            .ok()
+            .map(|root| crate::managed_agents::claude_config::agent_mcp_config_path(&root, &pubkey))
+    } else {
+        None
+    };
+
     Ok(resolve_config_surface(
         record,
         &personas,
         runtime_meta,
         session_cache.as_ref(),
         &global,
+        agent_mcp_path,
     ))
 }
 

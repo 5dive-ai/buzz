@@ -93,11 +93,6 @@ import {
   usePendingHarnessSelection,
 } from "./addCustomHarness";
 
-const ADVANCED_FIELDS_MOTION_TRANSITION = {
-  duration: 0.18,
-  ease: [0.23, 1, 0.32, 1],
-} as const;
-
 export function AgentInstanceEditDialog({
   agent,
   initialFocus,
@@ -846,7 +841,7 @@ export function AgentInstanceEditDialog({
   const previewAvatarUrl = avatarUrl.trim() || null;
   const advancedFieldsTransition = shouldReduceMotion
     ? { duration: 0 }
-    : ADVANCED_FIELDS_MOTION_TRANSITION;
+    : { duration: 0.18, ease: [0.23, 1, 0.32, 1] };
 
   return (
     <Dialog onOpenChange={handleOpenChange} open={open}>

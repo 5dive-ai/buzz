@@ -175,6 +175,12 @@ pub struct RuntimeConfigSurface {
     pub advanced: Vec<ConfigField>,
     pub extensions: Vec<ExtensionEntry>,
     pub sources: ConfigSourceReport,
+    /// Keys present in the owner's `~/.claude/settings.json` `env` block that
+    /// were stripped because they are owned by Buzz's launch policy (B7.7c).
+    /// Empty for non-claude runtimes and when no protected keys are present.
+    /// Rendered in the config panel as "owner setting overridden by Buzz policy".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stripped_owner_env_keys: Vec<String>,
 }
 
 /// Raw config values extracted from a runtime's config file.
@@ -198,6 +204,11 @@ pub struct ExtensionEntry {
     pub name: String,
     pub kind: String,
     pub enabled: bool,
+    /// Provenance tag for display. `Some("owner_user_scope")` means the entry
+    /// was inherited from the owner's user-scope `~/.claude.json` by B8.
+    /// `None` means the entry was read directly from the runtime's config file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Cached ACP session config from a running agent.

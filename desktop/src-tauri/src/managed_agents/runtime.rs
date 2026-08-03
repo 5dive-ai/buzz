@@ -814,17 +814,8 @@ pub fn spawn_agent_child(
 
     command.env("BUZZ_ACP_RELAY_OBSERVER", "true");
 
-    // ── Git credential helper for Buzz relay ──────────────────────────
-    //
-    // Agents need to clone/push repos hosted on the Buzz relay's git
-    // server, which authenticates via NIP-98. The `git-credential-nostr`
-    // binary signs auth events using the agent's nostr key.
-    //
-    // We configure git via GIT_CONFIG_COUNT env vars (ephemeral, no
-    // filesystem writes) scoped to the relay's git URL so we don't
-    // interfere with other remotes (e.g. GitHub).
-    //
-    // NOSTR_PRIVATE_KEY mirrors BUZZ_PRIVATE_KEY — keep in sync.
+    // Git credential helper: NIP-98 auth for Buzz relay git via git-credential-nostr.
+    // Ephemeral GIT_CONFIG_COUNT env vars scoped to relay HTTP URL; NOSTR_PRIVATE_KEY mirrors BUZZ_PRIVATE_KEY.
     if let Some(cred_helper) = resolve_command("git-credential-nostr") {
         let relay_http_url = crate::relay::relay_http_base_url(&effective_relay_url);
 
@@ -849,21 +840,13 @@ pub fn spawn_agent_child(
         );
     }
 
-    // ── User env vars: definition floor + global + live persona + agent overrides ──
-    //
-    // `descriptor.env` is the fully-layered result from `resolve_effective_harness_descriptor`:
-    // baked floor → runtime metadata → definition env (harness author defaults) →
-    // global → live persona → per-agent, with reserved-key and malformed-key filtering
-    // applied. Writing it last lets user-provided values win over every Buzz-set env
-    // written above — reserved keys were already stripped from descriptor.env so they
-    // cannot clobber BUZZ_PRIVATE_KEY, NOSTR_PRIVATE_KEY, etc.
+    // User env (descriptor.env): fully-layered floor→runtime→definition→global→persona→agent,
+    // reserved-key filtered. Written last so user-explicit values win over Buzz-set env.
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
 
-    // ── A1 + B1 + B7: Claude config isolation and model authority (local only) ──
-    // Policy values written AFTER descriptor.env (user-explicit Desktop overrides
-    // are not filtered; the protected-key predicate filters owner settings.json only).
+    // A1+B1+B7+B8: claude config isolation, model authority, MCP inheritance (local agents only).
     if record.backend == super::BackendKind::Local && runtime_meta.is_some_and(|r| r.id == "claude")
     {
         let managed_root = super::storage::managed_agents_base_dir(app)?;
@@ -873,9 +856,9 @@ pub fn spawn_agent_child(
             &managed_root,
             record.effort_level.clone(),
             effective_model.as_deref(),
+            resolved_mcp_command.as_deref(),
         )?;
     }
-
     configure_runtime_cli(&mut command, runtime_meta);
 
     // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible

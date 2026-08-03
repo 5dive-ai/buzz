@@ -234,7 +234,6 @@ pub fn project_settings_json(
 ///
 /// Used for provenance reporting in the config panel ("owner setting overridden
 /// by Buzz policy").
-#[allow(dead_code)] // consumed by the B4/B5 panel provenance endpoint (Desktop TS, forthcoming)
 pub fn collect_stripped_env_keys(owner_settings_path: &Path) -> Vec<String> {
     let (base, status) = read_owner_base(owner_settings_path);
     if matches!(
@@ -398,21 +397,167 @@ pub fn owner_mcp_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude.json"))
 }
 
-/// Apply the Claude-specific spawn policy to `command` (A1 + B1 + B7).
+/// Per-agent MCP config path: `<managed_root>/claude/<pubkey>/.claude.json`.
+///
+/// Returns the path where B8 writes the merged MCP config for an isolated agent.
+/// Used by the config panel to display the file the spawned process actually reads.
+pub fn agent_mcp_config_path(managed_root: &Path, pubkey: &str) -> PathBuf {
+    managed_root
+        .join("claude")
+        .join(pubkey)
+        .join(".claude.json")
+}
+
+// ── B8: Owner MCP server inheritance ─────────────────────────────────────────
+//
+// At each local claude spawn, after the B7 settings.json projection:
+//  1. Read the owner's ~/.claude.json for top-level `mcpServers` (user scope).
+//  2. Filter out any entry whose name collides with the ACP-provided server
+//     name (case-insensitive) — Buzz wins by construction, no SDK reliance.
+//  3. Read the agent-root .claude.json (missing / invalid → {}), overwrite its
+//     `mcpServers` key with the filtered set, write back atomically.
+//
+// Fault semantics (deliberately asymmetric to B7.5 spawn-fail):
+//  - Owner unreadable / invalid → preserve agent file's existing mcpServers,
+//    warn. A transient owner failure must NOT destroy inherited servers.
+//  - Agent file invalid → treat as {}, replace with owner servers, warn.
+//  - Agent file write failure → warn, spawn CONTINUES. B8 is inheritance, not
+//    policy integrity — its failure mode == pre-B8 status quo.
+
+/// Merge the owner's user-scope MCP servers into the agent-root `.claude.json`.
+///
+/// `agent_config_dir` is the per-agent config root (B1 `CLAUDE_CONFIG_DIR`).
+/// `owner_mcp_path` is `~/.claude.json`.
+/// `acp_server_name` is the file stem of the ACP MCP binary (e.g. `"buzz-mcp"`);
+/// any inherited server with this name (case-insensitive) is omitted and warned
+/// so Buzz's channel cannot be shadowed.
+///
+/// All errors are logged and swallowed; spawn always continues.
+pub fn merge_agent_mcp_servers(
+    agent_config_dir: &Path,
+    owner_mcp_path: &Path,
+    acp_server_name: &str,
+) {
+    // 1. Read owner user-scope mcpServers.
+    let owner_mcp_servers = match read_owner_mcp_servers(owner_mcp_path) {
+        Ok(servers) => servers,
+        Err(e) => {
+            // Owner unreadable: preserve existing agent servers, warn.
+            eprintln!(
+                "buzz-desktop: failed to read owner MCP config; \
+                 prior inherited servers preserved: {e}"
+            );
+            return;
+        }
+    };
+
+    // 2. Filter colliding entries.
+    let acp_upper = acp_server_name.to_ascii_uppercase();
+    let (servers, filtered): (serde_json::Map<String, Value>, Vec<String>) =
+        owner_mcp_servers.into_iter().fold(
+            (serde_json::Map::new(), Vec::new()),
+            |(mut kept, mut dropped), (name, def)| {
+                if !acp_upper.is_empty() && name.to_ascii_uppercase() == acp_upper {
+                    dropped.push(name);
+                } else {
+                    kept.insert(name, def);
+                }
+                (kept, dropped)
+            },
+        );
+    for name in &filtered {
+        eprintln!(
+            "buzz-desktop: inherited MCP server {name:?} omitted — \
+             name collides with Buzz's ACP-provided server"
+        );
+    }
+
+    // 3. Read agent .claude.json (missing / invalid → {}).
+    let agent_file = agent_config_dir.join(".claude.json");
+    let mut agent_json = match read_agent_mcp_file(&agent_file) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!(
+                "buzz-desktop: agent MCP config was unparsable — \
+                 state replaced with owner user-scope servers: {e}"
+            );
+            serde_json::Map::new()
+        }
+    };
+
+    // 4. Set mcpServers key and write back atomically.
+    agent_json.insert("mcpServers".to_string(), Value::Object(servers));
+    if let Err(e) = write_agent_mcp_file(&agent_file, agent_json) {
+        eprintln!(
+            "buzz-desktop: failed to write agent MCP config; \
+             inherited servers may be stale: {e}"
+        );
+    }
+}
+
+/// Read the top-level `mcpServers` object from an owner `.claude.json`.
+/// Returns `Ok(map)` (possibly empty) or `Err` when the file is unreadable or
+/// the JSON cannot be parsed.
+fn read_owner_mcp_servers(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let json: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(json
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Read the agent-root `.claude.json` as an object map.
+/// Returns `Err` when the file exists but cannot be read or parsed
+/// (missing file → `Ok(empty map)`).
+fn read_agent_mcp_file(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let json: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    json.as_object()
+        .cloned()
+        .ok_or_else(|| "agent .claude.json is not a JSON object".to_string())
+}
+
+/// Write `map` to `path` atomically (temp file + rename).
+fn write_agent_mcp_file(path: &Path, map: serde_json::Map<String, Value>) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(&Value::Object(map)).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Apply the Claude-specific spawn policy to `command` (A1 + B1 + B7 + B8).
 ///
 /// Called from `spawn_agent_child` for local Claude agents only.  Writes the
-/// projected `settings.json` (B7), injects `ANTHROPIC_MODEL` (A1) and the B1
-/// paired atom (`CLAUDE_CONFIG_DIR` + `CLAUDE_SECURESTORAGE_CONFIG_DIR`).
+/// projected `settings.json` (B7), inherits owner MCP servers (B8), injects
+/// `ANTHROPIC_MODEL` (A1) and the B1 paired atom
+/// (`CLAUDE_CONFIG_DIR` + `CLAUDE_SECURESTORAGE_CONFIG_DIR`).
 ///
 /// `effective_model` is `None` when no model is resolved; the env key is
 /// removed so Claude Code uses its own default.
+///
+/// `acp_mcp_command` is the resolved path to the ACP MCP binary (e.g.
+/// `buzz-mcp`) — used by B8 to filter name-colliding inherited servers.
 pub fn apply_claude_spawn_policy(
     command: &mut std::process::Command,
     pubkey: &str,
     managed_root: &Path,
     effort_level: Option<String>,
     effective_model: Option<&str>,
+    acp_mcp_command: Option<&std::path::Path>,
 ) -> Result<(), String> {
+    // A1: claude's startup model authority is ANTHROPIC_MODEL injected below.
+    // Remove BUZZ_ACP_MODEL first so the harness never sees two model authorities
+    // simultaneously (BUZZ_ACP_MODEL drives the catalog switch path; ANTHROPIC_MODEL
+    // locks the session model directly in the adapter env since claude >= 2.1.216).
+    command.env_remove("BUZZ_ACP_MODEL");
     let policy = ClaudeLaunchPolicy::build(pubkey, managed_root, effort_level)?;
     let owner_path = owner_settings_path()
         .unwrap_or_else(|| PathBuf::from("/nonexistent/no-home-dir/.claude/settings.json"));
@@ -424,6 +569,14 @@ pub fn apply_claude_spawn_policy(
         );
     }
     write_projected_settings(&policy, &projected)?;
+    // B8: inherit owner user-scope MCP servers into the per-agent .claude.json.
+    if let Some(owner_mcp) = owner_mcp_config_path() {
+        let acp_name = acp_mcp_command
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        merge_agent_mcp_servers(&policy.config_dir, &owner_mcp, acp_name);
+    }
     // A1: single startup model authority.
     match effective_model {
         Some(m) => command.env("ANTHROPIC_MODEL", m),
@@ -436,6 +589,16 @@ pub fn apply_claude_spawn_policy(
         &policy.secure_storage_config_dir,
     );
     Ok(())
+}
+
+/// B3: clean up the per-agent Claude config root, swallowing errors so
+/// deletion is never blocked by a failed cleanup.
+pub fn try_cleanup_claude_config_root(pubkey: &str, managed_root: &Path) {
+    if let Err(e) = cleanup_claude_config_root(pubkey, managed_root) {
+        eprintln!(
+            "buzz-desktop: failed to clean up Claude config root for {pubkey}: {e} (non-fatal)"
+        );
+    }
 }
 
 #[cfg(test)]

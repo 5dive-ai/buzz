@@ -373,8 +373,15 @@ export function AgentConfigPanel({
     );
   }
 
-  const { normalized, advanced, extensions, runtimeId, sources, isPreSpawn } =
-    data;
+  const {
+    normalized,
+    advanced,
+    extensions,
+    runtimeId,
+    sources,
+    isPreSpawn,
+    strippedOwnerEnvKeys,
+  } = data;
   const configFilePath = sources.configFilePath;
 
   const normalizedEntries = (
@@ -473,6 +480,20 @@ export function AgentConfigPanel({
               ))}
             </div>
           ) : null}
+        </div>
+      ) : null}
+
+      {strippedOwnerEnvKeys && strippedOwnerEnvKeys.length > 0 ? (
+        <div className="mt-3 border-t border-border/50 pt-2 px-4">
+          <p className="text-xs text-muted-foreground">
+            Owner settings overridden by Buzz policy:{" "}
+            {strippedOwnerEnvKeys.map((key, i) => (
+              <span key={key}>
+                <code className="font-mono text-xs">{key}</code>
+                {i < strippedOwnerEnvKeys.length - 1 ? ", " : ""}
+              </span>
+            ))}
+          </p>
         </div>
       ) : null}
     </div>

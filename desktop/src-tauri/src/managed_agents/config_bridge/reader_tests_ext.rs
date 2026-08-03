@@ -16,7 +16,7 @@ fn numeric_context_limit_inherits_from_persona_env() {
     let runtime = buzz_agent_runtime();
     let tiers = persona_env_tiers("BUZZ_AGENT_MAX_CONTEXT_TOKENS", "200000");
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let field = surface.normalized.context_limit.unwrap();
     assert_eq!(field.value.as_deref(), Some("200000"));
@@ -33,7 +33,7 @@ fn record_max_tokens_overrides_global_env_with_secondary() {
     let runtime = buzz_agent_runtime();
     let tiers = global_env_tiers("BUZZ_AGENT_MAX_OUTPUT_TOKENS", "16384");
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let field = surface.normalized.max_output_tokens.unwrap();
     assert_eq!(field.value.as_deref(), Some("8192"));
@@ -64,7 +64,7 @@ fn global_env_prompt_wins_over_persona_structured_prompt() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let prompt = surface.normalized.system_prompt.unwrap();
     assert_eq!(prompt.value.as_deref(), Some("global-env-prompt"));
@@ -87,7 +87,7 @@ fn persona_env_model_wins_over_persona_structured_model() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let model = surface.normalized.model.unwrap();
     // persona env outranks persona struct because env candidates precede struct
@@ -106,7 +106,7 @@ fn structured_fallback_intact_when_no_env_representation() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let model = surface.normalized.model.unwrap();
     assert_eq!(model.value.as_deref(), Some("struct-persona-model"));
@@ -130,7 +130,7 @@ fn post_sanitization_empty_global_env_falls_through_to_persona_tier() {
     // No global env (stripped); persona provides the valid fallback.
     let tiers = persona_env_tiers("BUZZ_AGENT_THINKING_EFFORT", "medium");
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     // Persona value surfaces instead of the stripped global value.
     let effort = surface.normalized.thinking_effort.unwrap();
@@ -157,7 +157,7 @@ fn record_env_prompt_wins_over_record_struct_prompt_as_buzz_explicit() {
     );
     let runtime = test_runtime();
 
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
 
     let prompt = surface.normalized.system_prompt.unwrap();
     assert_eq!(prompt.value.as_deref(), Some("env-prompt-B"));
@@ -189,7 +189,7 @@ fn definition_env_beats_structured_persona_model() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let model = surface.normalized.model.unwrap();
     assert_eq!(model.value.as_deref(), Some("harness-model"));
@@ -222,7 +222,7 @@ fn global_env_beats_definition_env() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let model = surface.normalized.model.unwrap();
     assert_eq!(model.value.as_deref(), Some("global-model"));
@@ -249,7 +249,7 @@ fn reserved_key_absent_from_definition_env_falls_through() {
         ..Default::default()
     };
 
-    let surface = read_config_surface(&record, Some(runtime), None, &tiers);
+    let surface = read_config_surface(&record, Some(runtime), None, &tiers, None);
 
     let model = surface.normalized.model.unwrap();
     // Falls through to persona structured model.
@@ -269,7 +269,7 @@ fn b4_canonical_effort_level_surfaces_as_buzz_explicit() {
     let mut record = test_record();
     record.effort_level = Some("high".to_string());
     let runtime = buzz_agent_runtime();
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
     let effort = surface
         .normalized
         .thinking_effort
@@ -286,7 +286,7 @@ fn b4_canonical_effort_level_shadows_file_tier() {
     record.effort_level = Some("medium".to_string());
     // no env var set — config-file would otherwise win if canonical absent
     let runtime = buzz_agent_runtime();
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
     let effort = surface
         .normalized
         .thinking_effort
@@ -304,7 +304,7 @@ fn b4_record_env_var_wins_over_canonical_effort_level() {
         .env_vars
         .insert("BUZZ_AGENT_THINKING_EFFORT".to_string(), "high".to_string());
     let runtime = buzz_agent_runtime();
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
     let effort = surface
         .normalized
         .thinking_effort
@@ -320,7 +320,7 @@ fn b4_record_env_var_wins_over_canonical_effort_level() {
 fn b4_none_canonical_effort_does_not_surface() {
     let record = test_record(); // effort_level defaults to None
     let runtime = buzz_agent_runtime();
-    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
     // No env var, no session cache, no file config → effort_level field absent.
     assert!(
         surface.normalized.thinking_effort.is_none(),

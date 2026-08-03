@@ -1,9 +1,16 @@
 use super::types::{ExtensionEntry, RuntimeFileConfig};
 
-/// Read Claude Code config from `~/.claude/settings.json` and `~/.claude.json`.
-pub(super) fn read_config_file() -> Option<RuntimeFileConfig> {
+/// Read Claude Code config from `~/.claude/settings.json` and MCP config.
+///
+/// `mcp_path_override` — when `Some`, reads MCP servers from that path instead
+/// of `~/.claude.json` (used for isolated agents whose B8 agent root is known).
+pub(super) fn read_config_file(
+    mcp_path_override: Option<&std::path::Path>,
+) -> Option<RuntimeFileConfig> {
     let settings_path = crate::managed_agents::claude_config::owner_settings_path()?;
-    let mcp_path = crate::managed_agents::claude_config::owner_mcp_config_path()?;
+    let mcp_path = mcp_path_override
+        .map(std::path::Path::to_path_buf)
+        .or_else(crate::managed_agents::claude_config::owner_mcp_config_path)?;
 
     let settings = read_json_file(&settings_path);
     let mcp_config = read_json_file(&mcp_path);
@@ -25,7 +32,10 @@ pub(super) fn read_config_file() -> Option<RuntimeFileConfig> {
         cfg.extra = super::schema_walker::extract_config_fields(s, skip);
     }
 
-    // MCP servers from ~/.claude.json
+    // MCP servers from the effective config path.
+    // When mcp_path_override is set, all entries came from the owner user scope
+    // via B8 inheritance — tag them with provenance for panel display.
+    let is_agent_root = mcp_path_override.is_some();
     let mut extensions = Vec::new();
     if let Some(ref mc) = mcp_config {
         if let Some(servers) = mc.get("mcpServers").and_then(|v| v.as_object()) {
@@ -34,6 +44,7 @@ pub(super) fn read_config_file() -> Option<RuntimeFileConfig> {
                     name: name.clone(),
                     kind: "mcp".to_string(),
                     enabled: true,
+                    source: is_agent_root.then(|| "owner_user_scope".to_string()),
                 });
             }
         }
@@ -168,6 +179,7 @@ mod tests {
                     name: name.clone(),
                     kind: "mcp".to_string(),
                     enabled: true,
+                    source: None,
                 });
             }
         }

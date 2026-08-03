@@ -93,7 +93,9 @@ function McpServerRow({
           {extension.name}
         </span>
         <span className="mt-0.5 block truncate text-2xs text-muted-foreground/70">
-          {extension.kind}
+          {extension.source === "owner_user_scope"
+            ? "inherited from owner user scope"
+            : extension.kind}
           {extension.enabled ? " enabled" : " disabled"}
         </span>
       </span>

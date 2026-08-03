@@ -337,18 +337,9 @@ export type ManagedAgent = {
   modelSource: "definition" | "global" | "instance_legacy" | null;
   /** LLM inference provider, from the agent's pinned record snapshot. */
   provider: string | null;
-  /**
-   * `true` when the linked persona has been edited since this agent was
-   * created — the running agent uses the older pinned snapshot. Surface a
-   * "out of date" marker and prompt the user to delete + respawn to update.
-   * Always `false` for non-persona agents and for orphaned agents.
-   */
+  /** True when the linked persona has been edited since this agent was created. */
   personaOutOfDate: boolean;
-  /**
-   * `true` when the agent's linked persona no longer exists. Distinct from
-   * out-of-date: there is no current persona to respawn into, so do not prompt
-   * a respawn — the pinned snapshot is all the config that remains.
-   */
+  /** True when this agent's linked persona no longer exists. */
   personaOrphaned: boolean;
   /**
    * `true` when the running process was spawned with a config that no longer
@@ -461,12 +452,7 @@ export type CancelManagedAgentTurnResult = {
   status: "sent" | "no_active_turn";
 };
 
-/**
- * Outcome of a live `switch_model` control frame, surfaced asynchronously via
- * the agent's `control_result` observer frame. Busy path: `sent` (cancel +
- * requeue on the new model) or `turn_ending` (oneshot already consumed this
- * turn). Idle path: `switched`, `unsupported_model`, or `no_active_turn`.
- */
+/** Outcome of a live `switch_model` control frame (`control_result` observer). */
 export type SwitchManagedAgentModelStatus =
   | "sent"
   | "turn_ending"
@@ -474,11 +460,14 @@ export type SwitchManagedAgentModelStatus =
   | "unsupported_model"
   | "no_active_turn";
 
-export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model";
-  status: string;
-  modelId?: string;
-};
+export type ControlResultFrame =
+  | { type: "cancel_turn" | "switch_model"; status: string; modelId?: string }
+  | {
+      type: "set_config_option";
+      status: "ok" | string;
+      configId: string;
+      value: string;
+    };
 
 export type GitBashPrerequisite = {
   available: boolean;
@@ -657,7 +646,12 @@ export type ConfigSourceReport = {
   mcpConfigFilePath: string | null;
 };
 
-export type ExtensionEntry = { name: string; kind: string; enabled: boolean };
+export type ExtensionEntry = {
+  name: string;
+  kind: string;
+  enabled: boolean;
+  source?: string;
+};
 
 export type NormalizedConfig = {
   model: NormalizedField | null;
@@ -677,6 +671,8 @@ export type RuntimeConfigSurface = {
   advanced: ConfigField[];
   extensions: ExtensionEntry[];
   sources: ConfigSourceReport;
+  /** Owner `~/.claude/settings.json` env keys stripped by Buzz launch policy (B7.7c). */
+  strippedOwnerEnvKeys?: string[];
 };
 
 export type UpdateManagedAgentInput = {

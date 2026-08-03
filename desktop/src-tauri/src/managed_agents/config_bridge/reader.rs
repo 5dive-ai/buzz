@@ -9,11 +9,16 @@ use super::types::*;
 /// persona and global tiers assembled at the command boundary. Each field
 /// builder constructs its own candidate list and resolves via
 /// `resolve_with_override`.
+///
+/// `agent_mcp_path` overrides the MCP config file path used for isolated
+/// claude agents (B8). When `Some`, extensions are read from the agent-root
+/// `.claude.json` instead of the owner path.
 pub(crate) fn read_config_surface(
     record: &ManagedAgentRecord,
     runtime_meta: Option<&KnownAcpRuntime>,
     session_cache: Option<&SessionConfigCache>,
     tiers: &InheritedConfigTiers,
+    agent_mcp_path: Option<&std::path::Path>,
 ) -> RuntimeConfigSurface {
     let is_pre_spawn = session_cache.is_none();
 
@@ -22,7 +27,7 @@ pub(crate) fn read_config_surface(
         .map(|m| m.id)
         .and_then(|id| match id {
             "goose" => super::goose::read_config_file().map(|c| (c, true)),
-            "claude" => super::claude::read_config_file().map(|c| (c, true)),
+            "claude" => super::claude::read_config_file(agent_mcp_path).map(|c| (c, true)),
             "codex" => super::codex::read_config_file().map(|c| (c, true)),
             "buzz-agent" => super::buzz_agent::read_config_file().map(|c| (c, true)),
             _ => None,
@@ -148,7 +153,8 @@ pub(crate) fn read_config_surface(
     let config_file_path = runtime_meta
         .and_then(|m| m.config_file_path)
         .map(resolve_tilde);
-    let mcp_config_file_path = runtime_meta.and_then(mcp_config_file_path_for_runtime);
+    let mcp_config_file_path =
+        runtime_meta.and_then(|m| mcp_config_file_path_for_runtime(m, agent_mcp_path));
     let extensions = file_config.extensions.clone();
 
     let sources = ConfigSourceReport {
@@ -189,16 +195,28 @@ pub(crate) fn read_config_surface(
         advanced,
         extensions,
         sources,
+        stripped_owner_env_keys: runtime_meta
+            .filter(|m| m.id == "claude")
+            .and_then(|_| crate::managed_agents::claude_config::owner_settings_path())
+            .map(|p| crate::managed_agents::claude_config::collect_stripped_env_keys(&p))
+            .unwrap_or_default(),
     }
 }
 
-fn mcp_config_file_path_for_runtime(runtime: &KnownAcpRuntime) -> Option<String> {
+fn mcp_config_file_path_for_runtime(
+    runtime: &KnownAcpRuntime,
+    agent_mcp_path: Option<&std::path::Path>,
+) -> Option<String> {
     match runtime.id {
         "goose" => {
             super::goose::goose_config_path().map(|path| path.to_string_lossy().into_owned())
         }
-        "claude" => crate::managed_agents::claude_config::owner_mcp_config_path()
-            .map(|p| p.to_string_lossy().into_owned()),
+        "claude" => agent_mcp_path
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| {
+                crate::managed_agents::claude_config::owner_mcp_config_path()
+                    .map(|p| p.to_string_lossy().into_owned())
+            }),
         "codex" => {
             super::codex::codex_config_path().map(|path| path.to_string_lossy().into_owned())
         }

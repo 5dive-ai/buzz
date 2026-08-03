@@ -885,6 +885,9 @@ fn handle_relay_observer_control_event(
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
         }
+        Some("set_config_option") => {
+            handle_set_config_option_control(&payload, observer);
+        }
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
         }
@@ -914,29 +917,16 @@ fn handle_cancel_turn_control(
             None,
             &observer::ObserverContext {
                 channel_id: Some(channel_id.to_string()),
-                session_id: None,
-                turn_id: None,
-                started_at: None,
+                ..Default::default()
             },
-            serde_json::json!({
-                "type": "cancel_turn",
-                "status": status,
-            }),
+            serde_json::json!({"type": "cancel_turn", "status": status}),
         );
     }
 }
 
-/// Handle a `switch_model` control frame (Phase 3a, Option ii).
-///
-/// Busy path: deliver `SwitchModel` over the in-flight task's oneshot — the
-/// task cancels the turn, sets `desired_model`, and requeues the batch so it
-/// re-runs on a fresh session under the new model. A catalog miss surfaces
-/// post-cancel via `create_session_and_apply_model` (the turn restarts on the
-/// unchanged model + an `unsupported_model` result).
-///
-/// Idle path: validate against the cached catalog *before* invalidating
-/// (pre-cancel guard), then set `desired_model` + invalidate. The override
-/// takes visible effect on the agent's next turn.
+/// Handle a `switch_model` control frame. Busy path: deliver `SwitchModel`
+/// over the in-flight task oneshot so it cancels + requeues on the new model.
+/// Idle path: validate against catalog then set `desired_model` + invalidate.
 fn handle_switch_model_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
@@ -955,18 +945,14 @@ fn handle_switch_model_control(
         return;
     };
 
-    // A turn is in flight for this channel iff a task_map entry exists. The
-    // agent is moved out of the pool during a turn, so the control oneshot is
-    // the only reachable lever; an idle channel has no such entry.
+    // A turn is in flight iff a task_map entry exists for this channel.
     let turn_in_flight = pool
         .task_map()
         .values()
         .any(|m| m.channel_id == Some(channel_id));
 
     let status = if turn_in_flight {
-        // Busy path: deliver over the oneshot. `false` means the oneshot was
-        // already consumed this turn (a prior cancel/interrupt) — the turn is
-        // already ending, so the switch cannot land on it.
+        // Busy path: deliver over the oneshot (`false` = oneshot already consumed, turn ending).
         if signal_in_flight_task(
             pool,
             channel_id,
@@ -991,17 +977,31 @@ fn handle_switch_model_control(
             None,
             &observer::ObserverContext {
                 channel_id: Some(channel_id.to_string()),
-                session_id: None,
-                turn_id: None,
-                started_at: None,
+                ..Default::default()
             },
-            serde_json::json!({
-                "type": "switch_model",
-                "status": status,
-                "modelId": model_id,
-            }),
+            serde_json::json!({"type": "switch_model", "status": status, "modelId": model_id}),
         );
     }
+}
+
+/// Ack a `set_config_option` control frame with `status: "ok"` so Desktop
+/// can persist the canonical value (e.g. `effort_level`) on positive ack.
+fn handle_set_config_option_control(
+    payload: &serde_json::Value,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let Some(obs) = observer else { return };
+    let config_id = payload
+        .get("configId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let value = payload.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    obs.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext::default(),
+        serde_json::json!({"type": "set_config_option", "configId": config_id, "status": "ok", "value": value}),
+    );
 }
 
 /// Maximum crashes in a 60-second window before a slot's circuit opens.

@@ -29,3 +29,22 @@ export async function switchManagedAgentModel(
     modelId,
   });
 }
+
+/**
+ * Send a `set_config_option` control frame to a running agent. The harness
+ * acknowledges via a `control_result` observer frame with `type:
+ * "set_config_option"` and `status: "ok"`. The caller uses this ack to
+ * persist the canonical value (e.g. `effort_level`) so it takes effect on
+ * the next agent spawn.
+ */
+export async function sendSetConfigOption(
+  pubkey: string,
+  configId: string,
+  value: string,
+): Promise<void> {
+  await sendAgentObserverControl(pubkey, {
+    type: "set_config_option",
+    configId,
+    value,
+  });
+}

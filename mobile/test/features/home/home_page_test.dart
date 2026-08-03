@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'dart:ui' show Tristate;
 
 import 'package:buzz/features/home/home_page.dart';
+import 'package:buzz/features/activity/activity_provider.dart';
+import 'package:buzz/features/activity/feed_item.dart';
 import 'package:buzz/features/channels/channel.dart';
 import 'package:buzz/features/channels/channels_page.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
@@ -25,6 +28,7 @@ void main() {
     CommunityListNotifier? communityListNotifier,
     Community? activeCommunity,
     List<Channel>? channels,
+    ActivityNotifier Function()? activityNotifier,
     bool usesMutableActiveCommunity = false,
   }) async {
     SharedPreferences.setMockInitialValues({});
@@ -32,6 +36,9 @@ void main() {
     return ProviderScope(
       overrides: [
         savedPrefsProvider.overrideWithValue(prefs),
+        activityProvider.overrideWith(
+          activityNotifier ?? _FakeActivityNotifier.new,
+        ),
         if (status != null)
           userStatusProvider.overrideWith(
             () => _FakeUserStatusNotifier(status),
@@ -718,6 +725,65 @@ void main() {
     );
   });
 
+  testWidgets('keeps the workspace skeleton until Activity is ready', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1180, 820);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final communities = [
+      Community(
+        id: 'alpha',
+        name: 'Alpha',
+        relayUrl: 'wss://alpha.example.com',
+        addedAt: DateTime(2026),
+      ),
+      Community(
+        id: 'bravo',
+        name: 'Bravo',
+        relayUrl: 'wss://bravo.example.com',
+        addedAt: DateTime(2026),
+      ),
+    ];
+    final communityListNotifier = _FakeCommunityListNotifier(communities);
+
+    await tester.pumpWidget(
+      await buildHome(
+        activityNotifier: _PendingActivityNotifier.new,
+        communityListNotifier: communityListNotifier,
+        activeCommunity: communities.first,
+      ),
+    );
+    await tester.pump();
+    await tester.tap(
+      find.byKey(const Key('wide-navigation-community-switcher')),
+    );
+    await tester.pump(const Duration(milliseconds: 300));
+    tester
+        .widget<InkWell>(
+          find.ancestor(of: find.text('Bravo'), matching: find.byType(InkWell)),
+        )
+        .onTap!();
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(
+      tester
+          .widget<SkeletonShimmer>(
+            find.ancestor(
+              of: find.byKey(
+                const Key('wide-navigation-community-switch-skeleton'),
+              ),
+              matching: find.byType(SkeletonShimmer),
+            ),
+          )
+          .enabled,
+      isTrue,
+    );
+  });
+
   testWidgets('a failed community swipe restores the workspace', (
     tester,
   ) async {
@@ -905,6 +971,21 @@ class _FakeChannelsNotifier extends ChannelsNotifier {
 
   @override
   Future<List<Channel>> build() async => _channels;
+}
+
+class _FakeActivityNotifier extends ActivityNotifier {
+  @override
+  Future<HomeFeedResponse> build() async => HomeFeedResponse(
+    mentions: const [],
+    needsAction: const [],
+    activity: const [],
+    agentActivity: const [],
+  );
+}
+
+class _PendingActivityNotifier extends ActivityNotifier {
+  @override
+  Future<HomeFeedResponse> build() => Completer<HomeFeedResponse>().future;
 }
 
 class _FakeCommunityListNotifier extends CommunityListNotifier {

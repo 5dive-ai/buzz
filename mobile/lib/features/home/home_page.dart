@@ -12,6 +12,7 @@ import '../../shared/theme/theme.dart';
 import '../../shared/widgets/mobile_tab_footer_backdrop.dart';
 import '../../shared/widgets/skeleton.dart';
 import '../activity/activity_page.dart';
+import '../activity/activity_provider.dart';
 import '../channels/channels_page.dart';
 import '../search/search_page.dart';
 
@@ -78,6 +79,8 @@ class HomePage extends HookConsumerWidget {
       selectedChannelCommunityId.value = activeCommunityId;
     }
     final isCommunitySwitching = pendingCommunityId.value != null;
+    final activityAsync = ref.watch(activityProvider);
+    final isActivityReady = activityAsync.hasValue && !activityAsync.isLoading;
     final systemBottomInset = MediaQuery.paddingOf(context).bottom;
     final navigationBarWidth = _floatingTabBarWidth(
       MediaQuery.sizeOf(context).width,
@@ -172,6 +175,7 @@ class HomePage extends HookConsumerWidget {
                             pendingCommunityId.value = communityId;
                           },
                           pendingCommunityId: pendingCommunityId.value,
+                          isActivityReady: isActivityReady,
                           onCommunitySwitchComplete: () {
                             pendingCommunityId.value = null;
                           },

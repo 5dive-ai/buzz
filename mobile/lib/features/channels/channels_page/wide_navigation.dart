@@ -34,6 +34,7 @@ class WideChannelsNavigation extends HookConsumerWidget {
   final bool isCommunitySwitching;
   final ValueChanged<String?> onCommunitySwitchStart;
   final String? pendingCommunityId;
+  final bool isActivityReady;
   final VoidCallback onCommunitySwitchComplete;
   final List<WideNavigationDestination> destinations;
 
@@ -47,6 +48,7 @@ class WideChannelsNavigation extends HookConsumerWidget {
     required this.isCommunitySwitching,
     required this.onCommunitySwitchStart,
     required this.pendingCommunityId,
+    required this.isActivityReady,
     required this.onCommunitySwitchComplete,
     required this.destinations,
   });
@@ -63,16 +65,28 @@ class WideChannelsNavigation extends HookConsumerWidget {
     final profiles = ref.watch(userCacheProvider);
     final channelsAsync = ref.watch(channelsProvider);
     final activeCommunityId = ref.watch(activeCommunityProvider).value?.id;
-    useEffect(() {
-      if (pendingCommunityId != activeCommunityId || channelsAsync.isLoading) {
-        return null;
-      }
-      final timer = Timer(
-        const Duration(milliseconds: 250),
-        onCommunitySwitchComplete,
-      );
-      return timer.cancel;
-    }, [pendingCommunityId, activeCommunityId, channelsAsync.isLoading]);
+    useEffect(
+      () {
+        if (pendingCommunityId != activeCommunityId ||
+            channelsAsync.isLoading ||
+            !channelsAsync.hasValue ||
+            !isActivityReady) {
+          return null;
+        }
+        final timer = Timer(
+          const Duration(milliseconds: 250),
+          onCommunitySwitchComplete,
+        );
+        return timer.cancel;
+      },
+      [
+        pendingCommunityId,
+        activeCommunityId,
+        channelsAsync.isLoading,
+        channelsAsync.hasValue,
+        isActivityReady,
+      ],
+    );
     final channels = (channelsAsync.asData?.value ?? const <Channel>[])
         .where((channel) => !channel.isArchived)
         .toList();

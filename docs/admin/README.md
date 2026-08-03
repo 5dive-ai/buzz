@@ -18,11 +18,17 @@ BUZZ_ADMIN_WEB_DIR=/srv/buzz/admin-web
 
 The relay requires HTTP Basic credentials before it serves the dashboard, its
 assets, any admin API, or an attachment. `BUZZ_ADMIN_USERNAME` defaults to
-`admin`; the password has no default,
-must be at least 16 bytes, and is retained by the relay only as a digest. The
-configured host and matching browser origin remain defense-in-depth checks.
-Requests and responses are bounded and uncached. Use HTTPS so the credentials
-are not exposed in transit, and route admin traffic through the private ingress.
+`admin` and must not contain a colon; the password has no default, must be 16
+to 1024 bytes, and is retained by the relay only as a digest. The configured
+host and matching browser origin remain defense-in-depth checks. Requests and
+responses are bounded and uncached. Use HTTPS so the credentials are not
+exposed in transit, and route admin traffic through the private ingress.
+
+If `BUZZ_ADMIN_HOST` is set but the credentials are missing or invalid, the
+relay logs an error, disables the dashboard, and continues serving normally —
+the admin host then behaves like any other host. The dashboard is an optional
+surface, so a missing password costs the dashboard rather than the relay. Check
+startup logs for `admin dashboard disabled` after any change to these variables.
 
 When the UI runs in a separate pod, proxy `/api/admin/v1/*` to the relay while
 preserving the admin `Host` header. A `NetworkPolicy` grants the admin pod access

@@ -948,18 +948,31 @@ impl Config {
         };
 
         // Read-only deployment-admin surface. The route is absent when the host is unset.
+        //
+        // A misconfigured admin host disables the dashboard rather than aborting startup.
+        // The relay is not an admin service: refusing to boot would turn a missing
+        // BUZZ_ADMIN_PASSWORD into a full relay outage, while leaving it off costs only
+        // the dashboard. Either way the surface never serves unauthenticated.
         let admin = match std::env::var("BUZZ_ADMIN_HOST")
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
         {
             None => None,
-            Some(host) => Some(AdminConfig::from_values(
+            Some(host) => match AdminConfig::from_values(
                 host,
                 std::env::var("BUZZ_ADMIN_USERNAME").ok(),
                 std::env::var("BUZZ_ADMIN_PASSWORD").ok(),
                 std::env::var("BUZZ_ADMIN_WEB_DIR").ok(),
-            )?),
+            ) {
+                Ok(admin) => Some(admin),
+                Err(error) => {
+                    tracing::error!(
+                        "admin dashboard disabled — BUZZ_ADMIN_HOST is set but the configuration is invalid: {error}"
+                    );
+                    None
+                }
+            },
         };
 
         // Web UI static file serving
@@ -1159,6 +1172,30 @@ mod tests {
     }
 
     #[test]
+    fn admin_host_without_a_password_disables_the_dashboard_but_still_boots() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous =
+            ["BUZZ_ADMIN_HOST", "BUZZ_ADMIN_PASSWORD"].map(|name| (name, std::env::var_os(name)));
+
+        std::env::remove_var("BUZZ_ADMIN_PASSWORD");
+        std::env::set_var("BUZZ_ADMIN_HOST", "admin.example");
+        let config = Config::from_env().expect("relay must boot without an admin password");
+        std::env::remove_var("BUZZ_ADMIN_HOST");
+
+        assert!(
+            config.admin.is_none(),
+            "an unusable admin credential must leave the surface off, not open"
+        );
+
+        for (name, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
     fn admin_env_vars_wire_into_config() {
         let _guard = ENV_MUTEX.lock().unwrap();
         let previous = [
@@ -1168,8 +1205,6 @@ mod tests {
         ]
         .map(|name| (name, std::env::var_os(name)));
 
-        // Set the password before the host. Other tests call `Config::from_env` without
-        // this mutex, and a host set without a password makes that call fail.
         std::env::set_var("BUZZ_ADMIN_PASSWORD", "correct horse battery staple");
         std::env::set_var("BUZZ_ADMIN_USERNAME", "operator");
         std::env::set_var("BUZZ_ADMIN_HOST", "admin.example");

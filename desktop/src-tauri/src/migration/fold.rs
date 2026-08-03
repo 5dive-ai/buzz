@@ -38,7 +38,7 @@ pub fn fold_personas_into_agent_store(app: &tauri::AppHandle) {
 /// Operates on the raw JSON files — no keyring interaction: instance records
 /// are passed through byte-identical, and folded definitions carry no keys.
 /// Returns `Ok(None)` when there is no `personas.json` to fold.
-fn fold_personas_in_dir(base_dir: &Path) -> Result<Option<usize>, String> {
+pub(crate) fn fold_personas_in_dir(base_dir: &Path) -> Result<Option<usize>, String> {
     let personas_path = base_dir.join("personas.json");
     if !personas_path.exists() {
         return Ok(None);

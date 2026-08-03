@@ -325,13 +325,73 @@ fn install_staged(
 
 /// Run idempotent scoped migrations against an installed scope directory.
 ///
-/// Currently a no-op: the boot-time migration pipeline in `migration.rs` still
-/// runs pre-scope and operates on the legacy unscoped paths. Per-scope
-/// migration scheduling (moving fold/strip/backfill into this pipeline) is
-/// Phase 2 follow-on work once the legacy data has been adopted.
-fn run_scoped_migrations(_scope_dir: &Path) -> Result<(), String> {
-    // Future: run fold_personas_into_agent_store_at, strip_baked_team_instructions_at,
-    // backfill_standalone_agents_at, etc. against scope_dir.
+/// This is the per-scope migration pipeline, run after staged install completes.
+/// Ordering mirrors `migration.rs::run_boot_migrations_inner` for the
+/// definition-touching steps (the ordering doc comment at `migration.rs:106-121`
+/// is load-bearing). Machine-level steps that stay pre-scope (dir init, dev
+/// symlinks, persona provider rename) are NOT included here.
+///
+/// # Order (must be preserved)
+/// 1. `fold_personas_in_dir` — fold personas.json into managed-agents.json.
+///    BEFORE all readers of the unified store (strip, backfill, materialize).
+/// 2. `strip_baked_team_instructions_in_dir` — clean legacy baked team-instructions
+///    suffix AFTER fold (so lifted definitions are also cleaned) and BEFORE
+///    backfill (so manufactured definitions never snapshot the suffix).
+/// 3. `refresh_builtin_agent_avatars_at` — refresh legacy builtin avatars.
+/// 4. `backfill_standalone_agents_in_dir` — manufacture definitions for standalone
+///    agents AFTER fold (slug collision checks see pre-existing definitions).
+/// 5. `detach_directory_backed_teams_in_dir` — lift pack instructions, clear
+///    source_dir on teams.
+/// 6. `reconcile_legacy_command_names_at` — fix stale command names.
+/// 7. `reconcile_provider_mcp_commands_at` — fix mcp_command values.
+/// 8. `reconcile_databricks_v1_to_v2_at` — V1→V2 provider migration.
+/// 9. `materialize_agent_runtimes_at` — materialize runtime onto each record.
+fn run_scoped_migrations(scope_dir: &Path) -> Result<(), String> {
+    // Step 1: fold personas.json into the unified store.
+    match crate::migration::fold_personas_in_dir(scope_dir) {
+        Ok(None) | Ok(Some(0)) => {}
+        Ok(Some(n)) => {
+            eprintln!("buzz-desktop: scope-init-fold: {n} definitions folded into scoped store");
+        }
+        Err(e) => eprintln!("buzz-desktop: scope-init-fold: {e}"),
+    }
+
+    // Step 2: strip baked team-instructions suffix.
+    match crate::migration::strip_baked_team_instructions_in_dir(scope_dir) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("buzz-desktop: scope-init-strip: {n} records cleaned"),
+        Err(e) => eprintln!("buzz-desktop: scope-init-strip: {e}"),
+    }
+
+    // Step 3: refresh legacy builtin agent avatars.
+    crate::migration::refresh_builtin_agent_avatars_at(scope_dir);
+
+    // Step 4: backfill standalone agents into definition-linked records.
+    match crate::migration::backfill_standalone_agents_in_dir(scope_dir) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("buzz-desktop: scope-init-backfill: {n} agents backfilled"),
+        Err(e) => eprintln!("buzz-desktop: scope-init-backfill: {e}"),
+    }
+
+    // Step 5: detach directory-backed teams.
+    match crate::migration::detach_directory_backed_teams_in_dir(scope_dir) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("buzz-desktop: scope-init-detach: {n} teams detached"),
+        Err(e) => eprintln!("buzz-desktop: scope-init-detach: {e}"),
+    }
+
+    // Step 6: reconcile legacy command names.
+    crate::migration::reconcile_legacy_command_names_at(scope_dir);
+
+    // Step 7: reconcile provider mcp_command values.
+    crate::migration::reconcile_provider_mcp_commands_at(scope_dir);
+
+    // Step 8: Databricks V1 → V2 provider migration.
+    crate::migration::reconcile_databricks_v1_to_v2_at(scope_dir);
+
+    // Step 9: materialize runtime onto each record.
+    crate::migration::materialize_agent_runtimes_at(scope_dir);
+
     Ok(())
 }
 

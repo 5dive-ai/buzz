@@ -39,7 +39,7 @@ pub fn detach_directory_backed_teams(app: &tauri::AppHandle) {
 ///
 /// `base_dir` is the managed-agents base directory (`<AppDataDir>/agents/`).
 /// Returns the number of teams detached (0 = nothing to do).
-pub(super) fn detach_directory_backed_teams_in_dir(base_dir: &Path) -> Result<usize, String> {
+pub(crate) fn detach_directory_backed_teams_in_dir(base_dir: &Path) -> Result<usize, String> {
     let teams_path = base_dir.join("teams.json");
     let agents_path = base_dir.join("managed-agents.json");
 

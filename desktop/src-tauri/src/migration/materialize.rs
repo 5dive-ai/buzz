@@ -39,7 +39,7 @@ pub fn materialize_agent_runtimes(app: &tauri::AppHandle) {
     }
 }
 
-fn materialize_runtimes_in_file(path: &Path) {
+pub(crate) fn materialize_runtimes_in_file(path: &Path) {
     let persona_runtimes = load_persona_runtimes(path);
     if persona_runtimes.is_empty() {
         return;

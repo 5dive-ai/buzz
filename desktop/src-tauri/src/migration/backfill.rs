@@ -48,7 +48,7 @@ pub fn backfill_standalone_agents(app: &tauri::AppHandle) {
 
 /// Core backfill logic, decoupled from the Tauri `AppHandle` for testing.
 /// Returns the number of records backfilled (0 = nothing to do).
-fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
+pub(crate) fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {
     let agents_path = base_dir.join("managed-agents.json");
     if !agents_path.exists() {
         return Ok(0);

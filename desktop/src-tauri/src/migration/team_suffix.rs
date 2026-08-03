@@ -64,7 +64,7 @@ pub fn strip_baked_team_instructions(app: &tauri::AppHandle) {
 /// `base_dir` is the managed-agents base directory (`<AppDataDir>/agents/`).
 /// Returns the number of records changed; `Ok(0)` means nothing to do and
 /// nothing was written, so a second boot is a clean no-op.
-pub(super) fn strip_baked_team_instructions_in_dir(base_dir: &Path) -> Result<usize, String> {
+pub(crate) fn strip_baked_team_instructions_in_dir(base_dir: &Path) -> Result<usize, String> {
     let agents_path = base_dir.join("managed-agents.json");
     if !agents_path.exists() {
         return Ok(0);

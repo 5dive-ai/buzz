@@ -91,7 +91,7 @@ mod tests {
             format!("_meta/{community}/{SHA}.json/extra"),
             format!("_meta/{}/{SHA}.json", community.simple()),
             format!("_meta/{community}/ABC.json"),
-            format!("m/{community}/{SHA}.json"),
+            format!("media/{community}/{SHA}.json"),
         ] {
             assert_eq!(parse_sidecar_key(&invalid), None, "{invalid}");
         }

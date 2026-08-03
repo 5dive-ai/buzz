@@ -13,8 +13,8 @@
 //!
 //! | Class | Shape |
 //! |---|---|
-//! | thumb | `{sha256}.thumb.jpg` or `m/{hh}/{hh}/{community-uuid}/{sha256}.thumb.jpg` |
-//! | blob | `{sha256}.{ext}` or `m/{hh}/{hh}/{community-uuid}/{sha256}.{ext}` (ext: 1-8 mixed-case alphanumeric) |
+//! | thumb | `{sha256}.thumb.jpg` or `media/{hh}/{hh}/{community-uuid}/{sha256}.thumb.jpg` |
+//! | blob | `{sha256}.{ext}` or `media/{hh}/{hh}/{community-uuid}/{sha256}.{ext}` (ext: 1-8 mixed-case alphanumeric) |
 //! | sidecar | `_meta/{community-uuid}/{sha256}.json` |
 //! | auxiliary | `_uploads/{community-uuid}/{sha256}/{ulid}.json` |
 //! | unknown | everything else |
@@ -155,11 +155,11 @@ fn parse_canonical_uuid(s: &str) -> Option<Uuid> {
     Uuid::parse_str(s).ok()
 }
 
-/// `m/{sha[0:2]}/{sha[2:4]}/{community}/{filename}`. The filename's digest
+/// `media/{sha[0:2]}/{sha[2:4]}/{community}/{filename}`. The filename's digest
 /// must agree with both shard segments; malformed migration keys stay unknown.
 fn parse_sharded_prefix(key: &str) -> Option<(Uuid, &str)> {
     let mut segments = key.split('/');
-    if segments.next()? != "m" {
+    if segments.next()? != "media" {
         return None;
     }
     let shard_1 = segments.next()?;
@@ -586,7 +586,7 @@ mod tests {
         let s = sha(0xab);
         let c = community(10);
         assert_eq!(
-            classify_key(&format!("m/ab/ab/{c}/{s}.png")),
+            classify_key(&format!("media/ab/ab/{c}/{s}.png")),
             KeyClass::Blob {
                 community: Some(c),
                 sha256: s.clone(),
@@ -594,7 +594,7 @@ mod tests {
             }
         );
         assert_eq!(
-            classify_key(&format!("m/ab/ab/{c}/{s}.thumb.jpg")),
+            classify_key(&format!("media/ab/ab/{c}/{s}.thumb.jpg")),
             KeyClass::Thumb {
                 community: Some(c),
                 sha256: s,
@@ -607,13 +607,13 @@ mod tests {
         let s = sha(0xab);
         let c = community(11);
         for key in [
-            format!("m/ff/ab/{c}/{s}.png"),
-            format!("m/ab/ff/{c}/{s}.png"),
-            format!("m/a/ab/{c}/{s}.png"),
-            format!("m/ab/ab/not-a-uuid/{s}.png"),
-            format!("m/ab/ab/{c}/{s}.png/extra"),
-            format!("m/ab/ab/{c}/{}.png", s.to_uppercase()),
-            format!("m/ab/ab/{c}/{s}.tar.gz"),
+            format!("media/ff/ab/{c}/{s}.png"),
+            format!("media/ab/ff/{c}/{s}.png"),
+            format!("media/a/ab/{c}/{s}.png"),
+            format!("media/ab/ab/not-a-uuid/{s}.png"),
+            format!("media/ab/ab/{c}/{s}.png/extra"),
+            format!("media/ab/ab/{c}/{}.png", s.to_uppercase()),
+            format!("media/ab/ab/{c}/{s}.tar.gz"),
         ] {
             assert_eq!(classify_key(&key), KeyClass::Unknown, "key: {key}");
         }
@@ -725,9 +725,9 @@ mod tests {
         let c = community(12);
         let mut agg = BucketAggregate::default();
         agg.fold(&format!("{s}.jpg"), 100);
-        agg.fold(&format!("m/ab/ab/{c}/{s}.jpg"), 100);
+        agg.fold(&format!("media/ab/ab/{c}/{s}.jpg"), 100);
         agg.fold(&format!("{s}.thumb.jpg"), 20);
-        agg.fold(&format!("m/ab/ab/{c}/{s}.thumb.jpg"), 20);
+        agg.fold(&format!("media/ab/ab/{c}/{s}.thumb.jpg"), 20);
         agg.fold(&format!("_meta/{c}/{s}.json"), 10);
 
         let snap = agg.finish();
@@ -748,7 +748,7 @@ mod tests {
         let sharded_community = community(13);
         let other_community = community(14);
         let mut agg = BucketAggregate::default();
-        agg.fold(&format!("m/cd/cd/{sharded_community}/{s}.jpg"), 200);
+        agg.fold(&format!("media/cd/cd/{sharded_community}/{s}.jpg"), 200);
         agg.fold(&format!("_meta/{sharded_community}/{s}.json"), 10);
         agg.fold(&format!("_meta/{other_community}/{s}.json"), 10);
 

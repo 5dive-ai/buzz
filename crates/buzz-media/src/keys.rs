@@ -60,7 +60,7 @@ pub fn legacy_blob_key(sha256: &str, ext: &str) -> Result<String, MediaKeyError>
     Ok(format!("{sha256}.{ext}"))
 }
 
-/// Hash-leading blob key: `m/<2>/<2>/<community>/<sha256>.<ext>`.
+/// Hash-leading blob key: `media/<2>/<2>/<community>/<sha256>.<ext>`.
 pub fn sharded_blob_key(
     community: CommunityId,
     sha256: &str,
@@ -68,7 +68,7 @@ pub fn sharded_blob_key(
 ) -> Result<String, MediaKeyError> {
     let filename = legacy_blob_key(sha256, ext)?;
     Ok(format!(
-        "m/{}/{}/{community}/{filename}",
+        "media/{}/{}/{community}/{filename}",
         &sha256[..2],
         &sha256[2..4]
     ))
@@ -80,11 +80,11 @@ pub fn legacy_thumb_key(sha256: &str) -> Result<String, MediaKeyError> {
     Ok(format!("{sha256}.thumb.jpg"))
 }
 
-/// Hash-leading thumbnail key: `m/<2>/<2>/<community>/<sha256>.thumb.jpg`.
+/// Hash-leading thumbnail key: `media/<2>/<2>/<community>/<sha256>.thumb.jpg`.
 pub fn sharded_thumb_key(community: CommunityId, sha256: &str) -> Result<String, MediaKeyError> {
     let filename = legacy_thumb_key(sha256)?;
     Ok(format!(
-        "m/{}/{}/{community}/{filename}",
+        "media/{}/{}/{community}/{filename}",
         &sha256[..2],
         &sha256[2..4]
     ))
@@ -135,11 +135,11 @@ mod tests {
 
         assert_eq!(
             sharded_blob_key(community, SHA, "jpg").unwrap(),
-            format!("m/ab/cd/{community}/{SHA}.jpg")
+            format!("media/ab/cd/{community}/{SHA}.jpg")
         );
         assert_eq!(
             sharded_thumb_key(community, SHA).unwrap(),
-            format!("m/ab/cd/{community}/{SHA}.thumb.jpg")
+            format!("media/ab/cd/{community}/{SHA}.thumb.jpg")
         );
         assert_ne!(
             sharded_blob_key(community, SHA, "jpg").unwrap(),
@@ -155,14 +155,14 @@ mod tests {
         assert_eq!(
             read_candidates(&ctx, &format!("{SHA}.png")).unwrap(),
             MediaReadCandidates {
-                sharded: format!("m/ab/cd/{community}/{SHA}.png"),
+                sharded: format!("media/ab/cd/{community}/{SHA}.png"),
                 legacy: format!("{SHA}.png"),
             }
         );
         assert_eq!(
             read_candidates(&ctx, &format!("{SHA}.thumb.jpg")).unwrap(),
             MediaReadCandidates {
-                sharded: format!("m/ab/cd/{community}/{SHA}.thumb.jpg"),
+                sharded: format!("media/ab/cd/{community}/{SHA}.thumb.jpg"),
                 legacy: format!("{SHA}.thumb.jpg"),
             }
         );

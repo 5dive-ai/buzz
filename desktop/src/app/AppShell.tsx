@@ -124,7 +124,9 @@ export function AppShell() {
   const mainInsetRef = React.useRef<HTMLElement>(null);
   const location = useLocation();
   const queryClient = useQueryClient();
-  useManagedAgentRuntimeReconciliation(`${activeCommunity?.id}-${reinitKey}`);
+  useManagedAgentRuntimeReconciliation(
+    `${activeCommunity?.id ?? "none"}-${reinitKey}`,
+  );
   const {
     goAgents,
     goChannel,

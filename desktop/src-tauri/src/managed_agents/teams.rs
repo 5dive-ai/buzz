@@ -3,14 +3,20 @@ use std::{fs, path::PathBuf};
 use tauri::AppHandle;
 
 use crate::{
-    managed_agents::{managed_agents_base_dir, ManagedAgentRecord, TeamRecord},
+    managed_agents::{ManagedAgentRecord, TeamRecord},
     util::now_iso,
 };
 
 use super::team_repair::team_persona_key;
 
+/// Resolve the active-scope `teams.json` path. Fails closed on `None` scope.
 pub(crate) fn teams_store_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(managed_agents_base_dir(app)?.join("teams.json"))
+    use tauri::Manager as _;
+    let state = app.state::<crate::app_state::AppState>();
+    let scope = state.capture_active_scope().ok_or_else(|| {
+        "no active workspace scope — apply a workspace before accessing teams".to_string()
+    })?;
+    Ok(teams_store_path_at(&scope.definitions_dir))
 }
 
 /// Scoped variant: resolve `teams.json` under a workspace scope's definitions dir.

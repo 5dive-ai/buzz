@@ -131,6 +131,14 @@ pub async fn apply_workspace(
     agent_managed_profiles: Option<bool>,
     app: AppHandle,
 ) -> Result<(), String> {
+    // ── Layer 1: async serialization lock ────────────────────────────────────
+    // workspace_transition serializes apply_workspace and live identity import
+    // so scope transitions are never concurrent. We acquire via a clone so the
+    // borrow does not prevent moving `app` into spawn_blocking below.
+    let lock_app = app.clone();
+    let lock_state = lock_app.state::<AppState>();
+    let _transition_guard = lock_state.workspace_transition.lock().await;
+
     let restore_app = app.clone();
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -163,7 +171,9 @@ pub async fn apply_workspace(
             None => None,
         };
 
-        // ── Apply all state changes (nothing below can fail) ──────────────────
+        // ── Layer 2: synchronous commit epoch ────────────────────────────────
+        // No .await may be held while any Layer-2 guard is live. Relay override,
+        // keys, and the active scope are all committed in this critical section.
         {
             let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
             *override_guard = Some(relay_url.clone());
@@ -185,9 +195,11 @@ pub async fn apply_workspace(
             .store(!agent_managed_profiles.unwrap_or(false), Ordering::Release);
 
         // ── Commit the active workspace agent scope ───────────────────────────
-        // Derive the scope from the now-applied relay + owner keys and store it
-        // as the active scope. All subsequent store reads/writes and event-sync
-        // calls use the scoped definitions directory.
+        // Derive the scope from the now-applied relay + owner keys and commit it
+        // as the active scope. All subsequent store reads/writes (via
+        // load_managed_agents, save_managed_agents, etc.) resolve through
+        // capture_active_scope() → scoped definitions directory. There is NO
+        // fallback to the legacy unscoped root.
         {
             let owner_pubkey = state
                 .keys
@@ -249,23 +261,23 @@ pub async fn apply_workspace(
             // instead of being abandoned by the storage cutover.
             migrate_legacy_retention_into(&restore_app, &scope);
 
-            // Use the scoped definitions directory for event sync.
-            // After apply_workspace commits the scope, capture_active_scope()
-            // returns the scoped dir; fall back to the legacy unscoped root
-            // only when no scope has been committed (pre-Phase-2 transition).
-            let definitions_dir = state
-                .capture_active_scope()
-                .map(|s| s.definitions_dir)
-                .unwrap_or_else(|| {
-                    crate::managed_agents::managed_agents_base_dir(&restore_app).unwrap_or_default()
-                });
-
-            crate::event_sync::spawn_event_sync(
-                restore_app.clone(),
-                scope.owner_keys,
-                scope.db_path,
-                definitions_dir,
-            )
+            // The active scope was committed in the spawn_blocking above.
+            // If it is somehow None here, event sync is skipped rather than
+            // falling back to the legacy unscoped root (which would recreate
+            // split-brain storage).
+            if let Some(agent_scope) = state.capture_active_scope() {
+                crate::event_sync::spawn_event_sync(
+                    restore_app.clone(),
+                    scope.owner_keys,
+                    scope.db_path,
+                    agent_scope.definitions_dir,
+                );
+            } else {
+                eprintln!(
+                    "buzz-desktop: active agent scope unavailable after workspace apply — \
+                     event sync skipped"
+                );
+            }
         }
         Err(error) => {
             eprintln!("buzz-desktop: scoped event-sync unavailable after workspace apply: {error}");

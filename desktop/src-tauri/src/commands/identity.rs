@@ -332,13 +332,54 @@ pub async fn save_ncryptsec_copy(
     Ok(Some(dest.display().to_string()))
 }
 
+/// Stop all live managed-agent runtimes as part of a workspace drain.
+///
+/// Called during identity import (live-active path) to stop all agents
+/// before the active scope is cleared. At call time the scope is still set,
+/// so `load_managed_agents` resolves correctly. After this returns the caller
+/// persists the new identity and clears the scope.
+///
+/// Delegates to `shutdown::shutdown_managed_agents` which handles the full
+/// Layer-2 stop sequence (runtime_transition → store → processes locks,
+/// SIGTERM fan-out, orphan sweep). Returns `Err` if any stop fails; the
+/// caller logs the error and proceeds.
+fn drain_all_managed_agent_runtimes(
+    app: &tauri::AppHandle,
+    _state: &AppState,
+) -> Result<(), String> {
+    crate::shutdown::shutdown_managed_agents(app)
+}
+
 #[tauri::command]
 pub async fn import_identity(
     nsec: String,
     password: Option<String>,
     app_handle: tauri::AppHandle,
 ) -> Result<IdentityInfo, String> {
-    tokio::task::spawn_blocking(move || {
+    // ── Layer 1: async serialization lock ────────────────────────────────────
+    // identity_mutation (Layer 1) must be held for the full import to prevent a
+    // concurrent stale persist from overwriting the imported key.
+    //
+    // If there is an active scope, we also take workspace_transition so that
+    // clearing the active scope is serialized against apply_workspace.
+    // Lock order: identity_mutation → workspace_transition.
+    let lock_app = app_handle.clone();
+    let lock_state = lock_app.state::<AppState>();
+    let _mutation_guard = lock_state.identity_mutation.lock().await;
+
+    // Capture whether an active scope exists BEFORE entering spawn_blocking.
+    let has_active_scope = lock_state.capture_active_scope().is_some();
+
+    // For the live-active path, also hold workspace_transition so that
+    // clearing the active scope is serialized against concurrent apply_workspace
+    // calls. Lock order: identity_mutation → workspace_transition.
+    let _transition_guard = if has_active_scope {
+        Some(lock_state.workspace_transition.lock().await)
+    } else {
+        None
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
         // NIP-49 backups require a passphrase and decrypt entirely in Rust.
         // Raw nsec/hex input follows the existing parser path unchanged.
         let password = password.map(zeroize::Zeroizing::new);
@@ -347,11 +388,7 @@ pub async fn import_identity(
             password.as_ref().map(|value| value.as_str()),
         )?;
 
-        // Serialize against persist_current_identity: hold this guard for the
-        // full function body so a concurrent stale persist can't overwrite
-        // this import.
         let state = app_handle.state::<AppState>();
-        let _mutation_guard = state.identity_mutation.blocking_lock();
 
         let data_dir = app_handle
             .path()
@@ -359,6 +396,23 @@ pub async fn import_identity(
             .map_err(|e| format!("app data dir: {e}"))?;
         std::fs::create_dir_all(&data_dir).map_err(|e| format!("create app data dir: {e}"))?;
         let key_path = data_dir.join("identity.key");
+
+        // ── Live-active path: drain runtimes before swapping identity ─────────
+        // When an active scope exists, stop all managed-agent runtimes before
+        // persisting the new identity. The frontend re-applies the workspace
+        // (which runs the scope initialization pipeline) to restore agents.
+        //
+        // Drain failures are logged rather than fatal — the identity persist
+        // and scope clear proceed regardless; the frontend's re-apply handles
+        // agent restoration.
+        if has_active_scope {
+            if let Err(e) = drain_all_managed_agent_runtimes(&app_handle, &state) {
+                eprintln!(
+                    "buzz-desktop: identity import drain warning — some runtimes may still be \
+                     running: {e}; workspace re-apply will restore agents"
+                );
+            }
+        }
 
         let (pubkey, storage) = commit_imported_identity(&state, &data_dir, keys, |keys| {
             // Persist into the OS keyring first (store → read-back verify →
@@ -368,6 +422,17 @@ pub async fn import_identity(
                 crate::secret_store::SecretStore::shared(crate::app_state::keyring_service());
             crate::app_state::persist_imported_identity(store, keys, &key_path, &data_dir)
         })?;
+
+        // ── Clear active scope and bump generation ────────────────────────────
+        // For no-active-scope path: no scope was ever set; clearing is a no-op
+        // but bumping generation invalidates any in-flight stale operations.
+        // For live-active path: agents are stopped; clearing scope makes all
+        // agent commands fail closed until the frontend re-applies a workspace.
+        //
+        // Invariant: the fallback relay can never claim legacy data — claims
+        // are only written inside apply_workspace's prepare stage.
+        state.clear_active_scope();
+        crate::managed_agents::scope::next_scope_generation();
 
         let pubkey_hex = pubkey.to_hex();
         let display_name = truncated_display_name(&pubkey)?;
@@ -384,7 +449,14 @@ pub async fn import_identity(
         })
     })
     .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
+    .map_err(|e| format!("spawn_blocking failed: {e}"))?;
+
+    // Guards must stay alive until spawn_blocking completes so the serialization
+    // covers the full duration of the import.
+    drop(_transition_guard);
+    drop(_mutation_guard);
+
+    result
 }
 
 /// Commit an imported identity: durably persist, swap in-memory keys, clear

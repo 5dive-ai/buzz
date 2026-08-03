@@ -18,7 +18,7 @@ use std::path::Path;
 /// (`WorkspaceAgentScope::definitions_dir`). Reads personas/teams/agents from
 /// that directory rather than the legacy unscoped `agents/` root.
 pub fn run_event_sync(
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
     owner_keys: &nostr::Keys,
     db_path: &Path,
     definitions_dir: &Path,

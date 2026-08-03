@@ -42,8 +42,20 @@ pub fn managed_agents_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Resolve the active-scope `managed-agents.json` path.
+///
+/// Routes through [`crate::app_state::AppState::capture_active_scope`] when a
+/// workspace scope has been committed, and fails closed with a clear error when
+/// no scope is active. There is NO fallback to the legacy unscoped root —
+/// returning a legacy path would recreate split-brain storage.
 pub(crate) fn managed_agents_store_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(managed_agents_base_dir(app)?.join("managed-agents.json"))
+    use tauri::Manager as _;
+    let state = app.state::<crate::app_state::AppState>();
+    let scope = state.capture_active_scope().ok_or_else(|| {
+        "no active workspace scope — apply a workspace before accessing agent definitions"
+            .to_string()
+    })?;
+    Ok(managed_agents_store_path_at(&scope.definitions_dir))
 }
 
 /// Scoped variant: resolve `managed-agents.json` under a workspace scope's
@@ -466,7 +478,7 @@ pub(crate) fn save_agent_definitions_at(
 /// name/pubkey order their save path established.
 fn write_agent_store(
     app: &AppHandle,
-    mut definitions: Vec<ManagedAgentRecord>,
+    definitions: Vec<ManagedAgentRecord>,
     instances: Vec<ManagedAgentRecord>,
 ) -> Result<(), String> {
     let path = managed_agents_store_path(app)?;

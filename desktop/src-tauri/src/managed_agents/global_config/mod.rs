@@ -30,7 +30,7 @@ use tauri::AppHandle;
 use crate::managed_agents::env_vars::{
     validate_user_env_keys, DERIVED_PROVIDER_MODEL_ENV_KEYS, MAX_ENV_VALUE_BYTES,
 };
-use crate::managed_agents::storage::{atomic_write_json_restricted, managed_agents_base_dir};
+use crate::managed_agents::storage::atomic_write_json_restricted;
 use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
 
 /// The global agent configuration record.
@@ -174,8 +174,15 @@ pub fn normalize_global_config_fields(config: &mut GlobalAgentConfig) {
     }
 }
 
+/// Resolve the active-scope `global-agent-config.json` path. Fails closed on
+/// `None` scope. No fallback to the legacy unscoped root.
 fn global_config_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
-    Ok(managed_agents_base_dir(app)?.join("global-agent-config.json"))
+    use tauri::Manager as _;
+    let state = app.state::<crate::app_state::AppState>();
+    let scope = state.capture_active_scope().ok_or_else(|| {
+        "no active workspace scope — apply a workspace before accessing global config".to_string()
+    })?;
+    Ok(global_config_path_at(&scope.definitions_dir))
 }
 
 /// Scoped variant: resolve `global-agent-config.json` under a workspace scope's

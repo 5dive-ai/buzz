@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::Response,
     routing::get,
     Json, Router,
 };

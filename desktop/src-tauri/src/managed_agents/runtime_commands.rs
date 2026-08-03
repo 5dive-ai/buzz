@@ -12,6 +12,9 @@ use super::{
     ManagedAgentRuntimeStatus,
 };
 use crate::app_state::AppState;
+use crate::managed_agents::global_config::load_global_agent_config_at;
+use crate::managed_agents::personas::load_personas_at;
+use crate::managed_agents::storage::{load_managed_agents_at, save_managed_agents_at};
 
 const STATUS_EVENT: &str = "managed-agent-runtime-status";
 
@@ -141,12 +144,22 @@ pub fn put_managed_agent_runtime_lifecycle(
 pub fn list_managed_agent_runtimes(
     app: AppHandle,
 ) -> Result<Vec<ManagedAgentRuntimeStatus>, String> {
+    // Capture scope at function entry — all reads in this function (personas,
+    // global config, managed agents) must use the same scope so a concurrent
+    // workspace switch cannot assemble mixed-scope inputs.
+    let state = app.state::<AppState>();
+    let scope = state
+        .capture_active_scope()
+        .ok_or_else(|| "list_managed_agent_runtimes: no active workspace scope".to_string())?;
+    let definitions_dir = scope.definitions_dir.clone();
+
     // This command is polled whenever the members sidebar opens and refetched
     // on every status event — load the per-row status inputs once, outside
     // the locks, instead of hitting disk per row while holding them.
-    let personas = load_personas(&app).unwrap_or_default();
-    let global = load_global_agent_config(&app).unwrap_or_default();
-    let state = app.state::<AppState>();
+    // Both loads use the captured scope so they are consistent with the
+    // load_managed_agents below.
+    let personas = load_personas_at(&definitions_dir).unwrap_or_default();
+    let global = load_global_agent_config_at(&definitions_dir).unwrap_or_default();
     let _transition = state
         .managed_agent_runtime_transition
         .lock()
@@ -155,7 +168,7 @@ pub fn list_managed_agent_runtimes(
         .managed_agents_store_lock
         .lock()
         .map_err(|e| e.to_string())?;
-    let mut records = load_managed_agents(&app)?;
+    let mut records = load_managed_agents_at(&definitions_dir)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
@@ -214,7 +227,7 @@ pub fn list_managed_agent_runtimes(
     // Records are only mutated above when a runtime exited — skip the store
     // rewrite on the common nothing-changed poll.
     if records_changed {
-        save_managed_agents(&app, &records)?;
+        save_managed_agents_at(&definitions_dir, &records)?;
     }
     Ok(statuses)
 }

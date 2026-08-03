@@ -1,9 +1,12 @@
 use super::{
-    find_managed_agent_mut, kill_stale_tracked_processes, load_managed_agents, load_personas,
-    save_managed_agents, spawn_agent_child, sync_managed_agent_processes, BackendKind,
-    ManagedAgentProcess,
+    find_managed_agent_mut, kill_stale_tracked_processes, spawn_agent_child,
+    sync_managed_agent_processes, BackendKind, ManagedAgentProcess,
 };
 use crate::app_state::AppState;
+#[cfg(feature = "mesh-llm")]
+use crate::managed_agents::global_config::load_global_agent_config_at;
+use crate::managed_agents::personas::load_personas_at;
+use crate::managed_agents::storage::{load_managed_agents_at, save_managed_agents_at};
 use crate::util;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
@@ -39,12 +42,21 @@ type AgentSpawnResult = (String, SpawnOutcome);
 /// `effective_config::resolve_effective_config`'s `OrphanedInstance` arm).
 pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+
+    // Capture scope at function entry — all reads/writes in this function use
+    // this single captured scope so a concurrent workspace switch cannot split
+    // records and personas across two different definition directories.
+    let scope = state.capture_active_scope().ok_or_else(|| {
+        "backfill_persona_snapshots: no active workspace scope — skipping".to_string()
+    })?;
+    let definitions_dir = &scope.definitions_dir;
+
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
 
-    let mut records = load_managed_agents(app)?;
+    let mut records = load_managed_agents_at(definitions_dir)?;
     let needs_backfill = records
         .iter()
         .any(|r| r.persona_id.is_some() && r.persona_source_version.is_none());
@@ -52,7 +64,7 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
         return Ok(());
     }
 
-    let personas = load_personas(app)?;
+    let personas = load_personas_at(definitions_dir)?;
     let mut changed = false;
     for record in records.iter_mut() {
         let Some(persona_id) = record.persona_id.clone() else {
@@ -78,7 +90,7 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
     }
 
     if changed {
-        save_managed_agents(app, &records)?;
+        save_managed_agents_at(definitions_dir, &records)?;
     }
     Ok(())
 }
@@ -99,6 +111,14 @@ pub async fn restore_managed_agents_on_launch(
 
     let state = app.state::<AppState>();
 
+    // Capture scope at function entry — all three phases (A, B, C) use this
+    // single captured definitions_dir so a concurrent workspace switch cannot
+    // write Phase C's results into a different scope's store than Phase A read.
+    let scope = state
+        .capture_active_scope()
+        .ok_or_else(|| "restore_managed_agents_on_launch: no active workspace scope".to_string())?;
+    let definitions_dir = scope.definitions_dir.clone();
+
     // ── Phase A (under lock): housekeeping + collect agents to restore ──
     let mut agents_to_start: Vec<super::ManagedAgentRecord>;
     {
@@ -111,7 +131,7 @@ pub async fn restore_managed_agents_on_launch(
             return Ok(());
         }
 
-        let mut records = load_managed_agents(app)?;
+        let mut records = load_managed_agents_at(&definitions_dir)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
@@ -194,7 +214,7 @@ pub async fn restore_managed_agents_on_launch(
         // Re-snapshot persona config for agents about to be restored, matching
         // the interactive spawn path so auto-start agents also pick up the
         // current persona on app launch.
-        let personas_for_snapshot = super::load_personas(app).unwrap_or_default();
+        let personas_for_snapshot = load_personas_at(&definitions_dir).unwrap_or_default();
         for record in records.iter_mut() {
             if !agents_to_start.iter().any(|r| r.pubkey == record.pubkey) {
                 continue;
@@ -220,7 +240,7 @@ pub async fn restore_managed_agents_on_launch(
             .collect();
 
         if changed {
-            save_managed_agents(app, &records)?;
+            save_managed_agents_at(&definitions_dir, &records)?;
         }
     }
 
@@ -244,8 +264,10 @@ pub async fn restore_managed_agents_on_launch(
         // (definition → global fallback). A linked instance's own `provider`/`model`/
         // `relay_mesh` bytes never contribute. See `start_local_agent_with_preflight`
         // in `commands/agents.rs` for the identical rationale on the interactive path.
-        let personas = load_personas(app).unwrap_or_default();
-        let global = super::load_global_agent_config(app).unwrap_or_default();
+        // Use the captured scope's definitions_dir for both loads so they read from
+        // the same scope as Phase A.
+        let personas = load_personas_at(&definitions_dir).unwrap_or_default();
+        let global = load_global_agent_config_at(&definitions_dir).unwrap_or_default();
         let mut mesh_preflight_failures = std::collections::HashSet::new();
         for record in &agents_to_start {
             let mesh_model_id = super::effective_config::resolve_effective_relay_mesh_model_id(
@@ -261,7 +283,7 @@ pub async fn restore_managed_agents_on_launch(
                 crate::commands::ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), false)
                     .await
             {
-                persist_restore_error(app, &state, &record.pubkey, error)?;
+                persist_restore_error(app, &state, &record.pubkey, &definitions_dir, error)?;
                 mesh_preflight_failures.insert(record.pubkey.clone());
             }
         }
@@ -287,13 +309,13 @@ pub async fn restore_managed_agents_on_launch(
     }
 
     // ── Phase B (transition lock held): resolve commands and spawn in parallel ──
-    let spawn_results: Vec<AgentSpawnResult> = std::thread::scope(|scope| {
+    let spawn_results: Vec<AgentSpawnResult> = std::thread::scope(|scope_s| {
         let owner_hex_ref = owner_hex.as_deref();
         let handles: Vec<_> = agents_to_start
             .iter()
             .filter(|_| !shutdown_started.load(Ordering::SeqCst))
             .map(|record| {
-                let handle = scope.spawn(move || {
+                let handle = scope_s.spawn(move || {
                     let workspace_relay =
                         crate::relay::relay_ws_url_with_override(&app.state::<AppState>());
                     let relay_url = crate::relay::effective_agent_relay_url(
@@ -359,11 +381,14 @@ pub async fn restore_managed_agents_on_launch(
     }
 
     // ── Phase C (re-acquire lock): write back PIDs and status to records ──
+    // Use the same captured definitions_dir from function entry so Phase C
+    // writes to the same scope Phase A read from, even if a workspace switch
+    // occurred during Phase B.
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
-    let mut records = load_managed_agents(app)?;
+    let mut records = load_managed_agents_at(&definitions_dir)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
@@ -417,7 +442,7 @@ pub async fn restore_managed_agents_on_launch(
     // releasing the lock. This mirrors the fire-and-forget pattern in
     // start_managed_agent — ensuring boot-restored agents get the same profile
     // self-healing as UI-started agents.
-    let reconcile_personas = super::load_personas(app).unwrap_or_default();
+    let reconcile_personas = load_personas_at(&definitions_dir).unwrap_or_default();
     let reconcile_items: Vec<(String, crate::commands::ProfileReconcileData)> =
         successfully_spawned
             .iter()
@@ -444,7 +469,7 @@ pub async fn restore_managed_agents_on_launch(
             })
             .collect();
 
-    save_managed_agents(app, &records)?;
+    save_managed_agents_at(&definitions_dir, &records)?;
     drop(runtimes);
     drop(_store_guard);
     drop(restore_transition);
@@ -473,15 +498,16 @@ fn persist_restore_error(
     app: &tauri::AppHandle,
     state: &AppState,
     pubkey: &str,
+    definitions_dir: &std::path::Path,
     error: String,
 ) -> Result<(), String> {
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|error| error.to_string())?;
-    let mut records = load_managed_agents(app)?;
+    let mut records = load_managed_agents_at(definitions_dir)?;
     let record = find_managed_agent_mut(&mut records, pubkey)?;
     record.updated_at = util::now_iso();
     record.last_error = Some(error);
-    save_managed_agents(app, &records)
+    save_managed_agents_at(definitions_dir, &records)
 }

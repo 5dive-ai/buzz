@@ -31,6 +31,7 @@ use crate::managed_agents::{
 /// The manufactured definition's slug is the agent's pubkey: 64-hex passes
 /// the NIP-AP slug grammar on both relay and desktop ends, and agent pubkeys
 /// are unique, so the coordinate is collision-free by construction.
+#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses backfill_standalone_agents_in_dir.
 pub fn backfill_standalone_agents(app: &tauri::AppHandle) {
     let Ok(base_dir) = crate::managed_agents::managed_agents_base_dir(app) else {
         return;

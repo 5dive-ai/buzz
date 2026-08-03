@@ -40,6 +40,7 @@ type AgentSpawnResult = (String, SpawnOutcome);
 /// If the linked persona is gone, we log loudly and leave the record untouched —
 /// it stays orphaned and `spawn_agent_child` refuses to start it (see
 /// `effective_config::resolve_effective_config`'s `OrphanedInstance` arm).
+#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses backfill_persona_snapshots_at.
 pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
 
@@ -415,7 +416,7 @@ pub async fn restore_managed_agents_on_launch(
                     "buzz-desktop: restore: {stale_msg}; terminating stale child for {pubkey}"
                 );
                 let _ = super::terminate_process(process.child.id());
-                let _ = super::remove_agent_runtime_receipt(app, key);
+                super::remove_agent_runtime_receipt(app, key);
             }
         }
         return Ok(());

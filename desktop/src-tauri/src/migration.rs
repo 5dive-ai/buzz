@@ -538,6 +538,7 @@ struct LegacyAvatarMatch<'a> {
 /// exact data URL or content-addressed upload digest makes the migration
 /// idempotent and avoids relying on timestamps or other persona fields the
 /// user may also have edited.
+#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses refresh_builtin_agent_avatars_at.
 fn refresh_builtin_agent_avatars(app: &tauri::AppHandle) {
     let Ok(dir) = app.path().app_data_dir() else {
         return;
@@ -1078,6 +1079,7 @@ fn reconcile_legacy_command_names_in_file(path: &Path) {
     });
 }
 
+#[allow(dead_code)] // Helper for reconcile_legacy_command_names (boot-migration shim).
 fn reconcile_legacy_persona_runtimes_in_file(path: &Path) {
     patch_json_records(path, |obj| {
         let Some(runtime) = obj.get("runtime").and_then(|v| v.as_str()) else {
@@ -1103,6 +1105,7 @@ fn reconcile_legacy_persona_runtimes_in_file(path: &Path) {
     });
 }
 
+#[allow(dead_code)] // Helper for reconcile_legacy_command_names (boot-migration shim).
 fn rewrite_legacy_persona_md_runtime(content: &str) -> Option<String> {
     let (frontmatter, body) = buzz_persona_pkg::persona::split_frontmatter(content).ok()?;
     let mut value = serde_yaml::from_str::<serde_yaml::Value>(frontmatter).ok()?;
@@ -1116,6 +1119,7 @@ fn rewrite_legacy_persona_md_runtime(content: &str) -> Option<String> {
     Some(format!("---\n{frontmatter}---\n{body}"))
 }
 
+#[allow(dead_code)] // Helper for reconcile_legacy_command_names (boot-migration shim).
 fn reconcile_legacy_team_persona_runtime_files(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1166,6 +1170,7 @@ fn reconcile_legacy_team_persona_runtime_files(dir: &Path) {
 
 /// Reconcile exact built-in command values persisted before the Sprout→Buzz
 /// rename. Custom commands and explicit paths are left untouched.
+#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses reconcile_legacy_command_names_at.
 pub fn reconcile_legacy_command_names(app: &tauri::AppHandle) {
     let Ok(current_dir) = app.path().app_data_dir() else {
         return;
@@ -1196,6 +1201,7 @@ pub fn reconcile_legacy_command_names(app: &tauri::AppHandle) {
 /// discovery table. Known runtimes get their canonical mcp_command;
 /// unknown/custom agents are left untouched. Covers both the current
 /// app data dir and the canonical dev data dir (for worktree instances).
+#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses reconcile_provider_mcp_commands_at.
 pub fn reconcile_provider_mcp_commands(app: &tauri::AppHandle) {
     let Ok(current_dir) = app.path().app_data_dir() else {
         return;
@@ -1295,6 +1301,7 @@ fn reconcile_databricks_v1_to_v2_in_file(path: &Path, rewrite_v1_provider: bool)
 /// Covers both the current app data dir and the canonical dev data dir
 /// (for worktree instances) — same dual-dir pattern as
 /// `reconcile_legacy_command_names` and `reconcile_provider_mcp_commands`.
+#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses reconcile_databricks_v1_to_v2_at.
 pub fn reconcile_databricks_v1_to_v2(app: &tauri::AppHandle) {
     use crate::managed_agents::baked_build_env;
     // On Block builds, the baked env contains BUZZ_AGENT_PROVIDER=databricks_v2.

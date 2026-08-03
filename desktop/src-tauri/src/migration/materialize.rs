@@ -21,6 +21,7 @@ use super::{canonical_dev_data_dir, load_persona_runtimes, patch_json_records};
 /// Idempotent: records that already carry `runtime` are untouched, as are
 /// records with no linked persona or a persona without a runtime (both keep
 /// resolving through the legacy fallback path unchanged).
+#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses materialize_agent_runtimes_at.
 pub fn materialize_agent_runtimes(app: &tauri::AppHandle) {
     let Ok(current_dir) = app.path().app_data_dir() else {
         return;

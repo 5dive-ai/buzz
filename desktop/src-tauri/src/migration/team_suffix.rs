@@ -45,6 +45,7 @@ const TEAM_DELIMITER: &str = "\n\n---\n# Team Instructions\n";
 /// `personas.json` are cleaned in the same boot, and BEFORE
 /// `backfill_standalone_agents` so a manufactured definition never snapshots
 /// a suffix this migration is about to remove.
+#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses strip_baked_team_instructions_in_dir.
 pub fn strip_baked_team_instructions(app: &tauri::AppHandle) {
     let Ok(base_dir) = crate::managed_agents::managed_agents_base_dir(app) else {
         return;

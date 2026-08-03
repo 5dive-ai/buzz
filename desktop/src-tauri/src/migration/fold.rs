@@ -19,6 +19,7 @@ use std::path::Path;
 /// `reconcile_provider_mcp_commands`, and `materialize_agent_runtimes` all
 /// read definitions post-fold via [`load_persona_runtimes`]'s unified-store
 /// branch.
+#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses fold_personas_in_dir.
 pub fn fold_personas_into_agent_store(app: &tauri::AppHandle) {
     let Ok(base_dir) = crate::managed_agents::managed_agents_base_dir(app) else {
         return;

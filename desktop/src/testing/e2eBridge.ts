@@ -11201,6 +11201,50 @@ export function maybeInstallE2eTauriMocks() {
           created_at: template.createdAt,
           updated_at: template.updatedAt,
         }));
+      case "create_channel_template": {
+        const { input } = payload as {
+          input: {
+            name: string;
+            description?: string;
+            channelType?: "stream" | "forum";
+            visibility?: "open" | "private";
+            canvasTemplate?: string;
+            agents?: ChannelTemplate["agents"];
+          };
+        };
+        const timestamp = new Date().toISOString();
+        const created: ChannelTemplate = {
+          id: `template-${Date.now()}`,
+          name: input.name,
+          description: input.description ?? null,
+          channelType: input.channelType ?? "stream",
+          visibility: input.visibility ?? "open",
+          canvasTemplate: input.canvasTemplate ?? null,
+          agents: input.agents ?? { personas: [], teams: [] },
+          isBuiltin: false,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        if (activeConfig) {
+          activeConfig.mock ??= {};
+          activeConfig.mock.channelTemplates = [
+            ...(activeConfig.mock.channelTemplates ?? []),
+            created,
+          ];
+        }
+        return {
+          id: created.id,
+          name: created.name,
+          description: created.description,
+          channel_type: created.channelType,
+          visibility: created.visibility,
+          canvas_template: created.canvasTemplate,
+          agents: created.agents,
+          is_builtin: created.isBuiltin,
+          created_at: created.createdAt,
+          updated_at: created.updatedAt,
+        };
+      }
       case "create_team":
         return handleCreateTeam(
           payload as Parameters<typeof handleCreateTeam>[0],
@@ -11852,8 +11896,9 @@ export function maybeInstallE2eTauriMocks() {
         // command was invoked via `__BUZZ_E2E_COMMANDS__`, not the dialog.
         return true;
       case "card_mint_key_status":
-        // Cards: pretend a key is configured so the mint form renders.
-        return true;
+        // Cards: pretend a key is configured in global defaults so the mint
+        // form renders and the key-status row is shown.
+        return "global";
       case "list_agent_cards":
         // Cards archive starts empty in E2E; specs exercising the gallery
         // can extend this with a seeded config knob when needed.

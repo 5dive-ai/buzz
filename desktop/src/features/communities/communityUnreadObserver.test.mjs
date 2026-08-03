@@ -544,102 +544,68 @@ function baseRelay(unreadEvent, mutesPayload = null) {
   ]);
 }
 
-test("fetchCommunityUnread threaded reply in untracked root → hasUnread:false", async () => {
-  const relay = baseRelay(threadedReplyEvent());
-
-  const result = await fetchCommunityUnread({
-    client: relay,
-    pubkey: PUBKEY,
-    nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
-    // No root in any set → gate rejects the threaded reply
-    readThreadRelationships: readRelationships(),
-  });
-
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
-});
-
-test("fetchCommunityUnread threaded reply in participatedRootIds → hasUnread:true", async () => {
-  const relay = baseRelay(threadedReplyEvent());
-
-  const result = await fetchCommunityUnread({
-    client: relay,
-    pubkey: PUBKEY,
-    nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
-    readThreadRelationships: readRelationships({
-      participatedRootIds: new Set([THREAD_ROOT_2]),
-    }),
-  });
-
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
-});
-
-test("fetchCommunityUnread #p-mention reply in untracked root → hasUnread:true (mention overrides)", async () => {
-  // A @mention of the user bypasses the follow/participation gate
-  const relay = baseRelay(
-    threadedReplyEvent({
+const THREAD_GATE_CASES = [
+  {
+    name: "threaded reply in untracked root → hasUnread:false",
+    unreadEvent: threadedReplyEvent(),
+    relationships: {},
+    expected: { hasUnread: false, mentionCount: 0 },
+  },
+  {
+    name: "threaded reply in participatedRootIds → hasUnread:true",
+    unreadEvent: threadedReplyEvent(),
+    relationships: { participatedRootIds: new Set([THREAD_ROOT_2]) },
+    expected: { hasUnread: true, mentionCount: 0 },
+  },
+  {
+    name: "#p-mention reply in untracked root → hasUnread:true (mention overrides)",
+    unreadEvent: threadedReplyEvent({
       id: "mention-reply".padEnd(64, "0"),
       extraTags: [["p", PUBKEY]],
     }),
-  );
-
-  const result = await fetchCommunityUnread({
-    client: relay,
-    pubkey: PUBKEY,
-    nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
-    readThreadRelationships: readRelationships(),
-  });
-
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
-});
-
-test("fetchCommunityUnread top-level post → hasUnread:true (no thread gate)", async () => {
-  // Top-level posts have no parentId — shouldNotifyForEvent returns true
-  const relay = baseRelay(
-    event({
+    relationships: {},
+    expected: { hasUnread: true, mentionCount: 0 },
+  },
+  {
+    name: "top-level post → hasUnread:true (no thread gate)",
+    unreadEvent: event({
       id: "toplevel".padEnd(64, "0"),
       created_at: 20,
       tags: [["h", CHANNEL_ID]],
     }),
-  );
-
-  const result = await fetchCommunityUnread({
-    client: relay,
-    pubkey: PUBKEY,
-    nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
-    readThreadRelationships: readRelationships(),
-  });
-
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
-});
-
-test("fetchCommunityUnread threaded reply whose root is in mutedRootIds → hasUnread:false", async () => {
-  const relay = baseRelay(
-    threadedReplyEvent({ id: "muted-reply".padEnd(64, "0") }),
-  );
-
-  const result = await fetchCommunityUnread({
-    client: relay,
-    pubkey: PUBKEY,
-    nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
-    // Root is participated but also muted — mute wins
-    readThreadRelationships: readRelationships({
+    relationships: {},
+    expected: { hasUnread: true, mentionCount: 0 },
+  },
+  {
+    name: "threaded reply whose root is in mutedRootIds → hasUnread:false",
+    unreadEvent: threadedReplyEvent({ id: "muted-reply".padEnd(64, "0") }),
+    relationships: {
       participatedRootIds: new Set([THREAD_ROOT_2]),
       mutedRootIds: new Set([THREAD_ROOT_2]),
-    }),
-  });
+    },
+    expected: { hasUnread: false, mentionCount: 0 },
+  },
+];
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
-});
+for (const {
+  name,
+  unreadEvent,
+  relationships,
+  expected,
+} of THREAD_GATE_CASES) {
+  test(`fetchCommunityUnread ${name}`, async () => {
+    const relay = baseRelay(unreadEvent);
+    const result = await fetchCommunityUnread({
+      client: relay,
+      pubkey: PUBKEY,
+      nowSeconds: 100,
+      decryptReadState: async (v) => v,
+      decryptMutes: async (v) => v,
+      readThreadRelationships: readRelationships(relationships),
+    });
+    assert.deepEqual(result, expected);
+  });
+}
 
 // ── Override register authoritative source tests ──────────────────────────
 

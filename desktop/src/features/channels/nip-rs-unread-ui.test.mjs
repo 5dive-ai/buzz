@@ -112,32 +112,20 @@ test("applyOverrideUnread_success_returns_true", () => {
   assert.equal(toasts.length, 0);
 });
 
-test("applyOverrideUnread_budget_exhausted_returns_false", () => {
-  const result = applyOverrideUnread("ch-1", {
-    markChannelUnread: () => ({ success: false, reason: "budget_exhausted" }),
-    markChannelRead: () => ({ success: true }),
-    getOverrideLiveness: () => null,
+for (const reason of [
+  "budget_exhausted",
+  "uint32_overflow",
+  "load_incomplete",
+]) {
+  test(`applyOverrideUnread_${reason}_returns_false`, () => {
+    const result = applyOverrideUnread("ch-1", {
+      markChannelUnread: () => ({ success: false, reason }),
+      markChannelRead: () => ({ success: true }),
+      getOverrideLiveness: () => null,
+    });
+    assert.equal(result, false);
   });
-  assert.equal(result, false);
-});
-
-test("applyOverrideUnread_uint32_overflow_returns_false", () => {
-  const result = applyOverrideUnread("ch-1", {
-    markChannelUnread: () => ({ success: false, reason: "uint32_overflow" }),
-    markChannelRead: () => ({ success: true }),
-    getOverrideLiveness: () => null,
-  });
-  assert.equal(result, false);
-});
-
-test("applyOverrideUnread_load_incomplete_returns_false", () => {
-  const result = applyOverrideUnread("ch-1", {
-    markChannelUnread: () => ({ success: false, reason: "load_incomplete" }),
-    markChannelRead: () => ({ success: true }),
-    getOverrideLiveness: () => null,
-  });
-  assert.equal(result, false);
-});
+}
 
 // ── Tests: applyOverrideRead ─────────────────────────────────────────────────
 //

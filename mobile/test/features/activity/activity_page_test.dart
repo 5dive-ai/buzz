@@ -316,6 +316,46 @@ void main() {
     },
   );
 
+  testWidgets('clears a retained wide detail when its filter changes', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1180, 820);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    await tester.pumpWidget(
+      await buildTestable(
+        feed: HomeFeedResponse(
+          mentions: [testMention],
+          needsAction: const [],
+          activity: const [],
+          agentActivity: const [],
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('inbox-row-m1')));
+    await tester.pumpAndSettle();
+    expect(find.byType(ChannelDetailPage), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('activity-options-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Show unread'));
+    await tester.pumpAndSettle();
+    expect(find.byType(ChannelDetailPage), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('activity-filter-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Reminders'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ChannelDetailPage), findsNothing);
+  });
+
   testWidgets('keeps footer clearance inside the scrollable content', (
     tester,
   ) async {

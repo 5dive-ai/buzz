@@ -378,6 +378,9 @@ class ActivityPage extends HookConsumerWidget {
             draftCount: drafts.length,
             onChanged: (nextFilter) {
               filter.value = nextFilter;
+              selectedItemId.value = null;
+              selectedItemTarget.value = null;
+              selectedItemForDetail.value = null;
             },
           ),
           _InboxOptionsButton(

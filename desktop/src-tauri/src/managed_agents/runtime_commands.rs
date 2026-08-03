@@ -648,7 +648,11 @@ mod tests {
     #[test]
     fn readiness_is_evaluated_for_the_selected_instance_runtime() {
         let selected = record_with_command("buzz-agent");
-        let unrelated_ready_runtime = record_with_command("/usr/bin/true");
+        let unrelated_ready_command = std::env::current_exe()
+            .expect("current test executable must be available")
+            .to_string_lossy()
+            .into_owned();
+        let unrelated_ready_runtime = record_with_command(&unrelated_ready_command);
         let global = super::super::GlobalAgentConfig::default();
 
         assert!(matches!(

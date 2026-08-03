@@ -658,6 +658,66 @@ void main() {
     );
   });
 
+  testWidgets('shows the workspace skeleton while sheet switching community', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1180, 820);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final communities = [
+      Community(
+        id: 'alpha',
+        name: 'Alpha',
+        relayUrl: 'wss://alpha.example.com',
+        addedAt: DateTime(2026),
+      ),
+      Community(
+        id: 'bravo',
+        name: 'Bravo',
+        relayUrl: 'wss://bravo.example.com',
+        addedAt: DateTime(2026),
+      ),
+    ];
+    final communityListNotifier = _FakeCommunityListNotifier(communities);
+
+    await tester.pumpWidget(
+      await buildHome(
+        communityListNotifier: communityListNotifier,
+        activeCommunity: communities.first,
+      ),
+    );
+    await tester.pump();
+
+    await tester.tap(
+      find.byKey(const Key('wide-navigation-community-switcher')),
+    );
+    await tester.pump(const Duration(milliseconds: 300));
+    tester
+        .widget<InkWell>(
+          find.ancestor(of: find.text('Bravo'), matching: find.byType(InkWell)),
+        )
+        .onTap!();
+    await tester.pump();
+
+    expect(communityListNotifier.switchedToId, 'bravo');
+    expect(
+      tester
+          .widget<SkeletonShimmer>(
+            find.ancestor(
+              of: find.byKey(
+                const Key('wide-navigation-community-switch-skeleton'),
+              ),
+              matching: find.byType(SkeletonShimmer),
+            ),
+          )
+          .enabled,
+      isTrue,
+    );
+  });
+
   testWidgets('a failed community swipe restores the workspace', (
     tester,
   ) async {

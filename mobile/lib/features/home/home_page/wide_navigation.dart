@@ -97,7 +97,12 @@ class _WideNavigationSidebar extends HookConsumerWidget {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 _WideNavigationCommunitySwitcher(
-                  onTap: () => unawaited(showCommunitySwitcherSheet(context)),
+                  onTap: () => unawaited(
+                    showCommunitySwitcherSheet(
+                      context,
+                      onCommunitySwitchStart: onCommunitySwitchStart,
+                    ),
+                  ),
                   onCommunitySwitchStart: onCommunitySwitchStart,
                 ),
                 const SizedBox(height: Grid.xxs),

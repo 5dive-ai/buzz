@@ -2,16 +2,22 @@ part of '../channels_page.dart';
 
 /// Opens the community switcher from either the compact channel header or the
 /// expanded iPad sidebar identity row.
-Future<void> showCommunitySwitcherSheet(BuildContext context) {
+Future<void> showCommunitySwitcherSheet(
+  BuildContext context, {
+  ValueChanged<String?>? onCommunitySwitchStart,
+}) {
   return showModalBottomSheet<void>(
     context: context,
     showDragHandle: true,
-    builder: (_) => const _CommunitySwitcherSheet(),
+    builder: (_) =>
+        _CommunitySwitcherSheet(onCommunitySwitchStart: onCommunitySwitchStart),
   );
 }
 
 class _CommunitySwitcherSheet extends HookConsumerWidget {
-  const _CommunitySwitcherSheet();
+  final ValueChanged<String?>? onCommunitySwitchStart;
+
+  const _CommunitySwitcherSheet({this.onCommunitySwitchStart});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -117,11 +123,21 @@ class _CommunitySwitcherSheet extends HookConsumerWidget {
                                   : () async {
                                       final community = communities[index];
                                       if (community.id != activeId) {
-                                        await ref
-                                            .read(
-                                              communityListProvider.notifier,
-                                            )
-                                            .switchCommunity(community.id);
+                                        onCommunitySwitchStart?.call(
+                                          community.id,
+                                        );
+                                        try {
+                                          await ref
+                                              .read(
+                                                communityListProvider.notifier,
+                                              )
+                                              .switchCommunity(community.id);
+                                        } catch (error) {
+                                          debugPrint(
+                                            '[CommunitySwitcherSheet] failed to switch community: $error',
+                                          );
+                                          onCommunitySwitchStart?.call(null);
+                                        }
                                       }
                                       if (context.mounted) {
                                         Navigator.of(context).pop();

@@ -124,7 +124,7 @@ class ActivityPage extends HookConsumerWidget {
         selectedItemTarget.value = null;
       }
       return null;
-    }, [isWideInbox, visibleItemIdsKey]);
+    }, [isWideInbox, visibleItemIdsKey, filter.value, unreadOnly.value]);
     final selectedItem = visibleItems.cast<InboxItem?>().firstWhere(
       (item) => item?.id == selectedItemId.value,
       orElse: () => null,

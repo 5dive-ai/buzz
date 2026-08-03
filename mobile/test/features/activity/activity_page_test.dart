@@ -211,6 +211,48 @@ void main() {
     );
   });
 
+  testWidgets('keeps a wide inbox detail selected across same-row filters', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1180, 820);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final secondMention = FeedItem(
+      id: 'm2',
+      kind: 9,
+      pubkey: 'bob_pk',
+      content: 'Another mention',
+      createdAt: now - 60,
+      channelId: 'ch2',
+      channelName: 'engineering',
+      tags: const [],
+      category: 'mention',
+    );
+
+    await tester.pumpWidget(
+      await buildTestable(
+        feed: HomeFeedResponse(
+          mentions: [testMention, secondMention],
+          needsAction: const [],
+          activity: const [],
+          agentActivity: const [],
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ChannelDetailPage), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('activity-filter-menu')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Mentions'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(ChannelDetailPage), findsOneWidget);
+  });
+
   testWidgets(
     'keeps the oldest unread deep link after a wide inbox row is read',
     (tester) async {

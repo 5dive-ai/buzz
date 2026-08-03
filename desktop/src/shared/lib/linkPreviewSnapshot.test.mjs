@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { parseLinkPreviewSnapshots } from "./linkPreviewSnapshot.ts";
+import {
+  buildLinkPreviewSnapshotTag,
+  parseLinkPreviewSnapshots,
+} from "./linkPreviewSnapshot.ts";
 
 const HASH = "a".repeat(64);
 const ORIGIN = "https://relay.example";
@@ -53,6 +56,31 @@ test("authored snapshots reject remote, malformed, credentialed, and hash-mismat
     parseLinkPreviewSnapshots([mismatch], CONTENT, ORIGIN).length,
     0,
   );
+});
+
+test("snapshot tags sanitize control characters and enforce UTF-8 byte limits", () => {
+  const tag = buildLinkPreviewSnapshotTag({
+    canonicalUrl: URL,
+    title: `Title\n${"😀".repeat(100)}`,
+    siteName: `Linear\u0000${"é".repeat(100)}`,
+    description: `First\nSecond${"😀".repeat(300)}`,
+    imageUrl: "",
+    imageSha256: "",
+    faviconUrl: "",
+    faviconSha256: "",
+  });
+
+  for (const value of tag.slice(4, 7)) {
+    assert.ok(
+      Array.from(value).every((char) => {
+        const code = char.charCodeAt(0);
+        return code > 0x1f && code !== 0x7f;
+      }),
+    );
+  }
+  assert.ok(Buffer.byteLength(tag[4], "utf8") <= 300);
+  assert.ok(Buffer.byteLength(tag[5], "utf8") <= 100);
+  assert.ok(Buffer.byteLength(tag[6], "utf8") <= 1000);
 });
 
 test("messages without authored snapshots never create recipient previews", () => {

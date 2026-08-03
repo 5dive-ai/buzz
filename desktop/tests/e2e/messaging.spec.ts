@@ -472,6 +472,36 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   await page.getByTestId("link-preview-style-compact").click();
 });
 
+test("completed link preview sends once and leaves the composer cleared", async ({
+  page,
+}) => {
+  const previewUrl = "https://github.com/block/buzz/pull/3246?send=complete";
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page.getByTestId("message-input").fill(previewUrl);
+  await waitForReadyComposerSnapshots(page);
+
+  const send = page.getByTestId("send-message");
+  await expect(send).toBeEnabled();
+  await send.click();
+  await expect(page.getByTestId("message-input")).toHaveText("");
+  await expect(page.locator("[data-composer-link-previews]")).toHaveCount(0);
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("message-input")).toHaveText("");
+
+  const calls = await page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).filter(
+      (entry) => entry.command === "send_channel_message",
+    ),
+  );
+  expect(calls).toHaveLength(1);
+  expect(
+    (
+      calls[0]?.payload as { linkPreviewTags?: string[][] | null } | undefined
+    )?.linkPreviewTags?.[0]?.slice(0, 4),
+  ).toEqual(["link-preview", "snapshot", "1", previewUrl]);
+});
+
 test("send does not wait for a pending link preview snapshot", async ({
   page,
 }) => {

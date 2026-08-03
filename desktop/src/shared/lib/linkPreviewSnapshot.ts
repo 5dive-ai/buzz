@@ -20,6 +20,24 @@ export type LinkPreviewSnapshot = {
   faviconSha256: string;
 };
 
+function isControlCharacter(char: string): boolean {
+  const code = char.charCodeAt(0);
+  return code <= 0x1f || code === 0x7f;
+}
+
+function sanitizeSnapshotText(value: string, maxBytes: number): string {
+  let result = "";
+  let byteLength = 0;
+  for (const rawChar of value) {
+    const char = isControlCharacter(rawChar) ? " " : rawChar;
+    const charBytes = new TextEncoder().encode(char).length;
+    if (byteLength + charBytes > maxBytes) break;
+    result += char;
+    byteLength += charBytes;
+  }
+  return result;
+}
+
 function validText(value: string, max: number): boolean {
   return (
     value.length <= max &&
@@ -132,9 +150,9 @@ export function buildLinkPreviewSnapshotTag(
     "snapshot",
     LINK_PREVIEW_SNAPSHOT_VERSION,
     snapshot.canonicalUrl,
-    snapshot.title,
-    snapshot.siteName,
-    snapshot.description,
+    sanitizeSnapshotText(snapshot.title, 300),
+    sanitizeSnapshotText(snapshot.siteName, 100),
+    sanitizeSnapshotText(snapshot.description, 1000),
     snapshot.imageUrl,
     snapshot.imageSha256,
     snapshot.faviconUrl,

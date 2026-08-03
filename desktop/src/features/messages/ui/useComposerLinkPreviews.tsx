@@ -12,8 +12,6 @@ import type { ResolvedLinkPreview } from "@/shared/lib/useResolvedLinkPreviews";
 import { useResolvedLinkPreviews } from "@/shared/lib/useResolvedLinkPreviews";
 import {
   Attachment,
-  AttachmentAction,
-  AttachmentActions,
   AttachmentContent,
   AttachmentDescription,
   AttachmentGroup,
@@ -21,6 +19,7 @@ import {
   AttachmentTitle,
   AttachmentTrigger,
 } from "@/shared/ui/attachment";
+import { Button } from "@/shared/ui/button";
 
 function previewHostname(href: string): string {
   try {
@@ -31,13 +30,9 @@ function previewHostname(href: string): string {
 }
 
 function ComposerLinkPreviewCard({
-  onHideAll,
   preview,
-  showHideControl,
 }: {
-  onHideAll: () => void;
   preview: ResolvedLinkPreview;
-  showHideControl: boolean;
 }) {
   const imageSrc = preview.imageState === "image" ? preview.imageDataUrl : null;
   const [failedImageSrc, setFailedImageSrc] = React.useState<string | null>(
@@ -98,19 +93,6 @@ function ComposerLinkPreviewCard({
               : preview.typeLabel}
         </AttachmentDescription>
       </AttachmentContent>
-      {showHideControl ? (
-        <AttachmentActions>
-          <AttachmentAction
-            aria-label="Hide all link previews"
-            data-testid="composer-hide-link-previews"
-            onClick={onHideAll}
-            title="Hide previews"
-            type="button"
-          >
-            <X />
-          </AttachmentAction>
-        </AttachmentActions>
-      ) : null}
       <AttachmentTrigger asChild>
         <a
           aria-label={`Open ${preview.title}`}
@@ -225,16 +207,25 @@ export function useComposerLinkPreviews(content: string) {
       data-composer-link-previews=""
       data-ready-snapshot-count={readyTagsRef.current.length}
     >
-      <AttachmentGroup className="max-w-full flex-row flex-wrap items-start overflow-visible pb-0">
-        {previews.map((preview, index) => (
-          <ComposerLinkPreviewCard
-            key={preview.href}
-            onHideAll={hideAll}
-            preview={preview}
-            showHideControl={index === 0}
-          />
-        ))}
-      </AttachmentGroup>
+      <div className="flex max-w-full items-start gap-1">
+        <AttachmentGroup className="max-w-full flex-row flex-wrap items-start overflow-visible pb-0">
+          {previews.map((preview) => (
+            <ComposerLinkPreviewCard key={preview.href} preview={preview} />
+          ))}
+        </AttachmentGroup>
+        <Button
+          aria-label="Hide all link previews"
+          className="mt-1 size-5 shrink-0 rounded-full text-muted-foreground hover:text-foreground [&_svg]:size-3"
+          data-testid="composer-hide-link-previews"
+          onClick={hideAll}
+          size="icon-xs"
+          title="Hide previews"
+          type="button"
+          variant="ghost"
+        >
+          <X aria-hidden="true" />
+        </Button>
+      </div>
     </div>
   ) : null;
   const getReadyTags = React.useCallback(() => readyTagsRef.current, []);

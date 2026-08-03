@@ -233,6 +233,7 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
 }
 
 /// Scoped variant: save global agent config into the given definitions dir.
+#[allow(dead_code)] // Part of the scoped _at() API; not yet called in this release.
 pub(crate) fn save_global_agent_config_at(
     definitions_dir: &std::path::Path,
     config: &GlobalAgentConfig,

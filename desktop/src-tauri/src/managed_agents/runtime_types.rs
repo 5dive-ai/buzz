@@ -55,6 +55,7 @@ pub struct ManagedAgentPairRuntime {
     /// entries (the seam that option 2 background-runtime pinning would build
     /// on). Under active-scope-only policy, all live entries should always
     /// match the current scope; this field makes the invariant testable.
+    #[allow(dead_code)] // Set at spawn; read in tests; seam for future option-2 pinning.
     pub scope_id: Option<String>,
 }
 

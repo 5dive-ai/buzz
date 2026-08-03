@@ -51,8 +51,11 @@ pub fn scope_for_arrival(
 ) -> Option<RetentionScope> {
     let same_relay =
         normalized_relay_scope(&scope.relay_url) == normalized_relay_scope(arrival_relay_url);
-    let same_owner = scope.owner_keys.public_key().to_hex().to_ascii_lowercase()
-        == arrival_owner_pubkey.trim().to_ascii_lowercase();
+    let same_owner = scope
+        .owner_keys
+        .public_key()
+        .to_hex()
+        .eq_ignore_ascii_case(arrival_owner_pubkey.trim());
     (same_relay && same_owner).then_some(scope)
 }
 

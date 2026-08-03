@@ -218,6 +218,7 @@ pub fn save_teams(app: &AppHandle, records: &[TeamRecord]) -> Result<(), String>
 }
 
 /// Scoped variant: load teams from the given definitions dir.
+#[allow(dead_code)] // Part of the scoped _at() API; called indirectly via save_teams_at.
 pub(crate) fn load_teams_at(definitions_dir: &std::path::Path) -> Result<Vec<TeamRecord>, String> {
     let path = teams_store_path_at(definitions_dir);
     let now = now_iso();
@@ -242,6 +243,7 @@ pub(crate) fn load_teams_at(definitions_dir: &std::path::Path) -> Result<Vec<Tea
 }
 
 /// Scoped variant: save teams into the given definitions dir.
+#[allow(dead_code)] // Part of the scoped _at() API; called by load_teams_at (idempotent write).
 pub(crate) fn save_teams_at(
     definitions_dir: &std::path::Path,
     records: &[TeamRecord],

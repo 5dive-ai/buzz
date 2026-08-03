@@ -695,8 +695,8 @@ pub(crate) fn drain_scope_runtimes(
             }
         };
         runtimes
-            .iter()
-            .map(|(key, _runtime)| {
+            .keys()
+            .map(|key| {
                 // Look up start_on_app_launch from the current store; if we
                 // can't read it, assume true (safer for compensation — we'd
                 // rather restart too many than too few).

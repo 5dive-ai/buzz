@@ -68,12 +68,17 @@ pub struct WorkspaceAgentScope {
     /// The normalized relay URL for this scope.
     pub relay_url: String,
     /// The owner's hex pubkey.
+    // Used in tests and by the scope-for-arrival inbound filter.
+    #[allow(dead_code)]
     pub owner_pubkey: String,
     /// The scoped definitions directory: `<agents-base>/scopes/<scope_id>/`.
     pub definitions_dir: PathBuf,
     /// Monotonically increasing generation counter; incremented on every scope
     /// change (including identity import that clears the active scope to None).
     /// Used by long-running operations to detect a mid-flight workspace switch.
+    // Generation is set at construction and read in tests; the field is the
+    // durable seam for stale-commit detection in future await-crossing paths.
+    #[allow(dead_code)]
     pub generation: u64,
 }
 
@@ -89,6 +94,7 @@ pub(crate) fn next_scope_generation() -> u64 {
 }
 
 /// Read the current generation without incrementing.
+#[allow(dead_code)] // Read in tests; here as a read-only probe for diagnostics.
 pub fn current_scope_generation() -> u64 {
     SCOPE_GENERATION.load(Ordering::Acquire)
 }
@@ -146,6 +152,7 @@ impl WorkspaceAgentScope {
     }
 
     /// Ensure the definitions directory exists.
+    #[allow(dead_code)] // Called in tests; here as a utility for future callers.
     pub fn ensure_dir(&self) -> Result<(), String> {
         std::fs::create_dir_all(&self.definitions_dir).map_err(|e| {
             format!(
@@ -156,16 +163,19 @@ impl WorkspaceAgentScope {
     }
 
     /// Path to the scoped `managed-agents.json`.
+    #[allow(dead_code)] // Called in tests; here as a canonical path accessor.
     pub fn managed_agents_path(&self) -> PathBuf {
         self.definitions_dir.join("managed-agents.json")
     }
 
     /// Path to the scoped `teams.json`.
+    #[allow(dead_code)] // Called in tests; here as a canonical path accessor.
     pub fn teams_path(&self) -> PathBuf {
         self.definitions_dir.join("teams.json")
     }
 
     /// Path to the scoped `global-agent-config.json`.
+    #[allow(dead_code)] // Called in tests; here as a canonical path accessor.
     pub fn global_config_path(&self) -> PathBuf {
         self.definitions_dir.join("global-agent-config.json")
     }

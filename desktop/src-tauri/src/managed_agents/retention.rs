@@ -77,14 +77,32 @@ pub fn scoped_retention_db_path(base_dir: &Path, relay_url: &str, owner_pubkey: 
 
 /// Snapshot the active relay + owner and resolve their durable event store.
 ///
+/// Derives relay and owner from the captured [`WorkspaceAgentScope`] so both
+/// the retention DB path and the definitions path come from the same single
+/// scope authority. Returns `Err` when no active scope exists (fail closed) or
+/// when the signing keys disagree with the scope's captured owner pubkey
+/// (defensive; the scope is the authority).
+///
 /// Callers keep the returned relay and keys alongside the path whenever work
 /// crosses an `.await`; a later workspace switch cannot retarget that work.
 pub fn active_retention_scope(app: &AppHandle, state: &AppState) -> Result<RetentionScope, String> {
-    let relay_url = crate::relay::relay_ws_url_with_override(state);
+    let scope = state.capture_active_scope().ok_or_else(|| {
+        "active_retention_scope: no active workspace scope — fail closed".to_string()
+    })?;
     let owner_keys = state.signing_keys()?;
+    // Validate that the signing keys agree with the scope's owner. In
+    // practice they are always consistent (committed together); this guard
+    // catches the narrow window where they haven't been committed yet.
+    let keys_pubkey = owner_keys.public_key().to_hex();
+    if !keys_pubkey.eq_ignore_ascii_case(&scope.owner_pubkey) {
+        return Err(format!(
+            "active_retention_scope: signing keys pubkey ({keys_pubkey}) does not match \
+             active scope owner ({}) — scope may not yet be fully committed",
+            scope.owner_pubkey
+        ));
+    }
     let base_dir = super::managed_agents_base_dir(app)?;
-    let db_path =
-        scoped_retention_db_path(&base_dir, &relay_url, &owner_keys.public_key().to_hex());
+    let db_path = scoped_retention_db_path(&base_dir, &scope.relay_url, &scope.owner_pubkey);
     let parent = db_path
         .parent()
         .ok_or_else(|| "retention scope path has no parent".to_string())?;
@@ -92,7 +110,7 @@ pub fn active_retention_scope(app: &AppHandle, state: &AppState) -> Result<Reten
         .map_err(|error| format!("failed to create retention scope directory: {error}"))?;
     Ok(RetentionScope {
         db_path,
-        relay_url,
+        relay_url: scope.relay_url,
         owner_keys,
     })
 }

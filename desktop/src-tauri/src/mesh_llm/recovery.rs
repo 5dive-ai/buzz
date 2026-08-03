@@ -276,9 +276,15 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
 
     // Capture scope once for the entire pass; a concurrent workspace switch
     // that commits after this point is handled on the next watchdog cycle.
-    let scope_relay = state
-        .capture_active_scope()
-        .map(|scope| scope.relay_url.clone());
+    // Both relay and definitions_dir come from the single captured scope so
+    // all store reads below target the same workspace as the relay check.
+    let (scope_relay, scope_definitions_dir) = {
+        let s = state.capture_active_scope();
+        (
+            s.as_ref().map(|scope| scope.relay_url.clone()),
+            s.map(|scope| scope.definitions_dir.clone()),
+        )
+    };
 
     let (runtime_mode, runtime_relay) = {
         let guard = state.mesh_llm_runtime.lock().await;
@@ -293,8 +299,16 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
     // Mesh participation is resolved through the same definition-authoritative
     // path as spawn/restore (#1968): definition → global fallback. A linked
     // instance's own bytes never contribute.
-    let personas = crate::managed_agents::load_personas(app).unwrap_or_default();
-    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    // Use _at(definitions_dir) so we read from the captured scope's store, not
+    // whichever scope happens to be active at the time each helper runs.
+    let personas = scope_definitions_dir
+        .as_deref()
+        .and_then(|dir| crate::managed_agents::load_personas_at(dir).ok())
+        .unwrap_or_default();
+    let global = scope_definitions_dir
+        .as_deref()
+        .and_then(|dir| crate::managed_agents::load_global_agent_config_at(dir).ok())
+        .unwrap_or_default();
 
     // Helper: does the live runtime's relay match the active scope relay?
     // When either is None we treat it as a mismatch (fail closed).
@@ -335,7 +349,10 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
                 app.request_restart();
                 return Ok(());
             }
-            let records = crate::managed_agents::load_managed_agents(app).unwrap_or_default();
+            let records = scope_definitions_dir
+                .as_deref()
+                .and_then(|dir| crate::managed_agents::load_managed_agents_at(dir).ok())
+                .unwrap_or_default();
             if !records.iter().any(|record| {
                 running_relay_mesh_model_id(record, &active_pubkeys, &personas, &global).is_some()
             }) {
@@ -356,7 +373,10 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
             ));
         }
         MeshRuntimeRecovery::Absent => {
-            let records = crate::managed_agents::load_managed_agents(app).unwrap_or_default();
+            let records = scope_definitions_dir
+                .as_deref()
+                .and_then(|dir| crate::managed_agents::load_managed_agents_at(dir).ok())
+                .unwrap_or_default();
             if !records.iter().any(|record| {
                 running_relay_mesh_model_id(record, &active_pubkeys, &personas, &global).is_some()
             }) {
@@ -366,7 +386,10 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
         MeshRuntimeRecovery::Evicted => {}
     }
 
-    let records = crate::managed_agents::load_managed_agents(app).unwrap_or_default();
+    let records = scope_definitions_dir
+        .as_deref()
+        .and_then(|dir| crate::managed_agents::load_managed_agents_at(dir).ok())
+        .unwrap_or_default();
     let mesh_records: Vec<_> = records
         .into_iter()
         .filter_map(|record| {
@@ -384,16 +407,22 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
         .await
         {
             Ok(()) => {
-                if let Err(error) = clear_mesh_last_error_if_set(app, &record.pubkey) {
-                    eprintln!("buzz-mesh: failed to clear recovery error: {error}");
+                if let Some(dir) = scope_definitions_dir.as_deref() {
+                    if let Err(error) = clear_mesh_last_error_if_set_at(app, dir, &record.pubkey) {
+                        eprintln!("buzz-mesh: failed to clear recovery error: {error}");
+                    }
                 }
             }
             Err(error) => {
                 let message = format!(
                     "{MESH_REARM_ERROR_SENTINEL}Buzz shared compute offline — failed to re-arm local ingress for this agent: {error}"
                 );
-                if let Err(persist_error) = persist_mesh_last_error(app, &record.pubkey, &message) {
-                    eprintln!("buzz-mesh: failed to persist recovery error: {persist_error}");
+                if let Some(dir) = scope_definitions_dir.as_deref() {
+                    if let Err(persist_error) =
+                        persist_mesh_last_error_at(app, dir, &record.pubkey, &message)
+                    {
+                        eprintln!("buzz-mesh: failed to persist recovery error: {persist_error}");
+                    }
                 }
                 first_error.get_or_insert(message);
             }
@@ -439,26 +468,35 @@ fn running_relay_mesh_model_id(
     )
 }
 
-fn persist_mesh_last_error(app: &AppHandle, pubkey: &str, error: &str) -> Result<(), String> {
+fn persist_mesh_last_error_at(
+    app: &AppHandle,
+    definitions_dir: &std::path::Path,
+    pubkey: &str,
+    error: &str,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire managed agents store lock: {e}"))?;
-    let mut records = crate::managed_agents::load_managed_agents(app)?;
+    let mut records = crate::managed_agents::load_managed_agents_at(definitions_dir)?;
     let record = crate::managed_agents::find_managed_agent_mut(&mut records, pubkey)?;
     record.last_error = Some(error.to_string());
     record.updated_at = crate::util::now_iso();
-    crate::managed_agents::save_managed_agents(app, &records)
+    crate::managed_agents::save_managed_agents_at(definitions_dir, &records)
 }
 
-fn clear_mesh_last_error_if_set(app: &AppHandle, pubkey: &str) -> Result<(), String> {
+fn clear_mesh_last_error_if_set_at(
+    app: &AppHandle,
+    definitions_dir: &std::path::Path,
+    pubkey: &str,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire managed agents store lock: {e}"))?;
-    let mut records = crate::managed_agents::load_managed_agents(app)?;
+    let mut records = crate::managed_agents::load_managed_agents_at(definitions_dir)?;
     let record = crate::managed_agents::find_managed_agent_mut(&mut records, pubkey)?;
     if !record
         .last_error
@@ -469,7 +507,7 @@ fn clear_mesh_last_error_if_set(app: &AppHandle, pubkey: &str) -> Result<(), Str
     }
     record.last_error = None;
     record.updated_at = crate::util::now_iso();
-    crate::managed_agents::save_managed_agents(app, &records)
+    crate::managed_agents::save_managed_agents_at(definitions_dir, &records)
 }
 
 #[cfg(test)]

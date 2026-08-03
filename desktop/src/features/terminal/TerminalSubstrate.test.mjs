@@ -26,6 +26,18 @@ before(async () => {
     window: dom.window,
     IS_REACT_ACT_ENVIRONMENT: true,
   });
+  // `navigator` is a getter-only global on Node, and the chord layer branches
+  // on `isMacPlatform()`. Pin it so these assertions describe macOS behaviour
+  // on every host instead of quietly inverting on a Linux runner.
+  Object.defineProperty(dom.window.navigator, "platform", {
+    configurable: true,
+    value: "MacIntel",
+  });
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: dom.window.navigator,
+    writable: true,
+  });
   dom.window.matchMedia = () => ({
     get matches() {
       return reducedMotion;
@@ -378,4 +390,140 @@ test("reduced motion keeps the terminal cursor solid", async () => {
   } finally {
     window.setInterval = originalSetInterval;
   }
+});
+
+function tabFixture(overrides = {}) {
+  const calls = { close: [], input: [], select: [], spawn: 0 };
+  const subject = fixture({
+    onCloseSession(id) {
+      calls.close.push(id);
+    },
+    onInput(value) {
+      calls.input.push(value);
+    },
+    onNewSession() {
+      calls.spawn += 1;
+    },
+    onSelectSession(id) {
+      calls.select.push(id);
+    },
+    sessions: [
+      { active: true, closing: false, id: "one", title: "SHELL" },
+      { active: false, closing: false, id: "two", title: "LOG" },
+    ],
+    ...overrides,
+  });
+  // Spread order matters: `fixture` returns its own `calls`, so ours goes last.
+  return { ...subject, calls };
+}
+
+function press(init) {
+  // Dispatched at the window, which is where the substrate's capture-phase
+  // listener lives -- firing at the textarea would test React's synthetic
+  // tree instead of the layer actually under test.
+  const event = new KeyboardEvent("keydown", {
+    bubbles: true,
+    cancelable: true,
+    ...init,
+  });
+  act(() => {
+    window.dispatchEvent(event);
+  });
+  return event;
+}
+
+async function revealed(overrides) {
+  const subject = tabFixture(overrides);
+  await ready(subject.view);
+  await reveal(subject.view);
+  return subject;
+}
+
+test("tab chords drive new, close, and select while the terminal owns input", async () => {
+  const subject = await revealed({
+    sessions: [
+      { active: false, closing: false, id: "one", title: "SHELL" },
+      { active: true, closing: false, id: "two", title: "LOG" },
+      { active: false, closing: false, id: "three", title: "TAIL" },
+    ],
+  });
+
+  const spawn = press({ code: "KeyT", metaKey: true });
+  assert.equal(subject.calls.spawn, 1);
+  assert.equal(spawn.defaultPrevented, true, "⌘T must not reach the page");
+
+  const close = press({ code: "KeyW", metaKey: true });
+  assert.deepEqual(subject.calls.close, ["two"]);
+  assert.equal(close.defaultPrevented, true, "⌘W must not reach the page");
+
+  press({ code: "ArrowRight", metaKey: true, shiftKey: true });
+  press({ code: "ArrowLeft", metaKey: true, shiftKey: true });
+  // Three sessions, active in the middle: with only two tabs, prev and next
+  // resolve to the same id and a direction swap would pass unnoticed.
+  assert.deepEqual(subject.calls.select, ["three", "one"]);
+
+  // Nothing was mistaken for terminal input along the way.
+  assert.deepEqual(subject.calls.input, []);
+});
+
+test("tab chords stay inert while Buzz owns input", async () => {
+  const subject = tabFixture();
+  await ready(subject.view);
+  // Deliberately not revealed: owner is "buzz".
+  const spawn = press({ code: "KeyT", metaKey: true });
+  press({ code: "KeyW", metaKey: true });
+  press({ code: "ArrowRight", metaKey: true, shiftKey: true });
+
+  assert.equal(subject.calls.spawn, 0);
+  assert.deepEqual(subject.calls.close, []);
+  assert.deepEqual(subject.calls.select, []);
+  assert.equal(
+    spawn.defaultPrevented,
+    false,
+    "Buzz-mode ⌘T belongs to the rest of the app",
+  );
+});
+
+test("control chords keep reaching the PTY instead of the tab layer", async () => {
+  const subject = await revealed();
+  const werase = press({ code: "KeyW", ctrlKey: true });
+
+  assert.deepEqual(subject.calls.close, [], "^W is werase, not close-tab");
+  assert.equal(subject.calls.spawn, 0);
+  assert.equal(
+    werase.defaultPrevented,
+    false,
+    "the chord layer must not consume ^W before the textarea encodes it",
+  );
+});
+
+test("⌘W on an already-closing tab does not re-fire close", async () => {
+  const subject = await revealed({
+    sessions: [
+      { active: true, closing: true, id: "one", title: "SHELL" },
+      { active: false, closing: false, id: "two", title: "LOG" },
+    ],
+  });
+  const close = press({ code: "KeyW", metaKey: true });
+
+  assert.deepEqual(subject.calls.close, []);
+  assert.equal(
+    close.defaultPrevented,
+    true,
+    "the chord is still ours -- swallowed, not forwarded",
+  );
+});
+
+test("the handoff chord still toggles with the tab layer installed", async () => {
+  const subject = tabFixture();
+  await ready(subject.view);
+  const substrate = subject.view.container.querySelector(
+    ".buzz-terminal-substrate",
+  );
+  toggleChord();
+  await waitFor(() =>
+    assert.equal(substrate.dataset.terminalOwner, "terminal"),
+  );
+  toggleChord();
+  await waitFor(() => assert.equal(substrate.dataset.terminalOwner, "buzz"));
 });

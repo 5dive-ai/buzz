@@ -2,13 +2,16 @@ import * as React from "react";
 
 import { useTheme } from "@/shared/theme/ThemeProvider";
 import { cn } from "@/shared/lib/cn";
+import { isMacPlatform } from "@/shared/lib/platform";
 import { FadeController } from "./fadeController";
 import {
   INITIAL_HANDOFF_STATE,
   accumulateScrollLines,
   encodePaste,
   encodeTerminalKey,
+  matchTabChord,
   reduceHandoff,
+  stepSession,
 } from "./terminalState";
 import { buildTerminalBanner } from "./terminalBanner";
 import { paintTerminalBanner } from "./terminalBannerPainter";
@@ -182,6 +185,30 @@ export function TerminalSubstrate({
   const consumeFrame = React.useEffectEvent((nextFrame: TerminalFrame) => {
     onFrameConsumed?.(nextFrame);
   });
+  /**
+   * Tab chords are handled at the window in capture phase, like the ⌘J
+   * handoff, so they win over the focused textarea. Gated on terminal
+   * ownership: in Buzz mode these keys belong to the rest of the app.
+   */
+  const runTabChord = React.useEffectEvent((event: KeyboardEvent): boolean => {
+    if (owner !== "terminal" || event.isComposing) return false;
+    const chord = matchTabChord(event, isMacPlatform());
+    if (!chord) return false;
+    if (chord === "new") {
+      onNewSession();
+      return true;
+    }
+    if (chord === "close") {
+      // A tab already closing has a disabled × in the tab bar; re-firing close
+      // on it would send a second shutdown for a session on its way out.
+      if (!activeSession || activeSession.closing) return true;
+      onCloseSession(activeSession.id);
+      return true;
+    }
+    const next = stepSession(sessions, chord === "next" ? 1 : -1);
+    if (next) onSelectSession(next);
+    return true;
+  });
   const reportViewportSize = React.useEffectEvent(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -259,7 +286,13 @@ export function TerminalSubstrate({
     if (!appSurface) return;
     fadeRef.current = new FadeController(appSurface);
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (!enabled || !isToggleChord(event)) return;
+      if (!enabled) return;
+      if (runTabChord(event)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      if (!isToggleChord(event)) return;
       if (event.isComposing) {
         handoffRef.current = reduceHandoff(handoffRef.current, {
           type: "focus-lost",

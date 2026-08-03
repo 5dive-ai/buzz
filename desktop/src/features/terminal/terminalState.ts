@@ -93,6 +93,72 @@ export function encodeTerminalKey(event: {
   return null;
 }
 
+export type TabChord = "close" | "new" | "next" | "previous";
+
+/**
+ * Tab-management chords, matched on `code` so they survive alternate layouts.
+ * `isMac` is a parameter rather than a `navigator` read so matching stays pure,
+ * the same shape as `matchBackForwardChord`.
+ *
+ * The modifier is the platform's primary one and *only* that one — deliberately
+ * narrower than the sibling `isToggleChord`, which accepts either. On macOS
+ * `^W` is werase and `^T` is transpose; a capture-phase listener that claimed
+ * them would consume the event before the textarea could encode it, so Control
+ * must keep falling through to the PTY. Non-mac platforms pay the mirror cost
+ * on Ctrl (matching gnome-terminal, which moves its own tab chords onto
+ * Ctrl+Shift for exactly this reason) — see the report for why that is scoped
+ * out rather than solved here.
+ *
+ * ⌘W is matched even though macOS currently resolves it as the File > Close
+ * Window key equivalent before the webview sees any key event: the accelerator
+ * has to be released natively for this arm to ever run, and matching it now
+ * means the frontend needs no further change when it is.
+ */
+export function matchTabChord(
+  event: {
+    altKey: boolean;
+    code: string;
+    ctrlKey: boolean;
+    metaKey: boolean;
+    shiftKey: boolean;
+  },
+  isMac: boolean,
+): TabChord | null {
+  if (event.altKey) return null;
+  if (isMac ? !event.metaKey || event.ctrlKey : !event.ctrlKey || event.metaKey)
+    return null;
+  if (event.shiftKey) {
+    if (event.code === "ArrowLeft") return "previous";
+    if (event.code === "ArrowRight") return "next";
+    return null;
+  }
+  if (event.code === "KeyT") return "new";
+  if (event.code === "KeyW") return "close";
+  return null;
+}
+
+/**
+ * The id ⇧⌘←/→ moves to, wrapping at both ends.
+ *
+ * Closing tabs are skipped because the tab bar disables their select button —
+ * the keyboard path must not reach a tab the mouse path cannot.
+ */
+export function stepSession(
+  sessions: readonly { active: boolean; closing: boolean; id: string }[],
+  direction: -1 | 1,
+): string | null {
+  const count = sessions.length;
+  const activeIndex = sessions.findIndex((session) => session.active);
+  if (activeIndex < 0) return null;
+  for (let offset = 1; offset < count; offset += 1) {
+    const index =
+      (((activeIndex + direction * offset) % count) + count) % count;
+    const candidate = sessions[index];
+    if (!candidate.closing) return candidate.id;
+  }
+  return null;
+}
+
 export function encodePaste(text: string, bracketed: boolean): string {
   return bracketed ? `\u001b[200~${text}\u001b[201~` : text;
 }

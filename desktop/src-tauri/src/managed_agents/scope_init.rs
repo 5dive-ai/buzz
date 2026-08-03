@@ -56,6 +56,21 @@ const DEFINITIONS_MIGRATION_NAME: &str = "legacy_global_retention_db";
 /// File written inside the scope directory after all migrations complete.
 const READY_MARKER: &str = "_ready";
 
+/// Version written into the `_ready` marker file.
+///
+/// Increment this when the initialization pipeline gains new required steps
+/// (retention migration, backfill, etc.). Any scope whose `_ready` file does
+/// not contain this exact version string will be forced through the corrected
+/// `run_pre_ready_family` pipeline before being considered fully ready.
+///
+/// History:
+/// - v0 (absent / "ready"): marker written before retention migration and
+///   persona backfill were added to `run_pre_ready_family`. Scopes at this
+///   version may have incomplete retention or missing persona snapshots.
+/// - v1: `run_pre_ready_family` (retention + backfill) runs before `_ready`;
+///   Option-A Mesh preflight; marker contains this version string.
+const READY_MARKER_VERSION: &str = "v1";
+
 /// File written inside the scope directory (or staging) as the initialization manifest.
 const MANIFEST_FILE: &str = "_manifest.json";
 
@@ -81,10 +96,22 @@ pub struct ScopeManifest {
     pub init_kind: ScopeInitKind,
 }
 
-/// Check whether a scope directory is already fully initialized (has the
-/// `_ready` marker). Fast path: skips the full initialization if true.
+/// Check whether a scope directory is already fully initialized at the current
+/// pipeline version (has the `_ready` marker with the current version string).
+///
+/// Returns `false` for:
+/// - Missing marker (never initialized, or crash before marker was written).
+/// - Marker with an older version string (written by a prior pipeline that
+///   lacked required steps such as retention migration or persona backfill).
+///
+/// Callers treat both cases the same: re-run `run_scoped_migrations` and
+/// `run_pre_ready_family`, then write the updated marker.
 pub fn scope_is_ready(scope_dir: &Path) -> bool {
-    scope_dir.join(READY_MARKER).exists()
+    let marker_path = scope_dir.join(READY_MARKER);
+    match std::fs::read_to_string(&marker_path) {
+        Ok(content) => content.trim() == READY_MARKER_VERSION,
+        Err(_) => false,
+    }
 }
 
 /// Ensure a scope directory is fully initialized and `Ready`.
@@ -381,6 +408,13 @@ fn install_staged(
 /// 9. `materialize_agent_runtimes_at` — materialize runtime onto each record.
 /// 10. Validate managed-agents.json is parseable JSON before writing Ready.
 fn run_scoped_migrations(scope_dir: &Path) -> Result<(), String> {
+    // Step 0: rename `provider` → `runtime` in personas.json before fold so
+    // the fold reads the correct `runtime` field. The pre-scope call in
+    // `run_boot_migrations_inner` is removed; this step is the canonical
+    // location for the persona-provider rename.
+    crate::migration::migrate_persona_provider_to_runtime_at(scope_dir)
+        .map_err(|e| format!("scope-init-persona-provider: {e}"))?;
+
     // Step 1: fold personas.json into the unified store.
     match crate::migration::fold_personas_in_dir(scope_dir) {
         Ok(None) | Ok(Some(0)) => {}
@@ -491,14 +525,25 @@ fn run_pre_ready_family(
         return Err(format!("scope-init-backfill: {e}"));
     }
 
+    // Step C (debug builds only): copy agent keys from the prod keyring into
+    // the dev service. Runs after staged copy so the scoped managed-agents.json
+    // exists with valid pubkeys. Replaces the pre-scope call in
+    // `run_boot_migrations_inner` which could not read the store before scope
+    // activation.
+    #[cfg(debug_assertions)]
+    crate::managed_agents::storage::migrate_agent_keys_to_dev_service_at(scope_dir);
+
     Ok(())
 }
 
 /// Write the `_ready` marker file inside the scope directory, signaling that
 /// all migrations are complete and the scope is available for use.
+///
+/// Writes `READY_MARKER_VERSION` so future pipeline upgrades can detect and
+/// re-run scopes initialized by an older pipeline.
 fn write_ready_marker(scope_dir: &Path) -> Result<(), String> {
     let marker_path = scope_dir.join(READY_MARKER);
-    std::fs::write(&marker_path, b"ready").map_err(|e| {
+    std::fs::write(&marker_path, READY_MARKER_VERSION.as_bytes()).map_err(|e| {
         format!(
             "failed to write ready marker at {}: {e}",
             marker_path.display()
@@ -907,6 +952,48 @@ mod tests {
         assert!(
             scope_is_ready(&scope_dir),
             "_ready must be written on successful retry"
+        );
+    }
+
+    /// Versioned `_ready` upgrade: a scope whose marker was written by an older
+    /// pipeline (e.g. "ready" or any non-current version) must be forced through
+    /// `run_pre_ready_family` again and have its marker upgraded to the current
+    /// version. An already-current marker is a fast no-op.
+    #[test]
+    fn test_old_ready_marker_forces_pre_ready_pipeline_and_upgrades_version() {
+        let (_tmp, base_dir) = make_base_dir_pair();
+        let scope_id = "versioned-scope";
+        let scope_dir = base_dir.join("scopes").join(scope_id);
+
+        // Full initialization with fresh scope → marker written at current version.
+        ensure_scope_ready(scope_id, &scope_dir, &base_dir, "test_owner").unwrap();
+        assert!(scope_is_ready(&scope_dir), "scope must be ready after init");
+        // Verify the marker actually carries the version string.
+        let marker_content = std::fs::read_to_string(scope_dir.join(READY_MARKER)).unwrap();
+        assert_eq!(
+            marker_content.trim(),
+            READY_MARKER_VERSION,
+            "marker must carry current version"
+        );
+
+        // Downgrade the marker to simulate a pre-existing scope from an older build.
+        std::fs::write(scope_dir.join(READY_MARKER), b"ready").unwrap();
+        assert!(
+            !scope_is_ready(&scope_dir),
+            "old-version marker must not be considered current"
+        );
+
+        // Re-running ensure_scope_ready must upgrade the marker.
+        ensure_scope_ready(scope_id, &scope_dir, &base_dir, "test_owner").unwrap();
+        assert!(
+            scope_is_ready(&scope_dir),
+            "scope must be ready after version upgrade"
+        );
+        let upgraded_content = std::fs::read_to_string(scope_dir.join(READY_MARKER)).unwrap();
+        assert_eq!(
+            upgraded_content.trim(),
+            READY_MARKER_VERSION,
+            "upgraded marker must carry current version"
         );
     }
 

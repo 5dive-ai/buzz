@@ -367,24 +367,25 @@ async fn test_managed_agent_tombstone_deletes_coordinate() {
     client.disconnect().await.expect("disconnect");
 }
 
-/// Two-workspace relay partition probe.
+/// NIP-33 author-coordinate isolation probe (relay-level, two keypairs on one relay).
 ///
-/// Workspace A and workspace B are modelled as two distinct owner keypairs on
-/// the same relay. This test verifies:
+/// This test verifies relay-level NIP-33 author scoping. It does NOT cover
+/// desktop workspace activation, `apply_workspace`, the scoped file store,
+/// inbound event routing, or runtime fan-out — those are verified by desktop
+/// unit tests and the live two-workspace probe run after Thufir's clear.
+///
+/// Two distinct owner keypairs share one relay. The test verifies:
 ///
 /// 1. Owner A's events are author-scoped: a subscription filtered by
 ///    `author: owner_a` returns only owner_a's events, not owner_b's.
 /// 2. Symmetrically, owner B's subscription returns only owner_b's events.
-/// 3. Cross-author subscriptions return zero events for the other owner's
-///    d-tag coordinate (NIP-33 scoping by `(kind, author, d-tag)` means
-///    the coordinate for owner_a's agent and the coordinate for owner_b's
-///    agent are disjoint — same d-tag value, but different author pubkeys
-///    produce different NIP-33 addresses).
+/// 3. NIP-33 coordinates are scoped by `(kind, author, d-tag)`. A subscription
+///    for `(kind=30177, author=owner_b, d=shared_d_tag)` returns B's event —
+///    not A's — confirming the (kind, author, d-tag) tuple is unique per owner.
 ///
-/// This is the relay-level half of the two-workspace isolation proof. The
-/// filesystem half is covered by the scope_id unit tests: different
-/// `(relay_url, owner_pubkey)` pairs always produce distinct scope_id
-/// directories under `agents/scopes/<scope_id>/`.
+/// The filesystem isolation proof (different `(relay_url, owner_pubkey)` pairs
+/// always produce distinct scope_id directories) is covered separately by the
+/// scope_id unit tests.
 #[tokio::test]
 #[ignore]
 async fn test_two_workspace_relay_partition() {
@@ -512,11 +513,12 @@ async fn test_two_workspace_relay_partition() {
         "workspace B's subscription must NOT return workspace A's content"
     );
 
-    // ── Direction 3: cross-scope subscription returns zero (NIP-33 isolation) ──
+    // ── Direction 3: NIP-33 coordinate ownership — B's coord returns B's event ──
     // Owner A subscribes to the same d-tag but filtered by owner_b's pubkey.
-    // This is the precise test that a workspace switching to B cannot accidentally
-    // read A's NIP-33 coordinates: the (kind=30177, author=owner_b, d=shared_d_tag)
-    // coordinate resolves to B's definition, not A's.
+    // This proves that NIP-33 coordinates are scoped by (kind, author, d-tag):
+    // A's coordinate and B's coordinate are distinct even though they share
+    // the same d-tag value, because they are authored by different pubkeys.
+    // The query returns B's event — not A's — confirming per-author isolation.
     let sid_cross = sub_id("probe-cross-scope");
     let filter_cross = Filter::new()
         .kind(Kind::Custom(AGENT_KIND))

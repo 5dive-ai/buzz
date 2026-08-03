@@ -53,25 +53,12 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
     backfill_persona_snapshots_in_dir(&scope.definitions_dir, &state)
 }
 
-/// Backfill persona snapshots in an explicit `definitions_dir`.
-///
-/// Called from the per-scope initialization pipeline (during prepare, before
-/// `_ready`) so auto-start agents boot from a valid snapshot even on first
-/// activation. Takes `definitions_dir` directly rather than capturing the
-/// active scope so it can run before the scope is committed.
-pub fn backfill_persona_snapshots_at(
-    definitions_dir: &std::path::Path,
-    state: &AppState,
-) -> Result<(), String> {
-    backfill_persona_snapshots_in_dir(definitions_dir, state)
-}
-
 /// Backfill persona snapshots without acquiring the store lock.
 ///
 /// For use during scope initialization (inside `ensure_scope_ready`), where the
 /// scope directory is not yet published as `_ready` and no concurrent reader or
-/// writer can legally access it. The lock-taking variant (`backfill_persona_snapshots_at`)
-/// must be used in all other contexts.
+/// writer can legally access it. In all other contexts the store lock must be
+/// held by the caller before reading or writing scope definitions.
 pub(crate) fn backfill_persona_snapshots_pre_ready(
     definitions_dir: &std::path::Path,
 ) -> Result<(), String> {

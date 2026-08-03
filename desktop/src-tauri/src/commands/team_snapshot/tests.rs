@@ -760,4 +760,18 @@ mod egress_guard_boundary {
         .unwrap_err();
         assert!(err.contains("key-backup material"), "{err}");
     }
+
+    /// Outbound profile/memory publication must use the captured scope's relay.
+    /// See corresponding test in personas/snapshot/import.rs for the same contract.
+    #[test]
+    fn test_team_outbound_relay_uses_captured_scope_not_live_state() {
+        let captured_relay = "wss://captured.example";
+        let live_relay = "wss://switched.example";
+        let record_relay = "";
+
+        let outbound = crate::relay::effective_agent_relay_url(record_relay, captured_relay);
+        let stale = crate::relay::effective_agent_relay_url(record_relay, live_relay);
+        assert_eq!(outbound, captured_relay);
+        assert_ne!(outbound, stale);
+    }
 }

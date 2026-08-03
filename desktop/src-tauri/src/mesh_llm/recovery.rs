@@ -411,18 +411,15 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
         .await
         {
             Ok(()) => {
-                if let Some(dir) = scope_definitions_dir.as_deref() {
-                    // Validate generation before writing to the captured scope's
-                    // directory — if the workspace switched during this await,
-                    // do not write the stale success into the new scope's store.
-                    if captured_scope.as_ref().map_or(false, |s| {
-                        crate::managed_agents::scope::validate_scope_generation(s).is_ok()
-                    }) {
-                        if let Err(error) =
-                            clear_mesh_last_error_if_set_at(app, dir, &record.pubkey)
-                        {
-                            eprintln!("buzz-mesh: failed to clear recovery error: {error}");
-                        }
+                if let (Some(dir), Some(scope)) =
+                    (scope_definitions_dir.as_deref(), captured_scope.as_ref())
+                {
+                    // Pass the captured scope to the helper so generation is
+                    // validated INSIDE the store lock, not before it.
+                    if let Err(error) =
+                        clear_mesh_last_error_if_set_at(app, dir, &record.pubkey, scope)
+                    {
+                        eprintln!("buzz-mesh: failed to clear recovery error: {error}");
                     }
                 }
             }
@@ -430,19 +427,15 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
                 let message = format!(
                     "{MESH_REARM_ERROR_SENTINEL}Buzz shared compute offline — failed to re-arm local ingress for this agent: {error}"
                 );
-                if let Some(dir) = scope_definitions_dir.as_deref() {
-                    // Validate generation before persisting the error — if the
-                    // workspace switched during this await, skip the write.
-                    if captured_scope.as_ref().map_or(false, |s| {
-                        crate::managed_agents::scope::validate_scope_generation(s).is_ok()
-                    }) {
-                        if let Err(persist_error) =
-                            persist_mesh_last_error_at(app, dir, &record.pubkey, &message)
-                        {
-                            eprintln!(
-                                "buzz-mesh: failed to persist recovery error: {persist_error}"
-                            );
-                        }
+                if let (Some(dir), Some(scope)) =
+                    (scope_definitions_dir.as_deref(), captured_scope.as_ref())
+                {
+                    // Pass the captured scope to the helper so generation is
+                    // validated INSIDE the store lock, not before it.
+                    if let Err(persist_error) =
+                        persist_mesh_last_error_at(app, dir, &record.pubkey, &message, scope)
+                    {
+                        eprintln!("buzz-mesh: failed to persist recovery error: {persist_error}");
                     }
                 }
                 first_error.get_or_insert(message);
@@ -494,12 +487,17 @@ fn persist_mesh_last_error_at(
     definitions_dir: &std::path::Path,
     pubkey: &str,
     error: &str,
+    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire managed agents store lock: {e}"))?;
+    // Validate generation inside the lock — if the workspace switched during
+    // the preceding await, abort rather than writing into the new scope's store.
+    crate::managed_agents::scope::validate_scope_generation(captured_scope)
+        .map_err(|e| format!("mesh recovery persist: {e}"))?;
     let mut records = crate::managed_agents::load_managed_agents_at(definitions_dir)?;
     let record = crate::managed_agents::find_managed_agent_mut(&mut records, pubkey)?;
     record.last_error = Some(error.to_string());
@@ -511,12 +509,17 @@ fn clear_mesh_last_error_if_set_at(
     app: &AppHandle,
     definitions_dir: &std::path::Path,
     pubkey: &str,
+    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire managed agents store lock: {e}"))?;
+    // Validate generation inside the lock — if the workspace switched during
+    // the preceding await, abort rather than writing into the new scope's store.
+    crate::managed_agents::scope::validate_scope_generation(captured_scope)
+        .map_err(|e| format!("mesh recovery clear: {e}"))?;
     let mut records = crate::managed_agents::load_managed_agents_at(definitions_dir)?;
     let record = crate::managed_agents::find_managed_agent_mut(&mut records, pubkey)?;
     if !record

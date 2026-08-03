@@ -64,58 +64,28 @@ pub(super) async fn check_mesh_runtime_relay_scope(state: &AppState) -> Result<b
     }
 }
 
-/// Drain the Mesh client runtime if it is bound to a relay other than
-/// `active_relay_url` (i.e. it belongs to a workspace that is being
-/// switched away from).
+/// Check whether a client-mode Mesh runtime is currently active.
 ///
-/// Serve-mode runtimes are machine-level and are deliberately NOT drained
-/// on workspace switch — they stay pinned to their configured relay.
+/// Returns `Err(msg)` with a user-facing message when a client runtime is
+/// present — the caller should fail the workspace switch / identity import
+/// with this message so the user knows to stop Mesh first.
 ///
-/// Called from the Layer-1 async serialization stage of `apply_workspace`
-/// (before `spawn_blocking`), while holding `workspace_transition` but
-/// without any synchronous Layer-2 guards.
-pub(crate) async fn drain_mesh_client_if_stale(
-    app: &AppHandle,
-    active_relay_url: &str,
-) -> Result<(), String> {
+/// Serve-mode runtimes and absent runtimes both return `Ok(())` — they are
+/// machine-level (serve) or simply not running (absent) and do not block
+/// a workspace switch.
+///
+/// Called from the Layer-1 async stage of `apply_workspace` and
+/// `import_identity` before entering `spawn_blocking`.
+pub(crate) async fn fail_if_client_mesh_active(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let (should_drain, taken) = {
-        let mut guard = state.mesh_llm_runtime.lock().await;
-        let is_client = guard
-            .as_ref()
-            .map_or(false, |r| r.mode() == mesh_llm::MeshNodeMode::Client);
-        if !is_client {
-            // Serve mode or no runtime — nothing to drain.
-            (false, None)
-        } else {
-            // Check relay match; drain only on mismatch.
-            let runtime_relay = guard
-                .as_ref()
-                .and_then(|r| r.start_request().relay_url.clone());
-            let relay_matches = runtime_relay.as_deref().map_or(false, |bound| {
-                crate::managed_agents::scope::normalize_relay_for_scope(bound)
-                    == crate::managed_agents::scope::normalize_relay_for_scope(active_relay_url)
-            });
-            if relay_matches {
-                (false, None)
-            } else {
-                (true, guard.take())
-            }
-        }
-    };
-
-    if should_drain {
-        if let Some(runtime) = taken {
-            if let Err(error) = runtime.stop().await {
-                eprintln!(
-                    "buzz-mesh: failed to drain stale client runtime during workspace switch: {error}"
-                );
-                // Non-fatal: the old client may have already exited or will be
-                // reclaimed by the watchdog. Log and continue — not stopping
-                // an old client is safer than blocking the workspace switch.
-            }
-        }
-        mesh_llm::publish_current_status_once(app, "workspace switch drain").await;
+    let guard = state.mesh_llm_runtime.lock().await;
+    let is_client = guard
+        .as_ref()
+        .map_or(false, |r| r.mode() == mesh_llm::MeshNodeMode::Client);
+    if is_client {
+        return Err("A Buzz shared compute (client) session is active. \
+             Stop it in the Shared Compute settings before switching workspaces."
+            .to_string());
     }
     Ok(())
 }

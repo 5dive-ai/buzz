@@ -389,33 +389,14 @@ pub async fn import_identity(
         None
     };
 
-    // ── Layer 1 async: drain the Mesh client when switching away from an active
-    // scope — mirrors the pre-spawn_blocking Mesh drain in apply_workspace so
-    // the Mesh client is not left running against a scope that no longer exists
-    // after the identity import clears the active scope. Best-effort: a drain
-    // failure is logged and the import proceeds.
+    // ── Layer 1 async: fail closed if a client-mode Mesh runtime is active ──
+    // Identity import clears the active scope entirely, so any live client-mode
+    // Mesh runtime would become dangling after the import. Option A ruling:
+    // require the user to stop it first. The journaled Mesh recipe is a tracked
+    // follow-up in the PR body.
     if has_active_scope {
         #[cfg(feature = "mesh-llm")]
-        {
-            // Drain using the current active relay — the import clears the scope
-            // entirely, so any live Mesh client becomes stale regardless of relay.
-            let active_relay = lock_state
-                .capture_active_scope()
-                .map(|s| s.relay_url.clone())
-                .unwrap_or_default();
-            if let Err(error) = crate::commands::mesh_llm::scope_impl::drain_mesh_client_if_stale(
-                &app_handle,
-                // Pass an empty string so any client (any relay) is treated
-                // as stale and drained; identity import invalidates all scopes.
-                "",
-            )
-            .await
-            {
-                eprintln!(
-                    "buzz-desktop: Mesh client drain before identity import failed: {error} (active_relay={active_relay})"
-                );
-            }
-        }
+        crate::commands::mesh_llm::scope_impl::fail_if_client_mesh_active(&app_handle).await?;
     }
 
     let result = tokio::task::spawn_blocking(move || {

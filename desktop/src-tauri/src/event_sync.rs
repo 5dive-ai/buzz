@@ -40,8 +40,10 @@ pub fn run_event_sync(
 /// async worker.
 ///
 /// The dispatch always succeeds (fire-and-forget); completion failures are
-/// logged internally. Callers that need observable failure should emit a
-/// workspace degradation event via `emit_workspace_degradation`.
+/// logged internally via `eprintln!`. Event-sync does not emit a structured
+/// degradation event because `spawn_blocking` failure means the Tauri runtime
+/// is shutting down — there is no user-visible surface to deliver a toast to
+/// at that point.
 pub fn spawn_event_sync(
     app: tauri::AppHandle,
     owner_keys: nostr::Keys,

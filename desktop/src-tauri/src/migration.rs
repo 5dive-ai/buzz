@@ -155,21 +155,18 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
 
     migrate_legacy_app_data_dir(app);
     sync_shared_agent_data(app);
-    // Dev-build-only: copy any agent keys that exist in the production
-    // keyring ("buzz-desktop") into the dev service ("buzz-desktop-dev")
-    // so existing agents don't lose their keys after the service-name split.
-    // Must run after sync_shared_agent_data (JSON symlinked) and before
-    // any load_managed_agents call (which runs hydrate_keys against the
-    // dev service and would log "has no key" for un-migrated entries).
-    #[cfg(debug_assertions)]
-    if is_dev {
-        crate::managed_agents::migrate_agent_keys_to_dev_service(app);
-    }
-    migrate_persona_provider_to_runtime(app);
-    // Definition-touching migrations (fold, strip, backfill, etc.) are NOT
-    // run here. They run inside the per-scope initialization pipeline
-    // (`scope_init::run_scoped_migrations`) after staged adoption so every
-    // scope sees exactly the migrations appropriate to its data.
+    // Definition-touching migrations (fold, strip, backfill, etc.) and the
+    // dev-key keyring migration are NOT run here. They run inside the per-scope
+    // initialization pipeline (`scope_init::run_scoped_migrations` and
+    // `run_pre_ready_family`) after staged adoption so every scope sees exactly
+    // the migrations appropriate to its data.
+    //
+    // `migrate_persona_provider_to_runtime` moved to `run_scoped_migrations`
+    // as step 0 (before fold); runs on the scoped personas.json, not the legacy
+    // `agents/personas.json`.
+    //
+    // `migrate_agent_keys_to_dev_service` moved to `run_pre_ready_family` as
+    // step C (debug builds); runs after the scoped store is populated.
 }
 
 /// Copy one-time app state from the legacy app identifier directory to
@@ -1176,17 +1173,6 @@ fn rename_provider_to_runtime_in_personas(path: &Path) {
     }) {
         eprintln!("buzz-desktop: rename-provider-to-runtime: {e}");
     }
-}
-
-pub fn migrate_persona_provider_to_runtime(app: &tauri::AppHandle) {
-    let Ok(dir) = app.path().app_data_dir() else {
-        return;
-    };
-    let path = dir.join("agents/personas.json");
-    if !path.exists() {
-        return;
-    }
-    rename_provider_to_runtime_in_personas(&path);
 }
 mod fold;
 mod materialize;

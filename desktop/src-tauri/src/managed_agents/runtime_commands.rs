@@ -258,6 +258,18 @@ fn start_pair(
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     let state = app.state::<AppState>();
+    // Check the compensation gate BEFORE taking the transition lock so a
+    // concurrent compensate_drain call is not blocked waiting for our lock
+    // while we wait for its gate — the transition mutex alone cannot prevent
+    // that ordering when compensation holds neither lock.
+    if state
+        .managed_agent_drain_compensation_in_progress
+        .load(Ordering::Acquire)
+    {
+        return Err(
+            "drain compensation in progress — retry after workspace transition completes".into(),
+        );
+    }
     let _transition = state
         .managed_agent_runtime_transition
         .lock()
@@ -741,8 +753,23 @@ pub(crate) fn drain_scope_runtimes(
 /// the prefix of the journal up to the first failure). We restart them so the
 /// old workspace is as intact as possible.
 ///
+/// Sets `managed_agent_drain_compensation_in_progress` in AppState while running
+/// so that concurrent `start_pair` calls back off — prevents a normal start
+/// from inserting a runtime into the gap between "drop transition lock" and
+/// "compensate_drain calls start_pair".
+///
 /// Returns a degradation message describing what could not be restarted.
 pub(crate) fn compensate_drain(app: &AppHandle, stopped: &[DrainJournalEntry]) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+
+    // Gate concurrent starts for the duration of compensation so no normal
+    // start_pair call can interleave with the journal restore.
+    state
+        .managed_agent_drain_compensation_in_progress
+        .store(true, Ordering::Release);
+
     let mut failed_restarts = Vec::new();
     for entry in stopped {
         let result = start_pair(
@@ -756,6 +783,11 @@ pub(crate) fn compensate_drain(app: &AppHandle, stopped: &[DrainJournalEntry]) -
             failed_restarts.push(format!("{}@{}: {e}", entry.key.pubkey, entry.key.relay_url));
         }
     }
+
+    state
+        .managed_agent_drain_compensation_in_progress
+        .store(false, Ordering::Release);
+
     if failed_restarts.is_empty() {
         None
     } else {

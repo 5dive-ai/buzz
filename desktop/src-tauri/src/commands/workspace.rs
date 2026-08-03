@@ -122,20 +122,14 @@ pub async fn apply_workspace(
     let lock_state = lock_app.state::<AppState>();
     let _transition_guard = lock_state.workspace_transition.lock().await;
 
-    // ── Layer 1 async: drain the Mesh client if it belongs to another relay ──
-    // Serve-mode runtimes stay pinned (machine-level, unaffected by workspace
-    // switches). Client-mode runtimes bound to a different relay are drained
-    // here, in the async layer, before entering spawn_blocking (which cannot
-    // await). Non-fatal: a drain failure is logged and the switch proceeds.
+    // ── Layer 1 async: fail closed if a client-mode Mesh runtime is active ──
+    // Serve-mode runtimes are machine-level and stay pinned across workspace
+    // switches — they never block a switch. Client-mode runtimes require an
+    // active scope to be meaningful and cannot be safely moved to a new scope
+    // atomically. Option A ruling: require the user to stop the client session
+    // first; the journaled Mesh recipe is a tracked follow-up in the PR body.
     #[cfg(feature = "mesh-llm")]
-    {
-        if let Err(error) =
-            crate::commands::mesh_llm::scope_impl::drain_mesh_client_if_stale(&app, &relay_url)
-                .await
-        {
-            eprintln!("buzz-desktop: Mesh client drain before workspace switch failed: {error}");
-        }
-    }
+    crate::commands::mesh_llm::scope_impl::fail_if_client_mesh_active(&app).await?;
 
     let restore_app = app.clone();
     let blocking_result: Result<WorkspaceApplyResult, String> =
@@ -188,43 +182,6 @@ pub async fn apply_workspace(
                 &base_dir,
                 &effective_owner_pubkey,
             )?;
-
-            // ── Legacy retention migration and persona snapshot backfill ─────────
-            // Both now run inside `ensure_scope_ready` above (as `run_pre_ready_family`),
-            // before the `_ready` marker is written. They remain here as
-            // best-effort guards for any pre-existing Ready scope that was
-            // initialized before these steps were added to the pipeline.
-            if let Err(e) = crate::managed_agents::backfill_persona_snapshots_at(
-                &scope_dir,
-                &state,
-            ) {
-                eprintln!("buzz-desktop: persona-snapshot backfill guard failed: {e}");
-            }
-
-            {
-                let effective_owner_pubkey_for_retention = effective_owner_pubkey.clone();
-                let retention_db_path = crate::managed_agents::retention::scoped_retention_db_path(
-                    &base_dir,
-                    &relay_url,
-                    &effective_owner_pubkey_for_retention,
-                );
-                if let Some(parent) = retention_db_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                match crate::managed_agents::retention::migrate_legacy_retention_db(
-                    &base_dir,
-                    &retention_db_path,
-                    &effective_owner_pubkey_for_retention,
-                ) {
-                    Ok(0) => {}
-                    Ok(copied) => eprintln!(
-                        "buzz-desktop: adopted {copied} legacy retained event(s) into this community"
-                    ),
-                    Err(error) => eprintln!(
-                        "buzz-desktop: legacy retention migration guard failed: {error}"
-                    ),
-                }
-            }
 
             // ── Layer 2: drain + commit under one continuous lock ─────────────
             // `managed_agent_runtime_transition` is held from journal creation
@@ -367,25 +324,6 @@ pub async fn apply_workspace(
     // If blocking returned a drain-failed result, surface it now.
     let apply_result = blocking_result?;
     if !apply_result.applied {
-        // The workspace switch failed (drain or commit error). The Mesh client
-        // may have been drained in the Layer-1 async stage before spawn_blocking
-        // was entered. Re-arm it so the old scope's sharing state is restored.
-        #[cfg(feature = "mesh-llm")]
-        {
-            let app = restore_app.clone();
-            tauri::async_runtime::spawn(async move {
-                let state = app.state::<AppState>();
-                if let Err(error) =
-                    crate::commands::mesh_llm::restore_mesh_sharing(&app, &state).await
-                {
-                    eprintln!(
-                        "buzz-desktop: failed to re-arm Mesh after failed workspace switch: {error}"
-                    );
-                }
-                crate::mesh_llm::publish_current_status_once(&app, "workspace switch rollback")
-                    .await;
-            });
-        }
         return Ok(apply_result);
     }
 

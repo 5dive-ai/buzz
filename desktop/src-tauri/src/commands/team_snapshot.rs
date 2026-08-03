@@ -22,7 +22,7 @@ use crate::{
         save_personas_at, save_teams_at, teams_store_path_at, AgentDefinition, ManagedAgentRecord,
         TeamRecord,
     },
-    relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
+    relay::{effective_agent_relay_url, sync_managed_agent_profile},
     util::now_iso,
 };
 
@@ -784,7 +784,9 @@ pub async fn confirm_team_snapshot_import(
     };
 
     // ── Phase 4 & 5: profile sync + memory restore (async, outside lock) ────
-    let relay_ws = relay_ws_url_with_override(&state);
+    // Use the captured scope's relay URL so profile and memory publication
+    // targets the same workspace where definitions were written in Phase 3.
+    let relay_ws: &str = &captured_scope.relay_url;
     let mut member_results: Vec<TeamSnapshotImportMemberResult> = Vec::with_capacity(minted.len());
 
     for (m, snap_member) in minted.iter().zip(snapshot.members.iter()) {

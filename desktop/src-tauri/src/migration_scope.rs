@@ -4,6 +4,21 @@ pub(crate) use fold::fold_personas_in_dir;
 pub(crate) use materialize::materialize_runtimes_in_file;
 pub(crate) use team_suffix::strip_baked_team_instructions_in_dir;
 
+/// Rename `provider` → `runtime` in a scoped `definitions_dir/personas.json`.
+///
+/// Runs BEFORE `fold_personas_in_dir` so the fold reads the correct `runtime`
+/// field. Idempotent: records that already have `runtime` are unchanged.
+/// Returns `Ok(())` when there is no `personas.json` to migrate.
+pub(crate) fn migrate_persona_provider_to_runtime_at(
+    definitions_dir: &std::path::Path,
+) -> Result<(), String> {
+    let path = definitions_dir.join("personas.json");
+    if path.exists() {
+        rename_provider_to_runtime_in_personas(&path);
+    }
+    Ok(())
+}
+
 /// Reconcile `mcp_command` values in a scoped `definitions_dir`.
 pub(crate) fn reconcile_provider_mcp_commands_at(definitions_dir: &std::path::Path) -> Result<(), String> {
     let path = definitions_dir.join("managed-agents.json");

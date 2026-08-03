@@ -17,8 +17,7 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         agent_readiness, current_instance_id, find_managed_agent_mut, known_acp_runtime,
-        load_global_agent_config, load_managed_agents, load_personas, record_agent_command,
-        resolve_effective_agent_env, save_global_agent_config, save_managed_agents,
+        load_global_agent_config, record_agent_command, resolve_effective_agent_env,
         stop_managed_agent_process, sync_managed_agent_processes, validate_global_config,
         AgentReadiness, BackendKind, GlobalAgentConfig,
     },
@@ -64,6 +63,20 @@ pub async fn set_global_agent_config(
     config: GlobalAgentConfig,
     app: AppHandle,
 ) -> Result<GlobalAgentConfigSaveResult, String> {
+    use tauri::Manager;
+
+    // Capture the active scope at command entry. All definition I/O targets
+    // the captured scope's definitions_dir throughout both phases so a concurrent
+    // workspace switch cannot split the config write (Phase 1) from the agent
+    // restart (Phase 2) across two different scopes.
+    let captured_scope = {
+        let state = app.state::<AppState>();
+        state
+            .capture_active_scope()
+            .ok_or("set_global_agent_config: no active workspace scope")?
+    };
+    let definitions_dir = captured_scope.definitions_dir.clone();
+
     // ── Phase 1: disk write (sync, spawn_blocking) ────────────────────────
     //
     // Validate, snapshot old config, write new config, collect pre-filter
@@ -71,21 +84,47 @@ pub async fn set_global_agent_config(
     // Ready).  The candidate list is a hint — eligibility is re-checked under
     // lock in Phase 2 after sync_managed_agent_processes.
     let app_for_write = app.clone();
+    let definitions_dir_for_phase1 = definitions_dir.clone();
+    let captured_scope_for_phase1 = captured_scope.clone();
     let phase1 = tokio::task::spawn_blocking(move || {
         validate_global_config(&config)?;
 
-        let old_global = load_global_agent_config(&app_for_write).unwrap_or_default();
+        let old_global = crate::managed_agents::global_config::load_global_agent_config_at(
+            &definitions_dir_for_phase1,
+        )
+        .unwrap_or_default();
 
-        save_global_agent_config(&app_for_write, &config)?;
+        // Validate generation before writing so a concurrent switch after the
+        // command was dispatched doesn't clobber a newly activated scope's config.
+        {
+            use tauri::Manager;
+            let state = app_for_write.state::<AppState>();
+            let _store = state
+                .managed_agents_store_lock
+                .lock()
+                .map_err(|e| e.to_string())?;
+            crate::managed_agents::scope::validate_scope_generation(&captured_scope_for_phase1)
+                .map_err(|e| format!("set_global_agent_config: {e}"))?;
+            crate::managed_agents::global_config::save_global_agent_config_at(
+                &definitions_dir_for_phase1,
+                &config,
+            )?;
+        }
 
         // Re-read from disk so the returned value reflects the strip-on-write pass.
-        let new_global = load_global_agent_config(&app_for_write)?;
+        let new_global = crate::managed_agents::global_config::load_global_agent_config_at(
+            &definitions_dir_for_phase1,
+        )?;
 
         // Pre-filter: identify agents that look eligible before taking any locks.
         // This is a hint only; definitive eligibility check happens under lock
         // in Phase 2.
-        let (candidates, personas_snapshot) =
-            collect_restart_candidates(&app_for_write, &old_global, &new_global);
+        let (candidates, personas_snapshot) = collect_restart_candidates_at(
+            &app_for_write,
+            &definitions_dir_for_phase1,
+            &old_global,
+            &new_global,
+        );
 
         Ok::<_, String>((new_global, old_global, candidates, personas_snapshot))
     })
@@ -101,6 +140,10 @@ pub async fn set_global_agent_config(
     // and passed (NIP-OA auth_tag fallback), the persona is re-snapshotted, and
     // last_error is persisted on failure.
     //
+    // Uses the same captured `definitions_dir` as Phase 1 so a concurrent
+    // workspace switch cannot split config-write from agent-restart across scopes.
+    // Generation is re-validated under lock before each stop.
+    //
     // Errors are non-fatal; the caller always receives the saved config.
     // failed_restart_count surfaces stops that succeeded but respawn failed.
     let mut restarted_count: u32 = 0;
@@ -113,6 +156,8 @@ pub async fn set_global_agent_config(
                 &old_global,
                 &new_global,
                 &personas_snapshot,
+                &captured_scope,
+                &definitions_dir,
             )
             .await;
             match outcome {
@@ -144,9 +189,13 @@ enum RestartOutcome {
 /// Collect pubkeys of local agents that should be restarted after a global
 /// config change, together with the personas snapshot used for the scan.
 ///
-/// Pre-lock hint used by Phase 1 of `set_global_agent_config`. Eligibility is
-/// re-verified under lock in Phase 2. The personas snapshot is threaded to
-/// `restart_local_agent_on_config_change` so it is not reloaded per agent.
+/// Scoped variant used by Phase 1 of `set_global_agent_config`: reads from the
+/// captured `definitions_dir` rather than the live active scope so a concurrent
+/// workspace switch cannot redirect the scan to a different scope's records.
+///
+/// Pre-lock hint — eligibility is re-verified under lock in Phase 2. The personas
+/// snapshot is threaded to `restart_local_agent_on_config_change` so it is not
+/// reloaded per agent.
 ///
 /// An agent is a candidate when it is a local backend with a recorded PID, and
 /// either:
@@ -155,12 +204,13 @@ enum RestartOutcome {
 /// - it was already `Ready`, its process is currently alive, and its effective
 ///   env changed (provider, model, or env var update that needs a restart to
 ///   take effect, since env is baked at spawn time).
-fn collect_restart_candidates(
+fn collect_restart_candidates_at(
     app: &AppHandle,
+    definitions_dir: &std::path::Path,
     old_global: &GlobalAgentConfig,
     new_global: &GlobalAgentConfig,
 ) -> (Vec<String>, Vec<crate::managed_agents::AgentDefinition>) {
-    let records = match load_managed_agents(app) {
+    let records = match crate::managed_agents::storage::load_managed_agents_at(definitions_dir) {
         Ok(r) => r,
         Err(e) => {
             eprintln!(
@@ -169,7 +219,7 @@ fn collect_restart_candidates(
             return (Vec::new(), Vec::new());
         }
     };
-    let all_personas = match load_personas(app) {
+    let all_personas = match crate::managed_agents::load_personas_at(definitions_dir) {
         Ok(p) => p,
         Err(e) => {
             eprintln!(
@@ -227,11 +277,13 @@ fn collect_restart_candidates(
 /// This is the per-agent restart step in Phase 2 of `set_global_agent_config`.
 /// It mirrors the semantics of a manual agent restart:
 ///
-/// 1. **Stop under lock** — acquires the store lock, calls
-///    `sync_managed_agent_processes`, re-verifies eligibility (local backend,
-///    live process, effective env changed or readiness transition), then stops
-///    the process and saves the record.  The lock is released before the start
-///    so `start_local_agent_with_preflight` can re-acquire it cleanly.
+/// 1. **Stop under lock** — acquires the store lock, validates scope generation
+///    (so a concurrent workspace switch aborts rather than clobbering the new
+///    scope's store), calls `sync_managed_agent_processes`, re-verifies eligibility
+///    (local backend, live process, effective env changed or readiness transition),
+///    then stops the process and saves the record using the captured
+///    `definitions_dir` so writes target the correct scope.  The lock is released
+///    before the start so `start_local_agent_with_preflight` can re-acquire it.
 ///    `personas_snapshot` is reused here instead of loading from disk again.
 ///
 /// 2. **Start via the normal preflight path** — calls
@@ -250,6 +302,8 @@ async fn restart_local_agent_on_config_change(
     old_global: &GlobalAgentConfig,
     new_global: &GlobalAgentConfig,
     personas_snapshot: &[crate::managed_agents::AgentDefinition],
+    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
+    definitions_dir: &std::path::Path,
 ) -> RestartOutcome {
     // ── Step 1: stop under lock, re-verifying eligibility ─────────────────
     let app_for_stop = app.clone();
@@ -257,6 +311,8 @@ async fn restart_local_agent_on_config_change(
     let old_global_clone = old_global.clone();
     let new_global_clone = new_global.clone();
     let personas_owned = personas_snapshot.to_vec();
+    let captured_scope_clone = captured_scope.clone();
+    let definitions_dir_owned = definitions_dir.to_path_buf();
 
     let stop_result = tokio::task::spawn_blocking(move || {
         use tauri::Manager;
@@ -267,7 +323,13 @@ async fn restart_local_agent_on_config_change(
             .lock()
             .map_err(|e| format!("failed to acquire store lock: {e}"))?;
 
-        let mut records = load_managed_agents(&app_for_stop)?;
+        // Validate scope generation before any disk write — if the workspace
+        // switched after Phase 1, abort rather than touching the new scope's store.
+        crate::managed_agents::scope::validate_scope_generation(&captured_scope_clone)
+            .map_err(|e| format!("set_global_agent_config Phase 2: {e}"))?;
+
+        let mut records =
+            crate::managed_agents::storage::load_managed_agents_at(&definitions_dir_owned)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
@@ -280,7 +342,10 @@ async fn restart_local_agent_on_config_change(
             &current_instance_id(&app_for_stop),
         );
         if sync_changed {
-            save_managed_agents(&app_for_stop, &records)?;
+            crate::managed_agents::storage::save_managed_agents_at(
+                &definitions_dir_owned,
+                &records,
+            )?;
         }
 
         // Re-check eligibility under lock with current record state.
@@ -322,10 +387,10 @@ async fn restart_local_agent_on_config_change(
             ));
         }
 
-        // Stop the process.
+        // Stop the process and save using captured definitions_dir.
         let record_mut = find_managed_agent_mut(&mut records, &pubkey_owned)?;
         stop_managed_agent_process(&app_for_stop, record_mut, &mut runtimes)?;
-        save_managed_agents(&app_for_stop, &records)?;
+        crate::managed_agents::storage::save_managed_agents_at(&definitions_dir_owned, &records)?;
 
         Ok(runtime_keys)
     })
@@ -361,7 +426,7 @@ async fn restart_local_agent_on_config_change(
             eprintln!(
                 "buzz-desktop: set_global_agent_config: failed to start {pubkey} after restart: {e}"
             );
-            if let Err(save_err) = persist_last_error(app, pubkey, &e) {
+            if let Err(save_err) = persist_last_error(app, pubkey, &e, definitions_dir) {
                 eprintln!(
                     "buzz-desktop: set_global_agent_config: failed to persist last_error for {pubkey}: {save_err}"
                 );
@@ -375,18 +440,24 @@ async fn restart_local_agent_on_config_change(
 ///
 /// Best-effort: called only after a failed restart to leave the record
 /// in a diagnosable state rather than a silent "stopped with no error" state.
-fn persist_last_error(app: &AppHandle, pubkey: &str, error: &str) -> Result<(), String> {
+/// Uses the captured `definitions_dir` so writes target the correct scope.
+fn persist_last_error(
+    app: &AppHandle,
+    pubkey: &str,
+    error: &str,
+    definitions_dir: &std::path::Path,
+) -> Result<(), String> {
     use tauri::Manager;
     let state = app.state::<AppState>();
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire store lock: {e}"))?;
-    let mut records = load_managed_agents(app)?;
+    let mut records = crate::managed_agents::storage::load_managed_agents_at(definitions_dir)?;
     let record = find_managed_agent_mut(&mut records, pubkey)?;
     record.last_error = Some(error.to_string());
     record.updated_at = crate::util::now_iso();
-    save_managed_agents(app, &records)
+    crate::managed_agents::storage::save_managed_agents_at(definitions_dir, &records)
 }
 
 /// Pure predicate: should an agent be restarted given resolved readiness and

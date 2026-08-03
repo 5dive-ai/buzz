@@ -533,32 +533,23 @@ fn persist_agent_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRec
     }
 }
 
-/// One-time migration of agent keys from the production keyring service
-/// (`"buzz-desktop"`) to the dev service (`"buzz-desktop-dev"`). Only runs
-/// in debug builds — release builds never touch `"buzz-desktop"` from this
-/// path.
+/// Dev-build scoped variant: copy agent keys from the prod keyring into the
+/// dev service using a scoped `definitions_dir` instead of the active scope.
 ///
-/// Idempotent: skips any key that already exists in the dev service so
-/// repeated boots after migration are no-ops. Leaves the production keyring
-/// untouched — a dev build and a prod install can coexist without sharing
-/// keys after this migration.
-///
-/// Call this at boot before `hydrate_keys` runs (i.e. before
-/// `load_managed_agents` is called) so agents find their keys on first boot
-/// after the service-name change.
+/// Runs inside `run_pre_ready_family` after the scope directory is staged and
+/// populated, before `_ready` is written. This replaces the pre-scope call in
+/// `run_boot_migrations_inner` which failed closed when no active scope existed.
 #[cfg(debug_assertions)]
-pub fn migrate_agent_keys_to_dev_service(app: &tauri::AppHandle) {
+pub(crate) fn migrate_agent_keys_to_dev_service_at(definitions_dir: &std::path::Path) {
     if !cfg!(feature = "system-keyring") || keyring_service() != "buzz-desktop-dev" {
         return;
     }
 
-    // Read the JSON store for pubkeys only — we want every instance
-    // record without running hydrate_keys (which would try the dev
-    // keyring that is empty, and log noisy "has no key" warnings).
-    let records = match load_agent_store(app) {
+    let agents_path = definitions_dir.join("managed-agents.json");
+    let records = match load_agent_store_at(&agents_path) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("buzz-desktop: keyring-dev-migration: cannot read agent store: {e}");
+            eprintln!("buzz-desktop: keyring-dev-migration: cannot read scoped agent store: {e}");
             return;
         }
     };
@@ -568,9 +559,6 @@ pub fn migrate_agent_keys_to_dev_service(app: &tauri::AppHandle) {
         .filter(|r| !r.pubkey.is_empty())
         .map(|r| r.pubkey)
         .collect();
-    // A fresh non-singleton store for the prod service — its own empty
-    // cache so reads go to the OS keyring without polluting the dev
-    // singleton's cache.
     let prod_store = crate::secret_store::SecretStore::keyring("buzz-desktop");
     let dev_store = crate::secret_store::SecretStore::shared(keyring_service());
     copy_agent_keys_between_stores(&pubkeys, &prod_store, dev_store);

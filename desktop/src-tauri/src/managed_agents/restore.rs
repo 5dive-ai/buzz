@@ -49,8 +49,26 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
     let scope = state.capture_active_scope().ok_or_else(|| {
         "backfill_persona_snapshots: no active workspace scope — skipping".to_string()
     })?;
-    let definitions_dir = &scope.definitions_dir;
+    backfill_persona_snapshots_in_dir(&scope.definitions_dir, &state)
+}
 
+/// Backfill persona snapshots in an explicit `definitions_dir`.
+///
+/// Called from the per-scope initialization pipeline (during prepare, before
+/// `_ready`) so auto-start agents boot from a valid snapshot even on first
+/// activation. Takes `definitions_dir` directly rather than capturing the
+/// active scope so it can run before the scope is committed.
+pub fn backfill_persona_snapshots_at(
+    definitions_dir: &std::path::Path,
+    state: &AppState,
+) -> Result<(), String> {
+    backfill_persona_snapshots_in_dir(definitions_dir, state)
+}
+
+fn backfill_persona_snapshots_in_dir(
+    definitions_dir: &std::path::Path,
+    state: &AppState,
+) -> Result<(), String> {
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
@@ -311,17 +329,16 @@ pub async fn restore_managed_agents_on_launch(
     // ── Phase B (transition lock held): resolve commands and spawn in parallel ──
     let spawn_results: Vec<AgentSpawnResult> = std::thread::scope(|scope_s| {
         let owner_hex_ref = owner_hex.as_deref();
+        // Use the captured scope's relay — not live state — so a mid-flight
+        // workspace switch cannot re-target Phase B spawns to the new relay.
+        let captured_relay = &scope.relay_url;
         let handles: Vec<_> = agents_to_start
             .iter()
             .filter(|_| !shutdown_started.load(Ordering::SeqCst))
             .map(|record| {
                 let handle = scope_s.spawn(move || {
-                    let workspace_relay =
-                        crate::relay::relay_ws_url_with_override(&app.state::<AppState>());
-                    let relay_url = crate::relay::effective_agent_relay_url(
-                        &record.relay_url,
-                        &workspace_relay,
-                    );
+                    let relay_url =
+                        crate::relay::effective_agent_relay_url(&record.relay_url, captured_relay);
                     let outcome =
                         match super::ManagedAgentRuntimeKey::new(record.pubkey.clone(), &relay_url)
                         {
@@ -384,6 +401,25 @@ pub async fn restore_managed_agents_on_launch(
     // Use the same captured definitions_dir from function entry so Phase C
     // writes to the same scope Phase A read from, even if a workspace switch
     // occurred during Phase B.
+    //
+    // Validate generation BEFORE acquiring store lock — if the scope changed
+    // during Phase B we must terminate any successfully-spawned children and
+    // abort rather than inserting stale-scope processes into the runtime map.
+    if let Err(stale_msg) = crate::managed_agents::scope::validate_scope_generation(&scope) {
+        // Scope changed mid-restore — terminate all children we spawned and
+        // remove their receipts. The new scope's own restore pass will spawn
+        // the correct agents.
+        for (pubkey, outcome) in &spawn_results {
+            if let SpawnOutcome::Spawned(ref key, ref process) = *outcome {
+                eprintln!(
+                    "buzz-desktop: restore: {stale_msg}; terminating stale child for {pubkey}"
+                );
+                let _ = super::terminate_process(process.child.id());
+                let _ = super::remove_agent_runtime_receipt(app, key);
+            }
+        }
+        return Ok(());
+    }
     let _store_guard = state
         .managed_agents_store_lock
         .lock()

@@ -166,29 +166,10 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
         crate::managed_agents::migrate_agent_keys_to_dev_service(app);
     }
     migrate_persona_provider_to_runtime(app);
-    reconcile_legacy_command_names(app);
-    // Fold personas.json into the unified store HERE: after the JSON-level
-    // personas.json migrations above (which must see the legacy file), and
-    // before every consumer of the load/save_personas shims below —
-    // sync_team_personas would otherwise operate on an empty definition set.
-    // Post-fold readers of the runtime map (`load_persona_runtimes`) fall
-    // back to the unified store's definitions.
-    fold_personas_into_agent_store(app);
-    // Clean the legacy baked team-instructions suffix out of stored prompts
-    // AFTER the fold (so definitions lifted out of personas.json are cleaned in
-    // the same boot) and BEFORE backfill_standalone_agents (so a manufactured
-    // definition never snapshots a suffix this strips).
-    strip_baked_team_instructions(app);
-    refresh_builtin_agent_avatars(app);
-    // B5: manufacture definitions for standalone agents AFTER the fold (so
-    // pre-existing definition slugs are present for collision checks) and
-    // before event sync republishes — the backfilled link is what flips the
-    // 30177 projection to its slim shape.
-    backfill_standalone_agents(app);
-    detach_directory_backed_teams(app);
-    reconcile_provider_mcp_commands(app);
-    reconcile_databricks_v1_to_v2(app);
-    materialize_agent_runtimes(app);
+    // Definition-touching migrations (fold, strip, backfill, etc.) are NOT
+    // run here. They run inside the per-scope initialization pipeline
+    // (`scope_init::run_scoped_migrations`) after staged adoption so every
+    // scope sees exactly the migrations appropriate to its data.
 }
 
 /// Copy one-time app state from the legacy app identifier directory to
@@ -1365,17 +1346,12 @@ pub fn migrate_persona_provider_to_runtime(app: &tauri::AppHandle) {
     }
     rename_provider_to_runtime_in_personas(&path);
 }
-mod materialize;
-pub use materialize::materialize_agent_runtimes;
 mod fold;
-pub use fold::fold_personas_into_agent_store;
+mod materialize;
 use fold::load_persona_runtimes;
 mod backfill;
-pub use backfill::backfill_standalone_agents;
 mod detach;
-pub use detach::detach_directory_backed_teams;
 mod team_suffix;
-pub use team_suffix::strip_baked_team_instructions;
 
 include!("migration_scope.rs");
 

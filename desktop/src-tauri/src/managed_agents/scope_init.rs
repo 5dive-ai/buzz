@@ -336,6 +336,10 @@ fn install_staged(
 
 /// Run idempotent scoped migrations against an installed scope directory.
 ///
+/// Returns `Err` on the FIRST step that fails so `ensure_scope_ready` can
+/// withhold the `_ready` marker and preserve the retry gate. A partial
+/// migration is better than permanently marking corrupt data as Ready.
+///
 /// This is the per-scope migration pipeline, run after staged install completes.
 /// Ordering mirrors `migration.rs::run_boot_migrations_inner` for the
 /// definition-touching steps (the ordering doc comment at `migration.rs:106-121`
@@ -357,6 +361,7 @@ fn install_staged(
 /// 7. `reconcile_provider_mcp_commands_at` — fix mcp_command values.
 /// 8. `reconcile_databricks_v1_to_v2_at` — V1→V2 provider migration.
 /// 9. `materialize_agent_runtimes_at` — materialize runtime onto each record.
+/// 10. Validate managed-agents.json is parseable JSON before writing Ready.
 fn run_scoped_migrations(scope_dir: &Path) -> Result<(), String> {
     // Step 1: fold personas.json into the unified store.
     match crate::migration::fold_personas_in_dir(scope_dir) {
@@ -364,14 +369,14 @@ fn run_scoped_migrations(scope_dir: &Path) -> Result<(), String> {
         Ok(Some(n)) => {
             eprintln!("buzz-desktop: scope-init-fold: {n} definitions folded into scoped store");
         }
-        Err(e) => eprintln!("buzz-desktop: scope-init-fold: {e}"),
+        Err(e) => return Err(format!("scope-init-fold: {e}")),
     }
 
     // Step 2: strip baked team-instructions suffix.
     match crate::migration::strip_baked_team_instructions_in_dir(scope_dir) {
         Ok(0) => {}
         Ok(n) => eprintln!("buzz-desktop: scope-init-strip: {n} records cleaned"),
-        Err(e) => eprintln!("buzz-desktop: scope-init-strip: {e}"),
+        Err(e) => return Err(format!("scope-init-strip: {e}")),
     }
 
     // Step 3: refresh legacy builtin agent avatars.
@@ -381,14 +386,14 @@ fn run_scoped_migrations(scope_dir: &Path) -> Result<(), String> {
     match crate::migration::backfill_standalone_agents_in_dir(scope_dir) {
         Ok(0) => {}
         Ok(n) => eprintln!("buzz-desktop: scope-init-backfill: {n} agents backfilled"),
-        Err(e) => eprintln!("buzz-desktop: scope-init-backfill: {e}"),
+        Err(e) => return Err(format!("scope-init-backfill: {e}")),
     }
 
     // Step 5: detach directory-backed teams.
     match crate::migration::detach_directory_backed_teams_in_dir(scope_dir) {
         Ok(0) => {}
         Ok(n) => eprintln!("buzz-desktop: scope-init-detach: {n} teams detached"),
-        Err(e) => eprintln!("buzz-desktop: scope-init-detach: {e}"),
+        Err(e) => return Err(format!("scope-init-detach: {e}")),
     }
 
     // Step 6: reconcile legacy command names.
@@ -402,6 +407,21 @@ fn run_scoped_migrations(scope_dir: &Path) -> Result<(), String> {
 
     // Step 9: materialize runtime onto each record.
     crate::migration::materialize_agent_runtimes_at(scope_dir);
+
+    // Step 10: validate the final managed-agents.json is parseable JSON before
+    // writing the Ready marker. Steps 6-9 use `patch_json_records` which logs
+    // and swallows parse failures internally; this final check ensures we never
+    // mark a scope Ready when its primary store is corrupt.
+    let agents_path = scope_dir.join("managed-agents.json");
+    if agents_path.exists() {
+        let content = std::fs::read_to_string(&agents_path)
+            .map_err(|e| format!("scope-init-validate: failed to read managed-agents.json: {e}"))?;
+        serde_json::from_str::<serde_json::Value>(&content).map_err(|e| {
+            format!(
+                "scope-init-validate: managed-agents.json is not valid JSON after migrations: {e}"
+            )
+        })?;
+    }
 
     Ok(())
 }
@@ -717,6 +737,13 @@ mod tests {
     /// and legacy files) but the `_ready` marker was never written (migrations
     /// didn't complete). On next activation, `ensure_scope_ready` must resume
     /// migrations and write the ready marker without re-copying files.
+    ///
+    /// The post-crash content must be valid JSON so `run_scoped_migrations`
+    /// step 10 (JSON validation gate) passes and `_ready` is written. The test
+    /// verifies that the content is NOT overwritten (no re-staging), which is
+    /// the behaviour that matters: a legitimate post-crash inbound write
+    /// must survive a resume. Content corruption is a separate failure mode
+    /// outside the scope of the crash-resume path.
     #[test]
     fn test_crash_after_rename_before_ready_resumes_migrations() {
         let tmp = make_base_dir();
@@ -729,7 +756,7 @@ mod tests {
             .join("scope_pre_ready");
 
         // Simulate: rename already happened — target has manifest + files but no
-        // _ready marker.
+        // _ready marker. Content is valid JSON so migrations can complete.
         std::fs::create_dir_all(&scope_dir).unwrap();
         let manifest = ScopeManifest {
             scope_id: "scope_pre_ready".into(),
@@ -740,7 +767,8 @@ mod tests {
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
-        std::fs::write(scope_dir.join("managed-agents.json"), b"[\"post-crash\"]").unwrap();
+        // Valid JSON array — simulates content written before the crash.
+        std::fs::write(scope_dir.join("managed-agents.json"), b"[]").unwrap();
         // No _ready marker.
         assert!(!scope_is_ready(&scope_dir));
 
@@ -753,8 +781,53 @@ mod tests {
         // Post-crash writes in the target must not be overwritten (no staging).
         let content = std::fs::read(scope_dir.join("managed-agents.json")).unwrap();
         assert_eq!(
-            content, b"[\"post-crash\"]",
+            content, b"[]",
             "post-crash target content must not be overwritten on retry"
+        );
+    }
+
+    /// C2: migration failure must NOT write the `_ready` marker.
+    ///
+    /// If `fold_personas_in_dir` fails (e.g. due to a corrupt personas.json)
+    /// `run_scoped_migrations` returns `Err` and `ensure_scope_ready` must
+    /// propagate that error without writing `_ready`. On a subsequent call with
+    /// the defect corrected, migrations complete and `_ready` IS written.
+    #[test]
+    fn test_migration_failure_withholds_ready_and_retry_succeeds() {
+        let tmp = make_base_dir();
+
+        // Create the legacy directory with a CORRUPT personas.json.
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("managed-agents.json"), b"[]").unwrap();
+        // Corrupt personas.json: `fold_personas_in_dir` tries to parse it and
+        // returns Err, which run_scoped_migrations propagates.
+        std::fs::write(agents_dir.join("personas.json"), b"not valid json").unwrap();
+
+        let scope_id = "scope_fail_retry";
+        let scope_dir = tmp.path().join("agents").join("scopes").join(scope_id);
+
+        // First attempt: migrations fail, _ready must NOT be written.
+        let result = ensure_scope_ready(scope_id, &scope_dir, tmp.path());
+        assert!(result.is_err(), "corrupt personas.json must cause Err");
+        assert!(
+            !scope_is_ready(&scope_dir),
+            "_ready must NOT be written when migrations fail"
+        );
+
+        // Repair the corrupt file.
+        std::fs::write(agents_dir.join("personas.json"), b"[]").unwrap();
+        // Also repair the scope_dir since ensure_scope_ready may have left it in
+        // a partial state — remove it so the state machine reruns from staging.
+        if scope_dir.exists() {
+            std::fs::remove_dir_all(&scope_dir).unwrap();
+        }
+
+        // Second attempt: migrations succeed, _ready IS written.
+        ensure_scope_ready(scope_id, &scope_dir, tmp.path()).unwrap();
+        assert!(
+            scope_is_ready(&scope_dir),
+            "_ready must be written on successful retry"
         );
     }
 }

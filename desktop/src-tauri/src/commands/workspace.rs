@@ -10,31 +10,6 @@ use crate::managed_agents::{
 };
 use crate::relay;
 
-/// Adopt the pre-scoping global retention database's pending rows into `scope`.
-///
-/// Best-effort: a failure is logged and the boot proceeds. The migration's own
-/// crash-safety guards make the next launch retry safely, and blocking the
-/// workspace apply on it would be worse than a delayed publish.
-fn migrate_legacy_retention_into(
-    app: &AppHandle,
-    scope: &crate::managed_agents::retention::RetentionScope,
-) {
-    let Ok(base_dir) = crate::managed_agents::managed_agents_base_dir(app) else {
-        return;
-    };
-    match crate::managed_agents::retention::migrate_legacy_retention_db(
-        &base_dir,
-        &scope.db_path,
-        &scope.owner_keys.public_key().to_hex(),
-    ) {
-        Ok(0) => {}
-        Ok(copied) => {
-            eprintln!("buzz-desktop: adopted {copied} legacy retained event(s) into this community")
-        }
-        Err(error) => eprintln!("buzz-desktop: legacy retention migration failed: {error}"),
-    }
-}
-
 #[derive(Deserialize)]
 struct RelayInfoIcon {
     #[serde(default)]
@@ -213,6 +188,55 @@ pub async fn apply_workspace(
                 &base_dir,
             )?;
 
+            // ── Persona snapshot backfill (still in prepare stage) ────────────
+            // Run before commit so auto-start agents in the newly-ready scope
+            // have valid persona snapshots available at the first restore pass.
+            // Best-effort: a failure is logged but does not block the transition.
+            if let Err(e) = crate::managed_agents::backfill_persona_snapshots_at(
+                &scope_dir,
+                &state,
+            ) {
+                eprintln!("buzz-desktop: persona-snapshot backfill failed during prepare: {e}");
+            }
+
+            // ── Legacy retention migration (still in prepare stage) ───────────
+            // Migrate legacy retained events into this scope's retention DB BEFORE
+            // committing the scope as active. Both the retention and definition
+            // stores must be migrated together so event-sync sees consistent data.
+            // Best-effort: a failure is logged and does not block the transition.
+            {
+                let effective_owner_pubkey_for_retention = match &parsed_keys {
+                    Some(keys) => keys.public_key().to_hex(),
+                    None => state
+                        .keys
+                        .lock()
+                        .map_err(|e| e.to_string())?
+                        .public_key()
+                        .to_hex(),
+                };
+                let retention_db_path = crate::managed_agents::retention::scoped_retention_db_path(
+                    &base_dir,
+                    &relay_url,
+                    &effective_owner_pubkey_for_retention,
+                );
+                if let Some(parent) = retention_db_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match crate::managed_agents::retention::migrate_legacy_retention_db(
+                    &base_dir,
+                    &retention_db_path,
+                    &effective_owner_pubkey_for_retention,
+                ) {
+                    Ok(0) => {}
+                    Ok(copied) => eprintln!(
+                        "buzz-desktop: adopted {copied} legacy retained event(s) into this community"
+                    ),
+                    Err(error) => eprintln!(
+                        "buzz-desktop: legacy retention migration failed during prepare: {error}"
+                    ),
+                }
+            }
+
             // ── Layer 2: drain + commit under one continuous lock ─────────────
             // `managed_agent_runtime_transition` is held from journal creation
             // through the end of the commit swap so no start/reconcile can insert
@@ -328,8 +352,6 @@ pub async fn apply_workspace(
                 }
             }
 
-            try_regenerate_nest(&app);
-
             Ok::<WorkspaceApplyResult, String>(WorkspaceApplyResult::success())
         })
         .await
@@ -346,22 +368,24 @@ pub async fn apply_workspace(
     // on the applied result — we never pretend the old scope survived.
     let mut degraded: Vec<String> = Vec::new();
 
+    // Nest context reflects the active scope's agents.md — regenerate now that
+    // the scope is committed. Best-effort; agents run fine with a stale AGENTS.md.
+    if let Err(error) = try_regenerate_nest(&restore_app) {
+        degraded.push(format!("nest context regeneration failed: {error}"));
+    }
+
     let state = restore_app.state::<AppState>();
     match crate::managed_agents::retention::active_retention_scope(&restore_app, &state) {
         Ok(scope) => {
-            // Adopt whatever the pre-scoping release left queued in the global
-            // retention database BEFORE the scoped reconcile and flush run, so
-            // stranded tombstones and archive requests publish on this boot
-            // instead of being abandoned by the storage cutover.
-            migrate_legacy_retention_into(&restore_app, &scope);
-
             if let Some(agent_scope) = state.capture_active_scope() {
-                crate::event_sync::spawn_event_sync(
+                if let Err(error) = crate::event_sync::spawn_event_sync(
                     restore_app.clone(),
                     scope.owner_keys,
                     scope.db_path,
                     agent_scope.definitions_dir,
-                );
+                ) {
+                    degraded.push(format!("event-sync dispatch failed: {error}"));
+                }
             } else {
                 degraded.push(
                     "active agent scope unavailable after workspace apply — event sync skipped"

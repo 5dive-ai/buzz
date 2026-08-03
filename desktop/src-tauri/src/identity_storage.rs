@@ -76,16 +76,6 @@ impl AppState {
         self.active_agent_scope.lock().ok().and_then(|g| g.clone())
     }
 
-    /// Commit the active scope. Called by the infallible Layer-2 commit stage.
-    pub(crate) fn commit_active_scope(
-        &self,
-        scope: crate::managed_agents::scope::WorkspaceAgentScope,
-    ) {
-        if let Ok(mut g) = self.active_agent_scope.lock() {
-            *g = Some(scope);
-        }
-    }
-
     /// Clear the active scope and bump the generation.
     /// Called by live identity import and prepare-rollback.
     pub(crate) fn clear_active_scope(&self) {

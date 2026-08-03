@@ -68,17 +68,12 @@ pub struct WorkspaceAgentScope {
     /// The normalized relay URL for this scope.
     pub relay_url: String,
     /// The owner's hex pubkey.
-    // Used in tests and by the scope-for-arrival inbound filter.
-    #[allow(dead_code)]
     pub owner_pubkey: String,
     /// The scoped definitions directory: `<agents-base>/scopes/<scope_id>/`.
     pub definitions_dir: PathBuf,
     /// Monotonically increasing generation counter; incremented on every scope
     /// change (including identity import that clears the active scope to None).
     /// Used by long-running operations to detect a mid-flight workspace switch.
-    // Generation is set at construction and read in tests; the field is the
-    // durable seam for stale-commit detection in future await-crossing paths.
-    #[allow(dead_code)]
     pub generation: u64,
 }
 
@@ -94,9 +89,35 @@ pub(crate) fn next_scope_generation() -> u64 {
 }
 
 /// Read the current generation without incrementing.
-#[allow(dead_code)] // Read in tests; here as a read-only probe for diagnostics.
 pub fn current_scope_generation() -> u64 {
     SCOPE_GENERATION.load(Ordering::Acquire)
+}
+
+/// Validate that a captured scope's generation still matches the global
+/// generation counter.
+///
+/// Call this immediately before any commit or runtime registration that was
+/// prepared under a previously-captured scope. Returns `Err` when a workspace
+/// switch happened between capture and commit, with a message naming the
+/// pubkey whose operation is being aborted.
+///
+/// Usage pattern:
+/// ```rust,ignore
+/// let scope = state.capture_active_scope().ok_or("no active scope")?;
+/// // ... async work ...
+/// validate_scope_generation(&scope)?;
+/// // commit / register runtime
+/// ```
+pub fn validate_scope_generation(captured: &WorkspaceAgentScope) -> Result<(), String> {
+    let current = current_scope_generation();
+    if captured.generation == current {
+        Ok(())
+    } else {
+        Err(format!(
+            "stale scope: captured generation {} ≠ current {}; workspace switched mid-operation",
+            captured.generation, current
+        ))
+    }
 }
 
 /// Relay-URL normalization used to derive a scope identifier. Must be

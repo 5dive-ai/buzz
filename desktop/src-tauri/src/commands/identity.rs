@@ -332,22 +332,26 @@ pub async fn save_ncryptsec_copy(
     Ok(Some(dest.display().to_string()))
 }
 
-/// Stop all live managed-agent runtimes as part of a workspace drain.
+/// Drain all live managed-agent runtimes as part of an identity import.
 ///
-/// Called during identity import (live-active path) to stop all agents
-/// before the active scope is cleared. At call time the scope is still set,
-/// so `load_managed_agents` resolves correctly. After this returns the caller
-/// persists the new identity and clears the scope.
+/// Uses the same journaled drain+compensation protocol as `apply_workspace`
+/// (Layer 2 of the transition state machine). The caller MUST hold
+/// `managed_agent_runtime_transition` before calling this function.
 ///
-/// Delegates to `shutdown::shutdown_managed_agents` which handles the full
-/// Layer-2 stop sequence (runtime_transition → store → processes locks,
-/// SIGTERM fan-out, orphan sweep). Returns `Err` if any stop fails; the
-/// caller logs the error and proceeds.
-fn drain_all_managed_agent_runtimes(
+/// Returns:
+/// - `Ok(())` when all runtimes were stopped (or there were none).
+/// - `Err(msg)` when the drain failed; the caller must NOT proceed with
+///   the identity persist and MUST compensate by restarting the stopped set.
+fn drain_managed_agent_runtimes_for_import(
     app: &tauri::AppHandle,
-    _state: &AppState,
-) -> Result<(), String> {
-    crate::shutdown::shutdown_managed_agents(app)
+    state: &AppState,
+) -> Result<Vec<crate::managed_agents::DrainJournalEntry>, String> {
+    let (stopped, _remaining, drain_error) =
+        crate::managed_agents::drain_scope_runtimes(app, state);
+    match drain_error {
+        None => Ok(stopped),
+        Some(e) => Err(e),
+    }
 }
 
 #[tauri::command]
@@ -397,31 +401,75 @@ pub async fn import_identity(
         std::fs::create_dir_all(&data_dir).map_err(|e| format!("create app data dir: {e}"))?;
         let key_path = data_dir.join("identity.key");
 
-        // ── Live-active path: drain runtimes before swapping identity ─────────
-        // When an active scope exists, stop all managed-agent runtimes before
-        // persisting the new identity. The frontend re-applies the workspace
-        // (which runs the scope initialization pipeline) to restore agents.
+        // ── Live-active path: journaled drain before swapping identity ─────────
+        // When an active scope exists, drain all managed-agent runtimes under
+        // `managed_agent_runtime_transition` (Layer 2) BEFORE persisting the
+        // new identity. This is the same drain-journal protocol used by
+        // `apply_workspace`.
         //
-        // Drain failures are logged rather than fatal — the identity persist
-        // and scope clear proceed regardless; the frontend's re-apply handles
-        // agent restoration.
-        if has_active_scope {
-            if let Err(e) = drain_all_managed_agent_runtimes(&app_handle, &state) {
-                eprintln!(
-                    "buzz-desktop: identity import drain warning — some runtimes may still be \
-                     running: {e}; workspace re-apply will restore agents"
-                );
-            }
-        }
+        // On drain failure: compensate by restarting what was stopped, then
+        // return Err — do NOT proceed with the identity persist. The caller
+        // (frontend membership-denied flow) must handle the Err and retry.
+        //
+        // The transition lock is held through the identity persist and scope
+        // clear so no concurrent start/reconcile can insert a runtime between
+        // drain and scope invalidation.
+        let _rt_transition_guard = if has_active_scope {
+            Some(
+                state
+                    .managed_agent_runtime_transition
+                    .lock()
+                    .map_err(|e| format!("managed_agent_runtime_transition poisoned: {e}"))?,
+            )
+        } else {
+            None
+        };
 
-        let (pubkey, storage) = commit_imported_identity(&state, &data_dir, keys, |keys| {
+        let stopped_entries = if has_active_scope {
+            match drain_managed_agent_runtimes_for_import(&app_handle, &state) {
+                Ok(stopped) => stopped,
+                Err(drain_err) => {
+                    // Drain failed — compensate and abort.
+                    let comp_err =
+                        crate::managed_agents::compensate_drain(&app_handle, &[]);
+                    let msg = match comp_err {
+                        Some(comp) => format!(
+                            "identity import drain failed: {drain_err}; compensation failed: {comp}"
+                        ),
+                        None => format!("identity import drain failed: {drain_err}"),
+                    };
+                    return Err(msg);
+                }
+            }
+        } else {
+            vec![]
+        };
+
+        let commit_result = commit_imported_identity(&state, &data_dir, keys, |keys| {
             // Persist into the OS keyring first (store → read-back verify →
             // marker → delete file). Falls back to the 0o600 file when the
             // keyring is unavailable; returns Err only when both backends fail.
             let store =
                 crate::secret_store::SecretStore::shared(crate::app_state::keyring_service());
             crate::app_state::persist_imported_identity(store, keys, &key_path, &data_dir)
-        })?;
+        });
+
+        // If identity persist failed after a successful drain, compensate.
+        let (pubkey, storage) = match commit_result {
+            Ok(result) => result,
+            Err(e) => {
+                if !stopped_entries.is_empty() {
+                    if let Some(comp_err) =
+                        crate::managed_agents::compensate_drain(&app_handle, &stopped_entries)
+                    {
+                        eprintln!(
+                            "buzz-desktop: identity import persist failed, compensation failed: {comp_err}"
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         // ── Clear active scope and bump generation ────────────────────────────
         // For no-active-scope path: no scope was ever set; clearing is a no-op

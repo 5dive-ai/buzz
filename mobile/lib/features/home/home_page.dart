@@ -35,7 +35,6 @@ class HomePage extends HookConsumerWidget {
   static const Duration _tabIconWeightDuration = Duration(milliseconds: 120);
   static const double _wideNavigationBreakpoint = 840;
   static const double _wideContentInset = Grid.half + Grid.quarter;
-  static const double _wideContentRadius = 24;
 
   static const _destinations = [
     WideNavigationDestination(
@@ -191,7 +190,7 @@ class HomePage extends HookConsumerWidget {
                               decoration: BoxDecoration(
                                 color: context.colors.surface,
                                 borderRadius: BorderRadius.circular(
-                                  HomePage._wideContentRadius,
+                                  Radii.dialog,
                                 ),
                                 // Matches desktop's Buzz content surface: a
                                 // hairline on the upper-left edge plus a very
@@ -215,7 +214,7 @@ class HomePage extends HookConsumerWidget {
                               ),
                               child: ClipRRect(
                                 borderRadius: BorderRadius.circular(
-                                  HomePage._wideContentRadius,
+                                  Radii.dialog,
                                 ),
                                 child: MediaQuery(
                                   // The desktop-like canvas is inset below the

@@ -11,6 +11,7 @@ const _wideNavigationIdentityAvatarInset =
     Grid.xs + Grid.half - (Grid.quarter / 2);
 const _wideNavigationIdentityLabelGap = Grid.half + (Grid.quarter / 2);
 
+/// A top-level tablet workspace destination supplied by the Home shell.
 class WideNavigationDestination {
   final IconData icon;
   final IconData selectedIcon;
@@ -23,6 +24,7 @@ class WideNavigationDestination {
   });
 }
 
+/// Tablet channel sidebar that owns channel/profile presentation and callbacks.
 class WideChannelsNavigation extends HookConsumerWidget {
   final int? selectedIndex;
   final ValueChanged<int> onDestinationSelected;
@@ -792,6 +794,7 @@ class _WideChannelDestination extends StatelessWidget {
   }
 }
 
+/// Nested tablet channel detail surface resolved from a selected channel ID.
 class WideChannelContent extends HookConsumerWidget {
   final String channelId;
   final VoidCallback onChannelLeft;

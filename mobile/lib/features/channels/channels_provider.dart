@@ -48,7 +48,6 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
   Set<String> _participatedRootIds = {};
   Set<String> _authoredRootIds = {};
   String? _threadInterestPubkey;
-  bool _hasLoaded = false;
 
   Map<String, int> get latestObservedByChannel =>
       Map.unmodifiable(_latestObservedByChannel);
@@ -110,7 +109,6 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
       subscribeLive: subscribeLive,
       fetchLastMessage: fetchLastMessage,
     );
-    _hasLoaded = true;
     return channels;
   }
 

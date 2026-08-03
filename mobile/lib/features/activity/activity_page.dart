@@ -118,12 +118,12 @@ class ActivityPage extends HookConsumerWidget {
     useEffect(() {
       if (!isWideInbox || visibleItems.isEmpty) return null;
       final hasSelectedItem = visibleItems.any(
-        (item) => item.id == selectedItemId.value,
+        (item) => item.conversationId == selectedItemId.value,
       );
       final retainsSelectedDetail =
-          selectedItemForDetail.value?.id == selectedItemId.value;
+          selectedItemForDetail.value?.conversationId == selectedItemId.value;
       if (!hasSelectedItem && !retainsSelectedDetail) {
-        selectedItemId.value = visibleItems.first.id;
+        selectedItemId.value = visibleItems.first.conversationId;
         selectedItemTarget.value = null;
         selectedItemForDetail.value = null;
       }
@@ -131,7 +131,7 @@ class ActivityPage extends HookConsumerWidget {
     }, [isWideInbox, visibleItemIdsKey, filter.value, unreadOnly.value]);
     final selectedItem =
         visibleItems.cast<InboxItem?>().firstWhere(
-          (item) => item?.id == selectedItemId.value,
+          (item) => item?.conversationId == selectedItemId.value,
           orElse: () => null,
         ) ??
         selectedItemForDetail.value;
@@ -213,7 +213,7 @@ class ActivityPage extends HookConsumerWidget {
           : thread.parentId;
 
       if (isWideInbox) {
-        selectedItemId.value = item.id;
+        selectedItemId.value = item.conversationId;
         selectedItemTarget.value = target;
         selectedItemForDetail.value = item;
         markItemRead(item);

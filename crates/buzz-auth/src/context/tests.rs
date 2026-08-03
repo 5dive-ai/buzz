@@ -111,6 +111,7 @@ fn binding_with_source_in(
         principal(),
         pubkey,
         BindingVersion::INITIAL,
+        None,
         source,
     )
     .expect("synthetic binding identifier is valid")
@@ -127,10 +128,24 @@ fn enrolled_binding(
         principal(),
         pubkey,
         BindingVersion::INITIAL,
+        None,
         source,
         reason,
     )
     .expect("synthetic enrolled binding is valid")
+}
+
+fn expiring_binding(pubkey: PublicKey, expires_at: u64) -> VersionedBindingRef {
+    VersionedBindingRef::new_existing_active_for_test(
+        authorization_domain(1),
+        Uuid::from_u128(10),
+        principal(),
+        pubkey,
+        BindingVersion::INITIAL,
+        Some(BindingExpiry::new(expires_at).expect("synthetic binding expiry is valid")),
+        BindingSource::AttestedKey,
+    )
+    .expect("synthetic binding identifier is valid")
 }
 
 fn input(
@@ -566,6 +581,14 @@ fn zero_binding_version_is_rejected() {
 }
 
 #[test]
+fn zero_binding_expiry_is_rejected() {
+    assert_eq!(
+        BindingExpiry::new(0),
+        Err(AuthContextError::InvalidBindingExpiry)
+    );
+}
+
+#[test]
 fn nil_binding_identifier_is_rejected() {
     let actor = Keys::generate();
     let error = VersionedBindingRef::new_existing_active_for_test(
@@ -574,6 +597,7 @@ fn nil_binding_identifier_is_rejected() {
         principal(),
         actor.public_key(),
         BindingVersion::INITIAL,
+        None,
         BindingSource::AttestedKey,
     )
     .expect_err("nil is not a stable binding identifier");
@@ -588,6 +612,7 @@ fn evidence_value_debug_output_redacts_numeric_values() {
     let assertion_not_before = AssertionNotBefore::new(100);
     let delegation_expiry = DelegationExpiry::new(300).expect("synthetic expiry is valid");
     let admission_expiry = AdmissionExpiry::new(350).expect("synthetic expiry is valid");
+    let binding_expiry = BindingExpiry::new(375).expect("synthetic expiry is valid");
     let binding_version = BindingVersion::new(400).expect("synthetic version is valid");
 
     assert_eq!(
@@ -605,6 +630,10 @@ fn evidence_value_debug_output_redacts_numeric_values() {
     assert_eq!(
         format!("{admission_expiry:?}"),
         "AdmissionExpiry(\"[redacted]\")"
+    );
+    assert_eq!(
+        format!("{binding_expiry:?}"),
+        "BindingExpiry(\"[redacted]\")"
     );
     assert_eq!(
         format!("{binding_version:?}"),
@@ -679,6 +708,50 @@ fn direct_authorization_rejects_expired_assertions() {
 
     assert_eq!(error, AuthContextError::AssertionExpired);
     assert_eq!(error.code(), "federated_assertion_expired");
+}
+
+#[test]
+fn direct_authorization_rejects_binding_at_exact_expiry() {
+    let actor = Keys::generate();
+    let error = AuthContext::finalize_v1(
+        input(actor.public_key(), AuthTransport::HttpBridge, None),
+        policy_required(EnrollmentMode::AttestedKey),
+        FederatedAuthorization::Direct {
+            binding: expiring_binding(actor.public_key(), 100),
+            assertion: assertion(principal(), AssertionTransport::ClientAttached, 200),
+        },
+        100,
+    )
+    .expect_err("authorization must not survive binding expiry");
+
+    assert_eq!(error, AuthContextError::BindingExpired);
+    assert_eq!(error.code(), "federated_binding_expired");
+}
+
+#[test]
+fn delegated_authorization_rejects_owner_binding_at_exact_expiry() {
+    let owner = Keys::generate();
+    let delegate = Keys::generate();
+    let error = AuthContext::finalize_v1(
+        input(
+            delegate.public_key(),
+            AuthTransport::RelayWebSocket,
+            Some(owner.public_key()),
+        ),
+        policy_required(EnrollmentMode::AttestedKey),
+        FederatedAuthorization::Delegated {
+            owner: expiring_binding(owner.public_key(), 100),
+            admission: VerifiedOwnerAdmission::new(
+                authorization_domain(1),
+                principal(),
+                AdmissionExpiry::new(200).expect("synthetic admission expiry is valid"),
+            ),
+        },
+        100,
+    )
+    .expect_err("delegated authorization must not survive owner-binding expiry");
+
+    assert_eq!(error, AuthContextError::BindingExpired);
 }
 
 #[test]
@@ -810,6 +883,7 @@ fn binding_lifecycle_result_owns_the_authorization_reason() {
         principal(),
         actor.public_key(),
         BindingVersion::INITIAL,
+        None,
         BindingSource::AttestedKey,
         AuthorizationReason::ExistingBinding,
     )
@@ -972,10 +1046,12 @@ fn authorization_error_codes_are_unique_and_provider_neutral() {
         AuthContextError::EmptySubject,
         AuthContextError::InvalidBindingVersion,
         AuthContextError::InvalidBindingId,
+        AuthContextError::InvalidBindingExpiry,
         AuthContextError::InvalidAssertionExpiry,
         AuthContextError::InvalidDelegationExpiry,
         AuthContextError::InvalidAdmissionExpiry,
         AuthContextError::AssertionExpired,
+        AuthContextError::BindingExpired,
         AuthContextError::AssertionNotYetValid,
         AuthContextError::KeyAttestationRequired,
         AuthContextError::KeyAttestationMismatch,
@@ -1059,7 +1135,8 @@ fn security_posture_debug_output_is_fully_redacted() {
             "binding_id: \"[redacted]\", principal: FederatedPrincipal { ",
             "issuer: \"[redacted]\", subject: \"[redacted]\" }, ",
             "bound_pubkey: \"[redacted]\", binding_version: \"[redacted]\", ",
-            "source: \"[redacted]\", resolution_reason: \"[redacted]\" }"
+            "expires_at: \"[redacted]\", source: \"[redacted]\", ",
+            "resolution_reason: \"[redacted]\" }"
         )
     );
     assert_eq!(

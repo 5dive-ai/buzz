@@ -58,6 +58,9 @@ pub enum AuthContextError {
     /// Binding identifier was the nil UUID.
     #[error("identity binding identifier must not be nil")]
     InvalidBindingId,
+    /// Binding expiry was not a valid Unix timestamp.
+    #[error("identity binding expiry must be greater than zero")]
+    InvalidBindingExpiry,
     /// Assertion expiry was not a valid Unix timestamp.
     #[error("federated assertion expiry must be greater than zero")]
     InvalidAssertionExpiry,
@@ -70,6 +73,9 @@ pub enum AuthContextError {
     /// Assertion had expired when authorization was evaluated.
     #[error("federated assertion has expired")]
     AssertionExpired,
+    /// Binding was no longer authorization-eligible when evaluated.
+    #[error("identity binding has expired")]
+    BindingExpired,
     /// Assertion was used before its validated not-before bound.
     #[error("federated assertion is not yet valid")]
     AssertionNotYetValid,
@@ -152,10 +158,12 @@ impl AuthContextError {
             Self::EmptySubject => "federated_principal_empty_subject",
             Self::InvalidBindingVersion => "federated_binding_invalid_version",
             Self::InvalidBindingId => "federated_binding_invalid_id",
+            Self::InvalidBindingExpiry => "federated_binding_invalid_expiry",
             Self::InvalidAssertionExpiry => "federated_assertion_invalid_expiry",
             Self::InvalidDelegationExpiry => "delegation_invalid_expiry",
             Self::InvalidAdmissionExpiry => "owner_admission_invalid_expiry",
             Self::AssertionExpired => "federated_assertion_expired",
+            Self::BindingExpired => "federated_binding_expired",
             Self::AssertionNotYetValid => "federated_assertion_not_yet_valid",
             Self::KeyAttestationRequired => "federated_key_attestation_required",
             Self::KeyAttestationMismatch => "federated_key_attestation_mismatch",

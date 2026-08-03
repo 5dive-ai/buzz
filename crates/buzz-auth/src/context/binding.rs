@@ -147,10 +147,48 @@ impl BindingVersion {
     }
 }
 
+/// Optional authoritative expiry of a lifecycle-active identity binding.
+///
+/// Expiry makes the binding ineligible for authorization but does not remove it
+/// from lifecycle state or turn it into retirement or revocation evidence.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BindingExpiry(u64);
+
+impl fmt::Debug for BindingExpiry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("BindingExpiry")
+            .field(&"[redacted]")
+            .finish()
+    }
+}
+
+impl BindingExpiry {
+    /// Build a non-zero binding expiry.
+    pub const fn new(unix_seconds: u64) -> Result<Self, AuthContextError> {
+        if unix_seconds == 0 {
+            return Err(AuthContextError::InvalidBindingExpiry);
+        }
+        Ok(Self(unix_seconds))
+    }
+
+    /// Expiry as seconds since the Unix epoch.
+    pub const fn unix_seconds(self) -> u64 {
+        self.0
+    }
+
+    /// Returns `true` when the binding is no longer authorization-eligible.
+    pub const fn is_expired_at(self, now_unix_seconds: u64) -> bool {
+        self.0 <= now_unix_seconds
+    }
+}
+
 /// Stable reference to one active identity-to-key binding.
 ///
 /// This reference is identity evidence. It is not an authorization lease and
-/// does not by itself provide expiry or live-revocation enforcement. An
+/// does not by itself provide live-revocation
+/// enforcement. Its optional authoritative expiry is a finalization and later
+/// lease bound; expiry does not synthesize lifecycle state. An
 /// authoritative binding adapter constructs this move-only value after checking
 /// active lifecycle state; it has no default or deserialization path.
 /// Production construction is intentionally unavailable in this phase. A
@@ -167,6 +205,7 @@ pub struct VersionedBindingRef {
     principal: FederatedPrincipal,
     bound_pubkey: PublicKey,
     binding_version: BindingVersion,
+    expires_at: Option<BindingExpiry>,
     source: BindingSource,
     resolution_reason: AuthorizationReason,
 }
@@ -180,6 +219,7 @@ impl fmt::Debug for VersionedBindingRef {
             .field("principal", &self.principal)
             .field("bound_pubkey", &"[redacted]")
             .field("binding_version", &"[redacted]")
+            .field("expires_at", &"[redacted]")
             .field("source", &"[redacted]")
             .field("resolution_reason", &"[redacted]")
             .finish()
@@ -195,6 +235,7 @@ impl VersionedBindingRef {
         principal: FederatedPrincipal,
         bound_pubkey: PublicKey,
         binding_version: BindingVersion,
+        expires_at: Option<BindingExpiry>,
         source: BindingSource,
     ) -> Result<Self, AuthContextError> {
         if binding_id.is_nil() {
@@ -206,6 +247,7 @@ impl VersionedBindingRef {
             principal,
             bound_pubkey,
             binding_version,
+            expires_at,
             source,
             resolution_reason: AuthorizationReason::ExistingBinding,
         })
@@ -213,12 +255,14 @@ impl VersionedBindingRef {
 
     /// Build a reference to a binding atomically enrolled in this decision.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_enrolled_active_for_test(
         authorization_domain: CommunityId,
         binding_id: Uuid,
         principal: FederatedPrincipal,
         bound_pubkey: PublicKey,
         binding_version: BindingVersion,
+        expires_at: Option<BindingExpiry>,
         source: BindingSource,
         reason: AuthorizationReason,
     ) -> Result<Self, AuthContextError> {
@@ -237,6 +281,7 @@ impl VersionedBindingRef {
             principal,
             bound_pubkey,
             binding_version,
+            expires_at,
             source,
             resolution_reason: reason,
         })
@@ -265,6 +310,11 @@ impl VersionedBindingRef {
     /// Current binding version.
     pub const fn binding_version(&self) -> BindingVersion {
         self.binding_version
+    }
+
+    /// Optional authoritative temporal bound for authorization eligibility.
+    pub const fn expires_at(&self) -> Option<BindingExpiry> {
+        self.expires_at
     }
 
     /// Provenance of the active binding.

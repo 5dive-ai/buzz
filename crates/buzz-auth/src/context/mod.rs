@@ -18,7 +18,7 @@ mod evidence;
 mod reason;
 
 pub use binding::{
-    BindingSource, BindingVersion, EnrollmentMode, FederatedIdentityRequirement,
+    BindingExpiry, BindingSource, BindingVersion, EnrollmentMode, FederatedIdentityRequirement,
     ResolvedFederatedPolicy, VersionedBindingRef,
 };
 pub use evidence::{
@@ -354,6 +354,7 @@ fn validate_federated_authorization(
             if binding.bound_pubkey() != actor_pubkey {
                 return Err(AuthContextError::DirectBindingKeyMismatch);
             }
+            validate_binding_time(binding, now_unix_seconds)?;
             validate_assertion_time(assertion, now_unix_seconds)?;
             let FederatedIdentityRequirement::Required(enrollment_mode) =
                 federated_policy.requirement()
@@ -382,6 +383,7 @@ fn validate_federated_authorization(
             if delegation.owner_pubkey() != owner.bound_pubkey() {
                 return Err(AuthContextError::DelegatedOwnerMismatch);
             }
+            validate_binding_time(owner, now_unix_seconds)?;
             if admission.fresh_until().is_expired_at(now_unix_seconds) {
                 return Err(AuthContextError::OwnerAdmissionExpired);
             }
@@ -392,6 +394,19 @@ fn validate_federated_authorization(
                 return Err(AuthContextError::DelegationExpired);
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_binding_time(
+    binding: &VersionedBindingRef,
+    now_unix_seconds: u64,
+) -> Result<(), AuthContextError> {
+    if binding
+        .expires_at()
+        .is_some_and(|expiry| expiry.is_expired_at(now_unix_seconds))
+    {
+        return Err(AuthContextError::BindingExpired);
     }
     Ok(())
 }

@@ -118,6 +118,7 @@ function ReplyRow({
           content={reply.content}
           messageId={reply.eventId}
           linkPreviewsSuppressed={hasLinkPreviewSuppression(reply.tags)}
+          linkPreviewTags={reply.tags}
           imetaByUrl={parseImetaTags(reply.tags)}
           mentionNames={replyMentionNames}
           mentionPubkeysByName={replyMentionPubkeysByName}
@@ -263,6 +264,7 @@ export function ForumThreadPanel({
               content={post.content}
               messageId={post.eventId}
               linkPreviewsSuppressed={hasLinkPreviewSuppression(post.tags)}
+              linkPreviewTags={post.tags}
               imetaByUrl={parseImetaTags(post.tags)}
               mentionNames={postMentionNames}
               mentionPubkeysByName={postMentionPubkeysByName}

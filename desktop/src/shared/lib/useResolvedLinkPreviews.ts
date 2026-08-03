@@ -10,7 +10,7 @@ type LinkPreviewImageFetchState =
   | "transient_failure"
   | "rejected";
 
-type LinkPreviewMetadata = {
+export type LinkPreviewMetadata = {
   title: string;
   siteName: string | null;
   description: string | null;
@@ -179,6 +179,8 @@ export type ResolvedLinkPreview = SupportedLinkPreview & {
   description?: string | null;
   faviconDataUrl?: string | null;
   imageState: LinkPreviewImageState;
+  /** Metadata extraction completed successfully; safe to snapshot after media uploads. */
+  snapshotReady?: boolean;
 };
 
 type ResolvedMetadataByHref = Record<
@@ -207,6 +209,7 @@ export function resolveLinkPreview(
       : "none";
   return {
     ...preview,
+    snapshotReady: true,
     title: metadata.title,
     description: metadata.description,
     faviconDataUrl: metadata.faviconDataUrl,

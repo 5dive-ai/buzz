@@ -726,6 +726,7 @@ export function useMentionSendFlow({
       capturedThreadContext = null,
       pendingImeta,
       queuedAttachments = [],
+      linkPreviewTags = [],
       sentDraftKey,
       recoveryDraftKey,
       spoileredAttachmentUrls = new Set(),
@@ -788,7 +789,10 @@ export function useMentionSendFlow({
             createdPersonaAgentPubkeySet.has(pubkey),
         );
         const pubkeys = explicitMentionPubkeys;
-        const outgoingTags = buildCustomEmojiTags(trimmed, customEmoji);
+        const outgoingTags = [
+          ...buildCustomEmojiTags(trimmed, customEmoji),
+          ...linkPreviewTags,
+        ];
         const nonMemberPubkeys = getNonMemberMentionPubkeys(pubkeys);
         let promptNonMemberPubkeys = nonMemberPubkeys.filter(
           (pubkey) =>

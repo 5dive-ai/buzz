@@ -24,11 +24,9 @@ import { invokeTauri } from "@/shared/api/tauri";
 import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
 import { cn } from "@/shared/lib/cn";
 import { copyTextToClipboard } from "@/shared/lib/clipboard";
-import {
-  extractSupportedLinkPreviews,
-  parseSupportedLinkPreview,
-} from "@/shared/lib/linkPreview";
-import { useResolvedLinkPreviews } from "@/shared/lib/useResolvedLinkPreviews";
+import { parseSupportedLinkPreview } from "@/shared/lib/linkPreview";
+import { parseLinkPreviewSnapshots } from "@/shared/lib/linkPreviewSnapshot";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
 import { AttachmentGroup } from "@/shared/ui/attachment";
 import { ConfigNudgeCard } from "@/shared/ui/config-nudge-attachment";
@@ -975,7 +973,7 @@ function ImageZoomOverlay({
   );
 }
 
-const LinkPreviewImageLightbox =
+export const LinkPreviewImageLightbox =
   createLinkPreviewImageLightbox(ImageZoomOverlay);
 
 /**
@@ -1822,6 +1820,7 @@ function MarkdownInner({
   mediaInset = false,
   messageId,
   linkPreviewsSuppressed = false,
+  linkPreviewTags,
   onRemoveLinkPreviewsForEveryone,
   mentionNames,
   mentionPubkeysByName,
@@ -1854,13 +1853,19 @@ function MarkdownInner({
     },
     [goChannel],
   );
-  const previewsGloballySuppressed = linkPreviewsSuppressed;
-  const linkPreviews = React.useMemo(
+  const relayOrigin = useRelayOrigin();
+  const resolvedLinkPreviews = React.useMemo(
     () =>
-      interactive && !previewsGloballySuppressed
-        ? extractSupportedLinkPreviews(content)
+      interactive && !linkPreviewsSuppressed
+        ? parseLinkPreviewSnapshots(linkPreviewTags, content, relayOrigin)
         : [],
-    [content, interactive, previewsGloballySuppressed],
+    [
+      content,
+      interactive,
+      linkPreviewTags,
+      linkPreviewsSuppressed,
+      relayOrigin,
+    ],
   );
   const configNudge = React.useMemo(
     () => computeConfigNudge(content, interactive, configNudgeAuthorPubkey),
@@ -1904,8 +1909,6 @@ function MarkdownInner({
   if (/(?:\s{2}\n)+$/.test(processedContent)) {
     processedContent = `${processedContent}\u200B`;
   }
-
-  const resolvedLinkPreviews = useResolvedLinkPreviews(linkPreviews);
 
   // When a config-nudge suppresses the prose (selectProseOrNudge returns
   // null), skip the parse entirely — it would be thrown away unrendered.
@@ -1977,6 +1980,7 @@ export const Markdown = React.memo(
     prev.mediaInset === next.mediaInset &&
     prev.messageId === next.messageId &&
     prev.linkPreviewsSuppressed === next.linkPreviewsSuppressed &&
+    prev.linkPreviewTags === next.linkPreviewTags &&
     prev.onRemoveLinkPreviewsForEveryone ===
       next.onRemoveLinkPreviewsForEveryone &&
     shallowRecordEqual(

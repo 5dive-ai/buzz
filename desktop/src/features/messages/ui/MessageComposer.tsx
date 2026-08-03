@@ -57,6 +57,7 @@ import { usePersistentAgentMentionHydration } from "./usePersistentAgentMentionH
 import { useComposerContentState } from "./useComposerContentState";
 import { useDraftPersistLifecycle } from "./useDraftPersistSnapshot";
 import { submitMessageEdit } from "./submitMessageEdit";
+import { useComposerLinkPreviews } from "./useComposerLinkPreviews";
 import type { MessageComposerProps } from "./MessageComposer.types";
 function MessageComposerImpl({
   audienceContext = null,
@@ -98,6 +99,11 @@ function MessageComposerImpl({
     syncComposerContentFromEditor,
     syncContentRefFromEditorRef,
   } = useComposerContentState();
+  const [previewContent, setPreviewContent] = React.useState("");
+  const {
+    previewList: composerLinkPreviews,
+    getReadyTags: getReadyLinkPreviewTags,
+  } = useComposerLinkPreviews(previewContent);
   const [isEmojiPickerOpen, setIsEmojiPickerOpen] = React.useState(false);
   const [isFormattingOpen, setIsFormattingOpen] = React.useState(false);
   const [spoileredAttachmentUrls, setSpoileredAttachmentUrls] = React.useState<
@@ -257,6 +263,7 @@ function MessageComposerImpl({
     onLinkShortcut: () => onLinkShortcutRef.current?.() ?? false,
     onUpdate: ({ cursor, text }) => {
       setComposerContentFromText(text);
+      setPreviewContent(text);
       mentions.updateMentionQuery(text, cursor);
       channelLinks.updateChannelQuery(text, cursor);
       emojiAutocomplete.updateEmojiQuery(text, cursor);
@@ -574,6 +581,7 @@ function MessageComposerImpl({
         capturedThreadContext,
         pendingImeta: currentPendingImeta,
         queuedAttachments: currentQueuedAttachments,
+        linkPreviewTags: getReadyLinkPreviewTags(),
         sentDraftKey: resolveSentDraftKey(
           effectiveDraftKeyRef.current,
           drafts.loadDraft,
@@ -594,6 +602,7 @@ function MessageComposerImpl({
     customEmoji,
     drafts.loadDraft,
     emojiAutocomplete.clearEmojis,
+    getReadyLinkPreviewTags,
     media.clearQueuedAttachments,
     media.pendingImetaRef,
     media.queuedAttachmentsRef,
@@ -951,6 +960,7 @@ function MessageComposerImpl({
               </div>
             ) : null}
 
+            {composerLinkPreviews}
             {(media.pendingImeta.length > 0 ||
               media.queuedAttachments.length > 0 ||
               media.isUploading) && (

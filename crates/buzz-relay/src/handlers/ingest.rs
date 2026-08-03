@@ -162,6 +162,52 @@ pub fn reject_with_transport(transport: &'static str, reason: &'static str) {
     .increment(1);
 }
 
+fn validate_link_preview_tags(event: &Event, media_base_url: &str) -> Result<(), String> {
+    const MAX_SNAPSHOTS: usize = 8;
+    const MAX_TITLE: usize = 300;
+    const MAX_SITE: usize = 100;
+    const MAX_DESCRIPTION: usize = 1000;
+
+    let mut count = 0;
+    let mut seen = std::collections::HashSet::new();
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.first().map(String::as_str) != Some("link-preview") {
+            continue;
+        }
+        count += 1;
+        if count > MAX_SNAPSHOTS || parts.len() != 11 || parts[1] != "snapshot" || parts[2] != "1" {
+            return Err("invalid link-preview snapshot tag".into());
+        }
+        let canonical =
+            url::Url::parse(&parts[3]).map_err(|_| "invalid link-preview canonical URL")?;
+        if canonical.scheme() != "https"
+            || !canonical.username().is_empty()
+            || canonical.password().is_some()
+            || canonical.fragment().is_some()
+            || !seen.insert(parts[3].clone())
+            || !event.content.contains(&parts[3])
+        {
+            return Err("invalid link-preview canonical URL".into());
+        }
+        for (value, max) in [
+            (&parts[4], MAX_TITLE),
+            (&parts[5], MAX_SITE),
+            (&parts[6], MAX_DESCRIPTION),
+        ] {
+            if value.len() > max || value.chars().any(char::is_control) {
+                return Err("invalid link-preview snapshot text".into());
+            }
+        }
+        if !super::imeta::validate_local_image_media_pair(&parts[7], &parts[8], media_base_url)
+            || !super::imeta::validate_local_image_media_pair(&parts[9], &parts[10], media_base_url)
+        {
+            return Err("link-preview media must reference matching local image blobs".into());
+        }
+    }
+    Ok(())
+}
+
 /// Successful ingestion result.
 pub struct IngestResult {
     /// Hex-encoded event ID.
@@ -2596,6 +2642,13 @@ async fn ingest_event_inner(
         });
     }
 
+    let tenant_media_base =
+        crate::api::media::media_base_url_for_tenant(&state.config.relay_url, tenant.host());
+    if kind_u32 == KIND_STREAM_MESSAGE {
+        validate_link_preview_tags(&event, &tenant_media_base)
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    }
+
     let imeta_tags: Vec<Vec<String>> = event
         .tags
         .iter()
@@ -2603,8 +2656,6 @@ async fn ingest_event_inner(
         .map(|t| t.as_slice().iter().map(|s| s.to_string()).collect())
         .collect();
     if !imeta_tags.is_empty() {
-        let tenant_media_base =
-            crate::api::media::media_base_url_for_tenant(&state.config.relay_url, tenant.host());
         crate::api::validate_imeta_tags(&imeta_tags, &tenant_media_base)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
         crate::api::verify_imeta_blobs(tenant, &imeta_tags, &state.media_storage)

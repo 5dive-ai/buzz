@@ -400,6 +400,7 @@ export const MessageRow = React.memo(
               content={message.body}
               messageId={message.id}
               linkPreviewsSuppressed={linkPreviewsSuppressed}
+              linkPreviewTags={message.tags}
               onRemoveLinkPreviewsForEveryone={removeLinkPreviewsForEveryone}
               customEmoji={customEmoji}
               imetaByUrl={imetaByUrl}

@@ -12,6 +12,7 @@ mod huddle;
 mod identity_storage;
 mod initial_window;
 mod key_backup;
+mod link_preview_tags;
 mod linux_media;
 mod managed_agents;
 mod media_proxy;
@@ -79,7 +80,6 @@ use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_window_state::StateFlags;
 #[cfg(target_os = "macos")]
 use tray_menu::show_main_window;
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // mesh-llm's async chains (model download, node start/join) overflow

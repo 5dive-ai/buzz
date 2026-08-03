@@ -124,6 +124,7 @@ export function ForumPostCard({
           content={previewContent}
           messageId={post.eventId}
           linkPreviewsSuppressed={hasLinkPreviewSuppression(post.tags)}
+          linkPreviewTags={post.tags}
           imetaByUrl={imetaByUrl}
           mentionNames={mentionNames}
           mentionPubkeysByName={mentionPubkeysByName}

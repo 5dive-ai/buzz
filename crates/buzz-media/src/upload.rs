@@ -95,9 +95,8 @@ where
     // Idempotent: short-circuit only if BOTH sidecar and blob exist. If the
     // sidecar exists but the blob is missing, fall through to re-upload.
     let sidecar_exists = storage.head(&meta_key).await?;
-    let existing_blob_key = match storage.resolve_read_key(ctx, &legacy_key).await {
-        Ok(key) => Some(key),
-        Err(MediaError::NotFound) => None,
+    let existing_blob_key = match storage.existing_write_key(ctx, &legacy_key).await {
+        Ok(key) => key,
         Err(error) => return Err(error),
     };
     if sidecar_exists && existing_blob_key.is_some() {
@@ -438,9 +437,8 @@ pub async fn process_video_upload(
 
     // --- 5. Idempotency check ---
     let sidecar_exists = storage.head(&meta_key).await?;
-    let existing_blob_key = match storage.resolve_read_key(ctx, &legacy_key).await {
-        Ok(key) => Some(key),
-        Err(MediaError::NotFound) => None,
+    let existing_blob_key = match storage.existing_write_key(ctx, &legacy_key).await {
+        Ok(key) => key,
         Err(error) => return Err(error),
     };
     if sidecar_exists && existing_blob_key.is_some() {
@@ -589,7 +587,7 @@ mod tests {
             s3_bucket: String::new(),
             s3_region: "us-east-1".to_string(),
             s3_addressing_style: crate::config::S3AddressingStyle::Path,
-            key_layout: crate::config::MediaKeyLayout::Legacy,
+            migration_phase: crate::config::MediaMigrationPhase::DualReadLegacyWrite,
             max_image_bytes: 50 * 1024 * 1024,
             max_gif_bytes: 10 * 1024 * 1024,
             max_video_bytes: 524_288_000,

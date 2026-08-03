@@ -1082,11 +1082,13 @@ dependencies = [
 name = "buzz-media"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "blurhash",
  "buzz-core",
  "bytes",
  "chrono",
+ "clap",
  "futures-core",
  "futures-util",
  "hex",
@@ -1105,6 +1107,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "ulid",
  "uuid",
 ]

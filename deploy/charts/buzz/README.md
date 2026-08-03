@@ -97,20 +97,20 @@ errors surface on the first storage operation.
 ## Media object-key migration
 
 Media writes stay on the flat legacy layout after an upgrade unless the operator
-explicitly advances `BUZZ_MEDIA_KEY_LAYOUT` (or Helm
-`relay.mediaKeyLayout`). The supported stages are:
+explicitly advances `BUZZ_MEDIA_MIGRATION_PHASE` (or Helm
+`relay.mediaMigrationPhase`). The supported stages are:
 
-1. `legacy` (default): write only existing flat keys. Deploy this release first
+1. `dual-read-legacy-write` (default): write only existing flat keys. Deploy this release first
    so every relay can read both layouts; upgrading alone does **not** double-write.
-2. `dual`: after all readers are compatible, write the sharded key and a flat
+2. `dual-read-dual-write`: after all readers are compatible, write the sharded key and a flat
    rollback copy. Monitor `buzz_media_s3_read_resolutions_total`,
    `buzz_media_s3_read_fallbacks_total`, and the storage duplicate-layout gauges.
-3. `sharded`: after backfill/reconciliation and a full rollback window, stop
+3. `sharded-only`: after backfill/reconciliation and a full rollback window, stop
    writing flat copies. Keep compatibility readers deployed while legacy objects
    are migrated and verified.
 
-Do not roll `sharded` writers back to a Buzz version that predates sharded reads.
-Returning from `sharded` to `dual` does not retroactively recreate legacy copies;
+Do not roll `sharded-only` writers back to a Buzz version that predates sharded reads.
+Returning from `sharded-only` to `dual-read-dual-write` does not retroactively recreate legacy copies;
 run and verify the backfill before relying on old-version rollback.
 
 ## Relay Pod extensions
@@ -278,3 +278,40 @@ helm unittest .
 helm dependency build .
 ct lint --config ../../../ct.yaml --charts .
 ```
+
+### Backfill and legacy cleanup Jobs
+
+The relay image includes `/usr/local/bin/buzz-media-layout-backfill` and
+`/usr/local/bin/buzz-media-layout-delete-legacy`; both use the relay's
+`BUZZ_S3_*` settings or IRSA credential chain. Runnable Kubernetes Job examples
+are in [`deploy/kubernetes/examples/`](../../kubernetes/examples/). The tools:
+
+- list canonical `_meta/<community>/<sha>.json` sidecars in bounded pages;
+- default to 25 total S3 requests/second, configurable with
+  `BUZZ_MEDIA_MIGRATION_REQUESTS_PER_SECOND`;
+- print the last completed sidecar as `checkpoint`; restart with
+  `BUZZ_MEDIA_MIGRATION_START_AFTER=<checkpoint>` if a Job fails;
+- are idempotent: backfill skips an existing destination, and deletion skips an
+  absent legacy source;
+- fail closed on malformed metadata or a missing source/destination.
+
+For an **existing deployment**:
+
+1. Upgrade with the default `dual-read-legacy-write`; confirm all relay pods can
+   read both layouts. No new duplicate writes start in this phase.
+2. Select `dual-read-dual-write` and observe successful writes and storage
+   telemetry through a rollback window.
+3. Run the backfill Job. Re-run from any logged checkpoint as needed, then run
+   it again to a clean `copied=0` result. Reconcile storage sweep unknown keys,
+   duplicate gauges, migration failures, and legacy fallback traffic.
+4. Select `sharded-only` only after every supported rollback version understands
+   sharded keys and reconciliation finds no missing sharded destination.
+5. Run the deletion Job with its default `dry-run=true`, review the output, and
+   retain a recovery window/S3 versions. Only then set `dry-run=false` and
+   `BUZZ_MEDIA_DELETE_CONFIRM=delete-verified-legacy-media`. The tool checks the
+   corresponding sharded object immediately before every deletion.
+
+For a **new empty deployment**, the chart and Compose defaults deliberately use
+`dual-read-legacy-write`, matching relay startup defaults. An operator who has
+verified the bucket has no legacy media may set `sharded-only` before accepting
+the first upload; no backfill or deletion Job is then needed.

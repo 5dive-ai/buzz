@@ -63,7 +63,7 @@
         "requireAuthToken": { "type": "boolean" },
         "requireRelayMembership": { "type": "boolean" },
         "requireMediaGetAuth": { "type": "boolean" },
-        "mediaKeyLayout": { "type": "string", "enum": ["legacy", "dual", "sharded"] },
+        "mediaMigrationPhase": { "type": "string", "enum": ["dual-read-legacy-write", "dual-read-dual-write", "sharded-only"] },
         "allowNipOaAuth": { "type": "boolean" },
         "huddleAudioAvailable": {
           "type": ["boolean", "null"],

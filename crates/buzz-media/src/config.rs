@@ -33,29 +33,41 @@ impl FromStr for S3AddressingStyle {
     }
 }
 
-/// Payload object-key layout used for new media writes.
+/// Relay media migration phase controlling both payload reads and writes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MediaKeyLayout {
-    /// Write only the pre-migration flat key.
+pub enum MediaMigrationPhase {
+    /// Compatibility default: prefer sharded reads with legacy fallback, but
+    /// write only legacy keys. Upgrades therefore do not begin double-writing.
     #[default]
-    Legacy,
-    /// Write the sharded key first, then a flat compatibility copy.
-    Dual,
-    /// Write only the hash-leading, community-scoped key.
-    Sharded,
+    #[serde(rename = "dual-read-legacy-write")]
+    DualReadLegacyWrite,
+    /// Migration phase: prefer sharded reads with legacy fallback and write
+    /// both layouts (sharded first, then legacy).
+    #[serde(rename = "dual-read-dual-write")]
+    DualReadDualWrite,
+    /// Final phase: read and write only hash-sharded keys.
+    #[serde(rename = "sharded-only")]
+    ShardedOnly,
 }
 
-impl FromStr for MediaKeyLayout {
+impl MediaMigrationPhase {
+    /// Whether reads may fall back to the legacy key.
+    pub const fn reads_legacy(self) -> bool {
+        !matches!(self, Self::ShardedOnly)
+    }
+}
+
+impl FromStr for MediaMigrationPhase {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "legacy" => Ok(Self::Legacy),
-            "dual" => Ok(Self::Dual),
-            "sharded" => Ok(Self::Sharded),
+            "dual-read-legacy-write" => Ok(Self::DualReadLegacyWrite),
+            "dual-read-dual-write" => Ok(Self::DualReadDualWrite),
+            "sharded-only" => Ok(Self::ShardedOnly),
             _ => Err(format!(
-                "BUZZ_MEDIA_KEY_LAYOUT must be 'legacy', 'dual', or 'sharded', got {value:?}"
+                "BUZZ_MEDIA_MIGRATION_PHASE must be 'dual-read-legacy-write', \
+                 'dual-read-dual-write', or 'sharded-only', got {value:?}"
             )),
         }
     }
@@ -95,9 +107,10 @@ pub struct MediaConfig {
     /// S3 URL addressing style. Defaults to path style for MinIO compatibility.
     #[serde(default)]
     pub s3_addressing_style: S3AddressingStyle,
-    /// Object-key layout for new media payload writes. Defaults to legacy.
+    /// Relay phase controlling media payload reads and writes. Defaults to
+    /// dual reads with legacy-only writes for upgrade safety.
     #[serde(default)]
-    pub key_layout: MediaKeyLayout,
+    pub migration_phase: MediaMigrationPhase,
     /// Maximum upload size for images (bytes). Default: 50 MB.
     pub max_image_bytes: u64,
     /// Maximum upload size for animated GIFs (bytes). Default: 10 MB.
@@ -190,7 +203,7 @@ impl MediaConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaConfig, MediaKeyLayout, S3AddressingStyle};
+    use super::{MediaConfig, MediaMigrationPhase, S3AddressingStyle};
     use std::str::FromStr;
 
     fn valid_config() -> MediaConfig {
@@ -201,7 +214,7 @@ mod tests {
             s3_bucket: "buzz-media".to_string(),
             s3_region: "us-east-1".to_string(),
             s3_addressing_style: S3AddressingStyle::Path,
-            key_layout: MediaKeyLayout::Legacy,
+            migration_phase: MediaMigrationPhase::DualReadLegacyWrite,
             max_image_bytes: 1,
             max_gif_bytes: 1,
             max_video_bytes: 1,
@@ -243,12 +256,23 @@ mod tests {
     }
 
     #[test]
-    fn media_key_layout_parses_and_defaults_to_legacy() {
-        assert_eq!(MediaKeyLayout::default(), MediaKeyLayout::Legacy);
-        assert_eq!("legacy".parse(), Ok(MediaKeyLayout::Legacy));
-        assert_eq!("dual".parse(), Ok(MediaKeyLayout::Dual));
-        assert_eq!("sharded".parse(), Ok(MediaKeyLayout::Sharded));
-        assert!("new".parse::<MediaKeyLayout>().is_err());
+    fn media_migration_phase_parses_and_has_upgrade_safe_default() {
+        assert_eq!(
+            MediaMigrationPhase::default(),
+            MediaMigrationPhase::DualReadLegacyWrite
+        );
+        assert_eq!(
+            "dual-read-legacy-write".parse(),
+            Ok(MediaMigrationPhase::DualReadLegacyWrite)
+        );
+        assert_eq!(
+            "dual-read-dual-write".parse(),
+            Ok(MediaMigrationPhase::DualReadDualWrite)
+        );
+        assert_eq!("sharded-only".parse(), Ok(MediaMigrationPhase::ShardedOnly));
+        for invalid in ["legacy", "dual", "sharded", "new"] {
+            assert!(invalid.parse::<MediaMigrationPhase>().is_err());
+        }
     }
 
     #[test]

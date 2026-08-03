@@ -7,6 +7,7 @@ pub mod bucket_index;
 pub mod config;
 pub mod error;
 pub mod keys;
+pub mod migration;
 pub mod storage;
 pub mod thumbnail;
 pub mod types;
@@ -18,7 +19,7 @@ pub use bucket_index::{
     classify_key, fold_bucket_listing, BucketAggregate, BucketSnapshot, CommunityStorage, KeyClass,
     Page, SweepError,
 };
-pub use config::{MediaConfig, MediaKeyLayout, S3AddressingStyle};
+pub use config::{MediaConfig, MediaMigrationPhase, S3AddressingStyle};
 pub use error::MediaError;
 pub use keys::{
     legacy_blob_key, legacy_thumb_key, read_candidates, sharded_blob_key, sharded_thumb_key,

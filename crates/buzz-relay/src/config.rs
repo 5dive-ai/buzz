@@ -733,12 +733,12 @@ impl Config {
                 ));
             }
         };
-        let media_key_layout = match std::env::var("BUZZ_MEDIA_KEY_LAYOUT") {
+        let media_migration_phase = match std::env::var("BUZZ_MEDIA_MIGRATION_PHASE") {
             Ok(value) => value.parse().map_err(ConfigError::InvalidValue)?,
-            Err(std::env::VarError::NotPresent) => buzz_media::MediaKeyLayout::default(),
+            Err(std::env::VarError::NotPresent) => buzz_media::MediaMigrationPhase::default(),
             Err(std::env::VarError::NotUnicode(_)) => {
                 return Err(ConfigError::InvalidValue(
-                    "BUZZ_MEDIA_KEY_LAYOUT must be valid Unicode".to_string(),
+                    "BUZZ_MEDIA_MIGRATION_PHASE must be valid Unicode".to_string(),
                 ));
             }
         };
@@ -754,7 +754,7 @@ impl Config {
                 .or_else(|_| std::env::var("AWS_REGION"))
                 .unwrap_or_else(|_| "us-east-1".to_string()),
             s3_addressing_style,
-            key_layout: media_key_layout,
+            migration_phase: media_migration_phase,
             max_image_bytes: std::env::var("BUZZ_MAX_IMAGE_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())

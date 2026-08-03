@@ -5,7 +5,7 @@ use std::pin::Pin;
 
 use buzz_core::tenant::{CommunityId, TenantContext};
 
-use crate::config::{MediaConfig, MediaKeyLayout, S3AddressingStyle};
+use crate::config::{MediaConfig, MediaMigrationPhase, S3AddressingStyle};
 use crate::error::MediaError;
 use bytes::Bytes;
 use s3::creds::Credentials;
@@ -18,7 +18,7 @@ pub type ByteStream = Pin<Box<dyn futures_core::Stream<Item = Result<Bytes, Medi
 /// S3-compatible object storage client.
 pub struct MediaStorage {
     bucket: Box<Bucket>,
-    key_layout: MediaKeyLayout,
+    migration_phase: MediaMigrationPhase,
 }
 
 impl MediaStorage {
@@ -69,7 +69,7 @@ impl MediaStorage {
         };
         Ok(Self {
             bucket,
-            key_layout: config.key_layout,
+            migration_phase: config.migration_phase,
         })
     }
 
@@ -124,17 +124,19 @@ impl MediaStorage {
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
         let sharded = crate::keys::sharded_blob_key(ctx.community(), sha256, ext)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        match self.key_layout {
-            MediaKeyLayout::Legacy => self.put(&legacy, bytes, content_type).await?,
-            MediaKeyLayout::Dual => {
+        match self.migration_phase {
+            MediaMigrationPhase::DualReadLegacyWrite => {
+                self.put(&legacy, bytes, content_type).await?
+            }
+            MediaMigrationPhase::DualReadDualWrite => {
                 self.put(&sharded, bytes, content_type).await?;
                 self.put(&legacy, bytes, content_type).await?;
             }
-            MediaKeyLayout::Sharded => self.put(&sharded, bytes, content_type).await?,
+            MediaMigrationPhase::ShardedOnly => self.put(&sharded, bytes, content_type).await?,
         }
-        Ok(match self.key_layout {
-            MediaKeyLayout::Legacy => legacy,
-            MediaKeyLayout::Dual | MediaKeyLayout::Sharded => sharded,
+        Ok(match self.migration_phase {
+            MediaMigrationPhase::DualReadLegacyWrite => legacy,
+            MediaMigrationPhase::DualReadDualWrite | MediaMigrationPhase::ShardedOnly => sharded,
         })
     }
 
@@ -151,17 +153,19 @@ impl MediaStorage {
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
         let sharded = crate::keys::sharded_blob_key(ctx.community(), sha256, ext)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        match self.key_layout {
-            MediaKeyLayout::Legacy => self.put_file(&legacy, path, content_type).await?,
-            MediaKeyLayout::Dual => {
+        match self.migration_phase {
+            MediaMigrationPhase::DualReadLegacyWrite => {
+                self.put_file(&legacy, path, content_type).await?
+            }
+            MediaMigrationPhase::DualReadDualWrite => {
                 self.put_file(&sharded, path, content_type).await?;
                 self.put_file(&legacy, path, content_type).await?;
             }
-            MediaKeyLayout::Sharded => self.put_file(&sharded, path, content_type).await?,
+            MediaMigrationPhase::ShardedOnly => self.put_file(&sharded, path, content_type).await?,
         }
-        Ok(match self.key_layout {
-            MediaKeyLayout::Legacy => legacy,
-            MediaKeyLayout::Dual | MediaKeyLayout::Sharded => sharded,
+        Ok(match self.migration_phase {
+            MediaMigrationPhase::DualReadLegacyWrite => legacy,
+            MediaMigrationPhase::DualReadDualWrite | MediaMigrationPhase::ShardedOnly => sharded,
         })
     }
 
@@ -176,18 +180,49 @@ impl MediaStorage {
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
         let sharded = crate::keys::sharded_thumb_key(ctx.community(), sha256)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        match self.key_layout {
-            MediaKeyLayout::Legacy => self.put(&legacy, bytes, "image/jpeg").await?,
-            MediaKeyLayout::Dual => {
+        match self.migration_phase {
+            MediaMigrationPhase::DualReadLegacyWrite => {
+                self.put(&legacy, bytes, "image/jpeg").await?
+            }
+            MediaMigrationPhase::DualReadDualWrite => {
                 self.put(&sharded, bytes, "image/jpeg").await?;
                 self.put(&legacy, bytes, "image/jpeg").await?;
             }
-            MediaKeyLayout::Sharded => self.put(&sharded, bytes, "image/jpeg").await?,
+            MediaMigrationPhase::ShardedOnly => self.put(&sharded, bytes, "image/jpeg").await?,
         }
-        Ok(match self.key_layout {
-            MediaKeyLayout::Legacy => legacy,
-            MediaKeyLayout::Dual | MediaKeyLayout::Sharded => sharded,
+        Ok(match self.migration_phase {
+            MediaMigrationPhase::DualReadLegacyWrite => legacy,
+            MediaMigrationPhase::DualReadDualWrite | MediaMigrationPhase::ShardedOnly => sharded,
         })
+    }
+
+    /// Return the authoritative key only when every layout required by the
+    /// current write phase already exists. This prevents a re-upload from
+    /// skipping the missing compatibility copy after a phase change.
+    pub async fn existing_write_key(
+        &self,
+        ctx: &TenantContext,
+        payload_name: &str,
+    ) -> Result<Option<String>, MediaError> {
+        let candidates =
+            crate::keys::read_candidates(ctx, payload_name).map_err(|_| MediaError::NotFound)?;
+        match self.migration_phase {
+            MediaMigrationPhase::DualReadLegacyWrite => self
+                .head(&candidates.legacy)
+                .await
+                .map(|exists| exists.then_some(candidates.legacy)),
+            MediaMigrationPhase::DualReadDualWrite => {
+                if self.head(&candidates.sharded).await? && self.head(&candidates.legacy).await? {
+                    Ok(Some(candidates.sharded))
+                } else {
+                    Ok(None)
+                }
+            }
+            MediaMigrationPhase::ShardedOnly => self
+                .head(&candidates.sharded)
+                .await
+                .map(|exists| exists.then_some(candidates.sharded)),
+        }
     }
 
     /// Retrieve an object's bytes.
@@ -294,6 +329,14 @@ impl MediaStorage {
                 .increment(1);
                 Ok(candidates.sharded)
             }
+            Ok(None) if !self.migration_phase.reads_legacy() => {
+                metrics::counter!(
+                    "buzz_media_s3_read_resolutions_total",
+                    "result" => "missing"
+                )
+                .increment(1);
+                Err(MediaError::NotFound)
+            }
             Ok(None) => {
                 metrics::counter!("buzz_media_s3_read_fallbacks_total").increment(1);
                 match self.head_with_metadata(&candidates.legacy).await {
@@ -332,6 +375,44 @@ impl MediaStorage {
                 Err(error)
             }
         }
+    }
+
+    /// Copy an object within the media bucket using an S3 server-side copy.
+    pub async fn copy(&self, source: &str, destination: &str) -> Result<(), MediaError> {
+        self.bucket
+            .copy_object_internal(source, destination)
+            .await
+            .map_err(|e| MediaError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// List one bounded page under a prefix for maintenance tools.
+    pub async fn list_prefix_page(
+        &self,
+        prefix: &str,
+        continuation_token: Option<String>,
+        start_after: Option<String>,
+        max_keys: usize,
+    ) -> Result<crate::bucket_index::Page, MediaError> {
+        let (result, _status) = self
+            .bucket
+            .list_page(
+                prefix.to_string(),
+                None,
+                continuation_token,
+                start_after,
+                Some(max_keys),
+            )
+            .await?;
+        Ok(crate::bucket_index::Page {
+            objects: result
+                .contents
+                .into_iter()
+                .map(|obj| (obj.key, obj.size))
+                .collect(),
+            next_continuation_token: result.next_continuation_token,
+            is_truncated: result.is_truncated,
+        })
     }
 
     /// Build the community-scoped sidecar key for a given sha256 (bare hash).
@@ -446,7 +527,7 @@ mod tests {
             s3_bucket: "buzz-media".to_string(),
             s3_region: "us-west-2".to_string(),
             s3_addressing_style: S3AddressingStyle::Path,
-            key_layout: crate::config::MediaKeyLayout::Legacy,
+            migration_phase: crate::config::MediaMigrationPhase::DualReadLegacyWrite,
             max_image_bytes: 50 * 1024 * 1024,
             max_gif_bytes: 10 * 1024 * 1024,
             max_video_bytes: 524_288_000,

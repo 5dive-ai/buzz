@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use tauri::{AppHandle, Emitter, Manager};
@@ -599,6 +600,69 @@ pub(crate) struct DrainJournalEntry {
     pub start_on_app_launch: bool,
 }
 
+/// Execute a drain journal against the runtime map.
+///
+/// Pure inner function: takes the map directly so callers (including tests)
+/// can drive it without an `AppHandle`. The `cleanup_fn` is called for each
+/// successfully stopped entry to remove its receipt and clear the session
+/// cache; the closure is a no-op in tests.
+///
+/// Returns `(stopped, remaining, first_stop_error)`:
+/// - `stopped` — entries successfully killed (compensation restores these).
+/// - `remaining` — entries NOT attempted due to an earlier stop failure.
+/// - error — the first stop failure, if any; `None` on full success.
+pub(crate) fn execute_drain_journal(
+    journal: &[DrainJournalEntry],
+    runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+    mut cleanup_fn: impl FnMut(&ManagedAgentRuntimeKey),
+) -> (
+    Vec<DrainJournalEntry>,
+    Vec<DrainJournalEntry>,
+    Option<String>,
+) {
+    let mut stopped: Vec<DrainJournalEntry> = Vec::new();
+    let mut first_error: Option<String> = None;
+
+    for (idx, entry) in journal.iter().enumerate() {
+        let key = &entry.key;
+        let stop_result = if let Some(mut runtime) = runtimes.remove(key) {
+            let kill_result = if super::process_is_running(runtime.child.id()) {
+                super::terminate_process(runtime.child.id())
+            } else {
+                Ok(())
+            }
+            .and_then(|()| runtime.child.wait().map_err(|e| e.to_string()));
+
+            match kill_result {
+                Ok(_) => {
+                    cleanup_fn(key);
+                    Ok(())
+                }
+                Err(e) => {
+                    // Put it back so the map is consistent.
+                    runtimes.insert(key.clone(), runtime);
+                    Err(e)
+                }
+            }
+        } else {
+            // Nothing live at this key — treat as already stopped.
+            Ok(())
+        };
+
+        match stop_result {
+            Ok(()) => stopped.push(entry.clone()),
+            Err(e) => {
+                let msg = format!("failed to stop agent {}@{}: {e}", key.pubkey, key.relay_url);
+                first_error.get_or_insert(msg);
+                // Return the un-attempted tail (idx+1 onward) as remaining.
+                return (stopped, journal[idx + 1..].to_vec(), first_error);
+            }
+        }
+    }
+
+    (stopped, vec![], first_error)
+}
+
 /// Drain all live runtimes from the runtime map and return a drain journal
 /// (keys + restart recipes) for use by compensation.
 ///
@@ -653,61 +717,21 @@ pub(crate) fn drain_scope_runtimes(
             .collect()
     };
 
-    let mut stopped: Vec<DrainJournalEntry> = Vec::new();
-    let mut first_error: Option<String> = None;
-
-    for (idx, entry) in journal.iter().enumerate() {
-        let key = &entry.key;
-        let stop_result = {
-            let mut runtimes = match state.managed_agent_processes.lock() {
-                Ok(r) => r,
-                Err(e) => {
-                    first_error.get_or_insert_with(|| {
-                        format!("runtime map lock poisoned during drain: {e}")
-                    });
-                    // Return remaining as the un-attempted tail.
-                    return (stopped, journal[idx..].to_vec(), first_error);
-                }
-            };
-            if let Some(mut runtime) = runtimes.remove(key) {
-                let kill_result = if super::process_is_running(runtime.child.id()) {
-                    super::terminate_process(runtime.child.id())
-                } else {
-                    Ok(())
-                }
-                .and_then(|()| runtime.child.wait().map_err(|e| e.to_string()));
-
-                match kill_result {
-                    Ok(_) => {
-                        // Remove the receipt so sweep/restore see a clean slate.
-                        super::remove_agent_runtime_receipt(app, key);
-                        state.clear_agent_session_cache(key);
-                        Ok(())
-                    }
-                    Err(e) => {
-                        // Put it back so the map is consistent.
-                        runtimes.insert(key.clone(), runtime);
-                        Err(e)
-                    }
-                }
-            } else {
-                // Nothing live at this key — treat as already stopped.
-                Ok(())
-            }
-        };
-
-        match stop_result {
-            Ok(()) => stopped.push(entry.clone()),
-            Err(e) => {
-                let msg = format!("failed to stop agent {}@{}: {e}", key.pubkey, key.relay_url);
-                first_error.get_or_insert(msg);
-                // Return the un-attempted tail (idx+1 onward) as remaining.
-                return (stopped, journal[idx + 1..].to_vec(), first_error);
-            }
+    let mut runtimes = match state.managed_agent_processes.lock() {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                vec![],
+                journal,
+                Some(format!("runtime map lock poisoned during drain: {e}")),
+            )
         }
-    }
+    };
 
-    (stopped, vec![], first_error)
+    execute_drain_journal(&journal, &mut runtimes, |key| {
+        super::remove_agent_runtime_receipt(app, key);
+        state.clear_agent_session_cache(key);
+    })
 }
 
 /// Compensate a partial drain by restarting the entries that were successfully
@@ -743,148 +767,5 @@ pub(crate) fn compensate_drain(app: &AppHandle, stopped: &[DrainJournalEntry]) -
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn payload(
-        relay_url: &str,
-        lifecycle: ManagedAgentRuntimeLifecycle,
-        error: Option<&str>,
-    ) -> super::super::ManagedAgentRuntimeLifecycleObserverPayload {
-        super::super::ManagedAgentRuntimeLifecycleObserverPayload {
-            pubkey: "aa".repeat(32),
-            relay_url: relay_url.into(),
-            start_nonce: "test-generation".into(),
-            lifecycle,
-            error: error.map(str::to_owned),
-        }
-    }
-
-    fn record_with_relay(relay_url: &str) -> super::super::ManagedAgentRecord {
-        serde_json::from_str(&format!(
-            r#"{{
-                "pubkey": "{}",
-                "name": "pin-test",
-                "relay_url": "{relay_url}",
-                "acp_command": "buzz-acp",
-                "agent_command": "goose",
-                "agent_args": [],
-                "mcp_command": "",
-                "turn_timeout_seconds": 320,
-                "system_prompt": "",
-                "created_at": "2026-01-01T00:00:00Z",
-                "updated_at": "2026-01-01T00:00:00Z"
-            }}"#,
-            "aa".repeat(32)
-        ))
-        .unwrap()
-    }
-
-    #[test]
-    fn legacy_relay_pin_is_ignored_for_fan_out() {
-        // Zero-touch cutover (#2122): a record carrying a creation-era
-        // `relay_url` pin must fan out exactly like an unpinned one — the
-        // stored field is parsed but never consulted. See
-        // `effective_agent_relay_url`.
-        let unpinned = record_with_relay("");
-        let pinned = record_with_relay("wss://one.example");
-        for record in [&unpinned, &pinned] {
-            assert_eq!(
-                crate::relay::effective_agent_relay_url(&record.relay_url, "wss://two.example"),
-                "wss://two.example"
-            );
-        }
-    }
-
-    #[test]
-    fn unkeyable_relay_degrades_to_failed_row() {
-        // A requested URL that cannot form a pair key must still yield a
-        // Failed row keyed by the raw requested string, so one bad community
-        // never aborts the rest of the reconcile batch.
-        let record = record_with_relay("");
-        let status = unkeyable_failed_status(
-            &record,
-            "not a url".to_string(),
-            "relay access probe timed out".to_string(),
-            &[],
-            &super::super::GlobalAgentConfig::default(),
-        );
-        assert!(matches!(
-            status.lifecycle,
-            ManagedAgentRuntimeLifecycle::Failed
-        ));
-        assert_eq!(status.relay_url, "not a url");
-        assert_eq!(status.requested_relay_url.as_deref(), Some("not a url"));
-        assert_eq!(status.pubkey, record.pubkey);
-        assert_eq!(
-            status.error.as_deref(),
-            Some("relay access probe timed out")
-        );
-        assert!(status.pid.is_none());
-    }
-
-    #[test]
-    fn runtime_key_rejects_non_hex_pubkeys() {
-        assert!(ManagedAgentRuntimeKey::new("../not-a-key", "wss://relay.example").is_err());
-        assert!(ManagedAgentRuntimeKey::new("gg".repeat(32), "wss://relay.example").is_err());
-    }
-
-    #[test]
-    fn runtime_key_canonicalizes_hex_pubkeys() {
-        let key = ManagedAgentRuntimeKey::new("AA".repeat(32), "wss://relay.example").unwrap();
-        assert_eq!(key.pubkey, "aa".repeat(32));
-    }
-
-    #[test]
-    fn observer_lifecycle_key_preserves_exact_canonical_pair() {
-        let first = payload(
-            "WSS://Relay.Example:443/",
-            ManagedAgentRuntimeLifecycle::Ready,
-            None,
-        );
-        let key = observer_lifecycle_key(&first.pubkey, &first).unwrap();
-        assert_eq!(key.pubkey, first.pubkey);
-        assert_eq!(key.relay_url, "wss://relay.example");
-
-        let other = payload(
-            "wss://other.example",
-            ManagedAgentRuntimeLifecycle::Ready,
-            None,
-        );
-        assert_ne!(key, observer_lifecycle_key(&other.pubkey, &other).unwrap());
-    }
-
-    #[test]
-    fn observer_lifecycle_rejects_cross_agent_and_desktop_states() {
-        let ready = payload(
-            "wss://relay.example",
-            ManagedAgentRuntimeLifecycle::Ready,
-            None,
-        );
-        assert!(observer_lifecycle_key(&"bb".repeat(32), &ready).is_err());
-
-        let stopped = payload(
-            "wss://relay.example",
-            ManagedAgentRuntimeLifecycle::Stopped,
-            None,
-        );
-        assert!(observer_lifecycle_key(&stopped.pubkey, &stopped).is_err());
-    }
-
-    #[test]
-    fn observer_lifecycle_enforces_failed_error_contract() {
-        let failed = payload(
-            "wss://relay.example",
-            ManagedAgentRuntimeLifecycle::Failed,
-            None,
-        );
-        assert!(observer_lifecycle_key(&failed.pubkey, &failed).is_err());
-
-        let ready_with_error = payload(
-            "wss://relay.example",
-            ManagedAgentRuntimeLifecycle::Ready,
-            Some("unexpected"),
-        );
-        assert!(observer_lifecycle_key(&ready_with_error.pubkey, &ready_with_error).is_err());
-    }
-}
+#[path = "runtime_commands_tests.rs"]
+mod tests;

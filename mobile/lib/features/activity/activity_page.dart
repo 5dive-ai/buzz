@@ -421,7 +421,7 @@ class ActivityPage extends HookConsumerWidget {
   }
 }
 
-class _WideActivityDetail extends StatelessWidget {
+class _WideActivityDetail extends HookWidget {
   final InboxItem? item;
   final Channel? channel;
   final String? initialMessageId;
@@ -440,13 +440,17 @@ class _WideActivityDetail extends StatelessWidget {
       return const _WideActivityEmptyDetail();
     }
 
-    return Navigator(
-      key: ValueKey('wide-activity-detail-${item!.id}'),
-      onGenerateRoute: (_) => MaterialPageRoute<void>(
-        builder: (_) => ChannelDetailPage(
-          channel: channel!,
-          initialMessageId: initialMessageId,
-          initialThreadRootId: initialThreadRootId,
+    final navigatorKey = useMemoized(GlobalKey<NavigatorState>.new, [item!.id]);
+    return NavigatorPopHandler(
+      onPopWithResult: (_) => navigatorKey.currentState?.maybePop(),
+      child: Navigator(
+        key: navigatorKey,
+        onGenerateRoute: (_) => MaterialPageRoute<void>(
+          builder: (_) => ChannelDetailPage(
+            channel: channel!,
+            initialMessageId: initialMessageId,
+            initialThreadRootId: initialThreadRootId,
+          ),
         ),
       ),
     );

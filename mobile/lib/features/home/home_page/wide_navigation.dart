@@ -745,17 +745,23 @@ class _WideChannelDestination extends StatelessWidget {
   }
 }
 
-class _WideChannelContent extends StatelessWidget {
+class _WideChannelContent extends HookWidget {
   final Channel channel;
 
   const _WideChannelContent({required this.channel});
 
   @override
   Widget build(BuildContext context) {
-    return Navigator(
-      key: ValueKey('wide-channel-detail-${channel.id}'),
-      onGenerateRoute: (_) => MaterialPageRoute<void>(
-        builder: (_) => ChannelDetailPage(channel: channel),
+    final navigatorKey = useMemoized(GlobalKey<NavigatorState>.new, [
+      channel.id,
+    ]);
+    return NavigatorPopHandler(
+      onPopWithResult: (_) => navigatorKey.currentState?.maybePop(),
+      child: Navigator(
+        key: navigatorKey,
+        onGenerateRoute: (_) => MaterialPageRoute<void>(
+          builder: (_) => ChannelDetailPage(channel: channel),
+        ),
       ),
     );
   }

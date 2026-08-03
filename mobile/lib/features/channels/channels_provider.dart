@@ -69,9 +69,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
         sessionState.status != SessionStatus.connected;
     ref.listen(relaySessionProvider, (previous, next) {
       if (next.status != SessionStatus.connected) return;
-      if (waitingForInitialConnection &&
-          !_hasLoaded &&
-          !connected.isCompleted) {
+      if (waitingForInitialConnection && !connected.isCompleted) {
         connected.complete();
       } else if (previous?.status != SessionStatus.connected) {
         unawaited(_backstopRefresh());

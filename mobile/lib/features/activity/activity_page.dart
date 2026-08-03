@@ -76,6 +76,7 @@ class ActivityPage extends HookConsumerWidget {
     // otherwise recomputes its deep link after the read marker changes and
     // opens the latest event instead of the oldest unread one the user chose.
     final selectedItemTarget = useState<FeedItem?>(null);
+    final selectedItemForDetail = useState<InboxItem?>(null);
     final isWideInbox =
         MediaQuery.sizeOf(context).width >= _wideInboxBreakpoint;
     final headerTitleStyle = context.textTheme.titleMedium?.copyWith(
@@ -119,16 +120,21 @@ class ActivityPage extends HookConsumerWidget {
       final hasSelectedItem = visibleItems.any(
         (item) => item.id == selectedItemId.value,
       );
-      if (!hasSelectedItem) {
+      final retainsSelectedDetail =
+          selectedItemForDetail.value?.id == selectedItemId.value;
+      if (!hasSelectedItem && !retainsSelectedDetail) {
         selectedItemId.value = visibleItems.first.id;
         selectedItemTarget.value = null;
+        selectedItemForDetail.value = null;
       }
       return null;
     }, [isWideInbox, visibleItemIdsKey, filter.value, unreadOnly.value]);
-    final selectedItem = visibleItems.cast<InboxItem?>().firstWhere(
-      (item) => item?.id == selectedItemId.value,
-      orElse: () => null,
-    );
+    final selectedItem =
+        visibleItems.cast<InboxItem?>().firstWhere(
+          (item) => item?.id == selectedItemId.value,
+          orElse: () => null,
+        ) ??
+        selectedItemForDetail.value;
 
     // Preload sender profiles for visible rows.
     final preloadPubkeys = {
@@ -209,6 +215,7 @@ class ActivityPage extends HookConsumerWidget {
       if (isWideInbox) {
         selectedItemId.value = item.id;
         selectedItemTarget.value = target;
+        selectedItemForDetail.value = item;
         markItemRead(item);
         return;
       }
@@ -356,6 +363,7 @@ class ActivityPage extends HookConsumerWidget {
             onChanged: (nextFilter) {
               selectedItemId.value = null;
               selectedItemTarget.value = null;
+              selectedItemForDetail.value = null;
               filter.value = nextFilter;
             },
           ),

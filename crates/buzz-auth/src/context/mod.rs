@@ -204,8 +204,21 @@ impl AuthContextInput {
     }
 
     #[allow(dead_code)]
+    pub(crate) const fn proof_method(&self) -> AuthMethod {
+        self.nostr_proof.proof_method()
+    }
+
+    #[allow(dead_code)]
     pub(crate) const fn actor_pubkey(&self) -> PublicKey {
         self.nostr_proof.actor_pubkey()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn verified_owner_pubkey(&self) -> Option<PublicKey> {
+        match self.nostr_proof.verified_delegation() {
+            Some(delegation) => Some(delegation.owner_pubkey()),
+            None => None,
+        }
     }
 }
 

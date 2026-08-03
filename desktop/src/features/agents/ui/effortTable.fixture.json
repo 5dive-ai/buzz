@@ -203,11 +203,18 @@
     "defaultValue": "medium"
   },
   {
-    "note": "openai-compat: all-7 with medium default",
+    "note": "openai-compat: canonicalizes to openai, empty model → all-except-max with medium default",
     "provider": "openai-compat",
     "model": "",
-    "validValues": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    "validValues": ["none", "minimal", "low", "medium", "high", "xhigh"],
     "defaultValue": "medium"
+  },
+  {
+    "note": "openai-compat/gpt-5-pro: canonicalizes to openai, gpt-5-pro → [high] only",
+    "provider": "openai-compat",
+    "model": "gpt-5-pro",
+    "validValues": ["high"],
+    "defaultValue": "high"
   },
   {
     "note": "openrouter: all-7 with medium default",

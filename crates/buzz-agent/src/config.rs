@@ -86,7 +86,7 @@ impl ThinkingEffort {
 /// - `llama-3`                    → `llama-3` (no family token, returned unchanged)
 ///
 /// If no family token is present the name is returned unchanged.
-fn strip_catalog_prefix(model: &str) -> &str {
+pub(crate) fn strip_catalog_prefix(model: &str) -> &str {
     const FAMILY_TOKENS: &[&str] = &["claude-", "gpt-"];
     let lower = model.to_ascii_lowercase();
     let first_idx = FAMILY_TOKENS.iter().filter_map(|tok| lower.find(tok)).min();
@@ -573,6 +573,195 @@ pub fn normalize_effort_for_anthropic_route(effort: ThinkingEffort) -> Option<Th
             None
         }
         other => Some(other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generated-backed production helpers (Phase 2 cutover)
+//
+// One adapter per request path — resolves the effective provider/model ONCE
+// from the generated manifest and applies every manifest-owned axis.
+// Old hand-table implementations are renamed `_old_*` and used only in tests
+// and the behavioral differential shims — they have no production callers.
+// ---------------------------------------------------------------------------
+
+/// Normalize the effort value for any OpenAI-shaped request (pure OpenAI or legacy Databricks).
+///
+/// Resolves the generated capability record for the actual provider/model and
+/// applies `resolve_openai_effort` over its `supported_efforts`.  Uses the same
+/// clamping/peer-fallback semantics as the old hand-table lookup but is driven by
+/// the generated manifest, so exact-record F1 corrections (e.g. `databricks-gpt-5-5`
+/// → `[low,medium,high]`) are enforced in production.
+///
+/// This is the single production authority for `Provider::OpenAi` and
+/// `Provider::Databricks` effort normalization.  The old helper
+/// `normalize_effort_for_openai_route` exists only as a test/differential shim.
+pub fn normalize_effort_for_provider(
+    provider: &str,
+    raw_model: &str,
+    effort: ThinkingEffort,
+) -> ThinkingEffort {
+    use crate::generated_model_capabilities::resolve_model_capabilities;
+    let cap = resolve_model_capabilities(provider, raw_model);
+    resolve_openai_effort(raw_model, effort, cap.supported_efforts.as_ref())
+}
+
+/// Normalize the effort value for a DatabricksV2 request.
+///
+/// Reads `normalization_policy` from the generated capability record for this
+/// raw model ID (provider = "databricks_v2") and applies it:
+/// - `OpenAiStandard`      → per-family table lookup (GPT-5.x, etc.)
+/// - `OpenAiClampMaxToXHigh` → clamp max → xhigh, pass others unchanged
+/// - `None`                → pass effort through unchanged (Anthropic path)
+///
+/// This is the production authority for DatabricksV2 effort normalization.
+/// `normalize_effort_for_provider` is the authority for pure OpenAI and legacy
+/// Databricks; `normalize_effort_for_openai_route` is a test/differential shim only.
+pub fn normalize_effort_for_databricks_v2(
+    effort: ThinkingEffort,
+    raw_model: &str,
+) -> ThinkingEffort {
+    use crate::generated_model_capabilities::{resolve_model_capabilities, NormalizationPolicy};
+    let cap = resolve_model_capabilities("databricks_v2", raw_model);
+    match cap.normalization_policy {
+        NormalizationPolicy::OpenAiStandard => {
+            // Resolve against the generated `supported_efforts` — this is the axis that
+            // carries exact-record corrections (e.g. databricks-gpt-5-5 → [low,medium,high]).
+            // Uses the same clamping/peer-fallback semantics as the old hand-table lookup.
+            resolve_openai_effort(raw_model, effort, cap.supported_efforts.as_ref())
+        }
+        NormalizationPolicy::OpenAiClampMaxToXHigh => {
+            // Only `max` is out-of-range; all other values pass through if supported.
+            // Resolve against supported_efforts so that unsupported values are clamped
+            // consistently (not just `max`).
+            if effort == ThinkingEffort::Max {
+                tracing::warn!(
+                    requested = "max",
+                    resolved = "xhigh",
+                    model = raw_model,
+                    "BUZZ_AGENT_THINKING_EFFORT=max not confirmed for this DatabricksV2 model; clamping to xhigh"
+                );
+                ThinkingEffort::XHigh
+            } else {
+                resolve_openai_effort(raw_model, effort, cap.supported_efforts.as_ref())
+            }
+        }
+        NormalizationPolicy::None => effort,
+    }
+}
+
+/// Build the Anthropic thinking/effort request fields for any manifest-owned provider/model.
+///
+/// Resolves `thinking_mode` and `supported_efforts` from the generated capability record
+/// for the effective provider/model and applies them:
+/// - `ManualBudget` → `thinking:{type:"enabled", budget_tokens}` shape
+/// - `Adaptive`     → `thinking:{type:"adaptive"} + output_config:{effort}` shape,
+///   with effort clamped down to the highest supported level
+/// - `OmitFields` / `None` / `NotApplicable` → omit both fields
+///
+/// This is the single production authority for all providers' Anthropic thinking.
+/// The old `anthropic_thinking_config_for_databricks_v2` is a test-only shim.
+pub fn anthropic_thinking_config_generated(
+    provider: &str,
+    raw_model: &str,
+    effort: ThinkingEffort,
+    max_output_tokens: u32,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    use crate::generated_model_capabilities::{resolve_model_capabilities, ThinkingMode};
+    use serde_json::json;
+
+    let cap = resolve_model_capabilities(provider, raw_model);
+    match cap.thinking_mode {
+        ThinkingMode::ManualBudget => {
+            // Manual-budget shape (claude-3*, claude-opus-4-5): budget_tokens clamped
+            // to fit within max_output_tokens.
+            const MIN_ANSWER_TOKENS: u32 = 1024;
+            let level_budget = effort.anthropic_budget_tokens();
+            let headroom = max_output_tokens.saturating_sub(MIN_ANSWER_TOKENS);
+            let budget = level_budget.min(headroom);
+            if budget < MIN_ANSWER_TOKENS {
+                tracing::warn!(
+                    max_output_tokens,
+                    level_budget,
+                    headroom,
+                    model = raw_model,
+                    "BUZZ_AGENT_THINKING_EFFORT: max_output_tokens too small to fit thinking budget + answer headroom; omitting thinking fields"
+                );
+                return (None, None);
+            }
+            (
+                Some(json!({ "type": "enabled", "budget_tokens": budget })),
+                None,
+            )
+        }
+        ThinkingMode::Adaptive => {
+            // Adaptive shape: clamp effort downward to the highest supported level.
+            // Uses the generated supported_efforts (the manifest-owned authority) rather
+            // than the legacy clamp_adaptive_effort hand table.
+            let clamped = cap
+                .supported_efforts
+                .iter()
+                .rev()
+                .find(|&&e| e <= effort)
+                .copied()
+                .unwrap_or(effort); // effort is below the lowest supported; pass through (rare)
+            if clamped != effort {
+                tracing::warn!(
+                    model = raw_model,
+                    requested = effort.openai_effort_str(),
+                    clamped = clamped.openai_effort_str(),
+                    "BUZZ_AGENT_THINKING_EFFORT is not available for this model; clamping to highest supported level"
+                );
+            }
+            (
+                Some(json!({ "type": "adaptive" })),
+                Some(json!({ "effort": clamped.anthropic_effort_str() })),
+            )
+        }
+        ThinkingMode::OmitFields | ThinkingMode::None | ThinkingMode::NotApplicable => {
+            // Unknown Anthropic model, non-Anthropic-routed, or not applicable:
+            // omit thinking fields rather than guess.
+            (None, None)
+        }
+    }
+}
+
+/// Old DatabricksV2-scoped Anthropic thinking config — kept as a differential shim.
+///
+/// Production code uses `anthropic_thinking_config_generated` instead.
+/// This hard-codes `"databricks_v2"` and uses the legacy `clamp_adaptive_effort` hand table.
+#[cfg(test)]
+pub(crate) fn _old_anthropic_thinking_config_for_databricks_v2(
+    raw_model: &str,
+    effort: ThinkingEffort,
+    max_output_tokens: u32,
+) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    use crate::generated_model_capabilities::{resolve_model_capabilities, ThinkingMode};
+    use serde_json::json;
+
+    match resolve_model_capabilities("databricks_v2", raw_model).thinking_mode {
+        ThinkingMode::ManualBudget => {
+            const MIN_ANSWER_TOKENS: u32 = 1024;
+            let level_budget = effort.anthropic_budget_tokens();
+            let headroom = max_output_tokens.saturating_sub(MIN_ANSWER_TOKENS);
+            let budget = level_budget.min(headroom);
+            if budget < MIN_ANSWER_TOKENS {
+                return (None, None);
+            }
+            (
+                Some(json!({ "type": "enabled", "budget_tokens": budget })),
+                None,
+            )
+        }
+        ThinkingMode::Adaptive => {
+            let model = strip_catalog_prefix(raw_model);
+            let clamped = clamp_adaptive_effort(model, effort);
+            (
+                Some(json!({ "type": "adaptive" })),
+                Some(json!({ "effort": clamped.anthropic_effort_str() })),
+            )
+        }
+        ThinkingMode::OmitFields | ThinkingMode::None | ThinkingMode::NotApplicable => (None, None),
     }
 }
 
@@ -1149,6 +1338,32 @@ fn parse_hook_servers(raw: Option<&str>) -> HookServers {
         return HookServers::All;
     }
     HookServers::Only(names)
+}
+
+// ---------------------------------------------------------------------------
+// Test-only re-exports: let llm.rs tests call private classifiers without
+// duplicating them. These wrappers are cfg(test)-only and intentionally thin.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) fn is_manual_budget_model_for_test(model: &str) -> bool {
+    is_manual_budget_model(model)
+}
+
+#[cfg(test)]
+pub(crate) fn is_adaptive_thinking_model_for_test(model: &str) -> bool {
+    is_adaptive_thinking_model(model)
+}
+
+/// Mirror of the `tests::valid_effort_values_for_provider_model` helper in config's
+/// own test module, promoted to a module-level cfg(test) function so llm.rs tests
+/// can call it without re-implementing the logic.
+#[cfg(test)]
+pub(crate) fn valid_effort_values_for_provider_model_for_test(
+    provider: &str,
+    model: &str,
+) -> (Vec<&'static str>, Option<&'static str>) {
+    tests::valid_effort_values_for_provider_model(provider, model)
 }
 
 #[cfg(test)]
@@ -2604,7 +2819,7 @@ mod tests {
     /// Returns `(valid_values, default_value)` where `default_value` is `None`
     /// for Anthropic manual-budget models (TS `defaultValue: null`), otherwise
     /// `Some("medium")` or `Some("high")`.
-    fn valid_effort_values_for_provider_model(
+    pub(super) fn valid_effort_values_for_provider_model(
         provider: &str,
         model: &str,
     ) -> (Vec<&'static str>, Option<&'static str>) {
@@ -2614,6 +2829,13 @@ mod tests {
         const GPT5_1: &[&str] = &["none", "low", "medium", "high"];
 
         let p = provider.to_ascii_lowercase();
+        // Canonicalize provider aliases — mirrors the production path and TS
+        // PROVIDER_ALIASES so this shim stays in sync with the fixture.
+        let p = match p.as_str() {
+            "openai-compat" => "openai".to_owned(),
+            "databricks-v2" => "databricks_v2".to_owned(),
+            _ => p,
+        };
         // Strip arbitrary endpoint-naming prefix before model matching, mirroring TS and
         // strip_catalog_prefix: find the first known family token (claude-, gpt-) and
         // drop everything before it. Handles any catalog naming convention.
@@ -2698,7 +2920,7 @@ mod tests {
         if p == "openrouter" {
             return (ALL_7.to_vec(), Some("medium"));
         }
-        // openai-compat, unknown, empty → all-7, default medium.
+        // Unknown/empty provider → all-7, default medium.
         (ALL_7.to_vec(), Some("medium"))
     }
 
@@ -2748,6 +2970,59 @@ mod tests {
                 entry.provider, entry.model,
             );
         }
+    }
+
+    // ---- normalize_effort_for_databricks_v2 regression tests (F1 corrections) ----
+    // These pin the exact behavior Paul's pre-review probes checked. The key invariant:
+    // normalize_effort_for_databricks_v2 must resolve against the generated supported_efforts
+    // (which carries exact-record F1 corrections), NOT the old hand table.
+
+    #[test]
+    fn normalize_effort_for_databricks_v2_gpt_5_5_xhigh_clamps_to_high() {
+        // F1 correction: databricks-gpt-5-5 generated supported_efforts = [low, medium, high].
+        // XHigh is outside the supported set → nearest supported is High.
+        assert_eq!(
+            normalize_effort_for_databricks_v2(ThinkingEffort::XHigh, "databricks-gpt-5-5"),
+            ThinkingEffort::High,
+            "databricks-gpt-5-5 XHigh must clamp to High (F1 correction: supported=[low,medium,high])"
+        );
+    }
+
+    #[test]
+    fn normalize_effort_for_databricks_v2_gpt_5_5_none_clamps_to_low() {
+        // F1 correction: databricks-gpt-5-5 supported_efforts = [low, medium, high].
+        // None is outside the set → nearest supported is Low.
+        assert_eq!(
+            normalize_effort_for_databricks_v2(ThinkingEffort::None, "databricks-gpt-5-5"),
+            ThinkingEffort::Low,
+            "databricks-gpt-5-5 None must clamp to Low (F1 correction: supported=[low,medium,high])"
+        );
+    }
+
+    #[test]
+    fn normalize_effort_for_databricks_v2_gpt_5_5_in_range_passes_through() {
+        // Values within the corrected set must pass through unchanged.
+        for effort in [
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::High,
+        ] {
+            assert_eq!(
+                normalize_effort_for_databricks_v2(effort, "databricks-gpt-5-5"),
+                effort,
+                "databricks-gpt-5-5 {effort:?} is in supported set, must pass through"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_effort_for_databricks_v2_gpt_5_6_sol_max_passes_through() {
+        // databricks-gpt-5-6-sol F1 adoption: [low, medium, high, max] — max is supported.
+        assert_eq!(
+            normalize_effort_for_databricks_v2(ThinkingEffort::Max, "databricks-gpt-5-6-sol"),
+            ThinkingEffort::Max,
+            "databricks-gpt-5-6-sol Max must pass through (F1: supported includes max)"
+        );
     }
 
     #[test]

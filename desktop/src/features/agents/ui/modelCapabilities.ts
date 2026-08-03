@@ -308,6 +308,17 @@ function lookupByFamilyRules(provider: string, normalized: string): CapabilityRe
           normalizationPolicy: "openai-standard",
         };
   }
+  // rule: openai-gpt5-pro, provider: databricks, priority: 20
+  if (provider === "databricks" && (gpt5TokenMatchesGenerated(lower, "gpt-5-pro") || gpt5TokenMatchesGenerated(lower, "gpt5-pro"))) {
+    return {
+          registryLabel: "GPT-5 Pro",
+          thinkingMode: "none",
+          supportedEfforts: ["high"] as const,
+          defaultEffort: "high",
+          databricksV2WireRoute: "not-applicable",
+          normalizationPolicy: "openai-standard",
+        };
+  }
   // rule: openai-gpt5-pro, provider: databricks_v2, priority: 20
   if (provider === "databricks_v2" && (gpt5TokenMatchesGenerated(lower, "gpt-5-pro") || gpt5TokenMatchesGenerated(lower, "gpt5-pro"))) {
     return {
@@ -321,6 +332,17 @@ function lookupByFamilyRules(provider: string, normalized: string): CapabilityRe
   }
   // rule: openai-gpt5-6, provider: openai, priority: 15
   if (provider === "openai" && (gpt5TokenMatchesGenerated(lower, "gpt-5.6") || gpt5TokenMatchesGenerated(lower, "gpt5.6") || gpt5TokenMatchesGenerated(lower, "gpt-5-6") || gpt5TokenMatchesGenerated(lower, "gpt5-6"))) {
+    return {
+          registryLabel: "GPT-5.6",
+          thinkingMode: "none",
+          supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"] as const,
+          defaultEffort: "medium",
+          databricksV2WireRoute: "not-applicable",
+          normalizationPolicy: "openai-standard",
+        };
+  }
+  // rule: openai-gpt5-6, provider: databricks, priority: 15
+  if (provider === "databricks" && (gpt5TokenMatchesGenerated(lower, "gpt-5.6") || gpt5TokenMatchesGenerated(lower, "gpt5.6") || gpt5TokenMatchesGenerated(lower, "gpt-5-6") || gpt5TokenMatchesGenerated(lower, "gpt5-6"))) {
     return {
           registryLabel: "GPT-5.6",
           thinkingMode: "none",
@@ -352,6 +374,17 @@ function lookupByFamilyRules(provider: string, normalized: string): CapabilityRe
           normalizationPolicy: "openai-standard",
         };
   }
+  // rule: openai-gpt5-5, provider: databricks, priority: 15
+  if (provider === "databricks" && (gpt5TokenMatchesGenerated(lower, "gpt-5.5") || gpt5TokenMatchesGenerated(lower, "gpt5.5") || gpt5TokenMatchesGenerated(lower, "gpt-5-5") || gpt5TokenMatchesGenerated(lower, "gpt5-5"))) {
+    return {
+          registryLabel: "GPT-5.5",
+          thinkingMode: "none",
+          supportedEfforts: ["none", "low", "medium", "high", "xhigh"] as const,
+          defaultEffort: "medium",
+          databricksV2WireRoute: "not-applicable",
+          normalizationPolicy: "openai-standard",
+        };
+  }
   // rule: openai-gpt5-5, provider: databricks_v2, priority: 15
   if (provider === "databricks_v2" && (gpt5TokenMatchesGenerated(lower, "gpt-5.5") || gpt5TokenMatchesGenerated(lower, "gpt5.5") || gpt5TokenMatchesGenerated(lower, "gpt-5-5") || gpt5TokenMatchesGenerated(lower, "gpt5-5"))) {
     return {
@@ -374,6 +407,17 @@ function lookupByFamilyRules(provider: string, normalized: string): CapabilityRe
           normalizationPolicy: "openai-standard",
         };
   }
+  // rule: openai-gpt5-4, provider: databricks, priority: 15
+  if (provider === "databricks" && (gpt5TokenMatchesGenerated(lower, "gpt-5.4") || gpt5TokenMatchesGenerated(lower, "gpt5.4") || gpt5TokenMatchesGenerated(lower, "gpt-5-4") || gpt5TokenMatchesGenerated(lower, "gpt5-4"))) {
+    return {
+          registryLabel: "GPT-5.4",
+          thinkingMode: "none",
+          supportedEfforts: ["none", "low", "medium", "high", "xhigh"] as const,
+          defaultEffort: "medium",
+          databricksV2WireRoute: "not-applicable",
+          normalizationPolicy: "openai-standard",
+        };
+  }
   // rule: openai-gpt5-4, provider: databricks_v2, priority: 15
   if (provider === "databricks_v2" && (gpt5TokenMatchesGenerated(lower, "gpt-5.4") || gpt5TokenMatchesGenerated(lower, "gpt5.4") || gpt5TokenMatchesGenerated(lower, "gpt-5-4") || gpt5TokenMatchesGenerated(lower, "gpt5-4"))) {
     return {
@@ -387,6 +431,17 @@ function lookupByFamilyRules(provider: string, normalized: string): CapabilityRe
   }
   // rule: openai-gpt5-1, provider: openai, priority: 15
   if (provider === "openai" && (gpt5TokenMatchesGenerated(lower, "gpt-5.1") || gpt5TokenMatchesGenerated(lower, "gpt5.1") || gpt5TokenMatchesGenerated(lower, "gpt-5-1") || gpt5TokenMatchesGenerated(lower, "gpt5-1"))) {
+    return {
+          registryLabel: "GPT-5.1",
+          thinkingMode: "none",
+          supportedEfforts: ["none", "low", "medium", "high"] as const,
+          defaultEffort: "none",
+          databricksV2WireRoute: "not-applicable",
+          normalizationPolicy: "openai-standard",
+        };
+  }
+  // rule: openai-gpt5-1, provider: databricks, priority: 15
+  if (provider === "databricks" && (gpt5TokenMatchesGenerated(lower, "gpt-5.1") || gpt5TokenMatchesGenerated(lower, "gpt5.1") || gpt5TokenMatchesGenerated(lower, "gpt-5-1") || gpt5TokenMatchesGenerated(lower, "gpt5-1"))) {
     return {
           registryLabel: "GPT-5.1",
           thinkingMode: "none",
@@ -651,6 +706,17 @@ function lookupByFamilyRules(provider: string, normalized: string): CapabilityRe
   }
   // rule: openai-gpt5-base, provider: openai, priority: 10
   if (provider === "openai" && (gpt5BaseMatchesGenerated(lower, "gpt-5") || gpt5BaseMatchesGenerated(lower, "gpt5"))) {
+    return {
+          registryLabel: "GPT-5",
+          thinkingMode: "none",
+          supportedEfforts: ["minimal", "low", "medium", "high"] as const,
+          defaultEffort: "medium",
+          databricksV2WireRoute: "not-applicable",
+          normalizationPolicy: "openai-standard",
+        };
+  }
+  // rule: openai-gpt5-base, provider: databricks, priority: 10
+  if (provider === "databricks" && (gpt5BaseMatchesGenerated(lower, "gpt-5") || gpt5BaseMatchesGenerated(lower, "gpt5"))) {
     return {
           registryLabel: "GPT-5",
           thinkingMode: "none",

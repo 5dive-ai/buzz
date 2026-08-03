@@ -253,6 +253,19 @@ pub fn lookup_by_family_rules(provider: &str, normalized: &str) -> Option<Capabi
             normalization_policy: NormalizationPolicy::OpenAiStandard,
         });
     }
+    // rule: openai-gpt5-pro, provider: databricks, priority: 20
+    if provider == "databricks"
+        && (gpt5_token_matches_rs(lower, "gpt-5-pro") || gpt5_token_matches_rs(lower, "gpt5-pro"))
+    {
+        return Some(CapabilityResult {
+            registry_label: Some("GPT-5 Pro"),
+            thinking_mode: ThinkingMode::None,
+            supported_efforts: Cow::Borrowed(&[ThinkingEffort::High]),
+            default_effort: Some(ThinkingEffort::High),
+            databricks_v2_wire_route: DatabricksV2Route::NotApplicable,
+            normalization_policy: NormalizationPolicy::OpenAiStandard,
+        });
+    }
     // rule: openai-gpt5-pro, provider: databricks_v2, priority: 20
     if provider == "databricks_v2"
         && (gpt5_token_matches_rs(lower, "gpt-5-pro") || gpt5_token_matches_rs(lower, "gpt5-pro"))
@@ -268,6 +281,29 @@ pub fn lookup_by_family_rules(provider: &str, normalized: &str) -> Option<Capabi
     }
     // rule: openai-gpt5-6, provider: openai, priority: 15
     if provider == "openai"
+        && (gpt5_token_matches_rs(lower, "gpt-5.6")
+            || gpt5_token_matches_rs(lower, "gpt5.6")
+            || gpt5_token_matches_rs(lower, "gpt-5-6")
+            || gpt5_token_matches_rs(lower, "gpt5-6"))
+    {
+        return Some(CapabilityResult {
+            registry_label: Some("GPT-5.6"),
+            thinking_mode: ThinkingMode::None,
+            supported_efforts: Cow::Borrowed(&[
+                ThinkingEffort::None,
+                ThinkingEffort::Low,
+                ThinkingEffort::Medium,
+                ThinkingEffort::High,
+                ThinkingEffort::XHigh,
+                ThinkingEffort::Max,
+            ]),
+            default_effort: Some(ThinkingEffort::Medium),
+            databricks_v2_wire_route: DatabricksV2Route::NotApplicable,
+            normalization_policy: NormalizationPolicy::OpenAiStandard,
+        });
+    }
+    // rule: openai-gpt5-6, provider: databricks, priority: 15
+    if provider == "databricks"
         && (gpt5_token_matches_rs(lower, "gpt-5.6")
             || gpt5_token_matches_rs(lower, "gpt5.6")
             || gpt5_token_matches_rs(lower, "gpt-5-6")
@@ -334,6 +370,28 @@ pub fn lookup_by_family_rules(provider: &str, normalized: &str) -> Option<Capabi
             normalization_policy: NormalizationPolicy::OpenAiStandard,
         });
     }
+    // rule: openai-gpt5-5, provider: databricks, priority: 15
+    if provider == "databricks"
+        && (gpt5_token_matches_rs(lower, "gpt-5.5")
+            || gpt5_token_matches_rs(lower, "gpt5.5")
+            || gpt5_token_matches_rs(lower, "gpt-5-5")
+            || gpt5_token_matches_rs(lower, "gpt5-5"))
+    {
+        return Some(CapabilityResult {
+            registry_label: Some("GPT-5.5"),
+            thinking_mode: ThinkingMode::None,
+            supported_efforts: Cow::Borrowed(&[
+                ThinkingEffort::None,
+                ThinkingEffort::Low,
+                ThinkingEffort::Medium,
+                ThinkingEffort::High,
+                ThinkingEffort::XHigh,
+            ]),
+            default_effort: Some(ThinkingEffort::Medium),
+            databricks_v2_wire_route: DatabricksV2Route::NotApplicable,
+            normalization_policy: NormalizationPolicy::OpenAiStandard,
+        });
+    }
     // rule: openai-gpt5-5, provider: databricks_v2, priority: 15
     if provider == "databricks_v2"
         && (gpt5_token_matches_rs(lower, "gpt-5.5")
@@ -378,6 +436,28 @@ pub fn lookup_by_family_rules(provider: &str, normalized: &str) -> Option<Capabi
             normalization_policy: NormalizationPolicy::OpenAiStandard,
         });
     }
+    // rule: openai-gpt5-4, provider: databricks, priority: 15
+    if provider == "databricks"
+        && (gpt5_token_matches_rs(lower, "gpt-5.4")
+            || gpt5_token_matches_rs(lower, "gpt5.4")
+            || gpt5_token_matches_rs(lower, "gpt-5-4")
+            || gpt5_token_matches_rs(lower, "gpt5-4"))
+    {
+        return Some(CapabilityResult {
+            registry_label: Some("GPT-5.4"),
+            thinking_mode: ThinkingMode::None,
+            supported_efforts: Cow::Borrowed(&[
+                ThinkingEffort::None,
+                ThinkingEffort::Low,
+                ThinkingEffort::Medium,
+                ThinkingEffort::High,
+                ThinkingEffort::XHigh,
+            ]),
+            default_effort: Some(ThinkingEffort::Medium),
+            databricks_v2_wire_route: DatabricksV2Route::NotApplicable,
+            normalization_policy: NormalizationPolicy::OpenAiStandard,
+        });
+    }
     // rule: openai-gpt5-4, provider: databricks_v2, priority: 15
     if provider == "databricks_v2"
         && (gpt5_token_matches_rs(lower, "gpt-5.4")
@@ -402,6 +482,27 @@ pub fn lookup_by_family_rules(provider: &str, normalized: &str) -> Option<Capabi
     }
     // rule: openai-gpt5-1, provider: openai, priority: 15
     if provider == "openai"
+        && (gpt5_token_matches_rs(lower, "gpt-5.1")
+            || gpt5_token_matches_rs(lower, "gpt5.1")
+            || gpt5_token_matches_rs(lower, "gpt-5-1")
+            || gpt5_token_matches_rs(lower, "gpt5-1"))
+    {
+        return Some(CapabilityResult {
+            registry_label: Some("GPT-5.1"),
+            thinking_mode: ThinkingMode::None,
+            supported_efforts: Cow::Borrowed(&[
+                ThinkingEffort::None,
+                ThinkingEffort::Low,
+                ThinkingEffort::Medium,
+                ThinkingEffort::High,
+            ]),
+            default_effort: Some(ThinkingEffort::None),
+            databricks_v2_wire_route: DatabricksV2Route::NotApplicable,
+            normalization_policy: NormalizationPolicy::OpenAiStandard,
+        });
+    }
+    // rule: openai-gpt5-1, provider: databricks, priority: 15
+    if provider == "databricks"
         && (gpt5_token_matches_rs(lower, "gpt-5.1")
             || gpt5_token_matches_rs(lower, "gpt5.1")
             || gpt5_token_matches_rs(lower, "gpt-5-1")
@@ -804,6 +905,24 @@ pub fn lookup_by_family_rules(provider: &str, normalized: &str) -> Option<Capabi
     }
     // rule: openai-gpt5-base, provider: openai, priority: 10
     if provider == "openai"
+        && (gpt5_base_matches_rs(lower, "gpt-5") || gpt5_base_matches_rs(lower, "gpt5"))
+    {
+        return Some(CapabilityResult {
+            registry_label: Some("GPT-5"),
+            thinking_mode: ThinkingMode::None,
+            supported_efforts: Cow::Borrowed(&[
+                ThinkingEffort::Minimal,
+                ThinkingEffort::Low,
+                ThinkingEffort::Medium,
+                ThinkingEffort::High,
+            ]),
+            default_effort: Some(ThinkingEffort::Medium),
+            databricks_v2_wire_route: DatabricksV2Route::NotApplicable,
+            normalization_policy: NormalizationPolicy::OpenAiStandard,
+        });
+    }
+    // rule: openai-gpt5-base, provider: databricks, priority: 10
+    if provider == "databricks"
         && (gpt5_base_matches_rs(lower, "gpt-5") || gpt5_base_matches_rs(lower, "gpt5"))
     {
         return Some(CapabilityResult {

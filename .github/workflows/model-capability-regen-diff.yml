@@ -9,6 +9,14 @@ on:
       - 'desktop/src/features/agents/ui/modelCapabilities.ts'
       - 'scripts/generated-model-capabilities-coverage.json'
       - '.github/workflows/model-capability-regen-diff.yml'
+      # Differential harness and fixtures — any change to old/new side or inputs re-runs.
+      - 'scripts/run-differential.mjs'
+      - 'scripts/normative-corpus.json'
+      - 'scripts/catalog-sample-fixture.json'
+      - 'desktop/src/features/agents/ui/effortTable.fixture.json'
+      - 'desktop/src/features/agents/ui/buzzAgentConfig.ts'
+      - 'crates/buzz-agent/src/config.rs'
+      - 'crates/buzz-agent/src/llm.rs'
   push:
     branches: [main, release, 'duncan/databricks-model-label-registry']
 
@@ -51,3 +59,19 @@ jobs:
 
       - name: Validate manifest (schema-negative tests)
         run: node --test scripts/test-manifest-validator.mjs
+
+      - name: Run differential harness (old vs new, all input sets)
+        run: node --experimental-strip-types scripts/run-differential.mjs
+
+  rust-unit-tests:
+    name: buzz-agent unit tests (normative corpus + behavioral differential)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Run buzz-agent unit tests
+        run: cargo test -p buzz-agent --lib

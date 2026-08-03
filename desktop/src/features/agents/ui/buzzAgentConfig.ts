@@ -1,9 +1,13 @@
 /**
  * Source-of-truth constants for buzz-agent model-tuning configuration knobs.
  *
- * Values must stay in sync with `crates/buzz-agent/src/config.rs`
- * `parse_thinking_effort` — that function is the authoritative list.
+ * Phase 2b pass 2: getProviderEffortConfig() is now generated-backed (thin
+ * wrapper over resolveModelCapabilities()). The legacy hand-table implementation
+ * is preserved as getProviderEffortConfig_oldHandTable() for the differential
+ * harness only — nothing user-facing imports the _old shim. Phase 3 retires it.
  */
+import { canonicalizeProvider } from "../lib/formatAgentModelLabel.ts";
+import { resolveModelCapabilities } from "./modelCapabilities.ts";
 
 /** Env var key for the thinking/effort level sent to the LLM. */
 export const BUZZ_AGENT_THINKING_EFFORT = "BUZZ_AGENT_THINKING_EFFORT";
@@ -61,23 +65,41 @@ const ALL_VALUES = BUZZ_AGENT_THINKING_EFFORT_VALUES;
 
 /**
  * Returns the valid thinking-effort values and semantic default for the
- * given provider and optional model string.
+ * given provider and optional model string, resolved from the generated
+ * model-capabilities manifest (modelCapabilities.ts).
  *
- * Model matching mirrors the Rust backend:
- * - Anthropic: strip any endpoint-naming prefix, then test `is_manual_budget_model`
- *   / `is_adaptive_thinking_model` / `clamp_adaptive_effort` family checks.
- * - OpenAI: strip any endpoint-naming prefix, then test `openai_efforts_for_model`
- *   family checks (boundary-aware: -pro before -5.x, digit/letter boundary).
- * - DatabricksV2: strip prefix and route by model family.
- * - Unknown/empty: all 7 values, default medium.
+ * This is the production entry point for all UI consumers. Resolution order:
+ *   1. Provider-qualified raw exact lookup
+ *   2. Provider-scoped family rules on normalized alias
+ *   3. Per-provider fallback
  *
- * Prefix stripping: finds the first occurrence of a known model-family token
- * (`claude-`, `gpt-`) and drops everything before it. This handles any
- * endpoint-naming convention (e.g. `databricks-`, `goose-`, `team-x-`) without
- * maintaining an allowlist of known prefixes. If no family token is found, the
- * raw model name is used as-is.
+ * The manifest's `supportedEfforts` maps to `validValues`; `defaultEffort`
+ * (which may be null for manual-budget models — "Inherit" is the natural
+ * default) maps to `defaultValue`.
  */
 export function getProviderEffortConfig(
+  providerId: string,
+  model?: string,
+): ProviderEffortConfig {
+  const cap = resolveModelCapabilities(
+    canonicalizeProvider(providerId),
+    model ?? "",
+  );
+  return {
+    validValues: cap.supportedEfforts,
+    defaultValue: cap.defaultEffort,
+  };
+}
+
+/**
+ * Legacy hand-table implementation — differential harness shim only.
+ *
+ * Preserved for the run-differential.mjs old-vs-new comparison until Phase 3
+ * retires it. Nothing user-facing should import this name.
+ *
+ * @deprecated Use getProviderEffortConfig() (generated-backed) instead.
+ */
+export function getProviderEffortConfig_oldHandTable(
   providerId: string,
   model?: string,
 ): ProviderEffortConfig {
@@ -307,3 +329,7 @@ function openaiConfig(m: string): ProviderEffortConfig {
 export function isBuzzAgentRuntime(runtimeId: string): boolean {
   return runtimeId === "buzz-agent";
 }
+
+// ---------------------------------------------------------------------------
+// Differential harness support
+// ---------------------------------------------------------------------------

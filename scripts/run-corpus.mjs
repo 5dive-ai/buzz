@@ -30,6 +30,19 @@ const corpus = JSON.parse(
   readFileSync(join(repoRoot, "scripts", "normative-corpus.json"), "utf8"),
 );
 
+// ----- Provider alias canonicalization -----
+// Mirrors production canonicalizeProvider() in desktop/src/features/agents/lib/formatAgentModelLabel.ts.
+// Applied before every generated lookup so alias vectors (e.g. "openai-compat") pass both interpreters.
+const PROVIDER_ALIASES = {
+  "databricks-v2": "databricks_v2",
+  "openai-compat": "openai",
+};
+
+function canonicalizeProvider(provider) {
+  const normalized = (provider ?? "").trim().toLowerCase();
+  return PROVIDER_ALIASES[normalized] ?? normalized;
+}
+
 // ----- Run corpus -----
 
 let passed = 0;
@@ -41,7 +54,7 @@ for (const entry of corpus) {
   if (!entry.expect) continue;
 
   // resolveModelCapabilities returns camelCase keys (registryLabel, thinkingMode, etc.)
-  const result = resolveModelCapabilities(entry.provider, entry.raw_model_id);
+  const result = resolveModelCapabilities(canonicalizeProvider(entry.provider), entry.raw_model_id);
   const expect = entry.expect;
 
   const failures = [];

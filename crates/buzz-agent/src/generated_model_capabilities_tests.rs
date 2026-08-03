@@ -135,7 +135,16 @@ mod shared_corpus_tests {
                 .as_ref()
                 .unwrap_or_else(|| panic!("corpus vector {id} missing expect"));
 
-            let result = resolve_model_capabilities(provider, raw_model_id);
+            // Canonicalize provider aliases before resolving — mirrors the
+            // production path where Rust normalizes "openai-compat" → Provider::OpenAi
+            // (config.rs) and the TS canonicalizeProvider() resolves "databricks-v2"
+            // → "databricks_v2" before generated lookups.
+            let canonical_provider = match provider {
+                "openai-compat" => "openai",
+                "databricks-v2" => "databricks_v2",
+                other => other,
+            };
+            let result = resolve_model_capabilities(canonical_provider, raw_model_id);
             ran += 1;
 
             // Check thinking_mode if present in expect

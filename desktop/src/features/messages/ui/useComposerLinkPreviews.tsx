@@ -1,8 +1,12 @@
 import * as React from "react";
 
-import { uploadMediaBytes } from "@/shared/api/tauri";
+import { getRelayHttpUrl, uploadMediaBytes } from "@/shared/api/tauri";
 import { extractSupportedLinkPreviews } from "@/shared/lib/linkPreview";
 import { buildLinkPreviewSnapshotTag } from "@/shared/lib/linkPreviewSnapshot";
+import {
+  beginRelayOriginFetch,
+  getCachedRelayOrigin,
+} from "@/shared/lib/mediaUrl";
 import { useResolvedLinkPreviews } from "@/shared/lib/useResolvedLinkPreviews";
 import { LinkPreviewList } from "@/shared/ui/link-preview-list";
 import { LinkPreviewImageLightbox } from "@/shared/ui/markdown";
@@ -39,6 +43,16 @@ export function useComposerLinkPreviews(content: string) {
   );
   const readyTagsRef = React.useRef<string[][]>([]);
   const uploadsRef = React.useRef(new Set<string>());
+  const activeHrefsRef = React.useRef(new Set<string>());
+  activeHrefsRef.current = new Set(candidates.map((preview) => preview.href));
+
+  React.useEffect(() => {
+    if (getCachedRelayOrigin()) return;
+    const publishRelayOrigin = beginRelayOriginFetch();
+    void getRelayHttpUrl()
+      .then((url) => publishRelayOrigin(url))
+      .catch(() => publishRelayOrigin(null));
+  }, []);
 
   React.useEffect(() => {
     const active = new Set(candidates.map((preview) => preview.href));
@@ -50,7 +64,6 @@ export function useComposerLinkPreviews(content: string) {
   }, [candidates]);
 
   React.useEffect(() => {
-    let cancelled = false;
     for (const preview of previews) {
       if (
         !preview.snapshotReady ||
@@ -64,7 +77,7 @@ export function useComposerLinkPreviews(content: string) {
         uploadDataUrl(preview.faviconDataUrl, "link-preview-favicon.png"),
       ])
         .then(([image, favicon]) => {
-          if (cancelled) return;
+          if (!activeHrefsRef.current.has(preview.href)) return;
           const tag = buildLinkPreviewSnapshotTag({
             canonicalUrl: preview.href,
             title: preview.title,
@@ -80,16 +93,17 @@ export function useComposerLinkPreviews(content: string) {
         .catch(() => {})
         .finally(() => uploadsRef.current.delete(preview.href));
     }
-    return () => {
-      cancelled = true;
-    };
   }, [previews, readyTags]);
 
   readyTagsRef.current = candidates.flatMap((candidate) =>
     readyTags[candidate.href] ? [readyTags[candidate.href]] : [],
   );
   const previewList = previews.length ? (
-    <div className="message-markdown mb-2" data-composer-link-previews="">
+    <div
+      className="message-markdown mb-2"
+      data-composer-link-previews=""
+      data-ready-snapshot-count={readyTagsRef.current.length}
+    >
       <LinkPreviewList
         ImageLightbox={LinkPreviewImageLightbox}
         previews={previews}

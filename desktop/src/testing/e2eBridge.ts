@@ -8869,12 +8869,30 @@ async function resolveMockUploadDescriptorForBytes(
     value.toString(16).padStart(2, "0"),
   ).join("");
   const filename = args.filename ?? "upload.bin";
-  const isAgentJson = filename.toLowerCase().endsWith(".agent.json");
+  const normalizedFilename = filename.toLowerCase();
+  const isAgentJson = normalizedFilename.endsWith(".agent.json");
+  const extension = isAgentJson
+    ? "json"
+    : normalizedFilename.endsWith(".png")
+      ? "png"
+      : normalizedFilename.endsWith(".jpg") ||
+          normalizedFilename.endsWith(".jpeg")
+        ? "jpg"
+        : normalizedFilename.endsWith(".gif")
+          ? "gif"
+          : normalizedFilename.endsWith(".webp")
+            ? "webp"
+            : "bin";
+  const type = isAgentJson
+    ? "application/json"
+    : extension === "bin"
+      ? "application/octet-stream"
+      : `image/${extension === "jpg" ? "jpeg" : extension}`;
   return {
-    url: `https://mock.relay/media/${sha256}${isAgentJson ? ".json" : ".bin"}`,
+    url: `${getRelayHttpUrl(config)}/media/${sha256}.${extension}`,
     sha256,
     size: bytes.length,
-    type: isAgentJson ? "application/json" : "application/octet-stream",
+    type,
     uploaded: Math.floor(Date.now() / 1000),
     filename,
   };
@@ -8889,6 +8907,7 @@ async function handleSendChannelMessage(
     mentionPubkeys?: string[];
     mediaTags?: string[][] | null;
     emojiTags?: string[][] | null;
+    linkPreviewTags?: string[][] | null;
     suppressLinkPreviews?: boolean;
   },
   config: E2eConfig | undefined,
@@ -8909,10 +8928,15 @@ async function handleSendChannelMessage(
   // relay echoes them back on the stored event too, so mirror that here so the
   // emoji renderer keeps resolving `:shortcode:` after the round-trip.
   const emojiTags = args.emojiTags ?? [];
+  // Sender-authored link preview snapshots are independently validated by the
+  // real command and echoed on the stored event. Preserve them in the mock so
+  // E2E recipient rendering exercises the same authored-snapshot path.
+  const linkPreviewTags = args.linkPreviewTags ?? [];
   // Both kinds end up on the stored event's tag set, just like the real relay.
   const extraTags = [
     ...mediaTags,
     ...emojiTags,
+    ...linkPreviewTags,
     ...(args.suppressLinkPreviews ? [["link-preview", "none"]] : []),
   ];
   const identity = getIdentity(config);

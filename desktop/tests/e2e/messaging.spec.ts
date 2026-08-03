@@ -5,6 +5,16 @@ import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 import { expectCornerRadiusPx, expectSmoothCorners } from "../helpers/css";
 import { openSettings } from "../helpers/settings";
 
+async function waitForReadyComposerSnapshots(
+  page: import("@playwright/test").Page,
+  count = 1,
+) {
+  await expect(page.locator("[data-composer-link-previews]")).toHaveAttribute(
+    "data-ready-snapshot-count",
+    String(count),
+  );
+}
+
 async function expectThreadReplyUnobscured(row: Locator) {
   await expect
     .poll(async () =>
@@ -139,7 +149,7 @@ test.beforeEach(async ({ page }, testInfo) => {
                   siteName: "GitHub",
                   description: "The image request completed.",
                   imageDataUrl:
-                    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1200' height='630'%3E%3Crect width='1200' height='630' fill='%237c3aed'/%3E%3C/svg%3E",
+                    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
                   imageDomain: "opengraph.githubassets.com",
                   imageFetchState: "image",
                   imageRetryAfterMs: null,
@@ -161,9 +171,9 @@ test.beforeEach(async ({ page }, testInfo) => {
                   title: "Invalid decoded preview image",
                   siteName: "GitHub",
                   description: "The browser should replace this image.",
-                  imageDataUrl: "data:image/png;base64,not-a-valid-image",
-                  imageDomain: "opengraph.githubassets.com",
-                  imageFetchState: "image",
+                  imageDataUrl: null,
+                  imageDomain: null,
+                  imageFetchState: "rejected",
                   imageRetryAfterMs: null,
                 },
               }
@@ -175,7 +185,7 @@ test.beforeEach(async ({ page }, testInfo) => {
                     siteName: "GitHub",
                     description: "A polished, stable preview for shared links.",
                     imageDataUrl:
-                      "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1600' height='120'%3E%3Crect width='1600' height='120' fill='%237c3aed'/%3E%3Ccircle cx='92' cy='60' r='48' fill='%23fff' fill-opacity='.9'/%3E%3C/svg%3E",
+                      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
                     imageDomain: "opengraph.githubassets.com",
                     faviconDataUrl:
                       "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -196,7 +206,23 @@ test.beforeEach(async ({ page }, testInfo) => {
                     },
                     linkPreviewMetadataDelayMs: 2_000,
                   }
-                : undefined;
+                : testInfo.title.includes("link preview") ||
+                    testInfo.title.includes("supported Compact")
+                  ? {
+                      linkPreviewMetadata: {
+                        title: "Buzz pull request",
+                        siteName: "GitHub",
+                        description: "A sender-authored preview snapshot.",
+                        imageDataUrl: null,
+                        imageDomain: null,
+                      },
+                      linkPreviewMetadataDelayMs:
+                        testInfo.title.includes("style defaults") ||
+                        testInfo.title.includes("send does not wait")
+                          ? 1_500
+                          : undefined,
+                    }
+                  : undefined;
   await installMockBridge(page, mock);
 });
 
@@ -346,6 +372,26 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await page.getByTestId("message-input").fill(previewUrl);
+  const composerPreview = page
+    .locator("[data-composer-link-previews]")
+    .locator('[data-link-preview="github-pull-request"]');
+  await expect(composerPreview).toHaveAttribute("data-image-state", "pending");
+  if (process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR) {
+    await waitForAnimations(page);
+    await page.screenshot({
+      animations: "disabled",
+      path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/compact-composer-loading.png`,
+    });
+  }
+  await waitForReadyComposerSnapshots(page);
+  await expect(composerPreview).toHaveAttribute("data-image-state", "none");
+  if (process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR) {
+    await waitForAnimations(page);
+    await page.screenshot({
+      animations: "disabled",
+      path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/compact-composer-ready.png`,
+    });
+  }
   await page.getByTestId("send-message").click();
 
   const row = page.getByTestId("message-row").last();
@@ -354,6 +400,13 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   );
   await expect(compactPreview).toHaveCSS("border-top-left-radius", "0px");
   await expect(compactPreview).toHaveCSS("border-left-width", "3px");
+  if (process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR) {
+    await waitForAnimations(page);
+    await page.screenshot({
+      animations: "disabled",
+      path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/recipient-compact.png`,
+    });
+  }
 
   await openSettings(page, "appearance");
   await expect(page.getByTestId("link-preview-style-trigger")).toHaveText(
@@ -380,10 +433,75 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   const richHostname = richPreview.locator("[data-link-preview-hostname]");
   await expect(richHostname).toHaveText("github.com");
   await expect(richHostname).toHaveAttribute("href", previewUrl);
+  if (process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR) {
+    await waitForAnimations(page);
+    await page.screenshot({
+      animations: "disabled",
+      path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/recipient-rich.png`,
+    });
+    const richComposerUrl = `${previewUrl}&composer=rich`;
+    await page.getByTestId("message-input").fill(richComposerUrl);
+    const richComposerPreview = page
+      .locator("[data-composer-link-previews]")
+      .locator('[data-link-preview="github-pull-request"]');
+    await expect(richComposerPreview).toHaveAttribute(
+      "data-image-state",
+      "pending",
+    );
+    await waitForAnimations(page);
+    await page.screenshot({
+      animations: "disabled",
+      path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/rich-composer-loading.png`,
+    });
+    await waitForReadyComposerSnapshots(page);
+    await expect(richComposerPreview).toHaveAttribute(
+      "data-image-state",
+      "none",
+    );
+    await waitForAnimations(page);
+    await page.screenshot({
+      animations: "disabled",
+      path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/rich-composer-ready.png`,
+    });
+    await page.getByTestId("message-input").fill("");
+  }
 
   await openSettings(page, "appearance");
   await page.getByTestId("link-preview-style-trigger").click();
   await page.getByTestId("link-preview-style-compact").click();
+});
+
+test("send does not wait for a pending link preview snapshot", async ({
+  page,
+}) => {
+  const previewUrl = "https://github.com/block/buzz/pull/3246?send=pending";
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page.getByTestId("message-input").fill(previewUrl);
+
+  const composerPreviews = page.locator("[data-composer-link-previews]");
+  await expect(composerPreviews).toHaveAttribute(
+    "data-ready-snapshot-count",
+    "0",
+  );
+  await expect(
+    composerPreviews.locator('[data-link-preview="github-pull-request"]'),
+  ).toHaveAttribute("data-image-state", "pending");
+
+  await page.getByTestId("send-message").click();
+  const row = page.getByTestId("message-row").last();
+  await expect(row).toContainText(previewUrl);
+  await expect(row.locator("[data-link-preview]")).toHaveCount(0);
+
+  const linkPreviewTags = await page.evaluate(() => {
+    const call = [...(window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [])]
+      .reverse()
+      .find((entry) => entry.command === "send_channel_message");
+    return (
+      call?.payload as { linkPreviewTags?: string[][] | null } | undefined
+    )?.linkPreviewTags;
+  });
+  expect(linkPreviewTags ?? []).toEqual([]);
 });
 
 test("link preview image geometry stays stable while loading", async ({
@@ -399,11 +517,8 @@ test("link preview image geometry stays stable while loading", async ({
     await page
       .getByTestId("message-input")
       .fill(`${previewUrl}?viewport=${width}`);
-    await page.getByTestId("send-message").click();
-
     const card = page
-      .getByTestId("message-row")
-      .last()
+      .locator("[data-composer-link-previews]")
       .locator('[data-link-preview="github-pull-request"]');
     await expect(card).toHaveAttribute("data-image-state", "pending");
     await expect(card).toBeVisible();
@@ -466,7 +581,7 @@ test("link preview image geometry stays stable while loading", async ({
         ?.getBoundingClientRect().width,
     }));
 
-    expect(pending.width).toBe(width < 640 ? 325 : 384);
+    expect(pending.width).toBe(width < 640 ? 345 : 384);
     expect(pending.height).toBe(84);
     expect(pending.textInset).toBe(8);
     expect(pending.thumbnailHeight).toBe(84);
@@ -493,11 +608,8 @@ test("link preview no-image layout keeps compact height", async ({ page }) => {
     await page
       .getByTestId("message-input")
       .fill(`${previewUrl}&viewport=${width}`);
-    await page.getByTestId("send-message").click();
-
     const card = page
-      .getByTestId("message-row")
-      .last()
+      .locator("[data-composer-link-previews]")
       .locator('[data-link-preview="github-pull-request"]');
     await expect(card).toHaveAttribute("data-image-state", "pending");
     await expect(card).toBeVisible();
@@ -555,6 +667,7 @@ test("mixed link preview image outcomes keep Compact and Rich fallbacks stable",
   await page
     .getByTestId("message-input")
     .fill(`${loadedUrl}\n${rateLimitedUrl}`);
+  await waitForReadyComposerSnapshots(page, 2);
   await page.getByTestId("send-message").click();
 
   const row = page.getByTestId("message-row").last();
@@ -565,13 +678,10 @@ test("mixed link preview image outcomes keep Compact and Rich fallbacks stable",
     "image",
   );
   await expect(compactCards.nth(0).locator("img")).toBeVisible();
-  await expect(compactCards.nth(1)).toHaveAttribute(
-    "data-image-state",
-    "fallback",
-  );
+  await expect(compactCards.nth(1)).toHaveAttribute("data-image-state", "none");
   await expect(
     compactCards.nth(1).locator("[data-link-preview-image-fallback]"),
-  ).toBeVisible();
+  ).toHaveCount(0);
 
   await openSettings(page, "appearance");
   await page.getByTestId("link-preview-style-trigger").click();
@@ -584,7 +694,7 @@ test("mixed link preview image outcomes keep Compact and Rich fallbacks stable",
   await expect(richCards).toHaveCount(2);
   await expect(
     richCards.nth(1).locator("[data-link-preview-image-fallback]"),
-  ).toBeVisible();
+  ).toHaveCount(0);
 });
 
 test("link preview browser image errors render a fallback", async ({
@@ -595,13 +705,15 @@ test("link preview browser image errors render a fallback", async ({
   await page
     .getByTestId("message-input")
     .fill("https://github.com/block/buzz/pull/4003");
+  await waitForReadyComposerSnapshots(page);
   await page.getByTestId("send-message").click();
 
   const row = page.getByTestId("message-row").last();
   const compactCard = row.locator('[data-link-preview="github-pull-request"]');
+  await expect(compactCard).toHaveAttribute("data-image-state", "none");
   await expect(
     compactCard.locator("[data-link-preview-image-fallback]"),
-  ).toBeVisible();
+  ).toHaveCount(0);
 
   await openSettings(page, "appearance");
   await page.getByTestId("link-preview-style-trigger").click();
@@ -613,7 +725,7 @@ test("link preview browser image errors render a fallback", async ({
   );
   await expect(
     richCard.locator("[data-link-preview-image-fallback]"),
-  ).toBeVisible();
+  ).toHaveCount(0);
 });
 
 test("supported Compact link previews keep the message link visible with square outer corners", async ({
@@ -626,6 +738,7 @@ test("supported Compact link previews keep the message link visible with square 
   await expect(page.getByTestId("chat-title")).toHaveText("general");
 
   await page.getByTestId("message-input").fill(previewUrl);
+  await waitForReadyComposerSnapshots(page);
   await page.getByTestId("send-message").click();
 
   const row = page.getByTestId("message-row").last();

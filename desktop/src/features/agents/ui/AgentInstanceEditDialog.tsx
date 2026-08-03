@@ -23,7 +23,10 @@ import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
-import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
+import {
+  setManagedAgentAutoRestart,
+  setManagedAgentResumeOnRestart,
+} from "@/shared/api/tauriManagedAgents";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
   AUTO_PROVIDER_DROPDOWN_VALUE,
@@ -147,6 +150,9 @@ export function AgentInstanceEditDialog({
   const [envVars, setEnvVars] = React.useState<EnvVarsValue>(agent.envVars);
   const [autoRestartOnConfigChange, setAutoRestartOnConfigChange] =
     React.useState(agent.autoRestartOnConfigChange);
+  const [resumeOnRestart, setResumeOnRestart] = React.useState(
+    agent.resumeOnRestart,
+  );
   const personasQuery = usePersonasQuery();
   const linkedPersona = React.useMemo(
     () =>
@@ -196,6 +202,7 @@ export function AgentInstanceEditDialog({
       setIsCustomProviderEditing(false);
       setEnvVars(agent.envVars);
       setAutoRestartOnConfigChange(agent.autoRestartOnConfigChange);
+      setResumeOnRestart(agent.resumeOnRestart);
       setRespondTo(agent.respondTo);
       setRespondToAllowlist(agent.respondToAllowlist);
       setAvatarUrl(agent.avatarUrl ?? "");
@@ -270,15 +277,14 @@ export function AgentInstanceEditDialog({
   }, [runtimes, originalAgentCommand]);
 
   // The runtime id that will actually be active after submit. When inheriting,
-  // resolve from the LINKED PERSONA's runtime — that is what will run once the
-  // override is cleared. Deriving from agent.agentCommand here is wrong for a
-  // pinned agent that just toggled "Inherit runtime from template": the override
-  // (e.g. a Claude pin) is still present on the record, so it would resolve to
-  // the old pin instead of the persona's runtime, hiding required credentials.
-  // Fall back to the agent.agentCommand dual-match (command path, then id) only
-  // when there is no linked persona or its runtime is unset. This single
-  // prospective id feeds BOTH the block-save gate (requiredEnvKeys) and the
-  // submit path so they never disagree on which runtime is being saved.
+  // resolve from the LINKED PERSONA's runtime — that is what runs once the
+  // override is cleared. Deriving from agent.agentCommand is wrong for a pinned
+  // agent that just toggled "Inherit runtime from template": the override (e.g.
+  // a Claude pin) still sits on the record, so it would resolve to the old pin
+  // and hide required credentials. Fall back to the agent.agentCommand
+  // dual-match (command path, then id) only when there is no linked persona or
+  // its runtime is unset. This single id feeds BOTH the block-save gate
+  // (requiredEnvKeys) and the submit path, so they never disagree.
   const prospectiveRuntimeId = React.useMemo(() => {
     if (!inheritHarness) {
       return selectedRuntime?.id ?? selectedRuntimeId;
@@ -381,10 +387,9 @@ export function AgentInstanceEditDialog({
 
   // Runtime/provider-required credential state, derived from the PROSPECTIVE
   // post-submit runtime — see the hook for the inherit-transition rationale.
-  // Pass globalProvider so the hook uses it as a fallback when the per-agent
-  // provider is empty (global-provider-only configs must surface required keys).
-  // Pass globalEnvVars so keys satisfied by global config are excluded from
-  // requiredEnvKeys and do not block Save (display and gate agree).
+  // globalProvider is the fallback when the per-agent provider is empty, so
+  // global-provider-only configs still surface their required keys; keys
+  // satisfied by globalEnvVars are excluded so display and the Save gate agree.
   const { requiredEnvKeys, fileSatisfiedEnvKeys, requiredEnvKeyMissing } =
     useRequiredCredentialState({
       open,
@@ -399,11 +404,10 @@ export function AgentInstanceEditDialog({
   const { data: bakedEnvKeys } = useBakedBuildEnvKeysQuery({ enabled: open });
 
   // Merge global env as the base layer so credential keys satisfied via global
-  // config (e.g. ANTHROPIC_API_KEY) are available to model discovery. Use
-  // `inheritedSubmission.envVars` (the same snapshot the credential gate
-  // validates) rather than raw `envVars`, so an inherit-transition that layers
-  // in persona env vars is reflected in discovery. Agent-local env takes
-  // precedence, matching the agent → global → file spawn-path precedence.
+  // config (e.g. ANTHROPIC_API_KEY) reach model discovery. The source is
+  // `inheritedSubmission.envVars` (the snapshot the credential gate validates)
+  // rather than raw `envVars`, so an inherit-transition's persona env vars are
+  // reflected too. Agent-local env wins, matching agent → global → file.
   const envVarsForDiscovery = React.useMemo(
     () => ({ ...globalConfig.env_vars, ...inheritedSubmission.envVars }),
     [globalConfig.env_vars, inheritedSubmission.envVars],
@@ -426,10 +430,9 @@ export function AgentInstanceEditDialog({
     selectedRuntime,
   });
 
-  // D2: derive advancedRequiredEnvKeys for EnvVarsEditor display.
-  // The full requiredEnvKeys/requiredEnvKeyMissing continue driving Save gating.
-  // D2/D3: the top-level API key owns display, while the readiness gate keeps
-  // the complete required-key list. The effective snapshot covers persona
+  // advancedRequiredEnvKeys drives EnvVarsEditor display only; the full
+  // requiredEnvKeys/requiredEnvKeyMissing keep driving Save gating. The
+  // top-level API key owns display, and the effective snapshot covers persona
   // inheritance during an instance inherit transition.
   const providerApiKeyEnvVar = getProviderApiKeyEnvVar(effectiveProvider);
   const personaSatisfied =
@@ -515,15 +518,13 @@ export function AgentInstanceEditDialog({
     const isCustomCommand = resolvedRuntimeId === "custom";
 
     // Only pin the harness when the selection can actually supply a command:
-    //   - "Custom command": the Advanced command input becomes editable, so the
-    //     user provides the command.
-    //   - a catalog entry with a concrete command: we set it below.
-    // A catalog entry with command:null (availability adapter_missing /
-    // not_installed) can't produce a runnable command — clearing inheritance
-    // there would omit agentCommand on Save (command unchanged) while the
-    // provider/model logic treats the new runtime as effective, so an inherited
-    // Claude agent could persist a Databricks provider while still running
-    // Claude. Keep inheriting in that case.
+    // "Custom command" makes the Advanced command input editable, and a catalog
+    // entry with a concrete command is set below. A catalog entry with
+    // command:null (availability adapter_missing / not_installed) can't produce
+    // a runnable command — clearing inheritance there would omit agentCommand
+    // on Save (command unchanged) while the provider/model logic treats the new
+    // runtime as effective, so an inherited Claude agent could persist a
+    // Databricks provider while still running Claude. Keep inheriting then.
     if (isCustomCommand || nextRuntime?.command) {
       setInheritHarness(false);
     }
@@ -641,12 +642,12 @@ export function AgentInstanceEditDialog({
 
       // Classify the effective post-submit runtime's provider capability as a
       // tri-state: "capable" persists the provider, "locked" clears it (only
-      // when we KNOW it's provider-locked, e.g. Claude), "unknown" OMITS it so a
-      // transient/custom state never becomes a destructive write. Resolved
-      // STATICALLY (by id) so a not-yet-loaded catalog can't misclassify a known
-      // runtime as "unknown" — see resolveRuntimeProviderCapability. The runtime
-      // id is the shared prospectiveRuntimeId, so submit and the block-save gate
-      // always agree on which runtime is being saved.
+      // when we KNOW it's provider-locked, e.g. Claude), "unknown" OMITS it so
+      // a transient/custom state never becomes a destructive write. Resolved
+      // STATICALLY (by id) so a not-yet-loaded catalog can't misclassify a
+      // known runtime as "unknown" — see resolveRuntimeProviderCapability. The
+      // shared prospectiveRuntimeId keeps submit and the block-save gate in
+      // agreement on which runtime is being saved.
       const providerRuntimeCapability = resolveRuntimeProviderCapability(
         prospectiveRuntimeId,
         runtimeSupportsLlmProviderSelection(prospectiveRuntimeId),
@@ -715,12 +716,11 @@ export function AgentInstanceEditDialog({
           ? undefined
           : submitEnvVars,
         respondTo: respondTo !== agent.respondTo ? respondTo : undefined,
-        // The allowlist is preserved across mode toggles in local UI state
-        // (so a user can flip away from allowlist and back without losing
-        // their entries), but we only send it on the wire when (a) it
-        // actually changed, AND (b) the saved mode will need it. Sending
-        // an allowlist while switching to a non-allowlist mode would be
-        // harmless server-side, but it's noise in the persisted record.
+        // The allowlist is preserved across mode toggles in local UI state (so
+        // a user can flip away from allowlist and back without losing entries),
+        // but it only goes on the wire when it actually changed AND the saved
+        // mode needs it. Sending it while switching to a non-allowlist mode is
+        // harmless server-side but noise in the persisted record.
         respondToAllowlist:
           respondTo === "allowlist" &&
           respondToAllowlist.join(",") !== agent.respondToAllowlist.join(",")
@@ -737,13 +737,16 @@ export function AgentInstanceEditDialog({
           autoRestartOnConfigChange,
         );
       }
+      if (resumeOnRestart !== agent.resumeOnRestart) {
+        await setManagedAgentResumeOnRestart(agent.pubkey, resumeOnRestart);
+      }
       showAgentProfileSyncWarning(result.agent.name, result.profileSyncError);
       handleOpenChange(false);
       onUpdated?.(result.agent);
       // The auto-restart policy deliberately never fires for a stopped or
-      // failing agent (a broken agent must not auto-loop), so an edit meant
-      // to FIX one silently waits for a manual start. Offer that start
-      // explicitly instead of relying on the user to know the policy.
+      // failing agent (a broken agent must not auto-loop), so an edit meant to
+      // FIX one silently waits for a manual start. Offer that start explicitly
+      // instead of relying on the user to know the policy.
       if (!isManagedAgentActive(result.agent)) {
         const startedName = result.agent.name;
         toast(`${startedName} saved while stopped.`, {
@@ -910,7 +913,6 @@ export function AgentInstanceEditDialog({
             )}
           </div>
           <div className="space-y-5">
-            {/* Agent name */}
             <div className="space-y-1.5">
               <label
                 className="text-sm font-medium text-foreground"
@@ -1010,7 +1012,6 @@ export function AgentInstanceEditDialog({
                 </div>
               </div>
             ) : null}
-            {/* LLM provider */}
             {llmProviderFieldVisible ? (
               <div className="space-y-1.5">
                 <label
@@ -1079,7 +1080,6 @@ export function AgentInstanceEditDialog({
               />
             ) : null}
 
-            {/* Model */}
             <div className="space-y-1.5">
               <label
                 className="text-sm font-medium text-foreground"
@@ -1146,7 +1146,6 @@ export function AgentInstanceEditDialog({
               returnFocusRef={aiDefaultsTriggerRef}
             />
 
-            {/* Advanced settings */}
             <div className="space-y-3">
               <button
                 aria-expanded={showAdvancedFields}
@@ -1200,6 +1199,7 @@ export function AgentInstanceEditDialog({
                       parallelism={parallelism}
                       provider={effectiveProvider}
                       requiredEnvKeys={advancedRequiredEnvKeys}
+                      resumeOnRestart={resumeOnRestart}
                       systemPrompt={systemPrompt}
                       onAcpCommandChange={setAcpCommand}
                       onAgentArgsChange={setAgentArgs}
@@ -1207,6 +1207,7 @@ export function AgentInstanceEditDialog({
                       onEnvVarsChange={setEnvVars}
                       onInheritHarnessChange={setInheritHarness}
                       onParallelismChange={setParallelism}
+                      onResumeOnRestartChange={setResumeOnRestart}
                       onSystemPromptChange={setSystemPrompt}
                     />
                   </motion.div>
@@ -1214,7 +1215,6 @@ export function AgentInstanceEditDialog({
               </AnimatePresence>
             </div>
 
-            {/* Error */}
             {updateMutation.error instanceof Error ? (
               <p className="text-sm text-destructive">
                 {updateMutation.error.message}

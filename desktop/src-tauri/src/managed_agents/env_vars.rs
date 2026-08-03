@@ -81,6 +81,12 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // desktop/provider-owned bounds while the saved record still promises them.
     "BUZZ_ACP_EXIT_AFTER_INACTIVITY",
     "BUZZ_ACP_NO_PRESENCE",
+    // Resume toggle: overriding would make the running agent's resume
+    // behavior diverge from the saved/UI-visible setting. Unlike
+    // BUZZ_ACP_IDLE_TIMEOUT (a tuning knob with no UI promise), this key
+    // carries an explicit UI toggle promise — the running agent must
+    // always match what the UI shows.
+    "BUZZ_ACP_RESUME_ON_RESTART",
     // Readiness handoff: desktop is the ONLY readiness source. A saved or
     // ambient env var must not be able to forge setup mode (NotReady) on a
     // Ready agent or suppress it (empty/stale payload) on a NotReady one.
@@ -309,6 +315,22 @@ pub(crate) fn live_persona_env(
         .and_then(|pid| personas.iter().find(|p| p.id == pid))
         .map(|p| p.env_vars.clone())
         .unwrap_or_default()
+}
+
+/// Emit `BUZZ_ACP_RESUME_ON_RESTART` onto a child `Command`, making the UI
+/// toggle authoritative in both directions.
+///
+/// Two-step: first `env_remove` clears any ambient value the desktop process
+/// inherited from its own environment, then `env` writes the record value
+/// unconditionally. This means `false` wins over an ambient `true` AND `true`
+/// wins over an ambient `false` — no leak in either direction.
+///
+/// `BUZZ_ACP_RESUME_ON_RESTART` is also in `RESERVED_ENV_KEYS`, so saved user
+/// env cannot reintroduce it after this call (reserved stripping happens in
+/// `merged_user_env`, applied when building `descriptor.env`).
+pub(crate) fn apply_resume_env(cmd: &mut std::process::Command, resume_on_restart: bool) {
+    cmd.env_remove("BUZZ_ACP_RESUME_ON_RESTART");
+    cmd.env("BUZZ_ACP_RESUME_ON_RESTART", resume_on_restart.to_string());
 }
 
 #[cfg(test)]

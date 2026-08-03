@@ -95,8 +95,9 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
     });
 
     if (sessionState.status != SessionStatus.connected) {
-      // Keep the prior community's cache visible until the new relay connects.
-      if (_hasLoaded) return state.value ?? const [];
+      // Preserve the prior community's cache as previous AsyncValue data while
+      // the new relay connects, but remain loading so consumers cannot expose
+      // stale channels as interactive rows in the new community.
       await connected.future;
     }
 

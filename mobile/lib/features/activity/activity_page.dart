@@ -442,6 +442,7 @@ class _WideActivityDetail extends HookWidget {
 
     final navigatorKey = useMemoized(GlobalKey<NavigatorState>.new, [item!.id]);
     return NavigatorPopHandler(
+      key: ValueKey('wide-activity-detail-${item!.id}'),
       onPopWithResult: (_) => navigatorKey.currentState?.maybePop(),
       child: Navigator(
         key: navigatorKey,

@@ -756,6 +756,7 @@ class _WideChannelContent extends HookWidget {
       channel.id,
     ]);
     return NavigatorPopHandler(
+      key: ValueKey('wide-channel-detail-${channel.id}'),
       onPopWithResult: (_) => navigatorKey.currentState?.maybePop(),
       child: Navigator(
         key: navigatorKey,

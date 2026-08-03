@@ -13,14 +13,21 @@ use uuid::Uuid;
 
 use crate::Scope;
 
+pub(crate) mod authority;
 mod binding;
 mod evidence;
 mod reason;
 
+pub use authority::{
+    resolve_current_federated_policy, AuthorityAdapterError, AuthorityAdapterFuture,
+    BindingResolutionRequest, CurrentPolicyRequest, CurrentPolicyResolutionSink,
+    DirectBindingResolutionSink, ExistingBindingResolutionSink, FederatedAuthorityAdapter,
+};
+pub(crate) use binding::AuthoritativeBindingEvidence;
 pub use binding::{
-    AuthoritativeBindingEvidence, AuthoritativeBindingResolution, BindingExpiry, BindingSource,
-    BindingVersion, EnrollmentMode, FederatedIdentityRequirement, FederatedPolicyStamp,
-    ResolvedFederatedPolicy, VersionedBindingRef,
+    AuthoritativeBindingResolution, BindingExpiry, BindingSource, BindingVersion, EnrollmentMode,
+    FederatedIdentityRequirement, FederatedPolicyStamp, ResolvedFederatedPolicy,
+    VersionedBindingRef,
 };
 pub use evidence::{
     AdmissionExpiry, AssertionExpiry, AssertionNotBefore, AssertionTransport, AuthMethod,
@@ -73,7 +80,7 @@ impl fmt::Debug for FederatedAuthorization {
     }
 }
 
-/// Authoritative O3 result consumed by the public O1 production finalizer.
+/// Authoritative result consumed by the production finalizer.
 ///
 /// Unlike [`FederatedAuthorization`], this input cannot contain a raw
 /// [`VersionedBindingRef`] or a caller-selected authorization reason.
@@ -83,15 +90,15 @@ pub enum AuthoritativeFederatedResolution {
     NotRequired,
     /// Direct authority backed by an existing or atomically enrolled binding.
     Direct {
-        /// Typed authoritative O3 lifecycle result.
+        /// Typed authoritative lifecycle result.
         binding: AuthoritativeBindingResolution,
         /// Current verified assertion for the authenticated actor.
         assertion: VerifiedFederatedAssertion,
     },
     /// Delegated authority backed by an already-active owner binding.
     Delegated {
-        /// Typed authoritative evidence for the existing owner binding.
-        owner: AuthoritativeBindingEvidence,
+        /// Typed authoritative result for the existing owner binding.
+        owner: AuthoritativeBindingResolution,
         /// Current admission resolved for the owner.
         admission: VerifiedOwnerAdmission,
     },
@@ -103,6 +110,17 @@ impl fmt::Debug for AuthoritativeFederatedResolution {
             .debug_tuple("AuthoritativeFederatedResolution")
             .field(&"[redacted]")
             .finish()
+    }
+}
+
+impl AuthoritativeFederatedResolution {
+    #[allow(dead_code)]
+    pub(crate) const fn principal(&self) -> Option<&FederatedPrincipal> {
+        match self {
+            Self::NotRequired => None,
+            Self::Direct { assertion, .. } => Some(assertion.principal()),
+            Self::Delegated { admission, .. } => Some(admission.principal()),
+        }
     }
 }
 
@@ -128,6 +146,31 @@ pub struct AuthContextInput {
     community_access: AuthorizedCommunityAccess,
 }
 
+/// Opaque proof that a validated capability snapshot was consumed.
+///
+/// Only the crate-owned provider finalizer can construct this value. It keeps
+/// the low-level context finalizer public for a stacked contract while making
+/// it impossible for downstream code to bypass capability authorization.
+pub struct CapabilityFinalizationSeal {
+    _private: (),
+}
+
+impl CapabilityFinalizationSeal {
+    #[allow(dead_code)]
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl fmt::Debug for CapabilityFinalizationSeal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("CapabilityFinalizationSeal")
+            .field(&"[redacted]")
+            .finish()
+    }
+}
+
 impl AuthContextInput {
     /// Collect evidence after cryptographic authentication and community
     /// admission have both succeeded.
@@ -143,6 +186,26 @@ impl AuthContextInput {
             nostr_proof,
             community_access,
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn authorization_domain(&self) -> CommunityId {
+        self.tenant.community()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn correlation_id(&self) -> Uuid {
+        self.correlation_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn transport(&self) -> AuthTransport {
+        self.nostr_proof.authorized_transport()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn actor_pubkey(&self) -> PublicKey {
+        self.nostr_proof.actor_pubkey()
     }
 }
 
@@ -182,14 +245,19 @@ impl fmt::Debug for AuthContext {
 }
 
 impl AuthContext {
-    /// Finalize an immutable V1 context from authoritative O3 binding evidence.
+    /// Finalize an immutable V1 context from authoritative binding evidence.
     ///
-    /// This is the production O1↔O3 seam. O3 must resolve the enrollment-policy
-    /// stamp and binding lifecycle state from current authoritative storage,
-    /// use the policy epoch as a conditional precondition for any atomic
-    /// enrollment, and pass the resulting typed lifecycle outcome here. O1
-    /// derives the authorization reason; transport code cannot select it.
+    /// A crate-owned authority adapter must resolve the enrollment-policy stamp
+    /// and binding lifecycle state from current authoritative storage, use the
+    /// policy epoch as a conditional precondition for any atomic enrollment,
+    /// and pass the resulting opaque lifecycle outcome here. The finalizer
+    /// derives the authorization reason; transport code cannot select it or
+    /// construct authoritative policy and binding outcomes.
+    ///
+    /// The opaque seal ensures a production caller first consumed the validated
+    /// capability decision supplied by the provider contract.
     pub fn finalize_authoritative_v1(
+        _capability: CapabilityFinalizationSeal,
         input: AuthContextInput,
         federated_policy: ResolvedFederatedPolicy,
         resolution: AuthoritativeFederatedResolution,
@@ -209,7 +277,7 @@ impl AuthContext {
             }
             AuthoritativeFederatedResolution::Delegated { owner, admission } => {
                 FederatedAuthorization::Delegated {
-                    owner: VersionedBindingRef::from_existing_authoritative_evidence(owner),
+                    owner: VersionedBindingRef::from_existing_authoritative_resolution(owner)?,
                     admission,
                 }
             }

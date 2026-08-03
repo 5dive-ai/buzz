@@ -132,6 +132,92 @@ fn authoritative_binding_evidence(
     .expect("synthetic authoritative binding evidence is valid")
 }
 
+struct TestAuthorityAdapter;
+
+impl FederatedAuthorityAdapter for TestAuthorityAdapter {
+    type Error = &'static str;
+
+    fn resolve_current_policy<'a>(
+        &'a self,
+        request: CurrentPolicyRequest,
+        sink: CurrentPolicyResolutionSink,
+    ) -> AuthorityAdapterFuture<
+        'a,
+        Result<ResolvedFederatedPolicy, AuthorityAdapterError<Self::Error>>,
+    > {
+        Box::pin(async move {
+            assert_eq!(request.authorization_domain(), authorization_domain(1));
+            assert_eq!(request.correlation_id(), Uuid::from_u128(2));
+            assert_eq!(request.observed_at(), 100);
+            assert!(!format!("{request:?}").contains("100"));
+            sink.resolved(
+                request.authorization_domain(),
+                Uuid::from_u128(40),
+                7,
+                FederatedIdentityRequirement::Required(EnrollmentMode::AttestedKey),
+                90,
+                200,
+            )
+            .map_err(AuthorityAdapterError::from)
+        })
+    }
+
+    fn resolve_direct_binding<'a>(
+        &'a self,
+        request: BindingResolutionRequest,
+        sink: DirectBindingResolutionSink,
+    ) -> AuthorityAdapterFuture<
+        'a,
+        Result<AuthoritativeBindingResolution, AuthorityAdapterError<Self::Error>>,
+    > {
+        Box::pin(async move {
+            assert_eq!(request.policy_id(), Uuid::from_u128(40));
+            assert_eq!(request.policy_epoch(), 7);
+            assert_eq!(
+                request.policy_requirement(),
+                FederatedIdentityRequirement::Required(EnrollmentMode::AttestedKey)
+            );
+            assert!(request.key_attested());
+            assert_eq!(request.effective_from(), 90);
+            assert_eq!(request.effective_until(), 180);
+            assert_eq!(request.observed_at(), 100);
+            assert!(!format!("{request:?}").contains("subject-123"));
+            sink.atomically_enrolled(
+                request.authorization_domain(),
+                Uuid::from_u128(10),
+                request.principal().clone(),
+                request.bound_pubkey(),
+                BindingVersion::INITIAL,
+                Some(BindingExpiry::new(180).expect("synthetic binding expiry is valid")),
+                BindingSource::AttestedKey,
+            )
+            .map_err(AuthorityAdapterError::from)
+        })
+    }
+
+    fn resolve_existing_binding<'a>(
+        &'a self,
+        request: BindingResolutionRequest,
+        sink: ExistingBindingResolutionSink,
+    ) -> AuthorityAdapterFuture<
+        'a,
+        Result<AuthoritativeBindingResolution, AuthorityAdapterError<Self::Error>>,
+    > {
+        Box::pin(async move {
+            sink.existing_active(
+                request.authorization_domain(),
+                Uuid::from_u128(10),
+                request.principal().clone(),
+                request.bound_pubkey(),
+                BindingVersion::INITIAL,
+                Some(BindingExpiry::new(180).expect("synthetic binding expiry is valid")),
+                BindingSource::Provisioned,
+            )
+            .map_err(AuthorityAdapterError::from)
+        })
+    }
+}
+
 fn binding_in(domain: u128, pubkey: PublicKey) -> VersionedBindingRef {
     binding_with_source_in(domain, pubkey, BindingSource::AttestedKey)
 }
@@ -1127,6 +1213,7 @@ fn authorization_error_codes_are_unique_and_provider_neutral() {
         AuthContextError::DelegateKeyMismatch,
         AuthContextError::DelegationRequired,
         AuthContextError::DelegatedOwnerMismatch,
+        AuthContextError::DelegatedBindingNotExistingActive,
     ];
     let mut codes = errors
         .iter()
@@ -1311,6 +1398,7 @@ fn federated_policy_stamp_rejects_invalid_lineage() {
 fn authoritative_finalizer_derives_binding_reason() {
     let existing_actor = Keys::generate();
     let existing = AuthContext::finalize_authoritative_v1(
+        CapabilityFinalizationSeal::new(),
         input(
             existing_actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -1336,6 +1424,7 @@ fn authoritative_finalizer_derives_binding_reason() {
 
     let attested_actor = Keys::generate();
     let attested = AuthContext::finalize_authoritative_v1(
+        CapabilityFinalizationSeal::new(),
         input(
             attested_actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -1366,6 +1455,7 @@ fn authoritative_finalizer_derives_binding_reason() {
 
     let tofu_actor = Keys::generate();
     let tofu = AuthContext::finalize_authoritative_v1(
+        CapabilityFinalizationSeal::new(),
         input(tofu_actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::Tofu),
         AuthoritativeFederatedResolution::Direct {
@@ -1388,10 +1478,149 @@ fn authoritative_finalizer_derives_binding_reason() {
     );
 }
 
+#[tokio::test]
+async fn cross_crate_authority_adapter_seals_policy_and_binding_outcome() {
+    let actor = Keys::generate();
+    let adapter = TestAuthorityAdapter;
+    let policy = resolve_current_federated_policy(
+        &adapter,
+        authorization_domain(1),
+        Uuid::from_u128(2),
+        100,
+    )
+    .await
+    .expect("current authoritative policy is valid");
+    let binding = authority::resolve_direct_binding(
+        &adapter,
+        &policy,
+        principal(),
+        actor.public_key(),
+        true,
+        90,
+        180,
+        100,
+    )
+    .await
+    .expect("atomic binding resolution is valid");
+    let context = AuthContext::finalize_authoritative_v1(
+        CapabilityFinalizationSeal::new(),
+        input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+        policy,
+        AuthoritativeFederatedResolution::Direct {
+            binding,
+            assertion: assertion_with_attested_key(
+                principal(),
+                AssertionTransport::TrustedProxy,
+                180,
+                actor.public_key(),
+            ),
+        },
+        100,
+    )
+    .expect("sealed adapter output finalizes");
+
+    assert_eq!(
+        context.authorization_reason(),
+        AuthorizationReason::EnrolledAttestedKey
+    );
+}
+
+#[tokio::test]
+async fn binding_sink_rejects_missing_attestation_for_attested_enrollment() {
+    struct MissingAttestationAdapter;
+
+    impl FederatedAuthorityAdapter for MissingAttestationAdapter {
+        type Error = &'static str;
+
+        fn resolve_current_policy<'a>(
+            &'a self,
+            request: CurrentPolicyRequest,
+            sink: CurrentPolicyResolutionSink,
+        ) -> AuthorityAdapterFuture<
+            'a,
+            Result<ResolvedFederatedPolicy, AuthorityAdapterError<Self::Error>>,
+        > {
+            Box::pin(async move {
+                sink.resolved(
+                    request.authorization_domain(),
+                    Uuid::from_u128(40),
+                    7,
+                    FederatedIdentityRequirement::Required(EnrollmentMode::AttestedKey),
+                    90,
+                    200,
+                )
+                .map_err(AuthorityAdapterError::from)
+            })
+        }
+
+        fn resolve_direct_binding<'a>(
+            &'a self,
+            request: BindingResolutionRequest,
+            sink: DirectBindingResolutionSink,
+        ) -> AuthorityAdapterFuture<
+            'a,
+            Result<AuthoritativeBindingResolution, AuthorityAdapterError<Self::Error>>,
+        > {
+            Box::pin(async move {
+                sink.atomically_enrolled(
+                    request.authorization_domain(),
+                    Uuid::from_u128(10),
+                    request.principal().clone(),
+                    request.bound_pubkey(),
+                    BindingVersion::INITIAL,
+                    None,
+                    BindingSource::AttestedKey,
+                )
+                .map_err(AuthorityAdapterError::from)
+            })
+        }
+
+        fn resolve_existing_binding<'a>(
+            &'a self,
+            _request: BindingResolutionRequest,
+            _sink: ExistingBindingResolutionSink,
+        ) -> AuthorityAdapterFuture<
+            'a,
+            Result<AuthoritativeBindingResolution, AuthorityAdapterError<Self::Error>>,
+        > {
+            Box::pin(async { Err(AuthorityAdapterError::adapter("not called")) })
+        }
+    }
+
+    let actor = Keys::generate();
+    let adapter = MissingAttestationAdapter;
+    let policy = resolve_current_federated_policy(
+        &adapter,
+        authorization_domain(1),
+        Uuid::from_u128(2),
+        100,
+    )
+    .await
+    .expect("current authoritative policy is valid");
+    let error = authority::resolve_direct_binding(
+        &adapter,
+        &policy,
+        principal(),
+        actor.public_key(),
+        false,
+        90,
+        180,
+        100,
+    )
+    .await
+    .expect_err("attested-key enrollment requires sealed matching attestation");
+
+    assert_eq!(
+        error,
+        AuthorityAdapterError::Contract(AuthContextError::KeyAttestationRequired)
+    );
+}
+
 #[test]
 fn authoritative_finalizer_rejects_incompatible_enrollment_result() {
     let actor = Keys::generate();
     let error = AuthContext::finalize_authoritative_v1(
+        CapabilityFinalizationSeal::new(),
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::Provisioned),
         AuthoritativeFederatedResolution::Direct {
@@ -1421,6 +1650,7 @@ fn authoritative_finalizer_carries_binding_expiry() {
     )
     .expect("synthetic authoritative binding evidence is valid");
     let error = AuthContext::finalize_authoritative_v1(
+        CapabilityFinalizationSeal::new(),
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::Provisioned),
         AuthoritativeFederatedResolution::Direct {
@@ -1432,6 +1662,63 @@ fn authoritative_finalizer_carries_binding_expiry() {
     .expect_err("production finalization must preserve the authoritative binding bound");
 
     assert_eq!(error, AuthContextError::BindingExpired);
+}
+
+#[test]
+fn authoritative_finalizer_requires_existing_active_delegated_owner() {
+    let actor = Keys::generate();
+    let owner = Keys::generate();
+    let admission = || {
+        VerifiedOwnerAdmission::new(
+            authorization_domain(1),
+            principal(),
+            AdmissionExpiry::new(200).expect("synthetic admission expiry is valid"),
+        )
+    };
+    let enrolled_error = AuthContext::finalize_authoritative_v1(
+        CapabilityFinalizationSeal::new(),
+        input(
+            actor.public_key(),
+            AuthTransport::RelayWebSocket,
+            Some(owner.public_key()),
+        ),
+        policy_required(EnrollmentMode::Provisioned),
+        AuthoritativeFederatedResolution::Delegated {
+            owner: AuthoritativeBindingResolution::atomically_enrolled(
+                authoritative_binding_evidence(owner.public_key(), BindingSource::Provisioned),
+            ),
+            admission: admission(),
+        },
+        100,
+    )
+    .expect_err("a newly enrolled record cannot be relabeled as an existing delegated owner");
+    assert_eq!(
+        enrolled_error,
+        AuthContextError::DelegatedBindingNotExistingActive
+    );
+
+    let existing = AuthContext::finalize_authoritative_v1(
+        CapabilityFinalizationSeal::new(),
+        input(
+            actor.public_key(),
+            AuthTransport::RelayWebSocket,
+            Some(owner.public_key()),
+        ),
+        policy_required(EnrollmentMode::Provisioned),
+        AuthoritativeFederatedResolution::Delegated {
+            owner: AuthoritativeBindingResolution::existing_active(authoritative_binding_evidence(
+                owner.public_key(),
+                BindingSource::Provisioned,
+            )),
+            admission: admission(),
+        },
+        100,
+    )
+    .expect("an existing active owner binding is eligible for delegated finalization");
+    assert_eq!(
+        existing.authorization_reason(),
+        AuthorizationReason::DelegatedOwnerBinding
+    );
 }
 
 #[test]

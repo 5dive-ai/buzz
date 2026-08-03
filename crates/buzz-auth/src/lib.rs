@@ -34,10 +34,13 @@ pub mod scope;
 
 pub use access::{check_read_access, check_write_access, require_scope, ChannelAccessChecker};
 pub use context::{
-    AdmissionExpiry, AssertionExpiry, AssertionNotBefore, AssertionTransport, AuthContext,
-    AuthContextError, AuthContextInput, AuthContextV1, AuthContextVersion, AuthMethod,
-    AuthTransport, AuthorizationReason, AuthorizedCommunityAccess, BindingSource, BindingVersion,
-    DelegationCapability, DelegationExpiry, EnrollmentMode, FederatedAuthorization,
+    resolve_current_federated_policy, AdmissionExpiry, AssertionExpiry, AssertionNotBefore,
+    AssertionTransport, AuthContext, AuthContextError, AuthContextInput, AuthContextV1,
+    AuthContextVersion, AuthMethod, AuthTransport, AuthorityAdapterError, AuthorityAdapterFuture,
+    AuthorizationReason, AuthorizedCommunityAccess, BindingResolutionRequest, BindingSource,
+    BindingVersion, CapabilityFinalizationSeal, CurrentPolicyRequest, CurrentPolicyResolutionSink,
+    DelegationCapability, DelegationExpiry, DirectBindingResolutionSink, EnrollmentMode,
+    ExistingBindingResolutionSink, FederatedAuthorityAdapter, FederatedAuthorization,
     FederatedIdentityRequirement, FederatedPrincipal, NostrAuthority, ResolvedFederatedPolicy,
     VerifiedFederatedAssertion, VerifiedKeyAttestation, VerifiedNostrProof, VerifiedOwnerAdmission,
     VerifiedTransportDelegation, VersionedBindingRef,

@@ -169,6 +169,9 @@ pub enum AuthContextError {
     /// Delegated authorization did not match the verified Nostr owner.
     #[error("delegated federated authorization does not match the verified Nostr owner")]
     DelegatedOwnerMismatch,
+    /// Delegated owner evidence did not resolve an already-active binding.
+    #[error("delegated federated authorization requires an existing active binding")]
+    DelegatedBindingNotExistingActive,
 }
 
 impl AuthContextError {
@@ -216,6 +219,9 @@ impl AuthContextError {
             Self::DelegateKeyMismatch => "federated_delegate_key_mismatch",
             Self::DelegationRequired => "federated_delegation_required",
             Self::DelegatedOwnerMismatch => "federated_delegated_owner_mismatch",
+            Self::DelegatedBindingNotExistingActive => {
+                "federated_delegated_binding_not_existing_active"
+            }
         }
     }
 }

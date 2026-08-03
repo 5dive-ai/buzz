@@ -48,8 +48,8 @@ impl fmt::Debug for FederatedIdentityRequirement {
 ///
 /// This stamp is not provider capability-policy evidence. It names the
 /// server-owned federated enrollment policy that supplied the requirement and
-/// its half-open effective interval. The constructor validates shape, while the
-/// O3 authority adapter remains responsible for sourcing current policy state.
+/// its half-open effective interval. The constructor validates shape, while a
+/// crate-owned authority adapter remains responsible for sourcing current policy state.
 #[derive(Clone, PartialEq, Eq)]
 pub struct FederatedPolicyStamp {
     authorization_domain: CommunityId,
@@ -62,12 +62,12 @@ pub struct FederatedPolicyStamp {
 }
 
 impl FederatedPolicyStamp {
-    /// Validate lineage read from current authoritative O3 policy state.
+    /// Validate lineage read from current authoritative policy state.
     ///
     /// This constructor enforces structural invariants only. Callers must not
-    /// source any field from transport input, and O3 must compare the epoch as
-    /// an atomic precondition before enrollment.
-    pub fn from_authoritative_state(
+    /// source any field from transport input, and the authority adapter must
+    /// compare the epoch as an atomic precondition before enrollment.
+    pub(crate) fn from_authoritative_state(
         authorization_domain: CommunityId,
         policy_id: Uuid,
         epoch: u64,
@@ -181,8 +181,8 @@ impl fmt::Debug for ResolvedFederatedPolicy {
 }
 
 impl ResolvedFederatedPolicy {
-    /// Seal structurally validated current O3 policy lineage for finalization.
-    pub const fn from_authoritative_resolution(stamp: FederatedPolicyStamp) -> Self {
+    /// Seal structurally validated current policy lineage for finalization.
+    pub(crate) const fn from_authoritative_resolution(stamp: FederatedPolicyStamp) -> Self {
         Self { stamp }
     }
 
@@ -234,6 +234,11 @@ impl ResolvedFederatedPolicy {
     /// Exact authoritative enrollment-policy lineage for this decision.
     pub const fn stamp(&self) -> &FederatedPolicyStamp {
         &self.stamp
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn into_stamp(self) -> FederatedPolicyStamp {
+        self.stamp
     }
 }
 
@@ -347,14 +352,14 @@ pub struct VersionedBindingRef {
     resolution_reason: AuthorizationReason,
 }
 
-/// Structurally validated binding fields returned by authoritative O3 state.
+/// Structurally validated binding fields returned by authoritative state.
 ///
 /// This is not authorization by itself. The crate-owned finalizer additionally
 /// requires a typed lifecycle outcome proving that the binding was already
 /// active or was atomically enrolled during this decision. It has no default or
 /// deserialization path.
 #[derive(PartialEq, Eq)]
-pub struct AuthoritativeBindingEvidence {
+pub(crate) struct AuthoritativeBindingEvidence {
     authorization_domain: CommunityId,
     binding_id: Uuid,
     principal: FederatedPrincipal,
@@ -367,7 +372,7 @@ pub struct AuthoritativeBindingEvidence {
 impl AuthoritativeBindingEvidence {
     /// Validate typed fields read from authoritative binding state.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         authorization_domain: CommunityId,
         binding_id: Uuid,
         principal: FederatedPrincipal,
@@ -447,9 +452,9 @@ enum BindingResolutionOutcome {
     AtomicallyEnrolled,
 }
 
-/// Typed authoritative lifecycle result consumed by the O1 finalizer.
+/// Typed authoritative lifecycle result consumed by the crate-owned finalizer.
 ///
-/// It carries no caller-selected authorization reason; O1 derives that reason
+/// It carries no caller-selected authorization reason; the finalizer derives that reason
 /// from the lifecycle outcome, persisted provenance, and current enrollment
 /// policy.
 #[derive(PartialEq, Eq)]
@@ -459,20 +464,60 @@ pub struct AuthoritativeBindingResolution {
 }
 
 impl AuthoritativeBindingResolution {
-    /// Record O3's authoritative result that the binding already existed.
-    pub fn existing_active(evidence: AuthoritativeBindingEvidence) -> Self {
+    /// Record the authoritative result that the binding already existed.
+    pub(crate) fn existing_active(evidence: AuthoritativeBindingEvidence) -> Self {
         Self {
             evidence,
             outcome: BindingResolutionOutcome::ExistingActive,
         }
     }
 
-    /// Record O3's authoritative result that enrollment committed atomically.
-    pub fn atomically_enrolled(evidence: AuthoritativeBindingEvidence) -> Self {
+    /// Record the authoritative result that enrollment committed atomically.
+    pub(crate) fn atomically_enrolled(evidence: AuthoritativeBindingEvidence) -> Self {
         Self {
             evidence,
             outcome: BindingResolutionOutcome::AtomicallyEnrolled,
         }
+    }
+
+    /// Whether authoritative storage resolved an already-active binding.
+    pub const fn is_existing_active(&self) -> bool {
+        matches!(self.outcome, BindingResolutionOutcome::ExistingActive)
+    }
+
+    /// Server-resolved authorization domain that owns the binding.
+    pub const fn authorization_domain(&self) -> CommunityId {
+        self.evidence.authorization_domain()
+    }
+
+    /// Stable binding identifier.
+    pub const fn binding_id(&self) -> Uuid {
+        self.evidence.binding_id()
+    }
+
+    /// Issuer-qualified principal represented by the binding.
+    pub const fn principal(&self) -> &FederatedPrincipal {
+        self.evidence.principal()
+    }
+
+    /// Nostr key owned by the binding.
+    pub const fn bound_pubkey(&self) -> PublicKey {
+        self.evidence.bound_pubkey()
+    }
+
+    /// Current local binding version.
+    pub const fn binding_version(&self) -> BindingVersion {
+        self.evidence.binding_version()
+    }
+
+    /// Optional authoritative temporal bound for authorization eligibility.
+    pub const fn expires_at(&self) -> Option<BindingExpiry> {
+        self.evidence.expires_at()
+    }
+
+    /// Persisted provenance of the active binding.
+    pub const fn source(&self) -> BindingSource {
+        self.evidence.source()
     }
 }
 
@@ -528,10 +573,16 @@ impl VersionedBindingRef {
         ))
     }
 
-    pub(super) fn from_existing_authoritative_evidence(
-        evidence: AuthoritativeBindingEvidence,
-    ) -> Self {
-        Self::from_authoritative_evidence(evidence, AuthorizationReason::ExistingBinding)
+    pub(super) fn from_existing_authoritative_resolution(
+        resolution: AuthoritativeBindingResolution,
+    ) -> Result<Self, AuthContextError> {
+        if !resolution.is_existing_active() {
+            return Err(AuthContextError::DelegatedBindingNotExistingActive);
+        }
+        Ok(Self::from_authoritative_evidence(
+            resolution.evidence,
+            AuthorizationReason::ExistingBinding,
+        ))
     }
 
     fn from_authoritative_evidence(

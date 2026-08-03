@@ -72,6 +72,10 @@ class ActivityPage extends HookConsumerWidget {
     final filter = useState(InboxFilter.all);
     final unreadOnly = useState(false);
     final selectedItemId = useState<String?>(null);
+    // A channel can be left from the persistent detail navigator before the
+    // refreshed Activity feed arrives. Hide its rows immediately so the
+    // sidebar cannot retain a detail for a channel that is no longer joined.
+    final leftChannelIds = useState<Set<String>>({});
     // Retain the event selected before its row is marked read. A grouped row
     // otherwise recomputes its deep link after the read marker changes and
     // opens the latest event instead of the oldest unread one the user chose.
@@ -108,7 +112,8 @@ class ActivityPage extends HookConsumerWidget {
 
     final visibleItems = [
       for (final item in allItems)
-        if (matchesInboxFilter(item, filter.value) &&
+        if (!leftChannelIds.value.contains(item.item.channelId) &&
+            matchesInboxFilter(item, filter.value) &&
             (!unreadOnly.value || !isDone(item)))
           item,
     ];
@@ -288,6 +293,14 @@ class ActivityPage extends HookConsumerWidget {
       ]);
     }
 
+    void handleChannelLeft(String channelId) {
+      leftChannelIds.value = {...leftChannelIds.value, channelId};
+      selectedItemId.value = null;
+      selectedItemTarget.value = null;
+      selectedItemForDetail.value = null;
+      unawaited(refresh());
+    }
+
     final Widget body;
     if (filter.value == InboxFilter.reminders) {
       body = _RemindersList(onOpen: openReminder, onRefresh: refresh);
@@ -431,6 +444,7 @@ class ActivityPage extends HookConsumerWidget {
                   channel: selectedChannel,
                   initialMessageId: selectedTarget?.id,
                   initialThreadRootId: selectedThread,
+                  onChannelLeft: () => handleChannelLeft(selectedChannel!.id),
                 ),
               ),
             ],
@@ -448,12 +462,14 @@ class _WideActivityDetail extends HookWidget {
   final Channel? channel;
   final String? initialMessageId;
   final String? initialThreadRootId;
+  final VoidCallback onChannelLeft;
 
   const _WideActivityDetail({
     required this.item,
     required this.channel,
     required this.initialMessageId,
     required this.initialThreadRootId,
+    required this.onChannelLeft,
   });
 
   @override
@@ -475,6 +491,7 @@ class _WideActivityDetail extends HookWidget {
             channel: channel!,
             initialMessageId: initialMessageId,
             initialThreadRootId: initialThreadRootId,
+            onChannelLeft: onChannelLeft,
           ),
         ),
       ),

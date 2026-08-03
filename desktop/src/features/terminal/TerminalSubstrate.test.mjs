@@ -53,6 +53,7 @@ after(() => dom.window.close());
 beforeEach(() => {
   cleanup?.();
   reducedMotion = false;
+  paintLog.length = 0;
   dom.window.localStorage.clear();
   dom.window.HTMLCanvasElement.prototype.getBoundingClientRect = () => ({
     bottom: 782,
@@ -65,18 +66,50 @@ beforeEach(() => {
     y: 0,
     toJSON() {},
   });
-  dom.window.HTMLCanvasElement.prototype.getContext = () => ({
+  dom.window.HTMLCanvasElement.prototype.getContext = function () {
+    return paintRecorder(this);
+  };
+});
+
+// The default stub discards everything it is handed, so an assertion made
+// against it cannot distinguish "repainted" from "drew nothing". This records
+// every draw call against the canvas that received it, so the tests below are
+// about commands actually issued and can exclude the banner canvas.
+const paintLog = [];
+
+function paintRecorder(canvas) {
+  return {
     clearRect() {},
-    fillRect() {},
+    fillRect(x, y, width, height) {
+      paintLog.push({
+        canvas,
+        height,
+        kind: "fill",
+        style: this.fillStyle,
+        width,
+        x,
+        y,
+      });
+    },
     fillStyle: "",
-    fillText() {},
+    fillText(text, x, y) {
+      paintLog.push({ canvas, kind: "text", text, x, y });
+    },
     font: "",
     restore() {},
     save() {},
     setTransform() {},
     textBaseline: "",
-  });
-});
+  };
+}
+
+/** Draws issued to the grid canvas only, newest paint pass included. */
+function gridDraws(view) {
+  const grid = view.container.querySelector(
+    ".buzz-terminal-viewport > canvas:not(.buzz-terminal-welcome)",
+  );
+  return paintLog.filter((entry) => entry.canvas === grid);
+}
 
 function fixture(overrides = {}) {
   const calls = { input: [], scroll: [] };
@@ -378,4 +411,175 @@ test("reduced motion keeps the terminal cursor solid", async () => {
   } finally {
     window.setInterval = originalSetInterval;
   }
+});
+
+const TWO_SESSIONS = [
+  { active: true, closing: false, id: "one", title: "SHELL" },
+  { active: false, closing: false, id: "two", title: "LOG" },
+];
+
+function frameWith(text, generation = 1) {
+  return {
+    cursor: { column: 0, line: 0, visible: false },
+    full: false,
+    rows: [
+      {
+        line: 0,
+        spans: [
+          {
+            style: { fg: 0, bg: 0, flags: 0 },
+            clusters: [{ column: 0, text, width: text.length }],
+          },
+        ],
+      },
+    ],
+    viewport: { columns: 112, generation, screenLines: 46 },
+  };
+}
+
+const SWAPPED_SESSIONS = [
+  { active: false, closing: false, id: "one", title: "SHELL" },
+  { active: true, closing: false, id: "two", title: "LOG" },
+];
+
+test("switching back to an idle session repaints its retained rows", async () => {
+  const subject = fixture({
+    sessionFrames: [
+      { frame: frameWith("one"), sessionId: "one" },
+      { frame: frameWith("two"), sessionId: "two" },
+    ],
+    sessions: TWO_SESSIONS,
+  });
+  await ready(subject.view);
+  await waitFor(() =>
+    assert.ok(gridDraws(subject.view).some((entry) => entry.text === "one")),
+  );
+
+  // A round trip is required, not a single switch: `paint()` is what drains the
+  // dirty set, so a grid that has never been painted still holds every line and
+  // repaints on first switch by luck. Only a session that was painted and then
+  // deactivated has an empty dirty set while holding rows.
+  subject.rerender({ sessions: SWAPPED_SESSIONS });
+  await waitFor(() =>
+    assert.ok(gridDraws(subject.view).some((entry) => entry.text === "two")),
+  );
+
+  paintLog.length = 0;
+  subject.rerender({ sessions: TWO_SESSIONS });
+  await waitFor(() =>
+    assert.ok(
+      gridDraws(subject.view).some((entry) => entry.text === "one"),
+      "returning to an idle session must repaint its retained rows",
+    ),
+  );
+  assert.equal(
+    gridDraws(subject.view).some((entry) => entry.text === "two"),
+    false,
+    "the outgoing session's rows must not be repainted",
+  );
+});
+
+test("switching to a session with no frame yet clears the outgoing pixels", async () => {
+  const subject = fixture({
+    sessionFrames: [{ frame: frameWith("one"), sessionId: "one" }],
+    sessions: TWO_SESSIONS,
+  });
+  await ready(subject.view);
+  await waitFor(() =>
+    assert.ok(gridDraws(subject.view).some((entry) => entry.text === "one")),
+  );
+
+  // Session "two" has delivered no frame, so it has no grid: `markAllDirty()`
+  // and `paint()` are both no-ops and only a background fill can erase "one".
+  paintLog.length = 0;
+  subject.rerender({ sessions: SWAPPED_SESSIONS });
+  await waitFor(() =>
+    assert.ok(
+      gridDraws(subject.view).some(
+        (entry) =>
+          entry.kind === "fill" &&
+          entry.x === 0 &&
+          entry.y === 0 &&
+          entry.width === 940.8 &&
+          entry.height === 782,
+      ),
+      "a full-viewport background fill must erase the outgoing session",
+    ),
+  );
+  assert.equal(
+    gridDraws(subject.view).some((entry) => entry.text === "one"),
+    false,
+  );
+});
+
+test("a frame on an unchanged session does not force a full repaint", async () => {
+  const subject = fixture({
+    sessionFrames: [{ frame: frameWith("one"), sessionId: "one" }],
+    sessions: TWO_SESSIONS,
+  });
+  await ready(subject.view);
+  await waitFor(() =>
+    assert.ok(gridDraws(subject.view).some((entry) => entry.text === "one")),
+  );
+
+  // Guards the damage model, not the bug: dropping the `paintedSessionRef`
+  // write leaves `sessionChanged` permanently true, which repaints the whole
+  // viewport on every frame. That looks correct on screen and passes every
+  // assertion above, so only a negative test can see it.
+  paintLog.length = 0;
+  subject.rerender({
+    sessionFrames: [{ frame: frameWith("more", 1), sessionId: "one" }],
+  });
+  await waitFor(() =>
+    assert.ok(gridDraws(subject.view).some((entry) => entry.text === "more")),
+  );
+  assert.equal(
+    gridDraws(subject.view).some(
+      (entry) =>
+        entry.kind === "fill" && entry.width === 940.8 && entry.height === 782,
+    ),
+    false,
+    "an incremental frame must not fill the whole viewport",
+  );
+});
+
+test("a switch during a bailed paint pass is honoured once painting resumes", async () => {
+  const subject = fixture({
+    sessionFrames: [{ frame: frameWith("one"), sessionId: "one" }],
+    sessions: TWO_SESSIONS,
+  });
+  await ready(subject.view);
+  await waitFor(() =>
+    assert.ok(gridDraws(subject.view).some((entry) => entry.text === "one")),
+  );
+
+  // The paint effect returns early when there is no 2d context. Writing
+  // `paintedSessionRef` before those returns would mark this switch as already
+  // painted, and the fill that erases "one" would never run.
+  dom.window.HTMLCanvasElement.prototype.getContext = () => null;
+  subject.rerender({ sessions: SWAPPED_SESSIONS });
+  paintLog.length = 0;
+
+  // Restoring the context is not enough to re-run the effect: its deps are the
+  // session, cursor, frames and palette. A frame for the now-inactive session
+  // re-triggers it without giving "two" a grid and without touching the palette,
+  // either of which would force the fill for an unrelated reason.
+  dom.window.HTMLCanvasElement.prototype.getContext = function () {
+    return paintRecorder(this);
+  };
+  subject.rerender({
+    sessionFrames: [{ frame: frameWith("one", 1), sessionId: "one" }],
+    sessions: SWAPPED_SESSIONS,
+  });
+  await waitFor(() =>
+    assert.ok(
+      gridDraws(subject.view).some(
+        (entry) =>
+          entry.kind === "fill" &&
+          entry.width === 940.8 &&
+          entry.height === 782,
+      ),
+      "the pending switch must still repaint after the bail",
+    ),
+  );
 });

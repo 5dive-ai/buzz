@@ -913,6 +913,7 @@ pub async fn create_managed_agent(
             } else {
                 relay_mesh.clone()
             },
+            effort_level: None,
         };
 
         records.push(record);
@@ -1333,6 +1334,21 @@ pub async fn delete_managed_agent(
             save_managed_agents(&app, &records)?;
             // Remove the agent's nsec from the keyring after the record is gone.
             crate::managed_agents::delete_agent_key(&pubkey);
+            // B3: clean up the per-agent Claude config root.  Must NOT block deletion —
+            // cleanup errors are logged and swallowed here.
+            if let Ok(managed_root) = crate::managed_agents::storage::managed_agents_base_dir(&app)
+            {
+                if let Err(e) =
+                    crate::managed_agents::claude_config::cleanup_claude_config_root(
+                        &pubkey,
+                        &managed_root,
+                    )
+                {
+                    eprintln!(
+                        "buzz-desktop: failed to clean up Claude config root for {pubkey}: {e} (non-fatal)"
+                    );
+                }
+            }
             // Tombstone-after-validation: only reached past the deployed-remote
             // guard above and a confirmed removal — never orphan a live remote
             // deployment's relay record. Inside the lock, before the block closes

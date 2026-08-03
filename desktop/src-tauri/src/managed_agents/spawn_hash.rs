@@ -152,6 +152,10 @@ pub(crate) fn spawn_config_hash(
     record.idle_timeout_seconds.hash(&mut hasher);
     record.max_turn_duration_seconds.hash(&mut hasher);
     record.parallelism.hash(&mut hasher);
+    // B6: canonical effort level — drives settings.json projection at spawn.
+    // Owner file bytes are excluded (B7.4): personal-settings edits must not
+    // force agent restarts; the hash covers canonical record values only.
+    record.effort_level.hash(&mut hasher);
 
     hasher.finish()
 }

@@ -14,6 +14,10 @@ use crate::{
     util::now_iso,
 };
 
+use super::claude_config::{
+    owner_settings_path, project_settings_json, write_projected_settings, ClaudeLaunchPolicy,
+};
+
 mod path;
 pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::compose_path_entries;
@@ -859,6 +863,57 @@ pub fn spawn_agent_child(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+
+    // ── B1 + B7: Claude config isolation (local Claude agents only) ──────────
+    //
+    // For local agents running the Claude Code harness (runtime id = "claude"):
+    //   B1 paired atom — inject CLAUDE_CONFIG_DIR + CLAUDE_SECURESTORAGE_CONFIG_DIR=""
+    //      so the agent has an isolated per-agent config root while sharing the
+    //      owner's default Keychain credential namespace (confirmed by Phase 1.5
+    //      binary analysis of claude 2.1.220).
+    //   B7 layered projection — write settings.json atomically into the per-agent
+    //      root as: owner ~/.claude/settings.json (base, read-only) + Buzz canonical
+    //      overlay (effortLevel etc.), with protected env keys stripped from the base.
+    //      Spawn FAILS if the projection write fails (B7.5).
+    //
+    // Written AFTER descriptor.env so the policy values override any user-provided
+    // CLAUDE_CONFIG_DIR or CLAUDE_SECURESTORAGE_CONFIG_DIR (protected keys were
+    // already stripped from descriptor.env by is_launch_policy_protected_key, so
+    // this is belt-and-suspenders final authority).
+    //
+    // Remote agents do NOT receive this policy — they get ANTHROPIC_MODEL in
+    // policy_env via a separate path and must never receive Desktop filesystem paths.
+    if record.backend == super::BackendKind::Local && runtime_meta.is_some_and(|r| r.id == "claude")
+    {
+        let managed_root = super::storage::managed_agents_base_dir(app)?;
+        let policy =
+            ClaudeLaunchPolicy::build(&record.pubkey, &managed_root, record.effort_level.clone())?;
+
+        // B7: project and write settings.json.
+        let owner_path = owner_settings_path().unwrap_or_else(|| {
+            std::path::PathBuf::from("/nonexistent/no-home-dir/.claude/settings.json")
+        });
+        let (projected, base_status) = project_settings_json(&owner_path, &policy);
+        if matches!(
+            base_status,
+            super::claude_config::OwnerBaseStatus::Unreadable { .. }
+        ) {
+            eprintln!(
+                "buzz-desktop: owner ~/.claude/settings.json unreadable for agent {} — \
+                 launching with overlay-only settings (non-fatal, personal settings skipped): {:?}",
+                record.name, base_status
+            );
+        }
+        write_projected_settings(&policy, &projected)?;
+
+        // B1: inject the paired atom.
+        command.env("CLAUDE_CONFIG_DIR", &policy.config_dir);
+        command.env(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            &policy.secure_storage_config_dir,
+        );
+    }
+
     configure_runtime_cli(&mut command, runtime_meta);
 
     // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible

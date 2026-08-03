@@ -57,6 +57,7 @@ fn record() -> ManagedAgentRecord {
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
         relay_mesh: None,
+        effort_level: None,
     }
 }
 
@@ -763,5 +764,36 @@ fn spawn_hash_instance_args_win_over_definition_args() {
     assert_ne!(
         h_instance, h_no_instance,
         "instance args and definition args must produce different hashes"
+    );
+}
+
+#[test]
+fn test_effort_level_change_raises_restart_badge() {
+    // B6: effort_level is a canonical record field covered by spawn_config_hash.
+    // Changing it must produce a different hash so the restart badge fires.
+    let mut r_no_effort = record();
+    r_no_effort.effort_level = None;
+
+    let mut r_high = record();
+    r_high.effort_level = Some("high".to_string());
+
+    let mut r_low = record();
+    r_low.effort_level = Some("low".to_string());
+
+    let h_none = spawn_config_hash(&r_no_effort, &[], &[], "ws://relay", &Default::default());
+    let h_high = spawn_config_hash(&r_high, &[], &[], "ws://relay", &Default::default());
+    let h_low = spawn_config_hash(&r_low, &[], &[], "ws://relay", &Default::default());
+
+    assert_ne!(
+        h_none, h_high,
+        "None vs high effort must produce different hashes"
+    );
+    assert_ne!(
+        h_none, h_low,
+        "None vs low effort must produce different hashes"
+    );
+    assert_ne!(
+        h_high, h_low,
+        "high vs low effort must produce different hashes"
     );
 }

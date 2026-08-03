@@ -153,6 +153,7 @@ impl AgentDefinition {
             definition_respond_to_allowlist: self.respond_to_allowlist,
             definition_parallelism: self.parallelism,
             relay_mesh: None,
+            effort_level: None,
         }
     }
 }
@@ -438,6 +439,15 @@ pub struct ManagedAgentRecord {
     /// deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mesh: Option<RelayMeshConfig>,
+    /// Claude Code effort level (maps to `effortLevel` in the per-agent
+    /// `settings.json`).  Written at spawn time into the projected
+    /// `settings.json`; updated on positive ACP `session/set_config_option`
+    /// ack.  `None` means no canonical effort level seeded — the owner's
+    /// personal `effortLevel` (if any) will pass through in the projection.
+    /// `#[serde(default)]` so records predating this field deserialize as
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<String>,
 }
 
 /// Typed relay-mesh configuration carried on a [`ManagedAgentRecord`].

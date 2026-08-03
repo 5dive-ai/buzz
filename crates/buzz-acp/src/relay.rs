@@ -3849,17 +3849,19 @@ async fn do_connect(
         .map_err(|e| RelayError::Http(format!("invalid relay URL: {e}")))?;
 
     // Advisory `Buzz-Client` identity so the relay can attribute this
-    // connection to the harness and its version. Best-effort: an unshipped
-    // platform or a destination we must not identify to simply connects
-    // without the header.
+    // connection to the harness. Best-effort: an unshipped platform or a
+    // destination we must not identify to simply connects without the header.
+    // No version is sent — buzz-acp inherits the workspace version, which is
+    // never bumped (see `RELEASING.md`), so reporting it would pin every
+    // harness connection to a fixed number forever.
     let request = {
         let uri = parsed
             .as_str()
             .parse()
             .map_err(|e| RelayError::Http(format!("invalid relay URL: {e}")))?;
         let builder = ClientRequestBuilder::new(uri);
-        match may_identify_to(parsed.as_str())
-            .then(|| client_header_value_for_host(ClientApp::Acp, env!("CARGO_PKG_VERSION")))
+        match may_identify_to(&parsed)
+            .then(|| client_header_value_for_host(ClientApp::Acp, None))
             .flatten()
         {
             Some(value) => builder.with_header(CLIENT_HEADER, value),

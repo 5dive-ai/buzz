@@ -13,6 +13,7 @@ use tokio_tungstenite::{
     tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Message},
 };
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -24,13 +25,19 @@ const SEND_QUEUE_CAPACITY: usize = 64;
 ///
 /// The header tells the relay which app, platform, and version a live
 /// connection belongs to. Attaching it never fails a connection: a destination
-/// outside `may_identify_to` or an unusable version just omits it, and the
-/// relay counts the connection as unidentified.
+/// outside `may_identify_to` or an unparseable URL just omits the header, and
+/// the relay counts the connection as unidentified.
+///
+/// The desktop app is one of the two lanes with an independently bumped
+/// release version (`RELEASING.md`), so `CARGO_PKG_VERSION` is a real version
+/// here — `bump-desktop-version` rewrites it. Clients that inherit the
+/// workspace version deliberately send none.
 fn client_request(url: &str) -> Result<ClientRequestBuilder, String> {
     let uri = url.parse().map_err(|error| format!("{error}"))?;
     let builder = ClientRequestBuilder::new(uri);
-    let Some(value) = may_identify_to(url)
-        .then(|| client_header_value_for_host(ClientApp::Desktop, env!("CARGO_PKG_VERSION")))
+    let permitted = Url::parse(url).is_ok_and(|parsed| may_identify_to(&parsed));
+    let Some(value) = permitted
+        .then(|| client_header_value_for_host(ClientApp::Desktop, Some(env!("CARGO_PKG_VERSION"))))
         .flatten()
     else {
         return Ok(builder);

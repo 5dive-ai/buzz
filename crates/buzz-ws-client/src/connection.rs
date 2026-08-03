@@ -11,6 +11,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::ClientRequestBuilder;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use tracing::debug;
+use url::Url;
 
 use crate::error::WsClientError;
 use crate::message::{build_auth_event, parse_relay_message, OkResponse, RelayMessage};
@@ -21,18 +22,18 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// header when the destination permits it.
 ///
 /// Attaching the header is never allowed to fail a connection: an unshipped
-/// platform, an unusable version, or a destination outside
-/// [`may_identify_to`] simply yields a request without the header.
+/// platform or a destination outside [`may_identify_to`] simply yields a
+/// request without the header.
 fn client_request(
-    url: &str,
+    url: &Url,
     app: ClientApp,
-    app_version: &str,
+    app_version: Option<&str>,
 ) -> Result<ClientRequestBuilder, WsClientError> {
-    let uri = url
-        .parse()
-        .map_err(|e: tokio_tungstenite::tungstenite::http::uri::InvalidUri| {
+    let uri = url.as_str().parse().map_err(
+        |e: tokio_tungstenite::tungstenite::http::uri::InvalidUri| {
             WsClientError::Url(e.to_string())
-        })?;
+        },
+    )?;
     let builder = ClientRequestBuilder::new(uri);
     if !may_identify_to(url) {
         return Ok(builder);
@@ -75,28 +76,38 @@ impl NostrWsConnection {
     }
 
     /// Connects to the relay at `url` without performing authentication.
+    ///
+    /// Identifies as [`ClientApp::Cli`], which covers the `buzz` CLI and the
+    /// test client. No version is sent: both inherit the workspace version,
+    /// which has never been bumped (see `RELEASING.md`), so reporting it would
+    /// pin every CLI connection to a fixed number forever. The relay records
+    /// the version as unknown, which is accurate.
     pub async fn connect(url: &str) -> Result<Self, WsClientError> {
-        Self::connect_as(url, ClientApp::Cli, env!("CARGO_PKG_VERSION")).await
+        Self::connect_as(url, ClientApp::Cli, None).await
     }
 
-    /// Connects to the relay at `url`, identifying as `app` version
-    /// `app_version` in the advisory `Buzz-Client` header.
+    /// Connects to the relay at `url`, identifying as `app` in the advisory
+    /// `Buzz-Client` header.
+    ///
+    /// Pass `app_version` only for a client with a real, independently bumped
+    /// release version; pass `None` otherwise so the relay reports the version
+    /// as unknown rather than as a misleading constant.
     ///
     /// The header lets the relay report which client versions and platforms
     /// its live connections come from. It is best-effort: if it cannot be
-    /// built (unshipped platform, unusable version) or the destination is not
-    /// one this client may identify itself to, the connection proceeds without
-    /// it and the relay counts it as unidentified.
+    /// built (unshipped platform) or the destination is not one this client may
+    /// identify itself to, the connection proceeds without it and the relay
+    /// counts it as unidentified.
     pub async fn connect_as(
         url: &str,
         app: ClientApp,
-        app_version: &str,
+        app_version: Option<&str>,
     ) -> Result<Self, WsClientError> {
         let parsed = url
-            .parse::<url::Url>()
+            .parse::<Url>()
             .map_err(|e| WsClientError::Url(e.to_string()))?;
 
-        let request = client_request(parsed.as_str(), app, app_version)?;
+        let request = client_request(&parsed, app, app_version)?;
         let (ws, _response) = connect_async(request)
             .await
             .map_err(WsClientError::WebSocket)?;

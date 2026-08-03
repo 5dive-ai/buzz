@@ -9,6 +9,17 @@
 //! Buzz-Client: v=1, app=buzz-desktop, platform=macos, app-version="0.5.2"
 //! ```
 //!
+//! # Only a real release version may be sent
+//!
+//! `app_version` is [`Option`] because not every client has a version worth
+//! publishing. Only the desktop app and the relay carry independently bumped
+//! release versions (`RELEASING.md`, "Version Sources"); crates that inherit
+//! `version.workspace = true` sit at a workspace version that has never been
+//! bumped, so `env!("CARGO_PKG_VERSION")` would pin them to a fixed number
+//! forever and a dashboard would read that as "nobody ever upgrades". Those
+//! clients pass `None` and are reported with an `unknown` version instead,
+//! which is accurate. A wrong version is worse than no version.
+//!
 //! This module owns only the *sending* half: the canonical header name, the
 //! app/platform vocabularies, and the serializer. The relay parses the header
 //! with its own lenient reader (`buzz-relay`'s `client_info`) and treats it as
@@ -24,6 +35,8 @@
 //! is never embedded in signed events.
 
 use std::fmt::Write as _;
+
+use url::{Host, Url};
 
 /// Canonical header name. Lowercase so it can be used directly as an HTTP/2
 /// field name and compared against `http::HeaderName` without reallocating.
@@ -126,57 +139,68 @@ impl ClientPlatform {
     }
 }
 
-/// Maximum serialized header length. A Buzz-generated value is far shorter;
-/// this only bounds a pathological `app_version` before it reaches the wire.
-const MAX_HEADER_LEN: usize = 256;
+/// Longest `Buzz-Client` header value either side will handle, in bytes.
+///
+/// One constant for both halves of the contract: the sender refuses to emit a
+/// longer value and the relay refuses to parse one, so a value that fits on
+/// the wire is always one the relay will read. A Buzz-generated header is well
+/// under 128 bytes; this only bounds parser work on a hostile input.
+pub const MAX_HEADER_LEN: usize = 256;
 
-/// Longest accepted `app-version`, matching the relay's own bound.
-const MAX_APP_VERSION_LEN: usize = 32;
+/// Longest accepted `app-version`, in bytes.
+///
+/// Shared with the sender so both halves of the contract agree on the bound.
+pub const MAX_APP_VERSION_LEN: usize = 32;
 
 /// Build the `Buzz-Client` header value for this client.
 ///
-/// Returns `None` when the platform is not one Buzz ships, or when
-/// `app_version` is empty or not a plausible version string. A missing header
-/// is a supported state on the relay, so refusing to send is always safe —
-/// callers must never substitute a placeholder.
+/// Pass `app_version` only when the client has a real, independently bumped
+/// release version; pass `None` otherwise, and the `app-version` member is
+/// omitted so the relay reports the version as unknown rather than as a
+/// misleading constant. An `app_version` that is not a plausible version
+/// string is treated the same as `None`.
 ///
 /// # Examples
 ///
 /// ```
 /// use buzz_core::client_identity::{client_header_value, ClientApp, ClientPlatform};
 ///
-/// let value = client_header_value(ClientApp::Desktop, ClientPlatform::MacOs, "0.5.2").unwrap();
+/// let value = client_header_value(ClientApp::Desktop, ClientPlatform::MacOs, Some("0.5.2"));
 /// assert_eq!(value, r#"v=1, app=buzz-desktop, platform=macos, app-version="0.5.2""#);
+///
+/// // A client with no real release version still reports app and platform.
+/// let value = client_header_value(ClientApp::Cli, ClientPlatform::Linux, None);
+/// assert_eq!(value, "v=1, app=buzz-cli, platform=linux");
 /// ```
 #[must_use]
 pub fn client_header_value(
     app: ClientApp,
     platform: ClientPlatform,
-    app_version: &str,
-) -> Option<String> {
-    // Only horizontal whitespace is trimmed. Trimming CR/LF would silently
-    // sanitize a header-injection attempt into an accepted value; those are
-    // rejected by `is_serializable_app_version` instead.
-    let app_version = app_version.trim_matches([' ', '\t']);
-    if !is_serializable_app_version(app_version) {
-        return None;
-    }
-
+    app_version: Option<&str>,
+) -> String {
     let mut value = String::with_capacity(64);
     // Field order matches the wire example and the relay's tests; RFC 8941
     // dictionaries are order-independent, so this is presentation only.
     let _ = write!(
         value,
-        "v={CLIENT_HEADER_FORMAT_VERSION}, app={}, platform={}, app-version=\"{app_version}\"",
+        "v={CLIENT_HEADER_FORMAT_VERSION}, app={}, platform={}",
         app.as_str(),
         platform.as_str(),
     );
 
-    // Unreachable for a validated version, but never emit an oversized header.
-    if value.len() > MAX_HEADER_LEN {
-        return None;
+    // Only horizontal whitespace is trimmed. Trimming CR/LF would silently
+    // sanitize a header-injection attempt into an accepted value; those are
+    // rejected by `is_serializable_app_version` instead.
+    if let Some(app_version) = app_version
+        .map(|raw| raw.trim_matches([' ', '\t']))
+        .filter(|raw| is_serializable_app_version(raw))
+    {
+        let _ = write!(value, ", app-version=\"{app_version}\"");
     }
-    Some(value)
+
+    // Unreachable for a validated version, but never emit an oversized header.
+    debug_assert!(value.len() <= MAX_HEADER_LEN, "{value}");
+    value
 }
 
 /// Build the header for the current compile target, or `None` on an unshipped
@@ -185,8 +209,12 @@ pub fn client_header_value(
 /// This is the entry point clients should use; it removes the chance of a
 /// caller hardcoding the wrong platform for a build.
 #[must_use]
-pub fn client_header_value_for_host(app: ClientApp, app_version: &str) -> Option<String> {
-    client_header_value(app, ClientPlatform::current()?, app_version)
+pub fn client_header_value_for_host(app: ClientApp, app_version: Option<&str>) -> Option<String> {
+    Some(client_header_value(
+        app,
+        ClientPlatform::current()?,
+        app_version,
+    ))
 }
 
 /// Whether `url` is a destination this client may identify itself to.
@@ -198,49 +226,33 @@ pub fn client_header_value_for_host(app: ClientApp, app_version: &str) -> Option
 /// origin would leak the header to any on-path observer. Loopback is exempted
 /// so local development still exercises the same code path.
 ///
+/// Takes a parsed [`Url`] so host extraction — userinfo, IPv6 literals, ports,
+/// percent-encoding — is the `url` crate's problem rather than this module's.
+///
 /// # Examples
 ///
 /// ```
 /// use buzz_core::client_identity::may_identify_to;
+/// use url::Url;
 ///
-/// assert!(may_identify_to("wss://buzz.example.com/"));
-/// assert!(may_identify_to("ws://127.0.0.1:8080/"));
-/// assert!(!may_identify_to("ws://buzz.example.com/"));
+/// assert!(may_identify_to(&Url::parse("wss://buzz.example.com/").unwrap()));
+/// assert!(may_identify_to(&Url::parse("ws://127.0.0.1:8080/").unwrap()));
+/// assert!(!may_identify_to(&Url::parse("ws://buzz.example.com/").unwrap()));
 /// ```
 #[must_use]
-pub fn may_identify_to(url: &str) -> bool {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return false;
-    };
-    match scheme.to_ascii_lowercase().as_str() {
+pub fn may_identify_to(url: &Url) -> bool {
+    match url.scheme() {
         // TLS: the header is only visible to the relay itself.
         "wss" | "https" => true,
         // Cleartext is acceptable only when it cannot leave the machine.
-        "ws" | "http" => is_loopback_authority(rest),
+        "ws" | "http" => match url.host() {
+            Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+            Some(Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
         _ => false,
     }
-}
-
-/// Whether an authority (`host[:port]`, possibly followed by a path) is
-/// loopback.
-fn is_loopback_authority(rest: &str) -> bool {
-    // Trim the path/query/fragment, then any `userinfo@` prefix.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_userinfo, host)| host);
-    let host = match authority.strip_prefix('[') {
-        // IPv6 literal: `[::1]:port`.
-        Some(inner) => inner.split(']').next().unwrap_or(""),
-        None => authority.split(':').next().unwrap_or(""),
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    // Parse as an address rather than prefix-matching "127.": a name like
-    // `127.0.0.1.example.com` shares the prefix but is a remote host.
-    host.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Whether `app_version` is safe to place inside an RFC 8941 quoted string.
@@ -269,11 +281,24 @@ mod tests {
 
     #[test]
     fn serializes_the_documented_wire_format() {
-        let value =
-            client_header_value(ClientApp::Desktop, ClientPlatform::MacOs, "0.5.2").unwrap();
+        let value = client_header_value(ClientApp::Desktop, ClientPlatform::MacOs, Some("0.5.2"));
         assert_eq!(
             value,
             r#"v=1, app=buzz-desktop, platform=macos, app-version="0.5.2""#
+        );
+    }
+
+    #[test]
+    fn omits_app_version_when_the_client_has_no_release_version() {
+        // buzz-cli and buzz-acp inherit the never-bumped workspace version, so
+        // they send no version at all rather than a misleading constant.
+        assert_eq!(
+            client_header_value(ClientApp::Cli, ClientPlatform::Linux, None),
+            "v=1, app=buzz-cli, platform=linux"
+        );
+        assert_eq!(
+            client_header_value(ClientApp::Acp, ClientPlatform::MacOs, None),
+            "v=1, app=buzz-acp, platform=macos"
         );
     }
 
@@ -321,17 +346,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_versions_that_are_not_versions() {
+    fn drops_versions_that_are_not_versions() {
+        // A placeholder must never be published as a version label; the header
+        // is still sent so app and platform are not lost.
         for bad in ["", "   ", "unknown", "dev", "v1.2.3", "nightly"] {
-            assert!(
-                client_header_value(ClientApp::Cli, ClientPlatform::Linux, bad).is_none(),
-                "expected {bad:?} to be refused"
+            assert_eq!(
+                client_header_value(ClientApp::Cli, ClientPlatform::Linux, Some(bad)),
+                "v=1, app=buzz-cli, platform=linux",
+                "expected {bad:?} to be dropped"
             );
         }
     }
 
     #[test]
-    fn rejects_versions_that_would_break_the_quoted_string() {
+    fn drops_versions_that_would_break_the_quoted_string() {
         // A quote or backslash would need RFC 8941 escaping; a newline would
         // allow header injection. All must be refused, never escaped.
         for bad in [
@@ -343,35 +371,49 @@ mod tests {
             "0.5.2\u{7f}",
             "0.5.2é",
         ] {
-            assert!(
-                client_header_value(ClientApp::Desktop, ClientPlatform::MacOs, bad).is_none(),
-                "expected {bad:?} to be refused"
+            let value = client_header_value(ClientApp::Desktop, ClientPlatform::MacOs, Some(bad));
+            assert_eq!(
+                value, "v=1, app=buzz-desktop, platform=macos",
+                "expected {bad:?} to be dropped"
             );
         }
     }
 
     #[test]
-    fn rejects_an_absurdly_long_version() {
+    fn drops_an_absurdly_long_version() {
         let long = format!("0.{}", "9".repeat(MAX_APP_VERSION_LEN));
         assert!(long.len() > MAX_APP_VERSION_LEN);
-        assert!(client_header_value(ClientApp::Cli, ClientPlatform::Linux, &long).is_none());
+        assert_eq!(
+            client_header_value(ClientApp::Cli, ClientPlatform::Linux, Some(&long)),
+            "v=1, app=buzz-cli, platform=linux"
+        );
     }
 
     #[test]
     fn accepts_prerelease_and_build_metadata() {
-        let value = client_header_value(ClientApp::Cli, ClientPlatform::Linux, "1.2.3-rc.1+build9")
-            .unwrap();
+        let value = client_header_value(
+            ClientApp::Cli,
+            ClientPlatform::Linux,
+            Some("1.2.3-rc.1+build9"),
+        );
         assert!(value.ends_with(r#"app-version="1.2.3-rc.1+build9""#));
     }
 
     #[test]
     fn trims_surrounding_spaces_and_tabs_before_validating() {
-        let value = client_header_value(ClientApp::Desktop, ClientPlatform::Windows, " \t0.5.2\t ")
-            .unwrap();
+        let value = client_header_value(
+            ClientApp::Desktop,
+            ClientPlatform::Windows,
+            Some(" \t0.5.2\t "),
+        );
         assert_eq!(
             value,
             r#"v=1, app=buzz-desktop, platform=windows, app-version="0.5.2""#
         );
+    }
+
+    fn url(raw: &str) -> Url {
+        Url::parse(raw).unwrap_or_else(|e| panic!("{raw:?} is not a URL: {e}"))
     }
 
     #[test]
@@ -383,11 +425,15 @@ mod tests {
             "https://buzz.example.com/",
             // Cleartext loopback cannot leave the machine.
             "ws://localhost:8080/",
+            "ws://LOCALHOST:8080/",
             "ws://127.0.0.1:8080/",
             "ws://127.3.2.1/",
             "ws://[::1]:8080/",
         ] {
-            assert!(may_identify_to(allowed), "expected {allowed:?} allowed");
+            assert!(
+                may_identify_to(&url(allowed)),
+                "expected {allowed:?} allowed"
+            );
         }
     }
 
@@ -403,12 +449,14 @@ mod tests {
             "ws://127.0.0.1.example.com/",
             // Loopback in userinfo must not fool the host check.
             "ws://localhost@evil.example.com/",
-            // Non-WebSocket and malformed destinations.
+            // Non-WebSocket destinations.
             "file:///etc/passwd",
-            "buzz.example.com",
-            "",
+            "ftp://buzz.example.com/",
         ] {
-            assert!(!may_identify_to(refused), "expected {refused:?} refused");
+            assert!(
+                !may_identify_to(&url(refused)),
+                "expected {refused:?} refused"
+            );
         }
     }
 
@@ -417,8 +465,12 @@ mod tests {
         // Tests only run on targets Buzz ships, so `current()` is `Some` here.
         let platform = ClientPlatform::current().expect("test host is a shipped platform");
         assert_eq!(
-            client_header_value_for_host(ClientApp::Cli, "0.1.0"),
-            client_header_value(ClientApp::Cli, platform, "0.1.0")
+            client_header_value_for_host(ClientApp::Cli, Some("0.1.0")),
+            Some(client_header_value(ClientApp::Cli, platform, Some("0.1.0")))
+        );
+        assert_eq!(
+            client_header_value_for_host(ClientApp::Cli, None),
+            Some(client_header_value(ClientApp::Cli, platform, None))
         );
     }
 
@@ -437,8 +489,10 @@ mod tests {
                 ClientPlatform::Ios,
                 ClientPlatform::Android,
             ] {
-                let value = client_header_value(app, platform, "10.20.30-rc.1").unwrap();
-                assert!(value.len() <= MAX_HEADER_LEN, "{value}");
+                for version in [None, Some("10.20.30-rc.1")] {
+                    let value = client_header_value(app, platform, version);
+                    assert!(value.len() <= MAX_HEADER_LEN, "{value}");
+                }
             }
         }
     }

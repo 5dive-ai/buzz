@@ -191,7 +191,7 @@ async fn handle_active_connection(
         addr = %addr,
         client.app = client.as_ref().map(ClientInfo::app),
         client.platform = client.as_ref().map(ClientInfo::platform),
-        client.app_version = client.as_ref().map(ClientInfo::app_version_detail),
+        client.app_version = client.as_ref().map(ClientInfo::app_version),
         "WebSocket connection established"
     );
     metrics::counter!(
@@ -199,7 +199,6 @@ async fn handle_active_connection(
         "community" => conn.tenant.host().to_owned()
     )
     .increment(1);
-    crate::client_info::record_connection(client.as_ref());
 
     let challenge_msg = RelayMessage::auth_challenge(&challenge);
     if tx

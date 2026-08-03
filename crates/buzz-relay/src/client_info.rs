@@ -17,14 +17,23 @@
 //! is a normal, supported state; a malformed one is counted and discarded. No
 //! input on this path can ever cause a connection to be rejected.
 //!
-//! # Cardinality is bounded by construction
+//! # Cardinality
 //!
-//! Label values are the guard against a forged header exploding Prometheus
-//! series. `app` and `platform` are resolved to `&'static str` from closed
-//! allowlists — an unrecognized token yields no label, never a passthrough of
+//! `app` and `platform` are resolved to `&'static str` from closed allowlists,
+//! so an unrecognized token yields no label rather than a passthrough of
 //! attacker-controlled bytes. `app_version` is narrowed to `MAJOR.MINOR` with
-//! both components bounded in length, so the worst case is
-//! `apps × platforms × plausible versions`.
+//! each component capped at [`MAX_VERSION_COMPONENT_LEN`] digits, which still
+//! leaves a large *reachable* label alphabet from a forgeable header.
+//!
+//! The bound that matters in practice is therefore not the alphabet but the
+//! metric kind: this module emits **only a gauge**. The Prometheus recorder is
+//! configured with an idle timeout for `MetricKindMask::GAUGE`
+//! (`metrics::install`), so a label set that stops being emitted is dropped
+//! from the registry. A burst of forged versions costs memory for one idle
+//! timeout window and then self-cleans. A counter would have to be retained
+//! for the process lifetime, so connection *rate* is deliberately left to the
+//! existing `buzz_ws_connections_total` rather than duplicated here with a
+//! forgeable label set.
 //!
 //! # Why a hand-written parser
 //!
@@ -36,34 +45,26 @@
 
 use axum::http::HeaderMap;
 use buzz_core::client_identity::{
-    ClientApp, ClientPlatform, CLIENT_HEADER, CLIENT_HEADER_FORMAT_VERSION,
+    ClientApp, ClientPlatform, CLIENT_HEADER, CLIENT_HEADER_FORMAT_VERSION, MAX_APP_VERSION_LEN,
+    MAX_HEADER_LEN,
 };
 
-/// Label value for connections with no usable `Buzz-Client` header.
+/// Label value used when a dimension is unknown.
 ///
-/// Emitting an explicit bucket rather than omitting the series is what lets
-/// `sum(buzz_client_connections_total)` reconcile with
-/// `sum(buzz_ws_connections_total)`, and puts "unidentified" on a dashboard as
-/// a visible line instead of a silent gap.
+/// Emitting an explicit bucket rather than omitting the series puts
+/// "unidentified" on a dashboard as a visible line instead of a silent gap,
+/// and lets `sum(buzz_client_connections_active)` reconcile with
+/// `buzz_ws_connections_active`. Used both for a wholly unidentified
+/// connection and for a client that identified itself but has no real release
+/// version to report (`buzz-cli` and `buzz-acp` inherit a workspace version
+/// that is never bumped, so they deliberately send no `app-version`).
 pub const UNKNOWN_LABEL: &str = "unknown";
-
-/// Longest `Buzz-Client` header the relay will parse, in bytes.
-///
-/// A Buzz-generated value is well under 128 bytes. This bounds parser work on
-/// a hostile input before any allocation.
-const MAX_HEADER_LEN: usize = 512;
 
 /// Longest accepted `MAJOR` or `MINOR` component of `app-version`.
 ///
 /// Five digits admits every plausible version while capping the label
 /// alphabet at 10^5 values per component.
 const MAX_VERSION_COMPONENT_LEN: usize = 5;
-
-/// Longest raw value retained for logging.
-///
-/// Log fields are not Prometheus labels, so they need no allowlist — only a
-/// length bound so a hostile header cannot bloat a log line.
-const MAX_LOGGED_VALUE_LEN: usize = 32;
 
 /// Why a present `Buzz-Client` header could not be used.
 ///
@@ -81,7 +82,7 @@ enum ParseFailure {
     UnknownApp,
     /// `platform` was absent or outside the allowlist.
     UnknownPlatform,
-    /// `app-version` was absent or not a bounded `MAJOR.MINOR[...]`.
+    /// `app-version` was present but not a bounded `MAJOR.MINOR[...]`.
     BadAppVersion,
 }
 
@@ -109,10 +110,9 @@ pub struct ClientInfo {
     app: &'static str,
     /// Allowlisted platform token.
     platform: &'static str,
-    /// `MAJOR.MINOR`, safe as a metric label.
-    app_version: String,
-    /// Exact version as sent, for logs only — never a label.
-    app_version_detail: String,
+    /// `MAJOR.MINOR`, safe as a metric label, or `None` when the client sent
+    /// no version.
+    app_version: Option<String>,
 }
 
 impl ClientInfo {
@@ -195,14 +195,19 @@ impl ClientInfo {
             })
             .ok_or(ParseFailure::UnknownPlatform)?;
 
-        let app_version_raw = app_version.ok_or(ParseFailure::BadAppVersion)?;
-        let app_version = major_minor(app_version_raw).ok_or(ParseFailure::BadAppVersion)?;
+        // An absent `app-version` is valid: clients without an independently
+        // bumped release version omit it rather than send a constant. A
+        // *present* one that is unusable is still a failure, so a genuinely
+        // broken version is visible rather than silently downgraded.
+        let app_version = match app_version {
+            Some(raw) => Some(major_minor(raw).ok_or(ParseFailure::BadAppVersion)?),
+            None => None,
+        };
 
         Ok(Self {
             app,
             platform,
             app_version,
-            app_version_detail: truncate_for_log(app_version_raw),
         })
     }
 
@@ -218,71 +223,47 @@ impl ClientInfo {
         self.platform
     }
 
-    /// `MAJOR.MINOR` version, safe as a metric label.
+    /// `MAJOR.MINOR` version, or [`UNKNOWN_LABEL`] when the client sent none.
     #[must_use]
     pub fn app_version(&self) -> &str {
-        &self.app_version
-    }
-
-    /// Exact version as sent, for logs only.
-    #[must_use]
-    pub fn app_version_detail(&self) -> &str {
-        &self.app_version_detail
+        self.app_version.as_deref().unwrap_or(UNKNOWN_LABEL)
     }
 }
 
-/// The three label values for a connection, using [`UNKNOWN_LABEL`] when the
-/// client did not identify itself.
-fn labels(info: Option<&ClientInfo>) -> (&str, &str, &str) {
-    match info {
-        Some(info) => (info.app, info.platform, info.app_version.as_str()),
-        None => (UNKNOWN_LABEL, UNKNOWN_LABEL, UNKNOWN_LABEL),
-    }
-}
-
-/// Count a newly established connection by client identity.
-pub fn record_connection(info: Option<&ClientInfo>) {
-    let (app, platform, app_version) = labels(info);
-    metrics::counter!(
-        "buzz_client_connections_total",
-        "app" => app.to_owned(),
-        "platform" => platform.to_owned(),
-        "app_version" => app_version.to_owned()
-    )
-    .increment(1);
-}
-
-/// Add a live connection to the per-client active gauge.
+/// The per-client live-connection gauge, labeled for `info`.
 ///
 /// This is a **separate** series from `buzz_ws_connections_active`, which is
 /// consumed by the HPA as an unlabeled `AverageValue` target. Labeling that
 /// gauge would shard the series the autoscaler reads; this parallel gauge
 /// gives the same breakdown without touching scaling behaviour.
-pub fn increment_active(info: Option<&ClientInfo>) {
-    let (app, platform, app_version) = labels(info);
+///
+/// A gauge is the only metric kind emitted here, deliberately: the recorder
+/// idle-evicts gauge series, so a forged label set cannot accumulate for the
+/// process lifetime the way a counter would.
+fn active_gauge(info: Option<&ClientInfo>) -> metrics::Gauge {
+    let (app, platform, app_version) = match info {
+        Some(info) => (info.app, info.platform, info.app_version()),
+        None => (UNKNOWN_LABEL, UNKNOWN_LABEL, UNKNOWN_LABEL),
+    };
     metrics::gauge!(
         "buzz_client_connections_active",
         "app" => app.to_owned(),
         "platform" => platform.to_owned(),
         "app_version" => app_version.to_owned()
     )
-    .increment(1.0);
+}
+
+/// Add a live connection to the per-client active gauge.
+pub fn increment_active(info: Option<&ClientInfo>) {
+    active_gauge(info).increment(1.0);
 }
 
 /// Remove a closed connection from the per-client active gauge.
 ///
 /// Must be paired with exactly one [`increment_active`] call, or the gauge
-/// drifts. Retired label sets are dropped by the recorder's configured gauge
-/// idle timeout rather than going stale.
+/// drifts.
 pub fn decrement_active(info: Option<&ClientInfo>) {
-    let (app, platform, app_version) = labels(info);
-    metrics::gauge!(
-        "buzz_client_connections_active",
-        "app" => app.to_owned(),
-        "platform" => platform.to_owned(),
-        "app_version" => app_version.to_owned()
-    )
-    .decrement(1.0);
+    active_gauge(info).decrement(1.0);
 }
 
 /// A dictionary member's value, still in its wire form.
@@ -408,10 +389,9 @@ fn is_token(candidate: &str) -> bool {
 /// Narrow a version to `MAJOR.MINOR`, or `None` if it is not one.
 ///
 /// Trailing components and pre-release/build metadata are discarded so patch
-/// releases do not each create a new time series. The *whole* string is still
-/// validated first: the discarded tail is retained for logging, so leaving it
-/// unchecked would let a hostile client put arbitrary text in a log field even
-/// though the metric label stayed bounded.
+/// releases do not each create a new time series. The whole string is
+/// validated first so a version that is malformed only in its discarded tail
+/// is still reported as a failure rather than silently accepted.
 fn major_minor(version: &str) -> Option<String> {
     if !is_plausible_version(version) {
         return None;
@@ -425,10 +405,11 @@ fn major_minor(version: &str) -> Option<String> {
 /// Whether the full version string looks like a version Buzz produced.
 ///
 /// Matches the sender-side rule in `buzz_core::client_identity`: dot-separated
-/// alphanumerics with optional `-`/`+` pre-release and build metadata.
+/// alphanumerics with optional `-`/`+` pre-release and build metadata, within
+/// the shared length bound.
 fn is_plausible_version(version: &str) -> bool {
     !version.is_empty()
-        && version.len() <= MAX_LOGGED_VALUE_LEN
+        && version.len() <= MAX_APP_VERSION_LEN
         && version
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
@@ -448,11 +429,6 @@ fn numeric_component(component: &str) -> Option<&str> {
     Some(component)
 }
 
-/// Bound a raw value's length for inclusion in a log line.
-fn truncate_for_log(value: &str) -> String {
-    value.chars().take(MAX_LOGGED_VALUE_LEN).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,7 +444,17 @@ mod tests {
         assert_eq!(info.app(), "buzz-desktop");
         assert_eq!(info.platform(), "macos");
         assert_eq!(info.app_version(), "0.5");
-        assert_eq!(info.app_version_detail(), "0.5.2");
+    }
+
+    #[test]
+    fn accepts_a_header_with_no_app_version() {
+        // buzz-cli and buzz-acp have no independently bumped release version,
+        // so they omit `app-version` rather than send a misleading constant.
+        // That must parse, not be counted as a failure.
+        let info = parse("v=1, app=buzz-cli, platform=linux").unwrap();
+        assert_eq!(info.app(), "buzz-cli");
+        assert_eq!(info.platform(), "linux");
+        assert_eq!(info.app_version(), UNKNOWN_LABEL);
     }
 
     #[test]
@@ -488,11 +474,13 @@ mod tests {
                 ClientPlatform::Ios,
                 ClientPlatform::Android,
             ] {
-                let raw = client_header_value(app, platform, "1.2.3").expect("builder emits");
-                let info = parse(&raw).unwrap_or_else(|e| panic!("{raw:?} rejected as {e:?}"));
-                assert_eq!(info.app(), app.as_str());
-                assert_eq!(info.platform(), platform.as_str());
-                assert_eq!(info.app_version(), "1.2");
+                for (version, expected) in [(Some("1.2.3"), "1.2"), (None, UNKNOWN_LABEL)] {
+                    let raw = client_header_value(app, platform, version);
+                    let info = parse(&raw).unwrap_or_else(|e| panic!("{raw:?} rejected as {e:?}"));
+                    assert_eq!(info.app(), app.as_str());
+                    assert_eq!(info.platform(), platform.as_str());
+                    assert_eq!(info.app_version(), expected);
+                }
             }
         }
     }
@@ -605,8 +593,11 @@ mod tests {
             parse(r#"v=1, app=buzz-desktop, app-version="1.0.0""#),
             Err(ParseFailure::UnknownPlatform)
         );
+        // `app-version` is the one optional member — absent is valid, but a
+        // present-and-broken one is still a failure.
+        assert!(parse("v=1, app=buzz-desktop, platform=macos").is_ok());
         assert_eq!(
-            parse(r#"v=1, app=buzz-desktop, platform=macos"#),
+            parse(r#"v=1, app=buzz-desktop, platform=macos, app-version="nope""#),
             Err(ParseFailure::BadAppVersion)
         );
     }
@@ -704,9 +695,20 @@ mod tests {
 
     #[test]
     fn unidentified_connections_get_the_unknown_bucket() {
-        assert_eq!(labels(None), (UNKNOWN_LABEL, UNKNOWN_LABEL, UNKNOWN_LABEL));
+        // An unidentified connection must still produce a series, so
+        // "unidentified" is a visible dashboard line rather than a silent gap.
         let info = parse(r#"v=1, app=buzz-cli, platform=linux, app-version="1.0.0""#).unwrap();
-        assert_eq!(labels(Some(&info)), ("buzz-cli", "linux", "1.0"));
+        assert_eq!(
+            (info.app(), info.platform(), info.app_version()),
+            ("buzz-cli", "linux", "1.0")
+        );
+        // Gauge helpers accept `None` and label every dimension unknown; they
+        // are exercised here to prove the label path cannot panic without a
+        // recorder installed.
+        increment_active(None);
+        decrement_active(None);
+        increment_active(Some(&info));
+        decrement_active(Some(&info));
     }
 
     #[test]
@@ -725,13 +727,16 @@ mod tests {
     }
 
     #[test]
-    fn logged_version_detail_is_length_bounded() {
-        // `app-version` is bounded by the builder, but the parser must not
-        // rely on a hostile client honouring that.
-        let long = "1.2".to_owned() + &".9".repeat(64);
-        assert_eq!(
-            truncate_for_log(&long).chars().count(),
-            MAX_LOGGED_VALUE_LEN
+    fn the_sender_cannot_emit_a_header_this_parser_would_reject_as_oversized() {
+        // Both halves share `MAX_HEADER_LEN`, so anything the builder produces
+        // must fit the parser's bound. A divergence here would silently count
+        // real clients as parse failures.
+        let longest = client_header_value(
+            ClientApp::Desktop,
+            ClientPlatform::Android,
+            Some("10000.10000.99999-rc.1+build"),
         );
+        assert!(longest.len() <= MAX_HEADER_LEN, "{longest}");
+        assert!(ClientInfo::parse_bytes(longest.as_bytes()).is_ok());
     }
 }

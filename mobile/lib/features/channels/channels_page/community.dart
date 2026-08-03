@@ -143,13 +143,29 @@ class _CommunitySwitcherSheet extends HookConsumerWidget {
                                         Navigator.of(context).pop();
                                       }
                                     },
-                              onRemove: () => _confirmRemoveCommunity(
-                                context,
-                                ref,
-                                communities[index],
-                                closeSheetAfterRemoval:
-                                    communities[index].id == activeId,
-                              ),
+                              onRemove: () {
+                                final community = communities[index];
+                                final nextCommunity = community.id == activeId
+                                    ? communities
+                                          .where(
+                                            (candidate) =>
+                                                candidate.id != community.id,
+                                          )
+                                          .firstOrNull
+                                    : null;
+                                unawaited(
+                                  _confirmRemoveCommunity(
+                                    context,
+                                    ref,
+                                    community,
+                                    closeSheetAfterRemoval:
+                                        community.id == activeId,
+                                    nextCommunityId: nextCommunity?.id,
+                                    onCommunitySwitchStart:
+                                        onCommunitySwitchStart,
+                                  ),
+                                );
+                              },
                             ),
                           ],
                           if (communities.isNotEmpty)
@@ -447,6 +463,8 @@ Future<void> _confirmRemoveCommunity(
   WidgetRef ref,
   Community community, {
   required bool closeSheetAfterRemoval,
+  required String? nextCommunityId,
+  ValueChanged<String?>? onCommunitySwitchStart,
 }) async {
   final confirmed = await showDialog<bool>(
     context: context,
@@ -473,6 +491,7 @@ Future<void> _confirmRemoveCommunity(
   if (confirmed != true || !context.mounted) return;
 
   final messenger = ScaffoldMessenger.of(context);
+  onCommunitySwitchStart?.call(nextCommunityId);
   try {
     await ref
         .read(communityListProvider.notifier)
@@ -481,6 +500,7 @@ Future<void> _confirmRemoveCommunity(
       Navigator.of(context).pop();
     }
   } catch (e) {
+    onCommunitySwitchStart?.call(null);
     messenger.showSnackBar(
       SnackBar(content: Text('Failed to remove community: $e')),
     );

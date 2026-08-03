@@ -4,29 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../theme/theme.dart';
+import 'frosted_header_scroll_state.dart';
 
 /// Minimum height of the frosted app bar content area below the safe area.
 const _kBarContentMinHeight = Grid.xxs + 32 + Grid.xxs; // 48
 const _kBottomBorderWidth = 1.0;
-
-/// Shares the scroll elevation state from [FrostedScaffold] with its header.
-/// Keeping this separate lets all of the existing page bodies continue to own
-/// their scroll views.
-class FrostedHeaderScrollState extends InheritedNotifier<ValueNotifier<bool>> {
-  const FrostedHeaderScrollState({
-    required super.notifier,
-    required super.child,
-    super.key,
-  });
-
-  static bool isScrolledOf(BuildContext context) {
-    return context
-            .dependOnInheritedWidgetOfExactType<FrostedHeaderScrollState>()
-            ?.notifier
-            ?.value ??
-        false;
-  }
-}
 
 TextStyle _effectiveTitleStyle(BuildContext context, TextStyle? titleStyle) {
   final baseStyle =

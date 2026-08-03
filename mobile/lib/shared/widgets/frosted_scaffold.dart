@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 
 import 'frosted_app_bar.dart';
+import 'frosted_header_scroll_state.dart';
 
 /// A convenience [Scaffold] that overlays a [FrostedAppBar] on top of its body.
 ///

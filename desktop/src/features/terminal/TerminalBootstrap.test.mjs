@@ -319,6 +319,43 @@ test("opening a tab keeps terminal ownership while its attachment is pending", a
   view.unmount();
 });
 
+test("a successful close removes the tab even if the exit event is lost", async () => {
+  const { createElement } = await import("react");
+  const { fireEvent, render, waitFor } = await import("@testing-library/react");
+  const { ThemeProvider } = await import("@/shared/theme/ThemeProvider");
+  const { TerminalBootstrap } = await import("./TerminalBootstrap.tsx");
+
+  const view = render(
+    createElement(
+      ThemeProvider,
+      null,
+      createElement("div", {
+        className: "buzz-huddle-app-surface",
+        tabIndex: -1,
+      }),
+      createElement(TerminalBootstrap, {
+        channelId: "channel-1",
+        channelName: "general",
+        npub: "npub1owner",
+        relayUrl: "wss://relay.example",
+        threadId: null,
+      }),
+    ),
+  );
+  await waitFor(() =>
+    assert.ok(calls.some(({ command }) => command === "terminal_attach")),
+  );
+  await waitFor(() => assert.ok(view.queryByRole("tab", { name: /SHELL/ })));
+
+  fireEvent.click(view.getByLabelText("Close SHELL"));
+
+  await waitFor(() =>
+    assert.ok(calls.some(({ command }) => command === "terminal_close")),
+  );
+  await waitFor(() => assert.equal(view.queryByRole("tab"), null));
+  view.unmount();
+});
+
 // The wheel-to-IPC path end to end. `TerminalSubstrate` already proves it
 // accumulates pixels into whole cells and `buzz-terminal` already proves which
 // way the engine goes; the seam between them is this file's business, and the

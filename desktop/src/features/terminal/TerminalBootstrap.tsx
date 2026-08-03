@@ -228,7 +228,10 @@ export function TerminalBootstrap({
           removeSession(key);
           return;
         }
-        void connection.close().catch(fail);
+        void connection
+          .close()
+          .then(() => removeSession(key))
+          .catch(fail);
       }}
       onFrameConsumed={(frame) => {
         const delivery = sessionsRef.current.find(

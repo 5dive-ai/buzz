@@ -1,7 +1,7 @@
 //! Private, read-only deployment moderation API.
 
 mod auth;
-mod error;
+pub(crate) mod error;
 
 use std::sync::Arc;
 
@@ -27,8 +27,8 @@ pub(crate) fn is_admin_host(state: &crate::state::AppState, headers: &HeaderMap)
 pub(crate) fn authorize_request(
     state: &crate::state::AppState,
     headers: &HeaderMap,
-) -> Result<(), Response> {
-    authorize(state, headers).map_err(|error| error.into_response())
+) -> Result<(), ApiError> {
+    authorize(state, headers)
 }
 
 /// Build the read-only deployment-admin routes.

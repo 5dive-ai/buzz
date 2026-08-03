@@ -1119,7 +1119,7 @@ mod tests {
             "BUZZ_ADMIN_PASSWORD",
             "BUZZ_ADMIN_WEB_DIR",
         ];
-        let previous = NAMES.map(|name| std::env::var_os(name));
+        let previous = NAMES.map(std::env::var_os);
         for name in NAMES {
             std::env::remove_var(name);
         }

@@ -101,6 +101,25 @@ class ActivityPage extends HookConsumerWidget {
 
     final channels = channelsAsync.asData?.value ?? const <Channel>[];
     final channelById = {for (final c in channels) c.id: c};
+    final memberChannelIds = {
+      for (final channel in channels)
+        if (channel.isMember) channel.id,
+    };
+    final memberChannelIdsKey = memberChannelIds.toList()..sort();
+    final previousMemberChannelIds = useRef<Set<String>>(memberChannelIds);
+    useEffect(() {
+      final rejoinedChannelIds = leftChannelIds.value.where(
+        (channelId) =>
+            !previousMemberChannelIds.value.contains(channelId) &&
+            memberChannelIds.contains(channelId),
+      );
+      if (rejoinedChannelIds.isNotEmpty) {
+        leftChannelIds.value = {...leftChannelIds.value}
+          ..removeAll(rejoinedChannelIds);
+      }
+      previousMemberChannelIds.value = memberChannelIds;
+      return null;
+    }, [memberChannelIdsKey.join('\u0000')]);
 
     int? markerOf(String contextId) => readState.effectiveTimestamp(contextId);
     bool isDone(InboxItem item) => isInboxItemDone(

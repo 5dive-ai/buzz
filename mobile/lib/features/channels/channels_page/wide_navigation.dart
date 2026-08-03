@@ -34,7 +34,7 @@ class WideChannelsNavigation extends HookConsumerWidget {
   final bool isCommunitySwitching;
   final ValueChanged<String?> onCommunitySwitchStart;
   final String? pendingCommunityId;
-  final bool isActivityReady;
+  final bool isActivitySettled;
   final VoidCallback onCommunitySwitchComplete;
   final List<WideNavigationDestination> destinations;
 
@@ -48,7 +48,7 @@ class WideChannelsNavigation extends HookConsumerWidget {
     required this.isCommunitySwitching,
     required this.onCommunitySwitchStart,
     required this.pendingCommunityId,
-    required this.isActivityReady,
+    required this.isActivitySettled,
     required this.onCommunitySwitchComplete,
     required this.destinations,
   });
@@ -69,8 +69,8 @@ class WideChannelsNavigation extends HookConsumerWidget {
       () {
         if (pendingCommunityId != activeCommunityId ||
             channelsAsync.isLoading ||
-            !channelsAsync.hasValue ||
-            !isActivityReady) {
+            !(channelsAsync.hasValue || channelsAsync.hasError) ||
+            !isActivitySettled) {
           return null;
         }
         final timer = Timer(
@@ -84,7 +84,8 @@ class WideChannelsNavigation extends HookConsumerWidget {
         activeCommunityId,
         channelsAsync.isLoading,
         channelsAsync.hasValue,
-        isActivityReady,
+        channelsAsync.hasError,
+        isActivitySettled,
       ],
     );
     final channels = (channelsAsync.asData?.value ?? const <Channel>[])

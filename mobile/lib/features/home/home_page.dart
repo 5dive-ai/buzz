@@ -80,7 +80,9 @@ class HomePage extends HookConsumerWidget {
     }
     final isCommunitySwitching = pendingCommunityId.value != null;
     final activityAsync = ref.watch(activityProvider);
-    final isActivityReady = activityAsync.hasValue && !activityAsync.isLoading;
+    final isActivitySettled =
+        !activityAsync.isLoading &&
+        (activityAsync.hasValue || activityAsync.hasError);
     final systemBottomInset = MediaQuery.paddingOf(context).bottom;
     final navigationBarWidth = _floatingTabBarWidth(
       MediaQuery.sizeOf(context).width,
@@ -175,7 +177,7 @@ class HomePage extends HookConsumerWidget {
                             pendingCommunityId.value = communityId;
                           },
                           pendingCommunityId: pendingCommunityId.value,
-                          isActivityReady: isActivityReady,
+                          isActivitySettled: isActivitySettled,
                           onCommunitySwitchComplete: () {
                             pendingCommunityId.value = null;
                           },

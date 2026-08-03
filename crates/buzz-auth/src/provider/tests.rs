@@ -11,9 +11,10 @@ use nostr::Keys;
 
 use super::*;
 use crate::context::{
-    AssertionExpiry, AssertionNotBefore, AssertionTransport, AuthTransport, BindingExpiry,
-    BindingSource, BindingVersion, DelegationExpiry, VerifiedKeyAttestation,
-    VerifiedTransportDelegation,
+    AssertionExpiry, AssertionNotBefore, AssertionTransport, AuthTransport,
+    AuthoritativeBindingEvidence, BindingExpiry, BindingSource, BindingVersion, DelegationExpiry,
+    EnrollmentMode, FederatedIdentityRequirement, FederatedPolicyStamp, ResolvedFederatedPolicy,
+    VerifiedKeyAttestation, VerifiedTransportDelegation,
 };
 
 const NOW: u64 = 100;
@@ -33,6 +34,39 @@ fn profile() -> AuthorizationProfileId {
 
 fn policy_version(value: &str) -> PolicyVersion {
     PolicyVersion::new(value).expect("synthetic policy version is valid")
+}
+
+fn federated_policy_with(
+    domain_value: u128,
+    correlation_id: Uuid,
+    epoch: u64,
+    enrollment_mode: EnrollmentMode,
+    effective_from: u64,
+    effective_until: u64,
+) -> ResolvedFederatedPolicy {
+    ResolvedFederatedPolicy::from_authoritative_resolution(
+        FederatedPolicyStamp::from_authoritative_state(
+            domain(domain_value),
+            Uuid::from_u128(40),
+            epoch,
+            correlation_id,
+            FederatedIdentityRequirement::Required(enrollment_mode),
+            effective_from,
+            effective_until,
+        )
+        .expect("synthetic federated policy lineage is valid"),
+    )
+}
+
+fn federated_policy() -> ResolvedFederatedPolicy {
+    federated_policy_with(
+        1,
+        Uuid::from_u128(20),
+        1,
+        EnrollmentMode::Provisioned,
+        1,
+        200,
+    )
 }
 
 fn provider_timeout() -> ProviderTimeout {
@@ -131,7 +165,7 @@ fn proof_method_for_transport(transport: AuthTransport) -> AuthMethod {
     }
 }
 
-fn all_contract_errors() -> [ProviderContractError; 22] {
+fn all_contract_errors() -> [ProviderContractError; 26] {
     [
         ProviderContractError::EmptyCapabilitySet,
         ProviderContractError::EmptyProfileId,
@@ -155,6 +189,10 @@ fn all_contract_errors() -> [ProviderContractError; 22] {
         ProviderContractError::DelegatedOwnerMismatch,
         ProviderContractError::DelegationExpired,
         ProviderContractError::BindingExpired,
+        ProviderContractError::FederatedPolicyDomainMismatch,
+        ProviderContractError::FederatedPolicyCorrelationMismatch,
+        ProviderContractError::FederatedPolicyNotYetEffective,
+        ProviderContractError::FederatedPolicyExpired,
     ]
 }
 
@@ -181,6 +219,7 @@ fn direct_request_for_transport(
     AuthorizationRequest::direct(
         &proof,
         &assertion,
+        &federated_policy(),
         profile(),
         requested,
         Uuid::from_u128(20),
@@ -212,11 +251,11 @@ fn direct_request(actor: &Keys) -> AuthorizationRequest {
     )
 }
 
-fn existing_binding(owner: &Keys) -> VersionedBindingRef {
+fn existing_binding(owner: &Keys) -> AuthoritativeBindingEvidence {
     existing_binding_in(1, owner)
 }
 
-fn existing_binding_in(domain_value: u128, owner: &Keys) -> VersionedBindingRef {
+fn existing_binding_in(domain_value: u128, owner: &Keys) -> AuthoritativeBindingEvidence {
     existing_binding_with_expiry_in(domain_value, owner, None)
 }
 
@@ -224,8 +263,8 @@ fn existing_binding_with_expiry_in(
     domain_value: u128,
     owner: &Keys,
     expires_at: Option<u64>,
-) -> VersionedBindingRef {
-    VersionedBindingRef::new_existing_active_for_test(
+) -> AuthoritativeBindingEvidence {
+    AuthoritativeBindingEvidence::new(
         domain(domain_value),
         Uuid::from_u128(10),
         principal(),
@@ -260,6 +299,7 @@ fn delegated_request(actor: &Keys, owner: &Keys, expiry: u64) -> AuthorizationRe
     AuthorizationRequest::delegated(
         &proof,
         &existing_binding(owner),
+        &federated_policy(),
         profile(),
         capabilities(&[AuthorizationCapability::CommunityRead]),
         Uuid::from_u128(20),
@@ -568,6 +608,186 @@ async fn provider_freshness_is_evaluated_after_async_io() {
 }
 
 #[tokio::test]
+async fn federated_policy_expiry_is_evaluated_after_async_io() {
+    let actor = Keys::generate();
+    let proof = VerifiedNostrProof::new(
+        domain(1),
+        AuthTransport::RelayWebSocket,
+        actor.public_key(),
+        AuthMethod::Nip42,
+        None,
+    )
+    .expect("synthetic proof is valid");
+    let assertion = VerifiedFederatedAssertion::new(
+        domain(1),
+        AuthTransport::RelayWebSocket,
+        principal(),
+        Some(VerifiedKeyAttestation::new(actor.public_key())),
+        AssertionTransport::TrustedProxy,
+        None,
+        AssertionExpiry::new(180).expect("synthetic assertion expiry is valid"),
+    );
+    let policy = federated_policy_with(
+        1,
+        Uuid::from_u128(20),
+        7,
+        EnrollmentMode::Provisioned,
+        1,
+        105,
+    );
+    let request = AuthorizationRequest::direct(
+        &proof,
+        &assertion,
+        &policy,
+        profile(),
+        capabilities(&[AuthorizationCapability::CommunityRead]),
+        Uuid::from_u128(20),
+        NOW,
+    )
+    .expect("federated policy is current when provider I/O begins");
+    let clock = TestClock::at(NOW);
+    let provider = AdvancingProvider::returning_at(
+        allow_for(
+            &request,
+            request.requested_capabilities().clone(),
+            "capability-policy-v1",
+            NOW,
+            180,
+        ),
+        clock.clone(),
+        105,
+    );
+
+    let AuthorizationOutcome::Deny(denial) =
+        resolve_authorization(&provider, &request, &clock, provider_timeout()).await
+    else {
+        panic!("federated enrollment policy expired after I/O must deny");
+    };
+    assert_eq!(
+        denial.reason(),
+        AuthorizationDenialReason::FederatedPolicyNotCurrent
+    );
+    assert_eq!(clock.reads(), 1);
+}
+
+#[tokio::test]
+async fn snapshot_requires_exact_enrollment_policy_lineage() {
+    let actor = Keys::generate();
+    let proof = VerifiedNostrProof::new(
+        domain(1),
+        AuthTransport::RelayWebSocket,
+        actor.public_key(),
+        AuthMethod::Nip42,
+        None,
+    )
+    .expect("synthetic proof is valid");
+    let assertion = VerifiedFederatedAssertion::new(
+        domain(1),
+        AuthTransport::RelayWebSocket,
+        principal(),
+        Some(VerifiedKeyAttestation::new(actor.public_key())),
+        AssertionTransport::TrustedProxy,
+        None,
+        AssertionExpiry::new(180).expect("synthetic assertion expiry is valid"),
+    );
+    let current_policy = federated_policy_with(
+        1,
+        Uuid::from_u128(20),
+        7,
+        EnrollmentMode::Provisioned,
+        1,
+        160,
+    );
+    let request = AuthorizationRequest::direct(
+        &proof,
+        &assertion,
+        &current_policy,
+        profile(),
+        capabilities(&[AuthorizationCapability::CommunityRead]),
+        Uuid::from_u128(20),
+        NOW,
+    )
+    .expect("current policy can enter provider evaluation");
+    let provider = FakeProvider::returning(allow_for(
+        &request,
+        request.requested_capabilities().clone(),
+        "6",
+        90,
+        180,
+    ));
+    let AuthorizationOutcome::Allow(snapshot) =
+        resolve_at(&provider, &request, NOW, provider_timeout()).await
+    else {
+        panic!("current provider and enrollment policy must allow");
+    };
+
+    let stale_tofu_policy =
+        federated_policy_with(1, Uuid::from_u128(20), 6, EnrollmentMode::Tofu, 1, 160);
+    assert!(snapshot.is_bound_to_federated_policy(&current_policy));
+    assert!(!snapshot.is_bound_to_federated_policy(&stale_tofu_policy));
+    assert_eq!(snapshot.policy_version().as_str(), "6");
+    assert_ne!(
+        snapshot.policy_version().as_str(),
+        snapshot.federated_policy().epoch().to_string()
+    );
+}
+
+#[tokio::test]
+async fn enrollment_policy_bounds_snapshot_effective_interval() {
+    let actor = Keys::generate();
+    let proof = VerifiedNostrProof::new(
+        domain(1),
+        AuthTransport::RelayWebSocket,
+        actor.public_key(),
+        AuthMethod::Nip42,
+        None,
+    )
+    .expect("synthetic proof is valid");
+    let assertion = VerifiedFederatedAssertion::new(
+        domain(1),
+        AuthTransport::RelayWebSocket,
+        principal(),
+        Some(VerifiedKeyAttestation::new(actor.public_key())),
+        AssertionTransport::TrustedProxy,
+        None,
+        AssertionExpiry::new(180).expect("synthetic assertion expiry is valid"),
+    );
+    let policy = federated_policy_with(
+        1,
+        Uuid::from_u128(20),
+        7,
+        EnrollmentMode::Provisioned,
+        1,
+        150,
+    );
+    let request = AuthorizationRequest::direct(
+        &proof,
+        &assertion,
+        &policy,
+        profile(),
+        capabilities(&[AuthorizationCapability::CommunityRead]),
+        Uuid::from_u128(20),
+        NOW,
+    )
+    .expect("current policy can enter provider evaluation");
+    let provider = FakeProvider::returning(allow_for(
+        &request,
+        request.requested_capabilities().clone(),
+        "capability-policy-v1",
+        90,
+        170,
+    ));
+    let AuthorizationOutcome::Allow(snapshot) =
+        resolve_at(&provider, &request, NOW, provider_timeout()).await
+    else {
+        panic!("current bounded policy must allow");
+    };
+
+    assert_eq!(request.evidence_valid_until(), Some(150));
+    assert_eq!(snapshot.effective_until(), 150);
+}
+
+#[tokio::test]
 async fn identity_evidence_is_evaluated_after_async_io() {
     let actor = Keys::generate();
     let request = direct_request_with_expiry(
@@ -608,6 +828,7 @@ async fn owner_binding_expiry_is_evaluated_after_async_io() {
     let request = AuthorizationRequest::delegated(
         &proof,
         &binding,
+        &federated_policy(),
         profile(),
         capabilities(&[AuthorizationCapability::CommunityRead]),
         Uuid::from_u128(20),
@@ -649,6 +870,7 @@ fn delegated_request_rejects_owner_binding_at_exact_expiry() {
     let error = AuthorizationRequest::delegated(
         &proof,
         &binding,
+        &federated_policy(),
         profile(),
         capabilities(&[AuthorizationCapability::CommunityRead]),
         Uuid::from_u128(20),
@@ -1230,6 +1452,7 @@ fn request_construction_rechecks_verified_bounds_and_relationships() {
         AuthorizationRequest::direct(
             &proof,
             &expired,
+            &federated_policy(),
             profile(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::nil(),
@@ -1241,6 +1464,7 @@ fn request_construction_rechecks_verified_bounds_and_relationships() {
         AuthorizationRequest::direct(
             &proof,
             &expired,
+            &federated_policy(),
             profile(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::from_u128(20),
@@ -1262,12 +1486,95 @@ fn request_construction_rechecks_verified_bounds_and_relationships() {
         AuthorizationRequest::direct(
             &proof,
             &future,
+            &federated_policy(),
             profile(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::from_u128(20),
             NOW,
         ),
         Err(ProviderContractError::AssertionNotYetValid)
+    );
+}
+
+#[test]
+fn request_construction_rejects_non_current_or_mismatched_federated_policy() {
+    let actor = Keys::generate();
+    let proof = VerifiedNostrProof::new(
+        domain(1),
+        AuthTransport::RelayWebSocket,
+        actor.public_key(),
+        AuthMethod::Nip42,
+        None,
+    )
+    .expect("synthetic proof is valid");
+    let assertion = VerifiedFederatedAssertion::new(
+        domain(1),
+        AuthTransport::RelayWebSocket,
+        principal(),
+        Some(VerifiedKeyAttestation::new(actor.public_key())),
+        AssertionTransport::TrustedProxy,
+        None,
+        AssertionExpiry::new(180).expect("synthetic assertion expiry is valid"),
+    );
+    let request_with = |policy: &ResolvedFederatedPolicy| {
+        AuthorizationRequest::direct(
+            &proof,
+            &assertion,
+            policy,
+            profile(),
+            capabilities(&[AuthorizationCapability::CommunityRead]),
+            Uuid::from_u128(20),
+            NOW,
+        )
+    };
+
+    let wrong_domain = federated_policy_with(
+        2,
+        Uuid::from_u128(20),
+        1,
+        EnrollmentMode::Provisioned,
+        1,
+        180,
+    );
+    assert_eq!(
+        request_with(&wrong_domain),
+        Err(ProviderContractError::FederatedPolicyDomainMismatch)
+    );
+    let wrong_correlation = federated_policy_with(
+        1,
+        Uuid::from_u128(21),
+        1,
+        EnrollmentMode::Provisioned,
+        1,
+        180,
+    );
+    assert_eq!(
+        request_with(&wrong_correlation),
+        Err(ProviderContractError::FederatedPolicyCorrelationMismatch)
+    );
+    let future = federated_policy_with(
+        1,
+        Uuid::from_u128(20),
+        1,
+        EnrollmentMode::Provisioned,
+        NOW + 1,
+        180,
+    );
+    assert_eq!(
+        request_with(&future),
+        Err(ProviderContractError::FederatedPolicyNotYetEffective)
+    );
+    let expired = federated_policy_with(
+        1,
+        Uuid::from_u128(20),
+        1,
+        EnrollmentMode::Provisioned,
+        1,
+        NOW,
+    );
+    assert_eq!(
+        request_with(&expired),
+        Err(ProviderContractError::FederatedPolicyExpired)
     );
 }
 
@@ -1301,6 +1608,7 @@ fn request_construction_rejects_mismatched_verified_evidence() {
         AuthorizationRequest::direct(
             proof,
             assertion,
+            &federated_policy(),
             profile(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::from_u128(20),
@@ -1359,20 +1667,23 @@ fn request_construction_rejects_mismatched_verified_evidence() {
         Err(ProviderContractError::DirectRequestHasOwner)
     );
 
-    let delegated_request_from = |proof: &VerifiedNostrProof, binding: &VersionedBindingRef| {
-        AuthorizationRequest::delegated(
-            proof,
-            binding,
-            profile(),
-            capabilities(&[AuthorizationCapability::CommunityRead]),
-            Uuid::from_u128(20),
-            NOW,
-        )
-    };
+    let delegated_request_from =
+        |proof: &VerifiedNostrProof, binding: &AuthoritativeBindingEvidence| {
+            AuthorizationRequest::delegated(
+                proof,
+                binding,
+                &federated_policy(),
+                profile(),
+                capabilities(&[AuthorizationCapability::CommunityRead]),
+                Uuid::from_u128(20),
+                NOW,
+            )
+        };
     assert_eq!(
         AuthorizationRequest::delegated(
             &delegated_proof,
             &existing_binding(&owner),
+            &federated_policy(),
             profile(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::nil(),
@@ -1422,6 +1733,7 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
         "transport: \"[redacted]\", actor_pubkey: \"[redacted]\", ",
         "proof_method: \"[redacted]\", ",
         "authority: \"[redacted]\", principal: \"[redacted]\", ",
+        "federated_policy: \"[redacted]\", ",
         "profile_id: \"[redacted]\", requested_capabilities: \"[redacted]\", ",
         "correlation_id: \"[redacted]\", decision_source: \"[redacted]\", ",
         "evidence_valid_until: \"[redacted]\" }"
@@ -1489,6 +1801,7 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
             "owner_pubkey: \"[redacted]\", binding_id: \"[redacted]\", ",
             "binding_version: \"[redacted]\", proof_method: \"[redacted]\", ",
             "principal: \"[redacted]\", ",
+            "federated_policy: \"[redacted]\", ",
             "profile_id: \"[redacted]\", capabilities: \"[redacted]\", ",
             "policy_version: \"[redacted]\", issued_at: \"[redacted]\", ",
             "fresh_until: \"[redacted]\", effective_until: \"[redacted]\", ",
@@ -1584,6 +1897,7 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
         AuthorizationDenialReason::StaleDecision,
         AuthorizationDenialReason::FutureDecision,
         AuthorizationDenialReason::IdentityEvidenceExpired,
+        AuthorizationDenialReason::FederatedPolicyNotCurrent,
     ] {
         assert_eq!(
             format!("{reason:?}"),
@@ -1641,13 +1955,14 @@ fn provider_trait_is_object_safe_and_codes_are_unique() {
         AuthorizationDenialReason::StaleDecision.code(),
         AuthorizationDenialReason::FutureDecision.code(),
         AuthorizationDenialReason::IdentityEvidenceExpired.code(),
+        AuthorizationDenialReason::FederatedPolicyNotCurrent.code(),
         ProviderUnavailableReason::TemporarilyUnavailable.code(),
         ProviderUnavailableReason::Timeout.code(),
         ProviderUnavailableReason::DependencyUnavailable.code(),
     ];
     codes.sort_unstable();
     codes.dedup();
-    assert_eq!(codes.len(), 12);
+    assert_eq!(codes.len(), 13);
 
     let contract_errors = all_contract_errors();
     let mut contract_codes = contract_errors

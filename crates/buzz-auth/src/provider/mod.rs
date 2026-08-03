@@ -12,8 +12,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::context::{
-    AuthMethod, AuthTransport, BindingVersion, FederatedPrincipal, VerifiedFederatedAssertion,
-    VerifiedNostrProof, VersionedBindingRef,
+    AuthMethod, AuthTransport, AuthoritativeBindingEvidence, BindingVersion, FederatedPolicyStamp,
+    FederatedPrincipal, ResolvedFederatedPolicy, VerifiedFederatedAssertion, VerifiedNostrProof,
 };
 
 const MAX_OPAQUE_ID_BYTES: usize = 256;
@@ -133,10 +133,12 @@ impl fmt::Debug for AuthorizationProfileId {
     }
 }
 
-/// Opaque, equality-comparable policy version returned by a provider.
+/// Opaque, equality-comparable capability-policy version returned by a provider.
 ///
 /// This is the typed policy-change seam that later lease and invalidation code
-/// can use without assuming a provider-specific numeric ordering.
+/// can use without assuming a provider-specific numeric ordering. It is a
+/// distinct namespace from [`FederatedPolicyStamp::epoch`] and must never be
+/// used as enrollment-policy currency evidence.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct PolicyVersion(String);
 
@@ -222,6 +224,7 @@ pub struct AuthorizationRequest {
     proof_method: AuthMethod,
     authority: AuthorizationAuthority,
     principal: FederatedPrincipal,
+    federated_policy: FederatedPolicyStamp,
     profile_id: AuthorizationProfileId,
     requested_capabilities: CapabilitySet,
     correlation_id: Uuid,
@@ -239,6 +242,7 @@ impl AuthorizationRequest {
     pub fn direct(
         proof: &VerifiedNostrProof,
         assertion: &VerifiedFederatedAssertion,
+        federated_policy: &ResolvedFederatedPolicy,
         profile_id: AuthorizationProfileId,
         requested_capabilities: CapabilitySet,
         correlation_id: Uuid,
@@ -247,6 +251,12 @@ impl AuthorizationRequest {
         if correlation_id.is_nil() {
             return Err(ProviderContractError::InvalidCorrelationId);
         }
+        validate_federated_policy(
+            federated_policy,
+            proof.authorization_domain(),
+            correlation_id,
+            now_unix_seconds,
+        )?;
         if proof.verified_delegation().is_some() {
             return Err(ProviderContractError::DirectRequestHasOwner);
         }
@@ -278,11 +288,17 @@ impl AuthorizationRequest {
             proof_method: proof.proof_method(),
             authority: AuthorizationAuthority::Direct,
             principal: assertion.principal().clone(),
+            federated_policy: federated_policy.stamp().clone(),
             profile_id,
             requested_capabilities,
             correlation_id,
             decision_source: DecisionSource::DirectAssertion,
-            evidence_valid_until: Some(assertion.expires_at().unix_seconds()),
+            evidence_valid_until: Some(
+                assertion
+                    .expires_at()
+                    .unix_seconds()
+                    .min(federated_policy.stamp().effective_until()),
+            ),
         })
     }
 
@@ -293,7 +309,8 @@ impl AuthorizationRequest {
     /// `now_unix_seconds` must come from the server clock.
     pub fn delegated(
         proof: &VerifiedNostrProof,
-        owner: &VersionedBindingRef,
+        owner: &AuthoritativeBindingEvidence,
+        federated_policy: &ResolvedFederatedPolicy,
         profile_id: AuthorizationProfileId,
         requested_capabilities: CapabilitySet,
         correlation_id: Uuid,
@@ -302,6 +319,12 @@ impl AuthorizationRequest {
         if correlation_id.is_nil() {
             return Err(ProviderContractError::InvalidCorrelationId);
         }
+        validate_federated_policy(
+            federated_policy,
+            proof.authorization_domain(),
+            correlation_id,
+            now_unix_seconds,
+        )?;
         if proof.authorization_domain() != owner.authorization_domain() {
             return Err(ProviderContractError::AuthorizationDomainMismatch);
         }
@@ -323,14 +346,13 @@ impl AuthorizationRequest {
         {
             return Err(ProviderContractError::BindingExpired);
         }
-        let evidence_valid_until = match (delegation.expires_at(), owner.expires_at()) {
-            (Some(delegation), Some(binding)) => {
-                Some(delegation.unix_seconds().min(binding.unix_seconds()))
-            }
-            (Some(delegation), None) => Some(delegation.unix_seconds()),
-            (None, Some(binding)) => Some(binding.unix_seconds()),
-            (None, None) => None,
-        };
+        let mut evidence_valid_until = federated_policy.stamp().effective_until();
+        if let Some(delegation) = delegation.expires_at() {
+            evidence_valid_until = evidence_valid_until.min(delegation.unix_seconds());
+        }
+        if let Some(binding) = owner.expires_at() {
+            evidence_valid_until = evidence_valid_until.min(binding.unix_seconds());
+        }
         Ok(Self {
             authorization_domain: proof.authorization_domain(),
             transport: proof.authorized_transport(),
@@ -342,11 +364,12 @@ impl AuthorizationRequest {
                 binding_version: owner.binding_version(),
             },
             principal: owner.principal().clone(),
+            federated_policy: federated_policy.stamp().clone(),
             profile_id,
             requested_capabilities,
             correlation_id,
             decision_source: DecisionSource::DelegatedOwnerBinding,
-            evidence_valid_until,
+            evidence_valid_until: Some(evidence_valid_until),
         })
     }
 
@@ -380,6 +403,11 @@ impl AuthorizationRequest {
         &self.principal
     }
 
+    /// Exact authoritative enrollment-policy lineage bound to this request.
+    pub const fn federated_policy(&self) -> &FederatedPolicyStamp {
+        &self.federated_policy
+    }
+
     /// Server-resolved provider profile.
     pub const fn profile_id(&self) -> &AuthorizationProfileId {
         &self.profile_id
@@ -401,7 +429,7 @@ impl AuthorizationRequest {
     }
 
     /// Earliest validity bound supplied by verified assertion, owner-binding,
-    /// or delegation evidence.
+    /// delegation, or authoritative enrollment-policy evidence.
     pub const fn evidence_valid_until(&self) -> Option<u64> {
         self.evidence_valid_until
     }
@@ -417,6 +445,7 @@ impl fmt::Debug for AuthorizationRequest {
             .field("proof_method", &"[redacted]")
             .field("authority", &"[redacted]")
             .field("principal", &"[redacted]")
+            .field("federated_policy", &"[redacted]")
             .field("profile_id", &"[redacted]")
             .field("requested_capabilities", &"[redacted]")
             .field("correlation_id", &"[redacted]")
@@ -505,6 +534,8 @@ pub enum AuthorizationDenialReason {
     FutureDecision,
     /// Verified identity evidence expired before the decision became effective.
     IdentityEvidenceExpired,
+    /// The bound federated enrollment policy was not current after provider I/O.
+    FederatedPolicyNotCurrent,
 }
 
 impl AuthorizationDenialReason {
@@ -519,6 +550,7 @@ impl AuthorizationDenialReason {
             Self::FutureDecision => "authorization_provider_deny_006",
             Self::IdentityEvidenceExpired => "authorization_provider_deny_007",
             Self::AuthorizationProfileMismatch => "authorization_provider_deny_008",
+            Self::FederatedPolicyNotCurrent => "authorization_provider_deny_009",
         }
     }
 }
@@ -779,6 +811,7 @@ pub struct CapabilitySnapshot {
     binding_version: Option<BindingVersion>,
     proof_method: AuthMethod,
     principal: FederatedPrincipal,
+    federated_policy: FederatedPolicyStamp,
     profile_id: AuthorizationProfileId,
     capabilities: CapabilitySet,
     policy_version: PolicyVersion,
@@ -832,6 +865,19 @@ impl CapabilitySnapshot {
     /// Exact admitted issuer-qualified principal.
     pub const fn principal(&self) -> &FederatedPrincipal {
         &self.principal
+    }
+
+    /// Exact authoritative enrollment-policy lineage bound to this decision.
+    pub const fn federated_policy(&self) -> &FederatedPolicyStamp {
+        &self.federated_policy
+    }
+
+    /// Whether a freshly resolved O3 policy is exactly the policy used here.
+    ///
+    /// O3 must additionally compare this stamp with current authoritative state
+    /// and use its epoch as an atomic enrollment precondition.
+    pub fn is_bound_to_federated_policy(&self, policy: &ResolvedFederatedPolicy) -> bool {
+        self.federated_policy == *policy.stamp()
     }
 
     /// Server-resolved authorization profile for this decision.
@@ -892,6 +938,7 @@ impl fmt::Debug for CapabilitySnapshot {
             .field("binding_version", &"[redacted]")
             .field("proof_method", &"[redacted]")
             .field("principal", &"[redacted]")
+            .field("federated_policy", &"[redacted]")
             .field("profile_id", &"[redacted]")
             .field("capabilities", &"[redacted]")
             .field("policy_version", &"[redacted]")
@@ -964,6 +1011,14 @@ pub async fn resolve_authorization(
         ));
     };
 
+    if request
+        .federated_policy
+        .is_not_yet_effective_at(now_unix_seconds)
+        || request.federated_policy.is_expired_at(now_unix_seconds)
+    {
+        return deny(AuthorizationDenialReason::FederatedPolicyNotCurrent);
+    }
+
     if allow.authorization_domain != request.authorization_domain {
         return deny(AuthorizationDenialReason::AuthorizationDomainMismatch);
     }
@@ -1013,6 +1068,7 @@ pub async fn resolve_authorization(
         },
         proof_method: request.proof_method,
         principal: allow.principal,
+        federated_policy: request.federated_policy.clone(),
         profile_id: allow.profile_id,
         capabilities: request.requested_capabilities.clone(),
         policy_version: allow.policy_version,
@@ -1099,6 +1155,18 @@ pub enum ProviderContractError {
     /// Owner binding was expired at server time.
     #[error("delegated provider request owner binding has expired")]
     BindingExpired,
+    /// Enrollment policy belonged to another authorization domain.
+    #[error("provider request enrollment policy does not match the authorization domain")]
+    FederatedPolicyDomainMismatch,
+    /// Enrollment policy belonged to another correlated decision.
+    #[error("provider request enrollment policy does not match the correlation identifier")]
+    FederatedPolicyCorrelationMismatch,
+    /// Enrollment policy was not yet effective at server time.
+    #[error("provider request enrollment policy is not yet effective")]
+    FederatedPolicyNotYetEffective,
+    /// Enrollment policy was expired at server time.
+    #[error("provider request enrollment policy has expired")]
+    FederatedPolicyExpired,
 }
 
 impl ProviderContractError {
@@ -1127,8 +1195,33 @@ impl ProviderContractError {
             Self::MissingKeyAttestation => "authorization_provider_contract_020",
             Self::FreshnessWindowTooLong => "authorization_provider_contract_021",
             Self::BindingExpired => "authorization_provider_contract_022",
+            Self::FederatedPolicyDomainMismatch => "authorization_provider_contract_023",
+            Self::FederatedPolicyCorrelationMismatch => "authorization_provider_contract_024",
+            Self::FederatedPolicyNotYetEffective => "authorization_provider_contract_025",
+            Self::FederatedPolicyExpired => "authorization_provider_contract_026",
         }
     }
+}
+
+fn validate_federated_policy(
+    policy: &ResolvedFederatedPolicy,
+    authorization_domain: CommunityId,
+    correlation_id: Uuid,
+    now_unix_seconds: u64,
+) -> Result<(), ProviderContractError> {
+    if policy.authorization_domain() != authorization_domain {
+        return Err(ProviderContractError::FederatedPolicyDomainMismatch);
+    }
+    if policy.stamp().correlation_id() != correlation_id {
+        return Err(ProviderContractError::FederatedPolicyCorrelationMismatch);
+    }
+    if policy.stamp().is_not_yet_effective_at(now_unix_seconds) {
+        return Err(ProviderContractError::FederatedPolicyNotYetEffective);
+    }
+    if policy.stamp().is_expired_at(now_unix_seconds) {
+        return Err(ProviderContractError::FederatedPolicyExpired);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -57,6 +57,7 @@ part 'channels_page/community.dart';
 part 'channels_page/quick_actions.dart';
 part 'channels_page/quick_actions_launcher.dart';
 part 'channels_page/wide_navigation.dart';
+part 'channels_page/wide_channel_content.dart';
 
 enum _QuickAction { createChannel, newDm }
 

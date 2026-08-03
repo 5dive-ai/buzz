@@ -658,6 +658,84 @@ void main() {
     );
   });
 
+  testWidgets('a failed community swipe restores the workspace', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1180, 820);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final communityListNotifier = _FailingCommunityListNotifier([
+      Community(
+        id: 'alpha',
+        name: 'Alpha',
+        relayUrl: 'wss://alpha.example.com',
+        addedAt: DateTime(2026),
+      ),
+      Community(
+        id: 'bravo',
+        name: 'Bravo',
+        relayUrl: 'wss://bravo.example.com',
+        addedAt: DateTime(2026),
+      ),
+    ]);
+
+    await tester.pumpWidget(
+      await buildHome(
+        communityListNotifier: communityListNotifier,
+        activeCommunity: communityListNotifier.communities.first,
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 1));
+
+    Future<void> swipe() async {
+      final gesture = tester.widget<GestureDetector>(
+        find.descendant(
+          of: find.byKey(const Key('wide-navigation-community-icon')),
+          matching: find.byType(GestureDetector),
+        ),
+      );
+      gesture.onVerticalDragStart!(
+        DragStartDetails(globalPosition: Offset.zero),
+      );
+      gesture.onVerticalDragUpdate!(
+        DragUpdateDetails(
+          globalPosition: const Offset(0, 40),
+          delta: const Offset(0, 40),
+        ),
+      );
+      await tester.pump();
+      gesture.onVerticalDragEnd!(DragEndDetails(velocity: Velocity.zero));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 120));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 120));
+      await tester.pump();
+    }
+
+    await swipe();
+    expect(communityListNotifier.switchAttempts, 1);
+    expect(
+      tester
+          .widget<SkeletonShimmer>(
+            find.ancestor(
+              of: find.byKey(
+                const Key('wide-navigation-community-switch-skeleton'),
+              ),
+              matching: find.byType(SkeletonShimmer),
+            ),
+          )
+          .enabled,
+      isFalse,
+    );
+
+    await swipe();
+    expect(communityListNotifier.switchAttempts, 2);
+  });
+
   testWidgets('gives selection haptics only when the tab changes', (
     tester,
   ) async {
@@ -781,5 +859,21 @@ class _FakeCommunityListNotifier extends CommunityListNotifier {
   @override
   Future<void> switchCommunity(String id) async {
     switchedToId = id;
+  }
+}
+
+class _FailingCommunityListNotifier extends CommunityListNotifier {
+  _FailingCommunityListNotifier(this.communities);
+
+  final List<Community> communities;
+  int switchAttempts = 0;
+
+  @override
+  Future<List<Community>> build() async => communities;
+
+  @override
+  Future<void> switchCommunity(String id) async {
+    switchAttempts++;
+    throw Exception('Unable to save active community');
   }
 }

@@ -7,7 +7,7 @@ class _WideNavigationSidebar extends HookConsumerWidget {
   final String? selectedChannelId;
   final VoidCallback onProfileSelected;
   final bool isCommunitySwitching;
-  final ValueChanged<String> onCommunitySwitchStart;
+  final ValueChanged<String?> onCommunitySwitchStart;
   final List<_HomeDestination> destinations;
 
   const _WideNavigationSidebar({
@@ -285,7 +285,7 @@ class _WideNavigationSectionLabel extends StatelessWidget {
 
 class _WideNavigationCommunitySwitcher extends HookConsumerWidget {
   final VoidCallback onTap;
-  final ValueChanged<String> onCommunitySwitchStart;
+  final ValueChanged<String?> onCommunitySwitchStart;
 
   const _WideNavigationCommunitySwitcher({
     required this.onTap,
@@ -350,9 +350,19 @@ class _WideNavigationCommunitySwitcher extends HookConsumerWidget {
       if (!context.mounted) return;
       onCommunitySwitchStart(nextCommunity.id);
       unawaited(HapticFeedback.selectionClick());
-      await ref
-          .read(communityListProvider.notifier)
-          .switchCommunity(nextCommunity.id);
+      try {
+        await ref
+            .read(communityListProvider.notifier)
+            .switchCommunity(nextCommunity.id);
+      } catch (error) {
+        debugPrint('[CommunitySwitcher] failed to switch community: $error');
+        if (!context.mounted) return;
+        onCommunitySwitchStart(null);
+        swipeProgress.value = 0;
+        switchTarget.value = null;
+        isSwitching.value = false;
+        return;
+      }
       if (!context.mounted) return;
       swipeProgress.value = 0;
       switchTarget.value = null;

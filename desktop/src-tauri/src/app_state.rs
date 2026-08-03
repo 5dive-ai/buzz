@@ -9,12 +9,12 @@ use std::{
 
 use nostr::{Keys, ToBech32};
 use tauri::{AppHandle, Manager};
-#[cfg(feature = "mesh-llm")]
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::huddle::HuddleState;
 pub(crate) use crate::identity_storage::{IdentityStorage, RecoveryState, ResolvedIdentity};
 use crate::managed_agents::config_bridge::SessionConfigCache;
+use crate::managed_agents::scope::WorkspaceAgentScope;
 use crate::managed_agents::{ManagedAgentPairRuntime, ManagedAgentRuntimeKey};
 
 pub struct AppState {
@@ -93,7 +93,26 @@ pub struct AppState {
     /// a newer imported key during concurrent calls. Deliberately separate from
     /// `keys` so readers (signing, get_identity, etc.) are not blocked during
     /// keyring I/O.
-    pub identity_mutation: Mutex<()>,
+    ///
+    /// **Layer 1 async lock** — callers may `.await` while holding this guard.
+    /// Lock order: `identity_mutation` → `workspace_transition` → Mesh
+    /// `rearm_lock` → `mesh_llm_runtime`. Converted from `Mutex<()>` to
+    /// `AsyncMutex<()>` so callers in async Tauri commands can hold it across
+    /// awaits without blocking the executor.
+    pub identity_mutation: AsyncMutex<()>,
+    /// Serializes workspace transitions (`apply_workspace` and live identity
+    /// import). Taken after `identity_mutation` in the lock order.
+    ///
+    /// **Layer 1 async lock** — callers may `.await` while holding this guard.
+    pub workspace_transition: AsyncMutex<()>,
+    /// The active workspace agent scope — `None` from boot until the first
+    /// successful `apply_workspace`. Every agent command fails closed on `None`.
+    /// There is NO fallback to the legacy unscoped root.
+    ///
+    /// Protected by the **Layer 2 synchronous commit epoch** (no `.await` while
+    /// `managed_agents_store_lock` is held). Read outside the lock for
+    /// non-mutating "capture at entry" use via `capture_active_scope()`.
+    pub active_agent_scope: Mutex<Option<WorkspaceAgentScope>>,
     /// Set when the boot-time Phase 2 reset attempted a wipe but verification
     /// failed. The sentinel is preserved so the next relaunch retries. All
     /// identity-dependent setup is skipped; the frontend shows a reset-failed
@@ -211,7 +230,9 @@ pub fn build_app_state() -> AppState {
         managed_agent_profile_reconcile_enabled: AtomicBool::new(true),
         shutdown_started: AtomicBool::new(false),
         managed_agent_runtime_transition: Mutex::new(()),
-        identity_mutation: Mutex::new(()),
+        identity_mutation: AsyncMutex::new(()),
+        workspace_transition: AsyncMutex::new(()),
+        active_agent_scope: Mutex::new(None),
         managed_agents_store_lock: Mutex::new(()),
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),

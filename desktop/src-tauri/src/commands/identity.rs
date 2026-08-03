@@ -226,7 +226,7 @@ pub(crate) fn create_backup_with_log_n(
     // Serialize against import_identity/persist_current_identity: the blob
     // must be derived from — and persisted for — one stable identity. Also
     // caps KDF concurrency at one.
-    let _mutation_guard = state.identity_mutation.lock().map_err(|e| e.to_string())?;
+    let _mutation_guard = state.identity_mutation.blocking_lock();
 
     // Recovery mode (lost/locked) → Err, same gate as signing.
     let keys = state.signing_keys()?;
@@ -351,7 +351,7 @@ pub async fn import_identity(
         // full function body so a concurrent stale persist can't overwrite
         // this import.
         let state = app_handle.state::<AppState>();
-        let _mutation_guard = state.identity_mutation.lock().map_err(|e| e.to_string())?;
+        let _mutation_guard = state.identity_mutation.blocking_lock();
 
         let data_dir = app_handle
             .path()
@@ -473,7 +473,7 @@ pub async fn persist_current_identity(
         // concurrent import_identity cannot complete between our check and
         // our persist, which would let the stale ephemeral key overwrite the
         // imported one.
-        let _mutation_guard = state.identity_mutation.lock().map_err(|e| e.to_string())?;
+        let _mutation_guard = state.identity_mutation.blocking_lock();
 
         if !state
             .identity_lost

@@ -121,11 +121,15 @@ fn reconcile_inbound_persona_event_blocking(
     // Resolve inbound vs. any pending local edit before touching the store, in
     // the scope the event ARRIVED on. A workspace switch since arrival leaves
     // this event to its own community's store — dropping it here is what keeps
-    // community A's head out of community B's database.
+    // community A's head out of community B's database. Match on both relay and
+    // owner: an in-flight old-owner event on the same relay must not land in
+    // the new owner's active store after an identity switch.
+    let arrival_owner_pubkey = event.pubkey.to_hex();
     let Some(scope) = crate::managed_agents::retention::arrival_retention_scope(
         &app,
         &state,
         &arrival_relay_url,
+        &arrival_owner_pubkey,
     )?
     else {
         return Ok(());
@@ -261,11 +265,16 @@ fn reconcile_inbound_tombstone(
 
     // Resolve against the retained tombstone row (keyed by the target
     // coordinate, F2c) so a re-received tombstone or one older than a pending
-    // local edit is a no-op. Scoped to the arrival community, so a workspace
-    // switch since arrival drops the tombstone instead of retaining it — and
-    // deleting a record — in the wrong community's store.
-    let Some(scope) =
-        crate::managed_agents::retention::arrival_retention_scope(app, state, arrival_relay_url)?
+    // local edit is a no-op. Scoped to the arrival community + owner, so a
+    // workspace switch since arrival drops the tombstone instead of retaining
+    // it — and deleting a record — in the wrong community's or owner's store.
+    let tombstone_owner_pubkey = event.pubkey.to_hex();
+    let Some(scope) = crate::managed_agents::retention::arrival_retention_scope(
+        app,
+        state,
+        arrival_relay_url,
+        &tombstone_owner_pubkey,
+    )?
     else {
         return Ok(());
     };

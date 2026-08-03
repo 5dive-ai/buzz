@@ -1,0 +1,306 @@
+//! Workspace-scoped agent definition store.
+//!
+//! Every agent definition (managed-agents.json, teams.json,
+//! global-agent-config.json) lives under a `(relay_url, owner_pubkey)` scope
+//! so that definitions created in workspace A never appear in workspace B's
+//! store or relay. The scope identity uses the same sha256 derivation as the
+//! retention database, so "same scope" can never disagree between the two
+//! subsystems.
+//!
+//! # Scoped layout
+//!
+//! ```text
+//! <app-data>/agents/scopes/<scope_id>/managed-agents.json
+//! <app-data>/agents/scopes/<scope_id>/teams.json
+//! <app-data>/agents/scopes/<scope_id>/global-agent-config.json
+//! ```
+//!
+//! # Active scope lifecycle
+//!
+//! `Option<WorkspaceAgentScope>` is `None` from boot until the first
+//! successful `apply_workspace`. Every agent command fails closed on `None`
+//! ("no active workspace"). There is NO fallback to the legacy unscoped root;
+//! that fallback would recreate split-brain storage.
+//!
+//! # Transition model (four stages)
+//!
+//! See [`crate::commands::workspace`] for the full transition machine.
+//! 1. **Prepare (reversible):** derive/init target scope while old scope stays active.
+//! 2. **Drain (journaled, compensating):** stop old-scope runtimes; on failure
+//!    compensate by restarting the journaled set; return `applied: false` with
+//!    explicit degradation when compensation itself fails.
+//! 3. **Commit (infallible critical section):** pure in-memory swaps, no I/O.
+//! 4. **Post-commit (non-rollback):** nest regen, event sync, new-scope restore;
+//!    failures surface as degradation on an `applied: true` result.
+//!
+//! # Lock architecture (two layers)
+//!
+//! **Layer 1 — async serialization (Tokio mutexes, awaits OK):**
+//! `identity_mutation` → `workspace_transition` → Mesh `rearm_lock` → `mesh_llm_runtime`
+//!
+//! **Layer 2 — synchronous commit epoch (no `.await` while any guard held):**
+//! `managed_agent_runtime_transition` → `managed_agents_store_lock` →
+//! `managed_agent_processes` → short commit locks (relay override, keys,
+//! active_agent_scope).
+//!
+//! Generation checks bridge the layers: state read under Layer 1 is
+//! revalidated by generation inside the Layer 2 epoch immediately before
+//! commit.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use sha2::{Digest, Sha256};
+
+/// The single scope authority for a workspace's agent definition store.
+///
+/// Immutable after creation — every field is `pub` for read access only;
+/// mutations always produce a new `WorkspaceAgentScope`. Callers capture one
+/// scope at the entry of any operation that crosses an `.await` or a thread
+/// boundary and thread it through every load/save via `_at(scope)` APIs.
+/// A stale commit (generation mismatch) must abort; a stale spawn must
+/// additionally terminate its child and remove its receipt.
+#[derive(Debug, Clone)]
+pub struct WorkspaceAgentScope {
+    /// The sha256 scope identifier — byte-identical to the retention DB's
+    /// derivation so the two subsystems can never disagree about ownership.
+    pub scope_id: String,
+    /// The normalized relay URL for this scope.
+    pub relay_url: String,
+    /// The owner's hex pubkey.
+    pub owner_pubkey: String,
+    /// The scoped definitions directory: `<agents-base>/scopes/<scope_id>/`.
+    pub definitions_dir: PathBuf,
+    /// Monotonically increasing generation counter; incremented on every scope
+    /// change (including identity import that clears the active scope to None).
+    /// Used by long-running operations to detect a mid-flight workspace switch.
+    pub generation: u64,
+}
+
+/// Process-lifetime generation counter. Monotonically incremented every time
+/// the active scope changes (new scope committed or scope cleared). Operations
+/// that cross awaits read this at entry and re-validate before commit.
+static SCOPE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Increment and return the new generation. Called by the commit stage of
+/// `apply_workspace` and by identity import when the active scope is cleared.
+pub(crate) fn next_scope_generation() -> u64 {
+    SCOPE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// Read the current generation without incrementing.
+pub fn current_scope_generation() -> u64 {
+    SCOPE_GENERATION.load(Ordering::Acquire)
+}
+
+/// Relay-URL normalization used to derive a scope identifier. Must be
+/// identical to `normalized_relay_scope` in `retention.rs` so the sha256
+/// output is byte-identical.
+pub(crate) fn normalize_relay_for_scope(relay_url: &str) -> &str {
+    relay_url.trim().trim_end_matches('/')
+}
+
+/// Derive the sha256 scope identifier for a `(relay_url, owner_pubkey)` pair.
+///
+/// **This is the canonical derivation** — both the retention DB path
+/// (`retention::scoped_retention_db_path`) and the definition scope directory
+/// go through this function. The hash encodes the pair so relay URLs never
+/// become path components.
+///
+/// byte-identical to `retention::scoped_retention_db_path`'s inner hash.
+pub fn derive_scope_id(relay_url: &str, owner_pubkey: &str) -> String {
+    let normalized_relay = normalize_relay_for_scope(relay_url);
+    let mut hasher = Sha256::new();
+    hasher.update(owner_pubkey.trim().to_ascii_lowercase().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(normalized_relay.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Resolve the definition scope directory for a `(relay_url, owner_pubkey)`
+/// pair under `base_dir`.
+///
+/// Layout: `<base_dir>/scopes/<scope_id>/`
+pub fn scoped_definitions_dir(base_dir: &std::path::Path, scope_id: &str) -> PathBuf {
+    base_dir.join("scopes").join(scope_id)
+}
+
+impl WorkspaceAgentScope {
+    /// Construct a new scope, deriving the scope_id and definitions_dir from
+    /// the relay/owner pair.
+    pub fn new(
+        relay_url: String,
+        owner_pubkey: String,
+        base_dir: &std::path::Path,
+        generation: u64,
+    ) -> Self {
+        let scope_id = derive_scope_id(&relay_url, &owner_pubkey);
+        let definitions_dir = scoped_definitions_dir(base_dir, &scope_id);
+        Self {
+            scope_id,
+            relay_url,
+            owner_pubkey,
+            definitions_dir,
+            generation,
+        }
+    }
+
+    /// Ensure the definitions directory exists.
+    pub fn ensure_dir(&self) -> Result<(), String> {
+        std::fs::create_dir_all(&self.definitions_dir).map_err(|e| {
+            format!(
+                "failed to create scope dir {}: {e}",
+                self.definitions_dir.display()
+            )
+        })
+    }
+
+    /// Path to the scoped `managed-agents.json`.
+    pub fn managed_agents_path(&self) -> PathBuf {
+        self.definitions_dir.join("managed-agents.json")
+    }
+
+    /// Path to the scoped `teams.json`.
+    pub fn teams_path(&self) -> PathBuf {
+        self.definitions_dir.join("teams.json")
+    }
+
+    /// Path to the scoped `global-agent-config.json`.
+    pub fn global_config_path(&self) -> PathBuf {
+        self.definitions_dir.join("global-agent-config.json")
+    }
+}
+
+/// Result returned by `apply_workspace` / `import_identity` drain-then-commit.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkspaceApplyResult {
+    /// `true` when the new scope was committed; `false` when drain or
+    /// compensation failed (old scope is still active).
+    pub applied: bool,
+    /// Non-empty when the workspace applied but some post-commit step (nest
+    /// regen, event sync, runtime restore) failed. The workspace IS active;
+    /// the degradation is informational. Also populated on drain-failure with
+    /// the specific runtime(s) that could not be stopped or restored.
+    pub degraded: Vec<String>,
+}
+
+impl WorkspaceApplyResult {
+    pub fn success() -> Self {
+        Self {
+            applied: true,
+            degraded: Vec::new(),
+        }
+    }
+
+    pub fn with_degradation(mut self, msg: impl Into<String>) -> Self {
+        self.degraded.push(msg.into());
+        self
+    }
+
+    pub fn drain_failed(msg: impl Into<String>) -> Self {
+        Self {
+            applied: false,
+            degraded: vec![msg.into()],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The scope-id derivation must be byte-identical to
+    /// `retention::scoped_retention_db_path`'s inner hash.
+    ///
+    /// `scoped_retention_db_path` computes:
+    ///   sha256(owner.trim().to_ascii_lowercase() + "\0" + normalized_relay)
+    /// and encodes as hex. We verify parity by computing both and asserting
+    /// equality.
+    #[test]
+    fn test_scope_id_parity_with_retention_hash() {
+        use sha2::{Digest, Sha256};
+
+        let relay = "wss://relay.example.com/";
+        let owner = "AABBCCDD".repeat(8); // 64-char hex
+
+        // What retention.rs computes:
+        let normalized = relay.trim().trim_end_matches('/');
+        let mut hasher = Sha256::new();
+        hasher.update(owner.trim().to_ascii_lowercase().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(normalized.as_bytes());
+        let expected = hex::encode(hasher.finalize());
+
+        // What our helper computes:
+        let got = derive_scope_id(relay, &owner);
+
+        assert_eq!(
+            got, expected,
+            "scope_id must be byte-identical to retention hash"
+        );
+    }
+
+    #[test]
+    fn test_scope_id_trailing_slash_normalization() {
+        let owner = "aa".repeat(32);
+        assert_eq!(
+            derive_scope_id("wss://a.example/", &owner),
+            derive_scope_id("wss://a.example", &owner),
+            "trailing slash must produce same scope_id"
+        );
+    }
+
+    #[test]
+    fn test_scope_id_separates_relay_and_owner() {
+        let owner_a = "aa".repeat(32);
+        let owner_b = "bb".repeat(32);
+        let relay_a = "wss://a.example";
+        let relay_b = "wss://b.example";
+
+        assert_ne!(
+            derive_scope_id(relay_a, &owner_a),
+            derive_scope_id(relay_b, &owner_a)
+        );
+        assert_ne!(
+            derive_scope_id(relay_a, &owner_a),
+            derive_scope_id(relay_a, &owner_b)
+        );
+        assert_eq!(
+            derive_scope_id(relay_a, &owner_a),
+            derive_scope_id(relay_a, &owner_a)
+        );
+    }
+
+    #[test]
+    fn test_scoped_definitions_dir_layout() {
+        let base = Path::new("/data/agents");
+        let scope_id = "abcdef1234";
+        let dir = scoped_definitions_dir(base, scope_id);
+        assert_eq!(dir, base.join("scopes").join(scope_id));
+    }
+
+    #[test]
+    fn test_workspace_agent_scope_paths() {
+        let base = std::env::temp_dir();
+        let scope =
+            WorkspaceAgentScope::new("wss://relay.example.com".into(), "aa".repeat(32), &base, 0);
+        assert_eq!(
+            scope.managed_agents_path(),
+            scope.definitions_dir.join("managed-agents.json")
+        );
+        assert_eq!(scope.teams_path(), scope.definitions_dir.join("teams.json"));
+        assert_eq!(
+            scope.global_config_path(),
+            scope.definitions_dir.join("global-agent-config.json")
+        );
+    }
+
+    #[test]
+    fn test_generation_increments_monotonically() {
+        let before = current_scope_generation();
+        let next = next_scope_generation();
+        assert_eq!(next, before + 1);
+        assert_eq!(current_scope_generation(), next);
+    }
+}

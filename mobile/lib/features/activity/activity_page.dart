@@ -336,7 +336,9 @@ class ActivityPage extends HookConsumerWidget {
                   channel: channel,
                   currentPubkey: myPk,
                   isDone: isDone(item),
-                  selected: isWideInbox && item.id == selectedItemId.value,
+                  selected:
+                      isWideInbox &&
+                      item.conversationId == selectedItemId.value,
                   onTap: () => openItem(item),
                   onMarkRead: () => markItemRead(item),
                   onMarkUnread: () => markItemUnread(item),
@@ -361,9 +363,6 @@ class ActivityPage extends HookConsumerWidget {
             dueReminderCount: dueReminderCount,
             draftCount: drafts.length,
             onChanged: (nextFilter) {
-              selectedItemId.value = null;
-              selectedItemTarget.value = null;
-              selectedItemForDetail.value = null;
               filter.value = nextFilter;
             },
           ),

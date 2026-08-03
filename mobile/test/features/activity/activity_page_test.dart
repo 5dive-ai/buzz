@@ -244,6 +244,8 @@ void main() {
     );
     await tester.pumpAndSettle();
 
+    await tester.tap(find.byKey(const ValueKey('inbox-row-m2')));
+    await tester.pumpAndSettle();
     expect(find.byType(ChannelDetailPage), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('activity-filter-menu')));
     await tester.pumpAndSettle();

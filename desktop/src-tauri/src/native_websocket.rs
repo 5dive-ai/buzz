@@ -1,11 +1,15 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use buzz_core_pkg::client_identity::{
+    client_header_value_for_host, may_identify_to, ClientApp, CLIENT_HEADER,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, plugin::TauriPlugin, Manager, Runtime};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::{
     connect_async,
+    tungstenite::client::ClientRequestBuilder,
     tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Message},
 };
 use tokio_util::sync::CancellationToken;
@@ -14,6 +18,25 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const SEND_QUEUE_CAPACITY: usize = 64;
+
+/// Build the handshake request for `url`, attaching the advisory `Buzz-Client`
+/// header when the destination permits it.
+///
+/// The header tells the relay which app, platform, and version a live
+/// connection belongs to. Attaching it never fails a connection: a destination
+/// outside `may_identify_to` or an unusable version just omits it, and the
+/// relay counts the connection as unidentified.
+fn client_request(url: &str) -> Result<ClientRequestBuilder, String> {
+    let uri = url.parse().map_err(|error| format!("{error}"))?;
+    let builder = ClientRequestBuilder::new(uri);
+    let Some(value) = may_identify_to(url)
+        .then(|| client_header_value_for_host(ClientApp::Desktop, env!("CARGO_PKG_VERSION")))
+        .flatten()
+    else {
+        return Ok(builder);
+    };
+    Ok(builder.with_header(CLIENT_HEADER, value))
+}
 
 pub(crate) fn install_crypto_provider() {
     // Dependencies enable both rustls providers; choose one before TLS setup.
@@ -127,9 +150,10 @@ async fn open_connection(
     on_message: Channel<serde_json::Value>,
 ) -> Result<Id, String> {
     let connect_cancel = manager.connect_cancel.lock().await.clone();
+    let request = client_request(url)?;
     let (socket, _) = tokio::select! {
         _ = connect_cancel.cancelled() => return Err("WebSocket connection cancelled".to_string()),
-        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url)) => result
+        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request)) => result
             .map_err(|_| "WebSocket connection timed out".to_string())?
             .map_err(|error| error.to_string())?,
     };

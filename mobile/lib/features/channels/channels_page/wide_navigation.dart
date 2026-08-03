@@ -608,10 +608,17 @@ class _WideNavigationProfile extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final palette = _wideSidebarPalette(context);
     final profile = ref.watch(profileProvider).value;
+    final status = ref.watch(userStatusProvider).asData?.value;
     final displayName = profile?.displayName?.trim();
     final name = displayName != null && displayName.isNotEmpty
         ? displayName
         : 'You';
+    final statusEmoji = status?.emoji ?? '';
+    final statusText = status?.text.trim() ?? '';
+    final statusLabel = [
+      if (statusEmoji.isNotEmpty) statusEmoji,
+      if (statusText.isNotEmpty) statusText,
+    ].join(' ');
 
     return SizedBox(
       key: const Key('wide-navigation-profile'),
@@ -652,6 +659,17 @@ class _WideNavigationProfile extends ConsumerWidget {
                                   fontWeight: FontWeight.w600,
                                 ),
                               ),
+                              if (statusLabel.isNotEmpty) ...[
+                                const SizedBox(height: Grid.quarter),
+                                Text(
+                                  statusLabel,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: context.textTheme.labelSmall?.copyWith(
+                                    color: palette.mutedForeground,
+                                  ),
+                                ),
+                              ],
                             ],
                           ),
                         ),

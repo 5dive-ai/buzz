@@ -13,6 +13,7 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../../shared/auth/auth.dart';
 import '../../shared/community/community_icon_provider.dart';
 import '../../shared/relay/relay.dart';
+import '../../shared/relay/user_status_provider.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/anchored_popover_menu.dart';

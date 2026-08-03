@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:buzz/shared/relay/relay_socket.dart';
-import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:pointycastle/digests/sha1.dart';
 
 /// A server that completes the WS handshake then never speaks again: no pongs,
 /// no close frame. Only a client-side ping timeout can notice.
@@ -19,13 +20,13 @@ Future<ServerSocket> _silentAfterHandshakeServer() async {
         ).firstMatch(String.fromCharCodes(data));
         if (match == null) return;
         final accept = base64.encode(
-          sha1
-              .convert(
-                utf8.encode(
-                  '${match.group(1)!.trim()}258EAFA5-E914-47DA-95CA-C5AB0DC85B11',
-                ),
-              )
-              .bytes,
+          SHA1Digest().process(
+            Uint8List.fromList(
+              utf8.encode(
+                '${match.group(1)!.trim()}258EAFA5-E914-47DA-95CA-C5AB0DC85B11',
+              ),
+            ),
+          ),
         );
         client.write(
           'HTTP/1.1 101 Switching Protocols\r\n'

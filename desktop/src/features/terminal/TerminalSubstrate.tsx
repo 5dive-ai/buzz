@@ -391,6 +391,13 @@ export function TerminalSubstrate({
     gridRef.current?.paint(context, TERMINAL_CELL_METRICS, terminalPalette);
   }, [activeSessionId, cursorPainted, frames, terminalPalette]);
 
+  const runTabAction = (action: () => void) => {
+    action();
+    if (owner === "terminal") {
+      textareaRef.current?.focus({ preventScroll: true });
+    }
+  };
+
   return (
     <section
       aria-label="Buzz Term"
@@ -431,7 +438,7 @@ export function TerminalSubstrate({
                 aria-selected={session.active}
                 className="buzz-terminal-tab-select"
                 disabled={session.closing}
-                onClick={() => onSelectSession(session.id)}
+                onClick={() => runTabAction(() => onSelectSession(session.id))}
                 role="tab"
                 type="button"
               >
@@ -444,7 +451,7 @@ export function TerminalSubstrate({
                 aria-label={`Close ${session.title}`}
                 className="buzz-terminal-close"
                 disabled={session.closing}
-                onClick={() => onCloseSession(session.id)}
+                onClick={() => runTabAction(() => onCloseSession(session.id))}
                 type="button"
               >
                 ×
@@ -454,7 +461,7 @@ export function TerminalSubstrate({
           <button
             aria-label="New Buzz Term tab"
             className="buzz-terminal-new-tab"
-            onClick={onNewSession}
+            onClick={() => runTabAction(onNewSession)}
             type="button"
           >
             +

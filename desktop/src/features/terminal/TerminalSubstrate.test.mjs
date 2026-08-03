@@ -159,6 +159,30 @@ test("mounted IME paths neither toggle nor emit preedit text", async () => {
   assert.deepEqual(calls.input, ["か"]);
 });
 
+test("tab actions restore terminal input focus", async () => {
+  const { view } = fixture();
+  await ready(view);
+  toggleChord();
+  const input = view.getByLabelText("Terminal input");
+  await waitFor(() => assert.equal(document.activeElement, input));
+
+  const actions = [
+    ["select", view.getByRole("tab")],
+    ["close", view.getByLabelText("Close SHELL")],
+    ["new", view.getByLabelText("New Buzz Term tab")],
+  ];
+  for (const [label, target] of actions) {
+    target.focus();
+    assert.equal(document.activeElement, target, `${label} takes focus`);
+    fireEvent.click(target);
+    assert.equal(
+      document.activeElement,
+      input,
+      `${label} restores terminal focus`,
+    );
+  }
+});
+
 const EMPTY_FRAME = {
   cursor: { column: 0, line: 0, visible: false },
   full: false,

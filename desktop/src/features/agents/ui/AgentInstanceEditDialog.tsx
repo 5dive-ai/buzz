@@ -843,7 +843,7 @@ export function AgentInstanceEditDialog({
   const previewAvatarUrl = avatarUrl.trim() || null;
   const advancedFieldsTransition = shouldReduceMotion
     ? { duration: 0 }
-    : { duration: 0.18, ease: [0.23, 1, 0.32, 1] };
+    : ADVANCED_FIELDS_MOTION_TRANSITION;
 
   return (
     <Dialog onOpenChange={handleOpenChange} open={open}>

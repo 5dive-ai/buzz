@@ -502,11 +502,15 @@ function dispatchControlResult(agentPubkey: string, payload: unknown) {
   if (!isControlResultFrame(payload)) {
     return;
   }
-  // B5: on a positive set_config_option ack for effort, persist the canonical
-  // value to the agent record so it seeds settings.json on next spawn (B7).
+  // B5: on a positive set_config_option ack for a confirmed thought_level
+  // option, persist the canonical value to the agent record so it seeds
+  // settings.json on next spawn (B7).
+  // Gate on `category === "thought_level"` (present only on real-forward acks)
+  // rather than a literal configId — if the adapter renames the configId,
+  // persistence still works; synthetic acks (no category) never persist.
   if (
     payload.type === "set_config_option" &&
-    payload.configId === "effort" &&
+    payload.category === "thought_level" &&
     payload.status === "ok"
   ) {
     void persistAgentEffortLevel(agentPubkey, payload.value || null).catch(

@@ -1016,7 +1016,8 @@ fn handle_set_config_option_control(
             .and_then(|c| c.thought_level_config_id.clone())
     });
 
-    let status = if thought_level_id.as_deref() == Some(config_id) {
+    let is_thought_level = thought_level_id.as_deref() == Some(config_id);
+    let status = if is_thought_level {
         match pool.set_idle_agent_effort(config_id, value) {
             IdleEffortResult::Queued => "ok",
             IdleEffortResult::NoCatalog => "pending_session",
@@ -1027,16 +1028,24 @@ fn handle_set_config_option_control(
         "ok"
     };
 
+    // B5: include "category": "thought_level" ONLY on the real-forward branch.
+    // Synthetic acks carry no category so the Desktop observer cannot persist
+    // them as if they were confirmed thought_level changes.
+    let mut ack = serde_json::json!({
+        "type": "set_config_option",
+        "configId": config_id,
+        "status": status,
+        "value": value,
+    });
+    if is_thought_level {
+        ack["category"] = serde_json::json!("thought_level");
+    }
+
     obs.emit(
         "control_result",
         None,
         &observer::ObserverContext::default(),
-        serde_json::json!({
-            "type": "set_config_option",
-            "configId": config_id,
-            "status": status,
-            "value": value,
-        }),
+        ack,
     );
 }
 
@@ -6892,6 +6901,12 @@ mod control_result_tests {
             "ok",
             "Queued must yield ok ack"
         );
+        // Real-forward ack must carry category so Desktop knows to persist.
+        assert_eq!(
+            ev.payload["category"].as_str().unwrap(),
+            "thought_level",
+            "real thought_level forward must include category field"
+        );
         // Session must be invalidated so next turn creates a fresh session.
         let agent = pool.agents_mut().iter().flatten().next().unwrap();
         assert!(
@@ -6923,6 +6938,11 @@ mod control_result_tests {
             "ok",
             "without thought_level_config_id, harness emits synthetic ok"
         );
+        // Synthetic ok must NOT carry category — Desktop must not persist it.
+        assert!(
+            events[0].payload.get("category").is_none() || events[0].payload["category"].is_null(),
+            "synthetic ok must not carry category field"
+        );
     }
 
     /// B5: a non-thought_level configId must still receive a synthetic "ok"
@@ -6943,6 +6963,82 @@ mod control_result_tests {
             events[0].payload["status"].as_str().unwrap(),
             "ok",
             "unknown configId must yield synthetic ok for backward compat"
+        );
+    }
+
+    /// B5 persistence gate — real-forward ack carries `"category": "thought_level"`.
+    /// The Desktop observer gates persistence on this field; renaming the adapter's
+    /// configId does not break persistence as long as the category is present.
+    #[tokio::test]
+    async fn test_b5_real_forward_ack_includes_thought_level_category() {
+        use crate::acp::AcpClient;
+        use crate::pool::AgentModelCapabilities;
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test agent");
+        // Use a renamed configId ("think_level_v2") to prove category-gating
+        // does not depend on a hardcoded "effort" literal.
+        let thought_level_id = "think_level_v2".to_string();
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                thought_level_config_id: Some(thought_level_id.clone()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": thought_level_id,
+            "value": "high",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["status"].as_str().unwrap(), "ok");
+        // Real-forward ack must carry category so Desktop persists.
+        assert_eq!(
+            events[0].payload["category"].as_str().unwrap(),
+            "thought_level",
+            "real thought_level forward must include category field"
+        );
+    }
+
+    /// B5 persistence gate — synthetic ack (no thought_level_config_id in pool)
+    /// must NOT carry `"category"`. The Desktop observer gates persistence on the
+    /// category field; absent category means no persist.
+    #[test]
+    fn test_b5_synthetic_ok_ack_has_no_category() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "high",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["status"].as_str().unwrap(), "ok");
+        // Synthetic ack must NOT carry category — Desktop must not persist it.
+        assert!(
+            events[0].payload.get("category").is_none() || events[0].payload["category"].is_null(),
+            "synthetic ok ack must not carry category field"
         );
     }
 }

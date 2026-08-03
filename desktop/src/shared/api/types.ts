@@ -467,6 +467,7 @@ export type ControlResultFrame =
       status: "ok" | string;
       configId: string;
       value: string;
+      category?: "thought_level";
     };
 
 export type GitBashPrerequisite = {
@@ -675,7 +676,6 @@ export type RuntimeConfigSurface = {
   strippedOwnerEnvKeys?: string[];
   /** Spawn warnings (B7/B8 failure states): owner unreadable, agent MCP replaced, write failed. */
   configWarnings?: string[];
-  /** B5: `thought_level` configId from the adapter's `session/new`. Claude only, post-first-session. */
   effortConfigId?: string;
 };
 

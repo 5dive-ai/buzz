@@ -818,6 +818,7 @@ fn test_b8_agent_mcp_config_path_location() {
 /// Agent `.claude.json` write failure (failure state #3): spawn continues.
 /// Simulated by making the parent directory read-only before the merge.
 /// The warning is returned and spawn proceeds.
+#[cfg(unix)]
 #[test]
 fn test_b8_agent_write_failure_does_not_block_spawn() {
     // Skip on CI where we may run as root (read-only dirs are ignored by root).

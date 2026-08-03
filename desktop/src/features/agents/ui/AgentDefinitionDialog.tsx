@@ -624,7 +624,7 @@ export function AgentDefinitionDialog({
   ) : null;
   const advancedFieldsTransition = shouldReduceMotion
     ? { duration: 0 }
-    : { duration: 0.18, ease: [0.23, 1, 0.32, 1] };
+    : ADVANCED_FIELDS_MOTION_TRANSITION;
 
   React.useEffect(() => {
     if (

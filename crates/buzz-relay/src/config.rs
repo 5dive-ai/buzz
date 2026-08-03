@@ -53,6 +53,61 @@ impl AdminConfig {
     pub(crate) fn credential_digest(username: &str, password: &str) -> [u8; 32] {
         Sha256::digest(format!("{username}:{password}").as_bytes()).into()
     }
+
+    /// Validate raw admin settings. Kept separate from `Config::from_env` so tests can
+    /// exercise the rejection cases without mutating process-global environment variables,
+    /// which other tests read concurrently via `Config::from_env`.
+    pub(crate) fn from_values(
+        host: String,
+        username: Option<String>,
+        password: Option<String>,
+        web_dir: Option<String>,
+    ) -> Result<Self, ConfigError> {
+        if host.contains(['/', '\\', '@']) {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_ADMIN_HOST must be an exact authority".to_string(),
+            ));
+        }
+        let username = username
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "admin".to_string());
+        if username.len() > 128 || username.contains(':') || username.chars().any(char::is_control)
+        {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_ADMIN_USERNAME must be at most 128 characters and contain no colon or control characters"
+                    .to_string(),
+            ));
+        }
+        let password = password.filter(|value| !value.is_empty()).ok_or_else(|| {
+            ConfigError::InvalidValue(
+                "BUZZ_ADMIN_PASSWORD is required when BUZZ_ADMIN_HOST is set".to_string(),
+            )
+        })?;
+        if !(16..=1024).contains(&password.len()) || password.chars().any(char::is_control) {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_ADMIN_PASSWORD must be 16 to 1024 bytes and contain no control characters"
+                    .to_string(),
+            ));
+        }
+        let web_dir = web_dir
+            .map(|value| std::path::PathBuf::from(value.trim()))
+            .filter(|value| !value.as_os_str().is_empty());
+        if let Some(ref dir) = web_dir {
+            if !dir.join("index.html").is_file() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "BUZZ_ADMIN_WEB_DIR={} does not contain index.html",
+                    dir.display()
+                )));
+            }
+        }
+        Ok(Self {
+            credential_digest: Self::credential_digest(&username, &password),
+            host,
+            username,
+            web_dir,
+        })
+    }
 }
 
 /// Relay-hosted policy content presented on join surfaces.
@@ -899,61 +954,12 @@ impl Config {
             .filter(|value| !value.is_empty())
         {
             None => None,
-            Some(host) => {
-                if host.contains(['/', '\\', '@']) {
-                    return Err(ConfigError::InvalidValue(
-                        "BUZZ_ADMIN_HOST must be an exact authority".to_string(),
-                    ));
-                }
-                let username = std::env::var("BUZZ_ADMIN_USERNAME")
-                    .ok()
-                    .map(|value| value.trim().to_owned())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "admin".to_string());
-                if username.len() > 128
-                    || username.contains(':')
-                    || username.chars().any(char::is_control)
-                {
-                    return Err(ConfigError::InvalidValue(
-                        "BUZZ_ADMIN_USERNAME must be at most 128 characters and contain no colon or control characters"
-                            .to_string(),
-                    ));
-                }
-                let password = std::env::var("BUZZ_ADMIN_PASSWORD")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        ConfigError::InvalidValue(
-                            "BUZZ_ADMIN_PASSWORD is required when BUZZ_ADMIN_HOST is set"
-                                .to_string(),
-                        )
-                    })?;
-                if !(16..=1024).contains(&password.len()) || password.chars().any(char::is_control)
-                {
-                    return Err(ConfigError::InvalidValue(
-                        "BUZZ_ADMIN_PASSWORD must be 16 to 1024 bytes and contain no control characters"
-                            .to_string(),
-                    ));
-                }
-                let web_dir = std::env::var("BUZZ_ADMIN_WEB_DIR")
-                    .ok()
-                    .map(|value| std::path::PathBuf::from(value.trim()))
-                    .filter(|value| !value.as_os_str().is_empty());
-                if let Some(ref dir) = web_dir {
-                    if !dir.join("index.html").is_file() {
-                        return Err(ConfigError::InvalidValue(format!(
-                            "BUZZ_ADMIN_WEB_DIR={} does not contain index.html",
-                            dir.display()
-                        )));
-                    }
-                }
-                Some(AdminConfig {
-                    credential_digest: AdminConfig::credential_digest(&username, &password),
-                    host,
-                    username,
-                    web_dir,
-                })
-            }
+            Some(host) => Some(AdminConfig::from_values(
+                host,
+                std::env::var("BUZZ_ADMIN_USERNAME").ok(),
+                std::env::var("BUZZ_ADMIN_PASSWORD").ok(),
+                std::env::var("BUZZ_ADMIN_WEB_DIR").ok(),
+            )?),
         };
 
         // Web UI static file serving
@@ -1112,40 +1118,78 @@ mod tests {
 
     #[test]
     fn admin_host_requires_a_strong_credential() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        const NAMES: [&str; 4] = [
-            "BUZZ_ADMIN_HOST",
-            "BUZZ_ADMIN_USERNAME",
-            "BUZZ_ADMIN_PASSWORD",
-            "BUZZ_ADMIN_WEB_DIR",
-        ];
-        let previous = NAMES.map(std::env::var_os);
-        for name in NAMES {
-            std::env::remove_var(name);
-        }
+        let host = || "admin.example".to_string();
 
-        std::env::set_var("BUZZ_ADMIN_HOST", "admin.example");
-        let missing = Config::from_env().expect_err("password must be required");
+        let missing = AdminConfig::from_values(host(), None, None, None)
+            .expect_err("password must be required");
         assert!(missing
             .to_string()
             .contains("BUZZ_ADMIN_PASSWORD is required"));
 
-        std::env::set_var("BUZZ_ADMIN_PASSWORD", "too-short");
-        let short = Config::from_env().expect_err("short password must be rejected");
+        let short = AdminConfig::from_values(host(), None, Some("too-short".to_string()), None)
+            .expect_err("short password must be rejected");
         assert!(short.to_string().contains("16 to 1024 bytes"));
 
-        std::env::set_var("BUZZ_ADMIN_USERNAME", "operator");
-        std::env::set_var("BUZZ_ADMIN_PASSWORD", "correct horse battery staple");
-        let config = Config::from_env().expect("valid admin credential");
-        let admin = config.admin.expect("admin config");
+        let colon = AdminConfig::from_values(
+            host(),
+            Some("oper:ator".to_string()),
+            Some("correct horse battery staple".to_string()),
+            None,
+        )
+        .expect_err("colon in username must be rejected");
+        assert!(colon.to_string().contains("no colon"));
+
+        let admin = AdminConfig::from_values(
+            host(),
+            Some("operator".to_string()),
+            Some("correct horse battery staple".to_string()),
+            None,
+        )
+        .expect("valid admin credential");
         assert_eq!(admin.username, "operator");
+        assert_eq!(
+            admin.credential_digest,
+            AdminConfig::credential_digest("operator", "correct horse battery staple")
+        );
         assert!(!format!("{admin:?}").contains("correct horse battery staple"));
 
-        for (name, value) in NAMES.into_iter().zip(previous) {
-            if let Some(value) = value {
-                std::env::set_var(name, value);
-            } else {
-                std::env::remove_var(name);
+        let default_username =
+            AdminConfig::from_values(host(), None, Some("a".repeat(16)), None).expect("defaults");
+        assert_eq!(default_username.username, "admin");
+    }
+
+    #[test]
+    fn admin_env_vars_wire_into_config() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = [
+            "BUZZ_ADMIN_HOST",
+            "BUZZ_ADMIN_USERNAME",
+            "BUZZ_ADMIN_PASSWORD",
+        ]
+        .map(|name| (name, std::env::var_os(name)));
+
+        // Set the password before the host. Other tests call `Config::from_env` without
+        // this mutex, and a host set without a password makes that call fail.
+        std::env::set_var("BUZZ_ADMIN_PASSWORD", "correct horse battery staple");
+        std::env::set_var("BUZZ_ADMIN_USERNAME", "operator");
+        std::env::set_var("BUZZ_ADMIN_HOST", "admin.example");
+        let admin = Config::from_env()
+            .expect("valid admin credential")
+            .admin
+            .expect("admin config");
+        std::env::remove_var("BUZZ_ADMIN_HOST");
+
+        assert_eq!(admin.host, "admin.example");
+        assert_eq!(admin.username, "operator");
+        assert_eq!(
+            admin.credential_digest,
+            AdminConfig::credential_digest("operator", "correct horse battery staple")
+        );
+
+        for (name, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
             }
         }
     }

@@ -181,6 +181,26 @@ pub struct RuntimeConfigSurface {
     /// Rendered in the config panel as "owner setting overridden by Buzz policy".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stripped_owner_env_keys: Vec<String>,
+    /// Visible warnings surfaced in the config panel for B7/B8 failure states.
+    ///
+    /// Entries come from two sources:
+    /// - B7: derived at bridge-read time from the owner `~/.claude/settings.json`
+    ///   state (if the file exists but is unparsable, the agent is running with
+    ///   overlay-only settings).
+    /// - B8: written atomically to `last_spawn_warnings.json` in the per-agent
+    ///   config root at each spawn and read back here. The three distinct B8
+    ///   states (owner-read failure, invalid-agent fallback, write failure)
+    ///   are preserved separately so the panel can render them distinctly.
+    ///
+    /// Empty for non-claude runtimes and when there are no warnings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_warnings: Vec<String>,
+    /// B5: the real `configId` for the `thought_level` ACP config option,
+    /// as advertised by the adapter in `session/new`. Present only for claude
+    /// runtimes after the first session is created. The UI uses this to send
+    /// `set_config_option` without hardcoding the configId.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_config_id: Option<String>,
 }
 
 /// Raw config values extracted from a runtime's config file.

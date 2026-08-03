@@ -200,6 +200,28 @@ pub(crate) fn read_config_surface(
             .and_then(|_| crate::managed_agents::claude_config::owner_settings_path())
             .map(|p| crate::managed_agents::claude_config::collect_stripped_env_keys(&p))
             .unwrap_or_default(),
+        config_warnings: runtime_meta
+            .filter(|m| m.id == "claude")
+            .and_then(|_| {
+                // Read B7/B8 spawn warnings from the per-agent config dir.
+                // agent_mcp_path is <config_dir>/.claude.json — its parent is the config dir.
+                agent_mcp_path
+                    .and_then(|p| p.parent())
+                    .map(crate::managed_agents::claude_config::read_spawn_warnings)
+            })
+            .unwrap_or_default(),
+        effort_config_id: if runtime_meta.map(|m| m.id == "claude").unwrap_or(false) {
+            // B5: extract the thought_level configId from the session cache so the
+            // UI can call set_config_option without hardcoding the adapter's id.
+            session_cache.and_then(|c| {
+                c.config_options
+                    .iter()
+                    .find(|opt| opt.category.as_deref() == Some("thought_level"))
+                    .map(|opt| opt.config_id.clone())
+            })
+        } else {
+            None
+        },
     }
 }
 

@@ -438,16 +438,33 @@ pub fn merge_agent_mcp_servers(
     owner_mcp_path: &Path,
     acp_server_name: &str,
 ) {
+    let warnings =
+        merge_agent_mcp_servers_with_warnings(agent_config_dir, owner_mcp_path, acp_server_name);
+    for w in &warnings {
+        eprintln!("buzz-desktop: {w}");
+    }
+}
+
+/// Like [`merge_agent_mcp_servers`] but returns the distinct warning strings
+/// for panel-visible persistence via [`write_spawn_warnings`] instead of only
+/// printing them.  Called from `apply_claude_spawn_policy` so warnings are
+/// collected alongside the B7 base-status warning.
+pub fn merge_agent_mcp_servers_with_warnings(
+    agent_config_dir: &Path,
+    owner_mcp_path: &Path,
+    acp_server_name: &str,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
     // 1. Read owner user-scope mcpServers.
     let owner_mcp_servers = match read_owner_mcp_servers(owner_mcp_path) {
         Ok(servers) => servers,
         Err(e) => {
-            // Owner unreadable: preserve existing agent servers, warn.
-            eprintln!(
-                "buzz-desktop: failed to read owner MCP config; \
-                 prior inherited servers preserved: {e}"
-            );
-            return;
+            // Owner unreadable (failure state #1): preserve existing agent servers, warn.
+            let msg =
+                format!("Failed to read owner MCP config; prior inherited servers preserved: {e}");
+            eprintln!("buzz-desktop: {msg}");
+            warnings.push(msg);
+            return warnings;
         }
     };
 
@@ -477,10 +494,12 @@ pub fn merge_agent_mcp_servers(
     let mut agent_json = match read_agent_mcp_file(&agent_file) {
         Ok(json) => json,
         Err(e) => {
-            eprintln!(
-                "buzz-desktop: agent MCP config was unparsable — \
-                 state replaced with owner user-scope servers: {e}"
+            // Invalid agent file (failure state #2): state replaced, warn.
+            let msg = format!(
+                "Agent MCP config was unparsable — state replaced with owner user-scope servers: {e}"
             );
+            eprintln!("buzz-desktop: {msg}");
+            warnings.push(msg);
             serde_json::Map::new()
         }
     };
@@ -488,11 +507,12 @@ pub fn merge_agent_mcp_servers(
     // 4. Set mcpServers key and write back atomically.
     agent_json.insert("mcpServers".to_string(), Value::Object(servers));
     if let Err(e) = write_agent_mcp_file(&agent_file, agent_json) {
-        eprintln!(
-            "buzz-desktop: failed to write agent MCP config; \
-             inherited servers may be stale: {e}"
-        );
+        // Write failure (failure state #3): warn, spawn continues.
+        let msg = format!("Failed to write agent MCP config; inherited servers may be stale: {e}");
+        eprintln!("buzz-desktop: {msg}");
+        warnings.push(msg);
     }
+    warnings
 }
 
 /// Read the top-level `mcpServers` object from an owner `.claude.json`.
@@ -562,11 +582,18 @@ pub fn apply_claude_spawn_policy(
     let owner_path = owner_settings_path()
         .unwrap_or_else(|| PathBuf::from("/nonexistent/no-home-dir/.claude/settings.json"));
     let (projected, base_status) = project_settings_json(&owner_path, &policy);
+
+    let mut spawn_warnings: Vec<String> = Vec::new();
+
     if matches!(base_status, OwnerBaseStatus::Unreadable { .. }) {
-        eprintln!(
-            "buzz-desktop: owner ~/.claude/settings.json unreadable — \
+        let msg = format!(
+            "owner ~/.claude/settings.json unreadable — \
              launching with overlay-only settings (non-fatal): {base_status:?}"
         );
+        eprintln!("buzz-desktop: {msg}");
+        spawn_warnings.push(format!(
+            "Owner settings.json unreadable — launching with overlay-only settings"
+        ));
     }
     write_projected_settings(&policy, &projected)?;
     // B8: inherit owner user-scope MCP servers into the per-agent .claude.json.
@@ -575,8 +602,12 @@ pub fn apply_claude_spawn_policy(
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        merge_agent_mcp_servers(&policy.config_dir, &owner_mcp, acp_name);
+        let b8_warnings =
+            merge_agent_mcp_servers_with_warnings(&policy.config_dir, &owner_mcp, acp_name);
+        spawn_warnings.extend(b8_warnings);
     }
+    // Persist spawn warnings for the panel surface (B7/B8 visible warnings).
+    write_spawn_warnings(&policy.config_dir, &spawn_warnings);
     // A1: single startup model authority.
     match effective_model {
         Some(m) => command.env("ANTHROPIC_MODEL", m),
@@ -599,6 +630,47 @@ pub fn try_cleanup_claude_config_root(pubkey: &str, managed_root: &Path) {
             "buzz-desktop: failed to clean up Claude config root for {pubkey}: {e} (non-fatal)"
         );
     }
+}
+
+// ── Spawn-time warning persistence (B7/B8 panel surface) ─────────────────────
+//
+// `apply_claude_spawn_policy` writes `last_spawn_warnings.json` atomically
+// into the per-agent config dir after B7 and B8 run.  The config-bridge reader
+// reads it at query time and surfaces the entries in `config_warnings`.
+//
+// The file is a JSON array of plain strings — one entry per distinct warning
+// state.  Only non-empty warning sets are written; an empty file means no
+// warnings on the last spawn.
+
+/// File name for the spawn-warning persistence file inside the config dir.
+pub const SPAWN_WARNINGS_FILE: &str = "last_spawn_warnings.json";
+
+/// Write `warnings` to `<config_dir>/last_spawn_warnings.json` atomically.
+/// Silently swallowed — warning persistence must never block spawn.
+pub fn write_spawn_warnings(config_dir: &Path, warnings: &[String]) {
+    if warnings.is_empty() {
+        // Remove a stale file from a previous failing spawn.
+        let _ = std::fs::remove_file(config_dir.join(SPAWN_WARNINGS_FILE));
+        return;
+    }
+    let json = match serde_json::to_string(warnings) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    let path = config_dir.join(SPAWN_WARNINGS_FILE);
+    let tmp = config_dir.join("last_spawn_warnings.json.tmp");
+    let _ = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path));
+}
+
+/// Read the spawn warnings written by the last `apply_claude_spawn_policy` call
+/// for this config dir.  Returns an empty vec when the file is absent or unparsable.
+pub fn read_spawn_warnings(config_dir: &Path) -> Vec<String> {
+    let path = config_dir.join(SPAWN_WARNINGS_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    serde_json::from_str::<Vec<String>>(&text).unwrap_or_default()
 }
 
 #[cfg(test)]

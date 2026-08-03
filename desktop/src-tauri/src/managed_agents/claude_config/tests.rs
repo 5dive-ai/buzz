@@ -812,3 +812,159 @@ fn test_b8_agent_mcp_config_path_location() {
         "path must be under managed_root"
     );
 }
+
+// ── B8 write-failure test ─────────────────────────────────────────────────────
+
+/// Agent `.claude.json` write failure (failure state #3): spawn continues.
+/// Simulated by making the parent directory read-only before the merge.
+/// The warning is returned and spawn proceeds.
+#[test]
+fn test_b8_agent_write_failure_does_not_block_spawn() {
+    // Skip on CI where we may run as root (read-only dirs are ignored by root).
+    if std::env::var("CI").is_ok() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let owner_mcp = dir.path().join("owner.claude.json");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+
+    write_json(
+        &owner_mcp,
+        &serde_json::json!({ "mcpServers": { "github": {} } }),
+    );
+
+    // Make the agent dir read-only so the write must fail.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // merge_agent_mcp_servers must not panic or return Err — spawn continues.
+    // We verify it returns exactly one warning (failure state #3).
+    let warnings = merge_agent_mcp_servers_with_warnings(&agent_dir, &owner_mcp, "buzz-mcp");
+    let has_write_failure_warning = warnings.iter().any(|w| w.contains("may be stale"));
+    assert!(
+        has_write_failure_warning,
+        "write failure must produce the 'may be stale' warning; got: {warnings:?}"
+    );
+
+    // Restore permissions so tempdir cleanup doesn't fail.
+    std::fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// ── apply_claude_spawn_policy env tests ──────────────────────────────────────
+
+/// B1: the paired isolation atom (CLAUDE_CONFIG_DIR + CLAUDE_SECURESTORAGE_CONFIG_DIR="")
+/// must be present in the spawned-child env after policy application.
+#[test]
+fn test_apply_policy_b1_paired_atom_present_in_spawned_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let managed_root = dir.path().to_path_buf();
+    let pubkey = "abcd1234abcd1234";
+    // Owner settings.json doesn't exist — overlay-only path.
+    let mut cmd = std::process::Command::new("true");
+    apply_claude_spawn_policy(&mut cmd, pubkey, &managed_root, None, None, None).unwrap();
+
+    let env_map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+
+    // CLAUDE_CONFIG_DIR must be set to the per-agent root.
+    let config_dir = env_map.get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"));
+    assert!(config_dir.is_some(), "CLAUDE_CONFIG_DIR must be present");
+    let config_dir_val = config_dir.unwrap().unwrap_or_default();
+    assert!(
+        config_dir_val.to_string_lossy().contains(pubkey),
+        "CLAUDE_CONFIG_DIR must contain the agent pubkey"
+    );
+
+    // CLAUDE_SECURESTORAGE_CONFIG_DIR must be the empty string.
+    let securestorage = env_map.get(std::ffi::OsStr::new("CLAUDE_SECURESTORAGE_CONFIG_DIR"));
+    assert!(
+        securestorage.is_some(),
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR must be present"
+    );
+    assert_eq!(
+        securestorage.unwrap().unwrap_or_default(),
+        "",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR must be empty string"
+    );
+}
+
+/// A1: BUZZ_ACP_MODEL must NOT be present in the spawned-child env after policy
+/// application, even if it was set before (dual-authority defect).
+#[test]
+fn test_apply_policy_a1_buzz_acp_model_absent_after_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let managed_root = dir.path().to_path_buf();
+    let pubkey = "abcd1234abcd1234";
+    let mut cmd = std::process::Command::new("true");
+    // Pre-set BUZZ_ACP_MODEL as if it came from descriptor.env.
+    cmd.env("BUZZ_ACP_MODEL", "claude-opus-4");
+    apply_claude_spawn_policy(
+        &mut cmd,
+        pubkey,
+        &managed_root,
+        None,
+        Some("claude-opus-4"),
+        None,
+    )
+    .unwrap();
+
+    let env_map: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+    // BUZZ_ACP_MODEL must be removed (env_remove).
+    // Command::get_envs returns None for removed keys.
+    let buzz_acp_model = env_map.get(std::ffi::OsStr::new("BUZZ_ACP_MODEL"));
+    assert!(
+        buzz_acp_model.is_none() || buzz_acp_model.unwrap().is_none(),
+        "BUZZ_ACP_MODEL must be absent (or explicitly removed) after policy application"
+    );
+    // ANTHROPIC_MODEL must be set to the resolved model.
+    let anthropic_model = env_map.get(std::ffi::OsStr::new("ANTHROPIC_MODEL"));
+    assert!(
+        anthropic_model.is_some(),
+        "ANTHROPIC_MODEL must be present after policy application"
+    );
+    assert_eq!(
+        anthropic_model.unwrap().unwrap_or_default(),
+        "claude-opus-4",
+        "ANTHROPIC_MODEL must equal the effective model"
+    );
+}
+
+// ── Spawn-warning persistence tests ──────────────────────────────────────────
+
+/// Spawn warnings round-trip through write_spawn_warnings / read_spawn_warnings.
+#[test]
+fn test_spawn_warnings_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().to_path_buf();
+    let warnings = vec![
+        "Owner settings.json unreadable — launching with overlay-only settings".to_string(),
+        "Failed to write agent MCP config; inherited servers may be stale: mock error".to_string(),
+    ];
+    write_spawn_warnings(&config_dir, &warnings);
+    let read_back = read_spawn_warnings(&config_dir);
+    assert_eq!(read_back, warnings, "read_back must equal written warnings");
+}
+
+/// Empty warnings → file removed (no stale warning from a previous spawn).
+#[test]
+fn test_spawn_warnings_empty_removes_stale_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().to_path_buf();
+    // Write a non-empty set first.
+    write_spawn_warnings(&config_dir, &["stale warning".to_string()]);
+    assert!(
+        config_dir.join(SPAWN_WARNINGS_FILE).exists(),
+        "file must exist after non-empty write"
+    );
+    // Write empty → file removed.
+    write_spawn_warnings(&config_dir, &[]);
+    assert!(
+        !config_dir.join(SPAWN_WARNINGS_FILE).exists(),
+        "file must be removed after empty write"
+    );
+    assert_eq!(
+        read_spawn_warnings(&config_dir),
+        Vec::<String>::new(),
+        "read after removal must return empty vec"
+    );
+}

@@ -64,7 +64,18 @@ pub(super) fn build_launch_block(
         policy_env.insert("BUZZ_ACP_SYSTEM_PROMPT".into(), value.to_string());
     }
     if let Some(value) = effective_model {
-        policy_env.insert("BUZZ_ACP_MODEL".into(), value.to_string());
+        // B2: remote env-authority model key. Claude's startup model authority
+        // is ANTHROPIC_MODEL (same as the local A1 path — the harness reads it
+        // first and skips the BUZZ_ACP_MODEL catalog-switch path that would
+        // introduce a second startup authority). All other runtimes use
+        // BUZZ_ACP_MODEL, which the harness reads into desired_model at spawn.
+        let is_claude = runtime.map(|r| r.id == "claude").unwrap_or(false);
+        let model_key = if is_claude {
+            "ANTHROPIC_MODEL"
+        } else {
+            "BUZZ_ACP_MODEL"
+        };
+        policy_env.insert(model_key.into(), value.to_string());
     }
     if let Some(value) = record.idle_timeout_seconds {
         policy_env.insert("BUZZ_ACP_IDLE_TIMEOUT".into(), value.to_string());
@@ -251,10 +262,44 @@ mod tests {
         );
         assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_TITLE"], "Agent Name");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_SYSTEM_PROMPT"], "prompt");
+        // goose runtime: model goes via BUZZ_ACP_MODEL (non-claude path).
         assert_eq!(launch["policy_env"]["BUZZ_ACP_MODEL"], "model");
+        assert!(
+            launch["policy_env"]["ANTHROPIC_MODEL"].is_null(),
+            "goose must NOT receive ANTHROPIC_MODEL"
+        );
         assert_eq!(launch["policy_env"]["BUZZ_ACP_IDLE_TIMEOUT"], "17");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_MAX_TURN_DURATION"], "23");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_AGENTS"], "4");
         assert_eq!(launch["owner_pubkey"], "owner-hex");
+    }
+
+    #[test]
+    fn launch_block_claude_runtime_uses_anthropic_model_not_buzz_acp_model() {
+        // B2: remote claude deploys must send ANTHROPIC_MODEL, not BUZZ_ACP_MODEL,
+        // so the remote harness has a single startup model authority matching A1.
+        let record = record();
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "claude".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        let teams: Vec<TeamRecord> = vec![];
+        let launch = build_launch_block(
+            &record,
+            &descriptor,
+            &teams,
+            None,
+            Some("claude-opus-4"),
+            "owner-hex",
+        );
+        assert_eq!(
+            launch["policy_env"]["ANTHROPIC_MODEL"], "claude-opus-4",
+            "claude remote must receive ANTHROPIC_MODEL"
+        );
+        assert!(
+            launch["policy_env"]["BUZZ_ACP_MODEL"].is_null(),
+            "claude remote must NOT receive BUZZ_ACP_MODEL"
+        );
     }
 }

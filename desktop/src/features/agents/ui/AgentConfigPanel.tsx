@@ -26,6 +26,7 @@ import type {
   NormalizedField,
 } from "@/shared/api/types";
 import { providerDisplayLabel } from "./agentConfigOptions";
+import { sendSetConfigOption } from "@/shared/api/agentControl";
 
 type Props = {
   pubkey: string;
@@ -345,6 +346,79 @@ function AdvancedRow({
   return <div className="flex items-center gap-3 px-4 py-3">{content}</div>;
 }
 
+// ── Claude effort picker (B5) ────────────────────────────────────────────────
+//
+// Renders a live effort control for claude runtimes when the session-level
+// `thought_level` configId is available (i.e. at least one session has been
+// created). Calls `sendSetConfigOption` so the harness forwards the change to
+// the adapter via `session/set_config_option`; the observer's
+// `dispatchControlResult` handler persists the canonical value on real ok.
+
+const CLAUDE_EFFORT_OPTIONS: { label: string; value: string }[] = [
+  { label: "Low", value: "low" },
+  { label: "Medium", value: "medium" },
+  { label: "High", value: "high" },
+];
+
+function EffortPicker({
+  pubkey,
+  effortConfigId,
+  currentEffort,
+}: {
+  pubkey: string;
+  effortConfigId: string;
+  currentEffort: string | null;
+}) {
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const handleChange = async (value: string) => {
+    if (!value) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await sendSetConfigOption(pubkey, effortConfigId, value);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 border-t border-border/50 pt-2 px-4">
+      <p className="text-xs font-medium text-foreground mb-1 flex items-center gap-1.5">
+        <Brain className="h-3.5 w-3.5 text-muted-foreground" />
+        Thinking / Effort
+      </p>
+      <div className="flex items-center gap-2">
+        <select
+          className="h-7 rounded border border-border/50 bg-muted/45 px-2 text-xs text-foreground focus:outline-none disabled:opacity-50"
+          disabled={saving}
+          onChange={(e) => void handleChange(e.target.value)}
+          value={currentEffort ?? ""}
+        >
+          <option value="">Auto (default)</option>
+          {CLAUDE_EFFORT_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+        {saving ? (
+          <span className="text-2xs text-muted-foreground">Setting…</span>
+        ) : null}
+        {error ? (
+          <span className="text-2xs text-destructive">{error}</span>
+        ) : null}
+      </div>
+      <p className="mt-0.5 text-2xs text-muted-foreground/70">
+        Live — persisted after agent acknowledges
+      </p>
+    </div>
+  );
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function AgentConfigPanel({
@@ -381,6 +455,8 @@ export function AgentConfigPanel({
     sources,
     isPreSpawn,
     strippedOwnerEnvKeys,
+    configWarnings,
+    effortConfigId,
   } = data;
   const configFilePath = sources.configFilePath;
 
@@ -495,6 +571,27 @@ export function AgentConfigPanel({
             ))}
           </p>
         </div>
+      ) : null}
+
+      {configWarnings && configWarnings.length > 0 ? (
+        <div className="mt-3 border-t border-border/50 pt-2 px-4 space-y-1">
+          {configWarnings.map((warning) => (
+            <p
+              key={warning}
+              className="text-xs text-yellow-600 dark:text-yellow-400"
+            >
+              ⚠ {warning}
+            </p>
+          ))}
+        </div>
+      ) : null}
+
+      {effortConfigId ? (
+        <EffortPicker
+          pubkey={pubkey}
+          effortConfigId={effortConfigId}
+          currentEffort={normalized.thinkingEffort?.value ?? null}
+        />
       ) : null}
     </div>
   );

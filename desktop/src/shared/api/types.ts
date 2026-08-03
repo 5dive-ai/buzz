@@ -673,6 +673,10 @@ export type RuntimeConfigSurface = {
   sources: ConfigSourceReport;
   /** Owner `~/.claude/settings.json` env keys stripped by Buzz launch policy (B7.7c). */
   strippedOwnerEnvKeys?: string[];
+  /** Spawn warnings (B7/B8 failure states): owner unreadable, agent MCP replaced, write failed. */
+  configWarnings?: string[];
+  /** B5: `thought_level` configId from the adapter's `session/new`. Claude only, post-first-session. */
+  effortConfigId?: string;
 };
 
 export type UpdateManagedAgentInput = {

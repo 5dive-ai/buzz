@@ -30,9 +30,9 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::acp::{
-    extract_model_config_options, extract_model_state, model_in_catalog,
-    resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod, StopReason,
-    SystemPromptTransport,
+    extract_model_config_options, extract_model_state, extract_thought_level_config_id,
+    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, McpServer,
+    ModelSwitchMethod, StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -78,6 +78,10 @@ pub struct AgentModelCapabilities {
     pub config_options_raw: Vec<serde_json::Value>,
     /// Unstable: SessionModelState from session/new.
     pub available_models_raw: Option<serde_json::Value>,
+    /// B5: configId for the `thought_level` category option, if the adapter
+    /// advertised one in session/new. Stored so `handle_set_config_option_control`
+    /// can forward effort changes without hardcoding the adapter's configId.
+    pub thought_level_config_id: Option<String>,
 }
 
 /// Per-channel session IDs and turn counters.
@@ -162,6 +166,11 @@ pub struct OwnedAgent {
     /// desktop reader to distinguish a genuine runtime override from a stale
     /// session whose persona model was edited. Reset on spawn/restart.
     pub model_overridden: bool,
+    /// B5: desired effort level `(config_id, value)` for the `thought_level` config
+    /// option. Applied after every `session_new_full()` via `session/set_config_option`.
+    /// `config_id` is the adapter's actual id from `AgentModelCapabilities::thought_level_config_id`;
+    /// it is set here by `set_idle_agent_effort` and never hardcoded in the harness.
+    pub desired_effort: Option<(String, String)>,
     /// Normalized agent name from initialize (`agentInfo.name`/`serverInfo.name`).
     pub agent_name: String,
     /// Whether Goose accepted its custom system-prompt method. `None` probes on
@@ -795,6 +804,38 @@ impl AgentPool {
         agent.state.invalidate_channel(&channel_id);
         IdleSwitchResult::Switched
     }
+
+    /// B5: Idle-path effort switch via `thought_level` configId.
+    ///
+    /// Stores `(config_id, value)` as `desired_effort` on the idle agent so
+    /// `create_session_and_apply_model` can forward it to the adapter via
+    /// `session_set_config_option` at the next session creation.  The existing
+    /// session is also invalidated so the next turn creates a fresh session and
+    /// applies the effort immediately — mirroring the idle-path model switch.
+    ///
+    /// Unlike model switches there is no busy-path cancel-and-requeue: effort
+    /// changes apply to the next prompt in any case, so queuing on the idle
+    /// agent is the correct semantics.
+    ///
+    /// Returns `IdleEffortResult::NoCatalog` when no session has been created
+    /// yet (the thought_level configId is unknown). In that case the caller
+    /// should treat the request as pending and report it as "pending_session".
+    pub fn set_idle_agent_effort(&mut self, config_id: &str, value: &str) -> IdleEffortResult {
+        let Some(agent) = self.agents.iter_mut().flatten().next() else {
+            return IdleEffortResult::NoIdleAgent;
+        };
+        // Verify the configId matches what the adapter advertised.
+        let caps = agent.model_capabilities.as_ref();
+        if caps.is_none_or(|c| c.thought_level_config_id.is_none()) {
+            return IdleEffortResult::NoCatalog;
+        }
+        agent.desired_effort = Some((config_id.to_string(), value.to_string()));
+        // Invalidate the current session so the next turn creates a new one
+        // and applies the effort via session_set_config_option immediately,
+        // rather than waiting for the session to be recreated for another reason.
+        agent.state.invalidate_all();
+        IdleEffortResult::Queued
+    }
 }
 
 /// Outcome of [`AgentPool::switch_idle_agent_model`].
@@ -805,6 +846,18 @@ pub enum IdleSwitchResult {
     /// Desired model is not in the agent's cached catalog — pick rejected,
     /// session untouched.
     UnsupportedModel,
+    /// No idle agent available (all checked out / none spawned).
+    NoIdleAgent,
+}
+
+/// Outcome of [`AgentPool::set_idle_agent_effort`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum IdleEffortResult {
+    /// `desired_effort` queued; will be applied at next session creation.
+    Queued,
+    /// No session has been created yet — thought_level configId unknown.
+    /// The caller should surface "pending_session" status to the observer.
+    NoCatalog,
     /// No idle agent available (all checked out / none spawned).
     NoIdleAgent,
 }
@@ -952,6 +1005,7 @@ async fn create_session_and_apply_model(
         agent.model_capabilities = Some(AgentModelCapabilities {
             config_options_raw: extract_model_config_options(&resp.raw),
             available_models_raw: extract_model_state(&resp.raw),
+            thought_level_config_id: extract_thought_level_config_id(&resp.raw),
         });
     }
 
@@ -987,6 +1041,51 @@ async fn create_session_and_apply_model(
     } else {
         false
     };
+
+    // B5: Apply desired_effort if set. Non-fatal — effort is optional capability.
+    // The configId comes from `desired_effort.0` (set by `set_idle_agent_effort`
+    // from the adapter's advertised thought_level configId).
+    if let Some((ref config_id, ref value)) = agent.desired_effort {
+        let result = tokio::time::timeout(MODEL_SWITCH_TIMEOUT, async {
+            agent
+                .acp
+                .session_set_config_option(&resp.session_id, config_id, value)
+                .await
+        })
+        .await;
+        match result {
+            Ok(Ok(_)) => {
+                tracing::info!(
+                    target: "pool::effort",
+                    "applied effort {value} via configId={config_id} on session {}",
+                    resp.session_id
+                );
+            }
+            Ok(Err(e @ AcpError::Io(_)))
+            | Ok(Err(e @ AcpError::WriteTimeout(_)))
+            | Ok(Err(e @ AcpError::Timeout(_)))
+            | Ok(Err(e @ AcpError::Protocol(_)))
+            | Ok(Err(e @ AcpError::AgentExited)) => {
+                tracing::error!(
+                    target: "pool::effort",
+                    "fatal error applying effort {value} via configId={config_id}: {e}"
+                );
+                return Err(e);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "pool::effort",
+                    "non-fatal error applying effort {value}: {e} — proceeding with agent default"
+                );
+            }
+            Err(_timeout) => {
+                tracing::warn!(
+                    target: "pool::effort",
+                    "effort switch {value} timed out — proceeding with agent default"
+                );
+            }
+        }
+    }
 
     // Emit session config for desktop consumption (config bridge tier 1b).
     // Emitted AFTER desired_model resolution so the desktop caches the
@@ -5930,6 +6029,7 @@ mod tests {
             model_capabilities: None,
             desired_model: None,
             model_overridden: false,
+            desired_effort: None,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -5988,6 +6088,7 @@ mod tests {
             model_capabilities: None,
             desired_model: None,
             model_overridden: false,
+            desired_effort: None,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -6904,5 +7005,152 @@ mod tests {
             "one fetch_channel_info sequence (initial attempt + single retry)"
         );
         server.abort();
+    }
+}
+
+// ── B5 effort-switch pool tests ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+
+    /// `extract_thought_level_config_id` finds the configId for `thought_level`
+    /// category in a session/new response.
+    #[test]
+    fn test_extract_thought_level_config_id_from_session_new() {
+        let session_new = serde_json::json!({
+            "configOptions": [
+                { "id": "model", "category": "model", "options": [] },
+                { "id": "effort", "category": "thought_level", "options": [
+                    { "value": "low" },
+                    { "value": "medium" },
+                    { "value": "high" },
+                ]},
+            ]
+        });
+        let id = crate::acp::extract_thought_level_config_id(&session_new);
+        assert_eq!(id.as_deref(), Some("effort"));
+    }
+
+    /// `extract_thought_level_config_id` returns None when no thought_level entry.
+    #[test]
+    fn test_extract_thought_level_config_id_returns_none_when_absent() {
+        let session_new = serde_json::json!({
+            "configOptions": [
+                { "id": "model", "category": "model", "options": [] },
+            ]
+        });
+        let id = crate::acp::extract_thought_level_config_id(&session_new);
+        assert_eq!(id, None);
+    }
+
+    /// `extract_thought_level_config_id` accepts `configId` key (spec spelling).
+    #[test]
+    fn test_extract_thought_level_config_id_accepts_configid_key() {
+        let session_new = serde_json::json!({
+            "configOptions": [
+                { "configId": "thinking_effort", "category": "thought_level", "options": [] },
+            ]
+        });
+        let id = crate::acp::extract_thought_level_config_id(&session_new);
+        assert_eq!(id.as_deref(), Some("thinking_effort"));
+    }
+
+    /// `extract_thought_level_config_id` returns None on empty configOptions.
+    #[test]
+    fn test_extract_thought_level_config_id_returns_none_on_empty() {
+        let session_new = serde_json::json!({ "configOptions": [] });
+        let id = crate::acp::extract_thought_level_config_id(&session_new);
+        assert_eq!(id, None);
+    }
+
+    /// `extract_thought_level_config_id` returns None when configOptions absent.
+    #[test]
+    fn test_extract_thought_level_config_id_returns_none_when_no_config_options() {
+        let session_new = serde_json::json!({});
+        let id = crate::acp::extract_thought_level_config_id(&session_new);
+        assert_eq!(id, None);
+    }
+
+    /// `set_idle_agent_effort` returns `NoIdleAgent` when pool has no agents.
+    #[test]
+    fn test_set_idle_agent_effort_returns_no_idle_agent_on_empty_pool() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let result = pool.set_idle_agent_effort("effort", "high");
+        assert_eq!(result, IdleEffortResult::NoIdleAgent);
+    }
+
+    /// `set_idle_agent_effort` returns `NoCatalog` when agent exists but has
+    /// no `thought_level_config_id` yet (no session created).
+    #[test]
+    fn test_set_idle_agent_effort_returns_no_catalog_when_no_session_created() {
+        // Pool with a None slot (agent not yet spawned).
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let result = pool.set_idle_agent_effort("effort", "high");
+        assert_eq!(result, IdleEffortResult::NoIdleAgent);
+    }
+
+    /// `AgentModelCapabilities::thought_level_config_id` is populated from the
+    /// correct field in the session/new response.
+    #[test]
+    fn test_thought_level_config_id_stored_in_capabilities() {
+        let caps = AgentModelCapabilities {
+            config_options_raw: vec![],
+            available_models_raw: None,
+            thought_level_config_id: Some("effort".to_string()),
+        };
+        assert_eq!(caps.thought_level_config_id.as_deref(), Some("effort"));
+    }
+
+    /// `set_idle_agent_effort` with `thought_level_config_id` set queues the
+    /// effort AND invalidates all channel sessions so the next turn creates a
+    /// fresh session (mirroring the idle-path model switch).
+    #[tokio::test]
+    async fn test_set_idle_agent_effort_queues_and_invalidates_session() {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test agent");
+        let ch = uuid::Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(ch, "sess-1".into());
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                thought_level_config_id: Some("effort".to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let result = pool.set_idle_agent_effort("effort", "high");
+        assert_eq!(result, IdleEffortResult::Queued, "must return Queued");
+        // Session must be invalidated so the next turn creates a fresh one.
+        let agent = pool.agents_mut().iter().flatten().next().unwrap();
+        assert!(
+            agent.state.sessions.is_empty(),
+            "session must be invalidated after effort change"
+        );
+        // desired_effort must be set for apply at next session creation.
+        assert_eq!(
+            agent
+                .desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("effort", "high")),
+            "desired_effort must be queued"
+        );
     }
 }

@@ -267,6 +267,40 @@ impl AppState {
         self.huddle_state.lock().map_err(|e| e.to_string())
     }
 
+    /// Capture a snapshot of the active workspace agent scope.
+    ///
+    /// Operations that cross an `.await` or a thread boundary MUST capture the
+    /// scope at entry (before the first await) and thread it through every
+    /// `_at(scope)` API. A stale commit (generation mismatch) must abort.
+    ///
+    /// Returns `None` when no workspace has been applied yet — callers must
+    /// fail closed on `None`; there is NO fallback to the legacy unscoped root.
+    pub fn capture_active_scope(&self) -> Option<WorkspaceAgentScope> {
+        self.active_agent_scope.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Set the active workspace agent scope. Called by the infallible commit
+    /// stage of the workspace transition machine.
+    ///
+    /// Must be called while holding `managed_agents_store_lock` (Layer 2) with
+    /// no `.await` pending — the commit stage is the only caller.
+    pub(crate) fn commit_active_scope(&self, scope: WorkspaceAgentScope) {
+        if let Ok(mut g) = self.active_agent_scope.lock() {
+            *g = Some(scope);
+        }
+    }
+
+    /// Clear the active workspace agent scope and bump the generation.
+    ///
+    /// Called by live identity import (drain → persist → clear → re-apply)
+    /// and by the prepare stage when rolling back after a failed pipeline.
+    pub(crate) fn clear_active_scope(&self) {
+        if let Ok(mut g) = self.active_agent_scope.lock() {
+            *g = None;
+        }
+        crate::managed_agents::scope::next_scope_generation();
+    }
+
     pub fn get_session_cache(&self, key: &ManagedAgentRuntimeKey) -> Option<SessionConfigCache> {
         self.session_config_cache.lock().ok()?.get(key).cloned()
     }

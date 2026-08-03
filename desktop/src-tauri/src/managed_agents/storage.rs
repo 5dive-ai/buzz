@@ -46,6 +46,13 @@ pub(crate) fn managed_agents_store_path(app: &AppHandle) -> Result<PathBuf, Stri
     Ok(managed_agents_base_dir(app)?.join("managed-agents.json"))
 }
 
+/// Scoped variant: resolve `managed-agents.json` under a workspace scope's
+/// definitions directory. For callers that have captured a
+/// `WorkspaceAgentScope` at their operation entry point.
+pub(crate) fn managed_agents_store_path_at(definitions_dir: &std::path::Path) -> PathBuf {
+    definitions_dir.join("managed-agents.json")
+}
+
 fn managed_agents_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = managed_agents_base_dir(app)?.join("logs");
     fs::create_dir_all(&dir).map_err(|error| format!("failed to create logs dir: {error}"))?;
@@ -238,12 +245,18 @@ pub(crate) fn spawn_key_refusal(record: &ManagedAgentRecord) -> Option<String> {
 /// with fail-loud parse handling. Internal seam; public readers filter.
 fn load_agent_store(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
     let path = managed_agents_store_path(app)?;
+    load_agent_store_at(&path)
+}
+
+/// Path-based variant of [`load_agent_store`]. Used by scoped callers that
+/// have already resolved the correct store path from a [`WorkspaceAgentScope`].
+pub(crate) fn load_agent_store_at(path: &Path) -> Result<Vec<ManagedAgentRecord>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
 
-    let content = fs::read_to_string(&path)
-        .map_err(|error| format!("failed to read agent store: {error}"))?;
+    let content =
+        fs::read_to_string(path).map_err(|error| format!("failed to read agent store: {error}"))?;
     serde_json::from_str(&content).map_err(|error| {
         // Fail loudly and preserve the evidence: a later in-app save rewrites
         // this file wholesale, which would silently destroy a malformed hand
@@ -251,7 +264,7 @@ fn load_agent_store(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> 
         // reconcile): the broken content survives as `.invalid` for the user
         // to recover, and the parse error propagates instead of being
         // swallowed into an empty store.
-        backup_invalid_store(&path);
+        backup_invalid_store(path);
         format!("failed to parse agent store (preserved as .invalid): {error}")
     })
 }
@@ -266,11 +279,33 @@ pub fn load_managed_agents(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, S
     Ok(records)
 }
 
+/// Scoped variant: load keyed agent instances from the given definitions dir.
+/// For callers that have captured a `WorkspaceAgentScope`.
+pub(crate) fn load_managed_agents_at(
+    definitions_dir: &Path,
+) -> Result<Vec<ManagedAgentRecord>, String> {
+    let path = managed_agents_store_path_at(definitions_dir);
+    let mut records = load_agent_store_at(&path)?;
+    records.retain(|record| !record.pubkey.is_empty());
+    hydrate_keys(&mut records);
+    Ok(records)
+}
+
 /// Load the key-less agent *definitions* (former personas) from the unified
 /// store. The persona compatibility shim (`load_personas`) presents these in
 /// the legacy shape via `to_definition_view`.
 pub(crate) fn load_agent_definitions(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
     let mut records = load_agent_store(app)?;
+    records.retain(|record| record.pubkey.is_empty());
+    Ok(records)
+}
+
+/// Scoped variant: load key-less agent definitions from the given definitions dir.
+pub(crate) fn load_agent_definitions_at(
+    definitions_dir: &Path,
+) -> Result<Vec<ManagedAgentRecord>, String> {
+    let path = managed_agents_store_path_at(definitions_dir);
+    let mut records = load_agent_store_at(&path)?;
     records.retain(|record| record.pubkey.is_empty());
     Ok(records)
 }
@@ -381,6 +416,25 @@ pub fn save_managed_agents(app: &AppHandle, records: &[ManagedAgentRecord]) -> R
     write_agent_store(app, definitions, sorted)
 }
 
+/// Scoped variant: save keyed agent instances into the given definitions dir.
+/// For callers that have captured a `WorkspaceAgentScope`.
+pub(crate) fn save_managed_agents_at(
+    definitions_dir: &Path,
+    records: &[ManagedAgentRecord],
+) -> Result<(), String> {
+    let definitions = load_agent_definitions_at(definitions_dir).unwrap_or_default();
+    let mut sorted = records.to_vec();
+    sorted.retain(|record| !record.pubkey.is_empty());
+    sorted.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.pubkey.cmp(&right.pubkey))
+    });
+    persist_agent_keys(&mut sorted);
+    write_agent_store_at(definitions_dir, definitions, sorted)
+}
+
 /// Save the key-less agent *definitions*, preserving the keyed instances —
 /// the definition-side mirror of [`save_managed_agents`].
 pub(crate) fn save_agent_definitions(
@@ -394,6 +448,19 @@ pub(crate) fn save_agent_definitions(
     write_agent_store(app, definitions, instances)
 }
 
+/// Scoped variant: save key-less agent definitions into the given definitions dir.
+pub(crate) fn save_agent_definitions_at(
+    definitions_dir: &Path,
+    definitions: &[ManagedAgentRecord],
+) -> Result<(), String> {
+    let path = managed_agents_store_path_at(definitions_dir);
+    let mut instances = load_agent_store_at(&path)?;
+    instances.retain(|record| !record.pubkey.is_empty());
+    let mut definitions = definitions.to_vec();
+    definitions.retain(|record| record.pubkey.is_empty());
+    write_agent_store_at(definitions_dir, definitions, instances)
+}
+
 /// Serialize definitions + instances into the single unified store file.
 /// Definitions sort first (by slug) for stable diffs; instances keep the
 /// name/pubkey order their save path established.
@@ -402,11 +469,35 @@ fn write_agent_store(
     mut definitions: Vec<ManagedAgentRecord>,
     instances: Vec<ManagedAgentRecord>,
 ) -> Result<(), String> {
+    let path = managed_agents_store_path(app)?;
+    write_agent_store_to_path(&path, definitions, instances)
+}
+
+/// Path-based variant of [`write_agent_store`]. Used by scoped callers.
+fn write_agent_store_at(
+    definitions_dir: &Path,
+    definitions: Vec<ManagedAgentRecord>,
+    instances: Vec<ManagedAgentRecord>,
+) -> Result<(), String> {
+    let path = managed_agents_store_path_at(definitions_dir);
+    // Ensure the directory exists (scoped dirs are created lazily).
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create scoped store dir: {e}"))?;
+    }
+    write_agent_store_to_path(&path, definitions, instances)
+}
+
+/// Write definitions + instances to a specific path.
+fn write_agent_store_to_path(
+    path: &Path,
+    mut definitions: Vec<ManagedAgentRecord>,
+    instances: Vec<ManagedAgentRecord>,
+) -> Result<(), String> {
     definitions.sort_by(|left, right| left.slug.cmp(&right.slug));
     let mut all = definitions;
     all.extend(instances);
 
-    let path = managed_agents_store_path(app)?;
     let payload = serde_json::to_vec_pretty(&all)
         .map_err(|error| format!("failed to serialize agent store: {error}"))?;
 
@@ -414,7 +505,7 @@ fn write_agent_store(
     // fallback. Write it owner-only (`0o600`) unconditionally — harmless for the
     // keyring-backed case (it is the user's own agent store) and closes the
     // umask window a post-write `chmod` would leave open.
-    atomic_write_json_restricted(&path, &payload)
+    atomic_write_json_restricted(path, &payload)
 }
 
 /// Write each record's in-memory key to the keyring and blank the inline copy

@@ -166,7 +166,7 @@ pub async fn apply_workspace(
         // ── Apply all state changes (nothing below can fail) ──────────────────
         {
             let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
-            *override_guard = Some(relay_url);
+            *override_guard = Some(relay_url.clone());
         }
         // Reset the Rust-side admission gate when switching workspace/community,
         // matching `resetRateLimitGate()` on the TS side (useCommunityInit.ts:38).
@@ -183,6 +183,32 @@ pub async fn apply_workspace(
         state
             .managed_agent_profile_reconcile_enabled
             .store(!agent_managed_profiles.unwrap_or(false), Ordering::Release);
+
+        // ── Commit the active workspace agent scope ───────────────────────────
+        // Derive the scope from the now-applied relay + owner keys and store it
+        // as the active scope. All subsequent store reads/writes and event-sync
+        // calls use the scoped definitions directory.
+        {
+            let owner_pubkey = state
+                .keys
+                .lock()
+                .map_err(|e| e.to_string())?
+                .public_key()
+                .to_hex();
+            let base_dir = crate::managed_agents::managed_agents_base_dir(&app).unwrap_or_default();
+            let generation = crate::managed_agents::scope::next_scope_generation();
+            let scope = crate::managed_agents::scope::WorkspaceAgentScope::new(
+                relay_url,
+                owner_pubkey,
+                &base_dir,
+                generation,
+            );
+            // Ensure the scoped dir exists so first-apply callers find it.
+            if let Err(e) = scope.ensure_dir() {
+                eprintln!("buzz-desktop: failed to create scope dir: {e}");
+            }
+            state.commit_active_scope(scope);
+        }
 
         // ── Filesystem side-effect (non-fatal) ────────────────────────────────
         // Persist the *effective* repos_dir (None when the candidate failed
@@ -222,10 +248,23 @@ pub async fn apply_workspace(
             // stranded tombstones and archive requests publish on this boot
             // instead of being abandoned by the storage cutover.
             migrate_legacy_retention_into(&restore_app, &scope);
+
+            // Use the scoped definitions directory for event sync.
+            // After apply_workspace commits the scope, capture_active_scope()
+            // returns the scoped dir; fall back to the legacy unscoped root
+            // only when no scope has been committed (pre-Phase-2 transition).
+            let definitions_dir = state
+                .capture_active_scope()
+                .map(|s| s.definitions_dir)
+                .unwrap_or_else(|| {
+                    crate::managed_agents::managed_agents_base_dir(&restore_app).unwrap_or_default()
+                });
+
             crate::event_sync::spawn_event_sync(
                 restore_app.clone(),
                 scope.owner_keys,
                 scope.db_path,
+                definitions_dir,
             )
         }
         Err(error) => {

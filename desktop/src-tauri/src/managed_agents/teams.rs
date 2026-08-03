@@ -13,6 +13,11 @@ pub(crate) fn teams_store_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(managed_agents_base_dir(app)?.join("teams.json"))
 }
 
+/// Scoped variant: resolve `teams.json` under a workspace scope's definitions dir.
+pub(crate) fn teams_store_path_at(definitions_dir: &std::path::Path) -> PathBuf {
+    definitions_dir.join("teams.json")
+}
+
 fn sort_teams(records: &mut [TeamRecord]) {
     records.sort_by(|left, right| {
         let left_builtin = if left.is_builtin { 0 } else { 1 };
@@ -201,6 +206,49 @@ pub fn save_teams(app: &AppHandle, records: &[TeamRecord]) -> Result<(), String>
     sort_teams(&mut sorted);
 
     let path = teams_store_path(app)?;
+    let payload = serde_json::to_vec_pretty(&sorted)
+        .map_err(|error| format!("failed to serialize teams store: {error}"))?;
+    crate::managed_agents::storage::atomic_write_json(&path, &payload)
+}
+
+/// Scoped variant: load teams from the given definitions dir.
+pub(crate) fn load_teams_at(definitions_dir: &std::path::Path) -> Result<Vec<TeamRecord>, String> {
+    let path = teams_store_path_at(definitions_dir);
+    let now = now_iso();
+
+    let records = if path.exists() {
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read teams store: {error}"))?;
+        serde_json::from_str::<Vec<TeamRecord>>(&content)
+            .map_err(|error| format!("failed to parse teams store: {error}"))?
+    } else {
+        Vec::new()
+    };
+
+    let (mut records, changed) = merge_teams(records, &now);
+    sort_teams(&mut records);
+
+    if changed || !path.exists() {
+        save_teams_at(definitions_dir, &records)?;
+    }
+
+    Ok(records)
+}
+
+/// Scoped variant: save teams into the given definitions dir.
+pub(crate) fn save_teams_at(
+    definitions_dir: &std::path::Path,
+    records: &[TeamRecord],
+) -> Result<(), String> {
+    let mut sorted = records.to_vec();
+    sort_teams(&mut sorted);
+
+    let path = teams_store_path_at(definitions_dir);
+    // Ensure the directory exists (scoped dirs are created lazily).
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create scoped store dir: {e}"))?;
+    }
     let payload = serde_json::to_vec_pretty(&sorted)
         .map_err(|error| format!("failed to serialize teams store: {error}"))?;
     crate::managed_agents::storage::atomic_write_json(&path, &payload)

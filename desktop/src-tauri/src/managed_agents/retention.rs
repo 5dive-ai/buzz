@@ -115,6 +115,32 @@ pub fn active_retention_scope(app: &AppHandle, state: &AppState) -> Result<Reten
     })
 }
 
+/// Build a `RetentionScope` from a captured [`WorkspaceAgentScope`] and keys.
+/// Use instead of [`active_retention_scope`] when a captured scope is held.
+/// Derives `base_dir` two levels up from `definitions_dir`.
+pub(crate) fn retention_scope_from_captured(
+    captured: &crate::managed_agents::scope::WorkspaceAgentScope,
+    owner_keys: nostr::Keys,
+) -> Result<RetentionScope, String> {
+    let base_dir = captured
+        .definitions_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or("retention_scope_from_captured: definitions_dir has fewer than two parent levels")?;
+    let db_path = scoped_retention_db_path(base_dir, &captured.relay_url, &captured.owner_pubkey);
+    std::fs::create_dir_all(
+        db_path
+            .parent()
+            .ok_or("retention scope path has no parent")?,
+    )
+    .map_err(|e| format!("failed to create retention scope directory: {e}"))?;
+    Ok(RetentionScope {
+        db_path,
+        relay_url: captured.relay_url.clone(),
+        owner_keys,
+    })
+}
+
 /// Snapshot the active relay + owner, but only when it is the scope that owns
 /// events delivered by `arrival_relay_url` from `arrival_owner_pubkey`.
 ///

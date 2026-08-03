@@ -18,8 +18,7 @@ use crate::{
             decrypt_envelope, parse_chunk_payload, resolve_unlock_secret, ChunkPayload,
             LOCKED_CARD_REFUSAL,
         },
-        load_managed_agents, load_personas, save_managed_agents, save_personas, AgentDefinition,
-        ManagedAgentRecord, RespondTo,
+        load_managed_agents, AgentDefinition, ManagedAgentRecord, RespondTo,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -124,33 +123,12 @@ pub struct AgentSnapshotImportResult {
 
 /// Resolve the behavioral defaults for an incoming agent snapshot.
 ///
-/// This is the single authoritative selection path for all import-time
-/// allowlist and behavioral decisions. It is extracted as a pure, testable
-/// function so that unit tests exercise the exact production logic rather
-/// than a reconstruction of it.
+/// Single authoritative selection path for all import-time allowlist and
+/// behavioral decisions. Extracted as a pure function for testability.
 ///
-/// # UI contract
-///
-/// The Keep/Clear toggle is shown whenever `has_source_allowlist` is true
-/// (i.e. the raw allowlist is non-empty), regardless of the source mode.
-/// The mode (`respond_to` wire string) and the list are independent axes.
-///
-/// # Decision table
-///
-/// | Source mode  | Non-empty list | keep=true            | keep=false              |
-/// |--------------|----------------|----------------------|-------------------------|
-/// | allowlist    | yes            | preserve mode + list | owner-only + empty      |
-/// | allowlist    | no             | **Err** (reject)     | **Err** (reject)        |
-/// | non-allowlist| yes            | preserve mode + list | preserve mode + empty   |
-/// | non-allowlist| no             | preserve mode        | preserve mode           |
-///
-/// Allowlist-mode + empty list is always rejected: the UI showed no choice
-/// and there is no coherent value to write.
-///
-/// Non-allowlist + non-empty + Clear: preserve the source mode but empty the
-/// list.  Only allowlist-mode requires a mode downgrade on Clear, because
-/// `allowlist` without entries is an invalid state.  Non-allowlist modes
-/// remain valid with an empty list.
+/// Decision: `allowlist` mode + empty list is rejected (invalid state).
+/// On `keep_allowlist=false` with `allowlist` mode, downgrades to owner-only.
+/// On `keep_allowlist=false` with other modes, preserves mode, clears list.
 pub(crate) fn resolve_snapshot_import_behavior(
     raw_respond_to: Option<&str>,
     raw_allowlist: &[String],
@@ -458,6 +436,13 @@ pub async fn confirm_agent_snapshot_import(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AgentSnapshotImportResult, String> {
+    // Capture the active scope at entry — all definition I/O targets this
+    // scope; the generation is re-validated before the first write in Phase 3a.
+    let captured_scope = state
+        .capture_active_scope()
+        .ok_or("confirm_agent_snapshot_import: no active workspace scope")?;
+    let definitions_dir = captured_scope.definitions_dir.clone();
+
     // ── Phase 1: validate (no writes) ────────────────────────────────────────
     // Locked cards unlock only via this machine's exact key endpoints;
     // anything else fails closed here, before key generation.
@@ -468,7 +453,7 @@ pub async fn confirm_agent_snapshot_import(
                 .managed_agents_store_lock
                 .lock()
                 .map_err(|e| e.to_string())?;
-            load_managed_agents(&app)?
+            crate::managed_agents::storage::load_managed_agents_at(&definitions_dir)?
         };
         decode_snapshot_for_import(&input.file_bytes, owner_keys.as_ref(), &records)?.0
     };
@@ -547,8 +532,21 @@ pub async fn confirm_agent_snapshot_import(
             .lock()
             .map_err(|e| e.to_string())?;
 
-        let mut personas = load_personas(&app)?;
-        let mut records = load_managed_agents(&app)?;
+        // Re-validate the captured scope's generation before any write; abort
+        // if the workspace switched since Phase 1.
+        crate::managed_agents::scope::validate_scope_generation(&captured_scope)
+            .map_err(|e| format!("confirm_agent_snapshot_import: {e}"))?;
+
+        // Resolve retention scope from the captured scope so retain calls
+        // write to the correct scope's DB even if live state diverged.
+        let owner_keys_for_retention = state.signing_keys()?;
+        let retention_scope = crate::managed_agents::retention::retention_scope_from_captured(
+            &captured_scope,
+            owner_keys_for_retention,
+        )?;
+
+        let mut personas = crate::managed_agents::load_personas_at(&definitions_dir)?;
+        let mut records = crate::managed_agents::storage::load_managed_agents_at(&definitions_dir)?;
 
         // Guard against duplicate pubkey (astronomically unlikely but safe).
         if records.iter().any(|r| r.pubkey == pubkey) {
@@ -587,10 +585,10 @@ pub async fn confirm_agent_snapshot_import(
         };
 
         personas.push(persona.clone());
-        save_personas(&app, &personas)?;
+        crate::managed_agents::save_personas_at(&definitions_dir, &personas)?;
 
         // Enqueue the kind:30175 persona event via the retention path.
-        super::super::pending::retain_persona_pending(&app, &state, &persona);
+        super::super::pending::retain_persona_pending_in_scope(&retention_scope, &persona);
 
         // Build the managed agent record — no machine-local commands, no
         // secrets, no lineage from the snapshot.
@@ -657,12 +655,12 @@ pub async fn confirm_agent_snapshot_import(
         };
 
         records.push(record.clone());
-        save_managed_agents(&app, &records)?;
+        crate::managed_agents::storage::save_managed_agents_at(&definitions_dir, &records)?;
 
         // Enqueue the kind:30177 managed-agent event via retention.
         // (Uses the same pattern as agents.rs::retain_managed_agent_pending
         // inlined here to avoid cross-module private-fn access.)
-        retain_agent_pending(&app, &state, &record);
+        retain_agent_pending(&retention_scope, &record);
 
         crate::managed_agents::try_regenerate_nest(&app).ok();
 
@@ -752,7 +750,10 @@ pub async fn confirm_agent_snapshot_import(
 /// Inline retention for the managed-agent kind:30177 event — mirrors
 /// `agents::retain_managed_agent_pending` without requiring cross-module
 /// private function access.
-fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgentRecord) {
+fn retain_agent_pending(
+    scope: &crate::managed_agents::retention::RetentionScope,
+    record: &ManagedAgentRecord,
+) {
     use crate::managed_agents::{
         agent_events::{agent_event_content, build_agent_event},
         persona_events::monotonic_created_at,
@@ -762,7 +763,6 @@ fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgent
     use nostr::JsonUtil;
 
     let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
         let conn = open_retention_db(&scope.db_path)?;
         let content = serde_json::to_string(&agent_event_content(record))
             .map_err(|e| format!("failed to serialize agent content: {e}"))?;

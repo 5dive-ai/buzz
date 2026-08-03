@@ -17,8 +17,10 @@ use crate::{
     },
     managed_agents::{
         agent_snapshot::{build_snapshot, AgentSnapshot, AgentSnapshotMemoryEntry, MemoryLevel},
-        load_managed_agents, load_personas, load_teams, load_teams_readonly, save_managed_agents,
-        save_personas, save_teams, AgentDefinition, ManagedAgentRecord, TeamRecord,
+        load_managed_agents, load_managed_agents_at, load_personas, load_personas_at, load_teams,
+        load_teams_readonly, managed_agents_store_path_at, save_managed_agents_at,
+        save_personas_at, save_teams_at, teams_store_path_at, AgentDefinition, ManagedAgentRecord,
+        TeamRecord,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -502,6 +504,16 @@ pub async fn confirm_team_snapshot_import(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TeamSnapshotImportResult, String> {
+    // ── Scope capture: snapshot the active workspace at entry ─────────────────
+    // All store reads and writes in Phase 3 use `definitions_dir` derived from
+    // this captured scope so a concurrent workspace switch cannot redirect them
+    // to the wrong scope. The generation is re-validated inside the store lock
+    // before the first write (Phase 3).
+    let captured_scope = state
+        .capture_active_scope()
+        .ok_or("confirm_team_snapshot_import: no active workspace scope — cannot import")?;
+    let definitions_dir = captured_scope.definitions_dir.clone();
+
     // ── Phase 1: validate (no I/O) ───────────────────────────────────────────
     let snapshot = decode_team_snapshot_from_bytes(&input.file_bytes)?;
     let now = now_iso();
@@ -631,8 +643,22 @@ pub async fn confirm_team_snapshot_import(
             .lock()
             .map_err(|e| e.to_string())?;
 
+        // Re-validate the captured scope's generation before any write.
+        // If the workspace switched since Phase 1, abort — writing to the
+        // new scope would import into the wrong workspace.
+        crate::managed_agents::scope::validate_scope_generation(&captured_scope)
+            .map_err(|e| format!("confirm_team_snapshot_import: {e}"))?;
+
+        // Resolve retention scope once from the captured workspace scope so
+        // all retain calls below write to the correct scope's database.
+        let owner_keys_for_retention = state.signing_keys()?;
+        let retention_scope = crate::managed_agents::retention::retention_scope_from_captured(
+            &captured_scope,
+            owner_keys_for_retention,
+        )?;
+
         // Guard against duplicate pubkeys (astronomically unlikely).
-        let existing_records = load_managed_agents(&app)?;
+        let existing_records = load_managed_agents_at(&definitions_dir)?;
         for m in &minted {
             if existing_records.iter().any(|r| r.pubkey == m.pubkey) {
                 return Err(format!(
@@ -646,13 +672,13 @@ pub async fn confirm_team_snapshot_import(
         // Distinguish "file exists with content" from "file absent" so rollback
         // can delete a file created by the import rather than leaving orphaned
         // records.
-        let agents_store_path = crate::managed_agents::storage::managed_agents_store_path(&app)?;
+        let agents_store_path = managed_agents_store_path_at(&definitions_dir);
         let agents_store_snapshot = match std::fs::read(&agents_store_path) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("failed to snapshot agent store: {e}")),
         };
-        let teams_store_path = crate::managed_agents::teams_store_path(&app)?;
+        let teams_store_path = teams_store_path_at(&definitions_dir);
         let teams_store_snapshot = match std::fs::read(&teams_store_path) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -700,11 +726,11 @@ pub async fn confirm_team_snapshot_import(
         };
 
         // Write all definitions.
-        let mut personas = load_personas(&app)?;
+        let mut personas = load_personas_at(&definitions_dir)?;
         for m in &minted {
             personas.push(m.definition.clone());
         }
-        if let Err(e) = save_personas(&app, &personas) {
+        if let Err(e) = save_personas_at(&definitions_dir, &personas) {
             return Err(rollback_agents(e));
         }
 
@@ -713,15 +739,15 @@ pub async fn confirm_team_snapshot_import(
         for m in &minted {
             records.push(m.record.clone());
         }
-        if let Err(e) = save_managed_agents(&app, &records) {
+        if let Err(e) = save_managed_agents_at(&definitions_dir, &records) {
             return Err(rollback_agents(e));
         }
 
         // Write the team record. `teams` was pre-loaded via the read-only
         // loader before any agent commits, so a read/parse failure already
-        // aborted before any phase-3 write. save_teams sorts and persists.
+        // aborted before any phase-3 write. save_teams_at sorts and persists.
         teams.push(imported_team.clone());
-        if let Err(e) = save_teams(&app, &teams) {
+        if let Err(e) = save_teams_at(&definitions_dir, &teams) {
             let err = rollback_agents(e);
             // Also restore teams store.
             let teams_restore = match &teams_store_snapshot {
@@ -741,10 +767,13 @@ pub async fn confirm_team_snapshot_import(
 
         // All writes committed — safe to update in-memory state.
         for m in &minted {
-            crate::commands::personas::retain_persona_pending(&app, &state, &m.definition);
+            crate::commands::personas::retain_persona_pending_in_scope(
+                &retention_scope,
+                &m.definition,
+            );
         }
         for m in &minted {
-            retain_agent_pending(&app, &state, &m.record);
+            retain_agent_pending(&retention_scope, &m.record);
         }
         crate::commands::teams::retain_team_pending(&app, &state, &imported_team);
 
@@ -847,7 +876,10 @@ pub async fn confirm_team_snapshot_import(
 
 /// Inline retention for the managed-agent kind:30177 event — mirrors
 /// `commands::personas::snapshot::import::retain_agent_pending`.
-fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgentRecord) {
+fn retain_agent_pending(
+    scope: &crate::managed_agents::retention::RetentionScope,
+    record: &ManagedAgentRecord,
+) {
     use crate::managed_agents::{
         agent_events::{agent_event_content, build_agent_event},
         persona_events::monotonic_created_at,
@@ -857,7 +889,6 @@ fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgent
     use nostr::JsonUtil;
 
     let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
         let conn = open_retention_db(&scope.db_path)?;
         let content = serde_json::to_string(&agent_event_content(record))
             .map_err(|e| format!("failed to serialize agent content: {e}"))?;

@@ -45,21 +45,6 @@ const TEAM_DELIMITER: &str = "\n\n---\n# Team Instructions\n";
 /// `personas.json` are cleaned in the same boot, and BEFORE
 /// `backfill_standalone_agents` so a manufactured definition never snapshots
 /// a suffix this migration is about to remove.
-#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses strip_baked_team_instructions_in_dir.
-pub fn strip_baked_team_instructions(app: &tauri::AppHandle) {
-    let Ok(base_dir) = crate::managed_agents::managed_agents_base_dir(app) else {
-        return;
-    };
-    match strip_baked_team_instructions_in_dir(&base_dir) {
-        Ok(0) => {}
-        Ok(stripped) => eprintln!(
-            "buzz-desktop: team-suffix-strip: removed the baked team-instructions suffix from \
-             {stripped} record(s)"
-        ),
-        Err(e) => eprintln!("buzz-desktop: team-suffix-strip: {e}"),
-    }
-}
-
 /// Core logic, decoupled from the Tauri `AppHandle` for testing.
 ///
 /// `base_dir` is the managed-agents base directory (`<AppDataDir>/agents/`).

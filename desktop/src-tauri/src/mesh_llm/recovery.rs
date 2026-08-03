@@ -278,11 +278,15 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
     // that commits after this point is handled on the next watchdog cycle.
     // Both relay and definitions_dir come from the single captured scope so
     // all store reads below target the same workspace as the relay check.
-    let (scope_relay, scope_definitions_dir) = {
+    // The generation is captured alongside so writes to definitions_dir can
+    // detect a mid-pass workspace switch via validate_scope_generation before
+    // persisting any error/clear record.
+    let (scope_relay, scope_definitions_dir, captured_scope) = {
         let s = state.capture_active_scope();
         (
             s.as_ref().map(|scope| scope.relay_url.clone()),
-            s.map(|scope| scope.definitions_dir.clone()),
+            s.as_ref().map(|scope| scope.definitions_dir.clone()),
+            s,
         )
     };
 
@@ -408,8 +412,17 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
         {
             Ok(()) => {
                 if let Some(dir) = scope_definitions_dir.as_deref() {
-                    if let Err(error) = clear_mesh_last_error_if_set_at(app, dir, &record.pubkey) {
-                        eprintln!("buzz-mesh: failed to clear recovery error: {error}");
+                    // Validate generation before writing to the captured scope's
+                    // directory — if the workspace switched during this await,
+                    // do not write the stale success into the new scope's store.
+                    if captured_scope.as_ref().map_or(false, |s| {
+                        crate::managed_agents::scope::validate_scope_generation(s).is_ok()
+                    }) {
+                        if let Err(error) =
+                            clear_mesh_last_error_if_set_at(app, dir, &record.pubkey)
+                        {
+                            eprintln!("buzz-mesh: failed to clear recovery error: {error}");
+                        }
                     }
                 }
             }
@@ -418,10 +431,18 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
                     "{MESH_REARM_ERROR_SENTINEL}Buzz shared compute offline — failed to re-arm local ingress for this agent: {error}"
                 );
                 if let Some(dir) = scope_definitions_dir.as_deref() {
-                    if let Err(persist_error) =
-                        persist_mesh_last_error_at(app, dir, &record.pubkey, &message)
-                    {
-                        eprintln!("buzz-mesh: failed to persist recovery error: {persist_error}");
+                    // Validate generation before persisting the error — if the
+                    // workspace switched during this await, skip the write.
+                    if captured_scope.as_ref().map_or(false, |s| {
+                        crate::managed_agents::scope::validate_scope_generation(s).is_ok()
+                    }) {
+                        if let Err(persist_error) =
+                            persist_mesh_last_error_at(app, dir, &record.pubkey, &message)
+                        {
+                            eprintln!(
+                                "buzz-mesh: failed to persist recovery error: {persist_error}"
+                            );
+                        }
                     }
                 }
                 first_error.get_or_insert(message);

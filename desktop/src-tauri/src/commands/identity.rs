@@ -339,18 +339,24 @@ pub async fn save_ncryptsec_copy(
 /// `managed_agent_runtime_transition` before calling this function.
 ///
 /// Returns:
-/// - `Ok(())` when all runtimes were stopped (or there were none).
-/// - `Err(msg)` when the drain failed; the caller must NOT proceed with
-///   the identity persist and MUST compensate by restarting the stopped set.
+/// - `Ok(stopped)` when all runtimes were stopped (or there were none).
+/// - `Err((stopped, msg))` when the drain failed; `stopped` contains the
+///   entries that were successfully killed before the failure — the caller
+///   MUST compensate these and then drop `managed_agent_runtime_transition`
+///   BEFORE calling `compensate_drain` (which re-acquires that lock via
+///   `start_pair`).
 fn drain_managed_agent_runtimes_for_import(
     app: &tauri::AppHandle,
     state: &AppState,
-) -> Result<Vec<crate::managed_agents::DrainJournalEntry>, String> {
+) -> Result<
+    Vec<crate::managed_agents::DrainJournalEntry>,
+    (Vec<crate::managed_agents::DrainJournalEntry>, String),
+> {
     let (stopped, _remaining, drain_error) =
         crate::managed_agents::drain_scope_runtimes(app, state);
     match drain_error {
         None => Ok(stopped),
-        Some(e) => Err(e),
+        Some(e) => Err((stopped, e)),
     }
 }
 
@@ -383,6 +389,35 @@ pub async fn import_identity(
         None
     };
 
+    // ── Layer 1 async: drain the Mesh client when switching away from an active
+    // scope — mirrors the pre-spawn_blocking Mesh drain in apply_workspace so
+    // the Mesh client is not left running against a scope that no longer exists
+    // after the identity import clears the active scope. Best-effort: a drain
+    // failure is logged and the import proceeds.
+    if has_active_scope {
+        #[cfg(feature = "mesh-llm")]
+        {
+            // Drain using the current active relay — the import clears the scope
+            // entirely, so any live Mesh client becomes stale regardless of relay.
+            let active_relay = lock_state
+                .capture_active_scope()
+                .map(|s| s.relay_url.clone())
+                .unwrap_or_default();
+            if let Err(error) = crate::commands::mesh_llm::scope_impl::drain_mesh_client_if_stale(
+                &app_handle,
+                // Pass an empty string so any client (any relay) is treated
+                // as stale and drained; identity import invalidates all scopes.
+                "",
+            )
+            .await
+            {
+                eprintln!(
+                    "buzz-desktop: Mesh client drain before identity import failed: {error} (active_relay={active_relay})"
+                );
+            }
+        }
+    }
+
     let result = tokio::task::spawn_blocking(move || {
         // NIP-49 backups require a passphrase and decrypt entirely in Rust.
         // Raw nsec/hex input follows the existing parser path unchanged.
@@ -407,13 +442,17 @@ pub async fn import_identity(
         // new identity. This is the same drain-journal protocol used by
         // `apply_workspace`.
         //
+        // `managed_agents_store_lock` is acquired at Layer 2 start (same as
+        // apply_workspace) so a concurrent save_managed_agents cannot interleave
+        // with the drain or the scope clear.
+        //
         // On drain failure: compensate by restarting what was stopped, then
         // return Err — do NOT proceed with the identity persist. The caller
         // (frontend membership-denied flow) must handle the Err and retry.
         //
-        // The transition lock is held through the identity persist and scope
-        // clear so no concurrent start/reconcile can insert a runtime between
-        // drain and scope invalidation.
+        // The transition lock (and store lock) must be DROPPED before calling
+        // compensate_drain — compensate_drain calls start_pair which re-acquires
+        // both managed_agent_runtime_transition and managed_agents_store_lock.
         let _rt_transition_guard = if has_active_scope {
             Some(
                 state
@@ -425,13 +464,30 @@ pub async fn import_identity(
             None
         };
 
+        let _store_guard = if has_active_scope {
+            Some(
+                state
+                    .managed_agents_store_lock
+                    .lock()
+                    .map_err(|e| format!("managed_agents_store_lock poisoned: {e}"))?,
+            )
+        } else {
+            None
+        };
+
         let stopped_entries = if has_active_scope {
             match drain_managed_agent_runtimes_for_import(&app_handle, &state) {
                 Ok(stopped) => stopped,
-                Err(drain_err) => {
-                    // Drain failed — compensate and abort.
+                Err((stopped, drain_err)) => {
+                    // Drain failed — drop the transition lock AND store lock BEFORE
+                    // compensating: compensate_drain calls start_pair which
+                    // re-acquires both managed_agent_runtime_transition and
+                    // managed_agents_store_lock. Holding either here deadlocks.
+                    // Also restore the partial stopped set, not an empty slice.
+                    drop(_store_guard);
+                    drop(_rt_transition_guard);
                     let comp_err =
-                        crate::managed_agents::compensate_drain(&app_handle, &[]);
+                        crate::managed_agents::compensate_drain(&app_handle, &stopped);
                     let msg = match comp_err {
                         Some(comp) => format!(
                             "identity import drain failed: {drain_err}; compensation failed: {comp}"
@@ -455,10 +511,14 @@ pub async fn import_identity(
         });
 
         // If identity persist failed after a successful drain, compensate.
+        // Drop the transition lock AND store lock BEFORE calling compensate_drain
+        // for the same reason: start_pair re-acquires both.
         let (pubkey, storage) = match commit_result {
             Ok(result) => result,
             Err(e) => {
                 if !stopped_entries.is_empty() {
+                    drop(_store_guard);
+                    drop(_rt_transition_guard);
                     if let Some(comp_err) =
                         crate::managed_agents::compensate_drain(&app_handle, &stopped_entries)
                     {

@@ -186,34 +186,23 @@ pub async fn apply_workspace(
                 &target_scope_id,
                 &scope_dir,
                 &base_dir,
+                &effective_owner_pubkey,
             )?;
 
-            // ── Persona snapshot backfill (still in prepare stage) ────────────
-            // Run before commit so auto-start agents in the newly-ready scope
-            // have valid persona snapshots available at the first restore pass.
-            // Best-effort: a failure is logged but does not block the transition.
+            // ── Legacy retention migration and persona snapshot backfill ─────────
+            // Both now run inside `ensure_scope_ready` above (as `run_pre_ready_family`),
+            // before the `_ready` marker is written. They remain here as
+            // best-effort guards for any pre-existing Ready scope that was
+            // initialized before these steps were added to the pipeline.
             if let Err(e) = crate::managed_agents::backfill_persona_snapshots_at(
                 &scope_dir,
                 &state,
             ) {
-                eprintln!("buzz-desktop: persona-snapshot backfill failed during prepare: {e}");
+                eprintln!("buzz-desktop: persona-snapshot backfill guard failed: {e}");
             }
 
-            // ── Legacy retention migration (still in prepare stage) ───────────
-            // Migrate legacy retained events into this scope's retention DB BEFORE
-            // committing the scope as active. Both the retention and definition
-            // stores must be migrated together so event-sync sees consistent data.
-            // Best-effort: a failure is logged and does not block the transition.
             {
-                let effective_owner_pubkey_for_retention = match &parsed_keys {
-                    Some(keys) => keys.public_key().to_hex(),
-                    None => state
-                        .keys
-                        .lock()
-                        .map_err(|e| e.to_string())?
-                        .public_key()
-                        .to_hex(),
-                };
+                let effective_owner_pubkey_for_retention = effective_owner_pubkey.clone();
                 let retention_db_path = crate::managed_agents::retention::scoped_retention_db_path(
                     &base_dir,
                     &relay_url,
@@ -232,7 +221,7 @@ pub async fn apply_workspace(
                         "buzz-desktop: adopted {copied} legacy retained event(s) into this community"
                     ),
                     Err(error) => eprintln!(
-                        "buzz-desktop: legacy retention migration failed during prepare: {error}"
+                        "buzz-desktop: legacy retention migration guard failed: {error}"
                     ),
                 }
             }
@@ -242,11 +231,21 @@ pub async fn apply_workspace(
             // through the end of the commit swap so no start/reconcile can insert
             // a new runtime into the gap between drain and scope publication.
             //
+            // `managed_agents_store_lock` is acquired immediately after
+            // `managed_agent_runtime_transition` and held through commit so that
+            // a concurrent save_managed_agents (e.g., a runtime status flush)
+            // cannot interleave with the drain or the scope swap.
+            //
             // All fallible guards (relay_url_override, keys, active_agent_scope)
             // are acquired BEFORE any field is mutated so a poison or other lock
             // failure cannot leave us half-committed with old processes drained.
             let rt_transition = state
                 .managed_agent_runtime_transition
+                .lock()
+                .map_err(|e| e.to_string())?;
+
+            let _store = state
+                .managed_agents_store_lock
                 .lock()
                 .map_err(|e| e.to_string())?;
 
@@ -256,10 +255,13 @@ pub async fn apply_workspace(
 
             if let Some(drain_err) = drain_error {
                 // Drain failed — compensate by restarting what we stopped.
-                // The rt_transition lock stays held during compensation so the
-                // runtime map is still protected.
-                let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                // Drop BOTH the transition lock AND the store lock BEFORE calling
+                // compensate_drain: start_pair re-acquires both
+                // managed_agent_runtime_transition and managed_agents_store_lock
+                // — holding either here would deadlock on the non-reentrant Mutex.
+                drop(_store);
                 drop(rt_transition);
+                let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
                 let degraded_msg = match comp_err {
                     Some(comp) => {
                         format!("drain failed ({drain_err}); compensation also failed: {comp}")
@@ -274,8 +276,11 @@ pub async fn apply_workspace(
             let mut override_guard = match state.relay_url_override.lock() {
                 Ok(g) => g,
                 Err(e) => {
-                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                    // Drop _store and rt_transition BEFORE compensate_drain:
+                    // start_pair re-acquires both; holding either here deadlocks.
+                    drop(_store);
                     drop(rt_transition);
+                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
                     let msg = format!(
                         "commit failed (relay lock poisoned: {e}){}",
                         comp_err
@@ -287,9 +292,10 @@ pub async fn apply_workspace(
             let mut keys_guard = match state.keys.lock() {
                 Ok(g) => g,
                 Err(e) => {
-                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
                     drop(override_guard);
+                    drop(_store);
                     drop(rt_transition);
+                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
                     let msg = format!(
                         "commit failed (keys lock poisoned: {e}){}",
                         comp_err
@@ -301,10 +307,11 @@ pub async fn apply_workspace(
             let mut scope_guard = match state.active_agent_scope.lock() {
                 Ok(g) => g,
                 Err(e) => {
-                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
                     drop(keys_guard);
                     drop(override_guard);
+                    drop(_store);
                     drop(rt_transition);
+                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
                     let msg = format!(
                         "commit failed (scope lock poisoned: {e}){}",
                         comp_err
@@ -360,6 +367,25 @@ pub async fn apply_workspace(
     // If blocking returned a drain-failed result, surface it now.
     let apply_result = blocking_result?;
     if !apply_result.applied {
+        // The workspace switch failed (drain or commit error). The Mesh client
+        // may have been drained in the Layer-1 async stage before spawn_blocking
+        // was entered. Re-arm it so the old scope's sharing state is restored.
+        #[cfg(feature = "mesh-llm")]
+        {
+            let app = restore_app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppState>();
+                if let Err(error) =
+                    crate::commands::mesh_llm::restore_mesh_sharing(&app, &state).await
+                {
+                    eprintln!(
+                        "buzz-desktop: failed to re-arm Mesh after failed workspace switch: {error}"
+                    );
+                }
+                crate::mesh_llm::publish_current_status_once(&app, "workspace switch rollback")
+                    .await;
+            });
+        }
         return Ok(apply_result);
     }
 
@@ -378,14 +404,12 @@ pub async fn apply_workspace(
     match crate::managed_agents::retention::active_retention_scope(&restore_app, &state) {
         Ok(scope) => {
             if let Some(agent_scope) = state.capture_active_scope() {
-                if let Err(error) = crate::event_sync::spawn_event_sync(
+                crate::event_sync::spawn_event_sync(
                     restore_app.clone(),
                     scope.owner_keys,
                     scope.db_path,
                     agent_scope.definitions_dir,
-                ) {
-                    degraded.push(format!("event-sync dispatch failed: {error}"));
-                }
+                );
             } else {
                 degraded.push(
                     "active agent scope unavailable after workspace apply — event sync skipped"
@@ -402,7 +426,8 @@ pub async fn apply_workspace(
 
     // Per-transition restore: always restore the new scope's auto-start agents
     // (replaces the launch-only `managed_agent_restore_pending.swap` one-shot).
-    // Fire-and-forget spawn so the command returns promptly; failures are logged.
+    // Fire-and-forget spawn so the command returns promptly; restore failures
+    // are surfaced as a structured `workspace-degraded` event consumed by the UI.
     #[cfg(feature = "mesh-llm")]
     {
         let app = restore_app.clone();
@@ -418,7 +443,9 @@ pub async fn apply_workspace(
             if let Err(error) =
                 restore_managed_agents_on_launch(&app, &state.shutdown_started).await
             {
-                eprintln!("buzz-desktop: failed to restore managed agents: {error}");
+                let msg = format!("agent restore failed: {error}");
+                eprintln!("buzz-desktop: {msg}");
+                let _ = app.emit("workspace-degraded", &msg);
             }
         });
     }
@@ -431,7 +458,9 @@ pub async fn apply_workspace(
             if let Err(error) =
                 restore_managed_agents_on_launch(&app, &state.shutdown_started).await
             {
-                eprintln!("buzz-desktop: failed to restore managed agents: {error}");
+                let msg = format!("agent restore failed: {error}");
+                eprintln!("buzz-desktop: {msg}");
+                let _ = app.emit("workspace-degraded", &msg);
             }
         });
     }

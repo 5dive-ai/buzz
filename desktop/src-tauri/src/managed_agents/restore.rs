@@ -66,6 +66,18 @@ pub fn backfill_persona_snapshots_at(
     backfill_persona_snapshots_in_dir(definitions_dir, state)
 }
 
+/// Backfill persona snapshots without acquiring the store lock.
+///
+/// For use during scope initialization (inside `ensure_scope_ready`), where the
+/// scope directory is not yet published as `_ready` and no concurrent reader or
+/// writer can legally access it. The lock-taking variant (`backfill_persona_snapshots_at`)
+/// must be used in all other contexts.
+pub(crate) fn backfill_persona_snapshots_pre_ready(
+    definitions_dir: &std::path::Path,
+) -> Result<(), String> {
+    backfill_persona_snapshots_inner(definitions_dir)
+}
+
 fn backfill_persona_snapshots_in_dir(
     definitions_dir: &std::path::Path,
     state: &AppState,
@@ -75,6 +87,10 @@ fn backfill_persona_snapshots_in_dir(
         .lock()
         .map_err(|error| error.to_string())?;
 
+    backfill_persona_snapshots_inner(definitions_dir)
+}
+
+fn backfill_persona_snapshots_inner(definitions_dir: &std::path::Path) -> Result<(), String> {
     let mut records = load_managed_agents_at(definitions_dir)?;
     let needs_backfill = records
         .iter()
@@ -440,6 +456,16 @@ pub async fn restore_managed_agents_on_launch(
             SpawnOutcome::Skipped => continue,
             SpawnOutcome::Spawned(key, mut process) => {
                 let Ok(record) = find_managed_agent_mut(&mut records, &pubkey) else {
+                    // Record was deleted between Phase B and Phase C — terminate
+                    // the spawned child and remove its receipt to avoid a leaked
+                    // process with no record to track it.
+                    eprintln!(
+                        "buzz-desktop: restore: record for {} was deleted during spawn; \
+                         terminating stale child",
+                        pubkey
+                    );
+                    let _ = super::terminate_process(process.child.id());
+                    super::remove_agent_runtime_receipt(app, &key);
                     continue;
                 };
                 let now = util::now_iso();

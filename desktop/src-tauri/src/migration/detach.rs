@@ -24,18 +24,6 @@ use crate::managed_agents::{ManagedAgentRecord, TeamRecord};
 ///    `instructions` if the field is not already set.
 /// 4. Clear `source_dir`, `is_symlink`, `symlink_target`, `version` on each
 ///    directory-backed `TeamRecord`.
-#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses detach_directory_backed_teams_in_dir.
-pub fn detach_directory_backed_teams(app: &tauri::AppHandle) {
-    let Ok(base_dir) = crate::managed_agents::managed_agents_base_dir(app) else {
-        return;
-    };
-    match detach_directory_backed_teams_in_dir(&base_dir) {
-        Ok(0) => {}
-        Ok(n) => eprintln!("buzz-desktop: detach-dir-teams: detached {n} directory-backed team(s)"),
-        Err(e) => eprintln!("buzz-desktop: detach-dir-teams: {e}"),
-    }
-}
-
 /// Core logic, decoupled from the Tauri `AppHandle` for testing.
 ///
 /// `base_dir` is the managed-agents base directory (`<AppDataDir>/agents/`).

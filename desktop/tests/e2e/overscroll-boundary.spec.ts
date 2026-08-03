@@ -70,7 +70,7 @@ test("locks viewport rubber-band outside conversation scrollers", async ({
   // gesture alone so the substrate's own handler can receive it.
   await page.evaluate(() => {
     const terminal = document.createElement("section");
-    terminal.dataset.terminalOwner = "buzz";
+    terminal.dataset.terminalOwner = "terminal";
     terminal.dataset.testid = "terminal-wheel-target";
     document.body.append(terminal);
   });
@@ -112,17 +112,42 @@ test("locks horizontal viewport pan everywhere", async ({ page }) => {
 
   await page.evaluate(() => {
     const terminal = document.createElement("section");
-    terminal.dataset.terminalOwner = "buzz";
+    terminal.dataset.terminalOwner = "terminal";
     terminal.dataset.testid = "terminal-wheel-target";
     document.body.append(terminal);
   });
-  for (const deltaX of [-120, 120]) {
+  for (const [deltaX, deltaY, prevented] of [
+    [120, 0, true],
+    [0, 120, false],
+    [120, 120, false],
+    [120, 20, true],
+  ] as const) {
     await expect(
       dispatchWheelPrevented(page, '[data-testid="terminal-wheel-target"]', {
         deltaX,
+        deltaY,
       }),
-    ).resolves.toBe(true);
+    ).resolves.toBe(prevented);
   }
+
+  // A concealed substrate is not an active custom wheel consumer. Keep dead
+  // space locked even if a future layout places Buzz content inside it.
+  await page.evaluate(() => {
+    const terminal = document.querySelector<HTMLElement>(
+      '[data-testid="terminal-wheel-target"]',
+    );
+    const buzzContent = document.createElement("div");
+    buzzContent.dataset.testid = "concealed-terminal-dead-space";
+    terminal?.append(buzzContent);
+    if (terminal) terminal.dataset.terminalOwner = "buzz";
+  });
+  await expect(
+    dispatchWheelPrevented(
+      page,
+      '[data-testid="concealed-terminal-dead-space"]',
+      { deltaY: 120 },
+    ),
+  ).resolves.toBe(true);
 
   // A predominantly vertical gesture with slight horizontal drift still
   // reaches the conversation scroller.

@@ -70,8 +70,6 @@ pub(crate) struct EffectiveAgentEnv {
     /// The process-env map the spawned harness would receive.
     pub env: BTreeMap<String, String>,
     /// Harness config file path, if any (e.g. `~/.config/goose/config.yaml`).
-    // Not read yet; kept for the unified-agent-record rewrite (chunk A) which
-    // replaces this resolution path wholesale.
     #[allow(dead_code)]
     pub config_file_path: Option<&'static str>,
     /// The resolved harness binary name (e.g. `"buzz-agent"`, `"goose"`).
@@ -1049,6 +1047,7 @@ mod tests {
             default_env: &[],
             supports_acp_native_config: false,
             thinking_env_var: None,
+            effort_normalization: None,
             max_tokens_env_var: None,
             context_limit_env_var: None,
             max_rounds_env_var: None,
@@ -1241,6 +1240,7 @@ mod tests {
             default_env: &[],
             supports_acp_native_config: false,
             thinking_env_var: None,
+            effort_normalization: None,
             max_tokens_env_var: None,
             context_limit_env_var: None,
             max_rounds_env_var: None,

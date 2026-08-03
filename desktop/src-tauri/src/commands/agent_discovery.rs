@@ -45,8 +45,7 @@ pub(crate) fn plan_adapter_install<'c>(
         {
             None
         }
-        // Codex adapter is outdated: uninstall the old package first so npm
-        // doesn't hit EEXIST on the shared `codex-acp` bin-link, then install.
+        // Codex adapter outdated: uninstall old package first (npm refuses to overwrite a bin from another pkg).
         Some(_) => Some(vec![
             "npm uninstall -g @zed-industries/codex-acp",
             "npm install -g @agentclientprotocol/codex-acp",
@@ -165,6 +164,7 @@ pub async fn save_custom_harness(
         model_env_var: None,
         provider_env_var: None,
         thinking_env_var: None,
+        accepted_effort_values: None,
         max_tokens_env_var: None,
         context_limit_env_var: None,
         max_rounds_env_var: None,

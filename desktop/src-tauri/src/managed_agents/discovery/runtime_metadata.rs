@@ -1,3 +1,62 @@
+/// Canonicalization contract for a harness's thinking-effort env var.
+///
+/// The authority for UI choices, spawn bridge, and reader. All candidates
+/// are normalized through `normalize()` before any validity, precedence,
+/// override, or B-equality check.
+///
+/// Source for Goose: `crates/goose-provider-types/src/thinking.rs`
+///   • `FromStr` (aliases, case-insensitive): `off|disabled|none`, `low`,
+///     `medium|med`, `high`, `max|xhigh`
+///   • `Display` (canonical): `off`, `low`, `medium`, `high`, `max`
+///   • Live ACP emits Display values via `response_builder.rs:326-337`.
+pub(crate) struct EffortNormalization {
+    /// Canonical values in UI display order (drive choices, persistence, ACP comparison).
+    pub canonical: &'static [&'static str],
+    /// `(alias, canonical)` pairs, case-insensitive. Only aliases that differ
+    /// from their canonical form are listed.
+    pub aliases: &'static [(&'static str, &'static str)],
+}
+
+/// Goose thinking-effort canonicalization contract.
+///
+/// Source: `crates/goose-provider-types/src/thinking.rs` at Goose `2db0e31fe`.
+/// Canonical Display values: `off`, `low`, `medium`, `high`, `max`.
+/// Aliases (case-insensitive): `none|disabled→off`, `med→medium`, `xhigh→max`.
+/// `minimal` (Buzz-only) is invalid — skipped as absent at every tier.
+pub(crate) static GOOSE_EFFORT_NORMALIZATION: EffortNormalization = EffortNormalization {
+    canonical: &["off", "low", "medium", "high", "max"],
+    aliases: &[
+        ("none", "off"),
+        ("disabled", "off"),
+        ("med", "medium"),
+        ("xhigh", "max"),
+    ],
+};
+
+impl EffortNormalization {
+    /// Normalize `raw` to a `String` canonical form.
+    /// `None` → invalid for this harness; caller must treat as absent (skip-as-absent policy).
+    pub fn normalize_str(&self, raw: &str) -> Option<String> {
+        let lower = raw.to_lowercase();
+        // Check direct canonical match first.
+        if self.canonical.contains(&lower.as_str()) {
+            return Some(lower);
+        }
+        // Check aliases.
+        for &(alias, canon) in self.aliases {
+            if lower == alias {
+                return Some(canon.to_string());
+            }
+        }
+        None
+    }
+
+    /// Return the canonical values slice (for UI choices).
+    pub fn canonical_values(&self) -> &'static [&'static str] {
+        self.canonical
+    }
+}
+
 /// Static capabilities and installation metadata for a known ACP runtime.
 pub(crate) struct KnownAcpRuntime {
     pub id: &'static str,
@@ -47,6 +106,20 @@ pub(crate) struct KnownAcpRuntime {
     pub config_file_format: Option<&'static str>,
     pub supports_acp_native_config: bool, // tier 1a: config/read+write
     pub thinking_env_var: Option<&'static str>,
+    /// Canonicalization contract for `thinking_env_var` on this harness.
+    ///
+    /// `Some(contract)` — harness uses a finite, static effort vocabulary.
+    /// All candidates (native env, legacy env, ACP tier, file tier) are
+    /// normalized through this contract before validity checks, precedence
+    /// resolution, override tracking, and B-equality comparison.
+    ///
+    /// `None` — harness accepts any provider/model-specific value via its own
+    /// catalog (buzz-agent); see `getProviderEffortConfig()` in TS for that path.
+    ///
+    /// The single canonical authority shared by UI choices, spawn bridge, and
+    /// reader. No value-authority logic may live outside this struct for
+    /// harnesses that declare one.
+    pub effort_normalization: Option<&'static EffortNormalization>,
     /// Env var for normalizing `max_output_tokens`. `None` when the harness
     /// does not have a first-class env var for this field (config-file only).
     pub max_tokens_env_var: Option<&'static str>,

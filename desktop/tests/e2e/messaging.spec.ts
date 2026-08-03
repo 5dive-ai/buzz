@@ -218,7 +218,8 @@ test.beforeEach(async ({ page }, testInfo) => {
                       },
                       linkPreviewMetadataDelayMs:
                         testInfo.title.includes("style defaults") ||
-                        testInfo.title.includes("send does not wait")
+                        testInfo.title.includes("send does not wait") ||
+                        testInfo.title.includes("attachment-sized")
                           ? 1_500
                           : undefined,
                     }
@@ -504,7 +505,41 @@ test("send does not wait for a pending link preview snapshot", async ({
   expect(linkPreviewTags ?? []).toEqual([]);
 });
 
-test("link preview image geometry stays stable while loading", async ({
+test("hiding composer previews suppresses the whole draft and emits the blanket marker", async ({
+  page,
+}) => {
+  const firstUrl = "https://github.com/block/buzz/pull/3246?hide=all";
+  const secondUrl = "https://linear.app/acme/issue/ABC-123/hidden-too";
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page.getByTestId("message-input").fill(firstUrl);
+  await expect(page.locator("[data-composer-link-previews]")).toBeVisible();
+
+  await page.getByTestId("composer-hide-link-previews").click();
+  await expect(page.locator("[data-composer-link-previews]")).toHaveCount(0);
+  await page.getByTestId("message-input").fill(`${firstUrl} ${secondUrl}`);
+  await expect(page.locator("[data-composer-link-previews]")).toHaveCount(0);
+  await page.getByTestId("send-message").click();
+
+  const row = page.getByTestId("message-row").last();
+  await expect(row).toContainText(firstUrl);
+  await expect(row).toContainText(secondUrl);
+  await expect(row.locator("[data-link-preview]")).toHaveCount(0);
+  const linkPreviewTags = await page.evaluate(() => {
+    const call = [...(window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [])]
+      .reverse()
+      .find((entry) => entry.command === "send_channel_message");
+    return (
+      call?.payload as { linkPreviewTags?: string[][] | null } | undefined
+    )?.linkPreviewTags;
+  });
+  expect(linkPreviewTags).toEqual([["link-preview", "none"]]);
+
+  await page.getByTestId("message-input").fill(firstUrl);
+  await expect(page.locator("[data-composer-link-previews]")).toBeVisible();
+});
+
+test("composer link preview embeds stay attachment-sized while loading and ready", async ({
   page,
 }) => {
   const previewUrl = "https://github.com/block/buzz/pull/3246";
@@ -520,32 +555,10 @@ test("link preview image geometry stays stable while loading", async ({
     const card = page
       .locator("[data-composer-link-previews]")
       .locator('[data-link-preview="github-pull-request"]');
-    await expect(card).toHaveAttribute("data-image-state", "pending");
     await expect(card).toBeVisible();
-    await expect(card.locator("[data-link-preview-thumbnail]")).toBeVisible();
-    if (process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR) {
-      await waitForAnimations(page);
-      await card.screenshot({
-        animations: "disabled",
-        path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/${width}-pending.png`,
-      });
-    }
-    const pending = await card.evaluate((element) => ({
+    const initial = await card.evaluate((element) => ({
       height: element.getBoundingClientRect().height,
       width: element.getBoundingClientRect().width,
-      textLeft: element
-        .querySelector('[data-slot="attachment-content"]')
-        ?.getBoundingClientRect().left,
-      textInset: (() => {
-        const content = element.querySelector("[data-link-preview-hostname]");
-        const thumbnail = element.querySelector(
-          "[data-link-preview-thumbnail]",
-        );
-        return content && thumbnail
-          ? content.getBoundingClientRect().left -
-              thumbnail.getBoundingClientRect().right
-          : undefined;
-      })(),
       thumbnailHeight: element
         .querySelector("[data-link-preview-thumbnail]")
         ?.getBoundingClientRect().height,
@@ -553,26 +566,22 @@ test("link preview image geometry stays stable while loading", async ({
         .querySelector("[data-link-preview-thumbnail]")
         ?.getBoundingClientRect().width,
     }));
-
-    await expect(card).toHaveAttribute("data-image-state", "image");
-    await expect(
-      card.locator("[data-link-preview-hostname-favicon]"),
-    ).toHaveAttribute("src", /data:image\/png;base64/);
     if (process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR) {
       await waitForAnimations(page);
-      await card.screenshot({
-        path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/${width}-loaded.png`,
+      await page.screenshot({
+        animations: "disabled",
+        path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/composer-${width}-loading.png`,
       });
     }
-    const loaded = await card.evaluate((element) => ({
-      description: element.querySelector('[data-slot="attachment-description"]')
-        ?.textContent,
+
+    await expect
+      .poll(() =>
+        card.evaluate((element) => element.getAttribute("data-state")),
+      )
+      .toBe("done");
+    const ready = await card.evaluate((element) => ({
       height: element.getBoundingClientRect().height,
-      titleClass: element.querySelector('[data-slot="attachment-title"]')
-        ?.className,
-      textLeft: element
-        .querySelector('[data-slot="attachment-content"]')
-        ?.getBoundingClientRect().left,
+      width: element.getBoundingClientRect().width,
       thumbnailHeight: element
         .querySelector("[data-link-preview-thumbnail]")
         ?.getBoundingClientRect().height,
@@ -580,81 +589,38 @@ test("link preview image geometry stays stable while loading", async ({
         .querySelector("[data-link-preview-thumbnail]")
         ?.getBoundingClientRect().width,
     }));
+    if (process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR) {
+      await waitForAnimations(page);
+      await page.screenshot({
+        animations: "disabled",
+        path: `${process.env.BUZZ_LINK_PREVIEW_SCREENSHOTS_DIR}/composer-${width}-ready.png`,
+      });
+    }
 
-    expect(pending.width).toBe(width < 640 ? 345 : 384);
-    expect(pending.height).toBe(84);
-    expect(pending.textInset).toBe(8);
-    expect(pending.thumbnailHeight).toBe(84);
-    expect(loaded.height).toBe(pending.height);
-    expect(loaded.textLeft).toBe(pending.textLeft);
-    expect(loaded.thumbnailHeight).toBe(pending.thumbnailHeight);
-    expect(loaded.thumbnailWidth).toBe(pending.thumbnailWidth);
-    expect(loaded.thumbnailWidth).toBe(width < 640 ? 120 : 136);
-    expect(loaded.titleClass).toContain("line-clamp-2");
-    expect(loaded.description).toBe(
-      "A polished, stable preview for shared links.",
-    );
+    expect(initial.height).toBe(55);
+    expect(initial.width).toBe(320);
+    expect(initial.thumbnailHeight).toBe(55);
+    expect(initial.thumbnailWidth).toBe(55);
+    expect(ready).toEqual(initial);
   }
 });
 
-test("link preview no-image layout keeps compact height", async ({ page }) => {
+test("composer no-image link embeds keep the attachment footprint", async ({
+  page,
+}) => {
   const previewUrl = "https://github.com/block/buzz/pull/3246?inline=none";
-
-  for (const width of [800, 420]) {
-    await page.setViewportSize({ width: 800, height: 700 });
-    await page.goto("/");
-    await page.getByTestId("channel-general").click();
-    await page.setViewportSize({ width, height: 700 });
-    await page
-      .getByTestId("message-input")
-      .fill(`${previewUrl}&viewport=${width}`);
-    const card = page
-      .locator("[data-composer-link-previews]")
-      .locator('[data-link-preview="github-pull-request"]');
-    await expect(card).toHaveAttribute("data-image-state", "pending");
-    await expect(card).toBeVisible();
-    await expect
-      .poll(() =>
-        card.evaluate((element) => element.getBoundingClientRect().height),
-      )
-      .toBe(84);
-    const pending = await card.evaluate((element) => ({
-      height: element.getBoundingClientRect().height,
-      textLeft: element
-        .querySelector('[data-slot="attachment-content"]')
-        ?.getBoundingClientRect().left,
-    }));
-
-    await expect(card).toHaveAttribute("data-image-state", "none");
-    await expect(card.locator("[data-link-preview-thumbnail]")).toHaveCount(0);
-    await expect(card.locator('[data-slot="attachment-media"]')).toHaveCount(0);
-    const hostnameLink = card.locator("[data-link-preview-hostname]");
-    await expect(hostnameLink).toHaveText("github.com");
-    await expect(hostnameLink).toHaveAttribute(
-      "href",
-      `${previewUrl}&viewport=${width}`,
-    );
-    await expect(
-      card.locator("[data-link-preview-hostname-favicon]"),
-    ).toHaveAttribute("src", /data:image\/png;base64/);
-    await expect(
-      card.locator('[data-slot="attachment-description"]'),
-    ).toHaveText("Open-source collaboration for the Buzz app.");
-    await expect(card).toHaveCSS("border-left-width", "3px");
-    const title = card.locator('[data-slot="attachment-title"]');
-    await card.hover();
-    await expect(hostnameLink).toHaveCSS("text-decoration-line", "underline");
-    await expect(title).toHaveCSS("text-decoration-line", "underline");
-    const resolved = await card.evaluate((element) => ({
-      height: element.getBoundingClientRect().height,
-      textLeft: element
-        .querySelector('[data-slot="attachment-content"]')
-        ?.getBoundingClientRect().left,
-    }));
-
-    expect(resolved.height).toBe(pending.height);
-    expect(resolved.textLeft).toBeLessThan(pending.textLeft ?? 0);
-  }
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page.getByTestId("message-input").fill(previewUrl);
+  const card = page
+    .locator("[data-composer-link-previews]")
+    .locator('[data-link-preview="github-pull-request"]');
+  await expect(card).toHaveAttribute("data-image-state", "none");
+  await expect(card.locator("[data-link-preview-thumbnail]")).toBeVisible();
+  await expect(card.locator('[data-slot="attachment-title"]')).toContainText(
+    /github\.com|Buzz/,
+  );
+  await expect(card).toHaveCSS("height", "55px");
 });
 
 test("mixed link preview image outcomes keep Compact and Rich fallbacks stable", async ({

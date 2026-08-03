@@ -57,6 +57,16 @@ pub fn append(
     let base = url::Url::parse(relay_base).map_err(|_| "invalid relay base URL")?;
     let mut seen = HashSet::new();
     for preview_tag in preview_tags {
+        if preview_tag.as_slice() == ["link-preview", "none"] {
+            if preview_tags.len() != 1 {
+                return Err("link-preview suppression cannot include snapshots".into());
+            }
+            tags.push(
+                Tag::parse(["link-preview", "none"])
+                    .map_err(|e| format!("invalid link-preview tag: {e}"))?,
+            );
+            continue;
+        }
         let valid = preview_tag.len() == 11
             && preview_tag[0] == "link-preview"
             && preview_tag[1] == "snapshot"
@@ -117,6 +127,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tags.len(), 1);
+    }
+
+    #[test]
+    fn append_accepts_blanket_suppression_by_itself() {
+        let mut tags = Vec::new();
+        append(
+            &[vec!["link-preview".into(), "none".into()]],
+            BASE,
+            &mut tags,
+        )
+        .unwrap();
+        assert_eq!(tags[0].as_slice(), ["link-preview", "none"]);
+        assert!(append(
+            &[vec!["link-preview".into(), "none".into()], tag("", ""),],
+            BASE,
+            &mut Vec::new(),
+        )
+        .is_err());
     }
 
     #[test]

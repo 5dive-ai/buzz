@@ -169,6 +169,7 @@ fn validate_link_preview_tags(event: &Event, media_base_url: &str) -> Result<(),
     const MAX_DESCRIPTION: usize = 1000;
 
     let mut count = 0;
+    let mut suppressed = false;
     let mut seen = std::collections::HashSet::new();
     for tag in event.tags.iter() {
         let parts = tag.as_slice();
@@ -176,7 +177,19 @@ fn validate_link_preview_tags(event: &Event, media_base_url: &str) -> Result<(),
             continue;
         }
         count += 1;
-        if count > MAX_SNAPSHOTS || parts.len() != 11 || parts[1] != "snapshot" || parts[2] != "1" {
+        if parts == ["link-preview", "none"] {
+            if count > 1 {
+                return Err("link-preview suppression cannot include snapshots".into());
+            }
+            suppressed = true;
+            continue;
+        }
+        if suppressed
+            || count > MAX_SNAPSHOTS
+            || parts.len() != 11
+            || parts[1] != "snapshot"
+            || parts[2] != "1"
+        {
             return Err("invalid link-preview snapshot tag".into());
         }
         let canonical =
@@ -3547,6 +3560,55 @@ mod tests {
             ],
         );
         assert!(validate_diff_event(&event).is_err());
+    }
+
+    #[test]
+    fn link_preview_suppression_accepts_blanket_marker() {
+        let event = make_event_with_tags(
+            KIND_STREAM_MESSAGE,
+            "https://example.com",
+            &[&["link-preview", "none"]],
+        );
+
+        assert!(validate_link_preview_tags(&event, "https://media.example.com").is_ok());
+    }
+
+    #[test]
+    fn link_preview_suppression_rejects_duplicate_marker() {
+        let event = make_event_with_tags(
+            KIND_STREAM_MESSAGE,
+            "https://example.com",
+            &[&["link-preview", "none"], &["link-preview", "none"]],
+        );
+
+        assert_eq!(
+            validate_link_preview_tags(&event, "https://media.example.com"),
+            Err("link-preview suppression cannot include snapshots".into())
+        );
+    }
+
+    #[test]
+    fn link_preview_suppression_rejects_mixed_snapshot_tags_in_either_order() {
+        let snapshot = [
+            "link-preview",
+            "snapshot",
+            "1",
+            "https://example.com",
+            "Example",
+            "Example",
+            "Description",
+            "",
+            "",
+            "",
+            "",
+        ];
+        for tags in [
+            vec![&["link-preview", "none"][..], &snapshot[..]],
+            vec![&snapshot[..], &["link-preview", "none"][..]],
+        ] {
+            let event = make_event_with_tags(KIND_STREAM_MESSAGE, "https://example.com", &tags);
+            assert!(validate_link_preview_tags(&event, "https://media.example.com").is_err());
+        }
     }
 
     fn make_dummy_event() -> Event {

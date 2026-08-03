@@ -194,6 +194,16 @@ impl AuthContextInput {
     }
 
     #[allow(dead_code)]
+    pub(crate) const fn nostr_proof_authorization_domain(&self) -> CommunityId {
+        self.nostr_proof.authorization_domain()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) const fn community_access_authorization_domain(&self) -> CommunityId {
+        self.community_access.authorization_domain()
+    }
+
+    #[allow(dead_code)]
     pub(crate) const fn correlation_id(&self) -> Uuid {
         self.correlation_id
     }

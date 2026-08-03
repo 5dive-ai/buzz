@@ -14,7 +14,7 @@ use super::{
 pub type AuthorityAdapterFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Failure while invoking or validating a federated authority adapter.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum AuthorityAdapterError<E> {
     /// The storage adapter failed before producing authoritative state.
     Adapter(E),
@@ -22,6 +22,21 @@ pub enum AuthorityAdapterError<E> {
     Contract(AuthContextError),
     /// Current policy no longer matches the atomic binding precondition.
     PolicyChanged,
+}
+
+impl<E> fmt::Debug for AuthorityAdapterError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            Self::Adapter(_) => "Adapter",
+            Self::Contract(_) => "Contract",
+            Self::PolicyChanged => "PolicyChanged",
+        };
+        formatter
+            .debug_struct("AuthorityAdapterError")
+            .field("variant", &variant)
+            .field("detail", &"[redacted]")
+            .finish()
+    }
 }
 
 impl<E> AuthorityAdapterError<E> {

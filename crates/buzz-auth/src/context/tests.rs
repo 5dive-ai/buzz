@@ -767,6 +767,18 @@ fn evidence_value_debug_output_redacts_numeric_values() {
 }
 
 #[test]
+fn authority_adapter_error_debug_output_redacts_storage_detail() {
+    let error = AuthorityAdapterError::adapter("private-storage-detail");
+
+    let rendered = format!("{error:?}");
+    assert_eq!(
+        rendered,
+        "AuthorityAdapterError { variant: \"Adapter\", detail: \"[redacted]\" }"
+    );
+    assert!(!rendered.contains("private-storage-detail"));
+}
+
+#[test]
 fn zero_owner_admission_expiry_is_rejected() {
     assert_eq!(
         AdmissionExpiry::new(0),

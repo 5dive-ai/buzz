@@ -265,15 +265,29 @@ pub(crate) async fn recover_stale_mesh_runtime(
 }
 
 /// Post-launch recovery for actively running relay-mesh agents.
+///
+/// Captures one active scope at function entry for the entire recovery pass.
+/// A live runtime is only treated as healthy when its bound relay matches the
+/// captured scope's relay — a mismatched runtime (from a switched-away scope)
+/// is treated as absent and re-arming proceeds for the current scope.
 pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let _rearm_guard = state.mesh_recovery.rearm_lock.lock().await;
-    let runtime_mode = state
-        .mesh_llm_runtime
-        .lock()
-        .await
-        .as_ref()
-        .map(|runtime| runtime.mode());
+
+    // Capture scope once for the entire pass; a concurrent workspace switch
+    // that commits after this point is handled on the next watchdog cycle.
+    let scope_relay = state
+        .capture_active_scope()
+        .map(|scope| scope.relay_url.clone());
+
+    let (runtime_mode, runtime_relay) = {
+        let guard = state.mesh_llm_runtime.lock().await;
+        let mode = guard.as_ref().map(|r| r.mode());
+        let relay = guard
+            .as_ref()
+            .and_then(|r| r.start_request().relay_url.clone());
+        (mode, relay)
+    };
     let recovery = recover_stale_mesh_runtime(&state, MeshRecoveryUrgency::Watchdog).await;
     let active_pubkeys = active_managed_agent_pubkeys(&state);
     // Mesh participation is resolved through the same definition-authoritative
@@ -282,10 +296,37 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
     let personas = crate::managed_agents::load_personas(app).unwrap_or_default();
     let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
 
+    // Helper: does the live runtime's relay match the active scope relay?
+    // When either is None we treat it as a mismatch (fail closed).
+    let runtime_relay_matches_scope = || -> bool {
+        let Some(scope_r) = scope_relay.as_deref() else {
+            return false;
+        };
+        let Some(runtime_r) = runtime_relay.as_deref() else {
+            return false;
+        };
+        crate::managed_agents::scope::normalize_relay_for_scope(runtime_r)
+            == crate::managed_agents::scope::normalize_relay_for_scope(scope_r)
+    };
+
     match recovery {
-        MeshRuntimeRecovery::Live
-        | MeshRuntimeRecovery::Debouncing
-        | MeshRuntimeRecovery::Replaced => return Ok(()),
+        MeshRuntimeRecovery::Live => {
+            // Only trust a live runtime whose relay matches the active scope.
+            // A mismatched live runtime (stale from a switched-away scope) is
+            // not healthy for the current scope — fall through to re-arm.
+            if runtime_relay_matches_scope() {
+                return Ok(());
+            }
+            // Mismatch: Serve-mode runtimes stay pinned (machine-level) and
+            // are never bounced by the watchdog — just skip this pass.
+            // Client-mode mismatch: let the loop below attempt re-arm; it
+            // will find the mismatch via ensure_relay_mesh_for_record and
+            // produce the appropriate error or start a new client.
+            if runtime_mode == Some(crate::mesh_llm::MeshNodeMode::Serve) {
+                return Ok(());
+            }
+        }
+        MeshRuntimeRecovery::Debouncing | MeshRuntimeRecovery::Replaced => return Ok(()),
         MeshRuntimeRecovery::RestartRequired => {
             if runtime_mode == Some(crate::mesh_llm::MeshNodeMode::Serve) {
                 eprintln!(

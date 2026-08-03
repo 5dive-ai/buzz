@@ -813,6 +813,16 @@ fn pick_serve_target_for_model(
 /// a relay query failure ("could not refresh targets") is not the same as a
 /// relay that answered with no live target for this model ("peer offline").
 /// Non relay-mesh records are a no-op.
+///
+/// **Scope ownership rule (v4):** a live runtime is only reused when its bound
+/// relay matches the active workspace scope's relay. A relay mismatch means the
+/// runtime belongs to a different scope:
+/// - Serve mode (Share Compute): fail closed with a precise error — the
+///   process has one singleton runtime slot and one `:9337` ingress; no client
+///   can start while serve occupies it; the user must stop sharing first.
+/// - Client mode: treat as absent and fall through to re-arm (the old client
+///   should have been drained on the workspace switch, but this is a safety
+///   net for any edge where drain did not reach it).
 pub(crate) async fn ensure_relay_mesh_for_record(
     app: &AppHandle,
     model_id: Option<&str>,
@@ -822,6 +832,14 @@ pub(crate) async fn ensure_relay_mesh_for_record(
     let Some(model_id) = model_id else {
         return Ok(());
     };
+
+    // Capture the active scope relay once. None means no workspace applied yet
+    // — fail closed rather than starting a mesh client with an unknown relay.
+    let scope_relay = state
+        .capture_active_scope()
+        .map(|scope| scope.relay_url.clone())
+        .ok_or_else(|| "Buzz shared compute cannot start: no active workspace scope".to_string())?;
+
     // A local serve/client runtime already owns the OpenAI ingress and its
     // router can resolve both `auto` and explicit remote models. Do not require
     // a separate relay-advertised target in that case — BUT only trust it when
@@ -832,37 +850,75 @@ pub(crate) async fn ensure_relay_mesh_for_record(
     // runtime and fall through to re-arm it. The mesh coordinator watchdog also
     // calls this path after eviction so recovery is not start-only (Brad #2304).
     if state.mesh_llm_runtime.lock().await.is_some() {
-        match mesh_llm::recover_stale_mesh_runtime(
-            &state,
-            mesh_llm::MeshRecoveryUrgency::Foreground,
-        )
-        .await
-        {
-            mesh_llm::MeshRuntimeRecovery::Live => {
-                return wait_for_mesh_inference(model_id).await;
+        // Before probing liveness, verify the runtime's relay matches the
+        // active scope. A mismatch means it belongs to a switched-away scope.
+        let (runtime_relay, runtime_mode) = {
+            let guard = state.mesh_llm_runtime.lock().await;
+            let relay = guard
+                .as_ref()
+                .and_then(|r| r.start_request().relay_url.clone());
+            let mode = guard.as_ref().map(|r| r.mode());
+            (relay, mode)
+        };
+
+        let relay_matches = runtime_relay.as_deref().map_or(false, |bound| {
+            crate::managed_agents::scope::normalize_relay_for_scope(bound)
+                == crate::managed_agents::scope::normalize_relay_for_scope(&scope_relay)
+        });
+
+        if !relay_matches {
+            match runtime_mode {
+                Some(mesh_llm::MeshNodeMode::Serve) => {
+                    // Fail closed: Share Compute is pinned to another relay.
+                    // The process has one runtime slot and one :9337 ingress.
+                    // No client can start while serve occupies it.
+                    let pinned_relay = runtime_relay.as_deref().unwrap_or("another relay");
+                    return Err(format!(
+                        "Share Compute is currently pinned to {pinned_relay}. \
+                         Stop sharing first, then switch workspaces to use \
+                         Buzz shared compute on this workspace."
+                    ));
+                }
+                Some(mesh_llm::MeshNodeMode::Client) | None => {
+                    // Stale client from a prior workspace. Treat as absent —
+                    // fall through to re-arm a new client for the active scope.
+                    // The drain stage in apply_workspace should have cleared
+                    // this; this is a safety net for missed drains.
+                }
             }
-            mesh_llm::MeshRuntimeRecovery::Evicted | mesh_llm::MeshRuntimeRecovery::Absent => {}
-            mesh_llm::MeshRuntimeRecovery::Debouncing => {
-                return Err(
-                    "Buzz shared compute ingress is temporarily unresponsive; recovery is already scheduled. Try again shortly."
-                        .to_string(),
-                );
-            }
-            mesh_llm::MeshRuntimeRecovery::ReleasePending => {
-                return Err(
-                    "Buzz shared compute is still shutting down its previous local ingress. Try again shortly."
-                        .to_string(),
-                );
-            }
-            mesh_llm::MeshRuntimeRecovery::Replaced => {
-                return wait_for_mesh_inference(model_id).await;
-            }
-            mesh_llm::MeshRuntimeRecovery::RestartRequired => {
-                app.request_restart();
-                return Err(
-                    "Buzz shared compute startup lost its local ingress before shutdown control became available. Buzz is restarting to recover it."
-                        .to_string(),
-                );
+        } else {
+            match mesh_llm::recover_stale_mesh_runtime(
+                &state,
+                mesh_llm::MeshRecoveryUrgency::Foreground,
+            )
+            .await
+            {
+                mesh_llm::MeshRuntimeRecovery::Live => {
+                    return wait_for_mesh_inference(model_id).await;
+                }
+                mesh_llm::MeshRuntimeRecovery::Evicted | mesh_llm::MeshRuntimeRecovery::Absent => {}
+                mesh_llm::MeshRuntimeRecovery::Debouncing => {
+                    return Err(
+                        "Buzz shared compute ingress is temporarily unresponsive; recovery is already scheduled. Try again shortly."
+                            .to_string(),
+                    );
+                }
+                mesh_llm::MeshRuntimeRecovery::ReleasePending => {
+                    return Err(
+                        "Buzz shared compute is still shutting down its previous local ingress. Try again shortly."
+                            .to_string(),
+                    );
+                }
+                mesh_llm::MeshRuntimeRecovery::Replaced => {
+                    return wait_for_mesh_inference(model_id).await;
+                }
+                mesh_llm::MeshRuntimeRecovery::RestartRequired => {
+                    app.request_restart();
+                    return Err(
+                        "Buzz shared compute startup lost its local ingress before shutdown control became available. Buzz is restarting to recover it."
+                            .to_string(),
+                    );
+                }
             }
         }
     }
@@ -898,6 +954,63 @@ pub(crate) async fn ensure_relay_mesh_for_record(
     // this client fallback.
     ensure_client_node_for_model(&state, model_id, Some(target.endpoint_addr)).await?;
     wait_for_mesh_inference(model_id).await
+}
+
+/// Drain the Mesh client runtime if it is bound to a relay other than
+/// `active_relay_url` (i.e. it belongs to a workspace that is being
+/// switched away from).
+///
+/// Serve-mode runtimes are machine-level and are deliberately NOT drained
+/// on workspace switch — they stay pinned to their configured relay.
+///
+/// Called from the Layer-1 async serialization stage of `apply_workspace`
+/// (before `spawn_blocking`), while holding `workspace_transition` but
+/// without any synchronous Layer-2 guards.
+#[cfg(feature = "mesh-llm")]
+pub(crate) async fn drain_mesh_client_if_stale(
+    app: &AppHandle,
+    active_relay_url: &str,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (should_drain, taken) = {
+        let mut guard = state.mesh_llm_runtime.lock().await;
+        let is_client = guard
+            .as_ref()
+            .map_or(false, |r| r.mode() == mesh_llm::MeshNodeMode::Client);
+        if !is_client {
+            // Serve mode or no runtime — nothing to drain.
+            (false, None)
+        } else {
+            // Check relay match; drain only on mismatch.
+            let runtime_relay = guard
+                .as_ref()
+                .and_then(|r| r.start_request().relay_url.clone());
+            let relay_matches = runtime_relay.as_deref().map_or(false, |bound| {
+                crate::managed_agents::scope::normalize_relay_for_scope(bound)
+                    == crate::managed_agents::scope::normalize_relay_for_scope(active_relay_url)
+            });
+            if relay_matches {
+                (false, None)
+            } else {
+                (true, guard.take())
+            }
+        }
+    };
+
+    if should_drain {
+        if let Some(runtime) = taken {
+            if let Err(error) = runtime.stop().await {
+                eprintln!(
+                    "buzz-mesh: failed to drain stale client runtime during workspace switch: {error}"
+                );
+                // Non-fatal: the old client may have already exited or will be
+                // reclaimed by the watchdog. Log and continue — not stopping
+                // an old client is safer than blocking the workspace switch.
+            }
+        }
+        mesh_llm::publish_current_status_once(app, "workspace switch drain").await;
+    }
+    Ok(())
 }
 
 #[tauri::command]

@@ -116,13 +116,19 @@ pub async fn validate_repos_dir(dir: String) -> Result<(), String> {
 /// Tauri backend with the selected workspace's relay URL, keys, and repos
 /// directory.
 ///
+/// Returns `WorkspaceApplyResult`:
+/// - `applied: true` → new scope committed; post-commit failures surface as
+///   `degraded` entries (informational — workspace IS active).
+/// - `applied: false` → drain failed; old scope still active; `degraded`
+///   names what could not be stopped or restored by compensation.
+///
 /// A bad `repos_dir` is non-fatal: relay/keys always apply (the relay is the
 /// active workspace's own choice — orthogonal to the filesystem repos dir),
 /// the bad value is NOT persisted (so the next boot starts clean), the
 /// `REPOS` symlink is skipped (REPOS stays a real dir), a `repos-dir-error`
-/// event surfaces the reason, and the command returns `Ok`. The dialogs
-/// already block a bad path at Save (`validate_repos_dir`); this fallback only
-/// catches a value that went bad after save (deleted dir, unmounted volume).
+/// event surfaces the reason. The dialogs already block a bad path at Save
+/// (`validate_repos_dir`); this fallback only catches a value that went bad
+/// after save (deleted dir, unmounted volume).
 #[tauri::command]
 pub async fn apply_workspace(
     relay_url: String,
@@ -130,7 +136,9 @@ pub async fn apply_workspace(
     repos_dir: Option<String>,
     agent_managed_profiles: Option<bool>,
     app: AppHandle,
-) -> Result<(), String> {
+) -> Result<crate::managed_agents::scope::WorkspaceApplyResult, String> {
+    use crate::managed_agents::scope::WorkspaceApplyResult;
+
     // ── Layer 1: async serialization lock ────────────────────────────────────
     // workspace_transition serializes apply_workspace and live identity import
     // so scope transitions are never concurrent. We acquire via a clone so the
@@ -139,142 +147,162 @@ pub async fn apply_workspace(
     let lock_state = lock_app.state::<AppState>();
     let _transition_guard = lock_state.workspace_transition.lock().await;
 
+    // ── Layer 1 async: drain the Mesh client if it belongs to another relay ──
+    // Serve-mode runtimes stay pinned (machine-level, unaffected by workspace
+    // switches). Client-mode runtimes bound to a different relay are drained
+    // here, in the async layer, before entering spawn_blocking (which cannot
+    // await). Non-fatal: a drain failure is logged and the switch proceeds.
+    #[cfg(feature = "mesh-llm")]
+    {
+        if let Err(error) =
+            crate::commands::mesh_llm::drain_mesh_client_if_stale(&app, &relay_url).await
+        {
+            eprintln!("buzz-desktop: Mesh client drain before workspace switch failed: {error}");
+        }
+    }
+
     let restore_app = app.clone();
-    tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
+    let blocking_result: Result<WorkspaceApplyResult, String> =
+        tokio::task::spawn_blocking(move || {
+            let state = app.state::<AppState>();
 
-        // ── Validate before mutating ──────────────────────────────────────────
-        let parsed_keys = match nsec.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(nsec_trimmed) => {
-                Some(Keys::parse(nsec_trimmed).map_err(|e| format!("invalid nsec: {e}"))?)
-            }
-            None => None,
-        };
-
-        // Decide the effective repos_dir from the candidate. A bad path does NOT
-        // reject — it is treated as if no override were set: relay/keys still
-        // apply, the bad value is not persisted, and a `repos-dir-error` surfaces
-        // the reason. Persisting a bad path would make every later boot read it,
-        // fail to resolve the symlink, and silently skip agent restore. One
-        // validate (inside `effective_repos_dir`) drives both the emit and the
-        // persisted value. `nest` is resolved softly: when absent there is nothing
-        // to persist or symlink, and relay/keys must still apply unconditionally.
-        let nest = nest_dir();
-        let effective_repos_dir = match nest.as_deref() {
-            Some(nest) => match effective_repos_dir(nest, repos_dir.as_deref()) {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = app.emit("repos-dir-error", error);
-                    None
+            // ── Validate before mutating ──────────────────────────────────────
+            let parsed_keys = match nsec.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(nsec_trimmed) => {
+                    Some(Keys::parse(nsec_trimmed).map_err(|e| format!("invalid nsec: {e}"))?)
                 }
-            },
-            None => None,
-        };
+                None => None,
+            };
 
-        // ── Prepare: derive target scope and run staged initialization ────────
-        // This is the reversible prepare stage: the old scope remains active
-        // throughout. We derive the effective owner pubkey (candidate keys win
-        // over existing, mirroring the commit below) and call ensure_scope_ready
-        // which handles the canonical claim ledger, staged install, idempotent
-        // migrations, and the Ready marker. Any error here leaves the old scope
-        // untouched and returns Err before any state mutation.
-        let base_dir = crate::managed_agents::managed_agents_base_dir(&app).unwrap_or_default();
-        let effective_owner_pubkey = match &parsed_keys {
-            Some(keys) => keys.public_key().to_hex(),
-            None => state
-                .keys
-                .lock()
-                .map_err(|e| e.to_string())?
-                .public_key()
-                .to_hex(),
-        };
-        let target_scope_id =
-            crate::managed_agents::scope::derive_scope_id(&relay_url, &effective_owner_pubkey);
-        let scope_dir =
-            crate::managed_agents::scope::scoped_definitions_dir(&base_dir, &target_scope_id);
-        crate::managed_agents::scope_init::ensure_scope_ready(
-            &target_scope_id,
-            &scope_dir,
-            &base_dir,
-        )?;
+            // Decide the effective repos_dir from the candidate. A bad path does NOT
+            // reject — it is treated as if no override were set: relay/keys still
+            // apply, the bad value is not persisted, and a `repos-dir-error` surfaces
+            // the reason.
+            let nest = nest_dir();
+            let effective_repos_dir = match nest.as_deref() {
+                Some(nest) => match effective_repos_dir(nest, repos_dir.as_deref()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = app.emit("repos-dir-error", error);
+                        None
+                    }
+                },
+                None => None,
+            };
 
-        // ── Layer 2: synchronous commit epoch ────────────────────────────────
-        // No .await may be held while any Layer-2 guard is live. Relay override,
-        // keys, and the active scope are all committed in this critical section.
-        {
-            let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
-            *override_guard = Some(relay_url.clone());
-        }
-        // Reset the Rust-side admission gate when switching workspace/community,
-        // matching `resetRateLimitGate()` on the TS side (useCommunityInit.ts:38).
-        crate::relay_admission::reset_gate_for_workspace_change();
-
-        if let Some(keys) = parsed_keys {
-            let mut keys_guard = state.keys.lock().map_err(|e| e.to_string())?;
-            *keys_guard = keys;
-        }
-
-        // Keep the backend-side reconcile guard aligned with the frontend
-        // experiment before launch-time restore can spawn any agents. Missing
-        // means the stable behavior: desktop remains authoritative.
-        state
-            .managed_agent_profile_reconcile_enabled
-            .store(!agent_managed_profiles.unwrap_or(false), Ordering::Release);
-
-        // ── Commit the active workspace agent scope ───────────────────────────
-        // Derive the scope from the now-applied relay + owner keys and commit it
-        // as the active scope. All subsequent store reads/writes (via
-        // load_managed_agents, save_managed_agents, etc.) resolve through
-        // capture_active_scope() → scoped definitions directory. There is NO
-        // fallback to the legacy unscoped root.
-        {
-            let owner_pubkey = state
-                .keys
-                .lock()
-                .map_err(|e| e.to_string())?
-                .public_key()
-                .to_hex();
-            let generation = crate::managed_agents::scope::next_scope_generation();
-            let scope = crate::managed_agents::scope::WorkspaceAgentScope::new(
-                relay_url,
-                owner_pubkey,
+            // ── Prepare: derive target scope and run staged initialization ────
+            // Reversible prepare stage: the old scope remains active throughout.
+            let base_dir = crate::managed_agents::managed_agents_base_dir(&app).unwrap_or_default();
+            let effective_owner_pubkey = match &parsed_keys {
+                Some(keys) => keys.public_key().to_hex(),
+                None => state
+                    .keys
+                    .lock()
+                    .map_err(|e| e.to_string())?
+                    .public_key()
+                    .to_hex(),
+            };
+            let target_scope_id =
+                crate::managed_agents::scope::derive_scope_id(&relay_url, &effective_owner_pubkey);
+            let scope_dir =
+                crate::managed_agents::scope::scoped_definitions_dir(&base_dir, &target_scope_id);
+            crate::managed_agents::scope_init::ensure_scope_ready(
+                &target_scope_id,
+                &scope_dir,
                 &base_dir,
-                generation,
-            );
-            state.commit_active_scope(scope);
-        }
+            )?;
 
-        // ── Filesystem side-effect (non-fatal) ────────────────────────────────
-        // Persist the *effective* repos_dir (None when the candidate failed
-        // validation) for the backend to read at boot, then re-point REPOS to
-        // match. Persisting first makes the dotfile authoritative even if the
-        // symlink apply fails here (e.g. a non-empty real REPOS): the next boot
-        // reads the persisted value and resolves the symlink before any agent can
-        // clone into REPOS. A bad candidate persists `None`, so the next boot is
-        // clean and agent restore proceeds. Failure of either must NOT fail the
-        // command — relay/keys are already applied. Surface symlink errors via
-        // `repos-dir-error`.
-        if let Some(nest) = nest.as_deref() {
-            if let Err(error) = write_persisted_repos_dir(nest, effective_repos_dir.as_deref()) {
-                eprintln!("buzz-desktop: persist repos dir failed: {error}");
+            // ── Drain: journal + stop all old-scope runtimes ──────────────────
+            // Before committing the new scope, drain all live managed-agent
+            // processes. Take managed_agent_runtime_transition (Layer 2) now;
+            // the commit below also holds it.
+            let (stopped_entries, _remaining, drain_error) = {
+                let _rt_transition = state
+                    .managed_agent_runtime_transition
+                    .lock()
+                    .map_err(|e| e.to_string())?;
+                crate::managed_agents::drain_scope_runtimes(&app, &state)
+            };
+
+            if let Some(drain_err) = drain_error {
+                // Drain failed — compensate by restarting what we stopped.
+                let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                let degraded_msg = match comp_err {
+                    Some(comp) => {
+                        format!("drain failed ({drain_err}); compensation also failed: {comp}")
+                    }
+                    None => format!("drain failed ({drain_err}); old runtimes restored"),
+                };
+                return Ok(WorkspaceApplyResult::drain_failed(degraded_msg));
             }
-            if let Err(error) = ensure_repos_symlink(nest, effective_repos_dir.as_deref()) {
-                eprintln!("buzz-desktop: repos dir setup failed: {error}");
-                let _ = app.emit("repos-dir-error", error);
+
+            // ── Layer 2: synchronous commit epoch ────────────────────────────
+            // No .await may be held while any Layer-2 guard is live.
+            {
+                let mut override_guard =
+                    state.relay_url_override.lock().map_err(|e| e.to_string())?;
+                *override_guard = Some(relay_url.clone());
             }
-        }
+            crate::relay_admission::reset_gate_for_workspace_change();
 
-        try_regenerate_nest(&app);
+            if let Some(keys) = parsed_keys {
+                let mut keys_guard = state.keys.lock().map_err(|e| e.to_string())?;
+                *keys_guard = keys;
+            }
 
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))??;
+            state
+                .managed_agent_profile_reconcile_enabled
+                .store(!agent_managed_profiles.unwrap_or(false), Ordering::Release);
+
+            // ── Commit the active workspace agent scope ───────────────────────
+            {
+                let owner_pubkey = state
+                    .keys
+                    .lock()
+                    .map_err(|e| e.to_string())?
+                    .public_key()
+                    .to_hex();
+                let generation = crate::managed_agents::scope::next_scope_generation();
+                let scope = crate::managed_agents::scope::WorkspaceAgentScope::new(
+                    relay_url,
+                    owner_pubkey,
+                    &base_dir,
+                    generation,
+                );
+                state.commit_active_scope(scope);
+            }
+
+            // ── Filesystem side-effects (non-fatal) ───────────────────────────
+            if let Some(nest) = nest.as_deref() {
+                if let Err(error) = write_persisted_repos_dir(nest, effective_repos_dir.as_deref())
+                {
+                    eprintln!("buzz-desktop: persist repos dir failed: {error}");
+                }
+                if let Err(error) = ensure_repos_symlink(nest, effective_repos_dir.as_deref()) {
+                    eprintln!("buzz-desktop: repos dir setup failed: {error}");
+                    let _ = app.emit("repos-dir-error", error);
+                }
+            }
+
+            try_regenerate_nest(&app);
+
+            Ok::<WorkspaceApplyResult, String>(WorkspaceApplyResult::success())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking failed: {e}"))?;
+
+    // If blocking returned a drain-failed result, surface it now.
+    let apply_result = blocking_result?;
+    if !apply_result.applied {
+        return Ok(apply_result);
+    }
+
+    // ── Post-commit (non-rollback) ────────────────────────────────────────────
+    // The workspace HAS switched. Post-commit failures surface as degradation
+    // on the applied result — we never pretend the old scope survived.
+    let mut degraded: Vec<String> = Vec::new();
 
     let state = restore_app.state::<AppState>();
-    // Backfill this exact relay+owner scope only after the workspace has been
-    // applied. Running at process boot would target the fallback relay and
-    // collapse every community into one pending-event store.
     match crate::managed_agents::retention::active_retention_scope(&restore_app, &state) {
         Ok(scope) => {
             // Adopt whatever the pre-scoping release left queued in the global
@@ -283,10 +311,6 @@ pub async fn apply_workspace(
             // instead of being abandoned by the storage cutover.
             migrate_legacy_retention_into(&restore_app, &scope);
 
-            // The active scope was committed in the spawn_blocking above.
-            // If it is somehow None here, event sync is skipped rather than
-            // falling back to the legacy unscoped root (which would recreate
-            // split-brain storage).
             if let Some(agent_scope) = state.capture_active_scope() {
                 crate::event_sync::spawn_event_sync(
                     restore_app.clone(),
@@ -295,53 +319,44 @@ pub async fn apply_workspace(
                     agent_scope.definitions_dir,
                 );
             } else {
-                eprintln!(
-                    "buzz-desktop: active agent scope unavailable after workspace apply — \
-                     event sync skipped"
+                degraded.push(
+                    "active agent scope unavailable after workspace apply — event sync skipped"
+                        .to_string(),
                 );
             }
         }
         Err(error) => {
-            eprintln!("buzz-desktop: scoped event-sync unavailable after workspace apply: {error}");
+            degraded.push(format!(
+                "scoped event-sync unavailable after workspace apply: {error}"
+            ));
         }
     }
 
-    let restore_pending = state
-        .managed_agent_restore_pending
-        .swap(false, Ordering::AcqRel);
-
-    // The coordinator starts before React applies the selected workspace, so
-    // its startup publication may have used the fallback relay and placeholder
-    // identity. Correct it off the command path so an unavailable relay cannot
-    // hold the frontend on its loading gate. On initial launch, restore MeshLLM
-    // first so a slow stopped-status request cannot overwrite a newly restored
-    // serving status, then restore managed agents after the admission identity
-    // has been published (or the bounded publication attempt has timed out).
+    // Per-transition restore: always restore the new scope's auto-start agents
+    // (replaces the launch-only `managed_agent_restore_pending.swap` one-shot).
+    // Fire-and-forget spawn so the command returns promptly; failures are logged.
     #[cfg(feature = "mesh-llm")]
     {
         let app = restore_app.clone();
         tauri::async_runtime::spawn(async move {
             let state = app.state::<AppState>();
-            if restore_pending {
-                if let Err(error) =
-                    crate::commands::mesh_llm::restore_mesh_sharing(&app, &state).await
-                {
-                    eprintln!("buzz-desktop: failed to restore Share Compute: {error}");
-                }
+            // Restore mesh sharing first so a slow stopped-status request cannot
+            // overwrite a newly restored serving status.
+            if let Err(error) = crate::commands::mesh_llm::restore_mesh_sharing(&app, &state).await
+            {
+                eprintln!("buzz-desktop: failed to restore Share Compute: {error}");
             }
             crate::mesh_llm::publish_current_status_once(&app, "workspace apply").await;
-            if restore_pending {
-                if let Err(error) =
-                    restore_managed_agents_on_launch(&app, &state.shutdown_started).await
-                {
-                    eprintln!("buzz-desktop: failed to restore managed agents: {error}");
-                }
+            if let Err(error) =
+                restore_managed_agents_on_launch(&app, &state.shutdown_started).await
+            {
+                eprintln!("buzz-desktop: failed to restore managed agents: {error}");
             }
         });
     }
 
     #[cfg(not(feature = "mesh-llm"))]
-    if restore_pending {
+    {
         let app = restore_app.clone();
         tauri::async_runtime::spawn(async move {
             let state = app.state::<AppState>();
@@ -353,5 +368,13 @@ pub async fn apply_workspace(
         });
     }
 
-    Ok(())
+    if degraded.is_empty() {
+        Ok(WorkspaceApplyResult::success())
+    } else {
+        Ok(degraded
+            .into_iter()
+            .fold(WorkspaceApplyResult::success(), |r, msg| {
+                r.with_degradation(msg)
+            }))
+    }
 }

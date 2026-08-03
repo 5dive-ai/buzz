@@ -425,7 +425,10 @@ pub async fn restore_managed_agents_on_launch(
                 record.last_stopped_at = None;
                 record.last_exit_code = None;
                 record.last_error = None;
-                runtimes.insert(key, super::ManagedAgentPairRuntime::starting(process));
+                runtimes.insert(
+                    key,
+                    super::ManagedAgentPairRuntime::starting(process, Some(scope.scope_id.clone())),
+                );
                 successfully_spawned.push(pubkey);
             }
             SpawnOutcome::Failed(error) => {
@@ -495,7 +498,7 @@ pub async fn restore_managed_agents_on_launch(
 
 #[cfg(feature = "mesh-llm")]
 fn persist_restore_error(
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
     state: &AppState,
     pubkey: &str,
     definitions_dir: &std::path::Path,

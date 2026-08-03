@@ -1019,7 +1019,12 @@ pub fn start_managed_agent_process(
     record.last_error = None;
     record.last_error_code = None;
 
-    runtimes.insert(key, ManagedAgentPairRuntime::starting(process));
+    let scope_id = {
+        use tauri::Manager;
+        let state = app.state::<crate::app_state::AppState>();
+        state.capture_active_scope().map(|s| s.scope_id.clone())
+    };
+    runtimes.insert(key, ManagedAgentPairRuntime::starting(process, scope_id));
     Ok(())
 }
 

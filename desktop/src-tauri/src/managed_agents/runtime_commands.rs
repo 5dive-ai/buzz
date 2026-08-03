@@ -296,6 +296,9 @@ fn start_pair(
         .lock()
         .ok()
         .map(|keys| keys.public_key().to_hex());
+    let scope_id = state
+        .capture_active_scope()
+        .map(|scope| scope.scope_id.clone());
     let mut process = spawn_agent_child(&app, record, &key.relay_url, lazy, owner.as_deref())?;
     let now = crate::util::now_iso();
     let receipt = ManagedAgentRuntimeReceipt {
@@ -314,7 +317,10 @@ fn start_pair(
     record.last_started_at = Some(now);
     record.last_stopped_at = None;
     record.last_error = None;
-    runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(process));
+    runtimes.insert(
+        key.clone(),
+        ManagedAgentPairRuntime::starting(process, scope_id),
+    );
     let status = status_for(&app, record, &key, runtimes.get(&key), None);
     drop(runtimes);
     save_managed_agents(&app, &records)?;
@@ -459,35 +465,37 @@ fn unkeyable_failed_status(
     }
 }
 
-/// Spawn a lazy harness pair for every eligible (agent, community) pair.
+/// Spawn a lazy harness pair for every auto-start local agent in the active
+/// workspace scope.
 ///
-/// Eligibility is deliberately gated on `start_on_app_launch`: auto-start is
-/// the *proactive fan-out* policy — "keep this agent warm in every community" —
-/// not a correctness prerequisite. A manual-start agent still works on demand
-/// everywhere: attaching it to a channel ensures its pair, an @mention wakes a
-/// pair, the members sidebar and Settings controls start pairs, and restore
-/// preserves running pairs across relaunch. Fanning out warm-socket pairs for
-/// agents the user chose *not* to auto-start would contradict that choice, so
-/// reconcile leaves them alone until something explicitly asks for them.
+/// The target relay is derived from the captured active scope — the
+/// `communities` fan-out parameter has been removed. Under the active-scope-only
+/// runtime policy, reconcile targets exactly one relay: the relay the current
+/// workspace is bound to. Cross-scope fan-out is no longer representable at the
+/// API level.
+///
+/// Eligibility is gated on `start_on_app_launch`: auto-start is the proactive
+/// fan-out policy — agents not set to auto-start are left alone until something
+/// explicitly asks for them.
 #[tauri::command]
 pub async fn reconcile_managed_agent_runtimes(
-    communities: Vec<super::ManagedAgentCommunityTarget>,
     app: AppHandle,
 ) -> Result<Vec<ManagedAgentRuntimeStatus>, String> {
     use futures_util::{stream, StreamExt};
 
+    let state = app.state::<AppState>();
+    let scope = state
+        .capture_active_scope()
+        .ok_or_else(|| "reconcile_managed_agent_runtimes: no active workspace scope".to_string())?;
+    let relay_url = scope.relay_url.clone();
+
     let records = load_managed_agents(&app)?;
     let mut jobs = Vec::new();
-    for community in communities {
-        for record in records
-            .iter()
-            .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
-        // The legacy per-record relay pin is deliberately ignored here — see
-        // `effective_agent_relay_url`. Every local auto-start agent fans out
-        // to every configured community.
-        {
-            jobs.push((record.clone(), community.relay_url.clone()));
-        }
+    for record in records
+        .iter()
+        .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
+    {
+        jobs.push((record.clone(), relay_url.clone()));
     }
     let probes: Vec<_> = stream::iter(jobs)
         .map(|(record, requested)| {
@@ -579,6 +587,159 @@ pub async fn reconcile_managed_agent_runtimes(
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))
+}
+
+/// A single entry in the drain journal: enough to restart the process if
+/// compensation is needed after a partial drain failure.
+#[derive(Debug, Clone)]
+pub(crate) struct DrainJournalEntry {
+    pub key: ManagedAgentRuntimeKey,
+    /// Whether the agent would auto-start on app launch (used to determine
+    /// whether compensation should restart it as auto-start or lazy).
+    pub start_on_app_launch: bool,
+}
+
+/// Drain all live runtimes from the runtime map and return a drain journal
+/// (keys + restart recipes) for use by compensation.
+///
+/// This runs under the `managed_agent_runtime_transition` lock (Layer 2
+/// synchronous epoch — no `.await`). Callers are responsible for acquiring
+/// that lock before calling this function.
+///
+/// Returns `(stopped, remaining, first_stop_error)`. `stopped` contains the
+/// entries that were successfully killed (compensation restores these).
+/// `remaining` contains entries that were NOT attempted (due to early-exit on
+/// first failure). On success `remaining` is empty.
+pub(crate) fn drain_scope_runtimes(
+    app: &AppHandle,
+    state: &AppState,
+) -> (
+    Vec<DrainJournalEntry>,
+    Vec<DrainJournalEntry>,
+    Option<String>,
+) {
+    // Snapshot the journal from the live runtime map before any stops.
+    let journal: Vec<DrainJournalEntry> = {
+        let runtimes = match state.managed_agent_processes.lock() {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    vec![],
+                    vec![],
+                    Some(format!("runtime map lock poisoned: {e}")),
+                )
+            }
+        };
+        runtimes
+            .iter()
+            .map(|(key, _runtime)| {
+                // Look up start_on_app_launch from the current store; if we
+                // can't read it, assume true (safer for compensation — we'd
+                // rather restart too many than too few).
+                let start_on_app_launch = load_managed_agents(app)
+                    .ok()
+                    .and_then(|records| {
+                        records
+                            .iter()
+                            .find(|r| r.pubkey == key.pubkey)
+                            .map(|r| r.start_on_app_launch)
+                    })
+                    .unwrap_or(true);
+                DrainJournalEntry {
+                    key: key.clone(),
+                    start_on_app_launch,
+                }
+            })
+            .collect()
+    };
+
+    let mut stopped: Vec<DrainJournalEntry> = Vec::new();
+    let mut first_error: Option<String> = None;
+
+    for (idx, entry) in journal.iter().enumerate() {
+        let key = &entry.key;
+        let stop_result = {
+            let mut runtimes = match state.managed_agent_processes.lock() {
+                Ok(r) => r,
+                Err(e) => {
+                    first_error.get_or_insert_with(|| {
+                        format!("runtime map lock poisoned during drain: {e}")
+                    });
+                    // Return remaining as the un-attempted tail.
+                    return (stopped, journal[idx..].to_vec(), first_error);
+                }
+            };
+            if let Some(mut runtime) = runtimes.remove(key) {
+                let kill_result = if super::process_is_running(runtime.child.id()) {
+                    super::terminate_process(runtime.child.id())
+                } else {
+                    Ok(())
+                }
+                .and_then(|()| runtime.child.wait().map_err(|e| e.to_string()));
+
+                match kill_result {
+                    Ok(_) => {
+                        // Remove the receipt so sweep/restore see a clean slate.
+                        super::remove_agent_runtime_receipt(app, key);
+                        state.clear_agent_session_cache(key);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Put it back so the map is consistent.
+                        runtimes.insert(key.clone(), runtime);
+                        Err(e)
+                    }
+                }
+            } else {
+                // Nothing live at this key — treat as already stopped.
+                Ok(())
+            }
+        };
+
+        match stop_result {
+            Ok(()) => stopped.push(entry.clone()),
+            Err(e) => {
+                let msg = format!("failed to stop agent {}@{}: {e}", key.pubkey, key.relay_url);
+                first_error.get_or_insert(msg);
+                // Return the un-attempted tail (idx+1 onward) as remaining.
+                return (stopped, journal[idx + 1..].to_vec(), first_error);
+            }
+        }
+    }
+
+    (stopped, vec![], first_error)
+}
+
+/// Compensate a partial drain by restarting the entries that were successfully
+/// stopped before the failure.
+///
+/// `stopped` is the slice of journal entries that were actually stopped (i.e.,
+/// the prefix of the journal up to the first failure). We restart them so the
+/// old workspace is as intact as possible.
+///
+/// Returns a degradation message describing what could not be restarted.
+pub(crate) fn compensate_drain(app: &AppHandle, stopped: &[DrainJournalEntry]) -> Option<String> {
+    let mut failed_restarts = Vec::new();
+    for entry in stopped {
+        let result = start_pair(
+            entry.key.pubkey.clone(),
+            entry.key.relay_url.clone(),
+            entry.start_on_app_launch,
+            None,
+            app.clone(),
+        );
+        if let Err(e) = result {
+            failed_restarts.push(format!("{}@{}: {e}", entry.key.pubkey, entry.key.relay_url));
+        }
+    }
+    if failed_restarts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "workspace drain compensation failed for: {}",
+            failed_restarts.join(", ")
+        ))
+    }
 }
 
 #[cfg(test)]

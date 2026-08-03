@@ -392,4 +392,6 @@ pub fn run_decision_pass(
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
+mod test_helpers;
+#[cfg(test)]
 mod tests;

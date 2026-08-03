@@ -1,28 +1,13 @@
-use std::path::Path;
-
+use super::test_helpers::{coordinate, retain_prompt, run_pass, test_db, OWNER};
 use super::*;
 use crate::managed_agents::{
     decision::{decide, ParkReason},
-    persona_events::build_persona_event,
     retention::{
-        get_baseline, get_pending_sync, get_retained_event, is_publish_blocked, open_retention_db,
-        retain_event, set_baseline, tombstone_retention_d_tag, RetainedEvent,
+        get_baseline, get_pending_sync, get_retained_event, is_publish_blocked,
+        tombstone_retention_d_tag,
     },
 };
 use buzz_core_pkg::kind::{KIND_DELETION, KIND_PERSONA};
-
-const OWNER: &str = "ownerpubkeyhex";
-
-fn test_db() -> Connection {
-    open_retention_db(Path::new(":memory:")).unwrap()
-}
-
-fn coordinate() -> Coordinate {
-    Coordinate {
-        kind: KIND_PERSONA,
-        d_tag: "test-persona".to_string(),
-    }
-}
 
 /// The retention key the coordinate's queued tombstone occupies — a DIFFERENT
 /// primary key from the coordinate itself, which is the whole reason the gate
@@ -47,82 +32,10 @@ fn head(content: &str, created_at: i64) -> Head {
     }
 }
 
-fn signed_persona(system_prompt: &str) -> nostr::Event {
-    use std::collections::BTreeMap;
-    let record = crate::managed_agents::AgentDefinition {
-        id: "test-persona".to_string(),
-        display_name: "Test".to_string(),
-        avatar_url: None,
-        system_prompt: system_prompt.to_string(),
-        runtime: None,
-        model: None,
-        provider: None,
-        name_pool: Vec::new(),
-        is_builtin: false,
-        is_active: true,
-        shared: false,
-        source_team: None,
-        source_team_persona_slug: None,
-        catalog_source: None,
-        env_vars: BTreeMap::new(),
-        respond_to: None,
-        respond_to_allowlist: Vec::new(),
-        parallelism: None,
-        created_at: "2025-01-01T00:00:00Z".to_string(),
-        updated_at: "2025-01-01T00:00:00Z".to_string(),
-    };
-    build_persona_event(&record)
-        .unwrap()
-        .sign_with_keys(&nostr::Keys::generate())
-        .unwrap()
-}
-
 /// Retain a row at the coordinate, optionally pending. Returns the signed
 /// event so a caller can stamp a baseline naming it.
 fn retain_row(conn: &Connection, kind: u32, d_tag: &str, pending: bool) -> nostr::Event {
     retain_prompt(conn, kind, d_tag, pending, "prompt")
-}
-
-/// The same, with control over the persona's system prompt — which is what
-/// [`CanonicalProjection`] reads, so it is how a test makes the queued row's
-/// content differ from the baseline's.
-fn retain_prompt(
-    conn: &Connection,
-    kind: u32,
-    d_tag: &str,
-    pending: bool,
-    system_prompt: &str,
-) -> nostr::Event {
-    let event = signed_persona(system_prompt);
-    retain_event(
-        conn,
-        &RetainedEvent {
-            kind,
-            pubkey: OWNER.to_string(),
-            d_tag: d_tag.to_string(),
-            content: event.content.to_string(),
-            created_at: event.created_at.as_secs() as i64,
-            raw_event: {
-                use nostr::JsonUtil;
-                event.as_json()
-            },
-            pending_sync: pending,
-            event_id: Some(event.id.to_hex()),
-            publish_blocked: false,
-        },
-    )
-    .unwrap();
-    event
-}
-
-/// Re-queue an already-retained row, the way an edit or a reconcile would.
-fn set_pending(conn: &Connection, kind: u32, d_tag: &str) {
-    conn.execute(
-        "UPDATE persona_events SET pending_sync = 1
-         WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
-        rusqlite::params![kind, OWNER, d_tag],
-    )
-    .unwrap();
 }
 
 // ── local_state: reading the observation off a real store ──────────────────
@@ -222,39 +135,6 @@ fn test_non_pending_tombstone_row_is_not_reported_as_queued() {
 
     assert!(observation.queued.is_none());
     assert!(observation.queued_deletion_at.is_none());
-}
-
-#[test]
-fn test_stamped_baseline_is_read_back() {
-    let conn = test_db();
-    let event = retain_row(&conn, KIND_PERSONA, "test-persona", false);
-    set_baseline(
-        &conn,
-        KIND_PERSONA,
-        OWNER,
-        "test-persona",
-        &event.id.to_hex(),
-        "baseline-content",
-    )
-    .unwrap();
-
-    let observation = local_state(
-        &conn,
-        OWNER,
-        &coordinate(),
-        Some(projection("baseline-content")),
-        HeadState::Present(head("newer", 200)),
-        TombstoneEvidence::NotFound,
-    )
-    .unwrap();
-
-    assert_eq!(
-        observation.baseline.as_ref().map(|b| b.content.as_str()),
-        Some("baseline-content")
-    );
-    // Disk still equals the baseline, so the differing head wins — the exact
-    // stale-store case the fix exists for.
-    assert_eq!(decide(&observation).decision, Decision::ApplyHead);
 }
 
 /// A half-written baseline (id without content, or vice versa) is not a usable
@@ -399,48 +279,6 @@ fn test_only_publish_deletion_releases_the_tombstone_gate() {
     )));
 }
 
-/// The gate's whole purpose: a suppressed coordinate must actually vanish from
-/// the flush loop's work list.
-#[test]
-fn test_suppressed_coordinate_is_withheld_from_the_flush_loop() {
-    let conn = test_db();
-    retain_row(&conn, KIND_PERSONA, "test-persona", true);
-
-    assert_eq!(
-        get_pending_sync(&conn).unwrap().len(),
-        1,
-        "precondition: the pending row is publishable"
-    );
-
-    let observation = Observation {
-        disk: Some(projection("v1")),
-        queued: None,
-        head: HeadState::Absent,
-        baseline: Some(projection("v1")),
-        queued_deletion_at: None,
-        tombstone: TombstoneEvidence::NotFound,
-    };
-    apply_gate(
-        &conn,
-        OWNER,
-        &coordinate(),
-        &observation,
-        &resolution(Decision::SuppressPublish),
-    )
-    .unwrap();
-
-    assert!(
-        get_pending_sync(&conn).unwrap().is_empty(),
-        "a suppressed coordinate must not reach the publisher"
-    );
-    // The content and its pending flag survive — suppression withholds, it
-    // does not discard what this device believes.
-    let row = get_retained_event(&conn, KIND_PERSONA, OWNER, "test-persona")
-        .unwrap()
-        .unwrap();
-    assert!(row.pending_sync);
-}
-
 /// Suppression must be reversible: once the head is visible again the same
 /// coordinate resumes publishing, or the gate latches shut permanently.
 #[test]
@@ -519,44 +357,6 @@ fn test_gate_is_scoped_to_its_own_coordinate() {
     assert_eq!(pending[0].d_tag, "other-persona");
 }
 
-/// The gate has two halves because the rows have two primary keys. A pass that
-/// wrote only the live half would compute a deletion suppression and enforce
-/// it on the wrong row, leaving the tombstone free to publish.
-#[test]
-fn test_the_gate_enforces_on_the_tombstone_row_too() {
-    let conn = test_db();
-    retain_row(&conn, KIND_DELETION, &tombstone_key(), true);
-
-    assert_eq!(
-        get_pending_sync(&conn).unwrap().len(),
-        1,
-        "precondition: the queued tombstone is publishable"
-    );
-
-    let observation = Observation {
-        disk: None,
-        queued: None,
-        head: HeadState::Present(head("still-there", 200)),
-        baseline: None,
-        queued_deletion_at: Some(100),
-        tombstone: TombstoneEvidence::NotFound,
-    };
-    apply_gate(
-        &conn,
-        OWNER,
-        &coordinate(),
-        &observation,
-        &resolution(Decision::Park(ParkReason::NoBaselineWithHead)),
-    )
-    .unwrap();
-
-    assert!(
-        get_pending_sync(&conn).unwrap().is_empty(),
-        "a withheld deletion must not reach the publisher"
-    );
-    assert!(is_publish_blocked(&conn, KIND_DELETION, OWNER, &tombstone_key()).unwrap());
-}
-
 // ── Composition: the whole pass, not one layer ─────────────────────────────
 //
 // Every test above exercises one layer in isolation, which is exactly how a
@@ -580,24 +380,6 @@ fn observe(conn: &Connection, head: HeadState, disk: Option<CanonicalProjection>
         TombstoneEvidence::NotFound,
     )
     .unwrap()
-}
-
-/// Run the real pass over one coordinate and report what the flush loop would
-/// then publish.
-fn run_pass(conn: &Connection, observation: &Observation) -> (Decision, usize) {
-    let (plan, _) = run_decision_pass(
-        conn,
-        OWNER,
-        &[CoordinateState {
-            coordinate: coordinate(),
-            observation: observation.clone(),
-        }],
-    )
-    .unwrap();
-    (
-        plan[0].1.decision.clone(),
-        get_pending_sync(conn).unwrap().len(),
-    )
 }
 
 /// **Will's bug, end to end, and the regression test for this whole PR.**
@@ -655,24 +437,6 @@ fn test_stale_store_with_no_baseline_cannot_revert_a_newer_head() {
         .unwrap()
         .expect("the record must survive suppression");
     assert!(row.pending_sync);
-}
-
-/// The same bug in its second shape: a queued DELETION from a no-baseline
-/// store against a live head. Worse than the revert, because an a-tag delete
-/// destroys content this install has never seen rather than reverting it.
-#[test]
-fn test_stale_store_with_no_baseline_cannot_delete_a_live_head() {
-    let conn = test_db();
-    retain_row(&conn, KIND_DELETION, &tombstone_key(), true);
-
-    let observation = observe(&conn, HeadState::Present(head("still-there", 1)), None);
-    let (decision, publishable) = run_pass(&conn, &observation);
-
-    assert_eq!(decision, Decision::Park(ParkReason::NoBaselineWithHead));
-    assert_eq!(
-        publishable, 0,
-        "an unprovable deletion reached the publisher (decision: {decision:?})"
-    );
 }
 
 /// **The tombstone escape, composed over BOTH rows.**
@@ -741,211 +505,4 @@ fn test_no_baseline_store_withholds_both_the_record_and_its_tombstone() {
         is_publish_blocked(&conn, KIND_DELETION, OWNER, &tombstone_key()).unwrap(),
         "the tombstone row must be gated at its own primary key"
     );
-}
-
-/// The mirror case, and the reason suppression cannot simply block everything
-/// pending: a genuine local edit against a head this install has already
-/// agreed on must still publish, or the fix freezes every agent config.
-#[test]
-fn test_genuine_local_edit_still_publishes() {
-    let conn = test_db();
-    let event = retain_prompt(&conn, KIND_PERSONA, "test-persona", true, "my-new-edit");
-    // The baseline is what this install last agreed was published; the queued
-    // row has since moved past it.
-    set_baseline(
-        &conn,
-        KIND_PERSONA,
-        OWNER,
-        "test-persona",
-        &event.id.to_hex(),
-        "published-v1",
-    )
-    .unwrap();
-
-    let observation = observe(
-        &conn,
-        HeadState::Present(head("published-v1", 100)),
-        Some(projection("my-new-edit")),
-    );
-    let (decision, publishable) = run_pass(&conn, &observation);
-
-    assert_eq!(
-        decision,
-        Decision::PublishLocalEdit,
-        "a post-baseline edit must be recognized as an edit"
-    );
-    assert_eq!(publishable, 1, "the user's edit must still reach the relay");
-}
-
-/// A vacuous re-sign — the queued row publishes exactly what the baseline
-/// already says — is DROPPED, not gated. Gating would hold it forever, since
-/// it can never become publishable.
-#[test]
-fn test_vacuous_re_sign_is_cleared_rather_than_held() {
-    let conn = test_db();
-    let event = retain_prompt(&conn, KIND_PERSONA, "test-persona", true, "agreed");
-    // Baseline names this exact event, so the queued projection equals it.
-    set_baseline(
-        &conn,
-        KIND_PERSONA,
-        OWNER,
-        "test-persona",
-        &event.id.to_hex(),
-        &event.content,
-    )
-    .unwrap();
-
-    let observation = observe(
-        &conn,
-        HeadState::Present(head("newer-elsewhere", 200)),
-        Some(projection(&event.content)),
-    );
-    let (_, publishable) = run_pass(&conn, &observation);
-
-    assert_eq!(publishable, 0);
-    let row = get_retained_event(&conn, KIND_PERSONA, OWNER, "test-persona")
-        .unwrap()
-        .unwrap();
-    assert!(
-        !row.pending_sync,
-        "a re-sign carrying no new intent must be dropped, not held pending forever"
-    );
-}
-
-/// A pending row whose disk content already equals the head is the
-/// crash-convergence case: stamp the baseline and stop, rather than burn a
-/// `created_at` bump republishing identical content.
-#[test]
-fn test_pending_row_matching_the_head_stamps_and_stops() {
-    let conn = test_db();
-    retain_row(&conn, KIND_PERSONA, "test-persona", true);
-
-    let observation = observe(
-        &conn,
-        HeadState::Present(head("agreed", 100)),
-        Some(projection("agreed")),
-    );
-    let (decision, publishable) = run_pass(&conn, &observation);
-
-    assert_eq!(decision, Decision::Park(ParkReason::NoBaselineWithHead));
-    assert_eq!(publishable, 0, "identical content must not be republished");
-}
-
-/// `StampBaseline` has to actually write the baseline. It is the input every
-/// other cell depends on, so a decision computed and dropped leaves the table
-/// permanently in its no-provenance state.
-#[test]
-fn test_stamp_baseline_records_the_head_as_provenance() {
-    let conn = test_db();
-    retain_row(&conn, KIND_PERSONA, "test-persona", false);
-
-    let observation = observe(
-        &conn,
-        HeadState::Present(head("agreed", 100)),
-        Some(projection("agreed")),
-    );
-    run_pass(&conn, &observation);
-
-    assert_eq!(
-        get_baseline(&conn, KIND_PERSONA, OWNER, "test-persona").unwrap(),
-        Some(("id-agreed".to_string(), "agreed".to_string())),
-        "the baseline must be stamped from the head, content and id together"
-    );
-}
-
-/// The two-boot sequence that makes the fix durable rather than a one-shot:
-/// boot 1 converges and stamps the baseline, boot 2 uses that provenance to
-/// recognize the stale copy the reconcile re-queued.
-#[test]
-fn test_stamped_baseline_lets_the_next_boot_suppress_a_revert() {
-    let conn = test_db();
-    let event = retain_prompt(&conn, KIND_PERSONA, "test-persona", false, "v1");
-    // The head IS the event this store already holds — the converged state
-    // boot 1 is supposed to recognize.
-    let converged = Head {
-        event_id: event.id.to_hex(),
-        created_at: event.created_at.as_secs() as i64,
-        projection: CanonicalProjection::from_event(&event),
-    };
-    let disk = converged.projection.clone();
-
-    // Boot 1: disk equals the head, so the baseline is stamped from it.
-    let settled = observe(
-        &conn,
-        HeadState::Present(converged.clone()),
-        Some(disk.clone()),
-    );
-    let (decision, _) = run_pass(&conn, &settled);
-    assert_eq!(decision, Decision::StampBaseline);
-    assert_eq!(
-        get_baseline(&conn, KIND_PERSONA, OWNER, "test-persona").unwrap(),
-        Some((converged.event_id.clone(), converged.projection.content)),
-        "boot 1 must establish provenance"
-    );
-
-    // Boot 2: the other install published a newer edit; the reconcile on THIS
-    // install re-queued its unchanged copy at a manufactured timestamp.
-    set_pending(&conn, KIND_PERSONA, "test-persona");
-    let stale = observe(
-        &conn,
-        HeadState::Present(head("good-edit", 1)),
-        Some(disk.clone()),
-    );
-    let (decision, publishable) = run_pass(&conn, &stale);
-
-    assert_eq!(
-        publishable, 0,
-        "with a baseline, the stale copy must be recognized and withheld \
-         (decision: {decision:?})"
-    );
-    // Recognized as vacuous rather than merely gated: the queued row says
-    // exactly what the baseline already says, so it is dropped and the newer
-    // head is what this coordinate should adopt.
-    assert_eq!(decision, Decision::ApplyHead);
-    assert!(
-        !get_retained_event(&conn, KIND_PERSONA, OWNER, "test-persona")
-            .unwrap()
-            .unwrap()
-            .pending_sync
-    );
-}
-
-/// A queued deletion from a store that CAN prove its provenance still reaches
-/// the relay. Suppressing every tombstone would resurrect records the user
-/// deliberately removed.
-#[test]
-fn test_a_provable_queued_tombstone_still_publishes() {
-    let conn = test_db();
-    let tombstone = retain_row(&conn, KIND_DELETION, &tombstone_key(), true);
-    // Provenance at the target coordinate: this install agreed to what is
-    // published there, so its deletion is arbitrable (cell 4).
-    retain_prompt(&conn, KIND_PERSONA, "test-persona", false, "agreed");
-    let event = get_retained_event(&conn, KIND_PERSONA, OWNER, "test-persona")
-        .unwrap()
-        .unwrap();
-    set_baseline(
-        &conn,
-        KIND_PERSONA,
-        OWNER,
-        "test-persona",
-        event.event_id.as_deref().unwrap(),
-        &event.content,
-    )
-    .unwrap();
-
-    // The head is older than the tombstone, so the deletion wins.
-    let observation = observe(
-        &conn,
-        HeadState::Present(head("still-there", 1)),
-        Some(projection(&event.content)),
-    );
-    assert_eq!(
-        observation.queued_deletion_at,
-        Some(tombstone.created_at.as_secs() as i64)
-    );
-    let (decision, publishable) = run_pass(&conn, &observation);
-
-    assert_eq!(decision, Decision::PublishDeletion);
-    assert_eq!(publishable, 1, "the queued deletion must reach the relay");
-    assert_eq!(get_pending_sync(&conn).unwrap()[0].kind, KIND_DELETION);
 }

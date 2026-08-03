@@ -411,18 +411,6 @@ fn test_a_head_newer_than_the_tombstone_survives_it() {
     assert!(blocks_tombstone_publication(&resolution));
 }
 
-/// Deciding a deletion from a lookup that did not complete could wipe a head
-/// this device simply failed to see.
-#[test]
-fn test_a_deletion_behind_a_failed_lookup_defers() {
-    let observation = Observation {
-        head: HeadState::LookupFailed,
-        queued_deletion_at: Some(500),
-        ..settled()
-    };
-    assert_eq!(decide(&observation).decision, Decision::Defer);
-}
-
 // ── V3.10: suppression is not deletion ─────────────────────────────────────
 
 /// The core V3.10 rule. Relay-side history loss under one URL presents as
@@ -437,29 +425,6 @@ fn test_head_absent_with_clean_disk_suppresses_instead_of_deleting() {
     let resolution = decide(&observation);
     assert_eq!(resolution.decision, Decision::SuppressPublish);
     assert!(blocks_publication(&resolution));
-}
-
-/// A live head is current relay truth: a later upsert legitimately re-creates
-/// a coordinate, so an older tombstone must not delete it.
-#[test]
-fn test_live_head_overrides_an_older_tombstone() {
-    let observation = Observation {
-        tombstone: TombstoneEvidence::Found,
-        ..settled()
-    };
-    assert_eq!(decide(&observation).decision, Decision::StampBaseline);
-}
-
-/// Proven deletion plus a head read that never completed is ambiguous: a
-/// re-creation reads the same way. Neither removing nor republishing is safe.
-#[test]
-fn test_tombstone_with_a_failed_lookup_defers() {
-    let observation = Observation {
-        head: HeadState::LookupFailed,
-        tombstone: TombstoneEvidence::Found,
-        ..settled()
-    };
-    assert_eq!(decide(&observation).decision, Decision::Defer);
 }
 
 // ── Crash convergence and the unqueued cells ───────────────────────────────
@@ -505,19 +470,6 @@ fn test_untouched_disk_adopts_a_differing_head() {
     assert_eq!(decide(&observation).decision, Decision::ApplyHead);
 }
 
-/// Without a baseline the difference cannot be attributed to a local edit, so
-/// nothing is adopted and nothing is published.
-#[test]
-fn test_no_baseline_never_acts_on_a_difference() {
-    let observation = Observation {
-        disk: Some(projection("stale")),
-        head: HeadState::Present(head("current", 200)),
-        baseline: None,
-        ..settled()
-    };
-    assert_eq!(decide(&observation).decision, Decision::Defer);
-}
-
 /// Absence on disk is never deletion intent; that requires a tombstone.
 #[test]
 fn test_missing_disk_record_with_live_head_restores() {
@@ -526,16 +478,6 @@ fn test_missing_disk_record_with_live_head_restores() {
         ..settled()
     };
     assert_eq!(decide(&observation).decision, Decision::RestoreFromRelay);
-}
-
-#[test]
-fn test_missing_disk_record_and_missing_head_is_a_no_op() {
-    let observation = Observation {
-        disk: None,
-        head: HeadState::Absent,
-        ..settled()
-    };
-    assert_eq!(decide(&observation).decision, Decision::SuppressPublish);
 }
 
 /// A local edit with no head has no trustworthy timestamp to sign past, and

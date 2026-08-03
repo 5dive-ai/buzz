@@ -1,122 +1,21 @@
 //! Regression tests for am#1, peon-P1#1/P1#2, am#2/peon-P2#1,
 //! and Thufir pass-1 findings.
-//!
-//! Kept separate from `tests.rs` to respect the 1000-line ceiling on new files.
 
-use std::path::Path;
-
+use super::test_helpers::{
+    coordinate, retain_prompt, run_pass, set_pending, signed_persona, test_db, OWNER,
+};
 use super::*;
 use crate::managed_agents::{
     decision::{Decision, HeadState, TombstoneEvidence},
-    persona_events::build_persona_event,
     reconcile::retain_agent_record,
     retention::{
         delete_retained_event, get_baseline, get_retained_event, is_publish_blocked,
-        mark_synced_and_stamp_baseline, open_retention_db, retain_event, retain_user_intent_event,
-        set_baseline, set_publish_blocked, tombstone_retention_d_tag, RetainedEvent,
+        mark_synced_and_stamp_baseline, retain_event, retain_user_intent_event, set_baseline,
+        set_publish_blocked, tombstone_retention_d_tag, RetainedEvent,
     },
     ManagedAgentRecord,
 };
 use buzz_core_pkg::kind::{KIND_DELETION, KIND_MANAGED_AGENT, KIND_PERSONA};
-use rusqlite::Connection;
-
-const OWNER: &str = "ownerpubkeyhex";
-
-fn test_db() -> Connection {
-    open_retention_db(Path::new(":memory:")).unwrap()
-}
-
-fn coordinate() -> Coordinate {
-    Coordinate {
-        kind: KIND_PERSONA,
-        d_tag: "test-persona".to_string(),
-    }
-}
-
-fn signed_persona(system_prompt: &str) -> nostr::Event {
-    use std::collections::BTreeMap;
-    let record = crate::managed_agents::AgentDefinition {
-        id: "test-persona".to_string(),
-        display_name: "Test".to_string(),
-        avatar_url: None,
-        system_prompt: system_prompt.to_string(),
-        runtime: None,
-        model: None,
-        provider: None,
-        name_pool: Vec::new(),
-        is_builtin: false,
-        is_active: true,
-        shared: false,
-        source_team: None,
-        source_team_persona_slug: None,
-        catalog_source: None,
-        env_vars: BTreeMap::new(),
-        respond_to: None,
-        respond_to_allowlist: Vec::new(),
-        parallelism: None,
-        created_at: "2025-01-01T00:00:00Z".to_string(),
-        updated_at: "2025-01-01T00:00:00Z".to_string(),
-    };
-    build_persona_event(&record)
-        .unwrap()
-        .sign_with_keys(&nostr::Keys::generate())
-        .unwrap()
-}
-
-fn retain_prompt(
-    conn: &Connection,
-    kind: u32,
-    d_tag: &str,
-    pending: bool,
-    system_prompt: &str,
-) -> nostr::Event {
-    let event = signed_persona(system_prompt);
-    retain_event(
-        conn,
-        &RetainedEvent {
-            kind,
-            pubkey: OWNER.to_string(),
-            d_tag: d_tag.to_string(),
-            content: event.content.to_string(),
-            created_at: event.created_at.as_secs() as i64,
-            raw_event: {
-                use nostr::JsonUtil;
-                event.as_json()
-            },
-            pending_sync: pending,
-            event_id: Some(event.id.to_hex()),
-            publish_blocked: false,
-        },
-    )
-    .unwrap();
-    event
-}
-
-fn set_pending(conn: &Connection, kind: u32, d_tag: &str) {
-    conn.execute(
-        "UPDATE persona_events SET pending_sync = 1
-         WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
-        rusqlite::params![kind, OWNER, d_tag],
-    )
-    .unwrap();
-}
-
-fn run_pass(conn: &Connection, observation: &Observation) -> (Decision, usize) {
-    use crate::managed_agents::retention::get_pending_sync;
-    let (plan, _) = run_decision_pass(
-        conn,
-        OWNER,
-        &[CoordinateState {
-            coordinate: coordinate(),
-            observation: observation.clone(),
-        }],
-    )
-    .unwrap();
-    (
-        plan[0].1.decision.clone(),
-        get_pending_sync(conn).unwrap().len(),
-    )
-}
 
 // ── (a) am#1 / peon-P1#1: publish-confirm stamps baseline so next boot
 // suppresses revert.

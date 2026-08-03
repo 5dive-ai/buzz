@@ -1,16 +1,42 @@
-part of '../home_page.dart';
+part of '../channels_page.dart';
 
-class _WideNavigationSidebar extends HookConsumerWidget {
+const _wideNavigationWidth = 280.0;
+const _wideNavigationIconSize = 20.0;
+const _wideNavigationDmAvatarSize = 24.0;
+const _wideNavigationPrimaryRowHeight = 52.0;
+const _wideNavigationChannelRowHeight = 48.0;
+const _wideNavigationLabelGap = Grid.twelve - Grid.quarter;
+const _wideNavigationDmLabelGap = _wideNavigationLabelGap - Grid.quarter;
+const _wideNavigationIdentityAvatarInset =
+    Grid.xs + Grid.half - (Grid.quarter / 2);
+const _wideNavigationIdentityLabelGap = Grid.half + (Grid.quarter / 2);
+
+class WideNavigationDestination {
+  final IconData icon;
+  final IconData selectedIcon;
+  final String label;
+
+  const WideNavigationDestination({
+    required this.icon,
+    required this.selectedIcon,
+    required this.label,
+  });
+}
+
+class WideChannelsNavigation extends HookConsumerWidget {
   final int? selectedIndex;
   final ValueChanged<int> onDestinationSelected;
-  final ValueChanged<Channel> onChannelSelected;
+  final ValueChanged<String> onChannelSelected;
   final String? selectedChannelId;
   final VoidCallback onProfileSelected;
   final bool isCommunitySwitching;
   final ValueChanged<String?> onCommunitySwitchStart;
-  final List<_HomeDestination> destinations;
+  final String? pendingCommunityId;
+  final VoidCallback onCommunitySwitchComplete;
+  final List<WideNavigationDestination> destinations;
 
-  const _WideNavigationSidebar({
+  const WideChannelsNavigation({
+    super.key,
     required this.selectedIndex,
     required this.onDestinationSelected,
     required this.onChannelSelected,
@@ -18,6 +44,8 @@ class _WideNavigationSidebar extends HookConsumerWidget {
     required this.onProfileSelected,
     required this.isCommunitySwitching,
     required this.onCommunitySwitchStart,
+    required this.pendingCommunityId,
+    required this.onCommunitySwitchComplete,
     required this.destinations,
   });
 
@@ -32,6 +60,17 @@ class _WideNavigationSidebar extends HookConsumerWidget {
     final currentPubkey = ref.watch(profileProvider).value?.pubkey;
     final profiles = ref.watch(userCacheProvider);
     final channelsAsync = ref.watch(channelsProvider);
+    final activeCommunityId = ref.watch(activeCommunityProvider).value?.id;
+    useEffect(() {
+      if (pendingCommunityId != activeCommunityId || channelsAsync.isLoading) {
+        return null;
+      }
+      final timer = Timer(
+        const Duration(milliseconds: 250),
+        onCommunitySwitchComplete,
+      );
+      return timer.cancel;
+    }, [pendingCommunityId, activeCommunityId, channelsAsync.isLoading]);
     final channels = (channelsAsync.asData?.value ?? const <Channel>[])
         .where((channel) => !channel.isArchived)
         .toList();
@@ -68,7 +107,7 @@ class _WideNavigationSidebar extends HookConsumerWidget {
 
     Future<void> createChannel() async {
       final channel = await showCreateChannelSheet(context);
-      if (channel != null) onChannelSelected(channel);
+      if (channel != null) onChannelSelected(channel.id);
     }
 
     Future<void> createDirectMessage() async {
@@ -76,12 +115,12 @@ class _WideNavigationSidebar extends HookConsumerWidget {
         context,
         currentPubkey: currentPubkey,
       );
-      if (channel != null) onChannelSelected(channel);
+      if (channel != null) onChannelSelected(channel.id);
     }
 
     return SizedBox(
       key: const Key('wide-navigation-sidebar'),
-      width: HomePage._wideNavigationWidth,
+      width: _wideNavigationWidth,
       child: DecoratedBox(
         key: const Key('wide-navigation-sidebar-background'),
         decoration: BoxDecoration(
@@ -109,7 +148,7 @@ class _WideNavigationSidebar extends HookConsumerWidget {
                 Expanded(
                   child: SkeletonReveal(
                     loading: isCommunitySwitching,
-                    skeleton: const _WideNavigationSidebarSkeleton(
+                    skeleton: const SizedBox(
                       key: Key('wide-navigation-community-switch-skeleton'),
                     ),
                     content: Column(
@@ -158,7 +197,7 @@ class _WideNavigationSidebar extends HookConsumerWidget {
                                     profiles: profiles,
                                   ),
                                   selected: channel.id == selectedChannelId,
-                                  onTap: () => onChannelSelected(channel),
+                                  onTap: () => onChannelSelected(channel.id),
                                 ),
                               const SizedBox(height: Grid.xs),
                               _WideNavigationSectionLabel(
@@ -182,7 +221,7 @@ class _WideNavigationSidebar extends HookConsumerWidget {
                                         profiles: profiles,
                                       ),
                                   selected: channel.id == selectedChannelId,
-                                  onTap: () => onChannelSelected(channel),
+                                  onTap: () => onChannelSelected(channel.id),
                                 ),
                             ],
                           ),
@@ -399,7 +438,7 @@ class _WideNavigationCommunitySwitcher extends HookConsumerWidget {
               alignment: Alignment.centerLeft,
               child: Padding(
                 padding: const EdgeInsets.only(
-                  left: HomePage._wideNavigationIdentityAvatarInset,
+                  left: _wideNavigationIdentityAvatarInset,
                   right: Grid.sm,
                 ),
                 child: Row(
@@ -429,9 +468,7 @@ class _WideNavigationCommunitySwitcher extends HookConsumerWidget {
                       },
                       onVerticalDragCancel: resetSwipe,
                     ),
-                    const SizedBox(
-                      width: HomePage._wideNavigationIdentityLabelGap,
-                    ),
+                    const SizedBox(width: _wideNavigationIdentityLabelGap),
                     ConstrainedBox(
                       constraints: const BoxConstraints(maxWidth: 192),
                       // The avatar motion carries the change. Keeping the
@@ -599,15 +636,13 @@ class _WideNavigationProfile extends ConsumerWidget {
                   onTap: onTap,
                   child: Padding(
                     padding: const EdgeInsets.only(
-                      left: HomePage._wideNavigationIdentityAvatarInset,
+                      left: _wideNavigationIdentityAvatarInset,
                       right: Grid.half,
                     ),
                     child: Row(
                       children: [
                         const ProfileAvatar(),
-                        const SizedBox(
-                          width: HomePage._wideNavigationIdentityLabelGap,
-                        ),
+                        const SizedBox(width: _wideNavigationIdentityLabelGap),
                         Expanded(
                           child: Column(
                             mainAxisAlignment: MainAxisAlignment.center,
@@ -692,7 +727,7 @@ class _WideChannelDestination extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.only(bottom: Grid.quarter),
         child: SizedBox(
-          height: HomePage._wideNavigationChannelRowHeight,
+          height: _wideNavigationChannelRowHeight,
           child: Material(
             color: selected ? palette.activeSurface : Colors.transparent,
             borderRadius: BorderRadius.circular(Radii.sm),
@@ -704,16 +739,13 @@ class _WideChannelDestination extends StatelessWidget {
                 child: Row(
                   children: [
                     SizedBox(
-                      width: channel.isDm
-                          ? HomePage._wideNavigationDmAvatarSize
-                          : HomePage._tabIconSize,
+                      width: channel.isDm ? _wideNavigationDmAvatarSize : 22,
                       child: Align(
                         alignment: Alignment.centerLeft,
                         child: channel.isDm
                             ? AvatarImage(
                                 imageUrl: directMessageProfile?.avatarUrl,
-                                radius:
-                                    HomePage._wideNavigationDmAvatarSize / 2,
+                                radius: _wideNavigationDmAvatarSize / 2,
                                 backgroundColor:
                                     context.colors.primaryContainer,
                                 fallback: Text(
@@ -727,14 +759,14 @@ class _WideChannelDestination extends StatelessWidget {
                             : Icon(
                                 icon,
                                 color: foregroundColor,
-                                size: HomePage._wideNavigationIconSize,
+                                size: _wideNavigationIconSize,
                               ),
                       ),
                     ),
                     SizedBox(
                       width: channel.isDm
-                          ? HomePage._wideNavigationDmLabelGap
-                          : HomePage._wideNavigationLabelGap,
+                          ? _wideNavigationDmLabelGap
+                          : _wideNavigationLabelGap,
                     ),
                     Expanded(
                       child: Text(
@@ -760,22 +792,29 @@ class _WideChannelDestination extends StatelessWidget {
   }
 }
 
-class _WideChannelContent extends HookWidget {
-  final Channel channel;
+class WideChannelContent extends HookConsumerWidget {
+  final String channelId;
   final VoidCallback onChannelLeft;
 
-  const _WideChannelContent({
-    required this.channel,
+  const WideChannelContent({
+    super.key,
+    required this.channelId,
     required this.onChannelLeft,
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final channels = ref.watch(channelsProvider).asData?.value;
+    final channel = channels?.cast<Channel?>().firstWhere(
+      (channel) => channel?.id == channelId,
+      orElse: () => null,
+    );
+    if (channel == null) return const SizedBox.shrink();
     final navigatorKey = useMemoized(GlobalKey<NavigatorState>.new, [
-      channel.id,
+      channelId,
     ]);
     return NavigatorPopHandler(
-      key: ValueKey('wide-channel-detail-${channel.id}'),
+      key: ValueKey('wide-channel-detail-$channelId'),
       onPopWithResult: (_) => navigatorKey.currentState?.maybePop(),
       child: Navigator(
         key: navigatorKey,
@@ -789,7 +828,7 @@ class _WideChannelContent extends HookWidget {
 }
 
 class _WideNavigationDestination extends StatelessWidget {
-  final _HomeDestination destination;
+  final WideNavigationDestination destination;
   final bool selected;
   final VoidCallback onTap;
 
@@ -817,7 +856,7 @@ class _WideNavigationDestination extends StatelessWidget {
         // channel list directly below it.
         padding: const EdgeInsets.only(bottom: Grid.quarter),
         child: SizedBox(
-          height: HomePage._wideNavigationPrimaryRowHeight,
+          height: _wideNavigationPrimaryRowHeight,
           child: Material(
             color: selected ? palette.activeSurface : Colors.transparent,
             borderRadius: BorderRadius.circular(Radii.md),
@@ -829,7 +868,7 @@ class _WideNavigationDestination extends StatelessWidget {
                 child: Row(
                   children: [
                     SizedBox(
-                      width: HomePage._tabIconSize,
+                      width: 22,
                       child: Align(
                         alignment: Alignment.centerLeft,
                         child: Icon(
@@ -838,11 +877,11 @@ class _WideNavigationDestination extends StatelessWidget {
                           // background, and label weight instead.
                           destination.selectedIcon,
                           color: foregroundColor,
-                          size: HomePage._wideNavigationIconSize,
+                          size: _wideNavigationIconSize,
                         ),
                       ),
                     ),
-                    const SizedBox(width: HomePage._wideNavigationLabelGap),
+                    const SizedBox(width: _wideNavigationLabelGap),
                     Expanded(
                       child: Text(
                         label,

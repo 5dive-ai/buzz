@@ -6,6 +6,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:flutter/physics.dart';
+import 'package:flutter/services.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
@@ -26,6 +27,8 @@ import '../profile/profile_avatar.dart';
 import '../profile/profile_provider.dart';
 import '../profile/presence_cache_provider.dart';
 import '../profile/user_cache_provider.dart';
+import '../profile/user_profile.dart';
+import '../profile/user_status_provider.dart';
 import '../pairing/pairing_page.dart';
 import '../pairing/pairing_provider.dart';
 import 'channel.dart';
@@ -53,6 +56,7 @@ part 'channels_page/skeleton.dart';
 part 'channels_page/community.dart';
 part 'channels_page/quick_actions.dart';
 part 'channels_page/quick_actions_launcher.dart';
+part 'channels_page/wide_navigation.dart';
 
 enum _QuickAction { createChannel, newDm }
 

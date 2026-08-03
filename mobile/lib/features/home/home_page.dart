@@ -7,27 +7,14 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
-import '../../shared/community/community.dart';
-import '../../shared/community/community_icon_provider.dart';
 import '../../shared/community/community_provider.dart';
 import '../../shared/theme/theme.dart';
-import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/mobile_tab_footer_backdrop.dart';
 import '../../shared/widgets/skeleton.dart';
 import '../activity/activity_page.dart';
-import '../channels/channel.dart';
-import '../channels/channel_detail_page.dart';
 import '../channels/channels_page.dart';
-import '../channels/channels_provider.dart';
-import '../channels/dm_channel_labels.dart';
-import '../profile/profile_avatar.dart';
-import '../profile/profile_provider.dart';
-import '../profile/user_cache_provider.dart';
-import '../profile/user_profile.dart';
-import '../profile/user_status_provider.dart';
 import '../search/search_page.dart';
 
-part 'home_page/wide_navigation.dart';
 part 'home_page/wide_navigation_skeletons.dart';
 
 class HomePage extends HookConsumerWidget {
@@ -44,36 +31,24 @@ class HomePage extends HookConsumerWidget {
   static const double _tabBarHorizontalMargin = Grid.gutter;
   static const double _tabDestinationHorizontalPadding = Grid.sm;
   static const double _tabIconSize = 22;
-  static const double _wideNavigationIconSize = 20;
-  static const double _wideNavigationDmAvatarSize = 24;
   static const double _fabClearance = _tabBarHeight + _tabBarBottomGap;
   static const Duration _tabIconWeightDuration = Duration(milliseconds: 120);
   static const double _wideNavigationBreakpoint = 840;
-  static const double _wideNavigationWidth = 280;
   static const double _wideContentInset = Grid.half + Grid.quarter;
   static const double _wideContentRadius = 24;
-  static const double _wideNavigationPrimaryRowHeight = 52;
-  static const double _wideNavigationChannelRowHeight = 48;
-  static const double _wideNavigationLabelGap = Grid.twelve - Grid.quarter;
-  static const double _wideNavigationDmLabelGap =
-      _wideNavigationLabelGap - Grid.quarter;
-  static const double _wideNavigationIdentityAvatarInset =
-      Grid.xs + Grid.half - (Grid.quarter / 2);
-  static const double _wideNavigationIdentityLabelGap =
-      Grid.half + (Grid.quarter / 2);
 
   static const _destinations = [
-    _HomeDestination(
+    WideNavigationDestination(
       icon: LucideIcons.house300,
       selectedIcon: LucideIcons.house500,
       label: 'Home',
     ),
-    _HomeDestination(
+    WideNavigationDestination(
       icon: LucideIcons.inbox300,
       selectedIcon: LucideIcons.inbox500,
       label: 'Activity',
     ),
-    _HomeDestination(
+    WideNavigationDestination(
       icon: LucideIcons.search300,
       selectedIcon: LucideIcons.search500,
       label: 'Search',
@@ -87,7 +62,7 @@ class HomePage extends HookConsumerWidget {
     // On iPad, the persistent sidebar replaces the phone's Home tab. Start at
     // Inbox, which is the first top-level destination in that layout.
     final tabIndex = useState(isWide ? 1 : 0);
-    final selectedChannel = useState<Channel?>(null);
+    final selectedChannelId = useState<String?>(null);
     final pendingCommunityId = useState<String?>(null);
     // Clear the tablet selection as soon as the active-community state begins
     // changing. The channel provider intentionally retains its last result
@@ -100,30 +75,9 @@ class HomePage extends HookConsumerWidget {
     );
     final selectedChannelCommunityId = useRef<String?>(activeCommunityId);
     if (selectedChannelCommunityId.value != activeCommunityId) {
-      selectedChannel.value = null;
+      selectedChannelId.value = null;
       selectedChannelCommunityId.value = activeCommunityId;
     }
-    final channelsAsync = ref.watch(channelsProvider);
-    final hasActivatedPendingCommunity =
-        pendingCommunityId.value != null &&
-        activeCommunityId == pendingCommunityId.value;
-    useEffect(
-      () {
-        if (!hasActivatedPendingCommunity || channelsAsync.isLoading) {
-          return null;
-        }
-
-        final timer = Timer(const Duration(milliseconds: 250), () {
-          pendingCommunityId.value = null;
-        });
-        return timer.cancel;
-      },
-      [
-        pendingCommunityId.value,
-        hasActivatedPendingCommunity,
-        channelsAsync.isLoading,
-      ],
-    );
     final isCommunitySwitching = pendingCommunityId.value != null;
     final systemBottomInset = MediaQuery.paddingOf(context).bottom;
     final navigationBarWidth = _floatingTabBarWidth(
@@ -133,10 +87,10 @@ class HomePage extends HookConsumerWidget {
     final useSidebarLayout = isWide;
 
     final pages = [
-      if (isWide && selectedChannel.value != null)
-        _WideChannelContent(
-          channel: selectedChannel.value!,
-          onChannelLeft: () => selectedChannel.value = null,
+      if (isWide && selectedChannelId.value != null)
+        WideChannelContent(
+          channelId: selectedChannelId.value!,
+          onChannelLeft: () => selectedChannelId.value = null,
         )
       else
         ChannelsPage(settingsPageBuilder: settingsPageBuilder),
@@ -148,9 +102,9 @@ class HomePage extends HookConsumerWidget {
     // returning from a nested route must land back in Inbox rather than reveal
     // the phone's ChannelsPage inside the desktop-style workspace.
     final wideFallbackToInbox =
-        isWide && selectedChannel.value == null && tabIndex.value == 0;
+        isWide && selectedChannelId.value == null && tabIndex.value == 0;
     final wideContentIndex = wideFallbackToInbox ? 1 : tabIndex.value;
-    final wideSidebarSelection = selectedChannel.value != null
+    final wideSidebarSelection = selectedChannelId.value != null
         ? null
         : wideFallbackToInbox
         ? 1
@@ -182,11 +136,11 @@ class HomePage extends HookConsumerWidget {
               child: useSidebarLayout
                   ? Row(
                       children: [
-                        _WideNavigationSidebar(
+                        WideChannelsNavigation(
                           selectedIndex: wideSidebarSelection,
                           onDestinationSelected: (index) {
                             final hadSelectedChannel =
-                                selectedChannel.value != null;
+                                selectedChannelId.value != null;
                             if (index == tabIndex.value &&
                                 !(hadSelectedChannel && index != 0)) {
                               return;
@@ -195,18 +149,18 @@ class HomePage extends HookConsumerWidget {
                             // the tablet workspace, so they must also clear
                             // the channel selection that owns the sidebar
                             // highlight.
-                            selectedChannel.value = null;
+                            selectedChannelId.value = null;
                             unawaited(HapticFeedback.selectionClick());
                             tabIndex.value = index;
                           },
-                          onChannelSelected: (channel) {
-                            selectedChannel.value = channel;
+                          onChannelSelected: (channelId) {
+                            selectedChannelId.value = channelId;
                             if (tabIndex.value != 0) {
                               unawaited(HapticFeedback.selectionClick());
                             }
                             tabIndex.value = 0;
                           },
-                          selectedChannelId: selectedChannel.value?.id,
+                          selectedChannelId: selectedChannelId.value,
                           onProfileSelected: () => unawaited(
                             Navigator.of(context).push(
                               MaterialPageRoute<void>(
@@ -217,6 +171,10 @@ class HomePage extends HookConsumerWidget {
                           isCommunitySwitching: isCommunitySwitching,
                           onCommunitySwitchStart: (communityId) {
                             pendingCommunityId.value = communityId;
+                          },
+                          pendingCommunityId: pendingCommunityId.value,
+                          onCommunitySwitchComplete: () {
+                            pendingCommunityId.value = null;
                           },
                           destinations: _destinations,
                         ),
@@ -380,22 +338,10 @@ MediaQueryData _mediaQueryWithFloatingTabBarClearance(
   );
 }
 
-class _HomeDestination {
-  final IconData icon;
-  final IconData selectedIcon;
-  final String label;
-
-  const _HomeDestination({
-    required this.icon,
-    required this.selectedIcon,
-    required this.label,
-  });
-}
-
 class _FloatingTabBar extends StatelessWidget {
   final int selectedIndex;
   final ValueChanged<int> onDestinationSelected;
-  final List<_HomeDestination> destinations;
+  final List<WideNavigationDestination> destinations;
 
   const _FloatingTabBar({
     required this.selectedIndex,
@@ -520,7 +466,7 @@ class _FloatingTabBar extends StatelessWidget {
 }
 
 class _FloatingTabDestination extends StatelessWidget {
-  final _HomeDestination destination;
+  final WideNavigationDestination destination;
   final bool selected;
   final VoidCallback onTap;
 

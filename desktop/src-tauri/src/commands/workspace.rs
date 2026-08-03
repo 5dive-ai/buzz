@@ -213,21 +213,29 @@ pub async fn apply_workspace(
                 &base_dir,
             )?;
 
-            // ── Drain: journal + stop all old-scope runtimes ──────────────────
-            // Before committing the new scope, drain all live managed-agent
-            // processes. Take managed_agent_runtime_transition (Layer 2) now;
-            // the commit below also holds it.
-            let (stopped_entries, _remaining, drain_error) = {
-                let _rt_transition = state
-                    .managed_agent_runtime_transition
-                    .lock()
-                    .map_err(|e| e.to_string())?;
-                crate::managed_agents::drain_scope_runtimes(&app, &state)
-            };
+            // ── Layer 2: drain + commit under one continuous lock ─────────────
+            // `managed_agent_runtime_transition` is held from journal creation
+            // through the end of the commit swap so no start/reconcile can insert
+            // a new runtime into the gap between drain and scope publication.
+            //
+            // All fallible guards (relay_url_override, keys, active_agent_scope)
+            // are acquired BEFORE any field is mutated so a poison or other lock
+            // failure cannot leave us half-committed with old processes drained.
+            let rt_transition = state
+                .managed_agent_runtime_transition
+                .lock()
+                .map_err(|e| e.to_string())?;
+
+            // Build the journal and drain under the held transition lock.
+            let (stopped_entries, _remaining, drain_error) =
+                crate::managed_agents::drain_scope_runtimes(&app, &state);
 
             if let Some(drain_err) = drain_error {
                 // Drain failed — compensate by restarting what we stopped.
+                // The rt_transition lock stays held during compensation so the
+                // runtime map is still protected.
                 let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                drop(rt_transition);
                 let degraded_msg = match comp_err {
                     Some(comp) => {
                         format!("drain failed ({drain_err}); compensation also failed: {comp}")
@@ -237,41 +245,76 @@ pub async fn apply_workspace(
                 return Ok(WorkspaceApplyResult::drain_failed(degraded_msg));
             }
 
-            // ── Layer 2: synchronous commit epoch ────────────────────────────
-            // No .await may be held while any Layer-2 guard is live.
-            {
-                let mut override_guard =
-                    state.relay_url_override.lock().map_err(|e| e.to_string())?;
-                *override_guard = Some(relay_url.clone());
-            }
+            // Acquire all fallible commit guards BEFORE mutating any field.
+            // If any guard fails, compensation runs and no field has changed.
+            let mut override_guard = match state.relay_url_override.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                    drop(rt_transition);
+                    let msg = format!(
+                        "commit failed (relay lock poisoned: {e}){}",
+                        comp_err
+                            .map_or_else(String::new, |c| format!("; compensation failed: {c}"))
+                    );
+                    return Ok(WorkspaceApplyResult::drain_failed(msg));
+                }
+            };
+            let mut keys_guard = match state.keys.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                    drop(override_guard);
+                    drop(rt_transition);
+                    let msg = format!(
+                        "commit failed (keys lock poisoned: {e}){}",
+                        comp_err
+                            .map_or_else(String::new, |c| format!("; compensation failed: {c}"))
+                    );
+                    return Ok(WorkspaceApplyResult::drain_failed(msg));
+                }
+            };
+            let mut scope_guard = match state.active_agent_scope.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                    drop(keys_guard);
+                    drop(override_guard);
+                    drop(rt_transition);
+                    let msg = format!(
+                        "commit failed (scope lock poisoned: {e}){}",
+                        comp_err
+                            .map_or_else(String::new, |c| format!("; compensation failed: {c}"))
+                    );
+                    return Ok(WorkspaceApplyResult::drain_failed(msg));
+                }
+            };
+
+            // ── Infallible commit: all guards held, no .await, no I/O ─────────
+            *override_guard = Some(relay_url.clone());
+            drop(override_guard);
             crate::relay_admission::reset_gate_for_workspace_change();
 
-            if let Some(keys) = parsed_keys {
-                let mut keys_guard = state.keys.lock().map_err(|e| e.to_string())?;
-                *keys_guard = keys;
+            if let Some(new_keys) = parsed_keys {
+                *keys_guard = new_keys;
             }
+            let owner_pubkey = keys_guard.public_key().to_hex();
+            drop(keys_guard);
 
             state
                 .managed_agent_profile_reconcile_enabled
                 .store(!agent_managed_profiles.unwrap_or(false), Ordering::Release);
 
-            // ── Commit the active workspace agent scope ───────────────────────
-            {
-                let owner_pubkey = state
-                    .keys
-                    .lock()
-                    .map_err(|e| e.to_string())?
-                    .public_key()
-                    .to_hex();
-                let generation = crate::managed_agents::scope::next_scope_generation();
-                let scope = crate::managed_agents::scope::WorkspaceAgentScope::new(
-                    relay_url,
-                    owner_pubkey,
-                    &base_dir,
-                    generation,
-                );
-                state.commit_active_scope(scope);
-            }
+            let generation = crate::managed_agents::scope::next_scope_generation();
+            let scope = crate::managed_agents::scope::WorkspaceAgentScope::new(
+                relay_url,
+                owner_pubkey,
+                &base_dir,
+                generation,
+            );
+            *scope_guard = Some(scope);
+            drop(scope_guard);
+            drop(rt_transition);
 
             // ── Filesystem side-effects (non-fatal) ───────────────────────────
             if let Some(nest) = nest.as_deref() {

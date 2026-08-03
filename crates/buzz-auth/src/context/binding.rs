@@ -44,55 +44,196 @@ impl fmt::Debug for FederatedIdentityRequirement {
     }
 }
 
+/// Exact authoritative enrollment-policy lineage for one decision.
+///
+/// This stamp is not provider capability-policy evidence. It names the
+/// server-owned federated enrollment policy that supplied the requirement and
+/// its half-open effective interval. The constructor validates shape, while the
+/// O3 authority adapter remains responsible for sourcing current policy state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FederatedPolicyStamp {
+    authorization_domain: CommunityId,
+    policy_id: Uuid,
+    epoch: u64,
+    correlation_id: Uuid,
+    requirement: FederatedIdentityRequirement,
+    effective_from: u64,
+    effective_until: u64,
+}
+
+impl FederatedPolicyStamp {
+    /// Validate lineage read from current authoritative O3 policy state.
+    ///
+    /// This constructor enforces structural invariants only. Callers must not
+    /// source any field from transport input, and O3 must compare the epoch as
+    /// an atomic precondition before enrollment.
+    pub fn from_authoritative_state(
+        authorization_domain: CommunityId,
+        policy_id: Uuid,
+        epoch: u64,
+        correlation_id: Uuid,
+        requirement: FederatedIdentityRequirement,
+        effective_from: u64,
+        effective_until: u64,
+    ) -> Result<Self, AuthContextError> {
+        if policy_id.is_nil() {
+            return Err(AuthContextError::InvalidFederatedPolicyId);
+        }
+        if epoch == 0 {
+            return Err(AuthContextError::InvalidFederatedPolicyEpoch);
+        }
+        if correlation_id.is_nil() {
+            return Err(AuthContextError::InvalidFederatedPolicyCorrelation);
+        }
+        if effective_from >= effective_until {
+            return Err(AuthContextError::InvalidFederatedPolicyInterval);
+        }
+        Ok(Self {
+            authorization_domain,
+            policy_id,
+            epoch,
+            correlation_id,
+            requirement,
+            effective_from,
+            effective_until,
+        })
+    }
+
+    /// Authorization domain whose enrollment policy was resolved.
+    pub const fn authorization_domain(&self) -> CommunityId {
+        self.authorization_domain
+    }
+
+    /// Stable, non-nil identifier of the enrollment-policy namespace.
+    pub const fn policy_id(&self) -> Uuid {
+        self.policy_id
+    }
+
+    /// Positive monotonic epoch within the enrollment-policy namespace.
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Correlation identifier of the decision that resolved this policy.
+    pub const fn correlation_id(&self) -> Uuid {
+        self.correlation_id
+    }
+
+    /// Federated-identity requirement resolved at this epoch.
+    pub const fn requirement(&self) -> FederatedIdentityRequirement {
+        self.requirement
+    }
+
+    /// Inclusive start of the policy's effective interval.
+    pub const fn effective_from(&self) -> u64 {
+        self.effective_from
+    }
+
+    /// Exclusive end of the policy's effective interval.
+    pub const fn effective_until(&self) -> u64 {
+        self.effective_until
+    }
+
+    /// Whether the policy is not yet effective at trusted server time.
+    pub const fn is_not_yet_effective_at(&self, now_unix_seconds: u64) -> bool {
+        now_unix_seconds < self.effective_from
+    }
+
+    /// Whether the policy is expired at trusted server time.
+    pub const fn is_expired_at(&self, now_unix_seconds: u64) -> bool {
+        now_unix_seconds >= self.effective_until
+    }
+}
+
+impl fmt::Debug for FederatedPolicyStamp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FederatedPolicyStamp")
+            .field("authorization_domain", &"[redacted]")
+            .field("policy_id", &"[redacted]")
+            .field("epoch", &"[redacted]")
+            .field("correlation_id", &"[redacted]")
+            .field("requirement", &"[redacted]")
+            .field("effective_from", &"[redacted]")
+            .field("effective_until", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Server-resolved federated-identity policy for an authorization decision.
 ///
-/// Raw request data cannot construct this value. A policy adapter must resolve
-/// the authorization domain's configuration before producing it. The evidence
-/// is intentionally move-only and has no default or deserialization path.
+/// A policy adapter must resolve the authorization domain's current
+/// configuration before producing it; transport values are never authoritative
+/// input. The evidence is intentionally move-only and has no default or
+/// deserialization path.
 #[derive(PartialEq, Eq)]
 pub struct ResolvedFederatedPolicy {
-    authorization_domain: CommunityId,
-    requirement: FederatedIdentityRequirement,
+    stamp: FederatedPolicyStamp,
 }
 
 impl fmt::Debug for ResolvedFederatedPolicy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ResolvedFederatedPolicy")
-            .field("authorization_domain", &"[redacted]")
-            .field("requirement", &"[redacted]")
+            .field("stamp", &self.stamp)
             .finish()
     }
 }
 
 impl ResolvedFederatedPolicy {
-    #[cfg(test)]
-    pub(crate) const fn not_required(authorization_domain: CommunityId) -> Self {
-        Self {
-            authorization_domain,
-            requirement: FederatedIdentityRequirement::NotRequired,
-        }
+    /// Seal structurally validated current O3 policy lineage for finalization.
+    pub const fn from_authoritative_resolution(stamp: FederatedPolicyStamp) -> Self {
+        Self { stamp }
     }
 
     #[cfg(test)]
-    pub(crate) const fn required(
+    pub(crate) fn not_required(authorization_domain: CommunityId) -> Self {
+        Self::from_authoritative_resolution(
+            FederatedPolicyStamp::from_authoritative_state(
+                authorization_domain,
+                Uuid::from_u128(40),
+                1,
+                Uuid::from_u128(2),
+                FederatedIdentityRequirement::NotRequired,
+                1,
+                u64::MAX,
+            )
+            .expect("synthetic federated policy lineage is valid"),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn required(
         authorization_domain: CommunityId,
         enrollment_mode: EnrollmentMode,
     ) -> Self {
-        Self {
-            authorization_domain,
-            requirement: FederatedIdentityRequirement::Required(enrollment_mode),
-        }
+        Self::from_authoritative_resolution(
+            FederatedPolicyStamp::from_authoritative_state(
+                authorization_domain,
+                Uuid::from_u128(40),
+                1,
+                Uuid::from_u128(2),
+                FederatedIdentityRequirement::Required(enrollment_mode),
+                1,
+                u64::MAX,
+            )
+            .expect("synthetic federated policy lineage is valid"),
+        )
     }
 
     /// Authorization domain whose configuration was resolved.
     pub const fn authorization_domain(&self) -> CommunityId {
-        self.authorization_domain
+        self.stamp.authorization_domain()
     }
 
     /// Resolved federated-identity requirement.
     pub const fn requirement(&self) -> FederatedIdentityRequirement {
-        self.requirement
+        self.stamp.requirement()
+    }
+
+    /// Exact authoritative enrollment-policy lineage for this decision.
+    pub const fn stamp(&self) -> &FederatedPolicyStamp {
+        &self.stamp
     }
 }
 
@@ -191,13 +332,9 @@ impl BindingExpiry {
 /// lease bound; expiry does not synthesize lifecycle state. An
 /// authoritative binding adapter constructs this move-only value after checking
 /// active lifecycle state; it has no default or deserialization path.
-/// Production construction is intentionally unavailable in this phase. A
-/// future crate-owned, sealed finalizer must require a durable non-nil ID, a
-/// positive version, authoritative active-state evidence, and a typed database
-/// result distinguishing a binding that already existed from one atomically
-/// enrolled during this decision. Transport callers must never select that
-/// lifecycle result. Pending, revoked, newly proposed, and synthetic records
-/// must not cross that gate.
+/// Production construction is available only through the crate-owned
+/// authoritative-resolution finalizer. Pending, revoked, newly proposed, and
+/// synthetic records must not cross that gate.
 #[derive(PartialEq, Eq)]
 pub struct VersionedBindingRef {
     authorization_domain: CommunityId,
@@ -208,6 +345,144 @@ pub struct VersionedBindingRef {
     expires_at: Option<BindingExpiry>,
     source: BindingSource,
     resolution_reason: AuthorizationReason,
+}
+
+/// Structurally validated binding fields returned by authoritative O3 state.
+///
+/// This is not authorization by itself. The crate-owned finalizer additionally
+/// requires a typed lifecycle outcome proving that the binding was already
+/// active or was atomically enrolled during this decision. It has no default or
+/// deserialization path.
+#[derive(PartialEq, Eq)]
+pub struct AuthoritativeBindingEvidence {
+    authorization_domain: CommunityId,
+    binding_id: Uuid,
+    principal: FederatedPrincipal,
+    bound_pubkey: PublicKey,
+    binding_version: BindingVersion,
+    expires_at: Option<BindingExpiry>,
+    source: BindingSource,
+}
+
+impl AuthoritativeBindingEvidence {
+    /// Validate typed fields read from authoritative binding state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        authorization_domain: CommunityId,
+        binding_id: Uuid,
+        principal: FederatedPrincipal,
+        bound_pubkey: PublicKey,
+        binding_version: BindingVersion,
+        expires_at: Option<BindingExpiry>,
+        source: BindingSource,
+    ) -> Result<Self, AuthContextError> {
+        if binding_id.is_nil() {
+            return Err(AuthContextError::InvalidBindingId);
+        }
+        Ok(Self {
+            authorization_domain,
+            binding_id,
+            principal,
+            bound_pubkey,
+            binding_version,
+            expires_at,
+            source,
+        })
+    }
+
+    /// Server-resolved authorization domain that owns the binding.
+    pub const fn authorization_domain(&self) -> CommunityId {
+        self.authorization_domain
+    }
+
+    /// Stable binding identifier.
+    pub const fn binding_id(&self) -> Uuid {
+        self.binding_id
+    }
+
+    /// Issuer-qualified principal represented by the binding.
+    pub const fn principal(&self) -> &FederatedPrincipal {
+        &self.principal
+    }
+
+    /// Nostr key owned by the binding.
+    pub const fn bound_pubkey(&self) -> PublicKey {
+        self.bound_pubkey
+    }
+
+    /// Current local binding version.
+    pub const fn binding_version(&self) -> BindingVersion {
+        self.binding_version
+    }
+
+    /// Optional authoritative temporal bound for authorization eligibility.
+    pub const fn expires_at(&self) -> Option<BindingExpiry> {
+        self.expires_at
+    }
+
+    /// Persisted provenance of the active binding.
+    pub const fn source(&self) -> BindingSource {
+        self.source
+    }
+}
+
+impl fmt::Debug for AuthoritativeBindingEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthoritativeBindingEvidence")
+            .field("authorization_domain", &"[redacted]")
+            .field("binding_id", &"[redacted]")
+            .field("principal", &"[redacted]")
+            .field("bound_pubkey", &"[redacted]")
+            .field("binding_version", &"[redacted]")
+            .field("expires_at", &"[redacted]")
+            .field("source", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingResolutionOutcome {
+    ExistingActive,
+    AtomicallyEnrolled,
+}
+
+/// Typed authoritative lifecycle result consumed by the O1 finalizer.
+///
+/// It carries no caller-selected authorization reason; O1 derives that reason
+/// from the lifecycle outcome, persisted provenance, and current enrollment
+/// policy.
+#[derive(PartialEq, Eq)]
+pub struct AuthoritativeBindingResolution {
+    evidence: AuthoritativeBindingEvidence,
+    outcome: BindingResolutionOutcome,
+}
+
+impl AuthoritativeBindingResolution {
+    /// Record O3's authoritative result that the binding already existed.
+    pub fn existing_active(evidence: AuthoritativeBindingEvidence) -> Self {
+        Self {
+            evidence,
+            outcome: BindingResolutionOutcome::ExistingActive,
+        }
+    }
+
+    /// Record O3's authoritative result that enrollment committed atomically.
+    pub fn atomically_enrolled(evidence: AuthoritativeBindingEvidence) -> Self {
+        Self {
+            evidence,
+            outcome: BindingResolutionOutcome::AtomicallyEnrolled,
+        }
+    }
+}
+
+impl fmt::Debug for AuthoritativeBindingResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("AuthoritativeBindingResolution")
+            .field(&"[redacted]")
+            .finish()
+    }
 }
 
 impl fmt::Debug for VersionedBindingRef {
@@ -227,6 +502,54 @@ impl fmt::Debug for VersionedBindingRef {
 }
 
 impl VersionedBindingRef {
+    pub(super) fn from_authoritative_resolution(
+        resolution: AuthoritativeBindingResolution,
+        requirement: FederatedIdentityRequirement,
+    ) -> Result<Self, AuthContextError> {
+        let reason = match resolution.outcome {
+            BindingResolutionOutcome::ExistingActive => AuthorizationReason::ExistingBinding,
+            BindingResolutionOutcome::AtomicallyEnrolled => {
+                match (requirement, resolution.evidence.source) {
+                    (
+                        FederatedIdentityRequirement::Required(EnrollmentMode::AttestedKey),
+                        BindingSource::AttestedKey,
+                    ) => AuthorizationReason::EnrolledAttestedKey,
+                    (
+                        FederatedIdentityRequirement::Required(EnrollmentMode::Tofu),
+                        BindingSource::Tofu | BindingSource::AttestedKey,
+                    ) => AuthorizationReason::EnrolledTofu,
+                    _ => return Err(AuthContextError::InvalidAuthorizationReason),
+                }
+            }
+        };
+        Ok(Self::from_authoritative_evidence(
+            resolution.evidence,
+            reason,
+        ))
+    }
+
+    pub(super) fn from_existing_authoritative_evidence(
+        evidence: AuthoritativeBindingEvidence,
+    ) -> Self {
+        Self::from_authoritative_evidence(evidence, AuthorizationReason::ExistingBinding)
+    }
+
+    fn from_authoritative_evidence(
+        evidence: AuthoritativeBindingEvidence,
+        resolution_reason: AuthorizationReason,
+    ) -> Self {
+        Self {
+            authorization_domain: evidence.authorization_domain,
+            binding_id: evidence.binding_id,
+            principal: evidence.principal,
+            bound_pubkey: evidence.bound_pubkey,
+            binding_version: evidence.binding_version,
+            expires_at: evidence.expires_at,
+            source: evidence.source,
+            resolution_reason,
+        }
+    }
+
     /// Build a reference to a binding authoritatively resolved as already active.
     #[cfg(test)]
     pub(crate) fn new_existing_active_for_test(

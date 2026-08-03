@@ -92,8 +92,44 @@ fn policy_required(enrollment_mode: EnrollmentMode) -> ResolvedFederatedPolicy {
     ResolvedFederatedPolicy::required(authorization_domain(1), enrollment_mode)
 }
 
+fn policy_with_lineage(
+    enrollment_mode: EnrollmentMode,
+    correlation_id: Uuid,
+    effective_from: u64,
+    effective_until: u64,
+) -> ResolvedFederatedPolicy {
+    ResolvedFederatedPolicy::from_authoritative_resolution(
+        FederatedPolicyStamp::from_authoritative_state(
+            authorization_domain(1),
+            Uuid::from_u128(40),
+            7,
+            correlation_id,
+            FederatedIdentityRequirement::Required(enrollment_mode),
+            effective_from,
+            effective_until,
+        )
+        .expect("synthetic federated policy lineage is valid"),
+    )
+}
+
 fn binding(pubkey: PublicKey) -> VersionedBindingRef {
     binding_in(1, pubkey)
+}
+
+fn authoritative_binding_evidence(
+    pubkey: PublicKey,
+    source: BindingSource,
+) -> AuthoritativeBindingEvidence {
+    AuthoritativeBindingEvidence::new(
+        authorization_domain(1),
+        Uuid::from_u128(10),
+        principal(),
+        pubkey,
+        BindingVersion::INITIAL,
+        None,
+        source,
+    )
+    .expect("synthetic authoritative binding evidence is valid")
 }
 
 fn binding_in(domain: u128, pubkey: PublicKey) -> VersionedBindingRef {
@@ -395,7 +431,10 @@ fn context_debug_output_omits_tenant_host() {
             "nostr: NostrAuthority { actor_pubkey: \"[redacted]\", ",
             "proof_method: Nip42, verified_delegation: \"[redacted]\" }, ",
             "federated_policy: ResolvedFederatedPolicy { ",
-            "authorization_domain: \"[redacted]\", requirement: \"[redacted]\" }, ",
+            "stamp: FederatedPolicyStamp { authorization_domain: \"[redacted]\", ",
+            "policy_id: \"[redacted]\", epoch: \"[redacted]\", ",
+            "correlation_id: \"[redacted]\", requirement: \"[redacted]\", ",
+            "effective_from: \"[redacted]\", effective_until: \"[redacted]\" } }, ",
             "federated: FederatedAuthorization(\"[redacted]\"), ",
             "scopes: \"[redacted]\", channel_ids: \"[redacted]\" })"
         )
@@ -814,7 +853,12 @@ fn enrolled_reason_must_match_policy_and_binding_source() {
                 BindingSource::AttestedKey,
                 AuthorizationReason::EnrolledAttestedKey,
             ),
-            assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
+            assertion: assertion_with_attested_key(
+                principal(),
+                AssertionTransport::TrustedProxy,
+                200,
+                actor.public_key(),
+            ),
         },
         100,
     )
@@ -1047,11 +1091,18 @@ fn authorization_error_codes_are_unique_and_provider_neutral() {
         AuthContextError::InvalidBindingVersion,
         AuthContextError::InvalidBindingId,
         AuthContextError::InvalidBindingExpiry,
+        AuthContextError::InvalidFederatedPolicyId,
+        AuthContextError::InvalidFederatedPolicyEpoch,
+        AuthContextError::InvalidFederatedPolicyCorrelation,
+        AuthContextError::InvalidFederatedPolicyInterval,
         AuthContextError::InvalidAssertionExpiry,
         AuthContextError::InvalidDelegationExpiry,
         AuthContextError::InvalidAdmissionExpiry,
         AuthContextError::AssertionExpired,
         AuthContextError::BindingExpired,
+        AuthContextError::FederatedPolicyCorrelationMismatch,
+        AuthContextError::FederatedPolicyNotYetEffective,
+        AuthContextError::FederatedPolicyExpired,
         AuthContextError::AssertionNotYetValid,
         AuthContextError::KeyAttestationRequired,
         AuthContextError::KeyAttestationMismatch,
@@ -1146,10 +1197,241 @@ fn security_posture_debug_output_is_fully_redacted() {
     assert_eq!(
         format!("{:?}", policy_required(EnrollmentMode::AttestedKey)),
         concat!(
-            "ResolvedFederatedPolicy { authorization_domain: \"[redacted]\", ",
-            "requirement: \"[redacted]\" }"
+            "ResolvedFederatedPolicy { stamp: FederatedPolicyStamp { ",
+            "authorization_domain: \"[redacted]\", policy_id: \"[redacted]\", ",
+            "epoch: \"[redacted]\", correlation_id: \"[redacted]\", ",
+            "requirement: \"[redacted]\", effective_from: \"[redacted]\", ",
+            "effective_until: \"[redacted]\" } }"
         )
     );
+}
+
+#[test]
+fn federated_policy_must_match_the_authorization_correlation() {
+    let actor = Keys::generate();
+    let error = AuthContext::finalize_v1(
+        input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+        policy_with_lineage(EnrollmentMode::AttestedKey, Uuid::from_u128(99), 1, 200),
+        FederatedAuthorization::Direct {
+            binding: binding(actor.public_key()),
+            assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
+        },
+        100,
+    )
+    .expect_err("policy evidence from another decision must not finalize");
+
+    assert_eq!(error, AuthContextError::FederatedPolicyCorrelationMismatch);
+}
+
+#[test]
+fn federated_policy_effective_interval_is_half_open() {
+    let actor = Keys::generate();
+    let not_yet_effective = AuthContext::finalize_v1(
+        input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+        policy_with_lineage(EnrollmentMode::AttestedKey, Uuid::from_u128(2), 101, 200),
+        FederatedAuthorization::Direct {
+            binding: binding(actor.public_key()),
+            assertion: assertion(principal(), AssertionTransport::TrustedProxy, 300),
+        },
+        100,
+    )
+    .expect_err("policy must not authorize before its effective interval");
+    assert_eq!(
+        not_yet_effective,
+        AuthContextError::FederatedPolicyNotYetEffective
+    );
+
+    let expired = AuthContext::finalize_v1(
+        input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+        policy_with_lineage(EnrollmentMode::AttestedKey, Uuid::from_u128(2), 50, 100),
+        FederatedAuthorization::Direct {
+            binding: binding(actor.public_key()),
+            assertion: assertion(principal(), AssertionTransport::TrustedProxy, 300),
+        },
+        100,
+    )
+    .expect_err("policy must deny at its exact exclusive bound");
+    assert_eq!(expired, AuthContextError::FederatedPolicyExpired);
+}
+
+#[test]
+fn federated_policy_stamp_rejects_invalid_lineage() {
+    let requirement = FederatedIdentityRequirement::Required(EnrollmentMode::Provisioned);
+    assert_eq!(
+        FederatedPolicyStamp::from_authoritative_state(
+            authorization_domain(1),
+            Uuid::nil(),
+            1,
+            Uuid::from_u128(2),
+            requirement,
+            1,
+            200,
+        ),
+        Err(AuthContextError::InvalidFederatedPolicyId)
+    );
+    assert_eq!(
+        FederatedPolicyStamp::from_authoritative_state(
+            authorization_domain(1),
+            Uuid::from_u128(40),
+            0,
+            Uuid::from_u128(2),
+            requirement,
+            1,
+            200,
+        ),
+        Err(AuthContextError::InvalidFederatedPolicyEpoch)
+    );
+    assert_eq!(
+        FederatedPolicyStamp::from_authoritative_state(
+            authorization_domain(1),
+            Uuid::from_u128(40),
+            1,
+            Uuid::nil(),
+            requirement,
+            1,
+            200,
+        ),
+        Err(AuthContextError::InvalidFederatedPolicyCorrelation)
+    );
+    assert_eq!(
+        FederatedPolicyStamp::from_authoritative_state(
+            authorization_domain(1),
+            Uuid::from_u128(40),
+            1,
+            Uuid::from_u128(2),
+            requirement,
+            200,
+            200,
+        ),
+        Err(AuthContextError::InvalidFederatedPolicyInterval)
+    );
+}
+
+#[test]
+fn authoritative_finalizer_derives_binding_reason() {
+    let existing_actor = Keys::generate();
+    let existing = AuthContext::finalize_authoritative_v1(
+        input(
+            existing_actor.public_key(),
+            AuthTransport::RelayWebSocket,
+            None,
+        ),
+        policy_required(EnrollmentMode::Tofu),
+        AuthoritativeFederatedResolution::Direct {
+            binding: AuthoritativeBindingResolution::existing_active(
+                authoritative_binding_evidence(
+                    existing_actor.public_key(),
+                    BindingSource::Provisioned,
+                ),
+            ),
+            assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
+        },
+        100,
+    )
+    .expect("existing authoritative binding is eligible");
+    assert_eq!(
+        existing.authorization_reason(),
+        AuthorizationReason::ExistingBinding
+    );
+
+    let attested_actor = Keys::generate();
+    let attested = AuthContext::finalize_authoritative_v1(
+        input(
+            attested_actor.public_key(),
+            AuthTransport::RelayWebSocket,
+            None,
+        ),
+        policy_required(EnrollmentMode::AttestedKey),
+        AuthoritativeFederatedResolution::Direct {
+            binding: AuthoritativeBindingResolution::atomically_enrolled(
+                authoritative_binding_evidence(
+                    attested_actor.public_key(),
+                    BindingSource::AttestedKey,
+                ),
+            ),
+            assertion: assertion_with_attested_key(
+                principal(),
+                AssertionTransport::TrustedProxy,
+                200,
+                attested_actor.public_key(),
+            ),
+        },
+        100,
+    )
+    .expect("attested enrollment result is eligible");
+    assert_eq!(
+        attested.authorization_reason(),
+        AuthorizationReason::EnrolledAttestedKey
+    );
+
+    let tofu_actor = Keys::generate();
+    let tofu = AuthContext::finalize_authoritative_v1(
+        input(tofu_actor.public_key(), AuthTransport::RelayWebSocket, None),
+        policy_required(EnrollmentMode::Tofu),
+        AuthoritativeFederatedResolution::Direct {
+            binding: AuthoritativeBindingResolution::atomically_enrolled(
+                authoritative_binding_evidence(tofu_actor.public_key(), BindingSource::AttestedKey),
+            ),
+            assertion: assertion_with_attested_key(
+                principal(),
+                AssertionTransport::TrustedProxy,
+                200,
+                tofu_actor.public_key(),
+            ),
+        },
+        100,
+    )
+    .expect("stronger attested provenance remains valid under TOFU enrollment");
+    assert_eq!(
+        tofu.authorization_reason(),
+        AuthorizationReason::EnrolledTofu
+    );
+}
+
+#[test]
+fn authoritative_finalizer_rejects_incompatible_enrollment_result() {
+    let actor = Keys::generate();
+    let error = AuthContext::finalize_authoritative_v1(
+        input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+        policy_required(EnrollmentMode::Provisioned),
+        AuthoritativeFederatedResolution::Direct {
+            binding: AuthoritativeBindingResolution::atomically_enrolled(
+                authoritative_binding_evidence(actor.public_key(), BindingSource::Provisioned),
+            ),
+            assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
+        },
+        100,
+    )
+    .expect_err("ordinary finalization cannot relabel provisioned state as enrollment");
+
+    assert_eq!(error, AuthContextError::InvalidAuthorizationReason);
+}
+
+#[test]
+fn authoritative_finalizer_carries_binding_expiry() {
+    let actor = Keys::generate();
+    let evidence = AuthoritativeBindingEvidence::new(
+        authorization_domain(1),
+        Uuid::from_u128(10),
+        principal(),
+        actor.public_key(),
+        BindingVersion::INITIAL,
+        Some(BindingExpiry::new(100).expect("synthetic binding expiry is valid")),
+        BindingSource::Provisioned,
+    )
+    .expect("synthetic authoritative binding evidence is valid");
+    let error = AuthContext::finalize_authoritative_v1(
+        input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+        policy_required(EnrollmentMode::Provisioned),
+        AuthoritativeFederatedResolution::Direct {
+            binding: AuthoritativeBindingResolution::existing_active(evidence),
+            assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
+        },
+        100,
+    )
+    .expect_err("production finalization must preserve the authoritative binding bound");
+
+    assert_eq!(error, AuthContextError::BindingExpired);
 }
 
 #[test]

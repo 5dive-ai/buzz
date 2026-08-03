@@ -61,6 +61,18 @@ pub enum AuthContextError {
     /// Binding expiry was not a valid Unix timestamp.
     #[error("identity binding expiry must be greater than zero")]
     InvalidBindingExpiry,
+    /// Enrollment-policy identifier was nil.
+    #[error("federated enrollment-policy identifier must not be nil")]
+    InvalidFederatedPolicyId,
+    /// Enrollment-policy epoch was zero.
+    #[error("federated enrollment-policy epoch must be greater than zero")]
+    InvalidFederatedPolicyEpoch,
+    /// Enrollment-policy correlation identifier was nil.
+    #[error("federated enrollment-policy correlation must not be nil")]
+    InvalidFederatedPolicyCorrelation,
+    /// Enrollment-policy effective interval was empty or reversed.
+    #[error("federated enrollment-policy effective interval is invalid")]
+    InvalidFederatedPolicyInterval,
     /// Assertion expiry was not a valid Unix timestamp.
     #[error("federated assertion expiry must be greater than zero")]
     InvalidAssertionExpiry,
@@ -76,6 +88,15 @@ pub enum AuthContextError {
     /// Binding was no longer authorization-eligible when evaluated.
     #[error("identity binding has expired")]
     BindingExpired,
+    /// Enrollment policy was resolved for another authorization decision.
+    #[error("federated enrollment policy does not match the authorization decision")]
+    FederatedPolicyCorrelationMismatch,
+    /// Enrollment policy was used before its effective interval.
+    #[error("federated enrollment policy is not yet effective")]
+    FederatedPolicyNotYetEffective,
+    /// Enrollment policy was used after its effective interval.
+    #[error("federated enrollment policy has expired")]
+    FederatedPolicyExpired,
     /// Assertion was used before its validated not-before bound.
     #[error("federated assertion is not yet valid")]
     AssertionNotYetValid,
@@ -159,11 +180,18 @@ impl AuthContextError {
             Self::InvalidBindingVersion => "federated_binding_invalid_version",
             Self::InvalidBindingId => "federated_binding_invalid_id",
             Self::InvalidBindingExpiry => "federated_binding_invalid_expiry",
+            Self::InvalidFederatedPolicyId => "federated_policy_invalid_id",
+            Self::InvalidFederatedPolicyEpoch => "federated_policy_invalid_epoch",
+            Self::InvalidFederatedPolicyCorrelation => "federated_policy_invalid_correlation",
+            Self::InvalidFederatedPolicyInterval => "federated_policy_invalid_interval",
             Self::InvalidAssertionExpiry => "federated_assertion_invalid_expiry",
             Self::InvalidDelegationExpiry => "delegation_invalid_expiry",
             Self::InvalidAdmissionExpiry => "owner_admission_invalid_expiry",
             Self::AssertionExpired => "federated_assertion_expired",
             Self::BindingExpired => "federated_binding_expired",
+            Self::FederatedPolicyCorrelationMismatch => "federated_policy_correlation_mismatch",
+            Self::FederatedPolicyNotYetEffective => "federated_policy_not_yet_effective",
+            Self::FederatedPolicyExpired => "federated_policy_expired",
             Self::AssertionNotYetValid => "federated_assertion_not_yet_valid",
             Self::KeyAttestationRequired => "federated_key_attestation_required",
             Self::KeyAttestationMismatch => "federated_key_attestation_mismatch",

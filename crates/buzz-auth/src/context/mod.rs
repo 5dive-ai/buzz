@@ -18,7 +18,8 @@ mod evidence;
 mod reason;
 
 pub use binding::{
-    BindingExpiry, BindingSource, BindingVersion, EnrollmentMode, FederatedIdentityRequirement,
+    AuthoritativeBindingEvidence, AuthoritativeBindingResolution, BindingExpiry, BindingSource,
+    BindingVersion, EnrollmentMode, FederatedIdentityRequirement, FederatedPolicyStamp,
     ResolvedFederatedPolicy, VersionedBindingRef,
 };
 pub use evidence::{
@@ -67,6 +68,39 @@ impl fmt::Debug for FederatedAuthorization {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_tuple("FederatedAuthorization")
+            .field(&"[redacted]")
+            .finish()
+    }
+}
+
+/// Authoritative O3 result consumed by the public O1 production finalizer.
+///
+/// Unlike [`FederatedAuthorization`], this input cannot contain a raw
+/// [`VersionedBindingRef`] or a caller-selected authorization reason.
+#[derive(PartialEq, Eq)]
+pub enum AuthoritativeFederatedResolution {
+    /// This domain's current policy does not require federated identity.
+    NotRequired,
+    /// Direct authority backed by an existing or atomically enrolled binding.
+    Direct {
+        /// Typed authoritative O3 lifecycle result.
+        binding: AuthoritativeBindingResolution,
+        /// Current verified assertion for the authenticated actor.
+        assertion: VerifiedFederatedAssertion,
+    },
+    /// Delegated authority backed by an already-active owner binding.
+    Delegated {
+        /// Typed authoritative evidence for the existing owner binding.
+        owner: AuthoritativeBindingEvidence,
+        /// Current admission resolved for the owner.
+        admission: VerifiedOwnerAdmission,
+    },
+}
+
+impl fmt::Debug for AuthoritativeFederatedResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("AuthoritativeFederatedResolution")
             .field(&"[redacted]")
             .finish()
     }
@@ -148,6 +182,41 @@ impl fmt::Debug for AuthContext {
 }
 
 impl AuthContext {
+    /// Finalize an immutable V1 context from authoritative O3 binding evidence.
+    ///
+    /// This is the production O1↔O3 seam. O3 must resolve the enrollment-policy
+    /// stamp and binding lifecycle state from current authoritative storage,
+    /// use the policy epoch as a conditional precondition for any atomic
+    /// enrollment, and pass the resulting typed lifecycle outcome here. O1
+    /// derives the authorization reason; transport code cannot select it.
+    pub fn finalize_authoritative_v1(
+        input: AuthContextInput,
+        federated_policy: ResolvedFederatedPolicy,
+        resolution: AuthoritativeFederatedResolution,
+        now_unix_seconds: u64,
+    ) -> Result<Self, AuthContextError> {
+        validate_federated_policy_stamp(&input, &federated_policy, now_unix_seconds)?;
+        let authorization = match resolution {
+            AuthoritativeFederatedResolution::NotRequired => FederatedAuthorization::NotRequired,
+            AuthoritativeFederatedResolution::Direct { binding, assertion } => {
+                FederatedAuthorization::Direct {
+                    binding: VersionedBindingRef::from_authoritative_resolution(
+                        binding,
+                        federated_policy.requirement(),
+                    )?,
+                    assertion,
+                }
+            }
+            AuthoritativeFederatedResolution::Delegated { owner, admission } => {
+                FederatedAuthorization::Delegated {
+                    owner: VersionedBindingRef::from_existing_authoritative_evidence(owner),
+                    admission,
+                }
+            }
+        };
+        Self::finalize_v1(input, federated_policy, authorization, now_unix_seconds)
+    }
+
     /// Validate all authorization evidence and finalize an immutable V1 context.
     ///
     /// Adapters must preserve this phase order: cryptographic proof and
@@ -158,7 +227,7 @@ impl AuthContext {
     ///
     /// `now_unix_seconds` must come from the server clock for the authorization
     /// decision being finalized.
-    pub fn finalize_v1(
+    pub(crate) fn finalize_v1(
         input: AuthContextInput,
         federated_policy: ResolvedFederatedPolicy,
         authorization: FederatedAuthorization,
@@ -169,9 +238,7 @@ impl AuthContext {
         if input.nostr_proof.authorization_domain() != authorization_domain {
             return Err(AuthContextError::NostrProofDomainMismatch);
         }
-        if federated_policy.authorization_domain() != authorization_domain {
-            return Err(AuthContextError::PolicyDomainMismatch);
-        }
+        validate_federated_policy_stamp(&input, &federated_policy, now_unix_seconds)?;
         if input.community_access.authorization_domain() != authorization_domain {
             return Err(AuthContextError::CommunityAccessDomainMismatch);
         }
@@ -291,6 +358,29 @@ impl AuthContext {
     pub fn has_scope(&self, scope: &Scope) -> bool {
         self.scopes().contains(scope)
     }
+}
+
+fn validate_federated_policy_stamp(
+    input: &AuthContextInput,
+    federated_policy: &ResolvedFederatedPolicy,
+    now_unix_seconds: u64,
+) -> Result<(), AuthContextError> {
+    if federated_policy.authorization_domain() != input.tenant.community() {
+        return Err(AuthContextError::PolicyDomainMismatch);
+    }
+    if federated_policy.stamp().correlation_id() != input.correlation_id {
+        return Err(AuthContextError::FederatedPolicyCorrelationMismatch);
+    }
+    if federated_policy
+        .stamp()
+        .is_not_yet_effective_at(now_unix_seconds)
+    {
+        return Err(AuthContextError::FederatedPolicyNotYetEffective);
+    }
+    if federated_policy.stamp().is_expired_at(now_unix_seconds) {
+        return Err(AuthContextError::FederatedPolicyExpired);
+    }
+    Ok(())
 }
 
 pub(super) const fn transport_accepts_proof(

@@ -353,7 +353,6 @@ pub fn run() {
 
     #[cfg(not(buzz_updater_enabled))]
     let builder = builder;
-
     let app = builder
         .register_asynchronous_uri_scheme_protocol("buzz-media", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
@@ -819,6 +818,7 @@ pub fn run() {
             get_baked_build_env_keys,
             get_baked_build_env,
             put_agent_session_config,
+            persist_agent_effort_level,
             get_global_agent_config,
             set_global_agent_config,
             mesh_start_node,

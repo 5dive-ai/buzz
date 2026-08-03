@@ -256,3 +256,74 @@ fn reserved_key_absent_from_definition_env_falls_through() {
     assert_eq!(model.value.as_deref(), Some("persona-struct-model"));
     assert_eq!(model.origin, ConfigOrigin::PersonaDefault);
 }
+
+// ── B4/B5 canonical effort_level tier tests ────────────────────────────────
+//
+// record.effort_level is the Buzz-canonical seeded value (B5 persisted from
+// a positive ACP ack).  It must surface as BuzzExplicit and take precedence
+// over the config-file tier (but not over record env vars).
+
+/// B4: record.effort_level surfaces as BuzzExplicit when no env var is set.
+#[test]
+fn b4_canonical_effort_level_surfaces_as_buzz_explicit() {
+    let mut record = test_record();
+    record.effort_level = Some("high".to_string());
+    let runtime = buzz_agent_runtime();
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("effort must surface from canonical record tier");
+    assert_eq!(effort.value.as_deref(), Some("high"));
+    assert_eq!(effort.origin, ConfigOrigin::BuzzExplicit);
+}
+
+/// B4: record.effort_level shadows the config-file tier.
+#[test]
+fn b4_canonical_effort_level_shadows_file_tier() {
+    let mut record = test_record();
+    // canonical effort takes precedence over file tier
+    record.effort_level = Some("medium".to_string());
+    // no env var set — config-file would otherwise win if canonical absent
+    let runtime = buzz_agent_runtime();
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("canonical effort must shadow file tier");
+    assert_eq!(effort.value.as_deref(), Some("medium"));
+    assert_eq!(effort.origin, ConfigOrigin::BuzzExplicit);
+}
+
+/// B4: a record env var override still wins over record.effort_level.
+#[test]
+fn b4_record_env_var_wins_over_canonical_effort_level() {
+    let mut record = test_record();
+    record.effort_level = Some("low".to_string());
+    record
+        .env_vars
+        .insert("BUZZ_AGENT_THINKING_EFFORT".to_string(), "high".to_string());
+    let runtime = buzz_agent_runtime();
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("env var must win over canonical effort");
+    assert_eq!(effort.value.as_deref(), Some("high"));
+    assert_eq!(effort.origin, ConfigOrigin::BuzzExplicit);
+    // canonical is the overridden baseline
+    assert_eq!(effort.overridden_value.as_deref(), Some("low"));
+}
+
+/// B4: None effort_level does not introduce a spurious tier.
+#[test]
+fn b4_none_canonical_effort_does_not_surface() {
+    let record = test_record(); // effort_level defaults to None
+    let runtime = buzz_agent_runtime();
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers());
+    // No env var, no session cache, no file config → effort_level field absent.
+    assert!(
+        surface.normalized.thinking_effort.is_none(),
+        "effort field must be absent when no tier has a value"
+    );
+}

@@ -197,7 +197,8 @@ fn mcp_config_file_path_for_runtime(runtime: &KnownAcpRuntime) -> Option<String>
         "goose" => {
             super::goose::goose_config_path().map(|path| path.to_string_lossy().into_owned())
         }
-        "claude" => Some(resolve_tilde("~/.claude.json")),
+        "claude" => crate::managed_agents::claude_config::owner_mcp_config_path()
+            .map(|p| p.to_string_lossy().into_owned()),
         "codex" => {
             super::codex::codex_config_path().map(|path| path.to_string_lossy().into_owned())
         }
@@ -491,7 +492,13 @@ fn build_thinking_field(
     session_cache: Option<&SessionConfigCache>,
     tiers: &InheritedConfigTiers,
 ) -> Option<NormalizedField> {
-    // Tier ordering: record env > ACP > persona env > global env > definition env > config file.
+    // Tier ordering:
+    //   record env > record.effort_level (canonical Buzz-seeded) > ACP >
+    //   persona env > global env > definition env > config file.
+    //
+    // record.effort_level is the B5 canonical value persisted from a positive
+    // ACP ack — it is seeded into the projected settings.json at spawn and
+    // represents the "configured" value in the B4 status contract.
     let [rec_env, pers_env, glob_env, def_env] = thinking_env_var
         .map(|k| {
             env_candidates(
@@ -504,8 +511,11 @@ fn build_thinking_field(
         })
         .unwrap_or([None, None, None, None]);
 
+    let canonical_effort = record.effort_level.as_deref();
+
     let tiers_list: &[(Option<&str>, ConfigOrigin)] = &[
         (rec_env, ConfigOrigin::BuzzExplicit),
+        (canonical_effort, ConfigOrigin::BuzzExplicit),
         (acp_effort.as_deref(), ConfigOrigin::AcpConfigOption),
         (pers_env, ConfigOrigin::PersonaDefault),
         (glob_env, ConfigOrigin::GlobalDefault),

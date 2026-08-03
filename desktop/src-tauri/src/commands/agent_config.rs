@@ -525,6 +525,35 @@ fn parse_models(raw: Option<&serde_json::Value>) -> (Vec<AcpModelEntry>, Option<
     (models, current_model)
 }
 
+/// Persist the canonical effort level for a managed agent after a positive ACP ack.
+///
+/// B5: called by the TypeScript observer when `session/set_config_option` for
+/// the "effort" config option receives a positive acknowledgement.  The record
+/// is updated in-place and persisted; the next spawn will seed this value into
+/// the projected `settings.json` overlay (B7).
+///
+/// `effort_level` is the acknowledged value.  Pass `None` to clear the
+/// canonical effort (reverts to owner-file passthrough on next spawn).
+#[tauri::command]
+pub fn persist_agent_effort_level(
+    pubkey: String,
+    effort_level: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut records = load_managed_agents(&app)?;
+    let record = records
+        .iter_mut()
+        .find(|r| r.pubkey == pubkey)
+        .ok_or_else(|| format!("agent {pubkey} not found"))?;
+    record.effort_level = effort_level;
+    save_managed_agents(&app, &records)
+}
+
 #[cfg(test)]
 #[path = "agent_config_tests.rs"]
 mod tests;

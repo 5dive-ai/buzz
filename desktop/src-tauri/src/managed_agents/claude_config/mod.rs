@@ -389,5 +389,54 @@ pub fn owner_settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
 
+/// Default owner MCP config path: `~/.claude.json`.
+///
+/// Claude Code stores MCP server definitions here. Exposed so callers use the
+/// same path as `config_bridge::claude::read_config_file` and `config_bridge::reader`
+/// rather than each hard-coding `~/.claude.json` independently.
+pub fn owner_mcp_config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude.json"))
+}
+
+/// Apply the Claude-specific spawn policy to `command` (A1 + B1 + B7).
+///
+/// Called from `spawn_agent_child` for local Claude agents only.  Writes the
+/// projected `settings.json` (B7), injects `ANTHROPIC_MODEL` (A1) and the B1
+/// paired atom (`CLAUDE_CONFIG_DIR` + `CLAUDE_SECURESTORAGE_CONFIG_DIR`).
+///
+/// `effective_model` is `None` when no model is resolved; the env key is
+/// removed so Claude Code uses its own default.
+pub fn apply_claude_spawn_policy(
+    command: &mut std::process::Command,
+    pubkey: &str,
+    managed_root: &Path,
+    effort_level: Option<String>,
+    effective_model: Option<&str>,
+) -> Result<(), String> {
+    let policy = ClaudeLaunchPolicy::build(pubkey, managed_root, effort_level)?;
+    let owner_path = owner_settings_path()
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/no-home-dir/.claude/settings.json"));
+    let (projected, base_status) = project_settings_json(&owner_path, &policy);
+    if matches!(base_status, OwnerBaseStatus::Unreadable { .. }) {
+        eprintln!(
+            "buzz-desktop: owner ~/.claude/settings.json unreadable — \
+             launching with overlay-only settings (non-fatal): {base_status:?}"
+        );
+    }
+    write_projected_settings(&policy, &projected)?;
+    // A1: single startup model authority.
+    match effective_model {
+        Some(m) => command.env("ANTHROPIC_MODEL", m),
+        None => command.env_remove("ANTHROPIC_MODEL"),
+    };
+    // B1: paired isolation atom.
+    command.env("CLAUDE_CONFIG_DIR", &policy.config_dir);
+    command.env(
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        &policy.secure_storage_config_dir,
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

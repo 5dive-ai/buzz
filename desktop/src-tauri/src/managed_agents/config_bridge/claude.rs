@@ -2,9 +2,8 @@ use super::types::{ExtensionEntry, RuntimeFileConfig};
 
 /// Read Claude Code config from `~/.claude/settings.json` and `~/.claude.json`.
 pub(super) fn read_config_file() -> Option<RuntimeFileConfig> {
-    let home = dirs::home_dir()?;
-    let settings_path = home.join(".claude").join("settings.json");
-    let mcp_path = home.join(".claude.json");
+    let settings_path = crate::managed_agents::claude_config::owner_settings_path()?;
+    let mcp_path = crate::managed_agents::claude_config::owner_mcp_config_path()?;
 
     let settings = read_json_file(&settings_path);
     let mcp_config = read_json_file(&mcp_path);

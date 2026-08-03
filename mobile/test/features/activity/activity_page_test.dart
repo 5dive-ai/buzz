@@ -209,6 +209,67 @@ void main() {
     );
   });
 
+  testWidgets(
+    'keeps the oldest unread deep link after a wide inbox row is read',
+    (tester) async {
+      tester.view.physicalSize = const Size(1180, 820);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+      final oldestUnread = FeedItem(
+        id: 'oldest-unread',
+        kind: 9,
+        pubkey: 'alice_pk',
+        content: 'First unread reply',
+        createdAt: now - 120,
+        channelId: 'ch1',
+        channelName: 'general',
+        tags: const [
+          ['e', 'thread-root', '', 'root'],
+          ['e', 'oldest-unread', '', 'reply'],
+        ],
+        category: 'activity',
+      );
+      final latestUnread = FeedItem(
+        id: 'latest-unread',
+        kind: 9,
+        pubkey: 'alice_pk',
+        content: 'Latest unread reply',
+        createdAt: now - 60,
+        channelId: 'ch1',
+        channelName: 'general',
+        tags: const [
+          ['e', 'thread-root', '', 'root'],
+          ['e', 'latest-unread', '', 'reply'],
+        ],
+        category: 'activity',
+      );
+      final feed = HomeFeedResponse(
+        mentions: const [],
+        needsAction: const [],
+        activity: [oldestUnread, latestUnread],
+        agentActivity: const [],
+      );
+
+      await tester.pumpWidget(
+        await buildTestable(
+          feed: feed,
+          readContexts: {'thread:thread-root': now - 180},
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('inbox-row-latest-unread')));
+      await tester.pump();
+
+      final detail = tester.widget<ChannelDetailPage>(
+        find.byType(ChannelDetailPage),
+      );
+      expect(detail.initialMessageId, 'oldest-unread');
+    },
+  );
+
   testWidgets('keeps bottom clearance for the floating tab bar', (
     tester,
   ) async {

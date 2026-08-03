@@ -26,7 +26,10 @@ class _WideNavigationSidebar extends HookConsumerWidget {
     final colors = context.colors;
     final sidebarGradient = context.appColors.topSectionGradient;
     final sidebarPalette = _wideSidebarPalette(context);
-    final currentPubkey = ref.watch(currentPubkeyProvider);
+    // The workspace sidebar only needs the signed-in profile identity to
+    // label direct-message participants. Keep that navigation concern out of
+    // the channel-management implementation.
+    final currentPubkey = ref.watch(profileProvider).value?.pubkey;
     final profiles = ref.watch(userCacheProvider);
     final channelsAsync = ref.watch(channelsProvider);
     final channels = (channelsAsync.asData?.value ?? const <Channel>[])

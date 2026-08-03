@@ -17,7 +17,6 @@ import '../../shared/widgets/skeleton.dart';
 import '../activity/activity_page.dart';
 import '../channels/channel.dart';
 import '../channels/channel_detail_page.dart';
-import '../channels/channel_management_provider.dart';
 import '../channels/channels_page.dart';
 import '../channels/channels_provider.dart';
 import '../channels/dm_channel_labels.dart';
@@ -90,7 +89,20 @@ class HomePage extends HookConsumerWidget {
     final tabIndex = useState(isWide ? 1 : 0);
     final selectedChannel = useState<Channel?>(null);
     final pendingCommunityId = useState<String?>(null);
-    final activeCommunityId = ref.watch(activeCommunityProvider).value?.id;
+    // Clear the tablet selection as soon as the active-community state begins
+    // changing. The channel provider intentionally retains its last result
+    // while the next relay connects, so retaining the selection here could
+    // briefly render (and query) an old-community channel in the new workspace.
+    final activeCommunityId = ref.watch(
+      activeCommunityProvider.select(
+        (value) => value.unwrapPrevious().value?.id,
+      ),
+    );
+    final selectedChannelCommunityId = useRef<String?>(activeCommunityId);
+    if (selectedChannelCommunityId.value != activeCommunityId) {
+      selectedChannel.value = null;
+      selectedChannelCommunityId.value = activeCommunityId;
+    }
     final channelsAsync = ref.watch(channelsProvider);
     final hasActivatedPendingCommunity =
         pendingCommunityId.value != null &&

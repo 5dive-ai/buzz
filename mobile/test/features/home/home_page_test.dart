@@ -25,6 +25,7 @@ void main() {
     CommunityListNotifier? communityListNotifier,
     Community? activeCommunity,
     List<Channel>? channels,
+    bool usesMutableActiveCommunity = false,
   }) async {
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();
@@ -37,7 +38,11 @@ void main() {
           ),
         if (communityListNotifier != null)
           communityListProvider.overrideWith(() => communityListNotifier),
-        if (activeCommunity != null)
+        if (usesMutableActiveCommunity)
+          activeCommunityProvider.overrideWith(
+            (ref) async => ref.watch(_mutableActiveCommunityProvider),
+          )
+        else if (activeCommunity != null)
           activeCommunityProvider.overrideWith((ref) async => activeCommunity),
         if (channels != null)
           channelsProvider.overrideWith(() => _FakeChannelsNotifier(channels)),
@@ -301,6 +306,85 @@ void main() {
     await tester.tap(communitySwitcher);
     await tester.pump();
     expect(find.byKey(const Key('community-switcher-sheet')), findsOneWidget);
+  });
+
+  testWidgets('clears a selected tablet channel when the community changes', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1180, 820);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    await tester.pumpWidget(
+      await buildHome(
+        usesMutableActiveCommunity: true,
+        channels: [
+          Channel(
+            id: 'alpha-channel',
+            name: 'alpha',
+            channelType: 'stream',
+            visibility: 'open',
+            description: '',
+            createdBy: 'me',
+            createdAt: DateTime(2026),
+            memberCount: 1,
+            isMember: true,
+          ),
+        ],
+      ),
+    );
+    final container = ProviderScope.containerOf(
+      tester.element(find.byType(HomePage)),
+    );
+    container
+        .read(_mutableActiveCommunityProvider.notifier)
+        .select(
+          Community(
+            id: 'alpha',
+            name: 'Alpha',
+            relayUrl: 'wss://alpha.example.com',
+            addedAt: DateTime(2026),
+          ),
+        );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('wide-channel-alpha-channel')));
+    await tester.pump();
+
+    expect(
+      tester
+          .getSemantics(
+            find.byKey(const ValueKey('wide-channel-alpha-channel')),
+          )
+          .flagsCollection
+          .isSelected,
+      Tristate.isTrue,
+    );
+
+    container
+        .read(_mutableActiveCommunityProvider.notifier)
+        .select(
+          Community(
+            id: 'bravo',
+            name: 'Bravo',
+            relayUrl: 'wss://bravo.example.com',
+            addedAt: DateTime(2026),
+          ),
+        );
+    await tester.pump();
+
+    expect(
+      tester
+          .getSemantics(
+            find.byKey(const ValueKey('wide-channel-alpha-channel')),
+          )
+          .flagsCollection
+          .isSelected,
+      Tristate.isFalse,
+    );
+    expect(find.byKey(const Key('wide-navigation-inbox')), findsOneWidget);
   });
 
   testWidgets('extends the Buzz gradient through the iPad sidebar', (
@@ -654,6 +738,18 @@ void main() {
 }
 
 Widget _buildSettingsPage(BuildContext context) => const SizedBox.shrink();
+
+final _mutableActiveCommunityProvider =
+    NotifierProvider<_MutableActiveCommunityNotifier, Community?>(
+      _MutableActiveCommunityNotifier.new,
+    );
+
+class _MutableActiveCommunityNotifier extends Notifier<Community?> {
+  @override
+  Community? build() => null;
+
+  void select(Community? community) => state = community;
+}
 
 class _FakeUserStatusNotifier extends UserStatusNotifier {
   _FakeUserStatusNotifier(this._status);

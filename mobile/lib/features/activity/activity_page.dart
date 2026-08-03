@@ -60,6 +60,10 @@ class ActivityPage extends HookConsumerWidget {
     final filter = useState(InboxFilter.all);
     final unreadOnly = useState(false);
     final selectedItemId = useState<String?>(null);
+    // Retain the event selected before its row is marked read. A grouped row
+    // otherwise recomputes its deep link after the read marker changes and
+    // opens the latest event instead of the oldest unread one the user chose.
+    final selectedItemTarget = useState<FeedItem?>(null);
     final isWideInbox =
         MediaQuery.sizeOf(context).width >= _wideInboxBreakpoint;
     final headerTitleStyle = context.textTheme.titleMedium?.copyWith(
@@ -103,7 +107,10 @@ class ActivityPage extends HookConsumerWidget {
       final hasSelectedItem = visibleItems.any(
         (item) => item.id == selectedItemId.value,
       );
-      if (!hasSelectedItem) selectedItemId.value = visibleItems.first.id;
+      if (!hasSelectedItem) {
+        selectedItemId.value = visibleItems.first.id;
+        selectedItemTarget.value = null;
+      }
       return null;
     }, [isWideInbox, visibleItemIdsKey]);
     final selectedItem = visibleItems.cast<InboxItem?>().firstWhere(
@@ -189,6 +196,7 @@ class ActivityPage extends HookConsumerWidget {
 
       if (isWideInbox) {
         selectedItemId.value = item.id;
+        selectedItemTarget.value = target;
         markItemRead(item);
         return;
       }
@@ -335,6 +343,7 @@ class ActivityPage extends HookConsumerWidget {
             draftCount: drafts.length,
             onChanged: (nextFilter) {
               selectedItemId.value = null;
+              selectedItemTarget.value = null;
               filter.value = nextFilter;
             },
           ),
@@ -369,7 +378,8 @@ class ActivityPage extends HookConsumerWidget {
         );
       }
 
-      final selectedTarget = detailTarget(selectedItem);
+      final selectedTarget =
+          selectedItemTarget.value ?? detailTarget(selectedItem);
       final selectedChannelId = selectedTarget?.channelId;
       final selectedChannel = selectedChannelId == null
           ? null

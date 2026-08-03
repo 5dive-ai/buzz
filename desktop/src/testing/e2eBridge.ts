@@ -1254,9 +1254,9 @@ declare global {
     __BUZZ_E2E_RELEASE_OBSERVER_ARCHIVE_POLICY__?: () => number;
     /** Number of observer archive policy commands currently held by the seam. */
     __BUZZ_E2E_OBSERVER_ARCHIVE_POLICY_PENDING__?: number;
-    /** Hold channel reads until released. */
+    /** Hold the next channel read until released. */
     __BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__?: () => void;
-    /** Release every channel read held by the explicit E2E seam. */
+    /** Disarm the latch and release the held channel read, if any. */
     __BUZZ_E2E_RELEASE_CHANNELS_READ__?: () => number;
     /** Number of channel reads currently held by the seam. */
     __BUZZ_E2E_CHANNELS_READ_PENDING__?: number;
@@ -9798,6 +9798,7 @@ export function maybeInstallE2eTauriMocks() {
     deferNextChannelsRead = true;
   };
   window.__BUZZ_E2E_RELEASE_CHANNELS_READ__ = () => {
+    deferNextChannelsRead = false;
     const queued = deferredChannelsReadQueue.splice(0);
     window.__BUZZ_E2E_CHANNELS_READ_PENDING__ = 0;
     for (const resolve of queued) resolve();

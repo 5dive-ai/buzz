@@ -2,7 +2,7 @@ import * as React from "react";
 
 const BOUNDARY_EPSILON_PX = 1;
 const CONVERSATION_SCROLL_SELECTOR = "[data-buzz-conversation-scroll]";
-const TERMINAL_SUBSTRATE_SELECTOR = "[data-terminal-owner]";
+const TERMINAL_SUBSTRATE_SELECTOR = '[data-terminal-owner="terminal"]';
 const SCROLLABLE_OVERFLOW_VALUES = new Set(["auto", "scroll", "overlay"]);
 
 function isHTMLElement(value: EventTarget | null): value is HTMLElement {

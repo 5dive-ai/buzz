@@ -55,12 +55,13 @@ pub use nip98_replay::{
     MAX_REPLAY_TTL_SECS,
 };
 pub use provider::{
-    resolve_authorization, AuthorizationAuthority, AuthorizationCapability, AuthorizationDenial,
+    AuthorizationAuthority, AuthorizationCapability, AuthorizationClock, AuthorizationDenial,
     AuthorizationDenialReason, AuthorizationOutcome, AuthorizationProfileId, AuthorizationProvider,
-    AuthorizationProviderFuture, AuthorizationRequest, CapabilitySet, CapabilitySnapshot,
-    DecisionSource, PolicyVersion, ProviderAllow, ProviderAllowReason, ProviderContractError,
-    ProviderDecision, ProviderTimeout, ProviderUnavailable, ProviderUnavailableReason, RetryAfter,
-    MAX_PROVIDER_FRESHNESS_SECONDS, MAX_PROVIDER_TIMEOUT,
+    AuthorizationProviderFuture, AuthorizationRequest, AuthorizationRuntime, CapabilitySet,
+    CapabilitySnapshot, DecisionSource, PolicyVersion, ProviderAllow, ProviderAllowReason,
+    ProviderAuthorizationError, ProviderContractError, ProviderDecision, ProviderTimeout,
+    ProviderUnavailable, ProviderUnavailableReason, RetryAfter, MAX_PROVIDER_FRESHNESS_SECONDS,
+    MAX_PROVIDER_TIMEOUT,
 };
 pub use rate_limit::{
     ip_rate_limit_key, rate_limit_key, LimitType, RateLimitConfig, RateLimitResult, RateLimiter,

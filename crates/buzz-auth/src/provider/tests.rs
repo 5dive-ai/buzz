@@ -12,9 +12,15 @@ use nostr::Keys;
 use super::*;
 use crate::context::{
     AssertionExpiry, AssertionNotBefore, AssertionTransport, AuthTransport,
-    AuthoritativeBindingEvidence, BindingExpiry, BindingSource, BindingVersion, DelegationExpiry,
-    EnrollmentMode, FederatedIdentityRequirement, FederatedPolicyStamp, ResolvedFederatedPolicy,
-    VerifiedKeyAttestation, VerifiedTransportDelegation,
+    AuthoritativeBindingEvidence, AuthoritativeBindingResolution, BindingExpiry, BindingSource,
+    BindingVersion, DelegationExpiry, EnrollmentMode, FederatedIdentityRequirement,
+    FederatedPolicyStamp, ResolvedFederatedPolicy, VerifiedKeyAttestation,
+    VerifiedTransportDelegation,
+};
+use crate::{
+    AuthorityAdapterFuture, AuthorizedCommunityAccess, BindingResolutionRequest,
+    CurrentPolicyRequest, CurrentPolicyResolutionSink, DirectBindingResolutionSink,
+    ExistingBindingResolutionSink, Scope,
 };
 
 const NOW: u64 = 100;
@@ -29,7 +35,8 @@ fn principal() -> FederatedPrincipal {
 }
 
 fn profile() -> AuthorizationProfileId {
-    AuthorizationProfileId::new("profile-1").expect("synthetic profile is valid")
+    AuthorizationProfileId::from_server_configuration("profile-1")
+        .expect("synthetic profile is valid")
 }
 
 fn policy_version(value: &str) -> PolicyVersion {
@@ -111,13 +118,185 @@ impl AuthorizationClock for TestClock {
     }
 }
 
+#[derive(Clone)]
+struct TestAuthorityAdapter {
+    policy_epoch: u64,
+    enrollment_mode: EnrollmentMode,
+    enroll_direct: bool,
+    policy_reads: Arc<AtomicUsize>,
+    direct_calls: Arc<AtomicUsize>,
+    existing_calls: Arc<AtomicUsize>,
+    committed_enrollments: Arc<AtomicUsize>,
+}
+
+impl TestAuthorityAdapter {
+    fn new(policy_epoch: u64, enrollment_mode: EnrollmentMode, enroll_direct: bool) -> Self {
+        Self {
+            policy_epoch,
+            enrollment_mode,
+            enroll_direct,
+            policy_reads: Arc::new(AtomicUsize::new(0)),
+            direct_calls: Arc::new(AtomicUsize::new(0)),
+            existing_calls: Arc::new(AtomicUsize::new(0)),
+            committed_enrollments: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl FederatedAuthorityAdapter for TestAuthorityAdapter {
+    type Error = &'static str;
+
+    fn resolve_current_policy<'a>(
+        &'a self,
+        request: CurrentPolicyRequest,
+        sink: CurrentPolicyResolutionSink,
+    ) -> AuthorityAdapterFuture<
+        'a,
+        Result<ResolvedFederatedPolicy, AuthorityAdapterError<Self::Error>>,
+    > {
+        Box::pin(async move {
+            self.policy_reads.fetch_add(1, Ordering::SeqCst);
+            sink.resolved(
+                request.authorization_domain(),
+                Uuid::from_u128(40),
+                self.policy_epoch,
+                FederatedIdentityRequirement::Required(self.enrollment_mode),
+                1,
+                200,
+            )
+            .map_err(AuthorityAdapterError::from)
+        })
+    }
+
+    fn resolve_direct_binding<'a>(
+        &'a self,
+        request: BindingResolutionRequest,
+        sink: DirectBindingResolutionSink,
+    ) -> AuthorityAdapterFuture<
+        'a,
+        Result<AuthoritativeBindingResolution, AuthorityAdapterError<Self::Error>>,
+    > {
+        Box::pin(async move {
+            self.direct_calls.fetch_add(1, Ordering::SeqCst);
+            let result = if self.enroll_direct {
+                let source = match self.enrollment_mode {
+                    EnrollmentMode::AttestedKey => BindingSource::AttestedKey,
+                    EnrollmentMode::Tofu => BindingSource::Tofu,
+                    EnrollmentMode::Provisioned => BindingSource::Provisioned,
+                };
+                sink.atomically_enrolled(
+                    request.authorization_domain(),
+                    Uuid::from_u128(10),
+                    request.principal().clone(),
+                    request.bound_pubkey(),
+                    BindingVersion::INITIAL,
+                    None,
+                    source,
+                )
+            } else {
+                sink.existing_active(
+                    request.authorization_domain(),
+                    Uuid::from_u128(10),
+                    request.principal().clone(),
+                    request.bound_pubkey(),
+                    BindingVersion::INITIAL,
+                    None,
+                    BindingSource::Provisioned,
+                )
+            };
+            let resolution = result.map_err(AuthorityAdapterError::from)?;
+            if self.enroll_direct {
+                self.committed_enrollments.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(resolution)
+        })
+    }
+
+    fn resolve_existing_binding<'a>(
+        &'a self,
+        request: BindingResolutionRequest,
+        sink: ExistingBindingResolutionSink,
+    ) -> AuthorityAdapterFuture<
+        'a,
+        Result<AuthoritativeBindingResolution, AuthorityAdapterError<Self::Error>>,
+    > {
+        Box::pin(async move {
+            self.existing_calls.fetch_add(1, Ordering::SeqCst);
+            sink.existing_active(
+                request.authorization_domain(),
+                Uuid::from_u128(10),
+                request.principal().clone(),
+                request.bound_pubkey(),
+                BindingVersion::INITIAL,
+                None,
+                BindingSource::Provisioned,
+            )
+            .map_err(AuthorityAdapterError::from)
+        })
+    }
+}
+
+fn direct_evidence(
+    actor: &Keys,
+    enrollment_mode: EnrollmentMode,
+    key_attested: bool,
+) -> (
+    VerifiedNostrProof,
+    VerifiedFederatedAssertion,
+    AuthorizationRequest,
+) {
+    let proof = VerifiedNostrProof::new(
+        domain(1),
+        AuthTransport::RelayWebSocket,
+        actor.public_key(),
+        AuthMethod::Nip42,
+        None,
+    )
+    .expect("synthetic proof is valid");
+    let assertion = VerifiedFederatedAssertion::new(
+        domain(1),
+        AuthTransport::RelayWebSocket,
+        principal(),
+        key_attested.then(|| VerifiedKeyAttestation::new(actor.public_key())),
+        AssertionTransport::TrustedProxy,
+        Some(AssertionNotBefore::new(90)),
+        AssertionExpiry::new(180).expect("synthetic assertion expiry is valid"),
+    );
+    let request = AuthorizationRequest::direct(
+        &proof,
+        &assertion,
+        federated_policy_with(1, Uuid::from_u128(20), 1, enrollment_mode, 1, 200),
+        capabilities(&[AuthorizationCapability::CommunityRead]),
+        Uuid::from_u128(20),
+        NOW,
+    )
+    .expect("synthetic direct request is valid");
+    (proof, assertion, request)
+}
+
+fn finalization_input(proof: VerifiedNostrProof) -> AuthContextInput {
+    AuthContextInput::new(
+        buzz_core::TenantContext::resolved(domain(1), "relay.example"),
+        Uuid::from_u128(20),
+        proof,
+        AuthorizedCommunityAccess::new(domain(1), Scope::all_known(), None),
+    )
+}
+
 async fn resolve_at(
     provider: &dyn AuthorizationProvider,
     request: &AuthorizationRequest,
     now: u64,
     timeout: ProviderTimeout,
 ) -> AuthorizationOutcome {
-    resolve_authorization(provider, request, &TestClock::at(now), timeout).await
+    resolve_authorization(
+        provider,
+        request,
+        &TestClock::at(now),
+        timeout,
+        Uuid::from_u128(99),
+    )
+    .await
 }
 
 fn capabilities(values: &[AuthorizationCapability]) -> CapabilitySet {
@@ -165,7 +344,7 @@ fn proof_method_for_transport(transport: AuthTransport) -> AuthMethod {
     }
 }
 
-fn all_contract_errors() -> [ProviderContractError; 26] {
+fn all_contract_errors() -> [ProviderContractError; 34] {
     [
         ProviderContractError::EmptyCapabilitySet,
         ProviderContractError::EmptyProfileId,
@@ -184,7 +363,7 @@ fn all_contract_errors() -> [ProviderContractError; 26] {
         ProviderContractError::AssertionNotYetValid,
         ProviderContractError::AssertionExpired,
         ProviderContractError::KeyAttestationMismatch,
-        ProviderContractError::MissingKeyAttestation,
+        ProviderContractError::DelegatedBindingNotExistingActive,
         ProviderContractError::DelegationRequired,
         ProviderContractError::DelegatedOwnerMismatch,
         ProviderContractError::DelegationExpired,
@@ -193,6 +372,14 @@ fn all_contract_errors() -> [ProviderContractError; 26] {
         ProviderContractError::FederatedPolicyCorrelationMismatch,
         ProviderContractError::FederatedPolicyNotYetEffective,
         ProviderContractError::FederatedPolicyExpired,
+        ProviderContractError::CapabilityNotYetEffective,
+        ProviderContractError::CapabilityExpired,
+        ProviderContractError::CapabilityContextMismatch,
+        ProviderContractError::CapabilityAuthorityMismatch,
+        ProviderContractError::CapabilityPrincipalMismatch,
+        ProviderContractError::CapabilityBindingChanged,
+        ProviderContractError::FederatedPolicyChanged,
+        ProviderContractError::AuthorizationRuntimeMismatch,
     ]
 }
 
@@ -219,8 +406,7 @@ fn direct_request_for_transport(
     AuthorizationRequest::direct(
         &proof,
         &assertion,
-        &federated_policy(),
-        profile(),
+        federated_policy(),
         requested,
         Uuid::from_u128(20),
         NOW,
@@ -251,11 +437,11 @@ fn direct_request(actor: &Keys) -> AuthorizationRequest {
     )
 }
 
-fn existing_binding(owner: &Keys) -> AuthoritativeBindingEvidence {
+fn existing_binding(owner: &Keys) -> AuthoritativeBindingResolution {
     existing_binding_in(1, owner)
 }
 
-fn existing_binding_in(domain_value: u128, owner: &Keys) -> AuthoritativeBindingEvidence {
+fn existing_binding_in(domain_value: u128, owner: &Keys) -> AuthoritativeBindingResolution {
     existing_binding_with_expiry_in(domain_value, owner, None)
 }
 
@@ -263,8 +449,8 @@ fn existing_binding_with_expiry_in(
     domain_value: u128,
     owner: &Keys,
     expires_at: Option<u64>,
-) -> AuthoritativeBindingEvidence {
-    AuthoritativeBindingEvidence::new(
+) -> AuthoritativeBindingResolution {
+    let evidence = AuthoritativeBindingEvidence::new(
         domain(domain_value),
         Uuid::from_u128(10),
         principal(),
@@ -274,7 +460,8 @@ fn existing_binding_with_expiry_in(
             .map(|expiry| BindingExpiry::new(expiry).expect("synthetic binding expiry is valid")),
         BindingSource::Provisioned,
     )
-    .expect("synthetic binding is valid")
+    .expect("synthetic binding is valid");
+    AuthoritativeBindingResolution::existing_active(evidence)
 }
 
 fn delegated_proof(actor: &Keys, owner: &Keys, expiry: u64) -> VerifiedNostrProof {
@@ -299,8 +486,7 @@ fn delegated_request(actor: &Keys, owner: &Keys, expiry: u64) -> AuthorizationRe
     AuthorizationRequest::delegated(
         &proof,
         &existing_binding(owner),
-        &federated_policy(),
-        profile(),
+        federated_policy(),
         capabilities(&[AuthorizationCapability::CommunityRead]),
         Uuid::from_u128(20),
         NOW,
@@ -319,7 +505,7 @@ fn allow_for(
         ProviderAllow::new(
             request.authorization_domain(),
             request.principal().clone(),
-            request.profile_id().clone(),
+            profile(),
             granted,
             policy_version(version),
             issued_at,
@@ -342,6 +528,10 @@ impl FakeProvider {
 }
 
 impl AuthorizationProvider for FakeProvider {
+    fn profile_id(&self) -> AuthorizationProfileId {
+        profile()
+    }
+
     fn authorize<'a>(
         &'a self,
         _request: &'a AuthorizationRequest,
@@ -352,6 +542,29 @@ impl AuthorizationProvider for FakeProvider {
                 .expect("synthetic provider mutex is not poisoned")
                 .take()
                 .expect("synthetic provider is called exactly once")
+        })
+    }
+}
+
+struct EchoAllowProvider;
+
+impl AuthorizationProvider for EchoAllowProvider {
+    fn profile_id(&self) -> AuthorizationProfileId {
+        profile()
+    }
+
+    fn authorize<'a>(
+        &'a self,
+        request: &'a AuthorizationRequest,
+    ) -> AuthorizationProviderFuture<'a> {
+        Box::pin(async move {
+            allow_for(
+                request,
+                request.requested_capabilities().clone(),
+                "version-a",
+                90,
+                180,
+            )
         })
     }
 }
@@ -384,6 +597,10 @@ impl AdvancingProvider {
 }
 
 impl AuthorizationProvider for AdvancingProvider {
+    fn profile_id(&self) -> AuthorizationProfileId {
+        profile()
+    }
+
     fn authorize<'a>(
         &'a self,
         _request: &'a AuthorizationRequest,
@@ -420,6 +637,10 @@ impl Drop for CancellationMarker {
 }
 
 impl AuthorizationProvider for PendingProvider {
+    fn profile_id(&self) -> AuthorizationProfileId {
+        profile()
+    }
+
     fn authorize<'a>(
         &'a self,
         _request: &'a AuthorizationRequest,
@@ -462,7 +683,7 @@ async fn current_allow_returns_request_scoped_snapshot() {
     assert_eq!(snapshot.binding_version(), None);
     assert_eq!(snapshot.proof_method(), AuthMethod::Nip42);
     assert_eq!(snapshot.principal(), request.principal());
-    assert_eq!(snapshot.profile_id(), request.profile_id());
+    assert_eq!(snapshot.profile_id(), &profile());
     assert_eq!(
         snapshot.capabilities().as_slice(),
         &[AuthorizationCapability::CommunityRead]
@@ -474,6 +695,212 @@ async fn current_allow_returns_request_scoped_snapshot() {
     assert_eq!(snapshot.decision_source(), DecisionSource::DirectAssertion);
     assert_eq!(snapshot.correlation_id(), request.correlation_id());
     assert_eq!(snapshot.reason(), ProviderAllowReason::CurrentPolicy);
+}
+
+#[tokio::test]
+async fn runtime_finalizer_allows_existing_binding_without_key_claim() {
+    let actor = Keys::generate();
+    let (proof, assertion, request) = direct_evidence(&actor, EnrollmentMode::Provisioned, false);
+    let provider = FakeProvider::returning(allow_for(
+        &request,
+        request.requested_capabilities().clone(),
+        "version-a",
+        90,
+        180,
+    ));
+    let authority = TestAuthorityAdapter::new(1, EnrollmentMode::Provisioned, false);
+    let runtime = AuthorizationRuntime::from_server_configuration(
+        authority.clone(),
+        TestClock::at(NOW),
+        provider,
+    );
+    let AuthorizationOutcome::Allow(snapshot) = runtime
+        .resolve_authorization(&request, provider_timeout())
+        .await
+    else {
+        panic!("current provider decision must allow");
+    };
+
+    let context = runtime
+        .finalize_direct_v1(*snapshot, finalization_input(proof), assertion)
+        .await
+        .expect("an existing active binding does not require a later key claim");
+
+    assert_eq!(
+        context.authorization_reason(),
+        crate::AuthorizationReason::ExistingBinding
+    );
+    assert_eq!(authority.policy_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.direct_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn attested_enrollment_without_sealed_key_claim_fails_before_commit() {
+    let actor = Keys::generate();
+    let (proof, assertion, request) = direct_evidence(&actor, EnrollmentMode::AttestedKey, false);
+    let provider = FakeProvider::returning(allow_for(
+        &request,
+        request.requested_capabilities().clone(),
+        "version-a",
+        90,
+        180,
+    ));
+    let authority = TestAuthorityAdapter::new(1, EnrollmentMode::AttestedKey, true);
+    let runtime = AuthorizationRuntime::from_server_configuration(
+        authority.clone(),
+        TestClock::at(NOW),
+        provider,
+    );
+    let AuthorizationOutcome::Allow(snapshot) = runtime
+        .resolve_authorization(&request, provider_timeout())
+        .await
+    else {
+        panic!("provider evaluation may allow before binding resolution");
+    };
+
+    let error = runtime
+        .finalize_direct_v1(*snapshot, finalization_input(proof), assertion)
+        .await
+        .expect_err("attested-key enrollment requires the sealed matching key claim");
+
+    assert_eq!(
+        error,
+        ProviderAuthorizationError::Authority(AuthorityAdapterError::Contract(
+            AuthContextError::KeyAttestationRequired
+        ))
+    );
+    assert_eq!(authority.direct_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.committed_enrollments.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fresh_policy_epoch_drift_blocks_binding_mutation() {
+    let actor = Keys::generate();
+    let (proof, assertion, request) = direct_evidence(&actor, EnrollmentMode::Tofu, false);
+    let provider = FakeProvider::returning(allow_for(
+        &request,
+        request.requested_capabilities().clone(),
+        "version-a",
+        90,
+        180,
+    ));
+    let authority = TestAuthorityAdapter::new(2, EnrollmentMode::Tofu, true);
+    let runtime = AuthorizationRuntime::from_server_configuration(
+        authority.clone(),
+        TestClock::at(NOW),
+        provider,
+    );
+    let AuthorizationOutcome::Allow(snapshot) = runtime
+        .resolve_authorization(&request, provider_timeout())
+        .await
+    else {
+        panic!("request-time policy is current during provider evaluation");
+    };
+
+    let error = runtime
+        .finalize_direct_v1(*snapshot, finalization_input(proof), assertion)
+        .await
+        .expect_err("fresh authoritative policy drift must fail before binding I/O");
+
+    assert_eq!(
+        error,
+        ProviderAuthorizationError::Contract(ProviderContractError::FederatedPolicyChanged)
+    );
+    assert_eq!(authority.policy_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.direct_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(authority.committed_enrollments.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn runtime_binding_rejects_forged_adapter_and_clock_substitution() {
+    let actor = Keys::generate();
+    let (proof, assertion, request) = direct_evidence(&actor, EnrollmentMode::Tofu, false);
+    let genuine_provider = FakeProvider::returning(allow_for(
+        &request,
+        request.requested_capabilities().clone(),
+        "version-a",
+        90,
+        180,
+    ));
+    let genuine_runtime = AuthorizationRuntime::from_server_configuration(
+        TestAuthorityAdapter::new(1, EnrollmentMode::Tofu, true),
+        TestClock::at(NOW),
+        genuine_provider,
+    );
+    let AuthorizationOutcome::Allow(snapshot) = genuine_runtime
+        .resolve_authorization(&request, provider_timeout())
+        .await
+    else {
+        panic!("genuine runtime must issue the capability snapshot");
+    };
+
+    let forged_authority = TestAuthorityAdapter::new(1, EnrollmentMode::Tofu, true);
+    let forged_runtime = AuthorizationRuntime::from_server_configuration(
+        forged_authority.clone(),
+        TestClock::at(NOW),
+        FakeProvider::returning(ProviderDecision::Deny(AuthorizationDenial::new(
+            AuthorizationDenialReason::ProviderDenied,
+        ))),
+    );
+    let error = forged_runtime
+        .finalize_direct_v1(*snapshot, finalization_input(proof), assertion)
+        .await
+        .expect_err("a legitimate snapshot cannot be spliced to a caller-selected runtime");
+
+    assert_eq!(
+        error,
+        ProviderAuthorizationError::Contract(ProviderContractError::AuthorizationRuntimeMismatch)
+    );
+    assert_eq!(forged_authority.policy_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(forged_authority.direct_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        forged_authority
+            .committed_enrollments
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn runtime_resolves_and_refinalizes_existing_delegated_owner() {
+    let delegate = Keys::generate();
+    let owner = Keys::generate();
+    let proof = delegated_proof(&delegate, &owner, 180);
+    let authority = TestAuthorityAdapter::new(1, EnrollmentMode::Provisioned, false);
+    let runtime = AuthorizationRuntime::from_server_configuration(
+        authority.clone(),
+        TestClock::at(NOW),
+        EchoAllowProvider,
+    );
+    let request = runtime
+        .resolve_delegated_authorization_request(
+            &proof,
+            principal(),
+            federated_policy(),
+            capabilities(&[AuthorizationCapability::CommunityRead]),
+            Uuid::from_u128(20),
+        )
+        .await
+        .expect("the configured adapter resolves an existing delegated owner");
+    let AuthorizationOutcome::Allow(snapshot) = runtime
+        .resolve_authorization(&request, provider_timeout())
+        .await
+    else {
+        panic!("the current owner admission must allow");
+    };
+
+    let context = runtime
+        .finalize_delegated_v1(*snapshot, finalization_input(proof))
+        .await
+        .expect("the owner is reread and finalized without enrollment");
+
+    assert_eq!(
+        context.authorization_reason(),
+        crate::AuthorizationReason::DelegatedOwnerBinding
+    );
+    assert_eq!(authority.policy_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.existing_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(authority.committed_enrollments.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -598,8 +1025,14 @@ async fn provider_freshness_is_evaluated_after_async_io() {
         105,
     );
 
-    let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&provider, &request, &clock, provider_timeout()).await
+    let AuthorizationOutcome::Deny(denial) = resolve_authorization(
+        &provider,
+        &request,
+        &clock,
+        provider_timeout(),
+        Uuid::from_u128(99),
+    )
+    .await
     else {
         panic!("a provider decision stale after I/O must deny");
     };
@@ -638,8 +1071,7 @@ async fn federated_policy_expiry_is_evaluated_after_async_io() {
     let request = AuthorizationRequest::direct(
         &proof,
         &assertion,
-        &policy,
-        profile(),
+        policy,
         capabilities(&[AuthorizationCapability::CommunityRead]),
         Uuid::from_u128(20),
         NOW,
@@ -658,8 +1090,14 @@ async fn federated_policy_expiry_is_evaluated_after_async_io() {
         105,
     );
 
-    let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&provider, &request, &clock, provider_timeout()).await
+    let AuthorizationOutcome::Deny(denial) = resolve_authorization(
+        &provider,
+        &request,
+        &clock,
+        provider_timeout(),
+        Uuid::from_u128(99),
+    )
+    .await
     else {
         panic!("federated enrollment policy expired after I/O must deny");
     };
@@ -701,8 +1139,7 @@ async fn snapshot_requires_exact_enrollment_policy_lineage() {
     let request = AuthorizationRequest::direct(
         &proof,
         &assertion,
-        &current_policy,
-        profile(),
+        current_policy,
         capabilities(&[AuthorizationCapability::CommunityRead]),
         Uuid::from_u128(20),
         NOW,
@@ -723,7 +1160,15 @@ async fn snapshot_requires_exact_enrollment_policy_lineage() {
 
     let stale_tofu_policy =
         federated_policy_with(1, Uuid::from_u128(20), 6, EnrollmentMode::Tofu, 1, 160);
-    assert!(snapshot.is_bound_to_federated_policy(&current_policy));
+    let current_policy_for_comparison = federated_policy_with(
+        1,
+        Uuid::from_u128(20),
+        7,
+        EnrollmentMode::Provisioned,
+        1,
+        160,
+    );
+    assert!(snapshot.is_bound_to_federated_policy(&current_policy_for_comparison));
     assert!(!snapshot.is_bound_to_federated_policy(&stale_tofu_policy));
     assert_eq!(snapshot.policy_version().as_str(), "6");
     assert_ne!(
@@ -763,8 +1208,7 @@ async fn enrollment_policy_bounds_snapshot_effective_interval() {
     let request = AuthorizationRequest::direct(
         &proof,
         &assertion,
-        &policy,
-        profile(),
+        policy,
         capabilities(&[AuthorizationCapability::CommunityRead]),
         Uuid::from_u128(20),
         NOW,
@@ -783,7 +1227,7 @@ async fn enrollment_policy_bounds_snapshot_effective_interval() {
         panic!("current bounded policy must allow");
     };
 
-    assert_eq!(request.evidence_valid_until(), Some(150));
+    assert_eq!(request.evidence_valid_until(), 150);
     assert_eq!(snapshot.effective_until(), 150);
 }
 
@@ -808,8 +1252,14 @@ async fn identity_evidence_is_evaluated_after_async_io() {
         105,
     );
 
-    let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&provider, &request, &clock, provider_timeout()).await
+    let AuthorizationOutcome::Deny(denial) = resolve_authorization(
+        &provider,
+        &request,
+        &clock,
+        provider_timeout(),
+        Uuid::from_u128(99),
+    )
+    .await
     else {
         panic!("identity evidence expired after I/O must deny");
     };
@@ -828,14 +1278,13 @@ async fn owner_binding_expiry_is_evaluated_after_async_io() {
     let request = AuthorizationRequest::delegated(
         &proof,
         &binding,
-        &federated_policy(),
-        profile(),
+        federated_policy(),
         capabilities(&[AuthorizationCapability::CommunityRead]),
         Uuid::from_u128(20),
         NOW,
     )
     .expect("owner binding is current at request construction");
-    assert_eq!(request.evidence_valid_until(), Some(105));
+    assert_eq!(request.evidence_valid_until(), 105);
 
     let clock = TestClock::at(NOW);
     let provider = AdvancingProvider::returning_at(
@@ -849,8 +1298,14 @@ async fn owner_binding_expiry_is_evaluated_after_async_io() {
         clock.clone(),
         105,
     );
-    let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&provider, &request, &clock, provider_timeout()).await
+    let AuthorizationOutcome::Deny(denial) = resolve_authorization(
+        &provider,
+        &request,
+        &clock,
+        provider_timeout(),
+        Uuid::from_u128(99),
+    )
+    .await
     else {
         panic!("owner binding expired after provider I/O must deny");
     };
@@ -870,8 +1325,7 @@ fn delegated_request_rejects_owner_binding_at_exact_expiry() {
     let error = AuthorizationRequest::delegated(
         &proof,
         &binding,
-        &federated_policy(),
-        profile(),
+        federated_policy(),
         capabilities(&[AuthorizationCapability::CommunityRead]),
         Uuid::from_u128(20),
         NOW,
@@ -898,7 +1352,14 @@ async fn decision_issued_during_async_io_is_not_false_future() {
     );
 
     assert!(matches!(
-        resolve_authorization(&provider, &request, &clock, provider_timeout()).await,
+        resolve_authorization(
+            &provider,
+            &request,
+            &clock,
+            provider_timeout(),
+            Uuid::from_u128(99)
+        )
+        .await,
         AuthorizationOutcome::Allow(_)
     ));
 }
@@ -919,8 +1380,14 @@ async fn clock_failure_after_provider_io_is_unavailable() {
         clock.clone(),
     );
 
-    let AuthorizationOutcome::Unavailable(unavailable) =
-        resolve_authorization(&provider, &request, &clock, provider_timeout()).await
+    let AuthorizationOutcome::Unavailable(unavailable) = resolve_authorization(
+        &provider,
+        &request,
+        &clock,
+        provider_timeout(),
+        Uuid::from_u128(99),
+    )
+    .await
     else {
         panic!("unavailable decision time must fail closed");
     };
@@ -1018,7 +1485,7 @@ async fn domain_principal_and_capability_mismatches_deny() {
         ProviderAllow::new(
             domain(2),
             request.principal().clone(),
-            request.profile_id().clone(),
+            profile(),
             request.requested_capabilities().clone(),
             policy_version("version-a"),
             90,
@@ -1041,7 +1508,7 @@ async fn domain_principal_and_capability_mismatches_deny() {
             domain(1),
             FederatedPrincipal::new("https://idp.example", "other-subject")
                 .expect("synthetic principal is valid"),
-            request.profile_id().clone(),
+            profile(),
             request.requested_capabilities().clone(),
             policy_version("version-a"),
             90,
@@ -1063,7 +1530,8 @@ async fn domain_principal_and_capability_mismatches_deny() {
         ProviderAllow::new(
             domain(1),
             request.principal().clone(),
-            AuthorizationProfileId::new("other-profile").expect("synthetic profile is valid"),
+            AuthorizationProfileId::from_server_configuration("other-profile")
+                .expect("synthetic profile is valid"),
             request.requested_capabilities().clone(),
             policy_version("version-a"),
             90,
@@ -1323,14 +1791,16 @@ fn provider_contract_rejects_malformed_values() {
         Err(ProviderContractError::EmptyCapabilitySet)
     );
     assert_eq!(
-        AuthorizationProfileId::new(""),
+        AuthorizationProfileId::from_server_configuration(""),
         Err(ProviderContractError::EmptyProfileId)
     );
     assert_eq!(
-        AuthorizationProfileId::new("x".repeat(MAX_OPAQUE_ID_BYTES + 1)),
+        AuthorizationProfileId::from_server_configuration("x".repeat(MAX_OPAQUE_ID_BYTES + 1)),
         Err(ProviderContractError::ProfileIdTooLong)
     );
-    assert!(AuthorizationProfileId::new("x".repeat(MAX_OPAQUE_ID_BYTES)).is_ok());
+    assert!(
+        AuthorizationProfileId::from_server_configuration("x".repeat(MAX_OPAQUE_ID_BYTES)).is_ok()
+    );
     assert_eq!(
         PolicyVersion::new(""),
         Err(ProviderContractError::EmptyPolicyVersion)
@@ -1452,8 +1922,7 @@ fn request_construction_rechecks_verified_bounds_and_relationships() {
         AuthorizationRequest::direct(
             &proof,
             &expired,
-            &federated_policy(),
-            profile(),
+            federated_policy(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::nil(),
             NOW,
@@ -1464,8 +1933,7 @@ fn request_construction_rechecks_verified_bounds_and_relationships() {
         AuthorizationRequest::direct(
             &proof,
             &expired,
-            &federated_policy(),
-            profile(),
+            federated_policy(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::from_u128(20),
             NOW,
@@ -1486,8 +1954,7 @@ fn request_construction_rechecks_verified_bounds_and_relationships() {
         AuthorizationRequest::direct(
             &proof,
             &future,
-            &federated_policy(),
-            profile(),
+            federated_policy(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::from_u128(20),
             NOW,
@@ -1516,12 +1983,11 @@ fn request_construction_rejects_non_current_or_mismatched_federated_policy() {
         None,
         AssertionExpiry::new(180).expect("synthetic assertion expiry is valid"),
     );
-    let request_with = |policy: &ResolvedFederatedPolicy| {
+    let request_with = |policy: ResolvedFederatedPolicy| {
         AuthorizationRequest::direct(
             &proof,
             &assertion,
             policy,
-            profile(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::from_u128(20),
             NOW,
@@ -1537,7 +2003,7 @@ fn request_construction_rejects_non_current_or_mismatched_federated_policy() {
         180,
     );
     assert_eq!(
-        request_with(&wrong_domain),
+        request_with(wrong_domain),
         Err(ProviderContractError::FederatedPolicyDomainMismatch)
     );
     let wrong_correlation = federated_policy_with(
@@ -1549,7 +2015,7 @@ fn request_construction_rejects_non_current_or_mismatched_federated_policy() {
         180,
     );
     assert_eq!(
-        request_with(&wrong_correlation),
+        request_with(wrong_correlation),
         Err(ProviderContractError::FederatedPolicyCorrelationMismatch)
     );
     let future = federated_policy_with(
@@ -1561,7 +2027,7 @@ fn request_construction_rejects_non_current_or_mismatched_federated_policy() {
         180,
     );
     assert_eq!(
-        request_with(&future),
+        request_with(future),
         Err(ProviderContractError::FederatedPolicyNotYetEffective)
     );
     let expired = federated_policy_with(
@@ -1573,7 +2039,7 @@ fn request_construction_rejects_non_current_or_mismatched_federated_policy() {
         NOW,
     );
     assert_eq!(
-        request_with(&expired),
+        request_with(expired),
         Err(ProviderContractError::FederatedPolicyExpired)
     );
 }
@@ -1608,8 +2074,7 @@ fn request_construction_rejects_mismatched_verified_evidence() {
         AuthorizationRequest::direct(
             proof,
             assertion,
-            &federated_policy(),
-            profile(),
+            federated_policy(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::from_u128(20),
             NOW,
@@ -1637,13 +2102,11 @@ fn request_construction_rejects_mismatched_verified_evidence() {
         ),
         Err(ProviderContractError::KeyAttestationMismatch)
     );
-    assert_eq!(
-        request(
-            &proof,
-            &assertion_in_domain(1, AuthTransport::RelayWebSocket, None),
-        ),
-        Err(ProviderContractError::MissingKeyAttestation)
-    );
+    assert!(request(
+        &proof,
+        &assertion_in_domain(1, AuthTransport::RelayWebSocket, None),
+    )
+    .is_ok());
 
     let delegation = VerifiedTransportDelegation::new_unrestricted(
         owner.public_key(),
@@ -1668,12 +2131,11 @@ fn request_construction_rejects_mismatched_verified_evidence() {
     );
 
     let delegated_request_from =
-        |proof: &VerifiedNostrProof, binding: &AuthoritativeBindingEvidence| {
+        |proof: &VerifiedNostrProof, binding: &AuthoritativeBindingResolution| {
             AuthorizationRequest::delegated(
                 proof,
                 binding,
-                &federated_policy(),
-                profile(),
+                federated_policy(),
                 capabilities(&[AuthorizationCapability::CommunityRead]),
                 Uuid::from_u128(20),
                 NOW,
@@ -1683,8 +2145,7 @@ fn request_construction_rejects_mismatched_verified_evidence() {
         AuthorizationRequest::delegated(
             &delegated_proof,
             &existing_binding(&owner),
-            &federated_policy(),
-            profile(),
+            federated_policy(),
             capabilities(&[AuthorizationCapability::CommunityRead]),
             Uuid::nil(),
             NOW,
@@ -1733,9 +2194,13 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
         "transport: \"[redacted]\", actor_pubkey: \"[redacted]\", ",
         "proof_method: \"[redacted]\", ",
         "authority: \"[redacted]\", principal: \"[redacted]\", ",
+        "key_attested: \"[redacted]\", assertion_transport: \"[redacted]\", ",
+        "assertion_not_before: \"[redacted]\", ",
+        "assertion_expires_at: \"[redacted]\", ",
         "federated_policy: \"[redacted]\", ",
-        "profile_id: \"[redacted]\", requested_capabilities: \"[redacted]\", ",
+        "requested_capabilities: \"[redacted]\", ",
         "correlation_id: \"[redacted]\", decision_source: \"[redacted]\", ",
+        "evidence_valid_from: \"[redacted]\", ",
         "evidence_valid_until: \"[redacted]\" }"
     );
     // Keep this exact-shape assertion deliberately: adding a field must fail until
@@ -1766,7 +2231,7 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
     let allow = ProviderAllow::new(
         request.authorization_domain(),
         request.principal().clone(),
-        request.profile_id().clone(),
+        profile(),
         request.requested_capabilities().clone(),
         policy_version("private-policy-version"),
         90,
@@ -1796,15 +2261,20 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
     assert_eq!(
         format!("{snapshot:?}"),
         concat!(
-            "CapabilitySnapshot { authorization_domain: \"[redacted]\", ",
+            "CapabilitySnapshot { runtime_binding: \"[redacted]\", ",
+            "authorization_domain: \"[redacted]\", ",
             "transport: \"[redacted]\", actor_pubkey: \"[redacted]\", ",
             "owner_pubkey: \"[redacted]\", binding_id: \"[redacted]\", ",
             "binding_version: \"[redacted]\", proof_method: \"[redacted]\", ",
             "principal: \"[redacted]\", ",
+            "key_attested: \"[redacted]\", assertion_transport: \"[redacted]\", ",
+            "assertion_not_before: \"[redacted]\", ",
+            "assertion_expires_at: \"[redacted]\", ",
             "federated_policy: \"[redacted]\", ",
             "profile_id: \"[redacted]\", capabilities: \"[redacted]\", ",
             "policy_version: \"[redacted]\", issued_at: \"[redacted]\", ",
-            "fresh_until: \"[redacted]\", effective_until: \"[redacted]\", ",
+            "fresh_until: \"[redacted]\", effective_from: \"[redacted]\", ",
+            "effective_until: \"[redacted]\", ",
             "decision_source: \"[redacted]\", correlation_id: \"[redacted]\", ",
             "reason: \"[redacted]\" }"
         )
@@ -1869,7 +2339,7 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
         "ProviderTimeout(\"[redacted]\")"
     );
     assert_eq!(
-        format!("{:?}", request.profile_id()),
+        format!("{:?}", &profile()),
         "AuthorizationProfileId(\"[redacted]\")"
     );
     assert_eq!(
@@ -1897,6 +2367,7 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
         AuthorizationDenialReason::StaleDecision,
         AuthorizationDenialReason::FutureDecision,
         AuthorizationDenialReason::IdentityEvidenceExpired,
+        AuthorizationDenialReason::IdentityEvidenceNotYetValid,
         AuthorizationDenialReason::FederatedPolicyNotCurrent,
     ] {
         assert_eq!(
@@ -1955,6 +2426,7 @@ fn provider_trait_is_object_safe_and_codes_are_unique() {
         AuthorizationDenialReason::StaleDecision.code(),
         AuthorizationDenialReason::FutureDecision.code(),
         AuthorizationDenialReason::IdentityEvidenceExpired.code(),
+        AuthorizationDenialReason::IdentityEvidenceNotYetValid.code(),
         AuthorizationDenialReason::FederatedPolicyNotCurrent.code(),
         ProviderUnavailableReason::TemporarilyUnavailable.code(),
         ProviderUnavailableReason::Timeout.code(),
@@ -1962,7 +2434,7 @@ fn provider_trait_is_object_safe_and_codes_are_unique() {
     ];
     codes.sort_unstable();
     codes.dedup();
-    assert_eq!(codes.len(), 13);
+    assert_eq!(codes.len(), 14);
 
     let contract_errors = all_contract_errors();
     let mut contract_codes = contract_errors

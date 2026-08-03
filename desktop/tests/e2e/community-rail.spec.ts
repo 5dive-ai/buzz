@@ -512,6 +512,27 @@ test.describe("community rail", () => {
           }
         ).__BUZZ_E2E_CHANNELS_READ_PENDING__ === 1,
     );
+    await page.evaluate(async () => {
+      const invoke = (
+        window as Window & {
+          __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
+            command: string,
+          ) => Promise<unknown>;
+        }
+      ).__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+      if (!invoke) throw new Error("missing mock command seam");
+      await invoke("get_channels");
+    });
+    expect(
+      await page.evaluate(
+        () =>
+          (
+            window as Window & {
+              __BUZZ_E2E_CHANNELS_READ_PENDING__?: number;
+            }
+          ).__BUZZ_E2E_CHANNELS_READ_PENDING__,
+      ),
+    ).toBe(1);
     await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
     await expect(page).not.toHaveURL(/#\/channels\/general$/);
     await expect

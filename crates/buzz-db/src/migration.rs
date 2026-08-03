@@ -351,7 +351,6 @@ mod tests {
             "community_deletion_requests",
             "community_deletion_approvals",
             "community_deletion_checkpoints",
-            "community_deletion_retention_exceptions",
             "community_serving_write_leases",
             "community_deletion_executor_heartbeats",
         ] {
@@ -1042,7 +1041,6 @@ mod tests {
         assert!(deletion.contains("CREATE TABLE community_deletion_requests"));
         assert!(deletion.contains("CREATE TABLE community_deletion_approvals"));
         assert!(deletion.contains("CREATE TABLE community_deletion_checkpoints"));
-        assert!(deletion.contains("CREATE TABLE community_deletion_retention_exceptions"));
         assert!(deletion.contains("CREATE TABLE community_serving_write_leases"));
         assert!(deletion.contains("CREATE TABLE community_deletion_executor_heartbeats"));
         assert!(deletion.contains("CREATE FUNCTION assert_community_write_allowed"));

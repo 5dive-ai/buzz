@@ -277,12 +277,11 @@ impl Session {
     }
 
     fn shutdown(mut self) {
-        if let Ok(mut channel) = self.channel.lock() {
-            *channel = None;
-        }
         // Publication is detached before the reader enters close mode; the
         // lifecycle helper then abandons parser work and keeps raw-draining
-        // through child termination and reap.
+        // through child termination and reap. Keep the renderer channel alive
+        // until the reader has reported Exit; close() removes the session from
+        // the runtime before shutdown begins, so this is its final message.
         if let Ok(mut publisher) = self.publisher.lock() {
             publisher.close();
         }
@@ -299,6 +298,9 @@ impl Session {
                 reader.stop();
                 reader.join();
             }
+        }
+        if let Ok(mut channel) = self.channel.lock() {
+            *channel = None;
         }
     }
 }

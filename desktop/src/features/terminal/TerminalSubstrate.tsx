@@ -102,6 +102,7 @@ export function TerminalSubstrate({
   const appliedFramesRef = React.useRef(new WeakSet<TerminalFrame>());
   const gridRef = React.useRef<TerminalGrid | null>(null);
   const paintedPaletteRef = React.useRef(terminalPalette);
+  const paintedSessionRef = React.useRef<string | null>(null);
   const previousFocusRef = React.useRef<HTMLElement | null>(null);
   const reportedFocusRef = React.useRef<boolean | null>(null);
   const scrollBySessionRef = React.useRef(new Map<string, number>());
@@ -408,21 +409,38 @@ export function TerminalSubstrate({
       canvas.width !== pixelWidth || canvas.height !== pixelHeight;
     const paletteChanged = paintedPaletteRef.current !== terminalPalette;
     paintedPaletteRef.current = terminalPalette;
+    // A grid drains its dirty set in paint(), so a session that was painted and
+    // then deactivated comes back holding rows with nothing marked dirty. Both
+    // refs are written after the early returns above, so a pass that bails
+    // keeps the switch pending instead of swallowing it.
+    const sessionChanged = paintedSessionRef.current !== activeSessionId;
+    paintedSessionRef.current = activeSessionId;
+    const repaintAll = resized || paletteChanged || sessionChanged;
     if (resized) {
       canvas.width = pixelWidth;
       canvas.height = pixelHeight;
     }
-    if (resized || paletteChanged) {
+    if (repaintAll) {
       gridRef.current?.markAllDirty();
     }
     context.setTransform(dpr, 0, 0, dpr, 0, 0);
-    if (resized || paletteChanged) {
+    if (repaintAll) {
+      // Not grid-guarded: switching to a session that has delivered no frame
+      // yet has no grid to mark or paint, so this fill is the only thing that
+      // erases the outgoing session's pixels.
       context.fillStyle = terminalPalette.background;
       context.fillRect(0, 0, bounds.width, bounds.height);
     }
     gridRef.current?.setCursorPainted(cursorPainted);
     gridRef.current?.paint(context, TERMINAL_CELL_METRICS, terminalPalette);
   }, [activeSessionId, cursorPainted, frames, terminalPalette]);
+
+  const runTabAction = (action: () => void) => {
+    action();
+    if (owner === "terminal") {
+      textareaRef.current?.focus({ preventScroll: true });
+    }
+  };
 
   return (
     <section
@@ -464,7 +482,7 @@ export function TerminalSubstrate({
                 aria-selected={session.active}
                 className="buzz-terminal-tab-select"
                 disabled={session.closing}
-                onClick={() => onSelectSession(session.id)}
+                onClick={() => runTabAction(() => onSelectSession(session.id))}
                 role="tab"
                 type="button"
               >
@@ -477,7 +495,7 @@ export function TerminalSubstrate({
                 aria-label={`Close ${session.title}`}
                 className="buzz-terminal-close"
                 disabled={session.closing}
-                onClick={() => onCloseSession(session.id)}
+                onClick={() => runTabAction(() => onCloseSession(session.id))}
                 type="button"
               >
                 ×
@@ -487,7 +505,7 @@ export function TerminalSubstrate({
           <button
             aria-label="New Buzz Term tab"
             className="buzz-terminal-new-tab"
-            onClick={onNewSession}
+            onClick={() => runTabAction(onNewSession)}
             type="button"
           >
             +

@@ -123,9 +123,7 @@ export function AppShell() {
   const mainInsetRef = React.useRef<HTMLElement>(null);
   const location = useLocation();
   const queryClient = useQueryClient();
-  useManagedAgentRuntimeReconciliation(
-    `${communitiesHook.activeCommunity?.id ?? "none"}-${communitiesHook.reinitKey}`,
-  ); // re-runs on workspace switch
+  useManagedAgentRuntimeReconciliation(String(communitiesHook.reinitKey)); // re-runs on workspace switch
   const {
     goAgents,
     goChannel,

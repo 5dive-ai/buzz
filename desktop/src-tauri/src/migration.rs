@@ -29,20 +29,12 @@ const LEGACY_RELEASE_IDENTIFIER: &str = "xyz.block.sprout.app";
 /// dev data directory. Only data files — never `agent-pids/` or `logs/`.
 /// `identity.key` is deliberately excluded because worktree instances
 /// receive their identity via the `BUZZ_PRIVATE_KEY` env var.
-///
-/// NOTE: `agents/managed-agents.json` and the other legacy unscoped files
-/// are intentionally absent — they now live under `agents/scopes/<scope_id>/`
-/// (the scoped layout). The `agents/scopes/` directory is shared via
-/// `SHARED_AGENT_DIRS` so all scoped stores are visible to every worktree.
+/// Legacy unscoped agent files are absent; scoped stores live in `agents/scopes/`.
 const SHARED_AGENT_FILES: &[&str] = &[];
 
 /// Directories symlinked from worktree data directories to the canonical
 /// dev data directory. Each entry becomes a single directory symlink.
-///
-/// `agents/scopes` is included so that scoped agent stores (managed-agents.json,
-/// teams.json, global-agent-config.json under each scope sub-directory) are
-/// shared across worktree instances without requiring knowledge of the dynamic
-/// scope ID at migration time.
+/// `agents/scopes` shares all scoped stores across worktrees.
 const SHARED_AGENT_DIRS: &[&str] = &["agents/teams", "agents/scopes"];
 
 /// Returns `true` when `name` is a dev data dir name — i.e. it is exactly the
@@ -1385,65 +1377,7 @@ pub use detach::detach_directory_backed_teams;
 mod team_suffix;
 pub use team_suffix::strip_baked_team_instructions;
 
-// ── Scoped migration helpers ──────────────────────────────────────────────────
-// Re-exports and thin wrappers used by `managed_agents::scope_init::run_scoped_migrations`.
-// Each function operates on a `definitions_dir` (the scoped agents directory:
-// `<app_data>/agents/scopes/<scope_id>/`) instead of the legacy
-// `<app_data>/agents/` root.
-pub(crate) use backfill::backfill_standalone_agents_in_dir;
-pub(crate) use detach::detach_directory_backed_teams_in_dir;
-pub(crate) use fold::fold_personas_in_dir;
-pub(crate) use materialize::materialize_runtimes_in_file;
-pub(crate) use team_suffix::strip_baked_team_instructions_in_dir;
-
-/// Reconcile `mcp_command` values in a scoped `definitions_dir`.
-pub(crate) fn reconcile_provider_mcp_commands_at(definitions_dir: &std::path::Path) {
-    let path = definitions_dir.join("managed-agents.json");
-    if path.exists() {
-        reconcile_mcp_commands_in_file(&path);
-    }
-}
-
-/// Reconcile Databricks V1 → V2 provider entries in a scoped `definitions_dir`.
-pub(crate) fn reconcile_databricks_v1_to_v2_at(definitions_dir: &std::path::Path) {
-    use crate::managed_agents::baked_build_env;
-    let rewrite_v1_provider = baked_build_env()
-        .get("BUZZ_AGENT_PROVIDER")
-        .map(|v| v == "databricks_v2")
-        .unwrap_or(false);
-    let path = definitions_dir.join("managed-agents.json");
-    if path.exists() {
-        reconcile_databricks_v1_to_v2_in_file(&path, rewrite_v1_provider);
-    }
-}
-
-/// Refresh legacy built-in agent avatars in a scoped `definitions_dir`.
-pub(crate) fn refresh_builtin_agent_avatars_at(definitions_dir: &std::path::Path) {
-    let path = definitions_dir.join("managed-agents.json");
-    if path.exists() {
-        refresh_builtin_agent_avatars_in_file(
-            &path,
-            LEGACY_BUILTIN_AVATARS,
-            &crate::util::now_iso(),
-        );
-    }
-}
-
-/// Reconcile legacy command names in a scoped `definitions_dir`.
-pub(crate) fn reconcile_legacy_command_names_at(definitions_dir: &std::path::Path) {
-    let path = definitions_dir.join("managed-agents.json");
-    if path.exists() {
-        reconcile_legacy_command_names_in_file(&path);
-    }
-}
-
-/// Materialize per-record runtimes in a scoped `definitions_dir`.
-pub(crate) fn materialize_agent_runtimes_at(definitions_dir: &std::path::Path) {
-    let path = definitions_dir.join("managed-agents.json");
-    if path.exists() {
-        materialize_runtimes_in_file(&path);
-    }
-}
+include!("migration_scope.rs");
 
 #[cfg(test)]
 #[path = "migration_test_support.rs"]

@@ -155,7 +155,8 @@ pub async fn apply_workspace(
     #[cfg(feature = "mesh-llm")]
     {
         if let Err(error) =
-            crate::commands::mesh_llm::drain_mesh_client_if_stale(&app, &relay_url).await
+            crate::commands::mesh_llm::scope_impl::drain_mesh_client_if_stale(&app, &relay_url)
+                .await
         {
             eprintln!("buzz-desktop: Mesh client drain before workspace switch failed: {error}");
         }

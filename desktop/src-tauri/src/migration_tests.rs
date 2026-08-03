@@ -73,8 +73,6 @@ fn setup_sync_layout() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let main_instance = parent.path().join("xyz.block.buzz.app.dev.main");
 
     std::fs::create_dir_all(canonical.join("agents")).unwrap();
-    // Legacy unscoped files remain in canonical for compatibility, but are no
-    // longer part of SHARED_AGENT_FILES (they're superseded by agents/scopes/).
     std::fs::write(
         canonical.join("agents/managed-agents.json"),
         r#"[{"id":"agent-1"}]"#,
@@ -87,8 +85,6 @@ fn setup_sync_layout() -> (tempfile::TempDir, PathBuf, PathBuf) {
     .unwrap();
     std::fs::write(canonical.join("agents/teams.json"), r#"[{"id":"team-1"}]"#).unwrap();
 
-    // Scopes directory: shared via SHARED_AGENT_DIRS so every worktree sees
-    // all scoped stores without knowing the dynamic scope ID.
     std::fs::create_dir_all(canonical.join("agents/scopes")).unwrap();
 
     // Teams installed from `.main` — canonical has no teams dir.
@@ -222,15 +218,12 @@ fn sync_files(canonical: &Path, worktree: &Path) -> u32 {
 fn sync_creates_symlinks_to_fresh_worktree() {
     let (_parent, canonical, worktree) = setup_sync_layout();
     let synced = sync_files(&canonical, &worktree);
-    // SHARED_AGENT_FILES is empty; SHARED_AGENT_DIRS has "agents/teams" and "agents/scopes".
     assert_eq!(synced, 2);
     for rel in SHARED_AGENT_DIRS {
         let dst = worktree.join(rel);
         assert!(dst.is_symlink(), "{rel} should be a symlink");
         assert_eq!(std::fs::read_link(&dst).unwrap(), canonical.join(rel));
     }
-    // Scoped store files are accessible through the agents/scopes symlink.
-    // (In production, managed-agents.json would live under agents/scopes/<scope_id>/.)
     assert!(worktree.join("agents/scopes").is_symlink());
 }
 
@@ -239,8 +232,6 @@ fn sync_creates_symlinks_to_fresh_worktree() {
 fn sync_replaces_existing_files_with_symlinks() {
     let (_parent, canonical, worktree) = setup_sync_layout();
     std::fs::create_dir_all(worktree.join("agents")).unwrap();
-    // Pre-existing unscoped files in the worktree are NOT replaced by the new
-    // sync (SHARED_AGENT_FILES is empty); only the scoped directories are synced.
     std::fs::write(worktree.join("agents/managed-agents.json"), "[]").unwrap();
     std::fs::write(worktree.join("agents/personas.json"), "[]").unwrap();
     std::fs::write(worktree.join("agents/teams.json"), "[]").unwrap();
@@ -257,7 +248,6 @@ fn sync_replaces_existing_files_with_symlinks() {
         );
         assert_eq!(std::fs::read_link(&dst).unwrap(), canonical.join(rel));
     }
-    // Unscoped files are untouched (not part of sync).
     assert!(worktree.join("agents/managed-agents.json").is_file());
 }
 
@@ -265,9 +255,7 @@ fn sync_replaces_existing_files_with_symlinks() {
 #[test]
 fn sync_preserves_correct_symlinks() {
     let (_parent, canonical, worktree) = setup_sync_layout();
-    // First sync creates 2 dir symlinks (agents/teams + agents/scopes).
     assert_eq!(sync_files(&canonical, &worktree), 2);
-    // Second sync sees correct symlinks and makes no changes.
     assert_eq!(sync_files(&canonical, &worktree), 0);
     for rel in SHARED_AGENT_DIRS {
         let dst = worktree.join(rel);
@@ -285,7 +273,6 @@ fn sync_replaces_wrong_symlinks() {
     for rel in SHARED_AGENT_DIRS {
         std::os::unix::fs::symlink(&wrong_target, worktree.join(rel)).unwrap();
     }
-    // 2 wrong dir symlinks get replaced.
     let synced = sync_files(&canonical, &worktree);
     assert_eq!(synced, 2);
     for rel in SHARED_AGENT_DIRS {
@@ -305,14 +292,12 @@ fn sync_handles_broken_symlinks() {
     for rel in SHARED_AGENT_DIRS {
         std::os::unix::fs::symlink(&broken_target, worktree.join(rel)).unwrap();
     }
-    // 2 broken dir symlinks get replaced.
     let synced = sync_files(&canonical, &worktree);
     assert_eq!(synced, 2);
     for rel in SHARED_AGENT_DIRS {
         let dst = worktree.join(rel);
         assert!(dst.is_symlink());
         assert_eq!(std::fs::read_link(&dst).unwrap(), canonical.join(rel));
-        // Directory content should be readable through the fixed symlink.
         assert!(std::fs::read_dir(&dst).is_ok());
     }
 }
@@ -323,9 +308,6 @@ fn writes_through_symlink_reach_canonical() {
     let (_parent, canonical, worktree) = setup_sync_layout();
     sync_files(&canonical, &worktree);
 
-    // Write a scoped managed-agents.json through the agents/scopes symlink.
-    // This is the real production path: worktree writes to its own scope dir
-    // via the shared agents/scopes symlink and the canonical instance sees it.
     let scope_id = "test_scope_abcdef0123456789";
     std::fs::create_dir_all(canonical.join("agents/scopes").join(scope_id)).unwrap();
 
@@ -335,7 +317,6 @@ fn writes_through_symlink_reach_canonical() {
         .join("managed-agents.json");
     std::fs::write(&canonical_path, r#"[{"id":"agent-canonical"}]"#).unwrap();
 
-    // The worktree accesses the same file through the agents/scopes symlink.
     let worktree_path = worktree
         .join("agents/scopes")
         .join(scope_id)
@@ -354,12 +335,10 @@ fn writes_through_symlink_reach_canonical() {
     std::fs::write(&tmp, new_content.as_bytes()).unwrap();
     std::fs::rename(&tmp, &resolved).unwrap();
 
-    // The canonical file should have the new content.
     assert_eq!(
         std::fs::read_to_string(&canonical_path).unwrap(),
         new_content
     );
-    // Reading through the symlink path should return the new content.
     assert_eq!(
         std::fs::read_to_string(&worktree_path).unwrap(),
         new_content
@@ -369,11 +348,8 @@ fn writes_through_symlink_reach_canonical() {
 #[cfg(unix)]
 #[test]
 fn seed_up_migrates_sibling_dir_to_canonical_then_symlinks() {
-    // Verifies that the scopes dir migration from a sibling works correctly.
-    // This replaces the old file-based seed_up test for the scoped layout.
     let (_parent, canonical, worktree) = setup_sync_layout();
     let rel = "agents/scopes";
-    // Remove canonical scopes dir so it gets migrated from a sibling.
     std::fs::remove_dir_all(canonical.join(rel)).unwrap();
     let sibling = canonical
         .parent()
@@ -391,10 +367,8 @@ fn seed_up_migrates_sibling_dir_to_canonical_then_symlinks() {
 
     sync_files(&canonical, &worktree);
 
-    // The scopes dir should now be at canonical (migrated from sibling).
     assert!(canonical.join(rel).is_dir());
     assert!(canonical.join(rel).join("scope_abc").exists());
-    // Worktree is symlinked to canonical's scopes dir.
     let dst = worktree.join(rel);
     assert!(dst.is_symlink());
     assert_eq!(std::fs::read_link(&dst).unwrap(), canonical.join(rel));
@@ -404,15 +378,11 @@ fn seed_up_migrates_sibling_dir_to_canonical_then_symlinks() {
 #[test]
 fn seed_up_no_sibling_content_is_noop() {
     let (_parent, canonical, worktree) = setup_sync_layout();
-    // SHARED_AGENT_FILES is empty, so no file seed-up occurs.
-    // The scopes dir IS in canonical (setup creates it), so this just verifies
-    // that canonical already having the scopes dir means the sibling is ignored.
     let rel = "agents/scopes";
     assert!(canonical.join(rel).is_dir());
 
     sync_files(&canonical, &worktree);
 
-    // Worktree has a symlink to canonical's scopes dir.
     assert!(worktree.join(rel).is_symlink());
     assert_eq!(
         std::fs::read_link(worktree.join(rel)).unwrap(),
@@ -425,7 +395,6 @@ fn seed_up_no_sibling_content_is_noop() {
 fn seed_up_skipped_when_canonical_has_dir() {
     let (_parent, canonical, worktree) = setup_sync_layout();
     let rel = "agents/scopes";
-    // A sibling also holds different content, but canonical already has the dir.
     let sibling = canonical
         .parent()
         .unwrap()
@@ -442,9 +411,7 @@ fn seed_up_skipped_when_canonical_has_dir() {
 
     sync_files(&canonical, &worktree);
 
-    // Canonical already had the scopes dir — sibling content was not promoted.
     assert!(!canonical.join(rel).join("scope_xyz").exists());
-    // Worktree is symlinked to canonical.
     let dst = worktree.join(rel);
     assert!(dst.is_symlink());
     assert_eq!(std::fs::read_link(&dst).unwrap(), canonical.join(rel));
@@ -456,7 +423,6 @@ fn seed_up_ignores_sibling_symlink_dir_as_source() {
     let (_parent, canonical, worktree) = setup_sync_layout();
     let rel = "agents/scopes";
     std::fs::remove_dir_all(canonical.join(rel)).unwrap();
-    // Sibling holds only a symlink (not a real dir) — not a valid seed source.
     let sibling = canonical
         .parent()
         .unwrap()
@@ -465,10 +431,7 @@ fn seed_up_ignores_sibling_symlink_dir_as_source() {
     std::os::unix::fs::symlink(PathBuf::from("/nonexistent/elsewhere"), sibling.join(rel)).unwrap();
 
     sync_files(&canonical, &worktree);
-
-    // The sibling symlink was not promoted; canonical stays missing, so
-    // the sync code creates the canonical dir empty and symlinks the worktree.
-    // (The sync dir-creation path creates canonical empty when canonical is absent.)
+    // Sibling symlink not promoted; sync creates canonical dir empty and symlinks worktree.
 }
 
 #[test]

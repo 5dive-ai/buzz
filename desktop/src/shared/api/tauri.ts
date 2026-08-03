@@ -1142,33 +1142,16 @@ export async function cancelPairing(): Promise<void> {
   await invokeTauri("cancel_pairing");
 }
 
-/**
- * Result from `apply_workspace` / `applyCommunity`.
- *
- * - `applied: true`  — new scope committed; post-commit failures surface in
- *   `degraded` (informational — workspace IS active).
- * - `applied: false` — drain failed; old scope still active; `degraded` names
- *   what could not be stopped or restored by compensation.
- */
-export interface WorkspaceApplyResult {
-  applied: boolean;
-  degraded: string[];
-}
-
+type ApplyWorkspaceResult = { applied: boolean; degraded: string[] };
 export async function applyCommunity(
   relayUrl: string,
   nsec?: string,
   token?: string,
   reposDir?: string,
   agentManagedProfiles?: boolean,
-): Promise<WorkspaceApplyResult> {
-  return invokeTauri<WorkspaceApplyResult>("apply_workspace", {
-    relayUrl,
-    nsec: nsec ?? null,
-    token: token ?? null,
-    reposDir: reposDir ?? null,
-    agentManagedProfiles: agentManagedProfiles ?? false,
-  });
+): Promise<ApplyWorkspaceResult> {
+  // biome-ignore format: single-line call keeps the function under the file-size limit
+  return invokeTauri<ApplyWorkspaceResult>("apply_workspace", { relayUrl, nsec: nsec ?? null, token: token ?? null, reposDir: reposDir ?? null, agentManagedProfiles: agentManagedProfiles ?? false });
 }
 
 // Validate a candidate repos dir without mutating the filesystem. Rejects

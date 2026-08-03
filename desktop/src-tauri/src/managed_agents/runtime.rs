@@ -972,14 +972,13 @@ pub fn start_managed_agent_process(
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
     owner_hex: Option<&str>,
 ) -> Result<(), String> {
-    let relay_url = {
-        use tauri::Manager;
-        let state = app.state::<crate::app_state::AppState>();
-        crate::relay::effective_agent_relay_url(
-            &record.relay_url,
-            &crate::relay::relay_ws_url_with_override(&state),
-        )
-    };
+    use tauri::Manager;
+    let state = app.state::<crate::app_state::AppState>();
+    let relay_url = crate::relay::effective_agent_relay_url(
+        &record.relay_url,
+        &crate::relay::relay_ws_url_with_override(&state),
+    );
+    let scope_id = state.capture_active_scope().map(|s| s.scope_id.clone());
     let key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), &relay_url)?;
     if let Some(runtime) = runtimes.get_mut(&key) {
         if runtime
@@ -1019,11 +1018,6 @@ pub fn start_managed_agent_process(
     record.last_error = None;
     record.last_error_code = None;
 
-    let scope_id = {
-        use tauri::Manager;
-        let state = app.state::<crate::app_state::AppState>();
-        state.capture_active_scope().map(|s| s.scope_id.clone())
-    };
     runtimes.insert(key, ManagedAgentPairRuntime::starting(process, scope_id));
     Ok(())
 }

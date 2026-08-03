@@ -42,12 +42,7 @@ pub fn managed_agents_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Resolve the active-scope `managed-agents.json` path.
-///
-/// Routes through [`crate::app_state::AppState::capture_active_scope`] when a
-/// workspace scope has been committed, and fails closed with a clear error when
-/// no scope is active. There is NO fallback to the legacy unscoped root —
-/// returning a legacy path would recreate split-brain storage.
+/// Resolve the active-scope `managed-agents.json` path, failing closed on no active scope.
 pub(crate) fn managed_agents_store_path(app: &AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager as _;
     let state = app.state::<crate::app_state::AppState>();
@@ -58,9 +53,7 @@ pub(crate) fn managed_agents_store_path(app: &AppHandle) -> Result<PathBuf, Stri
     Ok(managed_agents_store_path_at(&scope.definitions_dir))
 }
 
-/// Scoped variant: resolve `managed-agents.json` under a workspace scope's
-/// definitions directory. For callers that have captured a
-/// `WorkspaceAgentScope` at their operation entry point.
+/// Scoped path variant: resolves `managed-agents.json` under the given scope's definitions dir.
 pub(crate) fn managed_agents_store_path_at(definitions_dir: &std::path::Path) -> PathBuf {
     definitions_dir.join("managed-agents.json")
 }
@@ -260,8 +253,7 @@ fn load_agent_store(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> 
     load_agent_store_at(&path)
 }
 
-/// Path-based variant of [`load_agent_store`]. Used by scoped callers that
-/// have already resolved the correct store path from a [`WorkspaceAgentScope`].
+/// Path-based variant of [`load_agent_store`] for scoped callers.
 pub(crate) fn load_agent_store_at(path: &Path) -> Result<Vec<ManagedAgentRecord>, String> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -291,8 +283,7 @@ pub fn load_managed_agents(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, S
     Ok(records)
 }
 
-/// Scoped variant: load keyed agent instances from the given definitions dir.
-/// For callers that have captured a `WorkspaceAgentScope`.
+/// Scoped variant of [`load_managed_agents`]: load keyed instances from a definitions dir.
 pub(crate) fn load_managed_agents_at(
     definitions_dir: &Path,
 ) -> Result<Vec<ManagedAgentRecord>, String> {
@@ -312,7 +303,6 @@ pub(crate) fn load_agent_definitions(app: &AppHandle) -> Result<Vec<ManagedAgent
     Ok(records)
 }
 
-/// Scoped variant: load key-less agent definitions from the given definitions dir.
 pub(crate) fn load_agent_definitions_at(
     definitions_dir: &Path,
 ) -> Result<Vec<ManagedAgentRecord>, String> {
@@ -428,8 +418,7 @@ pub fn save_managed_agents(app: &AppHandle, records: &[ManagedAgentRecord]) -> R
     write_agent_store(app, definitions, sorted)
 }
 
-/// Scoped variant: save keyed agent instances into the given definitions dir.
-/// For callers that have captured a `WorkspaceAgentScope`.
+/// Scoped variant of [`save_managed_agents`]: save keyed instances into a definitions dir.
 pub(crate) fn save_managed_agents_at(
     definitions_dir: &Path,
     records: &[ManagedAgentRecord],
@@ -492,7 +481,6 @@ fn write_agent_store_at(
     instances: Vec<ManagedAgentRecord>,
 ) -> Result<(), String> {
     let path = managed_agents_store_path_at(definitions_dir);
-    // Ensure the directory exists (scoped dirs are created lazily).
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create scoped store dir: {e}"))?;
@@ -500,7 +488,6 @@ fn write_agent_store_at(
     write_agent_store_to_path(&path, definitions, instances)
 }
 
-/// Write definitions + instances to a specific path.
 fn write_agent_store_to_path(
     path: &Path,
     mut definitions: Vec<ManagedAgentRecord>,

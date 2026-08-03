@@ -94,24 +94,15 @@ pub struct AppState {
     /// `keys` so readers (signing, get_identity, etc.) are not blocked during
     /// keyring I/O.
     ///
-    /// **Layer 1 async lock** — callers may `.await` while holding this guard.
-    /// Lock order: `identity_mutation` → `workspace_transition` → Mesh
-    /// `rearm_lock` → `mesh_llm_runtime`. Converted from `Mutex<()>` to
-    /// `AsyncMutex<()>` so callers in async Tauri commands can hold it across
-    /// awaits without blocking the executor.
+    /// Layer 1 async lock (order: `identity_mutation` → `workspace_transition`
+    /// → Mesh `rearm_lock` → `mesh_llm_runtime`). May hold across `.await`.
     pub identity_mutation: AsyncMutex<()>,
     /// Serializes workspace transitions (`apply_workspace` and live identity
-    /// import). Taken after `identity_mutation` in the lock order.
-    ///
-    /// **Layer 1 async lock** — callers may `.await` while holding this guard.
+    /// import). Layer 1 async lock; taken after `identity_mutation`.
     pub workspace_transition: AsyncMutex<()>,
-    /// The active workspace agent scope — `None` from boot until the first
-    /// successful `apply_workspace`. Every agent command fails closed on `None`.
-    /// There is NO fallback to the legacy unscoped root.
-    ///
-    /// Protected by the **Layer 2 synchronous commit epoch** (no `.await` while
-    /// `managed_agents_store_lock` is held). Read outside the lock for
-    /// non-mutating "capture at entry" use via `capture_active_scope()`.
+    /// Active workspace agent scope. `None` until first `apply_workspace`.
+    /// Every agent command fails closed on `None` — no legacy-root fallback.
+    /// Layer 2 commit epoch (no `.await` while `managed_agents_store_lock` held).
     pub active_agent_scope: Mutex<Option<WorkspaceAgentScope>>,
     /// Set when the boot-time Phase 2 reset attempted a wipe but verification
     /// failed. The sentinel is preserved so the next relaunch retries. All
@@ -267,40 +258,6 @@ impl AppState {
         self.huddle_state.lock().map_err(|e| e.to_string())
     }
 
-    /// Capture a snapshot of the active workspace agent scope.
-    ///
-    /// Operations that cross an `.await` or a thread boundary MUST capture the
-    /// scope at entry (before the first await) and thread it through every
-    /// `_at(scope)` API. A stale commit (generation mismatch) must abort.
-    ///
-    /// Returns `None` when no workspace has been applied yet — callers must
-    /// fail closed on `None`; there is NO fallback to the legacy unscoped root.
-    pub fn capture_active_scope(&self) -> Option<WorkspaceAgentScope> {
-        self.active_agent_scope.lock().ok().and_then(|g| g.clone())
-    }
-
-    /// Set the active workspace agent scope. Called by the infallible commit
-    /// stage of the workspace transition machine.
-    ///
-    /// Must be called while holding `managed_agents_store_lock` (Layer 2) with
-    /// no `.await` pending — the commit stage is the only caller.
-    pub(crate) fn commit_active_scope(&self, scope: WorkspaceAgentScope) {
-        if let Ok(mut g) = self.active_agent_scope.lock() {
-            *g = Some(scope);
-        }
-    }
-
-    /// Clear the active workspace agent scope and bump the generation.
-    ///
-    /// Called by live identity import (drain → persist → clear → re-apply)
-    /// and by the prepare stage when rolling back after a failed pipeline.
-    pub(crate) fn clear_active_scope(&self) {
-        if let Ok(mut g) = self.active_agent_scope.lock() {
-            *g = None;
-        }
-        crate::managed_agents::scope::next_scope_generation();
-    }
-
     pub fn get_session_cache(&self, key: &ManagedAgentRuntimeKey) -> Option<SessionConfigCache> {
         self.session_config_cache.lock().ok()?.get(key).cloned()
     }
@@ -320,33 +277,6 @@ impl AppState {
     pub fn clear_agent_session_caches(&self, pubkey: &str) {
         if let Ok(mut map) = self.session_config_cache.lock() {
             map.retain(|key, _| key.pubkey != pubkey);
-        }
-    }
-
-    /// Record that `channel_id` was just created by `creator_pubkey` and its
-    /// kind:39002 owner membership has not yet been observed.
-    pub fn mark_pending_owned_channel(&self, creator_pubkey: &str, channel_id: &str) {
-        if let Ok(mut set) = self.pending_owned_channels.lock() {
-            set.insert((creator_pubkey.to_string(), channel_id.to_string()));
-        }
-    }
-
-    /// Whether `channel_id` is still awaiting `my_pubkey`'s kind:39002 entry.
-    /// Bound to `my_pubkey` so an in-process identity swap never inherits
-    /// another identity's pending-owner entry for the same channel id.
-    pub fn is_pending_owned_channel(&self, my_pubkey: &str, channel_id: &str) -> bool {
-        self.pending_owned_channels
-            .lock()
-            .map(|set| set.contains(&(my_pubkey.to_string(), channel_id.to_string())))
-            .unwrap_or(false)
-    }
-
-    /// Drop the `(my_pubkey, channel_id)` entry from the pending-owner
-    /// overlay once that identity's real kind:39002 membership has been
-    /// observed.
-    pub fn clear_pending_owned_channel(&self, my_pubkey: &str, channel_id: &str) {
-        if let Ok(mut set) = self.pending_owned_channels.lock() {
-            set.remove(&(my_pubkey.to_string(), channel_id.to_string()));
         }
     }
 

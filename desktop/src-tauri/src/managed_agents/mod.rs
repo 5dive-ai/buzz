@@ -31,6 +31,7 @@ mod runtime;
 mod runtime_commands;
 mod runtime_types;
 pub(crate) mod scope;
+pub(crate) mod scope_init;
 pub(crate) mod snapshot_avatar;
 pub(crate) mod spawn_hash;
 pub(crate) mod storage;

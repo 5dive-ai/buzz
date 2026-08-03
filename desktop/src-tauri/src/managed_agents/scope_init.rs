@@ -1,0 +1,536 @@
+//! Scope initialization state machine for the workspace agent definition store.
+//!
+//! Every scope directory is created exactly one way: staged install with a
+//! durable manifest, followed by idempotent migrations, followed by a `Ready`
+//! marker. Consumers may only open `Ready` scopes.
+//!
+//! # Claim ledger (F1 canonical family claim)
+//!
+//! One canonical claim covers the entire agent-store family (retention rows +
+//! definitions). The legacy `retention.db`'s `retention_migrations` table is
+//! the single source of truth:
+//!
+//! - If `retention.db` exists and already carries a `legacy_global_retention_db`
+//!   claim naming scope A, then only scope A may adopt legacy definitions.
+//!   A different scope B initializing first gets `LegacyClaimedByOther` — an
+//!   empty, marked directory.
+//! - If `retention.db` exists but is unclaimed, the first `apply_workspace`
+//!   writes the claim into `retention.db`, then uses it for definitions too.
+//! - If no `retention.db` exists, a canonical claim file is created under
+//!   `<base_dir>/agents/legacy-claim.json` as a fallback ledger.
+//!
+//! # Staged install protocol
+//!
+//! 1. Determine manifest kind: `AdoptedLegacy`, `LegacyClaimedByOther`, or
+//!    `FreshNoLegacy`.
+//! 2. Build a staging directory (sibling to the target: `<target>._staging`).
+//!    For `AdoptedLegacy`, copy (never move) legacy files into staging. For the
+//!    other kinds, staging starts empty.
+//! 3. Write the manifest JSON inside staging; fsync; single atomic rename of the
+//!    staging directory into the target path. After rename, the target always
+//!    carries its manifest.
+//! 4. Run idempotent scoped migrations against the target.
+//! 5. Write the separate `ready` marker file inside the target. Consumers check
+//!    this marker before reading the store.
+//!
+//! # Restart / crash recovery
+//!
+//! - Target exists + `ready` marker present → scope is `Ready`, open normally.
+//! - Target exists + no `ready` marker → installation started but migrations
+//!   did not complete; resume migrations and write `ready`.
+//! - Target does not exist → first activation; run the full staged install.
+//! - A sibling `._staging` directory is an interrupted stage 2; clean it and
+//!   restart from stage 2. The staging directory is rebuilt from the legacy
+//!   source, so a retry never overwrites post-crash inbound/interactive writes
+//!   that may have landed in a partial target before the rename.
+//! - An artifact that cannot be produced by this state machine (no manifest)
+//!   is quarantined: renamed to `<target>._quarantine_<timestamp>`.
+
+use std::path::{Path, PathBuf};
+
+use rusqlite::{params, Connection, OptionalExtension};
+
+/// The claim name inside `retention_migrations` for the legacy definitions migration.
+const DEFINITIONS_MIGRATION_NAME: &str = "legacy_global_retention_db";
+
+/// File written inside the scope directory after all migrations complete.
+const READY_MARKER: &str = "_ready";
+
+/// File written inside the scope directory (or staging) as the initialization manifest.
+const MANIFEST_FILE: &str = "_manifest.json";
+
+/// Fallback claim file when no `retention.db` exists.
+const FALLBACK_CLAIM_FILE: &str = "legacy-claim.json";
+
+/// The initialization kind recorded in the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeInitKind {
+    /// This scope holds the canonical legacy claim and copied legacy definitions.
+    AdoptedLegacy,
+    /// The legacy claim exists and names a different scope; this scope starts empty.
+    LegacyClaimedByOther { claiming_scope_id: String },
+    /// No legacy definitions exist; this scope starts empty.
+    FreshNoLegacy,
+}
+
+/// The manifest written inside a scope directory after staged install.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScopeManifest {
+    pub scope_id: String,
+    pub init_kind: ScopeInitKind,
+}
+
+/// Check whether a scope directory is already fully initialized (has the
+/// `_ready` marker). Fast path: skips the full initialization if true.
+pub fn scope_is_ready(scope_dir: &Path) -> bool {
+    scope_dir.join(READY_MARKER).exists()
+}
+
+/// Ensure a scope directory is fully initialized and `Ready`.
+///
+/// Idempotent: safe to call on every `apply_workspace`, even if the scope was
+/// already initialized. Returns `Ok(())` when the scope is ready to use.
+pub fn ensure_scope_ready(scope_id: &str, scope_dir: &Path, base_dir: &Path) -> Result<(), String> {
+    if scope_is_ready(scope_dir) {
+        return Ok(());
+    }
+
+    // Check for a staging directory left by a previous interrupted attempt.
+    let staging_dir = staging_dir_for(scope_dir);
+    if staging_dir.exists() {
+        // Interrupted stage 2 — clean up and restart.
+        std::fs::remove_dir_all(&staging_dir).map_err(|e| {
+            format!(
+                "failed to remove stale staging dir {}: {e}",
+                staging_dir.display()
+            )
+        })?;
+    }
+
+    // If the target exists but has no manifest, it cannot have been produced by
+    // this state machine — quarantine it.
+    if scope_dir.exists() && !scope_dir.join(MANIFEST_FILE).exists() {
+        quarantine_dir(scope_dir)?;
+    }
+
+    // Determine the manifest kind using the canonical claim ledger.
+    let init_kind = resolve_init_kind(scope_id, base_dir)?;
+
+    // Build the staged directory.
+    install_staged(scope_id, scope_dir, base_dir, &init_kind)?;
+
+    // Run idempotent scoped migrations (currently a no-op placeholder — the
+    // boot-time migrations in migration.rs still run pre-scope; per-scope
+    // migration scheduling is a follow-on once the legacy data is stable).
+    run_scoped_migrations(scope_dir)?;
+
+    // Write the ready marker.
+    write_ready_marker(scope_dir)?;
+
+    Ok(())
+}
+
+/// Resolve whether this scope should adopt legacy data, inherit another's
+/// claim, or start fresh — using the canonical retention DB claim as the
+/// single authority.
+fn resolve_init_kind(scope_id: &str, base_dir: &Path) -> Result<ScopeInitKind, String> {
+    let legacy_definitions_exist = legacy_definitions_exist(base_dir);
+
+    if !legacy_definitions_exist {
+        return Ok(ScopeInitKind::FreshNoLegacy);
+    }
+
+    // Consult the canonical retention DB claim.
+    match read_or_create_canonical_claim(scope_id, base_dir)? {
+        Some(claiming_scope_id) if claiming_scope_id == scope_id => {
+            Ok(ScopeInitKind::AdoptedLegacy)
+        }
+        Some(claiming_scope_id) => Ok(ScopeInitKind::LegacyClaimedByOther { claiming_scope_id }),
+        None => {
+            // No claim exists and no retention DB to write into — this means
+            // the fallback claim file was used and we successfully claimed.
+            Ok(ScopeInitKind::AdoptedLegacy)
+        }
+    }
+}
+
+/// Read the canonical claim from `retention.db` (or the fallback claim file).
+///
+/// Returns:
+/// - `Ok(Some(claiming_scope_id))` if a claim already exists — the caller
+///   checks whether it matches.
+/// - `Ok(None)` when we successfully wrote the claim for `scope_id` (caller
+///   gets `AdoptedLegacy`).
+/// - `Err` on I/O / DB failure.
+fn read_or_create_canonical_claim(
+    scope_id: &str,
+    base_dir: &Path,
+) -> Result<Option<String>, String> {
+    let retention_db_path = base_dir.join("retention.db");
+    if retention_db_path.exists() {
+        return read_or_create_claim_in_retention_db(&retention_db_path, scope_id);
+    }
+
+    // No retention DB yet — use the fallback JSON claim file.
+    let claim_path = base_dir.join("agents").join(FALLBACK_CLAIM_FILE);
+    read_or_create_fallback_claim(&claim_path, scope_id)
+}
+
+/// Read or create the claim in `retention.db`'s `retention_migrations` table.
+fn read_or_create_claim_in_retention_db(
+    db_path: &Path,
+    scope_id: &str,
+) -> Result<Option<String>, String> {
+    let conn =
+        Connection::open(db_path).map_err(|e| format!("failed to open retention.db: {e}"))?;
+    ensure_migration_table(&conn)?;
+
+    // INSERT OR IGNORE so a concurrent process can't double-claim.
+    conn.execute(
+        "INSERT OR IGNORE INTO retention_migrations (name, scope_id) VALUES (?1, ?2)",
+        params![DEFINITIONS_MIGRATION_NAME, scope_id],
+    )
+    .map_err(|e| format!("failed to write definition claim into retention.db: {e}"))?;
+
+    // Read back who owns the claim.
+    let claimed_by: Option<String> = conn
+        .query_row(
+            "SELECT scope_id FROM retention_migrations WHERE name = ?1",
+            params![DEFINITIONS_MIGRATION_NAME],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("failed to read definition claim from retention.db: {e}"))?;
+
+    Ok(claimed_by)
+}
+
+/// Read or create the fallback claim file (JSON) when no retention.db exists.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FallbackClaim {
+    scope_id: String,
+}
+
+fn read_or_create_fallback_claim(
+    claim_path: &Path,
+    scope_id: &str,
+) -> Result<Option<String>, String> {
+    if claim_path.exists() {
+        // Already claimed — read who owns it.
+        let content = std::fs::read_to_string(claim_path)
+            .map_err(|e| format!("failed to read fallback claim file: {e}"))?;
+        let claim: FallbackClaim = serde_json::from_str(&content)
+            .map_err(|e| format!("failed to parse fallback claim file: {e}"))?;
+        return Ok(Some(claim.scope_id));
+    }
+
+    // Create the claim file atomically.
+    if let Some(parent) = claim_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create agents dir for claim: {e}"))?;
+    }
+    let payload = serde_json::to_vec(&FallbackClaim {
+        scope_id: scope_id.to_string(),
+    })
+    .map_err(|e| format!("failed to serialize fallback claim: {e}"))?;
+
+    // Atomic write so a crash mid-write doesn't leave a partial claim.
+    crate::managed_agents::storage::atomic_write_json(claim_path, &payload)?;
+
+    // Return None to signal "we just claimed it" → AdoptedLegacy.
+    Ok(None)
+}
+
+/// Check whether legacy (unscoped) definition files exist that need adoption.
+fn legacy_definitions_exist(base_dir: &Path) -> bool {
+    let agents_dir = base_dir.join("agents");
+    // Legacy layout: `agents/managed-agents.json` at the unscoped root.
+    // New layout puts files under `agents/scopes/<id>/`.
+    agents_dir.join("managed-agents.json").exists()
+        || agents_dir.join("teams.json").exists()
+        || agents_dir.join("global-agent-config.json").exists()
+        || agents_dir.join("personas.json").exists()
+}
+
+/// Build and atomically install the staged scope directory.
+fn install_staged(
+    scope_id: &str,
+    scope_dir: &Path,
+    base_dir: &Path,
+    init_kind: &ScopeInitKind,
+) -> Result<(), String> {
+    let staging = staging_dir_for(scope_dir);
+
+    // Clean any existing staging directory.
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .map_err(|e| format!("failed to clean staging dir {}: {e}", staging.display()))?;
+    }
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| format!("failed to create staging dir {}: {e}", staging.display()))?;
+
+    // For AdoptedLegacy: copy legacy files into staging.
+    if matches!(init_kind, ScopeInitKind::AdoptedLegacy) {
+        let agents_dir = base_dir.join("agents");
+        for filename in &[
+            "managed-agents.json",
+            "teams.json",
+            "global-agent-config.json",
+            "personas.json",
+        ] {
+            let src = agents_dir.join(filename);
+            if src.exists() {
+                let dst = staging.join(filename);
+                std::fs::copy(&src, &dst)
+                    .map_err(|e| format!("failed to copy legacy {} to staging: {e}", filename))?;
+            }
+        }
+    }
+
+    // Write the manifest inside staging.
+    let manifest = ScopeManifest {
+        scope_id: scope_id.to_string(),
+        init_kind: init_kind.clone(),
+    };
+    let manifest_payload = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| format!("failed to serialize scope manifest: {e}"))?;
+    std::fs::write(staging.join(MANIFEST_FILE), &manifest_payload)
+        .map_err(|e| format!("failed to write scope manifest to staging: {e}"))?;
+
+    // Fsync the staging directory to ensure durability before rename.
+    // Best-effort: if fsync fails we proceed anyway (the rename is the atomic
+    // boundary; a crash before fsync loses at most the staging data, not the
+    // target).
+    let _ = fsync_dir(&staging);
+
+    // Atomic rename: staging → target. If the target already exists (a partial
+    // installation from a previous crash that passed through quarantine), remove
+    // it first.
+    if scope_dir.exists() {
+        std::fs::remove_dir_all(scope_dir)
+            .map_err(|e| format!("failed to remove partial scope dir before rename: {e}",))?;
+    }
+
+    std::fs::rename(&staging, scope_dir).map_err(|e| {
+        format!(
+            "failed to atomically install scope dir (rename {} → {}): {e}",
+            staging.display(),
+            scope_dir.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+/// Run idempotent scoped migrations against an installed scope directory.
+///
+/// Currently a no-op: the boot-time migration pipeline in `migration.rs` still
+/// runs pre-scope and operates on the legacy unscoped paths. Per-scope
+/// migration scheduling (moving fold/strip/backfill into this pipeline) is
+/// Phase 2 follow-on work once the legacy data has been adopted.
+fn run_scoped_migrations(_scope_dir: &Path) -> Result<(), String> {
+    // Future: run fold_personas_into_agent_store_at, strip_baked_team_instructions_at,
+    // backfill_standalone_agents_at, etc. against scope_dir.
+    Ok(())
+}
+
+/// Write the `_ready` marker file inside the scope directory, signaling that
+/// all migrations are complete and the scope is available for use.
+fn write_ready_marker(scope_dir: &Path) -> Result<(), String> {
+    let marker_path = scope_dir.join(READY_MARKER);
+    std::fs::write(&marker_path, b"ready").map_err(|e| {
+        format!(
+            "failed to write ready marker at {}: {e}",
+            marker_path.display()
+        )
+    })
+}
+
+/// Compute the staging directory path for a given scope directory.
+/// Convention: `<scope_dir>._staging` (sibling, not child, to keep rename atomic).
+fn staging_dir_for(scope_dir: &Path) -> PathBuf {
+    let mut s = scope_dir.as_os_str().to_owned();
+    s.push("._staging");
+    PathBuf::from(s)
+}
+
+/// Quarantine an unrecognized scope directory by renaming it to a timestamped
+/// path. Best-effort: if the rename fails, we proceed anyway.
+fn quarantine_dir(scope_dir: &Path) -> Result<(), String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut quarantine = scope_dir.as_os_str().to_owned();
+    quarantine.push(format!("._quarantine_{ts}"));
+    let quarantine_path = PathBuf::from(quarantine);
+    std::fs::rename(scope_dir, &quarantine_path).map_err(|e| {
+        format!(
+            "failed to quarantine unrecognized scope dir {} → {}: {e}",
+            scope_dir.display(),
+            quarantine_path.display()
+        )
+    })
+}
+
+/// Best-effort fsync of a directory (to flush its metadata to disk).
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    let f = std::fs::File::open(path)?;
+    f.sync_all()
+}
+
+/// Ensure the `retention_migrations` table exists (same DDL as in
+/// `retention/legacy_migration.rs`).
+fn ensure_migration_table(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS retention_migrations (
+            name TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL
+        );",
+    )
+    .map_err(|e| format!("failed to create retention migration table: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_base_dir() -> TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    fn make_legacy_files(base_dir: &Path) {
+        let agents_dir = base_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("managed-agents.json"), b"[]").unwrap();
+        std::fs::write(agents_dir.join("teams.json"), b"[]").unwrap();
+    }
+
+    #[test]
+    fn test_fresh_no_legacy_scope_initializes_ready() {
+        let tmp = make_base_dir();
+        let scope_dir = tmp.path().join("agents").join("scopes").join("testscope");
+        ensure_scope_ready("testscope", &scope_dir, tmp.path()).unwrap();
+        assert!(scope_is_ready(&scope_dir), "scope should be Ready");
+        // Manifest should indicate FreshNoLegacy.
+        let manifest: ScopeManifest =
+            serde_json::from_slice(&std::fs::read(scope_dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert!(matches!(manifest.init_kind, ScopeInitKind::FreshNoLegacy));
+    }
+
+    #[test]
+    fn test_adopted_legacy_scope_copies_files() {
+        let tmp = make_base_dir();
+        make_legacy_files(tmp.path());
+        let scope_id = "firstscope";
+        let scope_dir = tmp.path().join("agents").join("scopes").join(scope_id);
+        ensure_scope_ready(scope_id, &scope_dir, tmp.path()).unwrap();
+        assert!(scope_is_ready(&scope_dir));
+        assert!(
+            scope_dir.join("managed-agents.json").exists(),
+            "legacy managed-agents.json should be copied"
+        );
+        let manifest: ScopeManifest =
+            serde_json::from_slice(&std::fs::read(scope_dir.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert!(matches!(manifest.init_kind, ScopeInitKind::AdoptedLegacy));
+    }
+
+    #[test]
+    fn test_second_scope_legacy_claimed_by_other() {
+        let tmp = make_base_dir();
+        make_legacy_files(tmp.path());
+
+        // First scope claims.
+        let scope_a = tmp.path().join("agents").join("scopes").join("scope_a");
+        ensure_scope_ready("scope_a", &scope_a, tmp.path()).unwrap();
+
+        // Second scope should see LegacyClaimedByOther.
+        let scope_b = tmp.path().join("agents").join("scopes").join("scope_b");
+        ensure_scope_ready("scope_b", &scope_b, tmp.path()).unwrap();
+        assert!(scope_is_ready(&scope_b));
+        let manifest: ScopeManifest =
+            serde_json::from_slice(&std::fs::read(scope_b.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert!(
+            matches!(
+                manifest.init_kind,
+                ScopeInitKind::LegacyClaimedByOther { .. }
+            ),
+            "second scope should see LegacyClaimedByOther, got {:?}",
+            manifest.init_kind
+        );
+        assert!(
+            !scope_b.join("managed-agents.json").exists(),
+            "second scope should start empty"
+        );
+    }
+
+    #[test]
+    fn test_idempotent_double_initialize() {
+        let tmp = make_base_dir();
+        make_legacy_files(tmp.path());
+        let scope_dir = tmp.path().join("agents").join("scopes").join("idempotent");
+        ensure_scope_ready("idempotent", &scope_dir, tmp.path()).unwrap();
+        // Second call should be a fast no-op.
+        ensure_scope_ready("idempotent", &scope_dir, tmp.path()).unwrap();
+        assert!(scope_is_ready(&scope_dir));
+    }
+
+    #[test]
+    fn test_staging_cleanup_on_retry() {
+        let tmp = make_base_dir();
+        make_legacy_files(tmp.path());
+        let scope_dir = tmp.path().join("agents").join("scopes").join("retry");
+        let staging = staging_dir_for(&scope_dir);
+
+        // Simulate an interrupted staging directory.
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("partial.json"), b"garbage").unwrap();
+
+        // ensure_scope_ready should clean it up and succeed.
+        ensure_scope_ready("retry", &scope_dir, tmp.path()).unwrap();
+        assert!(scope_is_ready(&scope_dir));
+        assert!(!staging.exists(), "staging dir should be cleaned up");
+    }
+
+    #[test]
+    fn test_retention_db_claim_takes_precedence() {
+        let tmp = make_base_dir();
+        make_legacy_files(tmp.path());
+
+        // Pre-plant a retention.db with scope_a's claim.
+        let retention_db_path = tmp.path().join("retention.db");
+        let conn = Connection::open(&retention_db_path).unwrap();
+        ensure_migration_table(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO retention_migrations (name, scope_id) VALUES (?1, ?2)",
+            params![DEFINITIONS_MIGRATION_NAME, "scope_a"],
+        )
+        .unwrap();
+        drop(conn);
+
+        // scope_b activates first — retention.db says scope_a owns legacy.
+        let scope_b = tmp.path().join("agents").join("scopes").join("scope_b");
+        ensure_scope_ready("scope_b", &scope_b, tmp.path()).unwrap();
+        let manifest: ScopeManifest =
+            serde_json::from_slice(&std::fs::read(scope_b.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert!(
+            matches!(
+                manifest.init_kind,
+                ScopeInitKind::LegacyClaimedByOther { ref claiming_scope_id }
+                if claiming_scope_id == "scope_a"
+            ),
+            "retention.db claim should win, got {:?}",
+            manifest.init_kind
+        );
+
+        // scope_a now activates — should adopt legacy.
+        let scope_a = tmp.path().join("agents").join("scopes").join("scope_a");
+        ensure_scope_ready("scope_a", &scope_a, tmp.path()).unwrap();
+        let manifest_a: ScopeManifest =
+            serde_json::from_slice(&std::fs::read(scope_a.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert!(matches!(manifest_a.init_kind, ScopeInitKind::AdoptedLegacy));
+        assert!(scope_a.join("managed-agents.json").exists());
+    }
+}

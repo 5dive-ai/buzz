@@ -171,6 +171,33 @@ pub async fn apply_workspace(
             None => None,
         };
 
+        // ── Prepare: derive target scope and run staged initialization ────────
+        // This is the reversible prepare stage: the old scope remains active
+        // throughout. We derive the effective owner pubkey (candidate keys win
+        // over existing, mirroring the commit below) and call ensure_scope_ready
+        // which handles the canonical claim ledger, staged install, idempotent
+        // migrations, and the Ready marker. Any error here leaves the old scope
+        // untouched and returns Err before any state mutation.
+        let base_dir = crate::managed_agents::managed_agents_base_dir(&app).unwrap_or_default();
+        let effective_owner_pubkey = match &parsed_keys {
+            Some(keys) => keys.public_key().to_hex(),
+            None => state
+                .keys
+                .lock()
+                .map_err(|e| e.to_string())?
+                .public_key()
+                .to_hex(),
+        };
+        let target_scope_id =
+            crate::managed_agents::scope::derive_scope_id(&relay_url, &effective_owner_pubkey);
+        let scope_dir =
+            crate::managed_agents::scope::scoped_definitions_dir(&base_dir, &target_scope_id);
+        crate::managed_agents::scope_init::ensure_scope_ready(
+            &target_scope_id,
+            &scope_dir,
+            &base_dir,
+        )?;
+
         // ── Layer 2: synchronous commit epoch ────────────────────────────────
         // No .await may be held while any Layer-2 guard is live. Relay override,
         // keys, and the active scope are all committed in this critical section.
@@ -207,7 +234,6 @@ pub async fn apply_workspace(
                 .map_err(|e| e.to_string())?
                 .public_key()
                 .to_hex();
-            let base_dir = crate::managed_agents::managed_agents_base_dir(&app).unwrap_or_default();
             let generation = crate::managed_agents::scope::next_scope_generation();
             let scope = crate::managed_agents::scope::WorkspaceAgentScope::new(
                 relay_url,
@@ -215,10 +241,6 @@ pub async fn apply_workspace(
                 &base_dir,
                 generation,
             );
-            // Ensure the scoped dir exists so first-apply callers find it.
-            if let Err(e) = scope.ensure_dir() {
-                eprintln!("buzz-desktop: failed to create scope dir: {e}");
-            }
             state.commit_active_scope(scope);
         }
 

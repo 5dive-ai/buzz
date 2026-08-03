@@ -735,6 +735,96 @@ async fn runtime_finalizer_allows_existing_binding_without_key_claim() {
 }
 
 #[tokio::test]
+async fn mismatched_embedded_proof_domain_fails_before_authority_io() {
+    let actor = Keys::generate();
+    let (_, assertion, request) = direct_evidence(&actor, EnrollmentMode::Tofu, false);
+    let provider = FakeProvider::returning(allow_for(
+        &request,
+        request.requested_capabilities().clone(),
+        "version-a",
+        90,
+        180,
+    ));
+    let authority = TestAuthorityAdapter::new(1, EnrollmentMode::Tofu, true);
+    let runtime = AuthorizationRuntime::from_server_configuration(
+        authority.clone(),
+        TestClock::at(NOW),
+        provider,
+    );
+    let AuthorizationOutcome::Allow(snapshot) = runtime
+        .resolve_authorization(&request, provider_timeout())
+        .await
+    else {
+        panic!("current provider decision must allow");
+    };
+    let mismatched_proof = VerifiedNostrProof::new(
+        domain(2),
+        AuthTransport::RelayWebSocket,
+        actor.public_key(),
+        AuthMethod::Nip42,
+        None,
+    )
+    .expect("synthetic mismatched proof is structurally valid");
+
+    let error = runtime
+        .finalize_direct_v1(*snapshot, finalization_input(mismatched_proof), assertion)
+        .await
+        .expect_err("embedded proof domain mismatch must precede authority I/O");
+
+    assert_eq!(
+        error,
+        ProviderAuthorizationError::Context(AuthContextError::NostrProofDomainMismatch)
+    );
+    assert_eq!(authority.policy_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(authority.direct_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(authority.committed_enrollments.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn mismatched_community_access_domain_fails_before_authority_io() {
+    let actor = Keys::generate();
+    let (proof, assertion, request) = direct_evidence(&actor, EnrollmentMode::Tofu, false);
+    let provider = FakeProvider::returning(allow_for(
+        &request,
+        request.requested_capabilities().clone(),
+        "version-a",
+        90,
+        180,
+    ));
+    let authority = TestAuthorityAdapter::new(1, EnrollmentMode::Tofu, true);
+    let runtime = AuthorizationRuntime::from_server_configuration(
+        authority.clone(),
+        TestClock::at(NOW),
+        provider,
+    );
+    let AuthorizationOutcome::Allow(snapshot) = runtime
+        .resolve_authorization(&request, provider_timeout())
+        .await
+    else {
+        panic!("current provider decision must allow");
+    };
+    let input = AuthContextInput::new(
+        buzz_core::TenantContext::resolved(domain(1), "relay.example"),
+        Uuid::from_u128(20),
+        proof,
+        AuthorizedCommunityAccess::new(domain(2), Scope::all_known(), None),
+    );
+
+    let error = runtime
+        .finalize_direct_v1(*snapshot, input, assertion)
+        .await
+        .expect_err("embedded admission domain mismatch must precede authority I/O");
+
+    assert_eq!(
+        error,
+        ProviderAuthorizationError::Context(AuthContextError::CommunityAccessDomainMismatch)
+    );
+    assert_eq!(authority.policy_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(authority.direct_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(authority.committed_enrollments.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn attested_enrollment_without_sealed_key_claim_fails_before_commit() {
     let actor = Keys::generate();
     let (proof, assertion, request) = direct_evidence(&actor, EnrollmentMode::AttestedKey, false);

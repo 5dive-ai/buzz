@@ -1147,6 +1147,7 @@ impl CapabilitySnapshot {
         assertion: VerifiedFederatedAssertion,
         clock: &dyn AuthorizationClock,
     ) -> Result<AuthContext, ProviderAuthorizationError<A::Error>> {
+        self.validate_embedded_domains(&input)?;
         let before_policy = finalization_time(clock)?;
         self.validate_common(&input, before_policy)?;
         self.validate_direct_shape(&input, &assertion, before_policy)?;
@@ -1200,6 +1201,7 @@ impl CapabilitySnapshot {
         input: AuthContextInput,
         clock: &dyn AuthorizationClock,
     ) -> Result<AuthContext, ProviderAuthorizationError<A::Error>> {
+        self.validate_embedded_domains(&input)?;
         let before_policy = finalization_time(clock)?;
         self.validate_common(&input, before_policy)?;
         let owner_pubkey = self.validate_delegated_shape(&input)?;
@@ -1272,6 +1274,17 @@ impl CapabilitySnapshot {
         }
         if now_unix_seconds >= self.effective_until {
             return Err(ProviderContractError::CapabilityExpired);
+        }
+        Ok(())
+    }
+
+    fn validate_embedded_domains(&self, input: &AuthContextInput) -> Result<(), AuthContextError> {
+        let authorization_domain = input.authorization_domain();
+        if input.nostr_proof_authorization_domain() != authorization_domain {
+            return Err(AuthContextError::NostrProofDomainMismatch);
+        }
+        if input.community_access_authorization_domain() != authorization_domain {
+            return Err(AuthContextError::CommunityAccessDomainMismatch);
         }
         Ok(())
     }

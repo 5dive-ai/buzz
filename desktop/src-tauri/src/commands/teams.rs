@@ -239,7 +239,7 @@ pub async fn delete_team(id: String, app: AppHandle) -> Result<(), String> {
         for persona_d_tag in &cascaded_persona_d_tags {
             super::personas::tombstone_persona_pending(&app, &state, persona_d_tag);
         }
-        try_regenerate_nest(&app);
+        try_regenerate_nest(&app).ok();
         Ok(())
     })
     .await

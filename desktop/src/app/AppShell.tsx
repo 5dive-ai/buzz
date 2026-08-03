@@ -109,6 +109,7 @@ export function AppShell() {
   useTauriWindowDrag();
   useWebviewScrollBoundaryLock();
   const communitiesHook = useCommunities();
+  const { activeCommunity, reinitKey } = communitiesHook;
   const hasCommunityRail = communitiesHook.communities.length > 1;
   const addCommunityDialog = useAddCommunityDialogState();
   const [isChannelManagementOpen, setIsChannelManagementOpen] =
@@ -123,7 +124,7 @@ export function AppShell() {
   const mainInsetRef = React.useRef<HTMLElement>(null);
   const location = useLocation();
   const queryClient = useQueryClient();
-  useManagedAgentRuntimeReconciliation(String(communitiesHook.reinitKey)); // re-runs on workspace switch
+  useManagedAgentRuntimeReconciliation(`${activeCommunity?.id}-${reinitKey}`);
   const {
     goAgents,
     goChannel,
@@ -168,10 +169,7 @@ export function AppShell() {
   const { starredChannelIds, starChannel, unstarChannel } = useChannelStars(
     identityQuery.data?.pubkey,
   );
-  usePersonaSync(
-    identityQuery.data?.pubkey,
-    communitiesHook.activeCommunity?.relayUrl,
-  );
+  usePersonaSync(identityQuery.data?.pubkey, activeCommunity?.relayUrl);
   useAgentsDataRefresh();
   // Chunk F: auto-restart drifted idle agents (per-agent opt-out, default ON).
   useAutoRestartPolicy();
@@ -231,8 +229,8 @@ export function AppShell() {
       : undefined;
   const relayConnectionCard = useSidebarRelayConnectionCard(
     channelsErrorMessage,
-    communitiesHook.activeCommunity?.relayUrl,
-    `${communitiesHook.activeCommunity?.id ?? "none"}-${communitiesHook.reinitKey}`,
+    activeCommunity?.relayUrl,
+    `${activeCommunity?.id ?? "none"}-${reinitKey}`,
   );
   const memberChannels = React.useMemo(
     () => channels.filter((channel) => channel.isMember),

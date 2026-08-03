@@ -38,12 +38,17 @@ pub fn run_event_sync(
 /// `AppState::keys` mutex. The reconcile itself is still synchronous JSON,
 /// SQLite, and signing work, so it runs on the blocking pool rather than an
 /// async worker.
+///
+/// Returns `Err` when the `spawn_blocking` call itself fails to enqueue (the
+/// thread pool is exhausted or the runtime is shutting down). Completion
+/// failures from the reconcile task are logged internally and do not reach
+/// the caller — only dispatch failure reaches here.
 pub fn spawn_event_sync(
     app: tauri::AppHandle,
     owner_keys: nostr::Keys,
     db_path: std::path::PathBuf,
     definitions_dir: std::path::PathBuf,
-) {
+) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
             run_event_sync(&app, &owner_keys, &db_path, &definitions_dir);
@@ -53,6 +58,7 @@ pub fn spawn_event_sync(
             eprintln!("buzz-desktop: event-sync: spawn_blocking failed: {e}");
         }
     });
+    Ok(())
 }
 
 /// Reconcile `personas.json` into the persona-event retention store.

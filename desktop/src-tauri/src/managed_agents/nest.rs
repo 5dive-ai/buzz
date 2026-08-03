@@ -692,11 +692,13 @@ pub fn regenerate_nest_context(app: &AppHandle) -> Result<(), String> {
 /// Convenience wrapper: regenerates nest context, logging a warning on failure.
 ///
 /// All call sites treat regeneration as fire-and-forget — agents run fine with
-/// a stale AGENTS.md, so we warn and continue rather than propagating the error.
-pub fn try_regenerate_nest(app: &AppHandle) {
-    if let Err(error) = regenerate_nest_context(app) {
+/// a stale AGENTS.md. Returns `Err` when regeneration fails so callers can
+/// report it as degradation in the workspace-apply result.
+pub fn try_regenerate_nest(app: &AppHandle) -> Result<(), String> {
+    regenerate_nest_context(app).map_err(|error| {
         eprintln!("buzz-desktop: nest context regeneration failed: {error}");
-    }
+        error
+    })
 }
 
 #[cfg(test)]

@@ -748,7 +748,7 @@ pub async fn confirm_team_snapshot_import(
         }
         crate::commands::teams::retain_team_pending(&app, &state, &imported_team);
 
-        crate::managed_agents::try_regenerate_nest(&app);
+        crate::managed_agents::try_regenerate_nest(&app).ok();
         let _ = app.emit("agents-data-changed", ());
 
         imported_team

@@ -978,7 +978,7 @@ pub async fn create_managed_agent(
         agent
     };
 
-    try_regenerate_nest(&app);
+    try_regenerate_nest(&app).ok();
 
     // ── Phase 4: sync agent profile on relay (async, outside lock) ───────────
     // Use the avatar persisted on the record so the published profile and any
@@ -1343,7 +1343,7 @@ pub async fn delete_managed_agent(
             // best-effort, inside-the-lock contract as the tombstone above.
             archive_managed_agent_pending(&app, &state, &pubkey);
         }
-        try_regenerate_nest(&app);
+        try_regenerate_nest(&app).ok();
         Ok(())
     })
     .await

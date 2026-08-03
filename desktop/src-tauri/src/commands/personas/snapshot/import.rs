@@ -664,7 +664,7 @@ pub async fn confirm_agent_snapshot_import(
         // inlined here to avoid cross-module private-fn access.)
         retain_agent_pending(&app, &state, &record);
 
-        crate::managed_agents::try_regenerate_nest(&app);
+        crate::managed_agents::try_regenerate_nest(&app).ok();
 
         // Notify other mounted clients of local persona+managed-agent writes,
         // matching the contract used by other local managed-agent mutations.

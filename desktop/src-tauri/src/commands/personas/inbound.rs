@@ -177,7 +177,7 @@ fn reconcile_inbound_persona_event_blocking(
         }
         _ => unreachable!("kind gated above"),
     }
-    try_regenerate_nest(&app);
+    try_regenerate_nest(&app).ok();
 
     // Signal the live UI to refetch agents data — inbound relay events otherwise
     // land on disk silently, leaving the Agents tab stale until restart.
@@ -315,7 +315,7 @@ fn reconcile_inbound_tombstone(
         }
         _ => unreachable!("target kind gated above"),
     }
-    try_regenerate_nest(app);
+    try_regenerate_nest(app).ok();
 
     // Refresh the live UI on inbound deletion — a removal is as user-visible as
     // an upsert and the Agents tab must drop the tombstoned record without restart.

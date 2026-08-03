@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { isMacPlatform } from "@/shared/lib/platform";
+import { toast } from "sonner";
 
 import { relayClient } from "@/shared/api/relayClient";
 import { resetRateLimitGate } from "@/shared/api/relayRateLimitGate";
@@ -238,13 +239,19 @@ export function useCommunityInit(
           return;
         }
 
-        // Workspace applied. Log any post-commit degradation (informational —
-        // the workspace IS active; these are best-effort post-commit steps).
+        // Workspace applied. Surface any post-commit degradation as a
+        // user-visible warning toast — the workspace IS active, but some
+        // best-effort post-commit steps failed (nest, event-sync, restore).
         if (applyResult.degraded.length > 0) {
+          const reason = applyResult.degraded.join("; ");
           console.warn(
             "[useCommunityInit] workspace applied with degradation:",
             applyResult.degraded,
           );
+          toast.warning("Workspace applied with partial failures", {
+            description: reason,
+            duration: 8000,
+          });
         }
       } catch (error) {
         // A bad `repos_dir` no longer reaches here — `apply_workspace` treats

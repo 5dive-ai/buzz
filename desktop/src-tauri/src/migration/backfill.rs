@@ -31,7 +31,6 @@ use crate::managed_agents::{
 /// The manufactured definition's slug is the agent's pubkey: 64-hex passes
 /// the NIP-AP slug grammar on both relay and desktop ends, and agent pubkeys
 /// are unique, so the coordinate is collision-free by construction.
-
 /// Core backfill logic, decoupled from the Tauri `AppHandle` for testing.
 /// Returns the number of records backfilled (0 = nothing to do).
 pub(crate) fn backfill_standalone_agents_in_dir(base_dir: &Path) -> Result<usize, String> {

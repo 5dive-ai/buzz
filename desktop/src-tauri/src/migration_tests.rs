@@ -538,7 +538,8 @@ fn patch_json_records_rewrites_secret_store_owner_only() {
         let provider = obj.remove("provider").unwrap();
         obj.insert("runtime".to_string(), provider);
         true
-    });
+    })
+    .unwrap();
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "secret-bearing rewrite must be owner-only");
@@ -633,7 +634,7 @@ fn reconcile_mcp_commands_clears_stale_buzz_mcp_server() {
             "mcp_command": "buzz-mcp-server"
         }]),
     );
-    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json"));
+    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json")).unwrap();
     let records = read_agents_json(dir.path());
     assert_eq!(records[0]["mcp_command"], "");
 }
@@ -649,7 +650,7 @@ fn reconcile_mcp_commands_sets_canonical_for_buzz_agent() {
             "mcp_command": "buzz-mcp-server"
         }]),
     );
-    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json"));
+    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json")).unwrap();
     let records = read_agents_json(dir.path());
     assert_eq!(records[0]["mcp_command"], "buzz-dev-mcp");
 }
@@ -665,7 +666,7 @@ fn reconcile_mcp_commands_leaves_custom_value_untouched() {
     write_agents_json(dir.path(), &json);
     let path = dir.path().join("agents/managed-agents.json");
     let before = std::fs::read_to_string(&path).unwrap();
-    reconcile_mcp_commands_in_file(&path);
+    reconcile_mcp_commands_in_file(&path).unwrap();
     assert_eq!(before, std::fs::read_to_string(&path).unwrap());
 }
 
@@ -680,7 +681,7 @@ fn reconcile_mcp_commands_leaves_unknown_runtime_untouched() {
     write_agents_json(dir.path(), &json);
     let path = dir.path().join("agents/managed-agents.json");
     let before = std::fs::read_to_string(&path).unwrap();
-    reconcile_mcp_commands_in_file(&path);
+    reconcile_mcp_commands_in_file(&path).unwrap();
     assert_eq!(before, std::fs::read_to_string(&path).unwrap());
 }
 
@@ -696,9 +697,9 @@ fn reconcile_mcp_commands_is_idempotent() {
         }]),
     );
     let path = dir.path().join("agents/managed-agents.json");
-    reconcile_mcp_commands_in_file(&path);
+    reconcile_mcp_commands_in_file(&path).unwrap();
     let after_first = std::fs::read_to_string(&path).unwrap();
-    reconcile_mcp_commands_in_file(&path);
+    reconcile_mcp_commands_in_file(&path).unwrap();
     assert_eq!(after_first, std::fs::read_to_string(&path).unwrap());
 }
 
@@ -714,7 +715,7 @@ fn reconcile_mcp_commands_handles_mixed_agents() {
             {"name": "Stale Buzz", "agent_command": "buzz-agent", "mcp_command": "buzz-mcp-server"}
         ]),
     );
-    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json"));
+    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json")).unwrap();
     let records = read_agents_json(dir.path());
     assert_eq!(records[0]["mcp_command"], "");
     assert_eq!(records[1]["mcp_command"], "");
@@ -741,7 +742,7 @@ fn reconcile_mcp_commands_resolves_persona_runtime_over_stale_snapshot() {
         dir.path(),
         &serde_json::json!([{"id": "p1", "runtime": "goose"}]),
     );
-    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json"));
+    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json")).unwrap();
     let records = read_agents_json(dir.path());
     assert_eq!(records[0]["mcp_command"], "");
 }
@@ -771,7 +772,7 @@ fn reconcile_mcp_commands_sees_team_dir_runtime_edit_same_launch() {
         dir.path(),
         &serde_json::json!([{"id": "p1", "runtime": "goose"}]),
     );
-    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json"));
+    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json")).unwrap();
     assert_eq!(
         read_agents_json(dir.path())[0]["mcp_command"],
         "",
@@ -785,7 +786,7 @@ fn reconcile_mcp_commands_sees_team_dir_runtime_edit_same_launch() {
         dir.path(),
         &serde_json::json!([{"id": "p1", "runtime": "buzz-agent"}]),
     );
-    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json"));
+    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json")).unwrap();
     assert_eq!(
         read_agents_json(dir.path())[0]["mcp_command"],
         "buzz-dev-mcp",
@@ -813,7 +814,7 @@ fn reconcile_mcp_commands_honors_explicit_override_over_persona() {
         dir.path(),
         &serde_json::json!([{"id": "p1", "runtime": "goose"}]),
     );
-    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json"));
+    reconcile_mcp_commands_in_file(&dir.path().join("agents/managed-agents.json")).unwrap();
     let records = read_agents_json(dir.path());
     assert_eq!(records[0]["mcp_command"], "buzz-dev-mcp");
 }
@@ -828,7 +829,7 @@ fn reconcile_mcp_commands_skips_record_without_agent_command() {
     write_agents_json(dir.path(), &json);
     let path = dir.path().join("agents/managed-agents.json");
     let before = std::fs::read_to_string(&path).unwrap();
-    reconcile_mcp_commands_in_file(&path);
+    reconcile_mcp_commands_in_file(&path).unwrap();
     assert_eq!(before, std::fs::read_to_string(&path).unwrap());
 }
 

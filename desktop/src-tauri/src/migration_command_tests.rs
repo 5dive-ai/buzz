@@ -14,7 +14,7 @@ fn reconcile_legacy_command_names_rewrites_renamed_sidecars() {
         }]),
     );
 
-    reconcile_legacy_command_names_in_file(&dir.path().join("agents/managed-agents.json"));
+    reconcile_legacy_command_names_in_file(&dir.path().join("agents/managed-agents.json")).unwrap();
 
     let records = read_agents_json(dir.path());
     assert_eq!(records[0]["acp_command"], "buzz-acp");
@@ -35,7 +35,7 @@ fn reconcile_legacy_command_names_updates_removed_mcp_server_for_buzz_agent() {
         }]),
     );
 
-    reconcile_legacy_command_names_in_file(&dir.path().join("agents/managed-agents.json"));
+    reconcile_legacy_command_names_in_file(&dir.path().join("agents/managed-agents.json")).unwrap();
 
     let records = read_agents_json(dir.path());
     assert_eq!(records[0]["acp_command"], "buzz-acp");
@@ -56,7 +56,7 @@ fn reconcile_legacy_command_names_clears_removed_mcp_server_for_goose() {
         }]),
     );
 
-    reconcile_legacy_command_names_in_file(&dir.path().join("agents/managed-agents.json"));
+    reconcile_legacy_command_names_in_file(&dir.path().join("agents/managed-agents.json")).unwrap();
 
     let records = read_agents_json(dir.path());
     assert_eq!(records[0]["acp_command"], "buzz-acp");
@@ -77,7 +77,7 @@ fn reconcile_legacy_command_names_preserves_custom_commands() {
     let path = dir.path().join("agents/managed-agents.json");
     let before = std::fs::read_to_string(&path).unwrap();
 
-    reconcile_legacy_command_names_in_file(&path);
+    reconcile_legacy_command_names_in_file(&path).unwrap();
 
     assert_eq!(before, std::fs::read_to_string(&path).unwrap());
 }

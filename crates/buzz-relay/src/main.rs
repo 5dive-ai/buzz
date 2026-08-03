@@ -1342,6 +1342,24 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
 /// roughly the 5s grace plus the ack wait.
 const GRACEFUL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+async fn recv_single_node_fanout_event<T: Clone>(
+    events: &mut tokio::sync::broadcast::Receiver<T>,
+) -> Option<T> {
+    loop {
+        match events.recv().await {
+            Ok(event) => return Some(event),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                metrics::counter!("buzz_single_node_fanout_lag_total").increment(n);
+                tracing::warn!("Single-node fan-out lagged by {n} messages");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::error!("Single-node fan-out broadcast channel closed");
+                return None;
+            }
+        }
+    }
+}
+
 fn health_listener_ip(profile: RelayProfile) -> IpAddr {
     match profile {
         RelayProfile::SingleNode => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -2117,14 +2135,23 @@ mod tests {
 
     use super::{
         buzz_auto_migrate_enabled, dropped_in_memory_keys, idle_timeout_secs,
-        refresh_legacy_active_gauge_recency, run_periodic_until_cancelled, EmissionScope,
-        InMemoryMetricKey,
+        recv_single_node_fanout_event, refresh_legacy_active_gauge_recency,
+        run_periodic_until_cancelled, EmissionScope, InMemoryMetricKey,
     };
     use metrics::GaugeFn;
     use metrics_util::{
         debugging::DebugValue,
         registry::{GenerationalAtomicStorage, Registry},
     };
+
+    #[tokio::test]
+    async fn single_node_fanout_receives_after_broadcast_lag() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+        sender.send(1_u8).expect("first event");
+        sender.send(2_u8).expect("second event causes lag");
+
+        assert_eq!(recv_single_node_fanout_event(&mut receiver).await, Some(2));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn periodic_loop_exits_immediately_on_cancellation() {

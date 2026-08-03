@@ -303,4 +303,111 @@ mod tests {
         assert_eq!(next, before + 1);
         assert_eq!(current_scope_generation(), next);
     }
+
+    /// Stale-commit detection: an operation that captured generation G must
+    /// abort when the generation has advanced past G by commit time.
+    ///
+    /// This simulates the pattern used by every await-crossing workflow:
+    /// capture generation at entry → do async work → re-read current → abort
+    /// if stale. It verifies the global counter advances strictly so the
+    /// check `captured != current` is reliable.
+    #[test]
+    fn test_generation_staleness_detected_after_scope_change() {
+        let captured = next_scope_generation(); // capture at operation entry
+                                                // Simulate a concurrent workspace switch bumping the generation.
+        let after_switch = next_scope_generation();
+        // The captured generation no longer matches the current one.
+        assert_ne!(
+            captured,
+            current_scope_generation(),
+            "captured generation must be stale after a concurrent switch"
+        );
+        assert_eq!(
+            after_switch,
+            current_scope_generation(),
+            "after_switch must equal the current generation"
+        );
+    }
+
+    /// A→B→A round-trip: applying scope A, then B, then A again produces a
+    /// strictly increasing generation each time. The scope's relay and owner
+    /// fields correctly reflect the active workspace at each step.
+    #[test]
+    fn test_scope_switch_a_to_b_to_a_advances_generation() {
+        let base = std::env::temp_dir();
+        let owner = "aa".repeat(32);
+
+        // Step A: commit scope A.
+        let gen_a1 = next_scope_generation();
+        let scope_a =
+            WorkspaceAgentScope::new("wss://a.example".into(), owner.clone(), &base, gen_a1);
+        assert_eq!(scope_a.relay_url, "wss://a.example");
+        assert_eq!(scope_a.generation, gen_a1);
+
+        // Step B: commit scope B — generation advances.
+        let gen_b = next_scope_generation();
+        let scope_b =
+            WorkspaceAgentScope::new("wss://b.example".into(), owner.clone(), &base, gen_b);
+        assert_eq!(scope_b.relay_url, "wss://b.example");
+        assert!(gen_b > gen_a1, "B's generation must exceed A's");
+
+        // Step A again: generation continues to advance.
+        let gen_a2 = next_scope_generation();
+        let scope_a2 =
+            WorkspaceAgentScope::new("wss://a.example".into(), owner.clone(), &base, gen_a2);
+        assert_eq!(scope_a2.relay_url, "wss://a.example");
+        assert!(gen_a2 > gen_b, "A's second activation must exceed B's");
+        assert_ne!(
+            gen_a2, gen_a1,
+            "same relay does not reset the generation counter"
+        );
+    }
+
+    /// Rapid A→B→C: three distinct relays produce three strictly ordered
+    /// generations. Any in-flight stale-spawn at generation A or B detects
+    /// staleness after C is committed.
+    #[test]
+    fn test_rapid_scope_switch_a_b_c_all_stale_after_c() {
+        let base = std::env::temp_dir();
+        let owner = "bb".repeat(32);
+
+        let gen_a = next_scope_generation();
+        let _ = WorkspaceAgentScope::new("wss://a.example".into(), owner.clone(), &base, gen_a);
+
+        let gen_b = next_scope_generation();
+        let _ = WorkspaceAgentScope::new("wss://b.example".into(), owner.clone(), &base, gen_b);
+
+        let gen_c = next_scope_generation();
+        let current = current_scope_generation();
+
+        // Both A and B are stale relative to C.
+        assert_ne!(gen_a, current, "gen_a must be stale after C");
+        assert_ne!(gen_b, current, "gen_b must be stale after C");
+        assert_eq!(gen_c, current, "gen_c is the current generation");
+        assert!(gen_a < gen_b, "A < B");
+        assert!(gen_b < gen_c, "B < C");
+    }
+
+    /// Switch-during-restore: a restore operation that captured generation G
+    /// at entry must abort rather than commit its output if the active scope
+    /// changed while restore was in progress. This test verifies the detection
+    /// invariant without spawning threads — the generation counter is the
+    /// source of truth.
+    #[test]
+    fn test_switch_during_restore_detected_by_generation_check() {
+        // Restore captures the generation at its entry.
+        let captured_at_restore_entry = next_scope_generation();
+
+        // Simulate the restore doing async work (IO, network probes, etc.).
+        // Concurrently, a workspace switch bumps the generation.
+        let _new_scope_generation = next_scope_generation();
+
+        // Restore tries to commit: checks whether its captured generation
+        // still matches the current one.
+        let current = current_scope_generation();
+        assert_ne!(
+            captured_at_restore_entry, current,
+            "restore must detect the mid-flight switch and abort its commit"
+        );
+    }
 }

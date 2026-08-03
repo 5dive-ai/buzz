@@ -114,6 +114,17 @@ pub fn ensure_scope_ready(scope_id: &str, scope_dir: &Path, base_dir: &Path) -> 
         quarantine_dir(scope_dir)?;
     }
 
+    // If the target exists and already has a manifest, the staged install
+    // completed (rename fired) but migrations or the ready marker were not
+    // written before a crash. Skip re-staging and go straight to migrations —
+    // re-staging would overwrite post-crash inbound/interactive writes that may
+    // have landed in the target after the rename.
+    if scope_dir.exists() && scope_dir.join(MANIFEST_FILE).exists() {
+        run_scoped_migrations(scope_dir)?;
+        write_ready_marker(scope_dir)?;
+        return Ok(());
+    }
+
     // Determine the manifest kind using the canonical claim ledger.
     let init_kind = resolve_init_kind(scope_id, base_dir)?;
 
@@ -592,5 +603,158 @@ mod tests {
             serde_json::from_slice(&std::fs::read(scope_a.join(MANIFEST_FILE)).unwrap()).unwrap();
         assert!(matches!(manifest_a.init_kind, ScopeInitKind::AdoptedLegacy));
         assert!(scope_a.join("managed-agents.json").exists());
+    }
+
+    /// Crash boundary: claim written, then crash before any file is copied into
+    /// staging. On retry the staging directory does not exist, so the full
+    /// staged install runs again. The same scope wins the claim (INSERT OR
+    /// IGNORE is idempotent) and legacy files are copied correctly.
+    #[test]
+    fn test_crash_after_claim_before_staging_resumes_correctly() {
+        let tmp = make_base_dir();
+        make_legacy_files(tmp.path());
+
+        // Simulate: claim was written into the fallback file but no staging dir exists yet.
+        let agents_dir = tmp.path().join("agents");
+        let claim_path = agents_dir.join(FALLBACK_CLAIM_FILE);
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let claim = serde_json::json!({"scope_id": "scope_a"});
+        std::fs::write(&claim_path, serde_json::to_vec(&claim).unwrap()).unwrap();
+
+        // No staging dir exists — retry runs the full staged install from the claim.
+        let scope_a = tmp.path().join("agents").join("scopes").join("scope_a");
+        ensure_scope_ready("scope_a", &scope_a, tmp.path()).unwrap();
+
+        assert!(scope_is_ready(&scope_a), "scope must be Ready after retry");
+        let manifest: ScopeManifest =
+            serde_json::from_slice(&std::fs::read(scope_a.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert!(
+            matches!(manifest.init_kind, ScopeInitKind::AdoptedLegacy),
+            "scope_a owns the claim and must adopt legacy, got {:?}",
+            manifest.init_kind
+        );
+        assert!(
+            scope_a.join("managed-agents.json").exists(),
+            "legacy files must be copied after retry"
+        );
+    }
+
+    /// Crash boundary: staging directory exists (copy was in progress) but the
+    /// atomic rename never happened. On retry the stale staging dir is cleaned
+    /// and the full staged install runs again. The retry must not overwrite any
+    /// post-crash writes that might have landed in the target (the target
+    /// doesn't exist yet since rename never fired, so there's nothing to
+    /// overwrite — staging is the only artifact).
+    #[test]
+    fn test_crash_during_staging_copy_is_cleaned_on_retry() {
+        let tmp = make_base_dir();
+        make_legacy_files(tmp.path());
+
+        let scope_dir = tmp.path().join("agents").join("scopes").join("scope_retry");
+        let staging = staging_dir_for(&scope_dir);
+
+        // Simulate interrupted staging: directory exists with partial content.
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("managed-agents.json"), b"[\"partial\"]").unwrap();
+        // No manifest inside staging (write didn't complete).
+
+        ensure_scope_ready("scope_retry", &scope_dir, tmp.path()).unwrap();
+
+        assert!(scope_is_ready(&scope_dir));
+        assert!(
+            !staging.exists(),
+            "stale staging dir must be cleaned up on retry"
+        );
+        // The final managed-agents.json is from the legacy source, not the partial.
+        let content = std::fs::read(scope_dir.join("managed-agents.json")).unwrap();
+        assert_eq!(
+            content, b"[]",
+            "managed-agents.json must be from the legacy source after retry"
+        );
+    }
+
+    /// Crash boundary: staging complete (manifest written) but rename never
+    /// happened. Detected by: staging dir exists. On retry, clean staging and
+    /// re-run; the claim is idempotent so the same scope adopts legacy again.
+    #[test]
+    fn test_crash_after_staging_manifest_before_rename_resumes_correctly() {
+        let tmp = make_base_dir();
+        make_legacy_files(tmp.path());
+
+        let scope_dir = tmp
+            .path()
+            .join("agents")
+            .join("scopes")
+            .join("scope_rename");
+        let staging = staging_dir_for(&scope_dir);
+
+        // Simulate: staging complete with manifest, but rename never fired.
+        std::fs::create_dir_all(&staging).unwrap();
+        let manifest = ScopeManifest {
+            scope_id: "scope_rename".into(),
+            init_kind: ScopeInitKind::AdoptedLegacy,
+        };
+        std::fs::write(
+            staging.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(staging.join("managed-agents.json"), b"[]").unwrap();
+        // Scope dir itself does not exist (rename didn't fire).
+        assert!(!scope_dir.exists());
+
+        ensure_scope_ready("scope_rename", &scope_dir, tmp.path()).unwrap();
+
+        assert!(scope_is_ready(&scope_dir));
+        assert!(!staging.exists(), "staging must be cleaned after retry");
+        assert!(
+            scope_dir.join("managed-agents.json").exists(),
+            "adopted file must be present after retry"
+        );
+    }
+
+    /// Crash boundary: atomic rename happened (target dir exists with manifest
+    /// and legacy files) but the `_ready` marker was never written (migrations
+    /// didn't complete). On next activation, `ensure_scope_ready` must resume
+    /// migrations and write the ready marker without re-copying files.
+    #[test]
+    fn test_crash_after_rename_before_ready_resumes_migrations() {
+        let tmp = make_base_dir();
+        make_legacy_files(tmp.path());
+
+        let scope_dir = tmp
+            .path()
+            .join("agents")
+            .join("scopes")
+            .join("scope_pre_ready");
+
+        // Simulate: rename already happened — target has manifest + files but no
+        // _ready marker.
+        std::fs::create_dir_all(&scope_dir).unwrap();
+        let manifest = ScopeManifest {
+            scope_id: "scope_pre_ready".into(),
+            init_kind: ScopeInitKind::AdoptedLegacy,
+        };
+        std::fs::write(
+            scope_dir.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(scope_dir.join("managed-agents.json"), b"[\"post-crash\"]").unwrap();
+        // No _ready marker.
+        assert!(!scope_is_ready(&scope_dir));
+
+        ensure_scope_ready("scope_pre_ready", &scope_dir, tmp.path()).unwrap();
+
+        assert!(
+            scope_is_ready(&scope_dir),
+            "ready marker must be written on retry"
+        );
+        // Post-crash writes in the target must not be overwritten (no staging).
+        let content = std::fs::read(scope_dir.join("managed-agents.json")).unwrap();
+        assert_eq!(
+            content, b"[\"post-crash\"]",
+            "post-crash target content must not be overwritten on retry"
+        );
     }
 }

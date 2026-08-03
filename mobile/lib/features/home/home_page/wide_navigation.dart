@@ -757,8 +757,12 @@ class _WideChannelDestination extends StatelessWidget {
 
 class _WideChannelContent extends HookWidget {
   final Channel channel;
+  final VoidCallback onChannelLeft;
 
-  const _WideChannelContent({required this.channel});
+  const _WideChannelContent({
+    required this.channel,
+    required this.onChannelLeft,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -771,7 +775,8 @@ class _WideChannelContent extends HookWidget {
       child: Navigator(
         key: navigatorKey,
         onGenerateRoute: (_) => MaterialPageRoute<void>(
-          builder: (_) => ChannelDetailPage(channel: channel),
+          builder: (_) =>
+              ChannelDetailPage(channel: channel, onChannelLeft: onChannelLeft),
         ),
       ),
     );

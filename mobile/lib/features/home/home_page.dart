@@ -134,7 +134,10 @@ class HomePage extends HookConsumerWidget {
 
     final pages = [
       if (isWide && selectedChannel.value != null)
-        _WideChannelContent(channel: selectedChannel.value!)
+        _WideChannelContent(
+          channel: selectedChannel.value!,
+          onChannelLeft: () => selectedChannel.value = null,
+        )
       else
         ChannelsPage(settingsPageBuilder: settingsPageBuilder),
       const ActivityPage(),

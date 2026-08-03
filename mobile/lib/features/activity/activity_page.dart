@@ -42,6 +42,18 @@ const _wideInboxBreakpoint = 1000.0;
 const _wideInboxMinListWidth = 300.0;
 const _wideInboxMaxListWidth = 400.0;
 
+EdgeInsets _activityScrollPadding(
+  BuildContext context, {
+  double horizontal = 0,
+  double top = Grid.xxs,
+  double bottom = Grid.xxs,
+}) => EdgeInsets.fromLTRB(
+  horizontal,
+  top,
+  horizontal,
+  MediaQuery.paddingOf(context).bottom + bottom,
+);
+
 /// Conversation-oriented Activity inbox.
 ///
 /// Matches desktop's Home inbox item design and semantics (see
@@ -301,7 +313,7 @@ class ActivityPage extends HookConsumerWidget {
       body = RefreshIndicator(
         onRefresh: refresh,
         child: ListView.builder(
-          padding: const EdgeInsets.symmetric(vertical: Grid.xxs),
+          padding: _activityScrollPadding(context),
           itemCount: visibleItems.length,
           itemBuilder: (context, index) {
             final item = visibleItems[index];
@@ -360,7 +372,9 @@ class ActivityPage extends HookConsumerWidget {
         ],
       ),
       body: SafeArea(
+        key: const ValueKey('activity-content-safe-area'),
         top: false,
+        bottom: false,
         child: Padding(
           padding: EdgeInsets.only(
             top: frostedAppBarHeight(context, titleStyle: headerTitleStyle),

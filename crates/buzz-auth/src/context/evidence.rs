@@ -423,9 +423,9 @@ impl fmt::Debug for VerifiedFederatedAssertion {
 /// This evidence is independent of a federated assertion: a delegated request
 /// need not possess the owner's token. A provider adapter will construct it
 /// only after confirming that the bound owner is currently admitted in the
-/// same authorization domain. Until that adapter exists, only crate tests can
-/// construct this move-only value, so delegated enterprise finalization cannot
-/// be activated by production handlers.
+/// same authorization domain. Construction remains crate-private so only the
+/// validated provider finalizer can turn a current capability decision into
+/// this move-only evidence.
 #[derive(PartialEq, Eq)]
 pub struct VerifiedOwnerAdmission {
     authorization_domain: CommunityId,
@@ -434,7 +434,8 @@ pub struct VerifiedOwnerAdmission {
 }
 
 impl VerifiedOwnerAdmission {
-    #[cfg(test)]
+    // Consumed by the provider finalizer in the stacked capability contract.
+    #[allow(dead_code)]
     pub(crate) const fn new(
         authorization_domain: CommunityId,
         principal: FederatedPrincipal,

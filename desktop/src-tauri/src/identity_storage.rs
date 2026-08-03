@@ -84,6 +84,18 @@ impl AppState {
         }
         crate::managed_agents::scope::next_scope_generation();
     }
+
+    /// Commit the active scope directly. Used by tests that need to set up a
+    /// live workspace without running the full `apply_workspace` pipeline.
+    #[cfg(test)]
+    pub(crate) fn commit_active_scope(
+        &self,
+        scope: crate::managed_agents::scope::WorkspaceAgentScope,
+    ) {
+        if let Ok(mut g) = self.active_agent_scope.lock() {
+            *g = Some(scope);
+        }
+    }
 }
 
 /// Pending-owned-channel overlay — moved here to keep `app_state.rs` within

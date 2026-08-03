@@ -317,6 +317,20 @@ impl AuthorizationRequest {
         {
             return Err(ProviderContractError::DelegationExpired);
         }
+        if owner
+            .expires_at()
+            .is_some_and(|bound| bound.is_expired_at(now_unix_seconds))
+        {
+            return Err(ProviderContractError::BindingExpired);
+        }
+        let evidence_valid_until = match (delegation.expires_at(), owner.expires_at()) {
+            (Some(delegation), Some(binding)) => {
+                Some(delegation.unix_seconds().min(binding.unix_seconds()))
+            }
+            (Some(delegation), None) => Some(delegation.unix_seconds()),
+            (None, Some(binding)) => Some(binding.unix_seconds()),
+            (None, None) => None,
+        };
         Ok(Self {
             authorization_domain: proof.authorization_domain(),
             transport: proof.authorized_transport(),
@@ -332,7 +346,7 @@ impl AuthorizationRequest {
             requested_capabilities,
             correlation_id,
             decision_source: DecisionSource::DelegatedOwnerBinding,
-            evidence_valid_until: delegation.expires_at().map(|bound| bound.unix_seconds()),
+            evidence_valid_until,
         })
     }
 
@@ -386,7 +400,8 @@ impl AuthorizationRequest {
         self.decision_source
     }
 
-    /// Earliest validity bound supplied by verified assertion or delegation evidence.
+    /// Earliest validity bound supplied by verified assertion, owner-binding,
+    /// or delegation evidence.
     pub const fn evidence_valid_until(&self) -> Option<u64> {
         self.evidence_valid_until
     }
@@ -630,6 +645,17 @@ impl fmt::Debug for ProviderTimeout {
             .field(&"[redacted]")
             .finish()
     }
+}
+
+/// Trusted server time used to validate a provider result.
+///
+/// The resolver samples this source exactly once for an allowed decision. A
+/// source must return current Unix time without reusing a value captured before
+/// provider I/O, and must not block the async executor. Returning `None` fails
+/// closed as dependency unavailability.
+pub trait AuthorizationClock: Send + Sync {
+    /// Current trusted Unix time, or `None` when it cannot be obtained.
+    fn now_unix_seconds(&self) -> Option<u64>;
 }
 
 /// Fail-closed provider unavailability.
@@ -904,11 +930,14 @@ impl fmt::Debug for AuthorizationOutcome {
 ///
 /// Unavailability is preserved as a fail-closed outcome. This function never
 /// falls back to Nostr-only authorization or applies an implicit grace period.
-/// `now_unix_seconds` must come from the server clock.
+/// `clock` must be the server's trusted time source. After provider I/O
+/// completes, an allowed decision is checked against exactly one fresh sample.
+/// Provider freshness and all effective evidence bounds use that same value;
+/// callers must not precompute and pass a decision-start timestamp.
 pub async fn resolve_authorization(
     provider: &dyn AuthorizationProvider,
     request: &AuthorizationRequest,
-    now_unix_seconds: u64,
+    clock: &dyn AuthorizationClock,
     timeout: ProviderTimeout,
 ) -> AuthorizationOutcome {
     let decision = match tokio::time::timeout(timeout.duration(), provider.authorize(request)).await
@@ -927,6 +956,12 @@ pub async fn resolve_authorization(
         ProviderDecision::Unavailable(unavailable) => {
             return AuthorizationOutcome::Unavailable(unavailable);
         }
+    };
+    let Some(now_unix_seconds) = clock.now_unix_seconds() else {
+        return AuthorizationOutcome::Unavailable(ProviderUnavailable::new(
+            ProviderUnavailableReason::DependencyUnavailable,
+            None,
+        ));
     };
 
     if allow.authorization_domain != request.authorization_domain {
@@ -1061,6 +1096,9 @@ pub enum ProviderContractError {
     /// Delegation was expired at server time.
     #[error("delegated provider request has expired")]
     DelegationExpired,
+    /// Owner binding was expired at server time.
+    #[error("delegated provider request owner binding has expired")]
+    BindingExpired,
 }
 
 impl ProviderContractError {
@@ -1088,6 +1126,7 @@ impl ProviderContractError {
             Self::InvalidCorrelationId => "authorization_provider_contract_019",
             Self::MissingKeyAttestation => "authorization_provider_contract_020",
             Self::FreshnessWindowTooLong => "authorization_provider_contract_021",
+            Self::BindingExpired => "authorization_provider_contract_022",
         }
     }
 }

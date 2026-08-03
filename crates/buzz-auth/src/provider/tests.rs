@@ -1,7 +1,7 @@
 use std::{
     future::pending,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -11,8 +11,9 @@ use nostr::Keys;
 
 use super::*;
 use crate::context::{
-    AssertionExpiry, AssertionNotBefore, AssertionTransport, AuthTransport, BindingSource,
-    BindingVersion, DelegationExpiry, VerifiedKeyAttestation, VerifiedTransportDelegation,
+    AssertionExpiry, AssertionNotBefore, AssertionTransport, AuthTransport, BindingExpiry,
+    BindingSource, BindingVersion, DelegationExpiry, VerifiedKeyAttestation,
+    VerifiedTransportDelegation,
 };
 
 const NOW: u64 = 100;
@@ -36,6 +37,53 @@ fn policy_version(value: &str) -> PolicyVersion {
 
 fn provider_timeout() -> ProviderTimeout {
     ProviderTimeout::new(Duration::from_secs(1)).expect("synthetic timeout is finite")
+}
+
+#[derive(Clone)]
+struct TestClock {
+    now: Arc<AtomicU64>,
+    available: Arc<AtomicBool>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl TestClock {
+    fn at(now: u64) -> Self {
+        Self {
+            now: Arc::new(AtomicU64::new(now)),
+            available: Arc::new(AtomicBool::new(true)),
+            reads: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn set(&self, now: u64) {
+        self.now.store(now, Ordering::SeqCst);
+    }
+
+    fn set_available(&self, available: bool) {
+        self.available.store(available, Ordering::SeqCst);
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl AuthorizationClock for TestClock {
+    fn now_unix_seconds(&self) -> Option<u64> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.available
+            .load(Ordering::SeqCst)
+            .then(|| self.now.load(Ordering::SeqCst))
+    }
+}
+
+async fn resolve_at(
+    provider: &dyn AuthorizationProvider,
+    request: &AuthorizationRequest,
+    now: u64,
+    timeout: ProviderTimeout,
+) -> AuthorizationOutcome {
+    resolve_authorization(provider, request, &TestClock::at(now), timeout).await
 }
 
 fn capabilities(values: &[AuthorizationCapability]) -> CapabilitySet {
@@ -83,7 +131,7 @@ fn proof_method_for_transport(transport: AuthTransport) -> AuthMethod {
     }
 }
 
-fn all_contract_errors() -> [ProviderContractError; 21] {
+fn all_contract_errors() -> [ProviderContractError; 22] {
     [
         ProviderContractError::EmptyCapabilitySet,
         ProviderContractError::EmptyProfileId,
@@ -106,6 +154,7 @@ fn all_contract_errors() -> [ProviderContractError; 21] {
         ProviderContractError::DelegationRequired,
         ProviderContractError::DelegatedOwnerMismatch,
         ProviderContractError::DelegationExpired,
+        ProviderContractError::BindingExpired,
     ]
 }
 
@@ -168,32 +217,46 @@ fn existing_binding(owner: &Keys) -> VersionedBindingRef {
 }
 
 fn existing_binding_in(domain_value: u128, owner: &Keys) -> VersionedBindingRef {
+    existing_binding_with_expiry_in(domain_value, owner, None)
+}
+
+fn existing_binding_with_expiry_in(
+    domain_value: u128,
+    owner: &Keys,
+    expires_at: Option<u64>,
+) -> VersionedBindingRef {
     VersionedBindingRef::new_existing_active_for_test(
         domain(domain_value),
         Uuid::from_u128(10),
         principal(),
         owner.public_key(),
         BindingVersion::INITIAL,
+        expires_at
+            .map(|expiry| BindingExpiry::new(expiry).expect("synthetic binding expiry is valid")),
         BindingSource::Provisioned,
     )
     .expect("synthetic binding is valid")
 }
 
-fn delegated_request(actor: &Keys, owner: &Keys, expiry: u64) -> AuthorizationRequest {
+fn delegated_proof(actor: &Keys, owner: &Keys, expiry: u64) -> VerifiedNostrProof {
     let delegation = VerifiedTransportDelegation::new_unrestricted(
         owner.public_key(),
         actor.public_key(),
         Some(DelegationExpiry::new(expiry).expect("synthetic delegation expiry is valid")),
     )
     .expect("synthetic delegation is valid");
-    let proof = VerifiedNostrProof::new(
+    VerifiedNostrProof::new(
         domain(1),
         AuthTransport::RelayWebSocket,
         actor.public_key(),
         AuthMethod::Nip42,
         Some(delegation),
     )
-    .expect("synthetic delegated proof is valid");
+    .expect("synthetic delegated proof is valid")
+}
+
+fn delegated_request(actor: &Keys, owner: &Keys, expiry: u64) -> AuthorizationRequest {
+    let proof = delegated_proof(actor, owner, expiry);
     AuthorizationRequest::delegated(
         &proof,
         &existing_binding(owner),
@@ -253,6 +316,56 @@ impl AuthorizationProvider for FakeProvider {
     }
 }
 
+struct AdvancingProvider {
+    decision: Mutex<Option<ProviderDecision>>,
+    clock: TestClock,
+    decision_time: u64,
+    clock_available: bool,
+}
+
+impl AdvancingProvider {
+    fn returning_at(decision: ProviderDecision, clock: TestClock, decision_time: u64) -> Self {
+        Self {
+            decision: Mutex::new(Some(decision)),
+            clock,
+            decision_time,
+            clock_available: true,
+        }
+    }
+
+    fn returning_with_clock_failure(decision: ProviderDecision, clock: TestClock) -> Self {
+        Self {
+            decision: Mutex::new(Some(decision)),
+            clock,
+            decision_time: 0,
+            clock_available: false,
+        }
+    }
+}
+
+impl AuthorizationProvider for AdvancingProvider {
+    fn authorize<'a>(
+        &'a self,
+        _request: &'a AuthorizationRequest,
+    ) -> AuthorizationProviderFuture<'a> {
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            assert_eq!(
+                self.clock.reads(),
+                0,
+                "decision time must not be sampled before provider I/O completes"
+            );
+            self.clock.set(self.decision_time);
+            self.clock.set_available(self.clock_available);
+            self.decision
+                .lock()
+                .expect("synthetic provider mutex is not poisoned")
+                .take()
+                .expect("synthetic provider is called exactly once")
+        })
+    }
+}
+
 struct PendingProvider {
     calls: Arc<AtomicUsize>,
     dropped: Arc<AtomicBool>,
@@ -296,7 +409,7 @@ async fn current_allow_returns_request_scoped_snapshot() {
     ));
 
     let AuthorizationOutcome::Allow(snapshot) =
-        resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+        resolve_at(&provider, &request, NOW, provider_timeout()).await
     else {
         panic!("current provider policy must allow");
     };
@@ -355,7 +468,7 @@ async fn allowed_snapshot_preserves_every_requested_transport_scope() {
         ));
 
         let AuthorizationOutcome::Allow(snapshot) =
-            resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+            resolve_at(&provider, &request, NOW, provider_timeout()).await
         else {
             panic!("current provider policy must allow every transport profile");
         };
@@ -374,7 +487,7 @@ async fn explicit_denial_is_preserved() {
     )));
 
     let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+        resolve_at(&provider, &request, NOW, provider_timeout()).await
     else {
         panic!("provider denial must fail closed");
     };
@@ -393,7 +506,7 @@ async fn provider_unavailability_never_falls_back_to_allow() {
         )));
 
     let AuthorizationOutcome::Unavailable(unavailable) =
-        resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+        resolve_at(&provider, &request, NOW, provider_timeout()).await
     else {
         panic!("provider unavailability must remain fail closed");
     };
@@ -418,7 +531,7 @@ async fn provider_call_deadline_returns_timeout_unavailability() {
         ProviderTimeout::new(Duration::from_millis(1)).expect("synthetic timeout is finite");
 
     let AuthorizationOutcome::Unavailable(unavailable) =
-        resolve_authorization(&provider, &request, NOW, timeout).await
+        resolve_at(&provider, &request, NOW, timeout).await
     else {
         panic!("provider timeout must remain fail closed");
     };
@@ -426,6 +539,173 @@ async fn provider_call_deadline_returns_timeout_unavailability() {
     assert_eq!(unavailable.retry_after(), None);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn provider_freshness_is_evaluated_after_async_io() {
+    let actor = Keys::generate();
+    let request = direct_request(&actor);
+    let clock = TestClock::at(NOW);
+    let provider = AdvancingProvider::returning_at(
+        allow_for(
+            &request,
+            request.requested_capabilities().clone(),
+            "version-a",
+            NOW,
+            105,
+        ),
+        clock.clone(),
+        105,
+    );
+
+    let AuthorizationOutcome::Deny(denial) =
+        resolve_authorization(&provider, &request, &clock, provider_timeout()).await
+    else {
+        panic!("a provider decision stale after I/O must deny");
+    };
+    assert_eq!(denial.reason(), AuthorizationDenialReason::StaleDecision);
+    assert_eq!(clock.reads(), 1);
+}
+
+#[tokio::test]
+async fn identity_evidence_is_evaluated_after_async_io() {
+    let actor = Keys::generate();
+    let request = direct_request_with_expiry(
+        &actor,
+        105,
+        capabilities(&[AuthorizationCapability::CommunityRead]),
+    );
+    let clock = TestClock::at(NOW);
+    let provider = AdvancingProvider::returning_at(
+        allow_for(
+            &request,
+            request.requested_capabilities().clone(),
+            "version-a",
+            NOW,
+            180,
+        ),
+        clock.clone(),
+        105,
+    );
+
+    let AuthorizationOutcome::Deny(denial) =
+        resolve_authorization(&provider, &request, &clock, provider_timeout()).await
+    else {
+        panic!("identity evidence expired after I/O must deny");
+    };
+    assert_eq!(
+        denial.reason(),
+        AuthorizationDenialReason::IdentityEvidenceExpired
+    );
+}
+
+#[tokio::test]
+async fn owner_binding_expiry_is_evaluated_after_async_io() {
+    let delegate = Keys::generate();
+    let owner = Keys::generate();
+    let proof = delegated_proof(&delegate, &owner, 140);
+    let binding = existing_binding_with_expiry_in(1, &owner, Some(105));
+    let request = AuthorizationRequest::delegated(
+        &proof,
+        &binding,
+        profile(),
+        capabilities(&[AuthorizationCapability::CommunityRead]),
+        Uuid::from_u128(20),
+        NOW,
+    )
+    .expect("owner binding is current at request construction");
+    assert_eq!(request.evidence_valid_until(), Some(105));
+
+    let clock = TestClock::at(NOW);
+    let provider = AdvancingProvider::returning_at(
+        allow_for(
+            &request,
+            request.requested_capabilities().clone(),
+            "version-a",
+            NOW,
+            180,
+        ),
+        clock.clone(),
+        105,
+    );
+    let AuthorizationOutcome::Deny(denial) =
+        resolve_authorization(&provider, &request, &clock, provider_timeout()).await
+    else {
+        panic!("owner binding expired after provider I/O must deny");
+    };
+    assert_eq!(
+        denial.reason(),
+        AuthorizationDenialReason::IdentityEvidenceExpired
+    );
+}
+
+#[test]
+fn delegated_request_rejects_owner_binding_at_exact_expiry() {
+    let delegate = Keys::generate();
+    let owner = Keys::generate();
+    let proof = delegated_proof(&delegate, &owner, 140);
+    let binding = existing_binding_with_expiry_in(1, &owner, Some(NOW));
+
+    let error = AuthorizationRequest::delegated(
+        &proof,
+        &binding,
+        profile(),
+        capabilities(&[AuthorizationCapability::CommunityRead]),
+        Uuid::from_u128(20),
+        NOW,
+    )
+    .expect_err("expired owner binding must not enter provider evaluation");
+    assert_eq!(error, ProviderContractError::BindingExpired);
+}
+
+#[tokio::test]
+async fn decision_issued_during_async_io_is_not_false_future() {
+    let actor = Keys::generate();
+    let request = direct_request(&actor);
+    let clock = TestClock::at(NOW);
+    let provider = AdvancingProvider::returning_at(
+        allow_for(
+            &request,
+            request.requested_capabilities().clone(),
+            "version-a",
+            104,
+            180,
+        ),
+        clock.clone(),
+        105,
+    );
+
+    assert!(matches!(
+        resolve_authorization(&provider, &request, &clock, provider_timeout()).await,
+        AuthorizationOutcome::Allow(_)
+    ));
+}
+
+#[tokio::test]
+async fn clock_failure_after_provider_io_is_unavailable() {
+    let actor = Keys::generate();
+    let request = direct_request(&actor);
+    let clock = TestClock::at(NOW);
+    let provider = AdvancingProvider::returning_with_clock_failure(
+        allow_for(
+            &request,
+            request.requested_capabilities().clone(),
+            "version-a",
+            NOW,
+            180,
+        ),
+        clock.clone(),
+    );
+
+    let AuthorizationOutcome::Unavailable(unavailable) =
+        resolve_authorization(&provider, &request, &clock, provider_timeout()).await
+    else {
+        panic!("unavailable decision time must fail closed");
+    };
+    assert_eq!(
+        unavailable.reason(),
+        ProviderUnavailableReason::DependencyUnavailable
+    );
 }
 
 #[tokio::test]
@@ -440,7 +720,7 @@ async fn stale_and_future_provider_decisions_deny() {
         90,
     ));
     let AuthorizationOutcome::Deny(stale_denial) =
-        resolve_authorization(&stale, &request, NOW, provider_timeout()).await
+        resolve_at(&stale, &request, NOW, provider_timeout()).await
     else {
         panic!("stale decision must deny");
     };
@@ -457,7 +737,7 @@ async fn stale_and_future_provider_decisions_deny() {
         180,
     ));
     let AuthorizationOutcome::Deny(future_denial) =
-        resolve_authorization(&future, &request, NOW, provider_timeout()).await
+        resolve_at(&future, &request, NOW, provider_timeout()).await
     else {
         panic!("future decision must deny");
     };
@@ -488,7 +768,7 @@ async fn provider_time_boundaries_and_current_assertion_are_exact() {
         180,
     ));
     assert!(matches!(
-        resolve_authorization(&issued_now, &request, NOW, provider_timeout()).await,
+        resolve_at(&issued_now, &request, NOW, provider_timeout()).await,
         AuthorizationOutcome::Allow(_)
     ));
 
@@ -500,7 +780,7 @@ async fn provider_time_boundaries_and_current_assertion_are_exact() {
         NOW,
     ));
     let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&stale_at_now, &request, NOW, provider_timeout()).await
+        resolve_at(&stale_at_now, &request, NOW, provider_timeout()).await
     else {
         panic!("freshness ending at server time must deny");
     };
@@ -525,7 +805,7 @@ async fn domain_principal_and_capability_mismatches_deny() {
         .expect("synthetic provider allow is structurally valid"),
     ));
     let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&wrong_domain, &request, NOW, provider_timeout()).await
+        resolve_at(&wrong_domain, &request, NOW, provider_timeout()).await
     else {
         panic!("cross-domain decision must deny");
     };
@@ -548,7 +828,7 @@ async fn domain_principal_and_capability_mismatches_deny() {
         .expect("synthetic provider allow is structurally valid"),
     ));
     let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&wrong_principal, &request, NOW, provider_timeout()).await
+        resolve_at(&wrong_principal, &request, NOW, provider_timeout()).await
     else {
         panic!("principal mismatch must deny");
     };
@@ -570,7 +850,7 @@ async fn domain_principal_and_capability_mismatches_deny() {
         .expect("synthetic provider allow is structurally valid"),
     ));
     let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&wrong_profile, &request, NOW, provider_timeout()).await
+        resolve_at(&wrong_profile, &request, NOW, provider_timeout()).await
     else {
         panic!("profile mismatch must deny");
     };
@@ -587,7 +867,7 @@ async fn domain_principal_and_capability_mismatches_deny() {
         180,
     ));
     let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&missing_capability, &request, NOW, provider_timeout()).await
+        resolve_at(&missing_capability, &request, NOW, provider_timeout()).await
     else {
         panic!("missing capability must deny");
     };
@@ -614,7 +894,7 @@ async fn invite_mint_does_not_authorize_invite_claim() {
     ));
 
     let AuthorizationOutcome::Deny(denial) =
-        resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+        resolve_at(&provider, &request, NOW, provider_timeout()).await
     else {
         panic!("invitation minting must not authorize a claim");
     };
@@ -661,7 +941,7 @@ async fn no_distinct_capability_authorizes_another_capability() {
                 180,
             ));
             let AuthorizationOutcome::Deny(denial) =
-                resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+                resolve_at(&provider, &request, NOW, provider_timeout()).await
             else {
                 panic!("a distinct capability must not widen provider authority");
             };
@@ -690,7 +970,7 @@ async fn assertion_expiry_bounds_provider_freshness() {
     ));
 
     let AuthorizationOutcome::Allow(snapshot) =
-        resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+        resolve_at(&provider, &request, NOW, provider_timeout()).await
     else {
         panic!("current bounded policy must allow");
     };
@@ -714,7 +994,7 @@ async fn identity_evidence_expiring_during_provider_resolution_denies() {
         180,
     ));
     let AuthorizationOutcome::Deny(direct_denial) =
-        resolve_authorization(&direct_provider, &direct, 120, provider_timeout()).await
+        resolve_at(&direct_provider, &direct, 120, provider_timeout()).await
     else {
         panic!("assertion expiring during provider resolution must deny");
     };
@@ -734,7 +1014,7 @@ async fn identity_evidence_expiring_during_provider_resolution_denies() {
         180,
     ));
     let AuthorizationOutcome::Deny(delegated_denial) =
-        resolve_authorization(&delegated_provider, &delegated, 140, provider_timeout()).await
+        resolve_at(&delegated_provider, &delegated, 140, provider_timeout()).await
     else {
         panic!("delegation expiring during provider resolution must deny");
     };
@@ -767,7 +1047,7 @@ async fn delegated_owner_admission_does_not_require_owner_assertion() {
         180,
     ));
     let AuthorizationOutcome::Allow(snapshot) =
-        resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+        resolve_at(&provider, &request, NOW, provider_timeout()).await
     else {
         panic!("current owner admission must allow delegated authority");
     };
@@ -791,7 +1071,7 @@ async fn policy_versions_detect_equality_and_change_without_ordering() {
         180,
     ));
     let AuthorizationOutcome::Allow(snapshot_a) =
-        resolve_authorization(&provider_a, &request_a, NOW, provider_timeout()).await
+        resolve_at(&provider_a, &request_a, NOW, provider_timeout()).await
     else {
         panic!("current provider policy must allow");
     };
@@ -805,7 +1085,7 @@ async fn policy_versions_detect_equality_and_change_without_ordering() {
         180,
     ));
     let AuthorizationOutcome::Allow(snapshot_b) =
-        resolve_authorization(&provider_b, &request_b, NOW, provider_timeout()).await
+        resolve_at(&provider_b, &request_b, NOW, provider_timeout()).await
     else {
         panic!("current provider policy must allow");
     };
@@ -1193,7 +1473,7 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
     let decision = ProviderDecision::Allow(allow);
     assert_eq!(format!("{decision:?}"), "ProviderDecision(\"[redacted]\")");
     let provider = FakeProvider::returning(decision);
-    let outcome = resolve_authorization(&provider, &request, NOW, provider_timeout()).await;
+    let outcome = resolve_at(&provider, &request, NOW, provider_timeout()).await;
     assert_eq!(
         format!("{outcome:?}"),
         "AuthorizationOutcome(\"[redacted]\")"

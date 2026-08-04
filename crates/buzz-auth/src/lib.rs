@@ -21,6 +21,10 @@ pub mod access;
 pub mod context;
 /// Authentication error types.
 pub mod error;
+/// Trusted-workspace adapter for sealed verifier and binding evidence.
+pub mod evidence_adapter;
+/// Bounded, versioned authorization leases.
+pub mod lease;
 /// NIP-42 challenge–response authentication.
 pub mod nip42;
 /// NIP-98 HTTP Auth verification (kind:27235).
@@ -43,11 +47,25 @@ pub use context::{
     BindingVersion, CapabilityFinalizationSeal, CurrentPolicyRequest, CurrentPolicyResolutionSink,
     DelegationCapability, DelegationExpiry, DirectBindingResolutionSink, EnrollmentMode,
     ExistingBindingResolutionSink, FederatedAuthorityAdapter, FederatedAuthorization,
-    FederatedIdentityRequirement, FederatedPrincipal, NostrAuthority, ResolvedFederatedPolicy,
-    VerifiedFederatedAssertion, VerifiedKeyAttestation, VerifiedNostrProof, VerifiedOwnerAdmission,
+    FederatedIdentityRequirement, FederatedPrincipal, NostrAuthority,
+    ProviderEvidenceValidationError, ResolvedFederatedPolicy, VerifiedFederatedAssertion,
+    VerifiedKeyAttestation, VerifiedNostrProof, VerifiedOwnerAdmission, VerifiedProviderEvidence,
     VerifiedTransportDelegation, VersionedBindingRef,
 };
 pub use error::AuthError;
+pub use evidence_adapter::{
+    ActiveBindingResolution, EvidenceAdapterError, VerifiedDelegationOutput,
+    VerifiedEvidenceAdapter,
+};
+pub use lease::{
+    AccessLeasePolicy, ApplicationLeaseLimit, AuthorizationClock, AuthorizationClockError,
+    AuthorizationClockSkew, AuthorizationLease, AuthorizationLeaseValidator,
+    AuthorizationOperationGuard, AuthorizationTime, BindingLeaseBound, LeaseIssueError,
+    LeasePolicyError, LeaseRenewalAction, LeaseRenewalLeadTime, LeaseRenewalSchedule,
+    LeaseUseRequirement, LeaseValidationError, LeaseVersion, SharedAuthorizationClock,
+    SystemAuthorizationClock, VerificationStatusPolicy, MAX_APPLICATION_LEASE_SECONDS,
+    MAX_AUTHORIZATION_CLOCK_SKEW_SECONDS, MAX_LEASE_RENEWAL_LEAD_SECONDS,
+};
 pub use nip42::{generate_challenge, verify_nip42_event};
 pub use nip98::verify_nip98_event;
 pub use nip98_replay::{
@@ -55,7 +73,8 @@ pub use nip98_replay::{
     MAX_REPLAY_TTL_SECS,
 };
 pub use provider::{
-    AuthorizationAuthority, AuthorizationCapability, AuthorizationClock, AuthorizationDenial,
+    AuthorizationAuthority, AuthorizationCapability,
+    AuthorizationClock as ProviderAuthorizationClock, AuthorizationDenial,
     AuthorizationDenialReason, AuthorizationOutcome, AuthorizationProfileId, AuthorizationProvider,
     AuthorizationProviderFuture, AuthorizationRequest, AuthorizationRuntime, CapabilitySet,
     CapabilitySnapshot, DecisionSource, PolicyVersion, ProviderAllow, ProviderAllowReason,

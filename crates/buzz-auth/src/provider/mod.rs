@@ -91,6 +91,11 @@ impl CapabilitySet {
             .iter()
             .all(|capability| self.0.binary_search(capability).is_ok())
     }
+
+    /// Return whether the set includes one exact portable capability.
+    pub fn contains(&self, capability: AuthorizationCapability) -> bool {
+        self.0.binary_search(&capability).is_ok()
+    }
 }
 
 impl fmt::Debug for CapabilitySet {

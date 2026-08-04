@@ -88,45 +88,21 @@ async function mergeFakeEvents(pubkey, specs) {
 // escapeFrontierKey / unescapeFrontierKey — table-driven
 // ---------------------------------------------------------------------------
 
-for (const { name, input, expected } of [
-  {
-    name: "normalCtx_passesThrough",
-    input: "some-channel-uuid",
-    expected: "some-channel-uuid",
-  },
-  {
-    name: "ovPrefix_prepentsEsc",
-    input: "ov_s:evil",
-    expected: "esc:ov_s:evil",
-  },
-  { name: "escPrefix_prepentsEsc", input: "esc:foo", expected: "esc:esc:foo" },
-  {
-    name: "ovStem_prepentsEsc",
-    input: "ov_c:something",
-    expected: "esc:ov_c:something",
-  },
+for (const [name, input, expected] of [
+  ["normalCtx_passesThrough", "some-channel-uuid", "some-channel-uuid"],
+  ["ovPrefix_prepentsEsc", "ov_s:evil", "esc:ov_s:evil"],
+  ["escPrefix_prepentsEsc", "esc:foo", "esc:esc:foo"],
+  ["ovStem_prepentsEsc", "ov_c:something", "esc:ov_c:something"],
 ]) {
   test(`escapeFrontierKey_${name}`, () => {
     assert.equal(escapeFrontierKey(input), expected);
   });
 }
 
-for (const { name, input, expected } of [
-  {
-    name: "noEscPrefix_passesThrough",
-    input: "some-channel-uuid",
-    expected: "some-channel-uuid",
-  },
-  {
-    name: "singleEscPrefix_strips",
-    input: "esc:ov_s:evil",
-    expected: "ov_s:evil",
-  },
-  {
-    name: "doubleEscPrefix_stripsExactlyOne",
-    input: "esc:esc:foo",
-    expected: "esc:foo",
-  },
+for (const [name, input, expected] of [
+  ["noEscPrefix_passesThrough", "some-channel-uuid", "some-channel-uuid"],
+  ["singleEscPrefix_strips", "esc:ov_s:evil", "ov_s:evil"],
+  ["doubleEscPrefix_stripsExactlyOne", "esc:esc:foo", "esc:foo"],
 ]) {
   test(`unescapeFrontierKey_${name}`, () => {
     assert.equal(unescapeFrontierKey(input), expected);
@@ -134,10 +110,10 @@ for (const { name, input, expected } of [
 }
 
 // First entry preserves the original bare name; subsequent entries add a suffix.
-for (const { name, raw } of [
-  { name: "isIdentity", raw: "ov_s:tricky" },
-  { name: "isIdentity_escPrefixed", raw: "esc:already-escaped" },
-  { name: "isIdentity_normalCtx", raw: "msg:deadbeef" },
+for (const [name, raw] of [
+  ["isIdentity", "ov_s:tricky"],
+  ["isIdentity_escPrefixed", "esc:already-escaped"],
+  ["isIdentity_normalCtx", "msg:deadbeef"],
 ]) {
   test(`escape_then_unescape_${name}`, () => {
     assert.equal(unescapeFrontierKey(escapeFrontierKey(raw)), raw);
@@ -148,13 +124,13 @@ for (const { name, raw } of [
 // isOverrideKey — table-driven
 // ---------------------------------------------------------------------------
 
-for (const { name, key, expected } of [
-  { name: "ovS_returnsTrue", key: "ov_s:ctx", expected: true },
-  { name: "ovC_returnsTrue", key: "ov_c:ctx", expected: true },
-  { name: "ovB_returnsTrue", key: "ov_b:ctx", expected: true },
-  { name: "frontierKey_returnsFalse", key: "some-channel", expected: false },
+for (const [name, key, expected] of [
+  ["ovS_returnsTrue", "ov_s:ctx", true],
+  ["ovC_returnsTrue", "ov_c:ctx", true],
+  ["ovB_returnsTrue", "ov_b:ctx", true],
+  ["frontierKey_returnsFalse", "some-channel", false],
   // esc:ov_s:… is a FRONTIER key, not an override key.
-  { name: "escapedKey_returnsFalse", key: "esc:ov_s:ctx", expected: false },
+  ["escapedKey_returnsFalse", "esc:ov_s:ctx", false],
 ]) {
   test(`isOverrideKey_${name}`, () => {
     assert.equal(isOverrideKey(key), expected);
@@ -167,68 +143,24 @@ for (const { name, key, expected } of [
 
 const UINT32_MAX = 4294967295;
 
-for (const { name, reg, frontier, expected } of [
+// biome-ignore format: compact table rows — UINT32_MAX rows exceed line width
+for (const [name, reg, frontier, expected] of [
   // S=2, C=1, B=100, F=50 → S>0 ∧ F<=B ∧ S>C
-  {
-    name: "liveOverride_returnsTrue",
-    reg: { s: 2, c: 1, b: 100 },
-    frontier: 50,
-    expected: true,
-  },
-  {
-    name: "virginRegister_returnsFalse",
-    reg: { s: 0, c: 0, b: 0 },
-    frontier: 0,
-    expected: false,
-  },
+  ["liveOverride_returnsTrue", { s: 2, c: 1, b: 100 }, 50, true],
+  ["virginRegister_returnsFalse", { s: 0, c: 0, b: 0 }, 0, false],
   // Frontier advance dominates: F=200 > B=100
-  {
-    name: "frontierExceedsBaseline_returnsFalse",
-    reg: { s: 1, c: 0, b: 100 },
-    frontier: 200,
-    expected: false,
-  },
+  ["frontierExceedsBaseline_returnsFalse", { s: 1, c: 0, b: 100 }, 200, false],
   // F <= B (equals case): still active
-  {
-    name: "frontierEqualsBaseline_returnsTrue",
-    reg: { s: 1, c: 0, b: 100 },
-    frontier: 100,
-    expected: true,
-  },
+  ["frontierEqualsBaseline_returnsTrue", { s: 1, c: 0, b: 100 }, 100, true],
   // S == C with S > 0 → clear-wins: inactive
-  {
-    name: "clearWinsTie_returnsFalse",
-    reg: { s: 1, c: 1, b: 100 },
-    frontier: 50,
-    expected: false,
-  },
-  {
-    name: "clearCounter_exceedsSet_returnsFalse",
-    reg: { s: 1, c: 2, b: 100 },
-    frontier: 50,
-    expected: false,
-  },
+  ["clearWinsTie_returnsFalse", { s: 1, c: 1, b: 100 }, 50, false],
+  ["clearCounter_exceedsSet_returnsFalse", { s: 1, c: 2, b: 100 }, 50, false],
   // Tombstone floor shape: s=0, c=k, b=0
-  {
-    name: "tombstoneFloor_returnsFalse",
-    reg: { s: 0, c: 5, b: 0 },
-    frontier: 0,
-    expected: false,
-  },
+  ["tombstoneFloor_returnsFalse", { s: 0, c: 5, b: 0 }, 0, false],
   // Boundary: S at uint32 max, C one less, B at max, F at zero
-  {
-    name: "uint32Max_liveOverride_returnsTrue",
-    reg: { s: UINT32_MAX, c: UINT32_MAX - 1, b: UINT32_MAX },
-    frontier: 0,
-    expected: true,
-  },
+  ["uint32Max_liveOverride_returnsTrue", { s: UINT32_MAX, c: UINT32_MAX - 1, b: UINT32_MAX }, 0, true],
   // S == C at max → clear-wins
-  {
-    name: "uint32Max_zeroFrontier_tile_returnsFalse",
-    reg: { s: UINT32_MAX, c: UINT32_MAX, b: 1 },
-    frontier: 0,
-    expected: false,
-  },
+  ["uint32Max_zeroFrontier_tile_returnsFalse", { s: UINT32_MAX, c: UINT32_MAX, b: 1 }, 0, false],
 ]) {
   test(`isOverrideActive_${name}`, () => {
     assert.equal(isOverrideActive(reg, frontier), expected);
@@ -292,57 +224,18 @@ test("mergeOverrideRegisters_uint32Max_commutative", () => {
 // encodeOverrideGroup — canonical wire encoding — table-driven
 // ---------------------------------------------------------------------------
 
-for (const { name, ctx, reg, frontier, expected } of [
-  {
-    name: "virginRegister_returnsEmpty",
-    ctx: "ctx",
-    reg: { s: 0, c: 0, b: 0 },
-    frontier: 0,
-    expected: {},
-  },
-  {
-    name: "liveOverride_returnsThreeKeys",
-    ctx: "ctx",
-    reg: { s: 2, c: 1, b: 100 },
-    frontier: 50,
-    expected: {
-      [`${OV_S_PREFIX}ctx`]: 2,
-      [`${OV_C_PREFIX}ctx`]: 1,
-      [`${OV_B_PREFIX}ctx`]: 100,
-    },
-  },
+// biome-ignore format: compact table rows — template-literal expected values exceed line width
+for (const [name, ctx, reg, frontier, expected] of [
+  ["virginRegister_returnsEmpty", "ctx", { s: 0, c: 0, b: 0 }, 0, {}],
+  ["liveOverride_returnsThreeKeys", "ctx", { s: 2, c: 1, b: 100 }, 50, { [`${OV_S_PREFIX}ctx`]: 2, [`${OV_C_PREFIX}ctx`]: 1, [`${OV_B_PREFIX}ctx`]: 100 }],
   // Dead: S=1, C=2 (clear-wins) → tombstone floor ov_c = max(1,2) = 2
-  {
-    name: "deadOverride_returnsOnlyOvC",
-    ctx: "ctx",
-    reg: { s: 1, c: 2, b: 100 },
-    frontier: 50,
-    expected: { [`${OV_C_PREFIX}ctx`]: 2 },
-  },
+  ["deadOverride_returnsOnlyOvC", "ctx", { s: 1, c: 2, b: 100 }, 50, { [`${OV_C_PREFIX}ctx`]: 2 }],
   // Tie S==C → clear-wins → tombstone floor
-  {
-    name: "tieRegister_returnsOnlyOvC",
-    ctx: "ctx",
-    reg: { s: 3, c: 3, b: 100 },
-    frontier: 50,
-    expected: { [`${OV_C_PREFIX}ctx`]: 3 },
-  },
+  ["tieRegister_returnsOnlyOvC", "ctx", { s: 3, c: 3, b: 100 }, 50, { [`${OV_C_PREFIX}ctx`]: 3 }],
   // Frontier past baseline: live rule fails → tombstone floor
-  {
-    name: "frontierDominated_returnsOnlyOvC",
-    ctx: "ctx",
-    reg: { s: 1, c: 0, b: 100 },
-    frontier: 200,
-    expected: { [`${OV_C_PREFIX}ctx`]: 1 },
-  },
+  ["frontierDominated_returnsOnlyOvC", "ctx", { s: 1, c: 0, b: 100 }, 200, { [`${OV_C_PREFIX}ctx`]: 1 }],
   // Pre-compacted floor: s=0, c=5, b=0 → dead → tombstone max(0,5)=5
-  {
-    name: "tombstoneFloorShape_returnsOnlyOvC",
-    ctx: "ctx",
-    reg: { s: 0, c: 5, b: 0 },
-    frontier: 0,
-    expected: { [`${OV_C_PREFIX}ctx`]: 5 },
-  },
+  ["tombstoneFloorShape_returnsOnlyOvC", "ctx", { s: 0, c: 5, b: 0 }, 0, { [`${OV_C_PREFIX}ctx`]: 5 }],
 ]) {
   test(`encodeOverrideGroup_${name}`, () => {
     assert.deepEqual(encodeOverrideGroup(ctx, reg, frontier), expected);
@@ -413,12 +306,12 @@ test("parseContexts_doubleEscapedFrontierKey_stripsOneEsc", () => {
 
 // ── partial-group rejection matrix (every illegal subset) — table-driven ────
 
-for (const { name, extra } of [
-  { name: "sOnly", extra: { "ov_s:ch:x": 1 } },
-  { name: "bOnly", extra: { "ov_b:ch:x": 50 } },
-  { name: "sConly", extra: { "ov_s:ch:x": 1, "ov_c:ch:x": 0 } },
-  { name: "sBonly", extra: { "ov_s:ch:x": 1, "ov_b:ch:x": 50 } },
-  { name: "cBonly", extra: { "ov_c:ch:x": 2, "ov_b:ch:x": 50 } },
+for (const [name, extra] of [
+  ["sOnly", { "ov_s:ch:x": 1 }],
+  ["bOnly", { "ov_b:ch:x": 50 }],
+  ["sConly", { "ov_s:ch:x": 1, "ov_c:ch:x": 0 }],
+  ["sBonly", { "ov_s:ch:x": 1, "ov_b:ch:x": 50 }],
+  ["cBonly", { "ov_c:ch:x": 2, "ov_b:ch:x": 50 }],
 ]) {
   test(`parseContexts_${name}_droppedFrontierRetained`, () => {
     const raw = { "ch:x": 100, ...extra };
@@ -430,34 +323,13 @@ for (const { name, extra } of [
 
 // ── invalid sibling at each position — table-driven ─────────────────────────
 
-for (const { name, raw } of [
-  {
-    name: "invalidS_liveGroupDropped",
-    raw: {
-      "ch:x": 100,
-      "ov_s:ch:x": "not-a-number",
-      "ov_c:ch:x": 0,
-      "ov_b:ch:x": 50,
-    },
-  },
-  {
-    name: "invalidC_liveGroupDropped",
-    raw: { "ch:x": 100, "ov_s:ch:x": 1, "ov_c:ch:x": 1.5, "ov_b:ch:x": 50 },
-  },
-  {
-    name: "invalidB_liveGroupDropped",
-    raw: { "ch:x": 100, "ov_s:ch:x": 1, "ov_c:ch:x": 0, "ov_b:ch:x": -1 },
-  },
-  {
-    name: "uint32Overflow_liveGroupDropped",
-    raw: {
-      "ch:x": 100,
-      "ov_s:ch:x": 4294967296,
-      "ov_c:ch:x": 0,
-      "ov_b:ch:x": 50,
-    },
-  },
-  { name: "invalidC_tombstoneDropped", raw: { "ch:x": 100, "ov_c:ch:x": -5 } },
+// biome-ignore format: compact table rows — 4-key raw objects exceed line width
+for (const [name, raw] of [
+  ["invalidS_liveGroupDropped", { "ch:x": 100, "ov_s:ch:x": "not-a-number", "ov_c:ch:x": 0, "ov_b:ch:x": 50 }],
+  ["invalidC_liveGroupDropped", { "ch:x": 100, "ov_s:ch:x": 1, "ov_c:ch:x": 1.5, "ov_b:ch:x": 50 }],
+  ["invalidB_liveGroupDropped", { "ch:x": 100, "ov_s:ch:x": 1, "ov_c:ch:x": 0, "ov_b:ch:x": -1 }],
+  ["uint32Overflow_liveGroupDropped", { "ch:x": 100, "ov_s:ch:x": 4294967296, "ov_c:ch:x": 0, "ov_b:ch:x": 50 }],
+  ["invalidC_tombstoneDropped", { "ch:x": 100, "ov_c:ch:x": -5 }],
 ]) {
   test(`parseContexts_${name}`, () => {
     const { frontiers, overrides } = parseContexts(raw);
@@ -468,30 +340,11 @@ for (const { name, raw } of [
 
 // ── uint32 boundary values accepted — table-driven ──────────────────────────
 
-for (const { name, raw, expectedFrontier, expectedOverride } of [
-  {
-    name: "uint32Zero_acceptedInLiveGroup",
-    raw: { "ch:x": 0, "ov_s:ch:x": 0, "ov_c:ch:x": 0, "ov_b:ch:x": 0 },
-    expectedFrontier: 0,
-    expectedOverride: { s: 0, c: 0, b: 0 },
-  },
-  {
-    name: "uint32Max_acceptedInLiveGroup",
-    raw: {
-      "ch:x": UINT32_MAX,
-      "ov_s:ch:x": UINT32_MAX,
-      "ov_c:ch:x": UINT32_MAX,
-      "ov_b:ch:x": UINT32_MAX,
-    },
-    expectedFrontier: UINT32_MAX,
-    expectedOverride: { s: UINT32_MAX, c: UINT32_MAX, b: UINT32_MAX },
-  },
-  {
-    name: "uint32Max_acceptedInTombstone",
-    raw: { "ch:x": 0, "ov_c:ch:x": UINT32_MAX },
-    expectedFrontier: 0,
-    expectedOverride: { s: 0, c: UINT32_MAX, b: 0 },
-  },
+// biome-ignore format: compact table rows — UINT32_MAX key values exceed line width
+for (const [name, raw, expectedFrontier, expectedOverride] of [
+  ["uint32Zero_acceptedInLiveGroup", { "ch:x": 0, "ov_s:ch:x": 0, "ov_c:ch:x": 0, "ov_b:ch:x": 0 }, 0, { s: 0, c: 0, b: 0 }],
+  ["uint32Max_acceptedInLiveGroup", { "ch:x": UINT32_MAX, "ov_s:ch:x": UINT32_MAX, "ov_c:ch:x": UINT32_MAX, "ov_b:ch:x": UINT32_MAX }, UINT32_MAX, { s: UINT32_MAX, c: UINT32_MAX, b: UINT32_MAX }],
+  ["uint32Max_acceptedInTombstone", { "ch:x": 0, "ov_c:ch:x": UINT32_MAX }, 0, { s: 0, c: UINT32_MAX, b: 0 }],
 ]) {
   test(`parseContexts_${name}`, () => {
     const { frontiers, overrides } = parseContexts(raw);
@@ -507,107 +360,24 @@ function asciiOfBytes(n) {
   return "a".repeat(n);
 }
 
-for (const { name, raw, key, checkFrontier, checkOverride, accepted } of [
+// biome-ignore format: compact table rows — function-valued fields with asciiOfBytes calls
+for (const [name, raw, key, checkFrontier, checkOverride, accepted] of [
   // ov_s: prefix is 5 bytes; a 251-byte suffix yields a 256-byte frontier wire key → accepted.
-  {
-    name: "frontierKey256Bytes_accepted",
-    raw: () => ({ [asciiOfBytes(251)]: 42 }),
-    key: () => asciiOfBytes(251),
-    accepted: true,
-    checkFrontier: true,
-    checkOverride: false,
-  },
+  ["frontierKey256Bytes_accepted", () => ({ [asciiOfBytes(251)]: 42 }), () => asciiOfBytes(251), true, false, true],
   // 257-byte frontier key → dropped from frontiers.
-  {
-    name: "frontierKey257Bytes_dropped",
-    raw: () => ({ [asciiOfBytes(257)]: 42 }),
-    key: () => asciiOfBytes(257),
-    accepted: false,
-    checkFrontier: true,
-    checkOverride: false,
-  },
+  ["frontierKey257Bytes_dropped", () => ({ [asciiOfBytes(257)]: 42 }), () => asciiOfBytes(257), true, false, false],
   // ov_s: is 5 bytes; suffix of 251 bytes → ov_s: wire key exactly 256 bytes → group accepted.
-  {
-    name: "liveGroupSiblingKey256Bytes_accepted",
-    raw: () => {
-      const s = asciiOfBytes(251);
-      return {
-        [s]: 10,
-        [`${OV_S_PREFIX}${s}`]: 1,
-        [`${OV_C_PREFIX}${s}`]: 0,
-        [`${OV_B_PREFIX}${s}`]: 9,
-      };
-    },
-    key: () => asciiOfBytes(251),
-    accepted: true,
-    checkFrontier: false,
-    checkOverride: true,
-  },
+  ["liveGroupSiblingKey256Bytes_accepted", () => { const s = asciiOfBytes(251); return { [s]: 10, [`${OV_S_PREFIX}${s}`]: 1, [`${OV_C_PREFIX}${s}`]: 0, [`${OV_B_PREFIX}${s}`]: 9 }; }, () => asciiOfBytes(251), false, true, true],
   // ov_s: is 5 bytes; suffix of 252 bytes → ov_s: wire key 257 bytes → group dropped (override only).
-  {
-    name: "liveGroupSiblingKey257Bytes_groupDropped",
-    raw: () => {
-      const s = asciiOfBytes(252);
-      return {
-        [s]: 10,
-        [`${OV_S_PREFIX}${s}`]: 1,
-        [`${OV_C_PREFIX}${s}`]: 0,
-        [`${OV_B_PREFIX}${s}`]: 9,
-      };
-    },
-    key: () => asciiOfBytes(252),
-    accepted: false,
-    checkFrontier: false,
-    checkOverride: true,
-  },
+  ["liveGroupSiblingKey257Bytes_groupDropped", () => { const s = asciiOfBytes(252); return { [s]: 10, [`${OV_S_PREFIX}${s}`]: 1, [`${OV_C_PREFIX}${s}`]: 0, [`${OV_B_PREFIX}${s}`]: 9 }; }, () => asciiOfBytes(252), false, true, false],
   // ov_c: is 5 bytes; suffix of 251 bytes → ov_c: wire key exactly 256 bytes → tombstone accepted.
-  {
-    name: "tombstoneFloorKey256Bytes_accepted",
-    raw: () => {
-      const s = asciiOfBytes(251);
-      return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 3 };
-    },
-    key: () => asciiOfBytes(251),
-    accepted: true,
-    checkFrontier: false,
-    checkOverride: true,
-  },
+  ["tombstoneFloorKey256Bytes_accepted", () => { const s = asciiOfBytes(251); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 3 }; }, () => asciiOfBytes(251), false, true, true],
   // ov_c: is 5 bytes; suffix of 252 bytes → ov_c: wire key 257 bytes → tombstone group dropped.
-  {
-    name: "tombstoneFloorKey257Bytes_groupDropped",
-    raw: () => {
-      const s = asciiOfBytes(252);
-      return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 3 };
-    },
-    key: () => asciiOfBytes(252),
-    accepted: false,
-    checkFrontier: false,
-    checkOverride: true,
-  },
+  ["tombstoneFloorKey257Bytes_groupDropped", () => { const s = asciiOfBytes(252); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 3 }; }, () => asciiOfBytes(252), false, true, false],
   // A 2-byte UTF-8 char (e.g. 'é') counts as 2 bytes. 127 × 'é' = 254 bytes; ov_c: (5) + 254 = 259 → over limit.
-  {
-    name: "multibyteSuffix_keyLengthCheckedInBytes",
-    raw: () => {
-      const s = "\u00e9".repeat(127);
-      return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 7 };
-    },
-    key: () => "\u00e9".repeat(127),
-    accepted: false,
-    checkFrontier: false,
-    checkOverride: true,
-  },
+  ["multibyteSuffix_keyLengthCheckedInBytes", () => { const s = "\u00e9".repeat(127); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 7 }; }, () => "\u00e9".repeat(127), false, true, false],
   // 'é' × 125 = 250 bytes; ov_c: (5) + 250 = 255 → under limit.
-  {
-    name: "multibyteSuffix_justUnder256_accepted",
-    raw: () => {
-      const s = "\u00e9".repeat(125);
-      return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 7 };
-    },
-    key: () => "\u00e9".repeat(125),
-    accepted: true,
-    checkFrontier: false,
-    checkOverride: true,
-  },
+  ["multibyteSuffix_justUnder256_accepted", () => { const s = "\u00e9".repeat(125); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 7 }; }, () => "\u00e9".repeat(125), false, true, true],
 ]) {
   test(`parseContexts_${name}`, () => {
     const r = raw();
@@ -1240,49 +1010,22 @@ test("mergeReadStateEventsStructured_fullCollisionWitness_distinctNamespaces", a
 // isValidReadStateDTag — spec-conformant d-tag validation (NIP-RS :55/:68) — table-driven
 // ---------------------------------------------------------------------------
 
-for (const { name, input, expected } of [
-  {
-    name: "valid32HexSlot_returnsTrue",
-    input: "read-state:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
-    expected: true,
-  },
+// biome-ignore format: compact table rows — hex string inputs exceed line width
+for (const [name, input, expected] of [
+  ["valid32HexSlot_returnsTrue", "read-state:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", true],
   // Uppercase letters are NOT valid — spec requires [0-9a-f]{32} only.
-  {
-    name: "uppercaseHex_returnsFalse",
-    input: "read-state:A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6",
-    expected: false,
-  },
+  ["uppercaseHex_returnsFalse", "read-state:A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6", false],
   // 'g' and 'z' are not hexadecimal.
-  {
-    name: "nonHexChars_returnsFalse",
-    input: "read-state:gggggggggggggggggggggggggggggggg",
-    expected: false,
-  },
+  ["nonHexChars_returnsFalse", "read-state:gggggggggggggggggggggggggggggggg", false],
   // One char short — must be exactly 32.
-  {
-    name: "31HexChars_returnsFalse",
-    input: "read-state:" + "a".repeat(31),
-    expected: false,
-  },
+  ["31HexChars_returnsFalse", "read-state:" + "a".repeat(31), false],
   // One char over — must be exactly 32.
-  {
-    name: "33HexChars_returnsFalse",
-    input: "read-state:" + "a".repeat(33),
-    expected: false,
-  },
-  {
-    name: "missingPrefix_returnsFalse",
-    input: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
-    expected: false,
-  },
-  { name: "emptySlot_returnsFalse", input: "read-state:", expected: false },
-  { name: "undefined_returnsFalse", input: undefined, expected: false },
+  ["33HexChars_returnsFalse", "read-state:" + "a".repeat(33), false],
+  ["missingPrefix_returnsFalse", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", false],
+  ["emptySlot_returnsFalse", "read-state:", false],
+  ["undefined_returnsFalse", undefined, false],
   // Non-conforming opaque slot names must be correctly rejected.
-  {
-    name: "legacySlot1_returnsFalse",
-    input: "read-state:slot1",
-    expected: false,
-  },
+  ["legacySlot1_returnsFalse", "read-state:slot1", false],
 ]) {
   test(`isValidReadStateDTag_${name}`, () => {
     assert.equal(isValidReadStateDTag(input), expected);

@@ -501,7 +501,7 @@ mod tests {
         migrations.sort_by_key(|migration| migration.version);
         migrations
             .into_iter()
-            .filter(|migration| migration.version > 27)
+            .filter(|migration| migration.version > 28)
             .flat_map(|migration| {
                 let statements = split_sql_statements(migration.sql.as_str());
                 let attachments = statements
@@ -668,7 +668,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 27);
+        assert_eq!(migrations.len(), 28);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1027,7 +1027,6 @@ mod tests {
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
 
-
         // Channel-id lookup index (0027): serves tenant-independent channel lookups.
         assert_eq!(migrations[26].version, 27);
         let channel_id_index = migrations[26].sql.as_str();
@@ -1339,7 +1338,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
     }
 
     #[tokio::test]

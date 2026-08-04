@@ -476,22 +476,17 @@ fn test_partial_drain_stop_failure_delivers_stopped_prefix_and_remaining_tail() 
 
 // ── compensate_drain_for tests ──────────────────────────────────────────────
 //
-// These tests call `compensate_drain_for` directly — the extracted production
-// core — with an injected `start_fn` instead of the real `start_pair_under_held_locks`.
-// The injected function records which entries were restarted and returns
+// These tests call `compensate_drain_for` directly — the lock-free production
+// core — with an injected `start_fn`. The function takes `&mut [ManagedAgentRecord]`
+// (loaded by the adapter under the store lock) and calls start_fn for each
+// stopped entry. Tests inject a closure that records calls and returns
 // synthetic success/failure without spawning processes or touching disk.
 //
-// This exercises the two critical invariants of compensation:
-//   1. Only the `stopped` prefix (not the full journal) is restarted.
-//   2. A stale captured scope skips compensation entirely (generation guard).
+// The stale-scope generation guard lives in the adapter (`compensate_drain`),
+// not the core, and is tested at the adapter level below.
 //
-// The `start_pair` gate invariant (concurrent ordinary starts are serialized by
-// holding the transition lock) is structural: `compensate_drain_for` runs under
-// the caller's held transition guard (see `compensate_drain`'s signature), and
-// every `start_pair`/`start_managed_agent_process` path acquires that same lock
-// before proceeding. The lock-order audit lives in `identity.rs` and
-// `workspace.rs`; no concurrent-thread test is added here because the Rust
-// type system enforces the ownership invariant at compile time.
+// The serialization invariant (writers blocked by store lock, not transition
+// guard) is documented in the adapter and verified in the adapter-level tests.
 
 fn make_captured_scope() -> super::super::scope::WorkspaceAgentScope {
     // Build a scope whose generation matches the current global counter.
@@ -510,6 +505,9 @@ fn make_captured_scope() -> super::super::scope::WorkspaceAgentScope {
 /// Two-entry compensation: entry 1 stopped, entry 2 stop-failed.
 /// `compensate_drain_for` must call start_fn exactly for entry 1 and return
 /// None (full success), proving the stopped-prefix contract.
+///
+/// The start_fn receives both the entry and the mutable records slice,
+/// matching `start_pair_under_held_locks`'s contract.
 #[test]
 fn test_compensate_for_restarts_stopped_entries_in_order() {
     let pubkey1 = "aa".repeat(32);
@@ -518,11 +516,9 @@ fn test_compensate_for_restarts_stopped_entries_in_order() {
     // entry2 was not stopped (stop failed), so it is NOT in the stopped slice.
     let stopped = vec![entry1.clone()];
 
-    let state = crate::app_state::build_app_state();
-    let captured_scope = make_captured_scope();
-
+    let mut records: Vec<super::super::ManagedAgentRecord> = Vec::new();
     let mut restarted: Vec<String> = Vec::new();
-    let result = compensate_drain_for(&state, &stopped, &captured_scope, |entry| {
+    let result = compensate_drain_for(&stopped, &mut records, |entry, _recs| {
         restarted.push(entry.key.pubkey.clone());
         Ok(())
     });
@@ -540,42 +536,6 @@ fn test_compensate_for_restarts_stopped_entries_in_order() {
     );
 }
 
-/// Stale scope: compensation skips all restarts and returns a degradation message.
-/// Proves the generation guard: a workspace switch between drain failure and
-/// compensation must prevent stale-scope agents from restarting.
-#[test]
-fn test_compensate_for_skips_all_on_stale_scope() {
-    let pubkey1 = "aa".repeat(32);
-    let entry1 = make_drain_entry(&pubkey1, "wss://relay.example", true);
-    let stopped = vec![entry1.clone()];
-
-    let state = crate::app_state::build_app_state();
-    let captured_scope = make_captured_scope();
-
-    // Advance the global generation — scope is now stale.
-    super::super::scope::next_scope_generation();
-
-    let mut restart_count = 0usize;
-    let result = compensate_drain_for(&state, &stopped, &captured_scope, |_entry| {
-        restart_count += 1;
-        Ok(())
-    });
-
-    assert!(
-        result.is_some(),
-        "stale scope must return a degradation message"
-    );
-    let msg = result.unwrap();
-    assert!(
-        msg.contains("compensation skipped") || msg.contains("stale scope"),
-        "degradation message must describe stale scope: {msg}"
-    );
-    assert_eq!(
-        restart_count, 0,
-        "start_fn must not be called when scope is stale"
-    );
-}
-
 /// Partial restart failure: start_fn returns an error for entry1, success for
 /// entry2. The function must return a degradation message naming the failing
 /// entry and not abort early (entry2 is still attempted).
@@ -587,11 +547,9 @@ fn test_compensate_for_reports_partial_restart_failure() {
     let entry2 = make_drain_entry(&pubkey2, "wss://relay.example", false);
     let stopped = vec![entry1.clone(), entry2.clone()];
 
-    let state = crate::app_state::build_app_state();
-    let captured_scope = make_captured_scope();
-
+    let mut records: Vec<super::super::ManagedAgentRecord> = Vec::new();
     let pubkey1_clone = pubkey1.clone();
-    let result = compensate_drain_for(&state, &stopped, &captured_scope, |entry| {
+    let result = compensate_drain_for(&stopped, &mut records, |entry, _recs| {
         if entry.key.pubkey == pubkey1_clone {
             Err(format!("injected failure for {}", entry.key.pubkey))
         } else {
@@ -607,6 +565,30 @@ fn test_compensate_for_reports_partial_restart_failure() {
     assert!(
         msg.contains(&pubkey1),
         "degradation message must name the failing entry: {msg}"
+    );
+}
+
+/// `compensate_drain_for` passes the records slice to start_fn so it can be
+/// mutated (matching `start_pair_under_held_locks`'s &mut [ManagedAgentRecord]).
+/// Prove start_fn receives and can mutate the slice.
+#[test]
+fn test_compensate_for_start_fn_receives_records_slice() {
+    let pubkey1 = "aa".repeat(32);
+    let entry1 = make_drain_entry(&pubkey1, "wss://relay.example", true);
+    let stopped = vec![entry1.clone()];
+
+    let mut records: Vec<super::super::ManagedAgentRecord> = Vec::new();
+    let mut received_records_len: Option<usize> = None;
+    let result = compensate_drain_for(&stopped, &mut records, |_entry, recs| {
+        received_records_len = Some(recs.len());
+        Ok(())
+    });
+
+    assert!(result.is_none(), "must succeed: {result:?}");
+    assert_eq!(
+        received_records_len,
+        Some(0),
+        "start_fn must receive the records slice (empty in this test)"
     );
 }
 

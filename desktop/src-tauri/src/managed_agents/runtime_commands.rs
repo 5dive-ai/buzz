@@ -820,9 +820,6 @@ pub(crate) fn drain_scope_runtimes(
 /// old workspace is as intact as possible.
 ///
 /// `captured_scope` is the workspace scope that was active when the drain began.
-/// Before restoring any entry this function validates that the scope generation
-/// has not changed — if a workspace switch raced the drain failure, compensation
-/// is skipped entirely (the new scope will restore its own agents).
 ///
 /// `_rt_transition_held` is the caller's already-held
 /// `managed_agent_runtime_transition` guard. The caller must NOT drop it before
@@ -830,66 +827,46 @@ pub(crate) fn drain_scope_runtimes(
 /// is held continuously from drain through all journal restarts, closing the
 /// drop-then-reacquire interleave window that a concurrent start could exploit.
 ///
-/// This function additionally re-acquires `managed_agents_store_lock` so all
-/// journal restarts run under both guards.  The caller must have released
-/// `managed_agents_store_lock` (only) before calling.
-///
 /// Returns a degradation message describing what could not be restarted.
 ///
 /// The journal-restore loop is implemented in [`compensate_drain_for`] with an
-/// injected start function, allowing the generation-validation + iteration
-/// contract to be unit-tested without an `AppHandle`.
+/// injected start function, allowing the iteration contract to be unit-tested
+/// without an `AppHandle`.
 // ────────────────────────────────────────────────────────────────────────────
-/// Testable core of [`compensate_drain`]: re-acquires the store lock, validates
-/// the captured scope generation, then calls `start_fn` for each stopped entry.
+/// Lock-free testable core of the journal-restore loop.
 ///
-/// The transition lock must already be held by the caller. `compensate_drain`
-/// passes a `start_fn` that invokes [`start_pair_under_held_locks`]; tests inject
-/// a closure that records calls and returns synthetic results without spawning
-/// processes or touching disk.
+/// **Preconditions (enforced by the [`compensate_drain`] adapter before calling):**
+/// - `managed_agent_runtime_transition` is held by the caller (passed by value
+///   to `compensate_drain`).
+/// - `managed_agents_store_lock` is acquired by the adapter BEFORE this call.
+/// - `records` is loaded by the adapter AFTER acquiring the store lock.
+///
+/// `compensate_drain` passes a `start_fn` that invokes
+/// [`start_pair_under_held_locks`]; tests inject a closure that records calls
+/// and returns synthetic results without spawning processes or touching disk.
+///
+/// The mechanism serializing writers: the adapter holds `managed_agents_store_lock`
+/// continuously across validate→load→restore→save, so any writer that takes only
+/// the store lock is serialized here — not on the transition guard.
 ///
 /// Returns a degradation message when one or more restarts fail, `None` on full
-/// success. A stale scope also returns a degradation message (compensation
-/// skipped) — that is not a hard failure, so callers treat it the same way.
+/// success.
 pub(crate) fn compensate_drain_for<F>(
-    state: &AppState,
     stopped: &[DrainJournalEntry],
-    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
+    records: &mut [super::ManagedAgentRecord],
     mut start_fn: F,
 ) -> Option<String>
 where
-    F: FnMut(&DrainJournalEntry) -> Result<(), String>,
+    F: FnMut(&DrainJournalEntry, &mut [super::ManagedAgentRecord]) -> Result<(), String>,
 {
     debug_assert!(
         !stopped.is_empty(),
         "compensate_drain_for called with empty stopped list"
     );
 
-    // Re-acquire only the store lock — the transition lock is already held via
-    // the caller's guard so no concurrent start can enter the window.
-    let _store = match state.managed_agents_store_lock.lock() {
-        Ok(g) => g,
-        Err(e) => {
-            return Some(format!(
-                "compensation failed: could not acquire store lock: {e}"
-            ));
-        }
-    };
-
-    // Validate the captured scope before restoring. If the workspace switched
-    // between the drain failure and this compensation, the new scope's own
-    // restore pass will start the correct agents — we must not restart agents
-    // for a scope that is no longer active.
-    if let Err(stale_msg) = crate::managed_agents::scope::validate_scope_generation(captured_scope)
-    {
-        return Some(format!(
-            "compensation skipped: {stale_msg}; new scope will restore its own agents"
-        ));
-    }
-
     let mut failed_restarts = Vec::new();
     for entry in stopped {
-        if let Err(e) = start_fn(entry) {
+        if let Err(e) = start_fn(entry, records) {
             failed_restarts.push(format!("{}@{}: {e}", entry.key.pubkey, entry.key.relay_url));
         }
     }
@@ -904,6 +881,17 @@ where
     }
 }
 
+/// Production adapter for [`compensate_drain_for`].
+///
+/// Lock acquisition order inside this function:
+///   1. `_rt_transition_held` — already held by caller (passed by value).
+///   2. Acquire `managed_agents_store_lock` — store-lock-only writers
+///      (instance edits, status flushes) are serialized here, not on the
+///      transition guard.
+///   3. Validate `captured_scope.generation` under the store lock.
+///   4. `load_managed_agents_at` — records loaded AFTER both locks held.
+///   5. Delegate to [`compensate_drain_for`] — store guard held through
+///      every save performed by `start_pair_under_held_locks`.
 pub(crate) fn compensate_drain<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     stopped: &[DrainJournalEntry],
@@ -920,6 +908,28 @@ pub(crate) fn compensate_drain<R: tauri::Runtime>(
 
     let state = app.state::<AppState>();
 
+    // 2. Acquire the store lock — transition already held via _rt_transition_held.
+    let _store = match state.managed_agents_store_lock.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            return Some(format!(
+                "compensation failed: could not acquire store lock: {e}"
+            ));
+        }
+    };
+
+    // 3. Validate the captured scope before restoring. If the workspace switched
+    // between the drain failure and this compensation, the new scope's own
+    // restore pass will start the correct agents — we must not restart agents
+    // for a scope that is no longer active.
+    if let Err(stale_msg) = crate::managed_agents::scope::validate_scope_generation(captured_scope)
+    {
+        return Some(format!(
+            "compensation skipped: {stale_msg}; new scope will restore its own agents"
+        ));
+    }
+
+    // 4. Load records under the held store lock.
     let mut records = match load_managed_agents_at(&captured_scope.definitions_dir) {
         Ok(r) => r,
         Err(e) => {
@@ -929,7 +939,8 @@ pub(crate) fn compensate_drain<R: tauri::Runtime>(
         }
     };
 
-    compensate_drain_for(&state, stopped, captured_scope, |entry| {
+    // 5. Delegate to the lock-free core — store guard is held through every save.
+    compensate_drain_for(stopped, &mut records, |entry, recs| {
         start_pair_under_held_locks(
             app,
             &state,
@@ -937,7 +948,7 @@ pub(crate) fn compensate_drain<R: tauri::Runtime>(
             entry.key.relay_url.clone(),
             entry.start_on_app_launch,
             None,
-            &mut records,
+            recs,
         )
         .map(|_| ())
     })

@@ -22,11 +22,14 @@ const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
 /// Parent-process variables that a Claude adapter needs for ordinary process
 /// startup. Everything else must be supplied explicitly through the persona.
-/// This keeps host credentials (for example AWS, GitHub, and Buzz keys) out of
-/// an agent that may process untrusted channel messages.
+/// This keeps host credentials (for example AWS and GitHub tokens) out of an
+/// agent that may process untrusted channel messages. Buzz's own signing key is
+/// unaffected either way: it reaches the agent through the MCP server
+/// environment the harness builds, not through the adapter process.
 const CLAUDE_PARENT_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
     "USER",
+    "USERNAME",
     "LOGNAME",
     "SHELL",
     "TMPDIR",
@@ -41,6 +44,15 @@ const CLAUDE_PARENT_ENV_ALLOWLIST: &[&str] = &[
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "NODE_EXTRA_CA_CERTS",
+    // Egress-proxied hosts have no route to the model API without these, and
+    // they carry no credential material.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    // Explicit operator opt-out of the profile git config projected below.
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
     "SYSTEMROOT",
     "COMSPEC",
     "PATHEXT",
@@ -50,11 +62,40 @@ const CLAUDE_PARENT_ENV_ALLOWLIST: &[&str] = &[
     "CLAUDE_CODE_EXECUTABLE",
 ];
 
-fn is_claude_adapter(command: &str) -> bool {
-    matches!(
-        crate::config::normalize_agent_command_identity(command).as_str(),
+/// Commands that delegate their runtime identity to the package named in their
+/// arguments, so the adapter cannot be recognized from the command alone.
+const JS_RUNNER_IDENTITIES: &[&str] = &[
+    "npx", "npm", "pnpx", "pnpm", "yarn", "bunx", "bun", "node", "deno",
+];
+
+const CLAUDE_ADAPTER_PACKAGES: &[&str] = &["claude-agent-acp", "claude-code-acp"];
+
+fn is_claude_adapter(command: &str, args: &[String]) -> bool {
+    let identity = crate::config::normalize_agent_command_identity(command);
+    if matches!(
+        identity.as_str(),
         "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode"
-    )
+    ) {
+        return true;
+    }
+    // `npx @agentclientprotocol/claude-agent-acp` and `node …/claude-agent-acp/
+    // dist/index.js` are the same runtime as the bare binary; matching only the
+    // command name would spawn them unisolated.
+    JS_RUNNER_IDENTITIES.contains(&identity.as_str())
+        && args.iter().any(|arg| {
+            let arg = arg.to_ascii_lowercase();
+            CLAUDE_ADAPTER_PACKAGES
+                .iter()
+                .any(|package| arg.contains(package))
+        })
+}
+
+/// True when a command looks like a Claude adapter that [`is_claude_adapter`]
+/// cannot confirm — a rename, a wrapper script, an unrecognized package name.
+/// Such a spawn gets no isolation, so it is worth saying so out loud.
+fn looks_like_unrecognized_claude(command: &str, args: &[String]) -> bool {
+    !is_claude_adapter(command, args)
+        && crate::config::normalize_agent_command_identity(command).contains("claude")
 }
 
 fn claude_parent_env_is_allowed(key: &std::ffi::OsStr) -> bool {
@@ -64,6 +105,103 @@ fn claude_parent_env_is_allowed(key: &std::ffi::OsStr) -> bool {
     CLAUDE_PARENT_ENV_ALLOWLIST
         .iter()
         .any(|allowed| key.eq_ignore_ascii_case(allowed))
+}
+
+/// Only the NIP-98 helper is projected into an isolated profile. It re-derives
+/// authentication from the nostr key the harness supplies deliberately, whereas
+/// `osxkeychain`, `store`, or a `!shell` fragment would hand the agent the
+/// operator's saved credentials — the class of access this isolation removes.
+fn git_credential_helper_is_portable(helper: &str) -> bool {
+    let helper = helper.trim();
+    !helper.starts_with('!')
+        && matches!(
+            crate::config::normalize_agent_command_identity(helper).as_str(),
+            "nostr" | "git-credential-nostr"
+        )
+}
+
+fn quote_git_config_value(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!("\"{escaped}\"")
+}
+
+/// Build the `.gitconfig` for an isolated Claude profile from the operator's
+/// global git config.
+///
+/// Redirecting `HOME` hides `~/.gitconfig`, which silently costs the agent its
+/// commit identity and, against Buzz's own git server, its push credential
+/// helper. Only these keys cross the boundary — never `url.*.insteadOf`, never a
+/// credential store. An operator who needs the full host config back can set
+/// `GIT_CONFIG_GLOBAL`, which git honors instead of this file.
+fn claude_profile_git_config(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let mut sections: Vec<(&str, Vec<(&str, String)>)> = Vec::new();
+
+    let user: Vec<(&str, String)> = [("name", "user.name"), ("email", "user.email")]
+        .into_iter()
+        .filter_map(|(field, key)| lookup(key).map(|value| (field, value)))
+        .collect();
+    if !user.is_empty() {
+        sections.push(("user", user));
+    }
+
+    if let Some(helper) =
+        lookup("credential.helper").filter(|h| git_credential_helper_is_portable(h))
+    {
+        let mut credential = vec![("helper", helper)];
+        if let Some(use_http_path) = lookup("credential.usehttppath") {
+            credential.push(("useHttpPath", use_http_path));
+        }
+        sections.push(("credential", credential));
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+    let mut config = String::new();
+    for (section, entries) in sections {
+        config.push_str(&format!("[{section}]\n"));
+        for (field, value) in entries {
+            config.push_str(&format!("\t{field} = {}\n", quote_git_config_value(&value)));
+        }
+    }
+    Some(config)
+}
+
+/// Read the operator's global git config. A missing or unreadable git is not an
+/// error: the profile then simply carries no git config.
+fn operator_global_git_config() -> std::collections::HashMap<String, String> {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["config", "--global", "--list", "-z"])
+        .output()
+    else {
+        return std::collections::HashMap::new();
+    };
+    let Ok(listing) = String::from_utf8(output.stdout) else {
+        return std::collections::HashMap::new();
+    };
+    listing
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .map(|record| match record.split_once('\n') {
+            Some((key, value)) => (key.to_owned(), value.to_owned()),
+            // A valueless entry is git's spelling of a true boolean.
+            None => (record.to_owned(), "true".to_owned()),
+        })
+        .collect()
+}
+
+/// Windows tooling that predates `USERPROFILE` composes the home directory from
+/// `HOMEDRIVE` + `HOMEPATH`; left inherited they point back at the operator.
+fn windows_home_split(root: &str) -> Option<(&str, &str)> {
+    let (drive, rest) = root.split_once(':')?;
+    let mut characters = drive.chars();
+    match (characters.next(), characters.next()) {
+        (Some(letter), None) if letter.is_ascii_alphabetic() => Some((&root[..2], rest)),
+        _ => None,
+    }
 }
 
 /// An MCP server configuration passed to `session/new`.
@@ -555,7 +693,17 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
-        let is_claude_adapter = is_claude_adapter(command);
+        let is_claude_adapter = is_claude_adapter(command, args);
+        if is_claude_adapter {
+            tracing::info!(command, "claude adapter: isolating environment and profile");
+        } else if looks_like_unrecognized_claude(command, args) {
+            tracing::warn!(
+                command,
+                "command resembles a Claude adapter but matches no known identity — spawning \
+                 WITHOUT environment or profile isolation; invoke it as `claude-agent-acp` to \
+                 isolate it"
+            );
+        }
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -638,6 +786,13 @@ impl AcpClient {
                 std::fs::create_dir_all(directory)?;
             }
 
+            let operator_git_config = operator_global_git_config();
+            if let Some(git_config) =
+                claude_profile_git_config(|key| operator_git_config.get(key).cloned())
+            {
+                std::fs::write(root.join(".gitconfig"), git_config)?;
+            }
+
             // Apply these last. Persona configuration must not redirect a
             // Claude process back to the operator's profile directories.
             cmd.env("HOME", root)
@@ -648,6 +803,9 @@ impl AcpClient {
                 .env("CLAUDE_CONFIG_DIR", claude)
                 .env("APPDATA", app_data)
                 .env("LOCALAPPDATA", local_app_data);
+            if let Some((drive, path)) = root.to_str().and_then(windows_home_split) {
+                cmd.env("HOMEDRIVE", drive).env("HOMEPATH", path);
+            }
         }
 
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
@@ -3022,16 +3180,33 @@ mod tests {
         var: &str,
         extra_env: &[(String, String)],
     ) -> String {
+        spawn_named_probe(
+            file_name,
+            &format!("printf '%s\\n' \"${{{var}:-<unset>}}\""),
+            extra_env,
+        )
+        .await
+    }
+
+    /// Run `snippet` inside a probe script whose file name carries a runtime
+    /// identity, and return its first line of stdout.
+    #[cfg(unix)]
+    async fn spawn_named_and_read_child_stdout(file_name: &str, snippet: &str) -> String {
+        spawn_named_probe(file_name, snippet, &[]).await
+    }
+
+    #[cfg(unix)]
+    async fn spawn_named_probe(
+        file_name: &str,
+        snippet: &str,
+        extra_env: &[(String, String)],
+    ) -> String {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("buzz-acp-env-probe-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create env probe dir");
         let path = dir.join(file_name);
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\nprintf '%s\\n' \"${{{var}:-<unset>}}\"\n"),
-        )
-        .expect("write env probe script");
+        std::fs::write(&path, format!("#!/bin/sh\n{snippet}\n")).expect("write env probe script");
         let mut permissions = std::fs::metadata(&path).expect("stat probe").permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(&path, permissions).expect("chmod probe");
@@ -3048,7 +3223,7 @@ mod tests {
             .reader
             .next()
             .await
-            .unwrap_or_else(|| panic!("child produced no output for {var}"))
+            .unwrap_or_else(|| panic!("child produced no output for `{snippet}`"))
             .expect("child stdout was not readable");
         client.shutdown().await;
         std::fs::remove_dir_all(&dir).expect("remove env probe dir");
@@ -3074,12 +3249,146 @@ mod tests {
             );
         }
 
-        for key in ["PATH", "TMPDIR", "SystemRoot", "CLAUDE_CODE_EXECUTABLE"] {
+        for key in [
+            "PATH",
+            "TMPDIR",
+            "SystemRoot",
+            "CLAUDE_CODE_EXECUTABLE",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "GIT_CONFIG_GLOBAL",
+        ] {
             assert!(
                 super::claude_parent_env_is_allowed(std::ffi::OsStr::new(key)),
                 "{key} is required for ordinary process startup"
             );
         }
+    }
+
+    /// A JS runner takes its identity from the package it launches, so matching
+    /// the command name alone would spawn the same adapter unisolated.
+    #[test]
+    fn claude_adapter_detection_covers_indirect_invocations() {
+        let cases: [(&str, &[&str], bool); 8] = [
+            ("claude-agent-acp", &[], true),
+            ("/usr/local/bin/claude-code-acp", &[], true),
+            (
+                "npx",
+                &["-y", "@agentclientprotocol/claude-agent-acp"],
+                true,
+            ),
+            (
+                "node",
+                &["/opt/node_modules/@zed-industries/claude-code-acp/dist/index.js"],
+                true,
+            ),
+            ("bunx", &["claude-agent-acp"], true),
+            ("npx", &["-y", "codex-acp"], false),
+            ("goose", &[], false),
+            ("claude-wrapper.sh", &[], false),
+        ];
+
+        for (command, args, expected) in cases {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            assert_eq!(
+                super::is_claude_adapter(command, &args),
+                expected,
+                "is_claude_adapter({command}, {args:?})"
+            );
+        }
+    }
+
+    /// An unrecognized Claude-looking command is spawned without isolation, so
+    /// the spawn logs a warning rather than failing silently open.
+    #[test]
+    fn unrecognized_claude_commands_are_flagged() {
+        for command in ["claude", "claude-acp", "my-claude-wrapper"] {
+            assert!(
+                super::looks_like_unrecognized_claude(command, &[]),
+                "{command} should warn about missing isolation"
+            );
+        }
+        for command in ["claude-agent-acp", "goose", "codex-acp"] {
+            assert!(
+                !super::looks_like_unrecognized_claude(command, &[]),
+                "{command} must not warn"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_git_config_projects_identity_and_nostr_helper_only() {
+        let host = std::collections::HashMap::from([
+            ("user.name".to_owned(), "Agent Smith".to_owned()),
+            ("user.email".to_owned(), "agent@example.com".to_owned()),
+            ("credential.helper".to_owned(), "nostr".to_owned()),
+            ("credential.usehttppath".to_owned(), "true".to_owned()),
+            (
+                "url.https://token@github.com/.insteadof".to_owned(),
+                "https://github.com/".to_owned(),
+            ),
+        ]);
+
+        let config = super::claude_profile_git_config(|key| host.get(key).cloned())
+            .expect("projected git config");
+
+        assert!(config.contains("name = \"Agent Smith\""));
+        assert!(config.contains("email = \"agent@example.com\""));
+        assert!(config.contains("helper = \"nostr\""));
+        assert!(config.contains("useHttpPath = \"true\""));
+        assert!(
+            !config.contains("insteadof") && !config.contains("token@"),
+            "only the projected keys may cross the isolation boundary: {config}"
+        );
+    }
+
+    #[test]
+    fn profile_git_config_drops_credential_store_helpers() {
+        for helper in [
+            "osxkeychain",
+            "store",
+            "manager",
+            "/usr/bin/git-credential-osxkeychain",
+            "!gh auth git-credential",
+        ] {
+            let config = super::claude_profile_git_config(|key| match key {
+                "credential.helper" => Some(helper.to_owned()),
+                "credential.usehttppath" => Some("true".to_owned()),
+                _ => None,
+            });
+            assert!(
+                config.is_none(),
+                "{helper} would expose the operator's stored credentials"
+            );
+        }
+
+        assert!(
+            super::claude_profile_git_config(|key| match key {
+                "credential.helper" => Some("/usr/local/bin/git-credential-nostr".to_owned()),
+                _ => None,
+            })
+            .is_some_and(|config| config.contains("git-credential-nostr")),
+            "the NIP-98 helper must survive so agents can still push to Buzz git"
+        );
+    }
+
+    #[test]
+    fn profile_git_config_is_absent_when_the_host_has_nothing_to_project() {
+        assert!(super::claude_profile_git_config(|_| None).is_none());
+    }
+
+    #[test]
+    fn windows_home_split_only_matches_drive_qualified_paths() {
+        assert_eq!(
+            super::windows_home_split(r"C:\Users\op\AppData\Local\Temp\buzz-claude-profile-x"),
+            Some(("C:", r"\Users\op\AppData\Local\Temp\buzz-claude-profile-x"))
+        );
+        assert_eq!(
+            super::windows_home_split("/tmp/buzz-claude-profile-x"),
+            None
+        );
+        assert_eq!(super::windows_home_split("relative/path"), None);
     }
 
     #[cfg(unix)]
@@ -3122,6 +3431,27 @@ mod tests {
         .await;
 
         assert_ne!(observed, configured);
+    }
+
+    /// The isolated profile is only usable for git work if the projected
+    /// `.gitconfig` actually lands in it before the child starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_profile_carries_the_projected_git_config() {
+        let host = super::operator_global_git_config();
+        let Some(projected) = super::claude_profile_git_config(|key| host.get(key).cloned()) else {
+            // Nothing to project on this machine; the pure tests cover the shape.
+            return;
+        };
+
+        let observed = spawn_named_and_read_child_stdout(
+            "claude-agent-acp",
+            // Flatten to one line: the probe reader returns a single line.
+            r#"tr '\n' '\037' < "$HOME/.gitconfig""#,
+        )
+        .await;
+
+        assert_eq!(observed, projected.replace('\n', "\u{1f}"));
     }
 
     /// Buzz-owned Hermes processes get the configured-MCP isolation default,

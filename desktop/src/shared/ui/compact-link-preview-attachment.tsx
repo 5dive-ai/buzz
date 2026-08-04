@@ -47,11 +47,13 @@ function LinkPreviewImageFallback({
 
 export function CompactLinkPreviewAttachment({
   className,
+  onOpen,
   onRemove,
   preview,
   showControls = false,
 }: {
   className?: string;
+  onOpen?: () => void;
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
   showControls?: boolean;
@@ -107,6 +109,14 @@ export function CompactLinkPreviewAttachment({
             className="relative z-20 flex w-fit max-w-full min-w-0 items-center gap-1.5 text-xs font-normal leading-4 text-muted-foreground/70 group-hover/attachment:underline"
             data-link-preview-hostname=""
             href={preview.href}
+            onClick={
+              onOpen
+                ? (event) => {
+                    event.preventDefault();
+                    onOpen();
+                  }
+                : undefined
+            }
             rel="noreferrer"
             target="_blank"
           >
@@ -130,21 +140,33 @@ export function CompactLinkPreviewAttachment({
             </AttachmentDescription>
           ) : null}
         </AttachmentContent>
-        <AttachmentTrigger
-          asChild
-          className={reserveImage ? undefined : "rounded-none"}
-        >
-          <a
+        {onOpen ? (
+          <AttachmentTrigger
             aria-label={`Open ${preview.provider} ${preview.typeLabel}: ${preview.title}`}
-            href={preview.href}
-            rel="noreferrer"
-            target="_blank"
+            className={reserveImage ? undefined : "rounded-none"}
+            onClick={onOpen}
           >
             <span className="sr-only">
               Open {preview.provider} {preview.typeLabel}: {preview.title}
             </span>
-          </a>
-        </AttachmentTrigger>
+          </AttachmentTrigger>
+        ) : (
+          <AttachmentTrigger
+            asChild
+            className={reserveImage ? undefined : "rounded-none"}
+          >
+            <a
+              aria-label={`Open ${preview.provider} ${preview.typeLabel}: ${preview.title}`}
+              href={preview.href}
+              rel="noreferrer"
+              target="_blank"
+            >
+              <span className="sr-only">
+                Open {preview.provider} {preview.typeLabel}: {preview.title}
+              </span>
+            </a>
+          </AttachmentTrigger>
+        )}
       </Attachment>
       {showControls ? (
         <LinkPreviewControls onRemove={onRemove} placement="left" />

@@ -233,12 +233,14 @@ function TweetPreview({
 export function RichLinkPreviewAttachment({
   className,
   ImageLightbox,
+  onOpen,
   onRemove,
   preview,
   showControls = false,
 }: {
   className?: string;
   ImageLightbox: LinkPreviewImageLightboxComponent;
+  onOpen?: () => void;
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
   showControls?: boolean;
@@ -279,6 +281,14 @@ export function RichLinkPreviewAttachment({
           data-link-preview-identity=""
           data-link-preview-hostname=""
           href={preview.href}
+          onClick={
+            onOpen
+              ? (event) => {
+                  event.preventDefault();
+                  onOpen();
+                }
+              : undefined
+          }
           rel="noreferrer"
           target="_blank"
         >
@@ -289,6 +299,14 @@ export function RichLinkPreviewAttachment({
           aria-label={`Open ${preview.provider} ${preview.typeLabel}: ${preview.title}`}
           className="mt-0.5 block text-sm font-semibold leading-5 text-foreground hover:underline"
           href={preview.href}
+          onClick={
+            onOpen
+              ? (event) => {
+                  event.preventDefault();
+                  onOpen();
+                }
+              : undefined
+          }
           rel="noreferrer"
           target="_blank"
         >

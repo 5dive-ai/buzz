@@ -1,8 +1,17 @@
 import * as React from "react";
 
 import { invokeTauri } from "@/shared/api/tauri";
+import { relayClient } from "@/shared/api/relayClient";
+import {
+  KIND_GIT_ISSUE,
+  KIND_GIT_PULL_REQUEST,
+} from "@/shared/constants/kinds";
 
-import type { SupportedLinkPreview } from "./linkPreview";
+import { parseEntityLink } from "./entityLink";
+import {
+  buzzEntityFallbackTitle,
+  type SupportedLinkPreview,
+} from "./linkPreview";
 
 type LinkPreviewImageFetchState =
   | "none"
@@ -167,10 +176,47 @@ function fetchLinkPreviewMetadata(
 const metadataLoader = createMetadataLoader({
   fetcher: fetchLinkPreviewMetadata,
 });
+const entityTitleLoader = createMetadataLoader({
+  fetcher: async (href) => {
+    const parsed = parseEntityLink(href);
+    if (!parsed.ok || parsed.value.type === "repo") return null;
+
+    const { id, owner, dtag } = parsed.value;
+    const expectedCoordinate = `30617:${owner}:${dtag}`;
+    const events = await relayClient.fetchEvents({
+      kinds: [
+        parsed.value.type === "pr" ? KIND_GIT_PULL_REQUEST : KIND_GIT_ISSUE,
+      ],
+      ids: [id],
+      limit: 1,
+    });
+    const event = events[0];
+    if (
+      !event?.tags.some(
+        (tag) => tag[0] === "a" && tag[1] === expectedCoordinate,
+      )
+    ) {
+      return null;
+    }
+
+    const subject = event.tags.find((tag) => tag[0] === "subject")?.[1];
+    const title = subject || event.content.split("\n")[0] || null;
+    return title
+      ? {
+          title,
+          siteName: "Buzz",
+          description: null,
+          imageDataUrl: null,
+          imageDomain: null,
+        }
+      : null;
+  },
+});
 
 /** Clear ephemeral metadata when the active relay/community changes. */
 export function resetLinkPreviewMetadataCache(): void {
   metadataLoader.reset();
+  entityTitleLoader.reset();
 }
 
 export type LinkPreviewImageState = "pending" | "image" | "fallback" | "none";
@@ -187,6 +233,15 @@ type ResolvedMetadataByHref = Record<
   string,
   LinkPreviewMetadata | null | undefined
 >;
+
+/** Only auto-generated titles may be replaced; explicit markdown labels win. */
+export function shouldResolveTitle(preview: SupportedLinkPreview): boolean {
+  if (preview.kind !== "buzz-pull-request" && preview.kind !== "buzz-issue") {
+    return true;
+  }
+  const parsed = parseEntityLink(preview.href);
+  return parsed.ok && preview.title === buzzEntityFallbackTitle(parsed.value);
+}
 
 export function resolveLinkPreview(
   preview: SupportedLinkPreview,
@@ -209,8 +264,8 @@ export function resolveLinkPreview(
       : "none";
   return {
     ...preview,
-    snapshotReady: true,
-    title: metadata.title,
+    snapshotReady: !preview.href.startsWith("buzz://"),
+    title: shouldResolveTitle(preview) ? metadata.title : preview.title,
     description: metadata.description,
     faviconDataUrl: metadata.faviconDataUrl,
     provider:
@@ -235,16 +290,16 @@ export function useResolvedLinkPreviews(
     let retryAt = Number.POSITIVE_INFINITY;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const scheduleRetry = ({
-      expiresAt,
-      key,
-    }: Pick<MetadataLoadResult, "expiresAt" | "key">) => {
+    const scheduleRetry = (
+      { expiresAt, key }: Pick<MetadataLoadResult, "expiresAt" | "key">,
+      loader: typeof metadataLoader,
+    ) => {
       if (expiresAt === null || expiresAt >= retryAt) return;
       retryAt = expiresAt;
       if (retryTimer !== null) clearTimeout(retryTimer);
       retryTimer = setTimeout(
         () => {
-          metadataLoader.deleteKey(key);
+          loader.deleteKey(key);
           setResolvedMetadata((current) => {
             if (!(key in current)) return current;
             const next = { ...current };
@@ -258,25 +313,28 @@ export function useResolvedLinkPreviews(
     };
 
     for (const preview of previews) {
-      const cached = metadataLoader.peek(preview.href);
+      const loader = preview.href.startsWith("buzz://")
+        ? entityTitleLoader
+        : metadataLoader;
+      const cached = loader.peek(preview.href);
       if (cached !== undefined) {
         setResolvedMetadata((current) =>
           current[cached.key] === cached.metadata
             ? current
             : { ...current, [cached.key]: cached.metadata },
         );
-        scheduleRetry(cached);
+        scheduleRetry(cached, loader);
         continue;
       }
 
-      void metadataLoader.load(preview.href).then((result) => {
+      void loader.load(preview.href).then((result) => {
         if (cancelled) return;
         setResolvedMetadata((current) =>
           current[result.key] === result.metadata
             ? current
             : { ...current, [result.key]: result.metadata },
         );
-        scheduleRetry(result);
+        scheduleRetry(result, loader);
       });
     }
 

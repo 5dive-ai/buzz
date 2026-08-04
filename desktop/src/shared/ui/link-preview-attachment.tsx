@@ -9,12 +9,14 @@ import {
 export function LinkPreviewAttachment({
   className,
   ImageLightbox,
+  onOpen,
   onRemove,
   preview,
   showControls,
 }: {
   className?: string;
   ImageLightbox: LinkPreviewImageLightboxComponent;
+  onOpen?: () => void;
   onRemove?: () => void;
   preview: ResolvedLinkPreview;
   showControls?: boolean;
@@ -25,6 +27,7 @@ export function LinkPreviewAttachment({
       <RichLinkPreviewAttachment
         className={className}
         ImageLightbox={ImageLightbox}
+        onOpen={onOpen}
         onRemove={onRemove}
         preview={preview}
         showControls={showControls}
@@ -35,6 +38,7 @@ export function LinkPreviewAttachment({
   return (
     <CompactLinkPreviewAttachment
       className={className}
+      onOpen={onOpen}
       onRemove={onRemove}
       preview={preview}
       showControls={showControls}

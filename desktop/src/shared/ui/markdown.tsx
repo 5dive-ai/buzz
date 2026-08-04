@@ -9,7 +9,6 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
@@ -23,11 +22,10 @@ import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { invokeTauri } from "@/shared/api/tauri";
 import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
 import { cn } from "@/shared/lib/cn";
-import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { parseSupportedLinkPreview } from "@/shared/lib/linkPreview";
 import { parseLinkPreviewSnapshots } from "@/shared/lib/linkPreviewSnapshot";
-import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { AttachmentGroup } from "@/shared/ui/attachment";
 import { ConfigNudgeCard } from "@/shared/ui/config-nudge-attachment";
 import { LinkPreviewList } from "@/shared/ui/link-preview-list";
@@ -57,6 +55,12 @@ import {
   MarkdownCodeBlock,
   SyntaxHighlightedCode,
 } from "./markdown/CodeBlock";
+import {
+  renderEntityLinkAnchor,
+  useEntityCardOpenHandlers,
+  useOpenEntityLink,
+} from "./markdown/entityLinks";
+import { ExternalLinkAnchor } from "./markdown/ExternalLinkAnchor";
 import { FileCard } from "./markdown/FileCard";
 import { InlineEmojiPopover } from "./markdown/InlineEmojiPopover";
 import { createLinkPreviewImageLightbox } from "./markdown/LinkPreviewImageLightbox";
@@ -92,7 +96,6 @@ import {
   IMAGE_LIGHTBOX_WHEEL_ZOOM_SPEED,
   IMAGE_LIGHTBOX_ZOOM_STEP,
   IMAGE_LIGHTBOX_ZOOM_TRANSITION_MS,
-  getImageLightboxFocusableElements,
   imageLightboxBasisBoxForItem,
   imageLightboxBoxFromRect,
   imageLightboxCornerRadiiFromElement,
@@ -108,7 +111,6 @@ import {
   visibleImageGalleryForTrigger,
 } from "./markdown/imageLightbox";
 import { MarkdownTable } from "./markdown/MarkdownTable";
-import { MaskedLinkTooltip } from "./markdown/MaskedLinkTooltip";
 import { ProgressiveImage } from "./markdown/ProgressiveImage";
 import { MessageLinkPill } from "./markdown/MessageLinkPill";
 import { renderCachedMarkdown } from "./markdown/nodeCache";
@@ -144,6 +146,28 @@ type ImageBlockProps = {
 type WebKitGestureLikeEvent = Event & {
   scale?: number;
 };
+
+function getImageLightboxFocusableElements(
+  container: HTMLElement,
+): HTMLElement[] {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(
+      [
+        "a[href]",
+        "button:not(:disabled)",
+        "input:not(:disabled)",
+        "select:not(:disabled)",
+        "textarea:not(:disabled)",
+        "[tabindex]:not([tabindex='-1'])",
+      ].join(","),
+    ),
+  ).filter(
+    (element) =>
+      !element.hasAttribute("disabled") &&
+      element.getAttribute("aria-hidden") !== "true" &&
+      element.getClientRects().length > 0,
+  );
+}
 
 function ImageZoomOverlay({
   alt,
@@ -1253,85 +1277,6 @@ function ImageMosaic({ children }: { children: React.ReactNode[] }) {
   );
 }
 
-/**
- * An external `[text](href)` link with a custom right-click menu.
- *
- * Buzz renders inside a native webview whose default context menu has no
- * useful link actions, so a plain right-click on a link is a no-op. This adds
- * an in-app menu with "Open link" (via the OS opener, matching the anchor's
- * left-click `target="_blank"` behavior) and "Copy link" (the real href, not
- * the masked display text).
- */
-function ExternalLinkAnchor({
-  anchorProps,
-  children,
-  href,
-  isLinearLink,
-  label,
-}: {
-  anchorProps: React.ComponentPropsWithoutRef<"a">;
-  children: React.ReactNode;
-  href: string | undefined;
-  isLinearLink: boolean;
-  label: string;
-}) {
-  const [menu, setMenu] = React.useState<MediaContextMenuPosition | null>(null);
-  const closeMenu = React.useCallback(() => setMenu(null), []);
-  useDismissMediaContextMenu(Boolean(menu), closeMenu);
-
-  const anchor = (
-    <a
-      {...anchorProps}
-      className={cn(
-        "font-medium underline underline-offset-4 transition-colors",
-        isLinearLink ? "linear-link" : "text-primary hover:text-primary/80",
-      )}
-      href={href}
-      onContextMenuCapture={(event) => {
-        if (!href) return;
-        event.preventDefault();
-        setMenu({ x: event.clientX, y: event.clientY });
-      }}
-      rel="noreferrer"
-      target="_blank"
-    >
-      {children}
-    </a>
-  );
-
-  return (
-    <>
-      <MaskedLinkTooltip disabled={isLinearLink} href={href} label={label}>
-        {anchor}
-      </MaskedLinkTooltip>
-      {menu && href ? (
-        <MediaContextMenu
-          dataAttributes={["data-link-context-menu"]}
-          items={[
-            {
-              label: "Open link",
-              onSelect: () => {
-                closeMenu();
-                void openUrl(href).catch(() => {
-                  toast.error("Failed to open link");
-                });
-              },
-            },
-            {
-              label: "Copy link",
-              onSelect: () => {
-                closeMenu();
-                copyTextToClipboard(href, "Link copied to clipboard");
-              },
-            },
-          ]}
-          position={menu}
-        />
-      ) : null}
-    </>
-  );
-}
-
 function createMarkdownComponents(
   interactive = true,
   mediaInset = false,
@@ -1347,8 +1292,10 @@ function createMarkdownComponents(
     const {
       channels,
       imetaByUrl,
+      onOpenEntityLink,
       onOpenMessageLink,
       onImportSnapshotFromUrl,
+      relayOrigin,
       snapshotSharedBy,
     } = useMarkdownRuntime();
     if (!interactive) {
@@ -1446,7 +1393,20 @@ function createMarkdownComponents(
       // anchor (renders as a normal external link).
     }
 
-    const supportedLinkPreview = href ? parseSupportedLinkPreview(href) : null;
+    // `buzz://pr|issue|repo?…` entity links navigate in-app; malformed ones
+    // fall through to the default anchor.
+    const entityAnchor = renderEntityLinkAnchor({
+      anchorProps: props,
+      children,
+      href,
+      onOpenEntityLink,
+      relayOrigin,
+    });
+    if (entityAnchor) return entityAnchor;
+
+    const supportedLinkPreview = href
+      ? parseSupportedLinkPreview(href, relayOrigin)
+      : null;
     const isLinearLink = supportedLinkPreview?.kind === "linear-issue";
 
     return (
@@ -1780,7 +1740,7 @@ function createMarkdownComponents(
  * four instances ever exist. Module-stable maps mean cached markdown element
  * trees (see ./markdown/nodeCache.ts) never embed per-mount closures.
  */
-const MARKDOWN_COMPONENT_SCHEMA_VERSION = "4";
+const MARKDOWN_COMPONENT_SCHEMA_VERSION = "5";
 const markdownComponentsByVariant = new Map<string, MarkdownComponentSet>();
 
 type MarkdownComponentSet = { components: Components; variant: string };
@@ -1837,6 +1797,7 @@ function MarkdownInner({
     },
     [goChannel],
   );
+  const onOpenEntityLink = useOpenEntityLink();
   const onOpenMessageLink = React.useCallback(
     (link: ParsedMessageLink) => {
       // Always route through `goChannel` with `messageId` set: the channel
@@ -1878,7 +1839,9 @@ function MarkdownInner({
       imetaByUrl,
       mentionPubkeysByName,
       onOpenChannel,
+      onOpenEntityLink,
       onOpenMessageLink,
+      relayOrigin,
       snapshotSharedBy,
       onImportSnapshotFromUrl: (
         fileBytes: number[],
@@ -1895,13 +1858,21 @@ function MarkdownInner({
       imetaByUrl,
       mentionPubkeysByName,
       onOpenChannel,
+      onOpenEntityLink,
       onOpenMessageLink,
+      relayOrigin,
       snapshotSharedBy,
       goAgents,
     ],
   );
 
   let processedContent = content;
+
+  // Note: stripping the sentinel here is intentionally omitted. When
+  // configNudge !== null, selectProseOrNudge() returns null — suppressing
+  // the prose node entirely — so processedContent is never rendered and
+  // stripConfigNudgeSentinel would be dead work on that path.
+
   if (/^(?:\s{2}\n)+/.test(processedContent)) {
     processedContent = `\u200B${processedContent}`;
   }
@@ -1909,6 +1880,11 @@ function MarkdownInner({
   if (/(?:\s{2}\n)+$/.test(processedContent)) {
     processedContent = `${processedContent}\u200B`;
   }
+
+  const entityCardOpenHandlers = useEntityCardOpenHandlers(
+    resolvedLinkPreviews,
+    onOpenEntityLink,
+  );
 
   // When a config-nudge suppresses the prose (selectProseOrNudge returns
   // null), skip the parse entirely — it would be thrown away unrendered.
@@ -1961,6 +1937,7 @@ function MarkdownInner({
           <LinkPreviewList
             ImageLightbox={LinkPreviewImageLightbox}
             key={messageId}
+            onOpenByHref={entityCardOpenHandlers}
             onRemoveForEveryone={onRemoveLinkPreviewsForEveryone}
             previews={resolvedLinkPreviews}
           />
@@ -1978,11 +1955,6 @@ export const Markdown = React.memo(
     prev.customEmoji === next.customEmoji &&
     prev.interactive === next.interactive &&
     prev.mediaInset === next.mediaInset &&
-    prev.messageId === next.messageId &&
-    prev.linkPreviewsSuppressed === next.linkPreviewsSuppressed &&
-    prev.linkPreviewTags === next.linkPreviewTags &&
-    prev.onRemoveLinkPreviewsForEveryone ===
-      next.onRemoveLinkPreviewsForEveryone &&
     shallowRecordEqual(
       prev.agentMentionPubkeysByName,
       next.agentMentionPubkeysByName,

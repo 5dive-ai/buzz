@@ -19,10 +19,12 @@ import type { LinkPreviewImageLightboxComponent } from "@/shared/ui/rich-link-pr
 
 export function LinkPreviewList({
   ImageLightbox,
+  onOpenByHref,
   onRemoveForEveryone,
   previews,
 }: {
   ImageLightbox: LinkPreviewImageLightboxComponent;
+  onOpenByHref?: ReadonlyMap<string, () => void>;
   onRemoveForEveryone?: () => Promise<void>;
   previews: ResolvedLinkPreview[];
 }) {
@@ -47,6 +49,7 @@ export function LinkPreviewList({
           <LinkPreviewAttachment
             key={preview.href}
             ImageLightbox={ImageLightbox}
+            onOpen={onOpenByHref?.get(preview.href)}
             onRemove={
               onRemoveForEveryone && index === controlsIndex
                 ? () => setDialogOpen(true)

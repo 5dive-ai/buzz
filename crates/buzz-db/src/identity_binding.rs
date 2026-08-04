@@ -16,6 +16,312 @@ use uuid::Uuid;
 use crate::error::{DbError, Result};
 use buzz_core::CommunityId;
 
+#[cfg(test)]
+pub(crate) mod test_lock_schedule {
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::sync::{Mutex, OnceLock};
+
+    use sqlx::{Postgres, Transaction};
+    use tokio::sync::{mpsc, oneshot};
+
+    tokio::task_local! {
+        static ACTOR: &'static str;
+        static ROW_REQUEST_REPORTED: Cell<bool>;
+        static ROW_ACQUIRED_REPORTED: Cell<bool>;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LockPhase {
+        Request,
+        Acquired,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum RowLockPhase {
+        Request,
+        Acquired,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct AdvisoryLockKey {
+        class_id: u32,
+        object_id: u32,
+    }
+
+    impl AdvisoryLockKey {
+        pub(crate) const fn class_id(self) -> u32 {
+            self.class_id
+        }
+
+        pub(crate) const fn object_id(self) -> u32 {
+            self.object_id
+        }
+    }
+
+    pub(crate) struct LockEvent {
+        actor: &'static str,
+        phase: LockPhase,
+        isolation: Option<String>,
+        transaction_id: Option<i64>,
+        backend_pid: i32,
+        database_oid: u32,
+        lock_keys: Vec<AdvisoryLockKey>,
+        resume: oneshot::Sender<()>,
+    }
+
+    impl LockEvent {
+        pub(crate) const fn actor(&self) -> &'static str {
+            self.actor
+        }
+
+        pub(crate) const fn phase(&self) -> LockPhase {
+            self.phase
+        }
+
+        pub(crate) fn isolation(&self) -> Option<&str> {
+            self.isolation.as_deref()
+        }
+
+        pub(crate) const fn transaction_id(&self) -> Option<i64> {
+            self.transaction_id
+        }
+
+        pub(crate) const fn backend_pid(&self) -> i32 {
+            self.backend_pid
+        }
+
+        pub(crate) const fn database_oid(&self) -> u32 {
+            self.database_oid
+        }
+
+        pub(crate) fn lock_keys(&self) -> &[AdvisoryLockKey] {
+            &self.lock_keys
+        }
+
+        pub(crate) const fn coordinate_count(&self) -> usize {
+            self.lock_keys.len()
+        }
+
+        pub(crate) fn resume(self) {
+            let _ = self.resume.send(());
+        }
+    }
+
+    fn controller() -> &'static Mutex<Option<mpsc::UnboundedSender<LockEvent>>> {
+        static CONTROLLER: OnceLock<Mutex<Option<mpsc::UnboundedSender<LockEvent>>>> =
+            OnceLock::new();
+        CONTROLLER.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(crate) struct ControllerGuard;
+
+    impl Drop for ControllerGuard {
+        fn drop(&mut self) {
+            *controller().lock().expect("lock test controller") = None;
+        }
+    }
+
+    pub(crate) fn install() -> (mpsc::UnboundedReceiver<LockEvent>, ControllerGuard) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut current = controller().lock().expect("lock test controller");
+        assert!(
+            current.is_none(),
+            "only one deterministic lock controller may be active"
+        );
+        *current = Some(sender);
+        (receiver, ControllerGuard)
+    }
+
+    pub(crate) struct RowLockEvent {
+        actor: &'static str,
+        phase: RowLockPhase,
+        transaction_id: i64,
+        backend_pid: i32,
+        database_oid: u32,
+        resume: oneshot::Sender<()>,
+    }
+
+    impl RowLockEvent {
+        pub(crate) const fn actor(&self) -> &'static str {
+            self.actor
+        }
+
+        pub(crate) const fn phase(&self) -> RowLockPhase {
+            self.phase
+        }
+
+        pub(crate) const fn transaction_id(&self) -> i64 {
+            self.transaction_id
+        }
+
+        pub(crate) const fn backend_pid(&self) -> i32 {
+            self.backend_pid
+        }
+
+        pub(crate) const fn database_oid(&self) -> u32 {
+            self.database_oid
+        }
+
+        pub(crate) fn resume(self) {
+            let _ = self.resume.send(());
+        }
+    }
+
+    fn row_controller() -> &'static Mutex<Option<mpsc::UnboundedSender<RowLockEvent>>> {
+        static CONTROLLER: OnceLock<Mutex<Option<mpsc::UnboundedSender<RowLockEvent>>>> =
+            OnceLock::new();
+        CONTROLLER.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(crate) struct RowControllerGuard;
+
+    impl Drop for RowControllerGuard {
+        fn drop(&mut self) {
+            *row_controller().lock().expect("lock row test controller") = None;
+        }
+    }
+
+    pub(crate) fn install_row() -> (mpsc::UnboundedReceiver<RowLockEvent>, RowControllerGuard) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut current = row_controller().lock().expect("lock row test controller");
+        assert!(
+            current.is_none(),
+            "only one deterministic row-lock controller may be active"
+        );
+        *current = Some(sender);
+        (receiver, RowControllerGuard)
+    }
+
+    pub(crate) async fn actor_scope<F>(actor: &'static str, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        ACTOR
+            .scope(
+                actor,
+                ROW_REQUEST_REPORTED.scope(
+                    Cell::new(false),
+                    ROW_ACQUIRED_REPORTED.scope(Cell::new(false), future),
+                ),
+            )
+            .await
+    }
+
+    pub(super) async fn checkpoint(
+        tx: &mut Transaction<'_, Postgres>,
+        phase: LockPhase,
+        coordinates: &[Vec<u8>],
+    ) {
+        let Ok(actor) = ACTOR.try_with(|actor| *actor) else {
+            return;
+        };
+        let sender = controller().lock().expect("lock test controller").clone();
+        let Some(sender) = sender else {
+            return;
+        };
+        let (backend_pid, database_oid): (i32, i64) = sqlx::query_as(
+            "SELECT pg_backend_pid(), oid::BIGINT \
+             FROM pg_database WHERE datname=current_database()",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .expect("read test lock backend identity");
+        let class_id: i32 = sqlx::query_scalar("SELECT hashtext('buzz_nip_fi_v1')")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("hash test lock namespace");
+        let mut lock_keys = Vec::with_capacity(coordinates.len());
+        for coordinate in coordinates {
+            let object_id: i32 = sqlx::query_scalar("SELECT hashtext(encode($1, 'hex'))")
+                .bind(coordinate.as_slice())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("hash test lock coordinate");
+            lock_keys.push(AdvisoryLockKey {
+                class_id: class_id as u32,
+                object_id: object_id as u32,
+            });
+        }
+        let (isolation, transaction_id) = if phase == LockPhase::Acquired {
+            let isolation = sqlx::query_scalar("SHOW transaction_isolation")
+                .fetch_one(&mut **tx)
+                .await
+                .ok();
+            let transaction_id = sqlx::query_scalar("SELECT txid_current()::BIGINT")
+                .fetch_one(&mut **tx)
+                .await
+                .ok();
+            (isolation, transaction_id)
+        } else {
+            (None, None)
+        };
+        let (resume, resumed) = oneshot::channel();
+        if sender
+            .send(LockEvent {
+                actor,
+                phase,
+                isolation,
+                transaction_id,
+                backend_pid,
+                database_oid: u32::try_from(database_oid)
+                    .expect("database OID fits the PostgreSQL OID type"),
+                lock_keys,
+                resume,
+            })
+            .is_ok()
+        {
+            let _ = resumed.await;
+        }
+    }
+
+    pub(crate) async fn row_checkpoint(tx: &mut Transaction<'_, Postgres>, phase: RowLockPhase) {
+        let Ok(actor) = ACTOR.try_with(|actor| *actor) else {
+            return;
+        };
+        let should_report = match phase {
+            RowLockPhase::Request => ROW_REQUEST_REPORTED
+                .try_with(|reported| !reported.replace(true))
+                .unwrap_or(false),
+            RowLockPhase::Acquired => ROW_ACQUIRED_REPORTED
+                .try_with(|reported| !reported.replace(true))
+                .unwrap_or(false),
+        };
+        if !should_report {
+            return;
+        }
+        let sender = row_controller()
+            .lock()
+            .expect("lock row test controller")
+            .clone();
+        let Some(sender) = sender else {
+            return;
+        };
+        let (backend_pid, database_oid, transaction_id): (i32, i64, i64) = sqlx::query_as(
+            "SELECT pg_backend_pid(), oid::BIGINT, txid_current()::BIGINT \
+             FROM pg_database WHERE datname=current_database()",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .expect("read test row-lock backend identity");
+        let (resume, resumed) = oneshot::channel();
+        if sender
+            .send(RowLockEvent {
+                actor,
+                phase,
+                transaction_id,
+                backend_pid,
+                database_oid: u32::try_from(database_oid)
+                    .expect("database OID fits the PostgreSQL OID type"),
+                resume,
+            })
+            .is_ok()
+        {
+            let _ = resumed.await;
+        }
+    }
+}
+
 /// Binding source when the IdP JWT carries the pubkey claim.
 pub const SOURCE_JWT_NPUB: &str = "jwt_npub";
 /// Binding source when the relay falls back to the stored uid/pubkey binding.
@@ -615,16 +921,20 @@ pub(crate) async fn lock_identity_coordinates_tx(
 ) -> Result<()> {
     coordinates.sort();
     coordinates.dedup();
-    for coordinate in coordinates {
+    #[cfg(test)]
+    test_lock_schedule::checkpoint(tx, test_lock_schedule::LockPhase::Request, &coordinates).await;
+    for coordinate in &coordinates {
         sqlx::query(
             "SELECT pg_advisory_xact_lock(\
                 hashtext('buzz_nip_fi_v1'), hashtext(encode($1, 'hex'))\
             )",
         )
-        .bind(coordinate)
+        .bind(coordinate.as_slice())
         .execute(&mut **tx)
         .await?;
     }
+    #[cfg(test)]
+    test_lock_schedule::checkpoint(tx, test_lock_schedule::LockPhase::Acquired, &coordinates).await;
     Ok(())
 }
 

@@ -390,6 +390,12 @@ async fn active_principal_tx(
     community_id: CommunityId,
     principal: IdentityPrincipal<'_>,
 ) -> Result<Option<ActiveBinding>> {
+    #[cfg(test)]
+    crate::identity_binding::test_lock_schedule::row_checkpoint(
+        tx,
+        crate::identity_binding::test_lock_schedule::RowLockPhase::Request,
+    )
+    .await;
     let row = sqlx::query(
         "SELECT binding_id, issuer, uid, pubkey, binding_version, binding_provenance \
          FROM identity_bindings \
@@ -401,6 +407,12 @@ async fn active_principal_tx(
     .bind(principal.subject)
     .fetch_optional(&mut **tx)
     .await?;
+    #[cfg(test)]
+    crate::identity_binding::test_lock_schedule::row_checkpoint(
+        tx,
+        crate::identity_binding::test_lock_schedule::RowLockPhase::Acquired,
+    )
+    .await;
     active_binding_from_row(row.as_ref())
 }
 
@@ -409,6 +421,12 @@ async fn active_key_tx(
     community_id: CommunityId,
     pubkey: &[u8],
 ) -> Result<Option<ActiveBinding>> {
+    #[cfg(test)]
+    crate::identity_binding::test_lock_schedule::row_checkpoint(
+        tx,
+        crate::identity_binding::test_lock_schedule::RowLockPhase::Request,
+    )
+    .await;
     let row = sqlx::query(
         "SELECT binding_id, issuer, uid, pubkey, binding_version, binding_provenance \
          FROM identity_bindings \
@@ -419,6 +437,12 @@ async fn active_key_tx(
     .bind(pubkey)
     .fetch_optional(&mut **tx)
     .await?;
+    #[cfg(test)]
+    crate::identity_binding::test_lock_schedule::row_checkpoint(
+        tx,
+        crate::identity_binding::test_lock_schedule::RowLockPhase::Acquired,
+    )
+    .await;
     active_binding_from_row(row.as_ref())
 }
 
@@ -1844,6 +1868,10 @@ pub async fn enable_identity_principal(
     )
     .await
 }
+
+#[cfg(test)]
+#[path = "identity_lifecycle_deterministic_tests.rs"]
+mod deterministic_tests;
 
 #[cfg(test)]
 mod tests {

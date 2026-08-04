@@ -501,14 +501,15 @@ export function useChannelUnreadState({
   // cleared on channel-leave; the channel-level force survives until reopen.
   const handleMarkMessageUnread = React.useCallback(
     (messageId: string) => {
+      // Call the manager-backed channel mark first; only add messages to the
+      // forced-unread overlay if the manager accepted (returns true). A refusal
+      // (budget_exhausted, load_incomplete) must not produce phantom unread state.
+      if (activeChannelId && !markChannelUnread(activeChannelId)) return;
       for (const id of [
         messageId,
         ...getReplyDescendantIdsForMessage(messageId),
       ]) {
         forcedUnreadMsgRef.current.add(id);
-      }
-      if (activeChannelId) {
-        markChannelUnread(activeChannelId);
       }
       forceUnreadRender();
     },

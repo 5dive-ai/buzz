@@ -620,3 +620,61 @@ test("adversarial-4: applyMarkAllReadTransition_both_branches", () => {
     "refused: forcedMap preserved",
   );
 });
+
+// ── Call-path witnesses (pass-4 corrective) ────────────────────────────────────
+
+test("adversarial-5: markChannelRead_refused_clear_preserves_forced_unread_entry", () => {
+  // Call-path witness for the markChannelRead fix: the production hook calls
+  // applyOverrideRead (C-bump) and ONLY clears forcedUnread when the outcome
+  // is "overrideCleared". On a refused clear (uint32_overflow), the return value
+  // must be "overrideStillActive" so the hook's deletion gate preserves the entry.
+  //
+  // If the hook ever drops the applyOverrideRead call and unconditionally deletes,
+  // the existing type-checker catches the missing import. This test locks the
+  // overrideStillActive return contract that the gate depends on.
+  const liveness = { active: true, frontier: 100 };
+  const result = applyOverrideRead(
+    "ch-refused",
+    makeApis({
+      isReadStateReady: true,
+      markChannelRead: () => ({ success: false, reason: "uint32_overflow" }),
+      getOverrideLiveness: () => liveness,
+    }),
+  );
+  assert.equal(
+    result,
+    "overrideStillActive",
+    "refused clear must return overrideStillActive so the hook preserves forcedUnread",
+  );
+});
+
+test("adversarial-6: markChannelRead_spec_order_frontier_advance_before_cbump", () => {
+  // Spec-ordering witness: the production markChannelRead advances the frontier
+  // BEFORE the C-bump. This means applyOverrideRead sees a post-advance frontier.
+  // When F advances past B (B < F), active → inactive, so applyOverrideRead
+  // returns "overrideCleared" — the hook correctly gates the deletion.
+  //
+  // Simulation: start with F=50, B=100 (active). Manager markChannelRead advances
+  // frontier to 101 (B < F → inactive). getOverrideLiveness reflects the new state.
+  // applyOverrideRead must return "overrideCleared".
+  let frontier = 50; // initial value; B=100, so active (B ≥ F)
+  const result = applyOverrideRead(
+    "ch-advanced",
+    makeApis({
+      isReadStateReady: true,
+      markChannelRead: (_id) => {
+        frontier = 101; // frontier advance: now F=101 > B=100 → inactive
+        return { success: true };
+      },
+      getOverrideLiveness: () => ({
+        active: frontier <= 100, // reflects post-advance state
+        frontier,
+      }),
+    }),
+  );
+  assert.equal(
+    result,
+    "overrideCleared",
+    "after frontier advance past B, C-bump must clear the override",
+  );
+});

@@ -5,10 +5,7 @@ import {
   type ForcedUnreadMap,
 } from "@/features/channels/forcedUnreadStore";
 import { DM_NOTIFIABLE_EVENT_KINDS } from "@/features/channels/isDmNotifiableKind";
-import {
-  mergeReadStateEvents,
-  mergeReadStateEventsStructured,
-} from "@/features/channels/readState/readStateSnapshot";
+import { mergeReadStateEventsStructured } from "@/features/channels/readState/readStateSnapshot";
 import { deduplicateByCoordinate } from "@/features/channels/readState/readStateFencedLoader";
 import {
   isOverrideActive,
@@ -242,13 +239,15 @@ export async function fetchCommunityUnread(args: {
     }
     readStateMap = merged;
   } else {
-    readStateMap = await mergeReadStateEvents(
-      readStateEvents,
+    const structured = await mergeReadStateEventsStructured(
+      deduplicateByCoordinate(readStateEvents),
       pubkey,
       args.decryptReadState,
     );
-    // No complete projection — override authority is the forced-unread store.
-    authoritative = new Map<string, OverrideRegister>();
+    // No complete projection — use fetched-deduped structured state as the
+    // override authority so active remote registers are not silently dropped.
+    authoritative = structured.overrides;
+    readStateMap = structured.frontiers;
   }
 
   let mutedIds = new Set<string>();
@@ -295,13 +294,19 @@ export async function fetchCommunityUnread(args: {
           hasUnread = true;
         }
       } else {
-        // Forced-unread lights the dot without a relay fetch, but only if the
-        // synced read marker has NOT advanced past the stored baseline. This
-        // prevents stale forced-unread from lighting the rail after a cross-device
-        // read has covered the channel (the drain path in useUnreadChannels only
-        // runs while the community is active, so the store may not be pruned for
-        // inactive communities).
-        if (Object.hasOwn(forcedUnreadMap, channel.id)) {
+        // No complete projection — check fetched-deduped override registers first
+        // (remote NIP-RS marks), then fall back to the locally-stored forced-unread
+        // map for marks not yet synced to the relay.
+        const reg = authoritative.get(channel.id);
+        if (reg !== undefined && isOverrideActive(reg, readAt ?? 0)) {
+          hasUnread = true;
+        } else if (Object.hasOwn(forcedUnreadMap, channel.id)) {
+          // Forced-unread lights the dot without a relay fetch, but only if the
+          // synced read marker has NOT advanced past the stored baseline. This
+          // prevents stale forced-unread from lighting the rail after a cross-device
+          // read has covered the channel (the drain path in useUnreadChannels only
+          // runs while the community is active, so the store may not be pruned for
+          // inactive communities).
           const markerAtWhenForced = forcedUnreadMarker(
             forcedUnreadMap[channel.id],
           );

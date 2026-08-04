@@ -24,6 +24,8 @@ import {
   useForcedUnreadActions,
 } from "@/features/channels/forcedUnreadStore";
 import {
+  applyMarkAllReadTransition,
+  applyOverrideRead,
   applyOverrideUnread,
   type OverrideAPIs,
 } from "@/features/channels/readStateOverride";
@@ -333,16 +335,8 @@ export function useUnreadChannels(
         topLevelOnly?: boolean;
       } = {},
     ) => {
-      if (
-        !preserveForcedUnread &&
-        Object.hasOwn(forcedUnreadRef.current, channelId)
-      ) {
-        delete forcedUnreadRef.current[channelId];
-        if (pubkey) {
-          forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
-        }
-        bumpLatestVersion();
-      }
+      // Frontier advance first (spec order: advance → C-bump → inspect liveness).
+      // The advance may make F > B, so applyOverrideRead sees an inactive override.
       const observedLatest = topLevelOnly
         ? undefined
         : latestByChannelRef.current.get(channelId);
@@ -350,19 +344,35 @@ export function useUnreadChannels(
         readAt,
         observedLatest,
       );
-      if (markAt === null) return;
-      markContextRead(channelId, markAt);
+      if (markAt !== null) {
+        markContextRead(channelId, markAt);
+      }
+      // C-bump; clear local presentation only when liveness is confirmed inactive
+      // AND the caller has not opted to preserve the forced-unread state.
+      // null ≠ inactive — pre-init fails closed.
+      if (!preserveForcedUnread) {
+        const outcome = applyOverrideRead(channelId, overrideApis);
+        if (outcome === "overrideCleared") {
+          if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
+            delete forcedUnreadRef.current[channelId];
+            if (pubkey) {
+              forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+            }
+            bumpLatestVersion();
+          }
+        }
+      }
       // Delegate destructive observed-ref removal to the fenced owner operation —
       // the parent must not delete from latestByChannelRef or
       // observedUnreadEventsByChannelRef directly on the clear-observed path,
       // or a stale scope-A callback could corrupt scope B before the fence rejects.
       // (Fenced record writes in handleChannelMessage and catch-up remain in the parent.)
-      if (clearObserved) {
+      if (markAt !== null && clearObserved) {
         observedPersistence.removeChannel(channelId);
         bumpLatestVersion();
       }
     },
-    [markContextRead, observedPersistence, pubkey],
+    [markContextRead, observedPersistence, overrideApis, pubkey],
   );
 
   const {
@@ -889,10 +899,10 @@ export function useUnreadChannels(
       let unreadChannelNotificationCount = 0;
 
       for (const channel of channels) {
-        const isForcedUnread = Object.hasOwn(
-          forcedUnreadRef.current,
-          channel.id,
-        );
+        const isForcedUnread =
+          // Manager liveness is authoritative (isReadStateReady). Use
+          // getOverrideLiveness, not forcedUnreadRef which may be stale.
+          getOverrideLiveness(channel.id)?.active === true;
         if (channel.id === activeChannelId && !isForcedUnread) continue;
 
         const observedEvents = observedUnreadEventsByChannelRef.current.get(
@@ -984,7 +994,6 @@ export function useUnreadChannels(
 
   const markAllChannelsRead = React.useCallback(() => {
     for (const channelId of unreadChannelIdsRef.current) {
-      delete forcedUnreadRef.current[channelId];
       const unixSeconds =
         latestByChannelRef.current.get(channelId) ??
         getEffectiveTimestamp(channelId) ??
@@ -992,17 +1001,30 @@ export function useUnreadChannels(
       if (unixSeconds !== null) {
         markContextRead(channelId, unixSeconds);
       }
+      // Gate evidence clearing on manager outcome — a refused clear (budget_exhausted,
+      // load_incomplete) must not wipe local forced-unread or observed state for
+      // channels whose override is still active. applyMarkAllReadTransition handles
+      // the forcedUnreadRef mutation; route observed deletion through the fenced API.
+      const outcome = applyMarkAllReadTransition(channelId, overrideApis, {
+        forcedUnread: forcedUnreadRef.current,
+        latestByChannel: latestByChannelRef.current,
+        observedUnreadEvents: observedUnreadEventsByChannelRef.current,
+      });
+      if (outcome === "overrideCleared") {
+        observedPersistence.removeChannel(channelId);
+      }
     }
     if (pubkey) {
       forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
     }
-    // Delegate destructive observed-ref clearing to the fenced owner operation —
-    // the parent must not reset the observed Maps directly on this path, or a
-    // stale scope-A callback could corrupt scope B before the fence rejects.
-    // (Fenced record writes in handleChannelMessage and catch-up remain in the parent.)
-    observedPersistence.clearAll();
     bumpLatestVersion();
-  }, [getEffectiveTimestamp, markContextRead, observedPersistence, pubkey]);
+  }, [
+    getEffectiveTimestamp,
+    markContextRead,
+    observedPersistence,
+    overrideApis,
+    pubkey,
+  ]);
 
   // Identity-stable snapshots of the membership sets for the notify gate.
   // Re-derived only when membershipVersion bumps (a set actually changed), so

@@ -1189,3 +1189,80 @@ test("fetchCommunityUnread adversarial-6: torn fetched register (ov_s+ov_c witho
   // no message events — rail must remain dark.
   assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
 });
+
+test("fetchCommunityUnread adversarial-7: active fetched register, no complete projection → rail lights", async () => {
+  // Positive fallback witness: when getProjection() is absent (null), the observer
+  // must decode the fetched read-state events with mergeReadStateEventsStructured
+  // and use the resulting `overrides` map as override authority. An active register
+  // (S > C, B ≥ F) in the fetched state must light the rail.
+  //
+  // This locks the fallback branch: before the fix, the fallback set authoritative
+  // to an empty Map(), so any remote NIP-RS override older than the seven-day
+  // horizon would be silently ignored. Adversarial-1 covers the tombstone (dark)
+  // case; this witness covers the live-register (lit) case.
+  const SLOT = "c".repeat(32); // valid 32-hex slot, distinct from other tests
+
+  const relay = relayFor([
+    // 1. member events
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["p", PUBKEY],
+        ],
+      }),
+    ],
+    // 2. metadata events
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["t", "stream"],
+        ],
+      }),
+    ],
+    // 3. visibility events
+    () => [],
+    // 4. read-state: live register S=5,C=0,B=100; frontier F=50 (B ≥ F, S > C → active)
+    () => [
+      event({
+        pubkey: PUBKEY,
+        created_at: 300,
+        tags: [
+          ["d", `read-state:${SLOT}`],
+          ["t", "read-state"],
+        ],
+        content: JSON.stringify({
+          v: 1,
+          client_id: "client",
+          contexts: {
+            [CHANNEL_ID]: 50,
+            [`ov_s:${CHANNEL_ID}`]: 5,
+            [`ov_c:${CHANNEL_ID}`]: 0,
+            [`ov_b:${CHANNEL_ID}`]: 100,
+          },
+        }),
+      }),
+    ],
+    // 5. mutes
+    () => [],
+    // 6. unread events — none (liveness from override register only)
+    () => [],
+    // 7. mention events — none
+    () => [],
+  ]);
+
+  // No getProjection — fallback path must use fetched structured overrides.
+  const result = await fetchCommunityUnread({
+    client: relay,
+    pubkey: PUBKEY,
+    nowSeconds: 400,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships(),
+    // Intentionally no getProjection.
+  });
+
+  // Fetched active register (S=5 > C=0, B=100 ≥ F=50) must light the rail.
+  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+});

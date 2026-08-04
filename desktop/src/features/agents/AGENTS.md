@@ -41,7 +41,7 @@ with a TypeScript lookup table or an id comparison in a component.
    `HarnessNativeEffortFields` so the write path never silently deletes the
    legacy key at a scope where it must not be touched.
 3. **Field absence has a named reason, not a boolean.** Codex effort is
-   `ownedByModelId`; Claude effort is `deferredUntilNativeOptionsAvailable`.
+   `ownedByModelId`; harnesses with no effort knob emit `unsupportedByHarness`.
    New absences get new named reasons in `AgentConfigOmission` /
    `render` — never a `showX` prop.
 4. **The clearing policy is the named types.** `onContextChange:

@@ -33,6 +33,23 @@ pub(crate) static GOOSE_EFFORT_NORMALIZATION: EffortNormalization = EffortNormal
     ],
 };
 
+/// Claude Code thinking-effort canonicalization contract.
+///
+/// Source: https://code.claude.com/docs/en/env-vars (`CLAUDE_CODE_EFFORT_LEVEL`)
+/// and https://code.claude.com/docs/en/model-config#adjust-effort-level.
+///
+/// Canonical values: `low`, `medium`, `high`, `xhigh`, `max`.
+/// No aliases — Claude accepts these natively, no alias mapping needed.
+/// Note: `auto` (model default) is deliberately excluded from the vocabulary;
+/// unset env already means model-default, so `auto` would create two spellings
+/// of the same state. Available levels are per-model (Opus 4.6/Sonnet 4.6 lack
+/// `xhigh`), but Claude Code falls back to the nearest supported level, so a
+/// static vocabulary declaration is safe.
+pub(crate) static CLAUDE_EFFORT_NORMALIZATION: EffortNormalization = EffortNormalization {
+    canonical: &["low", "medium", "high", "xhigh", "max"],
+    aliases: &[],
+};
+
 impl EffortNormalization {
     /// Normalize `raw` to a `String` canonical form.
     /// `None` → invalid for this harness; caller must treat as absent (skip-as-absent policy).
@@ -195,5 +212,38 @@ mod tests {
         );
         assert!(codex.adapter_install_instructions_url.contains("codex-acp"));
         assert!(codex.cli_install_hint.contains("Codex CLI"));
+    }
+
+    /// Claude Code catalog entry declares `CLAUDE_CODE_EFFORT_LEVEL` as its
+    /// native effort key with a static 5-value vocabulary and no aliases.
+    /// Pins the IPC contract that the UI and spawn bridge depend on.
+    #[test]
+    fn claude_effort_catalog_entry_pins() {
+        let claude = known_acp_runtime_exact("claude").unwrap();
+        assert_eq!(
+            claude.thinking_env_var,
+            Some("CLAUDE_CODE_EFFORT_LEVEL"),
+            "Claude Code must declare CLAUDE_CODE_EFFORT_LEVEL as its native effort key"
+        );
+        let norm = claude
+            .effort_normalization
+            .expect("Claude Code must have an effort normalization contract");
+        assert_eq!(
+            norm.canonical,
+            &["low", "medium", "high", "xhigh", "max"],
+            "Claude Code must declare the five-value static vocabulary"
+        );
+        assert!(
+            norm.aliases.is_empty(),
+            "Claude Code must declare no aliases — values are consumed natively"
+        );
+        // xhigh is canonical for Claude (not an alias like for Goose)
+        assert_eq!(norm.normalize_str("xhigh"), Some("xhigh".to_string()));
+        // "off" is valid for Goose but not Claude
+        assert_eq!(
+            norm.normalize_str("off"),
+            None,
+            "off is not in Claude's vocabulary"
+        );
     }
 }

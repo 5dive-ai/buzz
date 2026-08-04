@@ -289,19 +289,6 @@ export function deriveAgentConfigFieldModel({
         ? BUZZ_AGENT_THINKING_EFFORT
         : undefined,
     });
-  } else if (runtime?.id === "claude") {
-    fields.push({
-      kind: "effort",
-      optionSource: "harnessNative",
-      currentPersistence: { kind: "unavailable" },
-      targetApplication: {
-        kind: "acpConfigOption",
-        id: "effort",
-        category: "thought_level",
-      },
-      render: "deferredUntilNativeOptionsAvailable",
-      value: null,
-    });
   } else {
     omissions.push({
       kind: "effort",

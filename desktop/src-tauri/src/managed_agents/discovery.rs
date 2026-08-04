@@ -19,7 +19,7 @@ pub(crate) use presets::{
 };
 use presets::{preset_catalog_entry, PRESET_HARNESSES};
 pub(crate) use runtime_metadata::{
-    EffortNormalization, KnownAcpRuntime, GOOSE_EFFORT_NORMALIZATION,
+    EffortNormalization, KnownAcpRuntime, CLAUDE_EFFORT_NORMALIZATION, GOOSE_EFFORT_NORMALIZATION,
 };
 
 const GOOSE_AVATAR_URL: &str = "https://goose-docs.ai/img/logo_dark.png";
@@ -139,8 +139,8 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         config_file_path: Some("~/.claude/settings.json"),
         config_file_format: Some("json"),
         supports_acp_native_config: false,
-        thinking_env_var: None,
-        effort_normalization: None,
+        thinking_env_var: Some("CLAUDE_CODE_EFFORT_LEVEL"),
+        effort_normalization: Some(&CLAUDE_EFFORT_NORMALIZATION),
         max_tokens_env_var: None,
         context_limit_env_var: None,
         max_rounds_env_var: None,

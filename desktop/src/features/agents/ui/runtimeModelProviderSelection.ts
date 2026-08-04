@@ -91,32 +91,32 @@ export function selectionOnRuntimeChange(
   // and legacy keys when the runtime changes. Global scope is exempt (Delta-5
   // rule: global switches preserve both runtimes' native keys — that is handled
   // by resetConfigForHarnessChange's no-op policy).
-  // Skip when native key equals the legacy key (buzz-agent: they are the same
-  // key so no aliasing applies; no destructive cleanup needed).
   //
-  // Asymmetric case — prev==legacy + next==null (e.g. buzz→claude): neither
-  // branch fires, so BUZZ_AGENT_THINKING_EFFORT is preserved through the
-  // transition. This is intentional: claude has no effort env key so there is
-  // no stale-alias resurrection risk, and the value is safe to keep for a
-  // future buzz←claude switch. buzz→goose (next != legacy) DOES clear both
-  // keys because a stale BUZZ_AGENT_THINKING_EFFORT would be aliased into
-  // Goose effort on the next spawn.
-  if (
-    params.previousRuntimeNativeEffortKey &&
-    params.previousRuntimeNativeEffortKey !== BUZZ_AGENT_THINKING_EFFORT
-  ) {
-    const ev = { ...next.envVars };
-    delete ev[params.previousRuntimeNativeEffortKey];
-    delete ev[BUZZ_AGENT_THINKING_EFFORT];
-    next.envVars = ev;
-  } else if (
-    params.nextRuntimeNativeEffortKey &&
-    params.nextRuntimeNativeEffortKey !== BUZZ_AGENT_THINKING_EFFORT
-  ) {
-    const ev = { ...next.envVars };
-    delete ev[params.nextRuntimeNativeEffortKey];
-    delete ev[BUZZ_AGENT_THINKING_EFFORT];
-    next.envVars = ev;
+  // When BOTH native keys are non-legacy (e.g. claude↔goose), only the
+  // previous side was cleared before — leaving the destination-native key as
+  // a stale record entry the new runtime would silently inherit at spawn.
+  // Fix: clone once and independently delete all three keys whose harness
+  // now differs. Each deletion is conditional only on whether the key is a
+  // non-legacy native key (buzz-agent: native === legacy, so buzz→buzz keeps
+  // effort); deleting the same key twice from one clone is a no-op.
+  {
+    const prevKey = params.previousRuntimeNativeEffortKey;
+    const nextKey = params.nextRuntimeNativeEffortKey;
+    const hasNonLegacyKey =
+      (prevKey && prevKey !== BUZZ_AGENT_THINKING_EFFORT) ||
+      (nextKey && nextKey !== BUZZ_AGENT_THINKING_EFFORT);
+
+    if (hasNonLegacyKey) {
+      const ev = { ...next.envVars };
+      if (prevKey && prevKey !== BUZZ_AGENT_THINKING_EFFORT) {
+        delete ev[prevKey];
+      }
+      if (nextKey && nextKey !== BUZZ_AGENT_THINKING_EFFORT) {
+        delete ev[nextKey];
+      }
+      delete ev[BUZZ_AGENT_THINKING_EFFORT];
+      next.envVars = ev;
+    }
   }
 
   return next;

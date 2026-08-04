@@ -163,10 +163,15 @@ test("Goose reads value from native key, falls back to legacy pre-migration save
   assert.equal(field(modelLegacyOnly, "effort").value, "high");
 });
 
-test("Claude models effort as a deferred native ACP option", () => {
+test("Claude models effort as harnessNative via CLAUDE_CODE_EFFORT_LEVEL", () => {
+  const CLAUDE_ACCEPTED = ["low", "medium", "high", "xhigh", "max"];
   const model = deriveAgentConfigFieldModel({
     config,
-    runtime: runtime("claude"),
+    runtime: runtime("claude", {
+      thinkingEnvVar: "CLAUDE_CODE_EFFORT_LEVEL",
+      acceptedEffortValues: CLAUDE_ACCEPTED,
+      effortAliases: [],
+    }),
     scope: "global",
   });
 
@@ -174,17 +179,16 @@ test("Claude models effort as a deferred native ACP option", () => {
     model.fields.map((item) => item.kind),
     ["model", "effort"],
   );
-  assert.equal(
-    field(model, "effort").render,
-    "deferredUntilNativeOptionsAvailable",
-  );
-  assert.deepEqual(field(model, "effort").currentPersistence, {
-    kind: "unavailable",
+  const effortField = field(model, "effort");
+  assert.equal(effortField.render, "control");
+  assert.equal(effortField.optionSource, "harnessNative");
+  assert.deepEqual(effortField.currentPersistence, {
+    kind: "envVar",
+    key: "CLAUDE_CODE_EFFORT_LEVEL",
   });
-  assert.deepEqual(field(model, "effort").targetApplication, {
-    kind: "acpConfigOption",
-    id: "effort",
-    category: "thought_level",
+  assert.deepEqual(effortField.targetApplication, {
+    kind: "envVar",
+    key: "CLAUDE_CODE_EFFORT_LEVEL",
   });
 });
 
@@ -520,19 +524,23 @@ test("structuredEnvKeys_deferred_effort_excluded_from_result", () => {
   // its key to the hidden set — the value has no editor on this surface.
   const claudeModel = deriveAgentConfigFieldModel({
     config,
-    runtime: runtime("claude"),
+    runtime: runtime("claude", {
+      thinkingEnvVar: "CLAUDE_CODE_EFFORT_LEVEL",
+      acceptedEffortValues: ["low", "medium", "high", "xhigh", "max"],
+      effortAliases: [],
+    }),
     scope: "global",
   });
 
-  const allDescriptors = claudeModel.fields; // includes deferred effort
+  const allDescriptors = claudeModel.fields; // includes harnessNative effort
   const keys = structuredEnvKeys(allDescriptors);
 
-  // Claude's deferred effort has currentPersistence.kind === "unavailable"
-  // and render === "deferredUntilNativeOptionsAvailable"; no key emitted.
-  assert.equal(
-    keys.length,
-    0,
-    "deferred effort and model descriptors must not contribute hidden keys",
+  // Claude's harnessNative effort has currentPersistence.kind === "envVar"
+  // with key "CLAUDE_CODE_EFFORT_LEVEL" — it is a hidden key.
+  assert.deepEqual(
+    keys,
+    ["CLAUDE_CODE_EFFORT_LEVEL"],
+    "Claude effort env key must appear as a hidden structured key",
   );
 });
 

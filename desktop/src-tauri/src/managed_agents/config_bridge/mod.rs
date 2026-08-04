@@ -11,9 +11,9 @@ pub(crate) use types::*;
 /// The legacy effort env key written by pre-migration saves.
 ///
 /// Harnesses whose native `thinking_env_var` differs from this constant
-/// (currently: Goose uses `GOOSE_THINKING_EFFORT`) need the alias resolver
-/// below to translate old saves. buzz-agent's native key equals this constant,
-/// so no aliasing applies there.
+/// (Goose uses `GOOSE_THINKING_EFFORT`, Claude uses `CLAUDE_CODE_EFFORT_LEVEL`)
+/// need the alias resolver below to translate old saves.
+/// buzz-agent's native key equals this constant, so no aliasing applies there.
 pub(crate) const LEGACY_THINKING_EFFORT_KEY: &str = "BUZZ_AGENT_THINKING_EFFORT";
 
 /// Return all known native thinking-effort env keys across all runtimes.
@@ -194,6 +194,13 @@ mod tests {
     fn goose_rt() -> &'static crate::managed_agents::discovery::KnownAcpRuntime {
         crate::managed_agents::discovery::known_acp_runtime_exact("goose")
             .expect("goose must be in catalog")
+    }
+
+    /// Claude Code runtime from the catalog — has static effort vocabulary and
+    /// native key `CLAUDE_CODE_EFFORT_LEVEL`.
+    fn claude_rt() -> &'static crate::managed_agents::discovery::KnownAcpRuntime {
+        crate::managed_agents::discovery::known_acp_runtime_exact("claude")
+            .expect("claude must be in catalog")
     }
 
     fn empty_personas() -> Vec<crate::managed_agents::types::AgentDefinition> {
@@ -416,6 +423,159 @@ mod tests {
             env.get("GOOSE_THINKING_EFFORT").map(String::as_str),
             Some("medium"),
             "definition native key must be accepted and reinserted as canonical"
+        );
+    }
+
+    // ── Claude Code effort bridge ─────────────────────────────────────────────
+
+    /// Claude `CLAUDE_CODE_EFFORT_LEVEL=high` with no higher tier
+    /// → canonical `high` survives in the effective env.
+    #[test]
+    fn claude_native_effort_spawns_correctly() {
+        let record = env_with(&[("CLAUDE_CODE_EFFORT_LEVEL", "high")]);
+        let mut env = record.clone();
+
+        apply_effort_bridge(
+            &mut env,
+            Some(claude_rt()),
+            &record,
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            env.get("CLAUDE_CODE_EFFORT_LEVEL").map(String::as_str),
+            Some("high"),
+            "Claude native effort must survive to launch"
+        );
+    }
+
+    /// Claude has no aliases — an unrecognised value is invalid
+    /// for Claude Code's vocabulary and must be skipped as absent.
+    #[test]
+    fn claude_invalid_value_skipped_as_absent() {
+        // An invalid value (not in Claude's 5-value vocabulary) is skipped as absent.
+        // Note: unlike Goose where xhigh aliases to max, Claude's vocabulary is
+        // low|medium|high|xhigh|max — xhigh is canonical, so test with a truly
+        // invalid string.
+        let record = env_with(&[("CLAUDE_CODE_EFFORT_LEVEL", "invalid_val")]);
+        let mut env = record.clone();
+
+        apply_effort_bridge(
+            &mut env,
+            Some(claude_rt()),
+            &record,
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert!(
+            !env.contains_key("CLAUDE_CODE_EFFORT_LEVEL"),
+            "invalid Claude effort must be skipped (key absent from launch env)"
+        );
+    }
+
+    /// Claude foreign-key stripping: `GOOSE_THINKING_EFFORT` and
+    /// `BUZZ_AGENT_THINKING_EFFORT` must be absent from a Claude agent's env.
+    #[test]
+    fn claude_strips_foreign_effort_keys() {
+        let mut env = env_with(&[
+            ("GOOSE_THINKING_EFFORT", "high"),
+            ("BUZZ_AGENT_THINKING_EFFORT", "medium"),
+            ("CLAUDE_CODE_EFFORT_LEVEL", "low"),
+        ]);
+
+        apply_effort_bridge(
+            &mut env,
+            Some(claude_rt()),
+            &env_with(&[("CLAUDE_CODE_EFFORT_LEVEL", "low")]),
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert!(
+            !env.contains_key("GOOSE_THINKING_EFFORT"),
+            "Goose key must be stripped from Claude env"
+        );
+        assert!(
+            !env.contains_key("BUZZ_AGENT_THINKING_EFFORT"),
+            "Buzz legacy key must be stripped from Claude env"
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_EFFORT_LEVEL").map(String::as_str),
+            Some("low"),
+            "Claude native effort must survive"
+        );
+    }
+
+    /// Claude legacy alias at record tier: `BUZZ_AGENT_THINKING_EFFORT` with a
+    /// value valid in Claude's vocabulary IS aliased at record/persona tier
+    /// (plan v3 Delta 2: legacy alias applies to record and persona tiers for
+    /// non-buzz-agent harnesses). Invalid values are not aliased.
+    #[test]
+    fn claude_legacy_key_aliased_at_record_tier_when_valid() {
+        // record contains only the legacy key with a value valid in Claude's vocab
+        let record = env_with(&[("BUZZ_AGENT_THINKING_EFFORT", "high")]);
+        let mut env = record.clone();
+
+        apply_effort_bridge(
+            &mut env,
+            Some(claude_rt()),
+            &record,
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        );
+
+        // Legacy key is aliased to Claude's native key at record tier (valid value).
+        assert_eq!(
+            env.get("CLAUDE_CODE_EFFORT_LEVEL").map(String::as_str),
+            Some("high"),
+            "valid legacy key at record tier must be aliased to Claude native key"
+        );
+        assert!(
+            !env.contains_key("BUZZ_AGENT_THINKING_EFFORT"),
+            "legacy key must be stripped (foreign key sweep)"
+        );
+    }
+
+    /// Legacy value that is valid for Goose but NOT for Claude (`off`) must NOT
+    /// be aliased — normalization via Claude's vocabulary rejects it.
+    #[test]
+    fn claude_legacy_key_not_aliased_when_value_invalid_for_claude() {
+        // "off" is valid for Goose but not in Claude's 5-value vocabulary.
+        let record = env_with(&[("BUZZ_AGENT_THINKING_EFFORT", "off")]);
+        let mut env = record.clone();
+
+        apply_effort_bridge(
+            &mut env,
+            Some(claude_rt()),
+            &record,
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert!(
+            !env.contains_key("CLAUDE_CODE_EFFORT_LEVEL"),
+            "invalid-for-Claude legacy value must not produce a native effort key"
+        );
+        assert!(
+            !env.contains_key("BUZZ_AGENT_THINKING_EFFORT"),
+            "legacy key must be stripped as a foreign key regardless"
         );
     }
 }

@@ -1018,3 +1018,50 @@ test("normalizeEffortValue_non_goose_alias_resolves_from_descriptor", () => {
     null,
   );
 });
+
+// ── Claude Code effort normalization ─────────────────────────────────────────
+
+const CLAUDE_VALUES = ["low", "medium", "high", "xhigh", "max"];
+const CLAUDE_ALIASES = []; // Claude Code has no aliases
+
+test("claude_valid_effort_value_passes_through", () => {
+  // Claude Code canonical values pass through unchanged.
+  for (const v of CLAUDE_VALUES) {
+    assert.equal(
+      normalizeEffortValue(v, CLAUDE_VALUES, CLAUDE_ALIASES),
+      v,
+      `canonical value "${v}" must pass through for Claude`,
+    );
+  }
+});
+
+test("claude_no_alias_resolution_for_goose_aliases", () => {
+  // Claude has no alias table — Goose aliases (none→off, etc.)
+  // must NOT resolve for Claude. But xhigh IS canonical for Claude.
+  assert.equal(
+    normalizeEffortValue("xhigh", CLAUDE_VALUES, CLAUDE_ALIASES),
+    "xhigh",
+    "xhigh is canonical for Claude — must pass through unchanged",
+  );
+  // A Goose-only alias like "none" is not in Claude's vocabulary.
+  assert.equal(
+    normalizeEffortValue("none", CLAUDE_VALUES, CLAUDE_ALIASES),
+    null,
+    "Goose alias 'none' must not resolve for Claude (no alias table)",
+  );
+  assert.equal(
+    normalizeEffortValue("off", CLAUDE_VALUES, CLAUDE_ALIASES),
+    null,
+    "Goose canonical 'off' is not in Claude vocabulary — must return null",
+  );
+});
+
+test("claude_absent_aliases_means_no_aliases", () => {
+  // Passing an empty alias array (not null/undefined) must not fall back
+  // to any built-in table — the Goose fallback is dead.
+  assert.equal(
+    normalizeEffortValue("med", CLAUDE_VALUES, CLAUDE_ALIASES),
+    null,
+    "Goose alias 'med' must not resolve with empty aliases",
+  );
+});

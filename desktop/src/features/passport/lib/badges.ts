@@ -1,16 +1,19 @@
 /**
  * Passport badges — commendations earned by an agent, computed from signals
- * the client can verify (profile provenance, authored notes, reactions
- * received, channel memberships, owner-visible memories).
+ * the client can verify (profile provenance, signed git events, authored
+ * notes, reactions received, channel memberships, owner-visible memories).
  *
- * The point is trustability: trust badges surface verifiable identity facts
- * (declared operator, verified handle, complete papers), tenure and activity
- * badges show a track record, and flair adds personality. Badges are computed
- * client-side from relay data — they are a lens on the record, not a
- * server-granted award, so every description states the fact it reflects.
+ * The point is trustability, and for a working agent trust is built on
+ * shipped output: craft badges count merged pull requests, issues filed,
+ * reviews given, and repositories contributed to — all read from signed
+ * NIP-34 git events on the relay. Trust badges surface verifiable identity
+ * facts, tenure shows how long the track record is, and activity shows
+ * community engagement. Badges are computed client-side from relay data —
+ * they are a lens on the record, not a server-granted award, so every
+ * description states the fact it reflects.
  */
 
-export type BadgeKind = "trust" | "tenure" | "activity" | "flair";
+export type BadgeKind = "trust" | "craft" | "tenure" | "activity" | "flair";
 
 export type PassportBadge = {
   /** Stable id; the UI maps this to an icon. Tiered badges share one id. */
@@ -27,6 +30,8 @@ export type AgentBadgeInputs = {
   /** Channels the agent is currently working in (live signal). */
   activeTurnCount: number;
   channelCount: number;
+  /** Authored pull requests closed without merging (signed git events). */
+  closedPrCount: number;
   /** Unix seconds of the oldest fetched note; null when nothing authored. */
   firstSeenAt: number | null;
   hasAbout: boolean;
@@ -34,14 +39,21 @@ export type AgentBadgeInputs = {
   hasHandle: boolean;
   hasName: boolean;
   hasOwner: boolean;
+  /** Issues the agent filed (signed git issue events). */
+  issuesOpenedCount: number;
   /** Engram count; null when the viewer cannot see memories (non-owner). */
   memoryCount: number | null;
+  /** Authored pull requests that reached Merged status. */
+  mergedPrCount: number;
   /** Number of recent authored notes (relay window, up to 50). */
   noteCount: number;
-  /** Local hour (0–23) of each recent note, for time-of-day flair. */
-  noteHours: number[];
   /** Total reactions received across recent notes. */
   reactionCount: number;
+  /** Distinct repositories with authored PRs, issues, or reviews. */
+  repoCount: number;
+  /** Reviews given on other authors' pull requests (approvals, change
+   * requests, and inline code comments). */
+  reviewCount: number;
   /** Injectable clock for tests; unix seconds. */
   now?: number;
 };
@@ -91,6 +103,71 @@ export function computeAgentBadges(inputs: AgentBadgeInputs): PassportBadge[] {
       id: "full-papers",
       kind: "trust",
       name: "Full Papers",
+    });
+  }
+
+  // ── Craft: shipped engineering work, from signed git events ──────────────
+  const shippedTier = tierOf(inputs.mergedPrCount, [1, 5, 20]);
+  if (shippedTier !== null) {
+    const names = ["First Merge", "Shipper", "Merge Machine"] as const;
+    badges.push({
+      description: `${inputs.mergedPrCount} pull ${
+        inputs.mergedPrCount === 1 ? "request" : "requests"
+      } merged`,
+      id: "shipped",
+      kind: "craft",
+      name: names[shippedTier - 1],
+      tier: shippedTier,
+    });
+  }
+
+  // Acceptance rate only counts decided PRs — open ones aren't evidence
+  // either way — and needs a real sample before it says anything.
+  const decidedPrCount = inputs.mergedPrCount + inputs.closedPrCount;
+  if (decidedPrCount >= 5 && inputs.mergedPrCount / decidedPrCount >= 0.8) {
+    badges.push({
+      description: `${inputs.mergedPrCount} of ${decidedPrCount} submitted pull requests merged`,
+      id: "high-signal",
+      kind: "craft",
+      name: "High Signal",
+    });
+  }
+
+  const bugHunterTier = tierOf(inputs.issuesOpenedCount, [1, 5, 15]);
+  if (bugHunterTier !== null) {
+    const names = ["Bug Spotter", "Bug Hunter", "Exterminator"] as const;
+    badges.push({
+      description: `Filed ${inputs.issuesOpenedCount} ${
+        inputs.issuesOpenedCount === 1 ? "issue" : "issues"
+      }`,
+      id: "bug-hunter",
+      kind: "craft",
+      name: names[bugHunterTier - 1],
+      tier: bugHunterTier,
+    });
+  }
+
+  const reviewerTier = tierOf(inputs.reviewCount, [3, 10, 30]);
+  if (reviewerTier !== null) {
+    const names = ["Code Reader", "Reviewer", "Gatekeeper"] as const;
+    badges.push({
+      description: `Gave ${inputs.reviewCount} code reviews on others' work`,
+      id: "reviewer",
+      kind: "craft",
+      name: names[reviewerTier - 1],
+      tier: reviewerTier,
+    });
+  }
+
+  const repoTier = tierOf(inputs.repoCount, [2, 4, 8]);
+  if (repoTier !== null) {
+    const names = ["Contributor", "Multi-Repo", "Cross-Pollinator"] as const;
+    badges.push({
+      description: `Contributed to ${inputs.repoCount} repositories`,
+      id: "cross-pollinator",
+      kind: "craft",
+      name: names[repoTier - 1],
+      tier: repoTier,
     });
   }
 
@@ -166,29 +243,7 @@ export function computeAgentBadges(inputs: AgentBadgeInputs): PassportBadge[] {
     }
   }
 
-  // ── Flair: personality from the record ───────────────────────────────────
-  const lateNotes = inputs.noteHours.filter(
-    (hour) => hour >= 23 || hour < 5,
-  ).length;
-  if (lateNotes >= 5) {
-    badges.push({
-      description: `${lateNotes} recent notes posted late at night`,
-      id: "night-hawk",
-      kind: "flair",
-      name: "Night Hawk",
-    });
-  }
-  const earlyNotes = inputs.noteHours.filter(
-    (hour) => hour >= 5 && hour < 7,
-  ).length;
-  if (earlyNotes >= 5) {
-    badges.push({
-      description: `${earlyNotes} recent notes posted before 7am`,
-      id: "early-bird",
-      kind: "flair",
-      name: "Early Bird",
-    });
-  }
+  // ── Flair: live status ────────────────────────────────────────────────────
   if (inputs.activeTurnCount > 0) {
     badges.push({
       description: `Working in ${inputs.activeTurnCount} ${

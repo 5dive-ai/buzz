@@ -5380,6 +5380,114 @@ function buildMockProjectEvents(): RelayEvent[] {
     }
   }
 
+  events.push(...buildMockAgentCraftEvents(now));
+
+  return events;
+}
+
+/**
+ * A deterministic engineering record for the owned relay agent (nadia), so
+ * agent passports render craft badges (merged PRs, issues filed, reviews
+ * given) in screenshots and specs. Timestamps sit far in the past so these
+ * rows never outrank the seeded activity in recency-sorted lists.
+ */
+function buildMockAgentCraftEvents(now: number): RelayEvent[] {
+  const events: RelayEvent[] = [];
+  const daySeconds = 86_400;
+  const buzzOwner =
+    window.__BUZZ_E2E_PROJECT_OWNER_OVERRIDE__ ?? MOCK_PROJECT_SEEDS[0].owner;
+  const buzzAddress = `${KIND_REPO_ANNOUNCEMENT}:${buzzOwner}:buzz`;
+  const relayToolsAddress = `${KIND_REPO_ANNOUNCEMENT}:${ALICE_PUBKEY}:relay-tools`;
+
+  // Six authored PRs: five merged, one closed — enough for the Shipper tier
+  // and a High Signal merge rate (5/6).
+  for (let index = 0; index < 6; index += 1) {
+    const prId = `mockagentpr${index}`.padEnd(32, "0");
+    const createdAt = now - (220 - index * 3) * daySeconds;
+    events.push(
+      createMockEvent(
+        KIND_GIT_PULL_REQUEST,
+        `Agent PR ${index + 1}: harden relay reconnects`,
+        [
+          ["a", buzzAddress],
+          ["subject", `Agent PR ${index + 1}: harden relay reconnects`],
+          ["c", `agentcraft${index}`.padEnd(40, "0").slice(0, 40)],
+          ["branch-name", `agent/craft-${index}`],
+          ["clone", `https://relay.example.com/git/${buzzOwner}/buzz`],
+        ],
+        OWNED_RELAY_AGENT_PUBKEY,
+        createdAt,
+        prId,
+      ),
+    );
+    events.push(
+      createMockEvent(
+        index < 5 ? KIND_GIT_STATUS_MERGED : KIND_GIT_STATUS_CLOSED,
+        "",
+        [
+          ["e", prId, "", "root"],
+          ["a", buzzAddress],
+          ["p", OWNED_RELAY_AGENT_PUBKEY],
+        ],
+        buzzOwner,
+        createdAt + daySeconds,
+        `mockagentprstatus${index}`.padEnd(32, "0"),
+      ),
+    );
+  }
+
+  // Five filed issues, one of them in a second repo for the repo-spread badge.
+  for (let index = 0; index < 5; index += 1) {
+    events.push(
+      createMockEvent(
+        KIND_GIT_ISSUE,
+        `Agent issue ${index + 1}: flaky presence heartbeat`,
+        [
+          ["a", index === 4 ? relayToolsAddress : buzzAddress],
+          ["subject", `Agent issue ${index + 1}: flaky presence heartbeat`],
+        ],
+        OWNED_RELAY_AGENT_PUBKEY,
+        now - (215 - index * 2) * daySeconds,
+        `mockagentissue${index}`.padEnd(32, "0"),
+      ),
+    );
+  }
+
+  // A host PR by alice carrying three inline review comments from the agent.
+  const hostPrId = "mockagentreviewhost".padEnd(32, "0");
+  events.push(
+    createMockEvent(
+      KIND_GIT_PULL_REQUEST,
+      "Refactor subscription fan-out",
+      [
+        ["a", buzzAddress],
+        ["subject", "Refactor subscription fan-out"],
+        ["c", "hostcraft".padEnd(40, "0").slice(0, 40)],
+        ["branch-name", "alice/fan-out"],
+        ["clone", `https://relay.example.com/git/${buzzOwner}/buzz`],
+      ],
+      ALICE_PUBKEY,
+      now - 218 * daySeconds,
+      hostPrId,
+    ),
+  );
+  for (let index = 0; index < 3; index += 1) {
+    events.push(
+      createMockEvent(
+        1,
+        `Consider a bounded queue here (${index + 1}).`,
+        [
+          ["e", hostPrId, "", "root"],
+          ["a", buzzAddress],
+          ["t", "inline-comment"],
+        ],
+        OWNED_RELAY_AGENT_PUBKEY,
+        now - (217 - index) * daySeconds,
+        `mockagentreview${index}`.padEnd(32, "0"),
+      ),
+    );
+  }
+
   return events;
 }
 

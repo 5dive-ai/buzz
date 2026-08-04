@@ -2,29 +2,35 @@ import {
   Activity,
   BadgeCheck,
   Brain,
+  Bug,
   Feather,
+  FolderGit2,
+  GitMerge,
   Heart,
   type LucideIcon,
   Medal,
-  Moon,
   Network,
   ScrollText,
+  SearchCheck,
   ShieldCheck,
-  Sunrise,
+  Target,
 } from "lucide-react";
 
 import type { BadgeKind, PassportBadge } from "@/features/passport/lib/badges";
 import { cn } from "@/shared/lib/cn";
 
 const BADGE_ICONS: Record<string, LucideIcon> = {
-  "early-bird": Sunrise,
+  "bug-hunter": Bug,
+  "cross-pollinator": FolderGit2,
   "elephant-memory": Brain,
   "full-papers": ScrollText,
+  "high-signal": Target,
   liked: Heart,
-  "night-hawk": Moon,
   "on-duty": Activity,
   "registered-operator": ShieldCheck,
+  reviewer: SearchCheck,
   scribe: Feather,
+  shipped: GitMerge,
   tenure: Medal,
   "verified-handle": BadgeCheck,
   "well-connected": Network,
@@ -32,6 +38,7 @@ const BADGE_ICONS: Record<string, LucideIcon> = {
 
 const KIND_TONES: Record<BadgeKind, string> = {
   activity: "border-chart-3/60 text-chart-3",
+  craft: "border-chart-2/60 text-chart-2",
   flair: "border-chart-4/60 text-chart-4",
   tenure: "border-chart-5/60 text-chart-5",
   trust: "border-primary/60 text-primary",

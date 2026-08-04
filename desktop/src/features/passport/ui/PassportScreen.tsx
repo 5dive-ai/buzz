@@ -34,6 +34,10 @@ import {
   StampPage,
 } from "@/features/passport/ui/PassportRecordSections";
 import {
+  useProjectsQuery,
+  useProjectsWorkItemsQuery,
+} from "@/features/projects/hooks";
+import {
   useContactListQuery,
   useUserProfileQuery,
   useUsersBatchQuery,
@@ -254,6 +258,62 @@ export function PassportScreen({
   const reactionsQuery = usePulseReactionsQuery(isAgent ? noteIds : []);
   const activeTurnCount = useAgentWorking(isAgent ? pubkey : null).channels
     .length;
+
+  // Craft signals: the agent's engineering record, read from signed NIP-34
+  // git events across every project in the community. Only agent passports
+  // pay for the work-items fetch.
+  const projectsQuery = useProjectsQuery();
+  const workItemsProjects = React.useMemo(
+    () => (isAgent ? (projectsQuery.data ?? []) : []),
+    [isAgent, projectsQuery.data],
+  );
+  const workItemsQuery = useProjectsWorkItemsQuery(workItemsProjects);
+  const craft = React.useMemo(() => {
+    const counts = {
+      closedPrCount: 0,
+      issuesOpenedCount: 0,
+      mergedPrCount: 0,
+      repoCount: 0,
+      reviewCount: 0,
+    };
+    const workItems = workItemsQuery.data;
+    if (!pubkeyLower || !workItems) {
+      return counts;
+    }
+    const repos = new Set<string>();
+    for (const { project, pullRequest } of workItems.pullRequests.items) {
+      if (pullRequest.author.toLowerCase() === pubkeyLower) {
+        repos.add(project.id);
+        if (pullRequest.status === "Merged") {
+          counts.mergedPrCount += 1;
+        } else if (pullRequest.status === "Closed") {
+          counts.closedPrCount += 1;
+        }
+        continue;
+      }
+      // Reviews only count on other authors' PRs, and only comments that
+      // carry review weight (decisions and inline code comments).
+      for (const comment of pullRequest.comments) {
+        if (
+          comment.author.toLowerCase() === pubkeyLower &&
+          (comment.isApproval ||
+            comment.isChangeRequest ||
+            comment.isInlineComment)
+        ) {
+          counts.reviewCount += 1;
+          repos.add(project.id);
+        }
+      }
+    }
+    for (const { issue, project } of workItems.issues.items) {
+      if (issue.author.toLowerCase() === pubkeyLower) {
+        counts.issuesOpenedCount += 1;
+        repos.add(project.id);
+      }
+    }
+    counts.repoCount = repos.size;
+    return counts;
+  }, [pubkeyLower, workItemsQuery.data]);
   const badges = React.useMemo(() => {
     if (!isAgent) {
       return [];
@@ -263,6 +323,7 @@ export function PassportScreen({
       reactionCount += state.count;
     }
     return computeAgentBadges({
+      ...craft,
       activeTurnCount,
       channelCount: memberChannels.length,
       firstSeenAt:
@@ -276,14 +337,12 @@ export function PassportScreen({
       hasOwner: profile?.ownerPubkey != null,
       memoryCount,
       noteCount: allNotes.length,
-      noteHours: allNotes.map((note) =>
-        new Date(note.createdAt * 1_000).getHours(),
-      ),
       reactionCount,
     });
   }, [
     activeTurnCount,
     allNotes,
+    craft,
     isAgent,
     memberChannels.length,
     memoryCount,

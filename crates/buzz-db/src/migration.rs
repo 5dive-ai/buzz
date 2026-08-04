@@ -566,7 +566,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 44);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -617,6 +617,39 @@ mod tests {
             .as_str()
             .contains("CREATE INDEX idx_events_tags_gin"));
         assert!(!migrations[0].sql.as_str().contains("idx_events_tags_gin"));
+        assert_eq!(migrations[34].version, 35);
+        assert!(migrations[34]
+            .sql
+            .as_str()
+            .contains("ADD COLUMN publication_origin"));
+        assert!(!migrations[0].sql.as_str().contains("publication_origin"));
+        assert_eq!(migrations[39].version, 40);
+        assert!(migrations[39]
+            .sql
+            .as_str()
+            .contains("protected_domain_marker_delete_guard"));
+        assert_eq!(migrations[40].version, 41);
+        assert!(migrations[40].sql.as_str().contains("cleanup_requested_at"));
+        assert_eq!(migrations[41].version, 42);
+        assert!(migrations[41]
+            .sql
+            .as_str()
+            .contains("git_policy_update_authority_epoch"));
+        assert_eq!(migrations[42].version, 43);
+        let audio_visibility = migrations[42].sql.as_str();
+        assert!(audio_visibility.contains("visibility_observed_at"));
+        assert!(audio_visibility.contains("'reserved', 'active', 'visible', 'aborted', 'finished'"));
+        assert!(audio_visibility.contains("audio_admission_visibility_transition_guard"));
+        assert!(audio_visibility
+            .contains("OLD.state = 'active' AND NEW.state IN ('visible', 'aborted')"));
+        assert_eq!(migrations[43].version, 44);
+        let projection_retirement = migrations[43].sql.as_str();
+        assert!(projection_retirement.contains("identity_public_projection_heads"));
+        assert!(projection_retirement.contains("identity_public_projection_retirements"));
+        assert!(projection_retirement.contains("source_binding_version"));
+        assert!(!projection_retirement.contains("issuer"));
+        assert!(!projection_retirement.contains("subject TEXT"));
+        assert!(!projection_retirement.contains("display_name"));
 
         // NIP-AM (kind 44200) FTS exclusion: additive migration, never folded
         // into 0001 — folding would change 0001's checksum and break brownfield
@@ -982,6 +1015,74 @@ mod tests {
                 projection.contains(required),
                 "migration 0029 is missing {required}"
             );
+        }
+        assert_eq!(migrations[29].version, 30);
+        let invalidation = migrations[29].sql.as_str();
+        assert!(invalidation.contains("CREATE TABLE authorization_invalidation_domains"));
+        assert!(invalidation.contains("CREATE TABLE authorization_invalidation_receipts"));
+        assert!(invalidation.contains("CREATE TABLE authorization_invalidation_floors"));
+        assert_eq!(migrations[30].version, 31);
+        let operation_receipts = migrations[30].sql.as_str();
+        assert!(operation_receipts.contains("CREATE TABLE authorization_operation_receipts"));
+        assert!(operation_receipts.contains("request_fingerprint"));
+        assert!(operation_receipts.contains("result_payload"));
+        assert!(operation_receipts.contains("authorization_operation_expiry_guard"));
+        assert_eq!(migrations[31].version, 32);
+        let protected_publications = migrations[31].sql.as_str();
+        assert!(protected_publications.contains("CREATE TABLE git_repo_publications"));
+        assert!(protected_publications.contains("CREATE TABLE media_publications"));
+        assert_eq!(migrations[32].version, 33);
+        let audio_admissions = migrations[32].sql.as_str();
+        assert!(audio_admissions.contains("CREATE TABLE audio_session_admissions"));
+        assert!(audio_admissions.contains("lease_expires_at"));
+        assert!(audio_admissions.contains("audio_session_admissions_channel_fk"));
+        assert_eq!(migrations[33].version, 34);
+        let protected_object_authority = migrations[33].sql.as_str();
+        assert!(protected_object_authority.contains("CREATE TABLE protected_object_authority"));
+        assert!(protected_object_authority.contains("inventory_sha256"));
+        assert!(
+            protected_object_authority.contains("state IN ('legacy', 'importing', 'postgresql')")
+        );
+        assert_eq!(migrations[34].version, 35);
+        assert!(migrations[34]
+            .sql
+            .as_str()
+            .contains("ADD COLUMN publication_origin"));
+        assert_eq!(migrations[35].version, 36);
+        let audio_lifecycle = migrations[35].sql.as_str();
+        assert!(audio_lifecycle.contains("ADD COLUMN state TEXT"));
+        assert!(audio_lifecycle.contains("'reserved', 'active', 'aborted', 'finished'"));
+        assert!(audio_lifecycle.contains("idx_audio_session_admissions_reconcile"));
+        assert_eq!(migrations[36].version, 37);
+        assert_eq!(migrations[37].version, 38);
+        assert_eq!(migrations[38].version, 39);
+        assert!(migrations[38]
+            .sql
+            .as_str()
+            .contains("protected_community_lifecycle_guard"));
+        let authority_epochs = migrations[36].sql.as_str();
+        assert!(authority_epochs.contains("CREATE TABLE authorization_authority_epochs"));
+        assert!(authority_epochs.contains("CREATE TABLE client_status_revisions"));
+        assert!(authority_epochs.contains("advance_authorization_authority_epoch"));
+        assert!(authority_epochs.contains("pg_trigger_depth() > 1"));
+        assert!(authority_epochs.contains("ON DELETE CASCADE"));
+        for protected_table in [
+            "identity_bindings",
+            "identity_principals",
+            "identity_revoked_keys",
+            "identity_retired_pairs",
+            "relay_members",
+            "channel_members",
+            "community_bans",
+            "channels",
+            "users",
+            "authorization_invalidation_domains",
+            "git_repo_publications",
+            "media_publications",
+            "protected_object_authority",
+            "audio_session_admissions",
+        ] {
+            assert!(authority_epochs.contains(protected_table));
         }
     }
 
@@ -1419,7 +1520,15 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
+        let latest_version = MIGRATOR
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .expect("embedded migration set is non-empty");
+        assert_eq!(
+            applied_versions(&pool).await.last().copied(),
+            Some(latest_version)
+        );
     }
 
     #[tokio::test]
@@ -2595,5 +2704,97 @@ mod tests {
             search_expression.contains("ELSE NULL::tsvector"),
             "fresh installs must default non-allowlisted kinds to NULL: {search_expression}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn authority_triggers_preserve_off_and_deny_unwitnessed_protected_teardown() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations(&pool).await.expect("apply all migrations");
+
+        let community_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!(
+                "authority-trigger-{}.example",
+                community_id.simple()
+            ))
+            .execute(&pool)
+            .await
+            .expect("insert legacy community");
+        sqlx::query(
+            "INSERT INTO relay_members (community_id, pubkey, role) VALUES ($1, $2, 'member')",
+        )
+        .bind(community_id)
+        .bind("11".repeat(32))
+        .execute(&pool)
+        .await
+        .expect("legacy membership remains writable");
+        let legacy_domains: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM authorization_invalidation_domains WHERE community_id=$1",
+        )
+        .bind(community_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read legacy authorization rows");
+        assert_eq!(legacy_domains, 0, "Off must not acquire protected state");
+
+        sqlx::query("INSERT INTO authorization_invalidation_domains (community_id) VALUES ($1)")
+            .bind(community_id)
+            .execute(&pool)
+            .await
+            .expect("initialize protected domain");
+        sqlx::query(
+            "INSERT INTO relay_members (community_id, pubkey, role) VALUES ($1, $2, 'member')",
+        )
+        .bind(community_id)
+        .bind("22".repeat(32))
+        .execute(&pool)
+        .await
+        .expect("protected membership mutation");
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT generation FROM authorization_invalidation_domains WHERE community_id=$1",
+        )
+        .bind(community_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read protected generation");
+        assert_eq!(generation, 1, "one mutation advances generation once");
+
+        sqlx::query("DELETE FROM relay_members WHERE community_id=$1")
+            .bind(community_id)
+            .execute(&pool)
+            .await
+            .expect("delete ordinary community-owned rows first");
+        assert!(sqlx::query("DELETE FROM communities WHERE id=$1")
+            .bind(community_id)
+            .execute(&pool)
+            .await
+            .is_err());
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM authorization_authority_epochs WHERE community_id=$1",
+        )
+        .bind(community_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read retained authority state");
+        assert_eq!(retained, 1, "denied teardown retains the monotonic floor");
+
+        assert!(sqlx::query(
+            "DELETE FROM authorization_invalidation_domains WHERE community_id=$1"
+        )
+        .bind(community_id)
+        .execute(&pool)
+        .await
+        .is_err());
+        let marker: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM authorization_invalidation_domains WHERE community_id=$1",
+        )
+        .bind(community_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read retained activation marker");
+        assert_eq!(marker, 1, "protected activation is a one-way cutover");
     }
 }

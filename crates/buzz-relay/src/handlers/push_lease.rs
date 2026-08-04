@@ -477,6 +477,11 @@ pub async fn accept(
     const MAX_CONTENT: usize = 65_536;
     const MAX_PLAINTEXT: usize = 32_768;
     const MAX_ACTIVE_LEASES: i64 = 16;
+    if state.config.profile.is_single_node() {
+        return Err(AcceptError::Validation(
+            "unsupported_feature: push delivery is unavailable in single-node mode".to_string(),
+        ));
+    }
     if state.config.push_gateway_delivery_url.is_none() {
         return Err(AcceptError::Validation("push not supported".to_string()));
     }
@@ -607,6 +612,32 @@ mod tests {
             .custom_created_at(Timestamp::from(1_000_u64))
             .sign_with_keys(&Keys::generate())
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn single_node_rejects_push_before_persistence() {
+        let state = crate::test_support::test_state_with_config(|config| {
+            config.profile = crate::config::RelayProfile::SingleNode;
+            config.push_gateway_delivery_url =
+                Some(url::Url::parse("https://gateway.example").expect("gateway URL"));
+        })
+        .await;
+        let error = accept(
+            &buzz_core::TenantContext::resolved(
+                buzz_core::CommunityId::from_uuid(uuid::Uuid::nil()),
+                "relay.example",
+            ),
+            &state,
+            &event(vec![]),
+            1_000,
+        )
+        .await
+        .expect_err("single-node push is unsupported");
+        assert!(matches!(
+            error,
+            AcceptError::Validation(ref reason)
+                if reason == "unsupported_feature: push delivery is unavailable in single-node mode"
+        ));
     }
 
     #[test]

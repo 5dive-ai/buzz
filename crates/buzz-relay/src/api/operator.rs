@@ -22,7 +22,7 @@ use crate::handlers::community_provisioning::{
 };
 use crate::state::AppState;
 
-use super::{api_error, bridge, internal_error};
+use super::{api_error, bridge, internal_error, single_node_unsupported};
 
 /// Query parameters for `GET /operator/communities`.
 #[derive(Debug, Deserialize)]
@@ -151,6 +151,7 @@ pub async fn provision_community(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    single_node_unsupported(&state, "community lifecycle management")?;
     let pubkey = authorize_operator_request(
         &state,
         &headers,
@@ -206,6 +207,7 @@ pub async fn archive_community(
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     const PATH: &str = "/operator/communities/archive";
+    single_node_unsupported(&state, "community lifecycle management")?;
     authorize_operator_request(&state, &headers, "POST", PATH, None, Some(&body)).await?;
     let request: ArchiveCommunityRequest = serde_json::from_slice(&body).map_err(|e| {
         api_error(
@@ -268,6 +270,7 @@ pub async fn unarchive_community(
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     const PATH: &str = "/operator/communities/unarchive";
+    single_node_unsupported(&state, "community lifecycle management")?;
     authorize_operator_request(&state, &headers, "POST", PATH, None, Some(&body)).await?;
     let request: ArchiveCommunityRequest = serde_json::from_slice(&body).map_err(|e| {
         api_error(
@@ -305,6 +308,7 @@ pub async fn list_owned_communities(
     RawQuery(raw_query): RawQuery,
     Query(query): Query<ListCommunitiesQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    single_node_unsupported(&state, "community lifecycle management")?;
     authorize_operator_request(
         &state,
         &headers,
@@ -356,6 +360,7 @@ pub async fn transfer_community(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    single_node_unsupported(&state, "community lifecycle management")?;
     let _pubkey = authorize_operator_request(
         &state,
         &headers,
@@ -471,6 +476,7 @@ pub async fn community_availability(
     RawQuery(raw_query): RawQuery,
     Query(query): Query<CommunityAvailabilityQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    single_node_unsupported(&state, "community lifecycle management")?;
     authorize_operator_request(
         &state,
         &headers,
@@ -515,6 +521,7 @@ mod tests {
     use buzz_core::{kind::KIND_NIP43_MEMBERSHIP_LIST, CommunityId};
     use buzz_db::event::EventQuery;
 
+    use crate::config::RelayProfile;
     use crate::router::build_router;
     use crate::state::AppState;
 
@@ -569,8 +576,16 @@ mod tests {
     }
 
     async fn operator_test_state(operator_keys: &[Keys]) -> Arc<AppState> {
+        operator_test_state_for_profile(operator_keys, RelayProfile::Production).await
+    }
+
+    async fn operator_test_state_for_profile(
+        operator_keys: &[Keys],
+        profile: RelayProfile,
+    ) -> Arc<AppState> {
         crate::test_support::test_state_with_config_and_state(
             |config| {
+                config.profile = profile;
                 config.relay_url = "wss://tenant.example".to_string();
                 config.relay_operator_api_origin = Some(format!("http://{INGRESS_HOST}"));
                 config.relay_operator_pubkeys = operator_keys
@@ -666,6 +681,71 @@ mod tests {
                     .iter()
                     .any(|tag| is_member_tag(tag, pubkey, role)),
                 "missing {role} snapshot tag for {pubkey}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_node_community_lifecycle_routes_return_stable_unsupported_error() {
+        let operator = Keys::generate();
+        let state = operator_test_state_for_profile(
+            std::slice::from_ref(&operator),
+            RelayProfile::SingleNode,
+        )
+        .await;
+        let requests = [
+            ("GET", "/operator/communities?owner_pubkey=00", None),
+            (
+                "POST",
+                "/operator/communities",
+                Some(
+                    r#"{"host":"community.example","initial_owner_pubkey":"00","create_only":true}"#,
+                ),
+            ),
+            (
+                "POST",
+                "/operator/communities/archive",
+                Some(r#"{"host":"community.example","owner_pubkey":"00"}"#),
+            ),
+            (
+                "POST",
+                "/operator/communities/unarchive",
+                Some(r#"{"host":"community.example","owner_pubkey":"00"}"#),
+            ),
+            (
+                "GET",
+                "/operator/communities/availability?host=community.example",
+                None,
+            ),
+            (
+                "POST",
+                "/operator/communities/transfer",
+                Some(
+                    r#"{"community_id":"00000000-0000-0000-0000-000000000000","new_owner_pubkey":"00","expected_owner_pubkey":"00"}"#,
+                ),
+            ),
+        ];
+
+        for (method, path, body) in requests {
+            let response = signed_operator_request(
+                Arc::clone(&state),
+                &operator,
+                method,
+                path,
+                body.map(str::to_owned),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+            assert_eq!(
+                read_json(response).await,
+                serde_json::json!({
+                    "error": "unsupported_feature: community lifecycle management is unavailable in single-node mode"
+                }),
+                "{path}"
             );
         }
     }

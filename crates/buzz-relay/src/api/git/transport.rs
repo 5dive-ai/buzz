@@ -2797,6 +2797,8 @@ mod sec005_read_gate_tests {
 
     const GENERIC_DENIAL: &str = "repository not found";
 
+    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
+
     // ── authorize_git_read matrix (requires Postgres) ────────────────────
 
     async fn setup_db() -> buzz_db::Db {

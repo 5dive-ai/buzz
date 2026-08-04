@@ -45,6 +45,23 @@ The fresh WP-B matrix passed profiles, public relay-member admission (kind 9030)
 | Unsupported command families | `crates/buzz-relay/src/handlers/command_executor.rs:120-128` | Commands other than the dedicated atomic DM-open path are explicitly rejected before an idempotency event can be persisted. |
 | Thread summaries and NIP-43 publications | `crates/buzz-relay/src/handlers/side_effects.rs` (`emit_live_thread_summary`, `publish_nip43_membership_list`, `publish_nip43_delta`) | PostgreSQL-backed thread/list snapshots are omitted locally; globally scoped NIP-43 deltas are also suppressed to avoid leaking the loopback roster. Durable NIP-10 tags and the SQLite relay-members table remain authoritative. |
 
+## Local mode does not support
+
+The approved [S6 decision](docs/local-mode-s6-descope.md) de-scopes the
+34 methods in [`crates/buzz-db/SQLITE_BACKEND_INVENTORY.md`](crates/buzz-db/SQLITE_BACKEND_INVENTORY.md)
+from local-mode v1. PostgreSQL behavior is retained; these are local-profile
+limits, not removed features.
+
+| Group | Local-mode behavior | Error surface / guard |
+|---|---|---|
+| Community lifecycle management (5) | One local community per device; create, archive, unarchive, owner listing, availability checks, and ownership transfer are unavailable. | All `/operator/communities` lifecycle routes return HTTP 422 with `{"error":"unsupported_feature: community lifecycle management is unavailable in single-node mode"}` before auth, request parsing, or DB access. |
+| Push delivery persistence (14) | Push lease registration, matching, queueing, and gateway delivery are unavailable. Workers do not start. | NIP-PL lease submission rejects as `invalid: unsupported_feature: push delivery is unavailable in single-node mode` before decrypting or persisting; no push worker is started. |
+| Usage analytics (10) and operational infra (2) | Fleet metrics leadership and PostgreSQL transaction primitives are not used locally. Local loopback metrics remain available. | The single-node startup path bypasses the production usage poller; command persistence uses SQLite-specific atomic writes rather than `begin_transaction`. No HTTP route reaches these methods. |
+| Relay membership maintenance (3) | Allowlist migration is not needed for a new local SQLite store; global NIP-43 list snapshots and deltas are intentionally private/omitted. | Single-node startup has its own bootstrap path and never calls `backfill_from_allowlist`; NIP-43 publication helpers are explicit no-ops before `publish_nip43_membership_locked`. Ownership transfer is covered by the community-lifecycle HTTP 422 above. |
+
+The S4 SQLite handler classification remains the detailed test rationale for
+its nine PostgreSQL-only tests: [`crates/buzz-relay/SQLITE_HANDLER_TEST_SKIPS.md`](crates/buzz-relay/SQLITE_HANDLER_TEST_SKIPS.md).
+
 ## Blocked PostgreSQL-only public DB methods
 
 These calls fail with typed `DbError::UnsupportedBackend` if reached on SQLite; they are not silently emulated. The list is representative of the remaining families rather than a claim that every `Db` method is ported.

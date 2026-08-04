@@ -25,6 +25,22 @@ pub(crate) fn internal_error(msg: &str) -> (StatusCode, Json<serde_json::Value>)
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
+/// Reject a production-only surface before it can reach a SQLite-only backend.
+///
+/// The reason is deliberately stable for local-mode clients and documentation.
+pub(crate) fn single_node_unsupported(
+    state: &crate::state::AppState,
+    feature: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.config.profile.is_single_node() {
+        return Err(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("unsupported_feature: {feature} is unavailable in single-node mode"),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub(crate) fn not_found(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
     api_error(StatusCode::NOT_FOUND, msg)

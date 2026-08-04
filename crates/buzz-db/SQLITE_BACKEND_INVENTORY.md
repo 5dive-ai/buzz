@@ -2,6 +2,15 @@
 
 Generated from `#[sqlite_backend(...)]` declarations in `crates/buzz-db/src/lib.rs`.
 
+The 34 unsupported methods are deliberately out of local-mode v1 scope under
+[the approved S6 decision record](../../docs/local-mode-s6-descope.md)
+(Logan, 2026-08-04), rather than accidental SQLite gaps. Relay route and
+handler guards preserve the S4 skip-list justification chain in
+[`buzz-relay/SQLITE_HANDLER_TEST_SKIPS.md`](../buzz-relay/SQLITE_HANDLER_TEST_SKIPS.md).
+
+> **Generator note:** keep this decision cross-link when regenerating the table
+> below with `cargo test -p buzz-db backend_inventory_is_current -- --nocapture`.
+
 Regenerate after changing declarations with:
 
 ```sh

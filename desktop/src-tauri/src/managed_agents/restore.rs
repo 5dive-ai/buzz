@@ -21,7 +21,9 @@ use tauri::Manager;
 /// restore would kill reconcile's lazy child by its receipt and replace it with
 /// an eager one, flipping the pair's laziness on a startup race.
 enum SpawnOutcome {
-    Spawned(super::ManagedAgentRuntimeKey, ManagedAgentProcess),
+    /// Boxed: the spawned process carries its full spawn-config snapshot, so an
+    /// inline variant would make every `Skipped`/`Failed` outcome pay for it.
+    Spawned(super::ManagedAgentRuntimeKey, Box<ManagedAgentProcess>),
     Skipped,
     Failed(String),
 }
@@ -343,7 +345,9 @@ pub async fn restore_managed_agents_on_launch(
                                                 owner_hex_ref,
                                             )
                                         }) {
-                                        Ok(process) => SpawnOutcome::Spawned(key, process),
+                                        Ok(process) => {
+                                            SpawnOutcome::Spawned(key, Box::new(process))
+                                        }
                                         Err(error) => SpawnOutcome::Failed(error),
                                     }
                                 }
@@ -439,7 +443,10 @@ pub async fn restore_managed_agents_on_launch(
                 record.last_error = None;
                 runtimes.insert(
                     key,
-                    super::ManagedAgentPairRuntime::starting(process, Some(scope.scope_id.clone())),
+                    super::ManagedAgentPairRuntime::starting(
+                        *process,
+                        Some(scope.scope_id.clone()),
+                    ),
                 );
                 successfully_spawned.push(pubkey);
             }

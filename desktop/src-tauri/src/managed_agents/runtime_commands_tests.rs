@@ -171,7 +171,13 @@ fn make_exited_pair_runtime(scope_id: Option<String>) -> ManagedAgentPairRuntime
     let process = super::super::ManagedAgentProcess {
         child,
         log_path: std::path::PathBuf::new(),
-        spawn_config_hash: 0,
+        spawn_config: crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+            &record_with_relay(""),
+            &[],
+            &[],
+            "wss://relay.example",
+            &Default::default(),
+        ),
         setup_mode: false,
         adapter_availability: None,
         start_nonce: "test-nonce".to_string(),
@@ -197,7 +203,13 @@ fn make_live_pair_runtime() -> ManagedAgentPairRuntime {
     let process = super::super::ManagedAgentProcess {
         child,
         log_path: std::path::PathBuf::new(),
-        spawn_config_hash: 0,
+        spawn_config: crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+            &record_with_relay(""),
+            &[],
+            &[],
+            "wss://relay.example",
+            &Default::default(),
+        ),
         setup_mode: false,
         adapter_availability: None,
         start_nonce: "test-nonce".to_string(),

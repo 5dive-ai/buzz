@@ -550,7 +550,13 @@ fn test_record_mesh_change_after_preflight_aborts_before_stop() {
         let process = crate::managed_agents::ManagedAgentProcess {
             child,
             log_path: std::path::PathBuf::new(),
-            spawn_config_hash: 0,
+            spawn_config: crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+                &record,
+                &[],
+                &[],
+                relay_url,
+                &Default::default(),
+            ),
             setup_mode: false,
             adapter_availability: None,
             start_nonce: "test-nonce-mesh".to_string(),

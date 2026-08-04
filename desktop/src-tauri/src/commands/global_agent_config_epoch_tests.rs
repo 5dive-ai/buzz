@@ -125,7 +125,13 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
         let process = crate::managed_agents::ManagedAgentProcess {
             child,
             log_path: std::path::PathBuf::new(),
-            spawn_config_hash: 0,
+            spawn_config: crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+                &record,
+                &[],
+                &[],
+                relay_url,
+                &Default::default(),
+            ),
             setup_mode: false,
             adapter_availability: None,
             start_nonce: "test-nonce".to_string(),
@@ -191,7 +197,7 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
             Ok(())
         },
         // spawn_fn: record captured relay+owner, return a fresh process.
-        move |_app, _rec, relay, owner, _personas, _global, _teams| {
+        move |_app, rec, relay, owner, _personas, global, teams| {
             *spawn_relay2.lock().unwrap() = Some(relay.to_string());
             *spawn_owner2.lock().unwrap() = owner.map(str::to_string);
             // Return an immediately-exiting child as the fake process.
@@ -204,7 +210,14 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
             Ok(crate::managed_agents::ManagedAgentProcess {
                 child,
                 log_path: std::path::PathBuf::new(),
-                spawn_config_hash: 0,
+                spawn_config:
+                    crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+                        rec,
+                        &[],
+                        teams,
+                        relay,
+                        global,
+                    ),
                 setup_mode: false,
                 adapter_availability: None,
                 start_nonce: "test-nonce-spawn".to_string(),

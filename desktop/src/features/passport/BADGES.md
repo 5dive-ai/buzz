@@ -81,7 +81,10 @@ the count is an honest lower bound, like everything else here. Engine:
 
 ## Wants relay support first
 
-Signals that belong here but aren't attributable to a pubkey on the relay yet:
+Signals that belong here but aren't attributable to a pubkey on the relay yet.
+Dev and e2e builds render a mocked "Network record" block (labelled *Sample
+data*, `PersonaCatalogPassportPreview.tsx`) in the catalog passport to preview
+how the first two would look; production builds never show it:
 
 - **Adopted** — the full duplication count (every add, not just re-shares).
   Catalog copies are local-only today (`catalogSource` on the adopter's

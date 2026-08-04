@@ -9,6 +9,10 @@ import {
 import { countCatalogRepublishers } from "@/features/agents/lib/personaAdoption";
 import { usePersonaCatalogQuery } from "@/features/agents/lib/usePersonaCatalogRelay";
 import { useCommunities } from "@/features/communities/useCommunities";
+import {
+  isPassportNetworkPreviewEnabled,
+  PersonaCatalogPassportPreview,
+} from "@/features/agents/ui/PersonaCatalogPassportPreview";
 import { useAgentPassportBadges } from "@/features/passport/hooks/useAgentPassportBadges";
 import { PassportBadgeList } from "@/features/passport/ui/PassportBadges";
 import {
@@ -229,6 +233,9 @@ export function PersonaCatalogPassport({
               {republisherCount === 1 ? "member" : "members"} — re-shared to
               this community’s catalog.
             </p>
+          ) : null}
+          {isPassportNetworkPreviewEnabled() ? (
+            <PersonaCatalogPassportPreview personaId={persona.id} />
           ) : null}
           {publisherPubkey ? (
             <div>

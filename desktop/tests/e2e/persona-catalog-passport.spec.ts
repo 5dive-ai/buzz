@@ -116,6 +116,14 @@ test("catalog entry shows the deployed agent's passport record", async ({
     .getByTestId("persona-catalog-detail-pane")
     .screenshot({ path: `${OUTDIR}/01-catalog-passport.png` });
 
+  // Sample-data network record (dev/e2e builds only, labelled as such).
+  const preview = passportSection.getByTestId(
+    "persona-catalog-passport-preview",
+  );
+  await preview.scrollIntoViewIfNeeded();
+  await expect(preview).toBeVisible();
+  await preview.screenshot({ path: `${OUTDIR}/03-network-preview.png` });
+
   // The chip closes the dialog and lands on the agent's full passport.
   await passportSection.getByTestId("passport-agent-chip").click();
   await expect(page.getByTestId("persona-catalog-dialog")).toHaveCount(0);

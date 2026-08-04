@@ -339,10 +339,12 @@ fn test_workspace_apply_result_degradation_accumulates() {
 /// entry 2 (absent from map) is also treated as stopped. On full success,
 /// `stopped = [entry1, entry2]`, `remaining = []`, `err = None`.
 ///
-/// The compensation round-trip (`compensate_drain` + `start_pair_under_held_locks`)
-/// requires an `AppHandle` and is covered by the desktop integration test suite.
 /// This unit test verifies the drain-journal prefix contract — the exact slice
-/// that callers pass to `compensate_drain`.
+/// that callers pass to `compensate_drain`. The full compensation round-trip
+/// (`compensate_drain` + `start_pair_under_held_locks`) requires an `AppHandle`
+/// and cannot be exercised here: the codebase has no `tauri::test` harness and
+/// there is no `AppHandle` mock. Coverage of the restart path is therefore
+/// integration-only (manual two-workspace probe + the desktop smoke suite).
 #[test]
 #[cfg(unix)]
 fn test_partial_drain_delivers_correct_stopped_prefix_with_live_process() {

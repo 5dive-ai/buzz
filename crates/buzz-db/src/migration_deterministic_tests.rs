@@ -29,7 +29,7 @@ async fn connect_pool() -> PgPool {
         .expect("connect deterministic migration DB")
 }
 
-async fn reset_empty_to_0028(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
+async fn reset_empty_to_0029(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
     sqlx::query("DROP SCHEMA IF EXISTS public CASCADE")
         .execute(pool)
         .await
@@ -39,9 +39,9 @@ async fn reset_empty_to_0028(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
         .await
         .expect("create public schema");
     MIGRATOR
-        .run_to(28, pool)
+        .run_to(29, pool)
         .await
-        .expect("migrate through 0028");
+        .expect("migrate through 0029");
     let domain_a = Uuid::new_v4();
     let domain_b = Uuid::new_v4();
     for (domain, suffix) in [(domain_a, "a"), (domain_b, "b")] {
@@ -64,8 +64,8 @@ async fn reset_empty_to_0028(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
     (domain_a, domain_b)
 }
 
-async fn reset_to_0028(pool: &PgPool) -> (Uuid, Uuid) {
-    let (domain_a, domain_b) = reset_empty_to_0028(pool, "migration-fault").await;
+async fn reset_to_0029(pool: &PgPool) -> (Uuid, Uuid) {
+    let (domain_a, domain_b) = reset_empty_to_0029(pool, "migration-fault").await;
     sqlx::query(
         "INSERT INTO identity_bindings (community_id,issuer,uid,pubkey,source) \
          VALUES ($1,'https://idp.example','migration-fault-a-subject',$2,'db_binding')",
@@ -134,11 +134,11 @@ fn split_statements(sql: &str) -> Vec<String> {
     statements
 }
 
-fn migration_0029() -> &'static sqlx::migrate::Migration {
+fn migration_0030() -> &'static sqlx::migrate::Migration {
     MIGRATOR
         .iter()
-        .find(|migration| migration.version == 29)
-        .expect("embedded migration 0029")
+        .find(|migration| migration.version == 30)
+        .expect("embedded migration 0030")
 }
 
 async fn legacy_snapshot(pool: &PgPool) -> Vec<String> {
@@ -219,7 +219,7 @@ async fn identity_catalog_contract(pool: &PgPool) -> Vec<String> {
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn populated_0029_upgrade_matches_desired_identity_catalog() {
+async fn populated_0030_upgrade_matches_desired_identity_catalog() {
     let pool = connect_pool().await;
     sqlx::raw_sql("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public")
         .execute(&pool)
@@ -236,9 +236,9 @@ async fn populated_0029_upgrade_matches_desired_identity_catalog() {
         .await
         .expect("reset for populated upgrade");
     MIGRATOR
-        .run_to(28, &pool)
+        .run_to(29, &pool)
         .await
-        .expect("apply migrations through 0028");
+        .expect("apply migrations through 0029");
     let domain = Uuid::new_v4();
     sqlx::query("INSERT INTO communities (id,host) VALUES ($1,$2)")
         .bind(domain)
@@ -258,7 +258,7 @@ async fn populated_0029_upgrade_matches_desired_identity_catalog() {
     .expect("insert populated-upgrade successor");
     super::run_migrations(&pool)
         .await
-        .expect("apply populated 0029 upgrade");
+        .expect("apply populated 0030 upgrade");
     let upgraded = identity_catalog_contract(&pool).await;
     assert_eq!(upgraded, desired);
 }
@@ -288,10 +288,10 @@ async fn full_identity_snapshot(pool: &PgPool) -> Vec<String> {
         snapshot.extend(rows.into_iter().map(|row| format!("{table}:{row}")));
     }
     let marker: Vec<String> =
-        sqlx::query_scalar("SELECT to_jsonb(m)::text FROM _sqlx_migrations m WHERE version=29")
+        sqlx::query_scalar("SELECT to_jsonb(m)::text FROM _sqlx_migrations m WHERE version=30")
             .fetch_all(pool)
             .await
-            .expect("snapshot 0029 marker");
+            .expect("snapshot 0030 marker");
     snapshot.extend(marker.into_iter().map(|row| format!("marker:{row}")));
     snapshot.sort();
     snapshot
@@ -445,7 +445,7 @@ async fn response_loss_migrated_domain_sentinels(
     domain: Uuid,
 ) -> (Vec<String>, Vec<String>) {
     let marker_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version=29 AND success")
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version=30 AND success")
             .fetch_one(pool)
             .await
             .expect("count successful response-loss migration markers");
@@ -786,14 +786,14 @@ async fn migrated_authorization_projection(
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn identity_0029_all_32_legacy_presence_masks_are_lossless_and_fail_closed() {
+async fn identity_0030_all_32_legacy_presence_masks_are_lossless_and_fail_closed() {
     let mut executed = BTreeSet::new();
     for mask in 0_u8..32 {
         let case_id = format!("MIG-CART-{mask:05b}");
         assert!(executed.insert(case_id.clone()), "duplicate {case_id}");
 
         let pool = connect_pool().await;
-        let (domain_a, domain_b) = reset_empty_to_0028(&pool, "migration-mask").await;
+        let (domain_a, domain_b) = reset_empty_to_0029(&pool, "migration-mask").await;
         seed_legacy_presence_mask(&pool, domain_a, mask).await;
         let legacy_a = legacy_identity_facts(&pool, domain_a).await;
         let legacy_b = legacy_identity_facts(&pool, domain_b).await;
@@ -802,7 +802,7 @@ async fn identity_0029_all_32_legacy_presence_masks_are_lossless_and_fail_closed
         assert!(raw_domain_authorized(&pool, domain_b, &[72_u8; 32]).await);
 
         MIGRATOR
-            .run_to(29, &pool)
+            .run_to(30, &pool)
             .await
             .unwrap_or_else(|error| panic!("{case_id} migration failed: {error}"));
         assert_eq!(
@@ -823,7 +823,7 @@ async fn identity_0029_all_32_legacy_presence_masks_are_lossless_and_fail_closed
         assert!(raw_domain_authorized(&pool, domain_b, &[72_u8; 32]).await);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=29 AND success",
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=30 AND success",
             )
             .fetch_one(&pool)
             .await
@@ -1252,7 +1252,7 @@ async fn identity_0029_all_32_legacy_presence_masks_are_lossless_and_fail_closed
             "{case_id} restart"
         );
         MIGRATOR
-            .run_to(29, &pool)
+            .run_to(30, &pool)
             .await
             .unwrap_or_else(|error| panic!("{case_id} retry failed: {error}"));
         assert_eq!(
@@ -1277,7 +1277,7 @@ async fn identity_0029_all_32_legacy_presence_masks_are_lossless_and_fail_closed
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn identity_0029_frozen_20_case_literal_selector_corpus_preserves_exact_bytes() {
+async fn identity_0030_frozen_20_case_literal_selector_corpus_preserves_exact_bytes() {
     const LITERALS: [(&str, &str); 10] = [
         ("Issuer", "Subject"),
         ("issuer", "subject"),
@@ -1298,7 +1298,7 @@ async fn identity_0029_frozen_20_case_literal_selector_corpus_preserves_exact_by
             assert_ne!(pair.0.as_bytes(), pair.1.as_bytes(), "{case_id}");
 
             let pool = connect_pool().await;
-            let (domain_a, domain_b) = reset_empty_to_0028(&pool, "literal-corpus").await;
+            let (domain_a, domain_b) = reset_empty_to_0029(&pool, "literal-corpus").await;
             let fixed_issuer = "literal://fixed/issuer";
             let fixed_subject = " literal fixed subject ";
             let keys = [vec![111_u8; 32], vec![112_u8; 32]];
@@ -1327,7 +1327,7 @@ async fn identity_0029_frozen_20_case_literal_selector_corpus_preserves_exact_by
             assert!(raw_domain_authorized(&pool, domain_b, &[72_u8; 32]).await);
 
             MIGRATOR
-                .run_to(29, &pool)
+                .run_to(30, &pool)
                 .await
                 .unwrap_or_else(|error| panic!("migrate {case_id}: {error}"));
             assert_eq!(
@@ -1451,7 +1451,7 @@ async fn identity_0029_frozen_20_case_literal_selector_corpus_preserves_exact_by
                 "{case_id} restart"
             );
             MIGRATOR
-                .run_to(29, &pool)
+                .run_to(30, &pool)
                 .await
                 .unwrap_or_else(|error| panic!("retry {case_id}: {error}"));
             assert_eq!(full_identity_snapshot(&pool).await, post, "{case_id} retry");
@@ -1644,7 +1644,7 @@ async fn run_migration_as_role(
         .execute(&mut *connection)
         .await
         .expect("enter restricted migration role");
-    let result = MIGRATOR.run_to(29, &mut *connection).await;
+    let result = MIGRATOR.run_to(30, &mut *connection).await;
     sqlx::query("RESET ROLE")
         .execute(&mut *connection)
         .await
@@ -1666,13 +1666,13 @@ async fn drop_restricted_migration_role(pool: &PgPool, role: &str, controller: &
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn identity_0029_all_five_unreadable_legacy_variants_rollback_then_retry() {
+async fn identity_0030_all_five_unreadable_legacy_variants_rollback_then_retry() {
     let mut executed = BTreeSet::new();
     for variant in UnreadableLegacyVariant::ALL {
         let case_id = format!("MIG-AMB-005-{}", variant.name());
         assert!(executed.insert(case_id.clone()), "duplicate {case_id}");
         let pool = connect_pool().await;
-        let (domain_a, domain_b) = reset_empty_to_0028(&pool, "unreadable-legacy").await;
+        let (domain_a, domain_b) = reset_empty_to_0029(&pool, "unreadable-legacy").await;
         seed_legacy_presence_mask(&pool, domain_a, 0b1_1111).await;
         let before = legacy_snapshot(&pool).await;
         let domain_b_facts = legacy_identity_facts(&pool, domain_b).await;
@@ -1683,7 +1683,7 @@ async fn identity_0029_all_five_unreadable_legacy_variants_rollback_then_retry()
 
         let error = run_migration_as_role(&pool, &role)
             .await
-            .expect_err("unreadable retained state must abort 0029");
+            .expect_err("unreadable retained state must abort 0030");
         let error_text = error.to_string();
         assert!(
             error_text.contains("legacy identity state is unreadable"),
@@ -1704,7 +1704,7 @@ async fn identity_0029_all_five_unreadable_legacy_variants_rollback_then_retry()
         }
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=29 AND success",
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=30 AND success",
             )
             .fetch_one(&pool)
             .await
@@ -1787,7 +1787,7 @@ async fn identity_0029_all_five_unreadable_legacy_variants_rollback_then_retry()
             .unwrap_or_else(|error| panic!("{case_id} retry failed: {error}"));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=29 AND success",
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=30 AND success",
             )
             .fetch_one(&pool)
             .await
@@ -1828,7 +1828,7 @@ async fn identity_0029_all_five_unreadable_legacy_variants_rollback_then_retry()
             "{case_id} restart"
         );
         MIGRATOR
-            .run_to(29, &pool)
+            .run_to(30, &pool)
             .await
             .unwrap_or_else(|error| panic!("{case_id} no-op retry failed: {error}"));
         assert_eq!(
@@ -1844,17 +1844,17 @@ async fn identity_0029_all_five_unreadable_legacy_variants_rollback_then_retry()
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn identity_0029_fault_at_every_statement_boundary_restarts_and_retries() {
-    let statements = split_statements(migration_0029().sql.as_ref());
+async fn identity_0030_fault_at_every_statement_boundary_restarts_and_retries() {
+    let statements = split_statements(migration_0030().sql.as_ref());
     assert_eq!(
         statements.len(),
         34,
-        "0029 boundary count is part of the oracle adapter"
+        "0030 boundary count is part of the oracle adapter"
     );
 
     for boundary in 0..=statements.len() {
         let pool = connect_pool().await;
-        let (_domain_a, domain_b) = reset_to_0028(&pool).await;
+        let (_domain_a, domain_b) = reset_to_0029(&pool).await;
         let before = legacy_snapshot(&pool).await;
         let domain_b_facts = legacy_identity_facts(&pool, domain_b).await;
         let domain_b_audit = domain_audit_snapshot(&pool, domain_b).await;
@@ -1874,7 +1874,7 @@ async fn identity_0029_fault_at_every_statement_boundary_restarts_and_retries() 
                 .execute(&mut *tx)
                 .await
                 .unwrap_or_else(|error| {
-                    panic!("0029 statement before boundary {boundary} failed: {error}")
+                    panic!("0030 statement before boundary {boundary} failed: {error}")
                 });
         }
         let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
@@ -1907,12 +1907,12 @@ async fn identity_0029_fault_at_every_statement_boundary_restarts_and_retries() 
         );
         assert!(raw_domain_authorized(&pool, domain_b, &[72_u8; 32]).await);
 
-        MIGRATOR.run_to(29, &pool).await.unwrap_or_else(|error| {
+        MIGRATOR.run_to(30, &pool).await.unwrap_or_else(|error| {
             panic!("boundary {boundary} retry after restart failed: {error}")
         });
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=29 AND success"
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=30 AND success"
             )
             .fetch_one(&pool)
             .await
@@ -1940,7 +1940,7 @@ async fn identity_0029_fault_at_every_statement_boundary_restarts_and_retries() 
             complete_post,
             "boundary {boundary} complete post-state must survive restart"
         );
-        MIGRATOR.run_to(29, &pool).await.unwrap_or_else(|error| {
+        MIGRATOR.run_to(30, &pool).await.unwrap_or_else(|error| {
             panic!("boundary {boundary} idempotent post-restart retry failed: {error}")
         });
         assert_eq!(
@@ -1954,18 +1954,18 @@ async fn identity_0029_fault_at_every_statement_boundary_restarts_and_retries() 
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn identity_0029_commit_failure_rolls_back_projection_and_success_marker() {
+async fn identity_0030_commit_failure_rolls_back_projection_and_success_marker() {
     let pool = connect_pool().await;
-    let (_domain_a, domain_b) = reset_to_0028(&pool).await;
+    let (_domain_a, domain_b) = reset_to_0029(&pool).await;
     let before = legacy_snapshot(&pool).await;
-    let migration = migration_0029();
+    let migration = migration_0030();
     let statements = split_statements(migration.sql.as_ref());
     let mut tx = pool.begin().await.expect("begin commit-failure migration");
     for statement in statements {
         sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
             .execute(&mut *tx)
             .await
-            .expect("execute 0029 before commit failure");
+            .expect("execute 0030 before commit failure");
     }
     sqlx::query(
         "INSERT INTO _sqlx_migrations \
@@ -1977,7 +1977,7 @@ async fn identity_0029_commit_failure_rolls_back_projection_and_success_marker()
     .bind(migration.checksum.as_ref())
     .execute(&mut *tx)
     .await
-    .expect("insert transactional 0029 marker");
+    .expect("insert transactional 0030 marker");
     sqlx::query(
         "UPDATE identity_bindings SET replacement_binding_id=$1 \
          WHERE community_id=$2",
@@ -1995,27 +1995,27 @@ async fn identity_0029_commit_failure_rolls_back_projection_and_success_marker()
     assert!(raw_domain_authorized(&pool, domain_b, &[72_u8; 32]).await);
 
     MIGRATOR
-        .run_to(29, &pool)
+        .run_to(30, &pool)
         .await
         .expect("retry after commit failure");
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=29 AND success"
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version=30 AND success"
         )
         .fetch_one(&pool)
         .await
-        .expect("count successful 0029 marker"),
+        .expect("count successful 0030 marker"),
         1
     );
 }
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn identity_0029_backend_loss_restarts_cleanly_and_retry_converges() {
+async fn identity_0030_backend_loss_restarts_cleanly_and_retry_converges() {
     let pool = connect_pool().await;
-    let (_domain_a, domain_b) = reset_to_0028(&pool).await;
+    let (_domain_a, domain_b) = reset_to_0029(&pool).await;
     let before = legacy_snapshot(&pool).await;
-    let statements = split_statements(migration_0029().sql.as_ref());
+    let statements = split_statements(migration_0030().sql.as_ref());
     let mut connection = pool.acquire().await.expect("acquire migration backend");
     let backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *connection)
@@ -2043,18 +2043,18 @@ async fn identity_0029_backend_loss_restarts_cleanly_and_retry_converges() {
     assert_eq!(legacy_snapshot(&pool).await, before);
     assert!(raw_domain_authorized(&pool, domain_b, &[72_u8; 32]).await);
     MIGRATOR
-        .run_to(29, &pool)
+        .run_to(30, &pool)
         .await
         .expect("retry after backend restart");
 }
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn identity_0029_real_post_commit_response_loss_is_idempotent_after_restart() {
-    const GATE_CLASS: i32 = 2_147_400_029;
-    const GATE_OBJECT: i32 = 29;
+async fn identity_0030_real_post_commit_response_loss_is_idempotent_after_restart() {
+    const GATE_CLASS: i32 = 2_147_400_030;
+    const GATE_OBJECT: i32 = 30;
     let pool = connect_pool().await;
-    let (_domain_a, domain_b) = reset_to_0028(&pool).await;
+    let (_domain_a, domain_b) = reset_to_0029(&pool).await;
     sqlx::query(
         "INSERT INTO audit_log \
          (community_id,seq,hash,action,object_id,detail,created_at) \
@@ -2081,7 +2081,7 @@ async fn identity_0029_real_post_commit_response_loss_is_idempotent_after_restar
         &domain_b_history_pre,
     )
     .await;
-    let migration = migration_0029();
+    let migration = migration_0030();
     let statements = split_statements(migration.sql.as_ref());
 
     let mut gate = pool
@@ -2150,7 +2150,7 @@ async fn identity_0029_real_post_commit_response_loss_is_idempotent_after_restar
     for _ in 0..20_000 {
         let observed: bool = sqlx::query_scalar(
             "SELECT \
-               EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=29 AND success) \
+               EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=30 AND success) \
                AND EXISTS(\
                  SELECT 1 FROM pg_locks lock_row \
                  WHERE lock_row.locktype='advisory' \
@@ -2220,7 +2220,7 @@ async fn identity_0029_real_post_commit_response_loss_is_idempotent_after_restar
     assert_eq!(reconnected_domain_b_history, domain_b_history_post);
     assert_eq!(full_identity_snapshot(&pool).await, committed);
     MIGRATOR
-        .run_to(29, &pool)
+        .run_to(30, &pool)
         .await
         .expect("idempotent retry after response loss");
     assert_response_loss_legacy_sentinels(
@@ -2241,14 +2241,14 @@ async fn identity_0029_real_post_commit_response_loss_is_idempotent_after_restar
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
-async fn identity_0029_readable_ambiguities_preserve_facts_and_never_create_authority() {
+async fn identity_0030_readable_ambiguities_preserve_facts_and_never_create_authority() {
     static PROVISION_KEY: [u8; 32] = [91; 32];
     static ROTATE_KEY: [u8; 32] = [92; 32];
     static RECOVER_KEY: [u8; 32] = [93; 32];
     static ENABLE_KEY: [u8; 32] = [94; 32];
 
     let pool = connect_pool().await;
-    let (domain_a, domain_b) = reset_to_0028(&pool).await;
+    let (domain_a, domain_b) = reset_to_0029(&pool).await;
     let active_key = vec![71_u8; 32];
     let missing_predecessor = vec![73_u8; 32];
     let missing_target = vec![74_u8; 32];
@@ -2299,7 +2299,7 @@ async fn identity_0029_readable_ambiguities_preserve_facts_and_never_create_auth
     let legacy_a = legacy_identity_facts(&pool, domain_a).await;
     let legacy_b = legacy_identity_facts(&pool, domain_b).await;
     MIGRATOR
-        .run_to(29, &pool)
+        .run_to(30, &pool)
         .await
         .expect("readable ambiguity migrates into fail-closed quarantine");
     assert_eq!(legacy_identity_facts(&pool, domain_a).await, legacy_a);

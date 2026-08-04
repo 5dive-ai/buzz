@@ -104,7 +104,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
     type MigratedIdentityChainRow = (Vec<u8>, i64, Option<Vec<u8>>, String);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -566,7 +566,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -601,6 +601,7 @@ mod tests {
             .as_str()
             .contains("CREATE TABLE git_repo_names"));
         assert!(!migrations[0].sql.as_str().contains("git_repo_names"));
+
         // Same additive-migration rule for the per-community workspace icon
         // (NIP-11 `icon`): its own version, never folded into 0001.
         assert_eq!(migrations[2].version, 3);
@@ -884,6 +885,7 @@ mod tests {
             .to_lowercase()
             .contains("for update"));
         assert!(ttl_shared.contains("NEW.kind <> 9007"));
+
         // Use-limited invite links: durable relay_invites table stores only
         // the SHA-256 of an opaque v2 code, scoped by community_id. Never
         // listed in _operator_global_tables — it is community-scoped.
@@ -908,6 +910,7 @@ mod tests {
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
             "desired-state schema must include join-policy evidence used by invite claims",
         );
+
         // Replica heartbeat (this branch, renumbered to 0026 after
         // 0025_relay_invites landed on main): the fence's portable read-side
         // observation. A single CHECK'd row makes the token update the
@@ -922,48 +925,69 @@ mod tests {
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
 
-        // Relay-verified identity bindings are additive and community-scoped.
+        // Channel-id lookup index (0027): serves the tenant-independent
+        // `channels` lookups that carry no community_id predicate, which no
+        // community_id-leading index can satisfy. Covering + partial so the
+        // planner can go index-only; asserted NOT UNIQUE because `id` alone is
+        // not unique in this table (the same channel id may exist under more
+        // than one community), so a unique index would encode a false
+        // constraint and fail to build on such a database.
         assert_eq!(migrations[26].version, 27);
-        assert!(migrations[26]
+        let channel_id_index = migrations[26].sql.as_str();
+        assert!(channel_id_index.contains("idx_channels_id_live"));
+        assert!(channel_id_index.contains("INCLUDE (community_id)"));
+        assert!(channel_id_index.contains("WHERE deleted_at IS NULL"));
+        assert!(
+            !channel_id_index.contains("CREATE UNIQUE INDEX"),
+            "channels.id is not unique across communities — index must not be UNIQUE",
+        );
+        assert!(
+            desired_schema.contains("idx_channels_id_live"),
+            "desired-state schema must carry the channel-id lookup index",
+        );
+
+        // Relay-verified identity bindings are additive and community-scoped.
+        assert_eq!(migrations[27].version, 28);
+        assert!(migrations[27]
             .sql
             .as_str()
             .contains("CREATE TABLE identity_bindings"));
-        assert!(migrations[26]
+        assert!(migrations[27]
             .sql
             .as_str()
             .contains("idx_identity_bindings_active_principal"));
-        assert_eq!(migrations[27].version, 28);
-        assert!(migrations[27].sql.as_str().contains("revocation_scope"));
-        assert!(migrations[27]
+        assert_eq!(migrations[28].version, 29);
+        assert!(migrations[28].sql.as_str().contains("revocation_scope"));
+        assert!(migrations[28]
             .sql
             .as_str()
             .contains("idx_identity_bindings_revoked_principal"));
-        assert!(migrations[27]
+        assert!(migrations[28]
             .sql
             .as_str()
             .contains("CREATE TABLE identity_principals"));
-        assert!(migrations[27]
+        assert!(migrations[28]
             .sql
             .as_str()
             .contains("INSERT INTO identity_principals"));
-        assert!(migrations[27]
+        assert!(migrations[28]
             .sql
             .as_str()
             .contains("INSERT INTO identity_revoked_keys"));
-        assert!(migrations[27]
+        assert!(migrations[28]
             .sql
             .as_str()
             .contains("rotation_completed_at"));
-        assert!(migrations[27]
+        assert!(migrations[28]
             .sql
             .as_str()
             .contains("CREATE TABLE identity_revoked_keys"));
 
-        // Migration 0029 is a brownfield-safe additive projection over the
-        // frozen 0027/0028 identity tables. It must not rewrite or discard
+        // Migration 0030 is a brownfield-safe additive projection over the
+        // frozen 0028/0029 identity tables. It must not rewrite or discard
         // legacy authority.
-        assert_eq!(migrations[28].version, 29);
-        let projection = migrations[28].sql.as_str();
+        assert_eq!(migrations[29].version, 30);
+        let projection = migrations[29].sql.as_str();
         for required in [
             "ADD COLUMN binding_id",
             "ADD COLUMN binding_version",
@@ -980,7 +1004,7 @@ mod tests {
         ] {
             assert!(
                 projection.contains(required),
-                "migration 0029 is missing {required}"
+                "migration 0030 is missing {required}"
             );
         }
     }
@@ -1018,18 +1042,18 @@ mod tests {
     }
 
     #[test]
-    fn migration_0029_is_strictly_additive() {
+    fn migration_0030_is_strictly_additive() {
         let migration = MIGRATOR
             .iter()
-            .find(|migration| migration.version == 29)
-            .expect("migration 0029");
+            .find(|migration| migration.version == 30)
+            .expect("migration 0030");
         let executable = additive_identity_executable_sql(migration.sql.as_str());
         let normalized = normalize_sql(&executable);
 
         for forbidden in [" rename ", " drop ", " truncate ", " delete "] {
             assert!(
                 !format!(" {normalized} ").contains(forbidden),
-                "migration 0029 contains forbidden legacy mutation: {forbidden}"
+                "migration 0030 contains forbidden legacy mutation: {forbidden}"
             );
         }
         assert!(!normalized.contains("update identity_revoked_keys"));
@@ -1060,18 +1084,18 @@ mod tests {
                     .expect("metadata assignment");
                 assert!(
                     allowed_binding_columns.contains(&column),
-                    "migration 0029 rewrites legacy identity_bindings.{column}"
+                    "migration 0030 rewrites legacy identity_bindings.{column}"
                 );
             }
         }
     }
 
     #[test]
-    fn migration_0029_enforces_authoritative_binding_state_and_attribution() {
+    fn migration_0030_enforces_authoritative_binding_state_and_attribution() {
         let migration = MIGRATOR
             .iter()
-            .find(|migration| migration.version == 29)
-            .expect("migration 0029");
+            .find(|migration| migration.version == 30)
+            .expect("migration 0030");
         // This gate intentionally checks persisted enum literals; unlike the
         // additive-mutation scanner above, it must retain SQL string contents.
         let normalized = normalize_sql(migration.sql.as_str());
@@ -1082,11 +1106,11 @@ mod tests {
         );
         assert!(
             normalized.contains("'archived'"),
-            "migration 0029 must represent archived bindings explicitly"
+            "migration 0030 must represent archived bindings explicitly"
         );
         assert!(
             normalized.contains("creation_attribution_kind"),
-            "migration 0029 must distinguish verified creation attribution from legacy unknowns"
+            "migration 0030 must distinguish verified creation attribution from legacy unknowns"
         );
         assert!(
             !normalized.contains("set binding_provenance = 'provisioned'"),
@@ -1419,7 +1443,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(30));
     }
 
     #[tokio::test]
@@ -1484,11 +1508,11 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a dedicated disposable Postgres database"]
-    async fn identity_0029_additive_upgrade_preserves_legacy_state_and_handles_history() {
+    async fn identity_0030_additive_upgrade_preserves_legacy_state_and_handles_history() {
         let pool = connect_test_pool().await;
         reset_public_schema(&pool).await;
         MIGRATOR
-            .run_to(28, &pool)
+            .run_to(29, &pool)
             .await
             .expect("apply migrations through legacy identity lifecycle");
 
@@ -1497,7 +1521,7 @@ mod tests {
         for (domain, label) in [(domain_a, "a"), (domain_b, "b")] {
             sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
                 .bind(domain)
-                .bind(format!("identity-0029-{label}-{}.example", domain.simple()))
+                .bind(format!("identity-0030-{label}-{}.example", domain.simple()))
                 .execute(&pool)
                 .await
                 .expect("insert fixture community");
@@ -2221,11 +2245,11 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a dedicated disposable Postgres database"]
-    async fn identity_0029_imports_arbitrary_histories_and_quarantines_temporal_inversion() {
+    async fn identity_0030_imports_arbitrary_histories_and_quarantines_temporal_inversion() {
         let pool = connect_test_pool().await;
         reset_public_schema(&pool).await;
         MIGRATOR
-            .run_to(28, &pool)
+            .run_to(29, &pool)
             .await
             .expect("apply migrations through legacy identity lifecycle");
         let domain = uuid::Uuid::new_v4();
@@ -2234,7 +2258,7 @@ mod tests {
             sqlx::query("INSERT INTO communities (id, host) VALUES ($1,$2)")
                 .bind(community)
                 .bind(format!(
-                    "identity-0029-history-{suffix}-{}.example",
+                    "identity-0030-history-{suffix}-{}.example",
                     community.simple()
                 ))
                 .execute(&pool)
@@ -2460,18 +2484,18 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a dedicated disposable Postgres database"]
-    async fn identity_0029_failure_rolls_back_every_additive_projection() {
+    async fn identity_0030_failure_rolls_back_every_additive_projection() {
         let pool = connect_test_pool().await;
         reset_public_schema(&pool).await;
         MIGRATOR
-            .run_to(28, &pool)
+            .run_to(29, &pool)
             .await
             .expect("apply migrations through legacy identity lifecycle");
         let domain = uuid::Uuid::new_v4();
         sqlx::query("INSERT INTO communities (id, host) VALUES ($1,$2)")
             .bind(domain)
             .bind(format!(
-                "identity-0029-rollback-{}.example",
+                "identity-0030-rollback-{}.example",
                 domain.simple()
             ))
             .execute(&pool)
@@ -2486,7 +2510,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert rollback fixture");
-        // Reserve the name of 0029's final index so the transaction fails only
+        // Reserve the name of 0030's final index so the transaction fails only
         // after every preceding additive DDL and backfill statement has run.
         sqlx::query(
             "CREATE INDEX idx_identity_lifecycle_operations_key \
@@ -2496,7 +2520,7 @@ mod tests {
         .await
         .expect("create late migration conflict");
 
-        assert!(MIGRATOR.run_to(29, &pool).await.is_err());
+        assert!(MIGRATOR.run_to(30, &pool).await.is_err());
         let projected_tables: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
             "SELECT to_regclass('identity_retired_pairs')::text, \
                     to_regclass('identity_pending_replacements')::text, \
@@ -2520,7 +2544,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("read latest migration");
-        assert_eq!(latest, 28);
+        assert_eq!(latest, 29);
         // sqlx's failed pool-backed migration attempt can return the session
         // while its session advisory lock is still held. Closing this
         // disposable pool releases that lock before the explicit retry.

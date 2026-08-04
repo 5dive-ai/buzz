@@ -699,7 +699,7 @@ jobs:
             -c "CREATE DATABASE buzz_identity_tests"
           cargo nextest run \
             --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E '(package(buzz-db) and test(/identity_binding::tests/)) or (package(buzz-db) and test(/identity_lifecycle::tests|identity_lifecycle::deterministic_tests/)) or (package(buzz-db) and test(/migration::tests::identity_0029_|migration::deterministic_tests::identity_0029_/)) or (package(buzz-relay) and test(/corporate_identity::tests/))' \
+            -E '(package(buzz-db) and test(/identity_binding::tests/)) or (package(buzz-db) and test(/identity_lifecycle::tests|identity_lifecycle::deterministic_tests/)) or (package(buzz-db) and test(/migration::tests::identity_0030_|migration::deterministic_tests::identity_0030_/)) or (package(buzz-relay) and test(/corporate_identity::tests/))' \
             --test-threads 1 \
             --run-ignored ignored-only
         env:
@@ -1044,7 +1044,7 @@ jobs:
           git log -1 --format=%s | grep -qx smoke
           echo "Host bash resolved and functional; git commit round-trip passed"
       - name: Check (Tauri crate)
-        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml --target $env:TARGET
+        run: cargo check --manifest-path desktop/src-tauri/Cargo.toml --workspace --all-targets --target $env:TARGET
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
       - name: Test (Tauri crate)

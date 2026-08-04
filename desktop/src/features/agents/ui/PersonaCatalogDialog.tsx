@@ -16,6 +16,7 @@ import { Skeleton } from "@/shared/ui/skeleton";
 import agentOutlineUrl from "../assets/agent-outline.svg";
 import { AgentDefinitionMetadata } from "./AgentDefinitionMetadata";
 import { PersonaAddedBy } from "./PersonaAddedBy";
+import { PersonaCatalogPassport } from "./PersonaCatalogPassport";
 import { personaCatalogCopy } from "./personaLibraryCopy";
 
 type PersonaCatalogDialogProps = {
@@ -124,6 +125,7 @@ export function PersonaCatalogDialog({
           isLoading={isLoading}
           isPending={isPending}
           isSelectedPersonaActive={selectedPersonaIsActive}
+          onClose={() => onOpenChange(false)}
           onUsePersona={handleUseSelectedPersona}
           onSelectPersona={setSelectedPersonaId}
           personas={personas}
@@ -140,6 +142,7 @@ type PersonaCatalogChooserProps = {
   isLoading: boolean;
   isPending: boolean;
   isSelectedPersonaActive: boolean;
+  onClose: () => void;
   onUsePersona: () => void;
   onSelectPersona: (personaId: string) => void;
   personas: AgentPersona[];
@@ -152,6 +155,7 @@ function PersonaCatalogChooser({
   isLoading,
   isPending,
   isSelectedPersonaActive,
+  onClose,
   onUsePersona,
   onSelectPersona,
   personas,
@@ -237,7 +241,7 @@ function PersonaCatalogChooser({
           {isLoading ? <PersonaCatalogDetailSkeleton /> : null}
 
           {!isLoading && selectedPersona ? (
-            <PersonaCatalogDetail persona={selectedPersona} />
+            <PersonaCatalogDetail onClose={onClose} persona={selectedPersona} />
           ) : null}
 
           {error ? (
@@ -293,7 +297,13 @@ export function resolveCatalogOwnerLabel(
   );
 }
 
-function PersonaCatalogDetail({ persona }: { persona: AgentPersona }) {
+function PersonaCatalogDetail({
+  onClose,
+  persona,
+}: {
+  onClose: () => void;
+  persona: AgentPersona;
+}) {
   const isCommunityEntry =
     isCatalogPersona(persona) && !persona.catalogSource.isOwn;
   const ownerPubkey = isCommunityEntry
@@ -336,6 +346,8 @@ function PersonaCatalogDetail({ persona }: { persona: AgentPersona }) {
         model={persona.model}
         runtime={persona.runtime}
       />
+
+      <PersonaCatalogPassport onBeforeNavigate={onClose} persona={persona} />
 
       <div className="min-w-0 max-w-full pt-3">
         <p className="text-base font-semibold text-foreground">

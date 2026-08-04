@@ -134,6 +134,7 @@ export default defineConfig({
         "**/observer-archive-policy.spec.ts",
         "**/harness-management.spec.ts",
         "**/harness-catalog-screenshots.spec.ts",
+        "**/persona-catalog-passport.spec.ts",
         "**/inline-custom-harness.spec.ts",
         "**/where-to-run-config.spec.ts",
         "**/huddle-transcription.spec.ts",

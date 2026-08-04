@@ -5,18 +5,14 @@ import { toast } from "sonner";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import {
-  useAgentMemoryQuery,
-  useIsManagedAgent,
-} from "@/features/agent-memory/hooks";
-import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
-import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
 import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { useCommunities } from "@/features/communities/useCommunities";
-import { computeAgentBadges } from "@/features/passport/lib/badges";
+import { useAgentPassportBadges } from "@/features/passport/hooks/useAgentPassportBadges";
+import { resolveHolderChannels } from "@/features/passport/lib/holderChannels";
 import {
   loadTravelLog,
   normalizeRelayUrl,
@@ -34,19 +30,12 @@ import {
   StampPage,
 } from "@/features/passport/ui/PassportRecordSections";
 import {
-  useProjectsQuery,
-  useProjectsWorkItemsQuery,
-} from "@/features/projects/hooks";
-import {
   useContactListQuery,
   useUserProfileQuery,
   useUsersBatchQuery,
 } from "@/features/profile/hooks";
 import { PassportCard } from "@/features/profile/ui/PassportCard";
-import {
-  useMyNotesQuery,
-  usePulseReactionsQuery,
-} from "@/features/pulse/hooks";
+import { useMyNotesQuery } from "@/features/pulse/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
 import { safeNpub } from "@/shared/lib/nostrUtils";
@@ -98,12 +87,12 @@ export function PassportScreen({
       managedAgent ??
       (summary?.isAgent || profile?.ownerPubkey != null),
   );
-  const isLocallyManaged = useIsManagedAgent(isAgent ? pubkey : null);
-  const viewerIsOwner =
-    isAgent &&
-    (isLocallyManaged === true ||
-      (profile?.ownerPubkey != null &&
-        profile.ownerPubkey.toLowerCase() === selfPubkey?.toLowerCase()));
+
+  // Badges, memory visibility, and ownership come from the shared hook so the
+  // passport screen and the agent catalog read the exact same record.
+  const { badges, memoryCount, viewerIsOwner } = useAgentPassportBadges(
+    isAgent ? (pubkey ?? null) : null,
+  );
 
   // Record sources. Channel membership is derived from the viewer's channel
   // list, so private rooms only ever appear to viewers already in them.
@@ -111,31 +100,13 @@ export function PassportScreen({
   const channelsQuery = useChannelsQuery();
   const notesQuery = useMyNotesQuery(pubkey ?? undefined);
   const contactsQuery = useContactListQuery(pubkey ?? undefined);
-  const memoryQuery = useAgentMemoryQuery(pubkey, { enabled: viewerIsOwner });
   const { canOpenAgentActivity, openAgentActivity } = useOpenAgentActivity();
   const { goChannel } = useAppNavigation();
 
-  const memberChannels = React.useMemo(() => {
-    const links = new Map<string, { id: string; name: string }>();
-    relayAgent?.channels.forEach((name, index) => {
-      const id = relayAgent.channelIds[index] ?? name;
-      links.set(id, { id, name });
-    });
-    for (const channel of channelsQuery.data ?? []) {
-      if (channel.channelType === "dm") {
-        continue;
-      }
-      const isMember = channel.memberPubkeys.some(
-        (memberPubkey) => memberPubkey.toLowerCase() === pubkeyLower,
-      );
-      if (isMember) {
-        links.set(channel.id, { id: channel.id, name: channel.name });
-      }
-    }
-    return [...links.values()].sort((left, right) =>
-      left.name.localeCompare(right.name),
-    );
-  }, [channelsQuery.data, pubkeyLower, relayAgent]);
+  const memberChannels = React.useMemo(
+    () => resolveHolderChannels(channelsQuery.data, relayAgent, pubkeyLower),
+    [channelsQuery.data, pubkeyLower, relayAgent],
+  );
 
   // Visas: servers you are on now (saved communities) plus servers you have
   // been on before (persistent travel log), shown as expired stamps. Both are
@@ -242,113 +213,6 @@ export function PassportScreen({
   const npub = pubkey ? (safeNpub(pubkey) ?? pubkey) : null;
 
   const notes = notesQuery.data?.notes.slice(0, RECENT_NOTES_SHOWN) ?? [];
-  const memoryCount = memoryQuery.data
-    ? memoryQuery.data.memories.length + (memoryQuery.data.core ? 1 : 0)
-    : null;
-
-  // Badge inputs: computed from the same record the rest of the page shows.
-  const allNotes = React.useMemo(
-    () => notesQuery.data?.notes ?? [],
-    [notesQuery.data],
-  );
-  const noteIds = React.useMemo(
-    () => allNotes.map((note) => note.id),
-    [allNotes],
-  );
-  const reactionsQuery = usePulseReactionsQuery(isAgent ? noteIds : []);
-  const activeTurnCount = useAgentWorking(isAgent ? pubkey : null).channels
-    .length;
-
-  // Craft signals: the agent's engineering record, read from signed NIP-34
-  // git events across every project in the community. Only agent passports
-  // pay for the work-items fetch.
-  const projectsQuery = useProjectsQuery();
-  const workItemsProjects = React.useMemo(
-    () => (isAgent ? (projectsQuery.data ?? []) : []),
-    [isAgent, projectsQuery.data],
-  );
-  const workItemsQuery = useProjectsWorkItemsQuery(workItemsProjects);
-  const craft = React.useMemo(() => {
-    const counts = {
-      closedPrCount: 0,
-      issuesOpenedCount: 0,
-      mergedPrCount: 0,
-      repoCount: 0,
-      reviewCount: 0,
-    };
-    const workItems = workItemsQuery.data;
-    if (!pubkeyLower || !workItems) {
-      return counts;
-    }
-    const repos = new Set<string>();
-    for (const { project, pullRequest } of workItems.pullRequests.items) {
-      if (pullRequest.author.toLowerCase() === pubkeyLower) {
-        repos.add(project.id);
-        if (pullRequest.status === "Merged") {
-          counts.mergedPrCount += 1;
-        } else if (pullRequest.status === "Closed") {
-          counts.closedPrCount += 1;
-        }
-        continue;
-      }
-      // Reviews only count on other authors' PRs, and only comments that
-      // carry review weight (decisions and inline code comments).
-      for (const comment of pullRequest.comments) {
-        if (
-          comment.author.toLowerCase() === pubkeyLower &&
-          (comment.isApproval ||
-            comment.isChangeRequest ||
-            comment.isInlineComment)
-        ) {
-          counts.reviewCount += 1;
-          repos.add(project.id);
-        }
-      }
-    }
-    for (const { issue, project } of workItems.issues.items) {
-      if (issue.author.toLowerCase() === pubkeyLower) {
-        counts.issuesOpenedCount += 1;
-        repos.add(project.id);
-      }
-    }
-    counts.repoCount = repos.size;
-    return counts;
-  }, [pubkeyLower, workItemsQuery.data]);
-  const badges = React.useMemo(() => {
-    if (!isAgent) {
-      return [];
-    }
-    let reactionCount = 0;
-    for (const state of reactionsQuery.data?.values() ?? []) {
-      reactionCount += state.count;
-    }
-    return computeAgentBadges({
-      ...craft,
-      activeTurnCount,
-      channelCount: memberChannels.length,
-      firstSeenAt:
-        allNotes.length > 0
-          ? Math.min(...allNotes.map((note) => note.createdAt))
-          : null,
-      hasAbout: Boolean(profile?.about?.trim()),
-      hasAvatar: Boolean(profile?.avatarUrl),
-      hasHandle: Boolean(profile?.nip05Handle?.trim()),
-      hasName: Boolean(profile?.displayName?.trim()),
-      hasOwner: profile?.ownerPubkey != null,
-      memoryCount,
-      noteCount: allNotes.length,
-      reactionCount,
-    });
-  }, [
-    activeTurnCount,
-    allNotes,
-    craft,
-    isAgent,
-    memberChannels.length,
-    memoryCount,
-    profile,
-    reactionsQuery.data,
-  ]);
   const recordLoading =
     channelsQuery.isLoading || notesQuery.isLoading || contactsQuery.isLoading;
   const hasAgentRecord =

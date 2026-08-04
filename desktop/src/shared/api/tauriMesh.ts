@@ -186,3 +186,41 @@ export type MeshSnapshot = {
 export async function meshSnapshot(): Promise<MeshSnapshot> {
   return await invokeTauri<MeshSnapshot>("mesh_snapshot");
 }
+
+/** What a peer is doing, as *it* reports. Never inferred from traffic. */
+export type MeshPeerState = "serving" | "loading" | "standby" | "consuming";
+
+/**
+ * A node this machine's runtime is **actually connected to right now**.
+ *
+ * Distinct from `MeshSnapshotDevice`, which comes from relay status notes valid
+ * for 120s and therefore outlives the node that published it. Peers come from
+ * live gossip: present here means reachable now. See Rust `mesh_llm/peers.rs`.
+ */
+export type MeshPeer = {
+  id: string;
+  label: string;
+  state: MeshPeerState;
+  /** `null` when the peer shares none (client mode reports 0, shown as absent). */
+  capacityGb: number | null;
+  models: string[];
+  rttMs: number | null;
+};
+
+export type MeshLiveView = {
+  /**
+   * True when a local runtime is up. Distinguishes "no peers" (alone on the
+   * mesh) from "unknown" (not participating, nothing to report).
+   */
+  connected: boolean;
+  selfCapacityGb: number | null;
+  peers: MeshPeer[];
+};
+
+/**
+ * This machine's live gossip view of the mesh. Empty and `connected:false` when
+ * no node is running — a normal state, not an error.
+ */
+export async function meshLiveView(): Promise<MeshLiveView> {
+  return await invokeTauri<MeshLiveView>("mesh_live_view");
+}

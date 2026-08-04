@@ -31,6 +31,8 @@ mod media_gif;
 mod media_snapshot_png;
 mod media_transcode;
 #[cfg(feature = "mesh-llm")]
+mod mesh_live_view;
+#[cfg(feature = "mesh-llm")]
 pub(crate) mod mesh_llm;
 #[cfg(feature = "mesh-llm")]
 mod mesh_snapshot;
@@ -87,6 +89,8 @@ pub use legacy_storage::*;
 pub use link_preview::*;
 pub use media::*;
 pub use media_download::*;
+#[cfg(feature = "mesh-llm")]
+pub use mesh_live_view::*;
 #[cfg(feature = "mesh-llm")]
 pub use mesh_llm::*;
 #[cfg(feature = "mesh-llm")]

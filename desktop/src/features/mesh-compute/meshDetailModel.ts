@@ -1,12 +1,22 @@
-import type { MeshServingUsage, MeshSnapshot } from "@/shared/api/tauriMesh";
+import type {
+  MeshLiveView,
+  MeshServingUsage,
+  MeshSnapshot,
+} from "@/shared/api/tauriMesh";
+import { describeRequestOrigin } from "./meshActivity";
 
 /**
  * Pure projection for the mesh detail popover.
  *
  * The popover answers three questions the 256px card cannot:
- *   1. How big is the pool, and how much of the community is in it?
- *   2. Is the spice flowing — is work actually happening right now?
+ *   1. Who is on the mesh right now, and how much do they bring?
+ *   2. Is the spice flowing — is work actually happening?
  *   3. Am I running on someone else's machine, or my own?
+ *
+ * Peers come from the **live gossip view**, not the relay snapshot. Status notes
+ * stay valid for 120s and so outlive the node that wrote them; a topology built
+ * on notes shows devices gossip already knows are gone. The relay snapshot is
+ * used only when no local runtime exists, where it is the sole available view.
  *
  * The hard constraint this file exists to encode: **mesh-llm exposes no inbound
  * counter.** `routing_metrics` is incremented only by this node's own OpenAI
@@ -15,65 +25,33 @@ import type { MeshServingUsage, MeshSnapshot } from "@/shared/api/tauriMesh";
  *
  *   - "I used someone else's machine"  → provable (`remotelyServed`)
  *   - "my own GPU did the work"        → provable (`locallyServed`)
- *   - "someone used MY machine"        → NOT provable, only ever hinted
+ *   - "someone used MY machine"        → no counter; INFERRED by elimination
  *
- * `inflight` is the one live signal, and it does not say who the work is for.
- * That is why the busy state is worded "working" and never "someone is using
- * your compute".
+ * That last one is derivable without a counter: sharing, with work in flight,
+ * while our own dispatch count stays flat, means the work is not ours. See
+ * `inferInboundWork` in `meshActivity.ts`. It is sampled, so it can undercount
+ * — but it never over-claims, which is the direction that matters.
  */
 
-/** Ghost = a community member with no published status note. */
 export type MeshDetailModel = {
-  /** e.g. "115 GB" — pool capacity, or null when nobody reported a figure. */
+  /** e.g. "115 GB" — live pool capacity, or null when nothing is shared. */
   capacityLabel: string | null;
-  /** e.g. "2 of 12 members sharing". */
+  /** e.g. "2 peers connected", or the relay view when not participating. */
   participationLabel: string;
-  /** Members with no status note at all. Count only — never GB. */
-  ghostCount: number;
   /** True when inference is in flight on this node right now. */
   busyNow: boolean;
   /**
-   * Live activity phrase, or null when idle. Deliberately vague about *who*:
-   * the counters cannot attribute inbound work.
+   * Live activity phrase, or null when idle. Only claims inbound work when the
+   * elimination check in `meshActivity.ts` holds.
    */
   activityLabel: string | null;
   /** Where this machine's completed requests actually ran. */
   originLabel: string | null;
-  /** Distinct models ready across the pool. */
+  /** Distinct models serving across the live mesh. */
   modelCount: number;
+  /** True when a local runtime is up, so peers are knowable at all. */
+  connected: boolean;
 };
-
-function plural(n: number, one: string, many = `${one}s`): string {
-  return n === 1 ? one : many;
-}
-
-/**
- * Where this machine's work ran — the honest "am I borrowing someone's GPU"
- * line.
- *
- * `remotelyServed` counts *completed* requests a peer answered for us, so it is
- * a fact about our own consumption, not a guess. Returns null before any
- * request completes rather than claiming "0 remote".
- */
-export function describeRequestOrigin(
-  usage: MeshServingUsage | null,
-): string | null {
-  if (!usage) {
-    return null;
-  }
-  const remote = usage.remotelyServed + usage.endpointServed;
-  const total = usage.locallyServed + remote;
-  if (total === 0) {
-    return null;
-  }
-  if (remote === 0) {
-    return `${total} ${plural(total, "request")} · all on this computer`;
-  }
-  if (usage.locallyServed === 0) {
-    return `${remote} ${plural(remote, "request")} · all on shared compute`;
-  }
-  return `${remote} of ${total} requests on shared compute`;
-}
 
 /**
  * The live "spice is flowing" phrase.
@@ -82,13 +60,20 @@ export function describeRequestOrigin(
  * this node without distinguishing a local agent from a remote member, so this
  * may never assert that someone else is using this machine.
  */
-export function describeActivity(
-  usage: MeshServingUsage | null,
-  isSharing: boolean,
-): string | null {
+export function describeActivity({
+  usage,
+  isSharing,
+  inboundWork,
+}: {
+  usage: MeshServingUsage | null;
+  isSharing: boolean;
+  inboundWork: boolean;
+}): string | null {
   const inflight = usage?.inflight ?? 0;
   if (inflight > 0) {
-    return `${inflight} ${plural(inflight, "request")} in flight`;
+    const requests = `${inflight} ${inflight === 1 ? "request" : "requests"} in flight`;
+    // Only name a peer as the source when elimination proves it isn't ours.
+    return inboundWork ? `${requests} · from another member` : requests;
   }
   if (!usage) {
     return null;
@@ -102,35 +87,58 @@ export function describeActivity(
 }
 
 export function deriveMeshDetailModel({
+  view,
   snapshot,
   usage,
   isSharing,
+  inboundWork,
 }: {
+  view: MeshLiveView | null;
   snapshot: MeshSnapshot | null;
   usage: MeshServingUsage | null;
   isSharing: boolean;
+  inboundWork: boolean;
 }): MeshDetailModel {
-  const devices = snapshot?.devices ?? [];
-  const sharing = snapshot?.sharingDeviceCount ?? 0;
-  const members = snapshot?.memberCount ?? 0;
-  // Members who published nothing. Clamped at 0: a device may report without
-  // appearing in a stale roster page, and a negative ghost count is nonsense.
-  const ghostCount = Math.max(0, members - devices.length);
-  const capacityGb = snapshot?.sharedCapacityGb ?? null;
+  const connected = view?.connected === true;
+  const peers = view?.peers ?? [];
+
+  // Capacity from the live mesh: this machine plus serving peers. A consuming
+  // peer contributes presence but no GB, because it shares none.
+  const liveCapacity = connected
+    ? [
+        view?.selfCapacityGb ?? 0,
+        ...peers.map((peer) => peer.capacityGb ?? 0),
+      ].reduce((total, gb) => total + gb, 0)
+    : 0;
+  const capacityGb = connected
+    ? liveCapacity > 0
+      ? liveCapacity
+      : null
+    : (snapshot?.sharedCapacityGb ?? null);
+
+  const models = new Set(peers.flatMap((peer) => peer.models));
+  if (isSharing) {
+    for (const model of snapshot?.devices.find((d) => d.isSelf)?.models ?? []) {
+      models.add(model);
+    }
+  }
 
   return {
+    connected,
     capacityLabel:
       capacityGb === null
         ? null
         : `${capacityGb >= 10 ? Math.round(capacityGb) : Math.round(capacityGb * 10) / 10} GB`,
-    participationLabel:
-      members === 0
-        ? `${sharing} ${plural(sharing, "device")} sharing`
-        : `${sharing} of ${members} ${plural(members, "member")} sharing`,
-    ghostCount,
+    participationLabel: connected
+      ? peers.length === 0
+        ? "No other devices yet"
+        : `${peers.length} ${peers.length === 1 ? "peer" : "peers"} connected`
+      : // Not participating: the relay snapshot is all we have, and it is the
+        // reason to consider joining.
+        `${snapshot?.sharingDeviceCount ?? 0} sharing in this community`,
     busyNow: (usage?.inflight ?? 0) > 0,
-    activityLabel: describeActivity(usage, isSharing),
+    activityLabel: describeActivity({ usage, isSharing, inboundWork }),
     originLabel: describeRequestOrigin(usage),
-    modelCount: snapshot?.models.length ?? 0,
+    modelCount: models.size,
   };
 }

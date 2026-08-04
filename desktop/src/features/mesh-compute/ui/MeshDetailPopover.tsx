@@ -1,4 +1,8 @@
-import type { MeshServingUsage, MeshSnapshot } from "@/shared/api/tauriMesh";
+import type {
+  MeshLiveView,
+  MeshServingUsage,
+  MeshSnapshot,
+} from "@/shared/api/tauriMesh";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { POPOVER_SHADOW_STYLE } from "@/shared/ui/popoverSurface";
 import { deriveMeshDetailModel } from "../meshDetailModel";
@@ -10,25 +14,38 @@ import { MeshTopologyRadial } from "./MeshTopologyRadial";
  * Anchored rather than a centred dialog: this is a glance, not a task. It sits
  * beside the thing it explains, and dismisses on outside click.
  *
- * Every figure here is one this machine can actually vouch for. In particular
- * there is no "N requests served for others" line, because mesh-llm exposes no
- * inbound counter — only a soft hint when the pool is live. See
- * `meshDetailModel.ts` for the full constraint.
+ * Every figure here is one this machine can actually vouch for. Peers come from
+ * live gossip, so a node shown is a node we are connected to — not a relay note
+ * that may have outlived its writer. Inbound work has no counter, so it is
+ * inferred by elimination and only named when that inference holds. See
+ * `meshDetailModel.ts` and `meshActivity.ts`.
  */
 export function MeshDetailPopover({
   children,
+  view,
   snapshot,
   usage,
   isSharing,
+  inboundWork,
   onOpenComputeSettings,
 }: {
   children: React.ReactNode;
+  /** Live gossip view — the source for the topology. */
+  view: MeshLiveView | null;
+  /** Relay snapshot, used only when no local runtime exists. */
   snapshot: MeshSnapshot | null;
   usage: MeshServingUsage | null;
   isSharing: boolean;
+  inboundWork: boolean;
   onOpenComputeSettings?: () => void;
 }) {
-  const model = deriveMeshDetailModel({ snapshot, usage, isSharing });
+  const model = deriveMeshDetailModel({
+    view,
+    snapshot,
+    usage,
+    isSharing,
+    inboundWork,
+  });
 
   return (
     <Popover>
@@ -53,11 +70,14 @@ export function MeshDetailPopover({
             </p>
           </div>
 
-          <MeshTopologyRadial
-            busyNow={model.busyNow}
-            devices={snapshot?.devices ?? []}
-            ghostCount={model.ghostCount}
-          />
+          {model.connected ? (
+            <MeshTopologyRadial
+              busyNow={model.busyNow}
+              isSharing={isSharing}
+              peers={view?.peers ?? []}
+              selfCapacityGb={view?.selfCapacityGb ?? null}
+            />
+          ) : null}
 
           <div className="flex flex-col gap-1">
             {model.activityLabel ? (
@@ -95,13 +115,11 @@ export function MeshDetailPopover({
             ) : null}
           </div>
 
-          {model.ghostCount > 0 ? (
+          {model.connected ? null : (
             <p className="border-border/60 border-t pt-2 text-2xs leading-snug text-muted-foreground">
-              {model.ghostCount === 1
-                ? "1 member isn't sharing yet."
-                : `${model.ghostCount} members aren't sharing yet.`}
+              Turn on sharing to see who's on the mesh.
             </p>
-          ) : null}
+          )}
 
           {onOpenComputeSettings ? (
             <button

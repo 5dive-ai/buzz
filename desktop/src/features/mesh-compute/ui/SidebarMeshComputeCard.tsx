@@ -8,10 +8,12 @@ import { meshStartNode, meshStopNode } from "@/shared/api/tauriMesh";
 import type { MeshModelCatalog } from "@/shared/api/tauriMesh";
 import { meshModelCatalog } from "@/shared/api/tauriMesh";
 
+import { useMeshLiveView } from "../hooks/useMeshLiveView";
 import { useMeshNodeStatus } from "../hooks/useMeshNodeStatus";
 import { useMeshServingUsage } from "../hooks/useMeshServingUsage";
 import { useMeshSnapshot } from "../hooks/useMeshSnapshot";
 import { deriveMeshShareToggle } from "../shareToggleState";
+import { activitySample, inferInboundWork } from "../meshActivity";
 import { deriveMeshCardModel, type MeshCardTone } from "../meshCardModel";
 import { MeshDetailPopover } from "./MeshDetailPopover";
 import { MeshTopologyStrip } from "./MeshTopologyStrip";
@@ -22,7 +24,7 @@ import { MeshTopologyStrip } from "./MeshTopologyStrip";
  * Answers three questions at a glance, which is the whole reason it exists:
  *   - Am I sharing this computer?      → switch on, "Sharing this computer"
  *   - Am I using someone else's?       → switch off, "Using shared compute"
- *   - What does the community have?    → "3 devices sharing · 42 GB"
+ *   - What does the community have?    → "MeshLLM · 115 GB, 2 peers"
  *
  * Deliberately NOT a model picker. Turning it on shares the hardware-appropriate
  * curated recommendation (`catalog.recommended`); choosing a specific model,
@@ -90,8 +92,24 @@ export function SidebarMeshComputeCard({
   // are all OUTBOUND (incremented by this node's own ingress), so a remote/
   // endpoint attempt means this machine is CONSUMING, not being consumed.
   // Reading them as "someone is using my compute" is exactly backwards.
-  const busyNow = (usage?.inflight ?? 0) > 0;
-  const requestsRouted = usage?.requestsServed ?? 0;
+  // Live gossip view: peers we are actually connected to. Only meaningful while
+  // a runtime exists, so it is gated on slot occupancy.
+  const { view } = useMeshLiveView(toggle.isSharing || toggle.isConsuming);
+
+  // Inbound work has no counter in mesh-llm, so it is inferred by elimination
+  // across two samples: serving, inflight > 0, and our own dispatch count flat
+  // means the work is not ours. Keeping the previous sample in a ref (not
+  // state) avoids a re-render purely to remember history.
+  const sample = activitySample(usage);
+  const previousSampleRef = React.useRef<typeof sample>(null);
+  const inboundWork = inferInboundWork({
+    isSharing: toggle.isSharing,
+    current: sample,
+    previous: previousSampleRef.current,
+  });
+  React.useEffect(() => {
+    previousSampleRef.current = sample;
+  }, [sample]);
 
   // One-shot catalog fetch: the card needs the hardware-appropriate
   // recommendation so the switch can start sharing without a model picker.
@@ -123,8 +141,9 @@ export function SidebarMeshComputeCard({
     toggle,
     pendingAction,
     canShare: Boolean(recommended),
-    busyNow,
-    requestsRouted,
+    view,
+    usage,
+    inboundWork,
   });
 
   async function handleToggle(next: boolean) {
@@ -191,10 +210,12 @@ export function SidebarMeshComputeCard({
             Switch in a button would nest interactive elements.
           */}
           <MeshDetailPopover
+            inboundWork={inboundWork}
             isSharing={toggle.isSharing}
             onOpenComputeSettings={onOpenComputeSettings}
             snapshot={snapshot}
             usage={usage}
+            view={view}
           >
             <button
               className="min-w-0 flex-1 rounded-md text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"

@@ -1,31 +1,46 @@
 use serde::{Deserialize, Serialize};
 
-/// Host-side "who is using the compute I'm sharing" snapshot.
+/// This node's own routing activity, plus the peers it can currently see.
 ///
-/// Read-only projection of the serving node's own runtime metrics (the same
-/// `routing_metrics` / `inflight_requests` the SDK already exposes on the local
-/// console). No new trust surface: it reads the node's own status payload.
+/// Read-only projection of the node's own status payload — no new trust
+/// surface.
 ///
-/// The local/remote/endpoint attempt split is what distinguishes *my own*
-/// agent (local) from *another member consuming my compute* (remote/endpoint).
+/// **Direction matters.** Every counter here comes from `routing_metrics`,
+/// which is incremented only by this node's local OpenAI ingress
+/// (`network/openai/transport.rs`) when *this* node dispatches a request. The
+/// inbound peer-serving path (`mesh/stage_transport.rs`) never touches it — it
+/// only observes inflight. So the attempt/served split says *where my requests
+/// ran*, never *who asked me*:
+///
+/// - local  → my own GPU ran it
+/// - remote → a peer ran it for me (I am CONSUMING someone else's compute)
+///
+/// mesh-llm exposes no inbound counter (`fronted_request_count` merely aliases
+/// `request_count`), so nothing here may be labelled "served for others".
+/// Inbound work can only be *inferred*: serving, with inflight > 0, while our
+/// own dispatch count stays flat, means the work is necessarily not ours.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MeshServingUsage {
-    /// Requests being served right now.
+    /// Inference in flight on this node right now. Does NOT distinguish a local
+    /// agent's request from a remote member's — the only live signal available.
     pub inflight: u64,
     /// Highest concurrent in-flight seen this session.
     pub peak_inflight: u64,
-    /// Total requests routed through this node.
+    /// Requests this node's ingress has routed (outbound), NOT work served for
+    /// others. Named `requests_served` for wire compatibility; treat as
+    /// "requests routed".
     pub requests_served: u64,
-    /// Completion tokens produced.
+    /// Completion tokens this node observed on requests it dispatched.
     pub tokens_served: u64,
     /// Recent decode throughput.
     pub tokens_per_second: f64,
-    /// Requests served for this machine's own agents.
+    /// Attempts this node dispatched to its own GPU.
     pub local_attempts: u64,
-    /// Requests served for a remote peer (someone else consuming my compute).
+    /// Attempts this node dispatched to a peer — i.e. this machine consuming
+    /// someone else's compute.
     pub remote_attempts: u64,
-    /// Requests served via an advertised endpoint (also a remote consumer).
+    /// Attempts this node dispatched to a configured endpoint.
     pub endpoint_attempts: u64,
     /// Other nodes currently visible as peers.
     pub peers: u64,

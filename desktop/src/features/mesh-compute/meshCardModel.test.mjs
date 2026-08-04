@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 
 import {
   describeMeshCapacity,
-  describeParticipation,
+  describeMeshHeadline,
   describeReadyModels,
   deriveMeshCardModel,
   formatCapacityGb,
@@ -57,7 +57,38 @@ function snapshot(overrides = {}) {
     models: ["unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M"],
     devices: [device()],
     includesSelf: false,
+    memberCount: 1,
     reason: null,
+    ...overrides,
+  };
+}
+
+function usage(overrides = {}) {
+  return {
+    inflight: 0,
+    peakInflight: 0,
+    requestsServed: 0,
+    tokensServed: 0,
+    tokensPerSecond: 0,
+    localAttempts: 0,
+    remoteAttempts: 0,
+    endpointAttempts: 0,
+    peers: 0,
+    locallyServed: 0,
+    remotelyServed: 0,
+    endpointServed: 0,
+    ...overrides,
+  };
+}
+
+function peer(overrides = {}) {
+  return {
+    id: "peer-1",
+    label: "studio54.lan",
+    state: "serving",
+    capacityGb: 64,
+    models: ["m"],
+    rttMs: 30,
     ...overrides,
   };
 }
@@ -69,8 +100,9 @@ function derive(overrides = {}) {
     toggle: OFF_TOGGLE,
     pendingAction: null,
     canShare: true,
-    busyNow: false,
-    requestsRouted: 0,
+    view: null,
+    usage: usage(),
+    inboundWork: false,
     ...overrides,
   });
 }
@@ -138,103 +170,127 @@ test("ready models collapse to a count past one", () => {
 test("consuming never renders as sharing", () => {
   const model = derive({
     toggle: CONSUMING_TOGGLE,
-    snapshot: snapshot({ devices: [device({ label: "Mac Mini" })] }),
+    usage: usage({ remotelyServed: 4 }),
   });
   assert.equal(model.tone, "consuming");
   assert.equal(model.switchOn, false, "the Share switch must stay off");
-  assert.match(model.headline, /Using shared compute/);
-  assert.match(model.detail, /Mac Mini/);
+  // The headline names the mesh; the detail line carries this machine's role,
+  // and must say we are taking rather than giving.
+  assert.match(model.detail, /ran on shared compute/);
+  assert.ok(
+    !/You're sharing/.test(model.detail),
+    `consuming must not read as sharing: ${model.detail}`,
+  );
   // A consuming client may be replaced by a serve runtime, so the switch stays
   // usable rather than locked.
   assert.equal(model.switchDisabled, false);
 });
 
-test("sharing leads with mesh capacity and omits the model name", () => {
+const SERVE_STATUS = {
+  state: "running",
+  mode: "serve",
+  health: { status: "ok", reason: null },
+  modelId: "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M",
+  modelName: null,
+  apiBaseUrl: null,
+  consoleUrl: null,
+};
+
+test("the headline names MeshLLM, live capacity and peer count", () => {
+  assert.equal(
+    describeMeshHeadline({
+      view: {
+        connected: true,
+        selfCapacityGb: 115,
+        peers: [peer({ capacityGb: 64 })],
+      },
+      snapshot: snapshot(),
+    }),
+    "MeshLLM · 179 GB, 1 peer",
+  );
+});
+
+test("a consuming-only mesh shows peers without inventing capacity", () => {
+  // Client-mode peers share no memory, so a mesh of consumers has no GB to
+  // report — but the peers are still really there.
+  assert.equal(
+    describeMeshHeadline({
+      view: {
+        connected: true,
+        selfCapacityGb: null,
+        peers: [peer({ capacityGb: null, state: "consuming" })],
+      },
+      snapshot: snapshot(),
+    }),
+    "MeshLLM · 1 peer",
+  );
+});
+
+test("with no runtime the headline falls back to the relay snapshot", () => {
+  // Peers are unknowable without a node, so the community view is all we have.
+  assert.equal(
+    describeMeshHeadline({
+      view: { connected: false, selfCapacityGb: null, peers: [] },
+      snapshot: snapshot({ sharingDeviceCount: 3, sharedCapacityGb: 42 }),
+    }),
+    "42 GB · 3 devices",
+  );
+});
+
+test("sharing omits the model name and hints participation", () => {
   const model = derive({
     toggle: SHARING_TOGGLE,
-    status: {
-      state: "running",
-      mode: "serve",
-      health: { status: "ok", reason: null },
-      modelId: "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M",
-      modelName: null,
-      apiBaseUrl: null,
-      consoleUrl: null,
-    },
-    snapshot: snapshot({
-      sharingDeviceCount: 1,
-      sharedCapacityGb: 115,
-      devices: [device({ isSelf: true })],
-      includesSelf: true,
-    }),
+    status: SERVE_STATUS,
+    view: { connected: true, selfCapacityGb: 115, peers: [peer()] },
   });
   assert.equal(model.tone, "sharing");
   assert.equal(model.switchOn, true);
-  assert.equal(model.headline, "115 GB · 1 device");
+  assert.equal(model.headline, "MeshLLM · 179 GB, 1 peer");
+  assert.match(model.detail, /You're sharing/);
   // The model belongs in the detail view, not on a 256px card.
   assert.ok(!/Gemma/i.test(model.detail ?? ""), "card must not name the model");
 });
 
-test("inflight work reads as working, never as 'someone is using you'", () => {
+test("inferred inbound work is the one place a peer may be named", () => {
   const model = derive({
     toggle: SHARING_TOGGLE,
-    status: {
-      state: "running",
-      mode: "serve",
-      health: { status: "ok", reason: null },
-      modelId: "m",
-      modelName: null,
-      apiBaseUrl: null,
-      consoleUrl: null,
-    },
-    busyNow: true,
+    status: SERVE_STATUS,
+    usage: usage({ inflight: 1 }),
+    inboundWork: true,
+  });
+  assert.match(model.detail, /serving another member/);
+});
+
+test("inflight work alone reads as working, never as being used", () => {
+  // Without the elimination check the work may be our own agent's, so the copy
+  // must not attribute it to anyone.
+  const model = derive({
+    toggle: SHARING_TOGGLE,
+    status: SERVE_STATUS,
+    usage: usage({ inflight: 1 }),
+    inboundWork: false,
   });
   assert.match(model.detail, /working now/);
-});
-
-test("routed requests are a subtle used-ness signal, not a served claim", () => {
-  const model = derive({
-    toggle: SHARING_TOGGLE,
-    status: {
-      state: "running",
-      mode: "serve",
-      health: { status: "ok", reason: null },
-      modelId: "m",
-      modelName: null,
-      apiBaseUrl: null,
-      consoleUrl: null,
-    },
-    requestsRouted: 7,
-  });
-  assert.match(model.detail, /7 requests this session/);
-});
-
-test("participation copy never claims work was served for other members", () => {
-  // mesh-llm exposes no inbound counter, so no wording here may imply that
-  // another member consumed this machine's compute.
-  const claims = [
-    describeParticipation({ busyNow: false, requestsRouted: 0 }),
-    describeParticipation({ busyNow: true, requestsRouted: 3 }),
-    describeParticipation({ busyNow: false, requestsRouted: 3 }),
-  ];
-  assert.deepEqual(claims, [
-    "Sharing · ready",
-    "Sharing · working now",
-    "Sharing · 3 requests this session",
-  ]);
-  for (const claim of claims) {
-    assert.ok(
-      !/served|for (others|members|someone)|consumed/i.test(claim),
-      `must not claim served-for-others: ${claim}`,
-    );
-  }
-});
-
-test("one routed request is singular", () => {
-  assert.equal(
-    describeParticipation({ busyNow: false, requestsRouted: 1 }),
-    "Sharing · 1 request this session",
+  assert.ok(
+    !/another member|someone|served for/i.test(model.detail),
+    `must not attribute the work: ${model.detail}`,
   );
+});
+
+test("a solo sharer is a live-view fact, not a lone relay note", () => {
+  // One status note may simply be a stale one; only gossip can say "alone".
+  const alone = derive({
+    toggle: SHARING_TOGGLE,
+    status: SERVE_STATUS,
+    view: { connected: true, selfCapacityGb: 115, peers: [] },
+  });
+  assert.equal(alone.isSolo, true);
+  const populated = derive({
+    toggle: SHARING_TOGGLE,
+    status: SERVE_STATUS,
+    view: { connected: true, selfCapacityGb: 115, peers: [peer()] },
+  });
+  assert.equal(populated.isSolo, false);
 });
 
 test("a serve node with no advertised model is warming up, not serving", () => {
@@ -293,35 +349,4 @@ test("an unknown runtime occupant is not silently replaceable", () => {
     toggle: { isSharing: false, isConsuming: false, slotOccupied: true },
   });
   assert.equal(model.switchDisabled, true);
-});
-
-test("a solo sharer gets the waiting hint; a populated mesh does not", () => {
-  const sharingStatus = {
-    state: "running",
-    mode: "serve",
-    health: { status: "ok", reason: null },
-    modelId: "m",
-    modelName: null,
-    apiBaseUrl: null,
-    consoleUrl: null,
-  };
-  const solo = derive({
-    toggle: SHARING_TOGGLE,
-    status: sharingStatus,
-    snapshot: snapshot({ devices: [device({ isSelf: true })] }),
-  });
-  assert.equal(solo.showSoloHint, true);
-
-  const populated = derive({
-    toggle: SHARING_TOGGLE,
-    status: sharingStatus,
-    snapshot: snapshot({
-      sharingDeviceCount: 2,
-      devices: [
-        device({ isSelf: true }),
-        device({ deviceId: "e2", label: "Studio 2" }),
-      ],
-    }),
-  });
-  assert.equal(populated.showSoloHint, false);
 });

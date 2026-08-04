@@ -1,8 +1,11 @@
 import type {
+  MeshLiveView,
   MeshNodeStatus,
+  MeshServingUsage,
   MeshSnapshot,
   MeshSnapshotDevice,
 } from "@/shared/api/tauriMesh";
+import { describeParticipationHint } from "./meshActivity";
 import type { MeshShareToggleModel } from "./shareToggleState";
 
 /**
@@ -93,6 +96,41 @@ export function describeMeshCapacity(snapshot: MeshSnapshot | null): string {
     : `${formatCapacityGb(gb)} · ${devices}`;
 }
 
+/**
+ * The card headline once we have a live view: name the mesh, its capacity, and
+ * how many nodes we can actually see.
+ *
+ * Prefers the live gossip view over the relay snapshot. Peers listed here are
+ * ones our runtime is talking to *now*, whereas relay status notes stay valid
+ * for 120s and so outlive the node that wrote them — a graph built on notes
+ * shows devices gossip already knows are gone.
+ *
+ * Capacity sums this machine plus its serving peers. Consuming peers contribute
+ * a peer count but no GB, because they share none.
+ */
+export function describeMeshHeadline({
+  view,
+  snapshot,
+}: {
+  view: MeshLiveView | null;
+  snapshot: MeshSnapshot | null;
+}): string {
+  // Not participating: the relay snapshot is the only view of the pool, and the
+  // reason to consider joining.
+  if (!view?.connected) {
+    return describeMeshCapacity(snapshot);
+  }
+  const capacityGb = [
+    view.selfCapacityGb ?? 0,
+    ...view.peers.map((peer) => peer.capacityGb ?? 0),
+  ].reduce((total, gb) => total + gb, 0);
+  const peerCount = view.peers.length;
+  const peers = `${peerCount} ${plural(peerCount, "peer")}`;
+  return capacityGb > 0
+    ? `MeshLLM · ${formatCapacityGb(capacityGb)}, ${peers}`
+    : `MeshLLM · ${peers}`;
+}
+
 /** Short label for what is ready to run, or null when nothing is. */
 export function describeReadyModels(
   snapshot: MeshSnapshot | null,
@@ -105,30 +143,6 @@ export function describeReadyModels(
     return `${shortModelLabel(models[0])} ready`;
   }
   return `${models.length} models ready`;
-}
-
-/**
- * The sharing detail line: proof this machine is participating, and that the
- * mesh has actually been used.
- *
- * Scrupulously avoids claiming someone else consumed this machine's compute —
- * mesh-llm exposes no inbound counter, so "requests routed" is the strongest
- * true statement available. Worded as "requests" without "served for others".
- */
-export function describeParticipation({
-  busyNow,
-  requestsRouted,
-}: {
-  busyNow: boolean;
-  requestsRouted: number;
-}): string {
-  if (busyNow) {
-    return "Sharing · working now";
-  }
-  if (requestsRouted > 0) {
-    return `Sharing · ${requestsRouted} ${plural(requestsRouted, "request")} this session`;
-  }
-  return "Sharing · ready";
 }
 
 /**
@@ -161,8 +175,9 @@ export function deriveMeshCardModel({
   toggle,
   pendingAction,
   canShare,
-  busyNow,
-  requestsRouted,
+  view,
+  usage,
+  inboundWork,
 }: {
   snapshot: MeshSnapshot | null;
   status: MeshNodeStatus | null;
@@ -170,27 +185,28 @@ export function deriveMeshCardModel({
   pendingAction: "start" | "stop" | null;
   /** False when no model can be resolved yet (catalog still loading). */
   canShare: boolean;
+  /** Live gossip view. Null/disconnected falls back to the relay snapshot. */
+  view: MeshLiveView | null;
+  /** This node's own routing counters. All outbound — see `meshActivity.ts`. */
+  usage: MeshServingUsage | null;
   /**
-   * This node has inference in flight (`inflight > 0`).
-   *
-   * Honest but coarse: mesh-llm's inflight counter does not say whether the
-   * work is for a local agent or a remote member, so this only ever claims
-   * "working", never "someone is using your compute".
+   * Inbound work inferred by elimination (serving + inflight + our own dispatch
+   * count flat). Sampled, so it can undercount; it never over-claims.
    */
-  busyNow: boolean;
-  /**
-   * Requests this node's ingress has routed this session (`request_count`).
-   *
-   * Outbound routing, NOT work served for others — mesh-llm exposes no inbound
-   * counter. Used only as a subtle "this has been used" signal.
-   */
-  requestsRouted: number;
+  inboundWork: boolean;
 }): MeshCardModel {
   const devices = snapshot?.devices ?? [];
-  const participantCount = devices.length;
-  const capacity = describeMeshCapacity(snapshot);
+  const headline = describeMeshHeadline({ view, snapshot });
   const ready = describeReadyModels(snapshot);
-  const isSolo = participantCount === 1;
+  // Solo means "connected but nobody else is here" — a live-view fact. The
+  // relay snapshot cannot tell us this: a lone note may just be a stale one.
+  const isSolo = view?.connected === true && view.peers.length === 0;
+  const hint = describeParticipationHint({
+    isSharing: toggle.isSharing,
+    isConsuming: toggle.isConsuming,
+    inboundWork,
+    usage,
+  });
 
   const base = {
     devices,
@@ -232,16 +248,11 @@ export function deriveMeshCardModel({
   // Consuming: this machine is TAKING compute, not giving it. Say so plainly —
   // the switch is off here and that must not read as "nothing is happening".
   if (toggle.isConsuming) {
-    const peer = devices.find(
-      (device) => !device.isSelf && device.state === "serving",
-    );
     return {
       ...base,
       tone: "consuming",
-      headline: "Using shared compute",
-      detail: peer
-        ? `Running on ${peer.label}. Turn on to share this computer too.`
-        : "Running on another member's computer.",
+      headline,
+      detail: hint,
       showSoloHint: false,
     };
   }
@@ -274,8 +285,8 @@ export function deriveMeshCardModel({
     return {
       ...base,
       tone: "sharing",
-      headline: capacity,
-      detail: describeParticipation({ busyNow, requestsRouted }),
+      headline,
+      detail: hint,
       showSoloHint: isSolo,
     };
   }
@@ -285,8 +296,8 @@ export function deriveMeshCardModel({
   return {
     ...base,
     tone: "idle",
-    headline: capacity,
-    detail: ready ?? "Share compute to run models.",
+    headline,
+    detail: ready ?? hint,
     showSoloHint: false,
   };
 }

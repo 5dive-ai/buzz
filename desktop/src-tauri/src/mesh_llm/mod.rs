@@ -33,6 +33,9 @@ pub(crate) use recovery::{
     MeshRuntimeRecovery,
 };
 
+mod peers;
+pub use peers::{live_view_from_payload, MeshLiveView};
+
 mod usage;
 pub use usage::{serving_usage_from_payload, MeshServingUsage};
 
@@ -633,6 +636,19 @@ impl DesktopMeshRuntime {
         };
         let status = ready.status().await?;
         Ok(serving_usage_from_payload(&status.payload))
+    }
+
+    /// This machine's live gossip view of the mesh — who we are actually
+    /// connected to right now. Distinct from the relay snapshot, which reports
+    /// last-published notes valid for 120s. See [`peers`] for why both exist.
+    pub async fn live_view(&self) -> anyhow::Result<MeshLiveView> {
+        let mut handle = self.handle.lock().await;
+        Self::promote_finished_startup(&mut handle).await;
+        let DesktopMeshHandle::Ready(ready) = &*handle else {
+            anyhow::bail!("mesh management status is not ready");
+        };
+        let status = ready.status().await?;
+        Ok(live_view_from_payload(&status.payload))
     }
 
     pub async fn dial_endpoint_addr(&self, endpoint_addr: impl Into<String>) -> anyhow::Result<()> {

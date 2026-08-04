@@ -112,3 +112,37 @@ export type MeshModelCatalog = {
 export async function meshModelCatalog(): Promise<MeshModelCatalog> {
   return await invokeTauri<MeshModelCatalog>("mesh_model_catalog");
 }
+
+/** Coarse per-device state. See Rust `MeshDeviceState`. */
+export type MeshDeviceState = "serving" | "loading" | "standby" | "consuming";
+
+export type MeshSnapshotDevice = {
+  deviceId: string | null;
+  label: string;
+  /** Shared AI memory in GB, honoring that member's own cap. */
+  capacityGb: number | null;
+  models: string[];
+  state: MeshDeviceState;
+  isSelf: boolean;
+};
+
+/**
+ * Community-wide shared-compute snapshot: who is sharing right now, how much
+ * they are sharing, and what is ready to use.
+ *
+ * Presentation only — routing still goes through the availability path. An
+ * empty mesh arrives as `reason` with zero counts, never as an error.
+ */
+export type MeshSnapshot = {
+  sharingDeviceCount: number;
+  /** `null` when no sharing device reported a figure — render the count only. */
+  sharedCapacityGb: number | null;
+  models: string[];
+  devices: MeshSnapshotDevice[];
+  includesSelf: boolean;
+  reason: string | null;
+};
+
+export async function meshSnapshot(): Promise<MeshSnapshot> {
+  return await invokeTauri<MeshSnapshot>("mesh_snapshot");
+}

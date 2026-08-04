@@ -1945,6 +1945,45 @@ mod tests {
     }
 
     #[test]
+    fn o4_shared_contract_repairs_are_redacted_and_revision_exact() {
+        let sentinel_key = "private_raw_claim_key";
+        let sentinel_value = "private_raw_claim_value";
+        let raw_claims = RawJwtClaims {
+            claims: Map::from_iter([(
+                sentinel_key.to_string(),
+                Value::String(sentinel_value.to_string()),
+            )]),
+        };
+        let debug = format!("{raw_claims:?}");
+        let delegation_evidence = include_str!("../../buzz-auth/src/context/evidence.rs");
+        let invalidation_contract =
+            include_str!("../../buzz-db/src/authorization_invalidation.rs");
+
+        let mut missing = Vec::new();
+        if debug.contains(sentinel_key) || debug.contains(sentinel_value) {
+            missing.push("raw-jwt-debug-redaction");
+        }
+        if !(delegation_evidence.contains("DelegatedRelationshipId")
+            && delegation_evidence.contains("DelegatedRelationshipRevision")
+            && delegation_evidence.contains("relationship_id")
+            && delegation_evidence.contains("relationship_revision"))
+        {
+            missing.push("delegated-relationship-identity-and-revision");
+        }
+        if !(invalidation_contract.contains("AuthorizationSessionTarget")
+            && invalidation_contract.contains("issuance_fence")
+            && invalidation_contract.contains("session-issuance-v2"))
+        {
+            missing.push("session-issuance-nonreuse-fence");
+        }
+
+        assert!(
+            missing.is_empty(),
+            "missing O4 shared-contract repairs: {missing:?}"
+        );
+    }
+
+    #[test]
     fn observational_modes_never_mutate_the_public_projection() {
         use crate::authorization_runtime::finalization::AuthorizationMode;
 

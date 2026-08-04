@@ -193,6 +193,41 @@ fn operator_global_git_config() -> std::collections::HashMap<String, String> {
         .collect()
 }
 
+/// Toolchain caches an isolated session shares with the ones before it. A
+/// disposable `HOME` otherwise gives hermit, rustup, npm, and pub a cold cache,
+/// so every session re-downloads its whole toolchain — gigabytes in this repo.
+///
+/// `CARGO_HOME` is deliberately absent. It holds `credentials.toml`, and cargo
+/// offers no cache-only alternative, so sharing the registry would also share
+/// registry tokens between sessions.
+fn shared_toolchain_cache_env(root: &std::path::Path) -> [(&'static str, std::path::PathBuf); 4] {
+    [
+        ("HERMIT_STATE_DIR", root.join("hermit")),
+        ("RUSTUP_HOME", root.join("rustup")),
+        ("npm_config_cache", root.join("npm")),
+        ("PUB_CACHE", root.join("pub-cache")),
+    ]
+}
+
+/// Resolve the shared cache root from the operator's environment.
+///
+/// Buzz owns this directory rather than reusing the operator's own cache: agents
+/// write to it, and a poisoned toolchain must not reach the operator's builds.
+fn shared_toolchain_cache_root(
+    os: &str,
+    lookup: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let base = match os {
+        "macos" => lookup("HOME")?.join("Library").join("Caches"),
+        "windows" => lookup("LOCALAPPDATA")?,
+        _ => match lookup("XDG_CACHE_HOME") {
+            Some(cache) => cache,
+            None => lookup("HOME")?.join(".cache"),
+        },
+    };
+    Some(base.join("buzz").join("agent-toolchains"))
+}
+
 /// Windows tooling that predates `USERPROFILE` composes the home directory from
 /// `HOMEDRIVE` + `HOMEPATH`; left inherited they point back at the operator.
 fn windows_home_split(root: &str) -> Option<(&str, &str)> {
@@ -794,7 +829,36 @@ impl AcpClient {
             }
 
             // Apply these last. Persona configuration must not redirect a
-            // Claude process back to the operator's profile directories.
+            // Claude process back to the operator's profile directories — nor a
+            // cache variable at the operator's own toolchain, which the agent
+            // could then poison.
+            match shared_toolchain_cache_root(std::env::consts::OS, |key| {
+                std::env::var_os(key).map(std::path::PathBuf::from)
+            }) {
+                Some(cache_root) => {
+                    for (key, directory) in shared_toolchain_cache_env(&cache_root) {
+                        // A cold cache is slow, not broken: leave the variable
+                        // unset rather than failing the spawn.
+                        match std::fs::create_dir_all(&directory) {
+                            Ok(()) => {
+                                cmd.env(key, directory);
+                            }
+                            Err(error) => tracing::warn!(
+                                %error,
+                                key,
+                                ?directory,
+                                "claude adapter: shared toolchain cache unavailable; this session \
+                                 will re-download its toolchain"
+                            ),
+                        }
+                    }
+                }
+                None => tracing::warn!(
+                    "claude adapter: no host cache directory to derive a shared toolchain cache \
+                     from; this session will re-download its toolchain"
+                ),
+            }
+
             cmd.env("HOME", root)
                 .env("USERPROFILE", root)
                 .env("XDG_CONFIG_HOME", config)
@@ -3376,6 +3440,112 @@ mod tests {
     #[test]
     fn profile_git_config_is_absent_when_the_host_has_nothing_to_project() {
         assert!(super::claude_profile_git_config(|_| None).is_none());
+    }
+
+    #[test]
+    fn shared_toolchain_cache_root_follows_each_platform_convention() {
+        let host = |values: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                values
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| std::path::PathBuf::from(value))
+            }
+        };
+        let suffix: std::path::PathBuf = ["buzz", "agent-toolchains"].iter().collect();
+
+        assert_eq!(
+            super::shared_toolchain_cache_root("macos", host(&[("HOME", "/Users/op")])),
+            Some(
+                std::path::PathBuf::from("/Users/op")
+                    .join("Library")
+                    .join("Caches")
+                    .join(&suffix)
+            )
+        );
+        assert_eq!(
+            super::shared_toolchain_cache_root(
+                "windows",
+                host(&[("LOCALAPPDATA", r"C:\Users\op\AppData\Local")])
+            ),
+            Some(std::path::PathBuf::from(r"C:\Users\op\AppData\Local").join(&suffix))
+        );
+        // XDG wins over the `~/.cache` fallback on Linux.
+        assert_eq!(
+            super::shared_toolchain_cache_root(
+                "linux",
+                host(&[("HOME", "/home/op"), ("XDG_CACHE_HOME", "/var/cache/op")])
+            ),
+            Some(std::path::PathBuf::from("/var/cache/op").join(&suffix))
+        );
+        assert_eq!(
+            super::shared_toolchain_cache_root("linux", host(&[("HOME", "/home/op")])),
+            Some(
+                std::path::PathBuf::from("/home/op")
+                    .join(".cache")
+                    .join(&suffix)
+            )
+        );
+        // Nothing to derive from: callers must treat this as "no shared cache".
+        for os in ["macos", "windows", "linux"] {
+            assert_eq!(super::shared_toolchain_cache_root(os, host(&[])), None);
+        }
+    }
+
+    /// `CARGO_HOME` carries `credentials.toml`, so it must never be shared
+    /// between sessions even though that costs a per-session registry download.
+    #[test]
+    fn shared_toolchain_cache_env_covers_the_toolchains_but_never_cargo_home() {
+        let root = std::path::Path::new("/cache/buzz/agent-toolchains");
+        let shared = super::shared_toolchain_cache_env(root);
+        let keys: Vec<&str> = shared.iter().map(|(key, _)| *key).collect();
+
+        assert_eq!(
+            keys,
+            [
+                "HERMIT_STATE_DIR",
+                "RUSTUP_HOME",
+                "npm_config_cache",
+                "PUB_CACHE"
+            ]
+        );
+        assert!(!keys.contains(&"CARGO_HOME"));
+        for (key, directory) in shared {
+            assert!(
+                directory.starts_with(root) && directory != root,
+                "{key} must get its own subdirectory of the shared root, got {directory:?}"
+            );
+        }
+    }
+
+    /// The whole point of the shared cache: it must land outside the disposable
+    /// profile, or the next session starts cold again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_toolchain_cache_survives_the_disposable_profile() {
+        let observed = spawn_named_and_read_child_stdout(
+            "claude-agent-acp",
+            r#"printf '%s\t%s\t%s\n' "${HERMIT_STATE_DIR:-<unset>}" "$HOME" "${CARGO_HOME:-<unset>}""#,
+        )
+        .await;
+        let mut fields = observed.split('\t');
+        let hermit = fields.next().expect("hermit state dir field");
+        let home = fields.next().expect("home field");
+        let cargo_home = fields.next().expect("cargo home field");
+
+        assert_ne!(hermit, "<unset>", "the child needs a warm hermit state dir");
+        assert!(
+            !hermit.starts_with(home),
+            "{hermit} is inside the disposable profile {home} and dies with it"
+        );
+        assert!(
+            std::path::Path::new(hermit).is_dir(),
+            "{hermit} must exist before the child looks for a toolchain"
+        );
+        assert_eq!(
+            cargo_home, "<unset>",
+            "CARGO_HOME must stay unset: sharing it would share registry tokens"
+        );
     }
 
     #[test]

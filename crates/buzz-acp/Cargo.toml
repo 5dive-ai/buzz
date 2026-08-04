@@ -61,6 +61,8 @@ tracing-subscriber = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+
+# Disposable profile directories for isolated Claude adapters
 tempfile = "3"
 
 # CLI

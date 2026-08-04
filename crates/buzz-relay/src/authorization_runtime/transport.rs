@@ -16,6 +16,7 @@ use buzz_auth::{
     VerifiedFederatedAssertion, VerifiedNostrProof,
 };
 use buzz_core::CommunityId;
+use buzz_db::authorization_invalidation::AuthorizationSessionTarget;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -99,7 +100,7 @@ pub struct ProtectedOperationRequest {
     verified_proof: Arc<VerifiedNostrProof>,
     capability: AuthorizationCapability,
     correlation_id: Uuid,
-    session_id: Option<Uuid>,
+    session_target: Option<AuthorizationSessionTarget>,
     surface: &'static str,
     cancellation: Option<CancellationToken>,
     verified_assertion: Option<Arc<VerifiedFederatedAssertion>>,
@@ -132,14 +133,11 @@ impl ProtectedOperationRequest {
         capability: AuthorizationCapability,
         correlation_id: Uuid,
         surface: &'static str,
-        session_id: Option<Uuid>,
+        session_target: Option<AuthorizationSessionTarget>,
         cancellation: Option<CancellationToken>,
     ) -> Result<Self, ProtectedTransportError> {
         if correlation_id.is_nil() {
             return Err(ProtectedTransportError::InvalidCorrelationId);
-        }
-        if session_id == Some(Uuid::nil()) {
-            return Err(ProtectedTransportError::InvalidSessionId);
         }
         if surface.is_empty() {
             return Err(ProtectedTransportError::InvalidSurface);
@@ -155,7 +153,7 @@ impl ProtectedOperationRequest {
             verified_proof,
             capability,
             correlation_id,
-            session_id,
+            session_target,
             surface,
             cancellation,
             verified_assertion,
@@ -227,9 +225,9 @@ impl ProtectedOperationRequest {
         self.correlation_id
     }
 
-    /// Stable server-owned session identity for long-lived transports.
-    pub const fn session_id(&self) -> Option<Uuid> {
-        self.session_id
+    /// Exact server-issued target for a long-lived transport session.
+    pub const fn session_target(&self) -> Option<AuthorizationSessionTarget> {
+        self.session_target
     }
 
     /// Stable low-cardinality surface name for resolver telemetry.
@@ -688,6 +686,44 @@ pub async fn authorize_session_if_configured(
     session_id: Uuid,
     cancellation: CancellationToken,
 ) -> Result<ProtectedAuthorization, ProtectedTransportError> {
+    if state.protected_transport().is_none() {
+        return Ok(ProtectedAuthorization::Legacy);
+    }
+    let session_target = state
+        .conn_manager
+        .authorization_session_target(session_id)
+        .filter(|target| target.session_id() == session_id)
+        .ok_or(ProtectedTransportError::InvalidSessionId)?;
+    let authority = authorize_exact_session_if_configured(
+        state,
+        verified_proof,
+        verified_assertion,
+        capability,
+        correlation_id,
+        surface,
+        session_target,
+        cancellation,
+    )
+    .await?;
+    state
+        .conn_manager
+        .retain_protected_session_authority(session_id, &authority);
+    Ok(authority)
+}
+
+/// Consult the runtime for a server-issued session target that is not managed
+/// by the ordinary relay connection registry (for example, protected audio).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn authorize_exact_session_if_configured(
+    state: &crate::state::AppState,
+    verified_proof: Arc<VerifiedNostrProof>,
+    verified_assertion: Option<Arc<VerifiedFederatedAssertion>>,
+    capability: AuthorizationCapability,
+    correlation_id: Uuid,
+    surface: &'static str,
+    session_target: AuthorizationSessionTarget,
+    cancellation: CancellationToken,
+) -> Result<ProtectedAuthorization, ProtectedTransportError> {
     let Some(runtime) = state.protected_transport() else {
         return Ok(ProtectedAuthorization::Legacy);
     };
@@ -697,14 +733,10 @@ pub async fn authorize_session_if_configured(
         capability,
         correlation_id,
         surface,
-        Some(session_id),
+        Some(session_target),
         Some(cancellation),
     )?;
-    let authority = runtime.authorize(&request).await?;
-    state
-        .conn_manager
-        .retain_protected_session_authority(session_id, &authority);
-    Ok(authority)
+    runtime.authorize(&request).await
 }
 
 /// Resolve staged direct authority for atomic invite enrollment.

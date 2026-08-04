@@ -37,10 +37,11 @@ pub use binding::{
 };
 pub use evidence::{
     AdmissionExpiry, AssertionExpiry, AssertionNotBefore, AssertionTransport, AuthMethod,
-    AuthTransport, AuthorizedCommunityAccess, DelegationCapability, DelegationExpiry,
-    FederatedPrincipal, NostrAuthority, VerifiedFederatedAssertion, VerifiedKeyAttestation,
-    VerifiedNostrProof, VerifiedOperationBinding, VerifiedOperationBindingKind,
-    VerifiedOwnerAdmission, VerifiedTransportDelegation,
+    AuthTransport, AuthorizedCommunityAccess, DelegatedRelationshipId,
+    DelegatedRelationshipRevision, DelegationCapability, DelegationExpiry, FederatedPrincipal,
+    NostrAuthority, VerifiedFederatedAssertion, VerifiedKeyAttestation, VerifiedNostrProof,
+    VerifiedOperationBinding, VerifiedOperationBindingKind, VerifiedOwnerAdmission,
+    VerifiedTransportDelegation,
 };
 pub use reason::{AuthContextError, AuthorizationReason};
 

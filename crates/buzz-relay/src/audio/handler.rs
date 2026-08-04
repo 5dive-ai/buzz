@@ -37,7 +37,7 @@ use buzz_auth::{
     VerifiedEvidenceAdapter,
 };
 use buzz_core::{tenant::TenantContext, CommunityId};
-use buzz_db::channel::MemberRole;
+use buzz_db::{authorization_invalidation::AuthorizationSessionTarget, channel::MemberRole};
 
 use buzz_core::StoredEvent;
 use buzz_pubsub::EventTopic;
@@ -47,7 +47,7 @@ use crate::audio::room::{
     ProtectedPeerEpoch, Room, RoomOwnerEpoch,
 };
 use crate::authorization_runtime::transport::{
-    authorize_session_if_configured, ProtectedAuthorization,
+    authorize_exact_session_if_configured, ProtectedAuthorization,
 };
 use crate::state::{run_registered_community_connection, AppState};
 
@@ -269,6 +269,10 @@ async fn handle_active_audio_connection(
     cancel: CancellationToken,
     corporate_identity_assertion: Option<crate::corporate_identity::IdentityAssertionInput>,
 ) {
+    let Ok(session_target) = AuthorizationSessionTarget::new(session_id, Uuid::new_v4()) else {
+        cancel.cancel();
+        return;
+    };
     let (mut ws_send, mut ws_recv) = socket.split();
 
     let challenge = generate_challenge();
@@ -391,11 +395,20 @@ async fn handle_active_audio_connection(
         return;
     }
 
-    let transport_delegation = crate::corporate_identity::verify_unconditional_nip_oa_owner(
+    let transport_delegation = crate::corporate_identity::verify_unconditional_nip_oa_relationship(
         pubkey,
         auth_tag_json.as_deref(),
     )
-    .map(|owner| VerifiedDelegationOutput::from_workspace_verifier(owner, pubkey, None, true));
+    .map(|relationship| {
+        VerifiedDelegationOutput::from_workspace_verifier(
+            relationship.owner_pubkey(),
+            pubkey,
+            relationship.relationship_id(),
+            relationship.relationship_revision(),
+            None,
+            true,
+        )
+    });
     let verified_proof = match VerifiedEvidenceAdapter::new().verify_nip42(
         tenant.community(),
         AuthTransport::Audio,
@@ -436,14 +449,14 @@ async fn handle_active_audio_connection(
         },
         None => None,
     };
-    let protected_authority = match authorize_session_if_configured(
+    let protected_authority = match authorize_exact_session_if_configured(
         &state,
         Arc::clone(&verified_proof),
         verified_assertion,
         AuthorizationCapability::AudioJoin,
         Uuid::from_bytes(correlation),
         "audio.join",
-        session_id,
+        session_target,
         cancel.clone(),
     )
     .await

@@ -566,7 +566,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 44);
+        assert_eq!(migrations.len(), 45);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -650,6 +650,11 @@ mod tests {
         assert!(!projection_retirement.contains("issuer"));
         assert!(!projection_retirement.contains("subject TEXT"));
         assert!(!projection_retirement.contains("display_name"));
+        assert_eq!(migrations[44].version, 45);
+        let delegated_relationship = migrations[44].sql.as_str();
+        assert!(delegated_relationship.contains("delegated_relationship"));
+        assert!(delegated_relationship
+            .contains("authorization_invalidation_floors_selector_kind_check"));
 
         // NIP-AM (kind 44200) FTS exclusion: additive migration, never folded
         // into 0001 — folding would change 0001's checksum and break brownfield

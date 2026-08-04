@@ -278,12 +278,19 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
             return Err((StatusCode::FORBIDDEN, "restricted: not a relay member").into_response());
         }
         let verified_proof =
-            match crate::corporate_identity::verify_unconditional_nip_oa_owner(pubkey, auth_tag) {
-                Some(owner) => buzz_auth::VerifiedEvidenceAdapter::new()
+            match crate::corporate_identity::verify_unconditional_nip_oa_relationship(
+                pubkey, auth_tag,
+            ) {
+                Some(relationship) => buzz_auth::VerifiedEvidenceAdapter::new()
                     .attach_transport_delegation(
                         verified_proof,
                         buzz_auth::VerifiedDelegationOutput::from_workspace_verifier(
-                            owner, pubkey, None, true,
+                            relationship.owner_pubkey(),
+                            pubkey,
+                            relationship.relationship_id(),
+                            relationship.relationship_revision(),
+                            None,
+                            true,
                         ),
                     )
                     .map_err(|_| {

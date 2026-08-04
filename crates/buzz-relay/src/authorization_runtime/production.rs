@@ -380,9 +380,7 @@ impl ProtectedAuthorizationResolver for ProductionResolver {
             )
             .map_err(|_| ProtectedResolutionError::new("status_finalization"))?;
         let dependencies = AuthorizationDependencies::from_verification_only(
-            request
-                .session_id()
-                .unwrap_or_else(|| request.correlation_id()),
+            request.session_target(),
             &disposition,
         )
         .map_err(|_| ProtectedResolutionError::new("invalidation_dependencies"))?;
@@ -450,13 +448,9 @@ impl ProtectedAuthorizationResolver for ProductionResolver {
                     request.correlation_id(),
                 )
                 .map_err(|_| ProtectedResolutionError::new("enrollment_finalization"))?;
-            let dependencies = AuthorizationDependencies::from_enrollment(
-                request
-                    .session_id()
-                    .unwrap_or_else(|| request.correlation_id()),
-                &disposition,
-            )
-            .map_err(|_| ProtectedResolutionError::new("invalidation_dependencies"))?;
+            let dependencies =
+                AuthorizationDependencies::from_enrollment(request.session_target(), &disposition)
+                    .map_err(|_| ProtectedResolutionError::new("invalidation_dependencies"))?;
             let observer = self
                 .invalidation
                 .observe_authority(fence, dependencies, request.cancellation())
@@ -586,13 +580,9 @@ impl ProtectedAuthorizationResolver for ProductionResolver {
                 "non_authoritative_disposition",
             ));
         };
-        let dependencies = AuthorizationDependencies::from_context(
-            request
-                .session_id()
-                .unwrap_or_else(|| request.correlation_id()),
-            &context,
-        )
-        .map_err(|_| ProtectedResolutionError::new("invalidation_dependencies"))?;
+        let dependencies =
+            AuthorizationDependencies::from_context(request.session_target(), &context)
+                .map_err(|_| ProtectedResolutionError::new("invalidation_dependencies"))?;
         let observer = self
             .invalidation
             .observe_authority(fence, dependencies, request.cancellation())

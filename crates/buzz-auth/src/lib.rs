@@ -49,12 +49,13 @@ pub use context::{
     AuthContextVersion, AuthMethod, AuthTransport, AuthorityAdapterError, AuthorityAdapterFuture,
     AuthorizationReason, AuthorizedCommunityAccess, BindingResolutionRequest, BindingSource,
     BindingVersion, CapabilityFinalizationSeal, CurrentPolicyRequest, CurrentPolicyResolutionSink,
-    DelegationCapability, DelegationExpiry, DirectBindingResolutionSink, EnrollmentMode,
-    ExistingBindingResolutionSink, FederatedAuthorityAdapter, FederatedAuthorization,
-    FederatedIdentityRequirement, FederatedPrincipal, NostrAuthority, ResolvedFederatedPolicy,
-    VerifiedFederatedAssertion, VerifiedKeyAttestation, VerifiedNostrProof,
-    VerifiedOperationBinding, VerifiedOperationBindingKind, VerifiedOwnerAdmission,
-    VerifiedTransportDelegation, VersionedBindingRef,
+    DelegatedRelationshipId, DelegatedRelationshipRevision, DelegationCapability, DelegationExpiry,
+    DirectBindingResolutionSink, EnrollmentMode, ExistingBindingResolutionSink,
+    FederatedAuthorityAdapter, FederatedAuthorization, FederatedIdentityRequirement,
+    FederatedPrincipal, NostrAuthority, ResolvedFederatedPolicy, VerifiedFederatedAssertion,
+    VerifiedKeyAttestation, VerifiedNostrProof, VerifiedOperationBinding,
+    VerifiedOperationBindingKind, VerifiedOwnerAdmission, VerifiedTransportDelegation,
+    VersionedBindingRef,
 };
 pub use error::AuthError;
 pub use evidence_adapter::{

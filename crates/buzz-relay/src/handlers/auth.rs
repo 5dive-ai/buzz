@@ -397,12 +397,19 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
 
             info!(conn_id = %conn_id, "NIP-42 auth successful");
             let transport_delegation =
-                crate::corporate_identity::verify_unconditional_nip_oa_owner(
+                crate::corporate_identity::verify_unconditional_nip_oa_relationship(
                     pubkey,
                     auth_tag_json.as_deref(),
                 )
-                .map(|owner| {
-                    VerifiedDelegationOutput::from_workspace_verifier(owner, pubkey, None, true)
+                .map(|relationship| {
+                    VerifiedDelegationOutput::from_workspace_verifier(
+                        relationship.owner_pubkey(),
+                        pubkey,
+                        relationship.relationship_id(),
+                        relationship.relationship_revision(),
+                        None,
+                        true,
+                    )
                 });
             let verified_proof: Arc<VerifiedNostrProof> = match VerifiedEvidenceAdapter::new()
                 .verify_nip42(

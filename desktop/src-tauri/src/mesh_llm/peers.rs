@@ -63,6 +63,8 @@ pub struct MeshLiveView {
     pub connected: bool,
     /// This machine's own shared capacity, when serving.
     pub self_capacity_gb: Option<f64>,
+    /// Size of the model currently hosted on this machine, when reported.
+    pub self_model_size_gb: Option<f64>,
     /// Peers currently connected, sharing first then by label.
     pub peers: Vec<MeshPeer>,
 }
@@ -169,6 +171,7 @@ pub fn live_view_from_payload(payload: &serde_json::Value) -> MeshLiveView {
     MeshLiveView {
         connected: true,
         self_capacity_gb: f64_at(payload, "my_vram_gb").filter(|gb| *gb > 0.0),
+        self_model_size_gb: f64_at(payload, "model_size_gb").filter(|gb| *gb > 0.0),
         peers,
     }
 }
@@ -178,7 +181,11 @@ mod tests {
     use super::*;
 
     fn payload(peers: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({ "my_vram_gb": 115.0, "peers": peers })
+        serde_json::json!({
+            "my_vram_gb": 115.0,
+            "model_size_gb": 17.0,
+            "peers": peers,
+        })
     }
 
     #[test]
@@ -193,6 +200,7 @@ mod tests {
         }])));
         assert!(view.connected);
         assert_eq!(view.self_capacity_gb, Some(115.0));
+        assert_eq!(view.self_model_size_gb, Some(17.0));
         assert_eq!(view.peers.len(), 1);
         let peer = &view.peers[0];
         assert_eq!(peer.label, "studio54.lan");

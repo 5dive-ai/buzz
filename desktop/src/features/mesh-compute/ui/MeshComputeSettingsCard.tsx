@@ -38,9 +38,13 @@ import { useMeshNodeStatus } from "../hooks/useMeshNodeStatus";
 import { useMeshServingUsage } from "../hooks/useMeshServingUsage";
 import { deriveMeshShareToggle } from "../shareToggleState";
 import { deriveServingIndicator } from "../servingUsage";
-
-const MODEL_DRAFT_STORAGE_KEY = "buzz.mesh-compute.share.model.v1";
-const MAX_VRAM_DRAFT_STORAGE_KEY = "buzz.mesh-compute.share.max-vram-gb.v1";
+import {
+  getShareComputeModel,
+  setShareComputeMaxVramGb,
+  setShareComputeModel,
+  useShareComputeMaxVramGb,
+  useShareComputeModel,
+} from "../shareComputePreferences";
 
 // Keep the Share compute controls visually and behaviorally aligned with the
 // agent configuration fields. This is intentionally the same shell used by
@@ -56,26 +60,6 @@ const SHARE_COMPUTE_REVEAL_TRANSITION = {
   ease: [0.23, 1, 0.32, 1],
 } as const;
 
-function readDraft(key: string): string {
-  try {
-    return window.localStorage.getItem(key) ?? "";
-  } catch {
-    return "";
-  }
-}
-
-function writeDraft(key: string, value: string): void {
-  try {
-    if (value === "") {
-      window.localStorage.removeItem(key);
-    } else {
-      window.localStorage.setItem(key, value);
-    }
-  } catch {
-    // Ignore unavailable/full storage; the input still works for this session.
-  }
-}
-
 /**
  * Settings → Compute → Share compute.
  *
@@ -90,12 +74,8 @@ export function MeshComputeSettingsCard() {
     MeshModelOption[]
   >([]);
   const [catalog, setCatalog] = React.useState<MeshModelCatalog | null>(null);
-  const [modelInput, setModelInput] = React.useState(() =>
-    readDraft(MODEL_DRAFT_STORAGE_KEY),
-  );
-  const [maxVramGb, setMaxVramGb] = React.useState<string>(() =>
-    readDraft(MAX_VRAM_DRAFT_STORAGE_KEY),
-  );
+  const modelInput = useShareComputeModel();
+  const maxVramGb = useShareComputeMaxVramGb();
   const [isCustomModelEditing, setIsCustomModelEditing] = React.useState(false);
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const [actionInFlight, setActionInFlight] = React.useState(false);
@@ -139,11 +119,9 @@ export function MeshComputeSettingsCard() {
         const value = await meshModelCatalog();
         if (cancelled) return;
         setCatalog(value);
-        setModelInput((current) => {
-          if (current.trim() !== "" || !value.recommended) return current;
-          writeDraft(MODEL_DRAFT_STORAGE_KEY, value.recommended);
-          return value.recommended;
-        });
+        if (getShareComputeModel().trim() === "" && value.recommended) {
+          setShareComputeModel(value.recommended);
+        }
       } catch {
         // Non-fatal — picker just doesn't render.
       }
@@ -164,8 +142,7 @@ export function MeshComputeSettingsCard() {
       status.modelId &&
       status.modelId !== modelInput
     ) {
-      setModelInput(status.modelId);
-      writeDraft(MODEL_DRAFT_STORAGE_KEY, status.modelId);
+      setShareComputeModel(status.modelId);
     }
   }, [status?.state, status?.mode, status?.modelId, modelInput]);
 
@@ -287,10 +264,7 @@ export function MeshComputeSettingsCard() {
           isCustomModelEditing={isCustomModelEditing}
           model={modelInput}
           onCustomModelEditingChange={setIsCustomModelEditing}
-          onModelChange={(next) => {
-            setModelInput(next);
-            writeDraft(MODEL_DRAFT_STORAGE_KEY, next);
-          }}
+          onModelChange={setShareComputeModel}
         />
 
         <div className="pt-3">
@@ -321,8 +295,7 @@ export function MeshComputeSettingsCard() {
                 inputMode="decimal"
                 onChange={(e) => {
                   const next = e.target.value;
-                  setMaxVramGb(next);
-                  writeDraft(MAX_VRAM_DRAFT_STORAGE_KEY, next);
+                  setShareComputeMaxVramGb(next);
                 }}
                 placeholder="No limit"
                 usePersonaInputStyle

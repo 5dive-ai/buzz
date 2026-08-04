@@ -171,17 +171,22 @@ export function describeStartupHeadline(
 /** Secondary line for the startup stages. */
 export function describeStartupStage(
   progress: MeshDownloadProgress | null,
+  modelRef?: string | null,
 ): string {
+  const modelLabel = shortModelLabel(progress?.label || modelRef || "");
+  const modelPrefix = modelLabel ? `${modelLabel} · ` : "";
   if (progress?.status === "downloading") {
     const total = progress.totalBytes;
     return total === null
-      ? "First run downloads the model once."
-      : `${formatBytes(progress.downloadedBytes ?? 0)} of ${formatBytes(total)} · first run only`;
+      ? `${modelPrefix}First run downloads the model once.`
+      : `${modelPrefix}${formatBytes(progress.downloadedBytes ?? 0)} of ${formatBytes(total)} · first run only`;
   }
   if (progress?.status === "preparing") {
-    return "Checking what's already downloaded.";
+    return `${modelPrefix}Checking what's already downloaded.`;
   }
-  return "Loading the model into memory.";
+  return modelLabel
+    ? `Loading ${modelLabel} into memory.`
+    : "Loading the model into memory.";
 }
 
 function downloadPercent(progress: MeshDownloadProgress): number | null {
@@ -236,6 +241,7 @@ export function deriveMeshCardModel({
   usage,
   inboundWork,
   downloadProgress,
+  startingModel,
 }: {
   snapshot: MeshSnapshot | null;
   status: MeshNodeStatus | null;
@@ -260,6 +266,8 @@ export function deriveMeshCardModel({
    * the single longest and most opaque step, so it gets named and measured.
    */
   downloadProgress: MeshDownloadProgress | null;
+  /** Model requested by the current start action before node status exists. */
+  startingModel?: string | null;
 }): MeshCardModel {
   const devices = snapshot?.devices ?? [];
   const headline = describeMeshHeadline({ view, snapshot });
@@ -267,7 +275,10 @@ export function deriveMeshCardModel({
   // Solo means "connected but nobody else is here" — a live-view fact. The
   // relay snapshot cannot tell us this: a lone note may just be a stale one.
   const isSolo = view?.connected === true && view.peers.length === 0;
-  const startingDetail = describeStartupStage(downloadProgress);
+  const startingDetail = describeStartupStage(
+    downloadProgress,
+    status?.modelName ?? status?.modelId ?? startingModel,
+  );
   const hint = describeParticipationHint({
     isSharing: toggle.isSharing,
     isConsuming: toggle.isConsuming,
@@ -347,14 +358,13 @@ export function deriveMeshCardModel({
         showSoloHint: false,
       };
     }
-    // Model name is deliberately absent: it belongs in the detail view, not on
-    // a 256px card whose job is "am I in the mesh, and is it alive".
+    const activeModel = status?.modelName ?? status?.modelId;
     return {
       ...base,
       tone: "sharing",
-      headline,
-      detail: hint,
-      showSoloHint: isSolo,
+      headline: "You’re sharing compute.",
+      detail: activeModel ? shortModelLabel(activeModel) : "Model ready",
+      showSoloHint: false,
     };
   }
 

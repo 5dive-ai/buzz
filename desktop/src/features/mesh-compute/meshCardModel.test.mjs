@@ -240,7 +240,7 @@ test("with no runtime the headline falls back to the relay snapshot", () => {
   );
 });
 
-test("sharing omits the model name and hints participation", () => {
+test("sharing leads with the local role and names the hosted model", () => {
   const model = derive({
     toggle: SHARING_TOGGLE,
     status: SERVE_STATUS,
@@ -248,36 +248,19 @@ test("sharing omits the model name and hints participation", () => {
   });
   assert.equal(model.tone, "sharing");
   assert.equal(model.switchOn, true);
-  assert.equal(model.headline, "MeshLLM · 179 GB, 1 peer");
-  assert.match(model.detail, /You're sharing/);
-  // The model belongs in the detail view, not on a 256px card.
-  assert.ok(!/Gemma/i.test(model.detail ?? ""), "card must not name the model");
+  assert.equal(model.headline, "You’re sharing compute.");
+  assert.equal(model.detail, "Gemma 4 26B A4B");
+  assert.equal(model.showSoloHint, false);
 });
 
-test("inferred inbound work is the one place a peer may be named", () => {
+test("sharing keeps the model line stable while requests are active", () => {
   const model = derive({
     toggle: SHARING_TOGGLE,
     status: SERVE_STATUS,
     usage: usage({ inflight: 1 }),
     inboundWork: true,
   });
-  assert.match(model.detail, /serving another member/);
-});
-
-test("inflight work alone reads as working, never as being used", () => {
-  // Without the elimination check the work may be our own agent's, so the copy
-  // must not attribute it to anyone.
-  const model = derive({
-    toggle: SHARING_TOGGLE,
-    status: SERVE_STATUS,
-    usage: usage({ inflight: 1 }),
-    inboundWork: false,
-  });
-  assert.match(model.detail, /working now/);
-  assert.ok(
-    !/another member|someone|served for/i.test(model.detail),
-    `must not attribute the work: ${model.detail}`,
-  );
+  assert.equal(model.detail, "Gemma 4 26B A4B");
 });
 
 test("a solo sharer is a live-view fact, not a lone relay note", () => {
@@ -376,8 +359,11 @@ test("a download is named and measured, not hidden behind 'Starting…'", () => 
     "Downloading model · 29%",
   );
   assert.match(
-    describeStartupStage(progress({ downloadedBytes: 5e9, totalBytes: 17e9 })),
-    /5 GB of 17 GB/,
+    describeStartupStage(
+      progress({ downloadedBytes: 5e9, totalBytes: 17e9 }),
+      "fallback-model",
+    ),
+    /Gemma · 5 GB of 17 GB/,
   );
 });
 
@@ -389,22 +375,27 @@ test("a download with no known total says so rather than faking 0%", () => {
   );
 });
 
-test("each startup stage is distinguishable", () => {
+test("each startup stage is distinguishable and names the model", () => {
   assert.equal(
     describeStartupHeadline(progress({ status: "preparing" })),
     "Preparing model…",
   );
   assert.equal(describeStartupHeadline(null), "Starting to share…");
-  assert.match(describeStartupStage(null), /Loading the model into memory/);
+  assert.equal(
+    describeStartupStage(null, "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M"),
+    "Loading Gemma 4 E4B into memory.",
+  );
 });
 
-test("starting shows the download stage on the card", () => {
+test("starting shows the model and download stage on the card", () => {
   const model = derive({
     pendingAction: "start",
     downloadProgress: progress({ downloadedBytes: 2e9, totalBytes: 4e9 }),
+    startingModel: "fallback-model",
   });
   assert.equal(model.tone, "pending");
   assert.equal(model.headline, "Downloading model · 50%");
+  assert.match(model.detail, /Gemma · 2 GB of 4 GB/);
 });
 
 test("an empty community is a call to be first, not an error", () => {

@@ -1,10 +1,16 @@
 import type {
   MeshLiveView,
+  MeshNodeStatus,
   MeshServingUsage,
   MeshSnapshot,
 } from "@/shared/api/tauriMesh";
+import type { MeshDownloadProgress } from "../hooks/useMeshDownloadProgress";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { POPOVER_SHADOW_STYLE } from "@/shared/ui/popoverSurface";
+import {
+  describeStartupHeadline,
+  describeStartupStage,
+} from "../meshCardModel";
 import { deriveMeshDetailModel } from "../meshDetailModel";
 import { MeshTopologyRadial } from "./MeshTopologyRadial";
 
@@ -24,6 +30,10 @@ export function MeshDetailPopover({
   children,
   view,
   snapshot,
+  status,
+  pendingAction,
+  downloadProgress,
+  startingModel,
   usage,
   isSharing,
   inboundWork,
@@ -34,6 +44,10 @@ export function MeshDetailPopover({
   view: MeshLiveView | null;
   /** Relay snapshot, used only when no local runtime exists. */
   snapshot: MeshSnapshot | null;
+  status: MeshNodeStatus | null;
+  pendingAction: "start" | "stop" | null;
+  downloadProgress: MeshDownloadProgress | null;
+  startingModel: string | null;
   usage: MeshServingUsage | null;
   isSharing: boolean;
   inboundWork: boolean;
@@ -46,6 +60,14 @@ export function MeshDetailPopover({
     isSharing,
     inboundWork,
   });
+  const isStarting =
+    pendingAction === "start" ||
+    (isSharing &&
+      (status?.state === "starting" ||
+        snapshot?.devices.some(
+          (device) => device.isSelf && device.state === "loading",
+        )));
+  const selectedModel = status?.modelName ?? status?.modelId ?? startingModel;
 
   return (
     <Popover>
@@ -77,6 +99,20 @@ export function MeshDetailPopover({
               peers={view?.peers ?? []}
               selfCapacityGb={view?.selfCapacityGb ?? null}
             />
+          ) : null}
+
+          {isStarting ? (
+            <div
+              className="rounded-lg bg-muted/40 px-2.5 py-2"
+              data-testid="mesh-detail-startup-status"
+            >
+              <p className="text-xs font-medium">
+                {describeStartupHeadline(downloadProgress)}
+              </p>
+              <p className="mt-0.5 text-2xs leading-snug text-muted-foreground">
+                {describeStartupStage(downloadProgress, selectedModel)}
+              </p>
+            </div>
           ) : null}
 
           <div className="flex flex-col gap-1">

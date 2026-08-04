@@ -214,6 +214,8 @@ export type MeshLiveView = {
    */
   connected: boolean;
   selfCapacityGb: number | null;
+  /** Approximate hosted-model footprint, not live OS GPU allocation. */
+  selfModelSizeGb?: number | null;
   peers: MeshPeer[];
 };
 

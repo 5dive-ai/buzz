@@ -11,15 +11,24 @@ import { meshModelCatalog } from "@/shared/api/tauriMesh";
 import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import { requestOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
 import { deriveMeshCallToAction } from "../meshAgents";
+import { deriveMeshMemoryModel } from "../meshMemoryModel";
 import { useMeshDownloadProgress } from "../hooks/useMeshDownloadProgress";
 import { useMeshLiveView } from "../hooks/useMeshLiveView";
 import { useMeshNodeStatus } from "../hooks/useMeshNodeStatus";
 import { useMeshServingUsage } from "../hooks/useMeshServingUsage";
 import { useMeshSnapshot } from "../hooks/useMeshSnapshot";
 import { deriveMeshShareToggle } from "../shareToggleState";
+import {
+  getShareComputeModel,
+  resolveShareComputeModel,
+  setShareComputeModel,
+  useShareComputeMaxVramGb,
+  useShareComputeModel,
+} from "../shareComputePreferences";
 import { activitySample, inferInboundWork } from "../meshActivity";
 import { deriveMeshCardModel, type MeshCardTone } from "../meshCardModel";
 import { MeshDetailPopover } from "./MeshDetailPopover";
+import { MeshMemoryBulbs } from "./MeshMemoryBulbs";
 import { MeshTopologyStrip } from "./MeshTopologyStrip";
 
 /**
@@ -30,9 +39,9 @@ import { MeshTopologyStrip } from "./MeshTopologyStrip";
  *   - Am I using someone else's?       → switch off, "Using shared compute"
  *   - What does the community have?    → "MeshLLM · 115 GB, 2 peers"
  *
- * Deliberately NOT a model picker. Turning it on shares the hardware-appropriate
- * curated recommendation (`catalog.recommended`); choosing a specific model,
- * capping memory, and future split controls stay in Settings → Compute.
+ * Deliberately NOT a model picker. Turning it on uses the model and memory cap
+ * chosen in Settings → Compute; choosing them stays in Settings rather than
+ * duplicating configuration controls in the sidebar.
  *
  * Own file rather than living in `AppSidebar.tsx`, which sits at 999/1000 lines
  * against `desktop/scripts/check-file-sizes.mjs`.
@@ -75,6 +84,8 @@ export function SidebarMeshComputeCard({
 }) {
   const shouldReduceMotion = useReducedMotion();
   const { status, refresh: refreshStatus } = useMeshNodeStatus();
+  const selectedModel = useShareComputeModel();
+  const maxVramGb = useShareComputeMaxVramGb();
   const [catalog, setCatalog] = React.useState<MeshModelCatalog | null>(null);
   const [pendingAction, setPendingAction] = React.useState<
     "start" | "stop" | null
@@ -128,14 +139,19 @@ export function SidebarMeshComputeCard({
     previousSampleRef.current = sample;
   }, [sample]);
 
-  // One-shot catalog fetch: the card needs the hardware-appropriate
-  // recommendation so the switch can start sharing without a model picker.
+  // One-shot catalog fetch supplies hardware capacity and initializes the
+  // shared preference only when Settings has never chosen a model.
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const value = await meshModelCatalog();
-        if (!cancelled) setCatalog(value);
+        if (!cancelled) {
+          setCatalog(value);
+          if (getShareComputeModel().trim() === "" && value.recommended) {
+            setShareComputeModel(value.recommended);
+          }
+        }
       } catch {
         // Non-fatal: the switch stays disabled and Settings still works.
       }
@@ -151,17 +167,27 @@ export function SidebarMeshComputeCard({
     setSnapshotNonce((current) => current + 1);
   }, [status?.state, status?.mode]);
 
-  const recommended = catalog?.recommended ?? null;
+  const modelToShare = resolveShareComputeModel(
+    selectedModel,
+    catalog?.recommended,
+  );
+  const activeModel = status?.modelName ?? status?.modelId ?? modelToShare;
+  const memory = deriveMeshMemoryModel({
+    view,
+    catalog,
+    modelRef: activeModel,
+  });
   const model = deriveMeshCardModel({
     snapshot,
     status,
     toggle,
     pendingAction,
-    canShare: Boolean(recommended),
+    canShare: Boolean(modelToShare),
     view,
     usage,
     inboundWork,
     downloadProgress,
+    startingModel: modelToShare,
   });
 
   async function handleToggle(next: boolean) {
@@ -174,10 +200,19 @@ export function SidebarMeshComputeCard({
     setPendingAction(next ? "start" : "stop");
     try {
       if (next) {
-        if (!recommended) {
-          throw new Error("No suitable model for this computer yet");
+        if (!modelToShare) {
+          throw new Error("Choose a model in Compute settings first");
         }
-        await meshStartNode({ mode: "serve", modelId: recommended });
+        const maxVram =
+          maxVramGb.trim() === "" ? undefined : Number.parseFloat(maxVramGb);
+        await meshStartNode({
+          mode: "serve",
+          modelId: modelToShare,
+          maxVramGb:
+            typeof maxVram === "number" && !Number.isNaN(maxVram)
+              ? maxVram
+              : undefined,
+        });
       } else {
         await meshStopNode();
       }
@@ -231,10 +266,14 @@ export function SidebarMeshComputeCard({
             Switch in a button would nest interactive elements.
           */}
           <MeshDetailPopover
+            downloadProgress={downloadProgress}
             inboundWork={inboundWork}
             isSharing={toggle.isSharing}
             onOpenComputeSettings={onOpenComputeSettings}
+            pendingAction={pendingAction}
             snapshot={snapshot}
+            startingModel={modelToShare}
+            status={status}
             usage={usage}
             view={view}
           >
@@ -270,10 +309,14 @@ export function SidebarMeshComputeCard({
           />
         </div>
 
-        <MeshTopologyStrip
-          devices={model.devices}
-          showSoloHint={model.showSoloHint}
-        />
+        {toggle.isSharing && model.tone === "sharing" ? (
+          <MeshMemoryBulbs memory={memory} />
+        ) : (
+          <MeshTopologyStrip
+            devices={model.devices}
+            showSoloHint={model.showSoloHint}
+          />
+        )}
 
         {callToAction.kind === "createAgent" ? (
           // A tip, not a warning: there is compute here and nothing set up to

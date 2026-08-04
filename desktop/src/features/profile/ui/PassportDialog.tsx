@@ -1,4 +1,5 @@
-import { Copy } from "lucide-react";
+import { useNavigate } from "@tanstack/react-router";
+import { BookOpenText, Copy } from "lucide-react";
 import { toast } from "sonner";
 
 import { useCommunities } from "@/features/communities/useCommunities";
@@ -41,6 +42,7 @@ export function PassportDialog({
   ...cardProps
 }: PassportDialogProps) {
   const { activeCommunity } = useCommunities();
+  const navigate = useNavigate();
   const ownerProfileQuery = useUserProfileQuery(ownerPubkey ?? undefined);
   const operatorName = ownerPubkey
     ? ownerProfileQuery.data?.nip05Handle?.trim() ||
@@ -52,6 +54,14 @@ export function PassportDialog({
   const copyKey = async () => {
     await writeTextToClipboard(npub);
     toast.success("Identity key copied.");
+  };
+
+  const openFullPassport = () => {
+    onOpenChange(false);
+    void navigate({
+      search: { pubkey: cardProps.pubkey },
+      to: "/passport",
+    });
   };
 
   return (
@@ -74,16 +84,28 @@ export function PassportDialog({
           communityName={activeCommunity?.name ?? null}
           operatorName={operatorName}
         />
-        <Button
-          className="text-muted-foreground hover:text-foreground"
-          data-testid="passport-copy-key"
-          onClick={() => void copyKey()}
-          size="sm"
-          variant="ghost"
-        >
-          <Copy className="mr-2 h-3.5 w-3.5" />
-          Copy identity key
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button
+            className="text-muted-foreground hover:text-foreground"
+            data-testid="passport-copy-key"
+            onClick={() => void copyKey()}
+            size="sm"
+            variant="ghost"
+          >
+            <Copy className="mr-2 h-3.5 w-3.5" />
+            Copy identity key
+          </Button>
+          <Button
+            className="text-muted-foreground hover:text-foreground"
+            data-testid="passport-view-full"
+            onClick={openFullPassport}
+            size="sm"
+            variant="ghost"
+          >
+            <BookOpenText className="mr-2 h-3.5 w-3.5" />
+            View full passport
+          </Button>
+        </div>
       </DialogContent>
     </Dialog>
   );

@@ -328,19 +328,6 @@ export function MeshComputeSettingsCard() {
                 usePersonaInputStyle
                 value={maxVramGb}
               />
-              {status?.consoleUrl ? (
-                <p className="text-sm font-normal text-muted-foreground">
-                  Debug console:{" "}
-                  <a
-                    className="underline"
-                    href={status.consoleUrl}
-                    rel="noreferrer"
-                    target="_blank"
-                  >
-                    {status.consoleUrl}
-                  </a>
-                </p>
-              ) : null}
             </div>
           ) : null}
         </div>

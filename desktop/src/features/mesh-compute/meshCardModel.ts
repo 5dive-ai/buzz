@@ -5,6 +5,7 @@ import type {
   MeshSnapshot,
   MeshSnapshotDevice,
 } from "@/shared/api/tauriMesh";
+import type { MeshDownloadProgress } from "./hooks/useMeshDownloadProgress";
 import { describeParticipationHint } from "./meshActivity";
 import type { MeshShareToggleModel } from "./shareToggleState";
 
@@ -146,6 +147,62 @@ export function describeReadyModels(
 }
 
 /**
+ * Name the startup stage instead of showing one opaque "Starting…".
+ *
+ * A first-time start does three very different things behind one spinner:
+ * resolve the model, download several gigabytes, then load it into memory. The
+ * download dominates — minutes, not seconds — and an unlabelled spinner during
+ * it reads as a hang. So the download is named and measured; everything else
+ * stays honest about being indeterminate.
+ */
+export function describeStartupHeadline(
+  progress: MeshDownloadProgress | null,
+): string {
+  if (progress?.status === "downloading") {
+    const pct = downloadPercent(progress);
+    return pct === null ? "Downloading model…" : `Downloading model · ${pct}%`;
+  }
+  if (progress?.status === "preparing") {
+    return "Preparing model…";
+  }
+  return "Starting to share…";
+}
+
+/** Secondary line for the startup stages. */
+export function describeStartupStage(
+  progress: MeshDownloadProgress | null,
+): string {
+  if (progress?.status === "downloading") {
+    const total = progress.totalBytes;
+    return total === null
+      ? "First run downloads the model once."
+      : `${formatBytes(progress.downloadedBytes ?? 0)} of ${formatBytes(total)} · first run only`;
+  }
+  if (progress?.status === "preparing") {
+    return "Checking what's already downloaded.";
+  }
+  return "Loading the model into memory.";
+}
+
+function downloadPercent(progress: MeshDownloadProgress): number | null {
+  const { downloadedBytes, totalBytes } = progress;
+  // A percentage needs both figures and a non-zero denominator; without them a
+  // bare "Downloading…" beats a fabricated 0%.
+  if (downloadedBytes === null || totalBytes === null || totalBytes <= 0) {
+    return null;
+  }
+  return Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100));
+}
+
+function formatBytes(bytes: number): string {
+  const gb = bytes / 1e9;
+  if (gb >= 1) {
+    return `${Math.round(gb * 10) / 10} GB`;
+  }
+  return `${Math.round(bytes / 1e6)} MB`;
+}
+
+/**
  * Trim a model reference down to something that fits a 256px sidebar.
  * `unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M` → `Gemma 4 26B A4B`.
  */
@@ -178,6 +235,7 @@ export function deriveMeshCardModel({
   view,
   usage,
   inboundWork,
+  downloadProgress,
 }: {
   snapshot: MeshSnapshot | null;
   status: MeshNodeStatus | null;
@@ -194,6 +252,14 @@ export function deriveMeshCardModel({
    * count flat). Sampled, so it can undercount; it never over-claims.
    */
   inboundWork: boolean;
+  /**
+   * Live model-download progress, when a download is running.
+   *
+   * Without this, a first-time start shows "Starting to share…" for however
+   * long a multi-gigabyte download takes, which reads as a hang. A download is
+   * the single longest and most opaque step, so it gets named and measured.
+   */
+  downloadProgress: MeshDownloadProgress | null;
 }): MeshCardModel {
   const devices = snapshot?.devices ?? [];
   const headline = describeMeshHeadline({ view, snapshot });
@@ -201,6 +267,7 @@ export function deriveMeshCardModel({
   // Solo means "connected but nobody else is here" — a live-view fact. The
   // relay snapshot cannot tell us this: a lone note may just be a stale one.
   const isSolo = view?.connected === true && view.peers.length === 0;
+  const startingDetail = describeStartupStage(downloadProgress);
   const hint = describeParticipationHint({
     isSharing: toggle.isSharing,
     isConsuming: toggle.isConsuming,
@@ -230,8 +297,8 @@ export function deriveMeshCardModel({
     return {
       ...base,
       tone: "pending",
-      headline: "Starting to share…",
-      detail: "Loading the model. This can take a moment.",
+      headline: describeStartupHeadline(downloadProgress),
+      detail: startingDetail,
       showSoloHint: false,
     };
   }
@@ -275,8 +342,8 @@ export function deriveMeshCardModel({
       return {
         ...base,
         tone: "pending",
-        headline: "Starting to share…",
-        detail: "Loading the model. This can take a moment.",
+        headline: describeStartupHeadline(downloadProgress),
+        detail: startingDetail,
         showSoloHint: false,
       };
     }
@@ -291,8 +358,30 @@ export function deriveMeshCardModel({
     };
   }
 
-  // Idle: the invitation. Lead with what the community already has, because
-  // that is the reason to join — not with a description of the mechanism.
+  // Idle. Two very different situations share this branch, and conflating them
+  // was the old bug: a community with compute to offer is an invitation, while
+  // an empty one is a call to be first. Neither is an error.
+  const communityIsEmpty =
+    snapshot !== null && snapshot.sharingDeviceCount === 0;
+  if (communityIsEmpty) {
+    return {
+      ...base,
+      tone: "idle",
+      headline,
+      // No hedging about what *might* be available: nobody is sharing, so the
+      // only true statement is that turning this on creates the capacity.
+      detail: canShare
+        ? "Be the first to share compute here."
+        : // A machine that cannot host anything is not broken, and saying
+          // "turn it on" to someone who cannot is a dead end. It can still
+          // consume once somebody else shares.
+          "This computer is too small to share, but can use shared compute.",
+      showSoloHint: false,
+    };
+  }
+
+  // The community has compute. Lead with what it already has, because that is
+  // the reason to join — not with a description of the mechanism.
   return {
     ...base,
     tone: "idle",

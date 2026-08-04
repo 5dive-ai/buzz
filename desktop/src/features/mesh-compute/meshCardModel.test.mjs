@@ -17,6 +17,8 @@ import {
   describeMeshCapacity,
   describeMeshHeadline,
   describeReadyModels,
+  describeStartupHeadline,
+  describeStartupStage,
   deriveMeshCardModel,
   formatCapacityGb,
   shortModelLabel,
@@ -103,6 +105,7 @@ function derive(overrides = {}) {
     view: null,
     usage: usage(),
     inboundWork: false,
+    downloadProgress: null,
     ...overrides,
   });
 }
@@ -349,4 +352,86 @@ test("an unknown runtime occupant is not silently replaceable", () => {
     toggle: { isSharing: false, isConsuming: false, slotOccupied: true },
   });
   assert.equal(model.switchDisabled, true);
+});
+
+function progress(overrides = {}) {
+  return {
+    label: "gemma",
+    file: "model.gguf",
+    downloadedBytes: null,
+    totalBytes: null,
+    status: "downloading",
+    done: false,
+    ...overrides,
+  };
+}
+
+test("a download is named and measured, not hidden behind 'Starting…'", () => {
+  // Minutes of unlabelled spinner reads as a hang; the download is the longest
+  // and most opaque startup step, so it says so.
+  assert.equal(
+    describeStartupHeadline(
+      progress({ downloadedBytes: 5e9, totalBytes: 17e9 }),
+    ),
+    "Downloading model · 29%",
+  );
+  assert.match(
+    describeStartupStage(progress({ downloadedBytes: 5e9, totalBytes: 17e9 })),
+    /5 GB of 17 GB/,
+  );
+});
+
+test("a download with no known total says so rather than faking 0%", () => {
+  assert.equal(describeStartupHeadline(progress()), "Downloading model…");
+  assert.equal(
+    describeStartupHeadline(progress({ downloadedBytes: 1e9, totalBytes: 0 })),
+    "Downloading model…",
+  );
+});
+
+test("each startup stage is distinguishable", () => {
+  assert.equal(
+    describeStartupHeadline(progress({ status: "preparing" })),
+    "Preparing model…",
+  );
+  assert.equal(describeStartupHeadline(null), "Starting to share…");
+  assert.match(describeStartupStage(null), /Loading the model into memory/);
+});
+
+test("starting shows the download stage on the card", () => {
+  const model = derive({
+    pendingAction: "start",
+    downloadProgress: progress({ downloadedBytes: 2e9, totalBytes: 4e9 }),
+  });
+  assert.equal(model.tone, "pending");
+  assert.equal(model.headline, "Downloading model · 50%");
+});
+
+test("an empty community is a call to be first, not an error", () => {
+  const model = derive({
+    snapshot: snapshot({ sharingDeviceCount: 0, sharedCapacityGb: null }),
+  });
+  assert.equal(model.tone, "idle");
+  assert.match(model.detail, /Be the first to share/);
+});
+
+test("a machine that cannot host is told it can still consume", () => {
+  // Saying "turn it on" to someone who cannot is a dead end; consuming still
+  // works once somebody else shares.
+  const model = derive({
+    snapshot: snapshot({ sharingDeviceCount: 0, sharedCapacityGb: null }),
+    canShare: false,
+  });
+  assert.match(model.detail, /too small to share, but can use shared compute/);
+  assert.equal(model.switchDisabled, true);
+});
+
+test("an unfetched snapshot is not treated as an empty community", () => {
+  // null is "not checked yet" — claiming "be the first" before the relay
+  // answers would be a verdict on everyone else's machines.
+  const model = derive({ snapshot: null });
+  assert.ok(
+    !/Be the first/.test(model.detail ?? ""),
+    `must not claim empty before fetching: ${model.detail}`,
+  );
 });

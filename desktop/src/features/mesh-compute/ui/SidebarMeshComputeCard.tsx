@@ -8,6 +8,7 @@ import { meshStartNode, meshStopNode } from "@/shared/api/tauriMesh";
 import type { MeshModelCatalog } from "@/shared/api/tauriMesh";
 import { meshModelCatalog } from "@/shared/api/tauriMesh";
 
+import { useMeshDownloadProgress } from "../hooks/useMeshDownloadProgress";
 import { useMeshLiveView } from "../hooks/useMeshLiveView";
 import { useMeshNodeStatus } from "../hooks/useMeshNodeStatus";
 import { useMeshServingUsage } from "../hooks/useMeshServingUsage";
@@ -95,6 +96,8 @@ export function SidebarMeshComputeCard({
   // Live gossip view: peers we are actually connected to. Only meaningful while
   // a runtime exists, so it is gated on slot occupancy.
   const { view } = useMeshLiveView(toggle.isSharing || toggle.isConsuming);
+  const { progress: downloadProgress, reset: resetDownloadProgress } =
+    useMeshDownloadProgress();
 
   // Inbound work has no counter in mesh-llm, so it is inferred by elimination
   // across two samples: serving, inflight > 0, and our own dispatch count flat
@@ -144,6 +147,7 @@ export function SidebarMeshComputeCard({
     view,
     usage,
     inboundWork,
+    downloadProgress,
   });
 
   async function handleToggle(next: boolean) {
@@ -169,6 +173,9 @@ export function SidebarMeshComputeCard({
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
       setPendingAction(null);
+      // Clear a lingering final download event so the next start does not begin
+      // by replaying the last run's progress.
+      resetDownloadProgress();
     }
   }
 

@@ -432,23 +432,8 @@ pub fn agent_mcp_config_path(managed_root: &Path, pubkey: &str) -> PathBuf {
 /// any inherited server with this name (case-insensitive) is omitted and warned
 /// so Buzz's channel cannot be shadowed.
 ///
-/// All errors are logged and swallowed; spawn always continues.
-pub fn merge_agent_mcp_servers(
-    agent_config_dir: &Path,
-    owner_mcp_path: &Path,
-    acp_server_name: &str,
-) {
-    let warnings =
-        merge_agent_mcp_servers_with_warnings(agent_config_dir, owner_mcp_path, acp_server_name);
-    for w in &warnings {
-        eprintln!("buzz-desktop: {w}");
-    }
-}
-
-/// Like [`merge_agent_mcp_servers`] but returns the distinct warning strings
-/// for panel-visible persistence via [`write_spawn_warnings`] instead of only
-/// printing them.  Called from `apply_claude_spawn_policy` so warnings are
-/// collected alongside the B7 base-status warning.
+/// Returns the distinct warning strings for panel-visible persistence via
+/// [`write_spawn_warnings`]. All errors are swallowed; spawn always continues.
 pub fn merge_agent_mcp_servers_with_warnings(
     agent_config_dir: &Path,
     owner_mcp_path: &Path,
@@ -591,9 +576,9 @@ pub fn apply_claude_spawn_policy(
              launching with overlay-only settings (non-fatal): {base_status:?}"
         );
         eprintln!("buzz-desktop: {msg}");
-        spawn_warnings.push(format!(
-            "Owner settings.json unreadable — launching with overlay-only settings"
-        ));
+        spawn_warnings.push(
+            "Owner settings.json unreadable — launching with overlay-only settings".to_string(),
+        );
     }
     write_projected_settings(&policy, &projected)?;
     // B8: inherit owner user-scope MCP servers into the per-agent .claude.json.

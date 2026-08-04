@@ -329,10 +329,15 @@ fn test_no_effort_level_does_not_inject_empty() {
 
 #[test]
 fn test_projection_write_failure_blocks_spawn() {
-    // Simulate write failure by using a path under a nonexistent root
-    // with no create_dir_all help.
+    // Simulate write failure portably: create a regular file, then use a path
+    // *under* that file as config_dir.  create_dir_all fails on every OS when
+    // a path component is a regular file (not a directory), so the test does
+    // not rely on a non-existent root path that Windows can still create.
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("i_am_a_file");
+    std::fs::write(&blocker, b"").unwrap();
     let policy = ClaudeLaunchPolicy {
-        config_dir: PathBuf::from("/nonexistent/path/that/cannot/be/created/xyz"),
+        config_dir: blocker.join("cannot_create_under_a_file"),
         secure_storage_config_dir: String::new(),
         effort_level: None,
     };
@@ -541,7 +546,7 @@ fn test_b8_merge_writes_owner_mcp_servers_to_agent_root() {
         }),
     );
 
-    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+    merge_agent_mcp_servers_with_warnings(&agent_dir, &owner_mcp, "buzz-mcp");
 
     let result = read_json(&agent_file).expect("agent file written");
     let servers = result["mcpServers"].as_object().expect("mcpServers object");
@@ -571,7 +576,7 @@ fn test_b8_merge_preserves_agent_owned_keys() {
         &serde_json::json!({ "hasCompletedOnboarding": true }),
     );
 
-    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+    merge_agent_mcp_servers_with_warnings(&agent_dir, &owner_mcp, "buzz-mcp");
 
     let result = read_json(&agent_file).expect("agent file written");
     assert_eq!(
@@ -606,7 +611,7 @@ fn test_b8_owner_read_failure_preserves_prior_inherited_set() {
     // returns an Err, triggering the "preserve prior set" code path.
     let dir_as_file = dir.path().join("a_directory");
     std::fs::create_dir_all(&dir_as_file).unwrap();
-    merge_agent_mcp_servers(&agent_dir, &dir_as_file, "buzz-mcp");
+    merge_agent_mcp_servers_with_warnings(&agent_dir, &dir_as_file, "buzz-mcp");
 
     let after = std::fs::read_to_string(&agent_file).unwrap();
     assert_eq!(
@@ -631,7 +636,7 @@ fn test_b8_empty_owner_mcp_servers_clears_inherited_set() {
         &serde_json::json!({ "mcpServers": { "old-server": {} } }),
     );
 
-    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+    merge_agent_mcp_servers_with_warnings(&agent_dir, &owner_mcp, "buzz-mcp");
 
     let result = read_json(&agent_file).expect("file written");
     let servers = result["mcpServers"]
@@ -659,7 +664,7 @@ fn test_b8_invalid_agent_file_falls_back_to_owner_only() {
     );
     std::fs::write(&agent_file, b"not valid json {{ at all").unwrap();
 
-    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+    merge_agent_mcp_servers_with_warnings(&agent_dir, &owner_mcp, "buzz-mcp");
 
     let result = read_json(&agent_file).expect("file replaced with valid JSON");
     let servers = result["mcpServers"].as_object().expect("mcpServers object");
@@ -696,7 +701,7 @@ fn test_b8_collision_filter_removes_acp_name_collision() {
         }),
     );
 
-    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+    merge_agent_mcp_servers_with_warnings(&agent_dir, &owner_mcp, "buzz-mcp");
 
     let result = read_json(&agent_file).expect("file written");
     let servers = result["mcpServers"].as_object().expect("mcpServers object");
@@ -728,7 +733,7 @@ fn test_b8_empty_acp_name_disables_collision_filter() {
         &serde_json::json!({ "mcpServers": { "filesystem": {}, "github": {} } }),
     );
 
-    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "");
+    merge_agent_mcp_servers_with_warnings(&agent_dir, &owner_mcp, "");
 
     let result = read_json(&agent_file).expect("file written");
     let servers = result["mcpServers"].as_object().expect("mcpServers object");
@@ -749,7 +754,7 @@ fn test_b8_missing_owner_file_writes_empty_mcp_set() {
     std::fs::create_dir_all(&agent_dir).unwrap();
     let agent_file = agent_dir.join(".claude.json");
 
-    merge_agent_mcp_servers(&agent_dir, &owner_mcp, "buzz-mcp");
+    merge_agent_mcp_servers_with_warnings(&agent_dir, &owner_mcp, "buzz-mcp");
 
     let result = read_json(&agent_file).expect("file written for missing owner");
     let servers = result["mcpServers"]
@@ -761,7 +766,7 @@ fn test_b8_missing_owner_file_writes_empty_mcp_set() {
     );
 }
 
-/// Concurrent calls to `merge_agent_mcp_servers` for the same agent root must
+/// Concurrent calls to `merge_agent_mcp_servers_with_warnings` for the same agent root must
 /// not corrupt the file.  The atomic-rename durability primitive ensures each
 /// write is all-or-nothing; the winner produces valid JSON.
 ///
@@ -782,8 +787,10 @@ fn test_b8_serialization_no_lost_update() {
 
     let (o1, a1) = (Arc::clone(&owner_mcp), Arc::clone(&agent_dir));
     let (o2, a2) = (Arc::clone(&owner_mcp), Arc::clone(&agent_dir));
-    let t1 = std::thread::spawn(move || merge_agent_mcp_servers(&a1, &o1, "buzz-mcp"));
-    let t2 = std::thread::spawn(move || merge_agent_mcp_servers(&a2, &o2, "buzz-mcp"));
+    let t1 =
+        std::thread::spawn(move || merge_agent_mcp_servers_with_warnings(&a1, &o1, "buzz-mcp"));
+    let t2 =
+        std::thread::spawn(move || merge_agent_mcp_servers_with_warnings(&a2, &o2, "buzz-mcp"));
     t1.join().unwrap();
     t2.join().unwrap();
 
@@ -839,7 +846,7 @@ fn test_b8_agent_write_failure_does_not_block_spawn() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    // merge_agent_mcp_servers must not panic or return Err — spawn continues.
+    // merge_agent_mcp_servers_with_warnings must not panic or return Err — spawn continues.
     // We verify it returns exactly one warning (failure state #3).
     let warnings = merge_agent_mcp_servers_with_warnings(&agent_dir, &owner_mcp, "buzz-mcp");
     let has_write_failure_warning = warnings.iter().any(|w| w.contains("may be stale"));

@@ -217,7 +217,7 @@ test.beforeEach(async ({ page }, testInfo) => {
                         imageDomain: null,
                       },
                       linkPreviewMetadataDelayMs: testInfo.title.includes(
-                        "avoids a long task",
+                        "raw paste bypasses clipboard parsing",
                       )
                         ? 10_000
                         : testInfo.title.includes("style defaults") ||
@@ -475,7 +475,7 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   await page.getByTestId("link-preview-style-compact").click();
 });
 
-test("link preview plain URL paste avoids a long task before the loading card", async ({
+test("link preview raw paste bypasses clipboard parsing before loading", async ({
   page,
 }) => {
   const previewUrl = "https://github.com/block/buzz/pull/3246?paste=async";
@@ -512,9 +512,6 @@ test("link preview plain URL paste avoids a long task before the loading card", 
     };
   }, previewUrl);
   expect(firstPaint.text).toContain(previewUrl);
-  // A 50ms task is the browser's standard long-task boundary. Guard the
-  // synchronous paste event itself and require three advancing frames so a
-  // later multi-frame stall cannot hide behind one permissive rAF assertion.
   expect(firstPaint.pasteEventMs).toBeLessThan(50);
   expect(firstPaint.frameTimes).toHaveLength(3);
   expect(firstPaint.frameTimes[2]).toBeGreaterThan(firstPaint.frameTimes[0]);

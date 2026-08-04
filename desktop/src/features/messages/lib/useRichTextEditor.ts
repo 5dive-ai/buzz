@@ -486,6 +486,28 @@ export function useRichTextEditor({
         }),
       ],
       editorProps: {
+        handleDOMEvents: {
+          paste: (view, event) => {
+            const text = (event as ClipboardEvent).clipboardData?.getData(
+              "text/plain",
+            );
+            if (!text || !/^https?:\/\/\S+$/i.test(text)) return false;
+            const { from, to } = view.state.selection;
+            const link = view.state.schema.marks.link;
+            if (!link) return false;
+            let tr = view.state.tr.replaceRangeWith(
+              from,
+              to,
+              view.state.schema.text(text, [link.create({ href: text })]),
+            );
+            const end = tr.mapping.map(to);
+            tr = tr.insertText(" ", end).removeMark(end, end + 1, link);
+            tr = tr.setSelection(TextSelection.create(tr.doc, end + 1));
+            view.dispatch(tr.setStoredMarks([]).scrollIntoView());
+            event.preventDefault();
+            return true;
+          },
+        },
         attributes: {
           autocapitalize: "none",
           autocorrect: "off",
@@ -812,35 +834,6 @@ export function useRichTextEditor({
     [editor, customEmojiWiring.resolveUrl],
   );
 
-  const insertPlainHttpLink = React.useCallback(
-    (text: string): boolean => {
-      // A plain URL is the common link-preview path. Insert it directly as a
-      // ProseMirror link instead of sending it through tiptap-markdown's full
-      // clipboard parser; that parser blocks the paste event long enough to
-      // drop visible frames before the preview can render.
-      if (!editor || !/^https?:\/\/\S+$/i.test(text)) return false;
-      const { state, view } = editor;
-      const { from, to } = state.selection;
-      const linkMark = state.schema.marks.link;
-      if (!linkMark) return false;
-
-      const linkedText = state.schema.text(text, [
-        linkMark.create({ href: text }),
-      ]);
-      let transaction = state.tr.replaceRangeWith(from, to, linkedText);
-      const linkEnd = transaction.mapping.map(to);
-      transaction = transaction.insertText(" ", linkEnd);
-      transaction = transaction.removeMark(linkEnd, linkEnd + 1, linkMark);
-      transaction = transaction.setSelection(
-        TextSelection.create(transaction.doc, linkEnd + 1),
-      );
-      transaction.setStoredMarks([]);
-      view.dispatch(transaction.scrollIntoView());
-      return true;
-    },
-    [editor],
-  );
-
   /**
    * Link mark info for the current selection — its href and the covered
    * text, expanded to the full link range when the caret merely sits inside
@@ -928,7 +921,6 @@ export function useRichTextEditor({
     focusPreserve,
     getPlainTextAndCursor,
     replacePlainTextRange,
-    insertPlainHttpLink,
     getLinkSelectionInfo,
     applyLink,
     removeLink,

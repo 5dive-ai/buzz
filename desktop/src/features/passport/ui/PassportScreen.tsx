@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useNavigate } from "@tanstack/react-router";
 import { Activity, Copy, UserRound } from "lucide-react";
 import { toast } from "sonner";
 
@@ -19,6 +20,8 @@ import {
   normalizeRelayUrl,
 } from "@/features/passport/lib/travelLog";
 import {
+  AgentCrewList,
+  type CrewAgent,
   EmptyRecord,
   FollowingStrip,
   formatStampDate,
@@ -157,6 +160,63 @@ export function PassportScreen({
   );
   const contactProfilesQuery = useUsersBatchQuery(contactPubkeys.slice(0, 12));
 
+  // Agents operating under the holder's identity. Relay agents declare their
+  // owner publicly (kind-0 ownerPubkey), so this works on anyone's passport;
+  // locally managed agents are the viewer's own custody and merge in only on
+  // the self passport.
+  const agentPubkeys = React.useMemo(
+    () => (relayAgentsQuery.data ?? []).map((agent) => agent.pubkey),
+    [relayAgentsQuery.data],
+  );
+  const agentProfilesQuery = useUsersBatchQuery(agentPubkeys);
+  const ownedAgents = React.useMemo<CrewAgent[]>(() => {
+    if (!pubkeyLower || isAgent) {
+      return [];
+    }
+    const agents = new Map<string, CrewAgent>();
+    for (const agent of relayAgentsQuery.data ?? []) {
+      const summary =
+        agentProfilesQuery.data?.profiles[agent.pubkey.toLowerCase()];
+      if (summary?.ownerPubkey?.toLowerCase() === pubkeyLower) {
+        agents.set(agent.pubkey.toLowerCase(), {
+          avatarUrl: summary.avatarUrl ?? null,
+          name: summary.displayName?.trim() || agent.name,
+          pubkey: agent.pubkey,
+        });
+      }
+    }
+    if (isSelf) {
+      for (const agent of managedAgentsQuery.data ?? []) {
+        const key = agent.pubkey.toLowerCase();
+        if (!agents.has(key)) {
+          agents.set(key, {
+            avatarUrl: agent.avatarUrl,
+            name: agent.name,
+            pubkey: agent.pubkey,
+          });
+        }
+      }
+    }
+    return [...agents.values()].sort((left, right) =>
+      left.name.localeCompare(right.name),
+    );
+  }, [
+    agentProfilesQuery.data,
+    isAgent,
+    isSelf,
+    managedAgentsQuery.data,
+    pubkeyLower,
+    relayAgentsQuery.data,
+  ]);
+
+  const navigate = useNavigate();
+  const openAgentPassport = React.useCallback(
+    (agentPubkey: string) => {
+      void navigate({ search: { pubkey: agentPubkey }, to: "/passport" });
+    },
+    [navigate],
+  );
+
   // Card fields, resolved the same way the passport dialog resolves them.
   const displayName =
     profile?.displayName?.trim() ||
@@ -184,6 +244,7 @@ export function PassportScreen({
     memberChannels.length === 0 &&
     notes.length === 0 &&
     contactPubkeys.length === 0 &&
+    ownedAgents.length === 0 &&
     !isSelf &&
     !hasAgentRecord;
 
@@ -281,6 +342,18 @@ export function PassportScreen({
                     />
                   ))}
                 </StampPage>
+              </RecordSection>
+            ) : null}
+
+            {ownedAgents.length > 0 ? (
+              <RecordSection
+                label="Operates · Agents"
+                trailing={`${ownedAgents.length}`}
+              >
+                <AgentCrewList
+                  agents={ownedAgents}
+                  onOpenPassport={openAgentPassport}
+                />
               </RecordSection>
             ) : null}
 

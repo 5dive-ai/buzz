@@ -148,6 +148,53 @@ export function NoteRecordList({ notes }: { notes: UserNote[] }) {
   );
 }
 
+// ── Agent crew ───────────────────────────────────────────────────────────────
+
+export type CrewAgent = {
+  avatarUrl: string | null;
+  name: string;
+  pubkey: string;
+};
+
+/**
+ * Agents operating under the holder's identity. Each chip opens that agent's
+ * own passport — the operator link on it points back here.
+ */
+export function AgentCrewList({
+  agents,
+  onOpenPassport,
+}: {
+  agents: CrewAgent[];
+  onOpenPassport: (pubkey: string) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2" data-testid="passport-agents">
+      {agents.map((agent) => (
+        <button
+          className="flex min-w-0 items-center gap-2.5 rounded-xl border border-border/70 bg-muted/40 py-2 pr-3.5 pl-2.5 text-left transition-colors hover:border-border hover:bg-muted/70 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-hidden"
+          data-testid="passport-agent-chip"
+          key={agent.pubkey}
+          onClick={() => onOpenPassport(agent.pubkey)}
+          type="button"
+        >
+          <ProfileAvatar
+            avatarUrl={agent.avatarUrl}
+            className="h-8 w-8"
+            iconClassName="h-3.5 w-3.5"
+            label={agent.name}
+          />
+          <span className="flex min-w-0 flex-col">
+            <span className="truncate text-sm font-medium">{agent.name}</span>
+            <span className="text-3xs font-medium tracking-[0.2em] text-muted-foreground uppercase">
+              Agent · View passport
+            </span>
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // ── Following strip ──────────────────────────────────────────────────────────
 
 export function FollowingStrip({

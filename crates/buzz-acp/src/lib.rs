@@ -37,8 +37,8 @@ use filter::SubscriptionRule;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
-    PromptResult, PromptSource, SessionState, TimeoutKind,
+    AgentPool, ControlSignal, IdleEffortResult, IdleSwitchResult, OwnedAgent, PromptContext,
+    PromptOutcome, PromptResult, PromptSource, SessionState, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
@@ -885,6 +885,9 @@ fn handle_relay_observer_control_event(
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
         }
+        Some("set_config_option") => {
+            handle_set_config_option_control(&payload, pool, observer);
+        }
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
         }
@@ -914,29 +917,16 @@ fn handle_cancel_turn_control(
             None,
             &observer::ObserverContext {
                 channel_id: Some(channel_id.to_string()),
-                session_id: None,
-                turn_id: None,
-                started_at: None,
+                ..Default::default()
             },
-            serde_json::json!({
-                "type": "cancel_turn",
-                "status": status,
-            }),
+            serde_json::json!({"type": "cancel_turn", "status": status}),
         );
     }
 }
 
-/// Handle a `switch_model` control frame (Phase 3a, Option ii).
-///
-/// Busy path: deliver `SwitchModel` over the in-flight task's oneshot — the
-/// task cancels the turn, sets `desired_model`, and requeues the batch so it
-/// re-runs on a fresh session under the new model. A catalog miss surfaces
-/// post-cancel via `create_session_and_apply_model` (the turn restarts on the
-/// unchanged model + an `unsupported_model` result).
-///
-/// Idle path: validate against the cached catalog *before* invalidating
-/// (pre-cancel guard), then set `desired_model` + invalidate. The override
-/// takes visible effect on the agent's next turn.
+/// Handle a `switch_model` control frame. Busy path: deliver `SwitchModel`
+/// over the in-flight task oneshot so it cancels + requeues on the new model.
+/// Idle path: validate against catalog then set `desired_model` + invalidate.
 fn handle_switch_model_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
@@ -955,18 +945,14 @@ fn handle_switch_model_control(
         return;
     };
 
-    // A turn is in flight for this channel iff a task_map entry exists. The
-    // agent is moved out of the pool during a turn, so the control oneshot is
-    // the only reachable lever; an idle channel has no such entry.
+    // A turn is in flight iff a task_map entry exists for this channel.
     let turn_in_flight = pool
         .task_map()
         .values()
         .any(|m| m.channel_id == Some(channel_id));
 
     let status = if turn_in_flight {
-        // Busy path: deliver over the oneshot. `false` means the oneshot was
-        // already consumed this turn (a prior cancel/interrupt) — the turn is
-        // already ending, so the switch cannot land on it.
+        // Busy path: deliver over the oneshot (`false` = oneshot already consumed, turn ending).
         if signal_in_flight_task(
             pool,
             channel_id,
@@ -991,17 +977,76 @@ fn handle_switch_model_control(
             None,
             &observer::ObserverContext {
                 channel_id: Some(channel_id.to_string()),
-                session_id: None,
-                turn_id: None,
-                started_at: None,
+                ..Default::default()
             },
-            serde_json::json!({
-                "type": "switch_model",
-                "status": status,
-                "modelId": model_id,
-            }),
+            serde_json::json!({"type": "switch_model", "status": status, "modelId": model_id}),
         );
     }
+}
+
+/// Handle a `set_config_option` control frame.
+///
+/// For the `thought_level` category (B5 effort path): discovers the real
+/// configId from the agent's cached capabilities, queues `desired_effort` on
+/// the idle agent, and emits a real-status ack so Desktop persists only on
+/// genuine ok. If no session has been created yet (`NoCatalog`) the harness
+/// emits `"pending_session"` — Desktop must not persist on that status.
+///
+/// Unknown configIds and non-effort options are passed through with a synthetic
+/// `"ok"` ack (the pre-B5 behaviour), so existing callers don't break.
+fn handle_set_config_option_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let Some(obs) = observer else { return };
+    let config_id = payload
+        .get("configId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let value = payload.get("value").and_then(|v| v.as_str()).unwrap_or("");
+
+    // B5: for the thought_level configId, forward to the pool and report the
+    // real outcome. The configId the caller sends must match what the adapter
+    // advertised in session/new (agentConfigCore.ts uses the one from the
+    // session cache via deferredUntilNativeOptionsAvailable resolution).
+    let thought_level_id: Option<String> = pool.agents_mut().iter().flatten().find_map(|a| {
+        a.model_capabilities
+            .as_ref()
+            .and_then(|c| c.thought_level_config_id.clone())
+    });
+
+    let is_thought_level = thought_level_id.as_deref() == Some(config_id);
+    let status = if is_thought_level {
+        match pool.set_idle_agent_effort(config_id, value) {
+            IdleEffortResult::Queued => "ok",
+            IdleEffortResult::NoCatalog => "pending_session",
+            IdleEffortResult::NoIdleAgent => "no_idle_agent",
+        }
+    } else {
+        // Not a thought_level option — synthetic ok (no-op behaviour unchanged).
+        "ok"
+    };
+
+    // B5: include "category": "thought_level" ONLY on the real-forward branch.
+    // Synthetic acks carry no category so the Desktop observer cannot persist
+    // them as if they were confirmed thought_level changes.
+    let mut ack = serde_json::json!({
+        "type": "set_config_option",
+        "configId": config_id,
+        "status": status,
+        "value": value,
+    });
+    if is_thought_level {
+        ack["category"] = serde_json::json!("thought_level");
+    }
+
+    obs.emit(
+        "control_result",
+        None,
+        &observer::ObserverContext::default(),
+        ack,
+    );
 }
 
 /// Maximum crashes in a 60-second window before a slot's circuit opens.
@@ -1862,6 +1907,7 @@ async fn tokio_main() -> Result<()> {
                         model_capabilities: None,
                         desired_model: config.model.clone(),
                         model_overridden: false,
+                        desired_effort: None,
                         agent_name,
                         goose_system_prompt_supported: None,
                         protocol_version,
@@ -3938,6 +3984,7 @@ async fn initialize_agent_pool(
                             model_capabilities: None,
                             desired_model: startup.model.clone(),
                             model_overridden: false,
+                            desired_effort: None,
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
@@ -5391,6 +5438,7 @@ mod error_outcome_emission_tests {
             model_capabilities: None,
             desired_model: None,
             model_overridden: false,
+            desired_effort: None,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             // Error branches under test never read this; 1 is the legacy
@@ -6775,5 +6823,222 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+#[cfg(test)]
+mod control_result_tests {
+    use super::*;
+
+    // ── B5 harness-level tests for handle_set_config_option_control ──────────
+    //
+    // These tests verify the ack emitted by handle_set_config_option_control
+    // carries the real outcome from set_idle_agent_effort, not a synthetic "ok".
+    //
+    // The observer is checked via snapshot() after the call to verify
+    // both the kind ("control_result") and the status field.
+    //
+    // Implementation note: the harness only enters the thought_level branch when
+    // thought_level_id matches the incoming configId. When no agent has a
+    // thought_level_config_id set, the harness falls back to synthetic "ok"
+    // (backward compatibility — it cannot identify the option as thought_level).
+    // The meaningful test cases are therefore:
+    //   1. thought_level_config_id IS set and matches → pool outcome reflects reality
+    //   2. thought_level_config_id is NOT set (or pool empty) → synthetic ok
+    //   3. unknown configId → synthetic ok regardless
+
+    /// B5: when the pool has an agent whose thought_level_config_id matches
+    /// the incoming configId, the ack must carry the real pool outcome —
+    /// here Queued → "ok".  Session must also be invalidated.
+    #[tokio::test]
+    async fn test_b5_set_config_option_queued_emits_ok_ack_and_invalidates() {
+        use crate::acp::AcpClient;
+        use crate::pool::AgentModelCapabilities;
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test agent");
+        let ch = uuid::Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(ch, "sess-1".into());
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                // thought_level_config_id matches the configId we'll send.
+                thought_level_config_id: Some("effort".to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "high",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.kind, "control_result");
+        assert_eq!(ev.payload["type"].as_str().unwrap(), "set_config_option");
+        // Queued → "ok" ack — Desktop may persist on this status.
+        assert_eq!(
+            ev.payload["status"].as_str().unwrap(),
+            "ok",
+            "Queued must yield ok ack"
+        );
+        // Real-forward ack must carry category so Desktop knows to persist.
+        assert_eq!(
+            ev.payload["category"].as_str().unwrap(),
+            "thought_level",
+            "real thought_level forward must include category field"
+        );
+        // Session must be invalidated so next turn creates a fresh session.
+        let agent = pool.agents_mut().iter().flatten().next().unwrap();
+        assert!(
+            agent.state.sessions.is_empty(),
+            "session must be invalidated after effort queued"
+        );
+    }
+
+    /// B5: when the pool has no agents with thought_level_config_id set,
+    /// the harness cannot identify the option as thought_level and falls back
+    /// to synthetic "ok".  This is the pre-first-session state — Desktop sees
+    /// "ok" but the harness has not forwarded anything; however, this path is
+    /// only reachable when thought_level_config_id is unknown (no session yet).
+    #[test]
+    fn test_b5_set_config_option_no_thought_level_id_emits_synthetic_ok() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "high",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        // No thought_level_config_id in pool → falls back to synthetic ok.
+        assert_eq!(
+            events[0].payload["status"].as_str().unwrap(),
+            "ok",
+            "without thought_level_config_id, harness emits synthetic ok"
+        );
+        // Synthetic ok must NOT carry category — Desktop must not persist it.
+        assert!(
+            events[0].payload.get("category").is_none() || events[0].payload["category"].is_null(),
+            "synthetic ok must not carry category field"
+        );
+    }
+
+    /// B5: a non-thought_level configId must still receive a synthetic "ok"
+    /// for backward compatibility with unknown options.
+    #[test]
+    fn test_b5_set_config_option_unknown_config_id_emits_synthetic_ok() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "some_unknown_option",
+            "value": "x",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["status"].as_str().unwrap(),
+            "ok",
+            "unknown configId must yield synthetic ok for backward compat"
+        );
+    }
+
+    /// B5 persistence gate — real-forward ack carries `"category": "thought_level"`.
+    /// The Desktop observer gates persistence on this field; renaming the adapter's
+    /// configId does not break persistence as long as the category is present.
+    #[tokio::test]
+    async fn test_b5_real_forward_ack_includes_thought_level_category() {
+        use crate::acp::AcpClient;
+        use crate::pool::AgentModelCapabilities;
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test agent");
+        // Use a renamed configId ("think_level_v2") to prove category-gating
+        // does not depend on a hardcoded "effort" literal.
+        let thought_level_id = "think_level_v2".to_string();
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                thought_level_config_id: Some(thought_level_id.clone()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": thought_level_id,
+            "value": "high",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["status"].as_str().unwrap(), "ok");
+        // Real-forward ack must carry category so Desktop persists.
+        assert_eq!(
+            events[0].payload["category"].as_str().unwrap(),
+            "thought_level",
+            "real thought_level forward must include category field"
+        );
+    }
+
+    /// B5 persistence gate — synthetic ack (no thought_level_config_id in pool)
+    /// must NOT carry `"category"`. The Desktop observer gates persistence on the
+    /// category field; absent category means no persist.
+    #[test]
+    fn test_b5_synthetic_ok_ack_has_no_category() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "high",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["status"].as_str().unwrap(), "ok");
+        // Synthetic ack must NOT carry category — Desktop must not persist it.
+        assert!(
+            events[0].payload.get("category").is_none() || events[0].payload["category"].is_null(),
+            "synthetic ok ack must not carry category field"
+        );
     }
 }

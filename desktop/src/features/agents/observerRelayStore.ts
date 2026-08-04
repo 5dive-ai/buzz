@@ -3,7 +3,10 @@ import * as React from "react";
 import { subscribeToAgentObserverFrames } from "@/shared/api/observerRelay";
 import type { RelayEvent, ManagedAgent } from "@/shared/api/types";
 import type { ControlResultFrame } from "@/shared/api/types";
-import { putAgentSessionConfig } from "@/shared/api/tauri";
+import {
+  putAgentSessionConfig,
+  persistAgentEffortLevel,
+} from "@/shared/api/tauri";
 import { putManagedAgentRuntimeLifecycle } from "@/shared/api/tauriManagedAgents";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import { decryptObserverEvent } from "@/shared/api/tauriObserver";
@@ -498,6 +501,23 @@ function isControlResultFrame(payload: unknown): payload is ControlResultFrame {
 function dispatchControlResult(agentPubkey: string, payload: unknown) {
   if (!isControlResultFrame(payload)) {
     return;
+  }
+  // B5: on a positive set_config_option ack for a confirmed thought_level
+  // option, persist the canonical value to the agent record so it seeds
+  // settings.json on next spawn (B7).
+  // Gate on `category === "thought_level"` (present only on real-forward acks)
+  // rather than a literal configId — if the adapter renames the configId,
+  // persistence still works; synthetic acks (no category) never persist.
+  if (
+    payload.type === "set_config_option" &&
+    payload.category === "thought_level" &&
+    payload.status === "ok"
+  ) {
+    void persistAgentEffortLevel(agentPubkey, payload.value || null).catch(
+      (err: unknown) => {
+        console.warn("Failed to persist effort level:", err);
+      },
+    );
   }
   const subscribers = controlResultListeners.get(normalizePubkey(agentPubkey));
   if (!subscribers) {

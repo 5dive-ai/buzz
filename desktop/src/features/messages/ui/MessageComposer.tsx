@@ -100,11 +100,10 @@ function MessageComposerImpl({
     syncContentRefFromEditorRef,
   } = useComposerContentState();
   const [previewContent, setPreviewContent] = React.useState("");
-  const deferredPreviewContent = React.useDeferredValue(previewContent);
   const {
     previewList: composerLinkPreviews,
     getReadyTags: getReadyLinkPreviewTags,
-  } = useComposerLinkPreviews(deferredPreviewContent);
+  } = useComposerLinkPreviews(previewContent);
   const [isEmojiPickerOpen, setIsEmojiPickerOpen] = React.useState(false);
   const [isFormattingOpen, setIsFormattingOpen] = React.useState(false);
   const [spoileredAttachmentUrls, setSpoileredAttachmentUrls] = React.useState<
@@ -264,7 +263,7 @@ function MessageComposerImpl({
     onLinkShortcut: () => onLinkShortcutRef.current?.() ?? false,
     onUpdate: ({ cursor, text }) => {
       setComposerContentFromText(text);
-      setPreviewContent(text);
+      React.startTransition(() => setPreviewContent(text));
       mentions.updateMentionQuery(text, cursor);
       channelLinks.updateChannelQuery(text, cursor);
       emojiAutocomplete.updateEmojiQuery(text, cursor);
@@ -735,6 +734,8 @@ function MessageComposerImpl({
   // ── Media paste + ⌘K link shortcut via Tiptap editorProps ──────────
   const uploadFileRef = React.useRef(media.uploadFile);
   uploadFileRef.current = media.uploadFile;
+  const insertPlainHttpLinkRef = React.useRef(richText.insertPlainHttpLink);
+  insertPlainHttpLinkRef.current = richText.insertPlainHttpLink;
   React.useEffect(() => {
     if (!richText.editor) return;
     richText.editor.setOptions({
@@ -792,6 +793,10 @@ function MessageComposerImpl({
             return true;
           }
           const plainText = event.clipboardData?.getData("text/plain") ?? "";
+          if (insertPlainHttpLinkRef.current(plainText)) {
+            event.preventDefault();
+            return true;
+          }
           if (plainText.includes("\n")) {
             scrollComposerToBottom();
           }
@@ -820,11 +825,9 @@ function MessageComposerImpl({
     ],
   );
   const handleCaptureSelection = React.useCallback(() => {}, []);
-
   const handlePaperclipClick = React.useCallback(() => {
     void media.handlePaperclip();
   }, [media.handlePaperclip]);
-
   const handleRemoveAttachment = React.useCallback(
     (url: string) => {
       setSpoileredAttachmentUrls((current) => {
@@ -837,14 +840,12 @@ function MessageComposerImpl({
     },
     [media.removeAttachment],
   );
-
   const { handleAttachmentEditSave, handleAttachmentRevert } =
     useAttachmentEditing({
       revertAttachment: media.revertAttachment,
       setSpoileredAttachmentUrls,
       uploadEditedAttachment: media.uploadEditedAttachment,
     });
-
   const handleToggleAttachmentSpoiler = React.useCallback((url: string) => {
     setSpoileredAttachmentUrls((current) => {
       const next = new Set(current);
@@ -949,7 +950,6 @@ function MessageComposerImpl({
                 </button>
               </div>
             ) : null}
-
             {composerLinkPreviews}
             {(media.pendingImeta.length > 0 ||
               media.queuedAttachments.length > 0 ||

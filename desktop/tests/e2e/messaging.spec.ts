@@ -217,7 +217,7 @@ test.beforeEach(async ({ page }, testInfo) => {
                         imageDomain: null,
                       },
                       linkPreviewMetadataDelayMs: testInfo.title.includes(
-                        "loading card asynchronously",
+                        "avoids a long task",
                       )
                         ? 10_000
                         : testInfo.title.includes("style defaults") ||
@@ -475,7 +475,7 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   await page.getByTestId("link-preview-style-compact").click();
 });
 
-test("link preview paste paints the loading card asynchronously", async ({
+test("link preview plain URL paste avoids a long task before the loading card", async ({
   page,
 }) => {
   const previewUrl = "https://github.com/block/buzz/pull/3246?paste=async";
@@ -495,16 +495,29 @@ test("link preview paste paints the loading card asynchronously", async ({
         clipboardData,
       }),
     );
-    await new Promise<void>((resolve) =>
-      requestAnimationFrame(() => resolve()),
-    );
+    const pasteEventMs = performance.now() - startedAt;
+    const frameTimes: number[] = [];
+    for (let frame = 0; frame < 3; frame += 1) {
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame((timestamp) => {
+          frameTimes.push(timestamp - startedAt);
+          resolve();
+        }),
+      );
+    }
     return {
-      elapsedMs: performance.now() - startedAt,
+      pasteEventMs,
+      frameTimes,
       text: element.textContent,
     };
   }, previewUrl);
   expect(firstPaint.text).toContain(previewUrl);
-  expect(firstPaint.elapsedMs).toBeLessThan(250);
+  // A 50ms task is the browser's standard long-task boundary. Guard the
+  // synchronous paste event itself and require three advancing frames so a
+  // later multi-frame stall cannot hide behind one permissive rAF assertion.
+  expect(firstPaint.pasteEventMs).toBeLessThan(50);
+  expect(firstPaint.frameTimes).toHaveLength(3);
+  expect(firstPaint.frameTimes[2]).toBeGreaterThan(firstPaint.frameTimes[0]);
   const composerPreview = page
     .locator("[data-composer-link-previews]")
     .locator('[data-link-preview="github-pull-request"]');

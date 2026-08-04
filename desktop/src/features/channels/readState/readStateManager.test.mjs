@@ -96,121 +96,34 @@ const channelKey = "channel-1";
 const channelResolver = (ctx) =>
   ctx.startsWith("thread:") ? channelKey : null;
 
-// prettier-ignore
+// biome-ignore format: compact table rows
 const resolveEffectiveTimestampCases = [
-  {
-    name: "returns own value when context has no parent",
-    effectiveState: new Map([[channelKey, 200]]),
-    contextId: channelKey,
-    resolver: channelResolver,
-    expected: 200,
-  },
-  {
-    name: "inherits the channel frontier when it is newer than the thread",
-    effectiveState: new Map([
-      [threadKey, 100],
-      [channelKey, 300],
-    ]),
-    contextId: threadKey,
-    resolver: channelResolver,
-    expected: 300,
-  },
-  {
-    name: "keeps the thread frontier when it is newer than the channel",
-    effectiveState: new Map([
-      [threadKey, 400],
-      [channelKey, 300],
-    ]),
-    contextId: threadKey,
-    resolver: channelResolver,
-    expected: 400,
-  },
-  {
-    name: "returns the channel frontier when the thread was never read",
-    effectiveState: new Map([[channelKey, 300]]),
-    contextId: threadKey,
-    resolver: channelResolver,
-    expected: 300,
-  },
-  {
-    name: "degrades to the thread's own value when the root is unresolvable",
-    effectiveState: new Map([
-      [threadKey, 100],
-      [channelKey, 300],
-    ]),
-    contextId: threadKey,
-    resolver: () => null,
-    expected: 100,
-  },
-  {
-    name: "degrades to own value when no resolver is set",
-    effectiveState: new Map([
-      [threadKey, 100],
-      [channelKey, 300],
-    ]),
-    contextId: threadKey,
-    resolver: null,
-    expected: 100,
-  },
-  {
-    name: "returns null when neither context nor parent has a value",
-    effectiveState: new Map(),
-    contextId: threadKey,
-    resolver: channelResolver,
-    expected: null,
-  },
+  { name: "returns own value when context has no parent", effectiveState: new Map([[channelKey, 200]]), contextId: channelKey, resolver: channelResolver, expected: 200 },
+  { name: "inherits the channel frontier when it is newer than the thread", effectiveState: new Map([[threadKey, 100], [channelKey, 300]]), contextId: threadKey, resolver: channelResolver, expected: 300 },
+  { name: "keeps the thread frontier when it is newer than the channel", effectiveState: new Map([[threadKey, 400], [channelKey, 300]]), contextId: threadKey, resolver: channelResolver, expected: 400 },
+  { name: "returns the channel frontier when the thread was never read", effectiveState: new Map([[channelKey, 300]]), contextId: threadKey, resolver: channelResolver, expected: 300 },
+  { name: "degrades to the thread's own value when the root is unresolvable", effectiveState: new Map([[threadKey, 100], [channelKey, 300]]), contextId: threadKey, resolver: () => null, expected: 100 },
+  { name: "degrades to own value when no resolver is set", effectiveState: new Map([[threadKey, 100], [channelKey, 300]]), contextId: threadKey, resolver: null, expected: 100 },
+  { name: "returns null when neither context nor parent has a value", effectiveState: new Map(), contextId: threadKey, resolver: channelResolver, expected: null },
 ];
-for (const {
-  name,
-  effectiveState,
-  contextId,
-  resolver,
-  expected,
-} of resolveEffectiveTimestampCases) {
-  test(`resolveEffectiveTimestamp ${name}`, () => {
+for (const row of resolveEffectiveTimestampCases) {
+  test(`resolveEffectiveTimestamp ${row.name}`, () => {
     assert.equal(
       resolveEffectiveTimestamp({
-        effectiveState,
-        contextId,
-        parentResolver: resolver,
+        effectiveState: row.effectiveState,
+        contextId: row.contextId,
+        parentResolver: row.resolver,
       }),
-      expected,
+      row.expected,
     );
   });
 }
 
-// prettier-ignore
+// biome-ignore format: compact table rows
 const applyRemoteContextTimestampCases = [
-  {
-    name: "ignores older remote read markers from newer sync events",
-    initEffective: 200,
-    initSourceCreatedAt: 10,
-    timestamp: 100,
-    eventCreatedAt: 11,
-    expectedResult: "unchanged",
-    expectedEffective: 200,
-    expectedSourceCreatedAt: 11,
-  },
-  {
-    name: "advances to newer remote read markers",
-    initEffective: 100,
-    initSourceCreatedAt: 10,
-    timestamp: 200,
-    eventCreatedAt: 11,
-    expectedResult: "advanced",
-    expectedEffective: 200,
-    expectedSourceCreatedAt: 11,
-  },
-  {
-    name: "keeps read markers monotonic even if sync events arrive out of order",
-    initEffective: 100,
-    initSourceCreatedAt: 11,
-    timestamp: 200,
-    eventCreatedAt: 10,
-    expectedResult: "advanced",
-    expectedEffective: 200,
-    expectedSourceCreatedAt: 11,
-  },
+  { name: "ignores older remote read markers from newer sync events", initEffective: 200, initSourceCreatedAt: 10, timestamp: 100, eventCreatedAt: 11, expectedResult: "unchanged", expectedEffective: 200, expectedSourceCreatedAt: 11 },
+  { name: "advances to newer remote read markers", initEffective: 100, initSourceCreatedAt: 10, timestamp: 200, eventCreatedAt: 11, expectedResult: "advanced", expectedEffective: 200, expectedSourceCreatedAt: 11 },
+  { name: "keeps read markers monotonic even if sync events arrive out of order", initEffective: 100, initSourceCreatedAt: 11, timestamp: 200, eventCreatedAt: 10, expectedResult: "advanced", expectedEffective: 200, expectedSourceCreatedAt: 11 },
 ];
 for (const row of applyRemoteContextTimestampCases) {
   test(`applyRemoteContextTimestamp ${row.name}`, () => {
@@ -842,18 +755,10 @@ test("fetchAndMerge_emptyRelay_setsLoadComplete", async () => {
 // ── 2b/2c: lapse before EOSE (two scenarios: 250ms fallback path, terminal CLOSED) ─
 // Both reduce to lapseBeforeEose:true on the fence handle — the loader must
 // conclude complete:false in either case.
-// prettier-ignore
+// biome-ignore format: compact table rows
 const lapseBeforeEoseCases = [
-  {
-    name: "lapseBeforeEose_setsLoadIncomplete",
-    pubkey: "a1".repeat(32),
-    desc: "lapse before EOSE (e.g. 250 ms fallback path) must produce incomplete load",
-  },
-  {
-    name: "terminalClosed_setsLoadIncomplete",
-    pubkey: "a2".repeat(32),
-    desc: "terminal CLOSED (fence lapse before EOSE) must produce incomplete load",
-  },
+  { name: "lapseBeforeEose_setsLoadIncomplete", pubkey: "a1".repeat(32), desc: "lapse before EOSE (e.g. 250 ms fallback path) must produce incomplete load" },
+  { name: "terminalClosed_setsLoadIncomplete", pubkey: "a2".repeat(32), desc: "terminal CLOSED (fence lapse before EOSE) must produce incomplete load" },
 ];
 for (const { name, pubkey, desc } of lapseBeforeEoseCases) {
   test(`fetchAndMerge_${name}`, async () => {

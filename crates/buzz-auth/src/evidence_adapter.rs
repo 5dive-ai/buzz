@@ -197,6 +197,82 @@ impl VerifiedEvidenceAdapter {
         .map_err(Into::into)
     }
 
+    /// Fully verify and bind one exact Blossom upload operation.
+    pub fn verify_blossom_upload(
+        &self,
+        authorization_domain: CommunityId,
+        event: &Event,
+        sha256: &str,
+        server_domain: Option<&str>,
+        max_age_secs: u64,
+    ) -> Result<VerifiedNostrProof, EvidenceAdapterError> {
+        crate::blossom::verify_blossom_upload_auth(event, sha256, server_domain, max_age_secs)?;
+        let event_id = event.id.to_bytes();
+        let max_age = max_age_secs.to_be_bytes();
+        let binding = operation_binding(
+            VerifiedOperationBindingKind::BlossomUpload,
+            &[
+                &event_id,
+                sha256.as_bytes(),
+                server_domain.unwrap_or_default().as_bytes(),
+                &max_age,
+            ],
+        );
+        self.blossom_proof(
+            authorization_domain,
+            AuthTransport::MediaUpload,
+            event,
+            binding,
+        )
+    }
+
+    /// Fully verify and bind one exact Blossom GET or HEAD operation.
+    pub fn verify_blossom_download(
+        &self,
+        authorization_domain: CommunityId,
+        event: &Event,
+        sha256: &str,
+        server_domain: Option<&str>,
+        max_age_secs: u64,
+    ) -> Result<VerifiedNostrProof, EvidenceAdapterError> {
+        crate::blossom::verify_blossom_get_auth(event, sha256, server_domain, max_age_secs)?;
+        let event_id = event.id.to_bytes();
+        let max_age = max_age_secs.to_be_bytes();
+        let binding = operation_binding(
+            VerifiedOperationBindingKind::BlossomDownload,
+            &[
+                &event_id,
+                sha256.as_bytes(),
+                server_domain.unwrap_or_default().as_bytes(),
+                &max_age,
+            ],
+        );
+        self.blossom_proof(
+            authorization_domain,
+            AuthTransport::MediaDownload,
+            event,
+            binding,
+        )
+    }
+
+    fn blossom_proof(
+        &self,
+        authorization_domain: CommunityId,
+        transport: AuthTransport,
+        event: &Event,
+        binding: VerifiedOperationBinding,
+    ) -> Result<VerifiedNostrProof, EvidenceAdapterError> {
+        VerifiedNostrProof::from_evidence_adapter(
+            authorization_domain,
+            transport,
+            event.pubkey,
+            AuthMethod::Blossom,
+            binding,
+            None,
+        )
+        .map_err(Into::into)
+    }
+
     fn delegation(
         &self,
         actor: PublicKey,
@@ -392,6 +468,9 @@ pub enum EvidenceAdapterError {
     /// Existing cryptographic proof failed.
     #[error(transparent)]
     Authentication(#[from] crate::AuthError),
+    /// Existing full Blossom operation verification failed.
+    #[error(transparent)]
+    Blossom(#[from] crate::blossom::BlossomAuthError),
     /// Sealed context evidence was inconsistent.
     #[error(transparent)]
     Context(#[from] AuthContextError),
@@ -438,7 +517,7 @@ pub enum EvidenceAdapterError {
 
 #[cfg(test)]
 mod tests {
-    use nostr::{EventBuilder, Keys, RelayUrl};
+    use nostr::{EventBuilder, Keys, Kind, RelayUrl, Tag, Timestamp};
 
     use super::*;
 
@@ -672,5 +751,41 @@ mod tests {
             ),
             Err(EvidenceAdapterError::InvalidBindingResolution)
         ));
+    }
+
+    #[test]
+    fn blossom_factories_reverify_exact_hash_verb_and_server() {
+        let adapter = VerifiedEvidenceAdapter::new();
+        let expiration = (Timestamp::now().as_secs() + 300).to_string();
+        let upload_hash = "a".repeat(64);
+        let substituted_hash = "b".repeat(64);
+        let upload = EventBuilder::new(Kind::from(24_242), "upload")
+            .tags([
+                Tag::parse(["t", "upload"]).expect("verb"),
+                Tag::parse(["x", &upload_hash]).expect("hash"),
+                Tag::parse(["server", "relay.example"]).expect("server"),
+                Tag::parse(["expiration", &expiration]).expect("expiration"),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .expect("event");
+
+        assert!(adapter
+            .verify_blossom_upload(domain(1), &upload, &upload_hash, Some("relay.example"), 600,)
+            .is_ok());
+        assert!(adapter
+            .verify_blossom_upload(
+                domain(1),
+                &upload,
+                &substituted_hash,
+                Some("relay.example"),
+                600,
+            )
+            .is_err());
+        assert!(adapter
+            .verify_blossom_download(domain(1), &upload, &upload_hash, Some("relay.example"), 600,)
+            .is_err());
+        assert!(adapter
+            .verify_blossom_upload(domain(1), &upload, &upload_hash, Some("other.example"), 600,)
+            .is_err());
     }
 }

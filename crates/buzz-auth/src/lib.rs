@@ -17,6 +17,8 @@
 
 /// Channel access checking trait and helpers.
 pub mod access;
+/// Complete Blossom operation authentication verification.
+pub mod blossom;
 /// Versioned, transport-neutral authorization context.
 pub mod context;
 /// Authentication error types.

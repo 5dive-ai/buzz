@@ -1246,7 +1246,7 @@ impl CapabilitySnapshot {
         {
             return Err(ProviderContractError::CapabilityBindingChanged.into());
         }
-        let admission = VerifiedOwnerAdmission::new(
+        let admission = VerifiedOwnerAdmission::from_capability_snapshot(
             self.authorization_domain,
             self.principal,
             AdmissionExpiry::new(self.effective_until)?,

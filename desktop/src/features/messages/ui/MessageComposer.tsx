@@ -707,7 +707,6 @@ function MessageComposerImpl({
         }
         return;
       }
-
       // Escape in edit mode
       if (
         event.key === "Escape" &&
@@ -733,14 +732,11 @@ function MessageComposerImpl({
       onCancelEdit,
     ],
   );
-
   // ── Media paste + ⌘K link shortcut via Tiptap editorProps ──────────
   const uploadFileRef = React.useRef(media.uploadFile);
   uploadFileRef.current = media.uploadFile;
-
   React.useEffect(() => {
     if (!richText.editor) return;
-
     richText.editor.setOptions({
       editorProps: {
         ...richText.editor.options.editorProps,
@@ -758,7 +754,6 @@ function MessageComposerImpl({
             }
             return true;
           }
-
           // --- Buzz code-block paste ---
           // The code block copy button writes a small Buzz marker alongside
           // plain text. Use it to paste back as a literal code block so Markdown
@@ -785,7 +780,6 @@ function MessageComposerImpl({
             scrollComposerToBottom();
             return true;
           }
-
           // Restore Buzz snapshots before normal styled-HTML normalization.
           if (handleAgentSnapshotPaste(event, media.setPendingImeta))
             return true;
@@ -797,18 +791,15 @@ function MessageComposerImpl({
             _view.pasteHTML(cleanHtml);
             return true;
           }
-
           const plainText = event.clipboardData?.getData("text/plain") ?? "";
           if (plainText.includes("\n")) {
             scrollComposerToBottom();
           }
-
           return false;
         },
       },
     });
   }, [media.setPendingImeta, richText.editor, scrollComposerToBottom]);
-
   // ── Send button state ───────────────────────────────────────────────
   const sendDisabled = React.useMemo(
     () =>
@@ -828,7 +819,6 @@ function MessageComposerImpl({
       media.queuedAttachments.length,
     ],
   );
-
   const handleCaptureSelection = React.useCallback(() => {}, []);
 
   const handlePaperclipClick = React.useCallback(() => {

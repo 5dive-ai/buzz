@@ -353,7 +353,7 @@ fn delegated_authorization(
 fn context_preserves_server_resolved_authority() {
     let keys = Keys::generate();
     let correlation_id = Uuid::from_u128(2);
-    let context = AuthContext::finalize_v1(
+    let context = AuthContext::finalize_v1_evidence_for_test(
         AuthContextInput::new(
             tenant(1),
             correlation_id,
@@ -398,7 +398,7 @@ fn context_preserves_server_resolved_authority() {
 fn direct_authorization_requires_the_authenticated_key() {
     let actor = Keys::generate();
     let other = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::Direct {
@@ -415,7 +415,7 @@ fn direct_authorization_requires_the_authenticated_key() {
 fn delegated_authorization_requires_the_verified_owner() {
     let actor = Keys::generate();
     let owner = Keys::generate();
-    let context = AuthContext::finalize_v1(
+    let context = AuthContext::finalize_v1_evidence_for_test(
         input(
             actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -437,7 +437,7 @@ fn delegated_authorization_requires_the_verified_owner() {
 fn delegated_authorization_requires_verified_delegation() {
     let actor = Keys::generate();
     let owner = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::AttestedKey),
         delegated_authorization(1, owner.public_key(), principal(), 200),
@@ -482,7 +482,7 @@ fn principal_preserves_exact_validated_values() {
 fn context_debug_output_omits_tenant_host() {
     let actor = Keys::generate();
     let channel_id = Uuid::from_u128(20);
-    let context = AuthContext::finalize_v1(
+    let context = AuthContext::finalize_v1_evidence_for_test(
         AuthContextInput::new(
             tenant(1),
             Uuid::from_u128(2),
@@ -522,16 +522,33 @@ fn context_debug_output_omits_tenant_host() {
             "correlation_id: \"[redacted]\", requirement: \"[redacted]\", ",
             "effective_from: \"[redacted]\", effective_until: \"[redacted]\" } }, ",
             "federated: FederatedAuthorization(\"[redacted]\"), ",
+            "authorization_lease: \"[redacted]\", ",
             "scopes: \"[redacted]\", channel_ids: \"[redacted]\" })"
         )
     );
 }
 
 #[test]
+fn public_federated_finalization_requires_provider_decision() {
+    let actor = Keys::generate();
+    let error = AuthContext::finalize_v1(
+        input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+        policy_required(EnrollmentMode::AttestedKey),
+        FederatedAuthorization::Direct {
+            binding: binding(actor.public_key()),
+            assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
+        },
+        100,
+    )
+    .expect_err("federated context cannot bypass provider finalization");
+    assert_eq!(error, AuthContextError::ProviderDecisionRequired);
+}
+
+#[test]
 fn direct_authorization_rejects_a_verified_owner() {
     let actor = Keys::generate();
     let owner = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(
             actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -553,7 +570,7 @@ fn direct_authorization_rejects_a_verified_owner() {
 fn delegated_authorization_requires_current_owner_admission() {
     let actor = Keys::generate();
     let owner = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(
             actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -572,7 +589,7 @@ fn delegated_authorization_requires_current_owner_admission() {
 fn delegated_authorization_rejects_cross_domain_owner_admission() {
     let actor = Keys::generate();
     let owner = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(
             actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -600,7 +617,7 @@ fn delegated_authorization_requires_the_owner_admission_principal() {
     let owner = Keys::generate();
     let admission_principal = FederatedPrincipal::new("https://idp.example", "other-subject")
         .expect("synthetic principal is valid");
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(
             actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -619,7 +636,7 @@ fn delegated_authorization_requires_the_owner_admission_principal() {
 fn delegated_authorization_rejects_an_expired_proof() {
     let actor = Keys::generate();
     let owner = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input_with_delegation_expiry(
             actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -663,7 +680,7 @@ fn delegated_authorization_requires_the_bound_owner() {
     let actor = Keys::generate();
     let owner = Keys::generate();
     let other_owner = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(
             actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -682,7 +699,7 @@ fn delegated_authorization_requires_the_bound_owner() {
 fn delegated_binding_cannot_cross_authorization_domains() {
     let actor = Keys::generate();
     let owner = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(
             actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -832,7 +849,7 @@ fn verified_assertion_debug_output_is_fully_redacted() {
 #[test]
 fn direct_authorization_rejects_expired_assertions() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::HttpBridge, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::Direct {
@@ -894,7 +911,7 @@ fn delegated_authorization_rejects_owner_binding_at_exact_expiry() {
 #[test]
 fn direct_authorization_rejects_a_future_assertion() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::HttpBridge, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::Direct {
@@ -919,7 +936,7 @@ fn direct_authorization_rejects_a_future_assertion() {
 #[test]
 fn direct_authorization_requires_the_assertion_principal() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::Direct {
@@ -942,7 +959,7 @@ fn direct_authorization_requires_the_assertion_principal() {
 #[test]
 fn enrolled_reason_must_match_policy_and_binding_source() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::Provisioned),
         FederatedAuthorization::Direct {
@@ -981,7 +998,7 @@ fn existing_active_bindings_are_independent_of_enrollment_mode() {
 
     for enrollment_mode in enrollment_modes {
         for binding_source in binding_sources {
-            let context = AuthContext::finalize_v1(
+            let context = AuthContext::finalize_v1_evidence_for_test(
                 input(actor.public_key(), AuthTransport::RelayWebSocket, None),
                 policy_required(enrollment_mode),
                 FederatedAuthorization::Direct {
@@ -1038,7 +1055,7 @@ fn attested_enrollment_requires_matching_verified_key_evidence() {
     let actor = Keys::generate();
     let other = Keys::generate();
 
-    let missing = AuthContext::finalize_v1(
+    let missing = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::Direct {
@@ -1054,7 +1071,7 @@ fn attested_enrollment_requires_matching_verified_key_evidence() {
     .expect_err("attested enrollment cannot silently accept a missing key claim");
     assert_eq!(missing, AuthContextError::KeyAttestationRequired);
 
-    let mismatch = AuthContext::finalize_v1(
+    let mismatch = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::Direct {
@@ -1075,7 +1092,7 @@ fn attested_enrollment_requires_matching_verified_key_evidence() {
     .expect_err("attested enrollment cannot accept another Nostr key");
     assert_eq!(mismatch, AuthContextError::KeyAttestationMismatch);
 
-    let context = AuthContext::finalize_v1(
+    let context = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::Direct {
@@ -1104,7 +1121,7 @@ fn attested_enrollment_requires_matching_verified_key_evidence() {
 fn present_key_attestation_never_ignores_an_actor_mismatch() {
     let actor = Keys::generate();
     let other = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::Tofu),
         FederatedAuthorization::Direct {
@@ -1140,7 +1157,7 @@ fn tofu_enrollment_uses_tofu_reason_with_attested_provenance() {
         ),
     };
 
-    let context = AuthContext::finalize_v1(
+    let context = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::Tofu),
         authorization,
@@ -1736,7 +1753,7 @@ fn authoritative_finalizer_requires_existing_active_delegated_owner() {
 #[test]
 fn tofu_enrollment_cannot_use_attested_key_policy_reason() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::Tofu),
         FederatedAuthorization::Direct {
@@ -1769,17 +1786,37 @@ fn transport_and_proof_method_must_agree() {
 }
 
 #[test]
-fn blossom_upload_proof_cannot_authorize_media_downloads() {
+fn verified_blossom_proof_authorizes_media_download_profile() {
     let actor = Keys::generate();
-    let error = VerifiedNostrProof::new(
+    let proof = VerifiedNostrProof::new(
         authorization_domain(1),
         AuthTransport::MediaDownload,
         actor.public_key(),
         AuthMethod::Blossom,
         None,
     )
-    .expect_err("upload-only proof must not be widened to media download authority");
+    .expect("verified Blossom GET/HEAD proof matches the media download profile");
+    assert_eq!(proof.authorized_transport(), AuthTransport::MediaDownload);
+    assert_eq!(proof.proof_method(), AuthMethod::Blossom);
+}
+
+#[test]
+fn nip98_proof_cannot_substitute_for_blossom_media_download() {
+    let actor = Keys::generate();
+    let error = VerifiedNostrProof::new(
+        authorization_domain(1),
+        AuthTransport::MediaDownload,
+        actor.public_key(),
+        AuthMethod::Nip98,
+        None,
+    )
+    .expect_err("no implemented NIP-98 media GET/HEAD verifier exists");
     assert_eq!(error, AuthContextError::TransportProofMismatch);
+}
+
+#[test]
+fn blossom_media_proof_remains_bound_to_its_exact_operation() {
+    let actor = Keys::generate();
 
     VerifiedNostrProof::new(
         authorization_domain(1),
@@ -1788,13 +1825,13 @@ fn blossom_upload_proof_cannot_authorize_media_downloads() {
         AuthMethod::Blossom,
         None,
     )
-    .expect("Blossom proof may authorize the verified upload operation");
+    .expect("Blossom upload proof may authorize only its verified upload operation");
 }
 
 #[test]
 fn binding_cannot_cross_authorization_domains() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::Direct {
@@ -1813,7 +1850,7 @@ fn binding_cannot_cross_authorization_domains() {
 fn nostr_only_authorization_may_preserve_a_verified_owner() {
     let actor = Keys::generate();
     let owner = Keys::generate();
-    let context = AuthContext::finalize_v1(
+    let context = AuthContext::finalize_v1_evidence_for_test(
         input(
             actor.public_key(),
             AuthTransport::RelayWebSocket,
@@ -1859,7 +1896,7 @@ fn transport_delegation_is_explicitly_transport_wide() {
 #[test]
 fn required_policy_rejects_nostr_only_authorization() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::NotRequired,
@@ -1874,7 +1911,7 @@ fn required_policy_rejects_nostr_only_authorization() {
 #[test]
 fn not_required_policy_rejects_federated_authorization() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_not_required(),
         FederatedAuthorization::Direct {
@@ -1892,7 +1929,7 @@ fn not_required_policy_rejects_federated_authorization() {
 #[test]
 fn nostr_proof_cannot_cross_authorization_domains() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         AuthContextInput::new(
             tenant(1),
             Uuid::from_u128(2),
@@ -1912,7 +1949,7 @@ fn nostr_proof_cannot_cross_authorization_domains() {
 #[test]
 fn federated_policy_cannot_cross_authorization_domains() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         ResolvedFederatedPolicy::not_required(authorization_domain(2)),
         FederatedAuthorization::NotRequired,
@@ -1927,7 +1964,7 @@ fn federated_policy_cannot_cross_authorization_domains() {
 #[test]
 fn community_admission_cannot_cross_authorization_domains() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         AuthContextInput::new(
             tenant(1),
             Uuid::from_u128(2),
@@ -1947,7 +1984,7 @@ fn community_admission_cannot_cross_authorization_domains() {
 #[test]
 fn assertion_cannot_cross_authorization_domains() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::Direct {
@@ -1971,7 +2008,7 @@ fn assertion_cannot_cross_authorization_domains() {
 #[test]
 fn assertion_must_match_the_authorized_transport() {
     let actor = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(actor.public_key(), AuthTransport::RelayWebSocket, None),
         policy_required(EnrollmentMode::AttestedKey),
         FederatedAuthorization::Direct {
@@ -1996,7 +2033,7 @@ fn assertion_must_match_the_authorized_transport() {
 fn delegated_owner_admission_must_match_the_authorization_domain() {
     let actor = Keys::generate();
     let owner = Keys::generate();
-    let error = AuthContext::finalize_v1(
+    let error = AuthContext::finalize_v1_evidence_for_test(
         input(
             actor.public_key(),
             AuthTransport::RelayWebSocket,

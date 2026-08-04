@@ -24,19 +24,8 @@
 //!
 //! ## Env-assembly precedence (mirrors `spawn_agent_child`)
 //!
-//! 1. Baked build defaults (`baked_build_env()`) — injected first so the
-//!    layers above can override them.
-//! 2. Runtime metadata env vars (`runtime_metadata_env_vars`) — provider /
-//!    model env keys derived from the record's `model`/`provider` fields and
-//!    the runtime's `model_env_var`/`provider_env_var`.
-//! 3. Merged user env (`merged_user_env`) — live persona env under the
-//!    record's `env_vars` overrides, after reserved-key and malformed-key
-//!    filtering.  Last-wins on collision.
-//!
-//! The config-file tier (Goose `~/.config/goose/config.yaml`) is tracked
-//! separately because it is not part of the process env — the harness reads
-//! it at startup.  We do not evaluate it here; it is exposed for future
-//! UI display only.
+//! Baked build defaults → runtime metadata env → merged user env.
+//! Config-file tier (Goose `~/.config/goose/config.yaml`) tracked separately.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -250,17 +239,12 @@ fn resolve_effective_agent_env_with_def(
         }
     }
 
-    // Layer 3a: global env vars — the lowest user-settable layer.
-    // Injected before persona/agent so per-agent values win on collision.
-    // `merged_user_env` with an empty "lower" map applies reserved/malformed-key
-    // filtering to the global map for free.
+    // Layer 3a: global env vars (lowest user-settable layer).
+    // `merged_user_env` with empty lower map applies reserved/malformed-key filtering.
     let global_env = merged_user_env(&BTreeMap::new(), &global.env_vars);
     env.extend(global_env);
 
-    // Layer 3b: merged user env — live persona env under the record's own
-    // overrides (last-wins), after reserved/malformed-key filtering. Reading
-    // the persona live is what makes persona credential edits refresh on the
-    // next spawn instead of being frozen into the record.
+    // Layer 3b: merged user env — persona env under record overrides, filtered.
     let user_env = merged_user_env(
         &super::env_vars::live_persona_env(personas, record.persona_id.as_deref()),
         &record.env_vars,
@@ -274,6 +258,17 @@ fn resolve_effective_agent_env_with_def(
         &mut env,
         effective_provider.as_deref(),
         effective_model.as_deref(),
+    );
+
+    // Phase 3: translate legacy effort key → native key, strip foreign effort keys.
+    crate::managed_agents::config_bridge::apply_effort_bridge(
+        &mut env,
+        runtime,
+        &record.env_vars,
+        personas,
+        record.persona_id.as_deref(),
+        &global.env_vars,
+        harness_def.as_deref(),
     );
 
     EffectiveAgentEnv {
@@ -1739,3 +1734,8 @@ mod tests {
 #[cfg(test)]
 #[path = "readiness_goose_file_config_tests.rs"]
 mod goose_file_config_tests;
+
+// Phase 3 effort-bridge spawn tests live in a sibling file.
+#[cfg(test)]
+#[path = "readiness_effort_bridge_tests.rs"]
+mod effort_bridge_tests;

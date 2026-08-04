@@ -15,6 +15,10 @@ import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
+  loadTravelLog,
+  normalizeRelayUrl,
+} from "@/features/passport/lib/travelLog";
+import {
   EmptyRecord,
   FollowingStrip,
   formatStampDate,
@@ -120,6 +124,33 @@ export function PassportScreen({
     );
   }, [channelsQuery.data, pubkeyLower, relayAgent]);
 
+  // Visas: servers you are on now (saved communities) plus servers you have
+  // been on before (persistent travel log), shown as expired stamps. Both are
+  // local-device records, so this page only exists on your own passport.
+  const visas = React.useMemo(() => {
+    if (!isSelf) {
+      return [];
+    }
+    const savedRelays = new Set(
+      communities.map((community) => normalizeRelayUrl(community.relayUrl)),
+    );
+    const current = communities.map((community) => ({
+      departed: false,
+      key: community.id,
+      subtitle: `since ${formatStampDate(new Date(community.addedAt))}`,
+      title: community.name,
+    }));
+    const departed = loadTravelLog()
+      .filter((entry) => !savedRelays.has(normalizeRelayUrl(entry.relayUrl)))
+      .map((entry) => ({
+        departed: true,
+        key: `departed-${normalizeRelayUrl(entry.relayUrl)}`,
+        subtitle: `departed ${formatStampDate(new Date(entry.lastVisitedAt))}`,
+        title: entry.name,
+      }));
+    return [...current, ...departed];
+  }, [communities, isSelf]);
+
   const contactPubkeys = React.useMemo(
     () => contactsQuery.data?.contacts.map((contact) => contact.pubkey) ?? [],
     [contactsQuery.data],
@@ -214,19 +245,20 @@ export function PassportScreen({
           </div>
 
           <div className="flex min-w-0 flex-col gap-8">
-            {isSelf && communities.length > 0 ? (
+            {visas.length > 0 ? (
               <RecordSection
-                label="Visas · Communities"
-                trailing={`${communities.length}`}
+                label="Visas · Servers"
+                trailing={`${visas.length}`}
               >
                 <StampPage>
-                  {communities.map((community, index) => (
+                  {visas.map((visa, index) => (
                     <PassportStamp
                       index={index}
-                      key={community.id}
-                      subtitle={`since ${formatStampDate(new Date(community.addedAt))}`}
+                      key={visa.key}
+                      muted={visa.departed}
+                      subtitle={visa.subtitle}
                       testId="passport-community-stamp"
-                      title={community.name}
+                      title={visa.title}
                     />
                   ))}
                 </StampPage>

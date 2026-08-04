@@ -26,6 +26,7 @@ import {
 } from "@/features/agents/activeAgentTurnsStore";
 import { resetAgentWorkingSignal } from "@/features/agents/agentWorkingSignal";
 import { resetAgentObserverStore } from "@/features/agents/observerRelayStore";
+import { recordCommunityVisit } from "@/features/passport/lib/travelLog";
 import { resetAvatarPresentations } from "@/features/profile/avatarPresentationStore";
 import { resetAvatarProfileSync } from "@/features/profile/avatarProfileSync";
 import { resetSidebarRelayConnectionCardState } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
@@ -261,6 +262,13 @@ export function useCommunityInit(
             err,
           );
         }
+        // Stamp the passport travel log now that the connection applied. The
+        // log intentionally survives community switches and removals — it is
+        // the passport's record of every server this identity has been on.
+        recordCommunityVisit({
+          name: activeCommunity.name,
+          relayUrl: activeCommunity.relayUrl,
+        });
         // Restore any turn state saved for this community (a prior A→B round-
         // trip). This runs after applyCommunity succeeds and before the app
         // renders so components see the restored timers on first render.

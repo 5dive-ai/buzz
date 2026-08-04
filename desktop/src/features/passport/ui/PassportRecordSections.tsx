@@ -69,6 +69,7 @@ const STAMP_ROTATIONS = [
 
 export function PassportStamp({
   index,
+  muted = false,
   onClick,
   subtitle,
   testId,
@@ -76,6 +77,8 @@ export function PassportStamp({
 }: {
   /** Position in the stamp page — picks a stable ink color and tilt. */
   index: number;
+  /** Faded, dashed rendering for expired visas (servers since departed). */
+  muted?: boolean;
   onClick?: () => void;
   subtitle?: string | null;
   testId?: string;
@@ -91,6 +94,7 @@ export function PassportStamp({
         "group inline-flex max-w-56 min-w-0 flex-col items-start rounded-xl border-2 px-3.5 py-2 text-left opacity-90 saturate-[0.85] transition-transform",
         tone,
         rotation,
+        muted && "border-dashed opacity-45 saturate-50",
         onClick &&
           "cursor-pointer hover:rotate-0 hover:opacity-100 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
       )}

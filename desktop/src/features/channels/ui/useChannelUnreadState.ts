@@ -26,6 +26,26 @@ import { isConversationalUnreadKind } from "@/shared/constants/kinds";
 
 import { useWelcomeInitialUnreadSuppression } from "./useWelcomeInitialUnreadSuppression";
 
+/**
+ * Pure helper: apply the mark-unread divider overlay.
+ *
+ * Calls `markFn(channelId)` and, if it returns true (accepted), adds the
+ * channel to the `overlay` set. Returns the same boolean so callers can gate
+ * any additional side-effects on success.
+ *
+ * Extracted for testability: `handleMarkUnread` calls this instead of
+ * inlining the same two-step logic.
+ */
+export function applyMarkUnreadDividerOverlay(
+  channelId: string,
+  markFn: (id: string) => boolean,
+  overlay: Set<string>,
+): boolean {
+  const accepted = markFn(channelId);
+  if (accepted) overlay.add(channelId);
+  return accepted;
+}
+
 type UseChannelUnreadStateOptions = {
   activeChannelId: string | null;
   timelineMessages: TimelineMessage[];
@@ -36,7 +56,7 @@ type UseChannelUnreadStateOptions = {
   openThreadMessages?: MainTimelineEntry[];
   getChannelReadAt: (channelId: string) => number | null;
   getMessageReadAt: (messageId: string) => number | null;
-  markChannelUnread: (channelId: string) => void;
+  markChannelUnread: (channelId: string) => boolean;
   markMessageRead: (messageId: string, timestamp: number) => void;
   isThreadMuted: (rootId: string) => boolean;
   readStateVersion: number;
@@ -404,11 +424,12 @@ export function useChannelUnreadState({
 
   const handleMarkUnread = React.useCallback(() => {
     if (!activeChannelId) return;
-    // Mirror the deliberate mark-unread locally so the timeline marker is
-    // suppressed (see forcedUnreadRef above). Re-render so the memo re-runs.
-    forcedUnreadRef.current.add(activeChannelId);
+    applyMarkUnreadDividerOverlay(
+      activeChannelId,
+      markChannelUnread,
+      forcedUnreadRef.current,
+    );
     forceUnreadRender();
-    markChannelUnread(activeChannelId);
   }, [activeChannelId, markChannelUnread]);
 
   // Mark a message's directly-revealed children read (LP4 v3 open-at-level):

@@ -342,6 +342,7 @@ export function AppShell() {
     mutedRootIds,
     muteThread,
     unmuteThread,
+    getProjection,
   } = useUnreadChannels(sidebarChannels, activeChannel, {
     pubkey: identityQuery.data?.pubkey,
     relayClient,
@@ -404,8 +405,6 @@ export function AppShell() {
     mutedRootIds,
     channels,
   );
-
-  // Badge count consumes the shared NIP-RS read-state from useUnreadChannels.
   const { homeBadgeCount, homeBadgeCountExcludingHighPriority } =
     useHomeFeedNotificationState(
       homeFeedQuery.data,
@@ -733,6 +732,7 @@ export function AppShell() {
             threadActivityFeedItems,
             feedItemState,
             onOpenSettings: handleOpenSettings,
+            getProjection,
           }}
         >
           <HuddleProvider>

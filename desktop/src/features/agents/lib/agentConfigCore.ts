@@ -143,14 +143,15 @@ export function resolveEffortFromEnv(
   nativeKey: string,
   legacyKey: string | null,
   acceptedValues: readonly string[] | null,
+  effortAliases?: ReadonlyArray<readonly [string, string]> | null,
 ): { value: string | null; legacyConsumed: boolean } {
   const nativeRaw = envVars[nativeKey]?.trim() || null;
   const legacyRaw = legacyKey ? envVars[legacyKey]?.trim() || null : null;
   const nativeValue = nativeRaw
-    ? (normalizeEffortValue(nativeRaw, acceptedValues) ?? null)
+    ? (normalizeEffortValue(nativeRaw, acceptedValues, effortAliases) ?? null)
     : null;
   const legacyValue = legacyRaw
-    ? (normalizeEffortValue(legacyRaw, acceptedValues) ?? null)
+    ? (normalizeEffortValue(legacyRaw, acceptedValues, effortAliases) ?? null)
     : null;
   const value = nativeValue ?? legacyValue;
   const legacyConsumed = !nativeValue && !!legacyValue;
@@ -259,6 +260,7 @@ export function deriveAgentConfigFieldModel({
     const acceptedValues = isBuzzAgent
       ? null
       : (runtime.acceptedEffortValues ?? null);
+    const effortAliases = isBuzzAgent ? null : (runtime.effortAliases ?? null);
     // resolveEffortFromEnv is the single policy source for effort reads —
     // normalizes, applies native-first / valid-legacy-fallback, and reports
     // which key was consumed. HarnessNativeEffortFields calls the same fn.
@@ -267,6 +269,7 @@ export function deriveAgentConfigFieldModel({
       nativeKey,
       legacyKey,
       acceptedValues,
+      effortAliases,
     );
     fields.push({
       kind: "effort",
@@ -413,4 +416,24 @@ export function numericTuningPlaceholder(
   return inheritedValue
     ? `Inherit (${inheritedValue})`
     : "Inherit (agent default)";
+}
+
+/**
+ * Return all known native thinking-effort env keys from the runtime catalog.
+ *
+ * Derived from `runtime.thinkingEnvVar` declarations rather than a manually
+ * maintained constant — adding a new runtime to the catalog automatically
+ * participates in foreign-key stripping and transition cleanup.
+ *
+ * Use this in place of the static `ALL_KNOWN_EFFORT_KEYS` constant wherever
+ * the runtime catalog is available.
+ */
+export function allKnownEffortKeys(
+  runtimes: readonly Pick<AcpRuntimeCatalogEntry, "thinkingEnvVar">[],
+): string[] {
+  const keys = new Set<string>();
+  for (const rt of runtimes) {
+    if (rt.thinkingEnvVar) keys.add(rt.thinkingEnvVar);
+  }
+  return [...keys];
 }

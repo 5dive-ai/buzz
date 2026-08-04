@@ -629,7 +629,7 @@ fn baked_env_allowlist_is_case_insensitive() {
     assert!(super::is_safe_to_reveal("BUZZ_AGENT_MODEL"));
     assert!(super::is_safe_to_reveal("buzz_agent_thinking_effort"));
     assert!(super::is_safe_to_reveal("BUZZ_AGENT_THINKING_EFFORT"));
-    // Goose native effort key — derived from ALL_KNOWN_EFFORT_KEYS.
+    // Goose native effort key — derived from runtime declarations via all_known_effort_keys().
     assert!(super::is_safe_to_reveal("goose_thinking_effort"));
     assert!(super::is_safe_to_reveal("GOOSE_THINKING_EFFORT"));
     assert!(super::is_safe_to_reveal("databricks_host"));

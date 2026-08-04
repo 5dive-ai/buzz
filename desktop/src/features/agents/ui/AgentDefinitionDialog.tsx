@@ -177,9 +177,7 @@ export function AgentDefinitionDialog({
     inheritedEnvVars: inheritedEnvVarsForAdvanced,
   } = useAgentDialogDefaults({
     open,
-    nativeEffortKey: runtimes.find((r) => r.id === runtime)?.thinkingEnvVar,
-    acceptedEffortValues:
-      runtimes.find((r) => r.id === runtime)?.acceptedEffortValues ?? null,
+    runtime: runtimes.find((r) => r.id === runtime),
   });
   const defaultRuntime = React.useMemo(
     () => getDefaultPersonaRuntime(runtimes, globalConfig.preferred_runtime),

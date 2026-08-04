@@ -7352,6 +7352,17 @@ function withMockRuntimeConfigMetadata(
         : runtime.id === "goose"
           ? ["off", "low", "medium", "high", "max"]
           : null,
+    effort_aliases:
+      "effort_aliases" in runtime
+        ? runtime.effort_aliases
+        : runtime.id === "goose"
+          ? [
+              ["none", "off"],
+              ["disabled", "off"],
+              ["med", "medium"],
+              ["xhigh", "max"],
+            ]
+          : null,
   };
 }
 

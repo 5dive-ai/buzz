@@ -422,6 +422,7 @@ export function applyHarnessNativeEffortChange(
  */
 export function HarnessNativeEffortFields({
   acceptedEffortValues,
+  effortAliases,
   envVars,
   inheritedEnvVars,
   legacyEnvKey,
@@ -430,6 +431,12 @@ export function HarnessNativeEffortFields({
 }: {
   /** Ordered canonical effort values from `runtime.acceptedEffortValues`. */
   acceptedEffortValues: readonly string[];
+  /**
+   * Effort alias pairs from `runtime.effortAliases` — the single normalization authority.
+   * Passed to `resolveEffortFromEnv` and `normalizeEffortValue` for alias resolution.
+   * Absent means no aliases; the fallback table has been removed.
+   */
+  effortAliases?: ReadonlyArray<readonly [string, string]> | null;
   envVars: EnvVarsValue;
   /**
    * Inherited defaults (global config env_vars) used to show the Inherit
@@ -440,10 +447,11 @@ export function HarnessNativeEffortFields({
    * Legacy effort key for pre-migration personas (e.g. `BUZZ_AGENT_THINKING_EFFORT`).
    * When the native key is absent and the legacy key holds a valid canonical value,
    * that value is displayed (the read path mirrors `resolveEffortFromEnv`).
-   * Pass only at record/persona scope (definition/instance) — omit or pass undefined
-   * at global/onboarding scope to enforce the tier boundary.
+   * Pass `BUZZ_AGENT_THINKING_EFFORT` at record/persona scope (definition/instance);
+   * pass `null` at global/onboarding scope to enforce the tier boundary and prevent
+   * the write path from silently deleting the legacy key.
    */
-  legacyEnvKey?: string;
+  legacyEnvKey: string | null;
   /** The native effort env key for this runtime (e.g. `GOOSE_THINKING_EFFORT`). */
   nativeEffortKey: string;
   /**
@@ -453,13 +461,14 @@ export function HarnessNativeEffortFields({
   onEnvVarsChange: (next: EnvVarsValue) => void;
 }) {
   // Read current effort via the shared policy source: native-first, valid-legacy
-  // fallback (when legacyEnvKey is supplied). This guarantees the component and
+  // fallback (when legacyEnvKey is non-null). This guarantees the component and
   // deriveAgentConfigFieldModel agree on what value to display at any scope.
   const { value: currentEffort } = resolveEffortFromEnv(
     envVars,
     nativeEffortKey,
-    legacyEnvKey ?? null,
+    legacyEnvKey,
     acceptedEffortValues,
+    effortAliases,
   );
 
   // Inherited effort from global config; normalize so xhigh shows as max, etc.
@@ -472,7 +481,11 @@ export function HarnessNativeEffortFields({
   // legacy data (the control shows the legacy value via resolveEffortFromEnv above).
   const rawInherited = inheritedEnvVars?.[nativeEffortKey] ?? "";
   const inheritedEffort = rawInherited
-    ? (normalizeEffortValue(rawInherited, acceptedEffortValues) ?? undefined)
+    ? (normalizeEffortValue(
+        rawInherited,
+        acceptedEffortValues,
+        effortAliases,
+      ) ?? undefined)
     : undefined;
 
   const inheritLabel = inheritedEffort
@@ -486,11 +499,12 @@ export function HarnessNativeEffortFields({
 
   function handleChange(value: string) {
     // Record/persona scope: always pass the legacy key so it is atomically deleted.
+    // At global/onboarding scope legacyEnvKey is null — the write path skips deletion.
     onEnvVarsChange(
       applyHarnessNativeEffortChange(
         envVars,
         nativeEffortKey,
-        legacyEnvKey ?? BUZZ_AGENT_THINKING_EFFORT,
+        legacyEnvKey,
         value,
       ),
     );

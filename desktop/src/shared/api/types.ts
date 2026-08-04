@@ -514,9 +514,9 @@ export type AcpRuntimeCatalogEntry = {
   providerEnvVar: string | null;
   /** Environment variable used to apply thinking effort, when supported. */
   thinkingEnvVar: string | null;
-  /** Canonical effort values for runtimes with a static vocabulary (Goose: off|low|medium|high|max);
-   * `null` for buzz-agent (per-model catalog). Single authority for UI, spawn bridge, and reader. */
+  /** Canonical effort values for runtimes with a static vocabulary; `null` for buzz-agent. */
   acceptedEffortValues: string[] | null;
+  effortAliases: Array<[string, string]> | null;
   maxTokensEnvVar: string | null;
   contextLimitEnvVar: string | null;
   maxRoundsEnvVar: string | null;

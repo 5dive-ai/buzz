@@ -41,6 +41,7 @@ import {
   getInheritedAgentDefaults,
   getBakedProviderInheritLabel,
   resolveInheritedDefault,
+  resolveBakedEffort,
 } from "./bakedEnvHelpers.ts";
 import {
   deriveAgentConfigFieldModel,
@@ -1500,6 +1501,116 @@ test("baked_masked_native_effort_excluded_from_inherited_defaults", () => {
   );
 });
 
+// ── Baked effort: alias normalization and invalid-value skip ──────────────
+//
+// The baked tier must normalize values through the same contract as every
+// other tier — xhigh→max and invalid values produce absent inherited effort.
+// Paired with Rust `baked_xhigh_normalizes_to_max` and `baked_invalid_minimal_skipped`
+// in config_bridge/mod.rs which verify the spawn side; these verify the display side.
+
+test("baked_xhigh_normalizes_to_max_in_inherited_defaults", () => {
+  // Baked env has GOOSE_THINKING_EFFORT=xhigh (alias for max).
+  // getInheritedAgentDefaults must normalize it to canonical "max" before display.
+  const gooseAliases = [
+    ["none", "off"],
+    ["disabled", "off"],
+    ["med", "medium"],
+    ["xhigh", "max"],
+  ];
+  const defaults = getInheritedAgentDefaults(
+    { env_vars: {}, provider: null, model: null },
+    [{ key: "GOOSE_THINKING_EFFORT", value: "xhigh", masked: false }],
+    {
+      nativeEffortKey: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+      effortAliases: gooseAliases,
+    },
+  );
+  assert.deepEqual(
+    defaults.effort,
+    { source: "build", value: "max" },
+    "baked xhigh alias must normalize to canonical max for display",
+  );
+});
+
+test("baked_invalid_minimal_absent_in_inherited_defaults", () => {
+  // Baked env has GOOSE_THINKING_EFFORT=minimal (invalid for Goose static vocab).
+  // getInheritedAgentDefaults must skip it — UI shows no inherited effort value.
+  const gooseAliases = [
+    ["none", "off"],
+    ["disabled", "off"],
+    ["med", "medium"],
+    ["xhigh", "max"],
+  ];
+  const defaults = getInheritedAgentDefaults(
+    { env_vars: {}, provider: null, model: null },
+    [{ key: "GOOSE_THINKING_EFFORT", value: "minimal", masked: false }],
+    {
+      nativeEffortKey: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+      effortAliases: gooseAliases,
+    },
+  );
+  assert.deepEqual(
+    defaults.effort,
+    { source: null, value: "" },
+    "baked invalid value must be skipped — no inherited effort displayed",
+  );
+});
+
+// These two tests exercise `resolveBakedEffort` directly — the production
+// helper used by AgentConfigFields (global/onboarding baked display).
+// Paired with the getInheritedAgentDefaults tests above; both paths must
+// normalize through the same contract (alias→canonical, invalid→absent).
+
+test("resolveBakedEffort_xhigh_normalizes_to_max", () => {
+  // The global/onboarding control calls resolveBakedEffort(bakedEnv, key, selectedRuntime).
+  // Baked GOOSE_THINKING_EFFORT=xhigh must display as canonical "max".
+  const gooseRuntime = {
+    acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    effortAliases: [
+      ["none", "off"],
+      ["disabled", "off"],
+      ["med", "medium"],
+      ["xhigh", "max"],
+    ],
+  };
+  const result = resolveBakedEffort(
+    [{ key: "GOOSE_THINKING_EFFORT", value: "xhigh", masked: false }],
+    "GOOSE_THINKING_EFFORT",
+    gooseRuntime,
+  );
+  assert.equal(
+    result,
+    "max",
+    "resolveBakedEffort must alias xhigh→max for Goose runtime",
+  );
+});
+
+test("resolveBakedEffort_invalid_minimal_returns_null", () => {
+  // Baked GOOSE_THINKING_EFFORT=minimal is invalid for Goose static vocab.
+  // resolveBakedEffort must return null so the control shows no inherited value.
+  const gooseRuntime = {
+    acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    effortAliases: [
+      ["none", "off"],
+      ["disabled", "off"],
+      ["med", "medium"],
+      ["xhigh", "max"],
+    ],
+  };
+  const result = resolveBakedEffort(
+    [{ key: "GOOSE_THINKING_EFFORT", value: "minimal", masked: false }],
+    "GOOSE_THINKING_EFFORT",
+    gooseRuntime,
+  );
+  assert.equal(
+    result,
+    null,
+    "resolveBakedEffort must return null for invalid vocab value",
+  );
+});
+
 // ── bakedStructuredKeys: runtime-sensitive hidden-key set ─────────────────
 
 test("bakedStructuredKeys_with_native_effort_key_hides_both_fixed_and_native", () => {
@@ -1567,6 +1678,7 @@ test("global_native_xhigh_normalizes_to_max_for_goose_in_inherited_defaults", ()
     {
       nativeEffortKey: "GOOSE_THINKING_EFFORT",
       acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+      effortAliases: GOOSE_ALIASES,
     },
   );
   assert.deepEqual(
@@ -1582,10 +1694,21 @@ test("global_native_xhigh_normalizes_to_max_for_goose_in_inherited_defaults", ()
 // harness-native runtime must use descriptor metadata for effort options and
 // display, not the Buzz provider/model catalog (Delta 5 coexistence).
 
+// Aliases from GOOSE_EFFORT_NORMALIZATION (runtime_metadata.rs). The catalog
+// serializes these through effortAliases; fixtures must include them so
+// normalizeEffortValue resolves aliases from supplied metadata, not a built-in table.
+const GOOSE_ALIASES = [
+  ["none", "off"],
+  ["disabled", "off"],
+  ["med", "medium"],
+  ["xhigh", "max"],
+];
+
 const GOOSE_GLOBAL_RUNTIME = {
   id: "goose",
   thinkingEnvVar: "GOOSE_THINKING_EFFORT",
   acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+  effortAliases: GOOSE_ALIASES,
   providerEnvVar: "GOOSE_PROVIDER",
   modelEnvVar: "GOOSE_MODEL",
   maxTokensEnvVar: null,

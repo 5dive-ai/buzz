@@ -31,6 +31,7 @@ import {
   bakedStructuredKeys,
   getBakedProviderInheritLabel,
   getGlobalModelFallback,
+  resolveBakedEffort,
 } from "@/features/agents/ui/bakedEnvHelpers";
 import {
   AUTO_PROVIDER_DROPDOWN_VALUE,
@@ -286,12 +287,10 @@ export function AgentConfigFields({
     modelIsOptional ||
     (config.model?.trim().length ?? 0) > 0 ||
     fallbackModel !== null;
+  const bakedEffortKey = effortPersistenceKey ?? BUZZ_AGENT_THINKING_EFFORT;
   const bakedEffort = React.useMemo(
-    () =>
-      bakedEnv.find(
-        (e) => e.key === (effortPersistenceKey ?? BUZZ_AGENT_THINKING_EFFORT),
-      )?.value ?? null,
-    [bakedEnv, effortPersistenceKey],
+    () => resolveBakedEffort(bakedEnv, bakedEffortKey, selectedRuntime),
+    [bakedEnv, bakedEffortKey, selectedRuntime],
   );
   const bakedGenericRows = React.useMemo<readonly InheritedEnvRow[]>(
     () =>

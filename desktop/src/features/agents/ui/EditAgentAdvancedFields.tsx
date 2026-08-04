@@ -125,6 +125,8 @@ export function EditAgentAdvancedFields({
       ? (selectedRuntime?.acceptedEffortValues ?? null)
       : null;
   const harnessNativeEffortKey = selectedRuntime?.thinkingEnvVar ?? null;
+  const harnessNativeEffortAliases =
+    catalogStatus === "ready" ? (selectedRuntime?.effortAliases ?? null) : null;
   // EditAgentAdvancedFields operates at "instance" scope — legacy fallback applies.
   // resolveEffortFromEnv is the single policy source; the component reads the same fn.
   const legacyEffortConsumed = React.useMemo(() => {
@@ -134,8 +136,14 @@ export function EditAgentAdvancedFields({
       harnessNativeEffortKey,
       BUZZ_AGENT_THINKING_EFFORT,
       harnessNativeEffort,
+      harnessNativeEffortAliases,
     ).legacyConsumed;
-  }, [envVars, harnessNativeEffort, harnessNativeEffortKey]);
+  }, [
+    envVars,
+    harnessNativeEffort,
+    harnessNativeEffortKey,
+    harnessNativeEffortAliases,
+  ]);
 
   // Build the effective hidden-key list: caller's secrets + effort key (when
   // rendered by BuzzAgentModelTuningFields or HarnessNativeEffortFields) + numeric keys.
@@ -389,6 +397,7 @@ export function EditAgentAdvancedFields({
       ) : harnessNativeEffort && harnessNativeEffortKey ? (
         <HarnessNativeEffortFields
           acceptedEffortValues={harnessNativeEffort}
+          effortAliases={harnessNativeEffortAliases}
           envVars={envVars}
           inheritedEnvVars={inheritedEnvVars}
           legacyEnvKey={BUZZ_AGENT_THINKING_EFFORT}

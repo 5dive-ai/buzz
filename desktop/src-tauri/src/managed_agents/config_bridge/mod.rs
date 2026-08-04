@@ -16,13 +16,20 @@ pub(crate) use types::*;
 /// so no aliasing applies there.
 pub(crate) const LEGACY_THINKING_EFFORT_KEY: &str = "BUZZ_AGENT_THINKING_EFFORT";
 
-/// The set of all known native thinking-effort env keys across all runtimes.
-/// Used to strip foreign effort keys from a runtime's effective descriptor.
-/// Must stay in sync with `KnownAcpRuntime::thinking_env_var` declarations.
-pub(crate) const ALL_KNOWN_EFFORT_KEYS: &[&str] = &[
-    LEGACY_THINKING_EFFORT_KEY, // buzz-agent native
-    "GOOSE_THINKING_EFFORT",    // Goose native
-];
+/// Return all known native thinking-effort env keys across all runtimes.
+///
+/// Derived from `KNOWN_ACP_RUNTIMES::thinking_env_var` so that adding a new
+/// runtime automatically participates in foreign-key stripping without a
+/// separate constant to update.
+///
+/// Callers that need the slice for iterating (e.g. foreign-key stripping in
+/// `apply_effort_bridge`) should call this function rather than maintaining
+/// a parallel constant.
+pub(crate) fn all_known_effort_keys() -> impl Iterator<Item = &'static str> {
+    crate::managed_agents::discovery::KNOWN_ACP_RUNTIMES
+        .iter()
+        .filter_map(|rt| rt.thinking_env_var)
+}
 
 /// Resolve the thinking-effort value for a single env-var tier map, with
 /// within-tier legacy aliasing and normalization.
@@ -34,16 +41,27 @@ pub(crate) const ALL_KNOWN_EFFORT_KEYS: &[&str] = &[
 ///   1. Native key (`native_key`) — value normalized; invalid values skip as absent.
 ///   2. Legacy key (`BUZZ_AGENT_THINKING_EFFORT`) — honoured only when:
 ///      (a) `native_key` differs from the legacy key (i.e. non-buzz-agent runtime), AND
-///      (b) `global_tier` is false (legacy alias excluded from global tier), AND
+///      (b) `allow_legacy_alias` is true (record and persona tiers only), AND
 ///      (c) the value normalizes to a canonical form.
 ///      An invalid legacy value is skipped so the next tier can supply a candidate.
 ///
 /// The `norm` function normalizes a raw value to canonical form; `None` = invalid.
+///
+/// ## Per-tier `allow_legacy_alias` policy (plan v3)
+///
+/// | Tier        | `allow_legacy_alias` | Rationale                                        |
+/// |-------------|----------------------|--------------------------------------------------|
+/// | record      | `true`               | Record-level legacy key migrated at save         |
+/// | persona     | `true`               | Persona-level legacy key migrated at save        |
+/// | global      | `false`              | Global legacy excluded end-to-end (Delta 2/5)    |
+/// | definition  | `false`              | Definition env is author-controlled; legacy alias|
+/// |             |                      | would silently conflate foreign effort           |
+/// | baked       | `false`              | Build floor; only native key is authoritative    |
 pub(crate) fn effort_tier_alias(
     map: &std::collections::BTreeMap<String, String>,
     native_key: &str,
     norm: impl Fn(&str) -> Option<String>,
-    global_tier: bool,
+    allow_legacy_alias: bool,
 ) -> Option<String> {
     // Native key first — normalize the value; invalid → skip.
     if let Some(raw) = map.get(native_key) {
@@ -52,8 +70,8 @@ pub(crate) fn effort_tier_alias(
         }
         // Invalid native value: skip-as-absent, fall through to legacy.
     }
-    // Legacy alias — only when keys differ and this is not the global tier.
-    if !global_tier && native_key != LEGACY_THINKING_EFFORT_KEY {
+    // Legacy alias — only when keys differ and this tier permits legacy consumption.
+    if allow_legacy_alias && native_key != LEGACY_THINKING_EFFORT_KEY {
         if let Some(raw) = map.get(LEGACY_THINKING_EFFORT_KEY) {
             if let Some(canonical) = norm(raw) {
                 return Some(canonical);
@@ -84,9 +102,12 @@ pub(crate) fn read_goose_file_config() -> Option<RuntimeFileConfig> {
 ///
 /// Tier order (spawn; ACP and file tiers absent):
 ///   record native → record legacy → persona native → persona legacy
-///   → global native → definition native
+///   → global native → definition native → baked native
 ///
-/// Global legacy is excluded end-to-end (plan v3 Delta 2).
+/// Global and definition legacy are excluded (plan v3 Delta 2).
+/// Baked tier is native-only: build-floor values are already canonical;
+/// applying the legacy alias there would silently consume a foreign key.
+#[allow(clippy::too_many_arguments)] // baked tier is a required 8th param; grouping into a struct is premature
 pub(crate) fn apply_effort_bridge(
     env: &mut std::collections::BTreeMap<String, String>,
     runtime: Option<&crate::managed_agents::discovery::KnownAcpRuntime>,
@@ -95,6 +116,7 @@ pub(crate) fn apply_effort_bridge(
     persona_id: Option<&str>,
     global_env: &std::collections::BTreeMap<String, String>,
     harness_def: Option<&crate::managed_agents::custom_harnesses::HarnessDefinition>,
+    baked_env: &std::collections::BTreeMap<String, String>,
 ) {
     use std::collections::BTreeMap;
 
@@ -105,8 +127,9 @@ pub(crate) fn apply_effort_bridge(
     // Strip foreign known effort keys for any runtime that has a native effort key,
     // regardless of whether it has an effort_normalization contract.
     // This ensures GOOSE_THINKING_EFFORT is absent from buzz-agent descriptors and vice versa.
+    // Derived from runtime declarations — adding a new runtime automatically participates.
     if let Some(native_key) = &rt.thinking_env_var {
-        for &key in ALL_KNOWN_EFFORT_KEYS {
+        for key in all_known_effort_keys() {
             if key != *native_key {
                 env.remove(key);
             }
@@ -135,15 +158,264 @@ pub(crate) fn apply_effort_bridge(
         })
         .unwrap_or_default();
 
+    // Baked tier: native-key only (no legacy alias — build floor is already
+    // canonical; allowing legacy here would silently conflate a foreign effort key).
+    // Only the native key is extracted to avoid carrying arbitrary baked keys.
+    let baked_native: BTreeMap<String, String> = baked_env
+        .get(*native_key)
+        .map(|v| [(native_key.to_string(), v.clone())].into_iter().collect())
+        .unwrap_or_default();
+
+    // Tier precedence (highest → lowest):
+    //   record (legacy allowed) → persona (legacy allowed) → global (no legacy)
+    //   → definition (no legacy) → baked (no legacy)
     let canonical = None
-        .or_else(|| effort_tier_alias(&s_record, native_key, norm_fn, false))
-        .or_else(|| effort_tier_alias(&s_persona, native_key, norm_fn, false))
-        .or_else(|| effort_tier_alias(&s_global, native_key, norm_fn, true))
-        .or_else(|| effort_tier_alias(&s_def, native_key, norm_fn, false));
+        .or_else(|| effort_tier_alias(&s_record, native_key, norm_fn, true))
+        .or_else(|| effort_tier_alias(&s_persona, native_key, norm_fn, true))
+        .or_else(|| effort_tier_alias(&s_global, native_key, norm_fn, false))
+        .or_else(|| effort_tier_alias(&s_def, native_key, norm_fn, false))
+        .or_else(|| effort_tier_alias(&baked_native, native_key, norm_fn, false));
 
     // Remove raw native key (may be alias-form or invalid); canonical re-inserted below.
     env.remove(*native_key);
     if let Some(value) = canonical {
         env.insert(native_key.to_string(), value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// Goose runtime from the catalog — has static effort vocabulary and
+    /// native key `GOOSE_THINKING_EFFORT`.
+    fn goose_rt() -> &'static crate::managed_agents::discovery::KnownAcpRuntime {
+        crate::managed_agents::discovery::known_acp_runtime_exact("goose")
+            .expect("goose must be in catalog")
+    }
+
+    fn empty_personas() -> Vec<crate::managed_agents::types::AgentDefinition> {
+        Vec::new()
+    }
+
+    fn env_with(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    // ── baked tier tests ──────────────────────────────────────────────────────
+
+    /// Baked `GOOSE_THINKING_EFFORT=high` with no higher-precedence tier
+    /// → canonical `high` survives in the effective env.
+    #[test]
+    fn baked_high_value_spawns_as_effort() {
+        let baked = env_with(&[("GOOSE_THINKING_EFFORT", "high")]);
+        let record = BTreeMap::new();
+        let global = BTreeMap::new();
+        let mut env = baked.clone(); // spawn starts with baked floor
+
+        apply_effort_bridge(
+            &mut env,
+            Some(goose_rt()),
+            &record,
+            &empty_personas(),
+            None,
+            &global,
+            None,
+            &baked,
+        );
+
+        assert_eq!(
+            env.get("GOOSE_THINKING_EFFORT").map(String::as_str),
+            Some("high"),
+            "baked valid native value must survive to launch"
+        );
+    }
+
+    /// Baked `GOOSE_THINKING_EFFORT=xhigh` → normalized to canonical `max`.
+    #[test]
+    fn baked_xhigh_normalizes_to_max() {
+        let baked = env_with(&[("GOOSE_THINKING_EFFORT", "xhigh")]);
+        let mut env = baked.clone();
+
+        apply_effort_bridge(
+            &mut env,
+            Some(goose_rt()),
+            &BTreeMap::new(),
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            None,
+            &baked,
+        );
+
+        assert_eq!(
+            env.get("GOOSE_THINKING_EFFORT").map(String::as_str),
+            Some("max"),
+            "baked xhigh alias must normalize to canonical max"
+        );
+    }
+
+    /// Baked `GOOSE_THINKING_EFFORT=minimal` (invalid for Goose) → key absent from env.
+    #[test]
+    fn baked_invalid_minimal_skipped() {
+        let baked = env_with(&[("GOOSE_THINKING_EFFORT", "minimal")]);
+        let mut env = baked.clone();
+
+        apply_effort_bridge(
+            &mut env,
+            Some(goose_rt()),
+            &BTreeMap::new(),
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            None,
+            &baked,
+        );
+
+        assert!(
+            !env.contains_key("GOOSE_THINKING_EFFORT"),
+            "baked invalid value must be skipped (key absent from launch env)"
+        );
+    }
+
+    /// Baked env contains `BUZZ_AGENT_THINKING_EFFORT=high` (legacy key for Goose).
+    /// The baked tier is native-key-only — the legacy key must NOT be aliased.
+    #[test]
+    fn baked_legacy_key_not_aliased_in_baked_tier() {
+        // The baked env has only the legacy key — no Goose-native key.
+        let baked = env_with(&[("BUZZ_AGENT_THINKING_EFFORT", "high")]);
+        let mut env = baked.clone();
+
+        apply_effort_bridge(
+            &mut env,
+            Some(goose_rt()),
+            &BTreeMap::new(),
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            None,
+            &baked,
+        );
+
+        // Legacy key should be stripped (foreign to Goose) and native key absent.
+        assert!(
+            !env.contains_key("GOOSE_THINKING_EFFORT"),
+            "baked legacy key must not produce a native effort value (no aliasing in baked tier)"
+        );
+        // The legacy foreign key is also stripped by the foreign-key sweep.
+        assert!(
+            !env.contains_key("BUZZ_AGENT_THINKING_EFFORT"),
+            "foreign effort key must be stripped from Goose's env"
+        );
+    }
+
+    /// Record-level effort beats baked — record `max` wins over baked `high`.
+    #[test]
+    fn baked_beaten_by_record() {
+        let baked = env_with(&[("GOOSE_THINKING_EFFORT", "high")]);
+        let record = env_with(&[("GOOSE_THINKING_EFFORT", "max")]);
+        let mut env = {
+            let mut e = baked.clone();
+            for (k, v) in &record {
+                e.insert(k.clone(), v.clone());
+            }
+            e
+        };
+
+        apply_effort_bridge(
+            &mut env,
+            Some(goose_rt()),
+            &record,
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            None,
+            &baked,
+        );
+
+        assert_eq!(
+            env.get("GOOSE_THINKING_EFFORT").map(String::as_str),
+            Some("max"),
+            "record-level effort must beat baked floor"
+        );
+    }
+
+    // ── definition tier alias policy ──────────────────────────────────────────
+
+    fn def_with_env(
+        pairs: &[(&str, &str)],
+    ) -> crate::managed_agents::custom_harnesses::HarnessDefinition {
+        crate::managed_agents::custom_harnesses::HarnessDefinition {
+            id: "test-def".to_string(),
+            label: "Test Definition".to_string(),
+            command: "goose".to_string(),
+            args: Vec::new(),
+            env: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            install_instructions_url: String::new(),
+            install_hint: String::new(),
+        }
+    }
+
+    /// Definition env containing only the legacy key `BUZZ_AGENT_THINKING_EFFORT=high`
+    /// for a Goose agent → the bridge must NOT alias it; native key remains absent.
+    /// Mirrors reader.rs: definition tier uses `allow_legacy_alias=false`.
+    #[test]
+    fn definition_legacy_key_excluded_spawn() {
+        let harness_def = def_with_env(&[("BUZZ_AGENT_THINKING_EFFORT", "high")]);
+        let mut env = env_with(&[("BUZZ_AGENT_THINKING_EFFORT", "high")]);
+
+        apply_effort_bridge(
+            &mut env,
+            Some(goose_rt()),
+            &BTreeMap::new(),
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            Some(&harness_def),
+            &BTreeMap::new(),
+        );
+
+        assert!(
+            !env.contains_key("GOOSE_THINKING_EFFORT"),
+            "definition-tier legacy key must NOT be aliased to the native effort key"
+        );
+        // Legacy key is also stripped by the foreign-key sweep.
+        assert!(
+            !env.contains_key("BUZZ_AGENT_THINKING_EFFORT"),
+            "foreign effort key must be stripped from Goose's env"
+        );
+    }
+
+    /// Definition env with the native key `GOOSE_THINKING_EFFORT=medium`
+    /// → the bridge accepts it (native key at definition tier is fine).
+    #[test]
+    fn definition_native_key_accepted_spawn() {
+        let harness_def = def_with_env(&[("GOOSE_THINKING_EFFORT", "medium")]);
+        let mut env = env_with(&[("GOOSE_THINKING_EFFORT", "medium")]);
+
+        apply_effort_bridge(
+            &mut env,
+            Some(goose_rt()),
+            &BTreeMap::new(),
+            &empty_personas(),
+            None,
+            &BTreeMap::new(),
+            Some(&harness_def),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            env.get("GOOSE_THINKING_EFFORT").map(String::as_str),
+            Some("medium"),
+            "definition native key must be accepted and reinserted as canonical"
+        );
     }
 }

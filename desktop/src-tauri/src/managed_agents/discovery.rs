@@ -77,7 +77,7 @@ fn common_binary_paths() -> &'static [PathBuf] {
     })
 }
 
-const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
+pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
     KnownAcpRuntime {
         id: "goose",
         label: "Goose",
@@ -1390,6 +1390,12 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime) -> PartialEntr
             accepted_effort_values: runtime
                 .effort_normalization
                 .map(|n| n.canonical_values().iter().map(|s| s.to_string()).collect()),
+            effort_aliases: runtime.effort_normalization.map(|n| {
+                n.aliases
+                    .iter()
+                    .map(|(a, c)| (a.to_string(), c.to_string()))
+                    .collect()
+            }),
             max_tokens_env_var: runtime.max_tokens_env_var.map(str::to_string),
             context_limit_env_var: runtime.context_limit_env_var.map(str::to_string),
             max_rounds_env_var: runtime.max_rounds_env_var.map(str::to_string),
@@ -1538,8 +1544,7 @@ pub fn discover_acp_runtimes_from(
             entries.push(AcpRuntimeCatalogEntry {
                 id: def.id.clone(),
                 label: def.label.clone(),
-                // F1 security fix: never copy user-supplied avatar URL into the catalog.
-                // All icons are bundled assets; customs fall back to TerminalSquare in the UI.
+                // Security: never copy user-supplied avatar URL; all icons are bundled assets.
                 avatar_url: String::new(),
                 availability,
                 command,
@@ -1551,6 +1556,7 @@ pub fn discover_acp_runtimes_from(
                 provider_env_var: None,
                 thinking_env_var: None,
                 accepted_effort_values: None,
+                effort_aliases: None,
                 max_tokens_env_var: None,
                 context_limit_env_var: None,
                 max_rounds_env_var: None,
@@ -1565,23 +1571,16 @@ pub fn discover_acp_runtimes_from(
                 auth_status: AuthStatus::NotApplicable,
                 login_hint: None,
                 source: HarnessSource::Custom,
-                // Carry definition env into the catalog so the edit form can
-                // read it back — prevents silently erasing env on save.
+                // Carry definition env — prevents silently erasing env on save.
                 definition_env: def.env.clone(),
             });
         }
     }
 
-    // Publish the loaded-harness registry from a FRESH directory read under the
-    // persist mutex — never from the snapshot taken before the auth probes ran.
-    // A save/delete landing during Phase 2 already re-warmed the registry; a
-    // stale-snapshot publish here would clobber it (the just-saved harness
-    // would become unresolvable at spawn until the next discovery).
-    //
-    // This exact line is pinned by `discovery_publish_path_survives_mid_flight_save`
-    // / `..._drops_mid_flight_delete` (discovery tests), which land a save/delete
-    // through the pre-publish test hook below and red if this reverts to
-    // publishing a stale snapshot.
+    // Publish from a FRESH directory read under the persist mutex — never from
+    // the snapshot taken before auth probes ran. A save/delete during Phase 2
+    // already re-warmed the registry; a stale publish here would clobber it.
+    // (Pinned by discovery_publish_path_survives_mid_flight_save and _delete.)
     #[cfg(test)]
     pre_publish_test_hook::run();
     crate::managed_agents::custom_harnesses::warm_harness_registry_locked(custom_harnesses_dir);

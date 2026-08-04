@@ -642,6 +642,14 @@ test("effort none is invalid for anthropic manual-budget (should trigger auto-cl
 const GOOSE_NATIVE_KEY = "GOOSE_THINKING_EFFORT";
 // Forward-declare here so mutation + normalization tests share one definition.
 const GOOSE_VALUES = ["off", "low", "medium", "high", "max"];
+// Aliases from GOOSE_EFFORT_NORMALIZATION (runtime_metadata.rs). Tests that
+// exercise alias resolution must pass this explicitly — absent = no aliases.
+const GOOSE_ALIASES = [
+  ["none", "off"],
+  ["disabled", "off"],
+  ["med", "medium"],
+  ["xhigh", "max"],
+];
 
 test("harness_native_save_writes_native_key_and_deletes_legacy", () => {
   // Legacy-only state (pre-migration Goose record): selecting a value must
@@ -821,6 +829,7 @@ test("harness_native_legacy_to_native_migration_at_persona_scope_renders_value",
     "GOOSE_THINKING_EFFORT",
     BUZZ_AGENT_THINKING_EFFORT,
     GOOSE_VALUES,
+    GOOSE_ALIASES,
   );
   assert.equal(
     result1.value,
@@ -926,7 +935,7 @@ test("harness_native_global_scope_no_legacy_fallback", () => {
 // Source: goose `crates/goose-provider-types/src/thinking.rs:277-308`
 // Canonical: off|low|medium|high|max
 // Aliases: none|disabled→off, med→medium, xhigh→max (case-insensitive)
-// (GOOSE_VALUES is defined above in the HarnessNativeEffortFields section.)
+// (GOOSE_VALUES and GOOSE_ALIASES are defined above in the HarnessNativeEffortFields section.)
 
 test("normalizeEffortValue_canonical_values_pass_through", () => {
   for (const v of GOOSE_VALUES) {
@@ -935,25 +944,43 @@ test("normalizeEffortValue_canonical_values_pass_through", () => {
 });
 
 test("normalizeEffortValue_none_to_off", () => {
-  assert.equal(normalizeEffortValue("none", GOOSE_VALUES), "off");
+  assert.equal(
+    normalizeEffortValue("none", GOOSE_VALUES, GOOSE_ALIASES),
+    "off",
+  );
 });
 
 test("normalizeEffortValue_disabled_to_off", () => {
-  assert.equal(normalizeEffortValue("disabled", GOOSE_VALUES), "off");
+  assert.equal(
+    normalizeEffortValue("disabled", GOOSE_VALUES, GOOSE_ALIASES),
+    "off",
+  );
 });
 
 test("normalizeEffortValue_med_to_medium", () => {
-  assert.equal(normalizeEffortValue("med", GOOSE_VALUES), "medium");
+  assert.equal(
+    normalizeEffortValue("med", GOOSE_VALUES, GOOSE_ALIASES),
+    "medium",
+  );
 });
 
 test("normalizeEffortValue_xhigh_to_max", () => {
-  assert.equal(normalizeEffortValue("xhigh", GOOSE_VALUES), "max");
+  assert.equal(
+    normalizeEffortValue("xhigh", GOOSE_VALUES, GOOSE_ALIASES),
+    "max",
+  );
 });
 
 test("normalizeEffortValue_case_insensitive", () => {
   assert.equal(normalizeEffortValue("HIGH", GOOSE_VALUES), "high");
-  assert.equal(normalizeEffortValue("NONE", GOOSE_VALUES), "off");
-  assert.equal(normalizeEffortValue("XHIGH", GOOSE_VALUES), "max");
+  assert.equal(
+    normalizeEffortValue("NONE", GOOSE_VALUES, GOOSE_ALIASES),
+    "off",
+  );
+  assert.equal(
+    normalizeEffortValue("XHIGH", GOOSE_VALUES, GOOSE_ALIASES),
+    "max",
+  );
 });
 
 test("normalizeEffortValue_invalid_returns_null", () => {
@@ -965,4 +992,29 @@ test("normalizeEffortValue_null_acceptedValues_passthrough", () => {
   // buzz-agent path: no static vocab, pass through raw value unchanged.
   assert.equal(normalizeEffortValue("xhigh", null), "xhigh");
   assert.equal(normalizeEffortValue("minimal", null), "minimal");
+});
+
+test("normalizeEffortValue_absent_aliases_means_no_aliases", () => {
+  // With no alias table, aliases must NOT resolve — absent means no aliases,
+  // not Goose aliases. This pins that the fallback table is truly dead.
+  assert.equal(normalizeEffortValue("none", GOOSE_VALUES), null);
+  assert.equal(normalizeEffortValue("xhigh", GOOSE_VALUES), null);
+  assert.equal(normalizeEffortValue("med", GOOSE_VALUES), null);
+});
+
+test("normalizeEffortValue_non_goose_alias_resolves_from_descriptor", () => {
+  // A runtime with a non-Goose alias table (ultra→max) must resolve from
+  // the supplied descriptor, not from any built-in table. Pins that alias
+  // resolution is fully driven by the catalog metadata.
+  const customValues = ["low", "medium", "max"];
+  const customAliases = [["ultra", "max"]];
+  assert.equal(
+    normalizeEffortValue("ultra", customValues, customAliases),
+    "max",
+  );
+  // "xhigh" is NOT in this runtime's alias table — must return null.
+  assert.equal(
+    normalizeEffortValue("xhigh", customValues, customAliases),
+    null,
+  );
 });

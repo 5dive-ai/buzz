@@ -743,3 +743,53 @@ fn acp_effort_invalid_for_runtime_skipped_lower_tier_wins() {
         effort.write_via
     );
 }
+
+// ── Definition-tier effort alias policy (reader) ──────────────────────────────
+//
+// plan v3: legacy alias (`BUZZ_AGENT_THINKING_EFFORT`) is consumed only at
+// record and persona tiers; definition and global tiers use native-key-only
+// lookup. These tests verify the reader enforces the same tier boundary as
+// the spawn bridge.
+
+/// Definition env with legacy key `BUZZ_AGENT_THINKING_EFFORT=high` for Goose
+/// → reader must NOT surface it as effort (definition tier excludes legacy alias).
+#[test]
+fn definition_legacy_key_excluded_reader() {
+    let record = test_record();
+    let runtime = test_runtime(); // Goose
+    let mut tiers = no_tiers();
+    tiers
+        .definition_env
+        .insert("BUZZ_AGENT_THINKING_EFFORT".to_string(), "high".to_string());
+
+    let surface = with_goose_path_root(Some("/nonexistent"), || {
+        read_config_surface(&record, Some(runtime), None, &tiers)
+    });
+
+    assert!(
+        surface.normalized.thinking_effort.is_none(),
+        "definition-tier legacy key must NOT be surfaced as effort for Goose"
+    );
+}
+
+/// Definition env with native key `GOOSE_THINKING_EFFORT=medium` for Goose
+/// → reader surfaces it correctly (native key at definition tier is accepted).
+#[test]
+fn definition_native_key_accepted_reader() {
+    let record = test_record();
+    let runtime = test_runtime(); // Goose
+    let mut tiers = no_tiers();
+    tiers
+        .definition_env
+        .insert("GOOSE_THINKING_EFFORT".to_string(), "medium".to_string());
+
+    let surface = with_goose_path_root(Some("/nonexistent"), || {
+        read_config_surface(&record, Some(runtime), None, &tiers)
+    });
+
+    let effort = surface
+        .normalized
+        .thinking_effort
+        .expect("definition native key must surface as effort");
+    assert_eq!(effort.value.as_deref(), Some("medium"));
+}

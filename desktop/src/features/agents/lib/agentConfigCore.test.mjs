@@ -15,6 +15,15 @@ const config = {
   provider: "anthropic",
 };
 
+// Goose alias pairs — must come from the runtime descriptor (no fallback table).
+// Kept here as a fixture constant so alias tests don't hand-roll the same array.
+const GOOSE_ALIASES = [
+  ["none", "off"],
+  ["disabled", "off"],
+  ["med", "medium"],
+  ["xhigh", "max"],
+];
+
 function runtime(id, metadata = {}) {
   return {
     id,
@@ -29,6 +38,7 @@ function runtime(id, metadata = {}) {
     providerEnvVar: null,
     thinkingEnvVar: null,
     acceptedEffortValues: null,
+    effortAliases: null,
     maxTokensEnvVar: null,
     contextLimitEnvVar: null,
     maxRoundsEnvVar: null,
@@ -698,6 +708,7 @@ test("goose_alias_none_normalizes_to_off_in_display_value", () => {
     runtime: runtime("goose", {
       thinkingEnvVar: "GOOSE_THINKING_EFFORT",
       acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+      effortAliases: GOOSE_ALIASES,
     }),
     scope: "instance",
   });
@@ -720,6 +731,7 @@ test("goose_alias_xhigh_normalizes_to_max_in_display_value", () => {
     runtime: runtime("goose", {
       thinkingEnvVar: "GOOSE_THINKING_EFFORT",
       acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+      effortAliases: GOOSE_ALIASES,
     }),
     scope: "instance",
   });

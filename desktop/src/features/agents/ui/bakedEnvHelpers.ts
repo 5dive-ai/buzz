@@ -81,6 +81,44 @@ export function getBakedModelInheritLabel(bakedModelId: string): string {
   return `Inherit build default (${bakedModelId})`;
 }
 
+/**
+ * Resolve the baked build effort for a runtime's native key, normalized through
+ * the full effort contract: alias→canonical, invalid→null.
+ *
+ * This is the shared resolver for every baked-effort display surface
+ * (`AgentConfigFields` global/onboarding and `getInheritedAgentDefaults`).
+ * Both consumers must route through here so alias resolution and invalid-value
+ * suppression are applied consistently at display time.
+ *
+ * Returns `null` when:
+ * - the key is absent from baked env;
+ * - the entry is masked;
+ * - the raw value is empty;
+ * - the value is invalid for the runtime's static vocabulary.
+ */
+export function resolveBakedEffort(
+  bakedEnv: readonly BakedEnvEntry[] | undefined,
+  nativeKey: string,
+  runtime:
+    | {
+        acceptedEffortValues?: readonly string[] | null;
+        effortAliases?: ReadonlyArray<readonly [string, string]> | null;
+      }
+    | null
+    | undefined,
+): string | null {
+  const entry = bakedEnv?.find((e) => e.key === nativeKey && !e.masked);
+  const raw = entry?.value.trim() ?? "";
+  if (!raw) return null;
+  return (
+    normalizeEffortValue(
+      raw,
+      runtime?.acceptedEffortValues ?? null,
+      runtime?.effortAliases ?? null,
+    ) ?? null
+  );
+}
+
 function providerModelEnvKey(provider: string): string | null {
   switch (provider.trim().toLowerCase()) {
     case "databricks":
@@ -180,6 +218,12 @@ export function getInheritedAgentDefaults(
      * Pass `null` for buzz-agent (per-model catalog, no static vocabulary).
      */
     acceptedEffortValues?: readonly string[] | null;
+    /**
+     * Effort alias pairs from `runtime.effortAliases` — the single normalization authority.
+     * Passed to `normalizeEffortValue` so the TS alias table derives from Rust metadata.
+     * Absent means no aliases; the fallback table has been removed.
+     */
+    effortAliases?: ReadonlyArray<readonly [string, string]> | null;
   },
 ): {
   effort: InheritedDefault;
@@ -202,6 +246,7 @@ export function getInheritedAgentDefaults(
     ? (normalizeEffortValue(
         globalNativeRaw,
         options?.acceptedEffortValues ?? null,
+        options?.effortAliases,
       ) ?? null)
     : null;
   const globalEffortValue = globalNativeEffort || null;
@@ -246,10 +291,8 @@ export function getInheritedAgentDefaults(
         };
       }
       // Baked effort — native-only lookup for non-buzz-agent runtimes.
-      const baked = bakedEnv?.find(
-        (entry) => entry.key === bakedEffortKey && !entry.masked,
-      );
-      const bakedValue = baked?.value.trim() ?? "";
+      // Normalize through the shared resolver (alias→canonical, invalid→absent).
+      const bakedValue = resolveBakedEffort(bakedEnv, bakedEffortKey, options);
       return bakedValue
         ? { source: "build" as InheritedDefaultSource, value: bakedValue }
         : { source: null, value: "" };

@@ -508,8 +508,8 @@ fn build_thinking_field(
     // record and persona tiers is resolved via `effort_tier_alias`, which applies within-tier
     // legacy aliasing with normalization: if the native key is absent or invalid, fall back to
     // BUZZ_AGENT_THINKING_EFFORT when the value normalizes to a canonical form.
-    // Global env uses the same resolver but with `global_tier=true` — legacy alias excluded.
-    // Definition env also uses `global_tier=true` semantics (no legacy alias there).
+    // Global env uses the same resolver but with `allow_legacy_alias=false` — legacy alias excluded.
+    // Definition env also uses `allow_legacy_alias=false` semantics (no legacy alias there).
 
     // Resolve per-tier effort values with optional normalization.
     // Owned values kept in locals to outlive the &str borrows below.
@@ -527,10 +527,10 @@ fn build_thinking_field(
 
     if let Some((native, norm)) = thinking_env_var.zip(effort_norm) {
         let nf = |v: &str| norm.normalize_str(v);
-        _rec_o = effort_tier_alias(&record.env_vars, native, nf, false);
-        _per_o = effort_tier_alias(&tiers.persona_env, native, nf, false);
-        _glo_o = effort_tier_alias(&tiers.global_env, native, nf, true);
-        _def_o = effort_tier_alias(&tiers.definition_env, native, nf, true);
+        _rec_o = effort_tier_alias(&record.env_vars, native, nf, true);
+        _per_o = effort_tier_alias(&tiers.persona_env, native, nf, true);
+        _glo_o = effort_tier_alias(&tiers.global_env, native, nf, false);
+        _def_o = effort_tier_alias(&tiers.definition_env, native, nf, false);
         // Normalize file effort too for consistent B comparison.
         _file_o = file_effort.as_deref().and_then(|v| norm.normalize_str(v));
         rec_env = _rec_o.as_deref();

@@ -644,6 +644,9 @@ pub struct AcpRuntimeCatalogEntry {
     pub thinking_env_var: Option<String>,
     /// Canonical effort values (`off|low|medium|high|max` for Goose; `None` for per-model harnesses).
     pub accepted_effort_values: Option<Vec<String>>,
+    /// Effort aliases for TS normalization: `(alias, canonical)` pairs from
+    /// `EffortNormalization::aliases`. `None` when runtime has no static vocabulary.
+    pub effort_aliases: Option<Vec<(String, String)>>,
     pub max_tokens_env_var: Option<String>,
     pub context_limit_env_var: Option<String>,
     pub max_rounds_env_var: Option<String>,

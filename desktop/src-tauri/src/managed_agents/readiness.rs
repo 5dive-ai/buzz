@@ -229,8 +229,7 @@ fn resolve_effective_agent_env_with_def(
     }
 
     // Layer 2b: definition env — the harness author's defaults (e.g. CURSOR_ACP=1).
-    // Applied as a floor below global so user env always wins on collision.
-    // Reserved keys are stripped by the shared `is_reserved_env_key` predicate.
+    // Applied as a floor below global; reserved keys stripped by `is_reserved_env_key`.
     if let Some(ref def) = harness_def {
         for (key, value) in &def.env {
             if !super::env_vars::is_reserved_env_key(key) {
@@ -269,6 +268,7 @@ fn resolve_effective_agent_env_with_def(
         record.persona_id.as_deref(),
         &global.env_vars,
         harness_def.as_deref(),
+        &baked_build_env(),
     );
 
     EffectiveAgentEnv {

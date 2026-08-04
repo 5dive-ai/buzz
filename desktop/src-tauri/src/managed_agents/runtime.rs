@@ -451,8 +451,8 @@ pub(crate) fn configure_runtime_cli(
 /// `owner_hex`: the workspace owner's pubkey, used as a fallback for legacy
 /// records that have no NIP-OA `auth_tag`. See `build_respond_to_env`.
 ///
-/// Thin wrapper over [`spawn_agent_child_at`]: loads live personas and global
-/// config from `app`, then delegates to the fully captured variant.
+/// Thin wrapper over [`spawn_agent_child_at`]: loads live personas, global
+/// config, and teams from `app`, then delegates to the fully captured variant.
 pub fn spawn_agent_child<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     record: &ManagedAgentRecord,
@@ -462,19 +462,24 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     let personas = super::load_personas(app).unwrap_or_default();
     let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
-    spawn_agent_child_at(app, record, relay_url, lazy, owner_hex, &personas, &global)
+    let teams = super::load_teams(app).unwrap_or_default();
+    spawn_agent_child_at(
+        app, record, relay_url, lazy, owner_hex, &personas, &global, &teams,
+    )
 }
 
 /// Captured-scope variant of [`spawn_agent_child`]: accepts pre-loaded
-/// `personas` and `global` config instead of loading them via the `AppHandle`.
+/// `personas`, `global` config, and `teams` instead of loading them via the
+/// `AppHandle`.
 ///
-/// Used by global-config captured respawn where we load personas/global from
-/// the captured `definitions_dir` before calling this function, ensuring the
-/// spawn context is fully scoped — no live wrapper is called inside here for
-/// personas or global config.
+/// Used by global-config captured respawn where we load personas/global/teams
+/// from the captured `definitions_dir` before calling this function, ensuring
+/// the spawn context is fully scoped — no live wrapper is called inside here.
 ///
-/// `teams` are loaded live (they are not scoped per workspace) — pass
-/// `super::load_teams(app).unwrap_or_default()` or an empty Vec for test paths.
+/// INVARIANT: `managed_agent_runtime_transition` must be held by the caller
+/// through the entire epoch — no workspace switch can occur during this call,
+/// so the caller's captured teams (loaded from the captured definitions_dir)
+/// are the correct teams for this spawn.
 pub(crate) fn spawn_agent_child_at<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     record: &ManagedAgentRecord,
@@ -483,14 +488,12 @@ pub(crate) fn spawn_agent_child_at<R: tauri::Runtime>(
     owner_hex: Option<&str>,
     personas: &[super::AgentDefinition],
     global: &super::GlobalAgentConfig,
+    teams: &[super::TeamRecord],
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
     }
     let runtime_key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), relay_url)?;
-
-    // Teams are workspace-level context shared across scopes — load live.
-    let teams = super::load_teams(app).unwrap_or_default();
 
     let effective_cfg =
         crate::managed_agents::effective_config::resolve_effective_config(record, personas, global)

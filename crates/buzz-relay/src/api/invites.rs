@@ -284,11 +284,16 @@ async fn authenticate(
         true, // POST bodies must be covered by a payload tag
         tenant.community(),
     )?;
-    if state
+    let authorization_mode = state
         .protected_transport()
-        .and_then(|runtime| runtime.mode_for_domain(tenant.community()))
-        != Some(AuthorizationMode::Enforce)
-    {
+        .and_then(|runtime| runtime.mode_for_domain(tenant.community()));
+    if authorization_mode == Some(AuthorizationMode::DenyProtected) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "protected authorization denied",
+        ));
+    }
+    if authorization_mode != Some(AuthorizationMode::Enforce) {
         bridge::check_nip98_replay(state, &tenant, event_id_bytes).await?;
     }
 
@@ -556,10 +561,16 @@ pub async fn claim_invite(
     let (tenant, pubkey, identity_proof, verified_proof, enrollment_assertion) =
         authenticate(&state, &headers, "/api/invites/claim", &body).await?;
 
-    let enforcing = state
+    let authorization_mode = state
         .protected_transport()
-        .and_then(|runtime| runtime.mode_for_domain(tenant.community()))
-        == Some(AuthorizationMode::Enforce);
+        .and_then(|runtime| runtime.mode_for_domain(tenant.community()));
+    if authorization_mode == Some(AuthorizationMode::DenyProtected) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "protected authorization denied",
+        ));
+    }
+    let enforcing = authorization_mode == Some(AuthorizationMode::Enforce);
 
     if claim_rate_limited(&state, tenant.community(), &pubkey) {
         return Err(api_error(

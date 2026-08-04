@@ -732,14 +732,13 @@ pub async fn build_from_environment_with_providers(
         return Ok(None);
     }
     validate_provider_coverage(&configured, &providers)?;
-    if configured
-        .values()
-        .any(|mode| *mode != AuthorizationMode::Off)
+    if configured.values().any(|mode| mode.evaluates_provider())
         && state.identity_assertion_provenance().is_none()
     {
         return Err(ProductionRuntimeError::AssertionProvenanceMissing);
     }
-    let enforcing_domains = authoritative_domains(&configured);
+    let protected_domains = protected_domains(&configured);
+    let enforcing_domains = enforcing_domains(&configured);
     let projection_domains = projection_reconciliation_domains(&configured);
     if !enforcing_domains.is_empty() && state.corporate_identity.is_none() {
         return Err(ProductionRuntimeError::VerifierMissing);
@@ -747,7 +746,7 @@ pub async fn build_from_environment_with_providers(
     let clock: SharedAuthorizationClock = Arc::new(SystemAuthorizationClock);
     let restore_bootstraps = parse_restore_bootstraps(
         &env::var(RESTORE_BOOTSTRAPS_ENV).unwrap_or_default(),
-        &enforcing_domains,
+        &protected_domains,
     )?;
     let profile = env::var(PROFILE_ENV).unwrap_or_else(|_| "current-membership-v1".to_owned());
     let lease_seconds = parse_positive_seconds(LEASE_SECONDS_ENV, 300)?;
@@ -757,11 +756,13 @@ pub async fn build_from_environment_with_providers(
     let mut policies = Vec::with_capacity(configured.len());
     let mut transports = Vec::with_capacity(configured.len());
     for (domain, mode) in &configured {
-        let provider = if *mode == AuthorizationMode::Off {
+        transports.push(DomainTransportPolicy::from_server_configuration(
+            *domain, *mode,
+        ));
+        if !mode.evaluates_provider() {
             continue;
-        } else {
-            providers.provider_for(*domain)?
-        };
+        }
+        let provider = providers.provider_for(*domain)?;
         policies.push(DomainAuthorizationPolicy::from_server_configuration(
             *domain,
             profile.clone(),
@@ -772,16 +773,6 @@ pub async fn build_from_environment_with_providers(
             AccessLeasePolicy::new(lease_limit, skew),
             VerificationStatusPolicy::new(status_limit, skew),
         )?);
-        transports.push(DomainTransportPolicy::from_server_configuration(
-            *domain, *mode,
-        ));
-    }
-    for (domain, mode) in &configured {
-        if *mode == AuthorizationMode::Off {
-            transports.push(DomainTransportPolicy::from_server_configuration(
-                *domain, *mode,
-            ));
-        }
     }
     let hosts = state.db.usage_community_hosts().await?;
     let host_map = hosts
@@ -804,7 +795,7 @@ pub async fn build_from_environment_with_providers(
         restore_bootstraps,
     )
     .await?;
-    activate_enforcing_domains(&state.db, &restore, enforcing_domains.iter().copied()).await?;
+    activate_protected_domains(&state.db, &restore, protected_domains.iter().copied()).await?;
     reconcile_audio_admissions_once(&state.db, &restore, enforcing_domains.iter().copied()).await?;
     let invalidation = AuthorizationInvalidationRuntime::new_with_restore(
         state.db.clone(),
@@ -813,7 +804,7 @@ pub async fn build_from_environment_with_providers(
         Arc::clone(&restore),
     );
     invalidation
-        .initialize_domains(enforcing_domains.iter().copied())
+        .initialize_domains(protected_domains.iter().copied())
         .await?;
     crate::corporate_identity::reconcile_public_projection_retirements_startup(
         state,
@@ -843,7 +834,7 @@ pub async fn build_from_environment_with_providers(
     }))
 }
 
-async fn activate_enforcing_domains(
+async fn activate_protected_domains(
     db: &buzz_db::Db,
     restore: &Arc<super::restore::RestoreProtectionRuntime>,
     domains: impl IntoIterator<Item = CommunityId>,
@@ -886,7 +877,7 @@ fn validate_provider_coverage(
     providers: &ProductionProviderRegistry,
 ) -> Result<(), ProductionRuntimeError> {
     for (domain, mode) in configured {
-        if *mode != AuthorizationMode::Off {
+        if mode.evaluates_provider() {
             providers.provider_for(*domain)?;
         }
     }
@@ -897,10 +888,11 @@ fn validate_activated_domain_configuration(
     configured: &HashMap<CommunityId, AuthorizationMode>,
     activated: impl IntoIterator<Item = CommunityId>,
 ) -> Result<(), ProductionRuntimeError> {
-    if activated
-        .into_iter()
-        .any(|domain| configured.get(&domain) != Some(&AuthorizationMode::Enforce))
-    {
+    if activated.into_iter().any(|domain| {
+        !configured
+            .get(&domain)
+            .is_some_and(|mode| mode.protects_surfaces())
+    }) {
         return Err(ProductionRuntimeError::ActivatedDomainDowngrade);
     }
     Ok(())
@@ -1083,6 +1075,7 @@ fn parse_domains(
             "shadow" => AuthorizationMode::Shadow,
             "verify_only" => AuthorizationMode::VerifyOnly,
             "enforce" => AuthorizationMode::Enforce,
+            "deny_protected" => AuthorizationMode::DenyProtected,
             _ => return Err(ProductionRuntimeError::InvalidConfiguration),
         };
         if domains.insert(domain, mode).is_some() {
@@ -1092,7 +1085,14 @@ fn parse_domains(
     Ok(domains)
 }
 
-fn authoritative_domains(configured: &HashMap<CommunityId, AuthorizationMode>) -> Vec<CommunityId> {
+fn protected_domains(configured: &HashMap<CommunityId, AuthorizationMode>) -> Vec<CommunityId> {
+    configured
+        .iter()
+        .filter_map(|(domain, mode)| mode.protects_surfaces().then_some(*domain))
+        .collect()
+}
+
+fn enforcing_domains(configured: &HashMap<CommunityId, AuthorizationMode>) -> Vec<CommunityId> {
     configured
         .iter()
         .filter_map(|(domain, mode)| (*mode == AuthorizationMode::Enforce).then_some(*domain))
@@ -1112,7 +1112,7 @@ fn projection_reconciliation_domains(
 
 fn parse_restore_bootstraps(
     raw: &str,
-    enforcing_domains: &[CommunityId],
+    protected_domains: &[CommunityId],
 ) -> Result<Vec<(CommunityId, uuid::Uuid)>, ProductionRuntimeError> {
     let mut anchors = HashMap::new();
     for item in raw
@@ -1133,8 +1133,8 @@ fn parse_restore_bootstraps(
             return Err(ProductionRuntimeError::InvalidConfiguration);
         }
     }
-    let mut result = Vec::with_capacity(enforcing_domains.len());
-    for domain in enforcing_domains {
+    let mut result = Vec::with_capacity(protected_domains.len());
+    for domain in protected_domains {
         let bootstrap = anchors
             .remove(domain)
             .ok_or(ProductionRuntimeError::RestoreBootstrapMissing)?;
@@ -1240,8 +1240,11 @@ mod tests {
     fn exact_modes_parse_without_a_default() {
         let first = uuid::Uuid::new_v4();
         let second = uuid::Uuid::new_v4();
-        let parsed = parse_domains(&format!("{first}:enforce,{second}:verify_only"))
-            .expect("valid exact domains");
+        let third = uuid::Uuid::new_v4();
+        let parsed = parse_domains(&format!(
+            "{first}:enforce,{second}:verify_only,{third}:deny_protected"
+        ))
+        .expect("valid exact domains");
         assert_eq!(
             parsed.get(&CommunityId::from_uuid(first)),
             Some(&AuthorizationMode::Enforce)
@@ -1249,6 +1252,10 @@ mod tests {
         assert_eq!(
             parsed.get(&CommunityId::from_uuid(second)),
             Some(&AuthorizationMode::VerifyOnly)
+        );
+        assert_eq!(
+            parsed.get(&CommunityId::from_uuid(third)),
+            Some(&AuthorizationMode::DenyProtected)
         );
     }
 
@@ -1265,12 +1272,19 @@ mod tests {
         let shadow = uuid::Uuid::new_v4();
         let verify = uuid::Uuid::new_v4();
         let enforce = uuid::Uuid::new_v4();
+        let deny = uuid::Uuid::new_v4();
         let parsed = parse_domains(&format!(
-            "{off}:off,{shadow}:shadow,{verify}:verify_only,{enforce}:enforce"
+            "{off}:off,{shadow}:shadow,{verify}:verify_only,{enforce}:enforce,{deny}:deny_protected"
         ))
         .expect("valid exact modes");
+        let protected = protected_domains(&parsed)
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(protected.len(), 2);
+        assert!(protected.contains(&CommunityId::from_uuid(enforce)));
+        assert!(protected.contains(&CommunityId::from_uuid(deny)));
         assert_eq!(
-            authoritative_domains(&parsed),
+            enforcing_domains(&parsed),
             vec![CommunityId::from_uuid(enforce)]
         );
         let projection_domains = projection_reconciliation_domains(&parsed)
@@ -1281,6 +1295,7 @@ mod tests {
         assert!(!projection_domains.contains(&CommunityId::from_uuid(shadow)));
         assert!(!projection_domains.contains(&CommunityId::from_uuid(verify)));
         assert!(projection_domains.contains(&CommunityId::from_uuid(enforce)));
+        assert!(!projection_domains.contains(&CommunityId::from_uuid(deny)));
     }
 
     #[test]
@@ -1304,6 +1319,9 @@ mod tests {
         let configured = HashMap::from([(activated, AuthorizationMode::Enforce)]);
         validate_activated_domain_configuration(&configured, [activated])
             .expect("exact Enforce configuration preserves one-way activation");
+        let configured = HashMap::from([(activated, AuthorizationMode::DenyProtected)]);
+        validate_activated_domain_configuration(&configured, [activated])
+            .expect("deny-protected preserves the protected inventory after activation");
     }
 
     #[test]
@@ -1324,8 +1342,11 @@ mod tests {
     fn exact_provider_coverage_makes_enforce_constructible_without_fallback() {
         let enforce = CommunityId::from_uuid(uuid::Uuid::new_v4());
         let off = CommunityId::from_uuid(uuid::Uuid::new_v4());
-        let configured = parse_domains(&format!("{enforce}:enforce,{off}:off"))
-            .expect("exact production configuration");
+        let deny = CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let configured = parse_domains(&format!(
+            "{enforce}:enforce,{off}:off,{deny}:deny_protected"
+        ))
+        .expect("exact production configuration");
         assert!(matches!(
             validate_provider_coverage(&configured, &ProductionProviderRegistry::default()),
             Err(ProductionRuntimeError::ProviderMissing)
@@ -1356,10 +1377,10 @@ mod tests {
     fn enforce_domain_activation_precedes_snapshot_and_transport_reachability() {
         let source = include_str!("production.rs");
         let activation = source
-            .find("activate_enforcing_domains(&state.db")
+            .find("activate_protected_domains(&state.db")
             .expect("durable activation is part of construction");
         let snapshot = source
-            .find(".initialize_domains(enforcing_domains.iter().copied())")
+            .find(".initialize_domains(protected_domains.iter().copied())")
             .expect("invalidation snapshot is initialized");
         let transport = source
             .find("ProtectedTransportRuntime::new(transports, resolver, clock)")

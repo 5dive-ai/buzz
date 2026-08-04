@@ -533,9 +533,6 @@ pub async fn mesh_start_node(
     Ok(status)
 }
 
-/// Mesh can bind its HTTP ingress and advertise a model shortly before the
-/// router has installed a usable target. Probe the exact chat path agents use
-/// so startup cannot race that gap (`single target None unavailable`).
 /// Which startup stage a mesh client is stuck at when it never becomes
 /// inference-ready. The two live-observed failure modes are physically
 /// distinct and want different user copy:
@@ -898,9 +895,9 @@ pub(crate) async fn ensure_relay_mesh_for_record(
         }
     };
 
-    // No serving configuration exists, so this is a genuine consumer-only
-    // start. A configured serving machine is restored above and never reaches
-    // this client fallback.
+    // No serving configuration exists — genuine consumer-only start.
+    // Acquire workspace_transition to serialize client install against apply_workspace.
+    let _workspace_guard = state.workspace_transition.lock().await;
     ensure_client_node_for_model(&state, model_id, Some(target.endpoint_addr)).await?;
     wait_for_mesh_inference(model_id).await
 }
@@ -944,6 +941,9 @@ pub async fn mesh_stop_node(
     mesh_llm::publish_stopped_status_once_at(&app, bound_relay_url.as_deref(), "stop").await;
     Ok(mesh_llm::stopped_status())
 }
+
+/// Stop the local Mesh client (client-mode only). See [`scope_impl::mesh_stop_client`].
+pub use scope_impl::mesh_stop_client;
 
 #[tauri::command]
 pub async fn mesh_node_status(state: State<'_, AppState>) -> CmdResult<mesh_llm::MeshNodeStatus> {

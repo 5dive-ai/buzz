@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
-
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::{
@@ -258,23 +256,14 @@ fn start_pair(
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     let state = app.state::<AppState>();
-    // Check the compensation gate BEFORE taking the transition lock so a
-    // concurrent compensate_drain call is not blocked waiting for our lock
-    // while we wait for its gate — the transition mutex alone cannot prevent
-    // that ordering when compensation holds neither lock.
-    if state
-        .managed_agent_drain_compensation_in_progress
-        .load(Ordering::Acquire)
-    {
-        return Err(
-            "drain compensation in progress — retry after workspace transition completes".into(),
-        );
-    }
     let _transition = state
         .managed_agent_runtime_transition
         .lock()
         .map_err(|e| e.to_string())?;
-    if state.shutdown_started.load(Ordering::Acquire) {
+    if state
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         return Err("desktop shutdown has started".into());
     }
     let _store = state
@@ -282,7 +271,40 @@ fn start_pair(
         .lock()
         .map_err(|e| e.to_string())?;
     let mut records = load_managed_agents(&app)?;
-    let record = find_managed_agent_mut(&mut records, &pubkey)?;
+    start_pair_under_held_locks(
+        &app,
+        &state,
+        pubkey,
+        relay_url,
+        lazy,
+        expected_updated_at,
+        &mut records,
+    )
+}
+
+/// The spawn-and-register body of `start_pair`, called with the
+/// `managed_agent_runtime_transition` and `managed_agents_store_lock` already
+/// held by the caller.
+///
+/// Used by two callers:
+/// 1. `start_pair` — normal start path; locks are acquired immediately above.
+/// 2. `compensate_drain` — compensation path; locks are re-acquired by the
+///    compensation primitive before calling this function, so compensation never
+///    yields the epoch between journal entries and concurrent starts cannot
+///    interleave.
+///
+/// The caller is responsible for saving `records` to disk after the call (or
+/// for saving inside a batch loop if called for multiple entries).
+fn start_pair_under_held_locks(
+    app: &AppHandle,
+    state: &AppState,
+    pubkey: String,
+    relay_url: String,
+    lazy: bool,
+    expected_updated_at: Option<&str>,
+    records: &mut [super::ManagedAgentRecord],
+) -> Result<ManagedAgentRuntimeStatus, String> {
+    let record = find_managed_agent_mut(records, &pubkey)?;
     if record.backend != BackendKind::Local {
         return Err("managed runtime pairs require a local agent".into());
     }
@@ -298,11 +320,11 @@ fn start_pair(
         .get_mut(&key)
         .is_some_and(|runtime| runtime.child.try_wait().ok().flatten().is_none())
     {
-        let status = status_for(&app, record, &key, runtimes.get(&key), None);
+        let status = status_for(app, record, &key, runtimes.get(&key), None);
         return Ok(status);
     }
     runtimes.remove(&key);
-    terminate_untracked_pair_runtime(&app, &key)?;
+    terminate_untracked_pair_runtime(app, &key)?;
 
     let owner = state
         .keys
@@ -312,15 +334,15 @@ fn start_pair(
     let scope_id = state
         .capture_active_scope()
         .map(|scope| scope.scope_id.clone());
-    let mut process = spawn_agent_child(&app, record, &key.relay_url, lazy, owner.as_deref())?;
+    let mut process = spawn_agent_child(app, record, &key.relay_url, lazy, owner.as_deref())?;
     let now = crate::util::now_iso();
     let receipt = ManagedAgentRuntimeReceipt {
         key: key.clone(),
         pid: process.child.id(),
-        desktop_instance_id: current_instance_id(&app),
+        desktop_instance_id: current_instance_id(app),
         started_at: now.clone(),
     };
-    if let Err(error) = write_agent_runtime_receipt(&app, &receipt) {
+    if let Err(error) = write_agent_runtime_receipt(app, &receipt) {
         let _ = terminate_process(process.child.id());
         let _ = process.child.wait();
         return Err(error);
@@ -334,10 +356,10 @@ fn start_pair(
         key.clone(),
         ManagedAgentPairRuntime::starting(process, scope_id),
     );
-    let status = status_for(&app, record, &key, runtimes.get(&key), None);
+    let status = status_for(app, record, &key, runtimes.get(&key), None);
     drop(runtimes);
-    save_managed_agents(&app, &records)?;
-    emit_status(&app, &status);
+    save_managed_agents(app, records)?;
+    emit_status(app, &status);
     Ok(status)
 }
 
@@ -626,7 +648,36 @@ pub(crate) struct DrainJournalEntry {
 pub(crate) fn execute_drain_journal(
     journal: &[DrainJournalEntry],
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+    cleanup_fn: impl FnMut(&ManagedAgentRuntimeKey),
+) -> (
+    Vec<DrainJournalEntry>,
+    Vec<DrainJournalEntry>,
+    Option<String>,
+) {
+    drain_journal_with_stop(journal, runtimes, cleanup_fn, |key, runtime| {
+        let kill_result = if super::process_is_running(runtime.child.id()) {
+            super::terminate_process(runtime.child.id())
+        } else {
+            Ok(())
+        }
+        .and_then(|()| runtime.child.wait().map_err(|e| e.to_string()));
+        let _ = key; // key available for logging; unused in production path
+        kill_result.map(|_| ())
+    })
+}
+
+/// Inner implementation of drain journal execution, parameterized by a stop
+/// function for testability.
+///
+/// The `stop_fn` receives the journal key and a mutable reference to the
+/// runtime being stopped. It returns `Ok(())` on success or `Err(String)` on
+/// failure. In production it sends SIGTERM/SIGKILL + wait; in tests it can
+/// inject controlled failures per-key.
+fn drain_journal_with_stop(
+    journal: &[DrainJournalEntry],
+    runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
     mut cleanup_fn: impl FnMut(&ManagedAgentRuntimeKey),
+    mut stop_fn: impl FnMut(&ManagedAgentRuntimeKey, &mut ManagedAgentPairRuntime) -> Result<(), String>,
 ) -> (
     Vec<DrainJournalEntry>,
     Vec<DrainJournalEntry>,
@@ -638,15 +689,8 @@ pub(crate) fn execute_drain_journal(
     for (idx, entry) in journal.iter().enumerate() {
         let key = &entry.key;
         let stop_result = if let Some(mut runtime) = runtimes.remove(key) {
-            let kill_result = if super::process_is_running(runtime.child.id()) {
-                super::terminate_process(runtime.child.id())
-            } else {
-                Ok(())
-            }
-            .and_then(|()| runtime.child.wait().map_err(|e| e.to_string()));
-
-            match kill_result {
-                Ok(_) => {
+            match stop_fn(key, &mut runtime) {
+                Ok(()) => {
                     cleanup_fn(key);
                     Ok(())
                 }
@@ -673,6 +717,28 @@ pub(crate) fn execute_drain_journal(
     }
 
     (stopped, vec![], first_error)
+}
+
+/// Test-only variant of `execute_drain_journal` with an injectable stop
+/// function so partial-failure scenarios can be exercised without relying on
+/// OS-specific process-wait behavior.
+///
+/// The `stop_fn` receives the `ManagedAgentRuntimeKey` being stopped and
+/// returns `Ok(())` for simulated success or `Err(String)` for simulated
+/// failure. Entries absent from the runtime map are still treated as stopped
+/// (matching the production path).
+#[cfg(test)]
+pub(crate) fn execute_drain_journal_with_stop_fn(
+    journal: &[DrainJournalEntry],
+    runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+    cleanup_fn: impl FnMut(&ManagedAgentRuntimeKey),
+    mut stop_fn: impl FnMut(&ManagedAgentRuntimeKey) -> Result<(), String>,
+) -> (
+    Vec<DrainJournalEntry>,
+    Vec<DrainJournalEntry>,
+    Option<String>,
+) {
+    drain_journal_with_stop(journal, runtimes, cleanup_fn, |key, _runtime| stop_fn(key))
 }
 
 /// Drain all live runtimes from the runtime map and return a drain journal
@@ -753,40 +819,84 @@ pub(crate) fn drain_scope_runtimes(
 /// the prefix of the journal up to the first failure). We restart them so the
 /// old workspace is as intact as possible.
 ///
-/// Sets `managed_agent_drain_compensation_in_progress` in AppState while running
-/// so that concurrent `start_pair` calls back off — prevents a normal start
-/// from inserting a runtime into the gap between "drop transition lock" and
-/// "compensate_drain calls start_pair".
+/// `captured_scope` is the workspace scope that was active when the drain began.
+/// Before restoring any entry this function validates that the scope generation
+/// has not changed — if a workspace switch raced the drain failure, compensation
+/// is skipped entirely (the new scope will restore its own agents).
+///
+/// `_rt_transition_held` is the caller's already-held
+/// `managed_agent_runtime_transition` guard. The caller must NOT drop it before
+/// calling this function — passing ownership here ensures the transition lock
+/// is held continuously from drain through all journal restarts, closing the
+/// drop-then-reacquire interleave window that a concurrent start could exploit.
+///
+/// This function additionally re-acquires `managed_agents_store_lock` so all
+/// journal restarts run under both guards.  The caller must have released
+/// `managed_agents_store_lock` (only) before calling.
 ///
 /// Returns a degradation message describing what could not be restarted.
-pub(crate) fn compensate_drain(app: &AppHandle, stopped: &[DrainJournalEntry]) -> Option<String> {
-    use std::sync::atomic::Ordering;
-    use tauri::Manager;
+pub(crate) fn compensate_drain(
+    app: &AppHandle,
+    stopped: &[DrainJournalEntry],
+    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
+    // Caller passes ownership of the already-held transition guard so the lock
+    // is never dropped between drain and compensation.
+    _rt_transition_held: std::sync::MutexGuard<'_, ()>,
+) -> Option<String> {
+    if stopped.is_empty() {
+        // Release the transition guard immediately — nothing to restore.
+        drop(_rt_transition_held);
+        return None;
+    }
+
     let state = app.state::<AppState>();
 
-    // Gate concurrent starts for the duration of compensation so no normal
-    // start_pair call can interleave with the journal restore.
-    state
-        .managed_agent_drain_compensation_in_progress
-        .store(true, Ordering::Release);
+    // Re-acquire only the store lock — the transition lock is already held via
+    // `_rt_transition_held` so no concurrent start can enter the window.
+    let _store = match state.managed_agents_store_lock.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            return Some(format!(
+                "compensation failed: could not acquire store lock: {e}"
+            ));
+        }
+    };
+
+    // Validate the captured scope before restoring. If the workspace switched
+    // between the drain failure and this compensation, the new scope's own
+    // restore pass will start the correct agents — we must not restart agents
+    // for a scope that is no longer active.
+    if let Err(stale_msg) = crate::managed_agents::scope::validate_scope_generation(captured_scope)
+    {
+        return Some(format!(
+            "compensation skipped: {stale_msg}; new scope will restore its own agents"
+        ));
+    }
+
+    let mut records = match load_managed_agents(app) {
+        Ok(r) => r,
+        Err(e) => {
+            return Some(format!(
+                "compensation failed: could not load agent records: {e}"
+            ));
+        }
+    };
 
     let mut failed_restarts = Vec::new();
     for entry in stopped {
-        let result = start_pair(
+        let result = start_pair_under_held_locks(
+            app,
+            &state,
             entry.key.pubkey.clone(),
             entry.key.relay_url.clone(),
             entry.start_on_app_launch,
             None,
-            app.clone(),
+            &mut records,
         );
         if let Err(e) = result {
             failed_restarts.push(format!("{}@{}: {e}", entry.key.pubkey, entry.key.relay_url));
         }
     }
-
-    state
-        .managed_agent_drain_compensation_in_progress
-        .store(false, Ordering::Release);
 
     if failed_restarts.is_empty() {
         None

@@ -504,15 +504,24 @@ pub async fn confirm_team_snapshot_import(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TeamSnapshotImportResult, String> {
-    // ── Scope capture: snapshot the active workspace at entry ─────────────────
-    // All store reads and writes in Phase 3 use `definitions_dir` derived from
-    // this captured scope so a concurrent workspace switch cannot redirect them
-    // to the wrong scope. The generation is re-validated inside the store lock
-    // before the first write (Phase 3).
+    // ── Scope capture ─────────────────────────────────────────────────────────
+    // All Phase 3 writes use `definitions_dir` from this snapshot; generation
+    // is re-validated under the store lock before the first write.
     let captured_scope = state
         .capture_active_scope()
         .ok_or("confirm_team_snapshot_import: no active workspace scope — cannot import")?;
     let definitions_dir = captured_scope.definitions_dir.clone();
+
+    // Capture owner keys at entry to hold a consistent identity across all phases.
+    let captured_owner_keys = state
+        .signing_keys()
+        .map_err(|e| format!("confirm_team_snapshot_import: failed to capture owner keys: {e}"))?;
+    if captured_owner_keys.public_key().to_hex() != captured_scope.owner_pubkey {
+        return Err(
+            "confirm_team_snapshot_import: owner pubkey mismatch; identity may have changed"
+                .to_string(),
+        );
+    }
 
     // ── Phase 1: validate (no I/O) ───────────────────────────────────────────
     let snapshot = decode_team_snapshot_from_bytes(&input.file_bytes)?;
@@ -525,10 +534,7 @@ pub async fn confirm_team_snapshot_import(
 
     // ── Phase 2: mint keys + auth tags (sync, outside lock) ─────────────────
     // All mints must succeed before we enter the store. If any fails, zero writes.
-    let owner_pubkey_hex = {
-        let keys = state.signing_keys()?;
-        keys.public_key().to_hex()
-    };
+    let owner_pubkey_hex = captured_owner_keys.public_key().to_hex();
 
     let mut minted: Vec<MintedMember> = Vec::with_capacity(snapshot.members.len());
     for (member, definition) in snapshot.members.iter().zip(definitions) {
@@ -538,7 +544,6 @@ pub async fn confirm_team_snapshot_import(
         let minted_parallelism = definition.parallelism;
 
         let (agent_keys, private_key_nsec, pubkey, auth_tag) = {
-            let owner_keys = state.signing_keys()?;
             let agent_keys = nostr::Keys::generate();
             let pubkey = agent_keys.public_key().to_hex();
             let private_key_nsec = {
@@ -549,8 +554,9 @@ pub async fn confirm_team_snapshot_import(
                     .map_err(|e| format!("failed to encode agent private key: {e}"))?
             };
             // NIP-OA auth tag: bridge nostr 0.37 → 0.36 (buzz-sdk) via hex round-trip.
-            let compat_owner = nostr::Keys::parse(&owner_keys.secret_key().to_secret_hex())
-                .map_err(|e| format!("failed to bridge owner keys: {e}"))?;
+            let compat_owner =
+                nostr::Keys::parse(&captured_owner_keys.secret_key().to_secret_hex())
+                    .map_err(|e| format!("failed to bridge owner keys: {e}"))?;
             let compat_agent = nostr::PublicKey::from_hex(&pubkey)
                 .map_err(|e| format!("failed to bridge agent pubkey: {e}"))?;
             let auth_tag = Some(
@@ -649,12 +655,16 @@ pub async fn confirm_team_snapshot_import(
         crate::managed_agents::scope::validate_scope_generation(&captured_scope)
             .map_err(|e| format!("confirm_team_snapshot_import: {e}"))?;
 
-        // Resolve retention scope once from the captured workspace scope so
-        // all retain calls below write to the correct scope's database.
-        let owner_keys_for_retention = state.signing_keys()?;
+        // Re-verify owner key agreement under the store lock so a concurrent
+        // identity import cannot split disk writes across two different owners.
+        if captured_owner_keys.public_key().to_hex() != captured_scope.owner_pubkey {
+            return Err(
+                "confirm_team_snapshot_import: owner key changed before Phase 3 commit".to_string(),
+            );
+        }
         let retention_scope = crate::managed_agents::retention::retention_scope_from_captured(
             &captured_scope,
-            owner_keys_for_retention,
+            captured_owner_keys.clone(),
         )?;
 
         // Guard against duplicate pubkeys (astronomically unlikely).
@@ -790,7 +800,7 @@ pub async fn confirm_team_snapshot_import(
     let mut member_results: Vec<TeamSnapshotImportMemberResult> = Vec::with_capacity(minted.len());
 
     for (m, snap_member) in minted.iter().zip(snapshot.members.iter()) {
-        let relay_url = effective_agent_relay_url(&m.record.relay_url, &relay_ws);
+        let relay_url = effective_agent_relay_url(&m.record.relay_url, relay_ws);
 
         // Phase 4: profile sync (best-effort).
         let profile_sync_error = sync_managed_agent_profile(

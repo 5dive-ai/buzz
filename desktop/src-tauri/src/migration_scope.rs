@@ -9,12 +9,13 @@ pub(crate) use team_suffix::strip_baked_team_instructions_in_dir;
 /// Runs BEFORE `fold_personas_in_dir` so the fold reads the correct `runtime`
 /// field. Idempotent: records that already have `runtime` are unchanged.
 /// Returns `Ok(())` when there is no `personas.json` to migrate.
+/// Returns `Err` when the file exists but the patch fails.
 pub(crate) fn migrate_persona_provider_to_runtime_at(
     definitions_dir: &std::path::Path,
 ) -> Result<(), String> {
     let path = definitions_dir.join("personas.json");
     if path.exists() {
-        rename_provider_to_runtime_in_personas(&path);
+        rename_provider_to_runtime_in_personas(&path)?;
     }
     Ok(())
 }

@@ -16,9 +16,10 @@ const MIGRATION_TOAST_KEY = "buzz-legacy-nest-migrated-notified";
  *   legacy `~/.sprout` nest. Shown once per machine (deduped via
  *   localStorage); the backend re-emits each launch while `~/.sprout` exists,
  *   which also covers the event being emitted before this listener mounts.
- * - `workspace-degraded`: a post-commit restore or event-sync step failed
- *   after the workspace switch succeeded. The switch is live; the degradation
- *   is recoverable by restarting the app or re-applying the workspace.
+ * - `workspace-degraded`: a post-commit restore step failed after the workspace
+ *   switch succeeded. The switch is live; the degradation is recoverable by
+ *   restarting the app or re-applying the workspace. Event-sync dispatch failure
+ *   does not emit this event (shutdown-time error, no toast surface exists).
  *
  * Mounted at the app root ahead of the community-init effect so the listener
  * is registered before the first `apply_workspace` call.

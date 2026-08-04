@@ -559,7 +559,8 @@ fn rename_provider_to_runtime_migrates_field() {
             "provider": "goose"
         }]),
     );
-    rename_provider_to_runtime_in_personas(&dir.path().join("agents/personas.json"));
+    rename_provider_to_runtime_in_personas(&dir.path().join("agents/personas.json"))
+        .expect("rename should succeed");
     let records = read_personas_json(dir.path());
     assert_eq!(records[0]["runtime"], "goose");
     assert!(records[0].get("provider").is_none());
@@ -577,7 +578,8 @@ fn rename_provider_to_runtime_is_idempotent() {
         }]),
     );
     let before = std::fs::read_to_string(dir.path().join("agents/personas.json")).unwrap();
-    rename_provider_to_runtime_in_personas(&dir.path().join("agents/personas.json"));
+    rename_provider_to_runtime_in_personas(&dir.path().join("agents/personas.json"))
+        .expect("rename should succeed");
     let after = std::fs::read_to_string(dir.path().join("agents/personas.json")).unwrap();
     assert_eq!(
         before, after,
@@ -596,7 +598,8 @@ fn rename_provider_to_runtime_skips_record_without_either_key() {
         }]),
     );
     let before = std::fs::read_to_string(dir.path().join("agents/personas.json")).unwrap();
-    rename_provider_to_runtime_in_personas(&dir.path().join("agents/personas.json"));
+    rename_provider_to_runtime_in_personas(&dir.path().join("agents/personas.json"))
+        .expect("rename should succeed");
     let after = std::fs::read_to_string(dir.path().join("agents/personas.json")).unwrap();
     assert_eq!(
         before, after,
@@ -616,7 +619,8 @@ fn rename_provider_to_runtime_preserves_existing_runtime_over_provider() {
             "runtime": "correct-value"
         }]),
     );
-    rename_provider_to_runtime_in_personas(&dir.path().join("agents/personas.json"));
+    rename_provider_to_runtime_in_personas(&dir.path().join("agents/personas.json"))
+        .expect("rename should succeed");
     let records = read_personas_json(dir.path());
     assert_eq!(records[0]["runtime"], "correct-value");
     // provider key should still be there since the closure returns false when runtime exists

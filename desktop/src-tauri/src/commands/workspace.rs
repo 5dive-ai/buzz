@@ -206,19 +206,33 @@ pub async fn apply_workspace(
                 .lock()
                 .map_err(|e| e.to_string())?;
 
+            // Capture the current (pre-switch) scope so compensation can
+            // validate generation before restarting journal entries.
+            let pre_switch_scope = state.capture_active_scope();
+
             // Build the journal and drain under the held transition lock.
             let (stopped_entries, _remaining, drain_error) =
                 crate::managed_agents::drain_scope_runtimes(&app, &state);
 
             if let Some(drain_err) = drain_error {
                 // Drain failed — compensate by restarting what we stopped.
-                // Drop BOTH the transition lock AND the store lock BEFORE calling
-                // compensate_drain: start_pair re-acquires both
-                // managed_agent_runtime_transition and managed_agents_store_lock
-                // — holding either here would deadlock on the non-reentrant Mutex.
+                // Drop the store lock BEFORE calling compensate_drain (it
+                // re-acquires the store internally), but keep rt_transition
+                // held: passing it to compensate_drain closes the interleave
+                // window where a concurrent start could slip in between drop
+                // and reacquire.
                 drop(_store);
-                drop(rt_transition);
-                let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                let comp_err = if let Some(scope) = pre_switch_scope.as_ref() {
+                    crate::managed_agents::compensate_drain(
+                        &app,
+                        &stopped_entries,
+                        scope,
+                        rt_transition,
+                    )
+                } else {
+                    drop(rt_transition);
+                    None
+                };
                 let degraded_msg = match comp_err {
                     Some(comp) => {
                         format!("drain failed ({drain_err}); compensation also failed: {comp}")
@@ -230,14 +244,23 @@ pub async fn apply_workspace(
 
             // Acquire all fallible commit guards BEFORE mutating any field.
             // If any guard fails, compensation runs and no field has changed.
+            // For each failure: drop only _store before compensate_drain (which
+            // re-acquires it), but keep rt_transition held through the call.
             let mut override_guard = match state.relay_url_override.lock() {
                 Ok(g) => g,
                 Err(e) => {
-                    // Drop _store and rt_transition BEFORE compensate_drain:
-                    // start_pair re-acquires both; holding either here deadlocks.
                     drop(_store);
-                    drop(rt_transition);
-                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                    let comp_err = if let Some(scope) = pre_switch_scope.as_ref() {
+                        crate::managed_agents::compensate_drain(
+                            &app,
+                            &stopped_entries,
+                            scope,
+                            rt_transition,
+                        )
+                    } else {
+                        drop(rt_transition);
+                        None
+                    };
                     let msg = format!(
                         "commit failed (relay lock poisoned: {e}){}",
                         comp_err
@@ -251,8 +274,17 @@ pub async fn apply_workspace(
                 Err(e) => {
                     drop(override_guard);
                     drop(_store);
-                    drop(rt_transition);
-                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                    let comp_err = if let Some(scope) = pre_switch_scope.as_ref() {
+                        crate::managed_agents::compensate_drain(
+                            &app,
+                            &stopped_entries,
+                            scope,
+                            rt_transition,
+                        )
+                    } else {
+                        drop(rt_transition);
+                        None
+                    };
                     let msg = format!(
                         "commit failed (keys lock poisoned: {e}){}",
                         comp_err
@@ -267,8 +299,17 @@ pub async fn apply_workspace(
                     drop(keys_guard);
                     drop(override_guard);
                     drop(_store);
-                    drop(rt_transition);
-                    let comp_err = crate::managed_agents::compensate_drain(&app, &stopped_entries);
+                    let comp_err = if let Some(scope) = pre_switch_scope.as_ref() {
+                        crate::managed_agents::compensate_drain(
+                            &app,
+                            &stopped_entries,
+                            scope,
+                            rt_transition,
+                        )
+                    } else {
+                        drop(rt_transition);
+                        None
+                    };
                     let msg = format!(
                         "commit failed (scope lock poisoned: {e}){}",
                         comp_err

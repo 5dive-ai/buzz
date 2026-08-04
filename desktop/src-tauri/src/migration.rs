@@ -1159,8 +1159,8 @@ fn reconcile_databricks_v1_to_v2_in_file(
 /// Covers both the current app data dir and the canonical dev data dir
 /// (for worktree instances) — same dual-dir pattern as
 /// `reconcile_legacy_command_names` and `reconcile_provider_mcp_commands`.
-fn rename_provider_to_runtime_in_personas(path: &Path) {
-    if let Err(e) = patch_json_records(path, |obj| {
+fn rename_provider_to_runtime_in_personas(path: &Path) -> Result<(), String> {
+    patch_json_records(path, |obj| {
         if obj.contains_key("runtime") {
             return false;
         }
@@ -1170,9 +1170,8 @@ fn rename_provider_to_runtime_in_personas(path: &Path) {
         } else {
             false
         }
-    }) {
-        eprintln!("buzz-desktop: rename-provider-to-runtime: {e}");
-    }
+    })
+    .map_err(|e| format!("rename-provider-to-runtime: {e}"))
 }
 mod fold;
 mod materialize;

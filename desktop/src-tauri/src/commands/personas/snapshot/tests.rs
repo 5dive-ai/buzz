@@ -963,31 +963,5 @@ mod locked_import;
 
 // ── Import: captured-scope relay invariant ─────────────────────────────────
 
-/// Outbound profile/memory publication must use the captured scope's relay,
-/// not the live `relay_ws_url_with_override` value.
-///
-/// Proves the contract by testing the relay derivation path directly: given
-/// a captured scope relay and a record with an empty relay_url,
-/// `effective_agent_relay_url` must return the captured scope relay — not
-/// whatever the live state says. A workspace switch after Phase 3a cannot
-/// redirect this agent's profile to a different relay.
-#[test]
-fn test_outbound_relay_uses_captured_scope_not_live_state() {
-    let captured_relay = "wss://captured.example";
-    let live_relay = "wss://switched.example"; // simulates workspace switched post-Phase-3a
-
-    // Simulate record.relay_url being empty (always takes workspace relay).
-    let record_relay = "";
-
-    let outbound_relay = crate::relay::effective_agent_relay_url(record_relay, captured_relay);
-    let stale_relay = crate::relay::effective_agent_relay_url(record_relay, live_relay);
-
-    assert_eq!(
-        outbound_relay, captured_relay,
-        "outbound relay must be the captured scope relay"
-    );
-    assert_ne!(
-        outbound_relay, stale_relay,
-        "captured relay must differ from the post-switch live relay"
-    );
-}
+#[path = "tests_captured_scope.rs"]
+mod captured_scope;

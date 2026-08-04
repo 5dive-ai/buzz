@@ -27,32 +27,6 @@ enum SpawnOutcome {
 }
 type AgentSpawnResult = (String, SpawnOutcome);
 
-/// Backfill the pinned persona snapshot for pre-existing agents created before
-/// the record became the spawn source of truth. Runs once at launch, before
-/// `restore_managed_agents_on_launch` spawns anything, so no agent boots from an
-/// empty snapshot.
-///
-/// Only records with a `persona_id` but no `persona_source_version` are touched.
-/// Records that already have a `persona_source_version` — including those whose
-/// `model`/`provider` were clobbered by the old unconditional snapshot code before
-/// this fix — are skipped here; they self-heal on the next manual start via the
-/// start-path re-snapshot in `start_local_agent_with_preflight`.
-/// If the linked persona is gone, we log loudly and leave the record untouched —
-/// it stays orphaned and `spawn_agent_child` refuses to start it (see
-/// `effective_config::resolve_effective_config`'s `OrphanedInstance` arm).
-#[allow(dead_code)] // Boot-migration shim; scoped pipeline now uses backfill_persona_snapshots_at.
-pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> {
-    let state = app.state::<AppState>();
-
-    // Capture scope at function entry — all reads/writes in this function use
-    // this single captured scope so a concurrent workspace switch cannot split
-    // records and personas across two different definition directories.
-    let scope = state.capture_active_scope().ok_or_else(|| {
-        "backfill_persona_snapshots: no active workspace scope — skipping".to_string()
-    })?;
-    backfill_persona_snapshots_in_dir(&scope.definitions_dir, &state)
-}
-
 /// Backfill persona snapshots without acquiring the store lock.
 ///
 /// For use during scope initialization (inside `ensure_scope_ready`), where the
@@ -62,18 +36,6 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
 pub(crate) fn backfill_persona_snapshots_pre_ready(
     definitions_dir: &std::path::Path,
 ) -> Result<(), String> {
-    backfill_persona_snapshots_inner(definitions_dir)
-}
-
-fn backfill_persona_snapshots_in_dir(
-    definitions_dir: &std::path::Path,
-    state: &AppState,
-) -> Result<(), String> {
-    let _store_guard = state
-        .managed_agents_store_lock
-        .lock()
-        .map_err(|error| error.to_string())?;
-
     backfill_persona_snapshots_inner(definitions_dir)
 }
 

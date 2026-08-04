@@ -192,21 +192,11 @@ const PNG_MAGIC: [u8; 4] = [0x89, 0x50, 0x4e, 0x47];
 
 /// Decode a `buzz-agent-snapshot v1` manifest from raw bytes.
 ///
-/// Sniffs by magic bytes (PNG signature) first, then falls back to JSON.
-/// Fails closed on malformed content, wrong format, or unsupported version.
-/// Never trusts the file extension — only the bytes.
-///
-/// **Memory consistency:** any manifest whose `memory.entries` is non-empty
-/// despite `memory.level == None` is rejected before any write, regardless of
-/// the enclosing format.
-///
-/// **Size cap:** PNG inputs over 10 MiB and JSON inputs over 5 MiB are rejected
-/// before allocation to avoid avoidable large-input work.
-///
-/// **Locked cards:** a structurally valid locked envelope parses successfully
-/// as `ChunkPayload::Locked` — no decryption happens here. Callers that can
-/// unlock go through [`decode_snapshot_for_import`]; callers that only need
-/// transit validation (e.g. `fetch_snapshot_bytes`) accept `Locked` as-is.
+/// Sniffs by magic bytes (PNG) first, then falls back to JSON. Fails closed on
+/// malformed content, wrong format, or unsupported version. Never trusts the
+/// file extension — only the bytes. Size caps: PNG ≤ 10 MiB, JSON ≤ 5 MiB.
+/// A manifest with non-empty `memory.entries` but `memory.level == None` is
+/// rejected. Locked envelopes parse as `ChunkPayload::Locked` without decryption.
 pub(crate) fn parse_snapshot_payload_from_bytes(file_bytes: &[u8]) -> Result<ChunkPayload, String> {
     let payload: ChunkPayload = if file_bytes.len() >= 4 && file_bytes[..4] == PNG_MAGIC {
         if file_bytes.len() > MAX_SNAPSHOT_PNG_BYTES {
@@ -272,10 +262,7 @@ fn enforce_memory_consistency(
 }
 
 /// Decode a plain snapshot from raw bytes, refusing locked cards.
-///
-/// Test-only convenience: production call sites either unlock through
-/// [`decode_snapshot_for_import`] or validate structurally through
-/// [`parse_snapshot_payload_from_bytes`].
+/// Test-only: production paths use `decode_snapshot_for_import` or `parse_snapshot_payload_from_bytes`.
 #[cfg(test)]
 pub(crate) fn decode_snapshot_from_bytes(
     file_bytes: &[u8],
@@ -443,11 +430,21 @@ pub async fn confirm_agent_snapshot_import(
         .ok_or("confirm_agent_snapshot_import: no active workspace scope")?;
     let definitions_dir = captured_scope.definitions_dir.clone();
 
+    // Capture owner keys at entry to hold a consistent identity across all phases.
+    let captured_owner_keys = state
+        .signing_keys()
+        .map_err(|e| format!("confirm_agent_snapshot_import: failed to capture owner keys: {e}"))?;
+    if captured_owner_keys.public_key().to_hex() != captured_scope.owner_pubkey {
+        return Err(
+            "confirm_agent_snapshot_import: owner pubkey mismatch; identity may have changed"
+                .to_string(),
+        );
+    }
+
     // ── Phase 1: validate (no writes) ────────────────────────────────────────
     // Locked cards unlock only via this machine's exact key endpoints;
     // anything else fails closed here, before key generation.
     let snapshot = {
-        let owner_keys = state.signing_keys().ok();
         let records = {
             let _store_guard = state
                 .managed_agents_store_lock
@@ -455,7 +452,7 @@ pub async fn confirm_agent_snapshot_import(
                 .map_err(|e| e.to_string())?;
             crate::managed_agents::storage::load_managed_agents_at(&definitions_dir)?
         };
-        decode_snapshot_for_import(&input.file_bytes, owner_keys.as_ref(), &records)?.0
+        decode_snapshot_for_import(&input.file_bytes, Some(&captured_owner_keys), &records)?.0
     };
 
     let display_name = snapshot.profile.display_name.trim().to_string();
@@ -498,7 +495,6 @@ pub async fn confirm_agent_snapshot_import(
 
     // ── Phase 2: mint keys + auth tag (sync, outside lock) ───────────────────
     let (agent_keys, private_key_nsec, pubkey, auth_tag, owner_pubkey_hex) = {
-        let owner_keys = state.signing_keys()?;
         let agent_keys = nostr::Keys::generate();
         let pubkey = agent_keys.public_key().to_hex();
         let private_key_nsec = agent_keys
@@ -507,7 +503,7 @@ pub async fn confirm_agent_snapshot_import(
             .map_err(|e| format!("failed to encode agent private key: {e}"))?;
 
         // NIP-OA auth tag: bridge nostr 0.37 → 0.36 (buzz-sdk) via hex round-trip.
-        let compat_owner = nostr::Keys::parse(&owner_keys.secret_key().to_secret_hex())
+        let compat_owner = nostr::Keys::parse(&captured_owner_keys.secret_key().to_secret_hex())
             .map_err(|e| format!("failed to bridge owner keys: {e}"))?;
         let compat_agent = nostr::PublicKey::from_hex(&pubkey)
             .map_err(|e| format!("failed to bridge agent pubkey: {e}"))?;
@@ -515,7 +511,7 @@ pub async fn confirm_agent_snapshot_import(
             buzz_sdk_pkg::nip_oa::compute_auth_tag(&compat_owner, &compat_agent, "")
                 .map_err(|e| format!("failed to compute NIP-OA auth tag: {e}"))?,
         );
-        let owner_pubkey_hex = owner_keys.public_key().to_hex();
+        let owner_pubkey_hex = captured_owner_keys.public_key().to_hex();
         (
             agent_keys,
             private_key_nsec,
@@ -537,12 +533,16 @@ pub async fn confirm_agent_snapshot_import(
         crate::managed_agents::scope::validate_scope_generation(&captured_scope)
             .map_err(|e| format!("confirm_agent_snapshot_import: {e}"))?;
 
+        // Re-verify owner key under lock — concurrent identity swap must not split writes.
+        if captured_owner_keys.public_key().to_hex() != captured_scope.owner_pubkey {
+            return Err("confirm_agent_snapshot_import: owner key mismatch under lock".to_string());
+        }
+
         // Resolve retention scope from the captured scope so retain calls
         // write to the correct scope's DB even if live state diverged.
-        let owner_keys_for_retention = state.signing_keys()?;
         let retention_scope = crate::managed_agents::retention::retention_scope_from_captured(
             &captured_scope,
-            owner_keys_for_retention,
+            captured_owner_keys.clone(),
         )?;
 
         let mut personas = crate::managed_agents::load_personas_at(&definitions_dir)?;

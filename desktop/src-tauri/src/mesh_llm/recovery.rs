@@ -311,7 +311,7 @@ pub(crate) async fn rearm_relay_mesh_for_running_agents(app: &AppHandle) -> Resu
         .unwrap_or_default();
     let global = scope_definitions_dir
         .as_deref()
-        .and_then(|dir| crate::managed_agents::load_global_agent_config_at(dir).ok())
+        .and_then(|dir| crate::managed_agents::global_config::load_global_agent_config_at(dir).ok())
         .unwrap_or_default();
 
     // Helper: does the live runtime's relay match the active scope relay?

@@ -10307,6 +10307,18 @@ export function maybeInstallE2eTauriMocks() {
         mockMeshState.nodeState = "off";
         mockMeshState.nodeMode = null;
         return meshNodeStatus("off", null);
+      case "mesh_stop_client":
+        // Mirror the backend contract: only tears down a client-mode runtime.
+        // Serve-mode and absent runtimes are left unchanged.
+        if (mockMeshState.nodeMode !== "client") {
+          return meshNodeStatus(
+            mockMeshState.nodeState,
+            mockMeshState.nodeMode,
+          );
+        }
+        mockMeshState.nodeState = "off";
+        mockMeshState.nodeMode = null;
+        return meshNodeStatus("off", null);
       case "get_identity": {
         const isLost =
           !mockIdentityLostCleared && activeConfig?.mock?.identityLost === true;
@@ -10472,13 +10484,16 @@ export function maybeInstallE2eTauriMocks() {
       case "fetch_join_policy":
         return activeConfig?.mock?.joinPolicy ?? null;
       case "apply_workspace": {
+        // Must return { applied: boolean, degraded: string[] } — useCommunityInit
+        // dereferences .applied and .degraded immediately after the await.
         const applyDelayMs = activeConfig?.mock?.applyCommunityDelayMs ?? 0;
+        const applyResult = { applied: true, degraded: [] as string[] };
         if (applyDelayMs > 0) {
           return new Promise((resolve) =>
-            window.setTimeout(resolve, applyDelayMs),
+            window.setTimeout(() => resolve(applyResult), applyDelayMs),
           );
         }
-        return;
+        return applyResult;
       }
       case "update_tray_agent_activity":
       case "clear_tray_agent_activity":

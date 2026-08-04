@@ -389,7 +389,8 @@ fn install_staged(
 /// Ordering mirrors `migration.rs::run_boot_migrations_inner` for the
 /// definition-touching steps (the ordering doc comment at `migration.rs:106-121`
 /// is load-bearing). Machine-level steps that stay pre-scope (dir init, dev
-/// symlinks, persona provider rename) are NOT included here.
+/// symlinks) are NOT included here; persona-provider rename (step 0) IS included
+/// and runs first so the fold reads the correct `runtime` field.
 ///
 /// # Order (must be preserved)
 /// 1. `fold_personas_in_dir` — fold personas.json into managed-agents.json.
@@ -525,13 +526,18 @@ fn run_pre_ready_family(
         return Err(format!("scope-init-backfill: {e}"));
     }
 
-    // Step C (debug builds only): copy agent keys from the prod keyring into
+    // Step C (debug builds only, non-test): copy agent keys from the prod keyring into
     // the dev service. Runs after staged copy so the scoped managed-agents.json
     // exists with valid pubkeys. Replaces the pre-scope call in
     // `run_boot_migrations_inner` which could not read the store before scope
     // activation.
-    #[cfg(debug_assertions)]
-    crate::managed_agents::storage::migrate_agent_keys_to_dev_service_at(scope_dir);
+    //
+    // Skipped in unit tests (`#[cfg(not(test))]`) because the real keychain
+    // backend can block on macOS (waiting for a Keychain access dialog).
+    // The migration itself is covered by storage_tests.rs with a FakeKeyStore.
+    #[cfg(all(debug_assertions, not(test)))]
+    crate::managed_agents::storage::migrate_agent_keys_to_dev_service_at(scope_dir)
+        .map_err(|e| format!("scope-init-dev-keys: {e}"))?;
 
     Ok(())
 }
@@ -541,11 +547,28 @@ fn run_pre_ready_family(
 ///
 /// Writes `READY_MARKER_VERSION` so future pipeline upgrades can detect and
 /// re-run scopes initialized by an older pipeline.
+///
+/// Uses an atomic temp-file + rename so a crash mid-write cannot leave a
+/// partial/corrupt marker that `scope_is_ready` would misread.
 fn write_ready_marker(scope_dir: &Path) -> Result<(), String> {
     let marker_path = scope_dir.join(READY_MARKER);
-    std::fs::write(&marker_path, READY_MARKER_VERSION.as_bytes()).map_err(|e| {
+    // Write to a sibling temp file first, then rename atomically.
+    let tmp_path = {
+        let mut s = marker_path.as_os_str().to_owned();
+        s.push("._tmp");
+        PathBuf::from(s)
+    };
+    std::fs::write(&tmp_path, READY_MARKER_VERSION.as_bytes()).map_err(|e| {
         format!(
-            "failed to write ready marker at {}: {e}",
+            "failed to write ready marker temp at {}: {e}",
+            tmp_path.display()
+        )
+    })?;
+    std::fs::rename(&tmp_path, &marker_path).map_err(|e| {
+        // Best-effort cleanup of the temp file.
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "failed to atomically install ready marker at {}: {e}",
             marker_path.display()
         )
     })
@@ -595,7 +618,6 @@ fn ensure_migration_table(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("failed to create retention migration table: {e}"))
 }
-
 
 #[cfg(test)]
 #[path = "scope_init_tests.rs"]

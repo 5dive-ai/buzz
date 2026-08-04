@@ -540,17 +540,21 @@ fn persist_agent_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRec
 /// populated, before `_ready` is written. This replaces the pre-scope call in
 /// `run_boot_migrations_inner` which failed closed when no active scope existed.
 #[cfg(debug_assertions)]
-pub(crate) fn migrate_agent_keys_to_dev_service_at(definitions_dir: &std::path::Path) {
+#[cfg_attr(test, allow(dead_code))] // called only in non-test debug builds
+pub(crate) fn migrate_agent_keys_to_dev_service_at(
+    definitions_dir: &std::path::Path,
+) -> Result<(), String> {
     if !cfg!(feature = "system-keyring") || keyring_service() != "buzz-desktop-dev" {
-        return;
+        return Ok(());
     }
 
     let agents_path = definitions_dir.join("managed-agents.json");
     let records = match load_agent_store_at(&agents_path) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("buzz-desktop: keyring-dev-migration: cannot read scoped agent store: {e}");
-            return;
+            return Err(format!(
+                "keyring-dev-migration: cannot read scoped agent store: {e}"
+            ));
         }
     };
 
@@ -561,7 +565,8 @@ pub(crate) fn migrate_agent_keys_to_dev_service_at(definitions_dir: &std::path::
         .collect();
     let prod_store = crate::secret_store::SecretStore::keyring("buzz-desktop");
     let dev_store = crate::secret_store::SecretStore::shared(keyring_service());
-    copy_agent_keys_between_stores(&pubkeys, &prod_store, dev_store);
+    copy_agent_keys_between_stores(&pubkeys, &prod_store, dev_store)?;
+    Ok(())
 }
 
 /// Marker key stored inside the dev blob after a successful agent-key migration.
@@ -590,18 +595,23 @@ const DEV_MIGRATION_MARKER: &str = "_dev_migration_v1";
 /// New agents (pubkey not in `src`) are silently skipped — they will mint a
 /// fresh key on their next onboarding run.
 #[cfg(debug_assertions)]
-fn copy_agent_keys_between_stores(pubkeys: &[String], src: &impl KeyStore, dst: &impl KeyStore) {
+fn copy_agent_keys_between_stores(
+    pubkeys: &[String],
+    src: &impl KeyStore,
+    dst: &impl KeyStore,
+) -> Result<(), String> {
     // One read of the dev blob. If the migration-complete marker is present,
     // all prior agent keys are already in the dev service — skip entirely.
     let dst_map: HashMap<String, String> = match dst.load_all_readonly() {
         Ok(Some(map)) if map.contains_key(DEV_MIGRATION_MARKER) => {
-            return; // already migrated: 0 prod keyring accesses
+            return Ok(()); // already migrated: 0 prod keyring accesses
         }
         Ok(Some(map)) => map,
         Ok(None) => HashMap::new(),
         Err(e) => {
-            eprintln!("buzz-desktop: keyring-dev-migration: cannot read dev keyring: {e}");
-            return;
+            return Err(format!(
+                "keyring-dev-migration: cannot read dev keyring: {e}"
+            ));
         }
     };
     // Skip production when a reset left no agents or onboarding created every dev key.
@@ -615,8 +625,9 @@ fn copy_agent_keys_between_stores(pubkeys: &[String], src: &impl KeyStore, dst: 
             Ok(Some(map)) => map,
             Ok(None) => HashMap::new(), // prod has no blob yet — nothing to copy
             Err(e) => {
-                eprintln!("buzz-desktop: keyring-dev-migration: cannot read prod keyring: {e}");
-                return;
+                return Err(format!(
+                    "keyring-dev-migration: cannot read prod keyring: {e}"
+                ));
             }
         }
     };
@@ -641,16 +652,15 @@ fn copy_agent_keys_between_stores(pubkeys: &[String], src: &impl KeyStore, dst: 
     // even when there were no keys to copy (empty dev environment).
     to_write.insert(DEV_MIGRATION_MARKER.to_string(), "done".to_string());
 
-    if let Err(e) = dst.store_all(&to_write) {
-        eprintln!("buzz-desktop: keyring-dev-migration: cannot write to dev keyring: {e}");
-        return;
-    }
+    dst.store_all(&to_write)
+        .map_err(|e| format!("keyring-dev-migration: cannot write to dev keyring: {e}"))?;
 
     if copied > 0 {
         eprintln!(
             "buzz-desktop: keyring-dev-migration: copied {copied} agent key(s) from buzz-desktop"
         );
     }
+    Ok(())
 }
 
 /// Remove an agent's key from the keyring, returning an error on failure.

@@ -1,12 +1,14 @@
 //! Scope-aware helpers for the Mesh LLM command layer.
 //!
 //! Extracted from `mesh_llm.rs` to stay within the file-size ratchet.
-//! All items here are `pub(super)` so they remain private to the module.
+//! Most items here are `pub(super)` so they remain private to the module;
+//! `mesh_stop_client` is `pub(crate)` and re-exported as `pub` from `mesh_llm`.
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager, State};
 
 use crate::app_state::AppState;
 use crate::mesh_llm;
+type CmdResult<T> = Result<T, String>;
 
 /// Check whether the currently live Mesh runtime's relay matches the active
 /// workspace scope's relay.
@@ -35,7 +37,7 @@ pub(super) async fn check_mesh_runtime_relay_scope(state: &AppState) -> Result<b
 
     let relay_matches = runtime_relay.as_deref().map_or(false, |bound| {
         crate::managed_agents::scope::normalize_relay_for_scope(bound)
-            == crate::managed_agents::scope::normalize_relay_for_scope(scope_relay)
+            == crate::managed_agents::scope::normalize_relay_for_scope(&scope_relay)
     });
 
     if relay_matches {
@@ -88,4 +90,37 @@ pub(crate) async fn fail_if_client_mesh_active(app: &AppHandle) -> Result<(), St
             .to_string());
     }
     Ok(())
+}
+
+/// Stop the local Mesh **client** (consuming) runtime.
+///
+/// Only tears down a client-mode runtime. Serve-mode and absent runtimes are
+/// left unchanged — this command has no effect on sharing nodes.
+///
+/// Required by Option A: a workspace switch fails while a client is active;
+/// the user calls this command to stop the client before the switch proceeds.
+#[tauri::command]
+pub(crate) async fn mesh_stop_client(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<mesh_llm::MeshNodeStatus> {
+    let (taken, bound_relay_url) = {
+        let mut guard = state.mesh_llm_runtime.lock().await;
+        if let Some(runtime) = guard.as_ref() {
+            if runtime.mode() != mesh_llm::MeshNodeMode::Client {
+                return runtime.status().await.map_err(|e| e.to_string());
+            }
+        } else {
+            return Ok(mesh_llm::stopped_status());
+        }
+        let bound_relay_url = guard
+            .as_ref()
+            .and_then(|r| r.start_request().relay_url.clone());
+        (guard.take(), bound_relay_url)
+    };
+    if let Some(runtime) = taken {
+        runtime.stop().await.map_err(|e| e.to_string())?;
+    }
+    mesh_llm::publish_stopped_status_once_at(&app, bound_relay_url.as_deref(), "stop").await;
+    Ok(mesh_llm::stopped_status())
 }

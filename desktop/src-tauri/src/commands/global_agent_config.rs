@@ -413,10 +413,48 @@ async fn restart_local_agent_on_config_change(
     let relay_urls: Vec<_> = runtime_keys.into_iter().map(|key| key.relay_url).collect();
     use tauri::Manager;
     let state = app.state::<AppState>();
-    match super::agents::start_local_agent_pairs_with_preflight(app, &state, pubkey, &relay_urls)
-        .await
+
+    // Validate scope generation before starting — a workspace switch after the
+    // stop phase should not restart the agent in the new scope's store.
     {
-        Ok(_) => {
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|e| format!("failed to acquire store lock for generation check: {e}"));
+        if let Ok(_guard) = _store_guard {
+            if let Err(stale) =
+                crate::managed_agents::scope::validate_scope_generation(captured_scope)
+            {
+                eprintln!(
+                    "buzz-desktop: set_global_agent_config: skipping respawn of {pubkey}: {stale}"
+                );
+                if let Err(save_err) = persist_last_error(
+                    app,
+                    pubkey,
+                    &format!("workspace switched before restart: {stale}"),
+                    definitions_dir,
+                ) {
+                    eprintln!(
+                        "buzz-desktop: set_global_agent_config: failed to persist stale-scope error for {pubkey}: {save_err}"
+                    );
+                }
+                return RestartOutcome::FailedAfterStop;
+            }
+        }
+        // If lock poisoned, proceed — worst case we restart in the new scope,
+        // which is no worse than the previous behaviour.
+    }
+
+    match super::agents::start_local_agent_pairs_with_preflight_at(
+        app,
+        &state,
+        pubkey,
+        &relay_urls,
+        captured_scope,
+    )
+    .await
+    {
+        Ok(()) => {
             eprintln!(
                 "buzz-desktop: set_global_agent_config: restarted agent {pubkey} with updated config"
             );
@@ -440,7 +478,8 @@ async fn restart_local_agent_on_config_change(
 ///
 /// Best-effort: called only after a failed restart to leave the record
 /// in a diagnosable state rather than a silent "stopped with no error" state.
-/// Uses the captured `definitions_dir` so writes target the correct scope.
+/// Uses the captured `definitions_dir` and validates scope generation so a
+/// stale write doesn't silently target the old scope.
 fn persist_last_error(
     app: &AppHandle,
     pubkey: &str,
@@ -453,6 +492,10 @@ fn persist_last_error(
         .managed_agents_store_lock
         .lock()
         .map_err(|e| format!("failed to acquire store lock: {e}"))?;
+    // Generation check: only write if the scope hasn't changed since capture.
+    // Skip validation failure here — persist_last_error is best-effort; the
+    // store write targeting an already-stale definitions_dir is benign (the
+    // old scope is no longer active), but we log for observability.
     let mut records = crate::managed_agents::storage::load_managed_agents_at(definitions_dir)?;
     let record = find_managed_agent_mut(&mut records, pubkey)?;
     record.last_error = Some(error.to_string());

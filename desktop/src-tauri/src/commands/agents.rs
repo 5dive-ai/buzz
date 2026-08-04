@@ -264,95 +264,11 @@ async fn ensure_relay_mesh_for_record(
     Ok(())
 }
 
-pub(super) async fn start_local_agent_pairs_with_preflight(
-    app: &AppHandle,
-    state: &AppState,
-    pubkey: &str,
-    relay_urls: &[String],
-) -> Result<ManagedAgentSummary, String> {
-    let record_snapshot = {
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|e| e.to_string())?;
-        load_managed_agents(app)?
-            .into_iter()
-            .find(|record| record.pubkey == pubkey)
-            .ok_or_else(|| format!("agent {pubkey} not found"))?
-    };
-    if record_snapshot.backend != BackendKind::Local {
-        return Err(format!("agent {pubkey} is not a local agent"));
-    }
-    let personas_for_preflight = load_personas(app).unwrap_or_default();
-    let global_for_preflight =
-        crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
-    let mesh_model_id =
-        crate::managed_agents::effective_config::resolve_effective_relay_mesh_model_id(
-            &record_snapshot,
-            &personas_for_preflight,
-            &global_for_preflight,
-        );
-    ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), false).await?;
-
-    {
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|e| e.to_string())?;
-        let mut records = load_managed_agents(app)?;
-        let record = find_managed_agent_mut(&mut records, pubkey)?;
-        let personas = load_personas(app).unwrap_or_default();
-        if let Some(persona_id) = record.persona_id.clone() {
-            if let Some(persona) = personas.iter().find(|persona| persona.id == persona_id) {
-                crate::managed_agents::persona_events::apply_persona_snapshot(record, persona);
-                record.updated_at = crate::util::now_iso();
-            }
-        }
-        save_managed_agents(app, &records)?;
-        if let Some(saved_record) = records.iter().find(|record| record.pubkey == pubkey) {
-            retain_managed_agent_pending(app, state, saved_record);
-        }
-    }
-
-    let mut errors = Vec::new();
-    for relay_url in relay_urls {
-        if let Err(error) = crate::managed_agents::start_managed_agent_runtime_pair_lazy(
-            pubkey.to_string(),
-            relay_url.clone(),
-            app.clone(),
-        ) {
-            errors.push(format!("{relay_url}: {error}"));
-        }
-    }
-    if !errors.is_empty() {
-        return Err(format!(
-            "failed to restart one or more managed-agent runtime pairs: {}",
-            errors.join("; ")
-        ));
-    }
-
-    let _store_guard = state
-        .managed_agents_store_lock
-        .lock()
-        .map_err(|e| e.to_string())?;
-    let records = load_managed_agents(app)?;
-    let runtimes = state
-        .managed_agent_processes
-        .lock()
-        .map_err(|e| e.to_string())?;
-    let personas = load_personas(app).unwrap_or_default();
-    let record = records
-        .iter()
-        .find(|record| record.pubkey == pubkey)
-        .ok_or_else(|| format!("agent {pubkey} not found"))?;
-    build_managed_agent_summary(
-        app,
-        record,
-        &runtimes,
-        &personas,
-        &crate::managed_agents::load_global_agent_config(app).unwrap_or_default(),
-    )
-}
+#[path = "agents_scoped.rs"]
+mod scoped;
+pub(crate) use scoped::{
+    start_local_agent_pairs_with_preflight, start_local_agent_pairs_with_preflight_at,
+};
 
 pub(super) async fn start_local_agent_with_preflight(
     app: &AppHandle,
@@ -394,6 +310,14 @@ pub(super) async fn start_local_agent_with_preflight(
             &global,
         );
     ensure_relay_mesh_for_record(app, mesh_model_id.as_deref(), allow_fresh_create_start).await?;
+
+    // Acquire the runtime transition lock before spawning so this start is
+    // serialized against compensate_drain (which holds the same lock across all
+    // journal restarts). Lock order: transition → store (matching start_pair).
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|e| e.to_string())?;
 
     let _store_guard = state
         .managed_agents_store_lock

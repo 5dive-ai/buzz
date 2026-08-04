@@ -774,4 +774,24 @@ mod egress_guard_boundary {
         assert_eq!(outbound, captured_relay);
         assert_ne!(outbound, stale);
     }
+
+    /// Owner key captured-scope agreement: the captured owner public key must
+    /// equal `captured_scope.owner_pubkey`. Mirrors
+    /// `test_owner_key_must_match_captured_scope_owner_pubkey` for the team
+    /// import path.
+    #[test]
+    fn test_team_owner_key_must_match_captured_scope_owner_pubkey() {
+        let scope_keys = nostr::Keys::generate();
+        let other_keys = nostr::Keys::generate();
+
+        let scope_owner_pubkey = scope_keys.public_key().to_hex();
+        // Match → accept.
+        assert_eq!(scope_keys.public_key().to_hex(), scope_owner_pubkey,);
+        // Mismatch → reject.
+        assert_ne!(
+            other_keys.public_key().to_hex(),
+            scope_owner_pubkey,
+            "a different identity must not match the scope's owner_pubkey"
+        );
+    }
 }

@@ -431,9 +431,9 @@ pub async fn import_identity(
         // return Err — do NOT proceed with the identity persist. The caller
         // (frontend membership-denied flow) must handle the Err and retry.
         //
-        // The transition lock (and store lock) must be DROPPED before calling
-        // compensate_drain — compensate_drain calls start_pair which re-acquires
-        // both managed_agent_runtime_transition and managed_agents_store_lock.
+        // The store lock must be DROPPED before calling compensate_drain, but
+        // the transition lock is passed INTO compensate_drain so compensation
+        // runs without any interleave window.
         let _rt_transition_guard = if has_active_scope {
             Some(
                 state
@@ -456,19 +456,29 @@ pub async fn import_identity(
             None
         };
 
+        // Capture the pre-import scope for compensation validation.
+        let pre_import_scope = state.capture_active_scope();
+
         let stopped_entries = if has_active_scope {
             match drain_managed_agent_runtimes_for_import(&app_handle, &state) {
                 Ok(stopped) => stopped,
                 Err((stopped, drain_err)) => {
-                    // Drain failed — drop the transition lock AND store lock BEFORE
-                    // compensating: compensate_drain calls start_pair which
-                    // re-acquires both managed_agent_runtime_transition and
-                    // managed_agents_store_lock. Holding either here deadlocks.
-                    // Also restore the partial stopped set, not an empty slice.
+                    // Drain failed — drop the store lock BEFORE compensating
+                    // (compensate_drain re-acquires it), but pass the transition
+                    // guard into compensate_drain so there is no interleave window.
                     drop(_store_guard);
-                    drop(_rt_transition_guard);
-                    let comp_err =
-                        crate::managed_agents::compensate_drain(&app_handle, &stopped);
+                    let comp_err = match (pre_import_scope.as_ref(), _rt_transition_guard) {
+                        (Some(scope), Some(rt_guard)) => crate::managed_agents::compensate_drain(
+                            &app_handle,
+                            &stopped,
+                            scope,
+                            rt_guard,
+                        ),
+                        (_, leftover_guard) => {
+                            drop(leftover_guard);
+                            None
+                        }
+                    };
                     let msg = match comp_err {
                         Some(comp) => format!(
                             "identity import drain failed: {drain_err}; compensation failed: {comp}"
@@ -492,17 +502,26 @@ pub async fn import_identity(
         });
 
         // If identity persist failed after a successful drain, compensate.
-        // Drop the transition lock AND store lock BEFORE calling compensate_drain
-        // for the same reason: start_pair re-acquires both.
+        // Drop the store lock BEFORE calling compensate_drain; pass the
+        // transition guard into it so there is no interleave window.
         let (pubkey, storage) = match commit_result {
             Ok(result) => result,
             Err(e) => {
                 if !stopped_entries.is_empty() {
                     drop(_store_guard);
-                    drop(_rt_transition_guard);
-                    if let Some(comp_err) =
-                        crate::managed_agents::compensate_drain(&app_handle, &stopped_entries)
-                    {
+                    let comp_err = match (pre_import_scope.as_ref(), _rt_transition_guard) {
+                        (Some(scope), Some(rt_guard)) => crate::managed_agents::compensate_drain(
+                            &app_handle,
+                            &stopped_entries,
+                            scope,
+                            rt_guard,
+                        ),
+                        (_, leftover_guard) => {
+                            drop(leftover_guard);
+                            None
+                        }
+                    };
+                    if let Some(comp_err) = comp_err {
                         eprintln!(
                             "buzz-desktop: identity import persist failed, compensation failed: {comp_err}"
                         );

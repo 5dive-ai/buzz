@@ -6,15 +6,6 @@
 use super::*;
 use tempfile::TempDir;
 
-/// Create a temporary directory and return it. The agents base dir
-/// (`base_dir`) must be `tmp.path().join("agents")` — matching the
-/// production layout where `managed_agents_base_dir` returns
-/// `<app-data>/agents`. Callers use `make_base_dir_pair` to get both.
-#[allow(dead_code)] // Kept as documentation for the pair-based helpers.
-fn make_base_dir() -> TempDir {
-    tempfile::tempdir().expect("tempdir")
-}
-
 /// Returns `(TempDir, base_dir)` where `base_dir = tmp.path().join("agents")`.
 ///
 /// Production: `managed_agents_base_dir` returns `<app-data>/agents`.
@@ -455,5 +446,82 @@ fn test_production_shaped_adoption_finds_legacy_files() {
     assert!(
         !base_dir.join("agents").join(FALLBACK_CLAIM_FILE).exists(),
         "double-join claim path must NOT exist"
+    );
+}
+
+/// Old `_ready` marker with a migration failure: the scope stays at the old
+/// version until the broken file is repaired IN PLACE (no scope deletion),
+/// then the retry advances the marker to the current version.
+///
+/// This test covers the path where `scope_dir` already has a `MANIFEST_FILE`
+/// (staged install completed on a prior run) but carries an old-version
+/// `_ready` marker. `ensure_scope_ready` re-runs migrations via the fast-path
+/// at `scope_init.rs:158-162`.  A corrupt `personas.json` inside the scope
+/// directory makes `migrate_persona_provider_to_runtime_at` return `Err`,
+/// which withholds the `v1` upgrade.  After the file is repaired, a retry
+/// succeeds and the marker advances — without ever deleting or recreating the
+/// scope directory.
+#[test]
+fn test_migration_failure_withholds_ready_upgrade_repair_in_place() {
+    let (_tmp, base_dir) = make_base_dir_pair();
+    let scope_id = "scope-repair-in-place";
+    let scope_dir = base_dir.join("scopes").join(scope_id);
+
+    // ── Phase 1: full initialization → marker at v1 ─────────────────────────
+    ensure_scope_ready(scope_id, &scope_dir, &base_dir, "test_owner").unwrap();
+    assert!(
+        scope_is_ready(&scope_dir),
+        "scope must be v1-ready after init"
+    );
+
+    // ── Phase 2: downgrade marker → simulate a pre-existing old-version scope ─
+    std::fs::write(scope_dir.join(READY_MARKER), b"ready").unwrap();
+    assert!(
+        !scope_is_ready(&scope_dir),
+        "old-version marker must not be considered current"
+    );
+
+    // ── Phase 3: inject a migration failure ──────────────────────────────────
+    // Write a corrupt personas.json into the scope_dir so
+    // `migrate_persona_provider_to_runtime_at` returns Err when called on
+    // the scope_dir by the fast-path at scope_init.rs:158-162.
+    std::fs::write(scope_dir.join("personas.json"), b"not valid json").unwrap();
+
+    // Re-run ensure_scope_ready — must fail because migration fails.
+    let result = ensure_scope_ready(scope_id, &scope_dir, &base_dir, "test_owner");
+    assert!(
+        result.is_err(),
+        "corrupt personas.json must cause migration Err: {:?}",
+        result
+    );
+    // The marker must NOT have been advanced.
+    assert!(
+        !scope_is_ready(&scope_dir),
+        "_ready must NOT be upgraded when migration fails"
+    );
+    // Crucially, the scope_dir itself must still exist (repair in place).
+    assert!(
+        scope_dir.exists(),
+        "scope_dir must still exist after migration failure — no deletion allowed"
+    );
+    assert!(
+        scope_dir.join(MANIFEST_FILE).exists(),
+        "MANIFEST_FILE must survive migration failure"
+    );
+
+    // ── Phase 4: repair the file IN PLACE (no scope deletion) ───────────────
+    std::fs::remove_file(scope_dir.join("personas.json")).unwrap();
+
+    // ── Phase 5: retry → marker advances to v1 ───────────────────────────────
+    ensure_scope_ready(scope_id, &scope_dir, &base_dir, "test_owner").unwrap();
+    assert!(
+        scope_is_ready(&scope_dir),
+        "scope must be ready after in-place repair and retry"
+    );
+    let upgraded = std::fs::read_to_string(scope_dir.join(READY_MARKER)).unwrap();
+    assert_eq!(
+        upgraded.trim(),
+        READY_MARKER_VERSION,
+        "marker must carry current version after upgrade"
     );
 }

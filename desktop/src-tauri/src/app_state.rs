@@ -46,20 +46,13 @@ pub struct AppState {
     /// Never perform network I/O while holding this lock.
     pub managed_agent_runtime_transition: Mutex<()>,
     pub managed_agents_store_lock: Mutex<()>,
-    /// Set by `compensate_drain` while it is restarting stopped journal entries
-    /// so concurrent `start_pair` / reconcile calls back off rather than
-    /// racing the compensation. Prevents the interleave where a normal start
-    /// inserts a runtime between "drop transition lock" and "compensate_drain
-    /// calls start_pair" — the compensation would then find the entry already
-    /// live and either double-start or leave it in a mismatched state.
-    ///
-    /// `compensate_drain` sets this to `true` with `AcqRel`, runs each
-    /// `start_pair`, then clears it. `start_pair` checks `Acquire` before
-    /// proceeding and returns `Err` when set so callers can retry or surface
-    /// the contention. The window is very short (one start per stopped entry)
-    /// and the retry is idempotent (the next start attempt will succeed once
-    /// compensation completes).
-    pub managed_agent_drain_compensation_in_progress: AtomicBool,
+    /// `compensate_drain` reacquires `managed_agent_runtime_transition` and
+    /// `managed_agents_store_lock` directly and holds them across all journal
+    /// restarts, so no concurrent start or reconcile can interleave. The old
+    /// AtomicBool gate is removed; this field is a zero-cost placeholder that
+    /// preserves struct layout stability during this refactor pass.
+    #[allow(dead_code)]
+    _compensation_gate_removed: (),
     pub channel_templates_store_lock: Mutex<()>,
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
     pub huddle_state: Mutex<HuddleState>,
@@ -234,7 +227,7 @@ pub fn build_app_state() -> AppState {
         workspace_transition: AsyncMutex::new(()),
         active_agent_scope: Mutex::new(None),
         managed_agents_store_lock: Mutex::new(()),
-        managed_agent_drain_compensation_in_progress: AtomicBool::new(false),
+        _compensation_gate_removed: (),
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
         session_config_cache: Mutex::new(HashMap::new()),

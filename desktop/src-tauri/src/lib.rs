@@ -815,6 +815,7 @@ pub fn run() {
             set_global_agent_config,
             mesh_start_node,
             mesh_stop_node,
+            mesh_stop_client,
             mesh_node_status,
             mesh_serving_usage,
             mesh_installed_models,

@@ -361,23 +361,25 @@ function asciiOfBytes(n) {
 }
 
 // biome-ignore format: compact table rows — function-valued fields with asciiOfBytes calls
-for (const [name, raw, key, checkFrontier, checkOverride, accepted] of [
+// expectedValue: the exact frontier value (checkFrontier rows) or exact override register
+// (checkOverride rows) when accepted=true; null for rejected rows.
+for (const [name, raw, key, checkFrontier, checkOverride, accepted, expectedValue] of [
   // ov_s: prefix is 5 bytes; a 251-byte suffix yields a 256-byte frontier wire key → accepted.
-  ["frontierKey256Bytes_accepted", () => ({ [asciiOfBytes(251)]: 42 }), () => asciiOfBytes(251), true, false, true],
+  ["frontierKey256Bytes_accepted", () => ({ [asciiOfBytes(251)]: 42 }), () => asciiOfBytes(251), true, false, true, 42],
   // 257-byte frontier key → dropped from frontiers.
-  ["frontierKey257Bytes_dropped", () => ({ [asciiOfBytes(257)]: 42 }), () => asciiOfBytes(257), true, false, false],
+  ["frontierKey257Bytes_dropped", () => ({ [asciiOfBytes(257)]: 42 }), () => asciiOfBytes(257), true, false, false, null],
   // ov_s: is 5 bytes; suffix of 251 bytes → ov_s: wire key exactly 256 bytes → group accepted.
-  ["liveGroupSiblingKey256Bytes_accepted", () => { const s = asciiOfBytes(251); return { [s]: 10, [`${OV_S_PREFIX}${s}`]: 1, [`${OV_C_PREFIX}${s}`]: 0, [`${OV_B_PREFIX}${s}`]: 9 }; }, () => asciiOfBytes(251), false, true, true],
+  ["liveGroupSiblingKey256Bytes_accepted", () => { const s = asciiOfBytes(251); return { [s]: 10, [`${OV_S_PREFIX}${s}`]: 1, [`${OV_C_PREFIX}${s}`]: 0, [`${OV_B_PREFIX}${s}`]: 9 }; }, () => asciiOfBytes(251), false, true, true, { s: 1, c: 0, b: 9 }],
   // ov_s: is 5 bytes; suffix of 252 bytes → ov_s: wire key 257 bytes → group dropped (override only).
-  ["liveGroupSiblingKey257Bytes_groupDropped", () => { const s = asciiOfBytes(252); return { [s]: 10, [`${OV_S_PREFIX}${s}`]: 1, [`${OV_C_PREFIX}${s}`]: 0, [`${OV_B_PREFIX}${s}`]: 9 }; }, () => asciiOfBytes(252), false, true, false],
+  ["liveGroupSiblingKey257Bytes_groupDropped", () => { const s = asciiOfBytes(252); return { [s]: 10, [`${OV_S_PREFIX}${s}`]: 1, [`${OV_C_PREFIX}${s}`]: 0, [`${OV_B_PREFIX}${s}`]: 9 }; }, () => asciiOfBytes(252), false, true, false, null],
   // ov_c: is 5 bytes; suffix of 251 bytes → ov_c: wire key exactly 256 bytes → tombstone accepted.
-  ["tombstoneFloorKey256Bytes_accepted", () => { const s = asciiOfBytes(251); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 3 }; }, () => asciiOfBytes(251), false, true, true],
+  ["tombstoneFloorKey256Bytes_accepted", () => { const s = asciiOfBytes(251); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 3 }; }, () => asciiOfBytes(251), false, true, true, { s: 0, c: 3, b: 0 }],
   // ov_c: is 5 bytes; suffix of 252 bytes → ov_c: wire key 257 bytes → tombstone group dropped.
-  ["tombstoneFloorKey257Bytes_groupDropped", () => { const s = asciiOfBytes(252); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 3 }; }, () => asciiOfBytes(252), false, true, false],
+  ["tombstoneFloorKey257Bytes_groupDropped", () => { const s = asciiOfBytes(252); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 3 }; }, () => asciiOfBytes(252), false, true, false, null],
   // A 2-byte UTF-8 char (e.g. 'é') counts as 2 bytes. 127 × 'é' = 254 bytes; ov_c: (5) + 254 = 259 → over limit.
-  ["multibyteSuffix_keyLengthCheckedInBytes", () => { const s = "\u00e9".repeat(127); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 7 }; }, () => "\u00e9".repeat(127), false, true, false],
+  ["multibyteSuffix_keyLengthCheckedInBytes", () => { const s = "\u00e9".repeat(127); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 7 }; }, () => "\u00e9".repeat(127), false, true, false, null],
   // 'é' × 125 = 250 bytes; ov_c: (5) + 250 = 255 → under limit.
-  ["multibyteSuffix_justUnder256_accepted", () => { const s = "\u00e9".repeat(125); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 7 }; }, () => "\u00e9".repeat(125), false, true, true],
+  ["multibyteSuffix_justUnder256_accepted", () => { const s = "\u00e9".repeat(125); return { [s]: 0, [`${OV_C_PREFIX}${s}`]: 7 }; }, () => "\u00e9".repeat(125), false, true, true, { s: 0, c: 7, b: 0 }],
 ]) {
   test(`parseContexts_${name}`, () => {
     const r = raw();
@@ -385,9 +387,9 @@ for (const [name, raw, key, checkFrontier, checkOverride, accepted] of [
     const { frontiers, overrides } = parseContexts(r);
     if (accepted) {
       if (checkFrontier)
-        assert.ok(frontiers.has(k), `${k} must be accepted in frontiers`);
+        assert.equal(frontiers.get(k), expectedValue, `${k} must decode to exact frontier value`);
       if (checkOverride)
-        assert.ok(overrides.has(k), `${k} must be accepted in overrides`);
+        assert.deepEqual(overrides.get(k), expectedValue, `${k} must decode to exact override register`);
     } else {
       if (checkFrontier)
         assert.equal(
@@ -474,7 +476,7 @@ test("parseContexts_reservedIdCollision_frontierAndOverrideUseDistinctNamespaces
   assert.equal(
     isOverrideActive(regularReg, regularFrontier),
     true,
-    "regular override active because S>C, F<=B",
+    "regular override active: F(40) <= B(50), S(2) > C(0)",
   );
 });
 

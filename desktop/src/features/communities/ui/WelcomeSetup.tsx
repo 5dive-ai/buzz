@@ -285,7 +285,7 @@ export function WelcomeSetup({
               transitionKey={`owned-${transitionDirection}`}
             >
               <HostedCommunityOnboarding
-                onBack={() => onboardingHistory.push("community")}
+                onBack={() => onboardingHistory.back("community")}
               />
             </OnboardingSlideTransition>
           ) : (
@@ -373,7 +373,7 @@ export function WelcomeSetup({
             <HostedCommunityOnboarding
               onBack={() => onboardingHistory.back(routeForWelcomePage(page))}
               onReady={() => {
-                onboardingHistory.push("community-owned");
+                onboardingHistory.replace("community-owned");
               }}
               stageHidden
             />

@@ -1838,8 +1838,18 @@ async fn delegated_owner_admission_does_not_require_owner_assertion() {
     assert_eq!(snapshot.binding_id(), Some(Uuid::from_u128(10)));
     assert_eq!(snapshot.binding_version(), Some(BindingVersion::INITIAL));
     assert_eq!(snapshot.transport(), AuthTransport::RelayWebSocket);
+    let owner_binding = VersionedBindingRef::new_existing_active_for_test(
+        domain(1),
+        Uuid::from_u128(10),
+        principal(),
+        owner.public_key(),
+        BindingVersion::INITIAL,
+        None,
+        BindingSource::Provisioned,
+    )
+    .expect("synthetic owner binding is valid");
     let admission = snapshot
-        .verified_owner_admission(&existing_binding(&owner))
+        .verified_owner_admission(&owner_binding)
         .expect("delegated snapshot matches the exact owner binding");
     assert_eq!(admission.authorization_domain(), domain(1));
     assert_eq!(admission.principal(), request.principal());

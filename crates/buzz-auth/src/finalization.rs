@@ -417,9 +417,10 @@ mod tests {
     use crate::{
         context::{
             AssertionExpiry, AssertionTransport, AuthContextVersion, AuthMethod, AuthTransport,
+            AuthoritativeBindingEvidence, AuthoritativeBindingResolution,
             AuthorizedCommunityAccess, BindingSource, DelegationExpiry, EnrollmentMode,
-            VerifiedFederatedAssertion, VerifiedKeyAttestation, VerifiedNostrProof,
-            VerifiedTransportDelegation,
+            FederatedPolicyStamp, VerifiedFederatedAssertion, VerifiedKeyAttestation,
+            VerifiedNostrProof, VerifiedTransportDelegation,
         },
         lease::{
             ApplicationLeaseLimit, AuthorizationClock, AuthorizationClockSkew,
@@ -454,6 +455,12 @@ mod tests {
         }
     }
 
+    impl crate::provider::AuthorizationClock for FixedClock {
+        fn now_unix_seconds(&self) -> Option<u64> {
+            Some(self.0.load(Ordering::SeqCst))
+        }
+    }
+
     struct AllowProvider {
         issued_at: u64,
         fresh_until: u64,
@@ -471,7 +478,7 @@ mod tests {
             let allow = ProviderAllow::new(
                 request.authorization_domain(),
                 request.principal().clone(),
-                request.profile_id().clone(),
+                self.profile_id(),
                 request.requested_capabilities().clone(),
                 PolicyVersion::new("policy.synthetic.example")
                     .expect("synthetic policy version is valid"),
@@ -490,6 +497,24 @@ mod tests {
     fn profile() -> AuthorizationProfileId {
         AuthorizationProfileId::from_server_configuration("profile.synthetic.example")
             .expect("synthetic profile is valid")
+    }
+
+    fn required_policy(
+        correlation_id: Uuid,
+        enrollment_mode: EnrollmentMode,
+    ) -> ResolvedFederatedPolicy {
+        ResolvedFederatedPolicy::from_authoritative_resolution(
+            FederatedPolicyStamp::from_authoritative_state(
+                domain(),
+                Uuid::from_u128(0x40),
+                1,
+                correlation_id,
+                FederatedIdentityRequirement::Required(enrollment_mode),
+                1,
+                u64::MAX,
+            )
+            .expect("synthetic federated policy lineage is valid"),
+        )
     }
 
     struct DirectFixture {
@@ -532,6 +557,7 @@ mod tests {
             principal,
             actor,
             binding_version,
+            None,
             BindingSource::AttestedKey,
         )
         .expect("synthetic binding is valid");
@@ -546,10 +572,7 @@ mod tests {
                 proof,
                 AuthorizedCommunityAccess::new(domain(), vec![Scope::MessagesRead], None),
             ),
-            policy: ResolvedFederatedPolicy::server_resolved_required(
-                domain(),
-                EnrollmentMode::AttestedKey,
-            ),
+            policy: required_policy(Uuid::from_u128(0x300), EnrollmentMode::AttestedKey),
             authorization: FederatedAuthorization::Direct { binding, assertion },
             binding_bound,
             binding_id,
@@ -560,7 +583,7 @@ mod tests {
 
     async fn direct_snapshot(
         fixture: &DirectFixture,
-        profile: AuthorizationProfileId,
+        clock: &FixedClock,
         provider_fresh_until: u64,
     ) -> Box<CapabilitySnapshot> {
         let FederatedAuthorization::Direct { assertion, .. } = &fixture.authorization else {
@@ -569,7 +592,7 @@ mod tests {
         let request = AuthorizationRequest::direct(
             fixture.input.nostr_proof(),
             assertion,
-            profile,
+            required_policy(fixture.input.correlation_id(), EnrollmentMode::AttestedKey),
             CapabilitySet::single(AuthorizationCapability::CommunityRead),
             fixture.input.correlation_id(),
             1_000,
@@ -581,8 +604,9 @@ mod tests {
                 fresh_until: provider_fresh_until,
             },
             &request,
-            1_000,
+            clock,
             ProviderTimeout::new(Duration::from_secs(1)).expect("synthetic timeout is valid"),
+            Uuid::from_u128(0x600),
         )
         .await;
         match outcome {
@@ -605,7 +629,7 @@ mod tests {
         let finalizer = AuthorizationFinalizer::new(clock.clone());
         let expected_profile = profile();
         let fixture = direct_fixture(1_500, 1_400);
-        let snapshot = direct_snapshot(&fixture, expected_profile.clone(), 1_300).await;
+        let snapshot = direct_snapshot(&fixture, clock.as_ref(), 1_300).await;
         let context = finalizer
             .finalize_access(
                 fixture.input,
@@ -660,7 +684,7 @@ mod tests {
         let actor = fixture.actor_pubkey;
         let binding_id = fixture.binding_id;
         let binding_version = fixture.binding_version;
-        let snapshot = direct_snapshot(&fixture, expected_profile.clone(), 1_300).await;
+        let snapshot = direct_snapshot(&fixture, clock.as_ref(), 1_300).await;
         let context = finalizer
             .finalize_access(
                 fixture.input,
@@ -708,7 +732,7 @@ mod tests {
         let fixture = direct_fixture(1_500, 1_400);
         let actor = fixture.actor_pubkey;
         let binding_version = fixture.binding_version;
-        let snapshot = direct_snapshot(&fixture, expected_profile.clone(), 1_300).await;
+        let snapshot = direct_snapshot(&fixture, clock.as_ref(), 1_300).await;
         let context = finalizer
             .finalize_access(
                 fixture.input,
@@ -750,7 +774,7 @@ mod tests {
         let actor = fixture.actor_pubkey;
         let binding_id = fixture.binding_id;
         let binding_version = fixture.binding_version;
-        let snapshot = direct_snapshot(&fixture, expected_profile.clone(), 1_300).await;
+        let snapshot = direct_snapshot(&fixture, clock.as_ref(), 1_300).await;
         let context = finalizer
             .finalize_access(
                 fixture.input,
@@ -795,7 +819,7 @@ mod tests {
         let actor = fixture.actor_pubkey;
         let binding_id = fixture.binding_id;
         let binding_version = fixture.binding_version;
-        let snapshot = direct_snapshot(&fixture, expected_profile.clone(), 1_300).await;
+        let snapshot = direct_snapshot(&fixture, clock.as_ref(), 1_300).await;
         let context = finalizer
             .finalize_access(
                 fixture.input,
@@ -847,7 +871,7 @@ mod tests {
         let finalizer = AuthorizationFinalizer::new(clock.clone());
         let expected_profile = profile();
         let fixture = direct_fixture(1_500, 1_400);
-        let snapshot = direct_snapshot(&fixture, expected_profile.clone(), 1_300).await;
+        let snapshot = direct_snapshot(&fixture, clock.as_ref(), 1_300).await;
         let status = finalizer
             .finalize_verification_only(
                 fixture.input,
@@ -875,7 +899,7 @@ mod tests {
         let finalizer = AuthorizationFinalizer::new(clock.clone());
         let expected_profile = profile();
         let fixture = direct_fixture(1_500, 1_400);
-        let snapshot = direct_snapshot(&fixture, expected_profile.clone(), 1_300).await;
+        let snapshot = direct_snapshot(&fixture, clock.as_ref(), 1_300).await;
         let context = finalizer
             .finalize_access(
                 fixture.input,
@@ -920,7 +944,7 @@ mod tests {
     #[tokio::test]
     async fn delegated_lease_is_bounded_by_delegation_and_owner_binding() {
         let clock = Arc::new(FixedClock::new(1_000));
-        let finalizer = AuthorizationFinalizer::new(clock);
+        let finalizer = AuthorizationFinalizer::new(clock.clone());
         let expected_profile = profile();
         let owner = Keys::generate().public_key();
         let delegate = Keys::generate().public_key();
@@ -956,13 +980,26 @@ mod tests {
             principal.clone(),
             owner,
             binding_version,
+            None,
             BindingSource::Provisioned,
         )
         .expect("synthetic owner binding is valid");
+        let owner_resolution = AuthoritativeBindingResolution::existing_active(
+            AuthoritativeBindingEvidence::new(
+                domain(),
+                binding_id,
+                principal,
+                owner,
+                binding_version,
+                None,
+                BindingSource::Provisioned,
+            )
+            .expect("synthetic owner binding resolution is valid"),
+        );
         let request = AuthorizationRequest::delegated(
             &proof,
-            &owner_binding,
-            expected_profile.clone(),
+            &owner_resolution,
+            required_policy(Uuid::from_u128(0x500), EnrollmentMode::Provisioned),
             CapabilitySet::single(AuthorizationCapability::CommunityWrite),
             Uuid::from_u128(0x500),
             1_000,
@@ -974,8 +1011,9 @@ mod tests {
                 fresh_until: 1_300,
             },
             &request,
-            1_000,
+            clock.as_ref(),
             ProviderTimeout::new(Duration::from_secs(1)).expect("synthetic timeout is valid"),
+            Uuid::from_u128(0x600),
         )
         .await
         {
@@ -1001,10 +1039,7 @@ mod tests {
         let context = finalizer
             .finalize_access(
                 input,
-                ResolvedFederatedPolicy::server_resolved_required(
-                    domain(),
-                    EnrollmentMode::Provisioned,
-                ),
+                required_policy(Uuid::from_u128(0x500), EnrollmentMode::Provisioned),
                 authorization,
                 snapshot,
                 &expected_profile,

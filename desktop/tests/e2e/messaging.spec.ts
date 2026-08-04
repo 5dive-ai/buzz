@@ -216,10 +216,13 @@ test.beforeEach(async ({ page }, testInfo) => {
                         imageDataUrl: null,
                         imageDomain: null,
                       },
-                      linkPreviewMetadataDelayMs:
-                        testInfo.title.includes("style defaults") ||
-                        testInfo.title.includes("send does not wait") ||
-                        testInfo.title.includes("attachment-sized")
+                      linkPreviewMetadataDelayMs: testInfo.title.includes(
+                        "loading card asynchronously",
+                      )
+                        ? 10_000
+                        : testInfo.title.includes("style defaults") ||
+                            testInfo.title.includes("send does not wait") ||
+                            testInfo.title.includes("attachment-sized")
                           ? 1_500
                           : undefined,
                     }
@@ -470,6 +473,36 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   await openSettings(page, "appearance");
   await page.getByTestId("link-preview-style-trigger").click();
   await page.getByTestId("link-preview-style-compact").click();
+});
+
+test("link preview paste paints the loading card asynchronously", async ({
+  page,
+}) => {
+  const previewUrl = "https://github.com/block/buzz/pull/3246?paste=async";
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  const input = page.getByTestId("message-input");
+  await input.focus();
+
+  await input.evaluate((element, url) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", url);
+    element.dispatchEvent(
+      new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData,
+      }),
+    );
+  }, previewUrl);
+  const composerPreview = page
+    .locator("[data-composer-link-previews]")
+    .locator('[data-link-preview="github-pull-request"]');
+  await expect(input).toContainText(previewUrl, { timeout: 1_000 });
+  await expect(composerPreview).toHaveAttribute("data-state", "processing", {
+    timeout: 1_000,
+  });
+  await expect(page.getByTestId("send-message")).toBeEnabled();
 });
 
 test("completed link preview sends once and leaves the composer cleared", async ({

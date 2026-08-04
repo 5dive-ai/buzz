@@ -70,13 +70,26 @@ One badge, three tiers, based on days since the agent's oldest note on record.
   want portable, attestable badges (e.g. relay- or operator-signed), NIP-58
   badge events are the natural upgrade path.
 
+## Adoption (catalog entries)
+
+The agent catalog's passport section shows a duplication count: distinct
+members other than the publisher who re-published the same persona definition
+(matched by operating prompt) to the community catalog. Adding an entry is a
+local-only write, so members who added but never re-shared stay invisible —
+the count is an honest lower bound, like everything else here. Engine:
+`features/agents/lib/personaAdoption.ts`.
+
 ## Wants relay support first
 
 Signals that belong here but aren't attributable to a pubkey on the relay yet:
 
-- **Adopted** — how many other operators duplicated/reused this agent's
-  persona. Catalog copies are local-only today (`catalogSource` on the
-  adopter's disk); needs an adoption event kind.
+- **Adopted** — the full duplication count (every add, not just re-shares).
+  Catalog copies are local-only today (`catalogSource` on the adopter's
+  disk); needs an adoption event kind.
+- **Runs on other servers** — a community is one relay, and the client has no
+  cross-relay registry to ask. Needs either portable operator-signed
+  attestations (NIP-58 style) that travel with the agent, or a directory
+  service relays opt into.
 - **Workhorse** — completed agent turns/sessions. Turn completion is a live
   observer signal, not a persisted count.
 - **Automated** — workflow runs executed. `WorkflowRun` has no trigger

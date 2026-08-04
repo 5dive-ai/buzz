@@ -1,11 +1,14 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { IdCard } from "lucide-react";
+import { CopyPlus, IdCard } from "lucide-react";
 
 import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
+import { countCatalogRepublishers } from "@/features/agents/lib/personaAdoption";
+import { usePersonaCatalogQuery } from "@/features/agents/lib/usePersonaCatalogRelay";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { useAgentPassportBadges } from "@/features/passport/hooks/useAgentPassportBadges";
 import { PassportBadgeList } from "@/features/passport/ui/PassportBadges";
 import {
@@ -123,6 +126,27 @@ export function PersonaCatalogPassport({
   const firstAgent = deployedAgents[0] ?? null;
   const { badges } = useAgentPassportBadges(firstAgent?.pubkey ?? null);
 
+  // Adoption: members who added this persona and re-shared their copy publish
+  // a second catalog head with the same definition. Adds that were never
+  // re-shared are local-only, so this is an honest lower bound — and
+  // cross-server runs are invisible from a single relay entirely.
+  const { activeCommunity } = useCommunities();
+  const catalogQuery = usePersonaCatalogQuery(activeCommunity?.id ?? null);
+  const republisherCount = React.useMemo(
+    () =>
+      countCatalogRepublishers(catalogQuery.data ?? [], {
+        displayName: persona.displayName,
+        publisherPubkey,
+        systemPrompt: persona.systemPrompt,
+      }),
+    [
+      catalogQuery.data,
+      persona.displayName,
+      persona.systemPrompt,
+      publisherPubkey,
+    ],
+  );
+
   const navigate = useNavigate();
   const openPassport = React.useCallback(
     (pubkey: string) => {
@@ -195,6 +219,17 @@ export function PersonaCatalogPassport({
               appears here once one is.
             </p>
           )}
+          {republisherCount > 0 ? (
+            <p
+              className="flex items-center gap-2 text-sm text-muted-foreground"
+              data-testid="persona-catalog-adoption"
+            >
+              <CopyPlus className="h-3.5 w-3.5 shrink-0" />
+              Duplicated by {republisherCount} other{" "}
+              {republisherCount === 1 ? "member" : "members"} — re-shared to
+              this community’s catalog.
+            </p>
+          ) : null}
           {publisherPubkey ? (
             <div>
               <Button

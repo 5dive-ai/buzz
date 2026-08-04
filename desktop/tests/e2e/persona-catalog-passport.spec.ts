@@ -65,6 +65,15 @@ test("catalog entry shows the deployed agent's passport record", async ({
         sourcePersonaId: "nadia-persona",
         systemPrompt: "Ship relay fixes and review incoming pull requests.",
       }),
+      // Alice re-shared her copy of the persona (same operating prompt) —
+      // that is the observable trace of a duplication.
+      createCatalogEvent({
+        displayName: "nadia (fork)",
+        id: "6".repeat(64),
+        ownerPubkey: TEST_IDENTITIES.alice.pubkey,
+        sourcePersonaId: "nadia-persona-fork",
+        systemPrompt: "Ship relay fixes and review incoming pull requests.",
+      }),
     ],
     relayAgents: [
       {
@@ -75,6 +84,8 @@ test("catalog entry shows the deployed agent's passport record", async ({
     ],
   });
   await openCatalog(page);
+  // Both entries share the prompt; "nadia" sorts before "nadia (fork)" and is
+  // auto-selected, so the detail pane shows the original.
 
   const passportSection = page.getByTestId("persona-catalog-passport");
   await expect(passportSection).toBeVisible();
@@ -94,6 +105,11 @@ test("catalog entry shows the deployed agent's passport record", async ({
   await expect(
     passportSection.getByTestId("persona-catalog-publisher-passport"),
   ).toHaveText(/View your passport/);
+
+  // Alice's re-shared copy of the same prompt counts as a duplication.
+  await expect(
+    passportSection.getByTestId("persona-catalog-adoption"),
+  ).toHaveText(/Duplicated by 1 other member/);
 
   await waitForAnimations(page);
   await page

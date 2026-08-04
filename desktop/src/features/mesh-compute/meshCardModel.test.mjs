@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 
 import {
   describeMeshCapacity,
+  describeParticipation,
   describeReadyModels,
   deriveMeshCardModel,
   formatCapacityGb,
@@ -68,7 +69,8 @@ function derive(overrides = {}) {
     toggle: OFF_TOGGLE,
     pendingAction: null,
     canShare: true,
-    activeConsumers: false,
+    busyNow: false,
+    requestsRouted: 0,
     ...overrides,
   });
 }
@@ -78,13 +80,13 @@ test("capacity headline counts devices and sums reported memory", () => {
     describeMeshCapacity(
       snapshot({ sharingDeviceCount: 3, sharedCapacityGb: 42.3 }),
     ),
-    "3 devices sharing · 42 GB",
+    "42 GB · 3 devices",
   );
   assert.equal(
     describeMeshCapacity(
       snapshot({ sharingDeviceCount: 1, sharedCapacityGb: 18 }),
     ),
-    "1 device sharing · 18 GB",
+    "18 GB · 1 device",
   );
 });
 
@@ -92,7 +94,7 @@ test("unknown capacity degrades to a device count, never 0 GB", () => {
   const text = describeMeshCapacity(
     snapshot({ sharingDeviceCount: 3, sharedCapacityGb: null }),
   );
-  assert.equal(text, "3 devices sharing");
+  assert.equal(text, "Mesh capacity · 3 devices");
   assert.ok(!text.includes("0 GB"), "must not claim zero capacity");
 });
 
@@ -101,9 +103,9 @@ test("an empty mesh reads as an honest empty state", () => {
     describeMeshCapacity(
       snapshot({ sharingDeviceCount: 0, sharedCapacityGb: null }),
     ),
-    "No compute shared yet",
+    "No mesh capacity yet",
   );
-  assert.equal(describeMeshCapacity(null), "No compute shared yet");
+  assert.equal(describeMeshCapacity(null), "No mesh capacity yet");
 });
 
 test("capacity formatting keeps small figures meaningful", () => {
@@ -145,7 +147,7 @@ test("consuming never renders as sharing", () => {
   assert.equal(model.switchDisabled, false);
 });
 
-test("sharing states name the model and the community capacity", () => {
+test("sharing leads with mesh capacity and omits the model name", () => {
   const model = derive({
     toggle: SHARING_TOGGLE,
     status: {
@@ -158,16 +160,20 @@ test("sharing states name the model and the community capacity", () => {
       consoleUrl: null,
     },
     snapshot: snapshot({
+      sharingDeviceCount: 1,
+      sharedCapacityGb: 115,
       devices: [device({ isSelf: true })],
       includesSelf: true,
     }),
   });
   assert.equal(model.tone, "sharing");
   assert.equal(model.switchOn, true);
-  assert.match(model.detail, /Gemma 4 26B A4B/);
+  assert.equal(model.headline, "115 GB · 1 device");
+  // The model belongs in the detail view, not on a 256px card.
+  assert.ok(!/Gemma/i.test(model.detail ?? ""), "card must not name the model");
 });
 
-test("active consumers are called out in the headline", () => {
+test("inflight work reads as working, never as 'someone is using you'", () => {
   const model = derive({
     toggle: SHARING_TOGGLE,
     status: {
@@ -179,9 +185,54 @@ test("active consumers are called out in the headline", () => {
       apiBaseUrl: null,
       consoleUrl: null,
     },
-    activeConsumers: true,
+    busyNow: true,
   });
-  assert.match(model.headline, /in use now/);
+  assert.match(model.detail, /working now/);
+});
+
+test("routed requests are a subtle used-ness signal, not a served claim", () => {
+  const model = derive({
+    toggle: SHARING_TOGGLE,
+    status: {
+      state: "running",
+      mode: "serve",
+      health: { status: "ok", reason: null },
+      modelId: "m",
+      modelName: null,
+      apiBaseUrl: null,
+      consoleUrl: null,
+    },
+    requestsRouted: 7,
+  });
+  assert.match(model.detail, /7 requests this session/);
+});
+
+test("participation copy never claims work was served for other members", () => {
+  // mesh-llm exposes no inbound counter, so no wording here may imply that
+  // another member consumed this machine's compute.
+  const claims = [
+    describeParticipation({ busyNow: false, requestsRouted: 0 }),
+    describeParticipation({ busyNow: true, requestsRouted: 3 }),
+    describeParticipation({ busyNow: false, requestsRouted: 3 }),
+  ];
+  assert.deepEqual(claims, [
+    "Sharing · ready",
+    "Sharing · working now",
+    "Sharing · 3 requests this session",
+  ]);
+  for (const claim of claims) {
+    assert.ok(
+      !/served|for (others|members|someone)|consumed/i.test(claim),
+      `must not claim served-for-others: ${claim}`,
+    );
+  }
+});
+
+test("one routed request is singular", () => {
+  assert.equal(
+    describeParticipation({ busyNow: false, requestsRouted: 1 }),
+    "Sharing · 1 request this session",
+  );
 });
 
 test("a serve node with no advertised model is warming up, not serving", () => {
@@ -227,7 +278,7 @@ test("the idle invitation leads with what the community already has", () => {
     snapshot: snapshot({ sharingDeviceCount: 2, sharedCapacityGb: 54 }),
   });
   assert.equal(model.tone, "idle");
-  assert.equal(model.headline, "2 devices sharing · 54 GB");
+  assert.equal(model.headline, "54 GB · 2 devices");
 });
 
 test("the switch is disabled until a model can be resolved", () => {

@@ -62,9 +62,12 @@ const TONE_RING_CLASS: Record<MeshCardTone, string> = {
 export function SidebarMeshComputeCard({
   className,
   onOpenComputeSettings,
+  onOpenDetail,
 }: {
   className?: string;
   onOpenComputeSettings?: () => void;
+  /** Open the full mesh view (topology, capacity, per-device detail). */
+  onOpenDetail?: () => void;
 }) {
   const shouldReduceMotion = useReducedMotion();
   const { status, refresh: refreshStatus } = useMeshNodeStatus();
@@ -82,9 +85,15 @@ export function SidebarMeshComputeCard({
   });
 
   const toggle = deriveMeshShareToggle(status);
-  const usage = useMeshServingUsage(toggle.isSharing);
-  const activeConsumers =
-    (usage?.remoteAttempts ?? 0) > 0 || (usage?.endpointAttempts ?? 0) > 0;
+  // Poll whenever a runtime slot is occupied, not just when sharing: a
+  // consuming node also has inflight work worth showing.
+  const usage = useMeshServingUsage(toggle.isSharing || toggle.isConsuming);
+  // `inflight` is the only honest "working" signal: mesh-llm's routing metrics
+  // are all OUTBOUND (incremented by this node's own ingress), so a remote/
+  // endpoint attempt means this machine is CONSUMING, not being consumed.
+  // Reading them as "someone is using my compute" is exactly backwards.
+  const busyNow = (usage?.inflight ?? 0) > 0;
+  const requestsRouted = usage?.requestsServed ?? 0;
 
   // One-shot catalog fetch: the card needs the hardware-appropriate
   // recommendation so the switch can start sharing without a model picker.
@@ -116,7 +125,8 @@ export function SidebarMeshComputeCard({
     toggle,
     pendingAction,
     canShare: Boolean(recommended),
-    activeConsumers,
+    busyNow,
+    requestsRouted,
   });
 
   async function handleToggle(next: boolean) {
@@ -146,7 +156,7 @@ export function SidebarMeshComputeCard({
   }
 
   // A transport failure is worth showing; an empty mesh is not an error and is
-  // already expressed by the headline ("No compute shared yet").
+  // already expressed by the headline ("No mesh capacity yet").
   const errorText = actionError ?? snapshotError;
 
   return (
@@ -178,7 +188,17 @@ export function SidebarMeshComputeCard({
             {TONE_ICON[model.tone]}
           </span>
 
-          <div className="min-w-0 flex-1">
+          {/*
+            Clickable region is the text block, not the whole card: wrapping the
+            Switch in a button would nest interactive elements.
+          */}
+          <button
+            className="min-w-0 flex-1 rounded-md text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default"
+            data-testid="mesh-card-open-detail"
+            disabled={!onOpenDetail}
+            onClick={onOpenDetail}
+            type="button"
+          >
             <p
               className="truncate text-sm font-semibold leading-tight"
               data-testid="mesh-card-headline"
@@ -193,7 +213,7 @@ export function SidebarMeshComputeCard({
                 {model.detail}
               </p>
             ) : null}
-          </div>
+          </button>
 
           <Switch
             aria-label={model.switchLabel}

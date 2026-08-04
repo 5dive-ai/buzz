@@ -53,9 +53,25 @@ export async function meshNodeStatus(): Promise<MeshNodeStatus> {
 }
 
 /**
- * Host-side usage of the compute this machine is sharing. The
- * local/remote/endpoint attempt split distinguishes this machine's own agents
- * (local) from another member consuming this machine's compute (remote/endpoint).
+ * This machine's own routing activity — **outbound**, not work done for others.
+ *
+ * Every counter here comes from mesh-llm's `routing_metrics`, which is
+ * incremented only by the local OpenAI ingress (`network/openai/transport.rs`)
+ * when *this* node dispatches a request. The inbound peer-serving path
+ * (`mesh/stage_transport.rs`) never touches it — it only observes inflight.
+ *
+ * So the attempt split means where MY requests went, not who asked me:
+ *   - `localAttempts`    — I ran it on my own GPU
+ *   - `remoteAttempts`   — I sent it to a peer (i.e. I am CONSUMING)
+ *   - `endpointAttempts` — I sent it to an endpoint
+ *
+ * `tokensServed` is likewise `completion_tokens_observed`: tokens I received,
+ * not tokens I produced for someone else.
+ *
+ * mesh-llm exposes no inbound "requests I served for others" counter today, so
+ * never label any field here as proof that this machine's compute was used by
+ * another member. `inflight` is the one honest "busy right now" signal, and it
+ * does not distinguish who the work is for.
  */
 export type MeshServingUsage = {
   inflight: number;

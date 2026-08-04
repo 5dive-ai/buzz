@@ -65,7 +65,11 @@ function plural(n: number, one: string, many = `${one}s`): string {
 }
 
 /**
- * The community headline: how much compute is actually available right now.
+ * The community headline: how much compute is actually reachable right now.
+ *
+ * Named "Mesh capacity" rather than "sharing" because the figure describes the
+ * pool, not this machine's participation — the switch already says whether you
+ * are in it.
  *
  * Counts only devices advertising a routable model — the same standard routing
  * uses — so the number never promises capacity that cannot be reached. Never
@@ -73,12 +77,14 @@ function plural(n: number, one: string, many = `${one}s`): string {
  */
 export function describeMeshCapacity(snapshot: MeshSnapshot | null): string {
   if (!snapshot || snapshot.sharingDeviceCount === 0) {
-    return "No compute shared yet";
+    return "No mesh capacity yet";
   }
   const { sharingDeviceCount: count, sharedCapacityGb: gb } = snapshot;
-  const devices = `${count} ${plural(count, "device")} sharing`;
+  const devices = `${count} ${plural(count, "device")}`;
   // Unknown capacity degrades to the device count rather than printing 0 GB.
-  return gb === null ? devices : `${devices} · ${formatCapacityGb(gb)}`;
+  return gb === null
+    ? `Mesh capacity · ${devices}`
+    : `${formatCapacityGb(gb)} · ${devices}`;
 }
 
 /** Short label for what is ready to run, or null when nothing is. */
@@ -93,6 +99,30 @@ export function describeReadyModels(
     return `${shortModelLabel(models[0])} ready`;
   }
   return `${models.length} models ready`;
+}
+
+/**
+ * The sharing detail line: proof this machine is participating, and that the
+ * mesh has actually been used.
+ *
+ * Scrupulously avoids claiming someone else consumed this machine's compute —
+ * mesh-llm exposes no inbound counter, so "requests routed" is the strongest
+ * true statement available. Worded as "requests" without "served for others".
+ */
+export function describeParticipation({
+  busyNow,
+  requestsRouted,
+}: {
+  busyNow: boolean;
+  requestsRouted: number;
+}): string {
+  if (busyNow) {
+    return "Sharing · working now";
+  }
+  if (requestsRouted > 0) {
+    return `Sharing · ${requestsRouted} ${plural(requestsRouted, "request")} this session`;
+  }
+  return "Sharing · ready";
 }
 
 /**
@@ -125,7 +155,8 @@ export function deriveMeshCardModel({
   toggle,
   pendingAction,
   canShare,
-  activeConsumers,
+  busyNow,
+  requestsRouted,
 }: {
   snapshot: MeshSnapshot | null;
   status: MeshNodeStatus | null;
@@ -133,8 +164,21 @@ export function deriveMeshCardModel({
   pendingAction: "start" | "stop" | null;
   /** False when no model can be resolved yet (catalog still loading). */
   canShare: boolean;
-  /** Another member is actively using this machine's compute right now. */
-  activeConsumers: boolean;
+  /**
+   * This node has inference in flight (`inflight > 0`).
+   *
+   * Honest but coarse: mesh-llm's inflight counter does not say whether the
+   * work is for a local agent or a remote member, so this only ever claims
+   * "working", never "someone is using your compute".
+   */
+  busyNow: boolean;
+  /**
+   * Requests this node's ingress has routed this session (`request_count`).
+   *
+   * Outbound routing, NOT work served for others — mesh-llm exposes no inbound
+   * counter. Used only as a subtle "this has been used" signal.
+   */
+  requestsRouted: number;
 }): MeshCardModel {
   const devices = snapshot?.devices ?? [];
   const participantCount = devices.length;
@@ -219,14 +263,13 @@ export function deriveMeshCardModel({
         showSoloHint: false,
       };
     }
-    const model = status?.modelName ?? status?.modelId;
+    // Model name is deliberately absent: it belongs in the detail view, not on
+    // a 256px card whose job is "am I in the mesh, and is it alive".
     return {
       ...base,
       tone: "sharing",
-      headline: activeConsumers
-        ? "Sharing · in use now"
-        : "Sharing this computer",
-      detail: model ? `${shortModelLabel(model)} · ${capacity}` : capacity,
+      headline: capacity,
+      detail: describeParticipation({ busyNow, requestsRouted }),
       showSoloHint: isSolo,
     };
   }

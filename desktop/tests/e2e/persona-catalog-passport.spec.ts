@@ -90,6 +90,11 @@ test("catalog entry shows the deployed agent's passport record", async ({
     passportSection.getByTestId("passport-badge-high-signal"),
   ).toBeVisible();
 
+  // Own entry: the publisher link points at the viewer's own passport.
+  await expect(
+    passportSection.getByTestId("persona-catalog-publisher-passport"),
+  ).toHaveText(/View your passport/);
+
   await waitForAnimations(page);
   await page
     .getByTestId("persona-catalog-detail-pane")
@@ -99,6 +104,40 @@ test("catalog entry shows the deployed agent's passport record", async ({
   await passportSection.getByTestId("passport-agent-chip").click();
   await expect(page.getByTestId("persona-catalog-dialog")).toHaveCount(0);
   await expect(page.getByTestId("passport-screen")).toBeVisible();
+});
+
+test("another member's deployment matches by persona name", async ({
+  page,
+}) => {
+  // Alice publishes the persona, but the running instance ("nadia") is
+  // operated by the viewer — adoption still shows on the entry.
+  await installMockBridge(page, {
+    personaCatalogEvents: [
+      createCatalogEvent({
+        displayName: "nadia",
+        id: "5".repeat(64),
+        ownerPubkey: TEST_IDENTITIES.alice.pubkey,
+        sourcePersonaId: "nadia-from-alice",
+        systemPrompt: "Shared by alice, run by anyone.",
+      }),
+    ],
+    relayAgents: [
+      {
+        channelNames: ["agents"],
+        name: "nadia",
+        pubkey: OWNED_RELAY_AGENT_PUBKEY,
+      },
+    ],
+  });
+  await openCatalog(page);
+
+  const passportSection = page.getByTestId("persona-catalog-passport");
+  await expect(
+    passportSection.getByTestId("passport-agent-chip"),
+  ).toBeVisible();
+  await expect(
+    passportSection.getByTestId("persona-catalog-publisher-passport"),
+  ).toHaveText(/View alice’s passport/);
 });
 
 test("entry without a deployed agent shows the empty passport state", async ({
@@ -119,6 +158,10 @@ test("entry without a deployed agent shows the empty passport state", async ({
 
   const emptyState = page.getByTestId("persona-catalog-passport-empty");
   await expect(emptyState).toBeVisible();
+  // Even with no deployment, the publisher's passport stays one click away.
+  await expect(
+    page.getByTestId("persona-catalog-publisher-passport"),
+  ).toBeVisible();
 
   await waitForAnimations(page);
   await page

@@ -606,6 +606,21 @@ fn baked_env_thinking_effort_is_unmasked() {
 }
 
 #[test]
+fn baked_env_goose_thinking_effort_is_unmasked() {
+    // GOOSE_THINKING_EFFORT is a non-secret canonical enum (off/low/medium/high/max) —
+    // must be revealed so the native baked lookup in `bakedEnvHelpers.ts` can read
+    // it as inherited effort for Goose agents (plan v3 pass-3 ★ pin).
+    let entries = baked_env_from_map(&[("GOOSE_THINKING_EFFORT", "high")]);
+    assert_eq!(entries.len(), 1);
+    let effort = entries
+        .iter()
+        .find(|e| e.key == "GOOSE_THINKING_EFFORT")
+        .unwrap();
+    assert_eq!(effort.value, "high");
+    assert!(!effort.masked);
+}
+
+#[test]
 fn baked_env_allowlist_is_case_insensitive() {
     // Known-safe keys — case-insensitive match must allow them.
     assert!(super::is_safe_to_reveal("buzz_agent_provider"));
@@ -614,6 +629,9 @@ fn baked_env_allowlist_is_case_insensitive() {
     assert!(super::is_safe_to_reveal("BUZZ_AGENT_MODEL"));
     assert!(super::is_safe_to_reveal("buzz_agent_thinking_effort"));
     assert!(super::is_safe_to_reveal("BUZZ_AGENT_THINKING_EFFORT"));
+    // Goose native effort key — derived from ALL_KNOWN_EFFORT_KEYS.
+    assert!(super::is_safe_to_reveal("goose_thinking_effort"));
+    assert!(super::is_safe_to_reveal("GOOSE_THINKING_EFFORT"));
     assert!(super::is_safe_to_reveal("databricks_host"));
     assert!(super::is_safe_to_reveal("DATABRICKS_HOST"));
     assert!(super::is_safe_to_reveal("databricks_model"));

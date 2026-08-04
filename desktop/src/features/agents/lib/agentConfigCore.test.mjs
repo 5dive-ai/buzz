@@ -28,6 +28,7 @@ function runtime(id, metadata = {}) {
     modelEnvVar: null,
     providerEnvVar: null,
     thinkingEnvVar: null,
+    acceptedEffortValues: null,
     maxTokensEnvVar: null,
     contextLimitEnvVar: null,
     maxRoundsEnvVar: null,
@@ -75,6 +76,34 @@ test("Goose exposes provider, model, and its real effort application key", () =>
       modelEnvVar: "GOOSE_MODEL",
       providerEnvVar: "GOOSE_PROVIDER",
       thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "global",
+  });
+
+  // With acceptedEffortValues, optionSource is "harnessNative" (single metadata authority).
+  assert.equal(field(model, "effort").optionSource, "harnessNative");
+  // Persistence key is the native key, not the legacy key.
+  assert.deepEqual(field(model, "effort").currentPersistence, {
+    kind: "envVar",
+    key: "GOOSE_THINKING_EFFORT",
+  });
+  assert.deepEqual(field(model, "effort").targetApplication, {
+    kind: "envVar",
+    key: "GOOSE_THINKING_EFFORT",
+  });
+});
+
+test("Goose without acceptedEffortValues falls back to legacyProviderModelCatalog", () => {
+  // When a Goose catalog entry predates acceptedEffortValues (null), the field
+  // falls back to legacyProviderModelCatalog — existing behavior preserved.
+  const model = deriveAgentConfigFieldModel({
+    config,
+    runtime: runtime("goose", {
+      modelEnvVar: "GOOSE_MODEL",
+      providerEnvVar: "GOOSE_PROVIDER",
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: null, // explicit null → legacy path
     }),
     scope: "global",
   });
@@ -83,14 +112,45 @@ test("Goose exposes provider, model, and its real effort application key", () =>
     field(model, "effort").optionSource,
     "legacyProviderModelCatalog",
   );
+  // Native key is still used as persistence key (v3 Phase 2 always uses native key).
   assert.deepEqual(field(model, "effort").currentPersistence, {
-    kind: "envVar",
-    key: "BUZZ_AGENT_THINKING_EFFORT",
-  });
-  assert.deepEqual(field(model, "effort").targetApplication, {
     kind: "envVar",
     key: "GOOSE_THINKING_EFFORT",
   });
+});
+
+test("Goose reads value from native key, falls back to legacy pre-migration save", () => {
+  // With both keys present, native wins (global scope — native-wins applies at all tiers).
+  const modelBothKeys = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: {
+        GOOSE_THINKING_EFFORT: "medium",
+        BUZZ_AGENT_THINKING_EFFORT: "high",
+      },
+    },
+    runtime: runtime("goose", {
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "global",
+  });
+  assert.equal(field(modelBothKeys, "effort").value, "medium");
+
+  // With only legacy key, read-old fallback kicks in at record/persona tier.
+  // At global scope, legacy is excluded (Delta 4 / effort_tier_alias(global_tier=true)).
+  const modelLegacyOnly = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: { BUZZ_AGENT_THINKING_EFFORT: "high" },
+    },
+    runtime: runtime("goose", {
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "instance",
+  });
+  assert.equal(field(modelLegacyOnly, "effort").value, "high");
 });
 
 test("Claude models effort as a deferred native ACP option", () => {
@@ -405,34 +465,35 @@ test("structuredEnvKeys_per_agent_buzz_agent_includes_effort_and_numeric_keys", 
   assert.ok(keys.includes("BUZZ_AGENT_MAX_ROUNDS"), "maxRounds present");
 });
 
-test("structuredEnvKeys_per_agent_goose_excludes_effort_key_discriminating_invariant", () => {
-  // Per-agent Goose: effort migration is out of scope, so no effort control
-  // renders on the per-agent surface for Goose. Only the 2 numeric descriptors
-  // are passed as the rendered set. The effort persistence key
-  // (BUZZ_AGENT_THINKING_EFFORT) must NOT appear in the output — any saved
-  // value must remain visible and editable as a generic env row.
+test("structuredEnvKeys_per_agent_goose_includes_effort_and_numeric_keys", () => {
+  // Per-agent Goose with acceptedEffortValues now renders an effort control —
+  // the native key (GOOSE_THINKING_EFFORT) must appear in the structured set.
+  // The legacy key (BUZZ_AGENT_THINKING_EFFORT) must NOT appear — it has no
+  // editor on this surface and must stay visible as a generic env row.
   const gooseModel = deriveAgentConfigFieldModel({
     config,
     runtime: runtime("goose", {
       thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
       maxTokensEnvVar: "GOOSE_MAX_TOKENS",
       contextLimitEnvVar: "GOOSE_CONTEXT_LIMIT",
     }),
     scope: "definition",
   });
 
-  // Simulate per-agent surface: only the numeric descriptors render (no effort
-  // control for Goose per-agent — effort migration is out of scope).
-  const numericDescriptorsOnly = gooseModel.fields.filter((f) =>
-    ["maxOutputTokens", "contextLimit", "maxRounds"].includes(f.kind),
+  const renderedDescriptors = gooseModel.fields.filter(
+    (f) => f.render === "control",
   );
+  const keys = structuredEnvKeys(renderedDescriptors);
 
-  const keys = structuredEnvKeys(numericDescriptorsOnly);
-
+  assert.ok(
+    keys.includes("GOOSE_THINKING_EFFORT"),
+    "Goose native effort key must be hidden (control renders)",
+  );
   assert.equal(
     keys.includes("BUZZ_AGENT_THINKING_EFFORT"),
     false,
-    "effort persistence key must NOT be hidden for Goose per-agent — no editor would replace it",
+    "legacy key must NOT be hidden — no editor owns it for Goose",
   );
   assert.ok(
     keys.includes("GOOSE_MAX_TOKENS"),
@@ -560,4 +621,213 @@ test("NUMERIC_KIND_MIN_contextLimit_is_1", () => {
 
 test("NUMERIC_KIND_MIN_maxRounds_is_0", () => {
   assert.equal(NUMERIC_KIND_MIN.maxRounds, 0);
+});
+
+test("unconsumed_legacy_effort_row_stays_visible_for_goose", () => {
+  // An invalid-for-Goose legacy value in a Goose record (BUZZ_AGENT_THINKING_EFFORT=minimal)
+  // must remain visible as a generic advanced-env row — it is not consumed as structured
+  // effort and must not be hidden. Only the native key (GOOSE_THINKING_EFFORT) is in
+  // structuredEnvKeys for Goose. (plan v3 pass-3 ★ pin: unconsumed legacy rows stay visible.)
+  // Uses `minimal` — invalid for Goose's canonical vocabulary — to pin the normalization
+  // rejection path: the value is present but normalization returns null → not consumed.
+  const gooseModel = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: { BUZZ_AGENT_THINKING_EFFORT: "minimal" },
+    },
+    runtime: runtime("goose", {
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "definition",
+  });
+  const renderedDescriptors = gooseModel.fields.filter(
+    (f) => f.render === "control",
+  );
+  const keys = structuredEnvKeys(renderedDescriptors);
+  // Legacy key is NOT in structured keys for Goose → stays visible as advanced row.
+  assert.equal(
+    keys.includes("BUZZ_AGENT_THINKING_EFFORT"),
+    false,
+    "legacy key must not be hidden for Goose — no structured control owns it",
+  );
+  // Invalid legacy value is not consumed → effort control shows empty.
+  assert.equal(
+    field(gooseModel, "effort").value,
+    null,
+    "invalid legacy `minimal` must not be consumed — effort control is empty",
+  );
+});
+
+test("goose_legacy_only_persona_scope_renders_canonical_value", () => {
+  // Legacy-only Goose persona (scope="definition") — the legacy fallback must
+  // apply at this scope and render the normalized canonical value.
+  // Exercises the legacy read path for the persona editor surface specifically.
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: { BUZZ_AGENT_THINKING_EFFORT: "high" },
+    },
+    runtime: runtime("goose", {
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "definition",
+  });
+  assert.equal(
+    field(model, "effort").value,
+    "high",
+    "valid legacy value at persona scope must be shown as canonical effort value",
+  );
+  assert.equal(
+    field(model, "effort").legacyConsumedKey,
+    "BUZZ_AGENT_THINKING_EFFORT",
+    "legacyConsumedKey set at persona scope so the duplicate env row is hidden",
+  );
+});
+
+test("goose_alias_none_normalizes_to_off_in_display_value", () => {
+  // Pre-migration Goose record with BUZZ_AGENT_THINKING_EFFORT=none.
+  // The display value must be normalized to "off" (canonical) not "none" (alias).
+  // Uses scope: "instance" — legacy is consumed only at record/persona tiers.
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: { BUZZ_AGENT_THINKING_EFFORT: "none" },
+    },
+    runtime: runtime("goose", {
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "instance",
+  });
+  assert.equal(
+    field(model, "effort").value,
+    "off",
+    "none (Buzz alias) must normalize to off (Goose canonical) for display",
+  );
+});
+
+test("goose_alias_xhigh_normalizes_to_max_in_display_value", () => {
+  // Pre-migration Goose record with BUZZ_AGENT_THINKING_EFFORT=xhigh.
+  // The display value must be normalized to "max" (canonical).
+  // Uses scope: "instance" — legacy is consumed only at record/persona tiers.
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: { BUZZ_AGENT_THINKING_EFFORT: "xhigh" },
+    },
+    runtime: runtime("goose", {
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "instance",
+  });
+  assert.equal(
+    field(model, "effort").value,
+    "max",
+    "xhigh (Buzz alias) must normalize to max (Goose canonical) for display",
+  );
+});
+
+test("goose_invalid_legacy_effort_shows_null_value_not_alias", () => {
+  // BUZZ_AGENT_THINKING_EFFORT=minimal is invalid for Goose (no alias). Display
+  // value must be null (skip-as-absent), not the raw invalid string.
+  // Uses scope: "instance" — legacy is consumed only at record/persona tiers.
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: { BUZZ_AGENT_THINKING_EFFORT: "minimal" },
+    },
+    runtime: runtime("goose", {
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "instance",
+  });
+  assert.equal(
+    field(model, "effort").value,
+    null,
+    "minimal (invalid for Goose) must yield null display value",
+  );
+});
+
+test("goose_legacy_consumed_as_effort_reports_legacyConsumedKey", () => {
+  // When a legacy value is consumed as Goose effort at record/persona tier
+  // (scope "instance"), the descriptor must set legacyConsumedKey so callers
+  // can suppress the dup row. Legacy is NOT consumed at global scope.
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: { BUZZ_AGENT_THINKING_EFFORT: "high" },
+    },
+    runtime: runtime("goose", {
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "instance",
+  });
+  assert.equal(
+    field(model, "effort").legacyConsumedKey,
+    "BUZZ_AGENT_THINKING_EFFORT",
+    "legacyConsumedKey must be set when legacy key value is shown via fallback",
+  );
+});
+
+test("goose_global_scope_legacy_not_consumed_effort_empty_and_row_visible", () => {
+  // Plan v3 Delta 4 pin: at global scope, BUZZ_AGENT_THINKING_EFFORT is
+  // buzz-agent's native key and must NEVER be consumed as Goose effort.
+  // The effort control must show empty; the legacy key must NOT appear in
+  // structuredEnvKeys (so it remains a visible advanced row).
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: { BUZZ_AGENT_THINKING_EFFORT: "high" },
+    },
+    runtime: runtime("goose", {
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "global",
+  });
+  assert.equal(
+    field(model, "effort").value,
+    null,
+    "Goose effort control must be empty at global scope with only legacy key",
+  );
+  assert.equal(
+    field(model, "effort").legacyConsumedKey,
+    undefined,
+    "legacyConsumedKey must be undefined at global scope — legacy stays a visible row",
+  );
+  // Legacy key must NOT be hidden (not in structuredEnvKeys).
+  const renderedDescriptors = model.fields.filter(
+    (f) => f.render === "control",
+  );
+  const keys = structuredEnvKeys(renderedDescriptors);
+  assert.equal(
+    keys.includes("BUZZ_AGENT_THINKING_EFFORT"),
+    false,
+    "legacy key must remain a visible advanced row at global scope for Goose",
+  );
+});
+
+test("goose_native_key_set_does_not_report_legacyConsumedKey", () => {
+  // When native key is present, legacyConsumedKey must be undefined (no dup row).
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: { GOOSE_THINKING_EFFORT: "medium" },
+    },
+    runtime: runtime("goose", {
+      thinkingEnvVar: "GOOSE_THINKING_EFFORT",
+      acceptedEffortValues: ["off", "low", "medium", "high", "max"],
+    }),
+    scope: "global",
+  });
+  assert.equal(
+    field(model, "effort").legacyConsumedKey,
+    undefined,
+    "legacyConsumedKey must be undefined when native key is set",
+  );
 });

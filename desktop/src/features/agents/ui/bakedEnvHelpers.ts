@@ -4,6 +4,29 @@
  * them without pulling in React, Tauri IPC, or TanStack Query.
  */
 
+import {
+  BUZZ_AGENT_THINKING_EFFORT,
+  normalizeEffortValue,
+} from "./buzzAgentConfig";
+
+const BAKED_STRUCTURED_KEYS_BASE = new Set([
+  "BUZZ_AGENT_PROVIDER",
+  "BUZZ_AGENT_MODEL",
+]);
+
+/**
+ * Returns the set of baked env keys hidden by structured controls.
+ * Only the current runtime's native effort key is hidden; a baked legacy key
+ * for a non-buzz-agent runtime remains visible as an advanced row (Delta-4).
+ */
+export function bakedStructuredKeys(
+  nativeEffortKey: string | undefined,
+): Set<string> {
+  const keys = new Set(BAKED_STRUCTURED_KEYS_BASE);
+  if (nativeEffortKey) keys.add(nativeEffortKey);
+  return keys;
+}
+
 /**
  * Return the provider option label for the zero-value (inherit) option when a
  * baked provider is present. Falls back to the raw provider id when the id
@@ -143,11 +166,50 @@ export function getInheritedAgentDefaults(
     provider: string | null;
   },
   bakedEnv: readonly BakedEnvEntry[] | undefined,
+  options?: {
+    /**
+     * The native effort env key for the current runtime (e.g. `GOOSE_THINKING_EFFORT`).
+     * When provided (and different from the legacy key), the native key is checked
+     * first and baked lookup uses native-only (no legacy fallback for baked tier).
+     * Defaults to `BUZZ_AGENT_THINKING_EFFORT` (buzz-agent behavior unchanged).
+     */
+    nativeEffortKey?: string;
+    /**
+     * Canonical effort values for the current runtime (from `runtime.acceptedEffortValues`).
+     * Used to normalize the global native effort value before display.
+     * Pass `null` for buzz-agent (per-model catalog, no static vocabulary).
+     */
+    acceptedEffortValues?: readonly string[] | null;
+  },
 ): {
   effort: InheritedDefault;
   model: InheritedDefault;
   provider: InheritedDefault;
 } {
+  const nativeEffortKey =
+    options?.nativeEffortKey ?? BUZZ_AGENT_THINKING_EFFORT;
+
+  // Effort value from global config: native key only.
+  // Global legacy (BUZZ_AGENT_THINKING_EFFORT for non-buzz-agent runtimes) is
+  // excluded — mirrors effort_tier_alias(global_tier=true) in Rust: spawn and
+  // the reader both exclude legacy at the global tier. For Goose, the legacy
+  // key is buzz-agent's native key (Delta 5); consuming it here would display
+  // buzz-agent's effort setting as Goose effort. Normalize the raw value so
+  // global GOOSE_THINKING_EFFORT=xhigh displays as canonical "max", not "xhigh"
+  // (acceptedEffortValues drives normalization; null = buzz-agent pass-through).
+  const globalNativeRaw = globalConfig.env_vars[nativeEffortKey]?.trim();
+  const globalNativeEffort = globalNativeRaw
+    ? (normalizeEffortValue(
+        globalNativeRaw,
+        options?.acceptedEffortValues ?? null,
+      ) ?? null)
+    : null;
+  const globalEffortValue = globalNativeEffort || null;
+
+  // Baked effort lookup: always use the native key (never the legacy key at
+  // baked tier, mirroring the global-tier native-only rule).
+  const bakedEffortKey = nativeEffortKey;
+
   return {
     provider: resolveInheritedDefault(
       globalConfig.provider,
@@ -175,10 +237,22 @@ export function getInheritedAgentDefaults(
         ? { source: "build", value: fallback }
         : { source: null, value: "" };
     })(),
-    effort: resolveInheritedDefault(
-      globalConfig.env_vars.BUZZ_AGENT_THINKING_EFFORT,
-      bakedEnv,
-      "BUZZ_AGENT_THINKING_EFFORT",
-    ),
+    effort: (() => {
+      // Global config effort wins (native then legacy fallback).
+      if (globalEffortValue) {
+        return {
+          source: "global" as InheritedDefaultSource,
+          value: globalEffortValue,
+        };
+      }
+      // Baked effort — native-only lookup for non-buzz-agent runtimes.
+      const baked = bakedEnv?.find(
+        (entry) => entry.key === bakedEffortKey && !entry.masked,
+      );
+      const bakedValue = baked?.value.trim() ?? "";
+      return bakedValue
+        ? { source: "build" as InheritedDefaultSource, value: bakedValue }
+        : { source: null, value: "" };
+    })(),
   };
 }

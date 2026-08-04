@@ -8,6 +8,48 @@
 /** Env var key for the thinking/effort level sent to the LLM. */
 export const BUZZ_AGENT_THINKING_EFFORT = "BUZZ_AGENT_THINKING_EFFORT";
 
+/**
+ * All native thinking-effort env keys across all known runtimes.
+ * Used to strip foreign effort keys from a runtime's effective descriptor and
+ * to clear all effort-related keys when switching runtimes (record/persona scope).
+ * Must stay in sync with `ALL_KNOWN_EFFORT_KEYS` in `config_bridge/mod.rs`.
+ */
+export const ALL_KNOWN_EFFORT_KEYS: readonly string[] = [
+  BUZZ_AGENT_THINKING_EFFORT, // buzz-agent native (= legacy key)
+  "GOOSE_THINKING_EFFORT", // Goose native
+] as const;
+
+/**
+ * Normalize a raw effort value to its canonical form for a runtime with a
+ * static effort vocabulary (e.g. Goose). Returns `null` when the value is
+ * invalid for the given canonical set.
+ *
+ * Aliases (case-insensitive, from Goose `thinking.rs:277-297`):
+ *   none|disabled → off, med → medium, xhigh → max
+ * Also case-folds (e.g. "HIGH" → "high").
+ *
+ * Pass `null` for `acceptedValues` to skip normalization (buzz-agent path).
+ */
+export function normalizeEffortValue(
+  raw: string,
+  acceptedValues: readonly string[] | null,
+): string | null {
+  if (!acceptedValues) return raw; // buzz-agent: pass through, no static vocab
+  const lower = raw.toLowerCase();
+  // Canonical direct match after case-fold.
+  if (acceptedValues.includes(lower)) return lower;
+  // Known aliases (mirrors GOOSE_EFFORT_NORMALIZATION in runtime_metadata.rs).
+  const ALIASES: Record<string, string> = {
+    none: "off",
+    disabled: "off",
+    med: "medium",
+    xhigh: "max",
+  };
+  const mapped = ALIASES[lower];
+  if (mapped && acceptedValues.includes(mapped)) return mapped;
+  return null; // invalid for this harness
+}
+
 /** Env var key for the maximum output token count per turn. */
 export const BUZZ_AGENT_MAX_OUTPUT_TOKENS = "BUZZ_AGENT_MAX_OUTPUT_TOKENS";
 

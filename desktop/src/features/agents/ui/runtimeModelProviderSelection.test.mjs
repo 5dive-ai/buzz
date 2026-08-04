@@ -228,3 +228,102 @@ test("auto-model selection clears the model; concrete selection sets it", () => 
   );
   assert.equal(concrete.model, "gpt-5");
 });
+
+// ── selectionOnRuntimeChange: effort-key cleanup ──────────────────────────
+//
+// At record/persona scope, a runtime change must clean up the previous
+// runtime's native effort key AND the legacy key (BUZZ_AGENT_THINKING_EFFORT).
+// The next runtime's native key is also cleared (stale leftover removal).
+// Unrelated env keys are preserved.
+
+test("selectionOnRuntimeChange_goose_to_buzz_clears_goose_native_and_legacy", () => {
+  // Goose→buzz-agent: GOOSE_THINKING_EFFORT (prev native) + BUZZ_AGENT_THINKING_EFFORT (legacy)
+  // are deleted. Unrelated keys survive.
+  const current = {
+    ...base,
+    envVars: {
+      GOOSE_THINKING_EFFORT: "medium",
+      BUZZ_AGENT_THINKING_EFFORT: "high",
+      SOME_KEY: "value",
+    },
+  };
+  const next = selectionOnRuntimeChange(current, {
+    previousRuntime: "goose",
+    nextRuntime: "buzz-agent",
+    nextRuntimeCanChooseProvider: false,
+    lockedRuntimeReset: "full",
+    previousRuntimeNativeEffortKey: "GOOSE_THINKING_EFFORT",
+    nextRuntimeNativeEffortKey: "BUZZ_AGENT_THINKING_EFFORT",
+  });
+  assert.equal(
+    next.envVars.GOOSE_THINKING_EFFORT,
+    undefined,
+    "prev native effort key must be cleared",
+  );
+  assert.equal(
+    next.envVars.BUZZ_AGENT_THINKING_EFFORT,
+    undefined,
+    "legacy effort key must be cleared",
+  );
+  assert.equal(
+    next.envVars.SOME_KEY,
+    "value",
+    "unrelated env key must survive",
+  );
+});
+
+test("selectionOnRuntimeChange_buzz_to_goose_clears_goose_native_and_legacy", () => {
+  // buzz-agent→Goose: previousRuntimeNativeEffortKey is BUZZ_AGENT_THINKING_EFFORT
+  // which equals the legacy key — cleanup fires via the nextRuntimeNativeEffortKey path.
+  const current = {
+    ...base,
+    envVars: {
+      GOOSE_THINKING_EFFORT: "low",
+      BUZZ_AGENT_THINKING_EFFORT: "high",
+      OTHER: "keep",
+    },
+  };
+  const next = selectionOnRuntimeChange(current, {
+    previousRuntime: "buzz-agent",
+    nextRuntime: "goose",
+    nextRuntimeCanChooseProvider: true,
+    lockedRuntimeReset: "full",
+    previousRuntimeNativeEffortKey: "BUZZ_AGENT_THINKING_EFFORT",
+    nextRuntimeNativeEffortKey: "GOOSE_THINKING_EFFORT",
+  });
+  // When prev native === legacy key, the else-if branch fires instead:
+  // it clears next native + legacy.
+  assert.equal(
+    next.envVars.GOOSE_THINKING_EFFORT,
+    undefined,
+    "next native effort key must be cleared",
+  );
+  assert.equal(
+    next.envVars.BUZZ_AGENT_THINKING_EFFORT,
+    undefined,
+    "legacy effort key must be cleared",
+  );
+  assert.equal(next.envVars.OTHER, "keep", "unrelated env key must survive");
+});
+
+test("selectionOnRuntimeChange_buzz_to_buzz_preserves_effort_keys", () => {
+  // buzz-agent→buzz-agent: no effort cleanup (native === legacy key,
+  // both branches skip). Effort keys survive.
+  const current = {
+    ...base,
+    envVars: { BUZZ_AGENT_THINKING_EFFORT: "high" },
+  };
+  const next = selectionOnRuntimeChange(current, {
+    previousRuntime: "buzz-agent",
+    nextRuntime: "buzz-agent",
+    nextRuntimeCanChooseProvider: false,
+    lockedRuntimeReset: "full",
+    previousRuntimeNativeEffortKey: "BUZZ_AGENT_THINKING_EFFORT",
+    nextRuntimeNativeEffortKey: "BUZZ_AGENT_THINKING_EFFORT",
+  });
+  assert.equal(
+    next.envVars.BUZZ_AGENT_THINKING_EFFORT,
+    "high",
+    "buzz-agent effort key preserved on same-runtime switch",
+  );
+});

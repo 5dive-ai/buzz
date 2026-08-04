@@ -12,6 +12,7 @@ import {
   envVarsClearingManagedApiKey,
   envVarsWithoutKey,
 } from "./providerEnvVarUpdates";
+import { BUZZ_AGENT_THINKING_EFFORT } from "./buzzAgentConfig";
 
 /**
  * Pure transition functions for the runtime -> LLM provider -> model dropdown
@@ -41,6 +42,19 @@ export function selectionOnRuntimeChange(
      * only the provider selection ("provider-only").
      */
     lockedRuntimeReset: "full" | "provider-only";
+    /**
+     * Native thinking-effort key for the PREVIOUS runtime, or `null` when the
+     * previous runtime has no effort key or it equals the legacy key.
+     * When provided, this key is deleted from envVars on runtime change.
+     */
+    previousRuntimeNativeEffortKey?: string | null;
+    /**
+     * Native thinking-effort key for the NEXT runtime, or `null` when the
+     * next runtime has no effort key or it equals the legacy key.
+     * When provided, this key is deleted from envVars on runtime change
+     * (any stale leftover from a prior session is removed).
+     */
+    nextRuntimeNativeEffortKey?: string | null;
   },
 ): RuntimeModelProviderSelection {
   const next = { ...current };
@@ -71,6 +85,38 @@ export function selectionOnRuntimeChange(
     }
     next.isCustomProviderEditing = false;
     next.provider = "";
+  }
+
+  // Effort cleanup at record/persona scope: clear prev native, next native,
+  // and legacy keys when the runtime changes. Global scope is exempt (Delta-5
+  // rule: global switches preserve both runtimes' native keys — that is handled
+  // by resetConfigForHarnessChange's no-op policy).
+  // Skip when native key equals the legacy key (buzz-agent: they are the same
+  // key so no aliasing applies; no destructive cleanup needed).
+  //
+  // Asymmetric case — prev==legacy + next==null (e.g. buzz→claude): neither
+  // branch fires, so BUZZ_AGENT_THINKING_EFFORT is preserved through the
+  // transition. This is intentional: claude has no effort env key so there is
+  // no stale-alias resurrection risk, and the value is safe to keep for a
+  // future buzz←claude switch. buzz→goose (next != legacy) DOES clear both
+  // keys because a stale BUZZ_AGENT_THINKING_EFFORT would be aliased into
+  // Goose effort on the next spawn.
+  if (
+    params.previousRuntimeNativeEffortKey &&
+    params.previousRuntimeNativeEffortKey !== BUZZ_AGENT_THINKING_EFFORT
+  ) {
+    const ev = { ...next.envVars };
+    delete ev[params.previousRuntimeNativeEffortKey];
+    delete ev[BUZZ_AGENT_THINKING_EFFORT];
+    next.envVars = ev;
+  } else if (
+    params.nextRuntimeNativeEffortKey &&
+    params.nextRuntimeNativeEffortKey !== BUZZ_AGENT_THINKING_EFFORT
+  ) {
+    const ev = { ...next.envVars };
+    delete ev[params.nextRuntimeNativeEffortKey];
+    delete ev[BUZZ_AGENT_THINKING_EFFORT];
+    next.envVars = ev;
   }
 
   return next;

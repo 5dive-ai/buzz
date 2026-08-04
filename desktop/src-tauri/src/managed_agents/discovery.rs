@@ -586,10 +586,8 @@ pub fn clear_resolve_cache() {
 }
 
 // ── Adapter availability cache (Phase-2 badge fallback) ─────────────────────
-//
 // Warmed by `discover_acp_runtimes`; invalidated by `clear_resolve_cache`.
-// Allows `build_managed_agent_summary` to compare adapter availability without
-// spawning a probe subprocess on every poll cycle.
+// Allows `build_managed_agent_summary` to check adapter availability without re-probing.
 
 fn adapter_availability_cache() -> &'static std::sync::Mutex<Option<AcpAvailabilityStatus>> {
     use std::sync::{Mutex, OnceLock};
@@ -1547,8 +1545,7 @@ pub fn discover_acp_runtimes_from(
                 command,
                 binary_path,
                 default_args,
-                // Custom harnesses are plain ACP — no MCP sidecar, no env-var
-                // model switching, no thinking knobs.
+                // Custom harnesses are plain ACP — no MCP sidecar, no env-var model switching, no thinking knobs.
                 mcp_command: None,
                 model_env_var: None,
                 provider_env_var: None,

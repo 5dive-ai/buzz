@@ -7346,6 +7346,12 @@ function withMockRuntimeConfigMetadata(
         : runtime.id === "buzz-agent"
           ? "BUZZ_AGENT_MAX_ROUNDS"
           : null,
+    accepted_effort_values:
+      "accepted_effort_values" in runtime
+        ? runtime.accepted_effort_values
+        : runtime.id === "goose"
+          ? ["off", "low", "medium", "high", "max"]
+          : null,
   };
 }
 

@@ -209,6 +209,32 @@ pub struct BakedEnvEntry {
     pub masked: bool,
 }
 
+/// Returns `true` when a baked-env key is safe to display unmasked in the UI.
+///
+/// This uses an explicit allowlist of keys that are known safe (non-secret).
+/// Any key NOT in this set is masked — default-deny for a security surface.
+///
+/// Allowlist (case-insensitive):
+/// - `BUZZ_AGENT_PROVIDER`, `BUZZ_AGENT_MODEL` — agent runtime selection
+/// - All known native thinking-effort keys (non-secret enum values) — derived
+///   from `ALL_KNOWN_EFFORT_KEYS` so this list stays in sync with runtime
+///   metadata declarations (`BUZZ_AGENT_THINKING_EFFORT`, `GOOSE_THINKING_EFFORT`).
+/// - `DATABRICKS_HOST`, `DATABRICKS_MODEL` — Block non-secret defaults
+fn is_safe_to_reveal(key: &str) -> bool {
+    use crate::managed_agents::config_bridge::ALL_KNOWN_EFFORT_KEYS;
+    const SAFE_KEYS: &[&str] = &[
+        "BUZZ_AGENT_PROVIDER",
+        "BUZZ_AGENT_MODEL",
+        "DATABRICKS_HOST",
+        "DATABRICKS_MODEL",
+    ];
+    let upper = key.to_ascii_uppercase();
+    SAFE_KEYS.iter().any(|safe| upper == *safe)
+        || ALL_KNOWN_EFFORT_KEYS
+            .iter()
+            .any(|effort| upper == effort.to_ascii_uppercase())
+}
+
 /// Expose the baked build env to the frontend with values shown, but any
 /// key not in the safe-to-reveal allowlist has its value replaced by `••••••`.
 ///

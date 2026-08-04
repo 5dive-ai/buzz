@@ -100,10 +100,11 @@ function MessageComposerImpl({
     syncContentRefFromEditorRef,
   } = useComposerContentState();
   const [previewContent, setPreviewContent] = React.useState("");
+  const deferredPreviewContent = React.useDeferredValue(previewContent);
   const {
     previewList: composerLinkPreviews,
     getReadyTags: getReadyLinkPreviewTags,
-  } = useComposerLinkPreviews(previewContent);
+  } = useComposerLinkPreviews(deferredPreviewContent);
   const [isEmojiPickerOpen, setIsEmojiPickerOpen] = React.useState(false);
   const [isFormattingOpen, setIsFormattingOpen] = React.useState(false);
   const [spoileredAttachmentUrls, setSpoileredAttachmentUrls] = React.useState<
@@ -506,7 +507,6 @@ function MessageComposerImpl({
     richText.focus,
     mentions.updateMentionQuery,
   ]);
-  // ── Submit message ──────────────────────────────────────────────────
   const submitMessage = React.useCallback(async () => {
     const trimmed = syncComposerContentFromEditor().trim();
     // Edit mode

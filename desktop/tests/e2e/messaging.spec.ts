@@ -484,9 +484,10 @@ test("link preview paste paints the loading card asynchronously", async ({
   const input = page.getByTestId("message-input");
   await input.focus();
 
-  await input.evaluate((element, url) => {
+  const firstPaint = await input.evaluate(async (element, url) => {
     const clipboardData = new DataTransfer();
     clipboardData.setData("text/plain", url);
+    const startedAt = performance.now();
     element.dispatchEvent(
       new ClipboardEvent("paste", {
         bubbles: true,
@@ -494,7 +495,16 @@ test("link preview paste paints the loading card asynchronously", async ({
         clipboardData,
       }),
     );
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
+    return {
+      elapsedMs: performance.now() - startedAt,
+      text: element.textContent,
+    };
   }, previewUrl);
+  expect(firstPaint.text).toContain(previewUrl);
+  expect(firstPaint.elapsedMs).toBeLessThan(250);
   const composerPreview = page
     .locator("[data-composer-link-previews]")
     .locator('[data-link-preview="github-pull-request"]');

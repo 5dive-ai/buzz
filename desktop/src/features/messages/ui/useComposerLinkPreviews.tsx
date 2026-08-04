@@ -142,6 +142,10 @@ export function useComposerLinkPreviews(content: string) {
     {},
   );
   const readyTagsRef = React.useRef<string[][]>([]);
+  const readyTagsByHrefRef = React.useRef(readyTags);
+  readyTagsByHrefRef.current = readyTags;
+  const suppressedRef = React.useRef(suppressed);
+  suppressedRef.current = suppressed;
   const uploadsRef = React.useRef(new Set<string>());
   const activeHrefsRef = React.useRef(new Set<string>());
   activeHrefsRef.current = new Set(candidates.map((preview) => preview.href));
@@ -228,6 +232,12 @@ export function useComposerLinkPreviews(content: string) {
       </div>
     </div>
   ) : null;
-  const getReadyTags = React.useCallback(() => readyTagsRef.current, []);
+  const getReadyTags = React.useCallback(() => {
+    if (suppressedRef.current) return [["link-preview", "none"]];
+    return [...activeHrefsRef.current].flatMap((href) => {
+      const tag = readyTagsByHrefRef.current[href];
+      return tag ? [tag] : [];
+    });
+  }, []);
   return { previewList, getReadyTags };
 }

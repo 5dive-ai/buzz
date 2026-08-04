@@ -1,4 +1,5 @@
 import * as React from "react";
+import type { ForcedUnreadSource } from "@/features/channels/forcedUnreadStore";
 import type { ContextParentResolver } from "@/features/channels/readState/readStateManager";
 import type { ReadStateProjection } from "@/features/channels/readState/readStateManager";
 import type { ThreadActivityItem } from "@/features/channels/useUnreadChannels";
@@ -13,9 +14,19 @@ type AppShellContextValue = {
   markChannelRead: (
     channelId: string,
     readAt: string | null | undefined,
-    options?: { topLevelOnly?: boolean },
+    options?: {
+      preserveForcedUnread?: boolean;
+      topLevelOnly?: boolean;
+    },
   ) => void;
-  markChannelUnread: (channelId: string) => boolean;
+  markChannelUnread: (
+    channelId: string,
+    source?: ForcedUnreadSource,
+  ) => boolean;
+  clearChannelUnreadSource: (
+    channelId: string,
+    source: ForcedUnreadSource,
+  ) => void;
   openBrowseChannels: () => void;
   openCreateChannel: () => void;
   openChannelManagement: (channelId?: string) => void;
@@ -32,6 +43,11 @@ type AppShellContextValue = {
   // read. Uses `msg:<id>` context keys folded through the active channel by the
   // parent resolver (LP4 v3 per-message badge model).
   getMessageReadAt: (messageId: string) => number | null;
+  // Read frontier for a channel-activity item, scoped to that item's own
+  // message and channel rather than the currently mounted channel resolver.
+  getChannelActivityItemReadAt: (
+    item: Pick<FeedItem, "channelId" | "id">,
+  ) => number | null;
   // Advance a single message's read marker to the given unix-seconds timestamp.
   markMessageRead: (messageId: string, timestamp: number) => void;
   // Bump-counter that invalidates whenever the read marker changes. Include
@@ -40,27 +56,45 @@ type AppShellContextValue = {
   // Inject the thread→channel parent resolver derived from the event graph
   // (NIP-RS hierarchical frontier). Set by the active channel surface.
   setContextParentResolver: (resolver: ContextParentResolver | null) => void;
+  // Snapshot of the ReadStateManager's projection (completeness + frontiers +
+  // overrides). Used by communityUnreadObserver for accurate per-community
+  // unread projections without a second manager instance.
+  getProjection: () => ReadStateProjection | null;
   followThread: (rootId: string) => void;
   unfollowThread: (rootId: string) => void;
   isFollowingThread: (rootId: string) => boolean;
   isNotifiedForThread: (rootId: string) => boolean;
+  recordThreadInteraction: (rootId: string) => void;
   isThreadMuted: (rootId: string) => boolean;
   threadActivityItems: ThreadActivityItem[];
   threadActivityFeedItems: FeedItem[];
+  // Home-feed items explicitly reopened from Inbox. Kept separate from live
+  // thread activity so older rows can be projected into channel hover cards
+  // without duplicating the Home feed itself.
+  locallyUnreadFeedItems: FeedItem[];
+  // Thread rows that remain unread until their own message/thread marker is
+  // advanced. Unlike the broad channel unread set, this includes the active
+  // channel so simply landing in it does not hide the wayfinding signal.
+  unreadThreadFeedItems: FeedItem[];
+  unreadThreadChannelIds: ReadonlySet<string>;
+  // Ordinary unread channel-level activity. Sidebar rows use this for text
+  // emphasis only; thread activity owns the dot.
+  topLevelUnreadChannelIds: ReadonlySet<string>;
+  // Lets isolated component tests retain the legacy hasUnread fallback while
+  // the mounted shell uses the split projections above.
+  hasSidebarUnreadProjections: boolean;
   feedItemState: FeedItemState;
   // Open the Settings panel at the given section. Available on all surfaces
   // that render under AppShell (channel, home, projects, pulse, agents).
   // Used by config-nudge cards to deep-link to Settings → Agents.
   onOpenSettings: ((section: SettingsSection) => void) | null;
-  // Manager projection accessor for community rail polls — re-read per poll,
-  // never cached across notification boundaries.
-  getProjection: () => ReadStateProjection | null;
 };
 
 const AppShellContext = React.createContext<AppShellContextValue>({
   markAllChannelsRead: () => {},
   markChannelRead: () => {},
   markChannelUnread: () => false,
+  clearChannelUnreadSource: () => {},
   openBrowseChannels: () => {},
   openCreateChannel: () => {},
   openChannelManagement: () => {},
@@ -68,16 +102,24 @@ const AppShellContext = React.createContext<AppShellContextValue>({
   getThreadReadAt: () => null,
   markThreadRead: () => {},
   getMessageReadAt: () => null,
+  getChannelActivityItemReadAt: () => null,
   markMessageRead: () => {},
   readStateVersion: 0,
   setContextParentResolver: () => {},
+  getProjection: () => null,
   followThread: () => {},
   unfollowThread: () => {},
   isFollowingThread: () => false,
   isNotifiedForThread: () => false,
+  recordThreadInteraction: () => {},
   isThreadMuted: () => false,
   threadActivityItems: [],
   threadActivityFeedItems: [],
+  locallyUnreadFeedItems: [],
+  unreadThreadFeedItems: [],
+  unreadThreadChannelIds: EMPTY_SET,
+  topLevelUnreadChannelIds: EMPTY_SET,
+  hasSidebarUnreadProjections: false,
   feedItemState: {
     doneSet: EMPTY_SET,
     markDone: () => {},
@@ -87,7 +129,6 @@ const AppShellContext = React.createContext<AppShellContextValue>({
     unreadSet: EMPTY_SET,
   },
   onOpenSettings: null,
-  getProjection: () => null,
 });
 
 export function AppShellProvider({

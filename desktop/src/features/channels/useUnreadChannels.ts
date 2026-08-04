@@ -9,8 +9,8 @@ import {
   countUnreadBadgeObservedEvents,
   countUnreadHighPriorityObservedEvents,
   countUnreadObservedEvents,
+  hasUnreadTopLevelObservedEvent,
   makeObservedUnreadEvent,
-  mapsEqual,
   observedUnreadEventReadAt,
   recordObservedUnreadEvent,
   type ObservedUnreadEvent,
@@ -20,12 +20,11 @@ import { makeRootIdStore } from "@/features/channels/unreadRootIdStore";
 import {
   forcedUnreadStore,
   type ForcedUnreadMap,
+  type ForcedUnreadSource,
+  useForcedUnreadActions,
 } from "@/features/channels/forcedUnreadStore";
 import {
-  applyMarkAllReadTransition,
-  applyOverrideRead,
   applyOverrideUnread,
-  persistForcedUnread,
   type OverrideAPIs,
 } from "@/features/channels/readStateOverride";
 import {
@@ -40,6 +39,7 @@ import {
 import type { RelayClient } from "@/shared/api/relayClientSession";
 import type { Channel, RelayEvent } from "@/shared/api/types";
 import { CHANNEL_MESSAGE_EVENT_KINDS } from "@/shared/constants/kinds";
+import { useStableMap, useStableSet } from "@/shared/hooks/useStableReference";
 import { normalizeRelayUrl } from "@/features/profile/lib/selfProfileStorage";
 import { DM_NOTIFIABLE_EVENT_KINDS } from "./isDmNotifiableKind";
 import {
@@ -59,6 +59,7 @@ export {
   readActivityFromStorage,
   writeActivityToStorage,
 } from "@/features/channels/threadActivityStorage";
+import { useObservedUnreadPersistence } from "@/features/channels/useObservedUnreadPersistence";
 
 type UseUnreadChannelsOptions = UseLiveChannelUpdatesOptions & {
   pubkey?: string;
@@ -105,10 +106,14 @@ function toUnixSeconds(isoOrMs: string | null | undefined): number | null {
 }
 
 // Resolve where the read marker should land when a channel is marked read.
-// Folds caller position + observed-live latest so explicit "mark read" covers
-// messages that arrived faster than channel metadata (load-bearing for Esc,
-// sidebar mark-read, and empty-channel open). Returns `clearObserved` when the
-// marker covers the observed timestamp so callers can drop stale refs.
+// Folds the caller's timeline position together with the newest event this
+// client has observed live (`observedLatest`), so an explicit "mark read" still
+// covers messages that arrived faster than channel metadata — this fold is
+// load-bearing for the Esc shortcut, sidebar mark-read, and empty-channel open,
+// all of which pass a null/stale caller value. `clearObserved` reports whether
+// the resulting marker covers the observed timestamp, signalling the caller to
+// drop its observed refs so the unread memo sees `latest === undefined` until a
+// genuinely newer event arrives.
 export function resolveChannelReadMarker(
   callerReadAt: string | null | undefined,
   observedLatest: number | undefined,
@@ -128,14 +133,6 @@ export function resolveObservedUnreadRootId(tags: string[][]): string | null {
   return isBroadcastReply(tags) ? null : getThreadReference(tags).rootId;
 }
 
-function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
-  if (a.size !== b.size) return false;
-  for (const item of a) {
-    if (!b.has(item)) return false;
-  }
-  return true;
-}
-
 export function useUnreadChannels(
   channels: Channel[],
   activeChannel: Channel | null,
@@ -150,12 +147,15 @@ export function useUnreadChannels(
   } = options;
   const activeChannelId = activeChannel?.id ?? null;
   const normalizedPubkey = pubkey?.toLowerCase() ?? null;
-  // Scoped relay key; empty string when relay not yet known.
+  // Scoped relay key for activity storage; empty string when relay not yet known
+  // so rows from an unknown relay never load into the wrong community.
   const normalizedRelayUrl = relayUrlOption
     ? normalizeRelayUrl(relayUrlOption)
     : "";
-  // Activity scope key: "" when pubkey/relay absent (never matches a valid
-  // loaded scope, so the fence returns [] until the buffer is seeded).
+  // Single identity for the in-memory thread-activity buffer — computed once
+  // per render and used at reset, both writers, and the return fence. The
+  // helper returns "" when either value is absent, which never matches a valid
+  // loaded scope, so the fence returns [] until the buffer is seeded.
   const currentActivityScope = activityScopeKey(
     normalizedPubkey,
     normalizedRelayUrl,
@@ -190,9 +190,9 @@ export function useUnreadChannels(
     ],
   );
 
-  // Observed "latest external trigger event" per channel — derived relay evidence
-  // used only to compare against the NIP-RS read marker. Reset on identity change;
-  // stale entries for left channels are ignored (memo iterates current channel list).
+  // Per-channel latest observed external trigger timestamp (unix seconds) and
+  // per-event metadata. Derived relay evidence, not source-of-truth; the unread
+  // memo compares these against NIP-RS markers. Hydrated/reset by the persistence hook.
   const latestByChannelRef = React.useRef(new Map<string, number>());
   const observedUnreadEventsByChannelRef = React.useRef(
     new Map<string, Map<string, ObservedUnreadEvent>>(),
@@ -201,10 +201,9 @@ export function useUnreadChannels(
   const channelsRef = React.useRef(channels);
   channelsRef.current = channels;
 
-  // Channels manually marked unread this session via right-click (NIP-RS local
-  // override cache). Monotonic read markers mean we can't lower them; this flag
-  // makes the badge appear without affecting synced state. Persisted so it
-  // survives reload and is visible to the rail observer for inactive communities.
+  // Channels manually marked unread this session. NIP-RS markers are monotonic,
+  // so this flag creates the badge without lowering synced read state.
+  // Persisted to buzz-forced-unread.v1 for cross-reload and rail-observer visibility.
   const forcedUnreadRef = React.useRef<ForcedUnreadMap>(
     pubkey ? forcedUnreadStore.read(pubkey) : {},
   );
@@ -229,28 +228,39 @@ export function useUnreadChannels(
     }
   }, [readStateVersion, drainSyncedAdvances]);
 
-  // Root event IDs of threads the current user has replied to (notification gating).
+  // Root event IDs of threads where the current user has replied at least once.
+  // Used to determine if thread replies should trigger unread notifications.
   const participatedRootIdsRef = React.useRef(new Set<string>());
 
   // Root event IDs of top-level messages authored by the current user.
+  // Used to notify the author when someone replies to their posts.
   const authoredRootIdsRef = React.useRef(new Set<string>());
 
-  // Thread roots with an external @-mention; ORed into badge gate for mention recipients.
+  // Root event IDs of threads where an external message @-mentioned the user.
+  // ORed into the badge gate so a mention recipient who never participated,
+  // authored, or followed the thread still gets the thread-unread badge.
   const mentionedRootIdsRef = React.useRef(new Set<string>());
 
-  // Thread roots the user has explicitly muted (takes precedence over all gating).
+  // Root event IDs of threads the user has explicitly muted. Takes precedence
+  // over participation, follow, and authorship for notification suppression.
   const mutedRootIdsRef = React.useRef(new Set<string>());
 
-  // Caller-supplied muted channel IDs — updated each render, not a dep.
+  // Stable ref for the caller-supplied muted channel IDs. Updated every render
+  // so the catch-up loop always reads the latest set without being a dep.
   const mutedChannelIdsRef = React.useRef<ReadonlySet<string>>(new Set());
   mutedChannelIdsRef.current = mutedChannelIdsOption ?? new Set();
 
-  // Thread reply events that triggered notifications (surfaced in Home feed).
+  // Thread reply events that triggered notifications — surfaced in the Home
+  // activity feed as synthetic FeedItems.
   const threadActivityRef = React.useRef<ThreadActivityItem[]>([]);
-  // (pubkey:relayUrl) scope in threadActivityRef; guards in-flight scope drift.
+  // Tracks the (pubkey:relayUrl) scope currently loaded into threadActivityRef.
+  // Writers guard against this before merging so in-flight writes from a prior
+  // scope cannot corrupt the new one; renders return [] until it matches.
   const threadActivityScopeRef = React.useRef<string>("");
 
-  // Channels already caught-up this session; reset on identity change.
+  // Tracks which channels we've already issued a catch-up REQ for this
+  // session. Prevents re-fetching on every channels-list refetch, while still
+  // letting newly-joined channels be caught up. Reset on identity change.
   const caughtUpChannelsRef = React.useRef(new Set<string>());
 
   const [latestVersion, bumpLatestVersion] = React.useReducer(
@@ -258,11 +268,26 @@ export function useUnreadChannels(
     0,
   );
 
-  // Separate from latestVersion: bumped only when badge-gating set membership
-  // changes, so gate snapshots don't re-allocate on every external message.
+  // Version signal bumped only when the participated/authored/mentioned
+  // root-id sets change, so the gate snapshots (re-derived below) don't
+  // re-allocate on every observed external message the way reusing
+  // latestVersion would.
   const [membershipVersion, bumpMembershipVersion] = React.useReducer(
     (x: number) => x + 1,
     0,
+  );
+
+  // Persistence layer: hydration, pagehide flush, scope fence, write-through, marker-prune.
+  const observedPersistence = useObservedUnreadPersistence(
+    normalizedPubkey,
+    normalizedRelayUrl,
+    isReadStateReady,
+    readStateVersion,
+    getEffectiveTimestamp,
+    getOwnTimestamp,
+    observedUnreadEventsByChannelRef,
+    latestByChannelRef,
+    { onPruned: bumpLatestVersion },
   );
 
   // Reset all in-session state when the identity or relay changes. In-memory
@@ -270,8 +295,6 @@ export function useUnreadChannels(
   // forced-unread, participation, etc. are correct for the new identity).
   // biome-ignore lint/correctness/useExhaustiveDependencies: pubkey/relayClient are intentional reset signals
   React.useEffect(() => {
-    latestByChannelRef.current = new Map();
-    observedUnreadEventsByChannelRef.current = new Map();
     // Load persisted forced-unread map for the new pubkey (do NOT clear the
     // store — another device's data should survive identity switches here).
     forcedUnreadRef.current = pubkey ? forcedUnreadStore.read(pubkey) : {};
@@ -295,19 +318,31 @@ export function useUnreadChannels(
     bumpMembershipVersion();
   }, [pubkey, relayClient, normalizedRelayUrl]);
 
-  // `topLevelOnly` = passive channel-open path (NIP-RS Option 1): caller's
-  // `readAt` is already the newest top-level message; skip `observedLatest`
-  // (which counts thread replies) and keep refs intact so the sidebar dot
-  // persists until an explicit mark-read covers the reply or a newer top-level
-  // message advances past it. Explicit "mark read" actions omit the flag.
+  // `topLevelOnly`: passive channel-open path (NIP-RS Option 1) — marker lands at newest
+  // top-level msg without folding observed replies; leaves refs intact so the dot persists
+  // until an explicit mark-read. Explicit reads omit this flag and clear the refs.
   const markChannelRead = React.useCallback(
     (
       channelId: string,
       readAt: string | null | undefined,
-      { topLevelOnly = false }: { topLevelOnly?: boolean } = {},
+      {
+        preserveForcedUnread = false,
+        topLevelOnly = false,
+      }: {
+        preserveForcedUnread?: boolean;
+        topLevelOnly?: boolean;
+      } = {},
     ) => {
-      // Frontier advance first (spec order: advance → C-bump → inspect liveness).
-      // The advance may make F > B, so applyOverrideRead sees an inactive override.
+      if (
+        !preserveForcedUnread &&
+        Object.hasOwn(forcedUnreadRef.current, channelId)
+      ) {
+        delete forcedUnreadRef.current[channelId];
+        if (pubkey) {
+          forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+        }
+        bumpLatestVersion();
+      }
       const observedLatest = topLevelOnly
         ? undefined
         : latestByChannelRef.current.get(channelId);
@@ -315,47 +350,41 @@ export function useUnreadChannels(
         readAt,
         observedLatest,
       );
-      if (markAt !== null) {
-        markContextRead(channelId, markAt);
-      }
-      // C-bump; clear local presentation only when liveness is confirmed inactive.
-      // null ≠ inactive — pre-init fails closed.
-      const outcome = applyOverrideRead(channelId, overrideApis);
-      if (outcome === "overrideCleared") {
-        if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
-          delete forcedUnreadRef.current[channelId];
-          if (pubkey) {
-            forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
-          }
-          bumpLatestVersion();
-        }
-      }
-      if (markAt !== null && clearObserved) {
-        latestByChannelRef.current.delete(channelId);
-        observedUnreadEventsByChannelRef.current.delete(channelId);
+      if (markAt === null) return;
+      markContextRead(channelId, markAt);
+      // Delegate destructive observed-ref removal to the fenced owner operation —
+      // the parent must not delete from latestByChannelRef or
+      // observedUnreadEventsByChannelRef directly on the clear-observed path,
+      // or a stale scope-A callback could corrupt scope B before the fence rejects.
+      // (Fenced record writes in handleChannelMessage and catch-up remain in the parent.)
+      if (clearObserved) {
+        observedPersistence.removeChannel(channelId);
         bumpLatestVersion();
       }
     },
-    [markContextRead, overrideApis, pubkey],
+    [markContextRead, observedPersistence, pubkey],
   );
 
-  // Manually mark a channel unread (right-click). Returns true when the manager
-  // accepted (use to gate session-local UI overlays on success only).
+  const {
+    clearChannelUnreadSource,
+    markChannelUnread: forcedMarkChannelUnread,
+  } = useForcedUnreadActions(
+    forcedUnreadRef,
+    getOwnTimestamp,
+    pubkey,
+    bumpLatestVersion,
+  );
+
+  // Manually mark a channel unread (right-click / Inbox). Gates the local
+  // persistence on NIP-RS manager acceptance so budget_exhausted / load_incomplete
+  // refusals prevent a phantom unread state. Returns true when accepted.
   const markChannelUnread = React.useCallback(
-    (channelId: string): boolean => {
+    (channelId: string, source?: ForcedUnreadSource): boolean => {
       if (!applyOverrideUnread(channelId, overrideApis)) return false;
-      if (
-        persistForcedUnread(
-          channelId,
-          forcedUnreadRef.current,
-          getOwnTimestamp,
-          pubkey,
-        )
-      )
-        bumpLatestVersion();
+      forcedMarkChannelUnread(channelId, source);
       return true;
     },
-    [getOwnTimestamp, overrideApis, pubkey],
+    [forcedMarkChannelUnread, overrideApis],
   );
 
   // Record the thread root of an EXTERNAL message that @-mentioned the user.
@@ -380,21 +409,22 @@ export function useUnreadChannels(
     [normalizedPubkey],
   );
 
-  // Feed the in-session "latest external trigger" map from live channel
-  // events. Composes with any caller-supplied onChannelMessage handler.
-  // useLiveChannelUpdates already filters this callback to trigger kinds
-  // and external authors, so the map is always a strict subset of "newest
-  // external trigger message this client has observed."
+  // Records an external trigger event and schedules persistence.
   const callerOnChannelMessage = liveUpdateOptions.onChannelMessage;
   const recordUnreadEvent = React.useCallback(
-    (channelId: string, event: ObservedUnreadEvent) =>
-      recordObservedUnreadEvent(
+    (channelId: string, event: ObservedUnreadEvent): boolean => {
+      if (!observedPersistence.isScopeLoaded()) return false;
+      const didRecord = recordObservedUnreadEvent(
         observedUnreadEventsByChannelRef.current,
         channelId,
         event,
         CATCH_UP_LIMIT,
-      ),
-    [],
+      );
+      if (didRecord)
+        observedPersistence.schedule(observedPersistence.currentScope);
+      return didRecord;
+    },
+    [observedPersistence],
   );
   const handleChannelMessage = React.useCallback(
     (channelId: string, event: RelayEvent) => {
@@ -417,11 +447,14 @@ export function useUnreadChannels(
           isThreadedReply,
         }),
       );
+      // Fence latestByChannelRef on the scope guard — a stale live callback
+      // during A→B drift must not write A's timestamp into B's hydrated ref.
+      const scopeOk = observedPersistence.isScopeLoaded();
       const current = latestByChannelRef.current.get(channelId) ?? 0;
-      if (event.created_at > current) {
+      if (scopeOk && event.created_at > current) {
         latestByChannelRef.current.set(channelId, event.created_at);
-        bumpLatestVersion();
-      } else if (didRecordUnreadEvent) {
+      }
+      if (didRecordUnreadEvent || (scopeOk && event.created_at > current)) {
         bumpLatestVersion();
       }
 
@@ -443,6 +476,7 @@ export function useUnreadChannels(
     [
       callerOnChannelMessage,
       normalizedPubkey,
+      observedPersistence,
       recordMentionedRoot,
       recordUnreadEvent,
     ],
@@ -472,6 +506,22 @@ export function useUnreadChannels(
         bumpMembershipVersion();
       }
       bumpLatestVersion();
+    },
+    [normalizedPubkey],
+  );
+
+  const recordThreadInteraction = React.useCallback(
+    (rootId: string) => {
+      const normalizedRootId = rootId.trim();
+      if (!normalizedRootId) return;
+      const target = participatedRootIdsRef.current;
+      const sizeBefore = target.size;
+      target.add(normalizedRootId);
+      if (target.size === sizeBefore) return;
+      if (normalizedPubkey !== null) {
+        participationStore.write(normalizedPubkey, target);
+      }
+      bumpMembershipVersion();
     },
     [normalizedPubkey],
   );
@@ -737,13 +787,9 @@ export function useUnreadChannels(
     ).then((results) => {
       if (isCancelled) return;
       // Guard: don't merge catch-up results into a ref whose scope has drifted
-      // (relay/pubkey changed while this async fetch was in flight). Also reject
-      // an empty scope for the same reason as the live writer above.
-      if (
-        !currentActivityScope ||
-        threadActivityScopeRef.current !== currentActivityScope
-      )
-        return;
+      // (relay/pubkey changed while this async fetch was in flight). Use the
+      // observed owner's loaded-scope predicate — one scope authority, not two.
+      if (!observedPersistence.isScopeLoaded()) return;
       let didAdvance = false;
       const allThreadReplies: ThreadActivityItem[] = [];
       for (const result of results) {
@@ -816,9 +862,9 @@ export function useUnreadChannels(
     relayClient,
   ]);
 
-  // Unread = channels (excluding active) that have either been manually
-  // marked unread this session, or whose observed latest external trigger
-  // timestamp is strictly newer than their NIP-RS read marker.
+  // Unread = inactive channels, plus any channel manually marked unread this
+  // session. A manually marked active channel must remain visible as unread
+  // until the user explicitly marks it read again.
   // High-priority unread = DMs or channels with a mention/broadcast newer
   // than the read marker. Forced-unread channels are dot tier only (not
   // high-priority). Both sets share identical deps and always invalidate
@@ -826,9 +872,10 @@ export function useUnreadChannels(
   const rawUnread =
     // biome-ignore lint/correctness/useExhaustiveDependencies: readStateVersion and latestVersion are intentional invalidation signals
     React.useMemo(() => {
-      if (!isReadStateReady) {
+      if (!isReadStateReady || !observedPersistence.isScopeLoaded()) {
         return {
           unreadChannelIds: new Set<string>(),
+          topLevelUnreadChannelIds: new Set<string>(),
           highPriorityUnreadChannelIds: new Set<string>(),
           unreadChannelCounts: new Map<string, number>(),
           unreadChannelNotificationCount: 0,
@@ -836,24 +883,17 @@ export function useUnreadChannels(
       }
 
       const unread = new Set<string>();
+      const topLevelUnread = new Set<string>();
       const highPriority = new Set<string>();
       const counts = new Map<string, number>();
       let unreadChannelNotificationCount = 0;
 
       for (const channel of channels) {
-        if (channel.id === activeChannelId) continue;
-
-        // Manager liveness is authoritative (isReadStateReady). Use
-        // getOverrideLiveness, not forcedUnreadRef which may be stale.
-        if (getOverrideLiveness(channel.id)?.active === true) {
-          // Forced-unread is dot tier only — not high-priority.
-          unread.add(channel.id);
-          counts.set(channel.id, 1);
-          unreadChannelNotificationCount += 1;
-          continue;
-        }
-
-        if (latestByChannelRef.current.get(channel.id) === undefined) continue;
+        const isForcedUnread = Object.hasOwn(
+          forcedUnreadRef.current,
+          channel.id,
+        );
+        if (channel.id === activeChannelId && !isForcedUnread) continue;
 
         const observedEvents = observedUnreadEventsByChannelRef.current.get(
           channel.id,
@@ -867,13 +907,25 @@ export function useUnreadChannels(
             (messageId) => getOwnTimestamp(`msg:${messageId}`),
           );
 
-        const unreadCount = countUnreadObservedEvents(
-          observedEvents,
-          readAtForObservedEvent,
-        );
-        if (unreadCount === 0) continue;
+        const unreadCount =
+          latestByChannelRef.current.get(channel.id) === undefined
+            ? 0
+            : countUnreadObservedEvents(observedEvents, readAtForObservedEvent);
+        if (unreadCount === 0) {
+          if (!isForcedUnread) continue;
+          unread.add(channel.id);
+          topLevelUnread.add(channel.id);
+          counts.set(channel.id, 1);
+          unreadChannelNotificationCount += 1;
+          continue;
+        }
 
         unread.add(channel.id);
+        if (
+          hasUnreadTopLevelObservedEvent(observedEvents, readAtForObservedEvent)
+        ) {
+          topLevelUnread.add(channel.id);
+        }
         const badgeCount = countUnreadBadgeObservedEvents(
           observedEvents,
           readAtForObservedEvent,
@@ -901,6 +953,7 @@ export function useUnreadChannels(
 
       return {
         unreadChannelIds: unread,
+        topLevelUnreadChannelIds: topLevelUnread,
         highPriorityUnreadChannelIds: highPriority,
         unreadChannelCounts: counts,
         unreadChannelNotificationCount,
@@ -915,37 +968,14 @@ export function useUnreadChannels(
       readStateVersion,
     ]);
 
-  // Stabilize Set references: only replace when contents actually change,
-  // so downstream memos don't re-run on every render when sets are equal.
-  const prevUnreadRef = React.useRef<ReadonlySet<string>>(new Set());
-  const prevHighPriorityRef = React.useRef<ReadonlySet<string>>(new Set());
-  const prevUnreadCountsRef = React.useRef<ReadonlyMap<string, number>>(
-    new Map(),
+  const unreadChannelIds = useStableSet(rawUnread.unreadChannelIds);
+  const topLevelUnreadChannelIds = useStableSet(
+    rawUnread.topLevelUnreadChannelIds,
   );
-
-  const unreadChannelIds = setsEqual(
-    rawUnread.unreadChannelIds,
-    prevUnreadRef.current,
-  )
-    ? prevUnreadRef.current
-    : rawUnread.unreadChannelIds;
-  prevUnreadRef.current = unreadChannelIds;
-
-  const highPriorityUnreadChannelIds = setsEqual(
+  const highPriorityUnreadChannelIds = useStableSet(
     rawUnread.highPriorityUnreadChannelIds,
-    prevHighPriorityRef.current,
-  )
-    ? prevHighPriorityRef.current
-    : rawUnread.highPriorityUnreadChannelIds;
-  prevHighPriorityRef.current = highPriorityUnreadChannelIds;
-
-  const unreadChannelCounts = mapsEqual(
-    rawUnread.unreadChannelCounts,
-    prevUnreadCountsRef.current,
-  )
-    ? prevUnreadCountsRef.current
-    : rawUnread.unreadChannelCounts;
-  prevUnreadCountsRef.current = unreadChannelCounts;
+  );
+  const unreadChannelCounts = useStableMap(rawUnread.unreadChannelCounts);
   const unreadChannelNotificationCount =
     rawUnread.unreadChannelNotificationCount;
 
@@ -954,6 +984,7 @@ export function useUnreadChannels(
 
   const markAllChannelsRead = React.useCallback(() => {
     for (const channelId of unreadChannelIdsRef.current) {
+      delete forcedUnreadRef.current[channelId];
       const unixSeconds =
         latestByChannelRef.current.get(channelId) ??
         getEffectiveTimestamp(channelId) ??
@@ -961,20 +992,22 @@ export function useUnreadChannels(
       if (unixSeconds !== null) {
         markContextRead(channelId, unixSeconds);
       }
-      applyMarkAllReadTransition(channelId, overrideApis, {
-        forcedUnread: forcedUnreadRef.current,
-        latestByChannel: latestByChannelRef.current,
-        observedUnreadEvents: observedUnreadEventsByChannelRef.current,
-      });
     }
     if (pubkey) {
       forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
     }
+    // Delegate destructive observed-ref clearing to the fenced owner operation —
+    // the parent must not reset the observed Maps directly on this path, or a
+    // stale scope-A callback could corrupt scope B before the fence rejects.
+    // (Fenced record writes in handleChannelMessage and catch-up remain in the parent.)
+    observedPersistence.clearAll();
     bumpLatestVersion();
-  }, [getEffectiveTimestamp, markContextRead, overrideApis, pubkey]);
+  }, [getEffectiveTimestamp, markContextRead, observedPersistence, pubkey]);
 
-  // Stable snapshots of membership sets — re-derived only when membershipVersion
-  // bumps; live consumers read the mutable refs directly between bumps.
+  // Identity-stable snapshots of the membership sets for the notify gate.
+  // Re-derived only when membershipVersion bumps (a set actually changed), so
+  // `isNotifiedForThread`'s useCallback deps invalidate on async discovery
+  // while live consumers keep reading the mutable refs directly.
   // biome-ignore lint/correctness/useExhaustiveDependencies: membershipVersion is the intentional re-derivation signal
   const participatedRootIds = React.useMemo(
     () => new Set(participatedRootIdsRef.current) as ReadonlySet<string>,
@@ -993,14 +1026,18 @@ export function useUnreadChannels(
 
   return {
     unreadChannelIds,
+    topLevelUnreadChannelIds,
     unreadChannelCounts,
     highPriorityUnreadChannelIds,
     unreadChannelNotificationCount,
     markAllChannelsRead,
     markChannelRead,
     markChannelUnread,
-    // Exposed for surfaces projecting per-item read state (Home) off the shared
-    // NIP-RS marker without a second ReadStateManager; readStateVersion = invalidation signal.
+    clearChannelUnreadSource,
+    // Exposed so other surfaces (e.g. Home) can project per-item read state
+    // off the same NIP-RS read marker without instantiating a second
+    // ReadStateManager. readStateVersion is the invalidation signal callers
+    // should include in memo deps.
     getEffectiveTimestamp,
     getOwnTimestamp,
     readStateVersion,
@@ -1008,6 +1045,7 @@ export function useUnreadChannels(
     participatedRootIds,
     authoredRootIds,
     mentionedRootIds,
+    recordThreadInteraction,
     threadActivityItems: projectActivityForScope(
       threadActivityScopeRef.current,
       currentActivityScope,

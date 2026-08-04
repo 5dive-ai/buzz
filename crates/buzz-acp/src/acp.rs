@@ -3433,6 +3433,38 @@ mod tests {
         assert_ne!(observed, configured);
     }
 
+    /// Live check against the real adapter: it must start under the cleared
+    /// environment and accept `session/new` carrying the isolation metadata.
+    /// The pure tests only assert the JSON we emit, so a wrong `_meta` key
+    /// would otherwise go unnoticed.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires claude-agent-acp on PATH"]
+    async fn isolated_claude_adapter_starts_and_accepts_the_session_metadata() {
+        let mut client = AcpClient::spawn("claude-agent-acp", &[], &[], false)
+            .await
+            .expect("spawn claude-agent-acp");
+
+        let initialize = client.initialize().await.expect("initialize");
+        println!(
+            "initialize = {}",
+            serde_json::to_string(&initialize).expect("serialize initialize")
+        );
+
+        let session = client
+            .session_new(
+                std::env::temp_dir().to_str().expect("temp dir is UTF-8"),
+                Vec::new(),
+                None,
+                Some("isolation repro"),
+            )
+            .await;
+        println!("session_new = {session:?}");
+
+        client.shutdown().await;
+        session.expect("session/new must be accepted with the isolation metadata");
+    }
+
     /// The isolated profile is only usable for git work if the projected
     /// `.gitconfig` actually lands in it before the child starts.
     #[cfg(unix)]

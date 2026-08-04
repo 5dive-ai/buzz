@@ -480,6 +480,7 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
 /// through the entire epoch — no workspace switch can occur during this call,
 /// so the caller's captured teams (loaded from the captured definitions_dir)
 /// are the correct teams for this spawn.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_agent_child_at<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     record: &ManagedAgentRecord,
@@ -680,7 +681,7 @@ pub(crate) fn spawn_agent_child_at<R: tauri::Runtime>(
             }
         }
     }
-    let team_instructions = super::spawn_hash::effective_team_instructions(record, &teams);
+    let team_instructions = super::spawn_hash::effective_team_instructions(record, teams);
     if let Some(instructions) = &team_instructions {
         command.env("BUZZ_ACP_TEAM_INSTRUCTIONS", instructions);
     } else {
@@ -802,13 +803,8 @@ pub(crate) fn spawn_agent_child_at<R: tauri::Runtime>(
         )
     })?;
 
-    let spawn_config_hash = super::spawn_hash::spawn_config_hash(
-        record,
-        personas,
-        &teams,
-        &effective_relay_url,
-        global,
-    );
+    let spawn_config_hash =
+        super::spawn_hash::spawn_config_hash(record, personas, teams, &effective_relay_url, global);
 
     let spawned_adapter_availability = if runtime_meta.is_some_and(|r| r.id == "codex") {
         super::adapter_availability_cached()

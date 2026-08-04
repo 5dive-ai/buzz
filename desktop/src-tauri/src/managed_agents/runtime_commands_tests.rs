@@ -488,6 +488,7 @@ fn test_partial_drain_stop_failure_delivers_stopped_prefix_and_remaining_tail() 
 // The serialization invariant (writers blocked by store lock, not transition
 // guard) is documented in the adapter and verified in the adapter-level tests.
 
+#[allow(dead_code)] // helper prepared for future tests; not yet referenced
 fn make_captured_scope() -> super::super::scope::WorkspaceAgentScope {
     // Build a scope whose generation matches the current global counter.
     // Tests that need a stale scope call `next_scope_generation()` after
@@ -858,7 +859,8 @@ fn test_compensate_drain_writer_vs_compensation_deterministic() {
         runtime: None,
         name_pool: vec![],
     };
-    super::super::storage::save_managed_agents_at(&tmp_path, &[initial_record.clone()]).unwrap();
+    super::super::storage::save_managed_agents_at(&tmp_path, std::slice::from_ref(&initial_record))
+        .unwrap();
 
     let entry1 = make_drain_entry(&pubkey1, "wss://relay.example", true);
     let stopped = vec![entry1.clone()];

@@ -866,6 +866,9 @@ async fn test_active_client_stop_then_transition_preflight_succeeds() {
 /// on the same lock. When the test body drops the guard the install task
 /// acquires, validates, and finds the captured scope stale.
 #[tokio::test]
+// SAFETY: single-threaded tokio runtime; lock serializes generation counter
+// mutations — cannot deadlock. See import_tests.rs for full rationale.
+#[allow(clippy::await_holding_lock)]
 async fn test_transition_held_queued_install_detects_stale_scope() {
     use crate::managed_agents::scope::{
         next_scope_generation, WorkspaceAgentScope, SCOPE_GENERATION_TEST_LOCK,
@@ -971,6 +974,9 @@ async fn test_transition_held_queued_install_detects_stale_scope() {
 /// on the same lock. When the test body drops the guard the transition task
 /// acquires, runs `fail_if_client_mesh_active`, and finds the installed client.
 #[tokio::test]
+// SAFETY: single-threaded tokio runtime; lock serializes generation counter
+// mutations — cannot deadlock. See import_tests.rs for full rationale.
+#[allow(clippy::await_holding_lock)]
 async fn test_install_held_transition_preflight_observes_client() {
     use crate::managed_agents::scope::{
         next_scope_generation, WorkspaceAgentScope, SCOPE_GENERATION_TEST_LOCK,

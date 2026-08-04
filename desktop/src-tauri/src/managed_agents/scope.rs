@@ -236,6 +236,18 @@ impl WorkspaceApplyResult {
     }
 }
 
+/// Process-global mutex that serializes tests touching the process-global
+/// scope generation counter.
+///
+/// Any test that (a) captures a generation and requires it to be stable
+/// through Phase 3a or (b) calls `next_scope_generation()` inside a hook
+/// must hold this guard for its entire duration.  Tests across modules share
+/// the same counter so they must share the same serialization primitive.
+///
+/// Exposed only under `#[cfg(test)]` to avoid polluting the production API.
+#[cfg(test)]
+pub(crate) static SCOPE_GENERATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,15 +454,3 @@ mod tests {
         );
     }
 }
-
-/// Process-global mutex that serializes tests touching the process-global
-/// scope generation counter.
-///
-/// Any test that (a) captures a generation and requires it to be stable
-/// through Phase 3a or (b) calls `next_scope_generation()` inside a hook
-/// must hold this guard for its entire duration.  Tests across modules share
-/// the same counter so they must share the same serialization primitive.
-///
-/// Exposed only under `#[cfg(test)]` to avoid polluting the production API.
-#[cfg(test)]
-pub(crate) static SCOPE_GENERATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

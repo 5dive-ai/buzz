@@ -245,6 +245,12 @@ fn setup_import_app_with_scope(
 /// The snapshot in this test has no memory entries so the memory adapter is
 /// never called; the profile-relay assertion is sufficient.
 #[tokio::test]
+// SAFETY: `#[tokio::test]` uses a single-threaded runtime by default, so
+// holding `std::sync::Mutex` across `.await` points cannot deadlock.
+// The lock serializes tests that advance the process-global scope generation
+// counter — dropping it early would let a racing test corrupt the counter
+// mid-import, causing a spurious stale-scope failure.
+#[allow(clippy::await_holding_lock)]
 async fn test_agent_switch_between_store_and_profile_finishes_captured_outbound() {
     // Serialize against the before_store rejection test to prevent the
     // concurrent next_scope_generation() bump from causing a spurious
@@ -284,7 +290,7 @@ async fn test_agent_switch_between_store_and_profile_finishes_captured_outbound(
 
     let result = confirm_agent_snapshot_import_core(
         input,
-        &handle,
+        handle,
         &state,
         || {}, // before_store: no-op
         move || {
@@ -335,6 +341,9 @@ async fn test_agent_switch_between_store_and_profile_finishes_captured_outbound(
 /// concurrent workspace switch that arrived after `capture_agent_snapshot_import_entry`
 /// returned but before Phase 3a acquired the store lock.
 #[tokio::test]
+// SAFETY: single-threaded tokio runtime; lock held to serialize generation
+// counter mutations — cannot deadlock. See sister test for full rationale.
+#[allow(clippy::await_holding_lock)]
 async fn test_agent_identity_switch_before_store_is_rejected() {
     // Serialize against the after_store test to prevent the generation bump
     // inside before_store from racing Phase 3a of the after_store test.
@@ -360,7 +369,7 @@ async fn test_agent_identity_switch_before_store_is_rejected() {
 
     let result = confirm_agent_snapshot_import_core(
         input,
-        &handle,
+        handle,
         &state,
         move || {
             // before_store: advance generation — simulates a workspace switch

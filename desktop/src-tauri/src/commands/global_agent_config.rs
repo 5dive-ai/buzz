@@ -352,7 +352,7 @@ async fn restart_local_agent_on_config_change(
             })
         },
         // Production stop function.
-        |app_ref, record_mut, runtimes| stop_managed_agent_process(app_ref, record_mut, runtimes),
+        stop_managed_agent_process,
         // Production spawn function.
         |app_ref, rec, relay, owner, personas, global, teams| {
             crate::managed_agents::spawn_agent_child_at(
@@ -360,7 +360,7 @@ async fn restart_local_agent_on_config_change(
             )
         },
         // Production receipt function.
-        |app_ref, receipt| crate::managed_agents::write_agent_runtime_receipt(app_ref, receipt),
+        crate::managed_agents::write_agent_runtime_receipt,
     )
     .await
 }
@@ -1390,8 +1390,8 @@ mod tests {
     #[test]
     fn test_record_mesh_change_after_preflight_aborts_before_stop() {
         use crate::managed_agents::{
-            storage::{load_managed_agents_at, save_managed_agents_at},
-            BackendKind, ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey,
+            storage::save_managed_agents_at, BackendKind, ManagedAgentPairRuntime,
+            ManagedAgentRecord, ManagedAgentRuntimeKey,
         };
         use tauri::Manager;
 
@@ -1466,7 +1466,7 @@ mod tests {
             runtime: None,
             name_pool: vec![],
         };
-        save_managed_agents_at(tmp.path(), &[record.clone()]).unwrap();
+        save_managed_agents_at(tmp.path(), std::slice::from_ref(&record)).unwrap();
 
         let app = make_mock_app();
         let app_handle = app.handle().clone();
@@ -1585,8 +1585,8 @@ mod tests {
     #[tokio::test]
     async fn test_full_tail_stop_spawn_receipt_register_save() {
         use crate::managed_agents::{
-            storage::{load_managed_agents_at, save_managed_agents_at},
-            BackendKind, ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey,
+            storage::save_managed_agents_at, BackendKind, ManagedAgentPairRuntime,
+            ManagedAgentRecord, ManagedAgentRuntimeKey,
         };
         use std::sync::{Arc, Mutex};
         use tauri::Manager;
@@ -1664,7 +1664,7 @@ mod tests {
         };
 
         // Write initial store.
-        save_managed_agents_at(tmp.path(), &[record.clone()]).unwrap();
+        save_managed_agents_at(tmp.path(), std::slice::from_ref(&record)).unwrap();
         std::fs::write(tmp.path().join("personas.json"), b"[]").unwrap();
         std::fs::write(tmp.path().join("global-agent-config.json"), b"{}").unwrap();
 

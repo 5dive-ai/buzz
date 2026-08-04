@@ -941,6 +941,9 @@ fn setup_team_import_app_with_scope(
 /// to a different relay + fresh owner inside the hook; all per-member profile
 /// adapters must receive the old captured relay URL.
 #[tokio::test]
+// SAFETY: single-threaded tokio runtime; lock held to serialize generation
+// counter mutations — cannot deadlock. See import_tests.rs for full rationale.
+#[allow(clippy::await_holding_lock)]
 async fn test_confirm_team_snapshot_import_switch_between_store_and_profile() {
     let _gen_guard = GENERATION_TEST_LOCK.lock().unwrap();
 
@@ -972,7 +975,7 @@ async fn test_confirm_team_snapshot_import_switch_between_store_and_profile() {
 
     let result = confirm_team_snapshot_import_core(
         input,
-        &handle,
+        handle,
         &state,
         || {},
         move || {
@@ -1032,6 +1035,9 @@ async fn test_confirm_team_snapshot_import_switch_between_store_and_profile() {
 /// `before_store` hook advances scope generation — Phase 3 must reject BEFORE
 /// any write and BEFORE any outbound call.
 #[tokio::test]
+// SAFETY: single-threaded tokio runtime; lock held to serialize generation
+// counter mutations — cannot deadlock. See import_tests.rs for full rationale.
+#[allow(clippy::await_holding_lock)]
 async fn test_team_identity_switch_before_store_is_rejected() {
     let _gen_guard = GENERATION_TEST_LOCK.lock().unwrap();
 
@@ -1054,7 +1060,7 @@ async fn test_team_identity_switch_before_store_is_rejected() {
 
     let result = confirm_team_snapshot_import_core(
         input,
-        &handle,
+        handle,
         &state,
         move || {
             next_scope_generation();

@@ -1,5 +1,6 @@
 import type { LucideIcon } from "lucide-react";
 import {
+  IdCard,
   MessageSquare,
   Pencil,
   Play,
@@ -35,6 +36,7 @@ export function ProfilePrimaryActions({
   onCreateCard,
   onEditAgent,
   onMessage,
+  onOpenPassport,
   pubkey,
   unfollowMutation,
 }: {
@@ -50,6 +52,7 @@ export function ProfilePrimaryActions({
   onCreateCard?: () => void;
   onEditAgent: () => void;
   onMessage?: () => void;
+  onOpenPassport?: () => void;
   pubkey: string;
   unfollowMutation: ReturnType<typeof useUnfollowMutation>;
 }) {
@@ -84,6 +87,14 @@ export function ProfilePrimaryActions({
           label="Message"
           onClick={onMessage}
           testId="user-profile-message"
+        />
+      ) : null}
+      {onOpenPassport ? (
+        <ProfileQuickAction
+          icon={IdCard}
+          label="Passport"
+          onClick={onOpenPassport}
+          testId="user-profile-passport"
         />
       ) : null}
       {canEditAgent ? (
@@ -165,6 +176,28 @@ export function ProfilePersonaPrimaryActions({
           testId="user-profile-create-card"
         />
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * Actions when viewing your own profile — today just the Passport. A
+ * dedicated row so self profiles gain identity actions without the
+ * follow/message set meant for other people.
+ */
+export function ProfileSelfPrimaryActions({
+  onOpenPassport,
+}: {
+  onOpenPassport: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-center gap-8">
+      <ProfileQuickAction
+        icon={IdCard}
+        label="Passport"
+        onClick={onOpenPassport}
+        testId="user-profile-passport"
+      />
     </div>
   );
 }

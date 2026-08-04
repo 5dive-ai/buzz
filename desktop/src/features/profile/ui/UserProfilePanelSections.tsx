@@ -36,9 +36,11 @@ import {
   STATUS_DOT_MASK_CURVE,
 } from "@/features/profile/ui/MaskedAvatarBadgeFrame";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
+import { PassportDialog } from "@/features/profile/ui/PassportDialog";
 import {
   ProfilePersonaPrimaryActions,
   ProfilePrimaryActions,
+  ProfileSelfPrimaryActions,
 } from "@/features/profile/ui/UserProfilePrimaryActions";
 import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
 import { BotIdenticon } from "@/features/messages/ui/BotIdenticon";
@@ -224,6 +226,12 @@ export function ProfileSummaryView({
 }: ProfileSummaryViewProps) {
   const activeTurns = useAgentWorking(isBot ? pubkey : null).channels;
 
+  // The passport is available for any profile with a pubkey — self, other
+  // people, and agents alike. Persona drafts have no keypair yet, so no
+  // passport has been "issued" for them.
+  const [passportOpen, setPassportOpen] = React.useState(false);
+  const onOpenPassport = pubkey ? () => setPassportOpen(true) : undefined;
+
   const showMemoriesTab = isOwner === true && Boolean(pubkey);
   const showInstructionBlock =
     isOwner === true &&
@@ -354,6 +362,7 @@ export function ProfileSummaryView({
           canEditAgent={canEditAgent}
           followMutation={followMutation}
           onCreateCard={onCreateCard}
+          onOpenPassport={onOpenPassport}
           onEditAgent={handleEditAgent}
           agentActionDisabled={isAgentActionPending}
           agentActionLabel={
@@ -384,6 +393,8 @@ export function ProfileSummaryView({
           pubkey={pubkey}
           unfollowMutation={unfollowMutation}
         />
+      ) : isSelf && onOpenPassport ? (
+        <ProfileSelfPrimaryActions onOpenPassport={onOpenPassport} />
       ) : null}
 
       {showTabSection ? (
@@ -456,6 +467,19 @@ export function ProfileSummaryView({
             />
           ) : null}
         </section>
+      ) : null}
+
+      {pubkey ? (
+        <PassportDialog
+          avatarUrl={profile?.avatarUrl ?? null}
+          displayName={displayName}
+          handle={profile?.nip05Handle ?? null}
+          isAgent={isBot}
+          onOpenChange={setPassportOpen}
+          open={passportOpen}
+          ownerPubkey={isBot ? (profile?.ownerPubkey ?? null) : null}
+          pubkey={pubkey}
+        />
       ) : null}
     </div>
   );

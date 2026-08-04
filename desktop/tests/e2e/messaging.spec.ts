@@ -217,7 +217,7 @@ test.beforeEach(async ({ page }, testInfo) => {
                         imageDomain: null,
                       },
                       linkPreviewMetadataDelayMs: testInfo.title.includes(
-                        "raw paste bypasses clipboard parsing",
+                        "loading card before cold resolver work",
                       )
                         ? 10_000
                         : testInfo.title.includes("style defaults") ||
@@ -225,6 +225,11 @@ test.beforeEach(async ({ page }, testInfo) => {
                             testInfo.title.includes("attachment-sized")
                           ? 1_500
                           : undefined,
+                      linkPreviewMetadataStartBlockMs: testInfo.title.includes(
+                        "loading card before cold resolver work",
+                      )
+                        ? 150
+                        : undefined,
                     }
                   : undefined;
   await installMockBridge(page, mock);
@@ -475,7 +480,7 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   await page.getByTestId("link-preview-style-compact").click();
 });
 
-test("link preview raw paste bypasses clipboard parsing before loading", async ({
+test("link preview paste paints its loading card before cold resolver work", async ({
   page,
 }) => {
   const previewUrl = "https://github.com/block/buzz/pull/3246?paste=async";
@@ -495,26 +500,20 @@ test("link preview raw paste bypasses clipboard parsing before loading", async (
         clipboardData,
       }),
     );
-    const pasteEventMs = performance.now() - startedAt;
-    const frameTimes: number[] = [];
-    for (let frame = 0; frame < 3; frame += 1) {
-      await new Promise<void>((resolve) =>
-        requestAnimationFrame((timestamp) => {
-          frameTimes.push(timestamp - startedAt);
-          resolve();
-        }),
-      );
-    }
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve()),
+    );
     return {
-      pasteEventMs,
-      frameTimes,
+      elapsedMs: performance.now() - startedAt,
+      resolverStarted: (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).some(
+        (entry) => entry.command === "fetch_link_preview_metadata",
+      ),
       text: element.textContent,
     };
   }, previewUrl);
   expect(firstPaint.text).toContain(previewUrl);
-  expect(firstPaint.pasteEventMs).toBeLessThan(50);
-  expect(firstPaint.frameTimes).toHaveLength(3);
-  expect(firstPaint.frameTimes[2]).toBeGreaterThan(firstPaint.frameTimes[0]);
+  expect(firstPaint.resolverStarted).toBe(false);
+  expect(firstPaint.elapsedMs).toBeLessThan(100);
   const composerPreview = page
     .locator("[data-composer-link-previews]")
     .locator('[data-link-preview="github-pull-request"]');

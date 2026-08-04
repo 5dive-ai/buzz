@@ -357,6 +357,8 @@ type E2eConfig = {
       } | null
     >;
     linkPreviewMetadataDelayMs?: number;
+    /** Simulates native cold-cache startup work before the async response. */
+    linkPreviewMetadataStartBlockMs?: number;
     searchProfiles?: MockSearchProfileSeed[];
     updateAvailable?: boolean;
     updateChannelDelayMs?: number;
@@ -11110,6 +11112,14 @@ export function maybeInstallE2eTauriMocks() {
       case "fetch_join_policy":
         return activeConfig?.mock?.joinPolicy ?? null;
       case "fetch_link_preview_metadata": {
+        const startBlockMs =
+          activeConfig?.mock?.linkPreviewMetadataStartBlockMs ?? 0;
+        if (startBlockMs > 0) {
+          const stopAt = performance.now() + startBlockMs;
+          while (performance.now() < stopAt) {
+            // Deliberately block to model uncached native command startup.
+          }
+        }
         const delayMs = activeConfig?.mock?.linkPreviewMetadataDelayMs ?? 0;
         if (delayMs > 0) {
           await new Promise((resolve) => window.setTimeout(resolve, delayMs));

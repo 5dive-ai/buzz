@@ -486,28 +486,6 @@ export function useRichTextEditor({
         }),
       ],
       editorProps: {
-        handleDOMEvents: {
-          paste: (view, event) => {
-            const text = (event as ClipboardEvent).clipboardData?.getData(
-              "text/plain",
-            );
-            if (!text || !/^https?:\/\/\S+$/i.test(text)) return false;
-            const { from, to } = view.state.selection;
-            const link = view.state.schema.marks.link;
-            if (!link) return false;
-            let tr = view.state.tr.replaceRangeWith(
-              from,
-              to,
-              view.state.schema.text(text, [link.create({ href: text })]),
-            );
-            const end = tr.mapping.map(to);
-            tr = tr.insertText(" ", end).removeMark(end, end + 1, link);
-            tr = tr.setSelection(TextSelection.create(tr.doc, end + 1));
-            view.dispatch(tr.setStoredMarks([]).scrollIntoView());
-            event.preventDefault();
-            return true;
-          },
-        },
         attributes: {
           autocapitalize: "none",
           autocorrect: "off",

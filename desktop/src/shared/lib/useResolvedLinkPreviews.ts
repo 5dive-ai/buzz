@@ -43,6 +43,30 @@ const DEFAULT_TRANSIENT_RETRY_MS = 30_000;
 const NULL_METADATA_RETRY_MS = 5 * 60_000;
 const MAX_CONCURRENT_METADATA_FETCHES = 2;
 
+/**
+ * React may flush an interaction-triggered effect before the browser paints.
+ * Start uncached preview I/O after a frame plus a task boundary so the pasted
+ * text and loading card are visible before native IPC work begins.
+ */
+function scheduleAfterPaint(task: () => void): () => void {
+  let frameId: number | null = null;
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const run = () => {
+    timeoutId = setTimeout(task, 0);
+  };
+
+  if (typeof requestAnimationFrame === "function") {
+    frameId = requestAnimationFrame(run);
+  } else {
+    run();
+  }
+
+  return () => {
+    if (frameId !== null) cancelAnimationFrame(frameId);
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  };
+}
+
 function metadataCacheKey(href: string): string {
   try {
     const url = new URL(href);
@@ -312,6 +336,7 @@ export function useResolvedLinkPreviews(
       );
     };
 
+    const cancelScheduledLoads: Array<() => void> = [];
     for (const preview of previews) {
       const loader = preview.href.startsWith("buzz://")
         ? entityTitleLoader
@@ -327,19 +352,24 @@ export function useResolvedLinkPreviews(
         continue;
       }
 
-      void loader.load(preview.href).then((result) => {
-        if (cancelled) return;
-        setResolvedMetadata((current) =>
-          current[result.key] === result.metadata
-            ? current
-            : { ...current, [result.key]: result.metadata },
-        );
-        scheduleRetry(result, loader);
-      });
+      cancelScheduledLoads.push(
+        scheduleAfterPaint(() => {
+          void loader.load(preview.href).then((result) => {
+            if (cancelled) return;
+            setResolvedMetadata((current) =>
+              current[result.key] === result.metadata
+                ? current
+                : { ...current, [result.key]: result.metadata },
+            );
+            scheduleRetry(result, loader);
+          });
+        }),
+      );
     }
 
     return () => {
       cancelled = true;
+      for (const cancel of cancelScheduledLoads) cancel();
       if (retryTimer !== null) clearTimeout(retryTimer);
     };
   }, [previews, retryGeneration]);

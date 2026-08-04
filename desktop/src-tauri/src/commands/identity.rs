@@ -39,6 +39,9 @@ pub fn get_identity(state: State<'_, AppState>) -> Result<IdentityInfo, String> 
     let reset_failed = state
         .reset_failed
         .load(std::sync::atomic::Ordering::Acquire);
+    let store_recovery_failed = state
+        .store_recovery_failed
+        .load(std::sync::atomic::Ordering::Acquire);
 
     Ok(IdentityInfo {
         pubkey: pubkey_hex,
@@ -47,6 +50,7 @@ pub fn get_identity(state: State<'_, AppState>) -> Result<IdentityInfo, String> 
         lost,
         locked,
         reset_failed,
+        store_recovery_failed,
     })
 }
 
@@ -382,6 +386,7 @@ pub async fn import_identity(
             lost: false,
             locked: false,
             reset_failed: false,
+            store_recovery_failed: false,
         })
     })
     .await
@@ -515,6 +520,7 @@ pub async fn persist_current_identity(
             lost: false,
             locked: false,
             reset_failed: false,
+            store_recovery_failed: false,
         })
     })
     .await

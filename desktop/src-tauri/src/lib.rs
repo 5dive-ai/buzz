@@ -340,6 +340,24 @@ pub fn run() {
                 return Ok(());
             }
 
+            // File-commit recovery MUST run before any migration, backfill, or
+            // canonical-store reader/writer.  A stale stage from a pre-crash
+            // commit must not overwrite migration output.  One owner, one site.
+            // Fail closed: a repair error sets store_recovery_failed and skips
+            // all store-touching setup.
+            {
+                let state = app_handle.state::<AppState>();
+                if let Err(e) =
+                    crate::managed_agents::store_journal::run_file_commit_recovery(&app_handle)
+                {
+                    eprintln!("buzz-desktop: file-commit-recovery: {e}");
+                    state
+                        .store_recovery_failed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Ok(());
+                }
+            }
+
             // Run all pre-identity data migrations before state loads from disk.
             if reset_outcome.completed {
                 migration::run_boot_migrations_after_reset(&app_handle);
@@ -596,18 +614,6 @@ pub fn run() {
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
                 });
-            }
-            // File-commit recovery runs synchronously under the advisory lock
-            // BEFORE spawn_boot_recovery is called.  This ensures the JSON
-            // store is in a consistent state (no dangling *.stage files)
-            // before the background task or any command can arrive.
-            // File repair has exactly ONE owner: this synchronous call.
-            // spawn_boot_recovery is publication-only — it does NOT run
-            // recover_interrupted_file_commits.
-            if let Err(e) =
-                crate::managed_agents::store_journal::run_file_commit_recovery(app.handle())
-            {
-                eprintln!("buzz-desktop: file-commit-recovery: {e}");
             }
             crate::managed_agents::spawn_boot_recovery(app.handle());
             Ok(())

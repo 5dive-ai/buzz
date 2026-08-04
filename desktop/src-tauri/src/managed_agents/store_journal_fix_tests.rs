@@ -674,6 +674,75 @@ fn test_sync_file_recovery_repairs_dangling_intent_row() {
     );
 }
 
+/// Fix A — production-order seam test: file-commit recovery must complete
+/// BEFORE any migration or canonical-store reader observes the canonical files.
+///
+/// Seam used: `file_commit_recovery_at_pub` is the exact function that
+/// `run_file_commit_recovery` delegates to in production — not a
+/// reimplementation.  The "migration read" is a direct filesystem read of the
+/// canonical path, matching what every real migration/backfill does.
+///
+/// Scenario: a process crashed after writing a stage file but before the rename
+/// completed.  The canonical (`managed-agents.json`) still holds pre-crash
+/// ("stale") content.  The stage file holds the intended post-crash ("repaired")
+/// content.  After recovery runs, the canonical must hold the repaired content —
+/// so any subsequent migration or backfill reader sees the repaired state.
+#[test]
+fn test_setup_order_recovery_completes_before_migration_reads_canonical() {
+    let dir = tmp_dir();
+    let anchor = dir.path().to_path_buf();
+
+    // "Stale" content — what canonical holds before recovery.
+    let stale_content = b"[{\"pubkey\":\"stale-pre-crash\"}]";
+    // "Repaired" content — what the stage file holds (the intended commit).
+    let repaired_content = b"[{\"pubkey\":\"repaired-post-crash\"}]";
+    let teams_content = b"[]";
+
+    let a_can = anchor.join("managed-agents.json");
+    let t_can = anchor.join("teams.json");
+    let a_stage = anchor.join("managed-agents.order_test.stage");
+    let t_stage = anchor.join("teams.order_test.stage");
+
+    // Write stale canonical — this is what migrations would see WITHOUT recovery.
+    std::fs::write(&a_can, stale_content).unwrap();
+    std::fs::write(&t_can, teams_content).unwrap();
+
+    // Write stage files containing the repaired (intended) state.
+    std::fs::write(&a_stage, repaired_content).unwrap();
+    std::fs::write(&t_stage, teams_content).unwrap();
+
+    // Plant the intent row — recovery will detect and replay it.
+    {
+        let j = open_journal(&anchor).unwrap();
+        insert_phase_row(
+            &j,
+            "order_test",
+            "intent",
+            a_stage.to_str().unwrap(),
+            t_stage.to_str().unwrap(),
+            &sha256_hex(repaired_content),
+            &sha256_hex(teams_content),
+        );
+    }
+
+    // Run recovery — the exact same code path production calls via
+    // run_file_commit_recovery → file_commit_recovery_at.
+    file_commit_recovery_at_pub(&anchor).unwrap();
+
+    // Now simulate a "migration read" — read the canonical directly, as every
+    // real migration/backfill does.
+    let observed = std::fs::read(&a_can).unwrap();
+    assert_eq!(
+        observed, repaired_content,
+        "migration read must observe the repaired canonical, not the stale pre-crash state"
+    );
+    // Stale content must not be present.
+    assert_ne!(
+        observed, stale_content,
+        "stale canonical content must have been replaced by recovery"
+    );
+}
+
 // ── Fix B: migration tests ───────────────────────────────────────────────────
 
 /// Helper: create a v2-shaped in-memory journal (no hash/d-tag columns).

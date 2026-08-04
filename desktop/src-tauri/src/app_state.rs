@@ -56,9 +56,8 @@ pub struct AppState {
     pub huddle_audio: crate::huddle::tts_settings::HuddleAudioSettingsState,
     /// Tauri app handle — stored after setup so huddle commands can emit
     /// `huddle-state-changed` events without needing the handle threaded
-    /// through every call site.
-    ///
-    /// Set once during `setup()` in `lib.rs`; never cleared.
+    /// through every call site.  Set once during `setup()` in `lib.rs`;
+    /// never cleared.
     pub app_handle: Mutex<Option<AppHandle>>,
     /// Port of the localhost media streaming proxy (set during setup).
     pub media_proxy_port: AtomicU16,
@@ -68,13 +67,8 @@ pub struct AppState {
     /// signing commands check this flag via [`AppState::signing_keys`] and
     /// return `Err` so no events are published under the inaccessible identity.
     /// Mutually exclusive with `identity_lost` (guaranteed by `RecoveryState`
-    /// at the resolve boundary).
-    ///
-    /// Ordering: writers store with `Ordering::Release` after `state.keys` is
-    /// updated, so a reader observing `false` with `Ordering::Acquire` is
-    /// guaranteed to see the updated keys. Writers: `setup()` (initial
-    /// resolution via `resolve_persisted_identity`) and `import_identity`
-    /// (clears the flag when the user successfully imports a new key).
+    /// at the resolve boundary).  Ordering: writers store with
+    /// `Ordering::Release`; readers use `Ordering::Acquire`.
     pub keyring_locked: AtomicBool,
     /// Set when identity resolution detected a "lost" state: the migration
     /// marker was present but the keyring was empty and no plaintext fallback
@@ -97,11 +91,12 @@ pub struct AppState {
     /// Set when the boot-time Phase 2 reset attempted a wipe but verification
     /// failed. The sentinel is preserved so the next relaunch retries. All
     /// identity-dependent setup is skipped; the frontend shows a reset-failed
-    /// recovery screen via `get_identity`.
-    ///
-    /// Ordering: written once in `setup()` with `Ordering::Release`; read in
-    /// `get_identity` with `Ordering::Acquire`.
+    /// recovery screen via `get_identity`.  Written once in `setup()` with
+    /// `Ordering::Release`; read in `get_identity` with `Ordering::Acquire`.
     pub reset_failed: AtomicBool,
+    /// Set when pre-migration file-commit recovery fails; all store-touching
+    /// setup is skipped. Same write/read ordering as `reset_failed`.
+    pub store_recovery_failed: AtomicBool,
     /// Cached ACP session config from running agents, keyed by canonical
     /// `(agent pubkey, relay URL)` runtime identity.
     /// Populated when the harness emits `session_config_captured` observer events.
@@ -226,6 +221,7 @@ pub fn build_app_state() -> AppState {
         keyring_locked: AtomicBool::new(false),
         identity_lost: AtomicBool::new(false),
         reset_failed: AtomicBool::new(false),
+        store_recovery_failed: AtomicBool::new(false),
         #[cfg(feature = "mesh-llm")]
         mesh_llm_runtime: AsyncMutex::new(None),
         #[cfg(feature = "mesh-llm")]

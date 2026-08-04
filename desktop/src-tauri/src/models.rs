@@ -24,6 +24,9 @@ pub struct IdentityInfo {
     /// reset-failed recovery screen. The sentinel is preserved so the next
     /// relaunch retries the wipe automatically.
     pub reset_failed: bool,
+    /// True when pre-migration file-commit recovery failed at boot. All
+    /// store-touching setup was skipped; the frontend shows a recovery screen.
+    pub store_recovery_failed: bool,
 }
 
 #[derive(Serialize, Deserialize)]

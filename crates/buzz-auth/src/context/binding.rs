@@ -185,7 +185,6 @@ impl ResolvedFederatedPolicy {
     pub(crate) const fn from_authoritative_resolution(stamp: FederatedPolicyStamp) -> Self {
         Self { stamp }
     }
-
     #[cfg(test)]
     pub(crate) fn not_required(authorization_domain: CommunityId) -> Self {
         Self::from_authoritative_resolution(
@@ -601,6 +600,42 @@ impl VersionedBindingRef {
         }
     }
 
+    pub(crate) fn from_evidence_adapter(
+        authorization_domain: CommunityId,
+        binding_id: Uuid,
+        principal: FederatedPrincipal,
+        bound_pubkey: PublicKey,
+        binding_version: BindingVersion,
+        expires_at: Option<BindingExpiry>,
+        source: BindingSource,
+        resolution_reason: AuthorizationReason,
+    ) -> Result<Self, AuthContextError> {
+        if binding_id.is_nil() {
+            return Err(AuthContextError::InvalidBindingId);
+        }
+        let valid_reason = matches!(
+            (source, resolution_reason),
+            (_, AuthorizationReason::ExistingBinding)
+                | (
+                    BindingSource::AttestedKey,
+                    AuthorizationReason::EnrolledAttestedKey
+                )
+                | (BindingSource::Tofu, AuthorizationReason::EnrolledTofu)
+        );
+        if !valid_reason {
+            return Err(AuthContextError::InvalidAuthorizationReason);
+        }
+        Ok(Self {
+            authorization_domain,
+            binding_id,
+            principal,
+            bound_pubkey,
+            binding_version,
+            expires_at,
+            source,
+            resolution_reason,
+        })
+    }
     /// Build a reference to a binding authoritatively resolved as already active.
     #[cfg(test)]
     pub(crate) fn new_existing_active_for_test(
@@ -697,7 +732,7 @@ impl VersionedBindingRef {
     }
 
     /// Stable reason proven by the authoritative binding lifecycle result.
-    pub(super) const fn authorization_reason(&self) -> AuthorizationReason {
+    pub(crate) const fn authorization_reason(&self) -> AuthorizationReason {
         self.resolution_reason
     }
 }

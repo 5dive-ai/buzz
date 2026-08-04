@@ -103,9 +103,7 @@ fn verified_identities(
                         && event
                             .tags
                             .iter()
-                            .filter(|candidate| {
-                                candidate.as_slice().first() == parts.first()
-                            })
+                            .filter(|candidate| candidate.as_slice().first() == parts.first())
                             .count()
                             == 1
                 })
@@ -718,21 +716,19 @@ mod tests {
         let subject = nostr::Keys::generate().public_key().to_hex();
         let created_at = nostr::Timestamp::now().as_secs();
         let expires_at = created_at + 60;
-        let canonical = nostr::EventBuilder::new(
-            nostr::Kind::Custom(KIND_USER_TRUSTED_ASSERTION as u16),
-            "",
-        )
-        .tags([
-            nostr::Tag::parse(["d", subject.as_str()]).unwrap(),
-            nostr::Tag::parse(["p", subject.as_str()]).unwrap(),
-            nostr::Tag::parse(["verified", "relay"]).unwrap(),
-            nostr::Tag::parse(["active", "true"]).unwrap(),
-            nostr::Tag::parse(["expiration", &expires_at.to_string()]).unwrap(),
-            nostr::Tag::parse(["display_name", "Example User"]).unwrap(),
-        ])
-        .custom_created_at(nostr::Timestamp::from(created_at))
-        .sign_with_keys(&relay)
-        .unwrap();
+        let canonical =
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_USER_TRUSTED_ASSERTION as u16), "")
+                .tags([
+                    nostr::Tag::parse(["d", subject.as_str()]).unwrap(),
+                    nostr::Tag::parse(["p", subject.as_str()]).unwrap(),
+                    nostr::Tag::parse(["verified", "relay"]).unwrap(),
+                    nostr::Tag::parse(["active", "true"]).unwrap(),
+                    nostr::Tag::parse(["expiration", &expires_at.to_string()]).unwrap(),
+                    nostr::Tag::parse(["display_name", "Example User"]).unwrap(),
+                ])
+                .custom_created_at(nostr::Timestamp::from(created_at))
+                .sign_with_keys(&relay)
+                .unwrap();
 
         for extra in [
             nostr::Tag::parse(["issuer", "private.invalid"]).unwrap(),
@@ -748,10 +744,11 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(created_at + 1))
             .sign_with_keys(&relay)
             .unwrap();
-            assert!(
-                verified_identities(&[canonical.clone(), malformed], Some(&relay.public_key().to_hex()))
-                    .is_empty()
-            );
+            assert!(verified_identities(
+                &[canonical.clone(), malformed],
+                Some(&relay.public_key().to_hex())
+            )
+            .is_empty());
         }
     }
 

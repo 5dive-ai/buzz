@@ -308,7 +308,7 @@ pub async fn set_persona_active(
 
 pub(crate) const PNG_MAGIC: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];
 mod card;
-mod snapshot;
+pub(crate) mod snapshot;
 pub use card::*;
 #[cfg(test)]
 pub(crate) use snapshot::import::decode_snapshot_from_bytes;

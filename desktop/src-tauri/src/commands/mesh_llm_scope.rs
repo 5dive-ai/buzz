@@ -4,6 +4,8 @@
 //! Most items here are `pub(super)` so they remain private to the module;
 //! `mesh_stop_client` is `pub(crate)` and re-exported as `pub` from `mesh_llm`.
 
+use std::future::Future;
+
 use tauri::{AppHandle, Manager, State};
 
 use crate::app_state::AppState;
@@ -93,6 +95,91 @@ pub(crate) async fn fail_if_client_mesh_active<R: tauri::Runtime>(
             .to_string());
     }
     Ok(())
+}
+
+/// Acquire the `workspace_transition` lock, run the production
+/// `fail_if_client_mesh_active` preflight, then invoke `transition_body` while
+/// the guard remains held.
+///
+/// Used by `apply_workspace` and live identity import so neither duplicates the
+/// acquire + preflight sequence inline. Tests call this helper directly to prove
+/// the serialization contract against `install_client_under_workspace_transition`.
+///
+/// The transition body runs synchronously (or dispatches to `spawn_blocking`)
+/// while the async guard is alive on the current task. If the preflight fails,
+/// `transition_body` is never called.
+pub(crate) async fn with_workspace_transition_preflight<R, F, T>(
+    app: &AppHandle<R>,
+    transition_body: F,
+) -> Result<T, String>
+where
+    R: tauri::Runtime,
+    F: FnOnce() -> Result<T, String>,
+{
+    let state = app.state::<AppState>();
+    let _transition_guard = state.workspace_transition.lock().await;
+
+    // Fail closed if a client-mode Mesh runtime is active.
+    #[cfg(feature = "mesh-llm")]
+    fail_if_client_mesh_active(app).await?;
+
+    transition_body()
+}
+
+/// Acquire the `workspace_transition` lock, validate the full captured scope
+/// identity under the guard — `(scope_id, normalized relay, owner_pubkey,
+/// generation)` — then call the injected `install` closure.
+///
+/// Fails if:
+/// - no active scope exists at the time of validation;
+/// - any identity field of the captured scope differs from the current active scope;
+/// - the generation counter has advanced (a workspace switch occurred).
+///
+/// Used by `ensure_relay_mesh_for_record` after capturing scope + discovering
+/// the bootstrap target. Tests inject `install` directly so no port is touched.
+pub(crate) async fn install_client_under_workspace_transition<R, I, Fut>(
+    app: &AppHandle<R>,
+    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
+    install: I,
+) -> Result<(), String>
+where
+    R: tauri::Runtime,
+    I: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let state = app.state::<AppState>();
+    let _transition_guard = state.workspace_transition.lock().await;
+
+    // Validate the captured scope's generation and full identity under the guard.
+    // If the workspace switched after discovery but before we acquired the lock,
+    // abort without invoking install.
+    crate::managed_agents::scope::validate_scope_generation(captured_scope)
+        .map_err(|e| format!("mesh client install: captured scope stale: {e}"))?;
+
+    let active = state.capture_active_scope().ok_or(
+        "mesh client install: no active workspace scope after lock acquisition".to_string(),
+    )?;
+
+    // Validate the full scope identity — not just the generation counter.
+    let normalize = crate::managed_agents::scope::normalize_relay_for_scope;
+    if active.scope_id != captured_scope.scope_id
+        || normalize(&active.relay_url) != normalize(&captured_scope.relay_url)
+        || active.owner_pubkey != captured_scope.owner_pubkey
+    {
+        return Err(format!(
+            "mesh client install: captured scope identity mismatch \
+             (captured scope_id={}, relay={}, owner={}; \
+              active scope_id={}, relay={}, owner={})",
+            captured_scope.scope_id,
+            captured_scope.relay_url,
+            captured_scope.owner_pubkey,
+            active.scope_id,
+            active.relay_url,
+            active.owner_pubkey,
+        ));
+    }
+
+    install().await
 }
 
 /// Stop the local Mesh **client** (consuming) runtime.

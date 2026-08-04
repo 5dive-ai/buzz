@@ -15,7 +15,7 @@ use crate::relay::relay_ws_url_with_override;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Manager};
+use tauri::Manager;
 
 use crate::managed_agents::discovery::known_skill_dirs;
 #[cfg(unix)]
@@ -670,7 +670,7 @@ pub fn upsert_managed_section(file_path: &Path, new_section_content: &str) -> io
     Ok(())
 }
 
-pub fn regenerate_nest_context(app: &AppHandle) -> Result<(), String> {
+pub fn regenerate_nest_context<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     let nest = nest_dir().ok_or("cannot resolve home directory for nest")?;
     let agents_md = nest.join("AGENTS.md");
 
@@ -694,7 +694,7 @@ pub fn regenerate_nest_context(app: &AppHandle) -> Result<(), String> {
 /// All call sites treat regeneration as fire-and-forget — agents run fine with
 /// a stale AGENTS.md. Returns `Err` when regeneration fails so callers can
 /// report it as degradation in the workspace-apply result.
-pub fn try_regenerate_nest(app: &AppHandle) -> Result<(), String> {
+pub fn try_regenerate_nest<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     regenerate_nest_context(app).map_err(|error| {
         eprintln!("buzz-desktop: nest context regeneration failed: {error}");
         error

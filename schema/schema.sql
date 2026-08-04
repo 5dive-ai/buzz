@@ -210,6 +210,13 @@ CREATE TABLE identity_bindings (
     rotated_to_pubkey BYTEA,
     rotation_by      BYTEA,
     rotation_reason  TEXT,
+    binding_id       UUID NOT NULL DEFAULT gen_random_uuid(),
+    binding_version  BIGINT NOT NULL DEFAULT 1,
+    binding_state    TEXT NOT NULL DEFAULT 'active',
+    binding_provenance TEXT NOT NULL DEFAULT 'tofu',
+    replacement_binding_id UUID,
+    created_by       BYTEA,
+    created_policy_version TEXT,
     CONSTRAINT chk_identity_bindings_issuer_not_empty CHECK (length(issuer) > 0),
     CONSTRAINT chk_identity_bindings_uid_not_empty CHECK (length(uid) > 0),
     CONSTRAINT chk_identity_bindings_pubkey_len CHECK (length(pubkey) = 32),
@@ -226,7 +233,25 @@ CREATE TABLE identity_bindings (
             AND (rotation_by IS NULL OR length(rotation_by) = 32)
             AND rotation_reason IS NOT NULL
             AND length(rotation_reason) > 0)
-    )
+    ),
+    CONSTRAINT identity_bindings_o3_id_unique UNIQUE (community_id, binding_id),
+    CONSTRAINT identity_bindings_o3_principal_version_unique
+        UNIQUE (community_id, issuer, uid, binding_version),
+    CONSTRAINT identity_bindings_o3_replacement_fk
+        FOREIGN KEY (community_id, replacement_binding_id)
+        REFERENCES identity_bindings (community_id, binding_id)
+        DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT chk_identity_bindings_o3_id_not_nil
+        CHECK (binding_id <> '00000000-0000-0000-0000-000000000000'::UUID),
+    CONSTRAINT chk_identity_bindings_o3_version_positive CHECK (binding_version > 0),
+    CONSTRAINT chk_identity_bindings_o3_state
+        CHECK (binding_state IN ('active', 'revoked', 'rotated')),
+    CONSTRAINT chk_identity_bindings_o3_provenance
+        CHECK (binding_provenance IN ('attested_key', 'provisioned', 'tofu')),
+    CONSTRAINT chk_identity_bindings_o3_created_by_len
+        CHECK (created_by IS NULL OR length(created_by) = 32),
+    CONSTRAINT chk_identity_bindings_o3_policy_version
+        CHECK (created_policy_version IS NULL OR length(created_policy_version) > 0)
 );
 
 CREATE UNIQUE INDEX idx_identity_bindings_active_principal
@@ -266,6 +291,183 @@ CREATE TABLE identity_revoked_keys (
     CHECK (revoked_by IS NULL OR length(revoked_by) = 32),
     CHECK (length(reason) > 0)
 );
+
+CREATE TABLE identity_migration_denials (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    issuer       TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    detected_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (community_id, issuer, subject),
+    CHECK (length(issuer) > 0),
+    CHECK (length(subject) > 0),
+    CHECK (length(reason) > 0)
+);
+
+CREATE TABLE identity_binding_lineage (
+    community_id           UUID NOT NULL REFERENCES communities(id),
+    predecessor_binding_id UUID NOT NULL,
+    successor_binding_id   UUID NOT NULL,
+    imported_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (community_id, predecessor_binding_id),
+    UNIQUE (community_id, successor_binding_id),
+    FOREIGN KEY (community_id, predecessor_binding_id)
+        REFERENCES identity_bindings (community_id, binding_id),
+    FOREIGN KEY (community_id, successor_binding_id)
+        REFERENCES identity_bindings (community_id, binding_id),
+    CHECK (predecessor_binding_id <> successor_binding_id)
+);
+
+CREATE TABLE identity_retired_pairs (
+    community_id            UUID NOT NULL REFERENCES communities(id),
+    issuer                  TEXT NOT NULL,
+    subject                 TEXT NOT NULL,
+    pubkey                  BYTEA NOT NULL,
+    retired_binding_id      UUID,
+    retired_binding_version BIGINT,
+    retired_at              TIMESTAMPTZ NOT NULL,
+    retired_by              BYTEA,
+    reason                  TEXT NOT NULL,
+    PRIMARY KEY (community_id, issuer, subject, pubkey),
+    UNIQUE (
+        community_id, issuer, subject, pubkey,
+        retired_binding_id, retired_binding_version
+    ),
+    FOREIGN KEY (community_id, retired_binding_id)
+        REFERENCES identity_bindings (community_id, binding_id),
+    CHECK (length(issuer) > 0),
+    CHECK (length(subject) > 0),
+    CHECK (length(pubkey) = 32),
+    CHECK (retired_binding_version IS NULL OR retired_binding_version > 0),
+    CHECK (
+        (retired_binding_id IS NULL AND retired_binding_version IS NULL)
+        OR
+        (retired_binding_id IS NOT NULL AND retired_binding_version IS NOT NULL)
+    ),
+    CHECK (retired_by IS NULL OR length(retired_by) = 32),
+    CHECK (length(reason) > 0)
+);
+
+CREATE TABLE identity_pending_replacements (
+    community_id            UUID NOT NULL REFERENCES communities(id),
+    issuer                  TEXT NOT NULL,
+    subject                 TEXT NOT NULL,
+    selector_version        BIGINT NOT NULL,
+    retired_pubkey          BYTEA NOT NULL,
+    retired_binding_id      UUID NOT NULL,
+    retired_binding_version BIGINT NOT NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_operation_id    UUID,
+    cleared_at              TIMESTAMPTZ,
+    cleared_operation_id    UUID,
+    PRIMARY KEY (community_id, issuer, subject, selector_version),
+    FOREIGN KEY (
+        community_id, issuer, subject, retired_pubkey,
+        retired_binding_id, retired_binding_version
+    ) REFERENCES identity_retired_pairs (
+        community_id, issuer, subject, pubkey,
+        retired_binding_id, retired_binding_version
+    ),
+    CHECK (length(issuer) > 0),
+    CHECK (length(subject) > 0),
+    CHECK (selector_version > 0),
+    CHECK (length(retired_pubkey) = 32),
+    CHECK (retired_binding_version > 0),
+    CHECK (
+        (cleared_at IS NULL AND cleared_operation_id IS NULL)
+        OR
+        (cleared_at IS NOT NULL AND cleared_operation_id IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX idx_identity_pending_replacements_active
+    ON identity_pending_replacements (community_id, issuer, subject)
+    WHERE cleared_at IS NULL;
+
+CREATE TABLE identity_binding_history (
+    community_id           UUID NOT NULL REFERENCES communities(id),
+    history_id             UUID NOT NULL DEFAULT gen_random_uuid(),
+    binding_id             UUID NOT NULL,
+    binding_version        BIGINT NOT NULL,
+    issuer                 TEXT NOT NULL,
+    subject                TEXT NOT NULL,
+    pubkey                 BYTEA NOT NULL,
+    binding_state          TEXT NOT NULL,
+    binding_provenance     TEXT NOT NULL,
+    transition_kind        TEXT NOT NULL,
+    replacement_binding_id UUID,
+    operation_id           UUID,
+    actor                  BYTEA,
+    reason                 TEXT NOT NULL,
+    recorded_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (community_id, history_id),
+    UNIQUE (community_id, binding_id, binding_version, transition_kind),
+    FOREIGN KEY (community_id, binding_id)
+        REFERENCES identity_bindings (community_id, binding_id),
+    FOREIGN KEY (community_id, replacement_binding_id)
+        REFERENCES identity_bindings (community_id, binding_id)
+        DEFERRABLE INITIALLY DEFERRED,
+    CHECK (history_id <> '00000000-0000-0000-0000-000000000000'::UUID),
+    CHECK (binding_version > 0),
+    CHECK (length(issuer) > 0),
+    CHECK (length(subject) > 0),
+    CHECK (length(pubkey) = 32),
+    CHECK (binding_state IN ('active', 'revoked', 'rotated')),
+    CHECK (binding_provenance IN ('attested_key', 'provisioned', 'tofu')),
+    CHECK (transition_kind IN (
+        'legacy_import', 'enroll', 'provision', 'provenance_strengthened',
+        'retire_pair', 'disable_identity', 'revoke_key', 'rotate',
+        'recover', 'enable_identity'
+    )),
+    CHECK (actor IS NULL OR length(actor) = 32),
+    CHECK (length(reason) > 0)
+);
+
+CREATE INDEX idx_identity_binding_history_principal
+    ON identity_binding_history (community_id, issuer, subject, recorded_at);
+
+CREATE TABLE identity_lifecycle_operations (
+    community_id           UUID NOT NULL REFERENCES communities(id),
+    operation_id           UUID NOT NULL,
+    operation_kind         TEXT NOT NULL,
+    request_fingerprint    BYTEA NOT NULL,
+    issuer                 TEXT,
+    subject                TEXT,
+    pubkey                 BYTEA,
+    replacement_pubkey     BYTEA,
+    binding_id             UUID,
+    replacement_binding_id UUID,
+    binding_version        BIGINT,
+    selector_version       BIGINT,
+    actor                  BYTEA,
+    reason                 TEXT NOT NULL,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (community_id, operation_id),
+    FOREIGN KEY (community_id, binding_id)
+        REFERENCES identity_bindings (community_id, binding_id),
+    FOREIGN KEY (community_id, replacement_binding_id)
+        REFERENCES identity_bindings (community_id, binding_id),
+    CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'::UUID),
+    CHECK (operation_kind IN (
+        'provision', 'retire_pair', 'disable_identity', 'revoke_key',
+        'rotate', 'recover', 'enable_identity'
+    )),
+    CHECK (length(request_fingerprint) = 32),
+    CHECK (issuer IS NULL OR length(issuer) > 0),
+    CHECK (subject IS NULL OR length(subject) > 0),
+    CHECK (pubkey IS NULL OR length(pubkey) = 32),
+    CHECK (replacement_pubkey IS NULL OR length(replacement_pubkey) = 32),
+    CHECK (binding_version IS NULL OR binding_version > 0),
+    CHECK (selector_version IS NULL OR selector_version > 0),
+    CHECK (actor IS NULL OR length(actor) = 32),
+    CHECK (length(reason) > 0)
+);
+
+CREATE INDEX idx_identity_lifecycle_operations_principal
+    ON identity_lifecycle_operations (community_id, issuer, subject, created_at);
+
+CREATE INDEX idx_identity_lifecycle_operations_key
+    ON identity_lifecycle_operations (community_id, pubkey, created_at);
 
 -- ── Events (partitioned by month on created_at) ──────────────────────────────
 -- Conformance: "Channel-less global events and DMs". `community_id` leads the

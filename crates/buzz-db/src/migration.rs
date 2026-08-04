@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 28);
+        assert_eq!(migrations.len(), 29);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -953,6 +953,107 @@ mod tests {
             .sql
             .as_str()
             .contains("CREATE TABLE identity_revoked_keys"));
+
+        // O3 is a brownfield-safe additive projection over the frozen 0027/0028
+        // identity tables. It must not rewrite or discard legacy authority.
+        assert_eq!(migrations[28].version, 29);
+        let o3 = migrations[28].sql.as_str();
+        for required in [
+            "ADD COLUMN binding_id",
+            "ADD COLUMN binding_version",
+            "ADD COLUMN binding_state",
+            "ADD COLUMN binding_provenance",
+            "CREATE TABLE identity_retired_pairs",
+            "CREATE TABLE identity_pending_replacements",
+            "CREATE TABLE identity_binding_history",
+            "CREATE TABLE identity_lifecycle_operations",
+            "CREATE TABLE identity_migration_denials",
+        ] {
+            assert!(
+                o3.contains(required),
+                "migration 0029 is missing {required}"
+            );
+        }
+    }
+
+    fn o3_executable_sql(sql: &str) -> String {
+        let mut output = String::with_capacity(sql.len());
+        let mut chars = sql.chars().peekable();
+        let mut in_line_comment = false;
+        let mut in_string = false;
+        while let Some(ch) = chars.next() {
+            if in_line_comment {
+                if ch == '\n' {
+                    in_line_comment = false;
+                    output.push(ch);
+                }
+                continue;
+            }
+            if !in_string && ch == '-' && chars.peek() == Some(&'-') {
+                chars.next();
+                in_line_comment = true;
+                continue;
+            }
+            if ch == '\'' {
+                if in_string && chars.peek() == Some(&'\'') {
+                    chars.next();
+                    continue;
+                }
+                in_string = !in_string;
+                output.push(' ');
+                continue;
+            }
+            output.push(if in_string { ' ' } else { ch });
+        }
+        output
+    }
+
+    #[test]
+    fn migration_0029_is_strictly_additive() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 29)
+            .expect("migration 0029");
+        let executable = o3_executable_sql(migration.sql.as_str());
+        let normalized = normalize_sql(&executable);
+
+        for forbidden in [" rename ", " drop ", " truncate ", " delete "] {
+            assert!(
+                !format!(" {normalized} ").contains(forbidden),
+                "migration 0029 contains forbidden legacy mutation: {forbidden}"
+            );
+        }
+        assert!(!normalized.contains("update identity_revoked_keys"));
+        assert!(!normalized.contains("update identity_principals"));
+        assert!(!normalized.contains("insert into identity_revoked_keys"));
+
+        let allowed_binding_columns = [
+            "binding_id",
+            "binding_version",
+            "binding_state",
+            "binding_provenance",
+            "replacement_binding_id",
+        ];
+        for statement in split_sql_statements(&executable) {
+            let statement = normalize_sql(&statement);
+            if !statement.starts_with("update identity_bindings ") {
+                continue;
+            }
+            let assignments = statement
+                .split_once(" set ")
+                .map(|(_, tail)| tail.split_once(" where ").map_or(tail, |(set, _)| set))
+                .expect("identity binding metadata update has SET clause");
+            for assignment in split_top_level_csv(assignments) {
+                let column = assignment
+                    .split_once('=')
+                    .map(|(column, _)| column.trim())
+                    .expect("metadata assignment");
+                assert!(
+                    allowed_binding_columns.contains(&column),
+                    "migration 0029 rewrites legacy identity_bindings.{column}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1128,6 +1229,73 @@ mod tests {
         .expect("read applied migrations")
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LegacyIdentitySnapshot {
+        bindings: Vec<String>,
+        principals: Vec<String>,
+        revoked_keys: Vec<String>,
+        catalog: Vec<String>,
+    }
+
+    async fn legacy_identity_snapshot(pool: &PgPool) -> LegacyIdentitySnapshot {
+        async fn json_rows(pool: &PgPool, query: &'static str) -> Vec<String> {
+            let mut rows = sqlx::query_scalar::<_, serde_json::Value>(query)
+                .fetch_all(pool)
+                .await
+                .expect("snapshot identity rows")
+                .into_iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        }
+
+        let bindings = json_rows(
+            pool,
+            "SELECT to_jsonb(binding) - ARRAY[\
+                'binding_id', 'binding_version', 'binding_state',\
+                'binding_provenance', 'replacement_binding_id', 'created_by',\
+                'created_policy_version']::text[] \
+             FROM identity_bindings binding",
+        )
+        .await;
+        let principals = json_rows(
+            pool,
+            "SELECT to_jsonb(principal) FROM identity_principals principal",
+        )
+        .await;
+        let revoked_keys = json_rows(
+            pool,
+            "SELECT to_jsonb(revoked) FROM identity_revoked_keys revoked",
+        )
+        .await;
+        let mut catalog = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT definition FROM (
+                SELECT 'constraint:' || conrelid::regclass::text || ':' || conname || ':' || pg_get_constraintdef(oid) AS definition
+                FROM pg_constraint
+                WHERE conrelid IN ('identity_bindings'::regclass, 'identity_principals'::regclass, 'identity_revoked_keys'::regclass)
+                UNION ALL
+                SELECT 'index:' || tablename || ':' || indexname || ':' || indexdef
+                FROM pg_indexes
+                WHERE schemaname='public'
+                  AND tablename IN ('identity_bindings', 'identity_principals', 'identity_revoked_keys')
+            ) definitions
+            ORDER BY definition
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .expect("snapshot identity catalog");
+        catalog.sort();
+        LegacyIdentitySnapshot {
+            bindings,
+            principals,
+            revoked_keys,
+            catalog,
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn pre_0007_ambiguous_nip_rs_data_blocks_without_mutation_and_allows_retry() {
@@ -1256,6 +1424,299 @@ mod tests {
         .await
         .expect("read post-push search behavior");
         assert_eq!(after, vec![(1, Some(true)), (30_350, None)]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated disposable Postgres database"]
+    async fn identity_0029_additive_upgrade_preserves_legacy_state_and_handles_history() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(28, &pool)
+            .await
+            .expect("apply migrations through legacy identity lifecycle");
+
+        let domain_a = uuid::Uuid::new_v4();
+        let domain_b = uuid::Uuid::new_v4();
+        for (domain, label) in [(domain_a, "a"), (domain_b, "b")] {
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(domain)
+                .bind(format!("identity-0029-{label}-{}.example", domain.simple()))
+                .execute(&pool)
+                .await
+                .expect("insert fixture community");
+        }
+
+        let active_key = vec![1_u8; 32];
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id, issuer, uid, pubkey, source, created_at, updated_at, last_seen_at) \
+             VALUES ($1, ' Issuer ', ' Subject ', $2, 'jwt_npub', \
+                     TIMESTAMPTZ '2025-01-01 00:00:00Z', TIMESTAMPTZ '2025-01-01 00:00:00Z', TIMESTAMPTZ '2025-01-01 00:00:00Z')",
+        )
+        .bind(domain_a)
+        .bind(&active_key)
+        .execute(&pool)
+        .await
+        .expect("insert literal active principal");
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id, issuer, uid, pubkey, source, created_at, updated_at, last_seen_at) \
+             VALUES ($1, ' Issuer ', ' Subject ', $2, 'jwt_npub', \
+                     TIMESTAMPTZ '2025-01-01 00:00:00Z', TIMESTAMPTZ '2025-01-01 00:00:00Z', TIMESTAMPTZ '2025-01-01 00:00:00Z')",
+        )
+        .bind(domain_b)
+        .bind(&active_key)
+        .execute(&pool)
+        .await
+        .expect("insert cross-domain control");
+
+        let chain_keys = [vec![10_u8; 32], vec![11_u8; 32], vec![12_u8; 32]];
+        for (index, key) in chain_keys.iter().enumerate() {
+            if let Some(successor) = chain_keys.get(index + 1) {
+                sqlx::query(
+                    "INSERT INTO identity_bindings \
+                     (community_id, issuer, uid, pubkey, source, created_at, updated_at, last_seen_at, \
+                      revoked_at, revoked_reason, revocation_scope, rotation_completed_at, \
+                      rotated_to_pubkey, rotation_reason) \
+                     VALUES ($1, 'https://idp.example', 'chain', $2, 'db_binding', \
+                             TIMESTAMPTZ '2025-02-01 00:00:00Z', TIMESTAMPTZ '2025-02-01 00:00:00Z', \
+                             TIMESTAMPTZ '2025-02-01 00:00:00Z', TIMESTAMPTZ '2025-02-01 00:00:00Z', \
+                             'legacy rotation', 'rotation', TIMESTAMPTZ '2025-02-01 00:00:00Z', \
+                             $3, 'legacy rotation')",
+                )
+                .bind(domain_a)
+                .bind(key)
+                .bind(successor)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("insert retired chain node {index}: {error}"));
+            } else {
+                sqlx::query(
+                    "INSERT INTO identity_bindings \
+                     (community_id, issuer, uid, pubkey, source, created_at, updated_at, last_seen_at) \
+                     VALUES ($1, 'https://idp.example', 'chain', $2, 'db_binding', \
+                             TIMESTAMPTZ '2025-02-01 00:00:00Z', TIMESTAMPTZ '2025-02-01 00:00:00Z', \
+                             TIMESTAMPTZ '2025-02-01 00:00:00Z')",
+                )
+                .bind(domain_a)
+                .bind(key)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("insert active chain node {index}: {error}"));
+            }
+        }
+        for old in chain_keys.iter().take(chain_keys.len() - 1) {
+            sqlx::query(
+                "INSERT INTO identity_revoked_keys (community_id, pubkey, revoked_at, reason) \
+                 VALUES ($1, $2, TIMESTAMPTZ '2025-02-01 00:00:00Z', 'legacy rotation')",
+            )
+            .bind(domain_a)
+            .bind(old)
+            .execute(&pool)
+            .await
+            .expect("insert legacy rotation tombstone");
+        }
+
+        let revoked_key = vec![20_u8; 32];
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id, issuer, uid, pubkey, source, revoked_at, revoked_reason, revocation_scope) \
+             VALUES ($1, 'https://idp.example', 'pending', $2, 'db_binding', NOW(), 'explicit revoke', 'key')",
+        )
+        .bind(domain_a)
+        .bind(&revoked_key)
+        .execute(&pool)
+        .await
+        .expect("insert pending revoked binding");
+        sqlx::query(
+            "INSERT INTO identity_revoked_keys (community_id, pubkey, revoked_at, reason) \
+             VALUES ($1, $2, TIMESTAMPTZ '2025-03-01 00:00:00Z', 'explicit revoke')",
+        )
+        .bind(domain_a)
+        .bind(&revoked_key)
+        .execute(&pool)
+        .await
+        .expect("insert explicit key selector");
+
+        sqlx::query(
+            "INSERT INTO identity_principals \
+             (community_id, issuer, uid, disabled_at, disabled_reason) \
+             VALUES ($1, 'https://idp.example', 'never-enrolled', NOW(), 'disabled before enrollment')",
+        )
+        .bind(domain_a)
+        .execute(&pool)
+        .await
+        .expect("insert disabled never-enrolled principal");
+
+        let missing_old = vec![30_u8; 32];
+        let missing_target = vec![31_u8; 32];
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id, issuer, uid, pubkey, source, revoked_at, revoked_reason, revocation_scope, \
+              rotation_completed_at, rotated_to_pubkey, rotation_reason) \
+             VALUES ($1, 'https://idp.example', 'ambiguous', $2, 'jwt_npub', NOW(), \
+                     'missing successor', 'rotation', NOW(), $3, 'missing successor')",
+        )
+        .bind(domain_a)
+        .bind(&missing_old)
+        .bind(&missing_target)
+        .execute(&pool)
+        .await
+        .expect("insert missing-lineage fixture");
+        sqlx::query(
+            "INSERT INTO identity_revoked_keys (community_id, pubkey, reason) VALUES ($1, $2, 'ambiguous legacy selector')",
+        )
+        .bind(domain_a)
+        .bind(&missing_old)
+        .execute(&pool)
+        .await
+        .expect("insert ambiguous selector");
+
+        let before = legacy_identity_snapshot(&pool).await;
+        run_migrations(&pool)
+            .await
+            .expect("additive identity migration succeeds on populated history");
+        let after = legacy_identity_snapshot(&pool).await;
+        assert_eq!(after.bindings, before.bindings, "legacy bindings changed");
+        assert_eq!(
+            after.principals, before.principals,
+            "legacy principals changed"
+        );
+        assert_eq!(after.revoked_keys, before.revoked_keys, "legacy Y changed");
+        assert!(
+            before
+                .catalog
+                .iter()
+                .all(|definition| after.catalog.contains(definition)),
+            "legacy identity constraints/indexes must remain unchanged"
+        );
+
+        let chain: Vec<(Vec<u8>, i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT binding.pubkey, binding.binding_version, replacement.pubkey \
+             FROM identity_bindings binding \
+             LEFT JOIN identity_bindings replacement \
+               ON replacement.community_id=binding.community_id \
+              AND replacement.binding_id=binding.replacement_binding_id \
+             WHERE binding.community_id=$1 AND binding.issuer='https://idp.example' AND binding.uid='chain' \
+             ORDER BY binding.binding_version",
+        )
+        .bind(domain_a)
+        .fetch_all(&pool)
+        .await
+        .expect("read migrated chain");
+        assert_eq!(chain.len(), 3);
+        assert_eq!(
+            chain[0],
+            (chain_keys[0].clone(), 1, Some(chain_keys[1].clone()))
+        );
+        assert_eq!(
+            chain[1],
+            (chain_keys[1].clone(), 2, Some(chain_keys[2].clone()))
+        );
+        assert_eq!(chain[2], (chain_keys[2].clone(), 3, None));
+
+        let pending: (Vec<u8>, i64, i64) = sqlx::query_as(
+            "SELECT retired_pubkey, retired_binding_version, selector_version \
+             FROM identity_pending_replacements \
+             WHERE community_id=$1 AND issuer='https://idp.example' AND subject='pending' AND cleared_at IS NULL",
+        )
+        .bind(domain_a)
+        .fetch_one(&pool)
+        .await
+        .expect("read pending selector");
+        assert_eq!(pending, (revoked_key, 1, 1));
+
+        let quarantined: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM identity_migration_denials \
+             WHERE community_id=$1 AND issuer='https://idp.example' AND subject='ambiguous')",
+        )
+        .bind(domain_a)
+        .fetch_one(&pool)
+        .await
+        .expect("read migration quarantine");
+        assert!(quarantined);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated disposable Postgres database"]
+    async fn identity_0029_failure_rolls_back_every_additive_projection() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(28, &pool)
+            .await
+            .expect("apply migrations through legacy identity lifecycle");
+        let domain = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1,$2)")
+            .bind(domain)
+            .bind(format!(
+                "identity-0029-rollback-{}.example",
+                domain.simple()
+            ))
+            .execute(&pool)
+            .await
+            .expect("insert rollback community");
+        sqlx::query(
+            "INSERT INTO identity_bindings (community_id, issuer, uid, pubkey, source) \
+             VALUES ($1,'https://idp.example','rollback',$2,'db_binding')",
+        )
+        .bind(domain)
+        .bind(vec![99_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("insert rollback fixture");
+        sqlx::query(
+            "CREATE FUNCTION reject_o3_projection() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'injected O3 projection failure'; END $$",
+        )
+        .execute(&pool)
+        .await
+        .expect("create failure function");
+        sqlx::query(
+            "CREATE TRIGGER reject_o3_projection BEFORE UPDATE ON identity_bindings \
+             FOR EACH ROW EXECUTE FUNCTION reject_o3_projection()",
+        )
+        .execute(&pool)
+        .await
+        .expect("create failure trigger");
+
+        assert!(MIGRATOR.run_to(29, &pool).await.is_err());
+        let projected_tables: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT to_regclass('identity_retired_pairs')::text, \
+                    to_regclass('identity_pending_replacements')::text, \
+                    to_regclass('identity_binding_history')::text",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect rolled back tables");
+        assert_eq!(projected_tables, (None, None, None));
+        let projected_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_schema='public' AND table_name='identity_bindings' \
+               AND column_name IN ('binding_id','binding_version','binding_state','binding_provenance')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect rolled back columns");
+        assert_eq!(projected_columns, 0);
+        let latest: i64 =
+            sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success")
+                .fetch_one(&pool)
+                .await
+                .expect("read latest migration");
+        assert_eq!(latest, 28);
+        sqlx::query("DROP TRIGGER reject_o3_projection ON identity_bindings")
+            .execute(&pool)
+            .await
+            .expect("drop failure trigger");
+        sqlx::query("DROP FUNCTION reject_o3_projection()")
+            .execute(&pool)
+            .await
+            .expect("drop failure function");
+        run_migrations(&pool)
+            .await
+            .expect("retry additive projection after rollback");
     }
 
     #[tokio::test]

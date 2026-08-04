@@ -28,8 +28,10 @@ pub(crate) mod media;
 mod media_animated;
 mod media_download;
 mod media_gif;
+mod media_raw;
 mod media_snapshot_png;
 mod media_transcode;
+mod media_upload_progress;
 #[cfg(feature = "mesh-llm")]
 mod mesh_live_view;
 #[cfg(feature = "mesh-llm")]
@@ -89,6 +91,7 @@ pub use legacy_storage::*;
 pub use link_preview::*;
 pub use media::*;
 pub use media_download::*;
+pub use media_raw::*;
 #[cfg(feature = "mesh-llm")]
 pub use mesh_live_view::*;
 #[cfg(feature = "mesh-llm")]

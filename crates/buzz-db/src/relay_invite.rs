@@ -469,6 +469,42 @@ mod tests {
 
     async fn delete_test_community(pool: &PgPool, community: CommunityId) {
         let mut tx = pool.begin().await.expect("begin test cleanup");
+        for (table, statement) in [
+            (
+                "identity_lifecycle_operations",
+                "DELETE FROM identity_lifecycle_operations WHERE community_id = $1",
+            ),
+            (
+                "identity_binding_history",
+                "DELETE FROM identity_binding_history WHERE community_id = $1",
+            ),
+            (
+                "identity_pending_replacements",
+                "DELETE FROM identity_pending_replacements WHERE community_id = $1",
+            ),
+            (
+                "identity_retired_pairs",
+                "DELETE FROM identity_retired_pairs WHERE community_id = $1",
+            ),
+            (
+                "identity_binding_lineage",
+                "DELETE FROM identity_binding_lineage WHERE community_id = $1",
+            ),
+            (
+                "identity_migration_denied_keys",
+                "DELETE FROM identity_migration_denied_keys WHERE community_id = $1",
+            ),
+            (
+                "identity_migration_denials",
+                "DELETE FROM identity_migration_denials WHERE community_id = $1",
+            ),
+        ] {
+            sqlx::query(statement)
+                .bind(community.as_uuid())
+                .execute(&mut *tx)
+                .await
+                .unwrap_or_else(|error| panic!("delete test rows from {table}: {error}"));
+        }
         sqlx::query("DELETE FROM identity_revoked_keys WHERE community_id = $1")
             .bind(community.as_uuid())
             .execute(&mut *tx)

@@ -304,6 +304,16 @@ CREATE TABLE identity_migration_denials (
     CHECK (length(reason) > 0)
 );
 
+CREATE TABLE identity_migration_denied_keys (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    pubkey       BYTEA NOT NULL,
+    reason       TEXT NOT NULL,
+    detected_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (community_id, pubkey),
+    CHECK (length(pubkey) = 32),
+    CHECK (length(reason) > 0)
+);
+
 CREATE TABLE identity_binding_lineage (
     community_id           UUID NOT NULL REFERENCES communities(id),
     predecessor_binding_id UUID NOT NULL,

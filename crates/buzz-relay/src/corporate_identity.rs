@@ -122,8 +122,8 @@ impl CorporateIdentityService {
         let decoded = decode::<RawJwtClaims>(token, &decoding_key, &validation)
             .map_err(|e| CorporateIdentityError::InvalidJwt(e.to_string()))?;
 
-        let issuer = claim_string(&decoded.claims.claims, "iss")?;
-        let uid = claim_string(&decoded.claims.claims, &self.config.uid_claim)?;
+        let issuer = claim_string_exact(&decoded.claims.claims, "iss")?;
+        let uid = claim_string_exact(&decoded.claims.claims, &self.config.uid_claim)?;
         let display_name = claim_string(&decoded.claims.claims, &self.config.display_claim)?;
         let public_display_name = self
             .config
@@ -1128,6 +1128,21 @@ fn claim_string(
     Ok(value.to_string())
 }
 
+fn claim_string_exact(
+    claims: &Map<String, Value>,
+    claim: &str,
+) -> Result<String, CorporateIdentityError> {
+    claims
+        .get(claim)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| CorporateIdentityError::InvalidClaim {
+            claim: claim.to_string(),
+            reason: "must be a non-empty literal string".to_string(),
+        })
+}
+
 fn configured_pubkey_claim(
     claims: &Map<String, Value>,
     claim: Option<&str>,
@@ -1264,6 +1279,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn issuer_and_subject_claims_preserve_literal_identity() {
+        let claims = serde_json::json!({"iss": " issuer ", "sub": " subject "});
+        let claims = claims.as_object().expect("claims object");
+
+        assert_eq!(claim_string_exact(claims, "iss").unwrap(), " issuer ");
+        assert_eq!(claim_string_exact(claims, "sub").unwrap(), " subject ");
+        assert!(claim_string_exact(claims, "missing").is_err());
+    }
+
     fn test_identity_binding(
         issuer: &str,
         uid: &str,
@@ -1271,9 +1296,13 @@ mod tests {
     ) -> buzz_db::identity_binding::IdentityBinding {
         let now = chrono::Utc::now();
         buzz_db::identity_binding::IdentityBinding {
+            binding_id: uuid::Uuid::new_v4(),
             issuer: issuer.to_string(),
             uid: uid.to_string(),
             pubkey: pubkey.to_bytes().to_vec(),
+            binding_version: 1,
+            binding_state: buzz_db::identity_binding::BindingState::Active,
+            binding_provenance: buzz_db::identity_binding::BindingProvenance::Tofu,
             display_name: None,
             source: SOURCE_DB_BINDING.to_string(),
             created_at: now,

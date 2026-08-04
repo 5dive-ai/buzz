@@ -121,8 +121,9 @@ HAVING COUNT(*) > 1
 ON CONFLICT (community_id, issuer, subject) DO NOTHING;
 
 -- A valid legacy principal is one complete, non-branching, acyclic chain. Edge
--- candidates include inactive replacements and ignore timestamps because NOW()
--- is transaction-stable in the legacy rotation helper.
+-- candidates include inactive replacements. Equality is intentional because
+-- NOW() is transaction-stable in the legacy rotation helper; an older row can
+-- never be selected as a successor.
 WITH RECURSIVE
 candidate_edges AS (
     SELECT
@@ -141,6 +142,7 @@ candidate_edges AS (
      AND successor.uid = predecessor.uid
      AND successor.pubkey = predecessor.rotated_to_pubkey
      AND successor.binding_id <> predecessor.binding_id
+     AND successor.created_at >= predecessor.rotation_completed_at
     WHERE predecessor.rotation_completed_at IS NOT NULL
 ),
 resolved_edges AS (
@@ -232,6 +234,38 @@ SELECT community_id, issuer, uid, 'ambiguous legacy replacement lineage'
 FROM invalid_principals
 ON CONFLICT (community_id, issuer, subject) DO NOTHING;
 
+-- Principal quarantine alone is insufficient: a missing or ambiguous target
+-- key must not be resurrected under a different principal in the same domain.
+-- Retain a domain-key denial for every stored or referenced key implicated by
+-- an invalid legacy graph.
+CREATE TABLE identity_migration_denied_keys (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    pubkey       BYTEA NOT NULL,
+    reason       TEXT NOT NULL,
+    detected_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (community_id, pubkey),
+    CHECK (length(pubkey) = 32),
+    CHECK (length(reason) > 0)
+);
+
+INSERT INTO identity_migration_denied_keys (community_id, pubkey, reason)
+SELECT DISTINCT binding.community_id, binding.pubkey,
+       'key implicated by ambiguous legacy replacement lineage'
+FROM identity_bindings binding
+JOIN identity_migration_denials denial
+  ON denial.community_id = binding.community_id
+ AND denial.issuer = binding.issuer
+ AND denial.subject = binding.uid
+UNION
+SELECT DISTINCT binding.community_id, binding.rotated_to_pubkey,
+       'key implicated by ambiguous legacy replacement lineage'
+FROM identity_bindings binding
+JOIN identity_migration_denials denial
+  ON denial.community_id = binding.community_id
+ AND denial.issuer = binding.issuer
+ AND denial.subject = binding.uid
+WHERE binding.rotated_to_pubkey IS NOT NULL;
+
 -- Topological versions are deterministic for valid histories. Quarantined
 -- rows receive stable positive versions solely for attribution, never auth.
 WITH RECURSIVE
@@ -252,6 +286,7 @@ candidate_edges AS (
      AND successor.uid = predecessor.uid
      AND successor.pubkey = predecessor.rotated_to_pubkey
      AND successor.binding_id <> predecessor.binding_id
+     AND successor.created_at >= predecessor.rotation_completed_at
     WHERE predecessor.rotation_completed_at IS NOT NULL
 ),
 resolved_edges AS (
@@ -349,6 +384,7 @@ WITH candidate_edges AS (
      AND successor.uid = predecessor.uid
      AND successor.pubkey = predecessor.rotated_to_pubkey
      AND successor.binding_id <> predecessor.binding_id
+     AND successor.created_at >= predecessor.rotation_completed_at
     WHERE predecessor.rotation_completed_at IS NOT NULL
 )
 INSERT INTO identity_binding_lineage
@@ -362,6 +398,16 @@ WHERE edge.outgoing_candidates = 1
         AND denial.issuer = edge.issuer
         AND denial.subject = edge.uid
   );
+
+-- The legacy rotation helper admits `db_binding` only after privileged
+-- replacement proof. Roots remain TOFU; unique imported successors retain the
+-- stronger provisioned provenance implied by that helper.
+UPDATE identity_bindings successor
+SET binding_provenance = 'provisioned'
+FROM identity_binding_lineage lineage
+WHERE lineage.community_id = successor.community_id
+  AND lineage.successor_binding_id = successor.binding_id
+  AND successor.source = 'db_binding';
 
 UPDATE identity_bindings predecessor
 SET replacement_binding_id = lineage.successor_binding_id

@@ -7,8 +7,11 @@
 //! single-key revocation, and authorized rotation; authentication never
 //! silently rewrites those states.
 
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Row, Transaction};
+use uuid::Uuid;
 
 use crate::error::{DbError, Result};
 use buzz_core::CommunityId;
@@ -18,15 +21,202 @@ pub const SOURCE_JWT_NPUB: &str = "jwt_npub";
 /// Binding source when the relay falls back to the stored uid/pubkey binding.
 pub const SOURCE_DB_BINDING: &str = "db_binding";
 
-/// Active corporate identity binding row.
+/// Server-resolved first-enrollment policy for one authorization domain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EnrollmentMode {
+    /// Require verified issuer evidence that attests the proven key.
+    AttestedKey,
+    /// Require an out-of-band provisioned binding.
+    Provisioned,
+    /// Allow trust on first use.
+    Tofu,
+}
+
+impl fmt::Debug for EnrollmentMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("EnrollmentMode")
+            .field(&"[redacted]")
+            .finish()
+    }
+}
+
+/// Provider-neutral persisted binding provenance.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BindingProvenance {
+    /// Verified issuer evidence attested the key.
+    AttestedKey,
+    /// The binding was provisioned out of band.
+    Provisioned,
+    /// The binding was established by trust on first use.
+    Tofu,
+}
+
+impl BindingProvenance {
+    /// Stable persistence label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AttestedKey => "attested_key",
+            Self::Provisioned => "provisioned",
+            Self::Tofu => "tofu",
+        }
+    }
+
+    pub(crate) fn legacy_source(self) -> &'static str {
+        match self {
+            Self::AttestedKey => SOURCE_JWT_NPUB,
+            Self::Provisioned | Self::Tofu => SOURCE_DB_BINDING,
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "attested_key" => Ok(Self::AttestedKey),
+            "provisioned" => Ok(Self::Provisioned),
+            "tofu" => Ok(Self::Tofu),
+            _ => Err(DbError::InvalidData(
+                "identity binding has invalid provenance".to_string(),
+            )),
+        }
+    }
+}
+
+impl fmt::Debug for BindingProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("BindingProvenance")
+            .field(&"[redacted]")
+            .finish()
+    }
+}
+
+/// Explicit persisted binding lifecycle state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BindingState {
+    /// The binding currently carries authority.
+    Active,
+    /// The binding was retired without an atomic replacement.
+    Revoked,
+    /// The binding was atomically replaced.
+    Rotated,
+}
+
+impl BindingState {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "active" => Ok(Self::Active),
+            "revoked" => Ok(Self::Revoked),
+            "rotated" => Ok(Self::Rotated),
+            _ => Err(DbError::InvalidData(
+                "identity binding has invalid lifecycle state".to_string(),
+            )),
+        }
+    }
+}
+
+impl fmt::Debug for BindingState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("BindingState")
+            .field(&"[redacted]")
+            .finish()
+    }
+}
+
+/// Stable evidence returned by authoritative binding resolution.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BindingEvidence {
+    /// Stable non-nil binding identifier.
+    pub binding_id: Uuid,
+    /// Positive authorization-relevant binding version.
+    pub binding_version: u64,
+    /// Persisted binding provenance.
+    pub provenance: BindingProvenance,
+}
+
+impl fmt::Debug for BindingEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BindingEvidence")
+            .field("binding_id", &"[redacted]")
+            .field("binding_version", &"[redacted]")
+            .field("provenance", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Stable denial from ordinary binding resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingDenial {
+    /// Another active principal or key owns the requested coordinate.
+    Conflict,
+    /// A lifecycle selector or migration quarantine denies authority.
+    Revoked,
+    /// The domain requires an out-of-band binding.
+    BindingRequired,
+    /// Attested enrollment lacked a verified matching key claim.
+    KeyAttestationRequired,
+}
+
+/// Result of resolving a binding during ordinary authorization.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveBindingResult {
+    /// A new authoritative binding was atomically enrolled.
+    Enrolled(BindingEvidence),
+    /// The exact authoritative binding already existed.
+    Existing(BindingEvidence),
+    /// Resolution denied without authority mutation.
+    Denied(BindingDenial),
+}
+
+/// Typed input to ordinary binding resolution.
+#[derive(Clone, Copy)]
+pub struct ResolveBindingInput<'a> {
+    /// Exact validated issuer bytes represented as UTF-8.
+    pub issuer: &'a str,
+    /// Exact validated subject bytes represented as UTF-8.
+    pub subject: &'a str,
+    /// Proven 32-byte Nostr public key.
+    pub pubkey: &'a [u8],
+    /// Private display metadata.
+    pub display_name: Option<&'a str>,
+    /// Server-resolved enrollment mode.
+    pub enrollment_mode: EnrollmentMode,
+    /// Whether verified identity evidence attested `pubkey`.
+    pub key_attested: bool,
+}
+
+impl fmt::Debug for ResolveBindingInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolveBindingInput")
+            .field("issuer", &"[redacted]")
+            .field("subject", &"[redacted]")
+            .field("pubkey", &"[redacted]")
+            .field("display_name", &"[redacted]")
+            .field("enrollment_mode", &"[redacted]")
+            .field("key_attested", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Active corporate identity binding row.
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdentityBinding {
+    /// Stable non-nil binding identifier.
+    pub binding_id: Uuid,
     /// Validated identity-provider issuer.
     pub issuer: String,
     /// Corporate IdP subject or configured stable uid claim.
     pub uid: String,
     /// Bound Nostr pubkey bytes.
     pub pubkey: Vec<u8>,
+    /// Positive authorization-relevant version.
+    pub binding_version: u64,
+    /// Explicit lifecycle state.
+    pub binding_state: BindingState,
+    /// Provider-neutral provenance.
+    pub binding_provenance: BindingProvenance,
     /// Human-readable display claim captured from the latest accepted JWT.
     pub display_name: Option<String>,
     /// Source that established or last strengthened the active binding.
@@ -39,8 +229,26 @@ pub struct IdentityBinding {
     pub last_seen_at: DateTime<Utc>,
 }
 
+impl fmt::Debug for IdentityBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdentityBinding")
+            .field("binding_id", &"[redacted]")
+            .field("issuer", &"[redacted]")
+            .field("uid", &"[redacted]")
+            .field("pubkey", &"[redacted]")
+            .field("binding_version", &"[redacted]")
+            .field("binding_state", &"[redacted]")
+            .field("binding_provenance", &"[redacted]")
+            .field("display_name", &"[redacted]")
+            .field("source", &"[redacted]")
+            .field("timestamps", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Existing active binding that conflicts with a requested binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdentityBindingConflict {
     /// Existing active issuer.
     pub issuer: String,
@@ -50,6 +258,18 @@ pub struct IdentityBindingConflict {
     pub pubkey: Vec<u8>,
     /// Existing active binding source.
     pub source: String,
+}
+
+impl fmt::Debug for IdentityBindingConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdentityBindingConflict")
+            .field("issuer", &"[redacted]")
+            .field("uid", &"[redacted]")
+            .field("pubkey", &"[redacted]")
+            .field("source", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Outcome of creating or validating a corporate identity binding.
@@ -66,7 +286,7 @@ pub enum BindIdentityResult {
 }
 
 /// Corporate identity data staged for an atomic admission transaction.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct IdentityBindingInput<'a> {
     /// Validated identity-provider issuer.
     pub issuer: &'a str,
@@ -80,13 +300,26 @@ pub struct IdentityBindingInput<'a> {
     pub source: &'a str,
 }
 
+impl fmt::Debug for IdentityBindingInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdentityBindingInput")
+            .field("issuer", &"[redacted]")
+            .field("uid", &"[redacted]")
+            .field("pubkey", &"[redacted]")
+            .field("display_name", &"[redacted]")
+            .field("source", &"[redacted]")
+            .finish()
+    }
+}
+
 fn validate_inputs(issuer: &str, uid: &str, pubkey: &[u8], source: &str) -> Result<()> {
-    if issuer.trim().is_empty() {
+    if issuer.is_empty() {
         return Err(DbError::InvalidData(
             "identity binding issuer must not be empty".to_string(),
         ));
     }
-    if uid.trim().is_empty() {
+    if uid.is_empty() {
         return Err(DbError::InvalidData(
             "identity binding uid must not be empty".to_string(),
         ));
@@ -127,10 +360,23 @@ pub(crate) fn validate_membership_identity_key(
 }
 
 fn row_to_binding(row: sqlx::postgres::PgRow) -> Result<IdentityBinding> {
+    let binding_id: Uuid = row.try_get("binding_id")?;
+    let binding_version: i64 = row.try_get("binding_version")?;
+    if binding_id.is_nil() || binding_version <= 0 {
+        return Err(DbError::InvalidData(
+            "identity binding has invalid stable evidence".to_string(),
+        ));
+    }
     Ok(IdentityBinding {
+        binding_id,
         issuer: row.try_get("issuer")?,
         uid: row.try_get("uid")?,
         pubkey: row.try_get("pubkey")?,
+        binding_version: u64::try_from(binding_version).map_err(|_| {
+            DbError::InvalidData("identity binding version is out of range".to_string())
+        })?,
+        binding_state: BindingState::parse(row.try_get("binding_state")?)?,
+        binding_provenance: BindingProvenance::parse(row.try_get("binding_provenance")?)?,
         display_name: row.try_get("display_name")?,
         source: row.try_get("source")?,
         created_at: row.try_get("created_at")?,
@@ -147,7 +393,8 @@ async fn active_by_principal_tx(
 ) -> Result<Option<IdentityBinding>> {
     let row = sqlx::query(
         r#"
-        SELECT issuer, uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
+        SELECT binding_id, issuer, uid, pubkey, binding_version, binding_state,
+               binding_provenance, display_name, source, created_at, updated_at, last_seen_at
         FROM identity_bindings
         WHERE community_id = $1 AND issuer = $2 AND uid = $3 AND revoked_at IS NULL
         FOR UPDATE
@@ -168,7 +415,8 @@ async fn active_by_pubkey_tx(
 ) -> Result<Option<IdentityBinding>> {
     let row = sqlx::query(
         r#"
-        SELECT issuer, uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
+        SELECT binding_id, issuer, uid, pubkey, binding_version, binding_state,
+               binding_provenance, display_name, source, created_at, updated_at, last_seen_at
         FROM identity_bindings
         WHERE community_id = $1 AND pubkey = $2 AND revoked_at IS NULL
         FOR UPDATE
@@ -179,34 +427,6 @@ async fn active_by_pubkey_tx(
     .fetch_optional(&mut **tx)
     .await?;
     row.map(row_to_binding).transpose()
-}
-
-async fn revoked_pair_exists_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
-    issuer: &str,
-    uid: &str,
-    pubkey: &[u8],
-) -> Result<bool> {
-    let row = sqlx::query(
-        r#"
-        SELECT 1
-        FROM identity_bindings
-        WHERE community_id = $1
-          AND issuer = $2
-          AND uid = $3
-          AND pubkey = $4
-          AND revoked_at IS NOT NULL
-        LIMIT 1
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(issuer)
-    .bind(uid)
-    .bind(pubkey)
-    .fetch_optional(&mut **tx)
-    .await?;
-    Ok(row.is_some())
 }
 
 async fn principal_disabled_tx(
@@ -221,9 +441,15 @@ async fn principal_disabled_tx(
         WHERE community_id = $1 AND issuer = $2 AND uid = $3
           AND disabled_at IS NOT NULL
         UNION ALL
-        SELECT 1 FROM identity_bindings
-        WHERE community_id = $1 AND issuer = $2 AND uid = $3
-          AND revoked_at IS NOT NULL AND revocation_scope = 'principal'
+        SELECT 1 FROM identity_bindings legacy
+        WHERE legacy.community_id = $1 AND legacy.issuer = $2 AND legacy.uid = $3
+          AND legacy.revoked_at IS NOT NULL AND legacy.revocation_scope = 'principal'
+          AND NOT EXISTS (
+              SELECT 1 FROM identity_principals current
+              WHERE current.community_id = legacy.community_id
+                AND current.issuer = legacy.issuer
+                AND current.uid = legacy.uid
+          )
         LIMIT 1
         "#,
     )
@@ -244,9 +470,6 @@ async fn key_revoked_tx(
         r#"
         SELECT 1 FROM identity_revoked_keys
         WHERE community_id = $1 AND pubkey = $2
-        UNION ALL
-        SELECT 1 FROM identity_bindings
-        WHERE community_id = $1 AND pubkey = $2 AND revoked_at IS NOT NULL
         LIMIT 1
         "#,
     )
@@ -266,13 +489,11 @@ async fn principal_requires_rotation_tx(
     let row = sqlx::query(
         r#"
         SELECT 1
-        FROM identity_bindings
+        FROM identity_pending_replacements
         WHERE community_id = $1
           AND issuer = $2
-          AND uid = $3
-          AND revoked_at IS NOT NULL
-          AND revocation_scope = 'key'
-          AND rotation_completed_at IS NULL
+          AND subject = $3
+          AND cleared_at IS NULL
         LIMIT 1
         "#,
     )
@@ -284,6 +505,65 @@ async fn principal_requires_rotation_tx(
     Ok(row.is_some())
 }
 
+async fn retired_pair_exists_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    issuer: &str,
+    subject: &str,
+    pubkey: &[u8],
+) -> Result<bool> {
+    Ok(sqlx::query(
+        "SELECT 1 FROM identity_retired_pairs \
+         WHERE community_id=$1 AND issuer=$2 AND subject=$3 AND pubkey=$4 \
+         UNION ALL \
+         SELECT 1 FROM identity_bindings \
+         WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND pubkey=$4 \
+           AND revoked_at IS NOT NULL \
+         LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(issuer)
+    .bind(subject)
+    .bind(pubkey)
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some())
+}
+
+async fn migration_denied_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    issuer: &str,
+    subject: &str,
+) -> Result<bool> {
+    Ok(sqlx::query(
+        "SELECT 1 FROM identity_migration_denials \
+         WHERE community_id=$1 AND issuer=$2 AND subject=$3",
+    )
+    .bind(community_id.as_uuid())
+    .bind(issuer)
+    .bind(subject)
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some())
+}
+
+async fn migration_key_denied_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    pubkey: &[u8],
+) -> Result<bool> {
+    Ok(sqlx::query(
+        "SELECT 1 FROM identity_migration_denied_keys \
+         WHERE community_id=$1 AND pubkey=$2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(pubkey)
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some())
+}
+
 fn conflict_from(binding: IdentityBinding) -> IdentityBindingConflict {
     IdentityBindingConflict {
         issuer: binding.issuer,
@@ -293,17 +573,57 @@ fn conflict_from(binding: IdentityBinding) -> IdentityBindingConflict {
     }
 }
 
-async fn lock_identity_key_strings_tx(
+const IDENTITY_LOCK_ENCODING_VERSION: u8 = 1;
+
+fn identity_lock_coordinate(kind: u8, community_id: CommunityId, parts: &[&[u8]]) -> Vec<u8> {
+    let mut coordinate =
+        Vec::with_capacity(2 + 16 + parts.iter().map(|part| 8 + part.len()).sum::<usize>());
+    coordinate.push(IDENTITY_LOCK_ENCODING_VERSION);
+    coordinate.push(kind);
+    coordinate.extend_from_slice(community_id.as_uuid().as_bytes());
+    for part in parts {
+        let length = part.len() as u64;
+        coordinate.extend_from_slice(&length.to_be_bytes());
+        coordinate.extend_from_slice(part);
+    }
+    coordinate
+}
+
+pub(crate) fn principal_lock_coordinate(
+    community_id: CommunityId,
+    issuer: &str,
+    subject: &str,
+) -> Vec<u8> {
+    identity_lock_coordinate(1, community_id, &[issuer.as_bytes(), subject.as_bytes()])
+}
+
+pub(crate) fn key_lock_coordinate(community_id: CommunityId, pubkey: &[u8]) -> Vec<u8> {
+    identity_lock_coordinate(2, community_id, &[pubkey])
+}
+
+pub(crate) fn binding_lock_coordinate(community_id: CommunityId, binding_id: Uuid) -> Vec<u8> {
+    identity_lock_coordinate(3, community_id, &[binding_id.as_bytes()])
+}
+
+pub(crate) fn operation_lock_coordinate(community_id: CommunityId, operation_id: Uuid) -> Vec<u8> {
+    identity_lock_coordinate(4, community_id, &[operation_id.as_bytes()])
+}
+
+pub(crate) async fn lock_identity_coordinates_tx(
     tx: &mut Transaction<'_, Postgres>,
-    mut keys: Vec<String>,
+    mut coordinates: Vec<Vec<u8>>,
 ) -> Result<()> {
-    keys.sort();
-    keys.dedup();
-    for key in keys {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('identity_bindings'), hashtext($1))")
-            .bind(key)
-            .execute(&mut **tx)
-            .await?;
+    coordinates.sort();
+    coordinates.dedup();
+    for coordinate in coordinates {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+                hashtext('buzz_nip_fi_v1'), hashtext(encode($1, 'hex'))\
+            )",
+        )
+        .bind(coordinate)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }
@@ -315,11 +635,11 @@ async fn lock_identity_keys_tx(
     uid: &str,
     pubkey: &[u8],
 ) -> Result<()> {
-    lock_identity_key_strings_tx(
+    lock_identity_coordinates_tx(
         tx,
         vec![
-            format!("{}:principal:{issuer}:{uid}", community_id.as_uuid()),
-            format!("{}:pubkey:{}", community_id.as_uuid(), hex::encode(pubkey)),
+            principal_lock_coordinate(community_id, issuer, uid),
+            key_lock_coordinate(community_id, pubkey),
         ],
     )
     .await
@@ -374,82 +694,232 @@ pub(crate) async fn bind_or_validate_identity_tx(
         source,
     } = *identity;
     validate_inputs(issuer, uid, pubkey, source)?;
+    let (enrollment_mode, key_attested) = match source {
+        SOURCE_JWT_NPUB => (EnrollmentMode::AttestedKey, true),
+        SOURCE_DB_BINDING => (EnrollmentMode::Tofu, false),
+        _ => {
+            return Err(DbError::InvalidData(
+                "identity binding has invalid legacy source".to_string(),
+            ))
+        }
+    };
+    let result = resolve_identity_binding_tx(
+        tx,
+        community_id,
+        &ResolveBindingInput {
+            issuer,
+            subject: uid,
+            pubkey,
+            display_name,
+            enrollment_mode,
+            key_attested,
+        },
+    )
+    .await?;
+    Ok(match result {
+        ResolveBindingResult::Enrolled(_) => BindIdentityResult::Created,
+        ResolveBindingResult::Existing(_) => BindIdentityResult::Matched,
+        ResolveBindingResult::Denied(BindingDenial::Conflict) => {
+            let conflict = active_by_principal_tx(tx, community_id, issuer, uid)
+                .await?
+                .or(active_by_pubkey_tx(tx, community_id, pubkey).await?)
+                .ok_or_else(|| {
+                    DbError::InvalidData(
+                        "identity binding conflict disappeared inside transaction".to_string(),
+                    )
+                })?;
+            BindIdentityResult::Conflict(conflict_from(conflict))
+        }
+        ResolveBindingResult::Denied(
+            BindingDenial::Revoked
+            | BindingDenial::BindingRequired
+            | BindingDenial::KeyAttestationRequired,
+        ) => BindIdentityResult::Revoked,
+    })
+}
 
+/// Resolve an exact issuer/subject/key binding under server-owned enrollment policy.
+pub async fn resolve_identity_binding(
+    pool: &PgPool,
+    community_id: CommunityId,
+    input: &ResolveBindingInput<'_>,
+) -> Result<ResolveBindingResult> {
+    let mut tx = pool.begin().await?;
+    let result = resolve_identity_binding_tx(&mut tx, community_id, input).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+async fn resolve_identity_binding_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    input: &ResolveBindingInput<'_>,
+) -> Result<ResolveBindingResult> {
+    validate_inputs(input.issuer, input.subject, input.pubkey, SOURCE_DB_BINDING)?;
     sqlx::query("SET LOCAL lock_timeout = '3s'")
         .execute(&mut **tx)
         .await?;
-    lock_identity_keys_tx(tx, community_id, issuer, uid, pubkey).await?;
+    lock_identity_keys_tx(tx, community_id, input.issuer, input.subject, input.pubkey).await?;
 
-    if principal_disabled_tx(tx, community_id, issuer, uid).await? {
-        return Ok(BindIdentityResult::Revoked);
-    }
-    if key_revoked_tx(tx, community_id, pubkey).await? {
-        return Ok(BindIdentityResult::Revoked);
-    }
-    if principal_requires_rotation_tx(tx, community_id, issuer, uid).await? {
-        return Ok(BindIdentityResult::Revoked);
+    let denied = migration_denied_tx(tx, community_id, input.issuer, input.subject).await?
+        || migration_key_denied_tx(tx, community_id, input.pubkey).await?
+        || principal_disabled_tx(tx, community_id, input.issuer, input.subject).await?
+        || key_revoked_tx(tx, community_id, input.pubkey).await?
+        || principal_requires_rotation_tx(tx, community_id, input.issuer, input.subject).await?
+        || retired_pair_exists_tx(tx, community_id, input.issuer, input.subject, input.pubkey)
+            .await?;
+    if denied {
+        return Ok(ResolveBindingResult::Denied(BindingDenial::Revoked));
     }
 
-    let active_principal = active_by_principal_tx(tx, community_id, issuer, uid).await?;
+    let active_principal =
+        active_by_principal_tx(tx, community_id, input.issuer, input.subject).await?;
+    if active_principal
+        .as_ref()
+        .is_some_and(|binding| binding.pubkey != input.pubkey)
+    {
+        return Ok(ResolveBindingResult::Denied(BindingDenial::Conflict));
+    }
+    let active_key = active_by_pubkey_tx(tx, community_id, input.pubkey).await?;
+    if active_key
+        .as_ref()
+        .is_some_and(|binding| binding.issuer != input.issuer || binding.uid != input.subject)
+    {
+        return Ok(ResolveBindingResult::Denied(BindingDenial::Conflict));
+    }
+
     if let Some(binding) = active_principal {
-        if binding.pubkey != pubkey {
-            return Ok(BindIdentityResult::Conflict(conflict_from(binding)));
-        }
-
+        let strengthen =
+            binding.binding_provenance == BindingProvenance::Tofu && input.key_attested;
+        let version = binding
+            .binding_version
+            .checked_add(u64::from(strengthen))
+            .ok_or_else(|| {
+                DbError::InvalidData("identity binding version exhausted".to_string())
+            })?;
         sqlx::query(
             r#"
             UPDATE identity_bindings
-            SET display_name = $5,
-                source = CASE
-                    WHEN source = 'jwt_npub' AND $6 = 'db_binding' THEN source
-                    ELSE $6
-                END,
-                updated_at = NOW(),
-                last_seen_at = NOW()
-            WHERE community_id = $1
-              AND issuer = $2
-              AND uid = $3
-              AND pubkey = $4
+            SET display_name=$5,
+                source=CASE WHEN $6 THEN 'jwt_npub' ELSE source END,
+                binding_provenance=CASE WHEN $6 THEN 'attested_key' ELSE binding_provenance END,
+                binding_version=CASE WHEN $6 THEN binding_version + 1 ELSE binding_version END,
+                updated_at=NOW(), last_seen_at=NOW()
+            WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND pubkey=$4
               AND revoked_at IS NULL
             "#,
         )
         .bind(community_id.as_uuid())
-        .bind(issuer)
-        .bind(uid)
-        .bind(pubkey)
-        .bind(display_name)
-        .bind(source)
+        .bind(input.issuer)
+        .bind(input.subject)
+        .bind(input.pubkey)
+        .bind(input.display_name)
+        .bind(strengthen)
         .execute(&mut **tx)
         .await?;
-        return Ok(BindIdentityResult::Matched);
-    }
-
-    let active_pubkey = active_by_pubkey_tx(tx, community_id, pubkey).await?;
-    if let Some(binding) = active_pubkey {
-        if binding.issuer != issuer || binding.uid != uid {
-            return Ok(BindIdentityResult::Conflict(conflict_from(binding)));
+        if strengthen {
+            sqlx::query(
+                r#"
+                INSERT INTO identity_binding_history
+                    (community_id, binding_id, binding_version, issuer, subject,
+                     pubkey, binding_state, binding_provenance, transition_kind, reason)
+                VALUES ($1, $2, $3, $4, $5, $6, 'active', 'attested_key',
+                        'provenance_strengthened', 'verified key attestation')
+                "#,
+            )
+            .bind(community_id.as_uuid())
+            .bind(binding.binding_id)
+            .bind(i64::try_from(version).map_err(|_| {
+                DbError::InvalidData("identity binding version is out of range".to_string())
+            })?)
+            .bind(input.issuer)
+            .bind(input.subject)
+            .bind(input.pubkey)
+            .execute(&mut **tx)
+            .await?;
         }
+        return Ok(ResolveBindingResult::Existing(BindingEvidence {
+            binding_id: binding.binding_id,
+            binding_version: version,
+            provenance: if strengthen {
+                BindingProvenance::AttestedKey
+            } else {
+                binding.binding_provenance
+            },
+        }));
     }
 
-    if revoked_pair_exists_tx(tx, community_id, issuer, uid, pubkey).await? {
-        return Ok(BindIdentityResult::Revoked);
+    let provenance = match input.enrollment_mode {
+        EnrollmentMode::AttestedKey if !input.key_attested => {
+            return Ok(ResolveBindingResult::Denied(
+                BindingDenial::KeyAttestationRequired,
+            ))
+        }
+        EnrollmentMode::AttestedKey => BindingProvenance::AttestedKey,
+        EnrollmentMode::Provisioned => {
+            return Ok(ResolveBindingResult::Denied(BindingDenial::BindingRequired))
+        }
+        EnrollmentMode::Tofu if input.key_attested => BindingProvenance::AttestedKey,
+        EnrollmentMode::Tofu => BindingProvenance::Tofu,
+    };
+    let next_version: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(binding_version), 0) + 1 FROM identity_bindings \
+         WHERE community_id=$1 AND issuer=$2 AND uid=$3",
+    )
+    .bind(community_id.as_uuid())
+    .bind(input.issuer)
+    .bind(input.subject)
+    .fetch_one(&mut **tx)
+    .await?;
+    if next_version <= 0 {
+        return Err(DbError::InvalidData(
+            "identity binding version exhausted".to_string(),
+        ));
     }
-
+    let binding_id = Uuid::new_v4();
     sqlx::query(
         r#"
-        INSERT INTO identity_bindings (community_id, issuer, uid, pubkey, display_name, source)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO identity_bindings
+            (community_id, issuer, uid, pubkey, display_name, source, binding_id,
+             binding_version, binding_state, binding_provenance)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9)
         "#,
     )
     .bind(community_id.as_uuid())
-    .bind(issuer)
-    .bind(uid)
-    .bind(pubkey)
-    .bind(display_name)
-    .bind(source)
+    .bind(input.issuer)
+    .bind(input.subject)
+    .bind(input.pubkey)
+    .bind(input.display_name)
+    .bind(provenance.legacy_source())
+    .bind(binding_id)
+    .bind(next_version)
+    .bind(provenance.as_str())
     .execute(&mut **tx)
     .await?;
-    Ok(BindIdentityResult::Created)
+    sqlx::query(
+        r#"
+        INSERT INTO identity_binding_history
+            (community_id, binding_id, binding_version, issuer, subject, pubkey,
+             binding_state, binding_provenance, transition_kind, reason)
+        VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, 'enroll', 'first enrollment')
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(binding_id)
+    .bind(next_version)
+    .bind(input.issuer)
+    .bind(input.subject)
+    .bind(input.pubkey)
+    .bind(provenance.as_str())
+    .execute(&mut **tx)
+    .await?;
+    Ok(ResolveBindingResult::Enrolled(BindingEvidence {
+        binding_id,
+        binding_version: u64::try_from(next_version).map_err(|_| {
+            DbError::InvalidData("identity binding version is out of range".to_string())
+        })?,
+        provenance,
+    }))
 }
 
 /// Return the active binding for `pubkey`, if one exists.
@@ -459,18 +929,29 @@ pub async fn get_active_identity_binding_by_pubkey(
     pubkey: &[u8],
 ) -> Result<Option<IdentityBinding>> {
     validate_pubkey(pubkey)?;
-    let row = sqlx::query(
-        r#"
-        SELECT issuer, uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
-        FROM identity_bindings
-        WHERE community_id = $1 AND pubkey = $2 AND revoked_at IS NULL
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(pubkey)
-    .fetch_optional(pool)
-    .await?;
-    row.map(row_to_binding).transpose()
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '3s'")
+        .execute(&mut *tx)
+        .await?;
+    lock_identity_coordinates_tx(&mut tx, vec![key_lock_coordinate(community_id, pubkey)]).await?;
+    let binding = active_by_pubkey_tx(&mut tx, community_id, pubkey).await?;
+    if let Some(binding) = binding.as_ref() {
+        let denied = migration_key_denied_tx(&mut tx, community_id, pubkey).await?
+            || migration_denied_tx(&mut tx, community_id, &binding.issuer, &binding.uid).await?
+            || principal_disabled_tx(&mut tx, community_id, &binding.issuer, &binding.uid).await?
+            || key_revoked_tx(&mut tx, community_id, pubkey).await?
+            || principal_requires_rotation_tx(&mut tx, community_id, &binding.issuer, &binding.uid)
+                .await?
+            || retired_pair_exists_tx(&mut tx, community_id, &binding.issuer, &binding.uid, pubkey)
+                .await?;
+        if denied {
+            return Err(DbError::InvalidData(
+                "active identity binding conflicts with lifecycle state".to_string(),
+            ));
+        }
+    }
+    tx.commit().await?;
+    Ok(binding)
 }
 
 /// Disable an issuer-qualified principal and revoke its active key.
@@ -486,80 +967,20 @@ pub async fn revoke_identity_principal(
     revoked_by: Option<&[u8]>,
     reason: &str,
 ) -> Result<bool> {
-    if issuer.trim().is_empty() || uid.trim().is_empty() || reason.trim().is_empty() {
-        return Err(DbError::InvalidData(
-            "identity principal revocation requires issuer, uid, and reason".to_string(),
-        ));
-    }
-    if let Some(pubkey) = revoked_by {
-        validate_pubkey(pubkey)?;
-    }
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET LOCAL lock_timeout = '3s'")
-        .execute(&mut *tx)
-        .await?;
-    // Enrollment and rotation take the principal lock first. Take it before
-    // discovering the current key so a concurrent first enrollment cannot
-    // slip between the lookup and the durable principal tombstone.
-    lock_identity_key_strings_tx(
-        &mut tx,
-        vec![format!(
-            "{}:principal:{issuer}:{uid}",
-            community_id.as_uuid()
-        )],
+    crate::identity_lifecycle::disable_identity_principal(
+        pool,
+        community_id,
+        crate::identity_lifecycle::LifecycleContext {
+            operation_id: Uuid::new_v4(),
+            actor: revoked_by,
+            reason,
+        },
+        crate::identity_lifecycle::IdentityPrincipal {
+            issuer,
+            subject: uid,
+        },
     )
     .await?;
-    let active_pubkey: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT pubkey FROM identity_bindings WHERE community_id = $1 AND issuer = $2 AND uid = $3 AND revoked_at IS NULL",
-    )
-    .bind(community_id.as_uuid())
-    .bind(issuer)
-    .bind(uid)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(pubkey) = active_pubkey.as_ref() {
-        lock_identity_key_strings_tx(
-            &mut tx,
-            vec![format!(
-                "{}:pubkey:{}",
-                community_id.as_uuid(),
-                hex::encode(pubkey)
-            )],
-        )
-        .await?;
-    }
-
-    sqlx::query(
-        r#"
-        INSERT INTO identity_principals
-            (community_id, issuer, uid, disabled_at, disabled_by, disabled_reason)
-        VALUES ($1, $2, $3, NOW(), $4, $5)
-        ON CONFLICT (community_id, issuer, uid) DO NOTHING
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(issuer)
-    .bind(uid)
-    .bind(revoked_by)
-    .bind(reason)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        r#"
-        UPDATE identity_bindings
-        SET revoked_at = NOW(), revoked_by = $4, revoked_reason = $5,
-            revocation_scope = 'principal', updated_at = NOW()
-        WHERE community_id = $1 AND issuer = $2 AND uid = $3 AND revoked_at IS NULL
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(issuer)
-    .bind(uid)
-    .bind(revoked_by)
-    .bind(reason)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
     Ok(true)
 }
 
@@ -572,60 +993,17 @@ pub async fn revoke_identity_key(
     revoked_by: Option<&[u8]>,
     reason: &str,
 ) -> Result<bool> {
-    validate_pubkey(pubkey)?;
-    if let Some(operator) = revoked_by {
-        validate_pubkey(operator)?;
-    }
-    if reason.trim().is_empty() {
-        return Err(DbError::InvalidData(
-            "identity key revocation reason must not be empty".to_string(),
-        ));
-    }
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET LOCAL lock_timeout = '3s'")
-        .execute(&mut *tx)
-        .await?;
-    // A community-scoped key tombstone is the entire correctness boundary.
-    // Do not acquire a principal lock after it: enrollment and rotation use
-    // principal→key ordering, and reversing that order can deadlock.
-    lock_identity_key_strings_tx(
-        &mut tx,
-        vec![format!(
-            "{}:pubkey:{}",
-            community_id.as_uuid(),
-            hex::encode(pubkey)
-        )],
+    crate::identity_lifecycle::revoke_identity_key(
+        pool,
+        community_id,
+        crate::identity_lifecycle::LifecycleContext {
+            operation_id: Uuid::new_v4(),
+            actor: revoked_by,
+            reason,
+        },
+        pubkey,
     )
     .await?;
-    sqlx::query(
-        r#"
-        INSERT INTO identity_revoked_keys
-            (community_id, pubkey, revoked_at, revoked_by, reason)
-        VALUES ($1, $2, NOW(), $3, $4)
-        ON CONFLICT (community_id, pubkey) DO NOTHING
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(pubkey)
-    .bind(revoked_by)
-    .bind(reason)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        r#"
-        UPDATE identity_bindings
-        SET revoked_at = NOW(), revoked_by = $3, revoked_reason = $4,
-            revocation_scope = 'key', updated_at = NOW()
-        WHERE community_id = $1 AND pubkey = $2 AND revoked_at IS NULL
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(pubkey)
-    .bind(revoked_by)
-    .bind(reason)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
     Ok(true)
 }
 
@@ -644,145 +1022,58 @@ pub async fn rotate_identity_binding(
     reason: &str,
 ) -> Result<()> {
     validate_inputs(issuer, uid, old_pubkey, source)?;
-    validate_pubkey(new_pubkey)?;
-    if old_pubkey == new_pubkey {
-        return Err(DbError::InvalidData(
-            "identity rotation requires a different replacement key".to_string(),
-        ));
-    }
-    if let Some(operator) = rotated_by {
-        validate_pubkey(operator)?;
-    }
-    if reason.trim().is_empty() {
-        return Err(DbError::InvalidData(
-            "identity rotation reason must not be empty".to_string(),
-        ));
-    }
-
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET LOCAL lock_timeout = '3s'")
-        .execute(&mut *tx)
-        .await?;
-    lock_identity_key_strings_tx(
-        &mut tx,
-        vec![
-            format!("{}:principal:{issuer}:{uid}", community_id.as_uuid()),
-            format!(
-                "{}:pubkey:{}",
-                community_id.as_uuid(),
-                hex::encode(old_pubkey)
-            ),
-            format!(
-                "{}:pubkey:{}",
-                community_id.as_uuid(),
-                hex::encode(new_pubkey)
-            ),
-        ],
-    )
-    .await?;
-    if principal_disabled_tx(&mut tx, community_id, issuer, uid).await? {
-        return Err(DbError::InvalidData(
-            "disabled identity principal cannot be rotated".to_string(),
-        ));
-    }
-    if key_revoked_tx(&mut tx, community_id, new_pubkey).await? {
-        return Err(DbError::InvalidData(
-            "identity rotation replacement key is revoked".to_string(),
-        ));
-    }
-    let active = active_by_principal_tx(&mut tx, community_id, issuer, uid).await?;
-    if active
-        .as_ref()
-        .is_some_and(|binding| binding.pubkey != old_pubkey)
-    {
-        return Err(DbError::InvalidData(
-            "identity rotation source key does not match active binding".to_string(),
-        ));
-    }
-    if active.is_none() {
-        let revoked_key = sqlx::query(
-            r#"
-            SELECT 1 FROM identity_bindings
-            WHERE community_id = $1 AND issuer = $2 AND uid = $3
-              AND pubkey = $4 AND revoked_at IS NOT NULL
-              AND revocation_scope = 'key'
-            FOR UPDATE
-            "#,
-        )
-        .bind(community_id.as_uuid())
-        .bind(issuer)
-        .bind(uid)
-        .bind(old_pubkey)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if revoked_key.is_none() {
+    let provenance = match source {
+        SOURCE_JWT_NPUB => BindingProvenance::AttestedKey,
+        SOURCE_DB_BINDING => BindingProvenance::Provisioned,
+        _ => {
             return Err(DbError::InvalidData(
-                "identity rotation source is neither active nor key-revoked".to_string(),
+                "identity rotation has invalid legacy source".to_string(),
+            ))
+        }
+    };
+    let replacement = crate::identity_lifecycle::VerifiedReplacementKey::after_verified_proof(
+        new_pubkey,
+        display_name,
+        provenance,
+        None,
+    )?;
+    let principal = crate::identity_lifecycle::IdentityPrincipal {
+        issuer,
+        subject: uid,
+    };
+    let context = crate::identity_lifecycle::LifecycleContext {
+        operation_id: Uuid::new_v4(),
+        actor: rotated_by,
+        reason,
+    };
+    if let Some(expected) =
+        crate::identity_lifecycle::get_pending_lineage(pool, community_id, principal).await?
+    {
+        if expected.retired_pubkey != old_pubkey {
+            return Err(DbError::InvalidData(
+                "identity rotation source does not match pending lineage".to_string(),
             ));
         }
+        crate::identity_lifecycle::recover_identity_binding(
+            pool,
+            community_id,
+            context,
+            principal,
+            &expected,
+            replacement,
+        )
+        .await?;
+    } else {
+        crate::identity_lifecycle::rotate_identity_binding(
+            pool,
+            community_id,
+            context,
+            principal,
+            old_pubkey,
+            replacement,
+        )
+        .await?;
     }
-    if active_by_pubkey_tx(&mut tx, community_id, new_pubkey)
-        .await?
-        .is_some()
-    {
-        return Err(DbError::InvalidData(
-            "identity rotation replacement key is already bound".to_string(),
-        ));
-    }
-
-    sqlx::query(
-        r#"
-        UPDATE identity_bindings
-        SET revoked_at = COALESCE(revoked_at, NOW()),
-            revoked_by = CASE WHEN revoked_at IS NULL THEN $5 ELSE revoked_by END,
-            revoked_reason = CASE WHEN revoked_at IS NULL THEN $6 ELSE revoked_reason END,
-            revocation_scope = CASE WHEN revoked_at IS NULL THEN 'rotation' ELSE revocation_scope END,
-            rotation_completed_at = NOW(), rotated_to_pubkey = $7,
-            rotation_by = $5, rotation_reason = $6, updated_at = NOW()
-        WHERE community_id = $1 AND issuer = $2 AND uid = $3
-          AND pubkey = $4
-          AND (revoked_at IS NULL OR revocation_scope = 'key')
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(issuer)
-    .bind(uid)
-    .bind(old_pubkey)
-    .bind(rotated_by)
-    .bind(reason)
-    .bind(new_pubkey)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        r#"
-        INSERT INTO identity_revoked_keys
-            (community_id, pubkey, revoked_at, revoked_by, reason)
-        VALUES ($1, $2, NOW(), $3, $4)
-        ON CONFLICT (community_id, pubkey) DO NOTHING
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(old_pubkey)
-    .bind(rotated_by)
-    .bind(reason)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        r#"
-        INSERT INTO identity_bindings
-            (community_id, issuer, uid, pubkey, display_name, source)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(issuer)
-    .bind(uid)
-    .bind(new_pubkey)
-    .bind(display_name)
-    .bind(source)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -822,6 +1113,46 @@ mod tests {
 
     fn random_pubkey() -> Vec<u8> {
         Keys::generate().public_key().to_bytes().to_vec()
+    }
+
+    #[test]
+    fn identity_lock_coordinates_are_typed_length_prefixed_and_domain_scoped() {
+        let first_domain = CommunityId::from_uuid(Uuid::from_u128(1));
+        let second_domain = CommunityId::from_uuid(Uuid::from_u128(2));
+        let principal_ab_c = principal_lock_coordinate(first_domain, "ab", "c");
+        let principal_a_bc = principal_lock_coordinate(first_domain, "a", "bc");
+
+        assert_ne!(
+            principal_ab_c, principal_a_bc,
+            "lengths must be unambiguous"
+        );
+        assert_ne!(
+            principal_ab_c,
+            principal_lock_coordinate(second_domain, "ab", "c"),
+            "domains must not share lock coordinates"
+        );
+        assert_ne!(
+            principal_ab_c,
+            key_lock_coordinate(first_domain, &[0_u8; 32]),
+            "coordinate kinds must be disjoint"
+        );
+    }
+
+    #[test]
+    fn identity_debug_formatting_redacts_private_coordinates() {
+        let input = IdentityBindingInput {
+            issuer: "private-issuer",
+            uid: "private-subject",
+            pubkey: &[42_u8; 32],
+            display_name: Some("private-display"),
+            source: SOURCE_JWT_NPUB,
+        };
+        let formatted = format!("{input:?}");
+
+        assert!(formatted.contains("[redacted]"));
+        for secret in ["private-issuer", "private-subject", "private-display"] {
+            assert!(!formatted.contains(secret));
+        }
     }
 
     #[test]
@@ -1338,6 +1669,15 @@ mod tests {
         .execute(&pool)
         .await
         .expect("simulate pre-lifecycle revocation");
+        sqlx::query(
+            "INSERT INTO identity_revoked_keys (community_id, pubkey, reason) \
+             VALUES ($1,$2,'legacy revoke')",
+        )
+        .bind(community.as_uuid())
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .expect("simulate legacy key tombstone projection");
 
         assert_eq!(
             bind_or_validate_identity(

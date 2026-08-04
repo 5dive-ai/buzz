@@ -101,6 +101,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+    type MigratedIdentityChainRow = (Vec<u8>, i64, Option<Vec<u8>>, String);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConstraintKind {
@@ -1539,6 +1540,27 @@ mod tests {
         .await
         .expect("insert explicit key selector");
 
+        let active_tombstoned_key = vec![21_u8; 32];
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id, issuer, uid, pubkey, source) \
+             VALUES ($1, 'https://idp.example', 'active-tombstone-owner', $2, 'db_binding')",
+        )
+        .bind(domain_a)
+        .bind(&active_tombstoned_key)
+        .execute(&pool)
+        .await
+        .expect("insert active binding overlapping legacy key tombstone");
+        sqlx::query(
+            "INSERT INTO identity_revoked_keys (community_id, pubkey, revoked_at, reason) \
+             VALUES ($1, $2, TIMESTAMPTZ '2025-03-02 00:00:00Z', 'legacy active overlap')",
+        )
+        .bind(domain_a)
+        .bind(&active_tombstoned_key)
+        .execute(&pool)
+        .await
+        .expect("insert authoritative tombstone overlapping active binding");
+
         sqlx::query(
             "INSERT INTO identity_principals \
              (community_id, issuer, uid, disabled_at, disabled_reason) \
@@ -1564,6 +1586,16 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert missing-lineage fixture");
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id, issuer, uid, pubkey, source) \
+             VALUES ($1, 'https://idp.example', 'active-target-owner', $2, 'db_binding')",
+        )
+        .bind(domain_a)
+        .bind(&missing_target)
+        .execute(&pool)
+        .await
+        .expect("insert cross-principal active target fixture");
         sqlx::query(
             "INSERT INTO identity_revoked_keys (community_id, pubkey, reason) VALUES ($1, $2, 'ambiguous legacy selector')",
         )
@@ -1592,8 +1624,8 @@ mod tests {
             "legacy identity constraints/indexes must remain unchanged"
         );
 
-        let chain: Vec<(Vec<u8>, i64, Option<Vec<u8>>)> = sqlx::query_as(
-            "SELECT binding.pubkey, binding.binding_version, replacement.pubkey \
+        let chain: Vec<MigratedIdentityChainRow> = sqlx::query_as(
+            "SELECT binding.pubkey, binding.binding_version, replacement.pubkey, binding.binding_provenance \
              FROM identity_bindings binding \
              LEFT JOIN identity_bindings replacement \
                ON replacement.community_id=binding.community_id \
@@ -1608,13 +1640,26 @@ mod tests {
         assert_eq!(chain.len(), 3);
         assert_eq!(
             chain[0],
-            (chain_keys[0].clone(), 1, Some(chain_keys[1].clone()))
+            (
+                chain_keys[0].clone(),
+                1,
+                Some(chain_keys[1].clone()),
+                "tofu".to_owned()
+            )
         );
         assert_eq!(
             chain[1],
-            (chain_keys[1].clone(), 2, Some(chain_keys[2].clone()))
+            (
+                chain_keys[1].clone(),
+                2,
+                Some(chain_keys[2].clone()),
+                "provisioned".to_owned()
+            )
         );
-        assert_eq!(chain[2], (chain_keys[2].clone(), 3, None));
+        assert_eq!(
+            chain[2],
+            (chain_keys[2].clone(), 3, None, "provisioned".to_owned())
+        );
 
         let pending: (Vec<u8>, i64, i64) = sqlx::query_as(
             "SELECT retired_pubkey, retired_binding_version, selector_version \
@@ -1625,7 +1670,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read pending selector");
-        assert_eq!(pending, (revoked_key, 1, 1));
+        assert_eq!(pending, (revoked_key.clone(), 1, 1));
 
         let quarantined: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM identity_migration_denials \
@@ -1636,6 +1681,338 @@ mod tests {
         .await
         .expect("read migration quarantine");
         assert!(quarantined);
+
+        let target_quarantined: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM identity_migration_denied_keys \
+             WHERE community_id=$1 AND pubkey=$2)",
+        )
+        .bind(domain_a)
+        .bind(&missing_target)
+        .fetch_one(&pool)
+        .await
+        .expect("read migrated key quarantine");
+        assert!(target_quarantined);
+
+        assert!(
+            crate::identity_binding::get_active_identity_binding_by_pubkey(
+                &pool,
+                buzz_core::CommunityId::from_uuid(domain_a),
+                &missing_target,
+            )
+            .await
+            .is_err(),
+            "migrated domain-key quarantine must deny active authorization lookup"
+        );
+
+        let clean_replacement_key = vec![32_u8; 32];
+        let clean_replacement =
+            crate::identity_lifecycle::VerifiedReplacementKey::after_verified_proof(
+                &clean_replacement_key,
+                None,
+                crate::identity_binding::BindingProvenance::Provisioned,
+                Some("migration-test-policy"),
+            )
+            .expect("construct clean rotation replacement");
+        assert!(crate::identity_lifecycle::rotate_identity_binding(
+            &pool,
+            buzz_core::CommunityId::from_uuid(domain_a),
+            crate::identity_lifecycle::LifecycleContext {
+                operation_id: uuid::Uuid::new_v4(),
+                actor: None,
+                reason: "migrated key quarantine must not be laundered",
+            },
+            crate::identity_lifecycle::IdentityPrincipal {
+                issuer: "https://idp.example",
+                subject: "active-target-owner",
+            },
+            &missing_target,
+            clean_replacement,
+        )
+        .await
+        .is_err());
+
+        assert!(
+            crate::identity_binding::get_active_identity_binding_by_pubkey(
+                &pool,
+                buzz_core::CommunityId::from_uuid(domain_a),
+                &active_tombstoned_key,
+            )
+            .await
+            .is_err(),
+            "legacy key tombstone must deny migrated active authorization lookup"
+        );
+        let tombstone_rotation_key = vec![33_u8; 32];
+        let tombstone_rotation =
+            crate::identity_lifecycle::VerifiedReplacementKey::after_verified_proof(
+                &tombstone_rotation_key,
+                None,
+                crate::identity_binding::BindingProvenance::Provisioned,
+                Some("migration-test-policy"),
+            )
+            .expect("construct tombstone rotation replacement");
+        assert!(crate::identity_lifecycle::rotate_identity_binding(
+            &pool,
+            buzz_core::CommunityId::from_uuid(domain_a),
+            crate::identity_lifecycle::LifecycleContext {
+                operation_id: uuid::Uuid::new_v4(),
+                actor: None,
+                reason: "legacy key tombstone must not be laundered",
+            },
+            crate::identity_lifecycle::IdentityPrincipal {
+                issuer: "https://idp.example",
+                subject: "active-tombstone-owner",
+            },
+            &active_tombstoned_key,
+            tombstone_rotation,
+        )
+        .await
+        .is_err());
+
+        let before_denials: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM identity_lifecycle_operations WHERE community_id=$1)",
+        )
+        .bind(domain_a)
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot migrated authority state");
+        let domain_a_id = buzz_core::CommunityId::from_uuid(domain_a);
+        for (subject, key) in [
+            ("ambiguous", missing_old.as_slice()),
+            ("other-principal", missing_target.as_slice()),
+            ("other-revoked-principal", revoked_key.as_slice()),
+        ] {
+            let result = crate::identity_binding::resolve_identity_binding(
+                &pool,
+                domain_a_id,
+                &crate::identity_binding::ResolveBindingInput {
+                    issuer: "https://idp.example",
+                    subject,
+                    pubkey: key,
+                    display_name: None,
+                    enrollment_mode: crate::identity_binding::EnrollmentMode::AttestedKey,
+                    key_attested: true,
+                },
+            )
+            .await
+            .expect("resolve migrated denied identity");
+            assert_eq!(
+                result,
+                crate::identity_binding::ResolveBindingResult::Denied(
+                    crate::identity_binding::BindingDenial::Revoked
+                )
+            );
+        }
+        let denied_replacement =
+            crate::identity_lifecycle::VerifiedReplacementKey::after_verified_proof(
+                &missing_target,
+                None,
+                crate::identity_binding::BindingProvenance::Provisioned,
+                Some("migration-test-policy"),
+            )
+            .expect("construct denied migrated replacement");
+        assert!(crate::identity_lifecycle::provision_identity_binding(
+            &pool,
+            domain_a_id,
+            crate::identity_lifecycle::LifecycleContext {
+                operation_id: uuid::Uuid::new_v4(),
+                actor: None,
+                reason: "migrated ambiguity must block lifecycle",
+            },
+            crate::identity_lifecycle::IdentityPrincipal {
+                issuer: "https://idp.example",
+                subject: "lifecycle-other-principal",
+            },
+            crate::identity_binding::EnrollmentMode::Provisioned,
+            denied_replacement,
+        )
+        .await
+        .is_err());
+        let after_denials: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM identity_lifecycle_operations WHERE community_id=$1)",
+        )
+        .bind(domain_a)
+        .fetch_one(&pool)
+        .await
+        .expect("verify migrated denials did not mutate authority");
+        assert_eq!(after_denials, before_denials);
+
+        let domain_b_result = crate::identity_binding::resolve_identity_binding(
+            &pool,
+            buzz_core::CommunityId::from_uuid(domain_b),
+            &crate::identity_binding::ResolveBindingInput {
+                issuer: "https://idp.example",
+                subject: "cross-domain-allowed",
+                pubkey: &missing_target,
+                display_name: None,
+                enrollment_mode: crate::identity_binding::EnrollmentMode::AttestedKey,
+                key_attested: true,
+            },
+        )
+        .await
+        .expect("resolve same key in independent domain");
+        assert!(matches!(
+            domain_b_result,
+            crate::identity_binding::ResolveBindingResult::Enrolled(_)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated disposable Postgres database"]
+    async fn identity_0029_imports_arbitrary_histories_and_quarantines_temporal_inversion() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(28, &pool)
+            .await
+            .expect("apply migrations through legacy identity lifecycle");
+        let domain = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1,$2)")
+            .bind(domain)
+            .bind(format!("identity-0029-history-{}.example", domain.simple()))
+            .execute(&pool)
+            .await
+            .expect("insert history community");
+
+        for length in [1_usize, 2, 3, 8, 32] {
+            let subject = format!("history-{length}");
+            let keys = (0..length)
+                .map(|index| {
+                    let mut key = vec![0_u8; 32];
+                    key[0] = length as u8;
+                    key[1] = index as u8;
+                    key[31] = 0xa5;
+                    key
+                })
+                .collect::<Vec<_>>();
+            // Deliberately reverse insertion order. Equal timestamps model the
+            // transaction-stable NOW() values emitted by the legacy helper.
+            for index in (0..length).rev() {
+                if index + 1 == length {
+                    sqlx::query(
+                        "INSERT INTO identity_bindings \
+                         (community_id,issuer,uid,pubkey,source,created_at,updated_at,last_seen_at) \
+                         VALUES ($1,'https://idp.example',$2,$3,'db_binding', \
+                                 TIMESTAMPTZ '2025-04-01 00:00:00Z', \
+                                 TIMESTAMPTZ '2025-04-01 00:00:00Z', \
+                                 TIMESTAMPTZ '2025-04-01 00:00:00Z')",
+                    )
+                    .bind(domain)
+                    .bind(&subject)
+                    .bind(&keys[index])
+                    .execute(&pool)
+                    .await
+                    .expect("insert terminal history node");
+                } else {
+                    sqlx::query(
+                        "INSERT INTO identity_bindings \
+                         (community_id,issuer,uid,pubkey,source,created_at,updated_at,last_seen_at, \
+                          revoked_at,revoked_reason,revocation_scope,rotation_completed_at, \
+                          rotated_to_pubkey,rotation_reason) \
+                         VALUES ($1,'https://idp.example',$2,$3,'db_binding', \
+                                 TIMESTAMPTZ '2025-04-01 00:00:00Z', \
+                                 TIMESTAMPTZ '2025-04-01 00:00:00Z', \
+                                 TIMESTAMPTZ '2025-04-01 00:00:00Z', \
+                                 TIMESTAMPTZ '2025-04-01 00:00:00Z','legacy rotation','rotation', \
+                                 TIMESTAMPTZ '2025-04-01 00:00:00Z',$4,'legacy rotation')",
+                    )
+                    .bind(domain)
+                    .bind(&subject)
+                    .bind(&keys[index])
+                    .bind(&keys[index + 1])
+                    .execute(&pool)
+                    .await
+                    .expect("insert retired history node");
+                }
+            }
+        }
+
+        let older_target = vec![240_u8; 32];
+        let newer_predecessor = vec![241_u8; 32];
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id,issuer,uid,pubkey,source,created_at,updated_at,last_seen_at) \
+             VALUES ($1,'https://idp.example','temporal-inversion',$2,'db_binding', \
+                     TIMESTAMPTZ '2024-01-01 00:00:00Z', \
+                     TIMESTAMPTZ '2024-01-01 00:00:00Z', \
+                     TIMESTAMPTZ '2024-01-01 00:00:00Z')",
+        )
+        .bind(domain)
+        .bind(&older_target)
+        .execute(&pool)
+        .await
+        .expect("insert older target");
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id,issuer,uid,pubkey,source,created_at,updated_at,last_seen_at, \
+              revoked_at,revoked_reason,revocation_scope,rotation_completed_at, \
+              rotated_to_pubkey,rotation_reason) \
+             VALUES ($1,'https://idp.example','temporal-inversion',$2,'db_binding', \
+                     TIMESTAMPTZ '2025-01-01 00:00:00Z', \
+                     TIMESTAMPTZ '2025-01-01 00:00:00Z', \
+                     TIMESTAMPTZ '2025-01-01 00:00:00Z', \
+                     TIMESTAMPTZ '2025-01-01 00:00:00Z','invalid rotation','rotation', \
+                     TIMESTAMPTZ '2025-01-01 00:00:00Z',$3,'invalid rotation')",
+        )
+        .bind(domain)
+        .bind(&newer_predecessor)
+        .bind(&older_target)
+        .execute(&pool)
+        .await
+        .expect("insert temporally inverted predecessor");
+
+        run_migrations(&pool)
+            .await
+            .expect("import arbitrary valid histories without aborting");
+        for length in [1_usize, 2, 3, 8, 32] {
+            let subject = format!("history-{length}");
+            let rows: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT binding_version,binding_provenance FROM identity_bindings \
+                 WHERE community_id=$1 AND issuer='https://idp.example' AND uid=$2 \
+                 ORDER BY binding_version",
+            )
+            .bind(domain)
+            .bind(&subject)
+            .fetch_all(&pool)
+            .await
+            .expect("read imported history");
+            assert_eq!(rows.len(), length);
+            for (index, (version, provenance)) in rows.iter().enumerate() {
+                assert_eq!(*version, (index + 1) as i64);
+                assert_eq!(provenance, if index == 0 { "tofu" } else { "provisioned" });
+            }
+            let edges: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM identity_binding_lineage lineage \
+                 JOIN identity_bindings binding \
+                   ON binding.community_id=lineage.community_id \
+                  AND binding.binding_id=lineage.predecessor_binding_id \
+                 WHERE binding.community_id=$1 AND binding.issuer='https://idp.example' AND binding.uid=$2",
+            )
+            .bind(domain)
+            .bind(&subject)
+            .fetch_one(&pool)
+            .await
+            .expect("count imported lineage");
+            assert_eq!(edges, length.saturating_sub(1) as i64);
+        }
+        let inversion_denied: (bool, bool) = sqlx::query_as(
+            "SELECT \
+               EXISTS(SELECT 1 FROM identity_migration_denials \
+                      WHERE community_id=$1 AND issuer='https://idp.example' AND subject='temporal-inversion'), \
+               EXISTS(SELECT 1 FROM identity_migration_denied_keys \
+                      WHERE community_id=$1 AND pubkey=$2)",
+        )
+        .bind(domain)
+        .bind(&older_target)
+        .fetch_one(&pool)
+        .await
+        .expect("read temporal inversion quarantine");
+        assert_eq!(inversion_denied, (true, true));
     }
 
     #[tokio::test]
@@ -1666,20 +2043,15 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert rollback fixture");
+        // Reserve the name of 0029's final index so the transaction fails only
+        // after every preceding additive DDL and backfill statement has run.
         sqlx::query(
-            "CREATE FUNCTION reject_o3_projection() RETURNS trigger LANGUAGE plpgsql AS $$ \
-             BEGIN RAISE EXCEPTION 'injected O3 projection failure'; END $$",
+            "CREATE INDEX idx_identity_lifecycle_operations_key \
+             ON identity_bindings (community_id, pubkey)",
         )
         .execute(&pool)
         .await
-        .expect("create failure function");
-        sqlx::query(
-            "CREATE TRIGGER reject_o3_projection BEFORE UPDATE ON identity_bindings \
-             FOR EACH ROW EXECUTE FUNCTION reject_o3_projection()",
-        )
-        .execute(&pool)
-        .await
-        .expect("create failure trigger");
+        .expect("create late migration conflict");
 
         assert!(MIGRATOR.run_to(29, &pool).await.is_err());
         let projected_tables: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
@@ -1706,14 +2078,15 @@ mod tests {
                 .await
                 .expect("read latest migration");
         assert_eq!(latest, 28);
-        sqlx::query("DROP TRIGGER reject_o3_projection ON identity_bindings")
+        // sqlx's failed pool-backed migration attempt can return the session
+        // while its session advisory lock is still held. Closing this
+        // disposable pool releases that lock before the explicit retry.
+        pool.close().await;
+        let pool = connect_test_pool().await;
+        sqlx::query("DROP INDEX idx_identity_lifecycle_operations_key")
             .execute(&pool)
             .await
-            .expect("drop failure trigger");
-        sqlx::query("DROP FUNCTION reject_o3_projection()")
-            .execute(&pool)
-            .await
-            .expect("drop failure function");
+            .expect("drop late migration conflict");
         run_migrations(&pool)
             .await
             .expect("retry additive projection after rollback");

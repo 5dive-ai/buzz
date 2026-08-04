@@ -105,7 +105,9 @@ test("an empty mesh reads as an honest empty state", () => {
     ),
     "No mesh capacity yet",
   );
-  assert.equal(describeMeshCapacity(null), "No mesh capacity yet");
+  // `null` is "not fetched yet" and must not be reported as an empty mesh:
+  // that would pass judgement on everyone else's machines during startup.
+  assert.equal(describeMeshCapacity(null), "Checking mesh capacity…");
 });
 
 test("capacity formatting keeps small figures meaningful", () => {

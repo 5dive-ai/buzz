@@ -29,6 +29,18 @@ pub struct MeshServingUsage {
     pub endpoint_attempts: u64,
     /// Other nodes currently visible as peers.
     pub peers: u64,
+    /// Completed requests this node's own GPU answered.
+    ///
+    /// From `routing_metrics.pressure`. Unlike the `*_attempts` counters these
+    /// count finished requests rather than tries, so they are the honest basis
+    /// for "this ran here" vs "this ran on someone else's machine".
+    pub locally_served: u64,
+    /// Completed requests a peer answered for this node — i.e. this machine
+    /// CONSUMED another member's compute. The one true "I used someone else's
+    /// hardware" figure available today.
+    pub remotely_served: u64,
+    /// Completed requests answered by a configured endpoint (not a mesh peer).
+    pub endpoint_served: u64,
 }
 
 /// Pure extractor: project a raw SDK status payload into [`MeshServingUsage`].
@@ -40,6 +52,7 @@ pub fn serving_usage_from_payload(payload: &serde_json::Value) -> MeshServingUsa
     let u64_at = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
     let rm = payload.get("routing_metrics");
     let local = rm.and_then(|m| m.get("local_node"));
+    let pressure = rm.and_then(|m| m.get("pressure"));
     let get_u64 = |obj: Option<&serde_json::Value>, key: &str| {
         obj.and_then(|o| o.get(key)).map(u64_at).unwrap_or(0)
     };
@@ -64,5 +77,8 @@ pub fn serving_usage_from_payload(payload: &serde_json::Value) -> MeshServingUsa
             .and_then(serde_json::Value::as_array)
             .map(|a| a.len() as u64)
             .unwrap_or(0),
+        locally_served: get_u64(pressure, "locally_served_request_count"),
+        remotely_served: get_u64(pressure, "remotely_served_request_count"),
+        endpoint_served: get_u64(pressure, "endpoint_request_count"),
     }
 }

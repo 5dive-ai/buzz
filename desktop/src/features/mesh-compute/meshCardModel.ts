@@ -76,7 +76,13 @@ function plural(n: number, one: string, many = `${one}s`): string {
  * says "total": the underlying query is capped at 100 members.
  */
 export function describeMeshCapacity(snapshot: MeshSnapshot | null): string {
-  if (!snapshot || snapshot.sharingDeviceCount === 0) {
+  // `null` is "not fetched yet", NOT "the community has nothing". Claiming an
+  // empty mesh before the first snapshot lands reads as a verdict on everyone
+  // else's machines while the card is still starting up.
+  if (!snapshot) {
+    return "Checking mesh capacity…";
+  }
+  if (snapshot.sharingDeviceCount === 0) {
     return "No mesh capacity yet";
   }
   const { sharingDeviceCount: count, sharedCapacityGb: gb } = snapshot;
@@ -280,7 +286,7 @@ export function deriveMeshCardModel({
     ...base,
     tone: "idle",
     headline: capacity,
-    detail: ready ?? "Turn on to let members run agents on this computer.",
+    detail: ready ?? "Share compute to run models.",
     showSoloHint: false,
   };
 }

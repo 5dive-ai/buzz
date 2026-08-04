@@ -227,7 +227,7 @@ export function MeshComputeSettingsCard() {
     <section className="min-w-0" data-testid="settings-mesh-share-compute">
       <SettingsSectionHeader
         title="Share compute"
-        description="Share this machine with members of this relay so they can run agents here."
+        description="Share this machine's compute so members can run models on it."
       />
 
       {error ? (

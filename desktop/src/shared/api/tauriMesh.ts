@@ -83,6 +83,22 @@ export type MeshServingUsage = {
   remoteAttempts: number;
   endpointAttempts: number;
   peers: number;
+  /**
+   * Completed requests this machine's own GPU answered.
+   *
+   * From `routing_metrics.pressure`. Unlike the `*Attempts` counters these are
+   * finished requests rather than tries, which makes them the honest basis for
+   * "this ran here" vs "this ran on someone else's machine".
+   */
+  locallyServed: number;
+  /**
+   * Completed requests a peer answered for this machine — i.e. this machine
+   * CONSUMED another member's compute. The one true "I used someone else's
+   * hardware" figure available today.
+   */
+  remotelyServed: number;
+  /** Completed requests answered by a configured endpoint, not a mesh peer. */
+  endpointServed: number;
 };
 
 export async function meshServingUsage(): Promise<MeshServingUsage> {
@@ -156,6 +172,14 @@ export type MeshSnapshot = {
   models: string[];
   devices: MeshSnapshotDevice[];
   includesSelf: boolean;
+  /**
+   * Members in the community right now (NIP-43 roster size).
+   *
+   * The denominator for "N of M sharing". Never used to estimate unshared
+   * capacity: a member who never starts a node publishes no status note, so
+   * their hardware is unknown by design. Ghosts are a count, never GB.
+   */
+  memberCount: number;
   reason: string | null;
 };
 

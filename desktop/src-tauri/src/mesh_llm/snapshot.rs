@@ -80,6 +80,13 @@ pub struct MeshSnapshot {
     pub devices: Vec<MeshSnapshotDevice>,
     /// True when the local member's own device is among the sharing devices.
     pub includes_self: bool,
+    /// Members in the community right now (NIP-43 roster size).
+    ///
+    /// The denominator for "N of M sharing". Deliberately NOT used to estimate
+    /// unshared capacity: a member who never starts a node publishes no status
+    /// note, so their hardware is unknown by design — they never consented to
+    /// disclose it. Ghost nodes in the topology are a count, never GB.
+    pub member_count: usize,
     /// Why the snapshot is empty, when it is. Never a hard error: an empty
     /// mesh is a normal, expected state.
     pub reason: Option<String>,
@@ -238,6 +245,7 @@ pub fn snapshot_from_events(
     };
 
     MeshSnapshot {
+        member_count: members.len(),
         sharing_device_count,
         shared_capacity_gb,
         models,

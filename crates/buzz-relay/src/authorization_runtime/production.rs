@@ -1208,6 +1208,13 @@ mod tests {
     struct SyntheticUnavailableProvider;
 
     impl AuthorizationProvider for SyntheticUnavailableProvider {
+        fn profile_id(&self) -> buzz_auth::AuthorizationProfileId {
+            buzz_auth::AuthorizationProfileId::from_server_configuration(
+                "profile.synthetic-unavailable.example",
+            )
+            .expect("synthetic profile is valid")
+        }
+
         fn authorize<'a>(
             &'a self,
             _request: &'a AuthorizationRequest,

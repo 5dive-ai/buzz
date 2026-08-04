@@ -460,6 +460,10 @@ mod tests {
     }
 
     impl AuthorizationProvider for AllowProvider {
+        fn profile_id(&self) -> AuthorizationProfileId {
+            profile()
+        }
+
         fn authorize<'a>(
             &'a self,
             request: &'a AuthorizationRequest,

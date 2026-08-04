@@ -1,5 +1,5 @@
 /**
- * Per-pubkey localStorage record store for channels manually marked unread via
+ * Per-pubkey localStorage cache of channels manually marked unread via
  * right-click → "mark unread". Keyed by channelId (not thread-root). Persisted
  * so the sidebar badge survives reload and the rail observer can read it for
  * inactive communities.
@@ -13,8 +13,12 @@
  * On identity change, the in-memory map is swapped to the current pubkey's
  * persisted data. Old pubkey data is NOT wiped from localStorage.
  *
- * NOT synced to the relay — NIP-RS markers are monotonic and cannot represent
- * a retrograde "unread" state. localStorage is best-effort (per-device).
+ * This store is the local-device cache of the NIP-RS manual-unread override
+ * layer (kind:30078 `ov_*` entries). Marking a channel unread publishes a
+ * NIP-RS override event to the relay via ReadStateManager so the override
+ * propagates to other devices. Marking a channel read clears the override
+ * both locally and on the relay. The `markerAtWhenForced` baseline still drives
+ * the "cross-device read already covered this" gate for the rail observer.
  */
 
 /** channelId → NIP-RS read marker (unix seconds) at force-time, or null */

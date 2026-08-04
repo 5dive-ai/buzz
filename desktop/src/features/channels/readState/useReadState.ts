@@ -2,13 +2,22 @@ import * as React from "react";
 import {
   ReadStateManager,
   type ContextParentResolver,
+  type MarkResult,
+  type ReadStateProjection,
 } from "@/features/channels/readState/readStateManager";
+import type { OverrideLiveness } from "@/features/channels/readState/readStateFormat";
 import type { RelayClient } from "@/shared/api/relayClientSession";
 
 const noopGetTimestamp = () => null;
 const noopMarkRead = () => {};
 const noopDrainAdvances = (): ReadonlySet<string> => new Set<string>();
 const noopSetResolver = () => {};
+const noopMarkOverride = (): MarkResult => ({
+  success: false,
+  reason: "load_incomplete",
+});
+const noopGetOverrideLiveness = (): OverrideLiveness | null => null;
+const noopGetProjection = (): ReadStateProjection | null => null;
 
 /**
  * React hook that creates and manages a ReadStateManager instance.
@@ -93,31 +102,80 @@ export function useReadState(
     [],
   );
 
+  // Override APIs for the NIP-RS manual-unread layer (slice 3 seam).
+  const markChannelUnread = React.useCallback(
+    (channelId: string): MarkResult => {
+      return (
+        managerRef.current?.markChannelUnread(channelId) ?? {
+          success: false,
+          reason: "load_incomplete",
+        }
+      );
+    },
+    [],
+  );
+
+  const markChannelRead = React.useCallback((channelId: string): MarkResult => {
+    return (
+      managerRef.current?.markChannelRead(channelId) ?? {
+        success: false,
+        reason: "load_incomplete",
+      }
+    );
+  }, []);
+
+  const getOverrideLiveness = React.useCallback(
+    (channelId: string): OverrideLiveness | null => {
+      return managerRef.current?.getOverrideLiveness(channelId) ?? null;
+    },
+    [],
+  );
+
+  const getProjection = React.useCallback((): ReadStateProjection | null => {
+    return managerRef.current?.getProjection() ?? null;
+  }, []);
+
   const isReady = Boolean(
     pubkey && relayClient && initializedPubkey === pubkey,
   );
+
+  // loadComplete is true only when the manager's full-state enumeration has
+  // terminated with a complete verdict. Distinct from isReady (initialized):
+  // a manager can be initialized with an incomplete load.
+  const isLoadComplete =
+    isReady && (managerRef.current?.getProjection().loadComplete ?? false);
 
   if (!pubkey || !relayClient) {
     return {
       getEffectiveTimestamp: noopGetTimestamp,
       isReady: false,
+      isLoadComplete: false,
       markContextRead: noopMarkRead,
       seedContextRead: noopMarkRead,
       drainSyncedAdvances: noopDrainAdvances,
       setContextParentResolver: noopSetResolver,
       readStateVersion: 0,
       getOwnTimestamp: noopGetTimestamp,
+      markChannelUnread: noopMarkOverride,
+      markChannelRead: noopMarkOverride,
+      getOverrideLiveness: noopGetOverrideLiveness,
+      getProjection: noopGetProjection,
     };
   }
 
   return {
     getEffectiveTimestamp,
     isReady,
+    isLoadComplete,
     markContextRead,
     seedContextRead,
     drainSyncedAdvances,
     setContextParentResolver,
     readStateVersion,
     getOwnTimestamp,
+    markChannelUnread,
+    markChannelRead,
+    getOverrideLiveness,
+    getProjection,
   };
 }

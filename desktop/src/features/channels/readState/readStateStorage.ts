@@ -8,6 +8,7 @@ import {
   MSG_PREFIX,
   READ_STATE_HORIZON_SECONDS,
   THREAD_PREFIX,
+  type OverrideRegister,
 } from "@/features/channels/readState/readStateFormat";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 
@@ -15,6 +16,7 @@ export type StoredReadState = {
   contexts: Map<string, number>;
   publishableContextIds: Set<string>;
   contextSourceCreatedAt: Map<string, number>;
+  overrideRegisters: Map<string, StoredOverrideEntry>;
 };
 
 function mergeLocalStorageKey(
@@ -100,6 +102,7 @@ export function readStoredReadState(pubkey: string): StoredReadState {
     contexts,
     publishableContextIds: readPublishableContextIds(pubkey),
     contextSourceCreatedAt: readContextSourceCreatedAt(pubkey),
+    overrideRegisters: readOverrideState(pubkey),
   };
 }
 
@@ -107,6 +110,87 @@ function isPrunableContextKey(contextId: string): boolean {
   return (
     contextId.startsWith(MSG_PREFIX) || contextId.startsWith(THREAD_PREFIX)
   );
+}
+
+// Key for persisted override state: registers + their frontier timestamps in one atomic write.
+// v2 stores {s, c, b, f} per context where f = the last known effective frontier.
+function localOverrideStateKey(pubkey: string): string {
+  return `buzz.nip-rs.override-state.v2:${pubkey}`;
+}
+
+// Legacy key retained for migration reads only — never written to after v2 migration.
+function localOverrideRegistersKeyLegacy(pubkey: string): string {
+  return `buzz.nip-rs.override-registers.v1:${pubkey}`;
+}
+
+export type StoredOverrideEntry = OverrideRegister & { f: number };
+
+function readOverrideState(pubkey: string): Map<string, StoredOverrideEntry> {
+  const result = new Map<string, StoredOverrideEntry>();
+  const raw = localStorage.getItem(localOverrideStateKey(pubkey));
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (isPlainRecord(parsed)) {
+        for (const [rawCtx, value] of Object.entries(parsed)) {
+          if (!isPlainRecord(value)) continue;
+          const { s, c, b, f } = value;
+          if (
+            typeof s === "number" &&
+            Number.isInteger(s) &&
+            s >= 0 &&
+            s <= 0xffffffff &&
+            typeof c === "number" &&
+            Number.isInteger(c) &&
+            c >= 0 &&
+            c <= 0xffffffff &&
+            typeof b === "number" &&
+            Number.isInteger(b) &&
+            b >= 0 &&
+            typeof f === "number" &&
+            Number.isInteger(f) &&
+            f >= 0
+          ) {
+            result.set(rawCtx, { s, c, b, f });
+          }
+        }
+      }
+    } catch {
+      // Corrupt storage — return empty; repopulated on next ingest.
+    }
+    return result;
+  }
+  // Migration: read from legacy v1 key if v2 key absent.
+  const legacyRaw = localStorage.getItem(
+    localOverrideRegistersKeyLegacy(pubkey),
+  );
+  if (!legacyRaw) return result;
+  try {
+    const parsed = JSON.parse(legacyRaw);
+    if (!isPlainRecord(parsed)) return result;
+    for (const [rawCtx, value] of Object.entries(parsed)) {
+      if (!isPlainRecord(value)) continue;
+      const { s, c, b } = value;
+      if (
+        typeof s === "number" &&
+        Number.isInteger(s) &&
+        s >= 0 &&
+        s <= 0xffffffff &&
+        typeof c === "number" &&
+        Number.isInteger(c) &&
+        c >= 0 &&
+        c <= 0xffffffff &&
+        typeof b === "number" &&
+        Number.isInteger(b) &&
+        b >= 0
+      ) {
+        result.set(rawCtx, { s, c, b, f: 0 }); // frontier unknown from legacy key
+      }
+    }
+  } catch {
+    // Corrupt legacy storage — ignore.
+  }
+  return result;
 }
 
 /**
@@ -147,7 +231,8 @@ export function writeStoredReadState(
   contexts: ReadonlyMap<string, number>,
   publishableContextIds: ReadonlySet<string>,
   contextSourceCreatedAt: ReadonlyMap<string, number>,
-): void {
+  overrideRegisters: ReadonlyMap<string, StoredOverrideEntry>,
+): boolean {
   const pruned = pruneStaleContexts(contexts, Math.floor(Date.now() / 1_000));
 
   const state: Record<string, string> = {};
@@ -155,6 +240,31 @@ export function writeStoredReadState(
     state[contextId] = new Date(timestamp * 1_000).toISOString();
   }
 
+  // Persist override registers atomically with their frontier timestamps (v2).
+  // Registers and frontiers in one JSON blob — a single write ensures they are
+  // never torn: a register cannot be present without its associated frontier.
+  // This is the ACTION COMMIT POINT: if ok4 is true the action is durably
+  // committed; ancillary frontier/cache write failures (ok1-ok3) do not fail
+  // the action.  If ok4 is false, the caller must roll back ALL state.
+  const overrideState: Record<
+    string,
+    { s: number; c: number; b: number; f: number }
+  > = {};
+  for (const [rawCtx, entry] of overrideRegisters) {
+    overrideState[rawCtx] = { s: entry.s, c: entry.c, b: entry.b, f: entry.f };
+  }
+  const ok4 = setLocalStorageItemWithRecovery(
+    localOverrideStateKey(pubkey),
+    JSON.stringify(overrideState),
+  );
+
+  // If the commit-point write failed, return immediately — do NOT write any
+  // ancillary keys.  The caller will roll back all in-memory and slot state.
+  // "v2 false ⇒ nothing durable anywhere" is the contract.
+  if (!ok4) return false;
+
+  // Ancillary writes: frontier cache, publishable set, source timestamps.
+  // Best-effort — failures do not fail the action.
   setLocalStorageItemWithRecovery(
     localReadStateKey(pubkey),
     JSON.stringify(state),
@@ -174,4 +284,7 @@ export function writeStoredReadState(
     localSourceCreatedAtKey(pubkey),
     JSON.stringify(sourceState),
   );
+
+  // The commit point: only the v2 override write determines action success.
+  return ok4;
 }

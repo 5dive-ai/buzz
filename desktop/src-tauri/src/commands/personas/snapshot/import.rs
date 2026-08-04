@@ -404,8 +404,6 @@ pub(crate) fn build_agent_snapshot_import_preview(
 #[path = "import_entry.rs"]
 mod import_entry;
 pub(crate) use import_entry::capture_agent_snapshot_import_entry;
-#[cfg(test)]
-pub(crate) use import_entry::AgentSnapshotImportEntry;
 
 // ── `confirm_agent_snapshot_import` ──────────────────────────────────────────
 

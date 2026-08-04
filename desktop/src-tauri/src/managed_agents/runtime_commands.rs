@@ -839,7 +839,7 @@ pub(crate) fn drain_scope_runtimes(
 /// The journal-restore loop is implemented in [`compensate_drain_for`] with an
 /// injected start function, allowing the generation-validation + iteration
 /// contract to be unit-tested without an `AppHandle`.
-
+// ────────────────────────────────────────────────────────────────────────────
 /// Testable core of [`compensate_drain`]: re-acquires the store lock, validates
 /// the captured scope generation, then calls `start_fn` for each stopped entry.
 ///

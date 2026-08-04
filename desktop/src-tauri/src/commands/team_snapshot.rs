@@ -476,6 +476,12 @@ pub async fn preview_team_snapshot_import(
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
+// Entry guard helper for `confirm_team_snapshot_import` — extracted to a
+// separate file to keep `team_snapshot.rs` within the line-count ratchet.
+#[path = "team_snapshot_entry.rs"]
+mod team_snapshot_entry;
+pub(crate) use team_snapshot_entry::capture_team_snapshot_import_entry;
+
 /// Import a team snapshot, minting full agent instances for every member.
 ///
 /// Phase sequence:
@@ -498,16 +504,6 @@ pub async fn preview_team_snapshot_import(
 ///
 /// Importing the same file twice yields two distinct teams with different
 /// agent keypairs (same as individual agent import).
-
-// ── `confirm_team_snapshot_import` entry guards ───────────────────────────────
-//
-// Extracted to `team_snapshot_entry.rs` to keep this file within the size ratchet.
-#[path = "team_snapshot_entry.rs"]
-mod team_snapshot_entry;
-pub(crate) use team_snapshot_entry::capture_team_snapshot_import_entry;
-#[cfg(test)]
-pub(crate) use team_snapshot_entry::TeamSnapshotImportEntry;
-
 #[tauri::command]
 pub async fn confirm_team_snapshot_import(
     input: TeamSnapshotImportConfirm,

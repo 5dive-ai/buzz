@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use buzz_core::tenant::TenantContext;
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -102,7 +103,7 @@ pub async fn authorize_moderation_action(
     // The target's community role is read only for the admin guard rail — i.e.
     // an admin actioning a pubkey with ban/timeout — so the owner and
     // channel-role paths stay at a single query.
-    let target_role = match (actor_role.as_deref(), action, target) {
+    let target_role: Option<String> = match (actor_role.as_deref(), action, target) {
         (Some("admin"), ModerationAction::Ban | ModerationAction::Timeout, target) => {
             match target {
                 ModerationTarget::Pubkey(pk) => state
@@ -118,7 +119,7 @@ pub async fn authorize_moderation_action(
 
     // The channel role is read only when community authority does not apply and
     // the action is channel-local (DeleteMessage/Kick within `channel_id`).
-    let channel_role = match (actor_role.as_deref(), action, channel_id) {
+    let channel_role: Option<String> = match (actor_role.as_deref(), action, channel_id) {
         (Some("owner") | Some("admin"), _, _) => None,
         (_, ModerationAction::DeleteMessage | ModerationAction::Kick, Some(channel_id)) => {
             state
@@ -129,6 +130,77 @@ pub async fn authorize_moderation_action(
         _ => None,
     };
 
+    decide_authority(
+        actor_role.as_deref(),
+        target_role.as_deref(),
+        channel_role.as_deref(),
+        action,
+    )
+}
+
+/// Revalidate role authority under locks owned by the caller's PostgreSQL
+/// authorization transaction.
+pub async fn authorize_moderation_action_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant: &TenantContext,
+    actor_pubkey: &[u8],
+    channel_id: Option<Uuid>,
+    target: ModerationTarget<'_>,
+    action: ModerationAction,
+) -> anyhow::Result<ModerationAuthority> {
+    // Moderation is rare. Table SHARE locks close the absent-row race as well
+    // as update/delete races: every role insert/update/delete takes the
+    // conflicting ROW EXCLUSIVE lock before it can commit.
+    sqlx::query("LOCK TABLE relay_members IN SHARE MODE")
+        .execute(&mut **transaction)
+        .await?;
+    if matches!(
+        action,
+        ModerationAction::DeleteMessage | ModerationAction::Kick
+    ) {
+        sqlx::query("LOCK TABLE channel_members IN SHARE MODE")
+            .execute(&mut **transaction)
+            .await?;
+    }
+    let community = tenant.community();
+    let actor_role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2",
+    )
+    .bind(community.as_uuid())
+    .bind(hex::encode(actor_pubkey))
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let target_role: Option<String> = match (actor_role.as_deref(), action, target) {
+        (
+            Some("admin"),
+            ModerationAction::Ban | ModerationAction::Timeout,
+            ModerationTarget::Pubkey(target),
+        ) => {
+            sqlx::query_scalar(
+                "SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(hex::encode(target))
+            .fetch_optional(&mut **transaction)
+            .await?
+        }
+        _ => None,
+    };
+    let channel_role: Option<String> = match (actor_role.as_deref(), action, channel_id) {
+        (Some("owner") | Some("admin"), _, _) => None,
+        (_, ModerationAction::DeleteMessage | ModerationAction::Kick, Some(channel_id)) => {
+            sqlx::query_scalar(
+                "SELECT role::text FROM channel_members WHERE community_id = $1 \
+                 AND channel_id = $2 AND pubkey = $3 AND removed_at IS NULL",
+            )
+            .bind(community.as_uuid())
+            .bind(channel_id)
+            .bind(actor_pubkey)
+            .fetch_optional(&mut **transaction)
+            .await?
+        }
+        _ => None,
+    };
     decide_authority(
         actor_role.as_deref(),
         target_role.as_deref(),

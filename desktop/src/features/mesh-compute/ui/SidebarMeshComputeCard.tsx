@@ -8,6 +8,9 @@ import { meshStartNode, meshStopNode } from "@/shared/api/tauriMesh";
 import type { MeshModelCatalog } from "@/shared/api/tauriMesh";
 import { meshModelCatalog } from "@/shared/api/tauriMesh";
 
+import { usePersonasQuery } from "@/features/agents/hooks";
+import { requestOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
+import { deriveMeshCallToAction } from "../meshAgents";
 import { useMeshDownloadProgress } from "../hooks/useMeshDownloadProgress";
 import { useMeshLiveView } from "../hooks/useMeshLiveView";
 import { useMeshNodeStatus } from "../hooks/useMeshNodeStatus";
@@ -98,6 +101,16 @@ export function SidebarMeshComputeCard({
   const { view } = useMeshLiveView(toggle.isSharing || toggle.isConsuming);
   const { progress: downloadProgress, reset: resetDownloadProgress } =
     useMeshDownloadProgress();
+
+  // Sharing compute no agent can use is a dead end, and this card is where
+  // someone would notice. The CTA stays silent unless the setup is actually
+  // incomplete — see deriveMeshCallToAction.
+  const { data: personas } = usePersonasQuery();
+  const callToAction = deriveMeshCallToAction({
+    personas,
+    isSharing: toggle.isSharing,
+    meshHasCapacity: (snapshot?.sharingDeviceCount ?? 0) > 0,
+  });
 
   // Inbound work has no counter in mesh-llm, so it is inferred by elimination
   // across two samples: serving, inflight > 0, and our own dispatch count flat
@@ -260,6 +273,17 @@ export function SidebarMeshComputeCard({
           devices={model.devices}
           showSoloHint={model.showSoloHint}
         />
+
+        {callToAction.kind === "createAgent" ? (
+          <button
+            className="mt-2 text-2xs font-medium text-foreground/80 underline-offset-2 transition-colors hover:text-foreground hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+            data-testid="mesh-card-create-agent"
+            onClick={() => requestOpenCreateAgent()}
+            type="button"
+          >
+            {callToAction.label}
+          </button>
+        ) : null}
 
         {errorText ? (
           <p

@@ -496,6 +496,9 @@ pub enum CorporateIdentityError {
     /// The requested uid/pubkey binding was previously revoked.
     #[error("corporate identity binding revoked")]
     BindingRevoked,
+    /// No active binding exists and this compatibility path cannot enroll one.
+    #[error("corporate identity binding requires authorized enrollment")]
+    BindingRequired,
     /// NIP-OA delegation was present but did not satisfy corporate identity.
     #[error("corporate identity delegation denied")]
     DelegationDenied,
@@ -515,6 +518,7 @@ impl CorporateIdentityError {
             | Self::NpubMismatch
             | Self::BindingConflict
             | Self::BindingRevoked
+            | Self::BindingRequired
             | Self::DelegationDenied => StatusCode::FORBIDDEN,
             Self::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -531,6 +535,7 @@ impl CorporateIdentityError {
             Self::NpubMismatch => "relay identity pubkey mismatch",
             Self::BindingConflict => "relay identity binding conflict",
             Self::BindingRevoked => "relay identity binding revoked",
+            Self::BindingRequired => "relay identity binding required",
             Self::DelegationDenied => "relay identity delegation denied",
             Self::Db(_) => "relay identity unavailable",
         }
@@ -725,7 +730,7 @@ async fn complete_direct_corporate_identity(
     binding: BindIdentityResult,
 ) -> Result<CorporateIdentityDecision, CorporateIdentityError> {
     let binding = match binding {
-        BindIdentityResult::Conflict(conflict) => {
+        BindIdentityResult::Conflict(_) => {
             metrics::counter!("buzz_corporate_identity_bindings_total", "result" => "conflict")
                 .increment(1);
             record_identity_binding_audit(
@@ -737,19 +742,10 @@ async fn complete_direct_corporate_identity(
                 &claims.uid,
                 serde_json::json!({
                     "source": source,
-                    "issuer": claims.issuer,
-                    "existing_uid": conflict.uid,
-                    "existing_issuer": conflict.issuer,
-                    "existing_pubkey": hex::encode(conflict.pubkey),
-                    "existing_source": conflict.source,
                 }),
             )
             .await;
-            warn!(
-                uid = %claims.uid,
-                signer = %signer.to_hex(),
-                "corporate identity binding conflict"
-            );
+            warn!("corporate identity binding conflict");
             return Err(CorporateIdentityError::BindingConflict);
         }
         BindIdentityResult::Revoked => {
@@ -765,12 +761,17 @@ async fn complete_direct_corporate_identity(
                 serde_json::json!({ "source": source, "issuer": claims.issuer }),
             )
             .await;
-            warn!(
-                uid = %claims.uid,
-                signer = %signer.to_hex(),
-                "corporate identity binding was previously revoked"
-            );
+            warn!("corporate identity binding was previously revoked");
             return Err(CorporateIdentityError::BindingRevoked);
+        }
+        BindIdentityResult::BindingRequired => {
+            metrics::counter!(
+                "buzz_corporate_identity_bindings_total",
+                "result" => "binding_required"
+            )
+            .increment(1);
+            warn!("corporate identity binding requires sealed enrollment evidence");
+            return Err(CorporateIdentityError::BindingRequired);
         }
         binding => binding,
     };
@@ -1194,6 +1195,7 @@ fn record_identity_binding_metric(binding: &BindIdentityResult) {
         BindIdentityResult::Matched => "matched",
         BindIdentityResult::Conflict(_) => "conflict",
         BindIdentityResult::Revoked => "revoked",
+        BindIdentityResult::BindingRequired => "binding_required",
     };
     metrics::counter!("buzz_corporate_identity_bindings_total", "result" => result).increment(1);
 }
@@ -1208,6 +1210,7 @@ fn record_corporate_identity_denial(error: &CorporateIdentityError) {
         CorporateIdentityError::NpubMismatch => "npub_mismatch",
         CorporateIdentityError::BindingConflict => "binding_conflict",
         CorporateIdentityError::BindingRevoked => "binding_revoked",
+        CorporateIdentityError::BindingRequired => "binding_required",
         CorporateIdentityError::DelegationDenied => "delegation_denied",
         CorporateIdentityError::Db(_) => "db",
     };
@@ -1303,6 +1306,11 @@ mod tests {
             binding_version: 1,
             binding_state: buzz_db::identity_binding::BindingState::Active,
             binding_provenance: buzz_db::identity_binding::BindingProvenance::Tofu,
+            creation_attribution:
+                buzz_db::identity_binding::CreationAttributionKind::AuthenticatedKey,
+            created_by: Some(pubkey.to_bytes().to_vec()),
+            created_policy_version: Some("relay-test-policy-v1".to_owned()),
+            expires_at: None,
             display_name: None,
             source: SOURCE_DB_BINDING.to_string(),
             created_at: now,
@@ -2120,16 +2128,24 @@ mod tests {
         .expect_err("owner without binding should be denied");
         assert!(matches!(err, CorporateIdentityError::DelegationDenied));
 
-        db.bind_or_validate_identity(
-            community,
-            &config.issuer,
-            "owner-uid",
-            owner_keys.public_key().as_bytes(),
-            Some("owner@example.com"),
-            SOURCE_DB_BINDING,
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id, issuer, uid, pubkey, display_name, source, binding_id, \
+              binding_version, binding_state, binding_provenance, created_by, \
+              created_policy_version, creation_attribution_kind) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,1,'active','attested_key',$4,$8,'authenticated_key')",
         )
+        .bind(community.as_uuid())
+        .bind(&config.issuer)
+        .bind("owner-uid")
+        .bind(owner_keys.public_key().as_bytes())
+        .bind("owner@example.com")
+        .bind(SOURCE_DB_BINDING)
+        .bind(Uuid::new_v4())
+        .bind("relay-test-policy-v1")
+        .execute(&pool)
         .await
-        .expect("create owner binding");
+        .expect("seed verified owner binding fixture");
 
         let decision = verify_delegated_corporate_identity(
             &db,

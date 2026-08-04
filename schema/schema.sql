@@ -187,9 +187,43 @@ CREATE UNIQUE INDEX idx_users_okta ON users (community_id, okta_user_id)
 -- ── Relay-verified identity bindings ─────────────────────────────────────────
 -- Conformance: verified identity is community-scoped. An issuer-qualified uid
 -- is the stable product/user-management identity; a Nostr pubkey is the
--- protocol credential currently bound to it. This table is intentionally a
--- binding and lifecycle authority. Revocation scope distinguishes principal
--- disablement, a single-key revocation, and an operator-authorized rotation.
+-- protocol credential currently bound to it. The binding table below is the
+-- lifecycle authority. Revocation scope distinguishes principal disablement,
+-- single-key revocation, and operator-authorized rotation.
+--
+-- Current verifier-owned enrollment policy. A fresh database intentionally
+-- contains no row, so the disabled candidate cannot enroll until a separately
+-- authorized server-configuration action installs one.
+CREATE TABLE identity_enrollment_policies (
+    community_id    UUID NOT NULL PRIMARY KEY REFERENCES communities(id),
+    policy_id       UUID NOT NULL,
+    policy_epoch    BIGINT NOT NULL,
+    requirement     TEXT NOT NULL,
+    effective_from  BIGINT NOT NULL,
+    effective_until BIGINT NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (policy_id <> '00000000-0000-0000-0000-000000000000'::UUID),
+    CHECK (policy_epoch > 0),
+    CHECK (requirement IN ('not_required', 'attested_key', 'provisioned', 'tofu')),
+    CHECK (effective_from >= 0),
+    CHECK (effective_from < effective_until)
+);
+
+CREATE FUNCTION enforce_identity_enrollment_policy_lineage()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.community_id <> OLD.community_id
+       OR NEW.policy_id <> OLD.policy_id
+       OR NEW.policy_epoch <= OLD.policy_epoch THEN
+        RAISE EXCEPTION 'identity enrollment policy lineage must advance monotonically';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER identity_enrollment_policy_lineage_guard
+BEFORE UPDATE ON identity_enrollment_policies
+FOR EACH ROW EXECUTE FUNCTION enforce_identity_enrollment_policy_lineage();
 
 CREATE TABLE identity_bindings (
     community_id    UUID NOT NULL REFERENCES communities(id),
@@ -217,6 +251,11 @@ CREATE TABLE identity_bindings (
     replacement_binding_id UUID,
     created_by       BYTEA,
     created_policy_version TEXT,
+    expires_at       TIMESTAMPTZ,
+    creation_attribution_kind TEXT NOT NULL,
+    archived_at      TIMESTAMPTZ,
+    archived_by      BYTEA,
+    archived_reason  TEXT,
     CONSTRAINT chk_identity_bindings_issuer_not_empty CHECK (length(issuer) > 0),
     CONSTRAINT chk_identity_bindings_uid_not_empty CHECK (length(uid) > 0),
     CONSTRAINT chk_identity_bindings_pubkey_len CHECK (length(pubkey) = 32),
@@ -234,32 +273,63 @@ CREATE TABLE identity_bindings (
             AND rotation_reason IS NOT NULL
             AND length(rotation_reason) > 0)
     ),
-    CONSTRAINT identity_bindings_o3_id_unique UNIQUE (community_id, binding_id),
-    CONSTRAINT identity_bindings_o3_principal_version_unique
-        UNIQUE (community_id, issuer, uid, binding_version),
-    CONSTRAINT identity_bindings_o3_replacement_fk
+    CONSTRAINT identity_bindings_binding_id_unique UNIQUE (community_id, binding_id),
+    CONSTRAINT identity_bindings_replacement_fk
         FOREIGN KEY (community_id, replacement_binding_id)
         REFERENCES identity_bindings (community_id, binding_id)
         DEFERRABLE INITIALLY DEFERRED,
-    CONSTRAINT chk_identity_bindings_o3_id_not_nil
+    CONSTRAINT chk_identity_bindings_id_not_nil
         CHECK (binding_id <> '00000000-0000-0000-0000-000000000000'::UUID),
-    CONSTRAINT chk_identity_bindings_o3_version_positive CHECK (binding_version > 0),
-    CONSTRAINT chk_identity_bindings_o3_state
-        CHECK (binding_state IN ('active', 'revoked', 'rotated')),
-    CONSTRAINT chk_identity_bindings_o3_provenance
+    CONSTRAINT chk_identity_bindings_version_positive CHECK (binding_version > 0),
+    CONSTRAINT chk_identity_bindings_state
+        CHECK (binding_state IN ('active', 'revoked', 'rotated', 'archived')),
+    CONSTRAINT chk_identity_bindings_provenance
         CHECK (binding_provenance IN ('attested_key', 'provisioned', 'tofu')),
-    CONSTRAINT chk_identity_bindings_o3_created_by_len
+    CONSTRAINT chk_identity_bindings_created_by_len
         CHECK (created_by IS NULL OR length(created_by) = 32),
-    CONSTRAINT chk_identity_bindings_o3_policy_version
-        CHECK (created_policy_version IS NULL OR length(created_policy_version) > 0)
+    CONSTRAINT chk_identity_bindings_policy_version
+        CHECK (created_policy_version IS NULL OR length(created_policy_version) > 0),
+    CONSTRAINT chk_identity_bindings_expiry
+        CHECK (expires_at IS NULL OR expires_at > TIMESTAMPTZ 'epoch'),
+    CONSTRAINT chk_identity_bindings_creation_attribution CHECK (
+        (creation_attribution_kind = 'legacy_unknown'
+            AND created_by IS NULL AND created_policy_version IS NULL)
+        OR
+        (creation_attribution_kind IN ('authenticated_key', 'operator')
+            AND created_by IS NOT NULL AND length(created_by) = 32
+            AND created_policy_version IS NOT NULL
+            AND length(created_policy_version) > 0)
+    ),
+    CONSTRAINT chk_identity_bindings_authority_state
+        CHECK ((binding_state = 'active') = (revoked_at IS NULL)),
+    CONSTRAINT chk_identity_bindings_archive_attribution CHECK (
+        (binding_state <> 'archived'
+            AND archived_at IS NULL AND archived_by IS NULL AND archived_reason IS NULL)
+        OR
+        (binding_state = 'archived'
+            AND archived_at IS NOT NULL
+            AND archived_by IS NOT NULL AND length(archived_by) = 32
+            AND archived_reason IS NOT NULL AND length(archived_reason) > 0)
+    ),
+    CONSTRAINT chk_identity_bindings_rotated_lineage
+        CHECK (binding_state <> 'rotated' OR replacement_binding_id IS NOT NULL)
 );
 
+-- Frozen 0027 compatibility indexes. The authority-state CHECK above makes
+-- `revoked_at IS NULL` equivalent to `binding_state = 'active'`; authoritative
+-- readers and the current indexes below still spell out both predicates.
 CREATE UNIQUE INDEX idx_identity_bindings_active_principal
     ON identity_bindings (community_id, issuer, uid)
     WHERE revoked_at IS NULL;
 CREATE UNIQUE INDEX idx_identity_bindings_active_pubkey
     ON identity_bindings (community_id, pubkey)
     WHERE revoked_at IS NULL;
+CREATE UNIQUE INDEX idx_identity_bindings_authoritative_principal
+    ON identity_bindings (community_id, issuer, uid)
+    WHERE binding_state = 'active' AND revoked_at IS NULL;
+CREATE UNIQUE INDEX idx_identity_bindings_authoritative_pubkey
+    ON identity_bindings (community_id, pubkey)
+    WHERE binding_state = 'active' AND revoked_at IS NULL;
 CREATE INDEX idx_identity_bindings_pubkey
     ON identity_bindings (community_id, pubkey);
 CREATE INDEX idx_identity_bindings_revoked_principal
@@ -422,12 +492,12 @@ CREATE TABLE identity_binding_history (
     CHECK (length(issuer) > 0),
     CHECK (length(subject) > 0),
     CHECK (length(pubkey) = 32),
-    CHECK (binding_state IN ('active', 'revoked', 'rotated')),
+    CHECK (binding_state IN ('active', 'revoked', 'rotated', 'archived')),
     CHECK (binding_provenance IN ('attested_key', 'provisioned', 'tofu')),
     CHECK (transition_kind IN (
         'legacy_import', 'enroll', 'provision', 'provenance_strengthened',
         'retire_pair', 'disable_identity', 'revoke_key', 'rotate',
-        'recover', 'enable_identity'
+        'recover', 'enable_identity', 'archive'
     )),
     CHECK (actor IS NULL OR length(actor) = 32),
     CHECK (length(reason) > 0)
@@ -448,8 +518,9 @@ CREATE TABLE identity_lifecycle_operations (
     binding_id             UUID,
     replacement_binding_id UUID,
     binding_version        BIGINT,
+    replacement_binding_version BIGINT,
     selector_version       BIGINT,
-    actor                  BYTEA,
+    actor                  BYTEA NOT NULL,
     reason                 TEXT NOT NULL,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (community_id, operation_id),
@@ -460,7 +531,7 @@ CREATE TABLE identity_lifecycle_operations (
     CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'::UUID),
     CHECK (operation_kind IN (
         'provision', 'retire_pair', 'disable_identity', 'revoke_key',
-        'rotate', 'recover', 'enable_identity'
+        'rotate', 'recover', 'enable_identity', 'archive'
     )),
     CHECK (length(request_fingerprint) = 32),
     CHECK (issuer IS NULL OR length(issuer) > 0),
@@ -468,8 +539,9 @@ CREATE TABLE identity_lifecycle_operations (
     CHECK (pubkey IS NULL OR length(pubkey) = 32),
     CHECK (replacement_pubkey IS NULL OR length(replacement_pubkey) = 32),
     CHECK (binding_version IS NULL OR binding_version > 0),
+    CHECK (replacement_binding_version IS NULL OR replacement_binding_version > 0),
     CHECK (selector_version IS NULL OR selector_version > 0),
-    CHECK (actor IS NULL OR length(actor) = 32),
+    CHECK (length(actor) = 32),
     CHECK (length(reason) > 0)
 );
 

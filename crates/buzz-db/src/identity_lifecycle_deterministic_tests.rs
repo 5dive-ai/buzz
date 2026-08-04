@@ -27,6 +27,7 @@ enum Action {
     Disable,
     Revoke,
     Enable,
+    Archive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,7 @@ struct Fixture {
     community_id: CommunityId,
     expected_pending: Option<PendingLineage>,
     enrollment_key: [u8; 32],
+    archive_binding_id: Option<Uuid>,
 }
 
 async fn setup_pool() -> PgPool {
@@ -76,9 +78,10 @@ fn principal() -> IdentityPrincipal<'static> {
 }
 
 fn context(operation_id: Uuid, reason: &'static str) -> LifecycleContext<'static> {
+    const ACTOR: [u8; 32] = [0xA1; 32];
     LifecycleContext {
-        operation_id,
-        actor: None,
+        operation_id: LifecycleOperationId::from_uuid_for_test(operation_id),
+        actor: &ACTOR,
         reason,
     }
 }
@@ -88,27 +91,37 @@ fn replacement(pubkey: &'static [u8; 32]) -> VerifiedReplacementKey<'static> {
         pubkey,
         None,
         BindingProvenance::AttestedKey,
-        Some("deterministic-policy-v1"),
+        "deterministic-policy-v1",
     )
     .expect("construct deterministic replacement")
 }
 
-async fn enroll_key(pool: &PgPool, community_id: CommunityId, pubkey: &[u8]) {
+async fn enroll_key(
+    pool: &PgPool,
+    community_id: CommunityId,
+    pubkey: &[u8],
+) -> crate::identity_binding::BindingEvidence {
     let result = resolve_identity_binding(
         pool,
-        community_id,
         &ResolveBindingInput {
+            authorization_domain: community_id,
             issuer: ISSUER,
             subject: SUBJECT,
             pubkey,
             display_name: None,
             enrollment_mode: EnrollmentMode::AttestedKey,
             key_attested: true,
+            policy_version: "deterministic-policy-v1",
+            evidence_valid_from: 0,
+            evidence_valid_until: i64::MAX as u64,
         },
     )
     .await
     .expect("seed enrollment");
-    assert!(matches!(result, ResolveBindingResult::Enrolled(_)));
+    match result {
+        ResolveBindingResult::Enrolled(evidence) => evidence,
+        other => panic!("expected deterministic enrollment, got {other:?}"),
+    }
 }
 
 fn pair_contains(pair: (Action, Action), action: Action) -> bool {
@@ -119,8 +132,24 @@ async fn setup_fixture(pool: &PgPool, pair: (Action, Action), label: &str) -> Fi
     let community_id = make_community(pool, label).await;
     let mut expected_pending = None;
     let mut enrollment_key = ENROLL_KEY;
+    let mut archive_binding_id = None;
 
-    if pair_contains(pair, Action::Enroll) && pair_contains(pair, Action::Rotate) {
+    if pair_contains(pair, Action::Archive) {
+        let evidence = enroll_key(pool, community_id, &OLD_KEY).await;
+        retire_identity_pair(
+            pool,
+            community_id,
+            context(Uuid::from_u128(9), "prepare archive recovery"),
+            principal(),
+            &OLD_KEY,
+        )
+        .await
+        .expect("prepare archivable pending recovery");
+        expected_pending = get_pending_lineage(pool, community_id, principal())
+            .await
+            .expect("read archive recovery selector");
+        archive_binding_id = Some(evidence.binding_id());
+    } else if pair_contains(pair, Action::Enroll) && pair_contains(pair, Action::Rotate) {
         enrollment_key = OLD_KEY;
     } else if pair_contains(pair, Action::Enroll) && pair_contains(pair, Action::Recover) {
         enroll_key(pool, community_id, &OLD_KEY).await;
@@ -171,6 +200,7 @@ async fn setup_fixture(pool: &PgPool, pair: (Action, Action), label: &str) -> Fi
         community_id,
         expected_pending,
         enrollment_key,
+        archive_binding_id,
     }
 }
 
@@ -183,14 +213,17 @@ async fn run_action(
     match action {
         Action::Enroll => match resolve_identity_binding(
             pool,
-            fixture.community_id,
             &ResolveBindingInput {
+                authorization_domain: fixture.community_id,
                 issuer: ISSUER,
                 subject: SUBJECT,
                 pubkey: &fixture.enrollment_key,
                 display_name: None,
                 enrollment_mode: EnrollmentMode::AttestedKey,
                 key_attested: true,
+                policy_version: "deterministic-policy-v1",
+                evidence_valid_from: 0,
+                evidence_valid_until: i64::MAX as u64,
             },
         )
         .await
@@ -201,7 +234,9 @@ async fn run_action(
                 BindingDenial::Conflict
                 | BindingDenial::Revoked
                 | BindingDenial::BindingRequired
-                | BindingDenial::KeyAttestationRequired,
+                | BindingDenial::KeyAttestationRequired
+                | BindingDenial::BindingExpired
+                | BindingDenial::StaleEvidence,
             )) => Outcome::Denied,
             Err(_) => Outcome::Error,
         },
@@ -265,6 +300,19 @@ async fn run_action(
         )
         .await
         .map_or(Outcome::Error, |_| Outcome::Applied),
+        Action::Archive => {
+            let Some(binding_id) = fixture.archive_binding_id else {
+                return Outcome::Error;
+            };
+            archive_identity_binding(
+                pool,
+                fixture.community_id,
+                context(operation_id, "deterministic archive"),
+                binding_id,
+            )
+            .await
+            .map_or(Outcome::Error, |_| Outcome::Applied)
+        }
     }
 }
 
@@ -287,7 +335,7 @@ async fn normalized_rows(
 
 async fn logical_snapshot(pool: &PgPool, community_id: CommunityId) -> Vec<String> {
     let queries = [
-        "SELECT jsonb_build_object('t','binding','v',to_jsonb(b)-ARRAY['community_id','binding_id','replacement_binding_id','created_at','updated_at','last_seen_at','revoked_at','revoked_by','rotation_completed_at','rotation_by']::text[]) FROM identity_bindings b WHERE community_id=$1",
+        "SELECT jsonb_build_object('t','binding','v',to_jsonb(b)-ARRAY['community_id','binding_id','replacement_binding_id','created_at','updated_at','last_seen_at','revoked_at','revoked_by','rotation_completed_at','rotation_by','archived_at']::text[]) FROM identity_bindings b WHERE community_id=$1",
         "SELECT jsonb_build_object('t','principal','v',jsonb_build_object('issuer',issuer,'subject',uid,'disabled',disabled_at IS NOT NULL,'reason',disabled_reason)) FROM identity_principals WHERE community_id=$1",
         "SELECT jsonb_build_object('t','revoked_key','v',jsonb_build_object('pubkey',encode(pubkey,'hex'),'reason',reason)) FROM identity_revoked_keys WHERE community_id=$1",
         "SELECT jsonb_build_object('t','retired','v',to_jsonb(r)-ARRAY['community_id','retired_binding_id','retired_at','retired_by']::text[]) FROM identity_retired_pairs r WHERE community_id=$1",
@@ -666,69 +714,306 @@ async fn enrollment_rotate_and_recover_have_forced_orders_and_references() {
 
 #[tokio::test]
 #[ignore = "requires a dedicated disposable Postgres database"]
+async fn archive_and_recovery_have_forced_orders_and_references() {
+    let pool = setup_pool().await;
+    exercise_ordered_case(&pool, Action::Archive, Action::Recover).await;
+    exercise_ordered_case(&pool, Action::Recover, Action::Archive).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated disposable Postgres database"]
 async fn compare_and_clear_rejects_aba_recreation_and_preserves_domain_b() {
     let pool = setup_pool().await;
     let fixture = setup_fixture(&pool, (Action::Recover, Action::Disable), "identity-aba").await;
     let expected = fixture.expected_pending.expect("pending selector");
+    let independently_observed = get_pending_lineage(&pool, fixture.community_id, principal())
+        .await
+        .expect("read second stale G1 observation")
+        .expect("G1 remains active before either actor");
+    assert!(expected == independently_observed);
     let domain_b = make_community(&pool, "identity-aba-domain-b").await;
     enroll_key(&pool, domain_b, &DOMAIN_B_KEY).await;
     let domain_b_bytes = raw_domain_snapshot(&pool, domain_b).await;
     let domain_b_auth = authorization_sentinel(&pool, domain_b).await;
+    let history_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1")
+            .bind(fixture.community_id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("count pre-ABA history");
+    let operations_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM identity_lifecycle_operations WHERE community_id=$1",
+    )
+    .bind(fixture.community_id.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .expect("count pre-ABA operations");
 
-    let mut tx = pool.begin().await.expect("begin ABA transaction");
-    sqlx::query(
-        "UPDATE identity_pending_replacements SET cleared_at=NOW(), cleared_operation_id=$4 \
-         WHERE community_id=$1 AND issuer=$2 AND subject=$3 AND cleared_at IS NULL",
-    )
-    .bind(fixture.community_id.as_uuid())
-    .bind(ISSUER)
-    .bind(SUBJECT)
-    .bind(Uuid::from_u128(200))
-    .execute(&mut *tx)
-    .await
-    .expect("clear G1");
-    sqlx::query(
-        "INSERT INTO identity_pending_replacements \
-         (community_id,issuer,subject,selector_version,retired_pubkey,retired_binding_id,retired_binding_version,created_operation_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-    )
-    .bind(fixture.community_id.as_uuid())
-    .bind(ISSUER)
-    .bind(SUBJECT)
-    .bind(i64::try_from(expected.selector_version + 1).expect("selector fits i64"))
-    .bind(&expected.retired_pubkey)
-    .bind(expected.retired_binding_id)
-    .bind(i64::try_from(expected.retired_binding_version).expect("version fits i64"))
-    .bind(Uuid::from_u128(201))
-    .execute(&mut *tx)
-    .await
-    .expect("recreate G2");
-    assert!(compare_and_clear_pending_tx(
-        &mut tx,
-        fixture.community_id,
-        context(Uuid::from_u128(202), "stale ABA compare"),
-        principal(),
-        &expected,
-    )
-    .await
-    .is_err());
-    let active_selector: i64 = sqlx::query_scalar(
-        "SELECT selector_version FROM identity_pending_replacements \
-         WHERE community_id=$1 AND issuer=$2 AND subject=$3 AND cleared_at IS NULL",
-    )
-    .bind(fixture.community_id.as_uuid())
-    .bind(ISSUER)
-    .bind(SUBJECT)
-    .fetch_one(&mut *tx)
-    .await
-    .expect("G2 remains active");
-    assert_eq!(
-        active_selector,
-        i64::try_from(expected.selector_version + 1).unwrap()
-    );
-    tx.rollback()
+    let (mut events, _controller) = test_lock_schedule::install();
+    let winner_pool = pool.clone();
+    let winner_expected = expected.clone();
+    let winner_community = fixture.community_id;
+    let winner_task = tokio::spawn(test_lock_schedule::actor_scope("aba-winner", async move {
+        let winner_context = context(Uuid::from_u128(200), "committed ABA recreation");
+        let coordinates = lifecycle_coordinates(
+            winner_community,
+            winner_context,
+            Some(principal()),
+            &[],
+            None,
+        );
+        let mut tx = begin_locked(&winner_pool, coordinates)
+            .await
+            .expect("begin locked ABA winner");
+        let cleared = sqlx::query(
+            "UPDATE identity_pending_replacements \
+             SET cleared_at=NOW(),cleared_operation_id=$8 \
+             WHERE community_id=$1 AND issuer=$2 AND subject=$3 \
+               AND retired_pubkey=$4 AND retired_binding_id=$5 \
+               AND retired_binding_version=$6 AND selector_version=$7 \
+               AND cleared_at IS NULL",
+        )
+        .bind(winner_community.as_uuid())
+        .bind(ISSUER)
+        .bind(SUBJECT)
+        .bind(&winner_expected.retired_pubkey)
+        .bind(winner_expected.retired_binding_id)
+        .bind(i64::try_from(winner_expected.retired_binding_version).unwrap())
+        .bind(i64::try_from(winner_expected.selector_version).unwrap())
+        .bind(winner_context.operation_id.as_uuid())
+        .execute(&mut *tx)
         .await
-        .expect("rollback synthetic ABA recreation");
+        .expect("clear committed G1");
+        assert_eq!(cleared.rows_affected(), 1);
+        sqlx::query(
+            "INSERT INTO identity_pending_replacements \
+             (community_id,issuer,subject,selector_version,retired_pubkey, \
+              retired_binding_id,retired_binding_version,created_operation_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        )
+        .bind(winner_community.as_uuid())
+        .bind(ISSUER)
+        .bind(SUBJECT)
+        .bind(i64::try_from(winner_expected.selector_version + 1).unwrap())
+        .bind(&winner_expected.retired_pubkey)
+        .bind(winner_expected.retired_binding_id)
+        .bind(i64::try_from(winner_expected.retired_binding_version).unwrap())
+        .bind(Uuid::from_u128(201))
+        .execute(&mut *tx)
+        .await
+        .expect("create semantically equal G2");
+        tx.commit().await.expect("durably commit G1-to-G2 ABA");
+    }));
+    let winner_request = events.recv().await.expect("winner lock request");
+    assert_eq!(
+        (winner_request.actor(), winner_request.phase()),
+        ("aba-winner", test_lock_schedule::LockPhase::Request)
+    );
+    let winner_pid = winner_request.backend_pid();
+    let database_oid = winner_request.database_oid();
+    let winner_lock_keys = winner_request.lock_keys().to_vec();
+    winner_request.resume();
+    let winner_acquired = events.recv().await.expect("winner lock acquired");
+    assert_eq!(
+        (winner_acquired.actor(), winner_acquired.phase()),
+        ("aba-winner", test_lock_schedule::LockPhase::Acquired)
+    );
+    let winner_transaction_id = winner_acquired
+        .transaction_id()
+        .expect("winner transaction assigned");
+
+    let loser_pool = pool.clone();
+    let loser_expected = independently_observed.clone();
+    let loser_community = fixture.community_id;
+    let loser_task = tokio::spawn(test_lock_schedule::actor_scope("aba-loser", async move {
+        let loser_context = context(Uuid::from_u128(202), "stale committed ABA compare");
+        let coordinates =
+            lifecycle_coordinates(loser_community, loser_context, Some(principal()), &[], None);
+        let mut tx = begin_locked(&loser_pool, coordinates)
+            .await
+            .expect("begin locked ABA loser");
+        let g2_before: String = sqlx::query_scalar(
+            "SELECT to_jsonb(row_value)::TEXT FROM identity_pending_replacements row_value \
+             WHERE community_id=$1 AND issuer=$2 AND subject=$3 AND cleared_at IS NULL",
+        )
+        .bind(loser_community.as_uuid())
+        .bind(ISSUER)
+        .bind(SUBJECT)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read committed G2 before stale compare");
+        let exact_stale_match: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM identity_pending_replacements \
+             WHERE community_id=$1 AND issuer=$2 AND subject=$3 \
+               AND retired_pubkey=$4 AND retired_binding_id=$5 \
+               AND retired_binding_version=$6 AND selector_version=$7 \
+               AND cleared_at IS NULL",
+        )
+        .bind(loser_community.as_uuid())
+        .bind(ISSUER)
+        .bind(SUBJECT)
+        .bind(&loser_expected.retired_pubkey)
+        .bind(loser_expected.retired_binding_id)
+        .bind(i64::try_from(loser_expected.retired_binding_version).unwrap())
+        .bind(i64::try_from(loser_expected.selector_version).unwrap())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count stale G1 tuple at compare point");
+        assert_eq!(exact_stale_match, 0, "stale compare must affect zero rows");
+        let error = compare_and_clear_pending_tx(
+            &mut tx,
+            loser_community,
+            loser_context,
+            principal(),
+            &loser_expected,
+        )
+        .await
+        .expect_err("committed G2 must reject stale G1 compare");
+        assert!(error
+            .to_string()
+            .contains("pending identity lineage changed concurrently"));
+        let g2_after: String = sqlx::query_scalar(
+            "SELECT to_jsonb(row_value)::TEXT FROM identity_pending_replacements row_value \
+             WHERE community_id=$1 AND issuer=$2 AND subject=$3 AND cleared_at IS NULL",
+        )
+        .bind(loser_community.as_uuid())
+        .bind(ISSUER)
+        .bind(SUBJECT)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read G2 after stale compare");
+        assert_eq!(g2_after, g2_before);
+        tx.rollback().await.expect("rollback stale ABA actor");
+        g2_after
+    }));
+    let loser_request = events.recv().await.expect("loser lock request");
+    assert_eq!(
+        (loser_request.actor(), loser_request.phase()),
+        ("aba-loser", test_lock_schedule::LockPhase::Request)
+    );
+    let loser_pid = loser_request.backend_pid();
+    let shared_keys = winner_lock_keys
+        .iter()
+        .copied()
+        .filter(|key| loser_request.lock_keys().contains(key))
+        .collect::<Vec<_>>();
+    assert!(!shared_keys.is_empty());
+    loser_request.resume();
+    wait_for_advisory_waiter(&pool, database_oid, winner_pid, loser_pid, &shared_keys).await;
+    assert_eq!(raw_domain_snapshot(&pool, domain_b).await, domain_b_bytes);
+    assert_eq!(authorization_sentinel(&pool, domain_b).await, domain_b_auth);
+
+    winner_acquired.resume();
+    winner_task.await.expect("join committed ABA winner");
+    let loser_acquired = events
+        .recv()
+        .await
+        .expect("loser lock acquired after commit");
+    assert_eq!(
+        (loser_acquired.actor(), loser_acquired.phase()),
+        ("aba-loser", test_lock_schedule::LockPhase::Acquired)
+    );
+    assert_ne!(
+        loser_acquired.transaction_id(),
+        Some(winner_transaction_id),
+        "ABA actors must use distinct transactions"
+    );
+    loser_acquired.resume();
+    let g2_from_loser = loser_task.await.expect("join stale ABA loser");
+
+    let final_g2: String = sqlx::query_scalar(
+        "SELECT to_jsonb(row_value)::TEXT FROM identity_pending_replacements row_value \
+         WHERE community_id=$1 AND issuer=$2 AND subject=$3 AND cleared_at IS NULL",
+    )
+    .bind(fixture.community_id.as_uuid())
+    .bind(ISSUER)
+    .bind(SUBJECT)
+    .fetch_one(&pool)
+    .await
+    .expect("read final committed G2");
+    assert_eq!(final_g2, g2_from_loser);
+    let final_lineage = get_pending_lineage(&pool, fixture.community_id, principal())
+        .await
+        .expect("read final G2")
+        .expect("G2 remains active");
+    assert_eq!(
+        final_lineage.selector_version,
+        expected.selector_version + 1
+    );
+    assert_eq!(final_lineage.retired_pubkey, expected.retired_pubkey);
+    assert_eq!(
+        final_lineage.retired_binding_id,
+        expected.retired_binding_id
+    );
+    assert_eq!(
+        final_lineage.retired_binding_version,
+        expected.retired_binding_version
+    );
+    let active_pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM identity_pending_replacements \
+         WHERE community_id=$1 AND issuer=$2 AND subject=$3 AND cleared_at IS NULL",
+    )
+    .bind(fixture.community_id.as_uuid())
+    .bind(ISSUER)
+    .bind(SUBJECT)
+    .fetch_one(&pool)
+    .await
+    .expect("count final active G2");
+    assert_eq!(active_pending, 1);
+    let cleared_g1: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM identity_pending_replacements \
+         WHERE community_id=$1 AND issuer=$2 AND subject=$3 \
+           AND selector_version=$4 AND cleared_at IS NOT NULL",
+    )
+    .bind(fixture.community_id.as_uuid())
+    .bind(ISSUER)
+    .bind(SUBJECT)
+    .bind(i64::try_from(expected.selector_version).unwrap())
+    .fetch_one(&pool)
+    .await
+    .expect("count durably cleared G1");
+    assert_eq!(cleared_g1, 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1",
+        )
+        .bind(fixture.community_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("count post-ABA history"),
+        history_before
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM identity_lifecycle_operations WHERE community_id=$1",
+        )
+        .bind(fixture.community_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("count post-ABA operations"),
+        operations_before
+    );
+    let fresh_attempt = resolve_identity_binding(
+        &pool,
+        &ResolveBindingInput {
+            authorization_domain: fixture.community_id,
+            issuer: ISSUER,
+            subject: SUBJECT,
+            pubkey: &ENABLE_KEY,
+            display_name: None,
+            enrollment_mode: EnrollmentMode::AttestedKey,
+            key_attested: true,
+            policy_version: "deterministic-policy-v1",
+            evidence_valid_from: 0,
+            evidence_valid_until: i64::MAX as u64,
+        },
+    )
+    .await
+    .expect("pending G2 denies routine enrollment");
+    assert_eq!(
+        fresh_attempt,
+        ResolveBindingResult::Denied(BindingDenial::Revoked)
+    );
 
     assert_eq!(raw_domain_snapshot(&pool, domain_b).await, domain_b_bytes);
     assert_eq!(authorization_sentinel(&pool, domain_b).await, domain_b_auth);

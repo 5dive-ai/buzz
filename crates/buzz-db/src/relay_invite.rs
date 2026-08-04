@@ -62,6 +62,9 @@ pub enum ClaimOutcome {
     IdentityConflict(IdentityBindingConflict),
     /// The staged identity principal or key is revoked.
     IdentityRevoked,
+    /// The staged identity has no active binding and lacks sealed enrollment
+    /// evidence.
+    IdentityBindingRequired,
 }
 
 /// A freshly minted v2 invite, including the plaintext code and metadata.
@@ -286,6 +289,17 @@ pub async fn claim_relay_invite_with_identity(
                     Some(use_count),
                 );
                 return Ok(ClaimOutcome::IdentityRevoked);
+            }
+            BindIdentityResult::BindingRequired => {
+                tx.rollback().await?;
+                log_claim_outcome(
+                    community,
+                    Some(invite_id),
+                    "identity_binding_required",
+                    max_uses,
+                    Some(use_count),
+                );
+                return Ok(ClaimOutcome::IdentityBindingRequired);
             }
         }
     } else {
@@ -662,7 +676,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn invite_claim_commits_identity_and_membership_atomically() {
+    async fn invite_claim_requires_verified_binding_and_rolls_back_membership_atomically() {
         let pool = setup_pool().await;
         let community = make_test_community(&pool).await;
         let claimer = test_pubkey();
@@ -702,7 +716,7 @@ mod tests {
             .await
             .expect("mint invite");
         let hash = hash_v2_code(&invite.code);
-        assert!(matches!(
+        assert_eq!(
             claim_relay_invite_with_identity(
                 &pool,
                 community,
@@ -712,22 +726,21 @@ mod tests {
                 Some(&identity),
             )
             .await
-            .expect("valid atomic claim"),
-            ClaimOutcome::Joined { .. }
-        ));
-        assert!(is_relay_member(&pool, community, &claimer)
+            .expect("binding-required atomic claim"),
+            ClaimOutcome::IdentityBindingRequired
+        );
+        assert!(!is_relay_member(&pool, community, &claimer)
             .await
-            .expect("membership committed"));
-        assert_eq!(
+            .expect("membership rolled back"));
+        assert!(
             crate::identity_binding::get_active_identity_binding_by_pubkey(
                 &pool, community, &pubkey,
             )
             .await
             .expect("binding lookup")
-            .expect("binding committed")
-            .uid,
-            "atomic-user"
+            .is_none()
         );
+        assert_eq!(use_count(&pool, community, invite.invite_id).await, 0);
         delete_test_community(&pool, community).await;
     }
 

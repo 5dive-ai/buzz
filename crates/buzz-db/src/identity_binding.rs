@@ -14,6 +14,16 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::error::{DbError, Result};
+use buzz_auth::context::{
+    AuthoritativeBindingResolution, BindingExpiry as AuthorizedBindingExpiry,
+};
+use buzz_auth::{
+    AuthorityAdapterError, AuthorityAdapterFuture, BindingResolutionRequest,
+    BindingSource as AuthorizedBindingSource, BindingVersion as AuthorizedBindingVersion,
+    CurrentPolicyRequest, CurrentPolicyResolutionSink, DirectBindingResolutionSink,
+    EnrollmentMode as AuthorizedEnrollmentMode, ExistingBindingResolutionSink,
+    FederatedAuthorityAdapter, FederatedIdentityRequirement, ResolvedFederatedPolicy,
+};
 use buzz_core::CommunityId;
 
 #[cfg(test)]
@@ -327,6 +337,23 @@ pub const SOURCE_JWT_NPUB: &str = "jwt_npub";
 /// Binding source when the relay falls back to the stored uid/pubkey binding.
 pub const SOURCE_DB_BINDING: &str = "db_binding";
 
+/// PostgreSQL-backed trust root for current enrollment policy and binding state.
+///
+/// The adapter owns no request-selectable configuration. The application constructs one
+/// long-lived instance from the writer pool at application startup and injects
+/// that instance into the single authorization runtime.
+#[derive(Clone)]
+pub struct PostgresFederatedAuthorityAdapter {
+    pool: PgPool,
+}
+
+impl PostgresFederatedAuthorityAdapter {
+    /// Bind the authority adapter to the authoritative writer pool.
+    pub const fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
 /// Server-resolved first-enrollment policy for one authorization domain.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EnrollmentMode {
@@ -405,6 +432,8 @@ pub enum BindingState {
     Revoked,
     /// The binding was atomically replaced.
     Rotated,
+    /// The inactive binding was archived with explicit attribution.
+    Archived,
 }
 
 impl BindingState {
@@ -413,10 +442,52 @@ impl BindingState {
             "active" => Ok(Self::Active),
             "revoked" => Ok(Self::Revoked),
             "rotated" => Ok(Self::Rotated),
+            "archived" => Ok(Self::Archived),
             _ => Err(DbError::InvalidData(
                 "identity binding has invalid lifecycle state".to_string(),
             )),
         }
+    }
+}
+
+/// Truthful provenance for immutable binding-creation attribution.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CreationAttributionKind {
+    /// The legacy row predates trustworthy actor and policy attribution.
+    LegacyUnknown,
+    /// A directly authenticated key created the binding under verified policy.
+    AuthenticatedKey,
+    /// A verified operator lifecycle action created the binding.
+    Operator,
+}
+
+impl CreationAttributionKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyUnknown => "legacy_unknown",
+            Self::AuthenticatedKey => "authenticated_key",
+            Self::Operator => "operator",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "legacy_unknown" => Ok(Self::LegacyUnknown),
+            "authenticated_key" => Ok(Self::AuthenticatedKey),
+            "operator" => Ok(Self::Operator),
+            _ => Err(DbError::InvalidData(
+                "identity binding has invalid creation attribution".to_string(),
+            )),
+        }
+    }
+}
+
+impl fmt::Debug for CreationAttributionKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("CreationAttributionKind")
+            .field(&"[redacted]")
+            .finish()
     }
 }
 
@@ -430,14 +501,88 @@ impl fmt::Debug for BindingState {
 }
 
 /// Stable evidence returned by authoritative binding resolution.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct BindingEvidence {
+    pub(crate) authorization_domain: CommunityId,
+    pub(crate) issuer: String,
+    pub(crate) subject: String,
+    pub(crate) bound_pubkey: Vec<u8>,
+    pub(crate) binding_id: Uuid,
+    pub(crate) binding_version: u64,
+    pub(crate) binding_state: BindingState,
+    pub(crate) provenance: BindingProvenance,
+    pub(crate) creation_attribution: CreationAttributionKind,
+    pub(crate) created_by: Option<Vec<u8>>,
+    pub(crate) created_policy_version: Option<String>,
+    pub(crate) expires_at: Option<DateTime<Utc>>,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
+impl BindingEvidence {
+    /// Authorization domain whose active binding was resolved.
+    pub const fn authorization_domain(&self) -> CommunityId {
+        self.authorization_domain
+    }
+
+    /// Exact private issuer. Callers must not disclose it publicly.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Exact private subject. Callers must not disclose it publicly.
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// Exact bound key.
+    pub fn bound_pubkey(&self) -> &[u8] {
+        &self.bound_pubkey
+    }
+
     /// Stable non-nil binding identifier.
-    pub binding_id: Uuid,
-    /// Positive authorization-relevant binding version.
-    pub binding_version: u64,
-    /// Persisted binding provenance.
-    pub provenance: BindingProvenance,
+    pub const fn binding_id(&self) -> Uuid {
+        self.binding_id
+    }
+
+    /// Positive version local to the stable binding identifier.
+    pub const fn binding_version(&self) -> u64 {
+        self.binding_version
+    }
+
+    /// Explicit authoritative lifecycle state.
+    pub const fn binding_state(&self) -> BindingState {
+        self.binding_state
+    }
+
+    /// Persisted provider-neutral provenance.
+    pub const fn provenance(&self) -> BindingProvenance {
+        self.provenance
+    }
+
+    /// Truthful creation-attribution classification.
+    pub const fn creation_attribution(&self) -> CreationAttributionKind {
+        self.creation_attribution
+    }
+
+    /// Verified creation actor, absent only for explicitly unknown legacy rows.
+    pub fn created_by(&self) -> Option<&[u8]> {
+        self.created_by.as_deref()
+    }
+
+    /// Exact creation policy, absent only for explicitly unknown legacy rows.
+    pub fn created_policy_version(&self) -> Option<&str> {
+        self.created_policy_version.as_deref()
+    }
+
+    /// Optional authoritative binding-expiry boundary.
+    pub const fn expires_at(&self) -> Option<&DateTime<Utc>> {
+        self.expires_at.as_ref()
+    }
+
+    /// Immutable creation timestamp persisted by PostgreSQL.
+    pub const fn created_at(&self) -> &DateTime<Utc> {
+        &self.created_at
+    }
 }
 
 impl fmt::Debug for BindingEvidence {
@@ -446,7 +591,13 @@ impl fmt::Debug for BindingEvidence {
             .debug_struct("BindingEvidence")
             .field("binding_id", &"[redacted]")
             .field("binding_version", &"[redacted]")
+            .field("binding_state", &"[redacted]")
             .field("provenance", &"[redacted]")
+            .field("authorization_domain", &"[redacted]")
+            .field("principal", &"[redacted]")
+            .field("bound_pubkey", &"[redacted]")
+            .field("creation_attribution", &"[redacted]")
+            .field("expires_at", &"[redacted]")
             .finish()
     }
 }
@@ -462,10 +613,16 @@ pub enum BindingDenial {
     BindingRequired,
     /// Attested enrollment lacked a verified matching key claim.
     KeyAttestationRequired,
+    /// The exact active binding remains slot-occupying but is no longer
+    /// authorization-eligible at database time.
+    BindingExpired,
+    /// Authorization or assertion evidence was no longer current at the
+    /// database mutation boundary.
+    StaleEvidence,
 }
 
 /// Result of resolving a binding during ordinary authorization.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ResolveBindingResult {
     /// A new authoritative binding was atomically enrolled.
     Enrolled(BindingEvidence),
@@ -476,20 +633,17 @@ pub enum ResolveBindingResult {
 }
 
 /// Typed input to ordinary binding resolution.
-#[derive(Clone, Copy)]
-pub struct ResolveBindingInput<'a> {
-    /// Exact validated issuer bytes represented as UTF-8.
-    pub issuer: &'a str,
-    /// Exact validated subject bytes represented as UTF-8.
-    pub subject: &'a str,
-    /// Proven 32-byte Nostr public key.
-    pub pubkey: &'a [u8],
-    /// Private display metadata.
-    pub display_name: Option<&'a str>,
-    /// Server-resolved enrollment mode.
-    pub enrollment_mode: EnrollmentMode,
-    /// Whether verified identity evidence attested `pubkey`.
-    pub key_attested: bool,
+pub(crate) struct ResolveBindingInput<'a> {
+    pub(crate) authorization_domain: CommunityId,
+    pub(crate) issuer: &'a str,
+    pub(crate) subject: &'a str,
+    pub(crate) pubkey: &'a [u8],
+    pub(crate) display_name: Option<&'a str>,
+    pub(crate) enrollment_mode: EnrollmentMode,
+    pub(crate) key_attested: bool,
+    pub(crate) policy_version: &'a str,
+    pub(crate) evidence_valid_from: u64,
+    pub(crate) evidence_valid_until: u64,
 }
 
 impl fmt::Debug for ResolveBindingInput<'_> {
@@ -502,6 +656,9 @@ impl fmt::Debug for ResolveBindingInput<'_> {
             .field("display_name", &"[redacted]")
             .field("enrollment_mode", &"[redacted]")
             .field("key_attested", &"[redacted]")
+            .field("policy_version", &"[redacted]")
+            .field("evidence_valid_from", &"[redacted]")
+            .field("evidence_valid_until", &"[redacted]")
             .finish()
     }
 }
@@ -523,6 +680,14 @@ pub struct IdentityBinding {
     pub binding_state: BindingState,
     /// Provider-neutral provenance.
     pub binding_provenance: BindingProvenance,
+    /// Truthful creation-attribution classification.
+    pub creation_attribution: CreationAttributionKind,
+    /// Verified creation actor, absent only for legacy-unknown attribution.
+    pub created_by: Option<Vec<u8>>,
+    /// Verified creation policy, absent only for legacy-unknown attribution.
+    pub created_policy_version: Option<String>,
+    /// Optional authoritative authorization-eligibility expiry.
+    pub expires_at: Option<DateTime<Utc>>,
     /// Human-readable display claim captured from the latest accepted JWT.
     pub display_name: Option<String>,
     /// Source that established or last strengthened the active binding.
@@ -553,27 +718,15 @@ impl fmt::Debug for IdentityBinding {
     }
 }
 
-/// Existing active binding that conflicts with a requested binding.
-#[derive(Clone, PartialEq, Eq)]
-pub struct IdentityBindingConflict {
-    /// Existing active issuer.
-    pub issuer: String,
-    /// Existing active uid.
-    pub uid: String,
-    /// Existing active pubkey bytes.
-    pub pubkey: Vec<u8>,
-    /// Existing active binding source.
-    pub source: String,
-}
+/// Party-data-free marker for an active binding conflict.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct IdentityBindingConflict;
 
 impl fmt::Debug for IdentityBindingConflict {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("IdentityBindingConflict")
-            .field("issuer", &"[redacted]")
-            .field("uid", &"[redacted]")
-            .field("pubkey", &"[redacted]")
-            .field("source", &"[redacted]")
+            .debug_tuple("IdentityBindingConflict")
+            .field(&"[redacted]")
             .finish()
     }
 }
@@ -589,6 +742,9 @@ pub enum BindIdentityResult {
     Conflict(IdentityBindingConflict),
     /// The requested uid/pubkey pair was previously revoked.
     Revoked,
+    /// No active binding exists; sealed authorized-domain evidence is required
+    /// before first enrollment.
+    BindingRequired,
 }
 
 /// Corporate identity data staged for an atomic admission transaction.
@@ -602,7 +758,8 @@ pub struct IdentityBindingInput<'a> {
     pub pubkey: &'a [u8],
     /// Private display attribute retained in the binding table.
     pub display_name: Option<&'a str>,
-    /// Binding source (`jwt_npub` or `db_binding`).
+    /// Legacy verifier source (`jwt_npub` or `db_binding`). This compatibility
+    /// field never grants attested provenance; only sealed authorization evidence can.
     pub source: &'a str,
 }
 
@@ -632,9 +789,9 @@ fn validate_inputs(issuer: &str, uid: &str, pubkey: &[u8], source: &str) -> Resu
     }
     validate_pubkey(pubkey)?;
     if !matches!(source, SOURCE_JWT_NPUB | SOURCE_DB_BINDING) {
-        return Err(DbError::InvalidData(format!(
-            "invalid identity binding source: {source}"
-        )));
+        return Err(DbError::InvalidData(
+            "invalid identity binding source".to_string(),
+        ));
     }
     Ok(())
 }
@@ -673,6 +830,26 @@ fn row_to_binding(row: sqlx::postgres::PgRow) -> Result<IdentityBinding> {
             "identity binding has invalid stable evidence".to_string(),
         ));
     }
+    let creation_attribution =
+        CreationAttributionKind::parse(row.try_get("creation_attribution_kind")?)?;
+    let created_by: Option<Vec<u8>> = row.try_get("created_by")?;
+    let created_policy_version: Option<String> = row.try_get("created_policy_version")?;
+    let attribution_is_complete = match creation_attribution {
+        CreationAttributionKind::LegacyUnknown => {
+            created_by.is_none() && created_policy_version.is_none()
+        }
+        CreationAttributionKind::AuthenticatedKey | CreationAttributionKind::Operator => {
+            created_by.as_ref().is_some_and(|actor| actor.len() == 32)
+                && created_policy_version
+                    .as_ref()
+                    .is_some_and(|version| !version.is_empty())
+        }
+    };
+    if !attribution_is_complete {
+        return Err(DbError::InvalidData(
+            "identity binding has incomplete creation attribution".to_string(),
+        ));
+    }
     Ok(IdentityBinding {
         binding_id,
         issuer: row.try_get("issuer")?,
@@ -683,12 +860,39 @@ fn row_to_binding(row: sqlx::postgres::PgRow) -> Result<IdentityBinding> {
         })?,
         binding_state: BindingState::parse(row.try_get("binding_state")?)?,
         binding_provenance: BindingProvenance::parse(row.try_get("binding_provenance")?)?,
+        creation_attribution,
+        created_by,
+        created_policy_version,
+        expires_at: row.try_get("expires_at")?,
         display_name: row.try_get("display_name")?,
         source: row.try_get("source")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         last_seen_at: row.try_get("last_seen_at")?,
     })
+}
+
+fn evidence_from_binding(
+    authorization_domain: CommunityId,
+    binding: &IdentityBinding,
+    binding_version: u64,
+    provenance: BindingProvenance,
+) -> BindingEvidence {
+    BindingEvidence {
+        authorization_domain,
+        issuer: binding.issuer.clone(),
+        subject: binding.uid.clone(),
+        bound_pubkey: binding.pubkey.clone(),
+        binding_id: binding.binding_id,
+        binding_version,
+        binding_state: BindingState::Active,
+        provenance,
+        creation_attribution: binding.creation_attribution,
+        created_by: binding.created_by.clone(),
+        created_policy_version: binding.created_policy_version.clone(),
+        expires_at: binding.expires_at,
+        created_at: binding.created_at.to_owned(),
+    }
 }
 
 async fn active_by_principal_tx(
@@ -700,9 +904,12 @@ async fn active_by_principal_tx(
     let row = sqlx::query(
         r#"
         SELECT binding_id, issuer, uid, pubkey, binding_version, binding_state,
-               binding_provenance, display_name, source, created_at, updated_at, last_seen_at
+               binding_provenance, creation_attribution_kind, created_by,
+               created_policy_version, expires_at, display_name, source,
+               created_at, updated_at, last_seen_at
         FROM identity_bindings
-        WHERE community_id = $1 AND issuer = $2 AND uid = $3 AND revoked_at IS NULL
+        WHERE community_id = $1 AND issuer = $2 AND uid = $3
+          AND binding_state = 'active' AND revoked_at IS NULL
         FOR UPDATE
         "#,
     )
@@ -722,9 +929,12 @@ async fn active_by_pubkey_tx(
     let row = sqlx::query(
         r#"
         SELECT binding_id, issuer, uid, pubkey, binding_version, binding_state,
-               binding_provenance, display_name, source, created_at, updated_at, last_seen_at
+               binding_provenance, creation_attribution_kind, created_by,
+               created_policy_version, expires_at, display_name, source,
+               created_at, updated_at, last_seen_at
         FROM identity_bindings
-        WHERE community_id = $1 AND pubkey = $2 AND revoked_at IS NULL
+        WHERE community_id = $1 AND pubkey = $2
+          AND binding_state = 'active' AND revoked_at IS NULL
         FOR UPDATE
         "#,
     )
@@ -870,15 +1080,6 @@ async fn migration_key_denied_tx(
     .is_some())
 }
 
-fn conflict_from(binding: IdentityBinding) -> IdentityBindingConflict {
-    IdentityBindingConflict {
-        issuer: binding.issuer,
-        uid: binding.uid,
-        pubkey: binding.pubkey,
-        source: binding.source,
-    }
-}
-
 const IDENTITY_LOCK_ENCODING_VERSION: u8 = 1;
 
 fn identity_lock_coordinate(kind: u8, community_id: CommunityId, parts: &[&[u8]]) -> Vec<u8> {
@@ -955,15 +1156,16 @@ async fn lock_identity_keys_tx(
     .await
 }
 
-/// Create or validate an active corporate identity binding.
+/// Validate an existing active corporate identity binding.
 ///
-/// This is a fail-closed auth-time operation:
-/// - same issuer + uid + pubkey updates display/last_seen and succeeds;
+/// This compatibility operation cannot enroll or strengthen a binding because
+/// it does not carry sealed authorization evidence:
+/// - same issuer + uid + pubkey succeeds without mutating binding evidence;
 /// - same issuer + uid with a different pubkey conflicts;
 /// - same pubkey with a different issuer-qualified principal conflicts;
 /// - principal disablement and unresolved key revocation reject every key;
 /// - a previously revoked issuer/uid/pubkey tuple remains revoked;
-/// - no active row creates a new binding.
+/// - no active row returns [`BindIdentityResult::BindingRequired`].
 pub async fn bind_or_validate_identity(
     pool: &PgPool,
     community_id: CommunityId,
@@ -990,7 +1192,7 @@ pub async fn bind_or_validate_identity(
     Ok(result)
 }
 
-/// Create or validate a binding inside a caller-owned admission transaction.
+/// Validate an existing binding inside a caller-owned admission transaction.
 pub(crate) async fn bind_or_validate_identity_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -1000,76 +1202,550 @@ pub(crate) async fn bind_or_validate_identity_tx(
         issuer,
         uid,
         pubkey,
-        display_name,
+        display_name: _,
         source,
     } = *identity;
     validate_inputs(issuer, uid, pubkey, source)?;
-    let (enrollment_mode, key_attested) = match source {
-        SOURCE_JWT_NPUB => (EnrollmentMode::AttestedKey, true),
-        SOURCE_DB_BINDING => (EnrollmentMode::Tofu, false),
-        _ => {
-            return Err(DbError::InvalidData(
-                "identity binding has invalid legacy source".to_string(),
-            ))
-        }
-    };
-    let result = resolve_identity_binding_tx(
-        tx,
-        community_id,
-        &ResolveBindingInput {
-            issuer,
-            subject: uid,
-            pubkey,
-            display_name,
-            enrollment_mode,
-            key_attested,
-        },
-    )
-    .await?;
-    Ok(match result {
-        ResolveBindingResult::Enrolled(_) => BindIdentityResult::Created,
-        ResolveBindingResult::Existing(_) => BindIdentityResult::Matched,
-        ResolveBindingResult::Denied(BindingDenial::Conflict) => {
-            let conflict = active_by_principal_tx(tx, community_id, issuer, uid)
-                .await?
-                .or(active_by_pubkey_tx(tx, community_id, pubkey).await?)
-                .ok_or_else(|| {
-                    DbError::InvalidData(
-                        "identity binding conflict disappeared inside transaction".to_string(),
-                    )
-                })?;
-            BindIdentityResult::Conflict(conflict_from(conflict))
-        }
-        ResolveBindingResult::Denied(
-            BindingDenial::Revoked
-            | BindingDenial::BindingRequired
-            | BindingDenial::KeyAttestationRequired,
-        ) => BindIdentityResult::Revoked,
+    sqlx::query("SET LOCAL lock_timeout = '3s'")
+        .execute(&mut **tx)
+        .await?;
+    lock_identity_keys_tx(tx, community_id, issuer, uid, pubkey).await?;
+
+    let denied = migration_denied_tx(tx, community_id, issuer, uid).await?
+        || migration_key_denied_tx(tx, community_id, pubkey).await?
+        || principal_disabled_tx(tx, community_id, issuer, uid).await?
+        || key_revoked_tx(tx, community_id, pubkey).await?
+        || principal_requires_rotation_tx(tx, community_id, issuer, uid).await?
+        || retired_pair_exists_tx(tx, community_id, issuer, uid, pubkey).await?;
+    if denied {
+        return Ok(BindIdentityResult::Revoked);
+    }
+
+    let active_principal = active_by_principal_tx(tx, community_id, issuer, uid).await?;
+    if active_principal
+        .as_ref()
+        .is_some_and(|binding| binding.pubkey != pubkey)
+    {
+        return Ok(BindIdentityResult::Conflict(IdentityBindingConflict));
+    }
+    let active_key = active_by_pubkey_tx(tx, community_id, pubkey).await?;
+    if active_key
+        .as_ref()
+        .is_some_and(|binding| binding.issuer != issuer || binding.uid != uid)
+    {
+        return Ok(BindIdentityResult::Conflict(IdentityBindingConflict));
+    }
+
+    Ok(if active_principal.is_some() {
+        BindIdentityResult::Matched
+    } else {
+        BindIdentityResult::BindingRequired
     })
 }
 
-/// Resolve an exact issuer/subject/key binding under server-owned enrollment policy.
-pub async fn resolve_identity_binding(
+#[derive(Clone, Copy)]
+struct AuthoritativeBindingRequestView<'a> {
+    authorization_domain: CommunityId,
+    issuer: &'a str,
+    subject: &'a str,
+    pubkey: [u8; 32],
+    policy_id: Uuid,
+    policy_epoch: u64,
+    policy_requirement: FederatedIdentityRequirement,
+    key_attested: bool,
+    effective_from: u64,
+    effective_until: u64,
+}
+
+impl<'a> AuthoritativeBindingRequestView<'a> {
+    fn from_sealed(request: &'a BindingResolutionRequest) -> Self {
+        Self {
+            authorization_domain: request.authorization_domain(),
+            issuer: request.principal().issuer(),
+            subject: request.principal().subject(),
+            pubkey: request.bound_pubkey().to_bytes(),
+            policy_id: request.policy_id(),
+            policy_epoch: request.policy_epoch(),
+            policy_requirement: request.policy_requirement(),
+            key_attested: request.key_attested(),
+            effective_from: request.effective_from(),
+            effective_until: request.effective_until(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CurrentEnrollmentPolicy {
+    policy_id: Uuid,
+    policy_epoch: u64,
+    requirement: FederatedIdentityRequirement,
+    effective_from: u64,
+    effective_until: u64,
+}
+
+impl CurrentEnrollmentPolicy {
+    fn from_row(row: sqlx::postgres::PgRow) -> Result<Self> {
+        let policy_id: Uuid = row.try_get("policy_id")?;
+        let policy_epoch: i64 = row.try_get("policy_epoch")?;
+        let effective_from: i64 = row.try_get("effective_from")?;
+        let effective_until: i64 = row.try_get("effective_until")?;
+        if policy_id.is_nil()
+            || policy_epoch <= 0
+            || effective_from < 0
+            || effective_from >= effective_until
+        {
+            return Err(DbError::InvalidData(
+                "identity enrollment policy has invalid authoritative state".to_string(),
+            ));
+        }
+        Ok(Self {
+            policy_id,
+            policy_epoch: u64::try_from(policy_epoch).map_err(|_| {
+                DbError::InvalidData("identity enrollment policy epoch is out of range".to_string())
+            })?,
+            requirement: policy_requirement(row.try_get("requirement")?)?,
+            effective_from: u64::try_from(effective_from).map_err(|_| {
+                DbError::InvalidData(
+                    "identity enrollment policy lower bound is out of range".to_string(),
+                )
+            })?,
+            effective_until: u64::try_from(effective_until).map_err(|_| {
+                DbError::InvalidData(
+                    "identity enrollment policy upper bound is out of range".to_string(),
+                )
+            })?,
+        })
+    }
+
+    fn matches_binding_request(&self, request: &AuthoritativeBindingRequestView<'_>) -> bool {
+        self.policy_id == request.policy_id
+            && self.policy_epoch == request.policy_epoch
+            && self.requirement == request.policy_requirement
+            && request.effective_from >= self.effective_from
+            && request.effective_until <= self.effective_until
+            && request.effective_from < request.effective_until
+    }
+}
+
+fn policy_requirement(value: &str) -> Result<FederatedIdentityRequirement> {
+    match value {
+        "not_required" => Ok(FederatedIdentityRequirement::NotRequired),
+        "attested_key" => Ok(FederatedIdentityRequirement::Required(
+            AuthorizedEnrollmentMode::AttestedKey,
+        )),
+        "provisioned" => Ok(FederatedIdentityRequirement::Required(
+            AuthorizedEnrollmentMode::Provisioned,
+        )),
+        "tofu" => Ok(FederatedIdentityRequirement::Required(
+            AuthorizedEnrollmentMode::Tofu,
+        )),
+        _ => Err(DbError::InvalidData(
+            "identity enrollment policy has invalid requirement".to_string(),
+        )),
+    }
+}
+
+fn storage_enrollment_mode(
+    requirement: FederatedIdentityRequirement,
+) -> std::result::Result<EnrollmentMode, buzz_auth::AuthContextError> {
+    match requirement {
+        FederatedIdentityRequirement::Required(AuthorizedEnrollmentMode::AttestedKey) => {
+            Ok(EnrollmentMode::AttestedKey)
+        }
+        FederatedIdentityRequirement::Required(AuthorizedEnrollmentMode::Provisioned) => {
+            Ok(EnrollmentMode::Provisioned)
+        }
+        FederatedIdentityRequirement::Required(AuthorizedEnrollmentMode::Tofu) => {
+            Ok(EnrollmentMode::Tofu)
+        }
+        FederatedIdentityRequirement::NotRequired => {
+            Err(buzz_auth::AuthContextError::UnexpectedFederatedAuthorization)
+        }
+    }
+}
+
+async fn read_current_enrollment_policy(
     pool: &PgPool,
-    community_id: CommunityId,
+    authorization_domain: CommunityId,
+) -> Result<CurrentEnrollmentPolicy> {
+    let row = sqlx::query(
+        "SELECT policy_id, policy_epoch, requirement, effective_from, effective_until \
+         FROM identity_enrollment_policies WHERE community_id=$1",
+    )
+    .bind(authorization_domain.as_uuid())
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| {
+        DbError::InvalidData("current identity enrollment policy is unavailable".to_string())
+    })?;
+    CurrentEnrollmentPolicy::from_row(row)
+}
+
+async fn lock_current_enrollment_policy_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    authorization_domain: CommunityId,
+) -> Result<Option<CurrentEnrollmentPolicy>> {
+    sqlx::query(
+        "SELECT policy_id, policy_epoch, requirement, effective_from, effective_until \
+         FROM identity_enrollment_policies WHERE community_id=$1 FOR UPDATE",
+    )
+    .bind(authorization_domain.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(CurrentEnrollmentPolicy::from_row)
+    .transpose()
+}
+
+enum PolicyPreconditionState {
+    Current,
+    Changed,
+    NotYetEffective,
+    Expired,
+}
+
+async fn policy_precondition_state_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    request: &AuthoritativeBindingRequestView<'_>,
+) -> Result<PolicyPreconditionState> {
+    let Some(policy) = lock_current_enrollment_policy_tx(tx, request.authorization_domain).await?
+    else {
+        return Ok(PolicyPreconditionState::Changed);
+    };
+    if !policy.matches_binding_request(request) {
+        return Ok(PolicyPreconditionState::Changed);
+    }
+    let now: i64 =
+        sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
+            .fetch_one(&mut **tx)
+            .await?;
+    let effective_from = i64::try_from(request.effective_from).map_err(|_| {
+        DbError::InvalidData("identity evidence lower bound is out of range".to_string())
+    })?;
+    let effective_until = i64::try_from(request.effective_until).map_err(|_| {
+        DbError::InvalidData("identity evidence upper bound is out of range".to_string())
+    })?;
+    Ok(if now < effective_from {
+        PolicyPreconditionState::NotYetEffective
+    } else if now >= effective_until {
+        PolicyPreconditionState::Expired
+    } else {
+        PolicyPreconditionState::Current
+    })
+}
+
+fn enforce_policy_precondition(
+    state: PolicyPreconditionState,
+) -> std::result::Result<(), AuthorityAdapterError<DbError>> {
+    match state {
+        PolicyPreconditionState::Current => Ok(()),
+        PolicyPreconditionState::Changed => Err(AuthorityAdapterError::policy_changed()),
+        PolicyPreconditionState::NotYetEffective => {
+            Err(buzz_auth::AuthContextError::FederatedPolicyNotYetEffective.into())
+        }
+        PolicyPreconditionState::Expired => {
+            Err(buzz_auth::AuthContextError::FederatedPolicyExpired.into())
+        }
+    }
+}
+
+async fn resolve_authoritative_binding_request(
+    pool: &PgPool,
+    request: &BindingResolutionRequest,
+    enrollment_allowed: bool,
+) -> std::result::Result<ResolveBindingResult, AuthorityAdapterError<DbError>> {
+    resolve_authoritative_binding_view(
+        pool,
+        &AuthoritativeBindingRequestView::from_sealed(request),
+        enrollment_allowed,
+    )
+    .await
+}
+
+async fn resolve_authoritative_binding_view(
+    pool: &PgPool,
+    request: &AuthoritativeBindingRequestView<'_>,
+    enrollment_allowed: bool,
+) -> std::result::Result<ResolveBindingResult, AuthorityAdapterError<DbError>> {
+    let storage_mode = if enrollment_allowed {
+        storage_enrollment_mode(request.policy_requirement)?
+    } else {
+        EnrollmentMode::Provisioned
+    };
+    let policy_version = format!("{}:{}", request.policy_id, request.policy_epoch);
+    let input = ResolveBindingInput {
+        authorization_domain: request.authorization_domain,
+        issuer: request.issuer,
+        subject: request.subject,
+        pubkey: &request.pubkey,
+        display_name: None,
+        enrollment_mode: storage_mode,
+        key_attested: request.key_attested,
+        policy_version: &policy_version,
+        evidence_valid_from: request.effective_from,
+        evidence_valid_until: request.effective_until,
+    };
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| AuthorityAdapterError::adapter(error.into()))?;
+    sqlx::query("SET LOCAL lock_timeout = '3s'")
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| AuthorityAdapterError::adapter(error.into()))?;
+    let initial = policy_precondition_state_tx(&mut tx, request)
+        .await
+        .map_err(AuthorityAdapterError::adapter)?;
+    enforce_policy_precondition(initial)?;
+    let result = resolve_identity_binding_tx(&mut tx, request.authorization_domain, &input, true)
+        .await
+        .map_err(AuthorityAdapterError::adapter)?;
+    if matches!(
+        result,
+        ResolveBindingResult::Existing(_) | ResolveBindingResult::Enrolled(_)
+    ) {
+        let final_state = policy_precondition_state_tx(&mut tx, request)
+            .await
+            .map_err(AuthorityAdapterError::adapter)?;
+        enforce_policy_precondition(final_state)?;
+        tx.commit()
+            .await
+            .map_err(|error| AuthorityAdapterError::adapter(error.into()))?;
+    } else {
+        tx.rollback()
+            .await
+            .map_err(|error| AuthorityAdapterError::adapter(error.into()))?;
+    }
+    Ok(result)
+}
+
+fn authorized_binding_parts(
+    evidence: &BindingEvidence,
+) -> std::result::Result<
+    (
+        AuthorizedBindingVersion,
+        Option<AuthorizedBindingExpiry>,
+        AuthorizedBindingSource,
+    ),
+    buzz_auth::AuthContextError,
+> {
+    let binding_version = AuthorizedBindingVersion::new(evidence.binding_version)?;
+    let expires_at = evidence
+        .expires_at
+        .map(|value| {
+            u64::try_from(value.timestamp())
+                .map_err(|_| buzz_auth::AuthContextError::InvalidBindingExpiry)
+                .and_then(AuthorizedBindingExpiry::new)
+        })
+        .transpose()?;
+    let source = match evidence.provenance {
+        BindingProvenance::AttestedKey => AuthorizedBindingSource::AttestedKey,
+        BindingProvenance::Provisioned => AuthorizedBindingSource::Provisioned,
+        BindingProvenance::Tofu => AuthorizedBindingSource::Tofu,
+    };
+    Ok((binding_version, expires_at, source))
+}
+
+fn authority_denial(denial: BindingDenial, delegated: bool) -> AuthorityAdapterError<DbError> {
+    match denial {
+        BindingDenial::KeyAttestationRequired => {
+            buzz_auth::AuthContextError::KeyAttestationRequired.into()
+        }
+        BindingDenial::BindingExpired => buzz_auth::AuthContextError::BindingExpired.into(),
+        BindingDenial::StaleEvidence => buzz_auth::AuthContextError::FederatedPolicyExpired.into(),
+        BindingDenial::BindingRequired if delegated => {
+            buzz_auth::AuthContextError::DelegatedBindingNotExistingActive.into()
+        }
+        BindingDenial::Conflict | BindingDenial::Revoked | BindingDenial::BindingRequired => {
+            AuthorityAdapterError::adapter(DbError::InvalidData(
+                "identity binding resolution denied".to_string(),
+            ))
+        }
+    }
+}
+
+impl FederatedAuthorityAdapter for PostgresFederatedAuthorityAdapter {
+    type Error = DbError;
+
+    fn resolve_current_policy<'a>(
+        &'a self,
+        request: CurrentPolicyRequest,
+        sink: CurrentPolicyResolutionSink,
+    ) -> AuthorityAdapterFuture<
+        'a,
+        std::result::Result<ResolvedFederatedPolicy, AuthorityAdapterError<Self::Error>>,
+    > {
+        Box::pin(async move {
+            let policy = read_current_enrollment_policy(&self.pool, request.authorization_domain())
+                .await
+                .map_err(AuthorityAdapterError::adapter)?;
+            sink.resolved(
+                request.authorization_domain(),
+                policy.policy_id,
+                policy.policy_epoch,
+                policy.requirement,
+                policy.effective_from,
+                policy.effective_until,
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    fn resolve_direct_binding<'a>(
+        &'a self,
+        request: BindingResolutionRequest,
+        sink: DirectBindingResolutionSink,
+    ) -> AuthorityAdapterFuture<
+        'a,
+        std::result::Result<AuthoritativeBindingResolution, AuthorityAdapterError<Self::Error>>,
+    > {
+        Box::pin(async move {
+            let result = resolve_authoritative_binding_request(&self.pool, &request, true).await?;
+            let evidence = match result {
+                ResolveBindingResult::Existing(evidence) => (evidence, false),
+                ResolveBindingResult::Enrolled(evidence) => (evidence, true),
+                ResolveBindingResult::Denied(denial) => {
+                    return Err(authority_denial(denial, false))
+                }
+            };
+            let (binding_version, expires_at, source) = authorized_binding_parts(&evidence.0)?;
+            let seal = if evidence.1 {
+                DirectBindingResolutionSink::atomically_enrolled
+            } else {
+                DirectBindingResolutionSink::existing_active
+            };
+            seal(
+                sink,
+                evidence.0.authorization_domain,
+                evidence.0.binding_id,
+                request.principal().clone(),
+                request.bound_pubkey(),
+                binding_version,
+                expires_at,
+                source,
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    fn resolve_existing_binding<'a>(
+        &'a self,
+        request: BindingResolutionRequest,
+        sink: ExistingBindingResolutionSink,
+    ) -> AuthorityAdapterFuture<
+        'a,
+        std::result::Result<AuthoritativeBindingResolution, AuthorityAdapterError<Self::Error>>,
+    > {
+        Box::pin(async move {
+            let result = resolve_authoritative_binding_request(&self.pool, &request, false).await?;
+            let evidence = match result {
+                ResolveBindingResult::Existing(evidence) => evidence,
+                ResolveBindingResult::Enrolled(_) => {
+                    return Err(
+                        buzz_auth::AuthContextError::DelegatedBindingNotExistingActive.into(),
+                    )
+                }
+                ResolveBindingResult::Denied(denial) => return Err(authority_denial(denial, true)),
+            };
+            let (binding_version, expires_at, source) = authorized_binding_parts(&evidence)?;
+            sink.existing_active(
+                evidence.authorization_domain,
+                evidence.binding_id,
+                request.principal().clone(),
+                request.bound_pubkey(),
+                binding_version,
+                expires_at,
+                source,
+            )
+            .map_err(Into::into)
+        })
+    }
+}
+
+/// Resolve an exact issuer/subject/key binding under server-owned enrollment policy.
+#[cfg(test)]
+pub(crate) async fn resolve_identity_binding(
+    pool: &PgPool,
     input: &ResolveBindingInput<'_>,
 ) -> Result<ResolveBindingResult> {
     let mut tx = pool.begin().await?;
-    let result = resolve_identity_binding_tx(&mut tx, community_id, input).await?;
+    let result =
+        resolve_identity_binding_tx(&mut tx, input.authorization_domain, input, false).await?;
+    if matches!(
+        &result,
+        ResolveBindingResult::Enrolled(_) | ResolveBindingResult::Existing(_)
+    ) && !evidence_is_current_tx(&mut tx, input).await?
+    {
+        tx.rollback().await?;
+        return Ok(ResolveBindingResult::Denied(BindingDenial::StaleEvidence));
+    }
     tx.commit().await?;
     Ok(result)
+}
+
+async fn evidence_is_current_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: &ResolveBindingInput<'_>,
+) -> Result<bool> {
+    let evidence_valid_from = i64::try_from(input.evidence_valid_from).map_err(|_| {
+        DbError::InvalidData(
+            "identity evidence lower bound is outside the supported range".to_string(),
+        )
+    })?;
+    let evidence_valid_until = i64::try_from(input.evidence_valid_until).map_err(|_| {
+        DbError::InvalidData(
+            "identity evidence upper bound is outside the supported range".to_string(),
+        )
+    })?;
+    if evidence_valid_from >= evidence_valid_until {
+        return Err(DbError::InvalidData(
+            "identity binding authorization evidence has no valid interval".to_string(),
+        ));
+    }
+    sqlx::query_scalar(
+        "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT >= $1 \
+                AND FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT < $2",
+    )
+    .bind(evidence_valid_from)
+    .bind(evidence_valid_until)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
 }
 
 async fn resolve_identity_binding_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     input: &ResolveBindingInput<'_>,
+    existing_read_only: bool,
 ) -> Result<ResolveBindingResult> {
+    if community_id != input.authorization_domain || input.policy_version.is_empty() {
+        return Err(DbError::InvalidData(
+            "identity binding authorization domain or policy is invalid".to_string(),
+        ));
+    }
     validate_inputs(input.issuer, input.subject, input.pubkey, SOURCE_DB_BINDING)?;
+    let evidence_valid_from = i64::try_from(input.evidence_valid_from).map_err(|_| {
+        DbError::InvalidData(
+            "identity evidence lower bound is outside the supported range".to_string(),
+        )
+    })?;
+    let evidence_valid_until = i64::try_from(input.evidence_valid_until).map_err(|_| {
+        DbError::InvalidData(
+            "identity evidence upper bound is outside the supported range".to_string(),
+        )
+    })?;
+    if evidence_valid_from >= evidence_valid_until {
+        return Err(DbError::InvalidData(
+            "identity binding authorization evidence has no valid interval".to_string(),
+        ));
+    }
     sqlx::query("SET LOCAL lock_timeout = '3s'")
         .execute(&mut **tx)
         .await?;
     lock_identity_keys_tx(tx, community_id, input.issuer, input.subject, input.pubkey).await?;
+    if !evidence_is_current_tx(tx, input).await? {
+        return Ok(ResolveBindingResult::Denied(BindingDenial::StaleEvidence));
+    }
 
     let denied = migration_denied_tx(tx, community_id, input.issuer, input.subject).await?
         || migration_key_denied_tx(tx, community_id, input.pubkey).await?
@@ -1078,27 +1754,47 @@ async fn resolve_identity_binding_tx(
         || principal_requires_rotation_tx(tx, community_id, input.issuer, input.subject).await?
         || retired_pair_exists_tx(tx, community_id, input.issuer, input.subject, input.pubkey)
             .await?;
+    let active_principal =
+        active_by_principal_tx(tx, community_id, input.issuer, input.subject).await?;
+    let active_key = active_by_pubkey_tx(tx, community_id, input.pubkey).await?;
+
+    // Authorization evidence is a lease only for this mutation. Recheck the
+    // database clock after every potentially blocking lock/read so a waiter
+    // cannot enroll or refresh after expiry, and reject future-dated evidence.
+    if !evidence_is_current_tx(tx, input).await? {
+        return Ok(ResolveBindingResult::Denied(BindingDenial::StaleEvidence));
+    }
     if denied {
         return Ok(ResolveBindingResult::Denied(BindingDenial::Revoked));
     }
-
-    let active_principal =
-        active_by_principal_tx(tx, community_id, input.issuer, input.subject).await?;
     if active_principal
         .as_ref()
         .is_some_and(|binding| binding.pubkey != input.pubkey)
-    {
-        return Ok(ResolveBindingResult::Denied(BindingDenial::Conflict));
-    }
-    let active_key = active_by_pubkey_tx(tx, community_id, input.pubkey).await?;
-    if active_key
-        .as_ref()
-        .is_some_and(|binding| binding.issuer != input.issuer || binding.uid != input.subject)
+        || active_key
+            .as_ref()
+            .is_some_and(|binding| binding.issuer != input.issuer || binding.uid != input.subject)
     {
         return Ok(ResolveBindingResult::Denied(BindingDenial::Conflict));
     }
 
     if let Some(binding) = active_principal {
+        let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut **tx)
+            .await?;
+        if binding
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= database_now)
+        {
+            return Ok(ResolveBindingResult::Denied(BindingDenial::BindingExpired));
+        }
+        if existing_read_only {
+            return Ok(ResolveBindingResult::Existing(evidence_from_binding(
+                community_id,
+                &binding,
+                binding.binding_version,
+                binding.binding_provenance,
+            )));
+        }
         let strengthen =
             binding.binding_provenance == BindingProvenance::Tofu && input.key_attested;
         let version = binding
@@ -1107,7 +1803,7 @@ async fn resolve_identity_binding_tx(
             .ok_or_else(|| {
                 DbError::InvalidData("identity binding version exhausted".to_string())
             })?;
-        sqlx::query(
+        let updated = sqlx::query(
             r#"
             UPDATE identity_bindings
             SET display_name=$5,
@@ -1116,7 +1812,9 @@ async fn resolve_identity_binding_tx(
                 binding_version=CASE WHEN $6 THEN binding_version + 1 ELSE binding_version END,
                 updated_at=NOW(), last_seen_at=NOW()
             WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND pubkey=$4
-              AND revoked_at IS NULL
+              AND binding_state='active' AND revoked_at IS NULL
+              AND FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT >= $7
+              AND FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT < $8
             "#,
         )
         .bind(community_id.as_uuid())
@@ -1125,16 +1823,21 @@ async fn resolve_identity_binding_tx(
         .bind(input.pubkey)
         .bind(input.display_name)
         .bind(strengthen)
+        .bind(evidence_valid_from)
+        .bind(evidence_valid_until)
         .execute(&mut **tx)
         .await?;
+        if updated.rows_affected() != 1 {
+            return Ok(ResolveBindingResult::Denied(BindingDenial::StaleEvidence));
+        }
         if strengthen {
             sqlx::query(
                 r#"
                 INSERT INTO identity_binding_history
                     (community_id, binding_id, binding_version, issuer, subject,
-                     pubkey, binding_state, binding_provenance, transition_kind, reason)
+                     pubkey, binding_state, binding_provenance, transition_kind, actor, reason)
                 VALUES ($1, $2, $3, $4, $5, $6, 'active', 'attested_key',
-                        'provenance_strengthened', 'verified key attestation')
+                        'provenance_strengthened', $6, 'verified key attestation')
                 "#,
             )
             .bind(community_id.as_uuid())
@@ -1148,15 +1851,16 @@ async fn resolve_identity_binding_tx(
             .execute(&mut **tx)
             .await?;
         }
-        return Ok(ResolveBindingResult::Existing(BindingEvidence {
-            binding_id: binding.binding_id,
-            binding_version: version,
-            provenance: if strengthen {
+        return Ok(ResolveBindingResult::Existing(evidence_from_binding(
+            community_id,
+            &binding,
+            version,
+            if strengthen {
                 BindingProvenance::AttestedKey
             } else {
                 binding.binding_provenance
             },
-        }));
+        )));
     }
 
     let provenance = match input.enrollment_mode {
@@ -1172,27 +1876,17 @@ async fn resolve_identity_binding_tx(
         EnrollmentMode::Tofu if input.key_attested => BindingProvenance::AttestedKey,
         EnrollmentMode::Tofu => BindingProvenance::Tofu,
     };
-    let next_version: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(binding_version), 0) + 1 FROM identity_bindings \
-         WHERE community_id=$1 AND issuer=$2 AND uid=$3",
-    )
-    .bind(community_id.as_uuid())
-    .bind(input.issuer)
-    .bind(input.subject)
-    .fetch_one(&mut **tx)
-    .await?;
-    if next_version <= 0 {
-        return Err(DbError::InvalidData(
-            "identity binding version exhausted".to_string(),
-        ));
-    }
     let binding_id = Uuid::new_v4();
-    sqlx::query(
+    let created_at: Option<DateTime<Utc>> = sqlx::query_scalar(
         r#"
         INSERT INTO identity_bindings
             (community_id, issuer, uid, pubkey, display_name, source, binding_id,
-             binding_version, binding_state, binding_provenance)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9)
+             binding_version, binding_state, binding_provenance, created_by,
+             created_policy_version, expires_at, creation_attribution_kind)
+        SELECT $1, $2, $3, $4, $5, $6, $7, 1, 'active', $8, $4, $9, NULL, $10
+        WHERE FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT >= $11
+          AND FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT < $12
+        RETURNING created_at
         "#,
     )
     .bind(community_id.as_uuid())
@@ -1202,21 +1896,27 @@ async fn resolve_identity_binding_tx(
     .bind(input.display_name)
     .bind(provenance.legacy_source())
     .bind(binding_id)
-    .bind(next_version)
     .bind(provenance.as_str())
-    .execute(&mut **tx)
+    .bind(input.policy_version)
+    .bind(CreationAttributionKind::AuthenticatedKey.as_str())
+    .bind(evidence_valid_from)
+    .bind(evidence_valid_until)
+    .fetch_optional(&mut **tx)
     .await?;
+    let Some(created_at) = created_at else {
+        return Ok(ResolveBindingResult::Denied(BindingDenial::StaleEvidence));
+    };
     sqlx::query(
         r#"
         INSERT INTO identity_binding_history
             (community_id, binding_id, binding_version, issuer, subject, pubkey,
-             binding_state, binding_provenance, transition_kind, reason)
-        VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, 'enroll', 'first enrollment')
+             binding_state, binding_provenance, transition_kind, actor, reason)
+        VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, 'enroll', $6, 'first enrollment')
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(binding_id)
-    .bind(next_version)
+    .bind(1_i64)
     .bind(input.issuer)
     .bind(input.subject)
     .bind(input.pubkey)
@@ -1224,11 +1924,19 @@ async fn resolve_identity_binding_tx(
     .execute(&mut **tx)
     .await?;
     Ok(ResolveBindingResult::Enrolled(BindingEvidence {
+        authorization_domain: community_id,
+        issuer: input.issuer.to_owned(),
+        subject: input.subject.to_owned(),
+        bound_pubkey: input.pubkey.to_vec(),
         binding_id,
-        binding_version: u64::try_from(next_version).map_err(|_| {
-            DbError::InvalidData("identity binding version is out of range".to_string())
-        })?,
+        binding_version: 1,
+        binding_state: BindingState::Active,
         provenance,
+        creation_attribution: CreationAttributionKind::AuthenticatedKey,
+        created_by: Some(input.pubkey.to_vec()),
+        created_policy_version: Some(input.policy_version.to_owned()),
+        expires_at: None,
+        created_at,
     }))
 }
 
@@ -1246,6 +1954,16 @@ pub async fn get_active_identity_binding_by_pubkey(
     lock_identity_coordinates_tx(&mut tx, vec![key_lock_coordinate(community_id, pubkey)]).await?;
     let binding = active_by_pubkey_tx(&mut tx, community_id, pubkey).await?;
     if let Some(binding) = binding.as_ref() {
+        let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await?;
+        if binding
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= database_now)
+        {
+            tx.commit().await?;
+            return Ok(None);
+        }
         let denied = migration_key_denied_tx(&mut tx, community_id, pubkey).await?
             || migration_denied_tx(&mut tx, community_id, &binding.issuer, &binding.uid).await?
             || principal_disabled_tx(&mut tx, community_id, &binding.issuer, &binding.uid).await?
@@ -1272,16 +1990,17 @@ pub async fn get_active_identity_binding_by_pubkey(
 pub async fn revoke_identity_principal(
     pool: &PgPool,
     community_id: CommunityId,
+    operation_id: crate::identity_lifecycle::LifecycleOperationId,
     issuer: &str,
     uid: &str,
-    revoked_by: Option<&[u8]>,
+    revoked_by: &[u8],
     reason: &str,
 ) -> Result<bool> {
     crate::identity_lifecycle::disable_identity_principal(
         pool,
         community_id,
         crate::identity_lifecycle::LifecycleContext {
-            operation_id: Uuid::new_v4(),
+            operation_id,
             actor: revoked_by,
             reason,
         },
@@ -1299,15 +2018,16 @@ pub async fn revoke_identity_principal(
 pub async fn revoke_identity_key(
     pool: &PgPool,
     community_id: CommunityId,
+    operation_id: crate::identity_lifecycle::LifecycleOperationId,
     pubkey: &[u8],
-    revoked_by: Option<&[u8]>,
+    revoked_by: &[u8],
     reason: &str,
 ) -> Result<bool> {
     crate::identity_lifecycle::revoke_identity_key(
         pool,
         community_id,
         crate::identity_lifecycle::LifecycleContext {
-            operation_id: Uuid::new_v4(),
+            operation_id,
             actor: revoked_by,
             reason,
         },
@@ -1322,68 +2042,33 @@ pub async fn revoke_identity_key(
 pub async fn rotate_identity_binding(
     pool: &PgPool,
     community_id: CommunityId,
+    operation_id: crate::identity_lifecycle::LifecycleOperationId,
     issuer: &str,
     uid: &str,
     old_pubkey: &[u8],
-    new_pubkey: &[u8],
-    display_name: Option<&str>,
-    source: &str,
-    rotated_by: Option<&[u8]>,
+    replacement: crate::identity_lifecycle::VerifiedReplacementKey<'_>,
+    rotated_by: &[u8],
     reason: &str,
 ) -> Result<()> {
-    validate_inputs(issuer, uid, old_pubkey, source)?;
-    let provenance = match source {
-        SOURCE_JWT_NPUB => BindingProvenance::AttestedKey,
-        SOURCE_DB_BINDING => BindingProvenance::Provisioned,
-        _ => {
-            return Err(DbError::InvalidData(
-                "identity rotation has invalid legacy source".to_string(),
-            ))
-        }
-    };
-    let replacement = crate::identity_lifecycle::VerifiedReplacementKey::after_verified_proof(
-        new_pubkey,
-        display_name,
-        provenance,
-        None,
-    )?;
+    validate_inputs(issuer, uid, old_pubkey, SOURCE_DB_BINDING)?;
     let principal = crate::identity_lifecycle::IdentityPrincipal {
         issuer,
         subject: uid,
     };
     let context = crate::identity_lifecycle::LifecycleContext {
-        operation_id: Uuid::new_v4(),
+        operation_id,
         actor: rotated_by,
         reason,
     };
-    if let Some(expected) =
-        crate::identity_lifecycle::get_pending_lineage(pool, community_id, principal).await?
-    {
-        if expected.retired_pubkey != old_pubkey {
-            return Err(DbError::InvalidData(
-                "identity rotation source does not match pending lineage".to_string(),
-            ));
-        }
-        crate::identity_lifecycle::recover_identity_binding(
-            pool,
-            community_id,
-            context,
-            principal,
-            &expected,
-            replacement,
-        )
-        .await?;
-    } else {
-        crate::identity_lifecycle::rotate_identity_binding(
-            pool,
-            community_id,
-            context,
-            principal,
-            old_pubkey,
-            replacement,
-        )
-        .await?;
-    }
+    crate::identity_lifecycle::rotate_identity_binding(
+        pool,
+        community_id,
+        context,
+        principal,
+        old_pubkey,
+        replacement,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1392,6 +2077,13 @@ mod tests {
     use super::*;
     use nostr::Keys;
     use uuid::Uuid;
+
+    #[test]
+    fn postgres_authority_adapter_implements_the_sealed_provider_contract() {
+        fn assert_adapter<T: FederatedAuthorityAdapter<Error = DbError>>() {}
+
+        assert_adapter::<PostgresFederatedAuthorityAdapter>();
+    }
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
     const TEST_ISSUER: &str = "https://idp.example";
@@ -1421,8 +2113,453 @@ mod tests {
         CommunityId::from_uuid(id)
     }
 
+    async fn database_now(pool: &PgPool) -> u64 {
+        let now: i64 =
+            sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
+                .fetch_one(pool)
+                .await
+                .expect("read database clock");
+        u64::try_from(now).expect("database clock is non-negative")
+    }
+
+    async fn install_policy(
+        pool: &PgPool,
+        community: CommunityId,
+        policy_id: Uuid,
+        epoch: u64,
+        requirement: &str,
+        effective_from: u64,
+        effective_until: u64,
+    ) {
+        sqlx::query(
+            "INSERT INTO identity_enrollment_policies \
+             (community_id, policy_id, policy_epoch, requirement, effective_from, effective_until) \
+             VALUES ($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(community.as_uuid())
+        .bind(policy_id)
+        .bind(i64::try_from(epoch).expect("test epoch fits BIGINT"))
+        .bind(requirement)
+        .bind(i64::try_from(effective_from).expect("test lower bound fits BIGINT"))
+        .bind(i64::try_from(effective_until).expect("test upper bound fits BIGINT"))
+        .execute(pool)
+        .await
+        .expect("install test enrollment policy");
+    }
+
+    // Keep each authority input explicit so the negative-test matrix can vary
+    // one security-relevant field at a time without hiding defaults.
+    #[allow(clippy::too_many_arguments)]
+    fn authoritative_request<'a>(
+        community: CommunityId,
+        issuer: &'a str,
+        subject: &'a str,
+        pubkey: [u8; 32],
+        policy_id: Uuid,
+        policy_epoch: u64,
+        requirement: FederatedIdentityRequirement,
+        key_attested: bool,
+        effective_from: u64,
+        effective_until: u64,
+    ) -> AuthoritativeBindingRequestView<'a> {
+        AuthoritativeBindingRequestView {
+            authorization_domain: community,
+            issuer,
+            subject,
+            pubkey,
+            policy_id,
+            policy_epoch,
+            policy_requirement: requirement,
+            key_attested,
+            effective_from,
+            effective_until,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn current_policy_adapter_returns_exact_authoritative_lineage() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let policy_id = Uuid::new_v4();
+        let now = database_now(&pool).await;
+        install_policy(&pool, community, policy_id, 7, "tofu", now - 1, now + 60).await;
+        let correlation_id = Uuid::new_v4();
+        let adapter = PostgresFederatedAuthorityAdapter::new(pool);
+
+        let resolved =
+            buzz_auth::resolve_current_federated_policy(&adapter, community, correlation_id, now)
+                .await
+                .expect("authoritative current policy resolves");
+
+        assert_eq!(resolved.authorization_domain(), community);
+        assert_eq!(resolved.stamp().policy_id(), policy_id);
+        assert_eq!(resolved.stamp().epoch(), 7);
+        assert_eq!(resolved.stamp().correlation_id(), correlation_id);
+        assert_eq!(resolved.stamp().effective_from(), now - 1);
+        assert_eq!(resolved.stamp().effective_until(), now + 60);
+        assert_eq!(
+            resolved.requirement(),
+            FederatedIdentityRequirement::Required(AuthorizedEnrollmentMode::Tofu)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn stale_policy_epoch_fails_closed_without_binding_mutation() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let policy_id = Uuid::new_v4();
+        let now = database_now(&pool).await;
+        install_policy(&pool, community, policy_id, 1, "tofu", now - 1, now + 60).await;
+        sqlx::query(
+            "UPDATE identity_enrollment_policies \
+             SET policy_epoch=2, requirement='provisioned', updated_at=NOW() \
+             WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("advance test policy epoch");
+        let request = authoritative_request(
+            community,
+            TEST_ISSUER,
+            "stale-policy-user",
+            random_pubkey().try_into().expect("test key is 32 bytes"),
+            policy_id,
+            1,
+            FederatedIdentityRequirement::Required(AuthorizedEnrollmentMode::Tofu),
+            false,
+            now - 1,
+            now + 60,
+        );
+
+        let error = resolve_authoritative_binding_view(&pool, &request, true)
+            .await
+            .expect_err("stale policy epoch must fail closed");
+
+        assert!(matches!(error, AuthorityAdapterError::PolicyChanged));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1")
+                .bind(community.as_uuid())
+                .fetch_one(&pool)
+                .await
+                .expect("count bindings after stale policy");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn enrollment_policy_lineage_is_stable_and_monotonic() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let policy_id = Uuid::new_v4();
+        let now = database_now(&pool).await;
+        install_policy(&pool, community, policy_id, 1, "tofu", now - 1, now + 120).await;
+
+        let unchanged_epoch = sqlx::query(
+            "UPDATE identity_enrollment_policies SET requirement='attested_key' \
+             WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await;
+        assert!(
+            unchanged_epoch.is_err(),
+            "policy changes must advance the epoch"
+        );
+
+        let changed_id = sqlx::query(
+            "UPDATE identity_enrollment_policies SET policy_id=$1, policy_epoch=2 \
+             WHERE community_id=$2",
+        )
+        .bind(Uuid::new_v4())
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await;
+        assert!(changed_id.is_err(), "a community's policy ID is immutable");
+
+        sqlx::query(
+            "UPDATE identity_enrollment_policies \
+             SET policy_epoch=2, requirement='attested_key', updated_at=NOW() \
+             WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("strictly monotonic policy update succeeds");
+        let lineage: (Uuid, i64, String) = sqlx::query_as(
+            "SELECT policy_id,policy_epoch,requirement FROM identity_enrollment_policies \
+             WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("read stable policy lineage");
+        assert_eq!(lineage, (policy_id, 2, "attested_key".to_owned()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn policy_lock_wait_rechecks_database_time_before_any_binding_mutation() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let policy_id = Uuid::new_v4();
+        let now = database_now(&pool).await;
+        install_policy(&pool, community, policy_id, 1, "tofu", now - 1, now + 1).await;
+
+        let mut blocker = pool.begin().await.expect("start policy lock blocker");
+        sqlx::query("SELECT 1 FROM identity_enrollment_policies WHERE community_id=$1 FOR UPDATE")
+            .bind(community.as_uuid())
+            .fetch_one(&mut *blocker)
+            .await
+            .expect("lock current policy");
+
+        let request = authoritative_request(
+            community,
+            TEST_ISSUER,
+            "lock-wait-user",
+            random_pubkey().try_into().expect("test key is 32 bytes"),
+            policy_id,
+            1,
+            FederatedIdentityRequirement::Required(AuthorizedEnrollmentMode::Tofu),
+            false,
+            now - 1,
+            now + 1,
+        );
+        let request_pool = pool.clone();
+        let waiter = tokio::spawn(async move {
+            resolve_authoritative_binding_view(&request_pool, &request, true).await
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        blocker.commit().await.expect("release policy lock blocker");
+
+        let error = waiter
+            .await
+            .expect("policy waiter task completes")
+            .expect_err("expired policy after lock wait must fail closed");
+        assert!(matches!(
+            error,
+            AuthorityAdapterError::Contract(buzz_auth::AuthContextError::FederatedPolicyExpired)
+        ));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1")
+                .bind(community.as_uuid())
+                .fetch_one(&pool)
+                .await
+                .expect("count bindings after expired policy wait");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn authoritative_modes_and_expiry_are_fail_closed_and_non_mutating() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let policy_id = Uuid::new_v4();
+        let now = database_now(&pool).await;
+        install_policy(&pool, community, policy_id, 1, "tofu", now - 1, now + 120).await;
+        let key: [u8; 32] = random_pubkey().try_into().expect("test key is 32 bytes");
+        let request = authoritative_request(
+            community,
+            TEST_ISSUER,
+            "authoritative-user",
+            key,
+            policy_id,
+            1,
+            FederatedIdentityRequirement::Required(AuthorizedEnrollmentMode::Tofu),
+            false,
+            now - 1,
+            now + 120,
+        );
+
+        let enrolled = resolve_authoritative_binding_view(&pool, &request, true)
+            .await
+            .expect("current TOFU policy resolves");
+        let ResolveBindingResult::Enrolled(evidence) = enrolled else {
+            panic!("expected atomic enrollment, got {enrolled:?}");
+        };
+        assert_eq!(evidence.provenance(), BindingProvenance::Tofu);
+        assert_eq!(
+            evidence.created_policy_version(),
+            Some(format!("{policy_id}:1").as_str())
+        );
+
+        let before: (DateTime<Utc>, DateTime<Utc>, i64) = sqlx::query_as(
+            "SELECT updated_at, last_seen_at, \
+                    (SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1) \
+             FROM identity_bindings WHERE community_id=$1 AND binding_id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(evidence.binding_id())
+        .fetch_one(&pool)
+        .await
+        .expect("read binding before existing resolution");
+        assert!(matches!(
+            resolve_authoritative_binding_view(&pool, &request, true)
+                .await
+                .expect("existing binding resolves read-only"),
+            ResolveBindingResult::Existing(_)
+        ));
+        let after: (DateTime<Utc>, DateTime<Utc>, i64) = sqlx::query_as(
+            "SELECT updated_at, last_seen_at, \
+                    (SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1) \
+             FROM identity_bindings WHERE community_id=$1 AND binding_id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(evidence.binding_id())
+        .fetch_one(&pool)
+        .await
+        .expect("read binding after existing resolution");
+        assert_eq!(after, before, "existing resolution must be read-only");
+
+        sqlx::query(
+            "UPDATE identity_bindings SET expires_at=clock_timestamp() \
+             WHERE community_id=$1 AND binding_id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(evidence.binding_id())
+        .execute(&pool)
+        .await
+        .expect("expire authoritative binding");
+        assert_eq!(
+            resolve_authoritative_binding_view(&pool, &request, true)
+                .await
+                .expect("expired binding is a typed denial"),
+            ResolveBindingResult::Denied(BindingDenial::BindingExpired)
+        );
+        let active_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM identity_bindings \
+             WHERE community_id=$1 AND binding_id=$2 \
+               AND binding_state='active' AND revoked_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(evidence.binding_id())
+        .fetch_one(&pool)
+        .await
+        .expect("count slot-occupying expired binding");
+        assert_eq!(active_count, 1, "expiry must not free lifecycle slots");
+        assert!(
+            get_active_identity_binding_by_pubkey(&pool, community, &key)
+                .await
+                .expect("legacy authorization lookup handles expiry")
+                .is_none(),
+            "expired bindings cannot authorize delegated or revalidated sessions"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn provisioned_attested_and_delegated_absence_never_enroll() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let policy_id = Uuid::new_v4();
+        let now = database_now(&pool).await;
+        install_policy(
+            &pool,
+            community,
+            policy_id,
+            1,
+            "provisioned",
+            now - 1,
+            now + 120,
+        )
+        .await;
+        let key: [u8; 32] = random_pubkey().try_into().expect("test key is 32 bytes");
+        let provisioned = authoritative_request(
+            community,
+            TEST_ISSUER,
+            "mode-user",
+            key,
+            policy_id,
+            1,
+            FederatedIdentityRequirement::Required(AuthorizedEnrollmentMode::Provisioned),
+            false,
+            now - 1,
+            now + 120,
+        );
+        assert_eq!(
+            resolve_authoritative_binding_view(&pool, &provisioned, true)
+                .await
+                .expect("provisioned absence is a typed denial"),
+            ResolveBindingResult::Denied(BindingDenial::BindingRequired)
+        );
+        assert_eq!(
+            resolve_authoritative_binding_view(&pool, &provisioned, false)
+                .await
+                .expect("delegated absence is a typed denial"),
+            ResolveBindingResult::Denied(BindingDenial::BindingRequired)
+        );
+
+        sqlx::query(
+            "UPDATE identity_enrollment_policies \
+             SET policy_epoch=2, requirement='attested_key', updated_at=NOW() \
+             WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("advance policy to attested-key mode");
+        let unattested = authoritative_request(
+            community,
+            TEST_ISSUER,
+            "mode-user",
+            key,
+            policy_id,
+            2,
+            FederatedIdentityRequirement::Required(AuthorizedEnrollmentMode::AttestedKey),
+            false,
+            now - 1,
+            now + 120,
+        );
+        assert_eq!(
+            resolve_authoritative_binding_view(&pool, &unattested, true)
+                .await
+                .expect("missing attestation is a typed denial"),
+            ResolveBindingResult::Denied(BindingDenial::KeyAttestationRequired)
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1")
+                .bind(community.as_uuid())
+                .fetch_one(&pool)
+                .await
+                .expect("count bindings after denied modes");
+        assert_eq!(count, 0);
+    }
+
     fn random_pubkey() -> Vec<u8> {
         Keys::generate().public_key().to_bytes().to_vec()
+    }
+
+    async fn enroll_for_test(
+        pool: &PgPool,
+        community: CommunityId,
+        issuer: &str,
+        subject: &str,
+        pubkey: &[u8],
+        display_name: Option<&str>,
+    ) -> BindingEvidence {
+        match resolve_identity_binding(
+            pool,
+            &ResolveBindingInput {
+                authorization_domain: community,
+                issuer,
+                subject,
+                pubkey,
+                display_name,
+                enrollment_mode: EnrollmentMode::Tofu,
+                key_attested: false,
+                policy_version: "test-policy-v1",
+                evidence_valid_from: 0,
+                evidence_valid_until: i64::MAX as u64,
+            },
+        )
+        .await
+        .expect("resolve test binding")
+        {
+            ResolveBindingResult::Enrolled(evidence) => evidence,
+            other => panic!("expected enrolled binding, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1466,6 +2603,55 @@ mod tests {
     }
 
     #[test]
+    fn complete_binding_evidence_debug_is_party_data_free() {
+        let evidence = BindingEvidence {
+            authorization_domain: CommunityId::from_uuid(Uuid::from_u128(7)),
+            issuer: "private-evidence-issuer".to_string(),
+            subject: "private-evidence-subject".to_string(),
+            bound_pubkey: vec![0xBC; 32],
+            binding_id: Uuid::from_u128(8),
+            binding_version: 3,
+            binding_state: BindingState::Active,
+            provenance: BindingProvenance::AttestedKey,
+            creation_attribution: CreationAttributionKind::AuthenticatedKey,
+            created_by: Some(vec![0xBD; 32]),
+            created_policy_version: Some("private-policy-version".to_string()),
+            expires_at: Some(DateTime::<Utc>::from_timestamp(2, 0).expect("test expiry timestamp")),
+            created_at: DateTime::<Utc>::from_timestamp(1, 0).expect("test timestamp"),
+        };
+        let formatted = format!("{evidence:?}");
+        let encoded_key = hex::encode([0xBC; 32]);
+        let binding_id = evidence.binding_id().to_string();
+        assert!(formatted.contains("[redacted]"));
+        for secret in [
+            "private-evidence-issuer",
+            "private-evidence-subject",
+            "private-policy-version",
+            encoded_key.as_str(),
+            binding_id.as_str(),
+        ] {
+            assert!(!formatted.contains(secret));
+        }
+        assert_eq!(
+            evidence.creation_attribution(),
+            CreationAttributionKind::AuthenticatedKey
+        );
+        assert_eq!(evidence.created_by(), Some(&[0xBD; 32][..]));
+    }
+
+    #[test]
+    fn conflict_marker_cannot_carry_party_data() {
+        assert_eq!(std::mem::size_of::<IdentityBindingConflict>(), 0);
+        assert_eq!(
+            format!(
+                "{:?}",
+                BindIdentityResult::Conflict(IdentityBindingConflict)
+            ),
+            "Conflict(IdentityBindingConflict(\"[redacted]\"))"
+        );
+    }
+
+    #[test]
     fn staged_identity_key_must_match_membership_key() {
         let identity_key = [7_u8; 32];
         let other_key = [8_u8; 32];
@@ -1487,12 +2673,12 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn bind_identity_creates_then_matches_idempotently() {
+    async fn legacy_binding_api_cannot_enroll_without_authorized_domain_evidence() {
         let pool = setup_pool().await;
         let community = make_community(&pool).await;
         let pubkey = random_pubkey();
 
-        let created = bind_or_validate_identity(
+        let denied = bind_or_validate_identity(
             &pool,
             community,
             TEST_ISSUER,
@@ -1502,30 +2688,419 @@ mod tests {
             SOURCE_DB_BINDING,
         )
         .await
-        .expect("create binding");
-        assert_eq!(created, BindIdentityResult::Created);
+        .expect("fail closed without authorized domain evidence");
+        assert_eq!(denied, BindIdentityResult::BindingRequired);
+        assert!(
+            get_active_identity_binding_by_pubkey(&pool, community, &pubkey)
+                .await
+                .expect("lookup binding")
+                .is_none()
+        );
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("count binding history");
+        assert_eq!(history_count, 0);
+    }
 
-        let matched = bind_or_validate_identity(
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn new_bindings_require_immutable_creation_attribution() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let pubkey = random_pubkey();
+
+        enroll_for_test(
             &pool,
             community,
             TEST_ISSUER,
-            "user-1",
+            "attributed-user",
             &pubkey,
-            Some("second@example.com"),
-            SOURCE_JWT_NPUB,
+            None,
+        )
+        .await;
+
+        let attribution: (Option<Vec<u8>>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT created_by, created_policy_version, creation_attribution_kind \
+             FROM identity_bindings WHERE community_id=$1 AND issuer=$2 AND uid=$3",
+        )
+        .bind(community.as_uuid())
+        .bind(TEST_ISSUER)
+        .bind("attributed-user")
+        .fetch_one(&pool)
+        .await
+        .expect("read creation attribution");
+        assert_eq!(attribution.0.as_deref(), Some(pubkey.as_slice()));
+        assert_eq!(attribution.1.as_deref(), Some("test-policy-v1"));
+        assert_eq!(attribution.2.as_deref(), Some("authenticated_key"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn stale_authorized_evidence_cannot_enroll_or_refresh_metadata() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let pubkey = random_pubkey();
+        enroll_for_test(
+            &pool,
+            community,
+            TEST_ISSUER,
+            "stale-evidence-user",
+            &pubkey,
+            Some("original@example.com"),
+        )
+        .await;
+        let before: (Option<String>, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT display_name, updated_at, last_seen_at FROM identity_bindings \
+             WHERE community_id=$1 AND issuer=$2 AND uid=$3",
+        )
+        .bind(community.as_uuid())
+        .bind(TEST_ISSUER)
+        .bind("stale-evidence-user")
+        .fetch_one(&pool)
+        .await
+        .expect("read binding before stale replay");
+
+        let stale = resolve_identity_binding(
+            &pool,
+            &ResolveBindingInput {
+                authorization_domain: community,
+                issuer: TEST_ISSUER,
+                subject: "stale-evidence-user",
+                pubkey: &pubkey,
+                display_name: Some("changed@example.com"),
+                enrollment_mode: EnrollmentMode::Tofu,
+                key_attested: false,
+                policy_version: "test-policy-v1",
+                evidence_valid_from: 0,
+                evidence_valid_until: 1,
+            },
         )
         .await
-        .expect("match existing binding");
-        assert_eq!(matched, BindIdentityResult::Matched);
+        .expect("stale resolution is a typed denial");
+        assert_eq!(
+            stale,
+            ResolveBindingResult::Denied(BindingDenial::StaleEvidence)
+        );
+        let after: (Option<String>, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT display_name, updated_at, last_seen_at FROM identity_bindings \
+             WHERE community_id=$1 AND issuer=$2 AND uid=$3",
+        )
+        .bind(community.as_uuid())
+        .bind(TEST_ISSUER)
+        .bind("stale-evidence-user")
+        .fetch_one(&pool)
+        .await
+        .expect("read binding after stale replay");
+        assert_eq!(after, before);
 
-        let binding = get_active_identity_binding_by_pubkey(&pool, community, &pubkey)
+        let missing_key = random_pubkey();
+        let missing = resolve_identity_binding(
+            &pool,
+            &ResolveBindingInput {
+                authorization_domain: community,
+                issuer: TEST_ISSUER,
+                subject: "never-enrolled-stale-user",
+                pubkey: &missing_key,
+                display_name: None,
+                enrollment_mode: EnrollmentMode::Tofu,
+                key_attested: false,
+                policy_version: "test-policy-v1",
+                evidence_valid_from: 0,
+                evidence_valid_until: 1,
+            },
+        )
+        .await
+        .expect("stale first enrollment is a typed denial");
+        assert_eq!(
+            missing,
+            ResolveBindingResult::Denied(BindingDenial::StaleEvidence)
+        );
+        assert!(
+            get_active_identity_binding_by_pubkey(&pool, community, &missing_key)
+                .await
+                .expect("lookup missing stale key")
+                .is_none()
+        );
+
+        let database_now: i64 =
+            sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
+                .fetch_one(&pool)
+                .await
+                .expect("read database clock");
+        let future_key = random_pubkey();
+        let future = resolve_identity_binding(
+            &pool,
+            &ResolveBindingInput {
+                authorization_domain: community,
+                issuer: TEST_ISSUER,
+                subject: "not-yet-valid-user",
+                pubkey: &future_key,
+                display_name: None,
+                enrollment_mode: EnrollmentMode::Tofu,
+                key_attested: false,
+                policy_version: "test-policy-v1",
+                evidence_valid_from: u64::try_from(database_now + 60).unwrap(),
+                evidence_valid_until: u64::try_from(database_now + 120).unwrap(),
+            },
+        )
+        .await
+        .expect("future evidence is a typed denial");
+        assert_eq!(
+            future,
+            ResolveBindingResult::Denied(BindingDenial::StaleEvidence)
+        );
+        assert!(
+            get_active_identity_binding_by_pubkey(&pool, community, &future_key)
+                .await
+                .expect("lookup future-evidence key")
+                .is_none()
+        );
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("count unchanged binding history");
+        assert_eq!(history_count, 1, "only the verified seed may have history");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn evidence_expiring_while_waiting_for_identity_lock_cannot_enroll() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let pubkey = random_pubkey();
+        let database_now: i64 =
+            sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
+                .fetch_one(&pool)
+                .await
+                .expect("read database clock");
+
+        let mut blocker = pool.begin().await.expect("begin blocking transaction");
+        lock_identity_keys_tx(
+            &mut blocker,
+            community,
+            TEST_ISSUER,
+            "lock-wait-expiry-user",
+            &pubkey,
+        )
+        .await
+        .expect("hold identity coordinates");
+
+        let resolving_pool = pool.clone();
+        let resolving_key = pubkey.clone();
+        let resolving = tokio::spawn(async move {
+            resolve_identity_binding(
+                &resolving_pool,
+                &ResolveBindingInput {
+                    authorization_domain: community,
+                    issuer: TEST_ISSUER,
+                    subject: "lock-wait-expiry-user",
+                    pubkey: &resolving_key,
+                    display_name: None,
+                    enrollment_mode: EnrollmentMode::Tofu,
+                    key_attested: false,
+                    policy_version: "test-policy-v1",
+                    evidence_valid_from: 0,
+                    evidence_valid_until: u64::try_from(database_now + 1).unwrap(),
+                },
+            )
             .await
-            .expect("lookup binding")
-            .expect("binding exists");
-        assert_eq!(binding.uid, "user-1");
-        assert_eq!(binding.issuer, TEST_ISSUER);
-        assert_eq!(binding.display_name.as_deref(), Some("second@example.com"));
-        assert_eq!(binding.source, SOURCE_JWT_NPUB);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        blocker
+            .rollback()
+            .await
+            .expect("release identity coordinates");
+
+        assert_eq!(
+            resolving
+                .await
+                .expect("join blocked resolver")
+                .expect("resolver returns typed denial"),
+            ResolveBindingResult::Denied(BindingDenial::StaleEvidence)
+        );
+        assert!(
+            get_active_identity_binding_by_pubkey(&pool, community, &pubkey)
+                .await
+                .expect("lookup expired waiter")
+                .is_none()
+        );
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("count waiter history");
+        assert_eq!(history_count, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn evidence_expiring_during_existing_binding_update_rolls_back_metadata() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let pubkey = random_pubkey();
+        enroll_for_test(
+            &pool,
+            community,
+            TEST_ISSUER,
+            "commit-boundary-expiry-user",
+            &pubkey,
+            Some("original@example.com"),
+        )
+        .await;
+        let before: (Option<String>, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT display_name, updated_at, last_seen_at FROM identity_bindings \
+             WHERE community_id=$1 AND issuer=$2 AND uid=$3",
+        )
+        .bind(community.as_uuid())
+        .bind(TEST_ISSUER)
+        .bind("commit-boundary-expiry-user")
+        .fetch_one(&pool)
+        .await
+        .expect("read pre-boundary metadata");
+
+        let suffix = community.as_uuid().simple();
+        let sequence_name = format!("buzz_test_freshness_seq_{suffix}");
+        let function_name = format!("buzz_test_freshness_fn_{suffix}");
+        let trigger_name = format!("buzz_test_freshness_trigger_{suffix}");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE SEQUENCE {sequence_name}"
+        )))
+        .execute(&pool)
+        .await
+        .expect("create freshness trigger sequence");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM nextval('{sequence_name}'); PERFORM pg_sleep(2.5); RETURN NEW; END; $$"
+        )))
+        .execute(&pool)
+        .await
+        .expect("create freshness delay function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER {trigger_name} BEFORE UPDATE ON identity_bindings \
+             FOR EACH ROW WHEN (OLD.community_id = '{}'::uuid) \
+             EXECUTE FUNCTION {function_name}()",
+            community.as_uuid()
+        )))
+        .execute(&pool)
+        .await
+        .expect("create freshness delay trigger");
+
+        let database_now: i64 =
+            sqlx::query_scalar("SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
+                .fetch_one(&pool)
+                .await
+                .expect("read database clock");
+        let result = resolve_identity_binding(
+            &pool,
+            &ResolveBindingInput {
+                authorization_domain: community,
+                issuer: TEST_ISSUER,
+                subject: "commit-boundary-expiry-user",
+                pubkey: &pubkey,
+                display_name: Some("changed@example.com"),
+                enrollment_mode: EnrollmentMode::Tofu,
+                key_attested: false,
+                policy_version: "test-policy-v1",
+                evidence_valid_from: 0,
+                evidence_valid_until: u64::try_from(database_now + 2).unwrap(),
+            },
+        )
+        .await
+        .expect("commit-boundary expiry is a typed denial");
+        let trigger_state: (i64, bool) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT last_value, is_called FROM {sequence_name}"
+        )))
+        .fetch_one(&pool)
+        .await
+        .expect("read freshness trigger count");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER {trigger_name} ON identity_bindings"
+        )))
+        .execute(&pool)
+        .await
+        .expect("drop freshness delay trigger");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP FUNCTION {function_name}()"
+        )))
+        .execute(&pool)
+        .await
+        .expect("drop freshness delay function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SEQUENCE {sequence_name}"
+        )))
+        .execute(&pool)
+        .await
+        .expect("drop freshness trigger sequence");
+
+        assert_eq!(
+            trigger_state,
+            (1, true),
+            "the update reached the forced expiry gap"
+        );
+        assert_eq!(
+            result,
+            ResolveBindingResult::Denied(BindingDenial::StaleEvidence)
+        );
+        let after: (Option<String>, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT display_name, updated_at, last_seen_at FROM identity_bindings \
+             WHERE community_id=$1 AND issuer=$2 AND uid=$3",
+        )
+        .bind(community.as_uuid())
+        .bind(TEST_ISSUER)
+        .bind("commit-boundary-expiry-user")
+        .fetch_one(&pool)
+        .await
+        .expect("read rolled-back metadata");
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn lifecycle_state_and_revocation_timestamp_cannot_diverge() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let pubkey = random_pubkey();
+
+        enroll_for_test(
+            &pool,
+            community,
+            TEST_ISSUER,
+            "state-parity-user",
+            &pubkey,
+            None,
+        )
+        .await;
+
+        let malformed = sqlx::query(
+            "UPDATE identity_bindings SET binding_state='revoked' \
+             WHERE community_id=$1 AND issuer=$2 AND uid=$3 \
+               AND binding_state='active' AND revoked_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(TEST_ISSUER)
+        .bind("state-parity-user")
+        .execute(&pool)
+        .await;
+        assert!(
+            malformed.is_err(),
+            "storage must reject revoked or rotated labels with an active timestamp shape"
+        );
+
+        assert!(
+            get_active_identity_binding_by_pubkey(&pool, community, &pubkey)
+                .await
+                .expect("read active binding")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1536,17 +3111,15 @@ mod tests {
         let original_pubkey = random_pubkey();
         let conflicting_pubkey = random_pubkey();
 
-        bind_or_validate_identity(
+        enroll_for_test(
             &pool,
             community,
             TEST_ISSUER,
             "user-1",
             &original_pubkey,
             Some("user@example.com"),
-            SOURCE_DB_BINDING,
         )
-        .await
-        .expect("create binding");
+        .await;
 
         let result = bind_or_validate_identity(
             &pool,
@@ -1562,12 +3135,7 @@ mod tests {
 
         assert_eq!(
             result,
-            BindIdentityResult::Conflict(IdentityBindingConflict {
-                issuer: TEST_ISSUER.to_string(),
-                uid: "user-1".to_string(),
-                pubkey: original_pubkey,
-                source: SOURCE_DB_BINDING.to_string(),
-            })
+            BindIdentityResult::Conflict(IdentityBindingConflict)
         );
     }
 
@@ -1578,17 +3146,15 @@ mod tests {
         let community = make_community(&pool).await;
         let pubkey = random_pubkey();
 
-        bind_or_validate_identity(
+        enroll_for_test(
             &pool,
             community,
             TEST_ISSUER,
             "user-1",
             &pubkey,
             Some("user@example.com"),
-            SOURCE_DB_BINDING,
         )
-        .await
-        .expect("create binding");
+        .await;
 
         let result = bind_or_validate_identity(
             &pool,
@@ -1604,33 +3170,26 @@ mod tests {
 
         assert_eq!(
             result,
-            BindIdentityResult::Conflict(IdentityBindingConflict {
-                issuer: TEST_ISSUER.to_string(),
-                uid: "user-1".to_string(),
-                pubkey,
-                source: SOURCE_DB_BINDING.to_string(),
-            })
+            BindIdentityResult::Conflict(IdentityBindingConflict)
         );
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn bind_identity_does_not_downgrade_jwt_npub_source() {
+    async fn legacy_binding_bridge_cannot_manufacture_attested_provenance() {
         let pool = setup_pool().await;
         let community = make_community(&pool).await;
         let pubkey = random_pubkey();
 
-        bind_or_validate_identity(
+        enroll_for_test(
             &pool,
             community,
             TEST_ISSUER,
             "user-1",
             &pubkey,
             Some("user@example.com"),
-            SOURCE_JWT_NPUB,
         )
-        .await
-        .expect("create strong binding");
+        .await;
 
         let matched = bind_or_validate_identity(
             &pool,
@@ -1649,7 +3208,8 @@ mod tests {
             .await
             .expect("lookup binding")
             .expect("binding exists");
-        assert_eq!(binding.source, SOURCE_JWT_NPUB);
+        assert_eq!(binding.source, SOURCE_DB_BINDING);
+        assert_eq!(binding.binding_provenance, BindingProvenance::Tofu);
     }
 
     #[tokio::test]
@@ -1659,22 +3219,21 @@ mod tests {
         let community = make_community(&pool).await;
         let pubkey = random_pubkey();
 
-        bind_or_validate_identity(
+        enroll_for_test(
             &pool,
             community,
             TEST_ISSUER,
             "user-1",
             &pubkey,
             Some("user@example.com"),
-            SOURCE_JWT_NPUB,
         )
-        .await
-        .expect("create binding");
+        .await;
 
         sqlx::query(
             r#"
             UPDATE identity_bindings
-            SET revoked_at = NOW(), revoked_reason = 'test revocation'
+            SET binding_state = 'revoked', revoked_at = NOW(),
+                revoked_reason = 'test revocation'
             WHERE community_id = $1 AND issuer = $2 AND uid = $3 AND pubkey = $4
             "#,
         )
@@ -1728,28 +3287,31 @@ mod tests {
         let community = make_community(&pool).await;
         let old_pubkey = random_pubkey();
         let new_pubkey = random_pubkey();
-        bind_or_validate_identity(
+        enroll_for_test(
             &pool,
             community,
             TEST_ISSUER,
             "rotating-user",
             &old_pubkey,
             Some("user@example.com"),
-            SOURCE_JWT_NPUB,
         )
-        .await
-        .expect("create binding");
+        .await;
 
         rotate_identity_binding(
             &pool,
             community,
+            crate::identity_lifecycle::LifecycleOperationId::issue(),
             TEST_ISSUER,
             "rotating-user",
             &old_pubkey,
-            &new_pubkey,
-            Some("user@example.com"),
-            SOURCE_JWT_NPUB,
-            None,
+            crate::identity_lifecycle::VerifiedReplacementKey::after_verified_proof(
+                &new_pubkey,
+                Some("user@example.com"),
+                BindingProvenance::AttestedKey,
+                "test-policy-v1",
+            )
+            .expect("verified replacement"),
+            &old_pubkey,
             "device replacement",
         )
         .await
@@ -1792,22 +3354,25 @@ mod tests {
         let community = make_community(&pool).await;
         let old_pubkey = random_pubkey();
         let new_pubkey = random_pubkey();
-        bind_or_validate_identity(
+        enroll_for_test(
             &pool,
             community,
             TEST_ISSUER,
             "key-revoked-user",
             &old_pubkey,
             None,
-            SOURCE_DB_BINDING,
+        )
+        .await;
+        assert!(revoke_identity_key(
+            &pool,
+            community,
+            crate::identity_lifecycle::LifecycleOperationId::issue(),
+            &old_pubkey,
+            &old_pubkey,
+            "lost device",
         )
         .await
-        .expect("create binding");
-        assert!(
-            revoke_identity_key(&pool, community, &old_pubkey, None, "lost device",)
-                .await
-                .expect("revoke key")
-        );
+        .expect("revoke key"));
 
         assert_eq!(
             bind_or_validate_identity(
@@ -1824,20 +3389,53 @@ mod tests {
             BindIdentityResult::Revoked
         );
 
-        rotate_identity_binding(
+        assert!(rotate_identity_binding(
             &pool,
             community,
+            crate::identity_lifecycle::LifecycleOperationId::issue(),
             TEST_ISSUER,
             "key-revoked-user",
             &old_pubkey,
-            &new_pubkey,
-            None,
-            SOURCE_DB_BINDING,
-            None,
+            crate::identity_lifecycle::VerifiedReplacementKey::after_verified_proof(
+                &new_pubkey,
+                None,
+                BindingProvenance::Provisioned,
+                "test-policy-v1",
+            )
+            .expect("verified recovery key"),
+            &old_pubkey,
             "approved replacement",
         )
         .await
-        .expect("explicit rotation after key revocation");
+        .is_err());
+        let principal = crate::identity_lifecycle::IdentityPrincipal {
+            issuer: TEST_ISSUER,
+            subject: "key-revoked-user",
+        };
+        let expected = crate::identity_lifecycle::get_pending_lineage(&pool, community, principal)
+            .await
+            .expect("read pending recovery")
+            .expect("pending recovery exists");
+        crate::identity_lifecycle::recover_identity_binding(
+            &pool,
+            community,
+            crate::identity_lifecycle::LifecycleContext {
+                operation_id: crate::identity_lifecycle::LifecycleOperationId::issue(),
+                actor: &old_pubkey,
+                reason: "approved recovery",
+            },
+            principal,
+            &expected,
+            crate::identity_lifecycle::VerifiedReplacementKey::after_verified_proof(
+                &new_pubkey,
+                None,
+                BindingProvenance::Provisioned,
+                "test-policy-v1",
+            )
+            .expect("verified recovery key"),
+        )
+        .await
+        .expect("explicit recovery after key revocation");
         assert!(
             get_active_identity_binding_by_pubkey(&pool, community, &new_pubkey)
                 .await
@@ -1866,7 +3464,7 @@ mod tests {
         );
         assert_eq!(
             retired.try_get::<String, _>("rotation_reason").unwrap(),
-            "approved replacement"
+            "approved recovery"
         );
         assert_eq!(
             retired.try_get::<Vec<u8>, _>("rotated_to_pubkey").unwrap(),
@@ -1891,9 +3489,10 @@ mod tests {
         assert!(revoke_identity_principal(
             &pool,
             community,
+            crate::identity_lifecycle::LifecycleOperationId::issue(),
             TEST_ISSUER,
             "never-enrolled",
-            None,
+            &[0xA4; 32],
             "employment ended",
         )
         .await
@@ -1920,20 +3519,25 @@ mod tests {
         let pool = setup_pool().await;
         let community = make_community(&pool).await;
         let pubkey = random_pubkey();
-        bind_or_validate_identity(
+        enroll_for_test(
             &pool,
             community,
             TEST_ISSUER,
             "first-principal",
             &pubkey,
             None,
-            SOURCE_DB_BINDING,
+        )
+        .await;
+        revoke_identity_key(
+            &pool,
+            community,
+            crate::identity_lifecycle::LifecycleOperationId::issue(),
+            &pubkey,
+            &pubkey,
+            "compromised key",
         )
         .await
-        .expect("create binding");
-        revoke_identity_key(&pool, community, &pubkey, None, "compromised key")
-            .await
-            .expect("revoke key");
+        .expect("revoke key");
 
         assert_eq!(
             bind_or_validate_identity(
@@ -1957,19 +3561,18 @@ mod tests {
         let pool = setup_pool().await;
         let community = make_community(&pool).await;
         let pubkey = random_pubkey();
-        bind_or_validate_identity(
+        enroll_for_test(
             &pool,
             community,
             TEST_ISSUER,
             "legacy-principal",
             &pubkey,
             None,
-            SOURCE_DB_BINDING,
         )
-        .await
-        .expect("create binding");
+        .await;
         sqlx::query(
-            "UPDATE identity_bindings SET revoked_at = NOW(), revoked_reason = 'legacy revoke' \
+            "UPDATE identity_bindings \
+             SET binding_state = 'revoked', revoked_at = NOW(), revoked_reason = 'legacy revoke' \
              WHERE community_id = $1 AND issuer = $2 AND uid = $3 AND pubkey = $4",
         )
         .bind(community.as_uuid())
@@ -2013,31 +3616,25 @@ mod tests {
         let first_pubkey = random_pubkey();
         let second_pubkey = random_pubkey();
 
-        let first = bind_or_validate_identity(
+        enroll_for_test(
             &pool,
             community,
             "https://issuer-a.example",
             "shared-subject",
             &first_pubkey,
             Some("first@example.com"),
-            SOURCE_DB_BINDING,
         )
-        .await
-        .expect("create first issuer binding");
-        let second = bind_or_validate_identity(
+        .await;
+        enroll_for_test(
             &pool,
             community,
             "https://issuer-b.example",
             "shared-subject",
             &second_pubkey,
             Some("second@example.com"),
-            SOURCE_DB_BINDING,
         )
-        .await
-        .expect("create second issuer binding");
+        .await;
 
-        assert_eq!(first, BindIdentityResult::Created);
-        assert_eq!(second, BindIdentityResult::Created);
         assert_eq!(
             get_active_identity_binding_by_pubkey(&pool, community, &second_pubkey)
                 .await

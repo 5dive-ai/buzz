@@ -1,10 +1,61 @@
--- Additive O3 identity-binding projection.
+-- Additive identity-binding state projection.
 --
 -- Migrations 0027/0028 are a frozen compatibility boundary. This migration
 -- never renames or removes their columns, constraints, indexes, rows, or
 -- lifecycle selectors. In particular, every legacy identity_revoked_keys row
 -- remains authoritative because rotation-created and explicitly strengthened
 -- tombstones cannot be distinguished after the fact.
+
+-- Materialize every retained legacy identity row before projecting any new
+-- state. A storage/decoding/read-policy failure must abort this migration;
+-- treating an unreadable binding, principal denial, or key tombstone as
+-- absent could otherwise invent authority. This block is read-only and runs
+-- inside the migration transaction before the first persisted write.
+WITH legacy_rows AS MATERIALIZED (
+    SELECT to_jsonb(row_value) AS payload FROM identity_bindings row_value
+    UNION ALL
+    SELECT to_jsonb(row_value) AS payload FROM identity_principals row_value
+    UNION ALL
+    SELECT to_jsonb(row_value) AS payload FROM identity_revoked_keys row_value
+)
+SELECT COUNT(payload) FROM legacy_rows;
+
+-- Current verifier-owned enrollment policy. The table is intentionally empty
+-- after migration: installing a policy is a separately authorized server
+-- configuration action, so the disabled candidate fails closed by default.
+CREATE TABLE identity_enrollment_policies (
+    community_id   UUID NOT NULL PRIMARY KEY REFERENCES communities(id),
+    policy_id      UUID NOT NULL,
+    policy_epoch   BIGINT NOT NULL,
+    requirement    TEXT NOT NULL,
+    effective_from BIGINT NOT NULL,
+    effective_until BIGINT NOT NULL,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (policy_id <> '00000000-0000-0000-0000-000000000000'::UUID),
+    CHECK (policy_epoch > 0),
+    CHECK (requirement IN ('not_required', 'attested_key', 'provisioned', 'tofu')),
+    CHECK (effective_from >= 0),
+    CHECK (effective_from < effective_until)
+);
+
+-- The policy UUID is a stable namespace and every semantic replacement must
+-- advance its positive epoch. This makes an ID/epoch comparison inside the
+-- binding transaction sufficient to detect requirement or interval drift.
+CREATE FUNCTION enforce_identity_enrollment_policy_lineage()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.community_id <> OLD.community_id
+       OR NEW.policy_id <> OLD.policy_id
+       OR NEW.policy_epoch <= OLD.policy_epoch THEN
+        RAISE EXCEPTION 'identity enrollment policy lineage must advance monotonically';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER identity_enrollment_policy_lineage_guard
+BEFORE UPDATE ON identity_enrollment_policies
+FOR EACH ROW EXECUTE FUNCTION enforce_identity_enrollment_policy_lineage();
 
 ALTER TABLE identity_bindings
     ADD COLUMN binding_id UUID,
@@ -13,7 +64,12 @@ ALTER TABLE identity_bindings
     ADD COLUMN binding_provenance TEXT,
     ADD COLUMN replacement_binding_id UUID,
     ADD COLUMN created_by BYTEA,
-    ADD COLUMN created_policy_version TEXT;
+    ADD COLUMN created_policy_version TEXT,
+    ADD COLUMN expires_at TIMESTAMPTZ,
+    ADD COLUMN creation_attribution_kind TEXT,
+    ADD COLUMN archived_at TIMESTAMPTZ,
+    ADD COLUMN archived_by BYTEA,
+    ADD COLUMN archived_reason TEXT;
 
 -- Every row receives a stable persisted identifier. Unique legacy exact pairs
 -- use a reproducible length-prefixed hash. Byte-identical duplicate rows lack
@@ -77,7 +133,8 @@ SET binding_state = CASE
     binding_provenance = CASE source
         WHEN 'jwt_npub' THEN 'attested_key'
         ELSE 'tofu'
-    END;
+    END,
+    creation_attribution_kind = 'legacy_unknown';
 
 ALTER TABLE identity_bindings
     ALTER COLUMN binding_id SET NOT NULL,
@@ -86,21 +143,56 @@ ALTER TABLE identity_bindings
     ALTER COLUMN binding_state SET DEFAULT 'active',
     ALTER COLUMN binding_provenance SET NOT NULL,
     ALTER COLUMN binding_provenance SET DEFAULT 'tofu',
-    ADD CONSTRAINT identity_bindings_o3_id_unique
+    ALTER COLUMN creation_attribution_kind SET NOT NULL,
+    ADD CONSTRAINT identity_bindings_binding_id_unique
         UNIQUE (community_id, binding_id),
-    ADD CONSTRAINT chk_identity_bindings_o3_id_not_nil
+    ADD CONSTRAINT chk_identity_bindings_id_not_nil
         CHECK (binding_id <> '00000000-0000-0000-0000-000000000000'::UUID),
-    ADD CONSTRAINT chk_identity_bindings_o3_state
-        CHECK (binding_state IN ('active', 'revoked', 'rotated')),
-    ADD CONSTRAINT chk_identity_bindings_o3_provenance
+    ADD CONSTRAINT chk_identity_bindings_state
+        CHECK (binding_state IN ('active', 'revoked', 'rotated', 'archived')),
+    ADD CONSTRAINT chk_identity_bindings_provenance
         CHECK (binding_provenance IN ('attested_key', 'provisioned', 'tofu')),
-    ADD CONSTRAINT chk_identity_bindings_o3_created_by_len
+    ADD CONSTRAINT chk_identity_bindings_created_by_len
         CHECK (created_by IS NULL OR length(created_by) = 32),
-    ADD CONSTRAINT chk_identity_bindings_o3_policy_version
-        CHECK (created_policy_version IS NULL OR length(created_policy_version) > 0);
+    ADD CONSTRAINT chk_identity_bindings_policy_version
+        CHECK (created_policy_version IS NULL OR length(created_policy_version) > 0),
+    ADD CONSTRAINT chk_identity_bindings_expiry
+        CHECK (expires_at IS NULL OR expires_at > TIMESTAMPTZ 'epoch'),
+    ADD CONSTRAINT chk_identity_bindings_creation_attribution
+        CHECK (
+            (creation_attribution_kind = 'legacy_unknown'
+                AND created_by IS NULL AND created_policy_version IS NULL)
+            OR
+            (creation_attribution_kind IN ('authenticated_key', 'operator')
+                AND created_by IS NOT NULL AND length(created_by) = 32
+                AND created_policy_version IS NOT NULL
+                AND length(created_policy_version) > 0)
+        ),
+    ADD CONSTRAINT chk_identity_bindings_authority_state
+        CHECK ((binding_state = 'active') = (revoked_at IS NULL)),
+    ADD CONSTRAINT chk_identity_bindings_archive_attribution
+        CHECK (
+            (binding_state <> 'archived'
+                AND archived_at IS NULL AND archived_by IS NULL AND archived_reason IS NULL)
+            OR
+            (binding_state = 'archived'
+                AND archived_at IS NOT NULL
+                AND archived_by IS NOT NULL AND length(archived_by) = 32
+                AND archived_reason IS NOT NULL AND length(archived_reason) > 0)
+        );
+
+-- Preserve the checksum-frozen legacy indexes while making the authoritative
+-- predicate explicit in the current catalog as well as in every authority read.
+CREATE UNIQUE INDEX idx_identity_bindings_authoritative_principal
+    ON identity_bindings (community_id, issuer, uid)
+    WHERE binding_state = 'active' AND revoked_at IS NULL;
+CREATE UNIQUE INDEX idx_identity_bindings_authoritative_pubkey
+    ON identity_bindings (community_id, pubkey)
+    WHERE binding_state = 'active' AND revoked_at IS NULL;
 
 -- Invalid legacy graphs remain stored verbatim but are not usable as binding
--- authority. O3 exposes no operation that clears these migration denials.
+-- authority. The binding subsystem exposes no operation that clears these
+-- migration denials.
 CREATE TABLE identity_migration_denials (
     community_id UUID NOT NULL REFERENCES communities(id),
     issuer       TEXT NOT NULL,
@@ -266,92 +358,16 @@ JOIN identity_migration_denials denial
  AND denial.subject = binding.uid
 WHERE binding.rotated_to_pubkey IS NOT NULL;
 
--- Topological versions are deterministic for valid histories. Quarantined
--- rows receive stable positive versions solely for attribution, never auth.
-WITH RECURSIVE
-candidate_edges AS (
-    SELECT
-        predecessor.community_id,
-        predecessor.issuer,
-        predecessor.uid,
-        predecessor.binding_id AS predecessor_id,
-        successor.binding_id AS successor_id,
-        COUNT(*) OVER (
-            PARTITION BY predecessor.community_id, predecessor.binding_id
-        ) AS outgoing_candidates
-    FROM identity_bindings predecessor
-    JOIN identity_bindings successor
-      ON successor.community_id = predecessor.community_id
-     AND successor.issuer = predecessor.issuer
-     AND successor.uid = predecessor.uid
-     AND successor.pubkey = predecessor.rotated_to_pubkey
-     AND successor.binding_id <> predecessor.binding_id
-     AND successor.created_at >= predecessor.rotation_completed_at
-    WHERE predecessor.rotation_completed_at IS NOT NULL
-),
-resolved_edges AS (
-    SELECT community_id, issuer, uid, predecessor_id, successor_id
-    FROM candidate_edges
-    WHERE outgoing_candidates = 1
-),
-roots AS (
-    SELECT node.community_id, node.issuer, node.uid, node.binding_id
-    FROM identity_bindings node
-    WHERE NOT EXISTS (
-        SELECT 1 FROM resolved_edges edge
-        WHERE edge.community_id = node.community_id
-          AND edge.successor_id = node.binding_id
-    )
-),
-walk AS (
-    SELECT root.community_id, root.issuer, root.uid, root.binding_id, 1::BIGINT AS binding_version
-    FROM roots root
-    WHERE NOT EXISTS (
-        SELECT 1 FROM identity_migration_denials denial
-        WHERE denial.community_id = root.community_id
-          AND denial.issuer = root.issuer
-          AND denial.subject = root.uid
-    )
-    UNION ALL
-    SELECT edge.community_id, edge.issuer, edge.uid, edge.successor_id, walk.binding_version + 1
-    FROM walk
-    JOIN resolved_edges edge
-      ON edge.community_id = walk.community_id
-     AND edge.predecessor_id = walk.binding_id
-),
-quarantined AS (
-    SELECT
-        binding.community_id,
-        binding.binding_id,
-        ROW_NUMBER() OVER (
-            PARTITION BY binding.community_id, binding.issuer, binding.uid
-            ORDER BY binding.created_at, binding.updated_at,
-                     encode(binding.pubkey, 'hex'), binding.binding_id
-        )::BIGINT AS binding_version
-    FROM identity_bindings binding
-    JOIN identity_migration_denials denial
-      ON denial.community_id = binding.community_id
-     AND denial.issuer = binding.issuer
-     AND denial.subject = binding.uid
-),
-versions AS (
-    SELECT community_id, binding_id, binding_version FROM walk
-    UNION ALL
-    SELECT community_id, binding_id, binding_version FROM quarantined
-)
-UPDATE identity_bindings binding
-SET binding_version = versions.binding_version
-FROM versions
-WHERE binding.community_id = versions.community_id
-  AND binding.binding_id = versions.binding_id;
+-- A version belongs to one stable binding ID. Imported rows are snapshots of
+-- distinct legacy binding IDs, so each starts at version 1; later transitions
+-- increment only the binding ID whose authorization state changes.
+UPDATE identity_bindings SET binding_version = 1;
 
 ALTER TABLE identity_bindings
     ALTER COLUMN binding_version SET NOT NULL,
     ALTER COLUMN binding_version SET DEFAULT 1,
-    ADD CONSTRAINT chk_identity_bindings_o3_version_positive
-        CHECK (binding_version > 0),
-    ADD CONSTRAINT identity_bindings_o3_principal_version_unique
-        UNIQUE (community_id, issuer, uid, binding_version);
+    ADD CONSTRAINT chk_identity_bindings_version_positive
+        CHECK (binding_version > 0);
 
 CREATE TABLE identity_binding_lineage (
     community_id          UUID NOT NULL REFERENCES communities(id),
@@ -399,27 +415,26 @@ WHERE edge.outgoing_candidates = 1
         AND denial.subject = edge.uid
   );
 
--- The legacy rotation helper admits `db_binding` only after privileged
--- replacement proof. Roots remain TOFU; unique imported successors retain the
--- stronger provisioned provenance implied by that helper.
-UPDATE identity_bindings successor
-SET binding_provenance = 'provisioned'
-FROM identity_binding_lineage lineage
-WHERE lineage.community_id = successor.community_id
-  AND lineage.successor_binding_id = successor.binding_id
-  AND successor.source = 'db_binding';
-
 UPDATE identity_bindings predecessor
 SET replacement_binding_id = lineage.successor_binding_id
 FROM identity_binding_lineage lineage
 WHERE lineage.community_id = predecessor.community_id
   AND lineage.predecessor_binding_id = predecessor.binding_id;
 
+-- A legacy row whose successor could not be proven is inactive but not a
+-- completed rotation. Keep its legacy fields and quarantine intact while
+-- projecting the truthful binding state as revoked.
+UPDATE identity_bindings
+SET binding_state = 'revoked'
+WHERE binding_state = 'rotated' AND replacement_binding_id IS NULL;
+
 ALTER TABLE identity_bindings
-    ADD CONSTRAINT identity_bindings_o3_replacement_fk
+    ADD CONSTRAINT identity_bindings_replacement_fk
         FOREIGN KEY (community_id, replacement_binding_id)
         REFERENCES identity_bindings (community_id, binding_id)
-        DEFERRABLE INITIALLY DEFERRED;
+        DEFERRABLE INITIALLY DEFERRED,
+    ADD CONSTRAINT chk_identity_bindings_rotated_lineage
+        CHECK (binding_state <> 'rotated' OR replacement_binding_id IS NOT NULL);
 
 CREATE TABLE identity_retired_pairs (
     community_id           UUID NOT NULL REFERENCES communities(id),
@@ -524,6 +539,7 @@ WHERE terminal.revoked_at IS NOT NULL
       WHERE active.community_id = terminal.community_id
         AND active.issuer = terminal.issuer
         AND active.uid = terminal.uid
+        AND active.binding_state = 'active'
         AND active.revoked_at IS NULL
   )
   AND NOT EXISTS (
@@ -566,12 +582,12 @@ CREATE TABLE identity_binding_history (
     CHECK (length(issuer) > 0),
     CHECK (length(subject) > 0),
     CHECK (length(pubkey) = 32),
-    CHECK (binding_state IN ('active', 'revoked', 'rotated')),
+    CHECK (binding_state IN ('active', 'revoked', 'rotated', 'archived')),
     CHECK (binding_provenance IN ('attested_key', 'provisioned', 'tofu')),
     CHECK (transition_kind IN (
         'legacy_import', 'enroll', 'provision', 'provenance_strengthened',
         'retire_pair', 'disable_identity', 'revoke_key', 'rotate',
-        'recover', 'enable_identity'
+        'recover', 'enable_identity', 'archive'
     )),
     CHECK (actor IS NULL OR length(actor) = 32),
     CHECK (length(reason) > 0)
@@ -601,7 +617,7 @@ SELECT
 FROM identity_bindings;
 
 -- Idempotency and local state history only. Authorization and complete
--- operator audit authority remain outside O3.
+-- operator audit authority remain outside the binding persistence layer.
 CREATE TABLE identity_lifecycle_operations (
     community_id          UUID NOT NULL REFERENCES communities(id),
     operation_id          UUID NOT NULL,
@@ -614,8 +630,9 @@ CREATE TABLE identity_lifecycle_operations (
     binding_id            UUID,
     replacement_binding_id UUID,
     binding_version       BIGINT,
+    replacement_binding_version BIGINT,
     selector_version      BIGINT,
-    actor                 BYTEA,
+    actor                 BYTEA NOT NULL,
     reason                TEXT NOT NULL,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (community_id, operation_id),
@@ -626,7 +643,7 @@ CREATE TABLE identity_lifecycle_operations (
     CHECK (operation_id <> '00000000-0000-0000-0000-000000000000'::UUID),
     CHECK (operation_kind IN (
         'provision', 'retire_pair', 'disable_identity', 'revoke_key',
-        'rotate', 'recover', 'enable_identity'
+        'rotate', 'recover', 'enable_identity', 'archive'
     )),
     CHECK (length(request_fingerprint) = 32),
     CHECK (issuer IS NULL OR length(issuer) > 0),
@@ -634,8 +651,9 @@ CREATE TABLE identity_lifecycle_operations (
     CHECK (pubkey IS NULL OR length(pubkey) = 32),
     CHECK (replacement_pubkey IS NULL OR length(replacement_pubkey) = 32),
     CHECK (binding_version IS NULL OR binding_version > 0),
+    CHECK (replacement_binding_version IS NULL OR replacement_binding_version > 0),
     CHECK (selector_version IS NULL OR selector_version > 0),
-    CHECK (actor IS NULL OR length(actor) = 32),
+    CHECK (length(actor) = 32),
     CHECK (length(reason) > 0)
 );
 

@@ -15,17 +15,48 @@ use crate::error::{DbError, Result};
 use crate::identity_binding::{
     binding_lock_coordinate, key_lock_coordinate, lock_identity_coordinates_tx,
     operation_lock_coordinate, principal_lock_coordinate, BindingEvidence, BindingProvenance,
-    EnrollmentMode,
+    BindingState, CreationAttributionKind, EnrollmentMode,
 };
 use buzz_core::CommunityId;
+use chrono::{DateTime, Utc};
+
+/// Opaque server-issued identifier for one retryable lifecycle operation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LifecycleOperationId(Uuid);
+
+impl LifecycleOperationId {
+    /// Mint a new server-controlled identifier before accepting a transition.
+    pub fn issue() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Stable UUID retained by the server across retries.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_uuid_for_test(value: Uuid) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for LifecycleOperationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("LifecycleOperationId")
+            .field(&"[redacted]")
+            .finish()
+    }
+}
 
 /// Immutable evidence common to one privileged lifecycle request.
 #[derive(Clone, Copy)]
 pub struct LifecycleContext<'a> {
-    /// Caller-supplied idempotency identifier.
-    pub operation_id: Uuid,
-    /// Authenticated actor key, when available.
-    pub actor: Option<&'a [u8]>,
+    /// Server-issued idempotency identifier retained across retries.
+    pub operation_id: LifecycleOperationId,
+    /// Authenticated actor key.
+    pub actor: &'a [u8],
     /// Non-empty private transition reason.
     pub reason: &'a str,
 }
@@ -60,22 +91,26 @@ impl fmt::Debug for IdentityPrincipal<'_> {
     }
 }
 
-/// Replacement-key facts already verified by the caller.
+/// Replacement-key storage facts accepted only after an in-crate verifier has
+/// completed fresh proof. The fields and constructor are intentionally not
+/// available to external callers; a later proof-owning boundary must supply
+/// this value rather than selecting provenance or policy from raw input.
 #[derive(Clone, Copy)]
 pub struct VerifiedReplacementKey<'a> {
     pubkey: &'a [u8],
     display_name: Option<&'a str>,
     provenance: BindingProvenance,
-    created_policy_version: Option<&'a str>,
+    created_policy_version: &'a str,
 }
 
 impl<'a> VerifiedReplacementKey<'a> {
     /// Construct storage input after fresh replacement-key proof is verified.
-    pub fn after_verified_proof(
+    #[allow(dead_code)] // The proof-owning runtime boundary must wire this before activation.
+    pub(crate) fn after_verified_proof(
         pubkey: &'a [u8],
         display_name: Option<&'a str>,
         provenance: BindingProvenance,
-        created_policy_version: Option<&'a str>,
+        created_policy_version: &'a str,
     ) -> Result<Self> {
         validate_pubkey(pubkey)?;
         if provenance == BindingProvenance::Tofu {
@@ -83,7 +118,7 @@ impl<'a> VerifiedReplacementKey<'a> {
                 "privileged replacement cannot use TOFU provenance".to_string(),
             ));
         }
-        if created_policy_version.is_some_and(str::is_empty) {
+        if created_policy_version.is_empty() {
             return Err(DbError::InvalidData(
                 "identity policy version must not be empty".to_string(),
             ));
@@ -148,6 +183,8 @@ pub struct LifecycleReceipt {
     pub replacement_binding_id: Option<Uuid>,
     /// Resulting authorization-relevant binding version.
     pub binding_version: Option<u64>,
+    /// Version of the replacement binding ID, when a replacement was created.
+    pub replacement_binding_version: Option<u64>,
     /// Resulting pending selector version.
     pub selector_version: Option<u64>,
 }
@@ -159,6 +196,7 @@ impl fmt::Debug for LifecycleReceipt {
             .field("binding_id", &"[redacted]")
             .field("replacement_binding_id", &"[redacted]")
             .field("binding_version", &"[redacted]")
+            .field("replacement_binding_version", &"[redacted]")
             .field("selector_version", &"[redacted]")
             .finish()
     }
@@ -190,16 +228,15 @@ const OP_REVOKE_KEY: &str = "revoke_key";
 const OP_ROTATE: &str = "rotate";
 const OP_RECOVER: &str = "recover";
 const OP_ENABLE: &str = "enable_identity";
+const OP_ARCHIVE: &str = "archive";
 
 fn validate_context(context: LifecycleContext<'_>) -> Result<()> {
-    if context.operation_id.is_nil() || context.reason.is_empty() {
+    if context.operation_id.as_uuid().is_nil() || context.reason.trim().is_empty() {
         return Err(DbError::InvalidData(
             "identity lifecycle requires an operation ID and reason".to_string(),
         ));
     }
-    if let Some(actor) = context.actor {
-        validate_pubkey(actor)?;
-    }
+    validate_pubkey(context.actor)?;
     Ok(())
 }
 
@@ -236,12 +273,12 @@ fn request_fingerprint(
     context: LifecycleContext<'_>,
     parts: &[&[u8]],
 ) -> Vec<u8> {
-    let actor = context.actor.unwrap_or_default();
+    let operation_id = context.operation_id.as_uuid();
     let mut all = vec![
         kind.as_bytes(),
         community_id.as_uuid().as_bytes(),
-        context.operation_id.as_bytes(),
-        actor,
+        operation_id.as_bytes(),
+        context.actor,
         context.reason.as_bytes(),
     ];
     all.extend_from_slice(parts);
@@ -265,13 +302,12 @@ fn replacement_request_fingerprint(
     replacement: &VerifiedReplacementKey<'_>,
 ) -> Vec<u8> {
     let display_name = optional_fingerprint_bytes(replacement.display_name.map(str::as_bytes));
-    let policy_version =
-        optional_fingerprint_bytes(replacement.created_policy_version.map(str::as_bytes));
+    let policy_version = replacement.created_policy_version.as_bytes();
     let mut all = parts.to_vec();
     all.push(replacement.pubkey);
     all.push(&display_name);
     all.push(replacement.provenance.as_str().as_bytes());
-    all.push(&policy_version);
+    all.push(policy_version);
     request_fingerprint(kind, community_id, context, &all)
 }
 
@@ -306,7 +342,7 @@ fn lifecycle_coordinates(
 ) -> Vec<Vec<u8>> {
     let mut coordinates = vec![operation_lock_coordinate(
         community_id,
-        context.operation_id,
+        context.operation_id.as_uuid(),
     )];
     if let Some(principal) = principal {
         coordinates.push(principal_lock_coordinate(
@@ -399,7 +435,8 @@ async fn active_principal_tx(
     let row = sqlx::query(
         "SELECT binding_id, issuer, uid, pubkey, binding_version, binding_provenance \
          FROM identity_bindings \
-         WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND revoked_at IS NULL \
+         WHERE community_id=$1 AND issuer=$2 AND uid=$3 \
+           AND binding_state='active' AND revoked_at IS NULL \
          FOR UPDATE",
     )
     .bind(community_id.as_uuid())
@@ -430,7 +467,8 @@ async fn active_key_tx(
     let row = sqlx::query(
         "SELECT binding_id, issuer, uid, pubkey, binding_version, binding_provenance \
          FROM identity_bindings \
-         WHERE community_id=$1 AND pubkey=$2 AND revoked_at IS NULL \
+         WHERE community_id=$1 AND pubkey=$2 \
+           AND binding_state='active' AND revoked_at IS NULL \
          FOR UPDATE",
     )
     .bind(community_id.as_uuid())
@@ -569,23 +607,6 @@ pub async fn get_pending_lineage(
     Ok(pending)
 }
 
-async fn next_binding_version_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
-    principal: IdentityPrincipal<'_>,
-) -> Result<u64> {
-    let version: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(binding_version), 0) + 1 FROM identity_bindings \
-         WHERE community_id=$1 AND issuer=$2 AND uid=$3",
-    )
-    .bind(community_id.as_uuid())
-    .bind(principal.issuer)
-    .bind(principal.subject)
-    .fetch_one(&mut **tx)
-    .await?;
-    u64_version(version)
-}
-
 async fn replacement_eligible_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
@@ -614,15 +635,16 @@ async fn insert_binding_tx(
     replacement: &VerifiedReplacementKey<'_>,
     transition_kind: &str,
 ) -> Result<BindingEvidence> {
-    let version = next_binding_version_tx(tx, community_id, principal).await?;
+    let version = 1;
     let binding_id = Uuid::new_v4();
-    sqlx::query(
+    let created_at: DateTime<Utc> = sqlx::query_scalar(
         r#"
         INSERT INTO identity_bindings
             (community_id, issuer, uid, pubkey, display_name, source, binding_id,
              binding_version, binding_state, binding_provenance, created_by,
-             created_policy_version)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9, $10, $11)
+             created_policy_version, creation_attribution_kind)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9, $10, $11, $12)
+        RETURNING created_at
         "#,
     )
     .bind(community_id.as_uuid())
@@ -636,7 +658,8 @@ async fn insert_binding_tx(
     .bind(replacement.provenance.as_str())
     .bind(context.actor)
     .bind(replacement.created_policy_version)
-    .execute(&mut **tx)
+    .bind(CreationAttributionKind::Operator.as_str())
+    .fetch_one(&mut **tx)
     .await?;
     append_history_tx(
         tx,
@@ -653,9 +676,19 @@ async fn insert_binding_tx(
     )
     .await?;
     Ok(BindingEvidence {
+        authorization_domain: community_id,
+        issuer: principal.issuer.to_owned(),
+        subject: principal.subject.to_owned(),
+        bound_pubkey: replacement.pubkey.to_vec(),
         binding_id,
         binding_version: version,
+        binding_state: BindingState::Active,
         provenance: replacement.provenance,
+        creation_attribution: CreationAttributionKind::Operator,
+        created_by: Some(context.actor.to_vec()),
+        created_policy_version: Some(replacement.created_policy_version.to_owned()),
+        expires_at: None,
+        created_at,
     })
 }
 
@@ -692,7 +725,7 @@ async fn append_history_tx(
     .bind(provenance.as_str())
     .bind(transition_kind)
     .bind(replacement_binding_id)
-    .bind(context.operation_id)
+    .bind(context.operation_id.as_uuid())
     .bind(context.actor)
     .bind(context.reason)
     .execute(&mut **tx)
@@ -763,7 +796,7 @@ async fn insert_pending_tx(
     .bind(&binding.pubkey)
     .bind(binding.binding_id)
     .bind(i64_version(retired_version)?)
-    .bind(context.operation_id)
+    .bind(context.operation_id.as_uuid())
     .execute(&mut **tx)
     .await?;
     u64_version(selector_version)
@@ -811,7 +844,7 @@ async fn retire_active_tx(
             rotation_reason=CASE WHEN $6='rotated' THEN $8 ELSE rotation_reason END,
             replacement_binding_id=$11, updated_at=NOW()
         WHERE community_id=$1 AND binding_id=$2 AND issuer=$3 AND uid=$4
-          AND revoked_at IS NULL AND binding_version=$12
+          AND binding_state='active' AND revoked_at IS NULL AND binding_version=$12
         "#,
     )
     .bind(community_id.as_uuid())
@@ -866,11 +899,13 @@ async fn retire_active_tx(
 
 fn receipt_from_row(row: &sqlx::postgres::PgRow) -> Result<LifecycleReceipt> {
     let binding_version: Option<i64> = row.try_get("binding_version")?;
+    let replacement_binding_version: Option<i64> = row.try_get("replacement_binding_version")?;
     let selector_version: Option<i64> = row.try_get("selector_version")?;
     Ok(LifecycleReceipt {
         binding_id: row.try_get("binding_id")?,
         replacement_binding_id: row.try_get("replacement_binding_id")?,
         binding_version: binding_version.map(u64_version).transpose()?,
+        replacement_binding_version: replacement_binding_version.map(u64_version).transpose()?,
         selector_version: selector_version.map(u64_version).transpose()?,
     })
 }
@@ -885,14 +920,15 @@ async fn existing_operation_tx(
     let row = sqlx::query(
         r#"
         SELECT operation_kind, request_fingerprint, binding_id,
-               replacement_binding_id, binding_version, selector_version
+               replacement_binding_id, binding_version,
+               replacement_binding_version, selector_version
         FROM identity_lifecycle_operations
         WHERE community_id=$1 AND operation_id=$2
         FOR UPDATE
         "#,
     )
     .bind(community_id.as_uuid())
-    .bind(context.operation_id)
+    .bind(context.operation_id.as_uuid())
     .fetch_optional(&mut **tx)
     .await?;
     let Some(row) = row else {
@@ -928,13 +964,13 @@ async fn record_operation_tx(
         INSERT INTO identity_lifecycle_operations
             (community_id, operation_id, operation_kind, request_fingerprint,
              issuer, subject, pubkey, replacement_pubkey, binding_id,
-             replacement_binding_id, binding_version, selector_version,
-             actor, reason)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+             replacement_binding_id, binding_version, replacement_binding_version,
+             selector_version, actor, reason)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
         "#,
     )
     .bind(community_id.as_uuid())
-    .bind(context.operation_id)
+    .bind(context.operation_id.as_uuid())
     .bind(completion.kind)
     .bind(completion.fingerprint)
     .bind(completion.principal.map(|value| value.issuer))
@@ -947,6 +983,13 @@ async fn record_operation_tx(
         completion
             .receipt
             .binding_version
+            .map(i64_version)
+            .transpose()?,
+    )
+    .bind(
+        completion
+            .receipt
+            .replacement_binding_version
             .map(i64_version)
             .transpose()?,
     )
@@ -1041,6 +1084,7 @@ pub async fn provision_identity_binding(
         binding_id: Some(binding.binding_id),
         replacement_binding_id: None,
         binding_version: Some(binding.binding_version),
+        replacement_binding_version: None,
         selector_version: None,
     };
     finish(
@@ -1112,6 +1156,7 @@ pub async fn retire_identity_pair(
         binding_id: Some(active.binding_id),
         replacement_binding_id: None,
         binding_version: Some(version),
+        replacement_binding_version: None,
         selector_version,
     };
     finish(
@@ -1202,6 +1247,7 @@ pub async fn disable_identity_principal(
         binding_id,
         replacement_binding_id: None,
         binding_version: version,
+        replacement_binding_version: None,
         selector_version,
     };
     finish(
@@ -1293,6 +1339,7 @@ pub async fn revoke_identity_key(
         binding_id,
         replacement_binding_id: None,
         binding_version: version,
+        replacement_binding_version: None,
         selector_version,
     };
     let outcome = finish(
@@ -1374,7 +1421,7 @@ async fn verify_key_revocation_committed(
     )
     .bind(community_id.as_uuid())
     .bind(pubkey)
-    .bind(context.operation_id)
+    .bind(context.operation_id.as_uuid())
     .fetch_one(pool)
     .await?;
     if selector_and_operation != (true, true) {
@@ -1487,14 +1534,14 @@ pub async fn rotate_identity_binding(
         },
     )
     .await?;
-    let new_version = next_binding_version_tx(&mut tx, community_id, principal).await?;
+    let new_version = 1;
     sqlx::query(
         r#"
         INSERT INTO identity_bindings
             (community_id, issuer, uid, pubkey, display_name, source, binding_id,
              binding_version, binding_state, binding_provenance, created_by,
-             created_policy_version)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$10,$11)
+             created_policy_version, creation_attribution_kind)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$10,$11,$12)
         "#,
     )
     .bind(community_id.as_uuid())
@@ -1508,6 +1555,7 @@ pub async fn rotate_identity_binding(
     .bind(replacement.provenance.as_str())
     .bind(context.actor)
     .bind(replacement.created_policy_version)
+    .bind(CreationAttributionKind::Operator.as_str())
     .execute(&mut *tx)
     .await?;
     append_history_tx(
@@ -1536,10 +1584,10 @@ pub async fn rotate_identity_binding(
     let receipt = LifecycleReceipt {
         binding_id: Some(active.binding_id),
         replacement_binding_id: Some(replacement_binding_id),
-        binding_version: Some(new_version),
+        binding_version: Some(old_version),
+        replacement_binding_version: Some(new_version),
         selector_version: None,
     };
-    let _ = old_version;
     finish(
         tx,
         community_id,
@@ -1580,7 +1628,7 @@ async fn compare_and_clear_pending_tx(
     .bind(expected.retired_binding_id)
     .bind(i64_version(expected.retired_binding_version)?)
     .bind(i64_version(expected.selector_version)?)
-    .bind(context.operation_id)
+    .bind(context.operation_id.as_uuid())
     .execute(&mut **tx)
     .await?;
     if changed.rows_affected() != 1 {
@@ -1703,7 +1751,8 @@ pub async fn recover_identity_binding(
     let receipt = LifecycleReceipt {
         binding_id: Some(expected.retired_binding_id),
         replacement_binding_id: Some(binding.binding_id),
-        binding_version: Some(binding.binding_version),
+        binding_version: Some(expected.retired_binding_version),
+        replacement_binding_version: Some(binding.binding_version),
         selector_version: Some(expected.selector_version),
     };
     finish(
@@ -1847,12 +1896,22 @@ pub async fn enable_identity_principal(
         )
         .await?;
     }
-    let receipt = LifecycleReceipt {
-        binding_id: Some(binding.binding_id),
-        replacement_binding_id: None,
-        binding_version: Some(binding.binding_version),
-        selector_version: expected.map(|value| value.selector_version),
-    };
+    let receipt = expected.map_or_else(
+        || LifecycleReceipt {
+            binding_id: Some(binding.binding_id),
+            replacement_binding_id: None,
+            binding_version: Some(binding.binding_version),
+            replacement_binding_version: None,
+            selector_version: None,
+        },
+        |expected| LifecycleReceipt {
+            binding_id: Some(expected.retired_binding_id),
+            replacement_binding_id: Some(binding.binding_id),
+            binding_version: Some(expected.retired_binding_version),
+            replacement_binding_version: Some(binding.binding_version),
+            selector_version: Some(expected.selector_version),
+        },
+    );
     finish(
         tx,
         community_id,
@@ -1863,6 +1922,112 @@ pub async fn enable_identity_principal(
             principal: Some(principal),
             pubkey: expected.map(|value| value.retired_pubkey.as_slice()),
             replacement_pubkey: Some(replacement.pubkey),
+            receipt,
+        },
+    )
+    .await
+}
+
+/// Archive one already-inactive binding with complete actor and reason
+/// attribution. Archival never creates or restores authorization.
+pub async fn archive_identity_binding(
+    pool: &PgPool,
+    community_id: CommunityId,
+    context: LifecycleContext<'_>,
+    binding_id: Uuid,
+) -> Result<LifecycleResult> {
+    validate_context(context)?;
+    if binding_id.is_nil() {
+        return Err(DbError::InvalidData(
+            "identity archive requires a binding ID".to_string(),
+        ));
+    }
+    let fingerprint =
+        request_fingerprint(OP_ARCHIVE, community_id, context, &[binding_id.as_bytes()]);
+    let coordinates = lifecycle_coordinates(community_id, context, None, &[], Some(binding_id));
+    let mut tx = begin_locked(pool, coordinates).await?;
+    if let Some(receipt) =
+        existing_operation_tx(&mut tx, community_id, context, OP_ARCHIVE, &fingerprint).await?
+    {
+        tx.commit().await?;
+        return Ok(LifecycleResult::AlreadyApplied(receipt));
+    }
+    let row = sqlx::query(
+        r#"
+        SELECT issuer, uid, pubkey, binding_version, binding_provenance,
+               replacement_binding_id
+        FROM identity_bindings
+        WHERE community_id=$1 AND binding_id=$2
+          AND binding_state IN ('revoked', 'rotated') AND revoked_at IS NOT NULL
+        FOR UPDATE
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(binding_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| DbError::InvalidData("identity binding is not archivable".to_string()))?;
+    let issuer: String = row.try_get("issuer")?;
+    let subject: String = row.try_get("uid")?;
+    let pubkey: Vec<u8> = row.try_get("pubkey")?;
+    let version = u64_version(row.try_get("binding_version")?)?;
+    let provenance = BindingProvenance::parse(row.try_get("binding_provenance")?)?;
+    let replacement_binding_id: Option<Uuid> = row.try_get("replacement_binding_id")?;
+    let principal = IdentityPrincipal {
+        issuer: &issuer,
+        subject: &subject,
+    };
+    let changed = sqlx::query(
+        r#"
+        UPDATE identity_bindings
+        SET binding_state='archived', archived_at=NOW(), archived_by=$3,
+            archived_reason=$4, updated_at=NOW()
+        WHERE community_id=$1 AND binding_id=$2
+          AND binding_state IN ('revoked', 'rotated') AND revoked_at IS NOT NULL
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(binding_id)
+    .bind(context.actor)
+    .bind(context.reason)
+    .execute(&mut *tx)
+    .await?;
+    if changed.rows_affected() != 1 {
+        return Err(DbError::InvalidData(
+            "identity binding changed during archive".to_string(),
+        ));
+    }
+    append_history_tx(
+        &mut tx,
+        community_id,
+        context,
+        binding_id,
+        version,
+        principal,
+        &pubkey,
+        "archived",
+        provenance,
+        OP_ARCHIVE,
+        replacement_binding_id,
+    )
+    .await?;
+    let receipt = LifecycleReceipt {
+        binding_id: Some(binding_id),
+        replacement_binding_id: None,
+        binding_version: Some(version),
+        replacement_binding_version: None,
+        selector_version: None,
+    };
+    finish(
+        tx,
+        community_id,
+        context,
+        OperationFinish {
+            kind: OP_ARCHIVE,
+            fingerprint: &fingerprint,
+            principal: Some(principal),
+            pubkey: Some(&pubkey),
+            replacement_pubkey: None,
             receipt,
         },
     )
@@ -1917,14 +2082,17 @@ mod tests {
     ) -> BindingEvidence {
         match resolve_identity_binding(
             pool,
-            community_id,
             &ResolveBindingInput {
+                authorization_domain: community_id,
                 issuer: ISSUER,
                 subject,
                 pubkey,
                 display_name: None,
                 enrollment_mode: EnrollmentMode::AttestedKey,
                 key_attested: true,
+                policy_version: "test-policy-v1",
+                evidence_valid_from: 0,
+                evidence_valid_until: i64::MAX as u64,
             },
         )
         .await
@@ -1936,9 +2104,10 @@ mod tests {
     }
 
     fn context<'a>(reason: &'a str) -> LifecycleContext<'a> {
+        const ACTOR: [u8; 32] = [0xA3; 32];
         LifecycleContext {
-            operation_id: Uuid::new_v4(),
-            actor: None,
+            operation_id: LifecycleOperationId::issue(),
+            actor: &ACTOR,
             reason,
         }
     }
@@ -1948,7 +2117,7 @@ mod tests {
             pubkey,
             None,
             BindingProvenance::AttestedKey,
-            Some("test-policy-v1"),
+            "test-policy-v1",
         )
         .expect("verified replacement")
     }
@@ -1959,9 +2128,198 @@ mod tests {
             &[1_u8; 32],
             None,
             BindingProvenance::Tofu,
-            None,
+            "test-policy-v1",
         )
         .is_err());
+    }
+
+    #[test]
+    fn lifecycle_reason_must_contain_non_whitespace_attribution() {
+        assert!(validate_context(context(" \t\n ")).is_err());
+    }
+
+    #[test]
+    fn server_operation_identifier_is_opaque_and_redacted() {
+        let raw = Uuid::from_u128(0x1234);
+        let identifier = LifecycleOperationId::from_uuid_for_test(raw);
+        assert_eq!(identifier.as_uuid(), raw);
+        assert!(!format!("{identifier:?}").contains(&raw.to_string()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated disposable Postgres database"]
+    async fn inactive_binding_archive_is_attributed_and_idempotent() {
+        let pool = setup_pool().await;
+        let community_id = make_community(&pool).await;
+        let pubkey = [0xA5_u8; 32];
+        let evidence = enroll(&pool, community_id, "archive-subject", &pubkey).await;
+        retire_identity_pair(
+            &pool,
+            community_id,
+            context("retire before archive"),
+            IdentityPrincipal {
+                issuer: ISSUER,
+                subject: "archive-subject",
+            },
+            &pubkey,
+        )
+        .await
+        .expect("retire binding");
+        let pending_before = get_pending_lineage(
+            &pool,
+            community_id,
+            IdentityPrincipal {
+                issuer: ISSUER,
+                subject: "archive-subject",
+            },
+        )
+        .await
+        .expect("read pending lineage before archive")
+        .expect("retirement creates pending lineage");
+        let archive_context = context("archive inactive binding");
+        let applied =
+            archive_identity_binding(&pool, community_id, archive_context, evidence.binding_id())
+                .await
+                .expect("archive binding");
+        assert!(matches!(applied, LifecycleResult::Applied(_)));
+        let replay =
+            archive_identity_binding(&pool, community_id, archive_context, evidence.binding_id())
+                .await
+                .expect("replay archive");
+        assert!(matches!(replay, LifecycleResult::AlreadyApplied(_)));
+        type ArchivedBindingRow = (
+            String,
+            Option<DateTime<Utc>>,
+            Option<Vec<u8>>,
+            Option<String>,
+            i64,
+        );
+        let archived: ArchivedBindingRow = sqlx::query_as(
+            "SELECT binding_state, archived_at, archived_by, archived_reason, binding_version \
+             FROM identity_bindings \
+             WHERE community_id=$1 AND binding_id=$2",
+        )
+        .bind(community_id.as_uuid())
+        .bind(evidence.binding_id())
+        .fetch_one(&pool)
+        .await
+        .expect("read archived binding");
+        assert_eq!(archived.0, "archived");
+        assert!(archived.1.is_some());
+        assert_eq!(archived.2.as_deref(), Some(archive_context.actor));
+        assert_eq!(archived.3.as_deref(), Some(archive_context.reason));
+        assert_eq!(
+            u64::try_from(archived.4).unwrap(),
+            pending_before.retired_binding_version
+        );
+        assert_eq!(
+            get_pending_lineage(
+                &pool,
+                community_id,
+                IdentityPrincipal {
+                    issuer: ISSUER,
+                    subject: "archive-subject",
+                },
+            )
+            .await
+            .expect("read pending lineage after archive")
+            .expect("archive preserves recovery lineage"),
+            pending_before
+        );
+        let archive_history: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM identity_binding_history \
+             WHERE community_id=$1 AND binding_id=$2 AND transition_kind='archive'",
+        )
+        .bind(community_id.as_uuid())
+        .bind(evidence.binding_id())
+        .fetch_one(&pool)
+        .await
+        .expect("count archive history");
+        assert_eq!(archive_history, 1);
+        let ordinary = resolve_identity_binding(
+            &pool,
+            &ResolveBindingInput {
+                authorization_domain: community_id,
+                issuer: ISSUER,
+                subject: "archive-subject",
+                pubkey: &pubkey,
+                display_name: None,
+                enrollment_mode: EnrollmentMode::AttestedKey,
+                key_attested: true,
+                policy_version: "test-policy-v1",
+                evidence_valid_from: 0,
+                evidence_valid_until: i64::MAX as u64,
+            },
+        )
+        .await
+        .expect("ordinary authorization returns typed denial");
+        assert_eq!(
+            ordinary,
+            ResolveBindingResult::Denied(BindingDenial::Revoked)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated disposable Postgres database"]
+    async fn committed_rotation_replays_exact_receipt_after_response_loss_and_new_pool() {
+        let pool = setup_pool().await;
+        let community_id = make_community(&pool).await;
+        let principal = IdentityPrincipal {
+            issuer: ISSUER,
+            subject: "response-loss-rotation",
+        };
+        let old_key = [0xB1_u8; 32];
+        let new_key = [0xB2_u8; 32];
+        let old_evidence = enroll(&pool, community_id, principal.subject, &old_key).await;
+        let request = LifecycleContext {
+            operation_id: LifecycleOperationId::issue(),
+            actor: &old_key,
+            reason: "rotate with lost response",
+        };
+        let first = rotate_identity_binding(
+            &pool,
+            community_id,
+            request,
+            principal,
+            &old_key,
+            replacement(&new_key),
+        )
+        .await
+        .expect("commit rotation before simulated response loss");
+        let LifecycleResult::Applied(applied_receipt) = first else {
+            panic!("first rotation must apply");
+        };
+        assert_eq!(applied_receipt.binding_id, Some(old_evidence.binding_id()));
+        drop(pool);
+
+        let restarted_pool = setup_pool().await;
+        let replay = rotate_identity_binding(
+            &restarted_pool,
+            community_id,
+            request,
+            principal,
+            &old_key,
+            replacement(&new_key),
+        )
+        .await
+        .expect("retry exact rotation through a new pool");
+        assert_eq!(
+            replay,
+            LifecycleResult::AlreadyApplied(applied_receipt.clone())
+        );
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM identity_lifecycle_operations \
+                WHERE community_id=$1 AND operation_id=$2)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(request.operation_id.as_uuid())
+        .fetch_one(&restarted_pool)
+        .await
+        .expect("read response-loss retry counts");
+        assert_eq!(counts, (2, 3, 1));
     }
 
     #[tokio::test]
@@ -1975,7 +2333,7 @@ mod tests {
         };
         let retired_key = [1_u8; 32];
         let replacement_key = [2_u8; 32];
-        enroll(&pool, community_id, principal.subject, &retired_key).await;
+        let retired_evidence = enroll(&pool, community_id, principal.subject, &retired_key).await;
         revoke_identity_key(
             &pool,
             community_id,
@@ -2015,7 +2373,7 @@ mod tests {
             );
         }
 
-        recover_identity_binding(
+        let recovered = recover_identity_binding(
             &pool,
             community_id,
             context("exact recovery"),
@@ -2025,6 +2383,18 @@ mod tests {
         )
         .await
         .expect("recover by exact selector");
+        let LifecycleResult::Applied(receipt) = recovered else {
+            panic!("first exact recovery must apply");
+        };
+        assert_eq!(receipt.binding_id, Some(retired_evidence.binding_id()));
+        assert_eq!(
+            receipt.binding_version,
+            Some(expected.retired_binding_version)
+        );
+        assert!(receipt.replacement_binding_id.is_some());
+        assert_ne!(receipt.replacement_binding_id, receipt.binding_id);
+        assert_eq!(receipt.replacement_binding_version, Some(1));
+        assert_eq!(receipt.selector_version, Some(expected.selector_version));
         assert!(get_pending_lineage(&pool, community_id, principal)
             .await
             .expect("read cleared pending")
@@ -2042,7 +2412,7 @@ mod tests {
         };
         let retired_key = [4_u8; 32];
         let replacement_key = [5_u8; 32];
-        enroll(&pool, community_id, principal.subject, &retired_key).await;
+        let retired_evidence = enroll(&pool, community_id, principal.subject, &retired_key).await;
         disable_identity_principal(
             &pool,
             community_id,
@@ -2067,26 +2437,55 @@ mod tests {
         )
         .await
         .is_err());
-        enable_identity_principal(
+        let enable_request = context("exact enable");
+        let applied = enable_identity_principal(
             &pool,
             community_id,
-            context("exact enable"),
+            enable_request,
             principal,
             Some(&expected),
             replacement(&replacement_key),
         )
         .await
         .expect("enable by exact selector");
+        let LifecycleResult::Applied(receipt) = applied else {
+            panic!("first exact enablement must apply");
+        };
+        assert_eq!(receipt.binding_id, Some(retired_evidence.binding_id()));
+        assert_eq!(
+            receipt.binding_version,
+            Some(expected.retired_binding_version)
+        );
+        assert!(receipt.replacement_binding_id.is_some());
+        assert_ne!(receipt.replacement_binding_id, receipt.binding_id);
+        assert_eq!(receipt.replacement_binding_version, Some(1));
+        assert_eq!(receipt.selector_version, Some(expected.selector_version));
+        assert_eq!(
+            enable_identity_principal(
+                &pool,
+                community_id,
+                enable_request,
+                principal,
+                Some(&expected),
+                replacement(&replacement_key),
+            )
+            .await
+            .expect("replay exact enablement"),
+            LifecycleResult::AlreadyApplied(receipt)
+        );
         let resolved = resolve_identity_binding(
             &pool,
-            community_id,
             &ResolveBindingInput {
+                authorization_domain: community_id,
                 issuer: principal.issuer,
                 subject: principal.subject,
                 pubkey: &replacement_key,
                 display_name: None,
                 enrollment_mode: EnrollmentMode::AttestedKey,
                 key_attested: true,
+                policy_version: "test-policy-v1",
+                evidence_valid_from: 0,
+                evidence_valid_until: i64::MAX as u64,
             },
         )
         .await
@@ -2108,15 +2507,15 @@ mod tests {
             let key = [60_u8 + variant; 32];
             let operation_id = Uuid::new_v4();
             let request = LifecycleContext {
-                operation_id,
-                actor: None,
+                operation_id: LifecycleOperationId::from_uuid_for_test(operation_id),
+                actor: &key,
                 reason: "fingerprint replacement request",
             };
             let original = VerifiedReplacementKey::after_verified_proof(
                 &key,
                 None,
                 BindingProvenance::Provisioned,
-                Some("policy-v1"),
+                "policy-v1",
             )
             .expect("construct original replacement");
             provision_identity_binding(
@@ -2134,13 +2533,13 @@ mod tests {
                     &key,
                     Some("changed display"),
                     BindingProvenance::AttestedKey,
-                    Some("policy-v1"),
+                    "policy-v1",
                 ),
                 _ => VerifiedReplacementKey::after_verified_proof(
                     &key,
                     None,
                     BindingProvenance::Provisioned,
-                    Some("policy-v2"),
+                    "policy-v2",
                 ),
             }
             .expect("construct changed replacement");
@@ -2174,27 +2573,40 @@ mod tests {
         };
         let old_key = [64_u8; 32];
         let new_key = [65_u8; 32];
-        enroll(&pool, community_id, principal.subject, &old_key).await;
+        let old_evidence = enroll(&pool, community_id, principal.subject, &old_key).await;
         let request = LifecycleContext {
-            operation_id: Uuid::new_v4(),
-            actor: None,
+            operation_id: LifecycleOperationId::issue(),
+            actor: &old_key,
             reason: "fingerprint rotation request",
         };
         let original = VerifiedReplacementKey::after_verified_proof(
             &new_key,
             None,
             BindingProvenance::Provisioned,
-            Some("policy-v1"),
+            "policy-v1",
         )
         .expect("construct provisioned rotation");
-        rotate_identity_binding(&pool, community_id, request, principal, &old_key, original)
-            .await
-            .expect("apply original rotation");
+        let rotated =
+            rotate_identity_binding(&pool, community_id, request, principal, &old_key, original)
+                .await
+                .expect("apply original rotation");
+        let LifecycleResult::Applied(receipt) = rotated else {
+            panic!("first rotation must apply");
+        };
+        assert_eq!(receipt.binding_id, Some(old_evidence.binding_id()));
+        assert_eq!(
+            receipt.binding_version,
+            Some(old_evidence.binding_version() + 1)
+        );
+        assert!(receipt.replacement_binding_id.is_some());
+        assert_ne!(receipt.replacement_binding_id, receipt.binding_id);
+        assert_eq!(receipt.replacement_binding_version, Some(1));
+        assert_eq!(receipt.selector_version, None);
         let changed = VerifiedReplacementKey::after_verified_proof(
             &new_key,
             None,
             BindingProvenance::AttestedKey,
-            Some("policy-v1"),
+            "policy-v1",
         )
         .expect("construct changed rotation provenance");
         assert!(rotate_identity_binding(
@@ -2241,8 +2653,8 @@ mod tests {
             .expect("fingerprint pending selector");
         let operation_id = Uuid::new_v4();
         let request = LifecycleContext {
-            operation_id,
-            actor: None,
+            operation_id: LifecycleOperationId::from_uuid_for_test(operation_id),
+            actor: &old_key,
             reason: "fingerprint enable request",
         };
         enable_identity_principal(
@@ -2317,7 +2729,7 @@ mod tests {
 
         let versions: Vec<(Vec<u8>, i64, String)> = sqlx::query_as(
             "SELECT pubkey, binding_version, binding_state FROM identity_bindings \
-             WHERE community_id=$1 AND issuer=$2 AND uid=$3 ORDER BY binding_version",
+             WHERE community_id=$1 AND issuer=$2 AND uid=$3 ORDER BY pubkey",
         )
         .bind(community_id.as_uuid())
         .bind(principal.issuer)
@@ -2326,7 +2738,7 @@ mod tests {
         .await
         .expect("read rotation history");
         assert_eq!(versions.len(), keys.len());
-        let expected_versions = [2_i64, 4, 6, 7];
+        let expected_versions = [2_i64, 2, 2, 1];
         for (index, (pubkey, version, state)) in versions.iter().enumerate() {
             assert_eq!(pubkey, &keys[index]);
             assert_eq!(*version, expected_versions[index]);
@@ -2373,14 +2785,17 @@ mod tests {
         assert_eq!(
             resolve_identity_binding(
                 &pool,
-                community_id,
                 &ResolveBindingInput {
+                    authorization_domain: community_id,
                     issuer: principal.issuer,
                     subject: principal.subject,
                     pubkey: &key,
                     display_name: None,
                     enrollment_mode: EnrollmentMode::AttestedKey,
                     key_attested: true,
+                    policy_version: "test-policy-v1",
+                    evidence_valid_from: 0,
+                    evidence_valid_until: i64::MAX as u64,
                 },
             )
             .await
@@ -2410,14 +2825,17 @@ mod tests {
             enroll_gate.wait().await;
             resolve_identity_binding(
                 &enroll_pool,
-                community_id,
                 &ResolveBindingInput {
+                    authorization_domain: community_id,
                     issuer: ISSUER,
                     subject: "racing-subject",
                     pubkey: &key,
                     display_name: None,
                     enrollment_mode: EnrollmentMode::AttestedKey,
                     key_attested: true,
+                    policy_version: "test-policy-v1",
+                    evidence_valid_from: 0,
+                    evidence_valid_until: i64::MAX as u64,
                 },
             )
             .await
@@ -2450,7 +2868,7 @@ mod tests {
         let state: (bool, bool) = sqlx::query_as(
             "SELECT \
                EXISTS(SELECT 1 FROM identity_principals WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND disabled_at IS NOT NULL), \
-               EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND revoked_at IS NULL)",
+               EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND binding_state='active' AND revoked_at IS NULL)",
         )
         .bind(community_id.as_uuid())
         .bind(ISSUER)
@@ -2476,14 +2894,17 @@ mod tests {
                 task_gate.wait().await;
                 resolve_identity_binding(
                     &task_pool,
-                    community_id,
                     &ResolveBindingInput {
+                        authorization_domain: community_id,
                         issuer: ISSUER,
                         subject: "same-cross-domain-principal",
                         pubkey: &key,
                         display_name: None,
                         enrollment_mode: EnrollmentMode::AttestedKey,
                         key_attested: true,
+                        policy_version: "test-policy-v1",
+                        evidence_valid_from: 0,
+                        evidence_valid_until: i64::MAX as u64,
                     },
                 )
                 .await
@@ -2501,7 +2922,8 @@ mod tests {
         for community_id in domains {
             let count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM identity_bindings \
-                 WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND pubkey=$4 AND revoked_at IS NULL",
+                 WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND pubkey=$4 \
+                   AND binding_state='active' AND revoked_at IS NULL",
             )
             .bind(community_id.as_uuid())
             .bind(ISSUER)
@@ -2592,7 +3014,7 @@ mod tests {
             assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
             let state: (i64, bool, bool) = sqlx::query_as(
                 "SELECT \
-                   (SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND revoked_at IS NULL), \
+                   (SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND binding_state='active' AND revoked_at IS NULL), \
                    EXISTS(SELECT 1 FROM identity_principals WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND disabled_at IS NOT NULL), \
                    EXISTS(SELECT 1 FROM identity_pending_replacements WHERE community_id=$1 AND issuer=$2 AND subject=$3 AND cleared_at IS NULL)",
             )
@@ -2667,7 +3089,7 @@ mod tests {
         let state: (bool, bool, bool) = sqlx::query_as(
             "SELECT \
                EXISTS(SELECT 1 FROM identity_principals WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND disabled_at IS NOT NULL), \
-               EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND revoked_at IS NULL), \
+               EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND issuer=$2 AND uid=$3 AND binding_state='active' AND revoked_at IS NULL), \
                EXISTS(SELECT 1 FROM identity_pending_replacements WHERE community_id=$1 AND issuer=$2 AND subject=$3 AND cleared_at IS NULL)",
         )
         .bind(community_id.as_uuid())
@@ -2735,8 +3157,8 @@ mod tests {
             "SELECT \
                EXISTS(SELECT 1 FROM identity_bindings binding \
                       JOIN identity_revoked_keys revoked USING (community_id,pubkey) \
-                      WHERE binding.community_id=$1 AND binding.revoked_at IS NULL), \
-               EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND pubkey=$2 AND revoked_at IS NULL), \
+                      WHERE binding.community_id=$1 AND binding.binding_state='active' AND binding.revoked_at IS NULL), \
+               EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND pubkey=$2 AND binding_state='active' AND revoked_at IS NULL), \
                EXISTS(SELECT 1 FROM identity_revoked_keys WHERE community_id=$1 AND pubkey=$2)",
         )
         .bind(community_id.as_uuid())
@@ -2801,17 +3223,17 @@ mod tests {
                 .expect("key revocation commits");
             let state: (i64, bool, bool) = sqlx::query_as(
                 "SELECT \
-                   (SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1 AND revoked_at IS NULL), \
+                   (SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1 AND binding_state='active' AND revoked_at IS NULL), \
                    EXISTS(SELECT 1 FROM identity_bindings binding \
                           JOIN identity_revoked_keys revoked USING (community_id,pubkey) \
-                          WHERE binding.community_id=$1 AND binding.revoked_at IS NULL), \
+                          WHERE binding.community_id=$1 AND binding.binding_state='active' AND binding.revoked_at IS NULL), \
                    EXISTS(SELECT 1 FROM identity_bindings binding \
                           JOIN identity_retired_pairs retired \
                             ON retired.community_id=binding.community_id \
                            AND retired.issuer=binding.issuer \
                            AND retired.subject=binding.uid \
                            AND retired.pubkey=binding.pubkey \
-                          WHERE binding.community_id=$1 AND binding.revoked_at IS NULL)",
+                          WHERE binding.community_id=$1 AND binding.binding_state='active' AND binding.revoked_at IS NULL)",
             )
             .bind(community_id.as_uuid())
             .fetch_one(&pool)
@@ -2829,17 +3251,17 @@ mod tests {
         let community_id = make_community(&pool).await;
         let key = [41_u8; 32];
         enroll(&pool, community_id, "rollback-subject", &key).await;
-        let reason = "o3 lifecycle failure injection";
+        let reason = "identity lifecycle failure injection";
         sqlx::query(
-            "CREATE OR REPLACE FUNCTION o3_fail_history() RETURNS trigger LANGUAGE plpgsql AS $$ \
-             BEGIN IF NEW.reason = 'o3 lifecycle failure injection' THEN RAISE EXCEPTION 'injected history failure'; END IF; RETURN NEW; END $$",
+            "CREATE OR REPLACE FUNCTION identity_test_fail_history() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.reason = 'identity lifecycle failure injection' THEN RAISE EXCEPTION 'injected history failure'; END IF; RETURN NEW; END $$",
         )
         .execute(&pool)
         .await
         .expect("create failure function");
         sqlx::query(
-            "CREATE TRIGGER o3_fail_history_trigger BEFORE INSERT ON identity_binding_history \
-             FOR EACH ROW EXECUTE FUNCTION o3_fail_history()",
+            "CREATE TRIGGER identity_test_fail_history_trigger BEFORE INSERT ON identity_binding_history \
+             FOR EACH ROW EXECUTE FUNCTION identity_test_fail_history()",
         )
         .execute(&pool)
         .await
@@ -2850,7 +3272,7 @@ mod tests {
             .is_err();
         let state: (bool, bool, bool, bool) = sqlx::query_as(
             "SELECT \
-               EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND pubkey=$2 AND revoked_at IS NULL), \
+               EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND pubkey=$2 AND binding_state='active' AND revoked_at IS NULL), \
                EXISTS(SELECT 1 FROM identity_revoked_keys WHERE community_id=$1 AND pubkey=$2), \
                EXISTS(SELECT 1 FROM identity_retired_pairs WHERE community_id=$1 AND pubkey=$2), \
                EXISTS(SELECT 1 FROM identity_pending_replacements WHERE community_id=$1 AND retired_pubkey=$2 AND cleared_at IS NULL)",
@@ -2861,11 +3283,11 @@ mod tests {
         .await
         .expect("read rollback state");
 
-        sqlx::query("DROP TRIGGER o3_fail_history_trigger ON identity_binding_history")
+        sqlx::query("DROP TRIGGER identity_test_fail_history_trigger ON identity_binding_history")
             .execute(&pool)
             .await
             .expect("drop failure trigger");
-        sqlx::query("DROP FUNCTION o3_fail_history()")
+        sqlx::query("DROP FUNCTION identity_test_fail_history()")
             .execute(&pool)
             .await
             .expect("drop failure function");

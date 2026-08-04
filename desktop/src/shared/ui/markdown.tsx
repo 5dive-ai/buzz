@@ -661,16 +661,10 @@ function ImageZoomOverlay({
   const frameCornerRadii = isReturning
     ? returnCornerRadii
     : imageLightboxExpandedCornerRadii();
-  // Once fully settled at 1x, drop the transform to `none` so the wrapper
-  // leaves the GPU-composited path and the <img> repaints through WebKit's
-  // high-quality paint rasterizer — matching inline-image sharpness. An
-  // identity `translate3d` would keep it composited, so it must be `none`.
   const atRest =
     isOpen &&
     hasEntered &&
     zoom === IMAGE_LIGHTBOX_MIN_ZOOM &&
-    // Holds composited through the trackpad gesture-end idle window: after a
-    // pinch settles back to exactly 1x, `isAdjustingZoom` stays true for
     // IMAGE_LIGHTBOX_TRACKPAD_ZOOM_IDLE_MS, avoiding a demote/re-promote thrash.
     !isAdjustingZoom;
   const transform = atRest

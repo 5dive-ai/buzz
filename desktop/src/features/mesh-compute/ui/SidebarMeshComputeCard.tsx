@@ -13,6 +13,7 @@ import { useMeshServingUsage } from "../hooks/useMeshServingUsage";
 import { useMeshSnapshot } from "../hooks/useMeshSnapshot";
 import { deriveMeshShareToggle } from "../shareToggleState";
 import { deriveMeshCardModel, type MeshCardTone } from "../meshCardModel";
+import { MeshDetailPopover } from "./MeshDetailPopover";
 import { MeshTopologyStrip } from "./MeshTopologyStrip";
 
 /**
@@ -62,12 +63,9 @@ const TONE_RING_CLASS: Record<MeshCardTone, string> = {
 export function SidebarMeshComputeCard({
   className,
   onOpenComputeSettings,
-  onOpenDetail,
 }: {
   className?: string;
   onOpenComputeSettings?: () => void;
-  /** Open the full mesh view (topology, capacity, per-device detail). */
-  onOpenDetail?: () => void;
 }) {
   const shouldReduceMotion = useReducedMotion();
   const { status, refresh: refreshStatus } = useMeshNodeStatus();
@@ -192,28 +190,33 @@ export function SidebarMeshComputeCard({
             Clickable region is the text block, not the whole card: wrapping the
             Switch in a button would nest interactive elements.
           */}
-          <button
-            className="min-w-0 flex-1 rounded-md text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default"
-            data-testid="mesh-card-open-detail"
-            disabled={!onOpenDetail}
-            onClick={onOpenDetail}
-            type="button"
+          <MeshDetailPopover
+            isSharing={toggle.isSharing}
+            onOpenComputeSettings={onOpenComputeSettings}
+            snapshot={snapshot}
+            usage={usage}
           >
-            <p
-              className="truncate text-sm font-semibold leading-tight"
-              data-testid="mesh-card-headline"
+            <button
+              className="min-w-0 flex-1 rounded-md text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              data-testid="mesh-card-open-detail"
+              type="button"
             >
-              {model.headline}
-            </p>
-            {model.detail ? (
               <p
-                className="mt-0.5 line-clamp-2 text-2xs leading-snug text-muted-foreground"
-                data-testid="mesh-card-detail"
+                className="truncate text-sm font-semibold leading-tight"
+                data-testid="mesh-card-headline"
               >
-                {model.detail}
+                {model.headline}
               </p>
-            ) : null}
-          </button>
+              {model.detail ? (
+                <p
+                  className="mt-0.5 line-clamp-2 text-2xs leading-snug text-muted-foreground"
+                  data-testid="mesh-card-detail"
+                >
+                  {model.detail}
+                </p>
+              ) : null}
+            </button>
+          </MeshDetailPopover>
 
           <Switch
             aria-label={model.switchLabel}
@@ -237,17 +240,6 @@ export function SidebarMeshComputeCard({
           >
             {errorText}
           </p>
-        ) : null}
-
-        {onOpenComputeSettings ? (
-          <button
-            className="mt-2 text-2xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-            data-testid="mesh-card-advanced-link"
-            onClick={onOpenComputeSettings}
-            type="button"
-          >
-            Compute settings
-          </button>
         ) : null}
       </div>
     </motion.div>

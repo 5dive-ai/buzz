@@ -343,9 +343,9 @@ pub async fn save_ncryptsec_copy(
 /// - `Ok(stopped)` when all runtimes were stopped (or there were none).
 /// - `Err((stopped, msg))` when the drain failed; `stopped` contains the
 ///   entries that were successfully killed before the failure — the caller
-///   MUST compensate these and then drop `managed_agent_runtime_transition`
-///   BEFORE calling `compensate_drain` (which re-acquires that lock via
-///   `start_pair`).
+///   MUST pass the `managed_agent_runtime_transition` guard by value into
+///   `compensate_drain`, which holds it continuously through all journal
+///   restarts (no drop-and-reacquire interleave window).
 fn drain_managed_agent_runtimes_for_import(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -540,8 +540,10 @@ pub async fn import_identity(
         //
         // Invariant: the fallback relay can never claim legacy data — claims
         // are only written inside apply_workspace's prepare stage.
+        //
+        // `clear_active_scope()` internally calls `next_scope_generation()` —
+        // no additional bump is needed here.
         state.clear_active_scope();
-        crate::managed_agents::scope::next_scope_generation();
 
         let pubkey_hex = pubkey.to_hex();
         let display_name = truncated_display_name(&pubkey)?;

@@ -1,7 +1,5 @@
 use std::fs;
 
-use tauri::AppHandle;
-
 use crate::{managed_agents::AgentDefinition, util::now_iso};
 
 struct BuiltInPersona {
@@ -325,7 +323,9 @@ pub fn validate_persona_activation_change(
     Ok(())
 }
 
-pub fn load_personas(app: &AppHandle) -> Result<Vec<AgentDefinition>, String> {
+pub fn load_personas<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<Vec<AgentDefinition>, String> {
     let now = now_iso();
 
     // Post-fold: definitions live in the unified agent store, presented in
@@ -385,7 +385,10 @@ pub(crate) fn load_personas_from_path(
         .map_err(|error| format!("failed to parse persona store: {error}"))
 }
 
-pub fn save_personas(app: &AppHandle, records: &[AgentDefinition]) -> Result<(), String> {
+pub fn save_personas<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    records: &[AgentDefinition],
+) -> Result<(), String> {
     let mut sorted = records.to_vec();
     sort_personas(&mut sorted);
 

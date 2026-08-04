@@ -176,7 +176,9 @@ pub fn normalize_global_config_fields(config: &mut GlobalAgentConfig) {
 
 /// Resolve the active-scope `global-agent-config.json` path. Fails closed on
 /// `None` scope. No fallback to the legacy unscoped root.
-fn global_config_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+fn global_config_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<std::path::PathBuf, String> {
     use tauri::Manager as _;
     let state = app.state::<crate::app_state::AppState>();
     let scope = state.capture_active_scope().ok_or_else(|| {
@@ -194,7 +196,9 @@ pub(crate) fn global_config_path_at(definitions_dir: &std::path::Path) -> std::p
 /// Load the global agent config from disk.
 ///
 /// Returns the default (all-empty) config if the file does not exist yet.
-pub fn load_global_agent_config(app: &AppHandle) -> Result<GlobalAgentConfig, String> {
+pub fn load_global_agent_config<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<GlobalAgentConfig, String> {
     let path = global_config_path(app)?;
     load_global_agent_config_from_path(&path)
 }

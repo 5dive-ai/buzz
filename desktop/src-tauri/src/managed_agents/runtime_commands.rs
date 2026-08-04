@@ -17,8 +17,8 @@ use crate::managed_agents::storage::{load_managed_agents_at, save_managed_agents
 
 const STATUS_EVENT: &str = "managed-agent-runtime-status";
 
-fn status_for(
-    app: &AppHandle,
+fn status_for<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     record: &super::ManagedAgentRecord,
     key: &ManagedAgentRuntimeKey,
     runtime: Option<&ManagedAgentPairRuntime>,
@@ -46,8 +46,8 @@ struct StatusInputs<'a> {
     global: &'a super::GlobalAgentConfig,
 }
 
-fn status_for_with(
-    app: &AppHandle,
+fn status_for_with<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     record: &super::ManagedAgentRecord,
     key: &ManagedAgentRuntimeKey,
     runtime: Option<&ManagedAgentPairRuntime>,
@@ -75,7 +75,7 @@ fn status_for_with(
     }
 }
 
-fn emit_status(app: &AppHandle, status: &ManagedAgentRuntimeStatus) {
+fn emit_status<R: tauri::Runtime>(app: &tauri::AppHandle<R>, status: &ManagedAgentRuntimeStatus) {
     let _ = app.emit(STATUS_EVENT, status);
 }
 
@@ -295,8 +295,8 @@ fn start_pair(
 ///
 /// The caller is responsible for saving `records` to disk after the call (or
 /// for saving inside a batch loop if called for multiple entries).
-fn start_pair_under_held_locks(
-    app: &AppHandle,
+fn start_pair_under_held_locks<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &AppState,
     pubkey: String,
     relay_url: String,
@@ -835,24 +835,38 @@ pub(crate) fn drain_scope_runtimes(
 /// `managed_agents_store_lock` (only) before calling.
 ///
 /// Returns a degradation message describing what could not be restarted.
-pub(crate) fn compensate_drain(
-    app: &AppHandle,
+///
+/// The journal-restore loop is implemented in [`compensate_drain_for`] with an
+/// injected start function, allowing the generation-validation + iteration
+/// contract to be unit-tested without an `AppHandle`.
+
+/// Testable core of [`compensate_drain`]: re-acquires the store lock, validates
+/// the captured scope generation, then calls `start_fn` for each stopped entry.
+///
+/// The transition lock must already be held by the caller. `compensate_drain`
+/// passes a `start_fn` that invokes [`start_pair_under_held_locks`]; tests inject
+/// a closure that records calls and returns synthetic results without spawning
+/// processes or touching disk.
+///
+/// Returns a degradation message when one or more restarts fail, `None` on full
+/// success. A stale scope also returns a degradation message (compensation
+/// skipped) — that is not a hard failure, so callers treat it the same way.
+pub(crate) fn compensate_drain_for<F>(
+    state: &AppState,
     stopped: &[DrainJournalEntry],
     captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
-    // Caller passes ownership of the already-held transition guard so the lock
-    // is never dropped between drain and compensation.
-    _rt_transition_held: std::sync::MutexGuard<'_, ()>,
-) -> Option<String> {
-    if stopped.is_empty() {
-        // Release the transition guard immediately — nothing to restore.
-        drop(_rt_transition_held);
-        return None;
-    }
-
-    let state = app.state::<AppState>();
+    mut start_fn: F,
+) -> Option<String>
+where
+    F: FnMut(&DrainJournalEntry) -> Result<(), String>,
+{
+    debug_assert!(
+        !stopped.is_empty(),
+        "compensate_drain_for called with empty stopped list"
+    );
 
     // Re-acquire only the store lock — the transition lock is already held via
-    // `_rt_transition_held` so no concurrent start can enter the window.
+    // the caller's guard so no concurrent start can enter the window.
     let _store = match state.managed_agents_store_lock.lock() {
         Ok(g) => g,
         Err(e) => {
@@ -873,27 +887,9 @@ pub(crate) fn compensate_drain(
         ));
     }
 
-    let mut records = match load_managed_agents(app) {
-        Ok(r) => r,
-        Err(e) => {
-            return Some(format!(
-                "compensation failed: could not load agent records: {e}"
-            ));
-        }
-    };
-
     let mut failed_restarts = Vec::new();
     for entry in stopped {
-        let result = start_pair_under_held_locks(
-            app,
-            &state,
-            entry.key.pubkey.clone(),
-            entry.key.relay_url.clone(),
-            entry.start_on_app_launch,
-            None,
-            &mut records,
-        );
-        if let Err(e) = result {
+        if let Err(e) = start_fn(entry) {
             failed_restarts.push(format!("{}@{}: {e}", entry.key.pubkey, entry.key.relay_url));
         }
     }
@@ -906,6 +902,45 @@ pub(crate) fn compensate_drain(
             failed_restarts.join(", ")
         ))
     }
+}
+
+pub(crate) fn compensate_drain<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    stopped: &[DrainJournalEntry],
+    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
+    // Caller passes ownership of the already-held transition guard so the lock
+    // is never dropped between drain and compensation.
+    _rt_transition_held: std::sync::MutexGuard<'_, ()>,
+) -> Option<String> {
+    if stopped.is_empty() {
+        // Release the transition guard immediately — nothing to restore.
+        drop(_rt_transition_held);
+        return None;
+    }
+
+    let state = app.state::<AppState>();
+
+    let mut records = match load_managed_agents_at(&captured_scope.definitions_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return Some(format!(
+                "compensation failed: could not load agent records: {e}"
+            ));
+        }
+    };
+
+    compensate_drain_for(&state, stopped, captured_scope, |entry| {
+        start_pair_under_held_locks(
+            app,
+            &state,
+            entry.key.pubkey.clone(),
+            entry.key.relay_url.clone(),
+            entry.start_on_app_launch,
+            None,
+            &mut records,
+        )
+        .map(|_| ())
+    })
 }
 
 #[cfg(test)]

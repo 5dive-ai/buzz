@@ -266,9 +266,7 @@ async fn ensure_relay_mesh_for_record(
 
 #[path = "agents_scoped.rs"]
 mod scoped;
-pub(crate) use scoped::{
-    start_local_agent_pairs_with_preflight, start_local_agent_pairs_with_preflight_at,
-};
+pub(crate) use scoped::start_local_agent_pairs_with_preflight;
 
 pub(super) async fn start_local_agent_with_preflight(
     app: &AppHandle,

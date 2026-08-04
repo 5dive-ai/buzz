@@ -59,8 +59,9 @@ pub(super) async fn check_mesh_runtime_relay_scope(state: &AppState) -> Result<b
         Some(mesh_llm::MeshNodeMode::Client) | None => {
             // Stale client from a prior workspace. Treat as absent —
             // fall through to re-arm a new client for the active scope.
-            // The drain stage in apply_workspace should have cleared
-            // this; this is a safety net for missed drains.
+            // (Option A forbids switching with a client active; this path
+            // is only reached by a serve→client downgrade within the same
+            // scope or after `mesh_stop_client` cleared the prior client.)
             Ok(false)
         }
     }
@@ -78,7 +79,9 @@ pub(super) async fn check_mesh_runtime_relay_scope(state: &AppState) -> Result<b
 ///
 /// Called from the Layer-1 async stage of `apply_workspace` and
 /// `import_identity` before entering `spawn_blocking`.
-pub(crate) async fn fail_if_client_mesh_active(app: &AppHandle) -> Result<(), String> {
+pub(crate) async fn fail_if_client_mesh_active<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let guard = state.mesh_llm_runtime.lock().await;
     let is_client = guard
@@ -100,8 +103,8 @@ pub(crate) async fn fail_if_client_mesh_active(app: &AppHandle) -> Result<(), St
 /// Required by Option A: a workspace switch fails while a client is active;
 /// the user calls this command to stop the client before the switch proceeds.
 #[tauri::command]
-pub(crate) async fn mesh_stop_client(
-    app: AppHandle,
+pub(crate) async fn mesh_stop_client<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
 ) -> CmdResult<mesh_llm::MeshNodeStatus> {
     let (taken, bound_relay_url) = {

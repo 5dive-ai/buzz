@@ -186,6 +186,15 @@ enum RestartOutcome {
     Skipped,
 }
 
+/// Error returned by [`restart_under_captured_epoch`].
+#[derive(Debug)]
+enum EpochError {
+    /// Eligibility check failed before the stop; the agent was not touched.
+    Skipped(String),
+    /// Stop succeeded but the subsequent spawn failed.
+    FailedAfterStop(String),
+}
+
 /// Collect pubkeys of local agents that should be restarted after a global
 /// config change, together with the personas snapshot used for the scan.
 ///
@@ -271,31 +280,13 @@ fn collect_restart_candidates_at(
     (candidates, all_personas)
 }
 
-/// Stop-then-start a local agent whose effective env changed under the new
-/// global config.
+/// Restart a local agent whose effective env changed under the new global config.
 ///
-/// This is the per-agent restart step in Phase 2 of `set_global_agent_config`.
-/// It mirrors the semantics of a manual agent restart:
-///
-/// 1. **Stop under lock** — acquires the store lock, validates scope generation
-///    (so a concurrent workspace switch aborts rather than clobbering the new
-///    scope's store), calls `sync_managed_agent_processes`, re-verifies eligibility
-///    (local backend, live process, effective env changed or readiness transition),
-///    then stops the process and saves the record using the captured
-///    `definitions_dir` so writes target the correct scope.  The lock is released
-///    before the start so `start_local_agent_with_preflight` can re-acquire it.
-///    `personas_snapshot` is reused here instead of loading from disk again.
-///
-/// 2. **Start via the normal preflight path** — calls
-///    `start_local_agent_with_preflight`, which computes and passes `owner_hex`
-///    (NIP-OA fallback for legacy records without `auth_tag`), re-snapshots the
-///    persona (agent starts with current persona config), saves the updated
-///    record, and retains the event for relay sync.  On failure, `last_error` is
-///    persisted under lock so the UI surfaces a diagnosable stopped state.
-///
-/// All errors are logged to stderr. Returns `RestartOutcome::FailedAfterStop`
-/// when the stop succeeded but the spawn failed — the caller surfaces this as
-/// `failed_restart_count` so the UI can prompt the user to check the Agents tab.
+/// Drives the entire stop→spawn sequence through one
+/// [`restart_under_captured_epoch`] call so no concurrent workspace switch can
+/// land between the stop and the spawn.  Returns [`RestartOutcome::FailedAfterStop`]
+/// when the stop succeeded but the spawn failed; [`RestartOutcome::Skipped`] when
+/// eligibility was lost before the stop.
 async fn restart_local_agent_on_config_change(
     app: &AppHandle,
     pubkey: &str,
@@ -305,197 +296,323 @@ async fn restart_local_agent_on_config_change(
     captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
     definitions_dir: &std::path::Path,
 ) -> RestartOutcome {
-    // ── Step 1: stop under lock, re-verifying eligibility ─────────────────
-    let app_for_stop = app.clone();
+    let app_owned = app.clone();
     let pubkey_owned = pubkey.to_string();
-    let old_global_clone = old_global.clone();
-    let new_global_clone = new_global.clone();
+    let old_global_owned = old_global.clone();
+    let new_global_owned = new_global.clone();
     let personas_owned = personas_snapshot.to_vec();
-    let captured_scope_clone = captured_scope.clone();
+    let captured_scope_owned = captured_scope.clone();
     let definitions_dir_owned = definitions_dir.to_path_buf();
 
-    let stop_result = tokio::task::spawn_blocking(move || {
-        use tauri::Manager;
-        let state = app_for_stop.state::<AppState>();
-
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|e| format!("failed to acquire store lock: {e}"))?;
-
-        // Validate scope generation before any disk write — if the workspace
-        // switched after Phase 1, abort rather than touching the new scope's store.
-        crate::managed_agents::scope::validate_scope_generation(&captured_scope_clone)
-            .map_err(|e| format!("set_global_agent_config Phase 2: {e}"))?;
-
-        let mut records =
-            crate::managed_agents::storage::load_managed_agents_at(&definitions_dir_owned)?;
-        let mut runtimes = state
-            .managed_agent_processes
-            .lock()
-            .map_err(|e| format!("failed to acquire runtimes lock: {e}"))?;
-
-        // Sync process state so PID liveness reflects current reality.
-        let (sync_changed, _) = sync_managed_agent_processes(
-            &mut records,
-            &mut runtimes,
-            &current_instance_id(&app_for_stop),
-        );
-        if sync_changed {
-            crate::managed_agents::storage::save_managed_agents_at(
-                &definitions_dir_owned,
-                &records,
-            )?;
-        }
-
-        // Re-check eligibility under lock with current record state.
-        let record = records
-            .iter()
-            .find(|r| r.pubkey == pubkey_owned)
-            .ok_or_else(|| format!("agent {pubkey_owned} not found"))?;
-
-        if record.backend != BackendKind::Local {
-            return Err(format!("agent {pubkey_owned} is no longer a local agent"));
-        }
-        let runtime_keys =
-            crate::managed_agents::managed_agent_runtime_keys(&runtimes, &pubkey_owned);
-        if runtime_keys.is_empty() {
-            return Err(format!(
-                "agent {pubkey_owned} no longer has a live pair runtime after sync"
-            ));
-        }
-
-        // Re-check the eligibility predicate under lock:
-        //   (old NotReady && new Ready)  OR  (old Ready && env changed)
-        // TODO: busy/mid-turn deferral would slot in here
-        //
-        // Reuse personas_snapshot from Phase 1 — avoids loading personas again
-        // per agent when the save-command personas haven't changed.
-        let effective_cmd = record_agent_command(record, &personas_owned);
-        let runtime_meta = known_acp_runtime(&effective_cmd);
-        let old_effective =
-            resolve_effective_agent_env(record, &personas_owned, runtime_meta, &old_global_clone);
-        let new_effective =
-            resolve_effective_agent_env(record, &personas_owned, runtime_meta, &new_global_clone);
-        let old_ready = matches!(agent_readiness(&old_effective), AgentReadiness::Ready);
-        let new_ready = matches!(agent_readiness(&new_effective), AgentReadiness::Ready);
-        // Under lock, the alive check was already done above via process_is_running.
-        let env_changed = old_ready && old_effective.env != new_effective.env;
-        if !should_restart_on_config_change(old_ready, new_ready, env_changed) {
-            return Err(format!(
-                "agent {pubkey_owned} restart condition no longer valid under lock"
-            ));
-        }
-
-        // Stop the process and save using captured definitions_dir.
-        let record_mut = find_managed_agent_mut(&mut records, &pubkey_owned)?;
-        stop_managed_agent_process(&app_for_stop, record_mut, &mut runtimes)?;
-        crate::managed_agents::storage::save_managed_agents_at(&definitions_dir_owned, &records)?;
-
-        Ok(runtime_keys)
+    // Entire stop+spawn in one spawn_blocking call under one transition+store epoch.
+    let result = tokio::task::spawn_blocking(move || {
+        restart_under_captured_epoch(
+            &app_owned,
+            &pubkey_owned,
+            &old_global_owned,
+            &new_global_owned,
+            &personas_owned,
+            &captured_scope_owned,
+            &definitions_dir_owned,
+        )
     })
     .await;
 
-    let runtime_keys = match stop_result {
-        Ok(Ok(runtime_keys)) => runtime_keys,
-        Ok(Err(e)) => {
-            eprintln!("buzz-desktop: set_global_agent_config: skipping restart of {pubkey}: {e}");
-            return RestartOutcome::Skipped;
-        }
-        Err(e) => {
-            eprintln!(
-                "buzz-desktop: set_global_agent_config: spawn_blocking failed for stop of {pubkey}: {e}"
-            );
-            return RestartOutcome::Skipped;
-        }
-    };
-
-    let relay_urls: Vec<_> = runtime_keys.into_iter().map(|key| key.relay_url).collect();
-    use tauri::Manager;
-    let state = app.state::<AppState>();
-
-    // Validate scope generation before starting — a workspace switch after the
-    // stop phase should not restart the agent in the new scope's store.
-    {
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|e| format!("failed to acquire store lock for generation check: {e}"));
-        if let Ok(_guard) = _store_guard {
-            if let Err(stale) =
-                crate::managed_agents::scope::validate_scope_generation(captured_scope)
-            {
-                eprintln!(
-                    "buzz-desktop: set_global_agent_config: skipping respawn of {pubkey}: {stale}"
-                );
-                if let Err(save_err) = persist_last_error(
-                    app,
-                    pubkey,
-                    &format!("workspace switched before restart: {stale}"),
-                    definitions_dir,
-                ) {
-                    eprintln!(
-                        "buzz-desktop: set_global_agent_config: failed to persist stale-scope error for {pubkey}: {save_err}"
-                    );
-                }
-                return RestartOutcome::FailedAfterStop;
-            }
-        }
-        // If lock poisoned, proceed — worst case we restart in the new scope,
-        // which is no worse than the previous behaviour.
-    }
-
-    match super::agents::start_local_agent_pairs_with_preflight_at(
-        app,
-        &state,
-        pubkey,
-        &relay_urls,
-        captured_scope,
-    )
-    .await
-    {
-        Ok(()) => {
+    match result {
+        Ok(Ok(())) => {
             eprintln!(
                 "buzz-desktop: set_global_agent_config: restarted agent {pubkey} with updated config"
             );
             RestartOutcome::Restarted
         }
-        Err(e) => {
+        Ok(Err(EpochError::Skipped(e))) => {
+            eprintln!("buzz-desktop: set_global_agent_config: skipping restart of {pubkey}: {e}");
+            RestartOutcome::Skipped
+        }
+        Ok(Err(EpochError::FailedAfterStop(e))) => {
             eprintln!(
-                "buzz-desktop: set_global_agent_config: failed to start {pubkey} after restart: {e}"
+                "buzz-desktop: set_global_agent_config: failed to start {pubkey} after stop: {e}"
             );
-            if let Err(save_err) = persist_last_error(app, pubkey, &e, definitions_dir) {
+            // persist_last_error acquires the store lock itself — never call
+            // it while the epoch lock is held (restart_under_captured_epoch
+            // releases all locks before returning Err).
+            if let Err(save_err) = persist_last_error(app, pubkey, &e, captured_scope) {
                 eprintln!(
                     "buzz-desktop: set_global_agent_config: failed to persist last_error for {pubkey}: {save_err}"
                 );
             }
             RestartOutcome::FailedAfterStop
         }
+        Err(e) => {
+            eprintln!(
+                "buzz-desktop: set_global_agent_config: spawn_blocking panicked for {pubkey}: {e}"
+            );
+            RestartOutcome::Skipped
+        }
     }
 }
 
-/// Persist a `last_error` on the agent record under the store lock.
+/// One atomic stop→spawn epoch for a single agent restart.
 ///
-/// Best-effort: called only after a failed restart to leave the record
-/// in a diagnosable state rather than a silent "stopped with no error" state.
-/// Uses the captured `definitions_dir` and validates scope generation so a
-/// stale write doesn't silently target the old scope.
+/// Acquires `managed_agent_runtime_transition` and `managed_agents_store_lock`
+/// once, validates the captured generation, stops the process, and immediately
+/// spawns the replacement — all while both locks are held.  No live wrapper is
+/// called past the stop: records, personas, global config, owner hex, and scope
+/// ID all derive from `captured_scope`.
+///
+/// Called from inside `spawn_blocking` — no `.await` points, standard mutexes only.
+fn restart_under_captured_epoch<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    pubkey: &str,
+    old_global: &GlobalAgentConfig,
+    new_global: &GlobalAgentConfig,
+    personas_snapshot: &[crate::managed_agents::AgentDefinition],
+    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
+    definitions_dir: &std::path::Path,
+) -> Result<(), EpochError> {
+    use crate::managed_agents::{
+        managed_agent_runtime_keys,
+        storage::{load_managed_agents_at, save_managed_agents_at},
+        ManagedAgentPairRuntime, ManagedAgentRuntimeKey,
+    };
+    use tauri::Manager;
+
+    let state = app.state::<AppState>();
+
+    // Hold transition from stop through spawn — no concurrent start can enter.
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|e| EpochError::Skipped(format!("transition lock poisoned: {e}")))?;
+
+    let _store = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| EpochError::Skipped(format!("store lock poisoned: {e}")))?;
+
+    // Validate captured generation before touching any state.
+    crate::managed_agents::scope::validate_scope_generation(captured_scope)
+        .map_err(|e| EpochError::Skipped(format!("stale scope: {e}")))?;
+
+    let mut records = load_managed_agents_at(definitions_dir)
+        .map_err(|e| EpochError::Skipped(format!("load records: {e}")))?;
+    let mut runtimes = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|e| EpochError::Skipped(format!("runtimes lock poisoned: {e}")))?;
+
+    let (sync_changed, _) =
+        sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(app));
+    if sync_changed {
+        save_managed_agents_at(definitions_dir, &records)
+            .map_err(|e| EpochError::Skipped(format!("save after sync: {e}")))?;
+    }
+
+    // Re-check eligibility under both locks.
+    let record = records
+        .iter()
+        .find(|r| r.pubkey == pubkey)
+        .ok_or_else(|| EpochError::Skipped(format!("agent {pubkey} not found")))?;
+    if record.backend != BackendKind::Local {
+        return Err(EpochError::Skipped(format!(
+            "agent {pubkey} is not a local agent"
+        )));
+    }
+    let runtime_keys = managed_agent_runtime_keys(&runtimes, pubkey);
+    if runtime_keys.is_empty() {
+        return Err(EpochError::Skipped(format!(
+            "agent {pubkey} has no live pair runtime after sync"
+        )));
+    }
+    let relay_urls: Vec<String> = runtime_keys.iter().map(|k| k.relay_url.clone()).collect();
+
+    let effective_cmd = record_agent_command(record, personas_snapshot);
+    let runtime_meta = known_acp_runtime(&effective_cmd);
+    let old_effective =
+        resolve_effective_agent_env(record, personas_snapshot, runtime_meta, old_global);
+    let new_effective =
+        resolve_effective_agent_env(record, personas_snapshot, runtime_meta, new_global);
+    let old_ready = matches!(agent_readiness(&old_effective), AgentReadiness::Ready);
+    let new_ready = matches!(agent_readiness(&new_effective), AgentReadiness::Ready);
+    let env_changed = old_ready && old_effective.env != new_effective.env;
+    if !should_restart_on_config_change(old_ready, new_ready, env_changed) {
+        return Err(EpochError::Skipped(format!(
+            "agent {pubkey} restart condition no longer valid under lock"
+        )));
+    }
+
+    // Stop and save captured.
+    let record_mut = find_managed_agent_mut(&mut records, pubkey)
+        .map_err(|e| EpochError::Skipped(format!("find record: {e}")))?;
+    stop_managed_agent_process(app, record_mut, &mut runtimes)
+        .map_err(|e| EpochError::FailedAfterStop(format!("stop failed: {e}")))?;
+    save_managed_agents_at(definitions_dir, &records)
+        .map_err(|e| EpochError::FailedAfterStop(format!("save after stop: {e}")))?;
+
+    // Load personas and global config from the captured dir — no live wrapper past here.
+    let personas_at = crate::managed_agents::load_personas_at(definitions_dir).unwrap_or_default();
+    let global_at =
+        crate::managed_agents::global_config::load_global_agent_config_at(definitions_dir)
+            .unwrap_or_default();
+
+    // Reload records with the updated last_stopped_at.
+    let mut records = load_managed_agents_at(definitions_dir)
+        .map_err(|e| EpochError::FailedAfterStop(format!("reload records after stop: {e}")))?;
+
+    // Captured owner and scope from the captured scope — not from live state.
+    let owner_hex = &captured_scope.owner_pubkey;
+    let scope_id = captured_scope.scope_id.clone();
+    let mut spawn_errors: Vec<String> = Vec::new();
+
+    for relay_url in &relay_urls {
+        let key = match ManagedAgentRuntimeKey::new(pubkey, relay_url) {
+            Ok(k) => k,
+            Err(e) => {
+                spawn_errors.push(format!("{relay_url}: key error: {e}"));
+                continue;
+            }
+        };
+
+        // Apply persona snapshot before spawning (same as interactive start path).
+        if let Ok(record_mut) = find_managed_agent_mut(&mut records, pubkey) {
+            if let Some(persona_id) = record_mut.persona_id.clone() {
+                if let Some(persona) = personas_at.iter().find(|p| p.id == persona_id) {
+                    crate::managed_agents::persona_events::apply_persona_snapshot(
+                        record_mut, persona,
+                    );
+                    record_mut.updated_at = crate::util::now_iso();
+                }
+            }
+        }
+
+        // Spawn using captured personas/global config and captured owner.
+        let spawn_record = match records.iter().find(|r| r.pubkey == pubkey).cloned() {
+            Some(r) => r,
+            None => {
+                spawn_errors.push(format!("{relay_url}: record disappeared before spawn"));
+                continue;
+            }
+        };
+        let spawn_result = crate::managed_agents::spawn_agent_child_at(
+            app,
+            &spawn_record,
+            relay_url,
+            true,
+            Some(owner_hex.as_str()),
+            &personas_at,
+            &global_at,
+        );
+        let mut process = match spawn_result {
+            Ok(p) => p,
+            Err(e) => {
+                spawn_errors.push(format!("{relay_url}: spawn: {e}"));
+                continue;
+            }
+        };
+
+        let now = crate::util::now_iso();
+        let receipt = crate::managed_agents::ManagedAgentRuntimeReceipt {
+            key: key.clone(),
+            pid: process.child.id(),
+            desktop_instance_id: current_instance_id(app),
+            started_at: now.clone(),
+        };
+        if let Err(e) = crate::managed_agents::write_agent_runtime_receipt(app, &receipt) {
+            let _ = crate::managed_agents::terminate_process(process.child.id());
+            let _ = process.child.wait();
+            spawn_errors.push(format!("{relay_url}: receipt: {e}"));
+            continue;
+        }
+
+        if let Ok(record_mut) = find_managed_agent_mut(&mut records, pubkey) {
+            record_mut.runtime_pid = None;
+            record_mut.updated_at = now.clone();
+            record_mut.last_started_at = Some(now);
+            record_mut.last_stopped_at = None;
+            record_mut.last_error = None;
+        }
+        runtimes.insert(
+            key.clone(),
+            ManagedAgentPairRuntime::starting(process, Some(scope_id.clone())),
+        );
+    }
+
+    save_managed_agents_at(definitions_dir, &records)
+        .map_err(|e| EpochError::FailedAfterStop(format!("save after spawn: {e}")))?;
+
+    // Drop runtimes lock before retention (retention uses its own DB mutex).
+    drop(runtimes);
+
+    // Retain the agent event under the captured retention scope while transition
+    // + store are still held so no interleave can corrupt the pending row.
+    if let Some(saved_record) = records.iter().find(|r| r.pubkey == pubkey) {
+        // Get owner keys from current state and verify they still match the
+        // captured scope. If the scope has since changed, skip retention
+        // (best-effort: the record was already saved to captured dir above).
+        let owner_keys_result = state.signing_keys();
+        let scope_result = owner_keys_result
+            .ok()
+            .filter(|k| {
+                k.public_key()
+                    .to_hex()
+                    .eq_ignore_ascii_case(&captured_scope.owner_pubkey)
+            })
+            .map(|keys| {
+                crate::managed_agents::retention::retention_scope_from_captured(
+                    captured_scope,
+                    keys,
+                )
+            });
+        match scope_result {
+            Some(Ok(scope)) => {
+                use crate::managed_agents::{
+                    reconcile::retain_agent_record, retention::open_retention_db,
+                };
+                if let Ok(conn) = open_retention_db(&scope.db_path) {
+                    let _ = retain_agent_record(&conn, &scope.owner_keys, saved_record);
+                }
+            }
+            Some(Err(e)) => {
+                eprintln!(
+                    "buzz-desktop: set_global_agent_config: retention scope error for {pubkey}: {e}"
+                );
+            }
+            None => {
+                // Keys unavailable or scope switched — skip retention (best-effort).
+            }
+        }
+    }
+
+    if spawn_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(EpochError::FailedAfterStop(spawn_errors.join("; ")))
+    }
+}
+
+/// Persist a `last_error` on the agent record under a freshly acquired store lock.
+///
+/// Best-effort: called only after a failed restart to surface a diagnosable
+/// stopped state in the UI.  Takes `captured_scope`, validates generation under
+/// the acquired lock so a stale write doesn't silently target the old scope.
+///
+/// MUST NOT be called while `managed_agents_store_lock` is already held — this
+/// function acquires the lock itself and fails closed on poison.
 fn persist_last_error(
     app: &AppHandle,
     pubkey: &str,
     error: &str,
-    definitions_dir: &std::path::Path,
+    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
 ) -> Result<(), String> {
     use tauri::Manager;
     let state = app.state::<AppState>();
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
-        .map_err(|e| format!("failed to acquire store lock: {e}"))?;
-    // Generation check: only write if the scope hasn't changed since capture.
-    // Skip validation failure here — persist_last_error is best-effort; the
-    // store write targeting an already-stale definitions_dir is benign (the
-    // old scope is no longer active), but we log for observability.
+        .map_err(|e| format!("persist_last_error: store lock poisoned — fail closed: {e}"))?;
+    crate::managed_agents::scope::validate_scope_generation(captured_scope)
+        .map_err(|e| format!("persist_last_error: stale scope, skipping write: {e}"))?;
+    let definitions_dir = &captured_scope.definitions_dir;
     let mut records = crate::managed_agents::storage::load_managed_agents_at(definitions_dir)?;
     let record = find_managed_agent_mut(&mut records, pubkey)?;
     record.last_error = Some(error.to_string());
@@ -531,7 +648,7 @@ fn should_restart_on_config_change(old_ready: bool, new_ready: bool, env_changed
 
 #[cfg(test)]
 mod tests {
-    use super::should_restart_on_config_change;
+    use super::{restart_under_captured_epoch, should_restart_on_config_change, EpochError};
 
     /// Running agent (Ready) whose effective env changed → restart candidate.
     #[test]
@@ -607,5 +724,116 @@ mod tests {
             should_restart_on_config_change(false, true, true),
             "NotReady → Ready (with env change) must be a restart candidate"
         );
+    }
+
+    // ── restart_under_captured_epoch: generation guard ────────────────────────
+    //
+    // These tests call `restart_under_captured_epoch` directly — the production
+    // stop→spawn primitive — using a `tauri::test::mock_app()` runtime so the
+    // AppHandle is real. No live process is running, so the restart is skipped
+    // at the eligibility check. The generation tests drive the path that matters:
+    // does the captured-generation guard prevent a stale-scope restart?
+
+    fn make_test_scope(
+        definitions_dir: &std::path::Path,
+    ) -> crate::managed_agents::scope::WorkspaceAgentScope {
+        let gen = crate::managed_agents::scope::current_scope_generation();
+        crate::managed_agents::scope::WorkspaceAgentScope {
+            scope_id: "test-scope".to_string(),
+            relay_url: "wss://relay.example".to_string(),
+            owner_pubkey: "aa".repeat(32),
+            definitions_dir: definitions_dir.to_path_buf(),
+            generation: gen,
+        }
+    }
+
+    /// `restart_under_captured_epoch` with a fresh scope and an empty store
+    /// (no live pair runtime) → `EpochError::Skipped` after the agent-not-found
+    /// or no-live-runtime check. The generation guard passes, proving the path
+    /// proceeds to the eligibility check rather than aborting at the stale check.
+    ///
+    /// This is the stop-to-spawn production path: transition lock acquired,
+    /// store lock acquired, generation validated — all before any state change.
+    #[test]
+    fn test_restart_under_captured_epoch_fresh_scope_no_runtime_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write an empty managed-agents.json so load_managed_agents_at returns Ok([]).
+        std::fs::write(tmp.path().join("managed-agents.json"), b"[]").unwrap();
+
+        let app = tauri::test::mock_builder()
+            .manage(crate::app_state::build_app_state())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app");
+        let app_handle = app.handle().clone();
+        let captured_scope = make_test_scope(tmp.path());
+
+        let result = restart_under_captured_epoch(
+            &app_handle,
+            &"aa".repeat(32),
+            &crate::managed_agents::GlobalAgentConfig::default(),
+            &crate::managed_agents::GlobalAgentConfig::default(),
+            &[],
+            &captured_scope,
+            tmp.path(),
+        );
+
+        // No live runtime → Skipped before any state change.
+        assert!(
+            matches!(result, Err(EpochError::Skipped(_))),
+            "no live pair runtime must produce Skipped, not FailedAfterStop or Ok: {result:?}"
+        );
+        // Verify the skip message describes the agent-not-found or no-runtime reason.
+        if let Err(EpochError::Skipped(msg)) = result {
+            let is_expected = msg.contains("not found") || msg.contains("no live pair runtime");
+            assert!(
+                is_expected,
+                "Skipped reason must be agent-not-found or no-live-runtime: {msg}"
+            );
+        }
+    }
+
+    /// `restart_under_captured_epoch` with a STALE scope → `EpochError::Skipped`
+    /// at the generation validation step, before touching any agent state.
+    ///
+    /// This is the switch-between-stop-and-spawn test: simulates the race where
+    /// a workspace switch advances the generation between when the scope was
+    /// captured and when `restart_under_captured_epoch` runs. The generation
+    /// guard must abort before stopping — no agent is touched.
+    #[test]
+    fn test_restart_under_captured_epoch_stale_scope_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("managed-agents.json"), b"[]").unwrap();
+
+        let app = tauri::test::mock_builder()
+            .manage(crate::app_state::build_app_state())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app");
+        let app_handle = app.handle().clone();
+
+        // Capture the scope at the current generation, then advance to make it stale.
+        let stale_scope = make_test_scope(tmp.path());
+        crate::managed_agents::scope::next_scope_generation();
+
+        let result = restart_under_captured_epoch(
+            &app_handle,
+            &"aa".repeat(32),
+            &crate::managed_agents::GlobalAgentConfig::default(),
+            &crate::managed_agents::GlobalAgentConfig::default(),
+            &[],
+            &stale_scope,
+            tmp.path(),
+        );
+
+        // Stale generation → Skipped at the generation-validation step.
+        assert!(
+            matches!(result, Err(EpochError::Skipped(_))),
+            "stale scope must produce Skipped: {result:?}"
+        );
+        if let Err(EpochError::Skipped(msg)) = result {
+            assert!(
+                msg.contains("stale scope") || msg.contains("generation"),
+                "Skipped reason must mention stale scope or generation mismatch: {msg}"
+            );
+        }
     }
 }

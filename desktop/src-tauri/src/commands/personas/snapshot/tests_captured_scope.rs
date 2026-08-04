@@ -1,85 +1,159 @@
-//! Tests for captured-scope relay and owner-key invariants in snapshot import.
+//! Behavioral tests for captured-scope relay and owner-key invariants in snapshot import.
+//!
+//! These tests call production functions from the snapshot import path — not
+//! copies of their logic — to prove the captured-scope contracts hold when a
+//! workspace switch or identity change races an in-flight import.
+//!
+//! `capture_agent_snapshot_import_entry` is the production boundary guard used
+//! by `confirm_agent_snapshot_import` at command entry. Tests call it directly
+//! with a `tauri::test::mock_builder()` AppState, exercising the real scope
+//! capture and owner-key agreement checks without needing an AppHandle.
 //!
 //! Kept in a sibling file so `tests.rs` stays within the file-size ratchet.
 //! Included via `#[path]` from `tests.rs`.
 
-// ── Import: captured-scope relay invariant ─────────────────────────────────
+use crate::app_state::{build_app_state, AppState};
+use crate::commands::personas::snapshot::import::capture_agent_snapshot_import_entry;
+use crate::managed_agents::scope::{
+    current_scope_generation, next_scope_generation, WorkspaceAgentScope,
+};
 
-/// Outbound profile/memory publication must use the captured scope's relay,
-/// not the live `relay_ws_url_with_override` value.
+fn make_scope_with_keys(tmp: &tempfile::TempDir, owner_keys: &nostr::Keys) -> WorkspaceAgentScope {
+    let gen = current_scope_generation();
+    WorkspaceAgentScope {
+        scope_id: "test-scope".to_string(),
+        relay_url: "wss://captured.example".to_string(),
+        owner_pubkey: owner_keys.public_key().to_hex(),
+        definitions_dir: tmp.path().to_path_buf(),
+        generation: gen,
+    }
+}
+
+fn build_import_state(owner_keys: nostr::Keys) -> AppState {
+    let state = build_app_state();
+    {
+        let mut locked = state.keys.lock().unwrap();
+        *locked = owner_keys;
+    }
+    state
+}
+
+/// `capture_agent_snapshot_import_entry` with no active workspace scope → rejects
+/// with "no active workspace scope" before any other processing.
 ///
-/// Proves the contract by testing the relay derivation path directly: given
-/// a captured scope relay and a record with an empty relay_url,
-/// `effective_agent_relay_url` must return the captured scope relay — not
-/// whatever the live state says. A workspace switch after Phase 3a cannot
-/// redirect this agent's profile to a different relay.
+/// Calls the real production entry guard. Proves the no-scope fail-closed contract.
 #[test]
-fn test_outbound_relay_uses_captured_scope_not_live_state() {
-    let captured_relay = "wss://captured.example";
-    let live_relay = "wss://switched.example"; // simulates workspace switched post-Phase-3a
+fn test_confirm_agent_snapshot_import_no_scope_rejected() {
+    let owner_keys = nostr::Keys::generate();
+    let state = build_import_state(owner_keys);
+    // No scope committed — stays None.
 
-    // Simulate record.relay_url being empty (always takes workspace relay).
-    let record_relay = "";
+    let result = capture_agent_snapshot_import_entry(&state);
 
-    let outbound_relay = crate::relay::effective_agent_relay_url(record_relay, captured_relay);
-    let stale_relay = crate::relay::effective_agent_relay_url(record_relay, live_relay);
-
-    assert_eq!(
-        outbound_relay, captured_relay,
-        "outbound relay must be the captured scope relay"
+    assert!(
+        result.is_err(),
+        "no scope must reject the import entry guard"
     );
-    assert_ne!(
-        outbound_relay, stale_relay,
-        "captured relay must differ from the post-switch live relay"
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("no active workspace scope"),
+        "error must describe missing scope: {err}"
     );
 }
 
-// ── Import: owner key captured-scope agreement ───────────────────────────────
-
-/// Identity mismatch check: the captured owner public key must equal
-/// `captured_scope.owner_pubkey`. This mirrors the guard in
-/// `confirm_agent_snapshot_import` that runs at entry and again under the
-/// store lock before Phase 3a commit.
+/// `capture_agent_snapshot_import_entry` with a mismatched owner pubkey → rejects
+/// with "owner pubkey mismatch" before any file I/O.
 ///
-/// Proves the logic with nostr key math directly — no AppHandle needed —
-/// by testing the pubkey equality check the function performs.
+/// Calls the real production entry guard. Simulates a concurrent identity import
+/// that replaced the signing key between scope capture and Phase 1.
+/// This is the identity-switch-before-store rejection test.
 #[test]
-fn test_owner_key_must_match_captured_scope_owner_pubkey() {
+fn test_confirm_agent_snapshot_import_owner_mismatch_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
     let scope_keys = nostr::Keys::generate();
     let other_keys = nostr::Keys::generate();
 
-    // Match: same pubkey → accept.
-    let scope_owner_pubkey = scope_keys.public_key().to_hex();
-    assert_eq!(
-        scope_keys.public_key().to_hex(),
-        scope_owner_pubkey,
-        "owner key that generated the scope must match scope's owner_pubkey"
-    );
+    let scope = make_scope_with_keys(&tmp, &scope_keys);
+    // State holds other_keys — pubkey differs from scope.owner_pubkey.
+    let state = build_import_state(other_keys);
+    state.commit_active_scope(scope);
 
-    // Mismatch: different pubkey → reject.
-    assert_ne!(
-        other_keys.public_key().to_hex(),
-        scope_owner_pubkey,
-        "a different identity must not match the scope's owner_pubkey"
+    let result = capture_agent_snapshot_import_entry(&state);
+
+    assert!(
+        result.is_err(),
+        "owner mismatch must reject the import entry guard"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("owner pubkey mismatch") || err.contains("mismatch"),
+        "error must describe owner pubkey mismatch: {err}"
     );
 }
 
-/// Under-lock owner key re-check: after capturing owner keys at entry,
-/// re-checking under the store lock must detect if a different identity was
-/// substituted between entry and commit. This tests the comparison logic the
-/// guard at `import.rs:559-564` performs.
+/// `capture_agent_snapshot_import_entry` with owner keys matching the scope's
+/// owner pubkey → succeeds, returning captured scope and owner keys.
+///
+/// Calls the real production entry guard. Proves: scope capture → owner key
+/// check PASSES → `AgentSnapshotImportEntry` returned with matching pubkeys.
 #[test]
-fn test_owner_key_mismatch_detected_under_store_lock() {
-    let original_keys = nostr::Keys::generate();
-    let replaced_keys = nostr::Keys::generate();
+fn test_confirm_agent_snapshot_import_matching_owner_passes_entry_guard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner_keys = nostr::Keys::generate();
+    let scope = make_scope_with_keys(&tmp, &owner_keys);
+    let expected_pubkey = owner_keys.public_key().to_hex();
+    let state = build_import_state(owner_keys);
+    state.commit_active_scope(scope.clone());
 
-    let captured_owner_pubkey = original_keys.public_key().to_hex();
-    // Simulate: the live key was replaced by a concurrent identity import.
-    let live_pubkey_after_import = replaced_keys.public_key().to_hex();
+    let result = capture_agent_snapshot_import_entry(&state);
 
-    // The guard must reject this mismatch.
-    assert_ne!(
-        live_pubkey_after_import, captured_owner_pubkey,
-        "guard must detect mismatch between captured owner key and post-import live key"
+    assert!(
+        result.is_ok(),
+        "matching owner must pass the entry guard: {:?}",
+        result.err()
+    );
+    let entry = result.unwrap();
+    assert_eq!(
+        entry.captured_scope.owner_pubkey, expected_pubkey,
+        "captured scope must carry the expected owner pubkey"
+    );
+    assert_eq!(
+        entry.captured_owner_keys.public_key().to_hex(),
+        expected_pubkey,
+        "captured owner keys must match the scope owner pubkey"
+    );
+}
+
+/// Switch-between-Phase3a-and-Phase3b: `validate_scope_generation` correctly
+/// rejects a stale scope when the global generation was advanced after capture.
+///
+/// This is the switch-between-store-and-profile guard test for agent snapshot
+/// import. The Phase 3a write guard calls `validate_scope_generation` under the
+/// store lock to detect a workspace switch that raced the in-flight import.
+///
+/// Tests the production `validate_scope_generation` function directly — the
+/// exact guard that fires inside Phase 3a of `confirm_agent_snapshot_import`.
+#[test]
+fn test_scope_generation_guard_rejects_stale_scope_for_import() {
+    let tmp = tempfile::tempdir().unwrap();
+    let owner_keys = nostr::Keys::generate();
+
+    // Capture a scope at the current generation.
+    let scope = make_scope_with_keys(&tmp, &owner_keys);
+
+    // Simulate a workspace switch — advance the global generation.
+    next_scope_generation();
+
+    // The captured scope's generation is now stale.
+    let validation_result = crate::managed_agents::scope::validate_scope_generation(&scope);
+
+    assert!(
+        validation_result.is_err(),
+        "stale scope must be rejected by validate_scope_generation"
+    );
+    let err = validation_result.unwrap_err();
+    assert!(
+        err.contains("stale") || err.contains("generation"),
+        "error must describe stale generation: {err}"
     );
 }

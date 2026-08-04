@@ -64,11 +64,9 @@ fn test_live_import_with_active_scope_clears_scope_and_bumps_generation() {
 
     let generation_before_import = crate::managed_agents::scope::current_scope_generation();
 
-    // Simulate the live-import path: clear scope and bump generation.
+    // Simulate the live-import path: clear scope. `clear_active_scope()`
+    // bumps the generation internally — no additional bump needed.
     state.clear_active_scope();
-    // `clear_active_scope` calls `next_scope_generation()` internally;
-    // bumping again here models the extra call in import_identity.
-    crate::managed_agents::scope::next_scope_generation();
 
     let generation_after_import = crate::managed_agents::scope::current_scope_generation();
 
@@ -90,9 +88,9 @@ fn test_live_import_with_active_scope_clears_scope_and_bumps_generation() {
 /// from identity import. Verifies the claim ledger cannot be written without an
 /// explicit relay selection.
 ///
-/// This test verifies the structural invariant: `clear_active_scope()` and
-/// `next_scope_generation()` (the two operations identity import performs) do
-/// not touch the filesystem claim ledger.
+/// This test verifies the structural invariant: `clear_active_scope()` —
+/// the single operation identity import performs — does not touch the
+/// filesystem claim ledger.
 #[test]
 fn test_fallback_relay_never_claims_during_identity_import() {
     let tmp = tempfile::tempdir().unwrap();
@@ -105,9 +103,9 @@ fn test_fallback_relay_never_claims_during_identity_import() {
     std::fs::write(agents_dir.join("managed-agents.json"), b"[]").unwrap();
     std::fs::write(agents_dir.join("teams.json"), b"[]").unwrap();
 
-    // Simulate the import-before-first-apply path: clear + bump.
+    // Simulate the import-before-first-apply path: clear scope.
+    // `clear_active_scope()` bumps the generation internally.
     state.clear_active_scope();
-    crate::managed_agents::scope::next_scope_generation();
 
     // No claim file must exist: the fallback JSON claim path.
     let fallback_claim = tmp.path().join("agents").join("legacy-claim.json");

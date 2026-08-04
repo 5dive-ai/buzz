@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{Read as _, Seek, SeekFrom, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -32,7 +32,9 @@ fn agent_secret_store() -> Option<&'static SecretStore> {
     }
 }
 
-pub fn managed_agents_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub fn managed_agents_base_dir<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -43,7 +45,9 @@ pub fn managed_agents_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Resolve the active-scope `managed-agents.json` path, failing closed on no active scope.
-pub(crate) fn managed_agents_store_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn managed_agents_store_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<PathBuf, String> {
     use tauri::Manager as _;
     let state = app.state::<crate::app_state::AppState>();
     let scope = state.capture_active_scope().ok_or_else(|| {
@@ -58,7 +62,9 @@ pub(crate) fn managed_agents_store_path_at(definitions_dir: &std::path::Path) ->
     definitions_dir.join("managed-agents.json")
 }
 
-fn managed_agents_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
+fn managed_agents_logs_dir<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<PathBuf, String> {
     let dir = managed_agents_base_dir(app)?.join("logs");
     fs::create_dir_all(&dir).map_err(|error| format!("failed to create logs dir: {error}"))?;
     Ok(dir)
@@ -98,8 +104,8 @@ pub fn managed_agent_log_path(app: &AppHandle, pubkey: &str) -> Result<PathBuf, 
 
 /// Pair-scoped log path for a managed runtime. The relay URL never appears in
 /// the filename; the suffix is a hash of the canonical URL.
-pub fn managed_agent_runtime_log_path(
-    app: &AppHandle,
+pub fn managed_agent_runtime_log_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     key: &ManagedAgentRuntimeKey,
 ) -> Result<PathBuf, String> {
     Ok(managed_agents_logs_dir(app)?.join(format!("{}.log", key.runtime_id())))
@@ -248,7 +254,9 @@ pub(crate) fn spawn_key_refusal(record: &ManagedAgentRecord) -> Option<String> {
 
 /// Read the raw unified store — keyed instances AND key-less definitions —
 /// with fail-loud parse handling. Internal seam; public readers filter.
-fn load_agent_store(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
+fn load_agent_store<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<Vec<ManagedAgentRecord>, String> {
     let path = managed_agents_store_path(app)?;
     load_agent_store_at(&path)
 }
@@ -276,7 +284,9 @@ pub(crate) fn load_agent_store_at(path: &Path) -> Result<Vec<ManagedAgentRecord>
 /// Load the keyed agent *instances*. Key-less definitions (former personas,
 /// folded into the same store) are filtered out so every pre-fold call site
 /// keeps seeing exactly the records it always did.
-pub fn load_managed_agents(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
+pub fn load_managed_agents<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<Vec<ManagedAgentRecord>, String> {
     let mut records = load_agent_store(app)?;
     records.retain(|record| !record.pubkey.is_empty());
     hydrate_keys(&mut records);
@@ -297,7 +307,9 @@ pub(crate) fn load_managed_agents_at(
 /// Load the key-less agent *definitions* (former personas) from the unified
 /// store. The persona compatibility shim (`load_personas`) presents these in
 /// the legacy shape via `to_definition_view`.
-pub(crate) fn load_agent_definitions(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
+pub(crate) fn load_agent_definitions<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<Vec<ManagedAgentRecord>, String> {
     let mut records = load_agent_store(app)?;
     records.retain(|record| record.pubkey.is_empty());
     Ok(records)
@@ -397,7 +409,10 @@ fn hydrate_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRecord]) 
 /// [`load_managed_agents`], and this re-reads the definition half from disk
 /// before the wholesale rewrite so a definition is never dropped by an
 /// instance-side save (and vice versa via [`save_agent_definitions`]).
-pub fn save_managed_agents(app: &AppHandle, records: &[ManagedAgentRecord]) -> Result<(), String> {
+pub fn save_managed_agents<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    records: &[ManagedAgentRecord],
+) -> Result<(), String> {
     let definitions = load_agent_definitions(app).unwrap_or_default();
     let mut sorted = records.to_vec();
     // A caller-supplied key-less record would collide with the definition
@@ -438,8 +453,8 @@ pub(crate) fn save_managed_agents_at(
 
 /// Save the key-less agent *definitions*, preserving the keyed instances —
 /// the definition-side mirror of [`save_managed_agents`].
-pub(crate) fn save_agent_definitions(
-    app: &AppHandle,
+pub(crate) fn save_agent_definitions<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     definitions: &[ManagedAgentRecord],
 ) -> Result<(), String> {
     let mut instances = load_agent_store(app)?;
@@ -465,8 +480,8 @@ pub(crate) fn save_agent_definitions_at(
 /// Serialize definitions + instances into the single unified store file.
 /// Definitions sort first (by slug) for stable diffs; instances keep the
 /// name/pubkey order their save path established.
-fn write_agent_store(
-    app: &AppHandle,
+fn write_agent_store<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     definitions: Vec<ManagedAgentRecord>,
     instances: Vec<ManagedAgentRecord>,
 ) -> Result<(), String> {
@@ -809,7 +824,7 @@ pub(crate) fn append_log_marker(path: &Path, message: &str) -> Result<(), String
     writeln!(file, "{message}").map_err(|error| format!("failed to write log marker: {error}"))
 }
 
-fn agent_pids_dir(app: &AppHandle) -> Result<PathBuf, String> {
+fn agent_pids_dir<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
     let dir = managed_agents_base_dir(app)?.join("agent-pids");
     fs::create_dir_all(&dir)
         .map_err(|error| format!("failed to create agent-pids dir: {error}"))?;
@@ -819,8 +834,8 @@ fn agent_pids_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// Persist a pair-scoped runtime receipt atomically. Callers must register the
 /// process in memory in the same runtime transition; on write failure they must
 /// terminate the child before releasing that transition.
-pub fn write_agent_runtime_receipt(
-    app: &AppHandle,
+pub fn write_agent_runtime_receipt<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     receipt: &ManagedAgentRuntimeReceipt,
 ) -> Result<(), String> {
     let path = agent_pids_dir(app)?.join(format!("{}.json", receipt.key.runtime_id()));
@@ -829,7 +844,10 @@ pub fn write_agent_runtime_receipt(
     atomic_write_json_restricted(&path, &payload)
 }
 
-pub fn remove_agent_runtime_receipt(app: &AppHandle, key: &ManagedAgentRuntimeKey) {
+pub fn remove_agent_runtime_receipt<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    key: &ManagedAgentRuntimeKey,
+) {
     if let Ok(dir) = agent_pids_dir(app) {
         let _ = fs::remove_file(dir.join(format!("{}.json", key.runtime_id())));
     }
@@ -839,8 +857,8 @@ pub fn remove_agent_runtime_receipt_path(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
-pub fn read_all_agent_runtime_receipts(
-    app: &AppHandle,
+pub fn read_all_agent_runtime_receipts<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
 ) -> Vec<(PathBuf, ManagedAgentRuntimeReceipt)> {
     let Ok(dir) = agent_pids_dir(app) else {
         return Vec::new();
@@ -862,7 +880,7 @@ pub fn read_all_agent_runtime_receipts(
 }
 
 /// Remove the PID file for an agent (e.g. on normal stop).
-pub fn remove_agent_pid_file(app: &AppHandle, pubkey: &str) {
+pub fn remove_agent_pid_file<R: tauri::Runtime>(app: &tauri::AppHandle<R>, pubkey: &str) {
     if let Ok(dir) = agent_pids_dir(app) {
         let _ = fs::remove_file(dir.join(format!("{pubkey}.pid")));
     }
@@ -888,109 +906,9 @@ pub fn read_all_agent_pid_files(app: &AppHandle) -> Vec<(String, u32)> {
         .collect()
 }
 
-pub fn read_log_tail(path: &Path, max_lines: usize) -> Result<String, String> {
-    if !path.exists() {
-        return Ok(String::new());
-    }
-
-    let mut file = File::open(path)
-        .map_err(|error| format!("failed to read log file {}: {error}", path.display()))?;
-
-    let file_len = file
-        .seek(SeekFrom::End(0))
-        .map_err(|error| format!("failed to seek log file: {error}"))?;
-
-    if file_len == 0 {
-        return Ok(String::new());
-    }
-
-    // Read backward in chunks to find enough newlines.
-    const CHUNK_SIZE: u64 = 8 * 1024;
-    let mut buf = Vec::new();
-    let mut remaining = file_len;
-    let mut newline_count: usize = 0;
-    // We need max_lines + 1 newlines to delimit max_lines lines (the trailing
-    // newline of the last line counts as one).
-    let target_newlines = max_lines + 1;
-
-    while remaining > 0 && newline_count < target_newlines {
-        let chunk = remaining.min(CHUNK_SIZE);
-        remaining -= chunk;
-        file.seek(SeekFrom::Start(remaining))
-            .map_err(|error| format!("failed to seek log file: {error}"))?;
-
-        let mut tmp = vec![0u8; chunk as usize];
-        file.read_exact(&mut tmp)
-            .map_err(|error| format!("failed to read log chunk: {error}"))?;
-
-        // Prepend this chunk so buf always has the tail of the file.
-        tmp.append(&mut buf);
-        buf = tmp;
-
-        newline_count = bytecount_newlines(&buf);
-    }
-
-    // Strip ANSI escapes here (not in the harness) so the desktop log view
-    // renders cleanly while terminals and other tools still get the colors
-    // buzz-acp emits.
-    let cleaned = strip_ansi_escapes::strip_str(String::from_utf8_lossy(&buf));
-    let lines: Vec<&str> = cleaned.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
-    Ok(lines[start..].join("\n"))
-}
-
-fn bytecount_newlines(buf: &[u8]) -> usize {
-    buf.iter().filter(|&&b| b == b'\n').count()
-}
-
-/// A meaningful error recovered from an exited agent's log tail.
-pub struct AgentLogError {
-    /// The full log line, wrapped as `Agent reported error…` for display.
-    pub message: String,
-    /// JSON-RPC error code parsed from the line's `(code N)` marker, or a
-    /// synthetic code for known bare prefixes. `None` for legacy-format
-    /// lines that carry no code (or when the code fails to parse as i64).
-    pub code: Option<i64>,
-}
-
-pub fn meaningful_agent_error_from_log(path: &Path) -> Option<AgentLogError> {
-    let tail = read_log_tail(path, 200).ok()?;
-    tail.lines().rev().map(str::trim).find_map(|line| {
-        // New format: "Agent reported error (code -32002): ..."
-        if let Some(rest) = line.strip_prefix("Agent reported error (code ") {
-            if let Some(paren_end) = rest.find("): ") {
-                let code = rest[..paren_end].parse::<i64>().ok();
-                return Some(AgentLogError {
-                    message: line.to_string(),
-                    code,
-                });
-            }
-        }
-        // Legacy format (older buzz-acp builds): "Agent reported error: ..."
-        if line.starts_with("Agent reported error:") {
-            return Some(AgentLogError {
-                message: line.to_string(),
-                code: None,
-            });
-        }
-        // Bare prefixes emitted by older agent binaries whose Display still leaks
-        // unwrapped errors. Promote these so they surface instead of the generic
-        // "harness exited with status N" fallback.
-        if line.starts_with("llm auth:") {
-            return Some(AgentLogError {
-                message: format!("Agent reported error: {line}"),
-                code: Some(-32001),
-            });
-        }
-        if line.starts_with("llm model not found:") {
-            return Some(AgentLogError {
-                message: format!("Agent reported error: {line}"),
-                code: Some(-32002),
-            });
-        }
-        None
-    })
-}
+#[path = "storage_log.rs"]
+mod storage_log;
+pub use storage_log::{meaningful_agent_error_from_log, read_log_tail, AgentLogError};
 
 #[cfg(test)]
 #[path = "storage_tests.rs"]

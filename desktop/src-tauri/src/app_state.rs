@@ -46,13 +46,6 @@ pub struct AppState {
     /// Never perform network I/O while holding this lock.
     pub managed_agent_runtime_transition: Mutex<()>,
     pub managed_agents_store_lock: Mutex<()>,
-    /// `compensate_drain` reacquires `managed_agent_runtime_transition` and
-    /// `managed_agents_store_lock` directly and holds them across all journal
-    /// restarts, so no concurrent start or reconcile can interleave. The old
-    /// AtomicBool gate is removed; this field is a zero-cost placeholder that
-    /// preserves struct layout stability during this refactor pass.
-    #[allow(dead_code)]
-    _compensation_gate_removed: (),
     pub channel_templates_store_lock: Mutex<()>,
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
     pub huddle_state: Mutex<HuddleState>,
@@ -227,7 +220,6 @@ pub fn build_app_state() -> AppState {
         workspace_transition: AsyncMutex::new(()),
         active_agent_scope: Mutex::new(None),
         managed_agents_store_lock: Mutex::new(()),
-        _compensation_gate_removed: (),
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
         session_config_cache: Mutex::new(HashMap::new()),

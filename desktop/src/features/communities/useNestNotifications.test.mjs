@@ -1,126 +1,139 @@
 /**
- * Behavioral tests for useNestNotifications.
+ * Behavioral tests for useNestNotifications / registerNestNotifications.
  *
- * Verifies that:
- * - The hook registers a listener for `workspace-degraded` on mount.
- * - When the event fires, `toast.error` is called with the payload.
- * - The listener is cleaned up (unlisten called) on unmount.
+ * Tests call `registerNestNotifications` — the extracted production
+ * registration helper used by `useNestNotifications` inside its `useEffect`.
+ * This is the real production function, not a reconstruction of its logic.
  *
- * Uses a module-scope mock for @tauri-apps/api/event and sonner so we can
- * drive events synchronously without a real Tauri runtime.
+ * Proves:
+ * - `registerNestNotifications` registers listeners for all three event names
+ *   (repos-dir-error, legacy-nest-migrated, workspace-degraded) by inspecting
+ *   the `listenFn` call record.
+ * - When `workspace-degraded` fires, `toast.error` is called with the payload.
+ * - The returned cleanup function calls every unlisten function.
+ * - The event name and payload wiring survive rename/refactor of the production
+ *   code (the test would fail if the event name or toast call were deleted).
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 
-// ── Minimal React/hook harness ───────────────────────────────────────────────
-// useNestNotifications is a React hook (calls useEffect). We run it by
-// providing a minimal shim that invokes the cleanup function directly, making
-// the test synchronous and environment-free.
-const effectCallbacks = [];
-const effectCleanups = [];
-globalThis.React = {
-  useEffect: (cb) => {
-    const cleanup = cb();
-    effectCallbacks.push(cb);
-    effectCleanups.push(cleanup);
-  },
-};
+import { registerNestNotifications } from "./useNestNotifications.ts";
 
-// ── Mocks for @tauri-apps/api/event and sonner ──────────────────────────────
-let registeredListeners = [];
-const toastCalls = [];
+test("registerNestNotifications: registers listeners for all three events", () => {
+  const registeredEvents = [];
+  const unlistenFns = [];
 
-globalThis.__mockListen = (event, handler) => {
-  registeredListeners.push({ event, handler });
-  // Return a promise that resolves to the unlisten function (matches Tauri API).
-  return Promise.resolve(() => {
-    registeredListeners = registeredListeners.filter(
-      (l) => l.event !== event || l.handler !== handler,
-    );
-  });
-};
-
-globalThis.__mockToastError = (title, options) => {
-  toastCalls.push({ title, options });
-};
-
-// ── Module stubs are injected before import via globalThis ──────────────────
-// The hook imports "@tauri-apps/api/event" { listen } and "sonner" { toast }.
-// We inject module-resolution stubs via the TypeScript transpiler shim.
-// Since the test runner resolves bare imports, we patch globalThis so the TS
-// transpilation sees them.
-//
-// Instead of running the hook (which requires a full Node ESM module mock),
-// we exercise the behavioral contract directly: a captured `listen` call with
-// event="workspace-degraded" whose handler calls toast.error.
-
-test("workspace-degraded listener calls toast.error with payload", () => {
-  const toastErrorCalls = [];
-  const unlistenCalls = [];
-
-  // Construct the exact handler the hook registers, extracted here for direct
-  // verification. This mirrors the hook's implementation and verifies the
-  // behavior described in the work order.
-  //
-  // Real contract: listen("workspace-degraded", (event) => toast.error(...))
-  const fakeToast = {
-    error: (title, opts) => toastErrorCalls.push({ title, opts }),
+  const mockListen = (event, _handler) => {
+    registeredEvents.push(event);
+    const unlistenFn = () => unlistenFns.push(event);
+    return Promise.resolve(unlistenFn);
   };
-  const _fakeUnlisten = () => unlistenCalls.push("workspace-degraded");
 
-  // Simulate the handler registration and invocation.
-  const handler = (event) => {
-    fakeToast.error("Workspace partially degraded", {
-      description: event.payload,
+  const mockToast = { error: () => {}, success: () => {} };
+
+  const cleanup = registerNestNotifications(mockListen, mockToast);
+
+  assert.deepEqual(
+    registeredEvents.sort(),
+    ["legacy-nest-migrated", "repos-dir-error", "workspace-degraded"].sort(),
+    "must register listeners for all three events",
+  );
+
+  // Cleanup calls all three unlisten functions.
+  return Promise.resolve()
+    .then(() => {
+      cleanup();
+      return new Promise((resolve) => setTimeout(resolve, 0));
+    })
+    .then(() => {
+      assert.equal(
+        unlistenFns.length,
+        3,
+        "cleanup must call unlisten for all three events",
+      );
     });
+});
+
+test("registerNestNotifications: workspace-degraded fires toast.error with payload", () => {
+  const toastCalls = [];
+
+  let degradedHandler = null;
+  const mockListen = (event, handler) => {
+    if (event === "workspace-degraded") {
+      degradedHandler = handler;
+    }
+    return Promise.resolve(() => {});
   };
 
-  // Invoke handler as if the event fired with a degradation message.
-  handler({ payload: "restore failed: agent runtime could not be restarted" });
+  const mockToast = {
+    error: (title, opts) => toastCalls.push({ title, opts }),
+    success: () => {},
+  };
 
-  assert.equal(toastErrorCalls.length, 1, "toast.error must be called once");
-  assert.equal(toastErrorCalls[0].title, "Workspace partially degraded");
+  registerNestNotifications(mockListen, mockToast);
+
+  assert.ok(degradedHandler, "workspace-degraded handler must be registered");
+
+  // Fire the event as the Tauri event system would.
+  degradedHandler({
+    payload: "restore failed: agent runtime could not be restarted",
+  });
+
+  assert.equal(toastCalls.length, 1, "toast.error must be called once");
+  assert.equal(toastCalls[0].title, "Workspace partially degraded");
   assert.equal(
-    toastErrorCalls[0].opts.description,
+    toastCalls[0].opts.description,
     "restore failed: agent runtime could not be restarted",
   );
 });
 
-test("workspace-degraded listener cleanup unlists on unmount", () => {
-  // Verify that listen returns a promise whose resolution is the unlisten
-  // function, and that the hook's cleanup calls it.
-  let unlistenWasCalled = false;
-  const unlistenFn = () => {
-    unlistenWasCalled = true;
+test("registerNestNotifications: cleanup calls all unlisten functions", () => {
+  let unlistenCallCount = 0;
+  const unlisten = () => {
+    unlistenCallCount++;
   };
-  const listenPromise = Promise.resolve(unlistenFn);
+  const mockListen = (_event, _handler) => Promise.resolve(unlisten);
+  const mockToast = { error: () => {}, success: () => {} };
 
-  // Simulate the cleanup path: the hook calls `unlisten.then((fn) => fn())`
-  void listenPromise.then((fn) => fn());
+  const cleanup = registerNestNotifications(mockListen, mockToast);
 
-  // Flush the microtask queue.
-  return listenPromise.then(() => {
-    assert.equal(
-      unlistenWasCalled,
-      true,
-      "unlisten must be called when the hook unmounts",
-    );
-  });
+  // Call cleanup after promises resolve.
+  return new Promise((resolve) => setTimeout(resolve, 0))
+    .then(() => {
+      cleanup();
+      return new Promise((resolve) => setTimeout(resolve, 0));
+    })
+    .then(() => {
+      assert.equal(
+        unlistenCallCount,
+        3,
+        "cleanup must call unlisten for all three registered listeners",
+      );
+    });
 });
 
-test("workspace-degraded handler passes raw payload as description", () => {
-  // Boundary check: empty payload, long payload, special characters.
+test("registerNestNotifications: workspace-degraded handler passes raw payload as description", () => {
   const cases = ["", "a".repeat(500), "error: file not found\npath: /foo/bar"];
+
   for (const payload of cases) {
     const toastArgs = [];
-    const handler = (event) => {
-      toastArgs.push({
-        title: "Workspace partially degraded",
-        description: event.payload,
-      });
+    let handler = null;
+
+    const mockListen = (event, h) => {
+      if (event === "workspace-degraded") handler = h;
+      return Promise.resolve(() => {});
     };
+    const mockToast = {
+      error: (title, opts) =>
+        toastArgs.push({ title, description: opts?.description }),
+      success: () => {},
+    };
+
+    registerNestNotifications(mockListen, mockToast);
+    assert.ok(handler, "workspace-degraded handler must be set");
     handler({ payload });
+
+    assert.equal(toastArgs.length, 1);
     assert.equal(toastArgs[0].description, payload);
-    toastArgs.length = 0;
   }
 });

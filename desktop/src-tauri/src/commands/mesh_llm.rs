@@ -943,7 +943,7 @@ pub async fn mesh_stop_node(
 }
 
 /// Stop the local Mesh client (client-mode only). See [`scope_impl::mesh_stop_client`].
-pub use scope_impl::mesh_stop_client;
+pub(crate) use scope_impl::mesh_stop_client;
 
 #[tauri::command]
 pub async fn mesh_node_status(state: State<'_, AppState>) -> CmdResult<mesh_llm::MeshNodeStatus> {

@@ -498,30 +498,29 @@ pub async fn preview_team_snapshot_import(
 ///
 /// Importing the same file twice yields two distinct teams with different
 /// agent keypairs (same as individual agent import).
+
+// ── `confirm_team_snapshot_import` entry guards ───────────────────────────────
+//
+// Extracted to `team_snapshot_entry.rs` to keep this file within the size ratchet.
+#[path = "team_snapshot_entry.rs"]
+mod team_snapshot_entry;
+pub(crate) use team_snapshot_entry::capture_team_snapshot_import_entry;
+#[cfg(test)]
+pub(crate) use team_snapshot_entry::TeamSnapshotImportEntry;
+
 #[tauri::command]
 pub async fn confirm_team_snapshot_import(
     input: TeamSnapshotImportConfirm,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TeamSnapshotImportResult, String> {
-    // ── Scope capture ─────────────────────────────────────────────────────────
-    // All Phase 3 writes use `definitions_dir` from this snapshot; generation
-    // is re-validated under the store lock before the first write.
-    let captured_scope = state
-        .capture_active_scope()
-        .ok_or("confirm_team_snapshot_import: no active workspace scope — cannot import")?;
+    // Capture the active scope and verify owner-key agreement at entry.
+    // `capture_team_snapshot_import_entry` is the production boundary guard;
+    // it is also called directly by unit tests.
+    let entry = capture_team_snapshot_import_entry(&state)?;
+    let captured_scope = entry.captured_scope;
+    let captured_owner_keys = entry.captured_owner_keys;
     let definitions_dir = captured_scope.definitions_dir.clone();
-
-    // Capture owner keys at entry to hold a consistent identity across all phases.
-    let captured_owner_keys = state
-        .signing_keys()
-        .map_err(|e| format!("confirm_team_snapshot_import: failed to capture owner keys: {e}"))?;
-    if captured_owner_keys.public_key().to_hex() != captured_scope.owner_pubkey {
-        return Err(
-            "confirm_team_snapshot_import: owner pubkey mismatch; identity may have changed"
-                .to_string(),
-        );
-    }
 
     // ── Phase 1: validate (no I/O) ───────────────────────────────────────────
     let snapshot = decode_team_snapshot_from_bytes(&input.file_bytes)?;

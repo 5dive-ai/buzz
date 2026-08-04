@@ -340,11 +340,9 @@ fn test_workspace_apply_result_degradation_accumulates() {
 /// `stopped = [entry1, entry2]`, `remaining = []`, `err = None`.
 ///
 /// This unit test verifies the drain-journal prefix contract — the exact slice
-/// that callers pass to `compensate_drain`. The full compensation round-trip
-/// (`compensate_drain` + `start_pair_under_held_locks`) requires an `AppHandle`
-/// and cannot be exercised here: the codebase has no `tauri::test` harness and
-/// there is no `AppHandle` mock. Coverage of the restart path is therefore
-/// integration-only (manual two-workspace probe + the desktop smoke suite).
+/// that callers pass to `compensate_drain`. The compensation round-trip
+/// (`compensate_drain_for` with injected start_fn) is covered by
+/// `test_compensate_for_restarts_stopped_entries_in_order` and companions below.
 #[test]
 #[cfg(unix)]
 fn test_partial_drain_delivers_correct_stopped_prefix_with_live_process() {
@@ -384,31 +382,6 @@ fn test_partial_drain_delivers_correct_stopped_prefix_with_live_process() {
         "start_on_app_launch preserved for entry2"
     );
     assert!(map.is_empty(), "runtime map must be empty after drain");
-}
-
-/// Verifies the transition lock contract: after a drain succeeds (stopped is
-/// empty), calling `compensate_drain` should release the guard. This is
-/// verified structurally: compensate_drain takes `_rt_transition_held` by
-/// value and calls `drop(_rt_transition_held)` on the empty path. We verify
-/// the structural contract by confirming a local lock can be re-acquired after
-/// being dropped, which is identical to the compensation fast-path behavior.
-#[test]
-fn test_compensate_drain_empty_stopped_returns_none_and_releases_guard() {
-    // Simulate the caller's transition lock acquisition.
-    let transition_lock = std::sync::Mutex::new(());
-    let guard = transition_lock.lock().unwrap();
-
-    // Simulate: compensate_drain(app, &[], &scope, guard) returns None and
-    // drops the guard. We cannot call compensate_drain without an AppHandle,
-    // so we verify the structural contract: after the guard is consumed
-    // (dropped), the lock must be immediately re-acquirable.
-    drop(guard);
-
-    // The lock must be acquirable again immediately — the guard was released.
-    assert!(
-        transition_lock.try_lock().is_ok(),
-        "transition lock must be free after compensate_drain processes empty stopped list"
-    );
 }
 
 /// Partial drain failure: entry 1 succeeds, entry 2 fails with an injected
@@ -498,5 +471,298 @@ fn test_partial_drain_stop_failure_delivers_stopped_prefix_and_remaining_tail() 
     assert!(
         err_msg.contains(&pubkey2),
         "error message must name the failing entry pubkey: {err_msg}"
+    );
+}
+
+// ── compensate_drain_for tests ──────────────────────────────────────────────
+//
+// These tests call `compensate_drain_for` directly — the extracted production
+// core — with an injected `start_fn` instead of the real `start_pair_under_held_locks`.
+// The injected function records which entries were restarted and returns
+// synthetic success/failure without spawning processes or touching disk.
+//
+// This exercises the two critical invariants of compensation:
+//   1. Only the `stopped` prefix (not the full journal) is restarted.
+//   2. A stale captured scope skips compensation entirely (generation guard).
+//
+// The `start_pair` gate invariant (concurrent ordinary starts are serialized by
+// holding the transition lock) is structural: `compensate_drain_for` runs under
+// the caller's held transition guard (see `compensate_drain`'s signature), and
+// every `start_pair`/`start_managed_agent_process` path acquires that same lock
+// before proceeding. The lock-order audit lives in `identity.rs` and
+// `workspace.rs`; no concurrent-thread test is added here because the Rust
+// type system enforces the ownership invariant at compile time.
+
+fn make_captured_scope() -> super::super::scope::WorkspaceAgentScope {
+    // Build a scope whose generation matches the current global counter.
+    // Tests that need a stale scope call `next_scope_generation()` after
+    // capturing this value.
+    let gen = super::super::scope::current_scope_generation();
+    super::super::scope::WorkspaceAgentScope {
+        scope_id: "test-scope".to_string(),
+        relay_url: "wss://relay.example".to_string(),
+        owner_pubkey: "aa".repeat(32),
+        definitions_dir: std::path::PathBuf::from("/tmp/test-scope"),
+        generation: gen,
+    }
+}
+
+/// Two-entry compensation: entry 1 stopped, entry 2 stop-failed.
+/// `compensate_drain_for` must call start_fn exactly for entry 1 and return
+/// None (full success), proving the stopped-prefix contract.
+#[test]
+fn test_compensate_for_restarts_stopped_entries_in_order() {
+    let pubkey1 = "aa".repeat(32);
+    let pubkey2 = "bb".repeat(32);
+    let entry1 = make_drain_entry(&pubkey1, "wss://relay.example", true);
+    // entry2 was not stopped (stop failed), so it is NOT in the stopped slice.
+    let stopped = vec![entry1.clone()];
+
+    let state = crate::app_state::build_app_state();
+    let captured_scope = make_captured_scope();
+
+    let mut restarted: Vec<String> = Vec::new();
+    let result = compensate_drain_for(&state, &stopped, &captured_scope, |entry| {
+        restarted.push(entry.key.pubkey.clone());
+        Ok(())
+    });
+
+    assert!(result.is_none(), "compensation must succeed: {result:?}");
+    assert_eq!(
+        restarted,
+        vec![pubkey1.clone()],
+        "start_fn must be called exactly for entry1"
+    );
+    // entry2 was never in stopped — must not be restarted.
+    assert!(
+        !restarted.contains(&pubkey2),
+        "entry2 (stop-failed) must not be restarted"
+    );
+}
+
+/// Stale scope: compensation skips all restarts and returns a degradation message.
+/// Proves the generation guard: a workspace switch between drain failure and
+/// compensation must prevent stale-scope agents from restarting.
+#[test]
+fn test_compensate_for_skips_all_on_stale_scope() {
+    let pubkey1 = "aa".repeat(32);
+    let entry1 = make_drain_entry(&pubkey1, "wss://relay.example", true);
+    let stopped = vec![entry1.clone()];
+
+    let state = crate::app_state::build_app_state();
+    let captured_scope = make_captured_scope();
+
+    // Advance the global generation — scope is now stale.
+    super::super::scope::next_scope_generation();
+
+    let mut restart_count = 0usize;
+    let result = compensate_drain_for(&state, &stopped, &captured_scope, |_entry| {
+        restart_count += 1;
+        Ok(())
+    });
+
+    assert!(
+        result.is_some(),
+        "stale scope must return a degradation message"
+    );
+    let msg = result.unwrap();
+    assert!(
+        msg.contains("compensation skipped") || msg.contains("stale scope"),
+        "degradation message must describe stale scope: {msg}"
+    );
+    assert_eq!(
+        restart_count, 0,
+        "start_fn must not be called when scope is stale"
+    );
+}
+
+/// Partial restart failure: start_fn returns an error for entry1, success for
+/// entry2. The function must return a degradation message naming the failing
+/// entry and not abort early (entry2 is still attempted).
+#[test]
+fn test_compensate_for_reports_partial_restart_failure() {
+    let pubkey1 = "aa".repeat(32);
+    let pubkey2 = "bb".repeat(32);
+    let entry1 = make_drain_entry(&pubkey1, "wss://relay.example", true);
+    let entry2 = make_drain_entry(&pubkey2, "wss://relay.example", false);
+    let stopped = vec![entry1.clone(), entry2.clone()];
+
+    let state = crate::app_state::build_app_state();
+    let captured_scope = make_captured_scope();
+
+    let pubkey1_clone = pubkey1.clone();
+    let result = compensate_drain_for(&state, &stopped, &captured_scope, |entry| {
+        if entry.key.pubkey == pubkey1_clone {
+            Err(format!("injected failure for {}", entry.key.pubkey))
+        } else {
+            Ok(())
+        }
+    });
+
+    assert!(
+        result.is_some(),
+        "partial restart failure must return degradation message"
+    );
+    let msg = result.unwrap();
+    assert!(
+        msg.contains(&pubkey1),
+        "degradation message must name the failing entry: {msg}"
+    );
+}
+
+// ── compensate_drain round-trip tests (via tauri::test::mock_app) ──────────
+//
+// These tests call `compensate_drain` directly — the real production function
+// that takes an AppHandle and a held transition guard — using a
+// `tauri::test::mock_builder()` app. This proves the full production path:
+// AppHandle → load_managed_agents (reads live scope) → compensate_drain_for →
+// generation validation → per-entry start_fn dispatch.
+//
+// The test manages the active scope via `commit_active_scope` (the test-only
+// AppState helper) and writes managed-agents.json to the tmpdir so the live
+// scope load succeeds. Spawn fails for every entry (no real process/binary in
+// the test environment), so `compensate_drain` returns a degradation message
+// naming the failing entries — proving the path was entered, not skipped.
+//
+// Concurrent-start exclusion is structural: `compensate_drain` takes
+// `_rt_transition_held: MutexGuard<'_, ()>` by value. Passing ownership of
+// the guard into the function proves at the type level that the lock is held
+// continuously through every `start_pair_under_held_locks` call inside
+// `compensate_drain_for`. No concurrent thread test is added because the Rust
+// borrow checker enforces the exclusion contract at compile time.
+
+fn build_mock_app_with_scope(
+    tmp: &tempfile::TempDir,
+) -> (
+    tauri::App<tauri::test::MockRuntime>,
+    super::super::scope::WorkspaceAgentScope,
+) {
+    // Write empty managed-agents.json so load_managed_agents_at returns Ok([]).
+    std::fs::write(tmp.path().join("managed-agents.json"), b"[]").unwrap();
+    let gen = super::super::scope::current_scope_generation();
+    let scope = super::super::scope::WorkspaceAgentScope {
+        scope_id: "test-scope-comp".to_string(),
+        relay_url: "wss://relay.example".to_string(),
+        owner_pubkey: "aa".repeat(32),
+        definitions_dir: tmp.path().to_path_buf(),
+        generation: gen,
+    };
+    let app = tauri::test::mock_builder()
+        .manage(crate::app_state::build_app_state())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("failed to build mock app");
+    {
+        use tauri::Manager;
+        let state = app.state::<crate::app_state::AppState>();
+        state.commit_active_scope(scope.clone());
+    }
+    (app, scope)
+}
+
+/// `compensate_drain` with empty stopped list → returns `None` (no degradation)
+/// and releases the transition guard.
+///
+/// Calls the real production function with a real AppHandle. Proves the
+/// fast-path: empty stopped → guard dropped → None returned.
+#[test]
+fn test_compensate_drain_empty_stopped_returns_none_with_real_app() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, scope) = build_mock_app_with_scope(&tmp);
+    let app_handle = app.app_handle().clone();
+    use tauri::Manager;
+    let state = app.state::<crate::app_state::AppState>();
+    // Acquire and hold the transition lock, then hand it to compensate_drain.
+    let transition_guard = state.managed_agent_runtime_transition.lock().unwrap();
+
+    let result = compensate_drain(&app_handle, &[], &scope, transition_guard);
+
+    assert!(
+        result.is_none(),
+        "empty stopped list must return None (no degradation): {result:?}"
+    );
+    // Guard was consumed by compensate_drain. The lock must be free again.
+    assert!(
+        state.managed_agent_runtime_transition.try_lock().is_ok(),
+        "transition lock must be released after compensate_drain with empty stopped list"
+    );
+}
+
+/// `compensate_drain` with a stale scope → returns a degradation message and
+/// does NOT call start_pair for any entry.
+///
+/// Calls the real production function with a real AppHandle. Proves the
+/// generation guard fires before any spawn attempt.
+#[test]
+fn test_compensate_drain_stale_scope_skips_all_with_real_app() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, scope) = build_mock_app_with_scope(&tmp);
+    let app_handle = app.app_handle().clone();
+    use tauri::Manager;
+    let state = app.state::<crate::app_state::AppState>();
+
+    // Advance the generation AFTER capturing the scope to make it stale.
+    super::super::scope::next_scope_generation();
+
+    let pubkey = "bb".repeat(32);
+    let entry = make_drain_entry(&pubkey, "wss://relay.example", true);
+    let transition_guard = state.managed_agent_runtime_transition.lock().unwrap();
+
+    let result = compensate_drain(&app_handle, &[entry], &scope, transition_guard);
+
+    assert!(
+        result.is_some(),
+        "stale scope must return a degradation message"
+    );
+    let msg = result.unwrap();
+    assert!(
+        msg.contains("compensation skipped")
+            || msg.contains("stale scope")
+            || msg.contains("generation"),
+        "degradation message must describe stale scope: {msg}"
+    );
+}
+
+/// `compensate_drain` with a fresh scope and entries that cannot be spawned
+/// (no agent records in the empty store) → returns a degradation message
+/// naming the failed restarts.
+///
+/// This is the end-to-end round-trip test: the real compensate_drain function
+/// is called with a real AppHandle, loads managed-agents from the active scope,
+/// reacquires the store lock, validates the generation, then iterates entries
+/// via start_pair_under_held_locks. Since managed-agents.json is empty, every
+/// entry produces an "agent not found" error — proving the restart path was
+/// entered and attempted, not silently skipped.
+#[test]
+fn test_compensate_drain_attempts_restart_and_reports_degradation_with_real_app() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app, scope) = build_mock_app_with_scope(&tmp);
+    let app_handle = app.app_handle().clone();
+    use tauri::Manager;
+    let state = app.state::<crate::app_state::AppState>();
+
+    let pubkey1 = "aa".repeat(32);
+    let pubkey2 = "bb".repeat(32);
+    let entry1 = make_drain_entry(&pubkey1, "wss://relay.example", true);
+    let entry2 = make_drain_entry(&pubkey2, "wss://relay.example", false);
+    let transition_guard = state.managed_agent_runtime_transition.lock().unwrap();
+
+    // The active scope is set (generation valid). managed-agents.json is empty,
+    // so start_pair_under_held_locks will return "agent not found" for each entry.
+    let result = compensate_drain(&app_handle, &[entry1, entry2], &scope, transition_guard);
+
+    // Both entries fail to restart → degradation message is returned.
+    assert!(
+        result.is_some(),
+        "failed restarts must return a degradation message"
+    );
+    let msg = result.unwrap();
+    // The message must name the failing entries (pubkey1 or pubkey2).
+    let names_failing_entry = msg.contains(&pubkey1)
+        || msg.contains(&pubkey2)
+        || msg.contains("agent not found")
+        || msg.contains("failed");
+    assert!(
+        names_failing_entry,
+        "degradation message must describe why restart failed: {msg}"
     );
 }

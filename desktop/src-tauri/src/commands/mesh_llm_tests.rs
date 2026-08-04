@@ -675,3 +675,99 @@ fn test_watchdog_scope_relay_check_uses_normalized_comparison() {
         );
     }
 }
+
+// ── Option A behavioral tests ─────────────────────────────────────────────────
+//
+// These tests call the production functions `fail_if_client_mesh_active` and
+// `mesh_stop_client` directly via `tauri::test::mock_builder()`, exercising
+// the real production path (not a reconstruction of its logic).
+
+/// `fail_if_client_mesh_active` with no runtime → returns `Ok(())`.
+///
+/// Calls the production function with a real AppHandle. Proves the
+/// fast-path: absent runtime → no error, workspace switch is permitted.
+#[tokio::test]
+async fn test_fail_if_client_mesh_active_no_runtime_returns_ok() {
+    let app = tauri::test::mock_builder()
+        .manage(crate::app_state::build_app_state())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("failed to build mock app");
+    let app_handle = app.handle().clone();
+
+    // No runtime set — absent means no client.
+    let result = super::scope_impl::fail_if_client_mesh_active(&app_handle).await;
+
+    assert!(
+        result.is_ok(),
+        "absent runtime must return Ok (no client active): {result:?}"
+    );
+}
+
+/// `fail_if_client_mesh_active` with a client-mode runtime → returns `Err`.
+///
+/// Calls the production function with a real AppHandle. Sets a client runtime
+/// in the AppState before the call. Proves the active-client-rejection path:
+/// workspace switch must be blocked while a client is active.
+#[tokio::test]
+async fn test_fail_if_client_mesh_active_client_runtime_returns_err() {
+    use tauri::Manager;
+
+    let app = tauri::test::mock_builder()
+        .manage(crate::app_state::build_app_state())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("failed to build mock app");
+    let app_handle = app.handle().clone();
+
+    // Install a pending client runtime.
+    {
+        let state = app.state::<crate::app_state::AppState>();
+        let client_runtime = crate::mesh_llm::build_mock_client_runtime_for_test();
+        *state.mesh_llm_runtime.lock().await = Some(client_runtime);
+    }
+
+    let result = super::scope_impl::fail_if_client_mesh_active(&app_handle).await;
+
+    assert!(
+        result.is_err(),
+        "client runtime must cause fail_if_client_mesh_active to return Err: {result:?}"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("Stop") || err.contains("client") || err.contains("shared compute"),
+        "error must describe the active client and how to stop it: {err}"
+    );
+}
+
+/// `mesh_stop_client` with no runtime → returns `Ok` with stopped status.
+///
+/// Calls the production Tauri command with a real AppHandle. Proves the
+/// no-op path: no runtime → returns stopped status without error.
+#[tokio::test]
+async fn test_mesh_stop_client_no_runtime_returns_stopped_status() {
+    use tauri::Manager;
+
+    let app = tauri::test::mock_builder()
+        .manage(crate::app_state::build_app_state())
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("failed to build mock app");
+    let app_handle = app.handle().clone();
+    let state = app.state::<crate::app_state::AppState>();
+
+    let result = super::mesh_stop_client(app_handle, state).await;
+
+    assert!(
+        result.is_ok(),
+        "mesh_stop_client with no runtime must return Ok: {result:?}"
+    );
+    let status = result.unwrap();
+    assert!(
+        status.mode.is_none(),
+        "returned status mode must be None (not running) when no runtime is active: {:?}",
+        status.mode
+    );
+    assert_eq!(
+        status.state,
+        crate::mesh_llm::MeshNodeState::Off,
+        "returned status must be Off when no runtime is active"
+    );
+}

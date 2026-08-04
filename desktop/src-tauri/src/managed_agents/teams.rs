@@ -10,7 +10,9 @@ use crate::{
 use super::team_repair::team_persona_key;
 
 /// Resolve the active-scope `teams.json` path. Fails closed on `None` scope.
-pub(crate) fn teams_store_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn teams_store_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<PathBuf, String> {
     use tauri::Manager as _;
     let state = app.state::<crate::app_state::AppState>();
     let scope = state.capture_active_scope().ok_or_else(|| {
@@ -184,7 +186,7 @@ pub(crate) fn load_teams_readonly(path: &std::path::Path) -> Result<Vec<TeamReco
     Ok(records)
 }
 
-pub fn load_teams(app: &AppHandle) -> Result<Vec<TeamRecord>, String> {
+pub fn load_teams<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Vec<TeamRecord>, String> {
     let path = teams_store_path(app)?;
     let now = now_iso();
 
@@ -207,7 +209,10 @@ pub fn load_teams(app: &AppHandle) -> Result<Vec<TeamRecord>, String> {
     Ok(records)
 }
 
-pub fn save_teams(app: &AppHandle, records: &[TeamRecord]) -> Result<(), String> {
+pub fn save_teams<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    records: &[TeamRecord],
+) -> Result<(), String> {
     let mut sorted = records.to_vec();
     sort_teams(&mut sorted);
 

@@ -8,6 +8,7 @@ import {
   useAgentMemoryQuery,
   useIsManagedAgent,
 } from "@/features/agent-memory/hooks";
+import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
 import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
@@ -15,10 +16,12 @@ import {
 import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { useCommunities } from "@/features/communities/useCommunities";
+import { computeAgentBadges } from "@/features/passport/lib/badges";
 import {
   loadTravelLog,
   normalizeRelayUrl,
 } from "@/features/passport/lib/travelLog";
+import { PassportBadgeList } from "@/features/passport/ui/PassportBadges";
 import {
   AgentCrewList,
   type CrewAgent,
@@ -36,7 +39,10 @@ import {
   useUsersBatchQuery,
 } from "@/features/profile/hooks";
 import { PassportCard } from "@/features/profile/ui/PassportCard";
-import { useMyNotesQuery } from "@/features/pulse/hooks";
+import {
+  useMyNotesQuery,
+  usePulseReactionsQuery,
+} from "@/features/pulse/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
 import { safeNpub } from "@/shared/lib/nostrUtils";
@@ -235,6 +241,55 @@ export function PassportScreen({
   const memoryCount = memoryQuery.data
     ? memoryQuery.data.memories.length + (memoryQuery.data.core ? 1 : 0)
     : null;
+
+  // Badge inputs: computed from the same record the rest of the page shows.
+  const allNotes = React.useMemo(
+    () => notesQuery.data?.notes ?? [],
+    [notesQuery.data],
+  );
+  const noteIds = React.useMemo(
+    () => allNotes.map((note) => note.id),
+    [allNotes],
+  );
+  const reactionsQuery = usePulseReactionsQuery(isAgent ? noteIds : []);
+  const activeTurnCount = useAgentWorking(isAgent ? pubkey : null).channels
+    .length;
+  const badges = React.useMemo(() => {
+    if (!isAgent) {
+      return [];
+    }
+    let reactionCount = 0;
+    for (const state of reactionsQuery.data?.values() ?? []) {
+      reactionCount += state.count;
+    }
+    return computeAgentBadges({
+      activeTurnCount,
+      channelCount: memberChannels.length,
+      firstSeenAt:
+        allNotes.length > 0
+          ? Math.min(...allNotes.map((note) => note.createdAt))
+          : null,
+      hasAbout: Boolean(profile?.about?.trim()),
+      hasAvatar: Boolean(profile?.avatarUrl),
+      hasHandle: Boolean(profile?.nip05Handle?.trim()),
+      hasName: Boolean(profile?.displayName?.trim()),
+      hasOwner: profile?.ownerPubkey != null,
+      memoryCount,
+      noteCount: allNotes.length,
+      noteHours: allNotes.map((note) =>
+        new Date(note.createdAt * 1_000).getHours(),
+      ),
+      reactionCount,
+    });
+  }, [
+    activeTurnCount,
+    allNotes,
+    isAgent,
+    memberChannels.length,
+    memoryCount,
+    profile,
+    reactionsQuery.data,
+  ]);
   const recordLoading =
     channelsQuery.isLoading || notesQuery.isLoading || contactsQuery.isLoading;
   const hasAgentRecord =
@@ -306,6 +361,15 @@ export function PassportScreen({
           </div>
 
           <div className="flex min-w-0 flex-col gap-8">
+            {badges.length > 0 ? (
+              <RecordSection
+                label="Commendations · Badges"
+                trailing={`${badges.length}`}
+              >
+                <PassportBadgeList badges={badges} />
+              </RecordSection>
+            ) : null}
+
             {visas.length > 0 ? (
               <RecordSection
                 label="Visas · Servers"

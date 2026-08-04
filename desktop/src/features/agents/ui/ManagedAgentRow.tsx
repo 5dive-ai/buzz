@@ -5,14 +5,12 @@ import {
   ChevronDown,
   ChevronRight,
   RefreshCw,
-  Share2,
 } from "lucide-react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import { Badge } from "@/shared/ui/badge";
 import { AgentStatusBadge } from "@/features/agents/ui/AgentStatusBadge";
-import { usesMeshCompute } from "@/features/mesh-compute/meshAgents";
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
 import { useOpenAgentActivity } from "@/features/agents/useOpenAgentActivity";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
@@ -409,23 +407,8 @@ function RuntimeBlock({
       <p className="truncate font-mono text-xs text-foreground">
         {agent.agentCommand}
       </p>
-      {runtimeSource || agent.model || usesMeshCompute(agent) ? (
+      {runtimeSource || agent.model ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-          {/*
-            Where an agent's inference runs is otherwise invisible without
-            opening its config, and "on shared compute" is the one provider
-            whose health the user can actually act on from the sidebar card.
-          */}
-          {usesMeshCompute(agent) ? (
-            <span
-              className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400"
-              data-testid="agent-uses-mesh"
-              title="Runs on Buzz shared compute"
-            >
-              <Share2 aria-hidden className="h-3 w-3" />
-              Shared compute
-            </span>
-          ) : null}
           {runtimeSource ? <span>{runtimeSource}</span> : null}
           {agent.model ? <span>{agent.model}</span> : null}
         </div>

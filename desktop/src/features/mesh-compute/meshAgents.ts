@@ -1,88 +1,66 @@
-import type { AgentPersona } from "@/shared/api/types";
+import type { ManagedAgent } from "@/shared/api/types";
 
 /**
  * Which agents are set up to run on Buzz shared compute.
  *
- * A persona points at the mesh by carrying `provider === "relay-mesh"` — the
- * same id the backend gates mesh model discovery on
- * (`managed_agents::RELAY_MESH_PROVIDER_ID`), so this asks the persistent
- * record rather than inferring intent from a model string.
+ * ## Why this reads `ManagedAgent`, not `AgentPersona`
  *
- * The point is a call to action: sharing compute that no agent can use is a
- * dead end, and the card is where someone would notice. So the card needs to
- * know not just *whether* mesh agents exist but whether the whole setup is
- * inert — capacity with no consumer, or a consumer with no capacity.
+ * The mesh provider is usually set at the **global** layer
+ * (`global-agent-config.json`), not per agent — a persona's own `provider`
+ * field is null in that common case, so asking a persona "are you a mesh
+ * agent?" answers "no" for every agent on a machine whose global default is
+ * `relay-mesh`. That was the original bug here.
+ *
+ * Rust already resolves the layering (definition → global for linked
+ * instances, instance → global for definition-less ones) in
+ * `effective_config::resolve_effective_config`, and `runtime.rs` builds the
+ * `ManagedAgent` DTO from that resolved value. So this file consumes the
+ * resolved field and deliberately holds **no precedence rules of its own** —
+ * a second copy of that layering would drift from the one in Rust.
  */
 
-/** The provider id a persona carries when it runs on shared compute. */
+/** The provider id an agent carries when it runs on shared compute. */
 export const RELAY_MESH_PROVIDER_ID = "relay-mesh";
 
-export type MeshAgentSummary = {
-  /** Agents configured to run on shared compute. */
-  count: number;
-  /** Display names, for naming one specifically. Sorted for stable copy. */
-  names: string[];
-  /** True when at least one such agent exists. */
-  hasAny: boolean;
-};
-
-export function summarizeMeshAgents(
-  personas: AgentPersona[] | undefined,
-): MeshAgentSummary {
-  const matching = (personas ?? []).filter(
-    (persona) => persona.provider?.trim() === RELAY_MESH_PROVIDER_ID,
-  );
-  const names = matching
-    .map((persona) => persona.displayName)
-    .sort((a, b) => a.localeCompare(b));
-  return { count: matching.length, names, hasAny: matching.length > 0 };
-}
-
 /**
- * Whether a given persona runs on shared compute.
+ * Whether an agent runs on shared compute.
  *
- * Used to decorate an agent wherever it appears, so "this one is running on the
- * mesh" is legible without opening its config.
+ * Takes the resolved `provider` off a `ManagedAgent`; never re-derives it.
  */
 export function usesMeshCompute(
-  persona: Pick<AgentPersona, "provider"> | null | undefined,
+  agent: Pick<ManagedAgent, "provider"> | null | undefined,
 ): boolean {
-  return persona?.provider?.trim() === RELAY_MESH_PROVIDER_ID;
+  return agent?.provider?.trim() === RELAY_MESH_PROVIDER_ID;
 }
 
 /**
- * The card's call to action, or null when none is warranted.
+ * The card's call to action, or `none` when none is warranted.
  *
  * Deliberately silent in the common case. A nudge that appears every time the
  * card renders becomes furniture, so this only speaks when the setup is
- * genuinely incomplete in a way the person can act on:
- *
- *   - sharing (or capacity exists) but no agent can use it → offer to make one
- *   - an agent exists but nothing is shared anywhere       → offer to share
- *
- * Returns null while the picture is still unknown (`personas === undefined`),
- * because prompting someone to create an agent they may already have is worse
- * than staying quiet for a moment.
+ * genuinely incomplete in a way the person can act on: there is compute to use
+ * and nothing set up to use it.
  */
 export type MeshCallToAction =
   | { kind: "createAgent"; label: string }
   | { kind: "none" };
 
 export function deriveMeshCallToAction({
-  personas,
+  agents,
   isSharing,
   meshHasCapacity,
 }: {
-  personas: AgentPersona[] | undefined;
+  /** Resolved agent list. `undefined` while still loading. */
+  agents: ManagedAgent[] | undefined;
   isSharing: boolean;
   /** Anyone in the community is sharing, including this machine. */
   meshHasCapacity: boolean;
 }): MeshCallToAction {
   // Unknown yet — say nothing rather than nudge toward a duplicate.
-  if (personas === undefined) {
+  if (agents === undefined) {
     return { kind: "none" };
   }
-  if (summarizeMeshAgents(personas).hasAny) {
+  if (agents.some(usesMeshCompute)) {
     return { kind: "none" };
   }
   // Compute with no consumer is the dead end worth naming. Only prompt when

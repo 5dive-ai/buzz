@@ -8,7 +8,7 @@ import { meshStartNode, meshStopNode } from "@/shared/api/tauriMesh";
 import type { MeshModelCatalog } from "@/shared/api/tauriMesh";
 import { meshModelCatalog } from "@/shared/api/tauriMesh";
 
-import { usePersonasQuery } from "@/features/agents/hooks";
+import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import { requestOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
 import { deriveMeshCallToAction } from "../meshAgents";
 import { useMeshDownloadProgress } from "../hooks/useMeshDownloadProgress";
@@ -103,11 +103,12 @@ export function SidebarMeshComputeCard({
     useMeshDownloadProgress();
 
   // Sharing compute no agent can use is a dead end, and this card is where
-  // someone would notice. The CTA stays silent unless the setup is actually
-  // incomplete — see deriveMeshCallToAction.
-  const { data: personas } = usePersonasQuery();
+  // someone would notice. Reads the resolved `provider` off ManagedAgent, not
+  // a persona's raw field: the mesh provider is usually set globally, so the
+  // persona value is null for most mesh agents. See meshAgents.ts.
+  const { data: managedAgents } = useManagedAgentsQuery();
   const callToAction = deriveMeshCallToAction({
-    personas,
+    agents: managedAgents,
     isSharing: toggle.isSharing,
     meshHasCapacity: (snapshot?.sharingDeviceCount ?? 0) > 0,
   });
@@ -275,13 +276,22 @@ export function SidebarMeshComputeCard({
         />
 
         {callToAction.kind === "createAgent" ? (
+          // A tip, not a warning: there is compute here and nothing set up to
+          // use it. The dot pulses to catch the eye once, then the tip simply
+          // disappears the moment a mesh agent exists.
           <button
-            className="mt-2 text-2xs font-medium text-foreground/80 underline-offset-2 transition-colors hover:text-foreground hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+            className="mt-2 flex w-full items-center gap-1.5 rounded-md border border-border/60 bg-background/60 px-2 py-1.5 text-left text-2xs font-medium text-foreground/80 transition-colors hover:border-border hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
             data-testid="mesh-card-create-agent"
             onClick={() => requestOpenCreateAgent()}
             type="button"
           >
-            {callToAction.label}
+            <span className="relative flex h-1.5 w-1.5 shrink-0">
+              {shouldReduceMotion ? null : (
+                <span className="absolute h-1.5 w-1.5 animate-ping rounded-full bg-amber-500 dark:bg-amber-400" />
+              )}
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-500 dark:bg-amber-400" />
+            </span>
+            <span className="min-w-0 truncate">{callToAction.label}</span>
           </button>
         ) : null}
 

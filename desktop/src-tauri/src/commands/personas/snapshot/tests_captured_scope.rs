@@ -16,7 +16,6 @@ use crate::app_state::{build_app_state, AppState};
 use crate::commands::personas::snapshot::import::capture_agent_snapshot_import_entry;
 use crate::managed_agents::scope::{
     current_scope_generation, next_scope_generation, WorkspaceAgentScope,
-    SCOPE_GENERATION_TEST_LOCK,
 };
 
 fn make_scope_with_keys(tmp: &tempfile::TempDir, owner_keys: &nostr::Keys) -> WorkspaceAgentScope {

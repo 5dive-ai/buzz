@@ -91,12 +91,20 @@ async fn test_active_client_stop_then_transition_preflight_succeeds() {
 /// the lock is held), the install task acquires the lock and detects the stale
 /// captured scope without invoking the install closure.
 ///
-/// Both sides use production helpers — no direct `workspace_transition` lock
-/// acquisition.  Channels establish entry/release ordering without `sleep`.
+/// Handshake:
+///   1. Transition task acquires the lock, signals "lock_held" BEFORE committing
+///      scope B (so install's captured scope is still valid at its capture time).
+///   2. Install task spawns, calls `install_client_under_workspace_transition`
+///      with a pre-acquisition hook that signals "at_lock_boundary", then
+///      blocks on `workspace_transition.lock().await`.
+///   3. Test waits for "at_lock_boundary", then sends "release" to the
+///      transition body. The body commits scope B and returns, releasing the lock.
+///   4. Install task acquires the lock, re-validates scope, detects the stale
+///      generation, returns Err without invoking the install closure.
 ///
-/// Proves the first serialization direction: a workspace switch (transition
-/// side) commits between scope-capture and install lock-acquisition; the
-/// install helper must reject the stale scope under the lock.
+/// Invariant: if the contender could bypass the lock, it would acquire before
+/// the transition commits scope B, see a valid scope, and invoke the install
+/// closure — `install_was_called` would be true and the assertion would fail.
 #[tokio::test]
 async fn test_transition_held_queued_install_detects_stale_scope() {
     use crate::managed_agents::scope::{
@@ -130,23 +138,32 @@ async fn test_transition_held_queued_install_detects_stale_scope() {
         WorkspaceAgentScope::new(relay_a.to_string(), owner_a.clone(), &base, gen_a);
     state.commit_active_scope(captured_scope.clone());
 
-    // Channels: transition body signals "entered" once it holds the lock;
-    // test unblocks the body once the install task is queued.
-    let (body_entered_tx, body_entered_rx) = oneshot::channel::<()>();
+    // Channels:
+    //   lock_held:         transition body → test  (lock acquired, scope NOT yet committed)
+    //   at_lock_boundary:  install hook → test     (install is about to call lock().await)
+    //   body_release:      test → transition body  (ok to commit scope B and release)
+    let (lock_held_tx, lock_held_rx) = oneshot::channel::<()>();
+    let (at_lock_boundary_tx, at_lock_boundary_rx) = oneshot::channel::<()>();
     let (body_release_tx, body_release_rx) = oneshot::channel::<()>();
 
-    // ── Side A: transition side uses the production helper ───────────────────
-    // The body holds the lock, advances the scope, signals entry, then blocks
-    // until unblocked by the test — proving the hold is production-owned.
+    // ── Side A: transition side — signals lock_held BEFORE committing scope B ─
     let app_a = app_handle.clone();
     let base_a = base.clone();
     let transition_task = tokio::task::spawn(async move {
         let app_a_ref = app_a.clone();
         super::scope_impl::with_workspace_transition_preflight(&app_a_ref, move || {
             Box::pin(async move {
-                // Advance generation and commit a DISTINCT scope (different relay)
-                // to simulate a committed workspace switch while the lock is held.
                 let state_a = app_a.state::<crate::app_state::AppState>();
+
+                // Signal "lock held" BEFORE committing scope B.
+                // The install task captures its scope before this point;
+                // only after it queues at the lock does the holder commit B.
+                let _ = lock_held_tx.send(());
+
+                // Wait for the install task to queue at the lock boundary.
+                let _ = body_release_rx.await;
+
+                // Now commit scope B (advances generation, install sees stale).
                 let gen_b = next_scope_generation();
                 let new_scope = WorkspaceAgentScope::new(
                     "wss://transition-test-b.example".to_string(),
@@ -156,30 +173,29 @@ async fn test_transition_held_queued_install_detects_stale_scope() {
                 );
                 state_a.commit_active_scope(new_scope);
 
-                // Signal: holding the lock with committed scope change.
-                let _ = body_entered_tx.send(());
-                // Block until the test confirms the install task has queued.
-                let _ = body_release_rx.await;
-
                 Ok::<(), String>(())
             })
         })
         .await
     });
 
-    // Wait until the transition body signals it has the lock.
-    body_entered_rx
+    // Wait until the transition body holds the lock (before scope B is committed).
+    lock_held_rx
         .await
-        .expect("transition body must signal entry");
+        .expect("transition body must signal lock_held");
 
-    // ── Side B: install side uses the production helper ──────────────────────
+    // ── Side B: install side — pre-acquisition hook signals at_lock_boundary ──
     let install_was_called = Arc::new(AtomicBool::new(false));
     let install_called_clone = Arc::clone(&install_was_called);
     let app_b = app_handle.clone();
     let install_task = tokio::task::spawn(async move {
-        super::scope_impl::install_client_under_workspace_transition(
+        super::scope_impl::install_client_under_workspace_transition_with_hook(
             &app_b,
             &captured_scope,
+            // pre-acquisition hook: fires before lock().await — signals "queued".
+            move || {
+                let _ = at_lock_boundary_tx.send(());
+            },
             || {
                 let called = Arc::clone(&install_called_clone);
                 async move {
@@ -191,10 +207,13 @@ async fn test_transition_held_queued_install_detects_stale_scope() {
         .await
     });
 
-    // Yield to let the install task queue on the lock.
-    tokio::task::yield_now().await;
+    // Wait for install to reach the lock boundary, then unblock the transition.
+    at_lock_boundary_rx
+        .await
+        .expect("install hook must signal at_lock_boundary");
 
-    // Unblock the transition body → it releases the lock → install acquires it.
+    // Unblock the transition body → it commits scope B, releases the lock →
+    // install acquires the lock, detects stale scope, returns Err.
     let _ = body_release_tx.send(());
 
     let install_result = install_task.await.expect("install task must not panic");
@@ -226,12 +245,22 @@ async fn test_transition_held_queued_install_detects_stale_scope() {
 /// install body completes, the transition task acquires the lock, runs
 /// `fail_if_client_mesh_active`, and observes the installed client.
 ///
-/// Both sides use production helpers — no direct `workspace_transition` lock
-/// acquisition.  Channels establish entry/release ordering without `sleep`.
+/// Handshake:
+///   1. Install task acquires the lock, signals "lock_held" BEFORE installing the
+///      client runtime (so the client is not yet visible to the contender).
+///   2. Transition task calls `with_workspace_transition_preflight` with a
+///      pre-acquisition hook that signals "at_lock_boundary", then blocks on
+///      `workspace_transition.lock().await`.
+///   3. Test waits for "at_lock_boundary", then sends "release" to the
+///      install closure. The closure installs the client and returns, releasing
+///      the lock.
+///   4. Transition task acquires the lock, runs `fail_if_client_mesh_active`,
+///      observes the installed client, returns Err.
 ///
-/// Proves the second serialization direction: a client install commits between
-/// the transition's pre-lock preflight and its lock-acquisition; the transition
-/// helper must observe the installed client under the lock and fail.
+/// Invariant: if the contender could bypass the lock, it would run
+/// `fail_if_client_mesh_active` before the client is installed — seeing no
+/// client — and return Ok. The `transition_result.is_err()` assertion would
+/// then fail, proving the lock is not enforced.
 #[tokio::test]
 async fn test_install_held_transition_preflight_observes_client() {
     use crate::managed_agents::scope::{
@@ -262,14 +291,15 @@ async fn test_install_held_transition_preflight_observes_client() {
     let scope = WorkspaceAgentScope::new(relay.to_string(), owner.clone(), &base, gen);
     state.commit_active_scope(scope.clone());
 
-    // Channels: install body signals "entered + client installed" once it holds
-    // the lock; test unblocks the body once the transition task is queued.
-    let (install_entered_tx, install_entered_rx) = oneshot::channel::<()>();
+    // Channels:
+    //   lock_held:        install body → test  (lock acquired, client NOT yet installed)
+    //   at_lock_boundary: transition hook → test (transition is about to call lock().await)
+    //   install_release:  test → install body   (ok to install client and release lock)
+    let (lock_held_tx, lock_held_rx) = oneshot::channel::<()>();
+    let (at_lock_boundary_tx, at_lock_boundary_rx) = oneshot::channel::<()>();
     let (install_release_tx, install_release_rx) = oneshot::channel::<()>();
 
-    // ── Side A: install side uses the production helper ──────────────────────
-    // The install closure installs a mock client, signals entry, then blocks
-    // until unblocked — proving the client is committed under the lock.
+    // ── Side A: install side — signals lock_held BEFORE installing the client ─
     let app_a = app_handle.clone();
     let scope_a = scope.clone();
     let install_task = tokio::task::spawn(async move {
@@ -278,15 +308,18 @@ async fn test_install_held_transition_preflight_observes_client() {
             &app_a,
             &scope_a,
             move || async move {
-                // Install the mock client runtime while holding the lock.
+                // Signal "lock held" BEFORE installing the client.
+                // The transition task captures its pre-lock state before this
+                // point; only after it queues does the install closure install.
+                let _ = lock_held_tx.send(());
+
+                // Wait for the transition task to queue at the lock boundary.
+                let _ = install_release_rx.await;
+
+                // Now install the mock client runtime under the held lock.
                 let state_a = app_a_for_closure.state::<crate::app_state::AppState>();
                 let client_runtime = crate::mesh_llm::build_mock_client_runtime_for_test();
                 *state_a.mesh_llm_runtime.lock().await = Some(client_runtime);
-
-                // Signal: lock held, client installed.
-                let _ = install_entered_tx.send(());
-                // Block until the test confirms the transition task has queued.
-                let _ = install_release_rx.await;
 
                 Ok::<(), String>(())
             },
@@ -294,24 +327,32 @@ async fn test_install_held_transition_preflight_observes_client() {
         .await
     });
 
-    // Wait until the install body signals it has the lock with the client installed.
-    install_entered_rx
+    // Wait until the install body holds the lock (before client is installed).
+    lock_held_rx
         .await
-        .expect("install body must signal entry");
+        .expect("install body must signal lock_held");
 
-    // ── Side B: transition side uses the production helper ───────────────────
+    // ── Side B: transition side — pre-acquisition hook signals at_lock_boundary
     let app_b = app_handle.clone();
     let transition_task = tokio::task::spawn(async move {
-        super::scope_impl::with_workspace_transition_preflight(&app_b, || {
-            Box::pin(async { Ok::<&str, String>("body ran") })
-        })
+        super::scope_impl::with_workspace_transition_preflight_with_hook(
+            &app_b,
+            // pre-acquisition hook: fires before lock().await — signals "queued".
+            move || {
+                let _ = at_lock_boundary_tx.send(());
+            },
+            || Box::pin(async { Ok::<&str, String>("body ran") }),
+        )
         .await
     });
 
-    // Yield to let the transition task queue on the lock.
-    tokio::task::yield_now().await;
+    // Wait for transition to reach the lock boundary, then unblock the install.
+    at_lock_boundary_rx
+        .await
+        .expect("transition hook must signal at_lock_boundary");
 
-    // Unblock the install body → it releases the lock → transition acquires it.
+    // Unblock the install closure → it installs the client, releases the lock →
+    // transition acquires the lock, observes the client, returns Err.
     let _ = install_release_tx.send(());
 
     install_task

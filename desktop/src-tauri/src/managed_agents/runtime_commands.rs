@@ -236,7 +236,21 @@ pub(crate) fn start_managed_agent_runtime_pair_lazy(
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    start_pair(pubkey, relay_url, true, None, app)
+    start_pair_lazy_for(pubkey, relay_url, app)
+}
+
+/// Generic start-pair-lazy seam shared by the production adapter and tests.
+///
+/// Acquires `managed_agent_runtime_transition` as its first action — the same
+/// lock that `stop`, `restart`, and `drain` operations hold, serialising all
+/// runtime mutations. Tests that need a mock-runtime contender call this
+/// function directly instead of the non-generic production adapter.
+pub(crate) fn start_pair_lazy_for<R: tauri::Runtime>(
+    pubkey: String,
+    relay_url: String,
+    app: tauri::AppHandle<R>,
+) -> Result<ManagedAgentRuntimeStatus, String> {
+    start_pair_for(pubkey, relay_url, true, None, app)
 }
 
 #[tauri::command]
@@ -254,6 +268,16 @@ fn start_pair(
     lazy: bool,
     expected_updated_at: Option<&str>,
     app: AppHandle,
+) -> Result<ManagedAgentRuntimeStatus, String> {
+    start_pair_for(pubkey, relay_url, lazy, expected_updated_at, app)
+}
+
+fn start_pair_for<R: tauri::Runtime>(
+    pubkey: String,
+    relay_url: String,
+    lazy: bool,
+    expected_updated_at: Option<&str>,
+    app: tauri::AppHandle<R>,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     let state = app.state::<AppState>();
     let _transition = state
@@ -883,32 +907,45 @@ where
 
 /// Production adapter for [`compensate_drain_for`].
 ///
-/// Lock acquisition order inside this function:
-///   1. `_rt_transition_held` — already held by caller (passed by value).
-///   2. Acquire `managed_agents_store_lock` — store-lock-only writers
-///      (instance edits, status flushes) are serialized here, not on the
-///      transition guard.
-///   3. Validate `captured_scope.generation` under the store lock.
-///   4. `load_managed_agents_at` — records loaded AFTER both locks held.
-///   5. Delegate to [`compensate_drain_for`] — store guard held through
-///      every save performed by `start_pair_under_held_locks`.
+/// Delegates to [`compensate_drain_with_hook`] with a no-op hook.
+/// Lock acquisition order: transition guard already held → store lock acquired
+/// → hook fires (no-op in production) → validate generation → load → restore/save.
 pub(crate) fn compensate_drain<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     stopped: &[DrainJournalEntry],
     captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
-    // Caller passes ownership of the already-held transition guard so the lock
-    // is never dropped between drain and compensation.
     _rt_transition_held: std::sync::MutexGuard<'_, ()>,
 ) -> Option<String> {
+    compensate_drain_with_hook(app, stopped, captured_scope, _rt_transition_held, || {})
+}
+
+/// Inner implementation of [`compensate_drain`] with an injectable
+/// `on_store_acquired` hook.
+///
+/// Lock acquisition order:
+///   1. `_rt_transition_held` — already held by caller (passed by value).
+///   2. Acquire `managed_agents_store_lock`.
+///   3. Call `on_store_acquired` (no-op in production; tests inject a closure
+///      that writes a sentinel and synchronises with a writer thread to prove
+///      genuine store-lock contention).
+///   4. Validate `captured_scope.generation` under the store lock.
+///   5. `load_managed_agents_at` — records loaded AFTER both locks held.
+///   6. Delegate to [`compensate_drain_for`] — store guard held through every
+///      save performed by `start_pair_under_held_locks`.
+pub(crate) fn compensate_drain_with_hook<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    stopped: &[DrainJournalEntry],
+    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
+    _rt_transition_held: std::sync::MutexGuard<'_, ()>,
+    on_store_acquired: impl FnOnce(),
+) -> Option<String> {
     if stopped.is_empty() {
-        // Release the transition guard immediately — nothing to restore.
         drop(_rt_transition_held);
         return None;
     }
 
     let state = app.state::<AppState>();
 
-    // 2. Acquire the store lock — transition already held via _rt_transition_held.
     let _store = match state.managed_agents_store_lock.lock() {
         Ok(g) => g,
         Err(e) => {
@@ -918,10 +955,10 @@ pub(crate) fn compensate_drain<R: tauri::Runtime>(
         }
     };
 
-    // 3. Validate the captured scope before restoring. If the workspace switched
-    // between the drain failure and this compensation, the new scope's own
-    // restore pass will start the correct agents — we must not restart agents
-    // for a scope that is no longer active.
+    // 3. Fire the hook while both locks are held. No-op in production.
+    on_store_acquired();
+
+    // 4. Validate the captured scope under the store lock.
     if let Err(stale_msg) = crate::managed_agents::scope::validate_scope_generation(captured_scope)
     {
         return Some(format!(
@@ -929,7 +966,7 @@ pub(crate) fn compensate_drain<R: tauri::Runtime>(
         ));
     }
 
-    // 4. Load records under the held store lock.
+    // 5. Load records under the held store lock.
     let mut records = match load_managed_agents_at(&captured_scope.definitions_dir) {
         Ok(r) => r,
         Err(e) => {
@@ -939,7 +976,7 @@ pub(crate) fn compensate_drain<R: tauri::Runtime>(
         }
     };
 
-    // 5. Delegate to the lock-free core — store guard is held through every save.
+    // 6. Delegate — store guard held through every save.
     compensate_drain_for(stopped, &mut records, |entry, recs| {
         start_pair_under_held_locks(
             app,

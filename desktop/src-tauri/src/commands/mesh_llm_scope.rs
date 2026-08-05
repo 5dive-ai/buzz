@@ -102,15 +102,8 @@ pub(crate) async fn fail_if_client_mesh_active<R: tauri::Runtime>(
 /// `fail_if_client_mesh_active` preflight, then invoke `transition_body` while
 /// the guard remains held.
 ///
-/// Used by `apply_workspace`, live identity import, and tests to prove the
-/// serialization contract against `install_client_under_workspace_transition`.
-///
-/// `transition_body` is an async closure (returns a `BoxFuture`) so that
-/// production callers that dispatch `tokio::task::spawn_blocking` and await the
-/// result keep the guard alive across the dispatch. Tests may pass a simple
-/// sync-compatible closure via `|| Box::pin(async { Ok("done") })`.
-///
-/// If the preflight fails, `transition_body` is never called.
+/// Delegates to [`with_workspace_transition_preflight_with_hook`] with a no-op
+/// pre-acquisition hook. See that function for full documentation.
 pub(crate) async fn with_workspace_transition_preflight<R, F, T>(
     app: &AppHandle<R>,
     transition_body: F,
@@ -119,7 +112,31 @@ where
     R: tauri::Runtime,
     F: FnOnce() -> BoxFuture<'static, Result<T, String>>,
 {
+    with_workspace_transition_preflight_with_hook(app, || {}, transition_body).await
+}
+
+/// Inner implementation of [`with_workspace_transition_preflight`] with an
+/// injectable `pre_acquisition_hook`.
+///
+/// `pre_acquisition_hook` fires once, synchronously, immediately before
+/// `workspace_transition.lock().await`. In production this is `|| {}`; tests
+/// inject a closure that signals "I'm about to acquire" so the test can
+/// establish a deterministic ordering between holder and contender.
+///
+/// This is `pub(crate)` so tests in `mesh_llm_transition_tests` can drive the
+/// exact lock-acquisition boundary while remaining invisible to external callers.
+pub(crate) async fn with_workspace_transition_preflight_with_hook<R, H, F, T>(
+    app: &AppHandle<R>,
+    pre_acquisition_hook: H,
+    transition_body: F,
+) -> Result<T, String>
+where
+    R: tauri::Runtime,
+    H: FnOnce(),
+    F: FnOnce() -> BoxFuture<'static, Result<T, String>>,
+{
     let state = app.state::<AppState>();
+    pre_acquisition_hook();
     let _transition_guard = state.workspace_transition.lock().await;
 
     // Fail closed if a client-mode Mesh runtime is active.
@@ -152,13 +169,8 @@ where
 /// identity under the guard — `(scope_id, normalized relay, owner_pubkey,
 /// generation)` — then call the injected `install` closure.
 ///
-/// Fails if:
-/// - no active scope exists at the time of validation;
-/// - any identity field of the captured scope differs from the current active scope;
-/// - the generation counter has advanced (a workspace switch occurred).
-///
-/// Used by `ensure_relay_mesh_for_record` after capturing scope + discovering
-/// the bootstrap target. Tests inject `install` directly so no port is touched.
+/// Delegates to [`install_client_under_workspace_transition_with_hook`] with a
+/// no-op pre-acquisition hook. See that function for full documentation.
 pub(crate) async fn install_client_under_workspace_transition<R, I, Fut>(
     app: &AppHandle<R>,
     captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
@@ -169,7 +181,38 @@ where
     I: FnOnce() -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
+    install_client_under_workspace_transition_with_hook(app, captured_scope, || {}, install).await
+}
+
+/// Inner implementation of [`install_client_under_workspace_transition`] with an
+/// injectable `pre_acquisition_hook`.
+///
+/// `pre_acquisition_hook` fires once, synchronously, immediately before
+/// `workspace_transition.lock().await`. In production this is `|| {}`; tests
+/// inject a closure that signals "I'm about to acquire" so the test can
+/// establish a deterministic ordering between holder and contender.
+///
+/// Fails if:
+/// - no active scope exists at the time of validation;
+/// - any identity field of the captured scope differs from the current active scope;
+/// - the generation counter has advanced (a workspace switch occurred).
+///
+/// This is `pub(crate)` so tests in `mesh_llm_transition_tests` can drive the
+/// exact lock-acquisition boundary while remaining invisible to external callers.
+pub(crate) async fn install_client_under_workspace_transition_with_hook<R, H, I, Fut>(
+    app: &AppHandle<R>,
+    captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
+    pre_acquisition_hook: H,
+    install: I,
+) -> Result<(), String>
+where
+    R: tauri::Runtime,
+    H: FnOnce(),
+    I: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
     let state = app.state::<AppState>();
+    pre_acquisition_hook();
     let _transition_guard = state.workspace_transition.lock().await;
 
     // Validate the captured scope's generation and full identity under the guard.

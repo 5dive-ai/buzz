@@ -222,6 +222,12 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
     let spawn_got_nonempty_teams = Arc::new(Mutex::new(false));
     let spawn_got_nonempty_global = Arc::new(Mutex::new(false));
     let receipt_called = Arc::new(Mutex::new(false));
+    // Capture all receipt fields for post-completion assertions.
+    let receipt_pubkey = Arc::new(Mutex::new(None::<String>));
+    let receipt_relay = Arc::new(Mutex::new(None::<String>));
+    let receipt_pid = Arc::new(Mutex::new(0u32));
+    let receipt_instance_id = Arc::new(Mutex::new(String::new()));
+    let receipt_started_at = Arc::new(Mutex::new(String::new()));
 
     let stop_called2 = stop_called.clone();
     let spawn_relay2 = spawn_relay.clone();
@@ -230,9 +236,15 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
     let spawn_teams2 = spawn_got_nonempty_teams.clone();
     let spawn_global2 = spawn_got_nonempty_global.clone();
     let receipt_called2 = receipt_called.clone();
+    let receipt_pubkey2 = receipt_pubkey.clone();
+    let receipt_relay2 = receipt_relay.clone();
+    let receipt_pid2 = receipt_pid.clone();
+    let receipt_iid2 = receipt_instance_id.clone();
+    let receipt_sat2 = receipt_started_at.clone();
     let pubkey2 = pubkey.clone();
 
     let app_handle_for_assert = app_handle.clone();
+    let pubkey_for_assert = pubkey.clone();
     let result = tokio::task::spawn_blocking(move || {
         restart_under_captured_epoch_for(
             &app_handle,
@@ -273,9 +285,15 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
                     job: None,
                 })
             },
-            // write_receipt_fn: record the call, verify pubkey, succeed.
+            // write_receipt_fn: record all receipt fields for post-completion assertions.
+            // Full key (pubkey + relay_url), pid, desktop_instance_id, started_at.
             move |_app, receipt| {
                 *receipt_called2.lock().unwrap() = true;
+                *receipt_pubkey2.lock().unwrap() = Some(receipt.key.pubkey.clone());
+                *receipt_relay2.lock().unwrap() = Some(receipt.key.relay_url.clone());
+                *receipt_pid2.lock().unwrap() = receipt.pid;
+                *receipt_iid2.lock().unwrap() = receipt.desktop_instance_id.clone();
+                *receipt_sat2.lock().unwrap() = receipt.started_at.clone();
                 assert_eq!(
                     receipt.key.pubkey, pubkey2,
                     "receipt must carry the correct pubkey"
@@ -321,6 +339,36 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
         *receipt_called.lock().unwrap(),
         "write_receipt_fn must be called"
     );
+    // ── Receipt field assertions ──────────────────────────────────────────────
+    // A full relay-bearing key: pubkey + relay_url.
+    assert_eq!(
+        receipt_pubkey.lock().unwrap().as_deref(),
+        Some(pubkey_for_assert.as_str()),
+        "receipt.key.pubkey must match the restarted agent"
+    );
+    assert_eq!(
+        receipt_relay.lock().unwrap().as_deref(),
+        Some(relay_url),
+        "receipt.key.relay_url must match the captured relay; fails if the spawn path \
+         builds the receipt with an empty or wrong relay"
+    );
+    assert!(
+        *receipt_pid.lock().unwrap() > 0,
+        "receipt.pid must be non-zero (a real spawned child PID)"
+    );
+    // Assert receipt.desktop_instance_id equals the actual value produced by
+    // current_instance_id(app) — proves the field is sourced from the app
+    // handle, not left empty or set to a hardcoded value.
+    let expected_instance_id = app_handle_for_assert.config().identifier.clone();
+    assert_eq!(
+        receipt_instance_id.lock().unwrap().as_str(),
+        expected_instance_id.as_str(),
+        "receipt.desktop_instance_id must equal current_instance_id(app)"
+    );
+    assert!(
+        !receipt_started_at.lock().unwrap().is_empty(),
+        "receipt.started_at must be a non-empty ISO timestamp"
+    );
     // Verify the runtime is registered with the captured scope_id.
     {
         let state = app_handle_for_assert.state::<crate::app_state::AppState>();
@@ -333,12 +381,27 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
             "runtime must be registered with the captured scope_id"
         );
     }
-    // Verify the final captured disk record: the agent is present in the store.
+    // ── Final disk record assertions ──────────────────────────────────────────
+    // The restart-produced state: last_started_at set, last_stopped_at cleared,
+    // last_error cleared. Fails if the post-spawn save is removed or if the
+    // record-update block is bypassed.
     let final_records =
         crate::managed_agents::storage::load_managed_agents_at(tmp.path()).unwrap_or_default();
+    let final_rec = final_records
+        .iter()
+        .find(|r| r.pubkey == pubkey_for_assert)
+        .expect("final disk record must contain the restarted agent");
     assert!(
-        final_records.iter().any(|r| r.pubkey == "bb".repeat(32)),
-        "final disk record must contain the restarted agent"
+        final_rec.last_started_at.is_some(),
+        "last_started_at must be Some after a successful restart (set by post-spawn record update)"
+    );
+    assert!(
+        final_rec.last_stopped_at.is_none(),
+        "last_stopped_at must be None after restart (cleared by post-spawn record update)"
+    );
+    assert!(
+        final_rec.last_error.is_none(),
+        "last_error must be None after a successful restart (cleared by post-spawn record update)"
     );
 }
 

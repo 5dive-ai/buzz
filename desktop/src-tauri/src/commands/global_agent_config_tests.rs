@@ -512,32 +512,30 @@ async fn test_workspace_switch_after_preflight_aborts_before_stop() {
 /// A record-level Mesh model change after preflight (without advancing workspace
 /// generation) → epoch detects mismatch in re-resolved Mesh model, aborts before stop.
 ///
-/// Thufir's test 4: "drive the async production driver; seed an eligible runtime
-/// via the cross-platform child helper; mutate an actually-participating
-/// record/definition/global input from the injected mesh_fn (which runs in the
-/// pre-stop phase); assert re-resolution detects the mismatch and stop never
-/// fires."
+/// Drives `restart_local_agent_on_config_change_for` — the full async production
+/// driver. The injected `mesh_fn` mutates the on-disk record's `provider` to
+/// `"relay-mesh"` AFTER the driver has already resolved `context.mesh_model_id = None`
+/// (from the original `provider = "anthropic"`). The epoch's in-epoch TOCTOU guard
+/// then re-resolves the mutated record, gets `Some("auto")` ≠ `None`, and fires
+/// `Skipped` before stop.
 ///
-/// The async driver (`restart_local_agent_on_config_change_for`) runs mesh_fn
-/// in the pre-stop phase, captures the `CapturedRestartContext`, then hands off
-/// to `restart_under_captured_epoch_for` (the stop→spawn primitive). We inject
-/// a `mesh_fn` that succeeds but captures `mesh_model_id = Some("model-a")`
-/// into the context by returning Ok — the real driver then stores whatever
-/// the record has at the time of pre-stop resolution into `context.mesh_model_id`.
+/// Flow:
+///   1. Seed record: `provider = "anthropic"`, live runtime.
+///      Pre-stop resolve: `resolve_effective_relay_mesh_model_id` → `None`.
+///      `context.mesh_model_id = None`.
+///   2. `mesh_fn` rewrites `provider = "relay-mesh"` to disk and succeeds.
+///   3. Epoch re-resolves from the mutated record:
+///      `relay_mesh_model_id()` = `Some("auto")` ≠ `None` → TOCTOU guard fires → Skipped.
+///   4. Assert `RestartOutcome::Skipped`; stop_fn must NOT be called.
 ///
-/// To trigger the in-epoch TOCTOU guard:
-/// - The record on disk has `relay_mesh: None` → driver pre-resolves
-///   `mesh_model_id = None`.
-/// - We set `mesh_model_id = Some("model-a")` in an injected post-preflight
-///   hook by calling `restart_under_captured_epoch_for` directly with a context
-///   whose `mesh_model_id` disagrees with the on-disk record.
-///
-/// Approach: use `restart_under_captured_epoch_for` directly (with the
-/// cross-platform long-lived child seeded), so the in-epoch TOCTOU guard fires.
-/// The "async driver drives the TOCTOU guard" variant is covered by the
-/// generation-advance test (`test_workspace_switch_after_preflight_aborts_before_stop`).
+/// Invariant: removing the in-epoch re-resolve guard in
+/// `restart_under_captured_epoch_for` would allow the epoch to proceed with the
+/// old `context.mesh_model_id`, bypass the mismatch — stop would be called
+/// and the test would fail.
 #[tokio::test]
 async fn test_record_mesh_change_after_preflight_aborts_before_stop() {
+    use super::super::restart_local_agent_on_config_change_for;
+    use crate::commands::global_agent_config::RestartOutcome;
     use crate::managed_agents::{
         storage::save_managed_agents_at, BackendKind, ManagedAgentPairRuntime, ManagedAgentRecord,
         ManagedAgentRuntimeKey,
@@ -548,13 +546,9 @@ async fn test_record_mesh_change_after_preflight_aborts_before_stop() {
     let pubkey = "aa".repeat(32);
     let relay_url = "wss://relay.example";
 
-    // Build a Ready record: provider+model in structured fields so the agent
-    // passes the eligibility gate (old_ready = true). ANTHROPIC_API_KEY is
-    // required by buzz_agent_requirements when provider=anthropic, so we set
-    // it in env_vars to satisfy the readiness check. Two globals differ by
-    // one env_var so env_changed = true → should_restart_on_config_change
-    // returns true. relay_mesh: None so the in-epoch re-resolve yields None
-    // while context.mesh_model_id = Some("model-a") → Skipped before stop.
+    // Eligible record: provider=anthropic, model+ANTHROPIC_API_KEY → old_ready=true.
+    // relay_mesh=None so the pre-stop resolve yields mesh_model_id=None.
+    // old_global != new_global (env differ) so env_changed=true → eligible.
     let mut record_env_vars = std::collections::BTreeMap::new();
     record_env_vars.insert(
         "ANTHROPIC_API_KEY".to_string(),
@@ -581,7 +575,7 @@ async fn test_record_mesh_change_after_preflight_aborts_before_stop() {
         parallelism: 1,
         system_prompt: None,
         model: Some("claude-3-5-sonnet-20241022".to_string()),
-        provider: Some("anthropic".to_string()),
+        provider: Some("anthropic".to_string()), // initial provider — not relay-mesh
         persona_source_version: None,
         env_vars: record_env_vars,
         start_on_app_launch: false,
@@ -611,7 +605,7 @@ async fn test_record_mesh_change_after_preflight_aborts_before_stop() {
         definition_respond_to: None,
         definition_respond_to_allowlist: Default::default(),
         definition_parallelism: None,
-        relay_mesh: None, // ← no relay_mesh; re-resolve yields None ≠ Some("model-a")
+        relay_mesh: None, // no relay-mesh marker; pre-stop resolve yields None
         runtime: None,
         name_pool: vec![],
     };
@@ -621,6 +615,17 @@ async fn test_record_mesh_change_after_preflight_aborts_before_stop() {
 
     let app = make_mock_app();
     let app_handle = app.handle().clone();
+
+    // Derive the actual owner pubkey from the mock app's signing keys.
+    // restart_local_agent_on_config_change_for verifies hex == scope.owner_pubkey.
+    let actual_owner_hex = {
+        let state = app_handle.state::<crate::app_state::AppState>();
+        state
+            .signing_keys()
+            .expect("mock app must have signing keys")
+            .public_key()
+            .to_hex()
+    };
 
     // Seed a live runtime with a cross-platform long-lived child (avoids sync eviction).
     let rt_key = ManagedAgentRuntimeKey::new(&pubkey, relay_url).unwrap();
@@ -656,13 +661,13 @@ async fn test_record_mesh_change_after_preflight_aborts_before_stop() {
     let scope = crate::managed_agents::scope::WorkspaceAgentScope {
         scope_id: "test-scope".to_string(),
         relay_url: relay_url.to_string(),
-        owner_pubkey: "aa".repeat(32),
+        owner_pubkey: actual_owner_hex,
         definitions_dir: tmp.path().to_path_buf(),
         generation: gen,
     };
 
     // old_global and new_global differ by one env_var so env_changed = true
-    // (eligibility gate passes) while the record's relay_mesh stays None.
+    // (eligibility gate passes) while the record's provider stays anthropic.
     let mut new_global_env = std::collections::BTreeMap::new();
     new_global_env.insert("SOME_EXTRA_KEY".to_string(), "v2".to_string());
     let old_global = crate::managed_agents::GlobalAgentConfig::default();
@@ -671,62 +676,61 @@ async fn test_record_mesh_change_after_preflight_aborts_before_stop() {
         ..Default::default()
     };
 
-    // Build a context that claims `mesh_model_id = Some("model-a")`, but
-    // the actual records on disk have no relay_mesh config, so the epoch's
-    // re-resolve will return None — triggering the TOCTOU mismatch guard.
-    let context_with_mesh = CapturedRestartContext {
-        scope: scope.clone(),
-        personas: vec![],
-        teams: vec![],
-        global: old_global.clone(),
-        owner_hex: "aa".repeat(32),
-        mesh_model_id: Some("model-a".to_string()),
-    };
-
     let stop_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_called2 = stop_called.clone();
+    let tmp_path = tmp.path().to_path_buf();
+    let pubkey_clone = pubkey.clone();
 
-    // Call the epoch core directly — mesh_fn is not involved here since
-    // we're testing the in-epoch TOCTOU check that re-resolves relay_mesh.
-    // This exercises the same code path that the async driver reaches after
-    // mesh_fn completes: stop→spawn epoch with pre-captured context.
-    let result = tokio::task::spawn_blocking(move || {
-        restart_under_captured_epoch_for(
-            &app_handle,
-            &pubkey,
-            &old_global,
-            &new_global,
-            &[],
-            &context_with_mesh,
-            move |_app, _rec, _runtimes| {
-                stop_called2.store(true, std::sync::atomic::Ordering::SeqCst);
-                Err("stop_fn called unexpectedly".to_string())
-            },
-            |_app, _rec, _relay, _owner, _personas, _global, _teams| {
-                Err("spawn not expected".to_string())
-            },
-            |_app, _receipt| Err("receipt not expected".to_string()),
-        )
-    })
-    .await
-    .expect("spawn_blocking must not panic");
+    // Drive the full async production driver. The mesh_fn mutates the on-disk
+    // record's provider to "relay-mesh" AFTER the driver has resolved
+    // context.mesh_model_id = None (provider was "anthropic" at resolve time).
+    // The epoch then re-resolves the mutated record and gets Some("auto") != None
+    // -> TOCTOU guard fires -> Skipped before stop.
+    let outcome = restart_local_agent_on_config_change_for(
+        &app_handle,
+        &pubkey,
+        &old_global,
+        &new_global,
+        &[],
+        &scope,
+        tmp.path(),
+        // mesh_fn: rewrites provider to "relay-mesh" on disk, then succeeds.
+        // The driver already captured context.mesh_model_id=None from the
+        // original provider="anthropic" record — this mutation happens after.
+        move |_app, _model| {
+            let mut records = crate::managed_agents::storage::load_managed_agents_at(&tmp_path)
+                .unwrap_or_default();
+            for r in &mut records {
+                if r.pubkey == pubkey_clone {
+                    r.provider = Some("relay-mesh".to_string());
+                }
+            }
+            let _ = crate::managed_agents::storage::save_managed_agents_at(&tmp_path, &records);
+            Box::pin(async { Ok(()) })
+        },
+        // stop_fn: must NOT be called — TOCTOU guard fires before stop.
+        move |_app, _rec, _runtimes| {
+            stop_called2.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("stop must not be called when Mesh model changed after preflight".to_string())
+        },
+        |_app, _rec, _relay, _owner, _personas, _global, _teams| {
+            Err("spawn not expected".to_string())
+        },
+        |_app, _receipt| Err("receipt not expected".to_string()),
+    )
+    .await;
+
+    // Kill the seeded process now that the epoch has consumed it.
+    let _ = crate::managed_agents::terminate_process(seeded_pid);
 
     assert!(
-        matches!(result, Err(EpochError::Skipped(_))),
-        "Mesh model mismatch must produce Skipped before stop: {result:?}"
+        matches!(outcome, RestartOutcome::Skipped),
+        "Mesh model mismatch (via full async driver) must produce Skipped before stop: {outcome:?}"
     );
-    if let Err(EpochError::Skipped(msg)) = &result {
-        assert!(
-            msg.contains("relay-mesh model changed") || msg.contains("mesh"),
-            "Skipped reason must mention mesh model change: {msg}"
-        );
-    }
     assert!(
         !stop_called.load(std::sync::atomic::Ordering::SeqCst),
         "stop must NOT be called when Mesh model changed after preflight"
     );
-    // Cleanup: kill the seeded long-lived process so it doesn't leak.
-    let _ = crate::managed_agents::terminate_process(seeded_pid);
 }
 
 #[path = "global_agent_config_epoch_tests.rs"]

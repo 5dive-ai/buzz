@@ -215,11 +215,36 @@ test("an agent that uses the mesh leaves a busy sharer showing activity", () => 
 test("an empty mesh offers the action instead of sitting inert", () => {
   // Nothing to show and nothing happening: without a prompt the row is inert
   // and unexplained. The action is real -- you can be the first to share -- so
-  // the badge slot carries the word where a figure would go.
+  // the trailing slot carries an invitation where a figure would go.
   const model = derive({ snapshot: snapshot() });
   assert.equal(model.tone, "unknown");
-  assert.equal(model.badge, "Share");
+  assert.equal(model.callToAction, "Share your compute");
+  assert.equal(model.badge, null);
   assert.match(model.tooltip, /share this computer to start the mesh/);
+});
+
+test("the cold state drops the Buzz qualifier to make room", () => {
+  // "Buzz MeshLLM" plus "Share your compute" does not fit 256px. The name is
+  // the part that can afford to lose a word.
+  assert.equal(derive({ snapshot: snapshot() }).label, "MeshLLM");
+  assert.equal(
+    derive({
+      snapshot: snapshot({ sharingDeviceCount: 1, sharedCapacityGb: 36 }),
+    }).label,
+    "Buzz MeshLLM",
+  );
+});
+
+test("only the cold state invites; every other state reports", () => {
+  // A permanent nudge beside a real figure becomes furniture.
+  for (const input of [
+    { snapshot: null },
+    { snapshot: snapshot({ sharingDeviceCount: 2, sharedCapacityGb: 64 }) },
+    { toggle: SHARING, view: view() },
+    { toggle: CONSUMING },
+  ]) {
+    assert.equal(derive(input).callToAction, null);
+  }
 });
 
 test("an empty mesh does not throb, and an unfetched one offers nothing", () => {

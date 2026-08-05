@@ -31,6 +31,13 @@ import { describeRequestOrigin } from "./meshActivity";
  * while our own dispatch count stays flat, means the work is not ours. See
  * `inferInboundWork` in `meshActivity.ts`. It is sampled, so it can undercount
  * — but it never over-claims, which is the direction that matters.
+ *
+ * ## The cold state explains, it does not report
+ *
+ * With nothing shared anywhere there is no status worth stating, so the subtitle
+ * says what the switch does rather than restating a zero. Every other state has
+ * a real number, and an explanation sitting permanently beside those would be
+ * furniture.
  */
 
 export type MeshDetailModel = {
@@ -133,9 +140,12 @@ export function deriveMeshDetailModel({
       ? peers.length === 0
         ? "No other devices yet"
         : `${peers.length} ${peers.length === 1 ? "peer" : "peers"} connected`
-      : // Not participating: the relay snapshot is all we have, and it is the
-        // reason to consider joining.
-        `${snapshot?.sharingDeviceCount ?? 0} sharing in this community`,
+      : (snapshot?.sharingDeviceCount ?? 0) > 0
+        ? // Someone else is sharing: the count is the reason to join.
+          `${snapshot?.sharingDeviceCount ?? 0} sharing in this community`
+        : // Cold. There is no status worth reporting, so the line explains what
+          // the switch beside it actually does instead of restating a zero.
+          "Share your spare compute with the Buzz community to run models",
     busyNow: (usage?.inflight ?? 0) > 0,
     activityLabel: describeActivity({ usage, isSharing, inboundWork }),
     originLabel: describeRequestOrigin(usage),

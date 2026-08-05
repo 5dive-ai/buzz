@@ -1,3 +1,5 @@
+import { Share2 } from "lucide-react";
+
 import { SidebarMenuButton, SidebarMenuItem } from "@/shared/ui/sidebar";
 import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
 import { cn } from "@/shared/lib/cn";
@@ -81,31 +83,47 @@ export function SidebarMeshComputeRow({
             aria-hidden
             className="flex h-4 w-4 shrink-0 items-center justify-center"
           >
-            <span className="relative flex h-2 w-2 items-center justify-center">
-              {row.pulse === "none" ? null : (
-                <span
-                  className={cn(
-                    "absolute h-2 w-2 rounded-full opacity-75 motion-reduce:animate-none",
-                    PULSE_CLASS[row.pulse],
-                    TONE_PING[row.tone],
-                  )}
-                  data-mesh-pulse={row.pulse}
-                />
-              )}
-              <span
-                className={cn("h-2 w-2 rounded-full", TONE_DOT[row.tone])}
-                data-testid="mesh-row-dot"
+            {/*
+              In the cold state a status dot has nothing to say — there is no
+              capacity to report and nothing running — so the slot carries a
+              Share2 glyph, which names the action instead. Every other state has
+              a real status, and the dot is the more honest signal there.
+            */}
+            {row.callToAction ? (
+              <Share2
+                className="h-3.5 w-3.5 text-muted-foreground"
+                data-testid="mesh-row-share-icon"
               />
-            </span>
+            ) : (
+              <span className="relative flex h-2 w-2 items-center justify-center">
+                {row.pulse === "none" ? null : (
+                  <span
+                    className={cn(
+                      "absolute h-2 w-2 rounded-full opacity-75 motion-reduce:animate-none",
+                      PULSE_CLASS[row.pulse],
+                      TONE_PING[row.tone],
+                    )}
+                    data-mesh-pulse={row.pulse}
+                  />
+                )}
+                <span
+                  className={cn("h-2 w-2 rounded-full", TONE_DOT[row.tone])}
+                  data-testid="mesh-row-dot"
+                />
+              </span>
+            )}
           </span>
           <SidebarMenuLabel className="opacity-80">
-            Buzz MeshLLM
+            {row.label}
           </SidebarMenuLabel>
         </SidebarMenuButton>
       </MeshComputePopover>
 
       {/*
-        Capacity, in every state that has a number — not just while sharing.
+        The trailing slot: an invitation when cold, capacity otherwise.
+
+        Capacity shows in every state that has a number — not just while
+        sharing.
 
         This slot used to hold a 70%-scaled unlabelled Switch, which was hard to
         see and ambiguous about what it would do. The control moved wholesale to
@@ -114,7 +132,14 @@ export function SidebarMeshComputeRow({
         joining better than any exhortation, and unlike a nudge there is nothing
         to dismiss. Pointer-events off so the whole row stays one click target.
       */}
-      {row.badge ? (
+      {row.callToAction ? (
+        <span
+          className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-2xs font-medium text-muted-foreground group-data-[collapsible=icon]:hidden"
+          data-testid="mesh-row-cta"
+        >
+          {row.callToAction}
+        </span>
+      ) : row.badge ? (
         <span
           className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-2xs tabular-nums text-muted-foreground group-data-[collapsible=icon]:hidden"
           data-testid="mesh-row-badge"

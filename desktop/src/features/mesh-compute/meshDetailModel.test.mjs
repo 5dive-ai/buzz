@@ -327,3 +327,22 @@ test("the card hint distinguishes giving, taking, and neither", () => {
     "3 of 4 requests ran on shared compute",
   );
 });
+
+test("the cold popover explains the switch instead of restating a zero", () => {
+  // "0 sharing in this community" is a status line with no status. Someone
+  // opening this for the first time needs to know what the switch beside it
+  // does, which is the one thing a zero cannot tell them.
+  const model = deriveMeshDetailModel({
+    view: null,
+    snapshot: snapshot({
+      sharingDeviceCount: 0,
+      sharedCapacityGb: null,
+      devices: [],
+    }),
+    usage: null,
+    isSharing: false,
+    inboundWork: false,
+  });
+  assert.match(model.participationLabel, /Share your spare compute/);
+  assert.doesNotMatch(model.participationLabel, /^0 /);
+});

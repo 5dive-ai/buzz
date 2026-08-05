@@ -64,6 +64,11 @@ export type MeshRowPulse = "none" | "activity" | "invite";
 
 export type MeshRowModel = {
   tone: MeshRowTone;
+  /**
+   * Row label. Drops the "Buzz" qualifier in the cold state, where a call to
+   * action shares the same 256px and every character costs.
+   */
+  label: string;
   /** Accessible state sentence, used as the row tooltip. */
   tooltip: string;
   /**
@@ -79,11 +84,23 @@ export type MeshRowModel = {
    */
   badge: string | null;
   /**
+   * Invitation text, or null.
+   *
+   * Only set in the cold state — no capacity anywhere, nothing running. There
+   * is no number to show and no status to report, so without words the row is
+   * inert and unexplained. Every other state has a figure or a tone that speaks
+   * for itself, and a permanent nudge beside them would become furniture.
+   */
+  callToAction: string | null;
+  /**
    * Why the dot moves, if it does. Never decorative: a still dot is a real
    * statement that there is nothing to act on and nothing happening.
    */
   pulse: MeshRowPulse;
 };
+
+/** Full name. Used everywhere except the cold state, which needs the room. */
+const LABEL = "Buzz MeshLLM";
 
 /** Live pool capacity: this machine plus every peer that reports a figure. */
 function liveCapacityGb(view: MeshLiveView | null): number {
@@ -126,9 +143,11 @@ export function deriveMeshRowModel({
   ) {
     return {
       tone: "starting",
+      label: LABEL,
       tooltip:
         pendingAction === "stop" ? "Stopping sharing…" : "Starting to share…",
       badge: null,
+      callToAction: null,
       pulse: "none",
     };
   }
@@ -138,8 +157,10 @@ export function deriveMeshRowModel({
     if (health && health.status !== "ok") {
       return {
         tone: "failed",
+        label: LABEL,
         tooltip: "Sharing failed — open for details",
         badge: null,
+        callToAction: null,
         pulse: "none",
       };
     }
@@ -153,18 +174,22 @@ export function deriveMeshRowModel({
     if (hasMeshAgent === false) {
       return {
         tone: "sharing",
+        label: LABEL,
         tooltip: "Sharing compute · no agent is using it yet",
         badge,
+        callToAction: null,
         pulse: "invite",
       };
     }
     return {
       tone: "sharing",
+      label: LABEL,
       tooltip:
         peerCount > 0
           ? `Sharing compute · ${peerCount} ${plural(peerCount, "peer")}`
           : "Sharing compute · waiting for another device",
       badge,
+      callToAction: null,
       pulse: busyNow ? "activity" : "none",
     };
   }
@@ -173,8 +198,10 @@ export function deriveMeshRowModel({
     const gb = liveCapacityGb(view);
     return {
       tone: "consuming",
+      label: LABEL,
       tooltip: "Using shared compute from the mesh",
       badge: gb > 0 ? formatCapacityGb(gb) : null,
+      callToAction: null,
       pulse: busyNow ? "activity" : "none",
     };
   }
@@ -187,8 +214,12 @@ export function deriveMeshRowModel({
     // would appear for one poll and retract, which reads as a glitch.
     return {
       tone: "unknown",
+      label: LABEL,
       tooltip: "Checking for shared compute…",
       badge: null,
+      // Nothing offered from no data: a prompt that appears for one poll and
+      // retracts reads as a glitch, not a suggestion.
+      callToAction: null,
       pulse: "none",
     };
   }
@@ -203,14 +234,18 @@ export function deriveMeshRowModel({
     // annoyance. The invite throb stays reserved for capacity that exists.
     return {
       tone: "unknown",
+      // "Buzz" is dropped here so the invitation fits beside it.
+      label: "MeshLLM",
       tooltip: "No shared compute yet — share this computer to start the mesh",
-      badge: "Share",
+      badge: null,
+      callToAction: "Share your compute",
       pulse: "none",
     };
   }
   const gb = snapshot.sharedCapacityGb;
   return {
     tone: "available",
+    label: LABEL,
     tooltip:
       gb === null
         ? `Shared compute available · ${count} ${plural(count, "device")}`
@@ -221,6 +256,7 @@ export function deriveMeshRowModel({
       gb === null
         ? `${count} ${plural(count, "device")}`
         : formatCapacityGb(gb),
+    callToAction: null,
     pulse: "invite",
   };
 }

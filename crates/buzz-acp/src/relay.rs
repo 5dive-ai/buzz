@@ -1515,11 +1515,28 @@ async fn execute_connected_command(
             // indicators are worthless and sending them would consume admission
             // budget the relay already rejected us on.
             //
-            // INVARIANT: apart from observer frames (parked above), the WS publish
-            // path carries only ephemeral kinds (typing indicators). The silent
-            // drop-while-gated relies on that invariant. If a future caller
-            // publishes durable events through this path, it must extend the
-            // kind guard above to avoid silently discarding user data.
+            // INVARIANT: the WS publish path carries only ephemeral kinds
+            // (presence 20001, typing 20002, observer frames 24200 — the last
+            // parked above rather than dropped). The silent drop-while-gated
+            // below is only correct under that invariant: dropping a durable
+            // event here would discard user data while reporting success to
+            // the caller, since `publish_event` returns `Ok` once the command
+            // is queued and never learns what happened to it.
+            //
+            // The assertion encodes the boundary rather than widening the
+            // guard. Note that `is_ephemeral` is not usable as the drop
+            // predicate here: observer frames are themselves range-ephemeral,
+            // so testing it would send them down the drop path and undo the
+            // parking above. A durable event reaching this point is a bug at
+            // the *caller* — it should use `RestClient::submit_event`, which
+            // surfaces the relay's real response (see `publish_setup_nudge`).
+            debug_assert!(
+                buzz_core::kind::is_ephemeral(u32::from(event.kind.as_u16())),
+                "durable kind {} reached the WS publish path, which silently \
+                 drops while rate-gated or disconnected; publish durable events \
+                 via RestClient::submit_event instead",
+                event.kind.as_u16()
+            );
             if state.check_rate_gate().is_some() {
                 debug!("rate-gated: dropping ephemeral PublishEvent (typing indicator)");
                 return true;
@@ -4365,16 +4382,29 @@ mod tests {
         assert_eq!(sub_id, "ch-12345678-1234-5678-1234-567812345678");
     }
 
-    /// Build a real signed Nostr event for testing BgState.
+    /// Build a real signed durable kind:1 note for testing BgState.
     ///
     /// Uses `custom_created_at` so tests can control the timestamp.
     /// The event ID is determined by the nostr signing process — we don't
     /// control it, but we return it so callers can use it for dedup tests.
+    ///
+    /// Not valid as a `RelayCommand::PublishEvent` payload for
+    /// `execute_connected_command`: that path carries ephemeral kinds only and
+    /// asserts as much. Use [`make_test_typing_event`] for publish-path tests.
     fn make_test_event(keys: &nostr::Keys, created_at_secs: u64) -> Event {
         let ts = nostr::Timestamp::from(created_at_secs);
         EventBuilder::new(nostr::Kind::TextNote, "test")
             .tags([])
             .custom_created_at(ts)
+            .sign_with_keys(keys)
+            .expect("signing should succeed")
+    }
+
+    /// A kind:20002 typing indicator — a realistic payload for the WS publish
+    /// path, which carries ephemeral kinds only.
+    fn make_test_typing_event(keys: &nostr::Keys) -> Event {
+        EventBuilder::new(Kind::Custom(KIND_TYPING_INDICATOR as u16), "")
+            .tags([Tag::parse(["h", &Uuid::new_v4().to_string()]).expect("h tag")])
             .sign_with_keys(keys)
             .expect("signing should succeed")
     }
@@ -4542,7 +4572,8 @@ mod tests {
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         seed_test_subscription(&mut state, channel_id);
-        let event = make_test_event(&nostr::Keys::generate(), 2_000);
+        // A typing indicator: the WS publish path carries ephemeral kinds only.
+        let event = make_test_typing_event(&nostr::Keys::generate());
         let event_id = event.id.to_hex();
 
         let task = tokio::spawn(async move {

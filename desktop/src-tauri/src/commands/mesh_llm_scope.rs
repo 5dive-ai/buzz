@@ -116,6 +116,7 @@ pub(crate) async fn fail_if_client_mesh_active<R: tauri::Runtime>(
 /// Alternatively, callers that cannot fit their body into a sync `FnOnce` call
 /// `run_mesh_transition_preflight` (which they invoke after acquiring the lock
 /// themselves) to share the preflight logic without lifetime constraints.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn with_workspace_transition_preflight<R, F, T>(
     app: &AppHandle<R>,
     transition_body: F,

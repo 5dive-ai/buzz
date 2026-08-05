@@ -1,23 +1,29 @@
 use super::types::{ExtensionEntry, RuntimeFileConfig};
 
-/// Read Claude Code config from `settings.json` and `~/.claude.json`.
+/// Read Claude Code config from `settings.json` and `.claude.json`.
 ///
-/// `config_dir` — when `Some`, reads `settings.json` from that directory
-/// (the agent's effective `CLAUDE_CONFIG_DIR`) instead of `~/.claude/`.
-/// MCP servers are always read from `~/.claude.json` regardless of
-/// `CLAUDE_CONFIG_DIR` — Claude Code does not remap the global MCP config
-/// file via that variable.
+/// `config_dir` — when `Some`, reads both `settings.json` and `.claude.json`
+/// from that directory (the agent's effective `CLAUDE_CONFIG_DIR`).
+/// Defaults to `~/.claude/settings.json` and `~/.claude.json` when `None`.
+///
+/// Both files are resolved from the same directory: the claude 2.1.x binary
+/// resolves `.claude.json` as `join(process.env.CLAUDE_CONFIG_DIR || homedir(),
+/// ".claude.json")`, mirroring the `settings.json` resolver. A user-set
+/// `CLAUDE_CONFIG_DIR` therefore remaps both files — honoring only
+/// `settings.json` would misrepresent the agent's actual MCP config.
 pub(super) fn read_config_file(config_dir: Option<&std::path::Path>) -> Option<RuntimeFileConfig> {
     let home = dirs::home_dir()?;
 
-    // #3493: honor user-set CLAUDE_CONFIG_DIR for settings.json path.
+    // #3493: honor user-set CLAUDE_CONFIG_DIR for both settings.json and
+    // .claude.json — the binary resolves both relative to CLAUDE_CONFIG_DIR.
     // Panel reflects the actual config the agent reads.
     let settings_path = config_dir
         .map(|d| d.join("settings.json"))
         .unwrap_or_else(|| home.join(".claude").join("settings.json"));
 
-    // MCP config is always ~/ relative — CLAUDE_CONFIG_DIR does not affect it.
-    let mcp_path = home.join(".claude.json");
+    let mcp_path = config_dir
+        .map(|d| d.join(".claude.json"))
+        .unwrap_or_else(|| home.join(".claude.json"));
 
     let settings = read_json_file(&settings_path);
     let mcp_config = read_json_file(&mcp_path);

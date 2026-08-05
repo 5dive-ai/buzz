@@ -13,9 +13,9 @@ use crate::{
             },
         },
         current_instance_id, is_reserved_env_key, is_safe_to_reveal, is_well_formed_env_key,
-        known_acp_runtime, load_managed_agents, load_personas, save_managed_agents,
-        sync_managed_agent_processes, AgentDefinition, GlobalAgentConfig, KnownAcpRuntime,
-        ManagedAgentRecord, ManagedAgentRuntimeKey, MAX_ENV_VALUE_BYTES,
+        known_acp_runtime, load_managed_agents, load_personas, resolve_effective_agent_env,
+        save_managed_agents, sync_managed_agent_processes, AgentDefinition, GlobalAgentConfig,
+        KnownAcpRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey, MAX_ENV_VALUE_BYTES,
     },
 };
 
@@ -295,30 +295,29 @@ pub async fn get_agent_config_surface(
     let session_cache = state.get_session_cache(&runtime_key);
     let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
 
-    // #3493: for claude agents, resolve the settings.json path from the agent's
-    // effective CLAUDE_CONFIG_DIR env var (if set), falling back to ~/.claude/.
-    // We never provision this dir ourselves — we only respect what the user configured.
-    let claude_config_dir: Option<std::path::PathBuf> = if runtime_meta
-        .is_some_and(|m| m.id == "claude")
-    {
-        // Look up CLAUDE_CONFIG_DIR from the effective agent env (record overrides
-        // persona overrides global) — matching the precedence order at spawn.
-        let personas_ref = &personas;
-        let persona = record
-            .persona_id
-            .as_deref()
-            .and_then(|pid| personas_ref.iter().find(|p| p.id == pid));
-        let global_ref = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
-
-        record
-            .env_vars
-            .get("CLAUDE_CONFIG_DIR")
-            .or_else(|| persona.and_then(|p| p.env_vars.get("CLAUDE_CONFIG_DIR")))
-            .or_else(|| global_ref.env_vars.get("CLAUDE_CONFIG_DIR"))
-            .map(std::path::PathBuf::from)
-    } else {
-        None
-    };
+    // #3493: for claude agents, resolve the settings.json and .claude.json paths
+    // from the agent's effective CLAUDE_CONFIG_DIR env var (if set), falling
+    // back to ~/.claude/ and ~/.claude.json. We never provision this dir
+    // ourselves — we only respect what the user configured.
+    //
+    // Use resolve_effective_agent_env so the lookup covers all tiers (baked
+    // floor → definition → global → persona → record) and cannot diverge from
+    // what the spawned process actually sees.
+    let claude_config_dir: Option<std::path::PathBuf> =
+        if runtime_meta.is_some_and(|m| m.id == "claude") {
+            let effective_env = resolve_effective_agent_env(
+                &record,
+                &personas,
+                runtime_meta,
+                &global,
+            );
+            effective_env
+                .env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+        } else {
+            None
+        };
 
     Ok(resolve_config_surface(
         record,
@@ -540,8 +539,10 @@ fn parse_models(raw: Option<&serde_json::Value>) -> (Vec<AcpModelEntry>, Option<
 ///
 /// B5: called by the TypeScript observer when `session/set_config_option` for
 /// the "effort" config option receives a positive acknowledgement. The record
-/// is updated in-place and persisted; the next spawn will apply this value via
-/// `session/set_config_option` at session creation (in `create_session_and_apply_model`).
+/// is updated in-place and persisted. At the next spawn the Desktop injects
+/// `BUZZ_ACP_EFFORT_LEVEL` so the harness applies this value via
+/// `session/set_config_option` at session creation, pairing with the
+/// adapter-advertised `thought_level` configId discovered from capabilities.
 ///
 /// `effort_level` is the acknowledged value. Pass `None` to clear the
 /// canonical effort (reverts to adapter default on next spawn).

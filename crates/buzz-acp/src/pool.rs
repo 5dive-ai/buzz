@@ -171,6 +171,12 @@ pub struct OwnedAgent {
     /// `config_id` is the adapter's actual id from `AgentModelCapabilities::thought_level_config_id`;
     /// it is set here by `set_idle_agent_effort` and never hardcoded in the harness.
     pub desired_effort: Option<(String, String)>,
+    /// Startup effort value from `BUZZ_ACP_EFFORT_LEVEL` (carried from the Desktop
+    /// record). At the first session creation, if `desired_effort` is None, this
+    /// value is paired with the capabilities-derived `thought_level` configId to
+    /// form `desired_effort`. Non-fatal when absent or when the adapter does not
+    /// advertise `thought_level`.
+    pub startup_effort: Option<String>,
     /// Normalized agent name from initialize (`agentInfo.name`/`serverInfo.name`).
     pub agent_name: String,
     /// Whether Goose accepted its custom system-prompt method. `None` probes on
@@ -224,6 +230,26 @@ impl OwnedAgent {
             &self.agent_name,
             self.goose_system_prompt_supported,
         )
+    }
+
+    /// B5 startup-default: arms `desired_effort` from `startup_effort` + capabilities.
+    ///
+    /// Called once at first session creation after capabilities are populated.
+    /// No-op when `desired_effort` is already set (live pick takes precedence),
+    /// when `startup_effort` is absent, or when the adapter does not advertise
+    /// a `thought_level` configId for the current model.
+    pub(crate) fn resolve_startup_effort(&mut self) {
+        if self.desired_effort.is_none() {
+            if let Some(ref value) = self.startup_effort.clone() {
+                if let Some(config_id) = self
+                    .model_capabilities
+                    .as_ref()
+                    .and_then(|c| c.thought_level_config_id.clone())
+                {
+                    self.desired_effort = Some((config_id, value.clone()));
+                }
+            }
+        }
     }
 }
 
@@ -1016,6 +1042,11 @@ async fn create_session_and_apply_model(
             thought_level_config_id: extract_thought_level_config_id(&resp.raw),
         });
     }
+
+    // B5 startup-default: arm desired_effort from startup_effort + capabilities.
+    // No-op when desired_effort already set (live pick takes precedence) or when
+    // the adapter does not advertise thought_level for this model.
+    agent.resolve_startup_effort();
 
     // Apply desired_model if set, matching against the fresh session/new response.
     // Track whether the switch succeeded so session_config_captured reflects
@@ -6115,6 +6146,7 @@ mod tests {
             desired_model: None,
             model_overridden: false,
             desired_effort: None,
+            startup_effort: None,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -6174,6 +6206,7 @@ mod tests {
             desired_model: None,
             model_overridden: false,
             desired_effort: None,
+            startup_effort: None,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -7220,6 +7253,7 @@ mod effort_tests {
             desired_model: None,
             model_overridden: false,
             desired_effort: None,
+            startup_effort: None,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -7241,6 +7275,109 @@ mod effort_tests {
                 .map(|(id, v)| (id.as_str(), v.as_str())),
             Some(("effort", "high")),
             "desired_effort must be queued"
+        );
+    }
+
+    // ── resolve_startup_effort ────────────────────────────────────────────────
+
+    /// Helper to build a minimal `OwnedAgent` for `resolve_startup_effort` tests.
+    /// The bash subprocess is needed for `AcpClient` construction; none of the
+    /// tests below send any ACP messages.
+    async fn make_agent_for_startup_effort(
+        startup_effort: Option<&str>,
+        thought_level_config_id: Option<&str>,
+        desired_effort: Option<(&str, &str)>,
+    ) -> OwnedAgent {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test agent");
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: thought_level_config_id.map(|id| AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                thought_level_config_id: Some(id.to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: desired_effort.map(|(id, v)| (id.to_string(), v.to_string())),
+            startup_effort: startup_effort.map(str::to_string),
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    /// `resolve_startup_effort` arms `desired_effort` from `startup_effort` and the
+    /// capabilities-derived `thought_level` configId on the first session creation.
+    #[tokio::test]
+    async fn test_resolve_startup_effort_arms_desired_effort_from_startup_value() {
+        let mut agent = make_agent_for_startup_effort(Some("high"), Some("tlevel-id"), None).await;
+        agent.resolve_startup_effort();
+        assert_eq!(
+            agent
+                .desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("tlevel-id", "high")),
+            "desired_effort must be armed from startup_effort + thought_level configId"
+        );
+    }
+
+    /// `resolve_startup_effort` is a no-op when `desired_effort` is already set
+    /// (a live user pick must not be overridden by the startup default).
+    #[tokio::test]
+    async fn test_resolve_startup_effort_does_not_override_live_pick() {
+        let mut agent = make_agent_for_startup_effort(
+            Some("high"),
+            Some("tlevel-id"),
+            Some(("tlevel-id", "low")), // live pick already present
+        )
+        .await;
+        agent.resolve_startup_effort();
+        assert_eq!(
+            agent
+                .desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("tlevel-id", "low")),
+            "live desired_effort must not be overridden by startup default"
+        );
+    }
+
+    /// `resolve_startup_effort` is a no-op when no `startup_effort` was provided
+    /// (agent record had no persisted effort level).
+    #[tokio::test]
+    async fn test_resolve_startup_effort_noop_when_startup_effort_absent() {
+        let mut agent = make_agent_for_startup_effort(None, Some("tlevel-id"), None).await;
+        agent.resolve_startup_effort();
+        assert!(
+            agent.desired_effort.is_none(),
+            "desired_effort must stay None when no startup_effort set"
+        );
+    }
+
+    /// `resolve_startup_effort` is a no-op when the adapter has no `thought_level`
+    /// configId (model does not support thinking effort).
+    #[tokio::test]
+    async fn test_resolve_startup_effort_noop_when_model_lacks_thought_level() {
+        let mut agent = make_agent_for_startup_effort(
+            Some("high"),
+            None, // no thought_level_config_id → not supported
+            None,
+        )
+        .await;
+        agent.resolve_startup_effort();
+        assert!(
+            agent.desired_effort.is_none(),
+            "desired_effort must stay None when adapter does not advertise thought_level"
         );
     }
 }

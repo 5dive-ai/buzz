@@ -1908,6 +1908,7 @@ async fn tokio_main() -> Result<()> {
                         desired_model: config.model.clone(),
                         model_overridden: false,
                         desired_effort: None,
+                        startup_effort: config.effort_level.clone(),
                         agent_name,
                         goose_system_prompt_supported: None,
                         protocol_version,
@@ -3905,6 +3906,12 @@ struct PoolStartup {
     extra_env: Vec<(String, String)>,
     has_generated_codex_config: bool,
     model: Option<String>,
+    /// Persisted effort value to apply at the first session creation by pairing
+    /// with the adapter's advertised 'thought_level' configId. Carried from
+    ///  (the  env var). The configId
+    /// is unknown until capabilities arrive at session creation; it is never
+    /// hardcoded in the harness.
+    startup_effort: Option<String>,
     observer: Option<observer::ObserverHandle>,
 }
 
@@ -3917,6 +3924,7 @@ impl PoolStartup {
             extra_env: config.persona_env_vars.clone(),
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
+            startup_effort: config.effort_level.clone(),
             observer,
         }
     }
@@ -3985,6 +3993,7 @@ async fn initialize_agent_pool(
                             desired_model: startup.model.clone(),
                             model_overridden: false,
                             desired_effort: None,
+                            startup_effort: startup.startup_effort.clone(),
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
@@ -5439,6 +5448,7 @@ mod error_outcome_emission_tests {
             desired_model: None,
             model_overridden: false,
             desired_effort: None,
+            startup_effort: None,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             // Error branches under test never read this; 1 is the legacy
@@ -6878,6 +6888,7 @@ mod control_result_tests {
             desired_model: None,
             model_overridden: false,
             desired_effort: None,
+            startup_effort: None,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -6996,6 +7007,7 @@ mod control_result_tests {
             desired_model: None,
             model_overridden: false,
             desired_effort: None,
+            startup_effort: None,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,

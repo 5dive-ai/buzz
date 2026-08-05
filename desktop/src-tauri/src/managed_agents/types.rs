@@ -439,7 +439,8 @@ pub struct ManagedAgentRecord {
     /// deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mesh: Option<RelayMeshConfig>,
-    /// Canonical Claude Code effort level; seeded into the per-agent `settings.json` at spawn.
+    /// Canonical Claude Code effort level. Injected as `BUZZ_ACP_EFFORT_LEVEL` at spawn
+    /// so the harness applies it via `session/set_config_option` at session creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
 }

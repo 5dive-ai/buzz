@@ -760,6 +760,12 @@ pub fn spawn_agent_child(
     } else {
         command.env_remove("BUZZ_ACP_MODEL");
     }
+    // B5: carry persisted effort; harness resolves thought_level configId at first session.
+    if let Some(ref effort) = record.effort_level {
+        command.env("BUZZ_ACP_EFFORT_LEVEL", effort);
+    } else {
+        command.env_remove("BUZZ_ACP_EFFORT_LEVEL");
+    }
     // Session title for the harness to pass out-of-band on `session/new`. The
     // adapter names the session after it; it never reaches the prompt, so this
     // is display metadata only. The spawn-config snapshot records the same
@@ -837,10 +843,9 @@ pub fn spawn_agent_child(
         command.env(key, value);
     }
 
-    // A1: for local claude agents, ANTHROPIC_MODEL is the single startup model
-    // authority. BUZZ_ACP_MODEL is removed so the harness never sees two
-    // simultaneous model authorities (BUZZ_ACP_MODEL is for live ACP switches
-    // only; ANTHROPIC_MODEL locks the session model in the adapter env).
+    // A1: for local claude agents, ANTHROPIC_MODEL is the single startup model authority.
+    // BUZZ_ACP_MODEL is removed (live ACP switches only; two authorities in the same env
+    // would be ambiguous).
     if record.backend == super::BackendKind::Local && runtime_meta.is_some_and(|r| r.id == "claude")
     {
         apply_claude_model_env(&mut command, effective_model.as_deref());

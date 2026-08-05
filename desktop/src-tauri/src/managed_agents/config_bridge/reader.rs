@@ -154,7 +154,8 @@ pub(crate) fn read_config_surface(
     let config_file_path = runtime_meta
         .and_then(|m| m.config_file_path)
         .map(resolve_tilde);
-    let mcp_config_file_path = runtime_meta.and_then(mcp_config_file_path_for_runtime);
+    let mcp_config_file_path =
+        runtime_meta.and_then(|m| mcp_config_file_path_for_runtime(m, claude_config_dir));
     let extensions = file_config.extensions.clone();
 
     let sources = ConfigSourceReport {
@@ -211,12 +212,28 @@ pub(crate) fn read_config_surface(
     }
 }
 
-fn mcp_config_file_path_for_runtime(runtime: &KnownAcpRuntime) -> Option<String> {
+fn mcp_config_file_path_for_runtime(
+    runtime: &KnownAcpRuntime,
+    claude_config_dir: Option<&std::path::Path>,
+) -> Option<String> {
     match runtime.id {
         "goose" => {
             super::goose::goose_config_path().map(|path| path.to_string_lossy().into_owned())
         }
-        "claude" => dirs::home_dir().map(|h| h.join(".claude.json").to_string_lossy().into_owned()),
+        // #3493: the claude 2.1.x binary resolves .claude.json as
+        // join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json"), so the MCP
+        // config file moves with a user-set CLAUDE_CONFIG_DIR.
+        "claude" => Some(
+            claude_config_dir
+                .map(|d| d.join(".claude.json"))
+                .unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .map(|h| h.join(".claude.json"))
+                        .unwrap_or_default()
+                })
+                .to_string_lossy()
+                .into_owned(),
+        ),
         "codex" => {
             super::codex::codex_config_path().map(|path| path.to_string_lossy().into_owned())
         }

@@ -260,11 +260,11 @@ impl OwnedAgent {
 
 /// Pool-level capability snapshot for the `thought_level` config option.
 ///
-/// Written at `return_agent` (populated from the returned agent's capabilities)
-/// and at session creation via `notify_capabilities_discovered`. Because
-/// checked-out agents carry their own `model_capabilities`, this cache
-/// ensures `handle_set_config_option_control` can identify and validate effort
-/// picks even when all workers are checked out (pool slots are `None`).
+/// Written at `return_agent` when a worker with populated capabilities returns
+/// to the pool. Because checked-out agents carry their own `model_capabilities`,
+/// this cache ensures `handle_set_config_option_control` can identify and
+/// validate effort picks even when all workers are checked out (pool slots
+/// are `None`).
 #[derive(Debug, Clone, Default)]
 pub struct PoolEffortCapabilities {
     /// The adapter's `thought_level` configId from `session/new`.
@@ -302,15 +302,15 @@ pub struct AgentPool {
     pub effort_ever_picked: bool,
     /// Pool-level capability cache for the `thought_level` config option.
     ///
-    /// Written at `return_agent` (refreshed from the returned agent's capabilities)
-    /// and by `notify_capabilities_discovered` when called directly. Allows
-    /// `handle_set_config_option_control` to identify and validate effort picks
-    /// regardless of idle occupancy.
+    /// Written at `return_agent` (refreshed from the returned agent's
+    /// capabilities). Allows `handle_set_config_option_control` to identify
+    /// and validate effort picks regardless of idle occupancy.
     pub effort_capabilities: PoolEffortCapabilities,
     /// True once any worker has ever had capabilities populated and returned to
-    /// the pool. Used to distinguish "pre-first-session" (NoCatalog — configId
-    /// unknown) from "all workers currently busy" (configId known but cache
-    /// temporarily empty) in `handle_set_config_option_control`.
+    /// the pool. Used to distinguish "pre-first-return" (capabilities unknown
+    /// — case D trust path applies) from "all workers currently busy"
+    /// (capabilities known but cache temporarily empty — case C trust path)
+    /// in `handle_set_config_option_control`.
     pub capabilities_ever_discovered: bool,
 }
 /// Result returned by a completed prompt task.
@@ -990,17 +990,7 @@ impl AgentPool {
     /// Clearing effort (value == "") is handled by the caller before this is
     /// reached: the caller calls `clear_pool_effort` directly. This path is the
     /// non-empty-value live-pick case.
-    ///
-    /// Returns `SetPoolEffortResult::NoCatalog` when the pool-level capability
-    /// cache has no `thought_level` configId yet (no session ever created).
     pub fn set_pool_effort(&mut self, config_id: &str, value: &str) -> SetPoolEffortResult {
-        // Verify the pool-level capability cache has thought_level, OR that
-        // capabilities were previously discovered (workers are just all busy).
-        if self.effort_capabilities.config_id.is_none() && !self.capabilities_ever_discovered {
-            // No capabilities yet (no session ever created for any worker).
-            return SetPoolEffortResult::NoCatalog;
-        }
-
         self.desired_effort = Some((config_id.to_string(), value.to_string()));
         self.effort_ever_picked = true;
 
@@ -1037,11 +1027,11 @@ impl AgentPool {
 
     /// Notify the pool that capabilities have been discovered for a worker.
     ///
-    /// Called from `create_session_and_apply_model` after the first session/new
-    /// response so the pool-level capability cache is populated immediately,
-    /// before the worker returns. This ensures the capability cache is always
-    /// current even when all workers are simultaneously busy.
-    #[allow(dead_code)]
+    /// **Test-only helper.** In production the pool capability cache is written
+    /// by `return_agent` when a worker returns after completing its first session.
+    /// This function lets tests seed the cache directly without going through the
+    /// full spawn-session-return cycle.
+    #[cfg(test)]
     pub fn notify_capabilities_discovered(&mut self, caps: &AgentModelCapabilities) {
         if caps.thought_level_config_id.is_some() && self.effort_capabilities.config_id.is_none() {
             let valid_values = caps
@@ -1090,10 +1080,6 @@ pub enum SetPoolEffortResult {
     /// (may be 0 if all agents are either checked out or have no session yet).
     /// The final result arrives from `create_session_and_apply_model`.
     Stored { invalidated: u32 },
-    /// No worker has capabilities yet — the `thought_level` configId is unknown
-    /// (no session has ever been created). The caller should surface
-    /// `"pending_session"` status to the observer.
-    NoCatalog,
 }
 
 /// Timeout for a single pre-prompt context fetch attempt (thread/DM history).
@@ -7427,23 +7413,36 @@ mod effort_tests {
         assert_eq!(id, None);
     }
 
-    /// `set_pool_effort` returns `NoCatalog` when the pool has no agents with
-    /// capabilities (empty pool — no session ever created for any worker).
+    /// `set_pool_effort` stores the value even on an empty pool (no agents, no
+    /// capabilities discovered). The caller is responsible for gating calls on
+    /// `is_thought_level` — `set_pool_effort` always stores.
     #[test]
-    fn test_set_pool_effort_returns_no_catalog_on_empty_pool() {
+    fn test_set_pool_effort_stores_on_empty_pool() {
         let mut pool = AgentPool::from_slots(vec![]);
         let result = pool.set_pool_effort("effort", "high");
-        assert_eq!(result, SetPoolEffortResult::NoCatalog);
+        assert_eq!(result, SetPoolEffortResult::Stored { invalidated: 0 });
+        assert_eq!(
+            pool.desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("effort", "high")),
+        );
     }
 
-    /// `set_pool_effort` returns `NoCatalog` when agents exist but none has
-    /// `thought_level_config_id` yet (no session has been created).
+    /// `set_pool_effort` stores the value when agents exist but no session has
+    /// been created yet (pre-first-return window). `set_pool_effort` always stores.
     #[test]
-    fn test_set_pool_effort_returns_no_catalog_when_no_capabilities() {
-        // Pool with a None slot (agent not yet spawned).
+    fn test_set_pool_effort_stores_before_capabilities_discovered() {
+        // Pool with a None slot (agent not yet spawned or checked out).
         let mut pool = AgentPool::from_slots(vec![None]);
         let result = pool.set_pool_effort("effort", "high");
-        assert_eq!(result, SetPoolEffortResult::NoCatalog);
+        assert_eq!(result, SetPoolEffortResult::Stored { invalidated: 0 });
+        assert_eq!(
+            pool.desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("effort", "high")),
+        );
     }
 
     /// `AgentModelCapabilities::thought_level_config_id` is populated from the
@@ -7836,12 +7835,10 @@ mod effort_tests {
 
     // ── V-2: pick-while-all-busy is stored, not dropped ──────────────────────
 
-    /// V-2: when all workers are busy (slots are None), `set_pool_effort` must
-    /// still store the value (not drop it with a synthetic ok). The
-    /// `capabilities_ever_discovered` flag guards the "all-busy" path: with
-    /// capabilities already discovered but all workers checked out (pool-level
-    /// cache is non-None from the last return_agent), `set_pool_effort` stores
-    /// the effort and returns `Stored` rather than `NoCatalog`.
+    /// V-2: when all workers are busy (slots are None) and capabilities are
+    /// known from a prior session, `set_pool_effort` stores the effort and
+    /// returns `Stored`. The `handle_set_config_option_control` path emits a
+    /// real `pending_session` ack (not a synthetic ok).
     ///
     /// The full `handle_set_config_option_control` path (pending_session ack, not
     /// synthetic ok) is covered by `test_b5_set_config_option_stored_emits_pending_session_ack_and_invalidates`

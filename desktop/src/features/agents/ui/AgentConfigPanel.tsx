@@ -391,7 +391,12 @@ function EffortPicker({
         value,
         subscribe: (listener) => subscribeControlResults(pubkey, listener),
         send: async () => {
-          await sendSetConfigOption(pubkey, effortConfigId, value);
+          await sendSetConfigOption(
+            pubkey,
+            effortConfigId,
+            value,
+            "thought_level",
+          );
         },
         scheduleTimeout: (onTimeout) => {
           const id = window.setTimeout(onTimeout, 8_000);

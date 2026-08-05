@@ -1018,33 +1018,49 @@ fn handle_set_config_option_control(
     //
     // V-2 fix: use pool-level capability cache instead of scanning idle agents.
     // Checked-out workers leave None slots; the cache is written at return_agent
-    // and at the first session creation, so it is never stale.
+    // once the first worker completes a session and returns to the pool.
     //
-    // Three cases:
+    // Four cases:
     //  A. effort_capabilities.config_id is Some and matches → full validation path
-    //  B. effort_capabilities.config_id is None AND capabilities not yet discovered →
-    //     pre-first-session NoCatalog → pending_session (don't store)
+    //  B. effort_capabilities.config_id is None AND capabilities not yet discovered
+    //     AND no category trust → unknown configId → synthetic ok (non-effort)
     //  C. effort_capabilities.config_id is None AND capabilities were discovered →
     //     all workers are currently busy; trust the incoming configId from the
     //     Desktop's session cache and store for apply at next checkout/session.
+    //  D. effort_capabilities.config_id is None AND capabilities not yet discovered
+    //     AND category == "thought_level" → pre-first-session window; Desktop
+    //     sends its session-cache configId with category as the trust signal.
+    //     Store the value and ack pending_session — the first session creation
+    //     will apply it and emit the honest final ok/failure.
     let thought_level_id = pool
         .effort_capabilities
         .config_id
         .as_deref()
         .map(str::to_string);
 
-    // Determine if this is a thought_level pick: either the cache has a matching
-    // configId (case A) or all workers are busy but capabilities were already
-    // discovered (case C — trusted configId from Desktop session cache).
+    // Category from the incoming frame (Desktop sends "thought_level" for all
+    // effort picks and clears, including during the pre-discovery window).
+    let frame_category = payload
+        .get("category")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Determine if this is a thought_level pick:
+    //   Case A: cache has a matching configId.
+    //   Case C: capabilities known from a prior session, all workers busy.
+    //   Case D: pre-first-session, Desktop asserts category = "thought_level".
     //
-    // For the clear path (empty value), the same cases apply: we can clear even
-    // while workers are busy.
+    // For the clear path (empty value), the same cases apply.
     let cache_matches = thought_level_id.as_deref() == Some(config_id);
     // Case C: capabilities were discovered before (so configId is known) but
     // workers are currently checked out and the cache is temporarily None.
     let all_busy_with_known_caps =
         pool.capabilities_ever_discovered && thought_level_id.is_none() && config_id != "unknown";
-    let is_thought_level = cache_matches || all_busy_with_known_caps;
+    // Case D: pre-first-session; Desktop sends category as the trust signal.
+    let pre_discovery_trusted = !pool.capabilities_ever_discovered
+        && frame_category == "thought_level"
+        && config_id != "unknown";
+    let is_thought_level = cache_matches || all_busy_with_known_caps || pre_discovery_trusted;
 
     let (status, include_category) = if is_thought_level {
         // I-7: validate the incoming value against adapter-advertised options
@@ -1087,7 +1103,6 @@ fn handle_set_config_option_control(
             let result = pool.set_pool_effort(config_id, value);
             match result {
                 SetPoolEffortResult::Stored { .. } => ("pending_session", true),
-                SetPoolEffortResult::NoCatalog => ("pending_session", true),
             }
         }
     } else {
@@ -7141,11 +7156,11 @@ mod control_result_tests {
         );
     }
 
-    /// B5: when the pool has no agents with thought_level_config_id set,
-    /// the harness cannot identify the option as thought_level and falls back
-    /// to synthetic "ok".  This is the pre-first-session state — Desktop sees
-    /// "ok" but the harness has not forwarded anything; however, this path is
-    /// only reachable when thought_level_config_id is unknown (no session yet).
+    /// B5: when the pool has no capabilities (pre-first-return) AND the frame
+    /// does not include `category: "thought_level"`, the harness cannot identify
+    /// the option as thought_level and falls back to synthetic "ok". This is
+    /// case B — the caller did not assert the category, so we treat the configId
+    /// as unknown.
     #[test]
     fn test_b5_set_config_option_no_thought_level_id_emits_synthetic_ok() {
         let mut pool = AgentPool::from_slots(vec![]);
@@ -7154,15 +7169,16 @@ mod control_result_tests {
             "type": "set_config_option",
             "configId": "effort",
             "value": "high",
+            // No category field — case B (unknown, synthetic ok).
         });
         handle_set_config_option_control(&payload, &mut pool, Some(&obs));
         let events = obs.snapshot();
         assert_eq!(events.len(), 1);
-        // No thought_level_config_id in pool → falls back to synthetic ok.
+        // No thought_level trust (no category field) → falls back to synthetic ok.
         assert_eq!(
             events[0].payload["status"].as_str().unwrap(),
             "ok",
-            "without thought_level_config_id, harness emits synthetic ok"
+            "without category trust and no pool capabilities, harness emits synthetic ok"
         );
         // Synthetic ok must NOT carry category — Desktop must not persist it.
         assert!(
@@ -7192,8 +7208,86 @@ mod control_result_tests {
         );
     }
 
+    // ── Case D: pre-first-return window with category trust ──────────────────
+
+    /// Case D: in the pre-first-return window (capabilities never discovered),
+    /// a frame with `category: "thought_level"` is treated as a real effort pick —
+    /// value is stored, `pending_session` ack emitted (not synthetic ok), and
+    /// the pool's `desired_effort` is set for application at the first session.
+    #[test]
+    fn test_b5_pre_discovery_pick_with_category_stores_and_emits_pending_session() {
+        // Pre-first-return: no capabilities, all slots empty.
+        let mut pool = AgentPool::from_slots(vec![]);
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "high",
+            "category": "thought_level",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        // Must be pending_session — not synthetic ok.
+        assert_eq!(
+            ev.payload["status"].as_str().unwrap(),
+            "pending_session",
+            "case D: pre-discovery pick with category trust must emit pending_session, not synthetic ok"
+        );
+        // Must carry category so observer knows this is a real forward.
+        assert_eq!(
+            ev.payload["category"].as_str().unwrap(),
+            "thought_level",
+            "case D: pending_session ack must carry category"
+        );
+        // Value must be stored in the pool.
+        assert_eq!(
+            pool.desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("effort", "high")),
+            "case D: pool must store the effort value for application at first session"
+        );
+        // effort_ever_picked set so startup seeding cannot clobber the pick.
+        assert!(
+            pool.effort_ever_picked,
+            "case D: effort_ever_picked must be set"
+        );
+    }
+
+    /// Case D: in the pre-first-return window, a clear (empty value) with
+    /// `category: "thought_level"` must NOT emit synthetic ok — it must emit
+    /// `cleared` and set `effort_ever_picked`.
+    #[test]
+    fn test_b5_pre_discovery_clear_with_category_emits_cleared_not_synthetic_ok() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "",
+            "category": "thought_level",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        // Must be cleared — not synthetic ok.
+        assert_eq!(
+            ev.payload["status"].as_str().unwrap(),
+            "cleared",
+            "case D: pre-discovery clear with category trust must emit cleared, not synthetic ok"
+        );
+        assert_eq!(ev.payload["category"].as_str().unwrap(), "thought_level");
+        assert!(pool.effort_ever_picked, "clear must set effort_ever_picked");
+        assert!(
+            pool.desired_effort.is_none(),
+            "clear must set desired_effort to None"
+        );
+    }
+
     /// B5 persistence gate — real-forward ack carries `"category": "thought_level"`.
-    /// The Desktop observer gates persistence on this field; renaming the adapter's
     /// configId does not break persistence as long as the category is present.
     #[tokio::test]
     async fn test_b5_real_forward_ack_includes_thought_level_category() {

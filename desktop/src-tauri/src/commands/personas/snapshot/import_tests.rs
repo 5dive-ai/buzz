@@ -404,7 +404,7 @@ async fn test_agent_switch_between_store_and_profile_finishes_captured_outbound(
     assert!(
         memory_relay_seen
             .as_deref()
-            .map_or(false, |r| r.contains("captured.example")),
+            .is_some_and(|r| r.contains("captured.example")),
         "memory adapter relay_url must contain captured relay 'captured.example', \
          got: {memory_relay_seen:?}"
     );

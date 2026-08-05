@@ -57,9 +57,26 @@ async fn spawn_fake_llm(responses: Vec<Value>) -> String {
     url
 }
 
+struct CannedResponse {
+    status: u16,
+    body: Value,
+}
+
 /// Like `spawn_fake_llm` but also captures the full JSON request body from each
 /// incoming HTTP request. Returns (url, captured_requests).
 async fn spawn_capturing_fake_llm(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_capturing_fake_llm_with_statuses(
+        responses
+            .into_iter()
+            .map(|body| CannedResponse { status: 200, body })
+            .collect(),
+    )
+    .await
+}
+
+async fn spawn_capturing_fake_llm_with_statuses(
+    responses: Vec<CannedResponse>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
@@ -122,15 +139,22 @@ async fn spawn_capturing_fake_llm(responses: Vec<Value>) -> (String, Arc<Mutex<V
                 }
 
                 // Send canned response.
-                let body = queue
-                    .lock()
-                    .await
-                    .pop_front()
-                    .unwrap_or_else(|| json!({ "error": "no canned response" }));
-                let body_s = serde_json::to_string(&body).unwrap();
+                let response = queue.lock().await.pop_front().unwrap_or(CannedResponse {
+                    status: 500,
+                    body: json!({ "error": "no canned response" }),
+                });
+                let body_s = serde_json::to_string(&response.body).unwrap();
+                let reason = if response.status == 200 {
+                    "OK"
+                } else {
+                    "Error"
+                };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body_s.len(), body_s,
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.status,
+                    reason,
+                    body_s.len(),
+                    body_s,
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.shutdown().await;
@@ -313,6 +337,103 @@ async fn tool_call_then_end_turn() {
     // Final response.
     let v = h.recv_until(|v| v["id"] == json!(p_id)).await;
     assert_eq!(v["result"]["stopReason"], "end_turn");
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_image_response_recovers_without_replaying_image() {
+    let responses = vec![
+        CannedResponse {
+            status: 200,
+            body: openai_tool_call("call_image", "fake__tool_0", json!({})),
+        },
+        CannedResponse {
+            status: 404,
+            body: json!({
+                "error": { "message": "No endpoints found that support image input" }
+            }),
+        },
+        CannedResponse {
+            status: 200,
+            body: openai_text("recovered"),
+        },
+    ];
+    let (url, captures) = spawn_capturing_fake_llm_with_statuses(responses).await;
+    let mut h = Harness::spawn(&url).await;
+
+    h.send(
+        "initialize",
+        json!({"protocolVersion":2,"clientCapabilities":{}}),
+    )
+    .await;
+    let _ = h.recv().await;
+    let session_id = h
+        .send(
+            "session/new",
+            json!({
+                "cwd": "/tmp",
+                "mcpServers": [{
+                    "name": "fake",
+                    "command": env!("CARGO_BIN_EXE_fake-mcp"),
+                    "args": [],
+                    "env": [{ "name": "FAKE_MCP_IMAGE_RESULT", "value": "1" }],
+                }],
+            }),
+        )
+        .await;
+    let session = h.recv_until(|v| v["id"] == json!(session_id)).await;
+    let sid = session["result"]["sessionId"].as_str().unwrap();
+
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{"type":"text","text":"inspect the image"}],
+            }),
+        )
+        .await;
+    loop {
+        let message = h.recv().await;
+        if message.get("method") == Some(&json!("session/request_permission")) {
+            h.write(json!({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": { "outcome": { "outcome": "selected", "optionId": "allow" } },
+            }))
+            .await;
+        } else if message["id"] == json!(prompt_id) {
+            assert_eq!(message["result"]["stopReason"], "end_turn");
+            break;
+        }
+    }
+
+    let requests = captures.lock().await;
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected tool, rejection, recovery requests"
+    );
+    let rejected = requests[1].to_string();
+    assert!(
+        rejected.contains("data:image/png;base64,aW1n"),
+        "second request must contain the MCP image: {rejected}"
+    );
+    let recovered = requests[2].to_string();
+    assert!(
+        !recovered.contains("image_url") && !recovered.contains("data:image"),
+        "recovery request must not replay image input: {recovered}"
+    );
+    assert!(
+        recovered.contains("does not support image input")
+            && recovered.contains("text-based inspection"),
+        "recovery request must give the model actionable guidance: {recovered}"
+    );
+    assert!(
+        recovered.contains("call_image") && recovered.contains("tool_call_id"),
+        "recovery must preserve tool-call/result pairing: {recovered}"
+    );
+    drop(requests);
     h.shutdown().await;
 }
 

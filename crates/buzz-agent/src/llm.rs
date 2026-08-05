@@ -1711,10 +1711,6 @@ fn is_unsupported_image_input_error(body: &str) -> bool {
         .contains("no endpoints found that support image input")
 }
 
-fn unsupported_image_input_error(error_body: String) -> AgentError {
-    AgentError::UnsupportedImageInput(error_body)
-}
-
 /// Build the terminal `AgentError::Llm` for a `post()` exit that has given up
 /// retrying — persistent retryable status, transport failure, or a body-read
 /// break. `detail` carries the specific cause (status/body, or the transport
@@ -1875,7 +1871,9 @@ where
         if status == 404 {
             let error_body = read_error_body(resp).await;
             if is_unsupported_image_input_error(&error_body) {
-                return Err(PostError::Agent(unsupported_image_input_error(error_body)));
+                return Err(PostError::Agent(AgentError::UnsupportedImageInput(
+                    error_body,
+                )));
             }
             return Err(PostError::Agent(AgentError::LlmModelNotFound(format!(
                 "{status}: {error_body}"
@@ -2130,7 +2128,7 @@ async fn openrouter_post(
             // `LlmModelNotFound` (or vice versa) sends the user to the wrong fix.
             let error_body = read_error_body(resp).await;
             if is_unsupported_image_input_error(&error_body) {
-                return Err(unsupported_image_input_error(error_body));
+                return Err(AgentError::UnsupportedImageInput(error_body));
             }
             if error_body.contains("No endpoints found that can handle the requested parameters") {
                 return Err(openrouter_parameter_routing_error(&error_body));

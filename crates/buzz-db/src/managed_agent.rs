@@ -207,14 +207,20 @@ pub async fn commit_aggregate(
     request: &AggregateRequest,
 ) -> Result<AggregateCommit> {
     validate_request(request)?;
-    for attempt in 0..=2 {
-        match commit_aggregate_once(pool, community, request).await {
+    let mut serialization_retries = 0;
+    loop {
+        let result = commit_aggregate_once(pool, community, request).await;
+        let retryable = matches!(
+            &result,
             Err(DbError::Sqlx(sqlx::Error::Database(error)))
-                if error.code().as_deref() == Some("40001") && attempt < 2 => {}
-            result => return result,
+                if error.code().as_deref() == Some("40001")
+        );
+        if retryable && serialization_retries < 2 {
+            serialization_retries += 1;
+            continue;
         }
+        return result;
     }
-    unreachable!("bounded serialization retry always returns")
 }
 
 async fn commit_aggregate_once(
@@ -249,6 +255,41 @@ async fn commit_aggregate_once(
         .bind(lock)
         .execute(&mut *tx)
         .await?;
+
+    // The aggregate itself is the owner's authenticated, signed assertion that
+    // this pubkey is their managed agent. Materialize that binding in the SAME
+    // transaction as the head so a directly enrolled agent that never presents
+    // a NIP-OA auth tag is still revoked by a later tombstone. Do this before
+    // the idempotent-return path as well: retrying a head committed by an older
+    // relay must repair the formerly missing binding. Insert the owner first to
+    // satisfy the community-scoped FK, then set the agent mapping only when it
+    // is absent or already agrees. A conflicting pre-existing owner is a hard
+    // conflict; committing or serving the head without its revocation authority
+    // would leave a deleted agent able to participate.
+    sqlx::query("INSERT INTO users (community_id,pubkey) VALUES ($1,$2) ON CONFLICT DO NOTHING")
+        .bind(community.as_uuid())
+        .bind(&owner)
+        .execute(&mut *tx)
+        .await?;
+    let bound_agent = sqlx::query_scalar::<_, Vec<u8>>(
+        "INSERT INTO users (community_id,pubkey,agent_owner_pubkey) VALUES ($1,$2,$3) \
+         ON CONFLICT (community_id,pubkey) DO UPDATE \
+           SET agent_owner_pubkey=EXCLUDED.agent_owner_pubkey \
+         WHERE users.agent_owner_pubkey IS NULL \
+            OR users.agent_owner_pubkey=EXCLUDED.agent_owner_pubkey \
+         RETURNING agent_owner_pubkey",
+    )
+    .bind(community.as_uuid())
+    .bind(&agent)
+    .bind(&owner)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if bound_agent.as_deref() != Some(owner.as_slice()) {
+        return Err(DbError::ManagedAgentConflict(
+            "agent is already bound to a different owner".into(),
+        ));
+    }
+
     let current = sqlx::query("SELECT generation,event_id,state,definition_revision,definition_event_id,definition_content_sha256,instance_event_id,instance_content_sha256 FROM managed_agent_heads WHERE community_id=$1 AND owner_pubkey=$2 AND agent_pubkey=$3 FOR UPDATE")
         .bind(community.as_uuid()).bind(&owner).bind(&agent).fetch_optional(&mut *tx).await?;
     if let Some(row) = &current {
@@ -928,7 +969,7 @@ mod tests {
         );
         let foreign_owner = Keys::generate();
         assert!(
-            !participation_is_revoked(
+            participation_is_revoked(
                 &pool,
                 community,
                 first_agent.public_key().as_bytes(),
@@ -936,28 +977,53 @@ mod tests {
             )
             .await
             .unwrap(),
-            "a foreign owner cannot use another owner's tombstone to revoke an agent"
+            "foreign delegation evidence cannot bypass the aggregate's durable owner binding"
         );
-        let db = crate::Db::from_pool(pool.clone());
-        db.ensure_user(community, owner.public_key().as_bytes())
-            .await
-            .unwrap();
-        db.ensure_user(community, first_agent.public_key().as_bytes())
-            .await
-            .unwrap();
-        assert!(db
-            .set_agent_owner(
-                community,
-                first_agent.public_key().as_bytes(),
-                owner.public_key().as_bytes(),
-            )
-            .await
-            .unwrap());
         assert!(
             participation_is_revoked(&pool, community, first_agent.public_key().as_bytes(), None,)
                 .await
                 .unwrap(),
-            "the durable owner mapping revokes without request delegation evidence"
+            "the aggregate transaction materializes durable revocation authority without request delegation evidence"
+        );
+        let materialized_owner: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT agent_owner_pubkey FROM users WHERE community_id=$1 AND pubkey=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(first_agent.public_key().as_bytes())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            materialized_owner.as_deref(),
+            Some(owner.public_key().as_bytes().as_slice()),
+            "aggregate commit must bind a direct member to its owner atomically"
+        );
+
+        // Brownfield repair: a head committed by an older relay may predate the
+        // aggregate-owned binding. Replaying the exact tombstone must restore
+        // revocation authority even though the head itself is an idempotent
+        // no-op.
+        sqlx::query("UPDATE users SET agent_owner_pubkey=NULL WHERE community_id=$1 AND pubkey=$2")
+            .bind(community.as_uuid())
+            .bind(first_agent.public_key().as_bytes())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !participation_is_revoked(&pool, community, first_agent.public_key().as_bytes(), None)
+                .await
+                .unwrap(),
+            "the fixture must reproduce the old no-binding revocation gap"
+        );
+        let repaired = commit_aggregate(&pool, community, &tombstone)
+            .await
+            .unwrap();
+        assert!(!repaired.inserted);
+        assert!(
+            participation_is_revoked(&pool, community, first_agent.public_key().as_bytes(), None)
+                .await
+                .unwrap(),
+            "an exact aggregate retry must repair missing durable revocation authority"
         );
         assert!(
             !participation_is_revoked(

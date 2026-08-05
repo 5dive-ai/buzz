@@ -236,8 +236,11 @@ pub async fn apply_workspace(
             let migration_client = state.http_client.clone();
             let migration_relay_api = crate::relay::relay_http_base_url(&scope.relay_url);
             tauri::async_runtime::spawn(async move {
-                let extensions =
-                    match crate::managed_agents::migration::activation::discover_relay_extensions(
+                // Promotion is a one-way rollout and defaults off. Existing
+                // authoritative retries (including deletions) are still driven
+                // below so disabling NEW promotion never strands prior state.
+                if crate::managed_agents::migration::activation::automatic_migration_enabled() {
+                    let extensions = match crate::managed_agents::migration::activation::discover_relay_extensions(
                         &migration_client,
                         &migration_relay_api,
                     )
@@ -246,31 +249,31 @@ pub async fn apply_workspace(
                         Ok(extensions) => extensions,
                         Err(error) => {
                             eprintln!("buzz-desktop: PMA capability discovery failed: {error}");
-                            return;
+                            Vec::new()
                         }
                     };
-                let app = migration_app.clone();
-                let keys = scope.owner_keys.clone();
-                let db_path = scope.db_path.clone();
-                let enqueue_extensions = extensions.clone();
-                match tauri::async_runtime::spawn_blocking(move || {
-                    crate::managed_agents::migration::activation::enqueue_initial_migrations(
-                        &app,
-                        &keys,
-                        &db_path,
-                        &enqueue_extensions,
-                    )
-                })
-                .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        eprintln!("buzz-desktop: PMA migration enqueue failed: {error}");
-                        return;
-                    }
-                    Err(error) => {
-                        eprintln!("buzz-desktop: PMA migration enqueue task failed: {error}");
-                        return;
+                    if !extensions.is_empty() {
+                        let app = migration_app.clone();
+                        let keys = scope.owner_keys.clone();
+                        let db_path = scope.db_path.clone();
+                        match tauri::async_runtime::spawn_blocking(move || {
+                            crate::managed_agents::migration::activation::enqueue_initial_migrations(
+                                &app,
+                                &keys,
+                                &db_path,
+                                &extensions,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                eprintln!("buzz-desktop: PMA migration enqueue failed: {error}");
+                            }
+                            Err(error) => {
+                                eprintln!("buzz-desktop: PMA migration enqueue task failed: {error}");
+                            }
+                        }
                     }
                 }
                 if let Err(error) =

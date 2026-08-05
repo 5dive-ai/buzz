@@ -24,6 +24,31 @@ use crate::managed_agents::retention::{
 use crate::managed_agents::{load_managed_agents, save_managed_agents};
 use crate::{app_state::AppState, managed_agents};
 
+/// Automatic legacy-agent promotion is a one-way availability change: after
+/// promotion, edits and deletes require relay confirmation. Ship the protocol
+/// dark unless the release explicitly opts into that rollout at build time.
+/// Already-authoritative edit/deletion retry paths remain active independently.
+pub(crate) fn automatic_migration_enabled() -> bool {
+    automatic_migration_enabled_from(option_env!("BUZZ_DESKTOP_BUILD_PMA_MIGRATION"))
+}
+
+fn automatic_migration_enabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+#[cfg(test)]
+mod rollout_tests {
+    use super::automatic_migration_enabled_from;
+
+    #[test]
+    fn automatic_migration_is_default_off_and_requires_exact_opt_in() {
+        assert!(!automatic_migration_enabled_from(None));
+        assert!(!automatic_migration_enabled_from(Some("")));
+        assert!(!automatic_migration_enabled_from(Some("true")));
+        assert!(automatic_migration_enabled_from(Some("1")));
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RelayInformationDocument {
     #[serde(default)]

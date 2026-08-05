@@ -62,8 +62,8 @@ pub use schema::apply_journal_schema_pub;
 pub use schema::open_journal;
 
 pub use txn::{
-    advance_to_committed, mutate_store, prepare_publication, run_boot_recovery,
-    run_file_commit_recovery, StoreState,
+    advance_to_committed, mutate_store, prepare_publication, run_boot_recovery, run_recovery_gate,
+    StoreState,
 };
 #[cfg(test)]
 #[allow(unused_imports)]

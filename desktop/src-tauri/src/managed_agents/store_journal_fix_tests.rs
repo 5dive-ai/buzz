@@ -6,7 +6,7 @@
 use super::operations::insert_operation;
 use super::{
     apply_journal_schema_pub, file_commit_recovery_at_pub, insert_outbox_event, open_journal,
-    run_boot_recovery_at, Generation,
+    run_boot_recovery_at, run_recovery_gate, Generation,
 };
 use crate::managed_agents::retention::{
     get_pending_sync, open_retention_db, tombstone_retention_d_tag,
@@ -674,44 +674,24 @@ fn test_sync_file_recovery_repairs_dangling_intent_row() {
     );
 }
 
-/// Fix A — production-order seam test: file-commit recovery must complete
-/// BEFORE any migration or canonical-store reader observes the canonical files.
-///
-/// Seam used: `file_commit_recovery_at_pub` is the exact function that
-/// `run_file_commit_recovery` delegates to in production — not a
-/// reimplementation.  The "migration read" is a direct filesystem read of the
-/// canonical path, matching what every real migration/backfill does.
-///
-/// Scenario: a process crashed after writing a stage file but before the rename
-/// completed.  The canonical (`managed-agents.json`) still holds pre-crash
-/// ("stale") content.  The stage file holds the intended post-crash ("repaired")
-/// content.  After recovery runs, the canonical must hold the repaired content —
-/// so any subsequent migration or backfill reader sees the repaired state.
+/// Fix A — ordered seam: `run_recovery_gate` runs recovery before invoking the
+/// closure; the closure (= migrations) observes the repaired canonical.
+/// Both production and this test drive the same function.
 #[test]
 fn test_setup_order_recovery_completes_before_migration_reads_canonical() {
     let dir = tmp_dir();
     let anchor = dir.path().to_path_buf();
-
-    // "Stale" content — what canonical holds before recovery.
     let stale_content = b"[{\"pubkey\":\"stale-pre-crash\"}]";
-    // "Repaired" content — what the stage file holds (the intended commit).
     let repaired_content = b"[{\"pubkey\":\"repaired-post-crash\"}]";
     let teams_content = b"[]";
-
     let a_can = anchor.join("managed-agents.json");
     let t_can = anchor.join("teams.json");
     let a_stage = anchor.join("managed-agents.order_test.stage");
     let t_stage = anchor.join("teams.order_test.stage");
-
-    // Write stale canonical — this is what migrations would see WITHOUT recovery.
     std::fs::write(&a_can, stale_content).unwrap();
     std::fs::write(&t_can, teams_content).unwrap();
-
-    // Write stage files containing the repaired (intended) state.
     std::fs::write(&a_stage, repaired_content).unwrap();
     std::fs::write(&t_stage, teams_content).unwrap();
-
-    // Plant the intent row — recovery will detect and replay it.
     {
         let j = open_journal(&anchor).unwrap();
         insert_phase_row(
@@ -724,23 +704,122 @@ fn test_setup_order_recovery_completes_before_migration_reads_canonical() {
             &sha256_hex(teams_content),
         );
     }
-
-    // Run recovery — the exact same code path production calls via
-    // run_file_commit_recovery → file_commit_recovery_at.
-    file_commit_recovery_at_pub(&anchor).unwrap();
-
-    // Now simulate a "migration read" — read the canonical directly, as every
-    // real migration/backfill does.
-    let observed = std::fs::read(&a_can).unwrap();
+    let mut closure_saw: Option<Vec<u8>> = None;
+    let saw = &mut closure_saw;
+    run_recovery_gate(&anchor, || {
+        *saw = Some(std::fs::read(&a_can).unwrap());
+        Ok(())
+    })
+    .expect("run_recovery_gate must succeed");
+    let observed = closure_saw.expect("closure must have run");
     assert_eq!(
         observed, repaired_content,
-        "migration read must observe the repaired canonical, not the stale pre-crash state"
+        "closure must see repaired canonical"
     );
-    // Stale content must not be present.
     assert_ne!(
         observed, stale_content,
-        "stale canonical content must have been replaced by recovery"
+        "stale canonical must be replaced first"
     );
+}
+
+/// Fix A + GAP 3 — fail-closed: unresolved recovery → closure never runs,
+/// `run_recovery_gate` returns `Err`.
+#[test]
+fn test_recovery_gate_failure_skips_closure_and_returns_err() {
+    let dir = tmp_dir();
+    let anchor = dir.path().to_path_buf();
+    let a_stage = anchor.join("managed-agents.gate_fail.stage");
+    let t_stage = anchor.join("teams.gate_fail.stage");
+    // No stage files + empty hashes → hash-mismatch → 1 unresolved.
+    {
+        let j = open_journal(&anchor).unwrap();
+        insert_phase_row(
+            &j,
+            "gate_fail",
+            "intent",
+            a_stage.to_str().unwrap(),
+            t_stage.to_str().unwrap(),
+            "",
+            "",
+        );
+    }
+    let mut closure_ran = false;
+    let result = run_recovery_gate(&anchor, || {
+        closure_ran = true;
+        Ok(())
+    });
+    assert!(
+        result.is_err(),
+        "run_recovery_gate must return Err on unresolved commits"
+    );
+    assert!(
+        !closure_ran,
+        "closure must not run when recovery has unresolved commits"
+    );
+}
+
+/// GAP 2 — hash-mismatch: absent stages + non-matching hashes → unresolved count > 0.
+#[test]
+fn test_recovery_hash_mismatch_returns_unresolved_count() {
+    let dir = tmp_dir();
+    let anchor = dir.path().to_path_buf();
+    let a_stage = anchor.join("managed-agents.hmm.stage");
+    let t_stage = anchor.join("teams.hmm.stage");
+    std::fs::write(
+        anchor.join("managed-agents.json"),
+        b"[{\"pubkey\":\"actual\"}]",
+    )
+    .unwrap();
+    std::fs::write(anchor.join("teams.json"), b"[]").unwrap();
+    {
+        let j = open_journal(&anchor).unwrap();
+        insert_phase_row(
+            &j,
+            "hmm",
+            "intent",
+            a_stage.to_str().unwrap(),
+            t_stage.to_str().unwrap(),
+            "deadbeefdeadbeef",
+            "deadbeefdeadbeef",
+        );
+    }
+    let unresolved = file_commit_recovery_at_pub(&anchor).expect("must not Err");
+    assert_eq!(
+        unresolved, 1,
+        "hash-mismatch with absent stages → 1 unresolved"
+    );
+}
+
+/// GAP 2 — rename-failure: stage exists but canonical target is a directory
+/// (rename-over-directory is rejected by the OS) → unresolved count > 0.
+#[test]
+fn test_recovery_rename_failure_returns_unresolved_count() {
+    let dir = tmp_dir();
+    let anchor = dir.path().to_path_buf();
+    let repaired = b"[{\"pubkey\":\"rename-fail\"}]";
+    let teams = b"[]";
+    let a_stage = anchor.join("managed-agents.rfail.stage");
+    let t_stage = anchor.join("teams.rfail.stage");
+    let a_can = anchor.join("managed-agents.json");
+    std::fs::write(&a_stage, repaired).unwrap();
+    std::fs::write(&t_stage, teams).unwrap();
+    // canonical is a directory → rename(file, dir) → EISDIR
+    std::fs::create_dir_all(&a_can).unwrap();
+    std::fs::write(anchor.join("teams.json"), teams).unwrap();
+    {
+        let j = open_journal(&anchor).unwrap();
+        insert_phase_row(
+            &j,
+            "rfail",
+            "intent",
+            a_stage.to_str().unwrap(),
+            t_stage.to_str().unwrap(),
+            &sha256_hex(repaired),
+            &sha256_hex(teams),
+        );
+    }
+    let unresolved = file_commit_recovery_at_pub(&anchor).expect("must not Err");
+    assert_eq!(unresolved, 1, "rename failure → 1 unresolved");
 }
 
 // ── Fix B: migration tests ───────────────────────────────────────────────────

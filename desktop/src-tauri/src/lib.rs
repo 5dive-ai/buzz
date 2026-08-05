@@ -62,6 +62,7 @@ use huddle::{
     start_huddle, start_stt_pipeline, HuddlePhase,
 };
 use initial_window::*;
+use managed_agents::store_journal::{run_recovery_gate, store_anchor_dir};
 use managed_agents::{
     backfill_persona_snapshots, ensure_nest, list_managed_agent_runtimes,
     put_managed_agent_runtime_lifecycle, reconcile_managed_agent_runtimes,
@@ -340,29 +341,30 @@ pub fn run() {
                 return Ok(());
             }
 
-            // File-commit recovery MUST run before any migration, backfill, or
-            // canonical-store reader/writer.  A stale stage from a pre-crash
-            // commit must not overwrite migration output.  One owner, one site.
-            // Fail closed: a repair error sets store_recovery_failed and skips
-            // all store-touching setup.
+            // run_recovery_gate: file-commit recovery before migrations; fail closed.
             {
                 let state = app_handle.state::<AppState>();
-                if let Err(e) =
-                    crate::managed_agents::store_journal::run_file_commit_recovery(&app_handle)
-                {
+                let anchor = store_anchor_dir(&app_handle).unwrap_or_else(|_| {
+                    app_handle
+                        .path()
+                        .app_data_dir()
+                        .unwrap_or_default()
+                        .join("agents")
+                });
+                let _ = std::fs::create_dir_all(&anchor);
+                let reset_done = reset_outcome.completed;
+                if let Err(e) = run_recovery_gate(&anchor, || {
+                    if reset_done {
+                        migration::run_boot_migrations_after_reset(&app_handle);
+                    } else {
+                        migration::run_boot_migrations(&app_handle);
+                    }
+                    Ok(())
+                }) {
                     eprintln!("buzz-desktop: file-commit-recovery: {e}");
-                    state
-                        .store_recovery_failed
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    state.store_recovery_failed.store(true, Ordering::Release);
                     return Ok(());
                 }
-            }
-
-            // Run all pre-identity data migrations before state loads from disk.
-            if reset_outcome.completed {
-                migration::run_boot_migrations_after_reset(&app_handle);
-            } else {
-                migration::run_boot_migrations(&app_handle);
             }
 
             // Resolve persisted identity key (env var → file → generate+save).

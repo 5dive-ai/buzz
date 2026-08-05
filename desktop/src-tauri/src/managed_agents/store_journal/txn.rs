@@ -26,6 +26,7 @@ use std::sync::MutexGuard;
 
 use rusqlite::params;
 use tauri::AppHandle;
+use tauri::Manager;
 
 use crate::managed_agents::{ManagedAgentRecord, TeamRecord};
 
@@ -96,6 +97,29 @@ fn advance_file_commit_phase(
     Ok(())
 }
 
+/// Run file-commit recovery and, only if it succeeds with zero unresolved
+/// commits, execute `store_work`.
+///
+/// This is the structural seam that enforces "recovery before canonical-store
+/// access".  Both production setup and tests drive the same function, so the
+/// ordering invariant lives in one place and cannot drift.
+///
+/// Returns `Err` if recovery fails (`Err` or unresolved count > 0) or if
+/// `store_work` returns `Err`.  On recovery failure `store_work` is never
+/// called.
+pub fn run_recovery_gate<F>(anchor: &std::path::Path, store_work: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let unresolved = file_commit_recovery_at(anchor)?;
+    if unresolved > 0 {
+        return Err(format!(
+            "file-commit recovery: {unresolved} nonterminal commit(s) could not be resolved"
+        ));
+    }
+    store_work()
+}
+
 /// Mutate the store under the full lock sequence.
 ///
 /// The closure runs inside a real `rusqlite::Transaction` — if it returns
@@ -104,6 +128,10 @@ fn advance_file_commit_phase(
 ///
 /// On any decode error inside this function no file is written, no journal
 /// transition occurs, and the error is propagated with `?`.
+///
+/// Returns `Err` immediately if the `store_recovery_failed` flag is set on
+/// `AppState` — a recovery failure at boot means the store is in an uncertain
+/// state and no mutations are safe until the user relaunches.
 pub fn mutate_store<'g, F, T>(
     app: &AppHandle,
     store_mutex_guard: MutexGuard<'g, ()>,
@@ -112,6 +140,20 @@ pub fn mutate_store<'g, F, T>(
 where
     F: FnOnce(StoreState<'_>) -> Result<(Vec<ManagedAgentRecord>, Vec<TeamRecord>, T), String>,
 {
+    // Guard: a boot recovery failure means the store is in an uncertain state.
+    // Reject all mutations until the user relaunches and recovery succeeds.
+    {
+        use std::sync::atomic::Ordering;
+        let state = app.state::<crate::app_state::AppState>();
+        if state.store_recovery_failed.load(Ordering::Acquire) {
+            return Err(
+                "store mutation rejected: boot file-commit recovery failed; \
+                 relaunch to retry"
+                    .to_string(),
+            );
+        }
+    }
+
     let anchor = store_anchor_dir(app)?;
     std::fs::create_dir_all(&anchor).map_err(|e| format!("create anchor dir: {e}"))?;
 
@@ -415,9 +457,9 @@ pub fn run_boot_recovery(
 /// Path-level boot recovery — **publication-only** (no file repair).
 ///
 /// File-commit recovery (phase 1) is handled exclusively by the synchronous
-/// `run_file_commit_recovery` call in app setup, which runs BEFORE this
-/// background task is spawned.  This function runs only phase 2: publication
-/// recovery (outbox re-drive into the retention DB).
+/// `run_recovery_gate` call in app setup, which runs BEFORE this background
+/// task is spawned.  This function runs only phase 2: publication recovery
+/// (outbox re-drive into the retention DB).
 ///
 /// `retention_db_path` is the path to the anchor's active scoped retention DB.
 /// When `Some`, recovery re-inserts missing `pending_sync` retention rows from
@@ -428,30 +470,19 @@ pub(crate) fn run_boot_recovery_at(
     retention_db_path: Option<&std::path::Path>,
 ) -> Result<(), String> {
     // Publication recovery only — no file I/O, no lock required.
-    // File-commit repair is the sole responsibility of run_file_commit_recovery.
+    // File-commit repair is the sole responsibility of run_recovery_gate.
     let journal = open_journal(anchor)?;
     recover_nonterminal_operations(&journal, retention_db_path)?;
     Ok(())
 }
 
-/// File-commit-only recovery: acquire the advisory lock, replay any interrupted
-/// two-phase file commits, then release the lock.
-///
-/// Called synchronously during app setup (before commands are admitted) so the
-/// store is always in a consistent state by the time the first command runs.
-pub fn run_file_commit_recovery(app: &AppHandle) -> Result<(), String> {
-    let anchor = store_anchor_dir(app)?;
-    std::fs::create_dir_all(&anchor).map_err(|e| format!("boot-recovery create anchor: {e}"))?;
-    file_commit_recovery_at(&anchor)
-}
-
 /// Path-level file-commit recovery, extracted for testing without an AppHandle.
 #[cfg(test)]
-pub(crate) fn file_commit_recovery_at_pub(anchor: &std::path::Path) -> Result<(), String> {
+pub(crate) fn file_commit_recovery_at_pub(anchor: &std::path::Path) -> Result<usize, String> {
     file_commit_recovery_at(anchor)
 }
 
-fn file_commit_recovery_at(anchor: &std::path::Path) -> Result<(), String> {
+fn file_commit_recovery_at(anchor: &std::path::Path) -> Result<usize, String> {
     let _advisory = super::lock::JournalLockGuard::acquire(anchor)?;
     let journal = open_journal(anchor)?;
     recover_interrupted_file_commits(&journal)
@@ -497,8 +528,14 @@ fn sha256_hex_of_file(path: &std::path::Path) -> Option<String> {
     Some(hex::encode(sha2::Sha256::digest(&bytes)))
 }
 
+/// Recover any interrupted two-phase file commits.
+///
+/// Returns the number of nonterminal commits that could NOT be resolved (any
+/// branch that previously `continue`d without completing the rename sequence).
+/// A non-zero count means the store is in an uncertain state and callers must
+/// treat it as a recovery failure.
 #[allow(clippy::type_complexity)]
-fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<(), String> {
+fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<usize, String> {
     // Read commit_id, phase, stage paths, AND content hashes.
     let rows: Vec<(String, String, String, String, String, String)> = {
         let mut stmt = journal
@@ -528,6 +565,8 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
             .map_err(|e| format!("read file_commit_phases row: {e}"))?
     };
 
+    let mut unresolved: usize = 0;
+
     for (commit_id, phase_str, agents_stage_str, teams_stage_str, agents_hash, teams_hash) in rows {
         let phase = FileCommitPhase::from_str(&phase_str).unwrap_or(FileCommitPhase::Intent);
         let agents_stage = std::path::PathBuf::from(&agents_stage_str);
@@ -539,6 +578,15 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
 
         let agents_canonical = canonical_from_stage(&agents_stage);
         let teams_canonical = canonical_from_stage(&teams_stage);
+
+        // Macro that counts a skipped commit as unresolved and moves to the next.
+        macro_rules! skip_unresolved {
+            ($msg:expr) => {{
+                eprintln!("{}", $msg);
+                unresolved += 1;
+                continue;
+            }};
+        }
 
         match phase {
             FileCommitPhase::Intent => {
@@ -554,7 +602,8 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
                         && sha256_hex_of_file(&teams_canonical).as_deref() == Some(&teams_hash);
                     if agents_ok && teams_ok {
                         eprintln!(
-                            "buzz-desktop: boot-recovery: {commit_id}: both stage files absent,                              canonicals verified — advancing to committed"
+                            "buzz-desktop: boot-recovery: {commit_id}: both stage files absent, \
+                             canonicals verified — advancing to committed"
                         );
                         advance_file_commit_phase(journal, &commit_id, &FileCommitPhase::Committed)
                             .unwrap_or_else(|e| {
@@ -563,25 +612,28 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
                                 )
                             });
                     } else {
-                        eprintln!(
-                            "buzz-desktop: boot-recovery: {commit_id}: both stage files absent                              in intent phase and canonicals do not match recorded hashes —                              failing closed; manual recovery may be needed"
-                        );
+                        skip_unresolved!(format!(
+                            "buzz-desktop: boot-recovery: {commit_id}: both stage files absent \
+                             in intent phase and canonicals do not match recorded hashes — \
+                             failing closed; manual recovery may be needed"
+                        ));
                     }
                     continue;
                 }
                 if !agents_exists {
                     // Agents stage absent, teams stage present: ambiguous —
                     // cannot determine if agents rename completed without proof.
-                    // Fail closed: skip this commit; operator intervention needed.
-                    eprintln!(
-                        "buzz-desktop: boot-recovery: {commit_id}: agents stage absent in                          intent phase (teams stage present) — cannot safely complete;                          skipping (manual recovery may be needed)"
-                    );
-                    continue;
+                    skip_unresolved!(format!(
+                        "buzz-desktop: boot-recovery: {commit_id}: agents stage absent in \
+                         intent phase (teams stage present) — cannot safely complete; \
+                         skipping (manual recovery may be needed)"
+                    ));
                 }
                 // Agents stage exists — replay agents rename.
                 if let Err(e) = rename_staged(&agents_stage, &agents_canonical) {
-                    eprintln!("buzz-desktop: boot-recovery: agents rename failed: {e}");
-                    continue;
+                    skip_unresolved!(format!(
+                        "buzz-desktop: boot-recovery: agents rename failed: {e}"
+                    ));
                 }
                 if let Err(e) =
                     advance_file_commit_phase(journal, &commit_id, &FileCommitPhase::FirstRenamed)
@@ -591,20 +643,20 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
                 // Teams rename.
                 if teams_exists {
                     if let Err(e) = rename_staged(&teams_stage, &teams_canonical) {
-                        eprintln!("buzz-desktop: boot-recovery: teams rename failed: {e}");
-                        continue;
+                        skip_unresolved!(format!(
+                            "buzz-desktop: boot-recovery: teams rename failed: {e}"
+                        ));
                     }
                 } else {
                     // Teams stage absent after agents rename. Verify via hash.
                     let teams_ok = !teams_hash.is_empty()
                         && sha256_hex_of_file(&teams_canonical).as_deref() == Some(&teams_hash);
                     if !teams_ok {
-                        eprintln!(
+                        skip_unresolved!(format!(
                             "buzz-desktop: boot-recovery: {commit_id}: teams stage absent \
                              in intent phase (after agents rename) and canonical does not \
                              match recorded hash — failing closed"
-                        );
-                        continue;
+                        ));
                     }
                 }
                 advance_file_commit_phase(journal, &commit_id, &FileCommitPhase::Committed)
@@ -616,10 +668,9 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
                 // Agents already renamed; only teams stage remains.
                 if teams_stage.exists() {
                     if let Err(e) = rename_staged(&teams_stage, &teams_canonical) {
-                        eprintln!(
+                        skip_unresolved!(format!(
                             "buzz-desktop: boot-recovery: teams rename (first_renamed) failed: {e}"
-                        );
-                        continue;
+                        ));
                     }
                     // Teams rename succeeded — advance to committed.
                 } else {
@@ -627,10 +678,11 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
                     let teams_ok = !teams_hash.is_empty()
                         && sha256_hex_of_file(&teams_canonical).as_deref() == Some(&teams_hash);
                     if !teams_ok {
-                        eprintln!(
-                            "buzz-desktop: boot-recovery: {commit_id}: teams stage absent in                              first_renamed phase and canonical does not match recorded hash —                              failing closed; manual recovery may be needed"
-                        );
-                        continue;
+                        skip_unresolved!(format!(
+                            "buzz-desktop: boot-recovery: {commit_id}: teams stage absent in \
+                             first_renamed phase and canonical does not match recorded hash — \
+                             failing closed; manual recovery may be needed"
+                        ));
                     }
                     // Canonical matches — teams rename already completed.
                 }
@@ -643,7 +695,7 @@ fn recover_interrupted_file_commits(journal: &rusqlite::Connection) -> Result<()
         }
     }
 
-    Ok(())
+    Ok(unresolved)
 }
 
 /// Recover nonterminal operations from the journal outbox.

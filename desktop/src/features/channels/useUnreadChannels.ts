@@ -24,6 +24,7 @@ import {
 import {
   applyOverrideRead,
   applyOverrideUnread,
+  useClearChannelUnreadSource,
   type OverrideAPIs,
 } from "@/features/channels/readStateOverride";
 import {
@@ -159,16 +160,13 @@ export function useUnreadChannels(
   // Root event IDs of threads where the current user has replied at least once.
   // Used to determine if thread replies should trigger unread notifications.
   const participatedRootIdsRef = React.useRef(new Set<string>());
-
   // Root event IDs of top-level messages authored by the current user.
   // Used to notify the author when someone replies to their posts.
   const authoredRootIdsRef = React.useRef(new Set<string>());
-
   // Root event IDs of threads where an external message @-mentioned the user.
   // ORed into the badge gate so a mention recipient who never participated,
   // authored, or followed the thread still gets the thread-unread badge.
   const mentionedRootIdsRef = React.useRef(new Set<string>());
-
   // Root event IDs of threads the user has explicitly muted. Takes precedence
   // over participation, follow, and authorship for notification suppression.
   const mutedRootIdsRef = React.useRef(new Set<string>());
@@ -307,12 +305,16 @@ export function useUnreadChannels(
     [markContextRead, observedPersistence, overrideApis, pubkey],
   );
 
-  const {
-    clearChannelUnreadSource,
-    markChannelUnread: forcedMarkChannelUnread,
-  } = useForcedUnreadActions(
+  const { markChannelUnread: forcedMarkChannelUnread } = useForcedUnreadActions(
     forcedUnreadRef,
     getOwnTimestamp,
+    pubkey,
+    bumpLatestVersion,
+  );
+
+  const clearChannelUnreadSource = useClearChannelUnreadSource(
+    forcedUnreadRef,
+    overrideApis,
     pubkey,
     bumpLatestVersion,
   );

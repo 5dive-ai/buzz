@@ -356,6 +356,8 @@ export async function mountUnreadChannels({
   let capturedMarkChannelRead = null;
   let capturedMarkAllChannelsRead = null;
   let capturedMarkChannelUnread = null;
+  let capturedClearChannelUnreadSource = null;
+  let capturedUnreadChannelIds = null;
 
   function Inner({ pubkey: pk, relayClient: rc, channels: chs }) {
     const result = useUnreadChannels(chs, null, {
@@ -366,6 +368,8 @@ export async function mountUnreadChannels({
     capturedMarkChannelRead = result.markChannelRead;
     capturedMarkAllChannelsRead = result.markAllChannelsRead;
     capturedMarkChannelUnread = result.markChannelUnread;
+    capturedClearChannelUnreadSource = result.clearChannelUnreadSource;
+    capturedUnreadChannelIds = result.unreadChannelIds;
     return null;
   }
 
@@ -407,6 +411,12 @@ export async function mountUnreadChannels({
     },
     get markChannelUnread() {
       return capturedMarkChannelUnread;
+    },
+    get clearChannelUnreadSource() {
+      return capturedClearChannelUnreadSource;
+    },
+    get unreadChannelIds() {
+      return capturedUnreadChannelIds;
     },
     render,
     unmount: async () => {

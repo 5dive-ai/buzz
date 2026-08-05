@@ -5,13 +5,16 @@
  * override APIs (markChannelUnread / markChannelRead / getOverrideLiveness),
  * added by slice 2 (nip-rs-unread-manager).
  */
+import * as React from "react";
 import { toast } from "sonner";
 
 import type { OverrideLiveness } from "@/features/channels/readState/readStateFormat";
 import type { MarkResult } from "@/features/channels/readState/readStateManager";
 import {
   forcedUnreadStore,
+  removeForcedUnreadSource,
   type ForcedUnreadMap,
+  type ForcedUnreadSource,
 } from "@/features/channels/forcedUnreadStore";
 
 export type { MarkResult, OverrideLiveness };
@@ -136,6 +139,57 @@ export function applyOverrideRead(
     if (msg) toast.error(msg);
   }
   return "overrideStillActive";
+}
+
+/**
+ * Override-aware hook for clearing a forced-unread source on a channel.
+ *
+ * For non-last-source removals the operation is purely local — the remaining
+ * sources still own the override so the register stays active.
+ *
+ * For last-source removals the user's intent is "I am done with this override
+ * for this channel". That clear IS an explicit mark-read and must be routed
+ * through `applyOverrideRead` so the NIP-RS register receives its C-bump:
+ *
+ *   - `overrideCleared` → commit the local entry deletion and persist.
+ *   - `overrideStillActive` (refused C-bump) → keep the source entry; bold
+ *     persisting is correct fail-closed behavior, consistent with the
+ *     markChannelRead refusal semantics in useUnreadChannels.
+ *
+ * The no-local-entry early return is intentional: a remote-only register must
+ * not be C-bumped via the source-clear path — `applyOverrideRead` in the
+ * explicit markChannelRead is the correct path for that case.
+ */
+export function useClearChannelUnreadSource(
+  forcedUnreadRef: React.MutableRefObject<ForcedUnreadMap>,
+  apis: OverrideAPIs,
+  pubkey: string | undefined,
+  onChange: () => void,
+): (channelId: string, source: ForcedUnreadSource) => void {
+  return React.useCallback(
+    (channelId: string, source: ForcedUnreadSource) => {
+      if (!Object.hasOwn(forcedUnreadRef.current, channelId)) return;
+      const current = forcedUnreadRef.current[channelId];
+      const next = removeForcedUnreadSource(current, source);
+      if (next === current) return; // source not present — no-op
+      if (next !== undefined) {
+        // Non-last-source removal: update locally, register stays active.
+        forcedUnreadRef.current[channelId] = next;
+        if (pubkey) forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+        onChange();
+        return;
+      }
+      // Last-source removal: route through the mark-read seam.
+      const outcome = applyOverrideRead(channelId, apis);
+      if (outcome === "overrideCleared") {
+        delete forcedUnreadRef.current[channelId];
+        if (pubkey) forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+        onChange();
+      }
+      // overrideStillActive: keep entry; bold correctly persists on C-bump refusal.
+    },
+    [apis, forcedUnreadRef, onChange, pubkey],
+  );
 }
 
 /**

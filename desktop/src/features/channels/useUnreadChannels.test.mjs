@@ -486,3 +486,166 @@ test("markAllChannelsRead stale: fence-first guard rejects scope-A callback — 
 
   await harness.unmount();
 });
+
+// ── clearChannelUnreadSource seam tests ───────────────────────────────────────
+
+test("clearChannelUnreadSource last-source clear: routes through applyOverrideRead, liveness inactive and channel leaves unreadChannelIds", async () => {
+  // Bites: readStateOverride.ts:useClearChannelUnreadSource — the `applyOverrideRead`
+  // call on last-source removal. Without this call, the NIP-RS register never receives
+  // a C-bump, liveness stays ACTIVE (isForcedUnread = getOverrideLiveness(id).active),
+  // and the channel remains in unreadChannelIds and stays bold forever.
+  //
+  // Mutation (new): deleting the applyOverrideRead call → unconditional entry delete.
+  // Under this mutation: forcedUnreadStore check passes (entry deleted), BUT liveness
+  // stays ACTIVE because the register was never C-bumped → channel REMAINS in
+  // unreadChannelIds. The second assertion catches this.
+  installFreshStorage();
+
+  const PUBKEY = "pubkey-source-clear-last";
+  const rc = makeReadyRelayClient();
+  const harness = await mountUnreadChannels({
+    pubkey: PUBKEY,
+    channels: [makeChannel("channel-x")],
+    relayClient: rc,
+  });
+
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  // markChannelUnread: S-bump → register active, forced entry written with "inbox" source.
+  // channel-x appears in unreadChannelIds (isForcedUnread = liveness.active = true).
+  await act(async () => {
+    harness.markChannelUnread("channel-x", "inbox");
+  });
+
+  const forcedBefore = forcedUnreadStore.read(PUBKEY);
+  assert.ok(
+    Object.hasOwn(forcedBefore, "channel-x"),
+    "forced entry must exist before clear",
+  );
+  assert.ok(
+    harness.unreadChannelIds.has("channel-x"),
+    "channel-x must be in unreadChannelIds before clear",
+  );
+
+  // Clear the last (only) source. This must trigger applyOverrideRead → C-bump →
+  // overrideCleared → delete forced entry → liveness inactive → channel leaves unreadChannelIds.
+  await act(async () => {
+    harness.clearChannelUnreadSource("channel-x", "inbox");
+  });
+  harness.flushStorage();
+
+  const forcedAfter = forcedUnreadStore.read(PUBKEY);
+  assert.ok(
+    !Object.hasOwn(forcedAfter, "channel-x"),
+    "last-source clear must delete the forced-unread entry via overrideCleared",
+  );
+  // This assertion bites mutation (new) (applyOverrideRead deleted → unconditional delete):
+  // Without the C-bump the register stays ACTIVE, isForcedUnread stays true, and
+  // channel-x remains in unreadChannelIds even though forcedUnreadStore no longer has it.
+  assert.ok(
+    !harness.unreadChannelIds.has("channel-x"),
+    "last-source clear must cause channel-x to leave unreadChannelIds (liveness inactive after C-bump)",
+  );
+
+  await harness.unmount();
+});
+
+test("clearChannelUnreadSource refused C-bump: near-overflow register keeps source entry on overrideStillActive", async () => {
+  // Bites: readStateOverride.ts:useClearChannelUnreadSource — the `overrideStillActive`
+  // branch. With a near-overflow register {s:MAX, c:0, b:10B} seeded via localStorage,
+  // the C-bump overflows and liveness remains active → applyOverrideRead returns
+  // overrideStillActive → the source entry must NOT be deleted (fail-closed behavior).
+  // Removing the overrideStillActive guard (unconditionally deleting on last-source) fails.
+  installFreshStorage();
+
+  const PUBKEY = "pubkey-source-clear-refused";
+  const V2_KEY = `buzz.nip-rs.override-state.v2:${PUBKEY}`;
+  const FORCED_KEY = `buzz-forced-unread.v1:${PUBKEY}`;
+  // Near-overflow: C-bump overflows, frontier advance (~1.75B) stays below b=10B.
+  localStorage.setItem(
+    V2_KEY,
+    JSON.stringify({
+      "channel-d": { s: 4294967295, c: 0, b: 99999999999, f: 0 },
+    }),
+  );
+  localStorage.setItem(
+    FORCED_KEY,
+    JSON.stringify({
+      "channel-d": { markerAtWhenForced: 100, sources: ["inbox"] },
+    }),
+  );
+
+  const rc = makeReadyRelayClient();
+  const harness = await mountUnreadChannels({
+    pubkey: PUBKEY,
+    channels: [makeChannel("channel-d")],
+    relayClient: rc,
+  });
+
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  // Attempt to clear the last source. C-bump overflows → overrideStillActive → entry preserved.
+  await act(async () => {
+    harness.clearChannelUnreadSource("channel-d", "inbox");
+  });
+  harness.flushStorage();
+
+  const forcedAfter = forcedUnreadStore.read(PUBKEY);
+  assert.ok(
+    Object.hasOwn(forcedAfter, "channel-d"),
+    "refused clear (uint32_overflow): source entry must be preserved when C-bump is refused",
+  );
+
+  await harness.unmount();
+});
+
+test("clearChannelUnreadSource non-last source: purely local, entry retains remaining source", async () => {
+  // Verifies the non-last-source branch: removing one of two sources is purely local
+  // (no applyOverrideRead call), the remaining source is preserved in the forced entry.
+  installFreshStorage();
+
+  const PUBKEY = "pubkey-source-clear-nonlast";
+  const FORCED_KEY = `buzz-forced-unread.v1:${PUBKEY}`;
+  localStorage.setItem(
+    FORCED_KEY,
+    JSON.stringify({
+      "channel-e": { markerAtWhenForced: 100, sources: ["inbox", "manual"] },
+    }),
+  );
+
+  const rc = makeReadyRelayClient();
+  const harness = await mountUnreadChannels({
+    pubkey: PUBKEY,
+    channels: [makeChannel("channel-e")],
+    relayClient: rc,
+  });
+
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  // Remove "inbox" — "manual" remains. No applyOverrideRead should be called.
+  await act(async () => {
+    harness.clearChannelUnreadSource("channel-e", "inbox");
+  });
+  harness.flushStorage();
+
+  const forcedAfter = forcedUnreadStore.read(PUBKEY);
+  assert.ok(
+    Object.hasOwn(forcedAfter, "channel-e"),
+    "non-last-source clear must keep the forced-unread entry",
+  );
+  const entry = forcedAfter["channel-e"];
+  const sources =
+    typeof entry === "object" && entry !== null ? entry.sources : ["manual"];
+  assert.ok(
+    sources.includes("manual") && !sources.includes("inbox"),
+    'non-last-source clear must retain "manual" and remove "inbox" from sources',
+  );
+
+  await harness.unmount();
+});

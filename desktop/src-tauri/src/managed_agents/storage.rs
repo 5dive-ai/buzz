@@ -358,15 +358,12 @@ fn hydrate_keys(records: &mut [ManagedAgentRecord]) {
     // Without this guard `load_managed_agents_at` blocks on a macOS Security
     // daemon IPC call (`SecKeychainFindGenericPassword`) which hangs in
     // headless test environments.
-    #[cfg(test)]
-    {
-        let _ = records;
-        return;
+    #[cfg(not(test))]
+    if let Some(store) = agent_secret_store() {
+        hydrate_keys_with(store, records);
     }
-    let Some(store) = agent_secret_store() else {
-        return;
-    };
-    hydrate_keys_with(store, records);
+    #[cfg(test)]
+    let _ = records;
 }
 
 /// Testable core of [`hydrate_keys`], generic over the [`KeyStore`] seam.
@@ -544,16 +541,12 @@ fn persist_agent_keys(records: &mut [ManagedAgentRecord]) {
     // empty `private_key_nsec` where the keyring write is a no-op anyway.
     // Without this guard `save_managed_agents_at` blocks on a macOS Security
     // daemon IPC write call in headless test environments.
-    #[cfg(test)]
-    {
-        let _ = records;
-        return;
+    #[cfg(not(test))]
+    if let Some(store) = agent_secret_store() {
+        persist_agent_keys_with(store, records);
     }
-    let Some(store) = agent_secret_store() else {
-        // No keyring backend: keys stay inline.
-        return;
-    };
-    persist_agent_keys_with(store, records);
+    #[cfg(test)]
+    let _ = records;
 }
 
 /// Testable core of [`persist_agent_keys`], generic over the [`KeyStore`] seam.

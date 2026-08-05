@@ -4,6 +4,9 @@
 
 ### Desktop and shared changes
 
+- feat: paste composer text without formatting ([#4801](https://github.com/block/buzz/pull/4801)) ([`25a9cf1be6d245fbd7373cb1160dbc790baf5bd5`](https://github.com/block/buzz/commit/25a9cf1be6d245fbd7373cb1160dbc790baf5bd5))
+- Revert "chore(release): release Buzz Desktop version 0.5.5" ([#4808](https://github.com/block/buzz/pull/4808)) ([`79c52166cfe6b6d36bdc7686f943595c74e2f578`](https://github.com/block/buzz/commit/79c52166cfe6b6d36bdc7686f943595c74e2f578))
+- chore(release): release Buzz Desktop version 0.5.5 ([#4800](https://github.com/block/buzz/pull/4800)) ([`a0ed13de14ee64dd90c32335790f7d3b4e94330d`](https://github.com/block/buzz/commit/a0ed13de14ee64dd90c32335790f7d3b4e94330d))
 - fix: reauthenticate databricks model discovery ([#4008](https://github.com/block/buzz/pull/4008)) ([`4a2305170eef565bf1836e2859247e67c030f8af`](https://github.com/block/buzz/commit/4a2305170eef565bf1836e2859247e67c030f8af))
 - Revert "chore(release): release Buzz Desktop version 0.5.5" ([#4797](https://github.com/block/buzz/pull/4797)) ([`8faf09f9aedb4989e57c7b6c5bd1052a444a3370`](https://github.com/block/buzz/commit/8faf09f9aedb4989e57c7b6c5bd1052a444a3370))
 - feat: Buzz entity links — rich preview cards + in-app navigation for repos, PRs, and issues ([#4695](https://github.com/block/buzz/pull/4695)) ([`a1d78f2959b41c63f063ff818076d38c31071a47`](https://github.com/block/buzz/commit/a1d78f2959b41c63f063ff818076d38c31071a47))

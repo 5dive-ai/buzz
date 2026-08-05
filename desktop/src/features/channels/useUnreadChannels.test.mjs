@@ -11,32 +11,30 @@
  * The controllable NIP-RS manager (makeReadyRelayClient) gives us isLoadComplete:
  * true so the production clear-transition paths are exercised end-to-end.
  *
- * ## Mutation-test coverage
+ * Near-overflow registers are seeded via localStorage (buzz.nip-rs.override-state.v2:*)
+ * — the plaintext production ingest path (readStateStorage.ts). hydrateFromLocalStorage()
+ * picks them up at ReadStateManager construction time; no NIP-44 or tauri IPC needed.
  *
- * Tests are named and documented for the production call site whose deletion would
- * cause a failure — verified by manual mutation before committing.
+ * ## Mutation-test coverage (all three verified by manual mutation)
  *
  * Mutation (a): delete the isScopeLoaded() fence-first guard in markAllChannelsRead
- *   → "markAllChannelsRead stale" fails: stale A callback reaches the trailing
+ *   → "markAllChannelsRead stale" FAILS: stale A callback reaches the trailing
  *     forcedUnreadStore.write(pubkeyA, ...) and overwrites A's storage with B's map.
  *
  * Mutation (b): remove the overrideCleared gate in markAllChannelsRead (unconditional
- *   delete + removeChannel) — NOT INDEPENDENTLY BITABLE with this test infrastructure.
- *   The accepted-path test (non-empty mark-all) would still pass because
- *   applyOverrideRead returns overrideCleared for all reachable channels (normal
- *   counters). A test that bites mutation (b) in isolation requires applyOverrideRead
- *   to return overrideStillActive with channels in the loop, which requires a refused
- *   C-bump (storage_failed or uint32_overflow). That path is not reachable via the
- *   production hook without a fragile internal storage-failure mock. Reported to Paul.
+ *   delete + removeChannel)
+ *   → "markAllChannelsRead refused clear" FAILS: with a near-overflow register
+ *     {s:MAX, c:0, b:10B} seeded via localStorage, the C-bump overflows and
+ *     liveness remains active (frontier ~1.75B < b=10B), so applyOverrideRead
+ *     returns overrideStillActive — but the un-gated path deletes the forced
+ *     entry anyway.
  *
- * Mutation (c): swap frontier-advance and C-bump order in markChannelRead — NOT
- *   INDEPENDENTLY BITABLE with normal counter values. With {s:1,c:0,b:0} created by
- *   markChannelUnread, C-bump deactivates the register (s=1 → c=2, s>c=false)
- *   regardless of whether the frontier was advanced first. A test that bites mutation
- *   (c) requires a register where the C-bump alone cannot deactivate (uint32_overflow)
- *   and the frontier is the only deactivation path. Seeding such a register requires
- *   NIP-44-encrypted relay events (not constructible in Node tests without mocking
- *   the tauri IPC decrypt). Reported to Paul.
+ * Mutation (c): swap frontier-advance and C-bump order in markChannelRead
+ *   → "markChannelRead frontier-advance-before-cbump ordering" FAILS: with a
+ *     near-overflow register {s:MAX, c:0, b:1}, the C-bump alone overflows
+ *     (uint32_overflow, overrideStillActive), but F>B=1 deactivates the register
+ *     only when the frontier advance ran first. Swapping order leaves the forced
+ *     entry alive instead of deleting it.
  */
 
 import assert from "node:assert/strict";
@@ -141,7 +139,8 @@ test("markChannelRead frontier-advance-before-cbump: spec ordering gates overrid
   //
   // NOTE: The frontier-advance-before-C-bump ordering cannot be independently bited
   // with normal counter values — C-bump alone deactivates {s:1,c:0,b:0} → {s:1,c:2,b:0}
-  // regardless of whether frontier advance happened first. Documented in the file header.
+  // regardless of whether frontier advance happened first. See the ordering test below
+  // for the near-overflow probe that makes order observable.
   // This test verifies the with-register accepted path end-to-end.
   installFreshStorage();
 
@@ -177,6 +176,61 @@ test("markChannelRead frontier-advance-before-cbump: spec ordering gates overrid
   assert.ok(
     stored === null || !stored.has("channel-order"),
     "markChannelRead with active register: overrideCleared must clear observed evidence",
+  );
+
+  await harness.unmount();
+});
+
+test("markChannelRead frontier-advance-before-cbump ordering: F>B deactivation requires advance before C-bump", async () => {
+  // Bites: useUnreadChannels.ts:markChannelRead — the frontier advance
+  // (`markContextRead`) running BEFORE `applyOverrideRead` (C-bump). With a
+  // near-overflow register {s:MAX, c:0, b:1} seeded via hydrateFromLocalStorage,
+  // the C-bump overflows (uint32_overflow) and is the ONLY deactivation path that
+  // fails. Deactivation must come from F>B: advance sets F >> B=1 → inactive.
+  //
+  // Correct order: advance → F > B=1 → liveness inactive → overrideCleared → entry deleted.
+  // Swapped order: C-bump first (overflow, still active) → overrideStillActive → entry survives.
+  //
+  // isOverrideActive = s>0 && frontier<=b && s>c:
+  //   With F=0 (pre-advance): MAX>0 && 0<=1 && MAX>0 → ACTIVE.
+  //   With F=~1.75B (post-advance): MAX>0 && 1.75B<=1 → INACTIVE.
+  installFreshStorage();
+
+  const PUBKEY = "pubkey-order-cbump-frontier";
+  // Near-overflow register: s=MAX, c=0, b=1. C-bump overflows; only F>B clears.
+  const V2_KEY = `buzz.nip-rs.override-state.v2:${PUBKEY}`;
+  const FORCED_KEY = `buzz-forced-unread.v1:${PUBKEY}`;
+  localStorage.setItem(
+    V2_KEY,
+    JSON.stringify({ "channel-c": { s: 4294967295, c: 0, b: 1, f: 0 } }),
+  );
+  localStorage.setItem(FORCED_KEY, JSON.stringify({ "channel-c": 100 }));
+  const readAt = seedStorage(PUBKEY, RELAY, "channel-c");
+
+  const rc = makeReadyRelayClient();
+  const harness = await mountUnreadChannels({
+    pubkey: PUBKEY,
+    channels: [makeChannel("channel-c")],
+    relayClient: rc,
+  });
+
+  // Wait for initialize() + hydrateFromLocalStorage() to complete.
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  // markChannelRead: advance runs first → F (~1.75B) > B (1) → liveness inactive.
+  // Then C-bump overflows but re-read liveness is inactive → overrideCleared.
+  // Forced entry must be deleted.
+  await act(async () => {
+    harness.markChannelRead("channel-c", readAt);
+  });
+  harness.flushStorage();
+
+  const forcedMap = forcedUnreadStore.read(PUBKEY);
+  assert.ok(
+    !Object.hasOwn(forcedMap, "channel-c"),
+    "frontier-advance-before-cbump ordering: F>B must deactivate the register before the C-bump attempt",
   );
 
   await harness.unmount();
@@ -253,10 +307,9 @@ test("markAllChannelsRead accepted path: ready manager clears forced and observe
   // and deletes the forced entry + calls removeChannel. Deleting the loop entry-point
   // (applyOverrideRead call) or the forcedUnreadRef deletion fails this test.
   //
-  // NOTE: Mutation (b) — removing the overrideCleared gate (unconditional delete) —
-  // does NOT independently fail this test because applyOverrideRead always returns
-  // overrideCleared for reachable channels with normal counters. Documented in the
-  // file header. This test verifies the accepted-clearing path end-to-end.
+  // Mutation (b) bites the "refused clear" test below, not this one: with normal
+  // counters applyOverrideRead always returns overrideCleared, so the gate's presence
+  // is not observable here. This test verifies the accepted-clearing path end-to-end.
   installFreshStorage();
 
   const PUBKEY = "pubkey-accepted-mar";
@@ -302,6 +355,64 @@ test("markAllChannelsRead accepted path: ready manager clears forced and observe
   assert.ok(
     stored === null || !stored.has("channel-1"),
     "markAllChannelsRead accepted path: observed evidence must be removed",
+  );
+
+  await harness.unmount();
+});
+
+test("markAllChannelsRead refused clear: overrideCleared gate preserves forced entry on uint32_overflow", async () => {
+  // Bites: useUnreadChannels.ts:markAllChannelsRead — the `if (outcome ===
+  // "overrideCleared")` gate. With a near-overflow register seeded via
+  // hydrateFromLocalStorage ({s:MAX, c:0, b:10B}), the C-bump overflows
+  // (uint32_overflow refusal) and the frontier advance stays below b, so
+  // liveness remains active → applyOverrideRead returns overrideStillActive.
+  // The forced entry must NOT be deleted. Removing the gate (unconditional
+  // delete + removeChannel) deletes the entry even though the override is live.
+  //
+  // Seeding path: localStorage v2 key is the plaintext production ingest path
+  // (readStateStorage.ts); hydrateFromLocalStorage() ingests it on init,
+  // no NIP-44 or tauri IPC involved.
+  installFreshStorage();
+
+  const PUBKEY = "pubkey-refused-mar-overflow";
+  // Seed a near-overflow register: s=MAX, c=0, b=10B (frontier stays below b).
+  // isOverrideActive = s>0 && frontier<=b && s>c → true at any reasonable ts.
+  const V2_KEY = `buzz.nip-rs.override-state.v2:${PUBKEY}`;
+  const FORCED_KEY = `buzz-forced-unread.v1:${PUBKEY}`;
+  localStorage.setItem(
+    V2_KEY,
+    JSON.stringify({
+      "channel-b": { s: 4294967295, c: 0, b: 99999999999, f: 0 },
+    }),
+  );
+  localStorage.setItem(FORCED_KEY, JSON.stringify({ "channel-b": 100 }));
+  // Seed observed storage so latestByChannelRef is populated for frontier advance.
+  seedStorage(PUBKEY, RELAY, "channel-b");
+
+  const rc = makeReadyRelayClient();
+  const harness = await mountUnreadChannels({
+    pubkey: PUBKEY,
+    channels: [makeChannel("channel-b")],
+    relayClient: rc,
+  });
+
+  // Wait for initialize() + hydrateFromLocalStorage() to complete.
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  // markAllChannelsRead: "channel-b" is in unreadChannelIds (liveness active),
+  // frontier advance sets effectiveState to ts (~1.75B) < b (10B), C-bump overflows,
+  // applyOverrideRead → overrideStillActive → forced entry must be preserved.
+  await act(async () => {
+    harness.markAllChannelsRead();
+  });
+  harness.flushStorage();
+
+  const forcedMap = forcedUnreadStore.read(PUBKEY);
+  assert.ok(
+    Object.hasOwn(forcedMap, "channel-b"),
+    "refused clear (uint32_overflow): forced-unread entry must be preserved",
   );
 
   await harness.unmount();

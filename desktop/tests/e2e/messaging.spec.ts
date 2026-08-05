@@ -556,6 +556,13 @@ test("completed link previews send when one URL has an unsnapshotable fragment",
       }),
     );
   }, pastedText);
+  const composerPreviewCards = page.locator(
+    "[data-link-preview-composer-card]",
+  );
+  await expect(composerPreviewCards).toHaveCount(2);
+  await expect(
+    composerPreviewCards.locator(`a[href="${previewUrls[2]}"]`),
+  ).toHaveCount(0);
   await waitForReadyComposerSnapshots(page, 2);
 
   const send = page.getByTestId("send-message");

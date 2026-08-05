@@ -3,7 +3,10 @@ import { ImageOff, LoaderCircle, X } from "lucide-react";
 
 import { getRelayHttpUrl, uploadMediaBytes } from "@/shared/api/tauri";
 import { extractSupportedLinkPreviews } from "@/shared/lib/linkPreview";
-import { buildLinkPreviewSnapshotTag } from "@/shared/lib/linkPreviewSnapshot";
+import {
+  buildLinkPreviewSnapshotTag,
+  isValidLinkPreviewSnapshotCanonicalUrl,
+} from "@/shared/lib/linkPreviewSnapshot";
 import {
   beginRelayOriginFetch,
   getCachedRelayOrigin,
@@ -131,7 +134,12 @@ async function uploadDataUrl(
 export function useComposerLinkPreviews(content: string) {
   const [suppressed, setSuppressed] = React.useState(false);
   const candidates = React.useMemo(
-    () => extractSupportedLinkPreviews(content),
+    () =>
+      extractSupportedLinkPreviews(content).filter((preview) =>
+        preview.href.startsWith("buzz://")
+          ? true
+          : isValidLinkPreviewSnapshotCanonicalUrl(preview.href),
+      ),
     [content],
   );
   const previews = useResolvedLinkPreviews(suppressed ? [] : candidates);

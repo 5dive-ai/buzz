@@ -437,6 +437,67 @@ async fn unsupported_image_response_recovers_without_replaying_image() {
     h.shutdown().await;
 }
 
+/// The recovery path must only fire when it actually removed an image. If the
+/// provider emits the unsupported-image phrase while history holds no image
+/// (a misclassification, or a provider that returns the phrase for an
+/// unrelated reason), mutating nothing and continuing would spin the turn loop
+/// forever — `max_rounds` defaults to 0 (unlimited) in production, so nothing
+/// downstream bounds it. The turn must fail with the typed error instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_image_without_image_in_history_fails_instead_of_looping() {
+    // Five rejections but MAX_ROUNDS=4: if the guard is removed the loop
+    // re-requests without ever mutating history and drains the queue.
+    let responses = (0..5)
+        .map(|_| CannedResponse {
+            status: 404,
+            body: json!({
+                "error": { "message": "No endpoints found that support image input" }
+            }),
+        })
+        .collect();
+    let (url, captures) = spawn_capturing_fake_llm_with_statuses(responses).await;
+    let mut h = Harness::spawn(&url).await;
+
+    h.send(
+        "initialize",
+        json!({"protocolVersion":2,"clientCapabilities":{}}),
+    )
+    .await;
+    let _ = h.recv().await;
+    let session_id = h
+        .send("session/new", json!({ "cwd": "/tmp", "mcpServers": [] }))
+        .await;
+    let session = h.recv_until(|v| v["id"] == json!(session_id)).await;
+    let sid = session["result"]["sessionId"].as_str().unwrap();
+
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{"type":"text","text":"no image here"}],
+            }),
+        )
+        .await;
+    let reply = h.recv_until(|v| v["id"] == json!(prompt_id)).await;
+
+    assert!(
+        reply.get("result").is_none(),
+        "an unrecoverable image rejection must not complete the turn: {reply}"
+    );
+    let message = reply["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("image input unsupported"),
+        "the typed error must surface to the caller: {reply}"
+    );
+    assert_eq!(
+        captures.lock().await.len(),
+        1,
+        "the loop must not re-request after a rejection it could not repair"
+    );
+    h.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejects_concurrent_prompts() {
     // Slow first response so the second prompt arrives mid-flight.

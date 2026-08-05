@@ -415,28 +415,23 @@ fn commit_imported_identity(
 
     let storage = persist(&keys)?;
 
-    // Update in-memory keys BEFORE clearing recovery flags. The Release
-    // stores below pair with Acquire loads in get_identity: a reader
-    // observing false is guaranteed to see the updated keys.
+    // Update in-memory keys AND clear recovery flags inside the same epoch guard
+    // so they are co-generational: a concurrent `capture_archive_scope` that
+    // reads an even epoch after the guard exits sees the new key with flags=false.
     let pubkey = keys.public_key();
     {
         let _epoch_guard = state.begin_workspace_write()?;
         let mut active_keys = state.keys.lock().map_err(|e| e.to_string())?;
         *active_keys = keys;
         state.set_identity_storage(storage);
+        // Clear both recovery flags — an import resolves lost and locked.
+        state
+            .identity_lost
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        state
+            .keyring_locked
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
-
-    // Clear both recovery flags — an import is valid in either lost or
-    // keyring-locked state and resolves both. In the locked case the
-    // keyring is unreachable, so the persist step already fell back to
-    // identity.key; on the next Unreachable boot the file is loaded
-    // directly and when the keyring returns the adoption path picks it up.
-    state
-        .identity_lost
-        .store(false, std::sync::atomic::Ordering::Release);
-    state
-        .keyring_locked
-        .store(false, std::sync::atomic::Ordering::Release);
 
     // Importing a different identity invalidates the app-managed backup: it
     // encrypts the previous key and must not linger mislabeled. Best-effort

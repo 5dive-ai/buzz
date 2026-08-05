@@ -316,3 +316,47 @@ fn capture_archive_scope_rejects_when_keyring_locked() {
         "error must mention recovery mode"
     );
 }
+
+/// Finding 4 (fix round 2): recovery key + true flag must never yield a
+/// signable scope. This is the inverse-transition test:
+///   1. Start with a normal (non-recovery) key — capture succeeds.
+///   2. Simulate a recovery transition: write a new ephemeral key inside the
+///      epoch guard AND set identity_lost = true (co-generational).
+///   3. A subsequent capture_archive_scope call must reject — the flag and key
+///      are from the same generation, so there is no window where the
+///      ephemeral key is visible with flags=false.
+#[test]
+fn capture_archive_scope_rejects_after_recovery_transition() {
+    use std::sync::atomic::Ordering;
+
+    let normal_keys = Keys::generate();
+    let state = make_epoch_test_state(normal_keys);
+
+    // Pre-condition: capture succeeds with normal keys.
+    assert!(
+        state.capture_archive_scope(8).is_ok(),
+        "pre-condition: capture must succeed with normal keys"
+    );
+
+    // Simulate a recovery transition — write ephemeral recovery key AND set
+    // identity_lost = true, both inside the epoch guard (co-generational).
+    {
+        let _guard = state
+            .begin_workspace_write()
+            .expect("begin_workspace_write");
+        let ephemeral = Keys::generate();
+        *state.keys.lock().unwrap() = ephemeral;
+        state.identity_lost.store(true, Ordering::SeqCst);
+    }
+
+    // Post-condition: capture must reject the ephemeral recovery key.
+    let result = state.capture_archive_scope(8);
+    assert!(
+        result.is_err(),
+        "capture must reject ephemeral recovery key after co-generational transition"
+    );
+    assert!(
+        result.unwrap_err().contains("recovery mode"),
+        "error must mention recovery mode"
+    );
+}

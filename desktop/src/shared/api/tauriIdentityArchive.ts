@@ -55,13 +55,18 @@ export type OwnedAgentInstance = {
   /** NIP-OA owner proof for this instance — never omitted, only null in older responses. */
   nipIaOwnerProof: NipIaOwnerProof;
   archiveState: OwnedAgentArchiveState;
+  /** Persona ID parsed from `kind:30177` content. `null` for standalone agents. */
+  personaId: string | null;
 };
 
-/** Snapshot returned by `get_owned_agent_inventory`. */
+/** Complete merged view model returned by `get_owned_agent_inventory`. */
 export type OwnedAgentInventorySnapshot = {
   /** Whether the archive snapshot was loaded and trusted. */
   archiveStateTrusted: boolean;
-  instances: OwnedAgentInstance[];
+  /** Instances grouped by persona ID. Drives per-card counts and Sheet filtering. */
+  byPersonaId: Record<string, OwnedAgentInstance[]>;
+  /** Instances with no parseable persona ID (standalone agents). */
+  unknown: OwnedAgentInstance[];
 };
 
 type RawOwnerOfAgent = { owner: string; is_me: boolean };

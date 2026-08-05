@@ -472,8 +472,14 @@ async fn expired_bound_profile_mints_fresh_empty_condition_tag() {
     let (result, observed_event, _) =
         run_with_observation(&state, &scope, ArchiveKind::Archive, &agent_pubkey).await;
 
-    // The relay may accept or reject based on condition eval, but the
-    // submitted request MUST carry exactly one fresh empty-condition auth tag.
+    // NIP-IA §Published-profile rule: time clauses MUST NOT be evaluated by
+    // the relay — an expired profile MUST still be accepted for the owner path.
+    // `result.expect()` proves the zombie-agent path is not broken.
+    let relay_result = result.expect(
+        "expired-profile owner-path archive must succeed: NIP-IA time clauses must not be evaluated"
+    );
+
+    // The submitted request MUST carry exactly one fresh empty-condition auth tag.
     let observed_event = observed_event.expect("must have observed a production-signed event");
     let auth_tags: Vec<&[String]> = observed_event
         .tags
@@ -490,12 +496,21 @@ async fn expired_bound_profile_mints_fresh_empty_condition_tag() {
         auth_tags[0][2], "",
         "fresh-minted tag must have EMPTY condition (not the expired profile condition)"
     );
-    // Distinct from the profile tag: the profile tag has condition=past, the
-    // fresh tag has condition="". The assertion above confirms this.
 
-    // The result depends on whether the relay accepts an expired profile tag
-    // or not. Either way, the WIRE form was correct.
-    let _ = result;
+    // Assert owner-path archive state via kind:8002 delta.
+    let request_event_id = &relay_result.event_id;
+    let delta_8002 = query_nipia_delta(&state, &relay_url, 8002, request_event_id)
+        .await
+        .expect("query kind:8002 delta for expired-profile test");
+    let delta = delta_8002.as_ref().expect(
+        "kind:8002 delta must be emitted after owner-path archive of expired-profile agent",
+    );
+    let consent = extract_consent_tag(delta)
+        .expect("kind:8002 must have consent tag for expired-profile owner path");
+    assert_eq!(
+        consent, "owner",
+        "expired-profile owner-path kind:8002 consent must be 'owner'"
+    );
 }
 
 #[tokio::test]

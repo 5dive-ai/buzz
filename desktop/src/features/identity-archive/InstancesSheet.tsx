@@ -19,6 +19,7 @@ import { truncatePubkey } from "@/shared/lib/pubkey";
 import type {
   NipIaOwnerProof,
   OwnedAgentInstance,
+  OwnedAgentInventorySnapshot,
 } from "@/shared/api/tauriIdentityArchive";
 import type { AgentPersona } from "@/shared/api/types";
 import { Badge } from "@/shared/ui/badge";
@@ -42,8 +43,6 @@ function canMutate(proof: NipIaOwnerProof): boolean {
 type InstanceRowProps = {
   instance: OwnedAgentInstance;
   archiveStateTrusted: boolean;
-  /** Whether this instance's pubkey is managed locally (i.e. in the local agents list). */
-  isManagedLocally: boolean;
   onOpenProfile: (pubkey: string) => void;
   onArchive: (pubkey: string) => void;
   onUnarchive: (pubkey: string) => void;
@@ -54,7 +53,6 @@ type InstanceRowProps = {
 function InstanceRow({
   instance,
   archiveStateTrusted,
-  isManagedLocally,
   onOpenProfile,
   onArchive,
   onUnarchive,
@@ -115,8 +113,8 @@ function InstanceRow({
         </Badge>
       ) : null}
 
-      {/* "Not managed on this device" badge when no local agent exists */}
-      {!isManagedLocally && !isArchived ? (
+      {/* "Not managed on this device" badge for relay-only instances */}
+      {instance.personaId === null && !isArchived ? (
         <Badge className="shrink-0 gap-1" variant="outline">
           <MonitorOff className="h-3 w-3" />
           Relay only
@@ -163,30 +161,30 @@ type InstancesSheetProps = {
   /** The persona whose instances to display. Filters by persona coordinate. */
   persona: AgentPersona | null;
   /**
-   * Lowercase-hex pubkeys of local agents associated with the persona.
-   * Instances whose pubkey is in this set are marked as locally managed.
-   * Instances NOT in this set are marked "Relay only" (not on this device).
+   * The complete grouped inventory snapshot from the parent. The Sheet uses
+   * `inventory.byPersonaId[persona.id]` as the authoritative instance list for
+   * this persona — no secondary pubkey-set reconstruction needed.
+   * `null` when the inventory is not yet loaded.
    */
-  personaAgentPubkeys: ReadonlySet<string>;
+  inventory: OwnedAgentInventorySnapshot | undefined;
   /** Open the exact-pubkey profile panel. */
   onOpenProfile: (pubkey: string) => void;
 };
 
 /**
  * Sheet showing the owner's relay inventory of agent instances (`kind:30177`)
- * scoped to the opener's persona.
+ * scoped to the opener's persona via `inventory.byPersonaId[persona.id]`.
  *
  * - Rows link to the exact-pubkey profile panel.
  * - Archive/Unarchive are offered only for `Verified` instances.
  * - Unknown archive trust shows a retry affordance; mutations are suppressed.
  * - Tri-state badge is scoped to this surface — `useIsIdentityArchived` elsewhere is unchanged.
- * - "Relay only" marker for instances without a matching local agent.
  */
 export function InstancesSheet({
   open,
   onOpenChange,
   persona,
-  personaAgentPubkeys,
+  inventory,
   onOpenProfile,
 }: InstancesSheetProps) {
   const inventoryQuery = useOwnedAgentInventoryQuery(open);
@@ -198,21 +196,20 @@ export function InstancesSheet({
     string | null
   >(null);
 
-  const allInstances = inventoryQuery.data?.instances ?? [];
-  const archiveStateTrusted = inventoryQuery.data?.archiveStateTrusted ?? false;
+  // Use the parent-supplied snapshot when available; fall back to the Sheet's
+  // own query result. This avoids a redundant fetch while keeping the Sheet
+  // self-contained when opened standalone (e.g. from a future entry point).
+  const effectiveData = inventory ?? inventoryQuery.data;
+  const archiveStateTrusted = effectiveData?.archiveStateTrusted ?? false;
 
-  // Filter by persona's agent pubkeys when a persona is provided.
-  // When the persona has known agent pubkeys, show only instances whose pubkey
-  // appears in that set plus any relay-only instances (not managed on this device
-  // but owned by the same user). When no persona is provided, show all instances.
+  // Instances for THIS persona only — from byPersonaId[persona.id].
+  // The parent groups by persona_id parsed from kind:30177 content, so this
+  // is the authoritative view: it includes relay-only instances (no local
+  // agent) and excludes instances from other personas.
   const instances = React.useMemo(() => {
-    if (!persona || personaAgentPubkeys.size === 0) return allInstances;
-    // Show instances for this persona's known pubkeys, plus any relay-only
-    // instances that aren't matched to any local agent (orphaned relay instances).
-    return allInstances.filter((i) =>
-      personaAgentPubkeys.has(i.pubkey.toLowerCase()),
-    );
-  }, [allInstances, persona, personaAgentPubkeys]);
+    if (!persona || !effectiveData) return [];
+    return effectiveData.byPersonaId[persona.id] ?? [];
+  }, [effectiveData, persona]);
 
   function handleArchive(pubkey: string) {
     setConfirmArchivePubkey(pubkey);
@@ -230,6 +227,7 @@ export function InstancesSheet({
 
   const archivePending = archiveMutation.isPending;
   const unarchivePending = unarchiveMutation.isPending;
+  const isLoading = inventoryQuery.isLoading && !effectiveData;
 
   return (
     <>
@@ -248,7 +246,7 @@ export function InstancesSheet({
           </SheetHeader>
 
           <div className="mt-4 space-y-2 overflow-y-auto">
-            {inventoryQuery.isLoading ? (
+            {isLoading ? (
               <div className="flex items-center justify-center py-8">
                 <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
               </div>
@@ -269,7 +267,7 @@ export function InstancesSheet({
                   Retry
                 </Button>
               </div>
-            ) : !archiveStateTrusted && !inventoryQuery.isLoading ? (
+            ) : !archiveStateTrusted && !isLoading ? (
               <div className="space-y-2">
                 <p className="rounded-lg border border-warning/30 bg-warning/10 px-4 py-3 text-sm text-warning-foreground">
                   Archive status could not be verified from the relay. Archive
@@ -292,9 +290,6 @@ export function InstancesSheet({
                       archivePending={archivePending}
                       archiveStateTrusted={false}
                       instance={instance}
-                      isManagedLocally={personaAgentPubkeys.has(
-                        instance.pubkey.toLowerCase(),
-                      )}
                       key={instance.pubkey}
                       unarchivePending={unarchivePending}
                       onArchive={handleArchive}
@@ -314,9 +309,6 @@ export function InstancesSheet({
                   archivePending={archivePending}
                   archiveStateTrusted={archiveStateTrusted}
                   instance={instance}
-                  isManagedLocally={personaAgentPubkeys.has(
-                    instance.pubkey.toLowerCase(),
-                  )}
                   key={instance.pubkey}
                   unarchivePending={unarchivePending}
                   onArchive={handleArchive}

@@ -458,22 +458,23 @@ pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create app data dir: {e}"))?;
 
     let resolved = load_or_create_identity(&data_dir)?;
-    // Write keys and storage before setting the recovery flags (Release) so
-    // any thread that reads a flag as false with Acquire sees consistent data.
+    // Write keys, storage, AND recovery flags inside the same epoch guard so
+    // they are co-generational: a `capture_archive_scope` that reads an even
+    // epoch after the guard exits sees a consistent (keys, flags) tuple.
     {
         let _epoch_guard = state.begin_workspace_write()?;
         let mut active_keys = state.keys.lock().map_err(|e| e.to_string())?;
         *active_keys = resolved.keys;
         state.set_identity_storage(resolved.storage);
+        state.identity_lost.store(
+            resolved.recovery == RecoveryState::Lost,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        state.keyring_locked.store(
+            resolved.recovery == RecoveryState::KeyringLocked,
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
-    state.identity_lost.store(
-        resolved.recovery == RecoveryState::Lost,
-        std::sync::atomic::Ordering::Release,
-    );
-    state.keyring_locked.store(
-        resolved.recovery == RecoveryState::KeyringLocked,
-        std::sync::atomic::Ordering::Release,
-    );
     Ok(())
 }
 

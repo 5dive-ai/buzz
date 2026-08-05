@@ -224,8 +224,6 @@ test("an empty mesh offers the action instead of sitting inert", () => {
 });
 
 test("the label is the same in every state", () => {
-  // Two name variants was the source of drift: one surface kept saying "Buzz
-  // MeshLLM" after the other had dropped it.
   for (const input of [
     { snapshot: null },
     { snapshot: snapshot() },
@@ -233,7 +231,7 @@ test("the label is the same in every state", () => {
     { toggle: SHARING, view: view() },
     { toggle: CONSUMING },
   ]) {
-    assert.equal(derive(input).label, "MeshLLM");
+    assert.equal(derive(input).label, "Shared Compute");
   }
 });
 

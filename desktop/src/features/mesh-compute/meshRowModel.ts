@@ -96,9 +96,8 @@ export type MeshRowModel = {
   pulse: MeshRowPulse;
 };
 
-/** One name in every state. Two variants was the source of drift, and "Buzz"
- * adds nothing inside Buzz. */
-const LABEL = "MeshLLM";
+/** One name in every state. */
+const LABEL = "Shared Compute";
 
 /** Live pool capacity: this machine plus every peer that reports a figure. */
 function liveCapacityGb(view: MeshLiveView | null): number {

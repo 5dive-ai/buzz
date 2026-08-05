@@ -1,5 +1,3 @@
-import { Share2 } from "lucide-react";
-
 import { SidebarMenuButton, SidebarMenuItem } from "@/shared/ui/sidebar";
 import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
 import { cn } from "@/shared/lib/cn";
@@ -113,36 +111,6 @@ export function SidebarMeshComputeRow({
           </SidebarMenuLabel>
         </SidebarMenuButton>
       </MeshComputePopover>
-
-      {/*
-        The trailing slot: an invitation when cold, capacity otherwise.
-
-        Capacity shows in every state that has a number — not just while
-        sharing.
-
-        This slot used to hold a 70%-scaled unlabelled Switch, which was hard to
-        see and ambiguous about what it would do. The control moved wholesale to
-        the popover, which frees the slot for the figure. When this machine is
-        outside the mesh the number *is* the invitation: "92 GB" argues for
-        joining better than any exhortation, and unlike a nudge there is nothing
-        to dismiss. Pointer-events off so the whole row stays one click target.
-      */}
-      {row.callToAction ? (
-        <span
-          className="pointer-events-none absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1 text-2xs font-medium text-muted-foreground group-data-[collapsible=icon]:hidden"
-          data-testid="mesh-row-cta"
-        >
-          <Share2 aria-hidden className="h-3 w-3" />
-          {row.callToAction}
-        </span>
-      ) : row.badge ? (
-        <span
-          className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-2xs tabular-nums text-muted-foreground group-data-[collapsible=icon]:hidden"
-          data-testid="mesh-row-badge"
-        >
-          {row.badge}
-        </span>
-      ) : null}
     </SidebarMenuItem>
   );
 }

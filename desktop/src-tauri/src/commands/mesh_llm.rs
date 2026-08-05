@@ -751,6 +751,17 @@ pub(crate) async fn ensure_relay_mesh_for_record(
         return wait_for_mesh_inference(model_id).await;
     }
 
+    // No serving configuration exists — genuine consumer-only start.
+    // Capture scope BEFORE discovery so a concurrent workspace switch can be
+    // detected under the install lock. Route through
+    // `install_client_under_workspace_transition` which acquires
+    // `workspace_transition`, validates full scope identity
+    // (scope_id, relay, owner, generation), then calls the install closure —
+    // serialized against apply_workspace and live identity import.
+    let captured_scope = state
+        .capture_active_scope()
+        .ok_or("mesh client install: no active workspace scope")?;
+
     let target = match resolve_mesh_bootstrap_target(&state, model_id).await {
         Ok(Some(target)) => target,
         Ok(None) => {
@@ -765,17 +776,6 @@ pub(crate) async fn ensure_relay_mesh_for_record(
             ));
         }
     };
-
-    // No serving configuration exists — genuine consumer-only start.
-    // Capture scope BEFORE discovery so a concurrent workspace switch can be
-    // detected under the install lock. Route through
-    // `install_client_under_workspace_transition` which acquires
-    // `workspace_transition`, validates full scope identity
-    // (scope_id, relay, owner, generation), then calls the install closure —
-    // serialized against apply_workspace and live identity import.
-    let captured_scope = state
-        .capture_active_scope()
-        .ok_or("mesh client install: no active workspace scope")?;
     let model_id_owned = model_id.to_string();
     let endpoint = target.endpoint_addr;
     scope_impl::install_client_under_workspace_transition(app, &captured_scope, move || {

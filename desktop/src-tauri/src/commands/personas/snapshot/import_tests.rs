@@ -179,6 +179,51 @@ fn minimal_agent_snapshot_json(name: &str) -> Vec<u8> {
     encode_snapshot_json(&snap).expect("encode_snapshot_json must succeed for minimal snapshot")
 }
 
+/// Build a minimal agent snapshot JSON that includes one core memory entry.
+///
+/// Used by tests that must exercise the Phase-4 memory-publish path and assert
+/// that `MemoryPublish` carries the captured (pre-switch) relay and owner.
+fn minimal_agent_snapshot_json_with_memory(name: &str) -> Vec<u8> {
+    use crate::managed_agents::agent_snapshot::encode_snapshot_json;
+    use crate::managed_agents::agent_snapshot::{
+        AgentSnapshot, AgentSnapshotDefinition, AgentSnapshotMemory, AgentSnapshotMemoryEntry,
+        AgentSnapshotProfile, MemoryLevel, FORMAT_DISCRIMINATOR, FORMAT_VERSION,
+    };
+
+    let snap = AgentSnapshot {
+        format: FORMAT_DISCRIMINATOR.to_string(),
+        version: FORMAT_VERSION,
+        definition: AgentSnapshotDefinition {
+            name: name.to_string(),
+            source_is_builtin: false,
+            system_prompt: Some(format!("{name} prompt")),
+            runtime: None,
+            model: None,
+            provider: None,
+            parallelism: None,
+            respond_to: None,
+            respond_to_allowlist: vec![],
+            name_pool: vec![],
+            idle_timeout_seconds: None,
+            max_turn_duration_seconds: None,
+        },
+        profile: AgentSnapshotProfile {
+            display_name: name.to_string(),
+            about: None,
+            avatar_data_url: None,
+            avatar_url: Some(format!("https://example.test/{name}.png")),
+        },
+        memory: AgentSnapshotMemory {
+            level: MemoryLevel::Core,
+            entries: vec![AgentSnapshotMemoryEntry {
+                slug: buzz_core_pkg::engram::CORE_SLUG.to_string(),
+                body: format!("# {name}\nTest memory body."),
+            }],
+        },
+    };
+    encode_snapshot_json(&snap).expect("encode_snapshot_json must succeed for memory snapshot")
+}
+
 /// Set up a mock Tauri `App` with `AppState` managed, an active workspace
 /// scope, and matching owner keys.
 ///
@@ -242,8 +287,10 @@ fn setup_import_app_with_scope(
 /// adapter asserts it receives the OLD captured relay, proving Phase 3b is
 /// scope-independent after Phase 3a completes.
 ///
-/// The snapshot in this test has no memory entries so the memory adapter is
-/// never called; the profile-relay assertion is sufficient.
+/// The snapshot carries one core memory entry so `submit_memory` actually
+/// fires. The memory adapter asserts BOTH the captured relay URL AND that the
+/// built engram event's `p` tag (owner counterpart/coordinate) matches the
+/// CAPTURED owner key — not the new owner committed in `after_store`.
 #[tokio::test]
 // SAFETY: `#[tokio::test]` uses a single-threaded runtime by default, so
 // holding `std::sync::Mutex` across `.await` points cannot deadlock.
@@ -266,21 +313,29 @@ async fn test_agent_switch_between_store_and_profile_finishes_captured_outbound(
     use tauri::Manager;
 
     let tmp = tempfile::tempdir().unwrap();
-    let (app, _owner_keys) = setup_import_app_with_scope(&tmp);
+    let (app, owner_keys) = setup_import_app_with_scope(&tmp);
     let handle = app.handle();
 
-    let file_bytes = minimal_agent_snapshot_json("TestAgent");
+    // Snapshot with one core memory entry so Phase 4 actually calls submit_memory.
+    let file_bytes = minimal_agent_snapshot_json_with_memory("TestAgent");
     let input = AgentSnapshotImportConfirm {
         file_bytes,
         keep_allowlist: false,
     };
 
-    // Relay URL embedded in the captured scope (must appear in profile_sync).
+    // Relay URL embedded in the captured scope (must appear in profile_sync and
+    // in the relay URL passed to submit_memory).
     let expected_relay = "wss://captured.example".to_string();
+    // Captured owner pubkey — must appear in the `p` tag of the built engram event.
+    let captured_owner_pubkey_hex = owner_keys.public_key().to_hex();
 
-    // Track which relay URLs the outbound adapters received.
+    // Track what the outbound adapters received.
     let profile_relay = Arc::new(Mutex::new(None::<String>));
+    let memory_relay = Arc::new(Mutex::new(None::<String>));
+    let memory_owner_p_tag = Arc::new(Mutex::new(None::<String>));
     let pr = profile_relay.clone();
+    let mr = memory_relay.clone();
+    let mop = memory_owner_p_tag.clone();
 
     // The after_store hook needs to commit a new scope via AppState.
     // Get the state reference from the app's managed state.
@@ -316,7 +371,20 @@ async fn test_agent_switch_between_store_and_profile_finishes_captured_outbound(
                 Ok(())
             })
         },
-        |_m: MemoryPublish<'_>| Box::pin(async { panic!("no memory entries in this snapshot") }),
+        move |m: MemoryPublish<'_>| {
+            // Assert: relay URL contains the captured base relay, not the switched one.
+            let relay = m.relay_url.to_string();
+            *mr.lock().unwrap() = Some(relay.clone());
+
+            // Extract the `p` tag from the built engram event JSON.
+            // The `p` tag must carry the CAPTURED owner's pubkey hex — not the
+            // post-switch owner committed in after_store.
+            let event_bytes = m.event_json.to_vec();
+            let p_tag_hex = extract_p_tag_from_event_json(&event_bytes);
+            *mop.lock().unwrap() = p_tag_hex;
+
+            Box::pin(async move { Ok(()) })
+        },
     )
     .await;
 
@@ -330,7 +398,44 @@ async fn test_agent_switch_between_store_and_profile_finishes_captured_outbound(
         Some(expected_relay.as_str()),
         "profile adapter must receive captured relay, got: {profile_seen:?}"
     );
-    // No memory entries in this snapshot — memory adapter not called.
+
+    // Memory adapter received the OLD captured relay URL in its relay field.
+    let memory_relay_seen = memory_relay.lock().unwrap().clone();
+    assert!(
+        memory_relay_seen
+            .as_deref()
+            .map_or(false, |r| r.contains("captured.example")),
+        "memory adapter relay_url must contain captured relay 'captured.example', \
+         got: {memory_relay_seen:?}"
+    );
+
+    // Memory event's `p` tag must equal the CAPTURED owner's pubkey hex.
+    let p_tag_seen = memory_owner_p_tag.lock().unwrap().clone();
+    assert_eq!(
+        p_tag_seen.as_deref(),
+        Some(captured_owner_pubkey_hex.as_str()),
+        "engram event p-tag (owner counterpart/coordinate) must equal the captured \
+         owner's pubkey, not the post-switch owner; got: {p_tag_seen:?}"
+    );
+}
+
+/// Extract the first `p` tag value from a nostr event JSON byte slice.
+///
+/// Returns `Some(hex_pubkey)` if a `["p", "<hex>"]` tag entry is found,
+/// `None` if the JSON cannot be parsed or has no `p` tag.
+fn extract_p_tag_from_event_json(event_json: &[u8]) -> Option<String> {
+    let val: serde_json::Value = serde_json::from_slice(event_json).ok()?;
+    let tags = val.get("tags")?.as_array()?;
+    for tag in tags {
+        if let Some(arr) = tag.as_array() {
+            if arr.first().and_then(|v| v.as_str()) == Some("p") {
+                if let Some(hex) = arr.get(1).and_then(|v| v.as_str()) {
+                    return Some(hex.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `before_store` hook advances scope generation — Phase 3a must reject with

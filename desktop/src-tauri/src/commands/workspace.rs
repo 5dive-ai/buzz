@@ -112,22 +112,47 @@ pub async fn apply_workspace(
     agent_managed_profiles: Option<bool>,
     app: AppHandle,
 ) -> Result<crate::managed_agents::scope::WorkspaceApplyResult, String> {
-    use crate::managed_agents::scope::WorkspaceApplyResult;
-
     // ── Layer 1: async serialization lock + Mesh preflight ──────────────────
     // workspace_transition serializes apply_workspace and live identity import
-    // so scope transitions are never concurrent. We acquire via a clone so the
-    // borrow does not prevent moving `app` into spawn_blocking below.
-    let lock_app = app.clone();
-    let lock_state = lock_app.state::<AppState>();
-    let _transition_guard = lock_state.workspace_transition.lock().await;
-
-    // Fail closed if a client-mode Mesh runtime is active — no client-mode
-    // runtime may be active when a workspace switch begins (Option A ruling).
-    // Called via `run_mesh_transition_preflight` so the shared preflight logic
-    // is not duplicated inline; the guard above remains held throughout.
+    // so scope transitions are never concurrent.
+    //
+    // When the `mesh-llm` feature is active, `with_workspace_transition_preflight`
+    // acquires the lock AND runs `fail_if_client_mesh_active` under a single guard,
+    // with the guard held across the entire async body.  When the feature is off,
+    // we acquire the lock inline (no preflight needed).
     #[cfg(feature = "mesh-llm")]
-    crate::commands::mesh_llm::scope_impl::run_mesh_transition_preflight(&app).await?;
+    {
+        let app_for_preflight = app.clone();
+        return crate::commands::mesh_llm::scope_impl::with_workspace_transition_preflight(
+            &app_for_preflight,
+            move || {
+                Box::pin(apply_workspace_body(
+                    relay_url,
+                    nsec,
+                    repos_dir,
+                    agent_managed_profiles,
+                    app,
+                ))
+            },
+        )
+        .await;
+    }
+    #[cfg(not(feature = "mesh-llm"))]
+    {
+        let lock_app = app.clone();
+        let lock_state = lock_app.state::<AppState>();
+        let _transition_guard = lock_state.workspace_transition.lock().await;
+        apply_workspace_body(relay_url, nsec, repos_dir, agent_managed_profiles, app).await
+    }
+}
+async fn apply_workspace_body(
+    relay_url: String,
+    nsec: Option<String>,
+    repos_dir: Option<String>,
+    agent_managed_profiles: Option<bool>,
+    app: AppHandle,
+) -> Result<crate::managed_agents::scope::WorkspaceApplyResult, String> {
+    use crate::managed_agents::scope::WorkspaceApplyResult;
 
     let restore_app = app.clone();
     let blocking_result: Result<WorkspaceApplyResult, String> =
@@ -366,7 +391,7 @@ pub async fn apply_workspace(
         return Ok(apply_result);
     }
 
-    // ── Post-commit (non-rollback) ────────────────────────────────────────────
+    // ── Post-commit (non-rollback) ──────────────────────────────────────
     // The workspace HAS switched. Post-commit failures surface as degradation
     // on the applied result — we never pretend the old scope survived.
     let mut degraded: Vec<String> = Vec::new();

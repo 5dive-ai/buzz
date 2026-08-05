@@ -70,7 +70,7 @@ async fn test_active_client_stop_then_transition_preflight_succeeds() {
     // Step 3 — production transition preflight must succeed (no client active).
     // The no-op body proves the lock was acquired and the preflight passed.
     let result = super::scope_impl::with_workspace_transition_preflight(&app_handle, || {
-        Ok::<&str, String>("body ran")
+        Box::pin(async { Ok::<&str, String>("body ran") })
     })
     .await;
 
@@ -253,7 +253,7 @@ async fn test_install_held_transition_preflight_observes_client() {
     let app_handle_clone = app_handle.clone();
     let transition_task = tokio::task::spawn(async move {
         super::scope_impl::with_workspace_transition_preflight(&app_handle_clone, || {
-            Ok::<&str, String>("body ran")
+            Box::pin(async { Ok::<&str, String>("body ran") })
         })
         .await
     });

@@ -6,6 +6,7 @@
 
 use std::future::Future;
 
+use futures_util::future::BoxFuture;
 use tauri::{AppHandle, Manager, State};
 
 use crate::app_state::AppState;
@@ -104,26 +105,19 @@ pub(crate) async fn fail_if_client_mesh_active<R: tauri::Runtime>(
 /// Used by `apply_workspace`, live identity import, and tests to prove the
 /// serialization contract against `install_client_under_workspace_transition`.
 ///
-/// The transition body runs synchronously (or dispatches to `spawn_blocking`)
-/// while the async guard is alive on the current task. If the preflight fails,
-/// `transition_body` is never called.
+/// `transition_body` is an async closure (returns a `BoxFuture`) so that
+/// production callers that dispatch `tokio::task::spawn_blocking` and await the
+/// result keep the guard alive across the dispatch. Tests may pass a simple
+/// sync-compatible closure via `|| Box::pin(async { Ok("done") })`.
 ///
-/// Production callers that must `.await` after dispatch use this helper with
-/// a body that dispatches `tokio::task::spawn_blocking` and immediately returns
-/// the join handle's `.await` — the guard is held across the dispatch and the
-/// `.await` is done at the call site after this helper returns.
-///
-/// Alternatively, callers that cannot fit their body into a sync `FnOnce` call
-/// `run_mesh_transition_preflight` (which they invoke after acquiring the lock
-/// themselves) to share the preflight logic without lifetime constraints.
-#[cfg_attr(not(test), allow(dead_code))]
+/// If the preflight fails, `transition_body` is never called.
 pub(crate) async fn with_workspace_transition_preflight<R, F, T>(
     app: &AppHandle<R>,
     transition_body: F,
 ) -> Result<T, String>
 where
     R: tauri::Runtime,
-    F: FnOnce() -> Result<T, String>,
+    F: FnOnce() -> BoxFuture<'static, Result<T, String>>,
 {
     let state = app.state::<AppState>();
     let _transition_guard = state.workspace_transition.lock().await;
@@ -132,7 +126,7 @@ where
     #[cfg(feature = "mesh-llm")]
     fail_if_client_mesh_active(app).await?;
 
-    transition_body()
+    transition_body().await
 }
 
 /// Run only the Mesh-preflight portion of the workspace transition check.

@@ -101,13 +101,21 @@ pub(crate) async fn fail_if_client_mesh_active<R: tauri::Runtime>(
 /// `fail_if_client_mesh_active` preflight, then invoke `transition_body` while
 /// the guard remains held.
 ///
-/// Used by `apply_workspace` and live identity import so neither duplicates the
-/// acquire + preflight sequence inline. Tests call this helper directly to prove
-/// the serialization contract against `install_client_under_workspace_transition`.
+/// Used by `apply_workspace`, live identity import, and tests to prove the
+/// serialization contract against `install_client_under_workspace_transition`.
 ///
 /// The transition body runs synchronously (or dispatches to `spawn_blocking`)
 /// while the async guard is alive on the current task. If the preflight fails,
 /// `transition_body` is never called.
+///
+/// Production callers that must `.await` after dispatch use this helper with
+/// a body that dispatches `tokio::task::spawn_blocking` and immediately returns
+/// the join handle's `.await` — the guard is held across the dispatch and the
+/// `.await` is done at the call site after this helper returns.
+///
+/// Alternatively, callers that cannot fit their body into a sync `FnOnce` call
+/// `run_mesh_transition_preflight` (which they invoke after acquiring the lock
+/// themselves) to share the preflight logic without lifetime constraints.
 pub(crate) async fn with_workspace_transition_preflight<R, F, T>(
     app: &AppHandle<R>,
     transition_body: F,
@@ -124,6 +132,25 @@ where
     fail_if_client_mesh_active(app).await?;
 
     transition_body()
+}
+
+/// Run only the Mesh-preflight portion of the workspace transition check.
+///
+/// Called by production commands (`apply_workspace`, `import_identity`) that
+/// already hold `workspace_transition` and need to avoid duplicating the
+/// `fail_if_client_mesh_active` call inline. The guard must already be acquired
+/// and remain alive for the duration of the transition.
+///
+/// No-op when the `mesh-llm` feature is disabled.
+pub(crate) async fn run_mesh_transition_preflight<R>(app: &AppHandle<R>) -> Result<(), String>
+where
+    R: tauri::Runtime,
+{
+    #[cfg(feature = "mesh-llm")]
+    fail_if_client_mesh_active(app).await?;
+    #[cfg(not(feature = "mesh-llm"))]
+    let _ = app;
+    Ok(())
 }
 
 /// Acquire the `workspace_transition` lock, validate the full captured scope

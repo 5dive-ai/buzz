@@ -390,14 +390,13 @@ pub async fn import_identity(
         None
     };
 
-    // ── Layer 1 async: fail closed if a client-mode Mesh runtime is active ──
-    // Identity import clears the active scope entirely, so any live client-mode
-    // Mesh runtime would become dangling after the import. Option A ruling:
-    // require the user to stop it first. The journaled Mesh recipe is a tracked
-    // follow-up in the PR body.
+    // Fail closed if a client-mode Mesh runtime is active when there is an
+    // active scope — a live client-mode runtime would become dangling after the
+    // import (Option A ruling). Called via `run_mesh_transition_preflight` so the
+    // shared preflight logic is not duplicated inline; the guard above is held.
+    #[cfg(feature = "mesh-llm")]
     if has_active_scope {
-        #[cfg(feature = "mesh-llm")]
-        crate::commands::mesh_llm::scope_impl::fail_if_client_mesh_active(&app_handle).await?;
+        crate::commands::mesh_llm::scope_impl::run_mesh_transition_preflight(&app_handle).await?;
     }
 
     let result = tokio::task::spawn_blocking(move || {

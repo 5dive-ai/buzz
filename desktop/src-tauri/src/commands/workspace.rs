@@ -114,7 +114,7 @@ pub async fn apply_workspace(
 ) -> Result<crate::managed_agents::scope::WorkspaceApplyResult, String> {
     use crate::managed_agents::scope::WorkspaceApplyResult;
 
-    // ── Layer 1: async serialization lock ────────────────────────────────────
+    // ── Layer 1: async serialization lock + Mesh preflight ──────────────────
     // workspace_transition serializes apply_workspace and live identity import
     // so scope transitions are never concurrent. We acquire via a clone so the
     // borrow does not prevent moving `app` into spawn_blocking below.
@@ -122,14 +122,12 @@ pub async fn apply_workspace(
     let lock_state = lock_app.state::<AppState>();
     let _transition_guard = lock_state.workspace_transition.lock().await;
 
-    // ── Layer 1 async: fail closed if a client-mode Mesh runtime is active ──
-    // Serve-mode runtimes are machine-level and stay pinned across workspace
-    // switches — they never block a switch. Client-mode runtimes require an
-    // active scope to be meaningful and cannot be safely moved to a new scope
-    // atomically. Option A ruling: require the user to stop the client session
-    // first; the journaled Mesh recipe is a tracked follow-up in the PR body.
+    // Fail closed if a client-mode Mesh runtime is active — no client-mode
+    // runtime may be active when a workspace switch begins (Option A ruling).
+    // Called via `run_mesh_transition_preflight` so the shared preflight logic
+    // is not duplicated inline; the guard above remains held throughout.
     #[cfg(feature = "mesh-llm")]
-    crate::commands::mesh_llm::scope_impl::fail_if_client_mesh_active(&app).await?;
+    crate::commands::mesh_llm::scope_impl::run_mesh_transition_preflight(&app).await?;
 
     let restore_app = app.clone();
     let blocking_result: Result<WorkspaceApplyResult, String> =

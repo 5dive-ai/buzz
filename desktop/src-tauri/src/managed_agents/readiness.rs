@@ -37,7 +37,6 @@
 //! separately because it is not part of the process env — the harness reads
 //! it at startup.  We do not evaluate it here; it is exposed for future
 //! UI display only.
-
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

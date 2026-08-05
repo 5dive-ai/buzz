@@ -287,10 +287,7 @@ fn reconcile_inbound_private_managed_agent(
     Ok(())
 }
 
-fn merge_reconstructed_managed_agent(
-    local: &mut ManagedAgentRecord,
-    inbound: ManagedAgentRecord,
-) {
+fn merge_reconstructed_managed_agent(local: &mut ManagedAgentRecord, inbound: ManagedAgentRecord) {
     let start_on_app_launch = local.start_on_app_launch;
     let auto_restart = local.auto_restart_on_config_change;
     let provider_binary_path = local.provider_binary_path.clone();

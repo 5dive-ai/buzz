@@ -19,9 +19,17 @@ use crate::{
     managed_agents::{
         build_managed_agent_summary, current_instance_id, discovery_env_with_baked_floor,
         find_managed_agent_mut, known_acp_runtime, load_global_agent_config, load_managed_agents,
-        load_personas, managed_agent_avatar_url, missing_command_message, normalize_agent_args,
-        resolve_command, save_managed_agents, sync_managed_agent_processes, try_regenerate_nest,
-        AgentModelInfo, AgentModelsResponse, UpdateManagedAgentRequest, UpdateManagedAgentResponse,
+        load_personas, managed_agent_avatar_url,
+        migration::activation::{
+            confirm_authoritative_edit, enqueue_authoritative_edit, submit_authoritative_edit,
+        },
+        missing_command_message, normalize_agent_args, resolve_command,
+        retention::{
+            active_retention_scope, get_retained_managed_agent_aggregate, open_retention_db,
+            retire_managed_agent_aggregate,
+        },
+        save_managed_agents, sync_managed_agent_processes, try_regenerate_nest, AgentModelInfo,
+        AgentModelsResponse, UpdateManagedAgentRequest, UpdateManagedAgentResponse,
         DEFAULT_ACP_COMMAND,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
@@ -856,9 +864,7 @@ pub async fn update_managed_agent(
 
         let authoritative_edit = record.relay_authority.is_relay_authoritative();
         if authoritative_edit {
-            crate::managed_agents::migration::activation::enqueue_authoritative_edit(
-                &app, &state, record,
-            )?;
+            enqueue_authoritative_edit(&app, &state, record)?;
         }
 
         save_managed_agents(&app, &records)?;
@@ -916,57 +922,51 @@ pub async fn update_managed_agent(
     try_regenerate_nest(&app);
 
     if authoritative_edit {
-        let scope = crate::managed_agents::retention::active_retention_scope(&app, &state)?;
+        let scope = active_retention_scope(&app, &state)?;
         let relay_api = crate::relay::relay_http_base_url(&scope.relay_url);
-        let verified =
-            match crate::managed_agents::migration::activation::submit_authoritative_edit(
-                &state.http_client,
-                &relay_api,
-                &scope.owner_keys,
-                &scope.db_path,
-                &summary.pubkey,
-            )
-            .await
-            {
-                Ok(verified) => verified,
-                Err(sync_error) => {
-                    if sync_error.starts_with("conflict:") {
-                        let pending = crate::managed_agents::retention::get_retained_managed_agent_aggregate(
-                            &crate::managed_agents::retention::open_retention_db(&scope.db_path)?,
-                            &scope.owner_keys.public_key().to_hex(),
-                            &summary.pubkey,
-                        )?
-                        .ok_or_else(|| "conflicted edit lost its retained attempt".to_string())?;
-                        let conn = crate::managed_agents::retention::open_retention_db(
-                            &scope.db_path,
-                        )?;
-                        if !crate::managed_agents::retention::retire_managed_agent_aggregate(
-                            &conn,
-                            &pending.owner_pubkey,
-                            &pending.agent_pubkey,
-                            pending.generation,
-                            &pending.private_event_id,
-                        )? {
-                            return Err("conflicted edit could not retire its retained attempt".to_string());
-                        }
-                        let rollback = rollback.as_ref().ok_or_else(|| {
-                            "missing local rollback state after authoritative conflict".to_string()
-                        })?;
-                        rollback_failed_agent_update(
-                            &app,
-                            &state,
-                            &summary.pubkey,
-                            rollback.clone(),
-                        )?;
-                        return Err(format!(
+        let verified = match submit_authoritative_edit(
+            &state.http_client,
+            &relay_api,
+            &scope.owner_keys,
+            &scope.db_path,
+            &summary.pubkey,
+        )
+        .await
+        {
+            Ok(verified) => verified,
+            Err(sync_error) => {
+                if sync_error.starts_with("conflict:") {
+                    let pending = get_retained_managed_agent_aggregate(
+                        &open_retention_db(&scope.db_path)?,
+                        &scope.owner_keys.public_key().to_hex(),
+                        &summary.pubkey,
+                    )?
+                    .ok_or_else(|| "conflicted edit lost its retained attempt".to_string())?;
+                    let conn = open_retention_db(&scope.db_path)?;
+                    if !retire_managed_agent_aggregate(
+                        &conn,
+                        &pending.owner_pubkey,
+                        &pending.agent_pubkey,
+                        pending.generation,
+                        &pending.private_event_id,
+                    )? {
+                        return Err(
+                            "conflicted edit could not retire its retained attempt".to_string()
+                        );
+                    }
+                    let rollback = rollback.as_ref().ok_or_else(|| {
+                        "missing local rollback state after authoritative conflict".to_string()
+                    })?;
+                    rollback_failed_agent_update(&app, &state, &summary.pubkey, rollback.clone())?;
+                    return Err(format!(
                             "Agent edit conflicted with a newer relay head. No local changes were kept: {sync_error}"
                         ));
-                    }
-                    return Err(format!(
+                }
+                return Err(format!(
                         "Agent edit is retained for relay retry; local changes remain pending confirmation: {sync_error}"
                     ));
-                }
-            };
+            }
+        };
         {
             let _guard = state
                 .managed_agents_store_lock
@@ -982,10 +982,7 @@ pub async fn update_managed_agent(
             );
             save_managed_agents(&app, &records)?;
         }
-        crate::managed_agents::migration::activation::confirm_authoritative_edit(
-            &scope.db_path,
-            &verified,
-        )?;
+        confirm_authoritative_edit(&scope.db_path, &verified)?;
     }
 
     // Phase 2: relay profile sync (async, outside lock). A rename is committed
@@ -1018,87 +1015,8 @@ pub async fn update_managed_agent(
     })
 }
 
-// ── Model normalization ───────────────────────────────────────────────────────
-
-/// Normalize raw `buzz-acp models --json` output into a typed DTO for the frontend.
-///
-/// Merges models from both ACP paths (stable configOptions + unstable SessionModelState),
-/// deduplicates by ID (stable takes precedence), and returns a unified list.
-pub(super) fn normalize_agent_models(
-    raw: &serde_json::Value,
-    persisted_model: Option<String>,
-) -> AgentModelsResponse {
-    let agent_name = raw["agent"]["name"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
-    let agent_version = raw["agent"]["version"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
-
-    let mut models: Vec<AgentModelInfo> = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
-
-    // 1. Stable configOptions (preferred). Only entries with category "model"
-    //    are model options — the CLI pre-filters, but we're defensive here.
-    if let Some(config_options) = raw["stable"]["configOptions"].as_array() {
-        for opt in config_options {
-            if opt.get("category").and_then(|c| c.as_str()) != Some("model") {
-                continue;
-            }
-            if let Some(options) = opt.get("options").and_then(|v| v.as_array()) {
-                for o in options {
-                    if let Some(value) = o.get("value").and_then(|v| v.as_str()) {
-                        if seen_ids.insert(value.to_string()) {
-                            models.push(AgentModelInfo {
-                                id: value.to_string(),
-                                name: o
-                                    .get("displayName")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string),
-                                description: None,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Unstable availableModels (fallback — skip duplicates from stable).
-    let mut agent_default_model: Option<String> = None;
-    if let Some(unstable) = raw.get("unstable") {
-        agent_default_model = unstable["currentModelId"].as_str().map(str::to_string);
-        if let Some(available) = unstable["availableModels"].as_array() {
-            for m in available {
-                if let Some(id) = m.get("modelId").and_then(|v| v.as_str()) {
-                    if seen_ids.insert(id.to_string()) {
-                        models.push(AgentModelInfo {
-                            id: id.to_string(),
-                            name: m.get("name").and_then(|v| v.as_str()).map(str::to_string),
-                            description: m
-                                .get("description")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    let supports_switching = !models.is_empty();
-
-    AgentModelsResponse {
-        agent_name,
-        agent_version,
-        models,
-        agent_default_model,
-        selected_model: persisted_model,
-        supports_switching,
-    }
-}
+mod normalization;
+pub(crate) use normalization::normalize_agent_models;
 
 #[cfg(test)]
 #[path = "agent_models_tests.rs"]

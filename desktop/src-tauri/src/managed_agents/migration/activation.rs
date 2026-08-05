@@ -64,13 +64,18 @@ pub(crate) fn enqueue_authoritative_edit(
     let retained = get_retained_managed_agent_aggregate(&conn, &owner_pubkey, &record.pubkey)?
         .ok_or_else(|| "authoritative edit is missing its retained relay head".to_string())?;
     if retained.pending_sync {
-        return Err("managed-agent relay synchronization is still pending; retry the edit shortly".to_string());
+        return Err(
+            "managed-agent relay synchronization is still pending; retry the edit shortly"
+                .to_string(),
+        );
     }
     if retained.state != "active"
         || retained.generation != evidence.generation
         || retained.private_event_id != evidence.private_event_id
     {
-        return Err("local relay evidence does not match the retained authoritative head".to_string());
+        return Err(
+            "local relay evidence does not match the retained authoritative head".to_string(),
+        );
     }
     let stored: StoredAggregateRequest = serde_json::from_str(&retained.request_json)
         .map_err(|error| format!("retained authoritative request is invalid: {error}"))?;

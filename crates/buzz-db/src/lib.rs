@@ -4879,7 +4879,7 @@ impl Db {
             kind_i32 as u32,
             buzz_core::kind::KIND_PERSONA | buzz_core::kind::KIND_MANAGED_AGENT
         ) && managed_agent::projection_coordinate_is_authoritative_on(
-            &mut *tx,
+            &mut tx,
             community_id,
             kind_i32 as u32,
             pubkey_bytes.as_slice(),

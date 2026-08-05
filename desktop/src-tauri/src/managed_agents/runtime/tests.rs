@@ -1,5 +1,4 @@
 use crate::managed_agents::known_acp_runtime;
-
 // ── desktop binary name tests ───────────────────────────────────────────
 
 #[test]

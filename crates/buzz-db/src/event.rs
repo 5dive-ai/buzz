@@ -895,7 +895,7 @@ pub async fn soft_delete_by_coordinate(
         kind as u32,
         buzz_core::kind::KIND_PERSONA | buzz_core::kind::KIND_MANAGED_AGENT
     ) && crate::managed_agent::projection_coordinate_is_authoritative_on(
-        &mut *tx,
+        &mut tx,
         community_id,
         kind as u32,
         pubkey,
@@ -963,7 +963,7 @@ pub async fn soft_delete_event_and_update_thread(
                 .execute(&mut *tx)
                 .await?;
             if crate::managed_agent::projection_coordinate_is_authoritative_on(
-                &mut *tx,
+                &mut tx,
                 community_id,
                 kind as u32,
                 &pubkey,

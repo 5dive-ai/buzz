@@ -334,25 +334,102 @@ fn reconcile_inbound_private_managed_agent(
 }
 
 fn merge_reconstructed_managed_agent(local: &mut ManagedAgentRecord, inbound: ManagedAgentRecord) {
-    let start_on_app_launch = local.start_on_app_launch;
-    let auto_restart = local.auto_restart_on_config_change;
-    let provider_binary_path = local.provider_binary_path.clone();
-    let runtime_pid = local.runtime_pid;
-    let last_started_at = local.last_started_at.clone();
-    let last_stopped_at = local.last_stopped_at.clone();
-    let last_exit_code = local.last_exit_code;
-    let last_error = local.last_error.clone();
-    let last_error_code = local.last_error_code;
-    *local = inbound;
-    local.start_on_app_launch = start_on_app_launch;
-    local.auto_restart_on_config_change = auto_restart;
-    local.provider_binary_path = provider_binary_path;
-    local.runtime_pid = runtime_pid;
-    local.last_started_at = last_started_at;
-    local.last_stopped_at = last_stopped_at;
-    local.last_exit_code = last_exit_code;
-    local.last_error = last_error;
-    local.last_error_code = last_error_code;
+    // Deliberately exhaustive: adding a record field forces this authority
+    // boundary to classify it as relay-portable or device-local at compile time.
+    let ManagedAgentRecord {
+        pubkey,
+        name,
+        persona_id,
+        team_id,
+        private_key_nsec,
+        auth_tag,
+        relay_url,
+        avatar_url,
+        acp_command: _,
+        agent_command: _,
+        agent_command_override,
+        agent_args,
+        mcp_command: _,
+        turn_timeout_seconds: _,
+        idle_timeout_seconds,
+        max_turn_duration_seconds,
+        parallelism,
+        system_prompt,
+        model,
+        provider,
+        persona_source_version: _,
+        env_vars,
+        start_on_app_launch: _,
+        auto_restart_on_config_change: _,
+        runtime_pid: _,
+        backend,
+        backend_agent_id,
+        provider_binary_path: _,
+        persona_team_dir: _,
+        persona_name_in_team,
+        created_at: _,
+        updated_at,
+        last_started_at: _,
+        last_stopped_at: _,
+        last_exit_code: _,
+        last_error: _,
+        last_error_code: _,
+        respond_to,
+        respond_to_allowlist,
+        display_name,
+        slug,
+        runtime,
+        name_pool,
+        is_builtin,
+        is_active,
+        shared: _,
+        source_team,
+        source_team_persona_slug,
+        catalog_source,
+        definition_respond_to,
+        definition_respond_to_allowlist,
+        definition_parallelism,
+        relay_mesh,
+        relay_authority,
+    } = inbound;
+
+    local.pubkey = pubkey;
+    local.name = name;
+    local.persona_id = persona_id;
+    local.team_id = team_id;
+    local.private_key_nsec = private_key_nsec;
+    local.auth_tag = auth_tag;
+    local.relay_url = relay_url;
+    local.avatar_url = avatar_url;
+    local.agent_command_override = agent_command_override;
+    local.agent_args = agent_args;
+    local.idle_timeout_seconds = idle_timeout_seconds;
+    local.max_turn_duration_seconds = max_turn_duration_seconds;
+    local.parallelism = parallelism;
+    local.system_prompt = system_prompt;
+    local.model = model;
+    local.provider = provider;
+    local.env_vars = env_vars;
+    local.backend = backend;
+    local.backend_agent_id = backend_agent_id;
+    local.persona_name_in_team = persona_name_in_team;
+    local.updated_at = updated_at;
+    local.respond_to = respond_to;
+    local.respond_to_allowlist = respond_to_allowlist;
+    local.display_name = display_name;
+    local.slug = slug;
+    local.runtime = runtime;
+    local.name_pool = name_pool;
+    local.is_builtin = is_builtin;
+    local.is_active = is_active;
+    local.source_team = source_team;
+    local.source_team_persona_slug = source_team_persona_slug;
+    local.catalog_source = catalog_source;
+    local.definition_respond_to = definition_respond_to;
+    local.definition_respond_to_allowlist = definition_respond_to_allowlist;
+    local.definition_parallelism = definition_parallelism;
+    local.relay_mesh = relay_mesh;
+    local.relay_authority = relay_authority;
 }
 
 pub(crate) fn reconstruct_managed_agent_from_payload(

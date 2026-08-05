@@ -40,6 +40,7 @@ import { useFocusDrawerPresence } from "@/features/channels/ui/useFocusDrawerPre
 import { useCardMintJobs } from "@/features/agents/cardMintStore";
 import { BotActivityComposerAction } from "@/features/channels/ui/BotActivityBar";
 import { ChannelComposerActivityRow } from "@/features/channels/ui/ChannelComposerActivityRow";
+import { useThreadComposerActivity } from "@/features/channels/ui/useThreadComposerActivity";
 import { ComposerActivityAccessory } from "@/features/messages/ui/ComposerActivityAccessory";
 import { TypingIndicatorRow } from "@/features/messages/ui/TypingIndicatorRow";
 import {
@@ -286,6 +287,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     onEdit(target);
     return true;
   }, [findLastOwnEditable, messages, onEdit]);
+
   const handleEditLastOwnThreadMessage = React.useCallback((): boolean => {
     if (!onEdit) return false;
     const scope: TimelineMessage[] = [];
@@ -296,7 +298,9 @@ export const ChannelPane = React.memo(function ChannelPane({
     onEdit(target);
     return true;
   }, [findLastOwnEditable, onEdit, threadHeadMessage, threadMessages]);
+
   const timeoutState = useTimeoutState();
+
   // A moderation DM (1:1 with the relay identity) is read-only for the member;
   // only DMs pay for the NIP-11 `self` lookup. Fails open: no `relaySelf` →
   // ordinary DM, composer enabled.
@@ -306,6 +310,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     currentPubkey,
     relaySelfQuery.data,
   );
+
   const isComposerDisabled =
     !activeChannel?.isMember ||
     activeChannel.archivedAt !== null ||
@@ -315,6 +320,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     isSending;
   const knownAgentPubkeys = React.useMemo(() => {
     const pubkeys = new Set<string>();
+
     for (const pubkey of agentPubkeys ?? []) {
       pubkeys.add(pubkey.toLowerCase());
     }
@@ -324,12 +330,14 @@ export const ChannelPane = React.memo(function ChannelPane({
     for (const agent of activityAgents) {
       pubkeys.add(agent.pubkey.toLowerCase());
     }
+
     return pubkeys;
   }, [activityAgents, agentPubkeys, agentSessionAgents]);
   const completeWelcomeComposerBanner = React.useCallback(() => {
     if (!activeChannelId || !isActiveWelcomeChannel) {
       return;
     }
+
     clearWelcomeComposerDismissTimer();
     completedWelcomeBannerChannelIdsRef.current.add(activeChannelId);
     setWelcomeComposerBannerState("complete");
@@ -361,8 +369,10 @@ export const ChannelPane = React.memo(function ChannelPane({
         isActiveWelcomeChannel &&
         (containsWelcomePersonaMention(content) ||
           mentionsKnownAgent(mentionPubkeys, knownAgentPubkeys));
+
       messageTimelineRef.current?.scrollToBottomOnNextUpdate();
       await onSendMessage(content, mentionPubkeys, mediaTags, channelId);
+
       if (
         channelId &&
         channelId !== activeChannelId &&
@@ -371,6 +381,7 @@ export const ChannelPane = React.memo(function ChannelPane({
       ) {
         await goChannel(channelId, { replace: true });
       }
+
       if (shouldCompleteWelcomeBanner) {
         completeWelcomeComposerBanner();
       }
@@ -389,32 +400,24 @@ export const ChannelPane = React.memo(function ChannelPane({
     !isComposerDisabled &&
     !isMainDeferredEditPending &&
     !isSinglePanelView;
-  // Working set for the composer bar (observer turns + bot-typing fallback,
-  // folded by agentWorkingSignal); gates the dock's reserved bottom rail.
   const composerWorkingBotPubkeys = useChannelWorkingAgentPubkeys(
     activeChannel?.id ?? null,
   );
-  // Background card mints surface in the same rail ("Minting card…" chip),
-  // so they must also reserve the activity row.
   const hasCardMintActivity = useCardMintJobs().length > 0;
   const hasComposerBottomActivity =
     composerWorkingBotPubkeys.length > 0 ||
     typingPubkeys.length > 0 ||
     hasCardMintActivity;
-  const threadComposerBotTypingPubkeys = React.useMemo(() => {
-    if (!openThreadHeadId) return [];
-    return botTypingEntries
-      .filter((entry) => entry.threadHeadId === openThreadHeadId)
-      .map((entry) => entry.pubkey)
-      .filter(
-        (pubkey, index, all) =>
-          all.findIndex(
-            (candidate) => candidate.toLowerCase() === pubkey.toLowerCase(),
-          ) === index,
-      );
-  }, [botTypingEntries, openThreadHeadId]);
-  const hasThreadComposerBotActivity =
-    threadComposerBotTypingPubkeys.length > 0;
+  const {
+    combinedTypingPubkeys: combinedThreadTypingPubkeys,
+    hasActivity: hasThreadComposerActivity,
+    pillBotPubkeys: threadPillBotPubkeys,
+  } = useThreadComposerActivity({
+    botTypingEntries,
+    channelId: activeChannel?.id ?? null,
+    threadHeadId: openThreadHeadId,
+    typingPubkeys: threadTypingPubkeys,
+  });
   const directMessageIntro = React.useMemo(
     () =>
       buildDirectMessageIntro({
@@ -424,6 +427,7 @@ export const ChannelPane = React.memo(function ChannelPane({
       }),
     [activeChannel, currentPubkey, profiles],
   );
+
   const handleWelcomeAddAgent = React.useCallback(() => {
     onAddAgent?.({
       beforeSend: () =>
@@ -465,6 +469,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     for (const message of threadAllMessages) {
       messagesById.set(message.id, message);
     }
+
     return buildVideoReviewContextsByMessageId({
       channelId: activeChannel?.id ?? null,
       channelName: activeChannel?.name,
@@ -485,6 +490,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     threadAllMessages,
     threadHeadMessage,
   ]);
+
   const isOverlay = useIsThreadPanelOverlay();
   const useSplitAuxiliaryPane = !isSinglePanelView && !isOverlay;
   const threadViewMode = useThreadViewMode();
@@ -577,6 +583,7 @@ export const ChannelPane = React.memo(function ChannelPane({
           data-testid="channel-shared-header-backdrop"
         />
       ) : null}
+
       {!isSinglePanelView ? (
         <section
           aria-label="Channel messages and composer"
@@ -781,9 +788,6 @@ export const ChannelPane = React.memo(function ChannelPane({
                   }
                   showTopBorder={false}
                 />
-                {/* The accessory is anchored in the dock's reserved bottom
-                    rail, so fading it cannot change the observed overlay
-                    height or move the conversation. */}
                 <ComposerActivityAccessory visible={hasComposerBottomActivity}>
                   <ChannelComposerActivityRow
                     agents={activityAgents}
@@ -802,6 +806,7 @@ export const ChannelPane = React.memo(function ChannelPane({
           ) : null}
         </section>
       ) : null}
+
       {/*
        * `AnimatePresence` keeps the focus thread drawer mounted through its exit
        * animation — without it the drawer's own existence condition
@@ -878,33 +883,27 @@ export const ChannelPane = React.memo(function ChannelPane({
                   threadHeadMessage.id,
                 )}
                 threadReplyUnreadCounts={threadReplyUnreadCounts}
-                activityAccessoryVisible={
-                  hasThreadComposerBotActivity || threadTypingPubkeys.length > 0
-                }
+                activityAccessoryVisible={hasThreadComposerActivity}
                 activityAccessoryContent={
-                  hasThreadComposerBotActivity ||
-                  threadTypingPubkeys.length > 0 ? (
+                  hasThreadComposerActivity ? (
                     <BotActivityComposerAction
                       agents={activityAgents}
                       channelId={activeChannel?.id ?? null}
                       onOpenAgentSession={onOpenAgentSession}
                       profiles={profiles}
+                      typingBotPubkeys={threadPillBotPubkeys}
                       typingIndicator={
-                        threadTypingPubkeys.length > 0 ? (
+                        combinedThreadTypingPubkeys.length > 0 ? (
                           <TypingIndicatorRow
                             channel={activeChannel}
-                            // The strip's slot owns spacing and the
-                            // typing-only inset; zero the base paddings and
-                            // let the row shrink so the lone-item slot can
-                            // ellipsize the label.
                             className="min-w-0 shrink px-0 py-0 sm:px-0"
                             currentPubkey={currentPubkey}
                             profiles={profiles}
-                            typingPubkeys={threadTypingPubkeys}
+                            typingPubkeys={combinedThreadTypingPubkeys}
                           />
                         ) : null
                       }
-                      workingBotPubkeys={threadComposerBotTypingPubkeys}
+                      workingBotPubkeys={threadPillBotPubkeys}
                     />
                   ) : null
                 }

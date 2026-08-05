@@ -17,8 +17,10 @@ mod snapshot;
 pub use snapshot::{snapshot_from_events, MeshSnapshot};
 
 mod catalog;
+mod experimental_catalog;
 pub(crate) use catalog::canonical_curated_model_id;
 pub use catalog::{model_catalog, MeshModelCatalog};
+pub use experimental_catalog::{experimental_catalog, MeshExperimentalCatalog};
 
 mod identity;
 pub use identity::ensure_owner_identity;

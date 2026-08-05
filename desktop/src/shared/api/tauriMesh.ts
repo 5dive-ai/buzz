@@ -226,3 +226,58 @@ export type MeshLiveView = {
 export async function meshLiveView(): Promise<MeshLiveView> {
   return await invokeTauri<MeshLiveView>("mesh_live_view");
 }
+
+/**
+ * A model that can be served across several machines.
+ *
+ * Qualification is the presence of a published *layer package* — never a size
+ * heuristic and never the repo name. A plain GGUF is one opaque blob; splitting
+ * needs the repackaged form produced by `mesh-llm models package`, and mesh-llm
+ * detects it by probing for the package manifest.
+ */
+export type MeshSplitEntry = {
+  /** Model reference, valid as-is in the model field. */
+  name: string;
+  /** Catalog size label. Some entries publish "30 layers" instead of bytes. */
+  sizeLabel: string | null;
+  /** Parsed size, or null when the catalog publishes no byte size. */
+  sizeGb: number | null;
+  /** Layers in the package: the unit distributed across machines. */
+  layerCount: number | null;
+  /** The `-layers` repo holding the package. */
+  packageRepo: string;
+  /**
+   * Whether this machine alone could hold it.
+   *
+   * Load-bearing: a split-capable model that fits locally is not an
+   * experimental choice. Qwen3-8B is 5 GB and split-capable, and mesh-llm
+   * returns `SingleNodeFit` for it before ever considering a split.
+   */
+  fitsLocally: boolean;
+  description: string | null;
+};
+
+export type MeshExperimentalCatalog = {
+  /** Split-capable models, smallest reach first. */
+  entries: MeshSplitEntry[];
+  /** This machine's usable AI memory — the figure `fitsLocally` is against. */
+  vramGb: number;
+  /**
+   * The catalog cache is stale or unreadable. Surfaced rather than hidden: an
+   * empty list means something different when the catalog could not be read
+   * than when it genuinely holds no packages.
+   */
+  stale: boolean;
+};
+
+/**
+ * Models that can be served across several machines.
+ *
+ * Deliberately node-independent — you choose what to share before you start
+ * sharing it, so this works with the runtime off.
+ */
+export async function meshExperimentalCatalog(): Promise<MeshExperimentalCatalog> {
+  return await invokeTauri<MeshExperimentalCatalog>(
+    "mesh_experimental_catalog",
+  );
+}

@@ -776,6 +776,7 @@ pub fn run() {
             mesh_serving_usage,
             mesh_installed_models,
             mesh_model_catalog,
+            mesh_experimental_catalog,
             mesh_snapshot,
             mesh_live_view,
             update_managed_agent,

@@ -33,6 +33,8 @@ mod media_snapshot_png;
 mod media_transcode;
 mod media_upload_progress;
 #[cfg(feature = "mesh-llm")]
+mod mesh_experimental_catalog;
+#[cfg(feature = "mesh-llm")]
 mod mesh_live_view;
 #[cfg(feature = "mesh-llm")]
 pub(crate) mod mesh_llm;
@@ -92,6 +94,8 @@ pub use link_preview::*;
 pub use media::*;
 pub use media_download::*;
 pub use media_raw::*;
+#[cfg(feature = "mesh-llm")]
+pub use mesh_experimental_catalog::*;
 #[cfg(feature = "mesh-llm")]
 pub use mesh_live_view::*;
 #[cfg(feature = "mesh-llm")]

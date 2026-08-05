@@ -85,7 +85,7 @@ pub enum ModelFit {
     TooLarge,
 }
 
-fn fit_code(model_gb: f64, vram_gb: f64) -> ModelFit {
+pub(super) fn fit_code(model_gb: f64, vram_gb: f64) -> ModelFit {
     if model_gb <= vram_gb * 0.6 {
         ModelFit::Comfortable
     } else if model_gb <= vram_gb * 0.9 {

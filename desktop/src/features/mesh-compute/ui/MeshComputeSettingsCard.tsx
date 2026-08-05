@@ -27,6 +27,7 @@ import type {
   MeshModelOption,
   MeshNodeStatus,
 } from "@/shared/api/tauriMesh";
+import { MeshExperimentalSection } from "./MeshExperimentalSection";
 import { SettingsSectionHeader } from "@/features/settings/ui/SettingsSectionHeader";
 import { classifyModelRef } from "../classifyModelRef";
 import {
@@ -204,7 +205,7 @@ export function MeshComputeSettingsCard() {
     <section className="min-w-0" data-testid="settings-mesh-share-compute">
       <SettingsSectionHeader
         title="Share compute"
-        description="Share this machine's compute so members can run models on it."
+        description="Provide compute to your Buzz community. More capacity can increase intelligence and availability of models for agents."
       />
 
       {error ? (
@@ -300,6 +301,18 @@ export function MeshComputeSettingsCard() {
                 placeholder="No limit"
                 usePersonaInputStyle
                 value={maxVramGb}
+              />
+
+              {/*
+                Nested one level deeper than the memory cap: capping memory is a
+                normal advanced adjustment, whereas a collective model changes
+                whether sharing starts at all. Two clicks to reach it is the
+                point.
+              */}
+              <MeshExperimentalSection
+                disabled={controlsDisabled}
+                onModelChange={setShareComputeModel}
+                selectedModel={modelInput}
               />
             </div>
           ) : null}

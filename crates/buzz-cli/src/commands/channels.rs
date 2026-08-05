@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use buzz_core::kind::{KIND_MANAGED_AGENT, KIND_PRESENCE_SNAPSHOT, KIND_TEAM};
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -10,6 +11,7 @@ use crate::client::{
 };
 use crate::commands::agents::fetch_archived_snapshot;
 use crate::commands::channel_templates::{self, ChannelTemplateRecord, TemplateAgentRoster};
+use crate::commands::users::presence_subject;
 use crate::error::CliError;
 use crate::validate::{parse_uuid, read_or_stdin, validate_hex64, validate_uuid};
 
@@ -480,102 +482,117 @@ struct CandidateHint {
     /// whatever string the relay holds). `None` if the lookup failed or
     /// returned no event.
     presence: Option<String>,
-    /// `created_at` timestamp from the agent's kind:0 profile event, used as
-    /// a provisioned-at hint. `None` if the lookup failed or returned nothing.
-    provisioned_at: Option<u64>,
+    /// `created_at` timestamp from the agent's kind:0 profile event — the
+    /// time of the last profile update (kind:0 is replaceable; desktop
+    /// republishes it on rename and profile reconciliation). `None` if the
+    /// lookup failed or returned nothing.
+    profile_updated_at: Option<u64>,
 }
 
 /// Fetch best-effort presence (kind:40902) and kind:0 metadata for each
-/// pubkey in `pubkeys`. Returns a map from pubkey to hints; pubkeys with
-/// failed or absent lookups are absent from the map rather than causing an
-/// error — callers must handle the missing-hint case.
+/// pubkey in `pubkeys`, running both queries concurrently and bounding the
+/// whole enrichment phase by `timeout`. Returns a map from pubkey to hints;
+/// pubkeys with failed or absent lookups are absent from the map rather than
+/// causing an error — callers must handle the missing-hint case. On timeout
+/// or relay error, returns whatever partial hints were collected (possibly
+/// an empty map) so the caller can still print bare pubkeys promptly.
 ///
-/// This is fire-and-forget best-effort: a relay timeout or query failure
-/// returns an empty map so the duplicate-instance error still prints (with
-/// bare pubkeys instead of enriched hints).
+/// Only called when duplicate candidates have been detected: happy-path
+/// resolutions perform zero hint queries.
 async fn fetch_candidate_hints(
     client: &BuzzClient,
     pubkeys: &[String],
+    timeout: std::time::Duration,
 ) -> HashMap<String, CandidateHint> {
     if pubkeys.is_empty() {
         return HashMap::new();
     }
 
-    let mut hints: HashMap<String, CandidateHint> = HashMap::new();
-
-    // Presence: kind:40902, one per pubkey (parameterised-replaceable).
+    // Presence: kind:40902, relay-synthesized on demand.
     let presence_filter = serde_json::json!({
         "kinds": [KIND_PRESENCE_SNAPSHOT],
         "authors": pubkeys,
         "limit": pubkeys.len(),
     });
-    if let Ok(resp) = client.query(&presence_filter).await {
-        if let Ok(events) = serde_json::from_str::<Vec<serde_json::Value>>(&resp) {
-            for event in &events {
-                // Presence subject is the `p` tag's value when present,
-                // otherwise the event author — mirrors `presence_subject` in
-                // users.rs without the dep.
-                let subject = event
-                    .get("tags")
-                    .and_then(|t| t.as_array())
-                    .and_then(|tags| {
-                        tags.iter().find_map(|tag| {
-                            let arr = tag.as_array()?;
-                            if arr.first()?.as_str()? == "p" {
-                                arr.get(1)?.as_str().map(str::to_string)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .or_else(|| {
-                        event
-                            .get("pubkey")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    });
-                let Some(pubkey) = subject else { continue };
-                let status = event
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                hints
-                    .entry(pubkey)
-                    .or_insert(CandidateHint {
-                        presence: None,
-                        provisioned_at: None,
-                    })
-                    .presence = status;
-            }
-        }
-    }
-
-    // Kind:0 profile: one per pubkey, for `created_at` as provisioned-at.
+    // Profile: kind:0 replaceable head per author.
     let profile_filter = serde_json::json!({
         "kinds": [0],
         "authors": pubkeys,
         "limit": pubkeys.len(),
     });
-    if let Ok(resp) = client.query(&profile_filter).await {
-        if let Ok(events) = serde_json::from_str::<Vec<serde_json::Value>>(&resp) {
-            for event in &events {
-                let Some(pubkey) = event
-                    .get("pubkey")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                else {
-                    continue;
-                };
-                let created_at = event.get("created_at").and_then(|v| v.as_u64());
-                hints
-                    .entry(pubkey)
-                    .or_insert(CandidateHint {
-                        presence: None,
-                        provisioned_at: None,
-                    })
-                    .provisioned_at = created_at;
-            }
+
+    // Run both queries concurrently and bound by the overall timeout.
+    let (presence_result, profile_result) = tokio::time::timeout(timeout, async {
+        tokio::join!(
+            client.query(&presence_filter),
+            client.query(&profile_filter),
+        )
+    })
+    .await
+    .unwrap_or((
+        Err(crate::error::CliError::Other("hint timeout".to_string())),
+        Err(crate::error::CliError::Other("hint timeout".to_string())),
+    ));
+
+    let presence_events: Vec<serde_json::Value> = presence_result
+        .ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default();
+    let profile_events: Vec<serde_json::Value> = profile_result
+        .ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default();
+
+    build_hint_map(&presence_events, &profile_events)
+}
+
+/// Pure response-to-map conversion: takes the raw presence (kind:40902) and
+/// profile (kind:0) event slices returned by the relay and builds the
+/// per-pubkey hint map. Extracted as a sync function so it is directly
+/// unit-testable without a relay.
+///
+/// Presence subject is the `p`-tag value when present (relay signs the event
+/// and embeds the agent pubkey there), otherwise the event author.
+fn build_hint_map(
+    presence_events: &[serde_json::Value],
+    profile_events: &[serde_json::Value],
+) -> HashMap<String, CandidateHint> {
+    let mut hints: HashMap<String, CandidateHint> = HashMap::new();
+
+    for event in presence_events {
+        let subject = presence_subject(event).to_string();
+        if subject.is_empty() {
+            continue;
         }
+        let status = event
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        hints
+            .entry(subject)
+            .or_insert(CandidateHint {
+                presence: None,
+                profile_updated_at: None,
+            })
+            .presence = status;
+    }
+
+    for event in profile_events {
+        let Some(pubkey) = event
+            .get("pubkey")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let profile_updated_at = event.get("created_at").and_then(|v| v.as_u64());
+        hints
+            .entry(pubkey)
+            .or_insert(CandidateHint {
+                presence: None,
+                profile_updated_at: None,
+            })
+            .profile_updated_at = profile_updated_at;
     }
 
     hints
@@ -585,9 +602,9 @@ async fn fetch_candidate_hints(
 /// appending available hint fields in brackets. Pure and testable.
 ///
 /// Examples:
-/// - `"aaa…bbb [online, provisioned 2024-01-15]"`
+/// - `"aaa…bbb [online, profile updated 2024-01-15]"`
 /// - `"aaa…bbb [offline]"`
-/// - `"aaa…bbb [provisioned 2024-01-15]"`
+/// - `"aaa…bbb [profile updated 2024-01-15]"`
 /// - `"aaa…bbb"` (no hint at all)
 fn format_candidate(pubkey: &str, hint: Option<&CandidateHint>) -> String {
     let Some(h) = hint else {
@@ -597,23 +614,12 @@ fn format_candidate(pubkey: &str, hint: Option<&CandidateHint>) -> String {
     if let Some(status) = &h.presence {
         parts.push(status.clone());
     }
-    if let Some(ts) = h.provisioned_at {
-        // Format as a human-readable date so operators don't need to decode
-        // a unix timestamp by hand. Use simple arithmetic — no chrono dep.
-        let secs = ts;
-        let days_since_epoch = secs / 86400;
-        // Gregorian calendar calculation (Zeller / proleptic).
-        let z = days_since_epoch + 719468;
-        let era = z / 146097;
-        let doe = z - era * 146097;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = if m <= 2 { y + 1 } else { y };
-        parts.push(format!("provisioned {y}-{m:02}-{d:02}"));
+    if let Some(ts) = h.profile_updated_at {
+        // Use chrono for safe conversion; omit the date if the timestamp is
+        // out of range rather than panicking or printing garbage.
+        if let Some(dt) = DateTime::from_timestamp(ts as i64, 0) {
+            parts.push(format!("profile updated {}", dt.format("%Y-%m-%d")));
+        }
     }
     if parts.is_empty() {
         pubkey.to_string()
@@ -768,6 +774,11 @@ fn finalize_roster_resolution(
 /// for the pure filter+cardinality core and the fail-open contract). Runs
 /// entirely before any channel-creation side effect — a cardinality error
 /// aborts with nothing created.
+///
+/// Hint fetching is zero-cost on the happy path: hints are only queried when
+/// duplicate live instances are detected after archive filtering, and only for
+/// the pubkeys belonging to those duplicates. Queries run concurrently and are
+/// bounded by a 3-second timeout; on expiry the error prints with bare pubkeys.
 async fn build_roster_resolution(
     client: &BuzzClient,
     owner: &str,
@@ -798,15 +809,52 @@ async fn build_roster_resolution(
     }
 
     let slug_set: HashSet<&str> = slugs.iter().map(String::as_str).collect();
-    let found = scan_managed_agents_by_owner(client, owner, &slug_set).await?;
+    let (found, archived_result) = tokio::join!(
+        scan_managed_agents_by_owner(client, owner, &slug_set),
+        fetch_archived_snapshot(client),
+    );
+    let found = found?;
 
-    // Collect all candidate pubkeys for hint fetching: include all found
-    // instances (not just live ones) so the duplicate-instance error can
-    // annotate all candidates before archive filtering removes some.
-    let all_candidate_pubkeys: Vec<String> = found.iter().map(|a| a.pubkey.clone()).collect();
-    let hints = fetch_candidate_hints(client, &all_candidate_pubkeys).await;
+    // Determine which pubkeys belong to duplicate live instances so hints are
+    // only fetched when a cardinality error is inevitable. The archive snapshot
+    // may be Err (untrusted state 3), in which case we conservatively treat all
+    // found instances as live when deciding whether to fetch hints.
+    let duplicate_pubkeys: Vec<String> = {
+        let archived_set: HashSet<&str> = match &archived_result {
+            Ok(keys) => keys.iter().map(String::as_str).collect(),
+            Err(_) => HashSet::new(),
+        };
+        let live: Vec<&ResolvedAgent> = found
+            .iter()
+            .filter(|a| !archived_set.contains(a.pubkey.as_str()))
+            .collect();
+        // Collect pubkeys for slugs that have more than one live instance.
+        let mut slug_count: HashMap<&str, Vec<&str>> = HashMap::new();
+        for a in &live {
+            slug_count
+                .entry(a.persona_id.as_str())
+                .or_default()
+                .push(a.pubkey.as_str());
+        }
+        slug_count
+            .into_values()
+            .filter(|pks| pks.len() > 1)
+            .flatten()
+            .map(str::to_string)
+            .collect()
+    };
 
-    let archived_result = fetch_archived_snapshot(client).await;
+    let hints = if duplicate_pubkeys.is_empty() {
+        HashMap::new()
+    } else {
+        fetch_candidate_hints(
+            client,
+            &duplicate_pubkeys,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+    };
+
     finalize_roster_resolution(
         &slugs,
         found,
@@ -1350,7 +1398,7 @@ pub async fn dispatch_canvas(cmd: crate::CanvasCmd, client: &BuzzClient) -> Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cardinality_rule, build_template_report, cmd_set_add_policy,
+        apply_cardinality_rule, build_hint_map, build_template_report, cmd_set_add_policy,
         finalize_roster_resolution, format_candidate, name_matches,
         resolve_roster_with_archive_filter, validate_ttl_seconds, ArchivedExclusion, CandidateHint,
         ChannelSummary, ResolvedAgent, RosterResolution, SkippedSlug,
@@ -1368,10 +1416,10 @@ mod tests {
         HashMap::new()
     }
 
-    fn hint(presence: Option<&str>, provisioned_at: Option<u64>) -> CandidateHint {
+    fn hint(presence: Option<&str>, profile_updated_at: Option<u64>) -> CandidateHint {
         CandidateHint {
             presence: presence.map(str::to_string),
-            provisioned_at,
+            profile_updated_at,
         }
     }
 
@@ -1940,7 +1988,7 @@ mod tests {
         let formatted = format_candidate(&pk, Some(&h));
         assert!(formatted.contains(&pk), "pubkey must appear: {formatted}");
         assert!(
-            formatted.contains("provisioned 2024-01-15"),
+            formatted.contains("profile updated 2024-01-15"),
             "date must appear: {formatted}"
         );
     }
@@ -1956,7 +2004,7 @@ mod tests {
             "presence must appear: {formatted}"
         );
         assert!(
-            formatted.contains("provisioned 2024-01-15"),
+            formatted.contains("profile updated 2024-01-15"),
             "date must appear: {formatted}"
         );
     }
@@ -1987,7 +2035,7 @@ mod tests {
         assert!(msg.contains(&pk_b), "pk_b must appear: {msg}");
         assert!(msg.contains("offline"), "offline status must appear: {msg}");
         assert!(
-            msg.contains("provisioned 2024-01-15"),
+            msg.contains("profile updated 2024-01-15"),
             "provisioned date must appear: {msg}"
         );
         assert!(msg.contains("online"), "online status must appear: {msg}");
@@ -2018,5 +2066,105 @@ mod tests {
             !msg.contains(&format!("{pk_b} [")),
             "pk_b must not have hint brackets: {msg}"
         );
+    }
+
+    // --- build_hint_map boundary tests ---
+
+    #[test]
+    fn build_hint_map_uses_p_tag_over_author_for_presence() {
+        // Relay signs presence events with its own key; the agent pubkey is in
+        // the `p` tag. The relay author must NOT be used as the map key.
+        let relay_pk = "r".repeat(64);
+        let agent_pk = "a".repeat(64);
+        let presence = vec![json!({
+            "pubkey": relay_pk,
+            "content": "online",
+            "tags": [["p", agent_pk]],
+        })];
+        let map = build_hint_map(&presence, &[]);
+        assert!(
+            !map.contains_key(&relay_pk),
+            "relay author must not be the key: {map:?}"
+        );
+        assert!(
+            map.contains_key(&agent_pk),
+            "agent p-tag must be key: {map:?}"
+        );
+        assert_eq!(
+            map[&agent_pk].presence.as_deref(),
+            Some("online"),
+            "presence status preserved"
+        );
+    }
+
+    #[test]
+    fn build_hint_map_presence_failure_profile_survives() {
+        // If presence lookup fails (empty slice), profile hints must still be
+        // populated from the profile events alone.
+        let pk = "b".repeat(64);
+        let profile = vec![json!({
+            "pubkey": pk,
+            "created_at": 1_705_276_800_u64,
+        })];
+        let map = build_hint_map(&[], &profile);
+        assert!(map.contains_key(&pk), "pubkey must be in map: {map:?}");
+        assert_eq!(
+            map[&pk].profile_updated_at,
+            Some(1_705_276_800),
+            "profile timestamp preserved"
+        );
+        assert!(
+            map[&pk].presence.is_none(),
+            "presence must be absent when lookup failed"
+        );
+    }
+
+    #[test]
+    fn build_hint_map_profile_failure_presence_survives() {
+        // If profile lookup fails (empty slice), presence hints must still be
+        // populated from the presence events alone.
+        let pk = "c".repeat(64);
+        let presence = vec![json!({
+            "pubkey": pk,
+            "content": "offline",
+            "tags": [],
+        })];
+        let map = build_hint_map(&presence, &[]);
+        assert!(map.contains_key(&pk), "pubkey must be in map: {map:?}");
+        assert_eq!(
+            map[&pk].presence.as_deref(),
+            Some("offline"),
+            "presence status preserved"
+        );
+        assert!(
+            map[&pk].profile_updated_at.is_none(),
+            "profile_updated_at must be absent when lookup failed"
+        );
+    }
+
+    #[test]
+    fn build_hint_map_malformed_entries_are_skipped() {
+        // Presence events missing both pubkey and p-tag are skipped without
+        // panicking; profile events missing pubkey are skipped too.
+        let malformed_presence = vec![
+            json!({"content": "online"}), // no pubkey, no p-tag
+            json!({"pubkey": null, "content": "online", "tags": []}),
+        ];
+        let malformed_profile = vec![
+            json!({"created_at": 1_705_276_800_u64}), // no pubkey
+            json!({"pubkey": null, "created_at": 1_705_276_800_u64}),
+        ];
+        let map = build_hint_map(&malformed_presence, &malformed_profile);
+        assert!(
+            map.is_empty(),
+            "malformed entries must yield empty map: {map:?}"
+        );
+    }
+
+    #[test]
+    fn build_hint_map_both_failures_yield_empty_map() {
+        // Both slices empty simulates a total timeout / relay error.
+        let map = build_hint_map(&[], &[]);
+        assert!(map.is_empty(), "empty inputs must yield empty map");
     }
 }

@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";
+import { expectEmojiMartStylesInstalled } from "../helpers/css";
 import { seedActiveIdentity } from "../helpers/onboarding";
 
 const BLANK_TYLER_IDENTITY = {
@@ -51,6 +52,7 @@ test("avatar step shares the profile emoji picker controls", async ({
 
   const picker = page.locator("em-emoji-picker");
   await expect(picker.locator("input[type='search']")).toBeVisible();
+  await expectEmojiMartStylesInstalled(picker);
   await expect(page.getByTestId("onboarding-avatar-emoji-picker")).toHaveCSS(
     "height",
     "384px",

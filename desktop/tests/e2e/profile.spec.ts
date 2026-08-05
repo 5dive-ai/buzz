@@ -5,6 +5,7 @@ import {
   installMockBridge,
   TEST_IDENTITIES,
 } from "../helpers/bridge";
+import { expectEmojiMartStylesInstalled } from "../helpers/css";
 import { openProfileMenu, openSettings } from "../helpers/settings";
 
 async function expectHomeView(page: import("@playwright/test").Page) {
@@ -597,6 +598,7 @@ test("offers emoji search and skin-tone controls for profile avatars", async ({
   const picker = page.locator("em-emoji-picker");
   const searchInput = picker.locator("input[type='search']");
   await expect(searchInput).toBeVisible();
+  await expectEmojiMartStylesInstalled(picker);
   await expect(page.getByTestId("profile-avatar-emoji-picker")).toHaveCSS(
     "height",
     "384px",

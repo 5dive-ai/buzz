@@ -2,9 +2,10 @@
 //!
 //! Relay membership enforcement uses the shared
 //! [`crate::api::relay_members::enforce_relay_membership`] helper. NIP-OA
-//! owner evidence is returned by the shared gate on open relays unconditionally
-//! and on closed relays when delegation auth is enabled, then durably
-//! materialized for later transport-neutral revocation checks.
+//! owner evidence is returned by the shared gate whenever it verifies, while
+//! the feature flag controls only whether that evidence may grant closed-relay
+//! membership. The relationship is then durably materialized for later
+//! transport-neutral revocation checks.
 //!
 //! For WebSocket auth, the NIP-OA `auth` tag is extracted from the signed AUTH
 //! event itself (the tag is integrity-protected by the event signature).
@@ -237,9 +238,10 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 }
             };
 
-            // The shared gate returns a verified owner only when NIP-OA is
-            // enabled, including on open relays. Preserve that feature gate for
-            // ownership materialization.
+            // A verified owner is returned for both direct members and
+            // delegated admissions. The feature flag controls only whether the
+            // latter can grant access; owner evidence remains revocation
+            // authority in either case.
             // Stash NIP-OA owner on the auth context only after the shared
             // backfill confirms the first-write-wins relationship.
             if let Some(owner) = nip_oa_owner {

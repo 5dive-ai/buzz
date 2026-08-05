@@ -591,13 +591,20 @@ fn request_rejection_message(sub_id: Option<&str>, reason: &str) -> String {
     }
 }
 
+fn requires_participation_revalidation(msg: &ClientMessage) -> bool {
+    matches!(
+        msg,
+        ClientMessage::Req { .. } | ClientMessage::Count { .. } | ClientMessage::Event(_)
+    )
+}
+
 async fn enforce_ws_admission(
     msg: &ClientMessage,
     conn: &ConnectionState,
     state: &AppState,
 ) -> bool {
     let is_event = matches!(msg, ClientMessage::Event(_));
-    if !is_event && !matches!(msg, ClientMessage::Req { .. } | ClientMessage::Count { .. }) {
+    if !requires_participation_revalidation(msg) {
         return true;
     }
 
@@ -806,6 +813,35 @@ mod tests {
                 other => panic!("unexpected websocket message in test: {other:?}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn managed_agent_revocation_revalidates_req_and_all_event_storage_classes() {
+        use nostr::{EventBuilder, Filter, Keys, Kind};
+
+        let signed = |kind| {
+            EventBuilder::new(kind, "")
+                .sign_with_keys(&Keys::generate())
+                .expect("sign event")
+        };
+        let cases = [
+            ClientMessage::Req {
+                sub_id: "history".into(),
+                filters: vec![Filter::new()],
+            },
+            ClientMessage::Event(signed(Kind::TextNote)),
+            ClientMessage::Event(signed(Kind::Custom(20_001))),
+        ];
+
+        for case in &cases {
+            assert!(
+                requires_participation_revalidation(case),
+                "REQ, persistent EVENT, and ephemeral EVENT must all revalidate durable revocation"
+            );
+        }
+        assert!(!requires_participation_revalidation(&ClientMessage::Close(
+            "history".into()
+        )));
     }
 
     #[test]

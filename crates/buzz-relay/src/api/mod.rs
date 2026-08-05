@@ -47,8 +47,10 @@ pub mod relay_members {
     pub enum MembershipDecision {
         /// Relay membership enforcement is disabled.
         OpenRelay,
-        /// Caller is directly present in `relay_members`.
-        Member,
+        /// Caller is directly present in `relay_members`. A verified owner is
+        /// retained for revocation rechecks and durable owner materialization;
+        /// it did not grant this membership.
+        Member(Option<nostr::PublicKey>),
         /// Caller is admitted through a NIP-OA owner that is a relay member.
         ViaOwner(nostr::PublicKey),
         /// Caller is not admitted.
@@ -56,13 +58,9 @@ pub mod relay_members {
     }
 
     fn verified_nip_oa_owner(
-        allow_nip_oa_auth: bool,
         pubkey_bytes: &[u8],
         auth_tag_header: Option<&str>,
     ) -> Option<nostr::PublicKey> {
-        if !allow_nip_oa_auth {
-            return None;
-        }
         let tag_json = auth_tag_header?;
         let agent_pubkey = nostr::PublicKey::from_slice(pubkey_bytes).ok()?;
         match buzz_sdk::nip_oa::verify_auth_tag(tag_json, &agent_pubkey) {
@@ -91,11 +89,10 @@ pub mod relay_members {
         auth_tag_header: Option<&str>,
     ) -> Result<MembershipDecision, String> {
         let pubkey_hex = hex::encode(pubkey_bytes);
-        let verified_owner = verified_nip_oa_owner(
-            !state.config.require_relay_membership || state.config.allow_nip_oa_auth,
-            pubkey_bytes,
-            auth_tag_header,
-        );
+        // Verify owner evidence independently of whether NIP-OA may grant
+        // closed-relay membership. A direct member can still be a managed
+        // agent, and its proven owner is required to enforce a PMA tombstone.
+        let verified_owner = verified_nip_oa_owner(pubkey_bytes, auth_tag_header);
         let revoked = state
             .db
             .managed_agent_participation_is_revoked(
@@ -121,7 +118,7 @@ pub mod relay_members {
             .await
             .map_err(|e| format!("relay membership check failed: {e}"))?;
         if is_member {
-            return Ok(MembershipDecision::Member);
+            return Ok(MembershipDecision::Member(verified_owner));
         }
 
         if state.config.allow_nip_oa_auth {
@@ -148,15 +145,15 @@ pub mod relay_members {
 
     /// Enforce relay membership for a pubkey, with NIP-OA agent delegation fallback.
     ///
-    /// Returns `Ok(Some(owner_pubkey))` when the agent is not a direct member but
-    /// its NIP-OA owner *is* — access is granted via delegation.
+    /// Returns `Ok(Some(owner_pubkey))` whenever the caller supplies verified
+    /// NIP-OA owner evidence, including when the caller is itself a direct
+    /// member. The feature flag controls only whether that evidence can grant
+    /// admission to a non-member on a closed relay.
     ///
-    /// On open relays (`require_relay_membership = false`), returns a verified
-    /// NIP-OA owner unconditionally for durable backfill. The feature flag only
-    /// controls whether delegation can grant access on a closed relay.
+    /// On open relays (`require_relay_membership = false`), owner evidence is
+    /// likewise returned unconditionally for durable backfill.
     ///
-    /// Returns `Ok(None)` when the caller is a direct member (closed relay) or when
-    /// no NIP-OA tag is present/applicable (open relay without auth tag).
+    /// Returns `Ok(None)` only when no valid NIP-OA tag is present.
     pub async fn enforce_relay_membership(
         state: &AppState,
         community: CommunityId,
@@ -164,7 +161,8 @@ pub mod relay_members {
         auth_tag_header: Option<&str>,
     ) -> Result<Option<nostr::PublicKey>, (StatusCode, Json<serde_json::Value>)> {
         match check_relay_membership(state, community, pubkey_bytes, auth_tag_header).await {
-            Ok(MembershipDecision::OpenRelay) | Ok(MembershipDecision::Member) => Ok(None),
+            Ok(MembershipDecision::OpenRelay) => Ok(None),
+            Ok(MembershipDecision::Member(owner)) => Ok(owner),
             Ok(MembershipDecision::ViaOwner(owner)) => Ok(Some(owner)),
             Ok(MembershipDecision::Denied) => Err((
                 StatusCode::FORBIDDEN,
@@ -274,20 +272,16 @@ pub mod relay_members {
         use nostr::Keys;
 
         #[test]
-        fn closed_relay_disabled_nip_oa_does_not_supply_policy_owner_evidence() {
+        fn owner_evidence_is_verified_independently_of_membership_grant_policy() {
             let owner = Keys::generate();
             let agent = Keys::generate();
             let tag = compute_auth_tag(&owner, &agent.public_key(), "").unwrap();
             assert_eq!(
-                verified_nip_oa_owner(false, agent.public_key().as_bytes(), Some(&tag)),
-                None
-            );
-            assert_eq!(
-                verified_nip_oa_owner(true, agent.public_key().as_bytes(), Some(&tag)),
+                verified_nip_oa_owner(agent.public_key().as_bytes(), Some(&tag)),
                 Some(owner.public_key())
             );
             assert_eq!(
-                verified_nip_oa_owner(true, agent.public_key().as_bytes(), Some("invalid")),
+                verified_nip_oa_owner(agent.public_key().as_bytes(), Some("invalid")),
                 None
             );
         }

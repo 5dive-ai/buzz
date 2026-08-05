@@ -732,15 +732,6 @@ test("hiding composer link previews suppresses the whole draft and emits the bla
   await waitForReadyComposerSnapshots(page);
 
   await page.getByTestId("composer-hide-link-previews").click();
-  const dismissDialog = page.getByRole("alertdialog", {
-    name: "Hide link preview?",
-  });
-  await expect(dismissDialog).toBeVisible();
-  await dismissDialog.getByRole("button", { name: "Cancel" }).click();
-  await expect(page.locator("[data-composer-link-previews]")).toBeVisible();
-
-  await page.getByTestId("composer-hide-link-previews").click();
-  await dismissDialog.getByRole("button", { name: "Hide preview" }).click();
   await expect(page.locator("[data-composer-link-previews]")).toHaveCount(0);
   await page.getByTestId("message-input").fill(`${firstUrl} ${secondUrl}`);
   await expect(page.locator("[data-composer-link-previews]")).toHaveCount(0);

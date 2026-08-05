@@ -16,6 +16,7 @@ use crate::app_state::{build_app_state, AppState};
 use crate::commands::personas::snapshot::import::capture_agent_snapshot_import_entry;
 use crate::managed_agents::scope::{
     current_scope_generation, next_scope_generation, WorkspaceAgentScope,
+    SCOPE_GENERATION_TEST_LOCK,
 };
 
 fn make_scope_with_keys(tmp: &tempfile::TempDir, owner_keys: &nostr::Keys) -> WorkspaceAgentScope {
@@ -133,8 +134,18 @@ fn test_confirm_agent_snapshot_import_matching_owner_passes_entry_guard() {
 ///
 /// Tests the production `validate_scope_generation` function directly — the
 /// exact guard that fires inside Phase 3a of `confirm_agent_snapshot_import`.
+///
+/// Holds `SCOPE_GENERATION_TEST_LOCK` because `next_scope_generation()` mutates
+/// the process-global generation counter. Without the lock, the bump can race
+/// any async test holding a captured generation (e.g., generation-stability
+/// tests in `global_agent_config_epoch_tests` or
+/// `runtime_commands_concurrency_tests`), causing spurious stale-detection
+/// failures in the generation-sensitive path.
 #[test]
 fn test_scope_generation_guard_rejects_stale_scope_for_import() {
+    let _gen_guard = crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let owner_keys = nostr::Keys::generate();
 

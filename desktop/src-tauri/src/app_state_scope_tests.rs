@@ -97,8 +97,16 @@ fn test_live_import_with_active_scope_clears_scope_and_bumps_generation() {
 /// This test verifies the structural invariant: `clear_active_scope()` —
 /// the single operation identity import performs — does not touch the
 /// filesystem claim ledger.
+///
+/// Holds `SCOPE_GENERATION_TEST_LOCK` because `clear_active_scope()` internally
+/// calls `next_scope_generation()`, which mutates the process-global generation
+/// counter. Without the lock, this bump can race any test that relies on
+/// generation stability (e.g., captured-scope stale-detection tests).
 #[test]
 fn test_fallback_relay_never_claims_during_identity_import() {
+    let _gen_guard = crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let state = build_app_state();
 

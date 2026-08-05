@@ -17,7 +17,7 @@ pub(crate) fn start_pair_lazy_for_with_hook<R: tauri::Runtime>(
     relay_url: String,
     app: tauri::AppHandle<R>,
     on_before_transition: impl FnOnce(),
-    on_transition_acquired: impl FnOnce(),
+    on_transition_acquired: impl FnOnce(&std::sync::MutexGuard<'_, ()>),
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     start_pair_for_with_hook(
         pubkey,
@@ -33,14 +33,15 @@ pub(crate) fn start_pair_lazy_for_with_hook<R: tauri::Runtime>(
 /// Generic start-pair seam with injectable hooks.
 ///
 /// - `on_before_transition`: fires BEFORE `managed_agent_runtime_transition` is
-///   locked. Tests signal "at the lock boundary" from here — the contender is
-///   committed to acquiring `managed_agent_runtime_transition` immediately after.
+///   locked. Tests signal "entered the seam" from here.
 ///
 /// - `on_transition_acquired`: fires AFTER `managed_agent_runtime_transition` is
-///   acquired but BEFORE `managed_agents_store_lock` is attempted. Signals that
-///   start has passed the transition-lock boundary.
+///   acquired (borrowing the actual guard) but BEFORE `managed_agents_store_lock`
+///   is attempted. The argument is a borrow of the actual transition guard; a
+///   drop or removal of that guard before this call is a compile error.
 ///
-/// Production delegates with `|| {}` for both hooks — release-invisible no-ops.
+/// Production delegates with `|| {}` and `|_| {}` for the two hooks —
+/// release-invisible no-ops.
 pub(crate) fn start_pair_for_with_hook<R: tauri::Runtime>(
     pubkey: String,
     relay_url: String,
@@ -48,11 +49,11 @@ pub(crate) fn start_pair_for_with_hook<R: tauri::Runtime>(
     expected_updated_at: Option<&str>,
     app: tauri::AppHandle<R>,
     on_before_transition: impl FnOnce(),
-    on_transition_acquired: impl FnOnce(),
+    on_transition_acquired: impl FnOnce(&std::sync::MutexGuard<'_, ()>),
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     let state = app.state::<AppState>();
     on_before_transition();
-    let _transition = state
+    let transition_guard = state
         .managed_agent_runtime_transition
         .lock()
         .map_err(|e| e.to_string())?;
@@ -62,7 +63,7 @@ pub(crate) fn start_pair_for_with_hook<R: tauri::Runtime>(
     {
         return Err("desktop shutdown has started".into());
     }
-    on_transition_acquired();
+    on_transition_acquired(&transition_guard);
     let _store = state
         .managed_agents_store_lock
         .lock()

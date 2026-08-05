@@ -250,7 +250,7 @@ pub(crate) fn start_pair_lazy_for<R: tauri::Runtime>(
     relay_url: String,
     app: tauri::AppHandle<R>,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    start_pair_lazy_for_with_hook(pubkey, relay_url, app, || {}, || {})
+    start_pair_lazy_for_with_hook(pubkey, relay_url, app, || {}, |_| {})
 }
 
 // Start-pair hook seams: extracted to stay under the file-size ratchet.
@@ -291,7 +291,7 @@ fn start_pair_for<R: tauri::Runtime>(
         expected_updated_at,
         app,
         || {},
-        || {},
+        |_| {},
     )
 }
 
@@ -909,30 +909,24 @@ pub(crate) fn compensate_drain<R: tauri::Runtime>(
         captured_scope,
         _rt_transition_held,
         |_| {},
-        |_| {},
+        |_, _| {},
     )
 }
 
 /// Inner implementation of [`compensate_drain`] with injectable hooks.
 ///
 /// Lock order: transition guard held by caller → acquire store lock → validate generation
-/// → load records → `on_records_loaded(&mut records)` (no-op in production; tests inject
-/// a sentinel mutation) → delegate to `compensate_drain_for` → `on_after_restore(&mut records)`
-/// (no-op in production; tests assert/save the injected mutation to prove the store lock is
-/// held continuously through restore and the post-restore callback).
-///
-/// The store lock is held across the entire sequence: validate → load → pre-restore hook
-/// → every restore → post-restore callback. The caller-owned transition guard is retained
-/// across the whole interval. With no-op callbacks, production behavior is byte-for-byte
-/// equivalent to the pre-hook path on all paths (empty, stale-generation, load-failure,
-/// partial-restore, full-success).
+/// → load records → `on_records_loaded` → delegate to `compensate_drain_for` →
+/// `on_after_restore(&mut records, &_store)` (borrows the actual store guard; production
+/// passes `|_, _| {}`). Store lock held across the entire sequence. With no-op callbacks,
+/// production behavior is byte-for-byte equivalent to the pre-hook path.
 pub(crate) fn compensate_drain_with_hook<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     stopped: &[DrainJournalEntry],
     captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
     _rt_transition_held: std::sync::MutexGuard<'_, ()>,
     on_records_loaded: impl FnOnce(&mut Vec<super::ManagedAgentRecord>),
-    on_after_restore: impl FnOnce(&mut Vec<super::ManagedAgentRecord>),
+    on_after_restore: impl FnOnce(&mut Vec<super::ManagedAgentRecord>, &std::sync::MutexGuard<'_, ()>),
 ) -> Option<String> {
     if stopped.is_empty() {
         drop(_rt_transition_held);
@@ -986,9 +980,10 @@ pub(crate) fn compensate_drain_with_hook<R: tauri::Runtime>(
         .map(|_| ())
     });
 
-    // 7. Post-restore hook — no-op in production. Tests save the injected mutation
-    //    here to prove the store lock is held through restore and this callback.
-    on_after_restore(&mut records);
+    // 7. Post-restore hook — no-op in production. Tests add `COMP_SENTINEL` and save
+    //    while borrowing the actual store guard, proving the lock is held through restore
+    //    and this callback.
+    on_after_restore(&mut records, &_store);
 
     result
 }

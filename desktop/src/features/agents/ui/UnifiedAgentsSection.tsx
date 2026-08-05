@@ -4,6 +4,7 @@ import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
+import { InstancesSheet } from "@/features/identity-archive/InstancesSheet";
 import { useUserProfileQuery } from "@/features/profile/hooks";
 import type { AgentPersona, ManagedAgent } from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
@@ -102,6 +103,8 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     [personas, agents],
   );
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
+  // Instances Sheet state: which persona triggered the sheet open.
+  const [instancesSheetOpen, setInstancesSheetOpen] = React.useState(false);
   const {
     fileInputRef,
     isDragOver,
@@ -169,6 +172,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                       onShare={(persona, linkedAgent) =>
                         onSharePersona(persona, linkedAgent, effectiveAvatarUrl)
                       }
+                      onViewInstances={() => setInstancesSheetOpen(true)}
                     />
                   )}
                   agent={profileAgent}
@@ -235,6 +239,11 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
           {personasError.message}
         </p>
       ) : null}
+
+      <InstancesSheet
+        open={instancesSheetOpen}
+        onOpenChange={setInstancesSheetOpen}
+      />
     </section>
   );
 }

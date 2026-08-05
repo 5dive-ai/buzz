@@ -42,6 +42,7 @@ mod tray_menu;
 mod util;
 #[cfg(target_os = "linux")]
 pub mod webkit_rendering;
+mod workspace_epoch;
 use app_state::{build_app_state, resolve_persisted_identity, AppState};
 use builderlab::*;
 use commands::*;
@@ -744,6 +745,7 @@ pub fn run() {
             list_archived_identities,
             get_relay_self,
             resolve_oa_owner,
+            get_owned_agent_inventory,
             list_relay_agents,
             list_managed_agents,
             list_managed_agent_runtimes,

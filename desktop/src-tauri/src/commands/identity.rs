@@ -420,6 +420,7 @@ fn commit_imported_identity(
     // observing false is guaranteed to see the updated keys.
     let pubkey = keys.public_key();
     {
+        let _epoch_guard = state.begin_workspace_write()?;
         let mut active_keys = state.keys.lock().map_err(|e| e.to_string())?;
         *active_keys = keys;
         state.set_identity_storage(storage);

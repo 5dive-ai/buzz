@@ -1,8 +1,7 @@
 use std::{
     collections::HashMap,
-    io::Write,
     sync::{
-        atomic::{AtomicBool, AtomicU16, AtomicU8},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
 };
@@ -118,6 +117,17 @@ pub struct AppState {
     /// itself owns direct QUIC/iroh connection establishment.
     #[cfg(feature = "mesh-llm")]
     pub mesh_coordinator: AsyncMutex<Option<crate::mesh_llm::MeshCoordinator>>,
+    // ── Workspace-epoch seqlock ───────────────────────────────────────────────
+    //
+    // Epoch is even when stable, odd while a workspace transition is in
+    // progress. Readers capture (keys, relay_url_override) by sampling the
+    // epoch twice around the two field reads; they accept the pair only when
+    // both samples are identical AND even. This prevents consumers from
+    // observing an old actor with a new relay URL (or vice versa) during the
+    // brief overlap of `apply_workspace`. See [`WorkspaceEpochWriteGuard`].
+    pub(crate) workspace_epoch: AtomicU64,
+    pub(crate) workspace_write: Mutex<()>,
+
     /// `(creator_pubkey_hex, channel_id)` pairs for channels the *named*
     /// identity created via `create_channel` and has not yet observed its own
     /// kind:39002 membership entry for. The relay provisions that entry
@@ -233,6 +243,8 @@ pub fn build_app_state() -> AppState {
         #[cfg(feature = "mesh-llm")]
         mesh_coordinator: AsyncMutex::new(None),
         pending_owned_channels: Mutex::new(std::collections::HashSet::new()),
+        workspace_epoch: AtomicU64::new(0),
+        workspace_write: Mutex::new(()),
     }
 }
 
@@ -338,7 +350,69 @@ impl AppState {
         };
         crate::huddle::state::emit_huddle_state(&app, &snapshot);
     }
+
+    /// Acquire the serialized workspace-write guard, transitioning the epoch
+    /// even → odd. `Drop` restores even on every exit path (SeqCst throughout).
+    /// Must be held outermost — never hold `keys` / `relay_url_override` first.
+    pub fn begin_workspace_write(&self) -> Result<WorkspaceEpochWriteGuard<'_>, String> {
+        let guard = self
+            .workspace_write
+            .lock()
+            .map_err(|e| format!("workspace write mutex poisoned: {e}"))?;
+        // Transition even → odd: we are about to start mutating.
+        let prev = self.workspace_epoch.fetch_add(1, Ordering::SeqCst);
+        debug_assert!(
+            prev.is_multiple_of(2),
+            "workspace_epoch should be even before write"
+        );
+        Ok(WorkspaceEpochWriteGuard {
+            epoch: &self.workspace_epoch,
+            _guard: guard,
+        })
+    }
+
+    /// Capture an atomic `(keys, relay_url_override)` pair via the seqlock
+    /// protocol. Returns `Err` after `max_retries` exhausted attempts.
+    pub fn capture_archive_scope(&self, max_retries: u32) -> Result<ArchiveScope, String> {
+        for _ in 0..=max_retries {
+            // Sample epoch before reads.
+            let epoch_before = self.workspace_epoch.load(Ordering::SeqCst);
+            // Odd → writer is mid-transition; yield and retry.
+            if !epoch_before.is_multiple_of(2) {
+                std::thread::yield_now();
+                continue;
+            }
+
+            let keys = self
+                .keys
+                .lock()
+                .map_err(|e| format!("keys mutex poisoned: {e}"))?
+                .clone();
+            let relay_url_override = self
+                .relay_url_override
+                .lock()
+                .map_err(|e| format!("relay_url_override mutex poisoned: {e}"))?
+                .clone();
+
+            // Sample epoch after reads.
+            let epoch_after = self.workspace_epoch.load(Ordering::SeqCst);
+            // Accept only when unchanged and even — both fields from one generation.
+            if epoch_after == epoch_before && epoch_after.is_multiple_of(2) {
+                let actor = keys.public_key().to_hex();
+                return Ok(ArchiveScope {
+                    keys,
+                    actor,
+                    relay_url_override,
+                    workspace_epoch: epoch_after,
+                });
+            }
+            // Epoch changed mid-read: retry.
+        }
+        Err("workspace is switching — please retry the archive operation in a moment".to_string())
+    }
 }
+
+pub use crate::workspace_epoch::{ArchiveScope, WorkspaceEpochWriteGuard};
 
 /// Resolve the user's identity key from the app data directory and wire
 /// the resulting [`RecoveryState`] into `AppState`.
@@ -373,6 +447,7 @@ pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(
     // Write keys and storage before setting the recovery flags (Release) so
     // any thread that reads a flag as false with Acquire sees consistent data.
     {
+        let _epoch_guard = state.begin_workspace_write()?;
         let mut active_keys = state.keys.lock().map_err(|e| e.to_string())?;
         *active_keys = resolved.keys;
         state.set_identity_storage(resolved.storage);
@@ -899,181 +974,24 @@ pub(crate) fn persist_imported_identity(
     persist_imported_identity_impl(store, keys, legacy_path, data_dir)
 }
 
-/// Path of the migration-completed marker within `data_dir`.
-fn migration_marker_path(data_dir: &std::path::Path) -> std::path::PathBuf {
-    data_dir.join(keyring_config::migration_marker_name(
-        keyring_service(),
-        MIGRATION_MARKER_NAME,
-    ))
-}
-
-/// Atomically write (and fsync) the migration-completed marker. The content is
-/// irrelevant — only the file's durable existence is the signal — so a single
-/// byte keeps it minimal. Atomicity + fsync guarantee that once this returns
-/// `Ok`, the marker survives a crash, which is what makes deleting the legacy
-/// file afterward safe.
-fn write_migration_marker(marker_path: &std::path::Path) -> Result<(), String> {
-    use atomic_write_file::AtomicWriteFile;
-
-    let mut file = AtomicWriteFile::open(marker_path)
-        .map_err(|e| format!("open migration marker for atomic write: {e}"))?;
-    file.write_all(b"1")
-        .map_err(|e| format!("write migration marker: {e}"))?;
-    file.commit()
-        .map_err(|e| format!("commit migration marker: {e}"))
-}
-
-/// Generate a fresh identity, persist it through the store, return it.
-///
-/// On a keyring-backed persist no file is written, so a later
-/// keyring-Unreachable boot would see "no file, no marker" (identical to a
-/// fresh install) and silently rotate the identity. Writing the marker here
-/// makes that boot fail closed. If the marker write fails, fall back to the
-/// `0o600` file so the key is never keyring-only-without-marker.
-fn generate_and_persist(
-    store: &impl IdentityKeyStore,
-    legacy_path: &std::path::Path,
-    data_dir: &std::path::Path,
-) -> Result<(Keys, IdentityStorage), String> {
-    let keys = Keys::generate();
-    let storage = store_key_preferring_keyring(store, &keys, legacy_path)?;
-    if storage == IdentityStorage::SystemKeyring {
-        let marker_path = migration_marker_path(data_dir);
-        if let Err(e) = write_migration_marker(&marker_path) {
-            eprintln!(
-                "buzz-desktop: stored identity in keyring but failed to write migration marker \
-                 ({e}); saving identity.key fallback so the key is not stranded"
-            );
-            save_key_file(legacy_path, &keys)?;
-        }
-    }
-    eprintln!(
-        "buzz-desktop: generated and saved identity pubkey {}",
-        keys.public_key().to_hex()
-    );
-    Ok((keys, storage))
-}
-
-/// Persist `keys` through the store, silently falling back to the `0o600` file
-/// when the keyring write fails on an availability error. Reports which backend
-/// held the key (no verify/marker/delete — those belong to callers that own the
-/// full migration contract) so the caller can write the migration marker only on
-/// keyring success.
-fn store_key_preferring_keyring(
-    store: &impl IdentityKeyStore,
-    keys: &Keys,
-    legacy_path: &std::path::Path,
-) -> Result<IdentityStorage, String> {
-    let nsec = keys
-        .secret_key()
-        .to_bech32()
-        .map_err(|e| format!("encode nsec: {e}"))?;
-    match store.store(IDENTITY_KEY_NAME, &nsec) {
-        Ok(()) => Ok(IdentityStorage::SystemKeyring),
-        Err(keyring_err) => {
-            eprintln!("buzz-desktop: keyring write failed ({keyring_err}), using file fallback");
-            save_key_file(legacy_path, keys)?;
-            Ok(IdentityStorage::LocalFile)
-        }
-    }
-}
-
-/// Ensure the migration marker exists (writing it if absent), then remove the
-/// leftover `identity.key`. Crash-safe ordering: the marker is written and
-/// fsync-committed before the file is deleted, so a crash between the two
-/// leaves the marker on disk and the file intact — the invariant "keyring-only
-/// implies marker exists" is preserved. If the marker write fails, the file is
-/// kept so a later keyring-unreachable boot can use it as a fallback.
-fn ensure_marker_then_cleanup(data_dir: &std::path::Path, legacy_path: &std::path::Path) {
-    let marker_path = migration_marker_path(data_dir);
-    let marker_ok = marker_path.exists()
-        || write_migration_marker(&marker_path)
-            .map_err(|e| {
-                eprintln!(
-                    "buzz-desktop: keyring present but marker missing; \
-                     failed to write marker ({e}), keeping identity.key"
-                );
-            })
-            .is_ok();
-    if marker_ok {
-        cleanup_leftover_identity_file(legacy_path);
-    }
-}
-
-/// Best-effort removal of a leftover `identity.key` once the keyring is the
-/// authoritative store. Idempotent: a missing file is success. Logs but does
-/// not error on failure — a delete failure must never block startup.
-fn cleanup_leftover_identity_file(legacy_path: &std::path::Path) {
-    if !legacy_path.exists() {
-        return;
-    }
-    match std::fs::remove_file(legacy_path) {
-        Ok(()) => eprintln!("buzz-desktop: removed leftover identity.key (key is in keyring)"),
-        Err(e) => eprintln!("buzz-desktop: failed to remove leftover identity.key: {e}"),
-    }
-}
-
-/// Quarantine a corrupt `identity.key` with a timestamp so prior backups are
-/// never overwritten.
-fn quarantine_corrupt_key(key_path: &std::path::Path, data_dir: &std::path::Path, error: &str) {
-    if !key_path.exists() {
-        return;
-    }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let bad_name = format!("identity.key.bad.{ts}");
-    eprintln!("buzz-desktop: corrupt identity.key ({error}), quarantining to {bad_name}");
-    let bad_path = data_dir.join(bad_name);
-    if std::fs::rename(key_path, &bad_path).is_err() {
-        let _ = std::fs::remove_file(key_path);
-    }
-}
-
-fn load_key_file(path: &std::path::Path) -> Result<Keys, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("read identity.key: {e}"))?;
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return Err("empty identity.key".to_string());
-    }
-    Keys::parse(trimmed).map_err(|e| format!("parse identity.key: {e}"))
-}
-
-/// Atomically write the key to disk. Uses `atomic-write-file` which:
-/// 1. Writes to a temp file in the same directory
-/// 2. Calls fsync on the file
-/// 3. Renames temp → target (atomic on POSIX, best-effort on Windows)
-/// 4. Calls fsync on the parent directory
-///
-/// On Unix, the file is created with mode 0600 (owner read/write only).
-/// On Windows, default ACLs apply — the app data directory is already
-/// per-user, so the key is not world-readable in practice.
-pub(crate) fn save_key_file(path: &std::path::Path, keys: &Keys) -> Result<(), String> {
-    use atomic_write_file::AtomicWriteFile;
-
-    let nsec = keys
-        .secret_key()
-        .to_bech32()
-        .map_err(|e| format!("encode nsec: {e}"))?;
-
-    let mut file = AtomicWriteFile::open(path)
-        .map_err(|e| format!("open identity.key for atomic write: {e}"))?;
-
-    // Set owner-only permissions before writing the secret.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("set identity.key permissions: {e}"))?;
-    }
-
-    file.write_all(nsec.as_bytes())
-        .map_err(|e| format!("write identity.key: {e}"))?;
-    file.commit()
-        .map_err(|e| format!("commit identity.key: {e}"))
-}
+// File-system and OS-keyring helpers extracted to keep this module under the
+// file-size ratchet. The child module has full access to this module's private
+// items via `super::`.
+#[path = "app_state_keyfile_ops.rs"]
+mod keyfile_ops;
+use keyfile_ops::{
+    ensure_marker_then_cleanup, generate_and_persist, load_key_file, migration_marker_path,
+    quarantine_corrupt_key, write_migration_marker,
+};
+// Used by app_state_tests.rs via `use super::*`.
+#[cfg(test)]
+use keyfile_ops::cleanup_leftover_identity_file;
+pub(crate) use keyfile_ops::save_key_file;
 
 #[cfg(test)]
 #[path = "app_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "app_state_epoch_tests.rs"]
+mod epoch_tests;

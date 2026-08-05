@@ -14,6 +14,7 @@ const RELAY_QUERY_ROOTS = new Set<string>([
   "my-notes",
   "myRelayMembership",
   "oaOwner",
+  "owned-agent-inventory",
   "presence",
   "profile",
   "pulse-note",

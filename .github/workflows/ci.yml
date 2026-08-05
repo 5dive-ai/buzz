@@ -574,14 +574,43 @@ jobs:
   backend-integration:
     name: Backend Integration (relay e2e)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     needs: [changes, desktop-e2e-relay]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true'
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: desktop/src-tauri
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Install Tauri dependencies (Linux)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=120 \
+            build-essential \
+            curl \
+            file \
+            libasound2-dev \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
       - name: Install cargo-nextest
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
         with:
@@ -684,6 +713,16 @@ jobs:
           done
           cat /tmp/buzz-relay.log
           exit 1
+      - name: Desktop relay acceptance gate
+        # NIP-IA owner-consent proof: in-crate ignored tests under
+        # commands/identity_archive::relay_acceptance, exercised against the
+        # production build_router/POST /events path here (not in unit-test gate,
+        # which has no infra). Missing/unreachable infra panics — no skip, no
+        # silent Ok. See Plan v9 Amendment 6 for the fixture and assertion spec.
+        run: just desktop-tauri-relay-acceptance
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          RELAY_API_URL: http://localhost:3000
       - name: Invite security tests
         run: |
           cargo nextest run \

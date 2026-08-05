@@ -2,6 +2,7 @@ import {
   CopyPlus,
   EllipsisVertical,
   Pencil,
+  Server,
   Share2,
   Trash2,
 } from "lucide-react";
@@ -25,6 +26,7 @@ export function PersonaActionsMenu({
   onShare,
   onDeactivate,
   onDelete,
+  onViewInstances,
 }: {
   isActionPending: boolean;
   isPending: boolean;
@@ -39,6 +41,8 @@ export function PersonaActionsMenu({
   ) => void;
   onDeactivate: (persona: AgentPersona) => void;
   onDelete: (persona: AgentPersona) => void;
+  /** Optional: open the Instances Sheet for this persona's owner inventory. */
+  onViewInstances?: (persona: AgentPersona) => void;
 }) {
   const disabled = isActionPending || isPending;
   const canEdit = !persona.sourceTeam;
@@ -78,6 +82,18 @@ export function PersonaActionsMenu({
           <Share2 className="h-4 w-4" />
           Share
         </DropdownMenuItem>
+        {onViewInstances ? (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              disabled={disabled}
+              onClick={() => onViewInstances(persona)}
+            >
+              <Server className="h-4 w-4" />
+              Instances
+            </DropdownMenuItem>
+          </>
+        ) : null}
         <DropdownMenuSeparator />
         {persona.sourceTeam ? (
           <DropdownMenuItem disabled>

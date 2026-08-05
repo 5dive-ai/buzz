@@ -27,6 +27,30 @@ export type IdentityUnarchiveRequest = {
   reason?: string;
 };
 
+// ── Owned-agent relay inventory ─────────────────────────────────────────────
+
+/** Archive tri-state for a single owned-agent instance. */
+export type OwnedAgentArchiveState = {
+  /** `null` if the snapshot was not loaded (caller may treat as unknown). */
+  isArchived: boolean | null;
+};
+
+/** A single owned-agent instance from the relay `kind:30177` inventory. */
+export type OwnedAgentInstance = {
+  pubkey: string;
+  displayName: string | null;
+  picture: string | null;
+  relayUrl: string;
+  archiveState: OwnedAgentArchiveState;
+};
+
+/** Snapshot returned by `get_owned_agent_inventory`. */
+export type OwnedAgentInventorySnapshot = {
+  /** Whether the archive snapshot was loaded and trusted. */
+  archiveStateTrusted: boolean;
+  instances: OwnedAgentInstance[];
+};
+
 type RawOwnerOfAgent = { owner: string; is_me: boolean };
 
 /**
@@ -71,5 +95,20 @@ export async function unarchiveIdentity(
 export async function listArchivedIdentities(): Promise<ArchivedIdentitiesSnapshot> {
   return await invokeTauri<ArchivedIdentitiesSnapshot>(
     "list_archived_identities",
+  );
+}
+
+/**
+ * Query the relay's `kind:30177` inventory for agents owned by the current
+ * user. Applies NIP-33 dedup, NIP-OA reciprocal verification, and an
+ * archive-state join from the `kind:13535` snapshot.
+ */
+export async function getOwnedAgentInventory(
+  cursor?: number,
+  pageSize?: number,
+): Promise<OwnedAgentInventorySnapshot> {
+  return await invokeTauri<OwnedAgentInventorySnapshot>(
+    "get_owned_agent_inventory",
+    { cursor: cursor ?? null, pageSize: pageSize ?? null },
   );
 }

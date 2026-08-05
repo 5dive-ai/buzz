@@ -165,16 +165,20 @@ pub async fn apply_workspace(
 
         // ── Apply all state changes (nothing below can fail) ──────────────────
         {
-            let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
-            *override_guard = Some(relay_url);
-        }
-        // Reset the Rust-side admission gate when switching workspace/community,
-        // matching `resetRateLimitGate()` on the TS side (useCommunityInit.ts:38).
-        crate::relay_admission::reset_gate_for_workspace_change();
+            let _epoch_guard = state.begin_workspace_write()?;
+            {
+                let mut override_guard =
+                    state.relay_url_override.lock().map_err(|e| e.to_string())?;
+                *override_guard = Some(relay_url);
+            }
+            // Reset the Rust-side admission gate when switching workspace/community,
+            // matching `resetRateLimitGate()` on the TS side (useCommunityInit.ts:38).
+            crate::relay_admission::reset_gate_for_workspace_change();
 
-        if let Some(keys) = parsed_keys {
-            let mut keys_guard = state.keys.lock().map_err(|e| e.to_string())?;
-            *keys_guard = keys;
+            if let Some(keys) = parsed_keys {
+                let mut keys_guard = state.keys.lock().map_err(|e| e.to_string())?;
+                *keys_guard = keys;
+            }
         }
 
         // Keep the backend-side reconcile guard aligned with the frontend

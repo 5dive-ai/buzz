@@ -206,6 +206,13 @@ desktop-tauri-check: _ensure-sidecar-stubs
 desktop-tauri-test: _ensure-sidecar-stubs
     cd desktop/src-tauri && cargo test --workspace
 
+# Run the in-crate relay acceptance gate against a live relay + Postgres.
+# Requires DATABASE_URL and RELAY_API_URL in the environment.
+# CI mounts this step inside the Backend Integration (relay e2e) job which
+# already provisions both; locally you can use the same docker-compose setup.
+desktop-tauri-relay-acceptance: _ensure-sidecar-stubs
+    cargo nextest run --manifest-path desktop/src-tauri/Cargo.toml -p buzz-desktop --lib -E 'test(/relay_acceptance::/)' --run-ignored ignored-only
+
 # Run the native terminal latency gate explicitly on a known-idle host.
 # This is intentionally excluded from shared CI: scheduler contention makes a
 # wall-clock assertion flaky, and the release profile is the shipped shape.

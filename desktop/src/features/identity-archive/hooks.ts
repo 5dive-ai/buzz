@@ -6,15 +6,18 @@ import { useMyRelayMembershipQuery } from "@/features/community-members/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import {
   archiveIdentity,
+  getOwnedAgentInventory,
   listArchivedIdentities,
   resolveOaOwner,
   unarchiveIdentity,
   type ArchivedIdentitiesSnapshot,
   type IdentityArchiveRequest,
   type IdentityUnarchiveRequest,
+  type OwnedAgentInventorySnapshot,
 } from "@/shared/api/tauriIdentityArchive";
 
 export const archivedIdentitiesQueryKey = ["archivedIdentities"] as const;
+export const ownedAgentInventoryQueryKey = ["owned-agent-inventory"] as const;
 
 /** Cache the relay's `kind:13535` snapshot. Drives the "Archived" flair. */
 export function useArchivedIdentitiesQuery(enabled = true) {
@@ -22,6 +25,20 @@ export function useArchivedIdentitiesQuery(enabled = true) {
     enabled,
     queryKey: archivedIdentitiesQueryKey,
     queryFn: listArchivedIdentities,
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * Query the owner's `kind:30177` relay inventory (NIP-OA–verified agent
+ * instances). Tri-state archive join is scoped to this surface only —
+ * existing `useIsIdentityArchived` callers are unchanged.
+ */
+export function useOwnedAgentInventoryQuery(enabled = true) {
+  return useQuery<OwnedAgentInventorySnapshot>({
+    enabled,
+    queryKey: ownedAgentInventoryQueryKey,
+    queryFn: () => getOwnedAgentInventory(),
     staleTime: 30_000,
   });
 }
@@ -81,6 +98,9 @@ export function useArchiveIdentityMutation() {
       void queryClient.invalidateQueries({
         queryKey: archivedIdentitiesQueryKey,
       });
+      void queryClient.invalidateQueries({
+        queryKey: ownedAgentInventoryQueryKey,
+      });
     },
   });
 }
@@ -92,6 +112,9 @@ export function useUnarchiveIdentityMutation() {
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: archivedIdentitiesQueryKey,
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ownedAgentInventoryQueryKey,
       });
     },
   });

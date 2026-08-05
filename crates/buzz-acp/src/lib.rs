@@ -1015,64 +1015,68 @@ fn handle_set_config_option_control(
     // real outcome. The configId the caller sends must match what the adapter
     // advertised in session/new (agentConfigCore.ts uses the one from the
     // session cache via deferredUntilNativeOptionsAvailable resolution).
-    let thought_level_id: Option<String> = pool.agents_mut().iter().flatten().find_map(|a| {
-        a.model_capabilities
-            .as_ref()
-            .and_then(|c| c.thought_level_config_id.clone())
-    });
+    //
+    // V-2 fix: use pool-level capability cache instead of scanning idle agents.
+    // Checked-out workers leave None slots; the cache is written at return_agent
+    // and at the first session creation, so it is never stale.
+    //
+    // Three cases:
+    //  A. effort_capabilities.config_id is Some and matches → full validation path
+    //  B. effort_capabilities.config_id is None AND capabilities not yet discovered →
+    //     pre-first-session NoCatalog → pending_session (don't store)
+    //  C. effort_capabilities.config_id is None AND capabilities were discovered →
+    //     all workers are currently busy; trust the incoming configId from the
+    //     Desktop's session cache and store for apply at next checkout/session.
+    let thought_level_id = pool
+        .effort_capabilities
+        .config_id
+        .as_deref()
+        .map(str::to_string);
 
-    let is_thought_level = thought_level_id.as_deref() == Some(config_id);
+    // Determine if this is a thought_level pick: either the cache has a matching
+    // configId (case A) or all workers are busy but capabilities were already
+    // discovered (case C — trusted configId from Desktop session cache).
+    //
+    // For the clear path (empty value), the same cases apply: we can clear even
+    // while workers are busy.
+    let cache_matches = thought_level_id.as_deref() == Some(config_id);
+    // Case C: capabilities were discovered before (so configId is known) but
+    // workers are currently checked out and the cache is temporarily None.
+    let all_busy_with_known_caps =
+        pool.capabilities_ever_discovered && thought_level_id.is_none() && config_id != "unknown";
+    let is_thought_level = cache_matches || all_busy_with_known_caps;
+
     let (status, include_category) = if is_thought_level {
-        // I-7: validate the incoming value against adapter-advertised options.
-        let valid_values: Option<Vec<String>> = pool.agents_mut().iter().flatten().find_map(|a| {
-            a.model_capabilities.as_ref().and_then(|c| {
-                let opts = c.config_options_raw.iter().find(|opt| {
-                    opt.get("id")
-                        .or_else(|| opt.get("configId"))
-                        .and_then(|v| v.as_str())
-                        == Some(config_id)
-                })?;
-                let vals: Vec<String> = opts
-                    .get("options")
-                    .and_then(|o| o.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| {
-                                v.get("value").and_then(|s| s.as_str()).map(str::to_string)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if vals.is_empty() {
-                    None
-                } else {
-                    Some(vals)
-                }
-            })
-        });
+        // I-7: validate the incoming value against adapter-advertised options
+        // from the pool-level capability cache. Works even when all workers
+        // are checked out — the cache was written at the first session creation.
+        // Skip validation when cache is empty (case C — workers busy, no cache
+        // to validate against; trust the Desktop's session-cache configId).
+        let valid_values = &pool.effort_capabilities.valid_values;
 
-        if let Some(ref vals) = valid_values {
-            if !value.is_empty() && !vals.contains(&value.to_string()) {
-                // Value is not in the adapter's advertised option set.
-                tracing::warn!(
-                    target: "pool::effort",
-                    "effort value {value:?} not in advertised options {vals:?} — rejecting"
-                );
-                let mut ack = serde_json::json!({
-                    "type": "set_config_option",
-                    "configId": config_id,
-                    "status": "invalid_value",
-                    "value": value,
-                });
-                ack["category"] = serde_json::json!("thought_level");
-                obs.emit(
-                    "control_result",
-                    None,
-                    &observer::ObserverContext::default(),
-                    ack,
-                );
-                return;
-            }
+        if !valid_values.is_empty()
+            && !value.is_empty()
+            && !valid_values.contains(&value.to_string())
+        {
+            // Value is not in the adapter's advertised option set.
+            tracing::warn!(
+                target: "pool::effort",
+                "effort value {value:?} not in advertised options {valid_values:?} — rejecting"
+            );
+            let mut ack = serde_json::json!({
+                "type": "set_config_option",
+                "configId": config_id,
+                "status": "invalid_value",
+                "value": value,
+            });
+            ack["category"] = serde_json::json!("thought_level");
+            obs.emit(
+                "control_result",
+                None,
+                &observer::ObserverContext::default(),
+                ack,
+            );
+            return;
         }
 
         // Empty value = clear (Auto). Bypass set_pool_effort.
@@ -6960,6 +6964,11 @@ mod control_result_tests {
             protocol_version: 2,
         };
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
         let obs = observer::ObserverHandle::in_process();
         let payload = serde_json::json!({
             "type": "set_config_option",
@@ -7025,6 +7034,11 @@ mod control_result_tests {
         };
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
         pool.desired_effort = Some(("effort".to_string(), "high".to_string()));
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
         let obs = observer::ObserverHandle::in_process();
         // Empty value = Auto (clear path).
         let payload = serde_json::json!({
@@ -7092,6 +7106,19 @@ mod control_result_tests {
             protocol_version: 2,
         };
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![serde_json::json!({
+                "id": "effort",
+                "category": "thought_level",
+                "options": [
+                    { "value": "low" },
+                    { "value": "medium" },
+                    { "value": "high" },
+                ],
+            })],
+            available_models_raw: None,
+        });
         let obs = observer::ObserverHandle::in_process();
         // "ultra" is not in the advertised options.
         let payload = serde_json::json!({
@@ -7201,6 +7228,11 @@ mod control_result_tests {
             protocol_version: 2,
         };
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some(thought_level_id.clone()),
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
         let obs = observer::ObserverHandle::in_process();
         let payload = serde_json::json!({
             "type": "set_config_option",

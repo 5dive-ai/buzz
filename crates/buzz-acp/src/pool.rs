@@ -258,6 +258,23 @@ impl OwnedAgent {
     }
 }
 
+/// Pool-level capability snapshot for the `thought_level` config option.
+///
+/// Written at `return_agent` (populated from the returned agent's capabilities)
+/// and at session creation via `notify_capabilities_discovered`. Because
+/// checked-out agents carry their own `model_capabilities`, this cache
+/// ensures `handle_set_config_option_control` can identify and validate effort
+/// picks even when all workers are checked out (pool slots are `None`).
+#[derive(Debug, Clone, Default)]
+pub struct PoolEffortCapabilities {
+    /// The adapter's `thought_level` configId from `session/new`.
+    /// `None` until the first session has been created.
+    pub config_id: Option<String>,
+    /// Adapter-advertised option values for the `thought_level` config option.
+    /// Empty until the first session returns options.
+    pub valid_values: Vec<String>,
+}
+
 /// Pool of agents with take-and-return ownership semantics.
 ///
 /// Agents are either idle (sitting in `agents[i]`) or checked out
@@ -277,8 +294,25 @@ pub struct AgentPool {
     /// seeded from the first agent's `startup_effort` at first session creation.
     /// Clearing: `None` means "let the adapter choose its default."
     pub desired_effort: Option<(String, String)>,
+    /// Whether a live pick or clear has ever been applied to this pool via
+    /// `set_pool_effort` or `clear_pool_effort`. When `true`, `return_agent`
+    /// must NOT propagate a worker's startup-resolved `desired_effort` back to
+    /// pool level — a live pick/clear is always authoritative over startup seeding,
+    /// even if the pool value is `None` (i.e. the user explicitly cleared it).
+    pub effort_ever_picked: bool,
+    /// Pool-level capability cache for the `thought_level` config option.
+    ///
+    /// Written at `return_agent` (refreshed from the returned agent's capabilities)
+    /// and by `notify_capabilities_discovered` when called directly. Allows
+    /// `handle_set_config_option_control` to identify and validate effort picks
+    /// regardless of idle occupancy.
+    pub effort_capabilities: PoolEffortCapabilities,
+    /// True once any worker has ever had capabilities populated and returned to
+    /// the pool. Used to distinguish "pre-first-session" (NoCatalog — configId
+    /// unknown) from "all workers currently busy" (configId known but cache
+    /// temporarily empty) in `handle_set_config_option_control`.
+    pub capabilities_ever_discovered: bool,
 }
-
 /// Result returned by a completed prompt task.
 pub struct PromptResult {
     pub agent: OwnedAgent,
@@ -630,6 +664,9 @@ impl AgentPool {
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
             desired_effort: None,
+            effort_ever_picked: false,
+            effort_capabilities: PoolEffortCapabilities::default(),
+            capabilities_ever_discovered: false,
         }
     }
 
@@ -673,18 +710,81 @@ impl AgentPool {
 
     /// Return an agent to its slot after a task completes.
     ///
-    /// Propagates a startup-resolved effort back to the pool: if the pool's
-    /// `desired_effort` is still None (startup path — no live pick has happened
-    /// yet) and the returned agent acquired one via `resolve_startup_effort`,
-    /// adopt it as the new pool-level authority so future workers use it too.
-    pub fn return_agent(&mut self, agent: OwnedAgent) {
+    /// Three seam fixes happen here:
+    ///
+    /// **V-1 (clear resurrection prevention):** propagates a startup-resolved
+    /// effort back to pool level ONLY when no live pick or clear has ever been
+    /// made (`!effort_ever_picked`). If the user has explicitly cleared the effort
+    /// (or made any live pick), the pool value is always authoritative — even when
+    /// it is `None` — and the returning worker must not re-adopt a stale value.
+    ///
+    /// **V-3 (convergence at return):** if the worker's checkout snapshot
+    /// (`agent.desired_effort`) differs from the current pool value (set OR
+    /// cleared while the worker was busy), the worker's sessions are invalidated
+    /// so the next session creation applies the current pool value. This closes
+    /// the window where a busy worker's surviving session runs at a stale effort.
+    ///
+    /// **Capability refresh:** the pool-level `effort_capabilities` cache is
+    /// updated from the returned agent's capabilities (if populated), ensuring
+    /// the cache is available even when all other workers are checked out.
+    pub fn return_agent(&mut self, mut agent: OwnedAgent) {
         let idx = agent.index;
-        // Propagate startup-resolved effort back to pool level.
-        if self.desired_effort.is_none() {
+
+        // V-1: propagate startup-resolved effort back to pool level — but ONLY
+        // when no live pick/clear has ever been made. A live pick/clear is always
+        // authoritative over startup seeding, even when pool.desired_effort is None
+        // (the user explicitly cleared it).
+        if !self.effort_ever_picked {
             if let Some(ref e) = agent.desired_effort {
                 self.desired_effort = Some(e.clone());
             }
         }
+
+        // V-3: if the worker's checkout snapshot differs from the current pool
+        // value (i.e. a pick or clear arrived while this worker was busy),
+        // invalidate the worker's sessions so the next claim creates a fresh
+        // session under the current pool value.
+        //
+        // We compare by value: if the pool is Some(x) and agent carried Some(x)
+        // they match — no invalidation needed. Mismatch cases:
+        //   - pool cleared (None) while agent carried Some(_) → sessions stale
+        //   - pool picked Some(y) while agent carried Some(x) or None → stale
+        if agent.desired_effort != self.desired_effort {
+            agent.state.invalidate_all();
+        }
+
+        // Capability refresh: write back the agent's capability snapshot to the
+        // pool-level cache so validation remains available when all workers are
+        // checked out. Always overwrite — returned workers have fresh capabilities.
+        if let Some(ref caps) = agent.model_capabilities {
+            if caps.thought_level_config_id.is_some() {
+                let valid_values = caps
+                    .config_options_raw
+                    .iter()
+                    .find(|opt| {
+                        opt.get("id")
+                            .or_else(|| opt.get("configId"))
+                            .and_then(|v| v.as_str())
+                            == caps.thought_level_config_id.as_deref()
+                    })
+                    .and_then(|opt| opt.get("options"))
+                    .and_then(|o| o.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| {
+                                v.get("value").and_then(|s| s.as_str()).map(str::to_string)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.effort_capabilities = PoolEffortCapabilities {
+                    config_id: caps.thought_level_config_id.clone(),
+                    valid_values,
+                };
+                self.capabilities_ever_discovered = true;
+            }
+        }
+
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
             // loudly so it shows up in production logs, then overwrite — the
@@ -878,31 +978,31 @@ impl AgentPool {
     /// a fresh session and applies the effort rather than waiting for the
     /// current session to expire naturally.
     ///
+    /// Sets `effort_ever_picked = true` so `return_agent` will never resurrect
+    /// a stale startup-resolved value. From this point on the pool value is always
+    /// authoritative over per-worker startup seeding.
+    ///
     /// Returns the count of idle agents that had active sessions invalidated.
     /// Callers should emit `"pending_session"` as the immediate ack; the final
     /// `ok`/`failure` arrives from `create_session_and_apply_model` once a
     /// session is actually created and the ACP call completes.
     ///
     /// Clearing effort (value == "") is handled by the caller before this is
-    /// reached: the caller sets `desired_effort` to `None` directly and persists
-    /// `None` on the record. This path is the non-empty-value live-pick case.
+    /// reached: the caller calls `clear_pool_effort` directly. This path is the
+    /// non-empty-value live-pick case.
     ///
-    /// Returns `SetPoolEffortResult::NoCatalog` when no worker has capabilities
-    /// yet (no session ever created) — the `thought_level` configId is unknown.
+    /// Returns `SetPoolEffortResult::NoCatalog` when the pool-level capability
+    /// cache has no `thought_level` configId yet (no session ever created).
     pub fn set_pool_effort(&mut self, config_id: &str, value: &str) -> SetPoolEffortResult {
-        // Verify at least one worker has capabilities with thought_level.
-        let has_catalog = self.agents.iter().flatten().any(|a| {
-            a.model_capabilities
-                .as_ref()
-                .map(|c| c.thought_level_config_id.is_some())
-                .unwrap_or(false)
-        });
-        if !has_catalog {
+        // Verify the pool-level capability cache has thought_level, OR that
+        // capabilities were previously discovered (workers are just all busy).
+        if self.effort_capabilities.config_id.is_none() && !self.capabilities_ever_discovered {
             // No capabilities yet (no session ever created for any worker).
             return SetPoolEffortResult::NoCatalog;
         }
 
         self.desired_effort = Some((config_id.to_string(), value.to_string()));
+        self.effort_ever_picked = true;
 
         // Invalidate all idle agents' sessions so the next turn applies the
         // new effort immediately (rather than reusing a stale session).
@@ -922,12 +1022,50 @@ impl AgentPool {
     /// invalidates all idle sessions so the next session creation does not apply
     /// a stale value. Called when the user selects "Auto (default)" in the
     /// EffortPicker.
+    ///
+    /// Sets `effort_ever_picked = true` so `return_agent` will never resurrect
+    /// a stale startup-resolved value (V-1).
     pub fn clear_pool_effort(&mut self) {
         self.desired_effort = None;
+        self.effort_ever_picked = true;
         for agent in self.agents.iter_mut().flatten() {
             if !agent.state.sessions.is_empty() {
                 agent.state.invalidate_all();
             }
+        }
+    }
+
+    /// Notify the pool that capabilities have been discovered for a worker.
+    ///
+    /// Called from `create_session_and_apply_model` after the first session/new
+    /// response so the pool-level capability cache is populated immediately,
+    /// before the worker returns. This ensures the capability cache is always
+    /// current even when all workers are simultaneously busy.
+    #[allow(dead_code)]
+    pub fn notify_capabilities_discovered(&mut self, caps: &AgentModelCapabilities) {
+        if caps.thought_level_config_id.is_some() && self.effort_capabilities.config_id.is_none() {
+            let valid_values = caps
+                .config_options_raw
+                .iter()
+                .find(|opt| {
+                    opt.get("id")
+                        .or_else(|| opt.get("configId"))
+                        .and_then(|v| v.as_str())
+                        == caps.thought_level_config_id.as_deref()
+                })
+                .and_then(|opt| opt.get("options"))
+                .and_then(|o| o.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.get("value").and_then(|s| s.as_str()).map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.effort_capabilities = PoolEffortCapabilities {
+                config_id: caps.thought_level_config_id.clone(),
+                valid_values,
+            };
+            self.capabilities_ever_discovered = true;
         }
     }
 }
@@ -7353,6 +7491,11 @@ mod effort_tests {
             protocol_version: 2,
         };
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
         let result = pool.set_pool_effort("effort", "high");
         assert_eq!(
             result,
@@ -7416,6 +7559,11 @@ mod effort_tests {
         let a = make_worker(0, ch_a, "sess-a").await;
         let b = make_worker(1, ch_b, "sess-b").await;
         let mut pool = AgentPool::from_slots(vec![Some(a), Some(b)]);
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
 
         // set_pool_effort must invalidate both idle workers.
         let result = pool.set_pool_effort("effort", "high");
@@ -7602,6 +7750,264 @@ mod effort_tests {
         assert!(
             agent.desired_effort.is_none(),
             "desired_effort must stay None when adapter does not advertise thought_level"
+        );
+    }
+
+    // ── V-1: clear-while-busy resurrection prevention ────────────────────────
+
+    /// V-1: when the user clears effort while a worker is busy (checked out),
+    /// `return_agent` must NOT resurrect the cleared value. The pool stays None
+    /// and the returning worker's sessions are invalidated (V-3) so the next
+    /// session creates a fresh one without any effort applied.
+    ///
+    /// Sequence:
+    ///  1. Pool has effort "high" set; worker checks out carrying Some("high").
+    ///  2. User selects Auto (clear) → `clear_pool_effort()` → pool.desired_effort = None,
+    ///     effort_ever_picked = true.
+    ///  3. Worker returns carrying Some("high") (its checkout snapshot).
+    ///  4. `return_agent` sees effort_ever_picked = true → must NOT adopt worker's value.
+    ///  5. Pool stays None; worker's sessions are invalidated (checkout vs pool mismatch).
+    #[tokio::test]
+    async fn test_v1_clear_while_busy_return_does_not_resurrect_cleared_effort() {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        let ch = uuid::Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(ch, "sess-1".into());
+        // Worker has desire_effort=Some("high") — the checkout snapshot.
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                thought_level_config_id: Some("effort".to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: Some(("effort".to_string(), "high".to_string())),
+            startup_effort: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![None]); // slot empty — worker is "checked out"
+        pool.desired_effort = Some(("effort".to_string(), "high".to_string()));
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
+
+        // User clears effort while worker is busy.
+        pool.clear_pool_effort();
+        assert!(
+            pool.desired_effort.is_none(),
+            "pool must be None after clear"
+        );
+        assert!(
+            pool.effort_ever_picked,
+            "effort_ever_picked must be set after clear"
+        );
+
+        // Worker returns carrying its old checkout snapshot (Some("high")).
+        pool.return_agent(agent);
+
+        // V-1: pool must still be None — worker's stale value must not resurrect it.
+        assert!(
+            pool.desired_effort.is_none(),
+            "V-1: return_agent must NOT resurrect cleared effort when effort_ever_picked=true"
+        );
+
+        // V-3: returning worker's sessions must be invalidated (checkout != pool).
+        let returned = pool.agents_mut().iter().flatten().next().unwrap();
+        assert!(
+            returned.state.sessions.is_empty(),
+            "V-3: sessions must be invalidated when checkout snapshot differs from pool value"
+        );
+    }
+
+    // ── V-2: pick-while-all-busy is stored, not dropped ──────────────────────
+
+    /// V-2: when all workers are busy (slots are None), `set_pool_effort` must
+    /// still store the value (not drop it with a synthetic ok). The
+    /// `capabilities_ever_discovered` flag guards the "all-busy" path: with
+    /// capabilities already discovered but all workers checked out (pool-level
+    /// cache is non-None from the last return_agent), `set_pool_effort` stores
+    /// the effort and returns `Stored` rather than `NoCatalog`.
+    ///
+    /// The full `handle_set_config_option_control` path (pending_session ack, not
+    /// synthetic ok) is covered by `test_b5_set_config_option_stored_emits_pending_session_ack_and_invalidates`
+    /// in lib.rs. This test verifies the pool-layer storage guarantee.
+    #[test]
+    fn test_v2_pick_while_all_busy_is_stored_not_dropped() {
+        let mut pool = AgentPool::from_slots(vec![None]); // slot empty — all workers busy
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
+
+        // All slots are None (workers checked out) but capabilities ARE known.
+        assert!(pool.effort_capabilities.config_id.is_some());
+        assert!(pool.capabilities_ever_discovered);
+        assert!(pool.agents_mut().iter().flatten().next().is_none());
+
+        // set_pool_effort should store, not return NoCatalog.
+        let result = pool.set_pool_effort("effort", "high");
+        assert!(
+            matches!(result, SetPoolEffortResult::Stored { .. }),
+            "V-2: set_pool_effort must store the value even when all workers are busy"
+        );
+        assert_eq!(
+            pool.desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("effort", "high")),
+            "V-2: pool must store the effort value even when all workers are busy"
+        );
+    }
+
+    // ── V-3: convergence at return_agent ─────────────────────────────────────
+
+    /// V-3: when a live pick arrives while a worker is busy, the returning
+    /// worker's surviving sessions must be invalidated so the next `try_claim`
+    /// creates a fresh session and applies the new pool value.
+    ///
+    /// Sequence:
+    ///  1. Worker is busy with checkout snapshot desired_effort = None.
+    ///  2. User picks "high" → `set_pool_effort` → pool.desired_effort = Some("high").
+    ///  3. Worker returns — its checkout snapshot (None) differs from pool (Some("high")).
+    ///  4. `return_agent` invalidates the worker's sessions.
+    ///  5. Next `try_claim` syncs `desired_effort = Some("high")` at checkout.
+    #[tokio::test]
+    async fn test_v3_busy_worker_sessions_invalidated_on_return_after_pick() {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        let ch = uuid::Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(ch, "old-sess".into());
+        // Worker has desired_effort=None — its checkout snapshot.
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                thought_level_config_id: Some("effort".to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![None]); // slot empty — worker is checked out
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
+
+        // Live pick while worker is busy.
+        let result = pool.set_pool_effort("effort", "high");
+        assert!(matches!(result, SetPoolEffortResult::Stored { .. }));
+        assert_eq!(
+            pool.desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("effort", "high"))
+        );
+
+        // Worker returns with old checkout snapshot (desired_effort = None).
+        pool.return_agent(agent);
+
+        // V-3: sessions must be invalidated (None != Some("high") mismatch).
+        let returned = pool.agents_mut().iter().flatten().next().unwrap();
+        assert!(
+            returned.state.sessions.is_empty(),
+            "V-3: busy worker's sessions must be invalidated on return when pool effort changed"
+        );
+
+        // Next try_claim syncs the new pool value onto the worker.
+        let claimed = pool.try_claim(Some(ch)).unwrap();
+        assert_eq!(
+            claimed
+                .desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("effort", "high")),
+            "V-3: claimed agent must carry the updated pool effort value"
+        );
+    }
+
+    // ── Startup propagation without live pick ─────────────────────────────────
+
+    /// Startup propagation: when no live pick/clear has ever been made
+    /// (`effort_ever_picked = false`), `return_agent` propagates a
+    /// startup-resolved `desired_effort` back to pool level.
+    ///
+    /// This seeds the pool on the first worker return so subsequent workers
+    /// that were idle at startup also pick up the persisted startup default
+    /// without needing a process restart.
+    #[tokio::test]
+    async fn test_startup_effort_propagates_to_pool_on_first_return_when_no_live_pick() {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        // Worker was resolved via startup: desired_effort is Some from resolve_startup_effort.
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                thought_level_config_id: Some("effort".to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: Some(("effort".to_string(), "medium".to_string())),
+            startup_effort: Some("medium".to_string()),
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![None]); // slot empty
+                                                          // No live pick has ever been made.
+        assert!(!pool.effort_ever_picked);
+        assert!(pool.desired_effort.is_none());
+
+        pool.return_agent(agent);
+
+        // Pool should now carry the startup-resolved effort.
+        assert_eq!(
+            pool.desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("effort", "medium")),
+            "startup-resolved effort must propagate to pool when no live pick occurred"
         );
     }
 }

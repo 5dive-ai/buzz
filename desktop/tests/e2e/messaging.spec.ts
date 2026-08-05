@@ -480,52 +480,57 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   await page.getByTestId("link-preview-style-compact").click();
 });
 
-test("angle-bracket link preview paste paints before cold resolver work", async ({
-  page,
-}) => {
-  const previewUrl = "https://github.com/block/buzz/pull/3246?paste=async";
-  await page.goto("/");
-  await page.getByTestId("channel-general").click();
-  const input = page.getByTestId("message-input");
-  await input.focus();
+for (const [pasteShape, wrapUrl] of [
+  ["bare", (url: string) => url],
+  ["angle-bracket", (url: string) => `<${url}>`],
+] as const) {
+  test(`${pasteShape} link preview paste paints before cold resolver work`, async ({
+    page,
+  }) => {
+    const previewUrl = `https://github.com/block/buzz/pull/3246?paste=${pasteShape}`;
+    await page.goto("/");
+    await page.getByTestId("channel-general").click();
+    const input = page.getByTestId("message-input");
+    await input.focus();
 
-  const pasteText = `<${previewUrl}>`;
-  const firstPaint = await input.evaluate(async (element, pasteText) => {
-    const clipboardData = new DataTransfer();
-    clipboardData.setData("text/plain", pasteText);
-    const startedAt = performance.now();
-    element.dispatchEvent(
-      new ClipboardEvent("paste", {
-        bubbles: true,
-        cancelable: true,
-        clipboardData,
-      }),
+    const pasteText = wrapUrl(previewUrl);
+    const firstPaint = await input.evaluate(async (element, pasteText) => {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData("text/plain", pasteText);
+      const startedAt = performance.now();
+      element.dispatchEvent(
+        new ClipboardEvent("paste", {
+          bubbles: true,
+          cancelable: true,
+          clipboardData,
+        }),
+      );
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve()),
+      );
+      return {
+        elapsedMs: performance.now() - startedAt,
+        resolverStarted: (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).some(
+          (entry) => entry.command === "fetch_link_preview_metadata",
+        ),
+        text: element.textContent,
+      };
+    }, pasteText);
+    expect(firstPaint.text).toContain(previewUrl);
+    expect(firstPaint.resolverStarted).toBe(false);
+    expect(firstPaint.elapsedMs).toBeLessThan(100);
+    const composerPreview = page
+      .locator("[data-composer-link-previews]")
+      .locator('[data-link-preview="github-pull-request"]');
+    await expect(input).toContainText(previewUrl, { timeout: 1_000 });
+    await expect(composerPreview).toHaveAttribute(
+      "data-state",
+      /^(processing|done)$/,
+      { timeout: 1_000 },
     );
-    await new Promise<void>((resolve) =>
-      requestAnimationFrame(() => resolve()),
-    );
-    return {
-      elapsedMs: performance.now() - startedAt,
-      resolverStarted: (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).some(
-        (entry) => entry.command === "fetch_link_preview_metadata",
-      ),
-      text: element.textContent,
-    };
-  }, pasteText);
-  expect(firstPaint.text).toContain(previewUrl);
-  expect(firstPaint.resolverStarted).toBe(false);
-  expect(firstPaint.elapsedMs).toBeLessThan(100);
-  const composerPreview = page
-    .locator("[data-composer-link-previews]")
-    .locator('[data-link-preview="github-pull-request"]');
-  await expect(input).toContainText(previewUrl, { timeout: 1_000 });
-  await expect(composerPreview).toHaveAttribute(
-    "data-state",
-    /^(processing|done)$/,
-    { timeout: 1_000 },
-  );
-  await expect(page.getByTestId("send-message")).toBeEnabled();
-});
+    await expect(page.getByTestId("send-message")).toBeEnabled();
+  });
+}
 
 test("completed link preview sends once and leaves the composer cleared", async ({
   page,

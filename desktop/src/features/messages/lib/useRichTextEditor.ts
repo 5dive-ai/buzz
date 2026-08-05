@@ -135,8 +135,13 @@ function shouldAppendSpaceAfterPaste(text: string): boolean {
   return PASTED_LINK_AT_END_RE.test(trimmedEnd);
 }
 
-function unwrapExactHttpAutolink(text: string): string | null {
-  return /^<(https?:\/\/[^\s<>]+)>$/i.exec(text)?.[1] ?? null;
+function unwrapExactHttpLink(text: string): string | null {
+  return (
+    /^(?:<(https?:\/\/[^\s<>]+)>|(https?:\/\/\S+))$/i
+      .exec(text)
+      ?.slice(1)
+      .find(Boolean) ?? null
+  );
 }
 
 const LinkPasteTrailingSpace = Extension.create({
@@ -493,7 +498,7 @@ export function useRichTextEditor({
       editorProps: {
         handleDOMEvents: {
           paste: (view, event) => {
-            const url = unwrapExactHttpAutolink(
+            const url = unwrapExactHttpLink(
               (event as ClipboardEvent).clipboardData?.getData("text/plain") ??
                 "",
             );

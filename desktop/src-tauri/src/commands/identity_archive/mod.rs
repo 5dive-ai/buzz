@@ -360,8 +360,10 @@ pub(crate) async fn scoped_archive_operation(
 pub(crate) mod test_hooks {
     use std::{cell::RefCell, sync::Arc};
 
+    type ObserverFn = Arc<dyn Fn(&nostr::Event) + Send + Sync>;
+
     thread_local! {
-        static OBSERVER: RefCell<Option<Arc<dyn Fn(&nostr::Event) + Send + Sync>>> =
+        static OBSERVER: RefCell<Option<ObserverFn>> =
             const { RefCell::new(None) };
         static ATTEMPT_COUNT: RefCell<u32> = const { RefCell::new(0) };
     }

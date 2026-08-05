@@ -37,6 +37,20 @@ export type MeshRowTone =
   /** The runtime occupies the slot but reports unhealthy. */
   | "failed";
 
+/**
+ * Why the dot is moving, not merely whether.
+ *
+ * Two different facts want motion, and collapsing them into one boolean would
+ * make a throb ambiguous:
+ *
+ *   - `activity` — real work is in flight on this node right now
+ *   - `invite`   — there is compute here to tap into, and we are not in it
+ *
+ * They are visually distinct (invite is slower and slate; activity matches the
+ * tone colour) so the same animation never means two things.
+ */
+export type MeshRowPulse = "none" | "activity" | "invite";
+
 export type MeshRowModel = {
   tone: MeshRowTone;
   /** Accessible state sentence, used as the row tooltip. */
@@ -51,10 +65,10 @@ export type MeshRowModel = {
   /** Label for the switch, read by screen readers. */
   switchLabel: string;
   /**
-   * Pulse the dot. Inflight work only — never a decorative animation, so a
-   * still dot is a real statement that nothing is happening.
+   * Why the dot moves, if it does. Never decorative: a still dot is a real
+   * statement that there is nothing to act on and nothing happening.
    */
-  pulse: boolean;
+  pulse: MeshRowPulse;
 };
 
 /** Live pool capacity: this machine plus every peer that reports a figure. */
@@ -97,7 +111,7 @@ export function deriveMeshRowModel({
       badge: null,
       showSwitch: false,
       switchLabel: shareLabel,
-      pulse: false,
+      pulse: "none",
     };
   }
 
@@ -110,7 +124,7 @@ export function deriveMeshRowModel({
         badge: null,
         showSwitch: false,
         switchLabel: "Stop sharing",
-        pulse: false,
+        pulse: "none",
       };
     }
     const gb = liveCapacityGb(view);
@@ -126,7 +140,7 @@ export function deriveMeshRowModel({
       badge: gb > 0 ? formatCapacityGb(gb) : null,
       showSwitch: false,
       switchLabel: "Stop sharing",
-      pulse: busyNow,
+      pulse: busyNow ? "activity" : "none",
     };
   }
 
@@ -139,7 +153,7 @@ export function deriveMeshRowModel({
       // a serve runtime at any time. Consuming is not a lock.
       showSwitch: true,
       switchLabel: shareLabel,
-      pulse: busyNow,
+      pulse: busyNow ? "activity" : "none",
     };
   }
 
@@ -155,7 +169,7 @@ export function deriveMeshRowModel({
       badge: null,
       showSwitch: true,
       switchLabel: shareLabel,
-      pulse: false,
+      pulse: "none",
     };
   }
   const gb = snapshot.sharedCapacityGb;
@@ -168,6 +182,8 @@ export function deriveMeshRowModel({
     badge: null,
     showSwitch: true,
     switchLabel: shareLabel,
-    pulse: false,
+    // The one state worth drawing the eye to unprompted: real capacity exists
+    // and this machine is neither using nor adding to it.
+    pulse: "invite",
   };
 }

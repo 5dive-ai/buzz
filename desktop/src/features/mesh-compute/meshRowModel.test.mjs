@@ -115,13 +115,42 @@ test("consuming keeps the switch: sharing is always available", () => {
   assert.equal(model.showSwitch, true);
 });
 
-test("pulse tracks inflight work only", () => {
-  assert.equal(derive({ toggle: SHARING, view: view() }).pulse, false);
+test("an activity pulse means real work, nothing else", () => {
+  // A still dot has to be a real statement, so motion is never decorative.
+  assert.equal(derive({ toggle: SHARING, view: view() }).pulse, "none");
   assert.equal(
     derive({ toggle: SHARING, view: view(), busyNow: true }).pulse,
-    true,
+    "activity",
   );
-  assert.equal(derive({ toggle: CONSUMING, busyNow: true }).pulse, true);
+  assert.equal(derive({ toggle: CONSUMING, busyNow: true }).pulse, "activity");
+});
+
+test("capacity you have not joined throbs as an invitation", () => {
+  // The one state worth drawing the eye to unprompted: there is compute to tap
+  // into, and this machine is neither using nor adding to it.
+  const model = derive({
+    snapshot: snapshot({ sharingDeviceCount: 3, sharedCapacityGb: 92 }),
+  });
+  assert.equal(model.pulse, "invite");
+});
+
+test("an invite is distinct from activity, so one animation never means two things", () => {
+  const invite = derive({
+    snapshot: snapshot({ sharingDeviceCount: 1, sharedCapacityGb: 36 }),
+  });
+  const activity = derive({
+    toggle: SHARING,
+    view: view(),
+    busyNow: true,
+  });
+  assert.notEqual(invite.pulse, activity.pulse);
+});
+
+test("an empty or unfetched community never throbs", () => {
+  // Nothing to act on: an invitation to join a mesh that does not exist would
+  // be a lie told with animation.
+  assert.equal(derive({ snapshot: null }).pulse, "none");
+  assert.equal(derive({ snapshot: snapshot() }).pulse, "none");
 });
 
 test("a transition outranks any steady tone", () => {

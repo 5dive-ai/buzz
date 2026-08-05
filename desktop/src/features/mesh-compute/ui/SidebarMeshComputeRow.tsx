@@ -4,7 +4,7 @@ import { Switch } from "@/shared/ui/switch";
 import { cn } from "@/shared/lib/cn";
 
 import { useMeshComputeState } from "../hooks/useMeshComputeState";
-import type { MeshRowTone } from "../meshRowModel";
+import type { MeshRowPulse, MeshRowTone } from "../meshRowModel";
 import { MeshComputePopover } from "./MeshComputePopover";
 
 /**
@@ -33,11 +33,28 @@ const TONE_DOT: Record<MeshRowTone, string> = {
 
 const TONE_PING: Record<MeshRowTone, string> = {
   unknown: "",
-  available: "",
+  // Slate rather than a tone colour: this is an invitation, not activity.
+  available: "bg-slate-400 dark:bg-slate-500",
   sharing: "bg-emerald-500 dark:bg-emerald-400",
   consuming: "bg-sky-500 dark:bg-sky-400",
   starting: "bg-amber-500 dark:bg-amber-400",
   failed: "",
+};
+
+/**
+ * Two facts want motion, so they must not look alike.
+ *
+ * `activity` is real work in flight — it uses Tailwind's stock ping, which is
+ * quick and insistent, because something is happening right now.
+ *
+ * `invite` says there is compute here to tap into and this machine is outside
+ * it. Nothing is happening, so it breathes slowly instead: noticeable on a
+ * second glance, never competing with unread badges.
+ */
+const PULSE_CLASS: Record<MeshRowPulse, string> = {
+  none: "",
+  activity: "animate-ping",
+  invite: "animate-mesh-invite",
 };
 
 export function SidebarMeshComputeRow({
@@ -66,14 +83,16 @@ export function SidebarMeshComputeRow({
             className="flex h-4 w-4 shrink-0 items-center justify-center"
           >
             <span className="relative flex h-2 w-2 items-center justify-center">
-              {row.pulse ? (
+              {row.pulse === "none" ? null : (
                 <span
                   className={cn(
-                    "absolute h-2 w-2 animate-ping rounded-full opacity-75 motion-reduce:animate-none",
+                    "absolute h-2 w-2 rounded-full opacity-75 motion-reduce:animate-none",
+                    PULSE_CLASS[row.pulse],
                     TONE_PING[row.tone],
                   )}
+                  data-mesh-pulse={row.pulse}
                 />
-              ) : null}
+              )}
               <span
                 className={cn("h-2 w-2 rounded-full", TONE_DOT[row.tone])}
                 data-testid="mesh-row-dot"

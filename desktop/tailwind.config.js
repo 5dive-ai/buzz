@@ -37,6 +37,21 @@ export default {
       spacing: {
         4.5: "1.125rem",
       },
+      keyframes: {
+        // The mesh-invite pulse: there is shared compute in the community and
+        // this machine is neither using nor adding to it. Deliberately unlike
+        // Tailwind's stock `ping`, which is quick and insistent because it
+        // signals something happening *now*. Nothing is happening here, so this
+        // breathes slowly and never reaches full opacity — noticeable on a
+        // second glance, never competing with unread badges.
+        "mesh-invite": {
+          "0%, 100%": { transform: "scale(1)", opacity: "0.55" },
+          "50%": { transform: "scale(2)", opacity: "0" },
+        },
+      },
+      animation: {
+        "mesh-invite": "mesh-invite 2.8s cubic-bezier(0.4, 0, 0.6, 1) infinite",
+      },
       fontFamily: {
         sans: [
           '"Inter Variable"',

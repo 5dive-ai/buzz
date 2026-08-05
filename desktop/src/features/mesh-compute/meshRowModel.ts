@@ -73,6 +73,9 @@ export type MeshRowModel = {
    * machine is outside the mesh the figure *is* the invitation: a real number
    * argues for joining better than any exhortation, and unlike a nudge there is
    * nothing to dismiss.
+   *
+   * When the mesh is empty there is no figure, so the slot carries the word
+   * "Share" — the row would otherwise be inert with nothing explaining why.
    */
   badge: string | null;
   /**
@@ -179,13 +182,29 @@ export function deriveMeshRowModel({
   // Not participating. The relay snapshot is the only view, and the only thing
   // that distinguishes "there is a mesh to join" from "there is nothing here".
   const count = snapshot?.sharingDeviceCount ?? 0;
-  if (!snapshot || count === 0) {
+  if (!snapshot) {
+    // Not asked yet. No figure, no prompt: a call to action based on no data
+    // would appear for one poll and retract, which reads as a glitch.
     return {
       tone: "unknown",
-      tooltip: snapshot
-        ? "No shared compute in this community yet"
-        : "Checking for shared compute…",
+      tooltip: "Checking for shared compute…",
       badge: null,
+      pulse: "none",
+    };
+  }
+  if (count === 0) {
+    // An empty mesh is the one state with nothing to show and nothing
+    // happening, so without a prompt the row is inert and unexplained. The
+    // action is real — you can be the first to share — so the badge slot
+    // carries the word instead of a figure.
+    //
+    // Static, not throbbing. A community that never uses the mesh would
+    // otherwise animate forever, and permanent motion earns nothing but
+    // annoyance. The invite throb stays reserved for capacity that exists.
+    return {
+      tone: "unknown",
+      tooltip: "No shared compute yet — share this computer to start the mesh",
+      badge: "Share",
       pulse: "none",
     };
   }

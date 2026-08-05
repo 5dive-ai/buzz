@@ -211,3 +211,22 @@ test("an agent that uses the mesh leaves a busy sharer showing activity", () => 
   });
   assert.equal(model.pulse, "activity");
 });
+
+test("an empty mesh offers the action instead of sitting inert", () => {
+  // Nothing to show and nothing happening: without a prompt the row is inert
+  // and unexplained. The action is real -- you can be the first to share -- so
+  // the badge slot carries the word where a figure would go.
+  const model = derive({ snapshot: snapshot() });
+  assert.equal(model.tone, "unknown");
+  assert.equal(model.badge, "Share");
+  assert.match(model.tooltip, /share this computer to start the mesh/);
+});
+
+test("an empty mesh does not throb, and an unfetched one offers nothing", () => {
+  // A community that never uses the mesh would otherwise animate forever;
+  // permanent motion earns nothing but annoyance. And a prompt derived from no
+  // data would appear for one poll then retract, reading as a glitch.
+  assert.equal(derive({ snapshot: snapshot() }).pulse, "none");
+  assert.equal(derive({ snapshot: null }).badge, null);
+  assert.equal(derive({ snapshot: null }).pulse, "none");
+});

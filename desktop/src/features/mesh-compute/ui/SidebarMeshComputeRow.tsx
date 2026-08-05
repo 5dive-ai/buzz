@@ -7,7 +7,7 @@ import type { MeshRowPulse, MeshRowTone } from "../meshRowModel";
 import { MeshComputePopover } from "./MeshComputePopover";
 
 /**
- * The sidebar Community mesh row.
+ * The sidebar Buzz MeshLLM row.
  *
  * Replaces the ~120px footer card with one menu line beside Inbox and Agents,
  * because front-page sidebar space is premium. The row carries a single signal
@@ -99,7 +99,7 @@ export function SidebarMeshComputeRow({
             </span>
           </span>
           <SidebarMenuLabel className="opacity-80">
-            Community mesh
+            Buzz MeshLLM
           </SidebarMenuLabel>
         </SidebarMenuButton>
       </MeshComputePopover>

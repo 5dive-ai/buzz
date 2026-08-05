@@ -32,16 +32,21 @@ export type LinkPreviewSnapshot = {
   faviconSha256: string;
 };
 
-function isControlCharacter(char: string): boolean {
+function isControlCharacter(char: string, allowNewlines = false): boolean {
+  if (allowNewlines && char === "\n") return false;
   const code = char.charCodeAt(0);
   return code <= 0x1f || code === 0x7f;
 }
 
-function sanitizeSnapshotText(value: string, maxBytes: number): string {
+function sanitizeSnapshotText(
+  value: string,
+  maxBytes: number,
+  allowNewlines = false,
+): string {
   let result = "";
   let byteLength = 0;
   for (const rawChar of value) {
-    const char = isControlCharacter(rawChar) ? " " : rawChar;
+    const char = isControlCharacter(rawChar, allowNewlines) ? " " : rawChar;
     const charBytes = new TextEncoder().encode(char).length;
     if (byteLength + charBytes > maxBytes) break;
     result += char;
@@ -50,12 +55,11 @@ function sanitizeSnapshotText(value: string, maxBytes: number): string {
   return result;
 }
 
-function validText(value: string, max: number): boolean {
+function validText(value: string, max: number, allowNewlines = false): boolean {
   return (
     new TextEncoder().encode(value).length <= max &&
     !Array.from(value).some((char) => {
-      const code = char.charCodeAt(0);
-      return code <= 0x1f || code === 0x7f;
+      return isControlCharacter(char, allowNewlines);
     })
   );
 }
@@ -131,7 +135,7 @@ export function parseLinkPreviewSnapshots(
     if (
       !validText(title, 300) ||
       !validText(siteName, 100) ||
-      !validText(description, 1000)
+      !validText(description, 1000, true)
     )
       continue;
     if (
@@ -166,7 +170,7 @@ export function buildLinkPreviewSnapshotTag(
     snapshot.canonicalUrl,
     sanitizeSnapshotText(snapshot.title, 300),
     sanitizeSnapshotText(snapshot.siteName, 100),
-    sanitizeSnapshotText(snapshot.description, 1000),
+    sanitizeSnapshotText(snapshot.description, 1000, true),
     snapshot.imageUrl,
     snapshot.imageSha256,
     snapshot.faviconUrl,

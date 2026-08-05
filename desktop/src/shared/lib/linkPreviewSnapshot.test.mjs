@@ -63,7 +63,7 @@ test("snapshot tags sanitize control characters and enforce UTF-8 byte limits", 
     canonicalUrl: URL,
     title: `Title\n${"😀".repeat(100)}`,
     siteName: `Linear\u0000${"é".repeat(100)}`,
-    description: `First\nSecond${"😀".repeat(300)}`,
+    description: `First\nSecond\t${"😀".repeat(300)}`,
     imageUrl: "",
     imageSha256: "",
     faviconUrl: "",
@@ -71,7 +71,9 @@ test("snapshot tags sanitize control characters and enforce UTF-8 byte limits", 
   });
 
   assert.ok(tag);
-  for (const value of tag.slice(4, 7)) {
+  assert.equal(tag[6].startsWith("First\nSecond"), true);
+  assert.equal(tag[6].includes("\t"), false);
+  for (const value of tag.slice(4, 6)) {
     assert.ok(
       Array.from(value).every((char) => {
         const code = char.charCodeAt(0);

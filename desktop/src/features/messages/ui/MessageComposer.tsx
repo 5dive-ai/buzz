@@ -262,9 +262,9 @@ function MessageComposerImpl({
     onEditLink: (info) => onEditLinkRef.current?.(info),
     onLinkSelectionChange: (info) => onLinkSelectionChangeRef.current?.(info),
     onLinkShortcut: () => onLinkShortcutRef.current?.() ?? false,
-    onUpdate: ({ cursor, text }) => {
+    onUpdate: ({ cursor, linkPreviewContent, text }) => {
       setComposerContentFromText(text);
-      setPreviewContent(text);
+      setPreviewContent(linkPreviewContent);
       mentions.updateMentionQuery(text, cursor);
       channelLinks.updateChannelQuery(text, cursor);
       emojiAutocomplete.updateEmojiQuery(text, cursor);

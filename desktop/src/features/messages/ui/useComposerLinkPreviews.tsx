@@ -14,6 +14,16 @@ import {
 import type { ResolvedLinkPreview } from "@/shared/lib/useResolvedLinkPreviews";
 import { useResolvedLinkPreviews } from "@/shared/lib/useResolvedLinkPreviews";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/shared/ui/alert-dialog";
+import {
   Attachment,
   AttachmentContent,
   AttachmentDescription,
@@ -133,6 +143,7 @@ async function uploadDataUrl(
 
 export function useComposerLinkPreviews(content: string) {
   const [suppressed, setSuppressed] = React.useState(false);
+  const [dismissDialogOpen, setDismissDialogOpen] = React.useState(false);
   const candidates = React.useMemo(
     () =>
       extractSupportedLinkPreviews(content).filter((preview) =>
@@ -213,33 +224,62 @@ export function useComposerLinkPreviews(content: string) {
     : candidates.flatMap((candidate) =>
         readyTags[candidate.href] ? [readyTags[candidate.href]] : [],
       );
-  const hideAll = React.useCallback(() => setSuppressed(true), []);
+  const previewNoun = previews.length === 1 ? "preview" : "previews";
+  const hideAll = React.useCallback(() => {
+    setSuppressed(true);
+    setDismissDialogOpen(false);
+  }, []);
   const previewList = previews.length ? (
-    <div
-      className="mb-2"
-      data-composer-link-previews=""
-      data-ready-snapshot-count={readyTagsRef.current.length}
-    >
-      <div className="flex max-w-full items-start gap-1">
-        <AttachmentGroup className="max-w-full flex-row flex-wrap items-start overflow-visible pb-0">
-          {previews.map((preview) => (
-            <ComposerLinkPreviewCard key={preview.href} preview={preview} />
-          ))}
-        </AttachmentGroup>
-        <Button
-          aria-label="Hide all link previews"
-          className="mt-1 size-5 shrink-0 rounded-full text-muted-foreground hover:text-foreground [&_svg]:size-3"
-          data-testid="composer-hide-link-previews"
-          onClick={hideAll}
-          size="icon-xs"
-          title="Hide previews"
-          type="button"
-          variant="ghost"
-        >
-          <X aria-hidden="true" />
-        </Button>
+    <>
+      <div
+        className="mb-2"
+        data-composer-link-previews=""
+        data-ready-snapshot-count={readyTagsRef.current.length}
+      >
+        <div className="flex max-w-full items-start gap-1">
+          <AttachmentGroup className="max-w-full flex-row flex-wrap items-start overflow-visible pb-0">
+            {previews.map((preview) => (
+              <ComposerLinkPreviewCard key={preview.href} preview={preview} />
+            ))}
+          </AttachmentGroup>
+          <Button
+            aria-label="Hide all link previews"
+            className="mt-1 size-5 shrink-0 rounded-full text-muted-foreground hover:text-foreground [&_svg]:size-3"
+            data-testid="composer-hide-link-previews"
+            onClick={() => setDismissDialogOpen(true)}
+            size="icon-xs"
+            title="Hide previews"
+            type="button"
+            variant="ghost"
+          >
+            <X aria-hidden="true" />
+          </Button>
+        </div>
       </div>
-    </div>
+      <AlertDialog onOpenChange={setDismissDialogOpen} open={dismissDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Hide link {previewNoun}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {previews.length === 1 ? "This preview" : "These previews"} won’t
+              be included when you send this message.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel asChild>
+              <Button type="button" variant="outline">
+                Cancel
+              </Button>
+            </AlertDialogCancel>
+            <AlertDialogAction asChild>
+              <Button onClick={hideAll} type="button" variant="destructive">
+                Hide {previewNoun}
+              </Button>
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   ) : null;
   const getReadyTags = React.useCallback(() => {
     if (suppressedRef.current) return [["link-preview", "none"]];

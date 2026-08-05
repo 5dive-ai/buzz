@@ -6,8 +6,11 @@ const MAX_TITLE: usize = 300;
 const MAX_SITE: usize = 100;
 const MAX_DESCRIPTION: usize = 1000;
 
-fn valid_text(value: &str, max: usize) -> bool {
-    value.len() <= max && !value.chars().any(char::is_control)
+fn valid_text(value: &str, max: usize, allow_newlines: bool) -> bool {
+    value.len() <= max
+        && !value
+            .chars()
+            .any(|character| character.is_control() && !(allow_newlines && character == '\n'))
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -78,9 +81,9 @@ pub fn append(
                     && url.fragment().is_none()
             })
             && seen.insert(preview_tag[3].clone())
-            && valid_text(&preview_tag[4], MAX_TITLE)
-            && valid_text(&preview_tag[5], MAX_SITE)
-            && valid_text(&preview_tag[6], MAX_DESCRIPTION)
+            && valid_text(&preview_tag[4], MAX_TITLE, false)
+            && valid_text(&preview_tag[5], MAX_SITE, false)
+            && valid_text(&preview_tag[6], MAX_DESCRIPTION, true)
             && valid_media_pair(&preview_tag[7], &preview_tag[8], &base)
             && valid_media_pair(&preview_tag[9], &preview_tag[10], &base);
         if !valid {
@@ -145,6 +148,20 @@ mod tests {
             &mut Vec::new(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn append_accepts_description_newlines() {
+        let mut preview_tag = tag("", "");
+        preview_tag[6] = "First paragraph\n\nSecond paragraph".into();
+        assert!(append(&[preview_tag], BASE, &mut Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn append_rejects_other_control_characters() {
+        let mut preview_tag = tag("", "");
+        preview_tag[6] = "Unsafe\tdescription".into();
+        assert!(append(&[preview_tag], BASE, &mut Vec::new()).is_err());
     }
 
     #[test]

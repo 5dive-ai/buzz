@@ -206,32 +206,46 @@ test.beforeEach(async ({ page }, testInfo) => {
                     },
                     linkPreviewMetadataDelayMs: 2_000,
                   }
-                : testInfo.title.includes("link preview") ||
-                    testInfo.title.includes("supported Compact")
+                : testInfo.title.includes(
+                      "rich link preview preserves description newlines",
+                    )
                   ? {
                       linkPreviewMetadata: {
                         title: "Buzz pull request",
                         siteName: "GitHub",
-                        description: "A sender-authored preview snapshot.",
+                        description:
+                          "First paragraph line one.\nFirst paragraph line two.\n\nSecond paragraph.",
                         imageDataUrl: null,
                         imageDomain: null,
                       },
-                      linkPreviewMetadataDelayMs: testInfo.title.includes(
-                        "loading card before cold resolver work",
-                      )
-                        ? 10_000
-                        : testInfo.title.includes("style defaults") ||
-                            testInfo.title.includes("send does not wait") ||
-                            testInfo.title.includes("attachment-sized")
-                          ? 1_500
-                          : undefined,
-                      linkPreviewMetadataStartBlockMs: testInfo.title.includes(
-                        "loading card before cold resolver work",
-                      )
-                        ? 150
-                        : undefined,
                     }
-                  : undefined;
+                  : testInfo.title.includes("link preview") ||
+                      testInfo.title.includes("supported Compact")
+                    ? {
+                        linkPreviewMetadata: {
+                          title: "Buzz pull request",
+                          siteName: "GitHub",
+                          description: "A sender-authored preview snapshot.",
+                          imageDataUrl: null,
+                          imageDomain: null,
+                        },
+                        linkPreviewMetadataDelayMs: testInfo.title.includes(
+                          "loading card before cold resolver work",
+                        )
+                          ? 10_000
+                          : testInfo.title.includes("style defaults") ||
+                              testInfo.title.includes("send does not wait") ||
+                              testInfo.title.includes("attachment-sized")
+                            ? 1_500
+                            : undefined,
+                        linkPreviewMetadataStartBlockMs:
+                          testInfo.title.includes(
+                            "loading card before cold resolver work",
+                          )
+                            ? 150
+                            : undefined,
+                      }
+                    : undefined;
   const mock = testInfo.title.includes("unresolvable preview")
     ? { linkPreviewMetadata: null, linkPreviewMetadataDelayMs: 150 }
     : baseMock;
@@ -535,6 +549,69 @@ for (const [pasteShape, wrapUrl] of [
   });
 }
 
+test("display-text link preview produces and sends its preview", async ({
+  page,
+}) => {
+  const previewUrl = "https://github.com/block/buzz/pull/3246?display=text";
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+
+  const input = page.getByTestId("message-input");
+  await input.click();
+  await input.pressSequentially("review the pull request");
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.press("ControlOrMeta+k");
+  const dialog = page.getByRole("dialog", { name: "Add link" });
+  await dialog.getByLabel("URL").fill(previewUrl);
+  await dialog.getByRole("button", { name: "Save" }).click();
+
+  await expect(input.locator(`a[href="${previewUrl}"]`)).toHaveText(
+    "review the pull request",
+  );
+  await expect(page.locator("[data-composer-link-previews]")).toBeVisible();
+  await waitForReadyComposerSnapshots(page);
+  await page.getByTestId("send-message").click();
+
+  const row = page.getByTestId("message-row").last();
+  await expect(
+    row.getByRole("link", { name: "review the pull request", exact: true }),
+  ).toHaveAttribute("href", previewUrl);
+  await expect(row.locator("[data-link-preview]")).toBeVisible();
+  const linkPreviewTags = await page.evaluate(() => {
+    const call = [...(window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [])]
+      .reverse()
+      .find((entry) => entry.command === "send_channel_message");
+    return (
+      call?.payload as { linkPreviewTags?: string[][] | null } | undefined
+    )?.linkPreviewTags;
+  });
+  expect(linkPreviewTags?.map((tag) => tag[3])).toEqual([previewUrl]);
+});
+
+test("rich link preview preserves description newlines after sending", async ({
+  page,
+}) => {
+  const previewUrl = "https://github.com/block/buzz/pull/3246?newlines=1";
+  await page.addInitScript(() =>
+    localStorage.setItem("buzz.appearance.linkPreviewStyle", "rich"),
+  );
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page.getByTestId("message-input").fill(previewUrl);
+  await waitForReadyComposerSnapshots(page);
+  await page.getByTestId("send-message").click();
+
+  const description = page
+    .getByTestId("message-row")
+    .last()
+    .locator('[data-link-preview-inline] [data-slot="attachment-description"]');
+  await expect(description.locator("p")).toHaveCount(2);
+  await expect(description).toHaveText(
+    "First paragraph line one.\nFirst paragraph line two.\n\nSecond paragraph.",
+    { useInnerText: true },
+  );
+});
+
 test("completed link previews send when one URL has an unsnapshotable fragment", async ({
   page,
 }) => {
@@ -643,7 +720,7 @@ test("send does not wait for a pending link preview snapshot", async ({
   expect(linkPreviewTags ?? []).toEqual([]);
 });
 
-test("hiding composer previews suppresses the whole draft and emits the blanket marker", async ({
+test("hiding composer link previews suppresses the whole draft and emits the blanket marker", async ({
   page,
 }) => {
   const firstUrl = "https://github.com/block/buzz/pull/3246?hide=all";
@@ -652,8 +729,18 @@ test("hiding composer previews suppresses the whole draft and emits the blanket 
   await page.getByTestId("channel-general").click();
   await page.getByTestId("message-input").fill(firstUrl);
   await expect(page.locator("[data-composer-link-previews]")).toBeVisible();
+  await waitForReadyComposerSnapshots(page);
 
   await page.getByTestId("composer-hide-link-previews").click();
+  const dismissDialog = page.getByRole("alertdialog", {
+    name: "Hide link preview?",
+  });
+  await expect(dismissDialog).toBeVisible();
+  await dismissDialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.locator("[data-composer-link-previews]")).toBeVisible();
+
+  await page.getByTestId("composer-hide-link-previews").click();
+  await dismissDialog.getByRole("button", { name: "Hide preview" }).click();
   await expect(page.locator("[data-composer-link-previews]")).toHaveCount(0);
   await page.getByTestId("message-input").fill(`${firstUrl} ${secondUrl}`);
   await expect(page.locator("[data-composer-link-previews]")).toHaveCount(0);

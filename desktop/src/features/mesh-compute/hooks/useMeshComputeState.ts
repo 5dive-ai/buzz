@@ -8,7 +8,7 @@ import {
 } from "@/shared/api/tauriMesh";
 
 import { useManagedAgentsQuery } from "@/features/agents/hooks";
-import { deriveMeshCallToAction } from "../meshAgents";
+import { deriveMeshCallToAction, usesMeshCompute } from "../meshAgents";
 import { activitySample, inferInboundWork } from "../meshActivity";
 import { deriveMeshMemoryModel } from "../meshMemoryModel";
 import { deriveMeshRowModel } from "../meshRowModel";
@@ -123,6 +123,13 @@ export function useMeshComputeState() {
   });
   const busyNow = (usage?.inflight ?? 0) > 0;
 
+  // `undefined` while the query is in flight, so the row can distinguish "no
+  // mesh agent" from "not known yet" and never throb a nudge that then vanishes.
+  const hasMeshAgent =
+    managedAgents === undefined
+      ? undefined
+      : managedAgents.some(usesMeshCompute);
+
   const row = deriveMeshRowModel({
     snapshot,
     status,
@@ -130,6 +137,7 @@ export function useMeshComputeState() {
     view,
     pendingAction,
     busyNow,
+    hasMeshAgent,
   });
 
   const setSharing = React.useCallback(

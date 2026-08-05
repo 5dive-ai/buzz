@@ -1,6 +1,5 @@
 import { SidebarMenuButton, SidebarMenuItem } from "@/shared/ui/sidebar";
 import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
-import { Switch } from "@/shared/ui/switch";
 import { cn } from "@/shared/lib/cn";
 
 import { useMeshComputeState } from "../hooks/useMeshComputeState";
@@ -63,7 +62,7 @@ export function SidebarMeshComputeRow({
   onOpenComputeSettings?: () => void;
 }) {
   const mesh = useMeshComputeState();
-  const { row, setSharing } = mesh;
+  const { row } = mesh;
 
   return (
     <SidebarMenuItem>
@@ -106,25 +105,16 @@ export function SidebarMeshComputeRow({
       </MeshComputePopover>
 
       {/*
-        The switch sits outside the button rather than inside it: nesting a
-        control in a control is invalid, and the row itself must stay clickable
-        as the way into the popover.
+        Capacity, in every state that has a number — not just while sharing.
 
-        Hidden once sharing — the state is legible from the dot, and Stop lives
-        in the popover. Collapsed sidebars hide it too: no room, and the dot
-        plus tooltip still carry the state.
+        This slot used to hold a 70%-scaled unlabelled Switch, which was hard to
+        see and ambiguous about what it would do. The control moved wholesale to
+        the popover, which frees the slot for the figure. When this machine is
+        outside the mesh the number *is* the invitation: "92 GB" argues for
+        joining better than any exhortation, and unlike a nudge there is nothing
+        to dismiss. Pointer-events off so the whole row stays one click target.
       */}
-      {row.showSwitch ? (
-        <div className="absolute right-2 top-1/2 -translate-y-1/2 group-data-[collapsible=icon]:hidden">
-          <Switch
-            aria-label={row.switchLabel}
-            checked={false}
-            className="scale-[0.7]"
-            data-testid="mesh-row-share-toggle"
-            onCheckedChange={setSharing}
-          />
-        </div>
-      ) : row.badge ? (
+      {row.badge ? (
         <span
           className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-2xs tabular-nums text-muted-foreground group-data-[collapsible=icon]:hidden"
           data-testid="mesh-row-badge"

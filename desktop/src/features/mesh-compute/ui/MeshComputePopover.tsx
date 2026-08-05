@@ -93,12 +93,18 @@ export function MeshComputePopover({
               </p>
             </div>
             {/*
-              Stop lives here, not on the row: the row hides its switch once
-              sharing so the state reads at a glance without a control competing
-              for the same 256px.
+              The only share control. It used to be duplicated as a 70%-scaled
+              unlabelled Switch on the row itself, which was hard to see and
+              ambiguous about what it would do; the row now carries state and
+              capacity only, and every control lives here where there is room to
+              label it.
             */}
             <Switch
-              aria-label={row.switchLabel}
+              aria-label={
+                toggle.isSharing
+                  ? "Stop sharing this computer's compute"
+                  : "Share this computer's compute"
+              }
               checked={toggle.isSharing}
               className="mt-0.5 shrink-0"
               data-testid="mesh-popover-share-toggle"

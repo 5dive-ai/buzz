@@ -53,6 +53,7 @@ function derive(overrides = {}) {
     view: null,
     pendingAction: null,
     busyNow: false,
+    hasMeshAgent: true,
     ...overrides,
   });
 }
@@ -78,7 +79,9 @@ test("capacity you have not joined is its own tone", () => {
   });
   assert.equal(model.tone, "available");
   assert.match(model.tooltip, /92 GB/);
-  assert.equal(model.showSwitch, true);
+  // The figure is the invitation: a real number argues for joining better than
+  // any exhortation, and there is nothing to dismiss.
+  assert.equal(model.badge, "92 GB");
 });
 
 test("unknown capacity degrades to a device count, never 0 GB", () => {
@@ -88,16 +91,17 @@ test("unknown capacity degrades to a device count, never 0 GB", () => {
   assert.equal(model.tone, "available");
   assert.match(model.tooltip, /2 devices/);
   assert.doesNotMatch(model.tooltip, /0 GB/);
+  // A count still says "there is something here", which is the badge's job.
+  assert.equal(model.badge, "2 devices");
+  assert.doesNotMatch(model.badge, /0 GB/);
 });
 
-test("sharing hides the switch and shows live capacity instead", () => {
+test("sharing shows live pool capacity, not just this machine's", () => {
   const model = derive({
     toggle: SHARING,
     view: view({ peers: [peer()] }),
   });
   assert.equal(model.tone, "sharing");
-  // Stop lives in the popover, so the row reclaims the space for the payoff.
-  assert.equal(model.showSwitch, false);
   assert.equal(model.badge, "151 GB");
   assert.match(model.tooltip, /1 peer\b/);
 });
@@ -107,12 +111,9 @@ test("a solo sharer is named as waiting, not as a peer count of zero", () => {
   assert.match(model.tooltip, /waiting for another device/);
 });
 
-test("consuming keeps the switch: sharing is always available", () => {
+test("consuming is distinct from sharing", () => {
   const model = derive({ toggle: CONSUMING });
   assert.equal(model.tone, "consuming");
-  // A client runtime can be replaced by a serve runtime. Consuming is not a
-  // lock, so the row must never present it as one.
-  assert.equal(model.showSwitch, true);
 });
 
 test("an activity pulse means real work, nothing else", () => {
@@ -171,5 +172,42 @@ test("an unhealthy serve runtime reads failed, and can still be stopped", () => 
     status: { state: "running", health: { status: "unreachable" } },
   });
   assert.equal(model.tone, "failed");
-  assert.equal(model.switchLabel, "Stop sharing");
+  assert.match(model.tooltip, /failed/i);
+});
+
+test("sharing with no agent throbs, but stays green", () => {
+  // Blue already means *consuming* — taking from the mesh. Sharing with no
+  // consumer is the opposite, so reusing blue would make blue meaningless. The
+  // dot keeps stating the truth (we are sharing) and the throb says there is a
+  // step left.
+  const model = derive({
+    toggle: SHARING,
+    view: view(),
+    hasMeshAgent: false,
+  });
+  assert.equal(model.tone, "sharing");
+  assert.equal(model.pulse, "invite");
+  assert.match(model.tooltip, /no agent is using it yet/);
+});
+
+test("a loading agent list never throbs a nudge that then vanishes", () => {
+  // `undefined` is "not known yet". Throbbing on it would flash a prompt for
+  // one poll and retract it, which reads as a glitch rather than a suggestion.
+  const model = derive({
+    toggle: SHARING,
+    view: view(),
+    hasMeshAgent: undefined,
+  });
+  assert.equal(model.pulse, "none");
+});
+
+test("an agent that uses the mesh leaves a busy sharer showing activity", () => {
+  // The agent nudge must not mask the real-work signal once setup is complete.
+  const model = derive({
+    toggle: SHARING,
+    view: view(),
+    busyNow: true,
+    hasMeshAgent: true,
+  });
+  assert.equal(model.pulse, "activity");
 });

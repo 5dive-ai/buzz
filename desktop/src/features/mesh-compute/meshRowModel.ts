@@ -7,10 +7,11 @@ import type { MeshShareToggleModel } from "./shareToggleState";
 import { formatCapacityGb, plural } from "./meshCardModel";
 
 /**
- * Pure projection for the sidebar Compute row.
+ * Pure projection for the sidebar Community mesh row.
  *
- * The row replaced a ~120px card with a single menu line, so it carries exactly
- * one signal: a coloured dot. Everything else moved into the popover.
+ * The row replaced a ~120px card with a single menu line, so it carries two
+ * signals only: a coloured dot and a capacity figure. Every control lives in
+ * the popover.
  *
  * ## Why "not participating" is two states, not one
  *
@@ -44,10 +45,20 @@ export type MeshRowTone =
  * make a throb ambiguous:
  *
  *   - `activity` — real work is in flight on this node right now
- *   - `invite`   — there is compute here to tap into, and we are not in it
+ *   - `invite`   — there is something worth doing, and nothing is happening
  *
- * They are visually distinct (invite is slower and slate; activity matches the
- * tone colour) so the same animation never means two things.
+ * They are visually distinct (invite breathes slowly; activity uses the quick
+ * stock ping) so the same animation never means two things.
+ *
+ * `invite` covers two situations that share one meaning — "act here":
+ *   - capacity exists and this machine is outside it
+ *   - this machine shares, but no agent is set up to use the mesh
+ *
+ * The second deliberately does **not** get its own colour. Blue already means
+ * *consuming*, i.e. taking from the mesh; sharing-with-no-consumer is the
+ * opposite, so painting it blue would make blue meaningless. The dot keeps
+ * saying what state we are in (green: sharing, truthfully) while the throb says
+ * there is an action worth taking, and the tooltip names which.
  */
 export type MeshRowPulse = "none" | "activity" | "invite";
 
@@ -56,14 +67,14 @@ export type MeshRowModel = {
   /** Accessible state sentence, used as the row tooltip. */
   tooltip: string;
   /**
-   * Compact trailing figure, or null. Only shown when the switch is absent
-   * (i.e. while sharing) so the two never compete for the same 256px.
+   * Compact trailing figure, or null when no capacity is known anywhere.
+   *
+   * Shown in every state that has a number, not just while sharing. When this
+   * machine is outside the mesh the figure *is* the invitation: a real number
+   * argues for joining better than any exhortation, and unlike a nudge there is
+   * nothing to dismiss.
    */
   badge: string | null;
-  /** Show the Share switch. Hidden once sharing — stop lives in the popover. */
-  showSwitch: boolean;
-  /** Label for the switch, read by screen readers. */
-  switchLabel: string;
   /**
    * Why the dot moves, if it does. Never decorative: a still dot is a real
    * statement that there is nothing to act on and nothing happening.
@@ -87,6 +98,7 @@ export function deriveMeshRowModel({
   view,
   pendingAction,
   busyNow,
+  hasMeshAgent,
 }: {
   snapshot: MeshSnapshot | null;
   status: MeshNodeStatus | null;
@@ -95,9 +107,14 @@ export function deriveMeshRowModel({
   pendingAction: "start" | "stop" | null;
   /** Work in flight on this node, inbound or outbound. */
   busyNow: boolean;
+  /**
+   * Any agent resolves to the shared-compute provider.
+   *
+   * `undefined` while the agent list is loading — treated as "assume set up",
+   * so a slow query never throbs a nudge that then vanishes.
+   */
+  hasMeshAgent: boolean | undefined;
 }): MeshRowModel {
-  const shareLabel = "Share this computer's compute";
-
   // A start/stop in flight outranks everything: the tone must not claim a
   // steady state while the runtime is mid-transition.
   if (
@@ -109,8 +126,6 @@ export function deriveMeshRowModel({
       tooltip:
         pendingAction === "stop" ? "Stopping sharing…" : "Starting to share…",
       badge: null,
-      showSwitch: false,
-      switchLabel: shareLabel,
       pulse: "none",
     };
   }
@@ -122,37 +137,41 @@ export function deriveMeshRowModel({
         tone: "failed",
         tooltip: "Sharing failed — open for details",
         badge: null,
-        showSwitch: false,
-        switchLabel: "Stop sharing",
         pulse: "none",
       };
     }
     const gb = liveCapacityGb(view);
     const peerCount = view?.peers.length ?? 0;
+    const badge = gb > 0 ? formatCapacityGb(gb) : null;
+    // Sharing compute nothing can use is a dead end, and the row is where it
+    // would go unnoticed. Green stays — we really are sharing — but the throb
+    // says there is a step left, and only once the agent list has actually
+    // resolved.
+    if (hasMeshAgent === false) {
+      return {
+        tone: "sharing",
+        tooltip: "Sharing compute · no agent is using it yet",
+        badge,
+        pulse: "invite",
+      };
+    }
     return {
       tone: "sharing",
       tooltip:
         peerCount > 0
           ? `Sharing compute · ${peerCount} ${plural(peerCount, "peer")}`
           : "Sharing compute · waiting for another device",
-      // Capacity is the payoff for sharing, so it earns the badge slot the
-      // switch vacates.
-      badge: gb > 0 ? formatCapacityGb(gb) : null,
-      showSwitch: false,
-      switchLabel: "Stop sharing",
+      badge,
       pulse: busyNow ? "activity" : "none",
     };
   }
 
   if (toggle.isConsuming) {
+    const gb = liveCapacityGb(view);
     return {
       tone: "consuming",
       tooltip: "Using shared compute from the mesh",
-      badge: null,
-      // Deliberately still offered: a member may replace a client runtime with
-      // a serve runtime at any time. Consuming is not a lock.
-      showSwitch: true,
-      switchLabel: shareLabel,
+      badge: gb > 0 ? formatCapacityGb(gb) : null,
       pulse: busyNow ? "activity" : "none",
     };
   }
@@ -167,8 +186,6 @@ export function deriveMeshRowModel({
         ? "No shared compute in this community yet"
         : "Checking for shared compute…",
       badge: null,
-      showSwitch: true,
-      switchLabel: shareLabel,
       pulse: "none",
     };
   }
@@ -179,11 +196,12 @@ export function deriveMeshRowModel({
       gb === null
         ? `Shared compute available · ${count} ${plural(count, "device")}`
         : `${formatCapacityGb(gb)} of shared compute available`,
-    badge: null,
-    showSwitch: true,
-    switchLabel: shareLabel,
-    // The one state worth drawing the eye to unprompted: real capacity exists
-    // and this machine is neither using nor adding to it.
+    // Unknown capacity degrades to a device count rather than printing 0 GB — a
+    // count still says "there is something here", which is the job.
+    badge:
+      gb === null
+        ? `${count} ${plural(count, "device")}`
+        : formatCapacityGb(gb),
     pulse: "invite",
   };
 }

@@ -244,6 +244,98 @@ pub struct TurnUsage {
     pub pricing_identity: Option<buzz_core::agent_turn_metric::PricingIdentity>,
 }
 
+/// Per-turn usage carried by a standard ACP `session/prompt` response.
+/// Adapter input excludes cache reads and writes, so NIP-AM input must add
+/// those subsets with checked arithmetic.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PromptResponseUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_read_tokens: Option<u64>,
+    pub cached_write_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandardAdapterKind {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct StandardUsageTracker {
+    sessions: HashMap<String, u64>,
+    in_flight_session: Option<String>,
+    pending_cost: Option<f64>,
+    pending_prompt: Option<(String, PromptResponseUsage, StandardAdapterKind)>,
+}
+
+impl StandardUsageTracker {
+    pub(crate) fn begin_turn(&mut self, session_id: &str) {
+        self.in_flight_session = Some(session_id.to_string());
+        self.pending_cost = None;
+        self.pending_prompt = None;
+    }
+
+    /// Claude's `usage_update.cost.amount` is a raw session-cumulative total.
+    pub(crate) fn record_cost(&mut self, session_id: &str, cost: f64) {
+        if cost.is_finite() && cost >= 0.0 && self.in_flight_session.as_deref() == Some(session_id)
+        {
+            self.pending_cost = Some(cost);
+        }
+    }
+
+    pub(crate) fn record_prompt_usage(
+        &mut self,
+        session_id: &str,
+        usage: PromptResponseUsage,
+        adapter: StandardAdapterKind,
+    ) {
+        if self.in_flight_session.as_deref() == Some(session_id) {
+            self.pending_prompt = Some((session_id.to_string(), usage, adapter));
+        }
+    }
+
+    pub(crate) fn take(&mut self) -> Option<TurnUsage> {
+        self.in_flight_session = None;
+        let cost = self.pending_cost.take();
+        let (session_id, usage, adapter) = self.pending_prompt.take()?;
+        let turn_seq = {
+            let seq = self.sessions.entry(session_id.clone()).or_default();
+            *seq += 1;
+            *seq
+        };
+        let inclusive_input = usage
+            .input_tokens
+            .checked_add(usage.cached_read_tokens.unwrap_or(0))
+            .and_then(|input| input.checked_add(usage.cached_write_tokens.unwrap_or(0)));
+
+        Some(TurnUsage {
+            session_id,
+            turn_seq,
+            delta_reliable: inclusive_input.is_some(),
+            turn_input_tokens: inclusive_input,
+            turn_output_tokens: Some(usage.output_tokens),
+            // Claude derives total by adding categories; Codex forwards the
+            // provider total and it remains valid independently of input overflow.
+            turn_total_tokens: (adapter == StandardAdapterKind::Codex)
+                .then_some(usage.total_tokens),
+            turn_cost_usd: None,
+            turn_cache_read_tokens: usage.cached_read_tokens,
+            turn_cache_write_tokens: usage.cached_write_tokens,
+            cumulative_input_tokens: None,
+            cumulative_output_tokens: None,
+            cumulative_total_tokens: None,
+            cumulative_cost_usd: cost,
+            cumulative_cache_read_tokens: None,
+            cumulative_cache_write_tokens: None,
+            model: None,
+            pricing_identity: None,
+        })
+    }
+}
+
 /// Tracks per-session cumulative usage state across turns.
 ///
 /// Cheap to construct. Usage lifecycle per turn:

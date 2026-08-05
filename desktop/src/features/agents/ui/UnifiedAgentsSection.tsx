@@ -104,13 +104,9 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     [personas, agents],
   );
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
-  // Instances Sheet state: track the persona that opened the sheet and its
-  // associated agent pubkeys (for filtering instances by device).
+  // Instances Sheet state: track the persona that opened the sheet.
   const [instancesSheetPersona, setInstancesSheetPersona] =
     React.useState<AgentPersona | null>(null);
-  const [instancesSheetPubkeys, setInstancesSheetPubkeys] = React.useState<
-    ReadonlySet<string>
-  >(new Set());
   const instancesSheetOpen = instancesSheetPersona !== null;
 
   // Pre-fetch the inventory so the start-control safeguard can consult it
@@ -135,45 +131,38 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
 
   /**
    * Start-control safeguard (Finding 4): before starting a new instance,
-   * check the relay inventory. If inventory is loading/untrusted OR there is
-   * already an active (non-archived) relay instance, open the Sheet instead
+   * check the relay inventory for THIS persona's instances only (byPersonaId).
+   * If inventory is loading/untrusted OR there is already an active
+   * (non-archived) relay instance for this persona, open the Sheet instead
    * of blindly minting a new one.
    */
   function handleStartPersonaWithSafeguard(persona: AgentPersona) {
     const inventory = inventoryQuery.data;
-    // Find the persona's local agents so the Sheet can mark each row correctly.
-    const groupAgents =
-      groups.find((g) => g.persona.id === persona.id)?.agents ?? [];
     // If inventory hasn't loaded yet or isn't trusted, show the Sheet so the
     // user can decide with full information rather than risking a 3rd instance.
     if (!inventory?.archiveStateTrusted) {
-      openInstancesSheet(persona, groupAgents);
+      openInstancesSheet(persona);
       return;
     }
-    // Count active (non-archived) relay instances.
-    const activeRelayInstances = inventory.instances.filter(
+    // Count active (non-archived) relay instances for THIS persona only.
+    const personaInstances = inventory.byPersonaId[persona.id] ?? [];
+    const activeRelayInstances = personaInstances.filter(
       (i) => i.archiveState.isArchived !== true,
     );
     if (activeRelayInstances.length >= 1) {
-      // There is at least one active relay-only instance; open the Sheet to
-      // let the user inspect and decide rather than minting a duplicate.
-      openInstancesSheet(persona, groupAgents);
+      // There is at least one active relay instance for this persona; open the
+      // Sheet to let the user inspect and decide rather than minting a duplicate.
+      openInstancesSheet(persona);
       return;
     }
-    // Safe to start — no active relay-only instance found.
+    // Safe to start — no active relay instance found for this persona.
     onStartPersona(persona);
   }
 
   /**
-   * Open the Instances Sheet for `persona`, recording which agent pubkeys
-   * are locally managed so rows can show "Relay only" for orphaned instances.
+   * Open the Instances Sheet for `persona`.
    */
-  function openInstancesSheet(
-    persona: AgentPersona,
-    groupAgents: readonly { pubkey: string }[],
-  ) {
-    const pubkeys = new Set(groupAgents.map((a) => a.pubkey.toLowerCase()));
-    setInstancesSheetPubkeys(pubkeys);
+  function openInstancesSheet(persona: AgentPersona) {
     setInstancesSheetPersona(persona);
   }
 
@@ -210,9 +199,10 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
           <div className={IDENTITY_CARD_GRID_CLASS}>
             {groups.map((group) => {
               const profileAgent = pickProfileAgent(group.agents);
-              // Count relay instances for this persona's agent (if known).
-              const relayInstanceCount =
-                inventoryQuery.data?.instances.length ?? 0;
+              // Count relay instances for THIS persona from the grouped view model.
+              const personaInstances =
+                inventoryQuery.data?.byPersonaId[group.persona.id] ?? [];
+              const relayInstanceCount = personaInstances.length;
               // Card-level instances indicator id for aria-controls.
               const instancesButtonId = `instances-sheet-${group.persona.id}`;
               return (
@@ -231,9 +221,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                           aria-label={`Instances (${relayInstanceCount})`}
                           className="flex h-7 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                           id={instancesButtonId}
-                          onClick={() =>
-                            openInstancesSheet(group.persona, group.agents)
-                          }
+                          onClick={() => openInstancesSheet(group.persona)}
                           type="button"
                         >
                           <Server className="h-3.5 w-3.5" />
@@ -260,7 +248,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                         }
                         onViewInstances={
                           relayInstanceCount > 0
-                            ? (p) => openInstancesSheet(p, group.agents)
+                            ? (p) => openInstancesSheet(p)
                             : undefined
                         }
                       />
@@ -334,12 +322,9 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
       <InstancesSheet
         open={instancesSheetOpen}
         persona={instancesSheetPersona}
-        personaAgentPubkeys={instancesSheetPubkeys}
+        inventory={inventoryQuery.data}
         onOpenChange={(o) => {
-          if (!o) {
-            setInstancesSheetPersona(null);
-            setInstancesSheetPubkeys(new Set());
-          }
+          if (!o) setInstancesSheetPersona(null);
         }}
         onOpenProfile={onOpenAgentProfile}
       />

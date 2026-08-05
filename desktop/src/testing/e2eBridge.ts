@@ -366,13 +366,28 @@ type E2eConfig = {
      */
     ownedAgentInventory?: {
       archiveStateTrusted: boolean;
-      instances: Array<{
+      /** Instances grouped by persona ID. Keys are persona IDs. */
+      byPersonaId: Record<
+        string,
+        Array<{
+          pubkey: string;
+          displayName: string | null;
+          picture: string | null;
+          relayUrl: string;
+          nipIaOwnerProof: { result: string; declared_owner?: string };
+          archiveState: { isArchived: boolean | null };
+          personaId: string | null;
+        }>
+      >;
+      /** Instances with no parseable persona ID (standalone agents). */
+      unknown: Array<{
         pubkey: string;
         displayName: string | null;
         picture: string | null;
         relayUrl: string;
         nipIaOwnerProof: { result: string; declared_owner?: string };
         archiveState: { isArchived: boolean | null };
+        personaId: string | null;
       }>;
     };
     // Relay's NIP-11 `self` pubkey (hex) for `get_relay_self`. A DM whose peer
@@ -12733,7 +12748,8 @@ export function maybeInstallE2eTauriMocks() {
         return (
           activeConfig?.mock?.ownedAgentInventory ?? {
             archiveStateTrusted: true,
-            instances: [],
+            byPersonaId: {},
+            unknown: [],
           }
         );
       }

@@ -62,24 +62,29 @@ test("start-control safeguard opens Instances Sheet instead of minting when inve
     // Seed 2 active (non-archived) relay instances — mirrors the incident.
     ownedAgentInventory: {
       archiveStateTrusted: true,
-      instances: [
-        {
-          pubkey: INSTANCE_PUBKEY_A,
-          displayName: "Duncan (instance A)",
-          picture: null,
-          relayUrl: RELAY_URL,
-          nipIaOwnerProof: { result: "verified" },
-          archiveState: { isArchived: false },
-        },
-        {
-          pubkey: INSTANCE_PUBKEY_B,
-          displayName: "Duncan (instance B)",
-          picture: null,
-          relayUrl: RELAY_URL,
-          nipIaOwnerProof: { result: "verified" },
-          archiveState: { isArchived: false },
-        },
-      ],
+      byPersonaId: {
+        [PERSONA_ID]: [
+          {
+            pubkey: INSTANCE_PUBKEY_A,
+            displayName: "Duncan (instance A)",
+            picture: null,
+            relayUrl: RELAY_URL,
+            nipIaOwnerProof: { result: "verified" },
+            archiveState: { isArchived: false },
+            personaId: PERSONA_ID,
+          },
+          {
+            pubkey: INSTANCE_PUBKEY_B,
+            displayName: "Duncan (instance B)",
+            picture: null,
+            relayUrl: RELAY_URL,
+            nipIaOwnerProof: { result: "verified" },
+            archiveState: { isArchived: false },
+            personaId: PERSONA_ID,
+          },
+        ],
+      },
+      unknown: [],
     },
   });
   await gotoAgentsView(page);
@@ -114,24 +119,29 @@ test("Instances Sheet shows both relay instances when seeded", async ({
     ],
     ownedAgentInventory: {
       archiveStateTrusted: true,
-      instances: [
-        {
-          pubkey: INSTANCE_PUBKEY_A,
-          displayName: "Duncan (instance A)",
-          picture: null,
-          relayUrl: RELAY_URL,
-          nipIaOwnerProof: { result: "verified" },
-          archiveState: { isArchived: false },
-        },
-        {
-          pubkey: INSTANCE_PUBKEY_B,
-          displayName: "Duncan (instance B)",
-          picture: null,
-          relayUrl: RELAY_URL,
-          nipIaOwnerProof: { result: "verified" },
-          archiveState: { isArchived: false },
-        },
-      ],
+      byPersonaId: {
+        [PERSONA_ID]: [
+          {
+            pubkey: INSTANCE_PUBKEY_A,
+            displayName: "Duncan (instance A)",
+            picture: null,
+            relayUrl: RELAY_URL,
+            nipIaOwnerProof: { result: "verified" },
+            archiveState: { isArchived: false },
+            personaId: PERSONA_ID,
+          },
+          {
+            pubkey: INSTANCE_PUBKEY_B,
+            displayName: "Duncan (instance B)",
+            picture: null,
+            relayUrl: RELAY_URL,
+            nipIaOwnerProof: { result: "verified" },
+            archiveState: { isArchived: false },
+            personaId: PERSONA_ID,
+          },
+        ],
+      },
+      unknown: [],
     },
   });
   await gotoAgentsView(page);
@@ -168,16 +178,20 @@ test("Archive button is present for Verified instances with trusted archive stat
     ],
     ownedAgentInventory: {
       archiveStateTrusted: true,
-      instances: [
-        {
-          pubkey: INSTANCE_PUBKEY_A,
-          displayName: "Duncan (instance A)",
-          picture: null,
-          relayUrl: RELAY_URL,
-          nipIaOwnerProof: { result: "verified" },
-          archiveState: { isArchived: false },
-        },
-      ],
+      byPersonaId: {
+        [PERSONA_ID]: [
+          {
+            pubkey: INSTANCE_PUBKEY_A,
+            displayName: "Duncan (instance A)",
+            picture: null,
+            relayUrl: RELAY_URL,
+            nipIaOwnerProof: { result: "verified" },
+            archiveState: { isArchived: false },
+            personaId: PERSONA_ID,
+          },
+        ],
+      },
+      unknown: [],
     },
   });
   await gotoAgentsView(page);
@@ -212,16 +226,20 @@ test("Archive/Unarchive actions suppressed when archive state is not trusted", a
     ],
     ownedAgentInventory: {
       archiveStateTrusted: false, // untrusted snapshot
-      instances: [
-        {
-          pubkey: INSTANCE_PUBKEY_A,
-          displayName: "Duncan (instance A)",
-          picture: null,
-          relayUrl: RELAY_URL,
-          nipIaOwnerProof: { result: "verified" },
-          archiveState: { isArchived: null }, // unknown
-        },
-      ],
+      byPersonaId: {
+        [PERSONA_ID]: [
+          {
+            pubkey: INSTANCE_PUBKEY_A,
+            displayName: "Duncan (instance A)",
+            picture: null,
+            relayUrl: RELAY_URL,
+            nipIaOwnerProof: { result: "verified" },
+            archiveState: { isArchived: null }, // unknown
+            personaId: PERSONA_ID,
+          },
+        ],
+      },
+      unknown: [],
     },
   });
   await gotoAgentsView(page);
@@ -264,7 +282,8 @@ test("no-third-mint: start is intercepted when inventory is untrusted", async ({
     // rather than proceeding with start.
     ownedAgentInventory: {
       archiveStateTrusted: false,
-      instances: [],
+      byPersonaId: {},
+      unknown: [],
     },
   });
   await gotoAgentsView(page);

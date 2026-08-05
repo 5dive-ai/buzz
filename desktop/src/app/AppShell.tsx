@@ -2,6 +2,7 @@ import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
 import { deriveShellRoute, markAllReadSources } from "@/app/AppShell.helpers";
+import { errorMessage } from "@/app/AppShell.helpers";
 import { useTerminalContext } from "@/app/useTerminalContext";
 import { AppShellProvider } from "@/app/AppShellContext";
 import { AppShellOverlays, TerminalBootstrap } from "@/app/AppShellOverlays";
@@ -234,10 +235,7 @@ export function AppShell() {
     refetchHomeFeedFromLiveSignal,
   );
   const { refetch: refetchChannels } = channelsQuery;
-  const channelsErrorMessage =
-    channelsQuery.error instanceof Error
-      ? channelsQuery.error.message
-      : undefined;
+  const channelsErrorMessage = errorMessage(channelsQuery.error);
   const relayConnectionCard = useSidebarRelayConnectionCard(
     channelsErrorMessage,
     communitiesHook.activeCommunity?.relayUrl,

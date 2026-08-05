@@ -28,7 +28,7 @@ import {
   persistForcedUnread,
 } from "./readStateOverride.ts";
 import { forcedUnreadStore } from "./forcedUnreadStore.ts";
-import { resolveChannelReadMarker } from "./useUnreadChannels.ts";
+import { resolveChannelReadMarker } from "./useUnreadChannelsHelpers.ts";
 import { applyMarkUnreadDividerOverlay } from "./ui/useChannelUnreadState.ts";
 
 // ── localStorage mock ────────────────────────────────────────────────────────

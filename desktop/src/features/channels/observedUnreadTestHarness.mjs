@@ -305,9 +305,40 @@ export function seedStorage(pubkey, relay, channelId, eventId = "evt-1") {
 }
 
 /**
+ * Build a minimal Channel object suitable for passing to useUnreadChannels.
+ * Only `id` and `channelType` are required by the projection code; all other
+ * fields are filled with safe defaults.
+ */
+export function makeChannel(id, channelType = "stream") {
+  return {
+    id,
+    channelType,
+    name: id,
+    visibility: "open",
+    description: "",
+    topic: null,
+    purpose: null,
+    memberCount: 0,
+    memberPubkeys: [],
+    lastMessageAt: null,
+    archivedAt: null,
+    participants: [],
+    participantPubkeys: [],
+    isMember: true,
+    ttlSeconds: null,
+    ttlDeadline: null,
+  };
+}
+
+/**
  * Mount useUnreadChannels inside a QueryClientProvider harness.
- * Returns { markChannelRead, markAllChannelsRead, render, unmount, flushStorage }.
+ * Returns { markChannelRead, markChannelUnread, markAllChannelsRead, render,
+ *           unmount, flushStorage }.
  *
+ * @param opts.channels  - Channel array passed as the first arg to useUnreadChannels.
+ *   Defaults to [] (empty — unreadChannelIds will always be empty).
+ *   Pass makeChannel() entries to populate the projection and allow
+ *   markChannelUnread / markAllChannelsRead to enter their transition loops.
  * @param opts.relayClient - Optional duck-typed relay client. Pass the result of
  *   makeReadyRelayClient() to give the hook a load-complete NIP-RS manager.
  *   Defaults to undefined (manager unavailable — isLoadComplete: false).
@@ -316,6 +347,7 @@ export async function mountUnreadChannels({
   pubkey,
   relay = "wss://relay.example.com",
   relayClient = undefined,
+  channels = [],
 }) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -323,41 +355,48 @@ export async function mountUnreadChannels({
 
   let capturedMarkChannelRead = null;
   let capturedMarkAllChannelsRead = null;
+  let capturedMarkChannelUnread = null;
 
-  function Inner({ pubkey: pk, relayClient: rc }) {
-    const result = useUnreadChannels([], null, {
+  function Inner({ pubkey: pk, relayClient: rc, channels: chs }) {
+    const result = useUnreadChannels(chs, null, {
       pubkey: pk,
       relayClient: rc,
       relayUrl: relay,
     });
     capturedMarkChannelRead = result.markChannelRead;
     capturedMarkAllChannelsRead = result.markAllChannelsRead;
+    capturedMarkChannelUnread = result.markChannelUnread;
     return null;
   }
 
-  function Harness({ pubkey: pk, relayClient: rc }) {
+  function Harness({ pubkey: pk, relayClient: rc, channels: chs }) {
     return React.createElement(
       QueryClientProvider,
       { client: qc },
-      React.createElement(Inner, { pubkey: pk, relayClient: rc }),
+      React.createElement(Inner, {
+        pubkey: pk,
+        relayClient: rc,
+        channels: chs,
+      }),
     );
   }
 
   const container = document.createElement("div");
   const root = createRoot(container);
 
-  const render = async (pk, rc) => {
+  const render = async (pk, rc, chs) => {
     await act(async () => {
       root.render(
         React.createElement(Harness, {
           pubkey: pk,
           relayClient: rc ?? relayClient,
+          channels: chs ?? channels,
         }),
       );
     });
   };
 
-  await render(pubkey, relayClient);
+  await render(pubkey, relayClient, channels);
 
   return {
     get markChannelRead() {
@@ -365,6 +404,9 @@ export async function mountUnreadChannels({
     },
     get markAllChannelsRead() {
       return capturedMarkAllChannelsRead;
+    },
+    get markChannelUnread() {
+      return capturedMarkChannelUnread;
     },
     render,
     unmount: async () => {

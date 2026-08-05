@@ -24,12 +24,18 @@ use super::*;
 /// the captured definitions_dir so the spawn_fn can assert they arrive.
 #[tokio::test]
 async fn test_full_tail_stop_spawn_receipt_register_save() {
+    use crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK;
     use crate::managed_agents::{
         storage::save_managed_agents_at, BackendKind, ManagedAgentPairRuntime, ManagedAgentRecord,
         ManagedAgentRuntimeKey,
     };
     use std::sync::{Arc, Mutex};
     use tauri::Manager;
+
+    // Serialize generation-sensitive work across parallel tests.
+    let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let tmp = tempfile::tempdir().unwrap();
     let pubkey = "bb".repeat(32);
@@ -431,11 +437,17 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
 async fn test_relay_mesh_preflight_precedes_stop() {
     use super::super::restart_local_agent_on_config_change_for;
     use crate::commands::global_agent_config::RestartOutcome;
+    use crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK;
     use crate::managed_agents::storage::save_managed_agents_at;
     use crate::managed_agents::{
         BackendKind, ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey,
     };
     use tauri::Manager;
+
+    // Serialize generation-sensitive work across parallel tests.
+    let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let tmp = tempfile::tempdir().unwrap();
 

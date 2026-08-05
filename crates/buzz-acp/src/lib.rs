@@ -1907,7 +1907,7 @@ async fn tokio_main() -> Result<()> {
         Result(Box<PromptResult>),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
-        Wake(u32, Result<AgentPool, String>),
+        Wake(u32, Box<Result<AgentPool, String>>),
     }
 
     loop {
@@ -2060,7 +2060,7 @@ async fn tokio_main() -> Result<()> {
                     Some(PoolEvent::SteerAck(ack_event))
                 }
                 Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
-                    Some(PoolEvent::Wake(attempt, result))
+                    Some(PoolEvent::Wake(attempt, Box::new(result)))
                 }
                 // Gated on pending work: with an empty queue there is nothing
                 // for the retry to dispatch, and a past `retry_at` would
@@ -2798,6 +2798,7 @@ async fn tokio_main() -> Result<()> {
                 }
             }
             Some(PoolEvent::Wake(attempt, result)) => {
+                let result = *result;
                 let completion = result.as_ref().map(|_| ()).map_err(|error| error.clone());
                 if let Err(error) =
                     pool_lifecycle.complete_wake(attempt, result, tokio::time::Instant::now())

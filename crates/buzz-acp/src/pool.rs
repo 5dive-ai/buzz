@@ -259,10 +259,12 @@ impl OwnedAgent {
     ///
     /// Called once at first session creation after capabilities are populated.
     /// No-op when `desired_effort` is already set (live pick takes precedence,
-    /// via the pool-level value copied at checkout), when `startup_effort` is
-    /// absent, or when the adapter does not advertise a `thought_level` configId.
+    /// via the pool-level value copied at checkout), when a live pick/clear has
+    /// ever occurred (`desired_effort_gen.is_some()` — prevents resurrection of
+    /// the startup default after a user clear), when `startup_effort` is absent,
+    /// or when the adapter does not advertise a `thought_level` configId.
     pub(crate) fn resolve_startup_effort(&mut self) {
-        if self.desired_effort.is_none() {
+        if self.desired_effort.is_none() && self.desired_effort_gen.is_none() {
             if let Some(ref value) = self.startup_effort.clone() {
                 if let Some(config_id) = self
                     .model_capabilities
@@ -1459,10 +1461,19 @@ async fn create_session_and_apply_model(
         // Pending clear: the session created without an effort override, which
         // means the adapter is now running on its default. Emit the final
         // "cleared" ack so the Desktop can persist null and resolve the picker.
+        //
+        // Use the real configId from model_capabilities so awaitEffortOutcome
+        // can correlate by configId+nonce. Falls back to "effort" when the
+        // adapter has not yet populated capabilities (pre-discovery clear).
+        let cleared_config_id = agent
+            .model_capabilities
+            .as_ref()
+            .and_then(|c| c.thought_level_config_id.as_deref())
+            .unwrap_or("effort");
         agent.last_effort_result = Some(EffortApplicationResult::Cleared);
         let mut cleared_ack = serde_json::json!({
             "type": "set_config_option",
-            "configId": "effort",
+            "configId": cleared_config_id,
             "value": "",
             "status": "cleared",
             "category": "thought_level",
@@ -7896,6 +7907,25 @@ mod effort_tests {
         assert!(
             agent.desired_effort.is_none(),
             "desired_effort must stay None when adapter does not advertise thought_level"
+        );
+    }
+
+    /// `resolve_startup_effort` is a no-op when `desired_effort_gen` is `Some`,
+    /// which signals that a live pick or clear has already occurred. This prevents
+    /// the startup default from resurrecting a value the user explicitly cleared.
+    ///
+    /// Without this guard: user clears → pool.desired_effort=None, gen=Some(N) →
+    /// session creates, resolve_startup_effort re-arms Some(old) → applies old
+    /// value, emits ok with the clear's nonce → observer persists old over the clear.
+    #[tokio::test]
+    async fn test_resolve_startup_effort_noop_after_live_clear_gen_is_some() {
+        let mut agent = make_agent_for_startup_effort(Some("high"), Some("tlevel-id"), None).await;
+        // Simulate post-clear checkout: desired_effort=None, gen=Some (a clear occurred)
+        agent.desired_effort_gen = Some(3);
+        agent.resolve_startup_effort();
+        assert!(
+            agent.desired_effort.is_none(),
+            "resolve_startup_effort must not re-arm after a live clear (gen is Some)"
         );
     }
 

@@ -6,7 +6,7 @@
 use super::operations::insert_operation;
 use super::{
     apply_journal_schema_pub, file_commit_recovery_at_pub, insert_outbox_event, open_journal,
-    run_boot_recovery_at, run_recovery_gate, Generation,
+    reject_if_recovery_failed, run_boot_recovery_at, run_recovery_gate, Generation,
 };
 use crate::managed_agents::retention::{
     get_pending_sync, open_retention_db, tombstone_retention_d_tag,
@@ -840,31 +840,27 @@ fn v2_journal() -> rusqlite::Connection {
     conn
 }
 
+/// Helper: returns column names of `table` via `PRAGMA table_info`.
+fn table_cols(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    stmt.query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
 /// Fix B: upgrade from v2 (no hash columns, no d-tag) adds all three columns
 /// and stamps version 4.
 #[test]
 fn test_schema_migration_from_v2_adds_all_columns() {
     let conn = v2_journal();
     apply_journal_schema_pub(&conn).unwrap();
-    // All three columns must exist after migration.
-    let fcp_cols: Vec<String> = {
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(file_commit_phases)")
-            .unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    };
+    let fcp_cols = table_cols(&conn, "file_commit_phases");
     assert!(fcp_cols.contains(&"agents_content_hash".to_string()));
     assert!(fcp_cols.contains(&"teams_content_hash".to_string()));
-    let oe_cols: Vec<String> = {
-        let mut stmt = conn.prepare("PRAGMA table_info(outbox_events)").unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    };
+    let oe_cols = table_cols(&conn, "outbox_events");
     assert!(oe_cols.contains(&"retention_d_tag".to_string()));
     let ver: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -887,13 +883,7 @@ fn test_schema_migration_from_partial_v3_adds_missing_d_tag() {
     )
     .unwrap();
     apply_journal_schema_pub(&conn).unwrap();
-    let oe_cols: Vec<String> = {
-        let mut stmt = conn.prepare("PRAGMA table_info(outbox_events)").unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    };
+    let oe_cols = table_cols(&conn, "outbox_events");
     assert!(
         oe_cols.contains(&"retention_d_tag".to_string()),
         "d-tag must be added from partial v3"
@@ -944,24 +934,10 @@ fn test_schema_migration_failure_does_not_advance_version() {
     apply_journal_schema_pub(&conn).unwrap();
 
     // All three columns must be present and version must reach 4.
-    let fcp_cols: Vec<String> = {
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(file_commit_phases)")
-            .unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    };
+    let fcp_cols = table_cols(&conn, "file_commit_phases");
     assert!(fcp_cols.contains(&"agents_content_hash".to_string()));
     assert!(fcp_cols.contains(&"teams_content_hash".to_string()));
-    let oe_cols: Vec<String> = {
-        let mut stmt = conn.prepare("PRAGMA table_info(outbox_events)").unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    };
+    let oe_cols = table_cols(&conn, "outbox_events");
     assert!(oe_cols.contains(&"retention_d_tag".to_string()));
     let ver2: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -986,4 +962,32 @@ fn test_schema_migration_idempotent_on_v4() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(ver2, 4);
+}
+
+// ── Round-13: admission-guard unit tests ─────────────────────────────────────
+
+/// GAP A: `reject_if_recovery_failed` returns `Ok` when the flag is clear.
+#[test]
+fn test_reject_if_recovery_failed_clear_returns_ok() {
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        reject_if_recovery_failed(&flag).is_ok(),
+        "must return Ok when store_recovery_failed is false"
+    );
+}
+
+/// GAP A: `reject_if_recovery_failed` returns `Err` when the flag is set,
+/// proving the admission guard closes the mutation path on recovery failure.
+#[test]
+fn test_reject_if_recovery_failed_set_returns_err() {
+    let flag = std::sync::atomic::AtomicBool::new(true);
+    let result = reject_if_recovery_failed(&flag);
+    assert!(
+        result.is_err(),
+        "must return Err when store_recovery_failed is true"
+    );
+    assert!(
+        result.unwrap_err().contains("relaunch to retry"),
+        "error message must mention relaunch"
+    );
 }

@@ -120,6 +120,24 @@ where
     store_work()
 }
 
+/// Reject a store mutation when the boot recovery flag is set.
+///
+/// Extracted for direct unit testing — `mutate_store` delegates to this
+/// function so the admission guard is testable without a full AppHandle.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn reject_if_recovery_failed(
+    flag: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    if flag.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(
+            "store mutation rejected: boot file-commit recovery failed; \
+             relaunch to retry"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Mutate the store under the full lock sequence.
 ///
 /// The closure runs inside a real `rusqlite::Transaction` — if it returns
@@ -142,17 +160,8 @@ where
 {
     // Guard: a boot recovery failure means the store is in an uncertain state.
     // Reject all mutations until the user relaunches and recovery succeeds.
-    {
-        use std::sync::atomic::Ordering;
-        let state = app.state::<crate::app_state::AppState>();
-        if state.store_recovery_failed.load(Ordering::Acquire) {
-            return Err(
-                "store mutation rejected: boot file-commit recovery failed; \
-                 relaunch to retry"
-                    .to_string(),
-            );
-        }
-    }
+    let state = app.state::<crate::app_state::AppState>();
+    reject_if_recovery_failed(&state.store_recovery_failed)?;
 
     let anchor = store_anchor_dir(app)?;
     std::fs::create_dir_all(&anchor).map_err(|e| format!("create anchor dir: {e}"))?;

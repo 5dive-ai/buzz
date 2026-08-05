@@ -62,7 +62,7 @@ use huddle::{
     start_huddle, start_stt_pipeline, HuddlePhase,
 };
 use initial_window::*;
-use managed_agents::store_journal::{run_recovery_gate, store_anchor_dir};
+use managed_agents::store_journal::run_boot_recovery_gate;
 use managed_agents::{
     backfill_persona_snapshots, ensure_nest, list_managed_agent_runtimes,
     put_managed_agent_runtime_lifecycle, reconcile_managed_agent_runtimes,
@@ -341,27 +341,14 @@ pub fn run() {
                 return Ok(());
             }
 
-            // run_recovery_gate: file-commit recovery before migrations; fail closed.
+            // Pre-admission recovery gate: file-commit recovery runs here —
+            // before migrations, backfill, and every canonical-store reader/writer.
+            // Fails closed: anchor error, unresolved commits, or migration error
+            // all set store_recovery_failed and skip all store-touching setup.
             {
                 let state = app_handle.state::<AppState>();
-                let anchor = store_anchor_dir(&app_handle).unwrap_or_else(|_| {
-                    app_handle
-                        .path()
-                        .app_data_dir()
-                        .unwrap_or_default()
-                        .join("agents")
-                });
-                let _ = std::fs::create_dir_all(&anchor);
-                let reset_done = reset_outcome.completed;
-                if let Err(e) = run_recovery_gate(&anchor, || {
-                    if reset_done {
-                        migration::run_boot_migrations_after_reset(&app_handle);
-                    } else {
-                        migration::run_boot_migrations(&app_handle);
-                    }
-                    Ok(())
-                }) {
-                    eprintln!("buzz-desktop: file-commit-recovery: {e}");
+                if let Err(e) = run_boot_recovery_gate(&app_handle, reset_outcome.completed) {
+                    eprintln!("buzz-desktop: boot-recovery-gate: {e}");
                     state.store_recovery_failed.store(true, Ordering::Release);
                     return Ok(());
                 }

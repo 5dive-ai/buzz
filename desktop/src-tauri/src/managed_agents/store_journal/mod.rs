@@ -20,6 +20,7 @@
 //! writers, sign-out/reset races, or concurrent bundles.
 
 mod anchor;
+mod boot;
 mod codec;
 mod events;
 mod generations;
@@ -35,6 +36,8 @@ mod writer;
 #[cfg(test)]
 pub use anchor::canonical_dev_anchor_pub;
 pub use anchor::store_anchor_dir;
+
+pub use boot::run_boot_recovery_gate;
 
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -67,7 +70,9 @@ pub use txn::{
 };
 #[cfg(test)]
 #[allow(unused_imports)]
-pub(crate) use txn::{file_commit_recovery_at_pub, read_store, run_boot_recovery_at};
+pub(crate) use txn::{
+    file_commit_recovery_at_pub, read_store, reject_if_recovery_failed, run_boot_recovery_at,
+};
 
 pub use util::new_operation_id;
 

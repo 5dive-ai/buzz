@@ -21,17 +21,52 @@ const PERSONA_SYNC_KINDS = [
   KIND_PRIVATE_MANAGED_AGENT,
   KIND_DELETION,
 ];
+const COMPATIBILITY_SYNC_KINDS = [
+  KIND_PERSONA,
+  KIND_TEAM,
+  KIND_MANAGED_AGENT,
+  KIND_DELETION,
+];
+const HYDRATION_PAGE_SIZE = 1_000;
+
+async function fetchAllPersonaSyncEvents(
+  pubkey: string,
+  kinds: number[],
+): Promise<RelayEvent[]> {
+  const byId = new Map<string, RelayEvent>();
+  let until: number | undefined;
+  while (true) {
+    const page = await relayClient.fetchEvents({
+      kinds,
+      authors: [pubkey],
+      limit: HYDRATION_PAGE_SIZE,
+      ...(until === undefined ? {} : { until }),
+    });
+    const sizeBefore = byId.size;
+    let oldestCreatedAt = Number.POSITIVE_INFINITY;
+    for (const event of page) {
+      byId.set(event.id, event);
+      oldestCreatedAt = Math.min(oldestCreatedAt, event.created_at);
+    }
+    if (page.length < HYDRATION_PAGE_SIZE || byId.size === sizeBefore) break;
+    until = oldestCreatedAt;
+  }
+  return [...byId.values()];
+}
 
 export async function hydratePersonaSync(
   pubkey: string,
   relayUrl: string,
   onCancelled: () => boolean = () => false,
 ): Promise<void> {
-  const events = await relayClient.fetchEvents({
-    kinds: PERSONA_SYNC_KINDS,
-    authors: [pubkey],
-    limit: 500,
-  });
+  // Keep PMA heads in their own writer-backed REQ. They must neither compete
+  // with compatibility events for one LIMIT nor come from a stale replica when
+  // Welcome provisioning uses the result to decide whether to mint an identity.
+  const [privateHeads, compatibilityEvents] = await Promise.all([
+    fetchAllPersonaSyncEvents(pubkey, [KIND_PRIVATE_MANAGED_AGENT]),
+    fetchAllPersonaSyncEvents(pubkey, COMPATIBILITY_SYNC_KINDS),
+  ]);
+  const events = [...privateHeads, ...compatibilityEvents];
   for (const event of events) {
     if (onCancelled()) return;
     if (event.pubkey !== pubkey) continue;

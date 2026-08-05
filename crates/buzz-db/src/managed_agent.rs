@@ -18,8 +18,10 @@ pub struct AggregateRequest {
     pub definition_event: Option<Event>,
     /// Signed kind:30177 candidate, required for active heads.
     pub instance_event: Option<Event>,
-    /// Revision already embedded in the encrypted active payload. Required for
-    /// active heads and rejected unless it matches the locked definition head.
+    /// Caller-supplied cleartext revision expected for the active definition.
+    /// The relay cannot inspect the encrypted payload; it CAS-checks this value
+    /// against the locked definition head, while Desktop verifies the encrypted
+    /// binding after writer-consistent read-back.
     pub expected_definition_revision: Option<u64>,
 }
 

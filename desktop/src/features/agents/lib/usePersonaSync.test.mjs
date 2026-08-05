@@ -39,17 +39,21 @@ test("startPersonaSync backfills history including the deletion kind", () => {
 
   startPersonaSync("owner-pubkey", "wss://relay.example", () => false);
 
-  assert.equal(fetchCalls.length, 1, "must do exactly one backfill fetch");
+  assert.equal(
+    fetchCalls.length,
+    2,
+    "PMA heads need a dedicated backfill fetch",
+  );
+  assert.deepEqual(fetchCalls[0].kinds, [KIND_PRIVATE_MANAGED_AGENT]);
   assert.deepEqual(
-    fetchCalls[0].kinds,
-    EXPECTED_KINDS,
-    "backfill must cover persona/team/agent + deletion",
+    fetchCalls[1].kinds,
+    [KIND_PERSONA, KIND_TEAM, KIND_MANAGED_AGENT, KIND_DELETION],
+    "compatibility backfill must cover persona/team/agent + deletion",
   );
-  assert.ok(
-    fetchCalls[0].limit > 0,
-    "backfill must request a positive limit — limit:0 returns no history",
-  );
-  assert.deepEqual(fetchCalls[0].authors, ["owner-pubkey"]);
+  for (const call of fetchCalls) {
+    assert.ok(call.limit > 0, "backfill must request a positive limit");
+    assert.deepEqual(call.authors, ["owner-pubkey"]);
+  }
 
   assert.equal(liveCalls.length, 1);
   assert.deepEqual(
@@ -81,9 +85,11 @@ test("startPersonaSync forwards its own relay as the event arrival relay", async
   const ownEvent = { id: "e1", pubkey: "owner-pubkey", kind: KIND_PERSONA };
   const foreignEvent = { id: "e2", pubkey: "someone-else", kind: KIND_PERSONA };
 
-  mock.method(relayClient, "fetchEvents", () =>
-    Promise.resolve([ownEvent, foreignEvent]),
-  );
+  let fetchIndex = 0;
+  mock.method(relayClient, "fetchEvents", () => {
+    fetchIndex += 1;
+    return Promise.resolve(fetchIndex === 1 ? [ownEvent, foreignEvent] : []);
+  });
   mock.method(relayClient, "subscribeLive", () =>
     Promise.resolve(() => Promise.resolve()),
   );

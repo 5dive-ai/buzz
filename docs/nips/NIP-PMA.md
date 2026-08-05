@@ -4,6 +4,11 @@
 privacy, transactional CAS, backup/restore, revocation, and capability gates are
 deployed.
 
+> **Deployment:** the foundation migration is maintenance-window-only on an
+> existing relay. Replacing `events.search_tsv` takes an `ACCESS EXCLUSIVE`
+> lock, rewrites the table, and rebuilds its GIN index; do not run it as part of
+> a rolling deployment.
+
 ## Purpose and kind
 
 Kind `30179` is an owner-authored, addressable, owner-readable aggregate for one

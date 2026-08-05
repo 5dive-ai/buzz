@@ -264,7 +264,7 @@ pub async fn handle_req(
     let mut total_sent: usize = 0;
 
     // Phase 1 — pure query construction, in filter order.
-    let filter_queries: Vec<(usize, Option<uuid::Uuid>, EventQuery)> = filters
+    let filter_queries: Vec<(usize, Option<uuid::Uuid>, EventQuery, bool)> = filters
         .iter()
         .enumerate()
         .map(|(idx, filter)| {
@@ -301,7 +301,12 @@ pub async fn handle_req(
             if filter_can_match_shared_gated_kinds(filter) {
                 params.shared_gated_reader = Some(pubkey_bytes.clone());
             }
-            (idx, per_filter_channel, params)
+            (
+                idx,
+                per_filter_channel,
+                params,
+                filter_requires_writer(filter),
+            )
         })
         .collect();
 
@@ -312,10 +317,14 @@ pub async fn handle_req(
     use futures_util::stream::{self, StreamExt};
     let db = state.db.clone();
     let mut results = stream::iter(filter_queries.into_iter().map(
-        |(idx, per_filter_channel, params)| {
+        |(idx, per_filter_channel, params, requires_writer)| {
             let db = db.clone();
             async move {
-                let filter_events = db.query_events_routed("req_historical", &params).await;
+                let filter_events = if requires_writer {
+                    db.query_events(&params).await
+                } else {
+                    db.query_events_routed("req_historical", &params).await
+                };
                 (idx, per_filter_channel, filter_events)
             }
         },
@@ -1160,6 +1169,13 @@ pub(crate) fn engram_filters_authorized(filters: &[Filter], authed_pubkey_hex: &
 /// Used by the COUNT handler to force the fallback path (per-event filtering)
 /// instead of the fast `count_events()` which cannot exclude other authors'
 /// author-only events from the aggregate count.
+fn filter_requires_writer(filter: &Filter) -> bool {
+    filter
+        .kinds
+        .as_ref()
+        .is_some_and(|kinds| !kinds.is_empty() && kinds.iter().all(|kind| kind.as_u16() == 30179))
+}
+
 pub(crate) fn filter_can_match_author_only_kinds(filter: &Filter) -> bool {
     filter.kinds.as_ref().is_none_or(|ks| {
         ks.iter()
@@ -1867,6 +1883,10 @@ mod tests {
         assert!(filter_can_match_author_only_kinds(&mixed));
         assert!(filter_can_match_author_only_kinds(&kindless));
         assert!(!filter_can_match_author_only_kinds(&public_only));
+        assert!(filter_requires_writer(&explicit));
+        assert!(!filter_requires_writer(&mixed));
+        assert!(!filter_requires_writer(&kindless));
+        assert!(!filter_requires_writer(&public_only));
     }
 
     #[test]

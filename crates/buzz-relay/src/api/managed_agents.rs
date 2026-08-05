@@ -118,7 +118,17 @@ pub async fn submit_aggregate(
             })?;
     }
     let owner_hex = owner.to_hex();
-    for stored in &commit.events {
+    let retry_private_event;
+    let dispatch_events: &[buzz_core::StoredEvent] = if commit.inserted {
+        &commit.events
+    } else {
+        // A tombstone may have committed before disconnect propagation failed.
+        // Its exact retry must fan the durable head out again after repairing
+        // that propagation; otherwise live Desktop sessions never learn it.
+        retry_private_event = buzz_core::StoredEvent::new(commit.private_event.clone(), None);
+        std::slice::from_ref(&retry_private_event)
+    };
+    for stored in dispatch_events {
         crate::handlers::event::dispatch_persistent_event(
             &tenant,
             &state,

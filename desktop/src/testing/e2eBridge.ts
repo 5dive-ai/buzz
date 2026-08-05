@@ -358,6 +358,23 @@ type E2eConfig = {
     // - `resolve_oa_owner` (oaOwnerIsMe)
     // - `resetMockRelayMembers` (relayRole)
     archivedIdentities?: string[];
+    /**
+     * Snapshot returned by `get_owned_agent_inventory`. Drives the
+     * Instances Sheet content and start-control safeguard in
+     * tests/e2e/agent-instances-sheet.spec.ts.
+     * Omitted → empty snapshot with archive state trusted.
+     */
+    ownedAgentInventory?: {
+      archiveStateTrusted: boolean;
+      instances: Array<{
+        pubkey: string;
+        displayName: string | null;
+        picture: string | null;
+        relayUrl: string;
+        nipIaOwnerProof: { result: string; declared_owner?: string };
+        archiveState: { isArchived: boolean | null };
+      }>;
+    };
     // Relay's NIP-11 `self` pubkey (hex) for `get_relay_self`. A DM whose peer
     // equals this is treated as a moderation DM (composer disabled). Absent →
     // fail open (no mod-DM detection), matching the Rust command's contract.
@@ -12711,6 +12728,14 @@ export function maybeInstallE2eTauriMocks() {
       case "list_archived_identities": {
         const archived = activeConfig?.mock?.archivedIdentities ?? [];
         return { archived };
+      }
+      case "get_owned_agent_inventory": {
+        return (
+          activeConfig?.mock?.ownedAgentInventory ?? {
+            archiveStateTrusted: true,
+            instances: [],
+          }
+        );
       }
       case "get_relay_self":
         if ((activeConfig?.mock?.relaySelfDelayMs ?? 0) > 0) {

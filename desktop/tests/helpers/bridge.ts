@@ -317,6 +317,23 @@ type MockBridgeOptions = {
    */
   archivedIdentities?: string[];
   /**
+   * Snapshot returned by `get_owned_agent_inventory`. Drives the Instances
+   * Sheet content and start-control safeguard in
+   * `tests/e2e/agent-instances-sheet.spec.ts`.
+   * Omitted → empty snapshot with archive state trusted.
+   */
+  ownedAgentInventory?: {
+    archiveStateTrusted: boolean;
+    instances: Array<{
+      pubkey: string;
+      displayName: string | null;
+      picture: string | null;
+      relayUrl: string;
+      nipIaOwnerProof: { result: string; declared_owner?: string };
+      archiveState: { isArchived: boolean | null };
+    }>;
+  };
+  /**
    * Drives the `is_me` field of `resolve_oa_owner`. When true, the harness
    * reports the active identity as the verified NIP-OA owner of the viewee
    * (owner-path branch of the gate).

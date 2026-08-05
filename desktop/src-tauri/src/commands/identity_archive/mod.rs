@@ -347,7 +347,7 @@ pub struct ArchivedIdentitiesSnapshot {
 }
 
 #[derive(Debug, Deserialize)]
-struct RelayInformationDocument {
+pub(crate) struct RelayInformationDocument {
     #[serde(default, rename = "self")]
     self_: Option<String>,
 }

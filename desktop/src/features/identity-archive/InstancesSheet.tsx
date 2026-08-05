@@ -234,7 +234,7 @@ export function InstancesSheet({
   return (
     <>
       <Sheet open={open} onOpenChange={onOpenChange}>
-        <SheetContent side="right">
+        <SheetContent data-testid="instances-sheet" side="right">
           <SheetHeader>
             <SheetTitle className="flex items-center gap-2">
               <Server className="h-4 w-4" />

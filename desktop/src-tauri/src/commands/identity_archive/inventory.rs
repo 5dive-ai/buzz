@@ -11,12 +11,14 @@ use serde::Serialize;
 use crate::{
     app_state::{AppState, ArchiveScope},
     relay::{
-        query_relay, query_relay_at_with_keys, relay_http_base_url, relay_ws_url_with_override,
+        classify_request_error, query_relay_at, query_relay_at_with_keys, relay_api_base_url,
+        relay_http_base_url,
     },
 };
 
 use super::{
-    archived_pubkeys_from_snapshot, classify_nip_ia_owner_proof, fetch_relay_self, NipIaOwnerProof,
+    archived_pubkeys_from_snapshot, classify_nip_ia_owner_proof, NipIaOwnerProof,
+    RelayInformationDocument,
 };
 
 // ── Model ────────────────────────────────────────────────────────────────────
@@ -222,34 +224,65 @@ async fn fetch_and_verify_kind0(
 // ── Archive snapshot loader ───────────────────────────────────────────────
 
 /// Load the relay's `kind:13535` archive snapshot for the tri-state join.
-async fn load_archive_snapshot(state: &AppState) -> (bool, HashSet<String>) {
-    match fetch_relay_self(state).await {
-        Err(_) | Ok(None) => (false, HashSet::new()),
-        Ok(Some(relay_self)) => {
-            let snaps = query_relay(
-                state,
-                &[serde_json::json!({
-                    "authors": [relay_self.clone()],
-                    "kinds": [13535u32],
-                    "limit": 1,
-                })],
-            )
+/// Uses the pre-scoped `api_base_url` so it queries the same relay instance
+/// captured by `capture_archive_scope` — no separate state read.
+async fn load_archive_snapshot(state: &AppState, api_base_url: &str) -> (bool, HashSet<String>) {
+    // Fetch the NIP-11 relay-information document at the scoped URL.
+    let relay_self: Option<String> = async {
+        let response = state
+            .http_client
+            .get(api_base_url)
+            .header("Accept", "application/nostr+json")
+            .send()
             .await
-            .unwrap_or_default();
-            match snaps.into_iter().next() {
-                None => (true, HashSet::new()),
-                Some(snap) => {
-                    if !snap.verify_id()
-                        || !snap.verify_signature()
-                        || !snap.pubkey.to_hex().eq_ignore_ascii_case(&relay_self)
-                    {
-                        (false, HashSet::new())
-                    } else {
-                        let set: HashSet<String> =
-                            archived_pubkeys_from_snapshot(&snap).into_iter().collect();
-                        (true, set)
-                    }
-                }
+            .map_err(|e| classify_request_error(&e))?;
+        if !response.status().is_success() {
+            return Ok::<_, String>(None);
+        }
+        let doc = response
+            .json::<RelayInformationDocument>()
+            .await
+            .map_err(|_| "relay returned malformed NIP-11 document".to_string())?;
+        let Some(s) = doc.self_.map(|v| v.to_ascii_lowercase()) else {
+            return Ok(None);
+        };
+        if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            Ok(Some(s))
+        } else {
+            Ok(None)
+        }
+    }
+    .await
+    .unwrap_or(None);
+
+    let Some(relay_self) = relay_self else {
+        return (false, HashSet::new());
+    };
+
+    let snaps = query_relay_at(
+        state,
+        api_base_url,
+        &[serde_json::json!({
+            "authors": [relay_self.clone()],
+            "kinds": [13535u32],
+            "limit": 1,
+        })],
+    )
+    .await
+    .unwrap_or_default();
+
+    match snaps.into_iter().next() {
+        None => (true, HashSet::new()),
+        Some(snap) => {
+            if !snap.verify_id()
+                || !snap.verify_signature()
+                || !snap.pubkey.to_hex().eq_ignore_ascii_case(&relay_self)
+            {
+                (false, HashSet::new())
+            } else {
+                let set: HashSet<String> =
+                    archived_pubkeys_from_snapshot(&snap).into_iter().collect();
+                (true, set)
             }
         }
     }
@@ -286,11 +319,15 @@ pub async fn get_owned_agent_inventory(
     state: tauri::State<'_, AppState>,
 ) -> Result<OwnedAgentInventorySnapshot, String> {
     let scope = state.capture_archive_scope(8)?;
-    let relay_url = relay_ws_url_with_override(&state);
-    let api_base_url = relay_http_base_url(&relay_url);
+    // Derive the API base URL from the epoch-captured scope — same pattern as
+    // `scoped_archive_operation`. Never re-reads state.relay_url_override.
+    let api_base_url = match &scope.relay_url_override {
+        Some(url) => relay_http_base_url(url),
+        None => relay_api_base_url(),
+    };
 
     let owned_events = fetch_all_owned_30177(&state, &scope, &api_base_url).await?;
-    let (archive_state_trusted, archived_set) = load_archive_snapshot(&state).await;
+    let (archive_state_trusted, archived_set) = load_archive_snapshot(&state, &api_base_url).await;
 
     let mut instances = Vec::with_capacity(owned_events.len());
     for ev in owned_events {

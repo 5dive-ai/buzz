@@ -1,25 +1,26 @@
 import type { useSidebarRelayConnectionCard } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
 import { SidebarRelayConnectionCard } from "@/features/sidebar/ui/SidebarRelayConnectionCard";
 import { SidebarUpdateCard } from "@/features/settings/SidebarUpdateCard";
-import { SidebarMeshComputeCard } from "@/features/mesh-compute/ui/SidebarMeshComputeCard";
 
 /**
  * The stack of transient cards above the sidebar profile row.
  *
- * Extracted from `AppSidebar.tsx` because that file sits exactly at the
- * 1000-line ceiling enforced by `desktop/scripts/check-file-sizes.mjs` — there
- * was no room to add another card inline, and this is a self-contained concern.
+ * Extracted from `AppSidebar.tsx` because that file sits at the 1000-line
+ * ceiling enforced by `desktop/scripts/check-file-sizes.mjs`, and this is a
+ * self-contained concern.
  *
  * Ordering is a priority queue, most urgent first: a broken relay connection
- * outranks an available update, which outranks the shared-compute card. Each
- * card is individually responsible for rendering nothing when it has nothing to
- * say, so the footer does not become permanent clutter.
+ * outranks an available update. Each card renders nothing when it has nothing
+ * to say, so the footer does not become permanent clutter.
+ *
+ * Shared compute used to live here as a third card. It moved to a one-line row
+ * under Agents (`SidebarMeshComputeRow`) because a persistent ~120px card is
+ * the wrong price for a state that is usually "on and fine".
  */
 export function SidebarFooterNotices({
   expanded,
   onDismissRelayConnectionCard,
   onDismissUpdateCard,
-  onOpenComputeSettings,
   onReconnectRelay,
   relayConnectionCard,
   showUpdateCard,
@@ -28,7 +29,6 @@ export function SidebarFooterNotices({
   expanded: boolean;
   onDismissRelayConnectionCard: () => void;
   onDismissUpdateCard: () => void;
-  onOpenComputeSettings: () => void;
   onReconnectRelay: () => void;
   relayConnectionCard: ReturnType<typeof useSidebarRelayConnectionCard>;
   showUpdateCard: boolean;
@@ -52,17 +52,6 @@ export function SidebarFooterNotices({
           <SidebarUpdateCard onDismiss={onDismissUpdateCard} />
         </div>
       ) : null}
-      {/*
-        Yield to the cards above: a relay problem or a pending update is more
-        urgent than an invitation to share compute.
-      */}
-      {relayConnectionCard.showSidebarRelayConnectionCard ||
-      showUpdateCard ? null : (
-        <SidebarMeshComputeCard
-          className="mb-2"
-          onOpenComputeSettings={onOpenComputeSettings}
-        />
-      )}
     </>
   );
 }

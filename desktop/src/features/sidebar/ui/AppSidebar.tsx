@@ -606,6 +606,7 @@ export function AppSidebar({
             >
               <AppSidebarPrimaryMenu
                 homeBadgeCount={homeBadgeCount}
+                onOpenComputeSettings={() => onSelectSettings("compute")}
                 onSelectAgents={onSelectAgents}
                 onSelectHome={onSelectHome}
                 onSelectProjects={onSelectProjects}
@@ -873,7 +874,6 @@ export function AppSidebar({
                 relayConnectionCard.onDismissRelayConnectionCard
               }
               onDismissUpdateCard={() => setIsSidebarUpdateCardDismissed(true)}
-              onOpenComputeSettings={() => onSelectSettings("compute")}
               onReconnectRelay={relayConnectionCard.onReconnectRelay}
               relayConnectionCard={relayConnectionCard}
               showUpdateCard={showSidebarUpdateCard}

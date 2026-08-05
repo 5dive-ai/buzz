@@ -64,7 +64,7 @@ export function formatCapacityGb(gb: number): string {
   return `${rounded} GB`;
 }
 
-function plural(n: number, one: string, many = `${one}s`): string {
+export function plural(n: number, one: string, many = `${one}s`): string {
   return n === 1 ? one : many;
 }
 

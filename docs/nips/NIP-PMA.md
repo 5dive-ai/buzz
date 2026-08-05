@@ -117,9 +117,9 @@ adopting generic LWW history as an untracked revision. Deleted `30177` instance
 coordinates remain fenced by their deleted aggregate head, so neither ordinary
 writes nor legacy kind `5` deletion can bypass generation CAS.
 
-## Deployment note: migration 0028
+## Deployment note: migration 0029
 
-`0028_private_managed_agent_foundation.sql` changes `events.search_tsv` by
+`0029_private_managed_agent_foundation.sql` changes `events.search_tsv` by
 dropping and re-adding the generated stored column, then rebuilding its GIN
 index. PostgreSQL performs a full `events` table rewrite while holding an
 `ACCESS EXCLUSIVE` lock. Operators MUST treat this as planned write downtime,

@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 28);
+        assert_eq!(migrations.len(), 29);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -919,7 +919,6 @@ mod tests {
         assert!(heartbeat.contains("epoch"));
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
-
         // Channel-id lookup index (0027): serves the tenant-independent
         // `channels` lookups that carry no community_id predicate, which no
         // community_id-leading index can satisfy. Covering + partial so the
@@ -941,11 +940,19 @@ mod tests {
             "desired-state schema must carry the channel-id lookup index",
         );
 
+        // Long reactions expand to the normalized shortcode ceiling.
+        assert_eq!(migrations[27].version, 28);
+        let long_reactions = migrations[27].sql.as_str();
+        assert!(
+            long_reactions.contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
+        );
+        assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
+
         // Private managed-agent ciphertext is author-only and must remain
         // unsearchable on brownfield databases without changing 0001's sqlx
-        // checksum. Migration 0028 also installs the relay authority tables.
-        assert_eq!(migrations[27].version, 28);
-        let private_managed_agent = migrations[27].sql.as_str();
+        // checksum. Migration 0029 also installs the relay authority tables.
+        assert_eq!(migrations[28].version, 29);
+        let private_managed_agent = migrations[28].sql.as_str();
         assert!(private_managed_agent.contains("CREATE TABLE managed_agent_heads"));
         assert!(private_managed_agent.contains("CREATE TABLE managed_agent_revisions"));
         assert!(private_managed_agent.contains("kind = 30179"));

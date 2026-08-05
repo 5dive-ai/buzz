@@ -104,7 +104,7 @@ async function measureThreadSummaryGeometry(summaryRow: Locator) {
 }
 
 test.beforeEach(async ({ page }, testInfo) => {
-  const mock = testInfo.title.includes("agent owner label")
+  const baseMock = testInfo.title.includes("agent owner label")
     ? {
         searchProfiles: [
           {
@@ -232,6 +232,9 @@ test.beforeEach(async ({ page }, testInfo) => {
                         : undefined,
                     }
                   : undefined;
+  const mock = testInfo.title.includes("unresolvable preview")
+    ? { linkPreviewMetadata: null, linkPreviewMetadataDelayMs: 150 }
+    : baseMock;
   await installMockBridge(page, mock);
 });
 
@@ -584,6 +587,27 @@ test("completed link previews send when one URL has an unsnapshotable fragment",
       calls[0]?.payload as { linkPreviewTags?: string[][] | null } | undefined
     )?.linkPreviewTags?.map((tag) => tag[3]),
   ).toEqual(previewUrls.slice(0, 2));
+});
+
+test("unresolvable preview disappears after the terminal miss", async ({
+  page,
+}) => {
+  const previewUrl = "https://x.com/tellaho/status";
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page.getByTestId("message-input").fill(previewUrl);
+
+  const composerPreviews = page.locator("[data-composer-link-previews]");
+  await expect(composerPreviews).toBeVisible();
+  await expect(
+    composerPreviews.locator("[data-link-preview-composer-card]"),
+  ).toHaveAttribute("data-image-state", "pending");
+  await expect(composerPreviews).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  const row = page.getByTestId("message-row").last();
+  await expect(row).toContainText(previewUrl);
+  await expect(row.locator("[data-link-preview]")).toHaveCount(0);
 });
 
 test("send does not wait for a pending link preview snapshot", async ({

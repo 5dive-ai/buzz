@@ -376,12 +376,10 @@ export function useResolvedLinkPreviews(
 
   return React.useMemo(
     () =>
-      previews.map((preview) =>
-        resolveLinkPreview(
-          preview,
-          resolvedMetadata[metadataCacheKey(preview.href)],
-        ),
-      ),
+      previews.flatMap((preview) => {
+        const metadata = resolvedMetadata[metadataCacheKey(preview.href)];
+        return metadata === null ? [] : [resolveLinkPreview(preview, metadata)];
+      }),
     [previews, resolvedMetadata],
   );
 }

@@ -252,6 +252,61 @@ const REST_RETRY_BASE_DELAYS: [Duration; 3] = [
     Duration::from_millis(2000),
 ];
 
+/// Upper bound on a REST retry sleep honouring a relay `retry in {N}s` hint.
+///
+/// The ladder's own rungs top out at 2s, far below the relay's 60s quota
+/// window, so a hint must be allowed to exceed them or honouring it is
+/// pointless. The cap exists only to bound a pathological hint; it sits above
+/// the longest window so a legitimate hint is never truncated into it. The
+/// `const` assertion pins that property rather than the literal.
+const REST_RETRY_HINT_MAX: Duration = Duration::from_secs(90);
+const _: () = assert!(
+    REST_RETRY_HINT_MAX.as_secs() >= 60,
+    "the hint cap must outlast the relay's longest quota window, or a client \
+     told to wait out a 60s window wakes inside it and is denied again"
+);
+
+/// The delay before the next REST attempt.
+///
+/// `hint_secs` is the relay's parsed `retry in {N}s` value when the previous
+/// attempt was refused with a rate-limit response, and `None` otherwise.
+///
+/// Without a hint this is the self-chosen ladder rung with symmetric jitter:
+/// waking early merely costs another attempt. With one, the relay has named
+/// the window TTL, and the ladder's sub-2s rungs are all shorter than any
+/// window it would name — retrying on them guarantees a denial that still
+/// costs a counter increment, because the limiter's `INCR` runs on refused
+/// checks too. So the hint wins whenever it is longer, and it is extended
+/// one-sided so jitter can never pull the wake-up back inside the window.
+///
+/// Pure, with entropy as a parameter, for the same reason as `gate_delay`:
+/// the "never wakes before the hint" property is only meaningfully asserted
+/// if the jitter endpoints can be driven rather than sampled.
+///
+/// Reachability: most REST callers wrap these requests in their own short
+/// `tokio::time::timeout` (500ms–5s), so a multi-second hint sleep is
+/// cancelled by the caller's budget rather than slept out. That is the
+/// intended direction — the alternative was retrying inside a window the
+/// relay had closed, which is denied anyway and still costs a counter
+/// increment, so the caller fails either way and the relay is charged less.
+/// The unbudgeted callers (the setup nudge, engram fetch) get the full
+/// benefit.
+fn rest_retry_delay(rung: Duration, hint_secs: Option<u64>, jitter_nanos: u32) -> Duration {
+    match hint_secs {
+        Some(secs) => {
+            let hint = Duration::from_secs(secs).min(REST_RETRY_HINT_MAX);
+            // A hint shorter than the rung we would have waited anyway is no
+            // reason to retry sooner.
+            if hint > rung {
+                extend_with(hint, jitter_nanos)
+            } else {
+                jittered_duration(rung)
+            }
+        }
+        None => jittered_duration(rung),
+    }
+}
+
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -323,13 +378,17 @@ impl RestClient {
         Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
     {
         let mut last_err = None;
+        // The relay's `retry in {N}s` hint from the previous attempt, if it was
+        // refused with a rate-limit response.
+        let mut retry_hint_secs: Option<u64> = None;
 
         for (attempt, delay) in std::iter::once(None)
             .chain(REST_RETRY_BASE_DELAYS.iter().map(|d| Some(*d)))
             .enumerate()
         {
             if let Some(base) = delay {
-                let jittered = jittered_duration(base);
+                let jittered =
+                    rest_retry_delay(base, retry_hint_secs, crate::backoff::clock_nanos());
                 tracing::debug!(
                     "retrying {method} {path} (attempt {attempt}) in {:.1}s",
                     jittered.as_secs_f64()
@@ -341,7 +400,23 @@ impl RestClient {
                 Ok(resp) if resp.status().is_success() => return Ok(resp),
                 Ok(resp) if is_retriable_status(resp.status()) => {
                     let status = resp.status();
-                    tracing::warn!("{method} {path} returned retriable HTTP {status}");
+                    // Read the body on a 429 for the relay's `retry in {N}s`
+                    // hint. Only the sleep length depends on it, so a body we
+                    // cannot read simply leaves the ladder rung in charge.
+                    retry_hint_secs = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        resp.text()
+                            .await
+                            .ok()
+                            .as_deref()
+                            .and_then(parse_rate_limit_retry_secs)
+                    } else {
+                        None
+                    };
+                    if let Some(secs) = retry_hint_secs {
+                        tracing::warn!("{method} {path} rate-limited, relay asked for {secs}s");
+                    } else {
+                        tracing::warn!("{method} {path} returned retriable HTTP {status}");
+                    }
                     last_err = Some(RelayError::Http(format!(
                         "{method} {path} returned HTTP {status}"
                     )));
@@ -5906,6 +5981,166 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A relay hint longer than the ladder rung wins, and is never shortened.
+    ///
+    /// The ladder tops out at 2s while the relay's quota windows run to 60s,
+    /// so this is the case that matters: without it the client retries inside
+    /// a window the relay has already closed, is denied, and still pays a
+    /// counter increment for the attempt.
+    ///
+    /// Endpoints are driven, not sampled, for the same reason as `gate_delay`:
+    /// a symmetric-jitter regression satisfies a range assertion on about half
+    /// of all draws, which reads as a surviving mutant rather than a failure.
+    #[test]
+    fn rest_retry_delay_honours_a_hint_longer_than_the_rung() {
+        let rung = Duration::from_millis(500);
+        for hint in [1u64, 2, 5, 51, 60] {
+            let base = Duration::from_secs(hint);
+
+            assert_eq!(
+                rest_retry_delay(rung, Some(hint), 0),
+                base,
+                "a {hint}s hint at zero jitter must be exactly {base:?} — \
+                 symmetric jitter would yield 0.8 x base and wake inside the window"
+            );
+
+            let ceiling = rest_retry_delay(rung, Some(hint), 999_999_999);
+            assert!(
+                ceiling > base.mul_f64(1.1999) && ceiling <= base.mul_f64(1.2),
+                "a {hint}s hint at max jitter gave {ceiling:?}, which must reach \
+                 1.2 x {base:?}"
+            );
+        }
+    }
+
+    /// No jitter sample can pull a honoured hint below the relay's window.
+    #[test]
+    fn rest_retry_delay_never_wakes_before_the_hint() {
+        let rung = Duration::from_millis(500);
+        for hint in [1u64, 5, 51, 60] {
+            let base = Duration::from_secs(hint);
+            for step in 0..=1_000u32 {
+                let nanos = (999_999_999f64 * f64::from(step) / 1_000.0) as u32;
+                let delay = rest_retry_delay(rung, Some(hint), nanos);
+                assert!(
+                    delay >= base && delay <= base.mul_f64(1.2),
+                    "a {hint}s hint with jitter nanos={nanos} gave {delay:?}, \
+                     outside [{base:?}, 1.2 x base]"
+                );
+            }
+        }
+    }
+
+    /// With no hint, and with a hint shorter than the rung, the self-chosen
+    /// ladder rung governs — symmetric jitter is correct there because waking
+    /// early only costs an attempt nobody asked us to defer.
+    ///
+    /// The sub-rung hint case is the one worth pinning: `Some(0)` must not
+    /// collapse the delay to zero and spin the ladder.
+    #[test]
+    fn rest_retry_delay_falls_back_to_the_rung() {
+        let rung = Duration::from_secs(2);
+        for hint in [None, Some(0), Some(1), Some(2)] {
+            for nanos in [0u32, 500_000_000, 999_999_999] {
+                let delay = rest_retry_delay(rung, hint, nanos);
+                assert!(
+                    delay >= rung.mul_f64(0.8) && delay <= rung.mul_f64(1.2),
+                    "hint={hint:?} nanos={nanos} gave {delay:?}, which is not \
+                     the {rung:?} ladder rung with symmetric jitter"
+                );
+            }
+        }
+    }
+
+    /// A pathological hint is capped, and the cap still outlasts the window.
+    ///
+    /// The cap is what stops a bad or hostile hint parking the client for
+    /// hours; the `const` assertion beside it is what stops the cap being
+    /// retuned back below the 60s window the hint exists to outlast.
+    #[test]
+    fn rest_retry_delay_caps_a_pathological_hint() {
+        let rung = Duration::from_millis(500);
+        let delay = rest_retry_delay(rung, Some(86_400), 0);
+        assert_eq!(
+            delay, REST_RETRY_HINT_MAX,
+            "a day-long hint must be capped at {REST_RETRY_HINT_MAX:?}"
+        );
+        assert!(
+            REST_RETRY_HINT_MAX >= Duration::from_secs(60),
+            "the cap must still outlast the relay's longest quota window"
+        );
+    }
+
+    /// The 429 hint actually reaches the sleep — the wiring, not the maths.
+    ///
+    /// The `rest_retry_delay` tests above are pure and cannot see the call
+    /// site: deleting the body read (so the hint is never parsed) leaves every
+    /// one of them green. This test is what kills that mutant. It serves a 429
+    /// carrying a 51s hint, then a 200, and asserts the retry slept for the
+    /// hint rather than the 500ms ladder rung.
+    ///
+    /// Time is paused, so the sleep is virtual and the assertion is on the
+    /// clock the sleep advanced, not on wall-clock duration.
+    #[tokio::test(start_paused = true)]
+    async fn rest_retry_sleeps_for_the_relay_hint_not_the_ladder_rung() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // First attempt: refused with the relay's real rejection text.
+            // Second: accepted.
+            let bodies = [
+                (
+                    "429 Too Many Requests",
+                    r#"{"error":"rate-limited: quota exceeded (api); retry in 51s"}"#,
+                ),
+                ("200 OK", "{}"),
+            ];
+            for (status, body) in bodies {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+
+        let start = tokio::time::Instant::now();
+        let resp = client
+            .submit_event(&make_test_event(&Keys::generate(), 1_000))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(resp.is_ok(), "the second attempt succeeds: {resp:?}");
+        assert!(
+            elapsed >= Duration::from_secs(51),
+            "the retry slept {elapsed:?}, but the relay asked for 51s — a sleep \
+             near the 500ms ladder rung means the hint was never read from the \
+             429 body, and the retry lands inside the window and is denied"
+        );
+        assert!(
+            elapsed < Duration::from_secs(70),
+            "slept {elapsed:?}: the hint should be honoured, not compounded"
+        );
+        server.abort();
     }
 
     /// Corroboration: the armed gate honours the computed delay.

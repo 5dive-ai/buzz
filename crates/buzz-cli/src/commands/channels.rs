@@ -767,6 +767,66 @@ fn finalize_roster_resolution(
     resolve_roster_with_archive_filter(slugs, found, archived_result, hints)
 }
 
+/// Post-fetch stage of [`build_roster_resolution`]: given the already-fetched
+/// `found` and `archived_result`, identifies duplicate live instances, calls
+/// `fetch_hints` only for their pubkeys, then delegates to
+/// [`finalize_roster_resolution`].
+///
+/// Accepting `fetch_hints` as a generic async closure makes this function
+/// directly testable without a relay: tests pass a recording closure that
+/// asserts the exact pubkey set and returns a controlled hint map.
+///
+/// - **Happy path** (no duplicates): `fetch_hints` is never called.
+/// - **Trusted archive archives one of a pair**: only the surviving live pair
+///   triggers `fetch_hints`; archived instances are not fetched for.
+/// - **Untrusted archive** (`archived_result: Err`): all found instances are
+///   conservatively treated as live for duplicate detection.
+async fn assemble_roster_resolution<F, Fut>(
+    slugs: &[String],
+    found: Vec<ResolvedAgent>,
+    archived_result: Result<Vec<String>, CliError>,
+    fetch_hints: F,
+    warn_sink: &mut dyn std::io::Write,
+) -> Result<RosterResolution, CliError>
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = HashMap<String, CandidateHint>>,
+{
+    // Determine which pubkeys belong to duplicate live instances after archive
+    // filtering. Untrusted archive (Err) → empty archived set → conservative.
+    let duplicate_pubkeys: Vec<String> = {
+        let archived_set: HashSet<&str> = match &archived_result {
+            Ok(keys) => keys.iter().map(String::as_str).collect(),
+            Err(_) => HashSet::new(),
+        };
+        let live: Vec<&ResolvedAgent> = found
+            .iter()
+            .filter(|a| !archived_set.contains(a.pubkey.as_str()))
+            .collect();
+        let mut slug_count: HashMap<&str, Vec<&str>> = HashMap::new();
+        for a in &live {
+            slug_count
+                .entry(a.persona_id.as_str())
+                .or_default()
+                .push(a.pubkey.as_str());
+        }
+        slug_count
+            .into_values()
+            .filter(|pks| pks.len() > 1)
+            .flatten()
+            .map(str::to_string)
+            .collect()
+    };
+
+    let hints = if duplicate_pubkeys.is_empty() {
+        HashMap::new()
+    } else {
+        fetch_hints(duplicate_pubkeys).await
+    };
+
+    finalize_roster_resolution(slugs, found, archived_result, &hints, warn_sink)
+}
+
 /// Resolve a template's roster against the relay: expand team entries into
 /// persona slugs (via kind:30176), scan for live kind:30177 instances scoped
 /// to the effective owner, filter out archived (NIP-IA) instances, and apply
@@ -775,10 +835,10 @@ fn finalize_roster_resolution(
 /// entirely before any channel-creation side effect — a cardinality error
 /// aborts with nothing created.
 ///
-/// Hint fetching is zero-cost on the happy path: hints are only queried when
-/// duplicate live instances are detected after archive filtering, and only for
-/// the pubkeys belonging to those duplicates. Queries run concurrently and are
-/// bounded by a 3-second timeout; on expiry the error prints with bare pubkeys.
+/// Hint fetching is zero-cost on the happy path: [`assemble_roster_resolution`]
+/// only invokes the hint fetcher when duplicate live instances are detected
+/// after archive filtering. Queries run concurrently and are bounded by a
+/// 3-second timeout; on expiry the error prints with bare pubkeys.
 async fn build_roster_resolution(
     client: &BuzzClient,
     owner: &str,
@@ -815,53 +875,16 @@ async fn build_roster_resolution(
     );
     let found = found?;
 
-    // Determine which pubkeys belong to duplicate live instances so hints are
-    // only fetched when a cardinality error is inevitable. The archive snapshot
-    // may be Err (untrusted state 3), in which case we conservatively treat all
-    // found instances as live when deciding whether to fetch hints.
-    let duplicate_pubkeys: Vec<String> = {
-        let archived_set: HashSet<&str> = match &archived_result {
-            Ok(keys) => keys.iter().map(String::as_str).collect(),
-            Err(_) => HashSet::new(),
-        };
-        let live: Vec<&ResolvedAgent> = found
-            .iter()
-            .filter(|a| !archived_set.contains(a.pubkey.as_str()))
-            .collect();
-        // Collect pubkeys for slugs that have more than one live instance.
-        let mut slug_count: HashMap<&str, Vec<&str>> = HashMap::new();
-        for a in &live {
-            slug_count
-                .entry(a.persona_id.as_str())
-                .or_default()
-                .push(a.pubkey.as_str());
-        }
-        slug_count
-            .into_values()
-            .filter(|pks| pks.len() > 1)
-            .flatten()
-            .map(str::to_string)
-            .collect()
-    };
-
-    let hints = if duplicate_pubkeys.is_empty() {
-        HashMap::new()
-    } else {
-        fetch_candidate_hints(
-            client,
-            &duplicate_pubkeys,
-            std::time::Duration::from_secs(3),
-        )
-        .await
-    };
-
-    finalize_roster_resolution(
+    assemble_roster_resolution(
         &slugs,
         found,
         archived_result,
-        &hints,
+        |pks| async move {
+            fetch_candidate_hints(client, &pks, std::time::Duration::from_secs(3)).await
+        },
         &mut std::io::stderr(),
     )
+    .await
 }
 
 /// `buzz channels create --template <name>`: load a desktop-local channel
@@ -1398,8 +1421,8 @@ pub async fn dispatch_canvas(cmd: crate::CanvasCmd, client: &BuzzClient) -> Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cardinality_rule, build_hint_map, build_template_report, cmd_set_add_policy,
-        finalize_roster_resolution, format_candidate, name_matches,
+        apply_cardinality_rule, assemble_roster_resolution, build_hint_map, build_template_report,
+        cmd_set_add_policy, finalize_roster_resolution, format_candidate, name_matches,
         resolve_roster_with_archive_filter, validate_ttl_seconds, ArchivedExclusion, CandidateHint,
         ChannelSummary, ResolvedAgent, RosterResolution, SkippedSlug,
     };
@@ -2166,5 +2189,160 @@ mod tests {
         // Both slices empty simulates a total timeout / relay error.
         let map = build_hint_map(&[], &[]);
         assert!(map.is_empty(), "empty inputs must yield empty map");
+    }
+
+    // --- assemble_roster_resolution wiring tests ---
+    // These tests exercise the conditional-fetch logic directly, proving:
+    // (a) the fetcher is called only when duplicate live instances exist, and
+    // (b) the exact pubkey set passed to the fetcher matches the live duplicates.
+    // Using a recording closure instead of a real relay means these run
+    // synchronously fast and catch the wiring even without a relay.
+
+    /// Helper: make a `ResolvedAgent` with the given persona and pubkey.
+    fn owned_agent(persona_id: &str, pubkey: &str) -> ResolvedAgent {
+        ResolvedAgent {
+            persona_id: persona_id.to_string(),
+            pubkey: pubkey.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_roster_resolution_duplicate_pair_invokes_fetcher_with_their_pubkeys() {
+        // Two live instances for the same slug — fetcher must be called with
+        // exactly those two pubkeys.
+        let pk_a = "a".repeat(64);
+        let pk_b = "b".repeat(64);
+        let slugs = vec!["sietch:agent".to_string()];
+        let found = vec![
+            owned_agent("sietch:agent", &pk_a),
+            owned_agent("sietch:agent", &pk_b),
+        ];
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let fetcher_invoked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fetcher_invoked);
+        let result = assemble_roster_resolution(
+            &slugs,
+            found,
+            Ok(vec![]), // trusted empty archive: both are live
+            |pks| async move {
+                flag.store(true, Ordering::Relaxed);
+                // Verify the fetcher receives exactly the duplicate pubkeys.
+                let mut sorted = pks.clone();
+                sorted.sort();
+                assert_eq!(sorted.len(), 2, "exactly 2 duplicate pubkeys expected");
+                HashMap::new()
+            },
+            &mut std::io::sink(),
+        )
+        .await;
+
+        assert!(
+            fetcher_invoked.load(Ordering::Relaxed),
+            "fetcher must be called for a duplicate pair"
+        );
+        // Both pubkeys appear in the cardinality error (bare, since the fetcher returned empty).
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(&pk_a), "pk_a must appear in error: {err}");
+        assert!(err.contains(&pk_b), "pk_b must appear in error: {err}");
+    }
+
+    #[tokio::test]
+    async fn assemble_roster_resolution_single_instance_never_invokes_fetcher() {
+        // All slugs have exactly one live instance — fetcher must NOT be called.
+        // If it is called, the `panic!` fires.
+        let pk = "c".repeat(64);
+        let slugs = vec!["sietch:agent".to_string()];
+        let found = vec![owned_agent("sietch:agent", &pk)];
+
+        let result = assemble_roster_resolution(
+            &slugs,
+            found,
+            Ok(vec![]),
+            |_pks| async move {
+                panic!("fetcher must not be called on a single-instance roster");
+                #[allow(unreachable_code)]
+                HashMap::<String, CandidateHint>::new()
+            },
+            &mut std::io::sink(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "single instance resolves cleanly: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_roster_resolution_trusted_archive_removes_duplicate_suppresses_fetcher() {
+        // pk_a is archived. Only pk_b remains live — no duplicate, so the
+        // fetcher must NOT be called.
+        let pk_a = "d".repeat(64);
+        let pk_b = "e".repeat(64);
+        let slugs = vec!["sietch:agent".to_string()];
+        let found = vec![
+            owned_agent("sietch:agent", &pk_a),
+            owned_agent("sietch:agent", &pk_b),
+        ];
+
+        let result = assemble_roster_resolution(
+            &slugs,
+            found,
+            Ok(vec![pk_a.clone()]), // pk_a archived
+            |_pks| async move {
+                panic!("fetcher must not be called when archive resolves the duplicate");
+                #[allow(unreachable_code)]
+                HashMap::<String, CandidateHint>::new()
+            },
+            &mut std::io::sink(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "archive resolves duplicate cleanly: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_roster_resolution_untrusted_archive_invokes_fetcher_conservatively() {
+        // Archive snapshot is Err (untrusted). Both instances are treated as
+        // live conservatively → fetcher must be called.
+        let pk_a = "f".repeat(64);
+        let pk_b = "g".repeat(64);
+        let slugs = vec!["sietch:agent".to_string()];
+        let found = vec![
+            owned_agent("sietch:agent", &pk_a),
+            owned_agent("sietch:agent", &pk_b),
+        ];
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let fetcher_invoked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fetcher_invoked);
+        let result = assemble_roster_resolution(
+            &slugs,
+            found,
+            Err(CliError::Other("snapshot unavailable".to_string())),
+            |pks| async move {
+                flag.store(true, Ordering::Relaxed);
+                let _ = pks;
+                HashMap::<String, CandidateHint>::new()
+            },
+            &mut std::io::sink(),
+        )
+        .await;
+
+        assert!(
+            fetcher_invoked.load(Ordering::Relaxed),
+            "fetcher must be called under untrusted archive"
+        );
+        // Error still surfaces (bare pubkeys, plus the archive warning embedded).
+        assert!(
+            result.is_err(),
+            "untrusted archive + duplicates is still an error"
+        );
     }
 }

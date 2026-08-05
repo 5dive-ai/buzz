@@ -23,6 +23,7 @@ use super::*;
 /// Non-empty personas, teams, and global are placed in both the context AND
 /// the captured definitions_dir so the spawn_fn can assert they arrive.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // SCOPE_GENERATION_TEST_LOCK serialises parallel tests
 async fn test_full_tail_stop_spawn_receipt_register_save() {
     use crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK;
     use crate::managed_agents::{
@@ -434,6 +435,7 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
 /// Owner key must match the app's signing key — use the actual generated key
 /// from the mock app's AppState.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // SCOPE_GENERATION_TEST_LOCK serialises parallel tests
 async fn test_relay_mesh_preflight_precedes_stop() {
     use super::super::restart_local_agent_on_config_change_for;
     use crate::commands::global_agent_config::RestartOutcome;

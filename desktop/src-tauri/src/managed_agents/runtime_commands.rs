@@ -908,36 +908,27 @@ where
 /// Production adapter for [`compensate_drain_for`].
 ///
 /// Delegates to [`compensate_drain_with_hook`] with a no-op hook.
-/// Lock acquisition order: transition guard already held → store lock acquired
-/// → hook fires (no-op in production) → validate generation → load → restore/save.
 pub(crate) fn compensate_drain<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     stopped: &[DrainJournalEntry],
     captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
     _rt_transition_held: std::sync::MutexGuard<'_, ()>,
 ) -> Option<String> {
-    compensate_drain_with_hook(app, stopped, captured_scope, _rt_transition_held, || {})
+    compensate_drain_with_hook(app, stopped, captured_scope, _rt_transition_held, |_| {})
 }
 
-/// Inner implementation of [`compensate_drain`] with an injectable
-/// `on_store_acquired` hook.
+/// Inner implementation of [`compensate_drain`] with an injectable `on_records_loaded` hook.
 ///
-/// Lock acquisition order:
-///   1. `_rt_transition_held` — already held by caller (passed by value).
-///   2. Acquire `managed_agents_store_lock`.
-///   3. Call `on_store_acquired` (no-op in production; tests inject a closure
-///      that writes a sentinel and synchronises with a writer thread to prove
-///      genuine store-lock contention).
-///   4. Validate `captured_scope.generation` under the store lock.
-///   5. `load_managed_agents_at` — records loaded AFTER both locks held.
-///   6. Delegate to [`compensate_drain_for`] — store guard held through every
-///      save performed by `start_pair_under_held_locks`.
+/// Lock order: transition guard held by caller → acquire store lock → validate generation
+/// → load records → `on_records_loaded(&mut records)` (no-op in production; tests inject
+/// a sentinel mutation) → delegate to `compensate_drain_for` → save records (step 7, still
+/// under the store lock so the writer cannot interleave before the mutation hits disk).
 pub(crate) fn compensate_drain_with_hook<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     stopped: &[DrainJournalEntry],
     captured_scope: &crate::managed_agents::scope::WorkspaceAgentScope,
     _rt_transition_held: std::sync::MutexGuard<'_, ()>,
-    on_store_acquired: impl FnOnce(),
+    on_records_loaded: impl FnOnce(&mut Vec<super::ManagedAgentRecord>),
 ) -> Option<String> {
     if stopped.is_empty() {
         drop(_rt_transition_held);
@@ -955,10 +946,7 @@ pub(crate) fn compensate_drain_with_hook<R: tauri::Runtime>(
         }
     };
 
-    // 3. Fire the hook while both locks are held. No-op in production.
-    on_store_acquired();
-
-    // 4. Validate the captured scope under the store lock.
+    // 3. Validate the captured scope under the store lock.
     if let Err(stale_msg) = crate::managed_agents::scope::validate_scope_generation(captured_scope)
     {
         return Some(format!(
@@ -966,7 +954,7 @@ pub(crate) fn compensate_drain_with_hook<R: tauri::Runtime>(
         ));
     }
 
-    // 5. Load records under the held store lock.
+    // 4. Load records under the held store lock.
     let mut records = match load_managed_agents_at(&captured_scope.definitions_dir) {
         Ok(r) => r,
         Err(e) => {
@@ -976,8 +964,13 @@ pub(crate) fn compensate_drain_with_hook<R: tauri::Runtime>(
         }
     };
 
-    // 6. Delegate — store guard held through every save.
-    compensate_drain_for(stopped, &mut records, |entry, recs| {
+    // 5. Fire the hook with the loaded records. No-op in production.
+    //    Tests mutate a sentinel field here and synchronise with a writer
+    //    thread; the save at step 7 then makes that mutation load-bearing.
+    on_records_loaded(&mut records);
+
+    // 6. Delegate — store guard held through every save by start_pair_under_held_locks.
+    let result = compensate_drain_for(stopped, &mut records, |entry, recs| {
         start_pair_under_held_locks(
             app,
             &state,
@@ -988,7 +981,17 @@ pub(crate) fn compensate_drain_with_hook<R: tauri::Runtime>(
             recs,
         )
         .map(|_| ())
-    })
+    });
+
+    // 7. Save the (hook-mutated) records while the store guard is still held.
+    //    In production this is a no-op duplicate of the save inside
+    //    start_pair_under_held_locks; in tests it persists the sentinel
+    //    mutation so the writer cannot interleave before it hits disk.
+    if let Err(e) = save_managed_agents_at(&captured_scope.definitions_dir, &records) {
+        return Some(format!("compensation failed: could not save records: {e}"));
+    }
+
+    result
 }
 
 #[cfg(test)]

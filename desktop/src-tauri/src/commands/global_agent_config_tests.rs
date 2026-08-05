@@ -186,6 +186,9 @@ fn test_restart_under_captured_epoch_fresh_scope_no_runtime_is_skipped() {
 /// guard must abort before stopping — no agent is touched.
 #[test]
 fn test_restart_under_captured_epoch_stale_scope_is_rejected() {
+    let _gen_guard = crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("managed-agents.json"), b"[]").unwrap();
 
@@ -316,9 +319,15 @@ fn make_mock_app() -> tauri::App<tauri::test::MockRuntime> {
 /// Thufir's test 1: "production async driver with injected loader failure;
 /// assert stop never called, RestartOutcome::Skipped."
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // SCOPE_GENERATION_TEST_LOCK serialises parallel tests
 async fn test_context_load_failure_leaves_runtime_running() {
     use super::restart_local_agent_on_config_change_for;
     use crate::commands::global_agent_config::RestartOutcome;
+    use crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK;
+
+    let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let tmp = tempfile::tempdir().unwrap();
     // Malformed JSON → load_agent_store_at (called by load_personas_at) returns
@@ -386,9 +395,15 @@ async fn test_context_load_failure_leaves_runtime_running() {
 /// Thufir's test 2: "real production driver/core with injected preflight error;
 /// stop never called, RestartOutcome::Skipped."
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // SCOPE_GENERATION_TEST_LOCK serialises parallel tests
 async fn test_mesh_preflight_failure_leaves_runtime_running() {
     use super::restart_local_agent_on_config_change_for;
     use crate::commands::global_agent_config::RestartOutcome;
+    use crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK;
+
+    let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let tmp = tempfile::tempdir().unwrap();
     // Provide persona and record files so context prep can pass them.
@@ -450,9 +465,15 @@ async fn test_mesh_preflight_failure_leaves_runtime_running() {
 /// Thufir's test 3: "injected preflight hook advances generation after it
 /// succeeds; epoch returns Skipped; stop never called."
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // SCOPE_GENERATION_TEST_LOCK serialises parallel tests
 async fn test_workspace_switch_after_preflight_aborts_before_stop() {
     use super::restart_local_agent_on_config_change_for;
     use crate::commands::global_agent_config::RestartOutcome;
+    use crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK;
+
+    let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("personas.json"), b"[]").unwrap();
@@ -533,14 +554,20 @@ async fn test_workspace_switch_after_preflight_aborts_before_stop() {
 /// old `context.mesh_model_id`, bypass the mismatch — stop would be called
 /// and the test would fail.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // SCOPE_GENERATION_TEST_LOCK serialises parallel tests
 async fn test_record_mesh_change_after_preflight_aborts_before_stop() {
     use super::super::restart_local_agent_on_config_change_for;
     use crate::commands::global_agent_config::RestartOutcome;
+    use crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK;
     use crate::managed_agents::{
         storage::save_managed_agents_at, BackendKind, ManagedAgentPairRuntime, ManagedAgentRecord,
         ManagedAgentRuntimeKey,
     };
     use tauri::Manager;
+
+    let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let tmp = tempfile::tempdir().unwrap();
     let pubkey = "aa".repeat(32);

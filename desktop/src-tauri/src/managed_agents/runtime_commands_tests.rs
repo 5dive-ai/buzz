@@ -5,6 +5,112 @@
 
 use super::*;
 
+/// Test seam: mirrors `start_pair_for` with two injectable hooks:
+///
+/// - `on_before_transition`: fires BEFORE `managed_agent_runtime_transition` is
+///   locked. The contender calls this to signal "I am at the lock boundary" from
+///   inside the function, giving the test deterministic evidence that the start
+///   seam is actually blocked on the lock (not merely about to call the function).
+///
+/// - `on_transition_acquired`: fires AFTER `managed_agent_runtime_transition` is
+///   acquired but BEFORE `managed_agents_store_lock` is attempted. Signals the
+///   test that start has passed the transition-lock boundary.
+///
+/// Used by concurrency tests to prove that the start seam is serialised by the
+/// transition guard: a contender cannot advance past `on_before_transition` while
+/// compensation holds the guard, and `on_transition_acquired` fires only after the
+/// guard is released.
+fn start_pair_for_with_hook<R: tauri::Runtime>(
+    pubkey: String,
+    relay_url: String,
+    lazy: bool,
+    expected_updated_at: Option<&str>,
+    app: tauri::AppHandle<R>,
+    on_before_transition: impl FnOnce(),
+    on_transition_acquired: impl FnOnce(),
+) -> Result<ManagedAgentRuntimeStatus, String> {
+    let state = app.state::<AppState>();
+    // Pre-acquisition hook: fires here, before the lock call. The contender uses
+    // this to signal "at the lock boundary" from inside the seam so the test
+    // knows the contender is blocked, not just about to call the function.
+    on_before_transition();
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|e| e.to_string())?;
+    if state
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err("desktop shutdown has started".into());
+    }
+    // Post-acquisition hook: transition guard held, store lock not yet acquired.
+    on_transition_acquired();
+    let _store = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut records = load_managed_agents(&app)?;
+    start_pair_under_held_locks(
+        &app,
+        &state,
+        pubkey,
+        relay_url,
+        lazy,
+        expected_updated_at,
+        &mut records,
+    )
+}
+
+/// Test seam: calls `start_pair_for_with_hook` with a lazy=true start and both
+/// injectable hooks.
+fn start_pair_lazy_for_with_hook<R: tauri::Runtime>(
+    pubkey: String,
+    relay_url: String,
+    app: tauri::AppHandle<R>,
+    on_before_transition: impl FnOnce(),
+    on_transition_acquired: impl FnOnce(),
+) -> Result<ManagedAgentRuntimeStatus, String> {
+    start_pair_for_with_hook(
+        pubkey,
+        relay_url,
+        true,
+        None,
+        app,
+        on_before_transition,
+        on_transition_acquired,
+    )
+}
+
+/// Spawn a long-lived child process that stays running long enough for tests.
+///
+/// Cross-platform replacement for `sleep 10000` — seeds the in-memory runtimes
+/// map before `sync_managed_agent_processes` runs its `try_wait()` scan so the
+/// runtime survives to the eligibility check. Tests using this helper MUST kill
+/// the returned `Child` when the test exits to avoid leaking OS processes.
+fn spawn_long_lived_child_for_test() -> std::process::Child {
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("sh")
+            .args(["-c", "while true; do sleep 1; done"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn long-lived test child (sh loop)")
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("ping")
+            .args(["-n", "100000", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn long-lived test child (ping)")
+    }
+}
+
 fn payload(
     relay_url: &str,
     lifecycle: ManagedAgentRuntimeLifecycle,
@@ -689,6 +795,9 @@ fn test_compensate_drain_empty_stopped_returns_none_with_real_app() {
 /// generation guard fires before any spawn attempt.
 #[test]
 fn test_compensate_drain_stale_scope_skips_all_with_real_app() {
+    let _gen_guard = super::super::scope::SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let (app, scope) = build_mock_app_with_scope(&tmp);
     let app_handle = app.app_handle().clone();
@@ -734,6 +843,9 @@ fn test_compensate_drain_stale_scope_skips_all_with_real_app() {
 /// with the stale-scope test that also needs it, making the window near-zero.
 #[test]
 fn test_compensate_drain_attempts_restart_and_reports_degradation_with_real_app() {
+    let _gen_guard = super::super::scope::SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("managed-agents.json"), b"[]").unwrap();
     let app = tauri::test::mock_builder()

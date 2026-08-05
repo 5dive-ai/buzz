@@ -341,6 +341,9 @@ mod tests {
 
     #[test]
     fn test_generation_increments_monotonically() {
+        let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let before = current_scope_generation();
         let next = next_scope_generation();
         assert_eq!(next, before + 1);
@@ -356,6 +359,9 @@ mod tests {
     /// check `captured != current` is reliable.
     #[test]
     fn test_generation_staleness_detected_after_scope_change() {
+        let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let captured = next_scope_generation(); // capture at operation entry
                                                 // Simulate a concurrent workspace switch bumping the generation.
         let after_switch = next_scope_generation();
@@ -377,6 +383,9 @@ mod tests {
     /// fields correctly reflect the active workspace at each step.
     #[test]
     fn test_scope_switch_a_to_b_to_a_advances_generation() {
+        let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir();
         let owner = "aa".repeat(32);
 
@@ -411,6 +420,9 @@ mod tests {
     /// staleness after C is committed.
     #[test]
     fn test_rapid_scope_switch_a_b_c_all_stale_after_c() {
+        let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let base = std::env::temp_dir();
         let owner = "bb".repeat(32);
 
@@ -438,6 +450,9 @@ mod tests {
     /// source of truth.
     #[test]
     fn test_switch_during_restore_detected_by_generation_check() {
+        let _gen_guard = SCOPE_GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Restore captures the generation at its entry.
         let captured_at_restore_entry = next_scope_generation();
 

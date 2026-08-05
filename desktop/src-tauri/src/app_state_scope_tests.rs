@@ -11,6 +11,9 @@ use super::*;
 /// only written inside `apply_workspace`'s prepare stage.
 #[test]
 fn test_import_before_first_apply_leaves_scope_none() {
+    let _gen_guard = crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let state = build_app_state();
 
     // Boot state: no active scope.
@@ -45,6 +48,9 @@ fn test_import_before_first_apply_leaves_scope_none() {
 /// commands fail closed until the frontend re-applies a workspace.
 #[test]
 fn test_live_import_with_active_scope_clears_scope_and_bumps_generation() {
+    let _gen_guard = crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let state = build_app_state();
     let base = std::env::temp_dir();
 
@@ -129,6 +135,9 @@ fn test_fallback_relay_never_claims_during_identity_import() {
 /// original scope.
 #[test]
 fn test_prepare_failure_leaves_old_scope_intact() {
+    let _gen_guard = crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let state = build_app_state();
     let base = std::env::temp_dir();
 
@@ -169,6 +178,9 @@ fn test_prepare_failure_leaves_old_scope_intact() {
 /// returning `None` is handled gracefully by callers that check the scope.
 #[test]
 fn test_inactive_runtime_exit_after_scope_cleared_is_safe() {
+    let _gen_guard = crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let state = build_app_state();
     let base = std::env::temp_dir();
 

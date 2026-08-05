@@ -235,6 +235,10 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
     let receipt_pid = Arc::new(Mutex::new(0u32));
     let receipt_instance_id = Arc::new(Mutex::new(String::new()));
     let receipt_started_at = Arc::new(Mutex::new(String::new()));
+    // Capture the PID of the spawned child so we can assert exact equality with
+    // receipt.pid — proves the receipt carries the real child's PID, not an
+    // arbitrary positive value.
+    let spawned_child_pid = Arc::new(Mutex::new(0u32));
 
     let stop_called2 = stop_called.clone();
     let spawn_relay2 = spawn_relay.clone();
@@ -248,6 +252,7 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
     let receipt_pid2 = receipt_pid.clone();
     let receipt_iid2 = receipt_instance_id.clone();
     let receipt_sat2 = receipt_started_at.clone();
+    let spawned_pid2 = spawned_child_pid.clone();
     let pubkey2 = pubkey.clone();
 
     let app_handle_for_assert = app_handle.clone();
@@ -268,14 +273,19 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
             },
             // spawn_fn: record captured relay+owner+personas+teams+global, return a noop child.
             // `spawn_noop_child_for_test()` replaces `/usr/bin/true` — cross-platform.
+            // Capture the child PID before wrapping so we can assert exact equality
+            // with receipt.pid — fails if production uses any PID other than the child's.
             move |_app, rec, relay, owner, personas, global, teams| {
                 *spawn_relay2.lock().unwrap() = Some(relay.to_string());
                 *spawn_owner2.lock().unwrap() = owner.map(str::to_string);
                 *spawn_personas2.lock().unwrap() = !personas.is_empty();
                 *spawn_teams2.lock().unwrap() = !teams.is_empty();
                 *spawn_global2.lock().unwrap() = !global.env_vars.is_empty();
+                let child = spawn_noop_child_for_test();
+                // Capture the real child PID before moving child into ManagedAgentProcess.
+                *spawned_pid2.lock().unwrap() = child.id();
                 Ok(crate::managed_agents::ManagedAgentProcess {
-                    child: spawn_noop_child_for_test(),
+                    child,
                     log_path: std::path::PathBuf::new(),
                     spawn_config:
                         crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
@@ -359,9 +369,15 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
         "receipt.key.relay_url must match the captured relay; fails if the spawn path \
          builds the receipt with an empty or wrong relay"
     );
-    assert!(
-        *receipt_pid.lock().unwrap() > 0,
-        "receipt.pid must be non-zero (a real spawned child PID)"
+    // Assert receipt.pid exactly matches the PID captured from the spawned child.
+    // Fails if production writes any PID other than `child.id()` into the receipt.
+    let expected_pid = *spawned_child_pid.lock().unwrap();
+    assert!(expected_pid > 0, "spawned child PID must be non-zero");
+    assert_eq!(
+        *receipt_pid.lock().unwrap(),
+        expected_pid,
+        "receipt.pid must equal the spawned child's PID (child.id()); \
+         fails if production assigns an arbitrary PID to the receipt"
     );
     // Assert receipt.desktop_instance_id equals the actual value produced by
     // current_instance_id(app) — proves the field is sourced from the app

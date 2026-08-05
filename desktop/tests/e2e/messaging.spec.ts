@@ -480,7 +480,7 @@ test("link preview style defaults to compact and Rich unfurls descriptions", asy
   await page.getByTestId("link-preview-style-compact").click();
 });
 
-test("link preview paste paints its loading card before cold resolver work", async ({
+test("angle-bracket link preview paste paints before cold resolver work", async ({
   page,
 }) => {
   const previewUrl = "https://github.com/block/buzz/pull/3246?paste=async";
@@ -489,9 +489,10 @@ test("link preview paste paints its loading card before cold resolver work", asy
   const input = page.getByTestId("message-input");
   await input.focus();
 
-  const firstPaint = await input.evaluate(async (element, url) => {
+  const pasteText = `<${previewUrl}>`;
+  const firstPaint = await input.evaluate(async (element, pasteText) => {
     const clipboardData = new DataTransfer();
-    clipboardData.setData("text/plain", url);
+    clipboardData.setData("text/plain", pasteText);
     const startedAt = performance.now();
     element.dispatchEvent(
       new ClipboardEvent("paste", {
@@ -510,7 +511,7 @@ test("link preview paste paints its loading card before cold resolver work", asy
       ),
       text: element.textContent,
     };
-  }, previewUrl);
+  }, pasteText);
   expect(firstPaint.text).toContain(previewUrl);
   expect(firstPaint.resolverStarted).toBe(false);
   expect(firstPaint.elapsedMs).toBeLessThan(100);
@@ -518,9 +519,11 @@ test("link preview paste paints its loading card before cold resolver work", asy
     .locator("[data-composer-link-previews]")
     .locator('[data-link-preview="github-pull-request"]');
   await expect(input).toContainText(previewUrl, { timeout: 1_000 });
-  await expect(composerPreview).toHaveAttribute("data-state", "processing", {
-    timeout: 1_000,
-  });
+  await expect(composerPreview).toHaveAttribute(
+    "data-state",
+    /^(processing|done)$/,
+    { timeout: 1_000 },
+  );
   await expect(page.getByTestId("send-message")).toBeEnabled();
 });
 

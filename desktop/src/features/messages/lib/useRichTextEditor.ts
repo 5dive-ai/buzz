@@ -135,6 +135,10 @@ function shouldAppendSpaceAfterPaste(text: string): boolean {
   return PASTED_LINK_AT_END_RE.test(trimmedEnd);
 }
 
+function unwrapExactHttpAutolink(text: string): string | null {
+  return /^<(https?:\/\/[^\s<>]+)>$/i.exec(text)?.[1] ?? null;
+}
+
 const LinkPasteTrailingSpace = Extension.create({
   name: "linkPasteTrailingSpace",
 
@@ -487,6 +491,32 @@ export function useRichTextEditor({
         }),
       ],
       editorProps: {
+        handleDOMEvents: {
+          paste: (view, event) => {
+            const url = unwrapExactHttpAutolink(
+              (event as ClipboardEvent).clipboardData?.getData("text/plain") ??
+                "",
+            );
+            if (!url) return false;
+            const link = view.state.schema.marks.link;
+            if (!link) return false;
+            const { from, to } = view.state.selection;
+            let transaction = view.state.tr.replaceRangeWith(
+              from,
+              to,
+              view.state.schema.text(url, [link.create({ href: url })]),
+            );
+            const end = transaction.mapping.map(to);
+            transaction = transaction.insertText(" ", end);
+            transaction = transaction.removeMark(end, end + 1, link);
+            transaction = transaction.setSelection(
+              TextSelection.create(transaction.doc, end + 1),
+            );
+            view.dispatch(transaction.setStoredMarks([]).scrollIntoView());
+            event.preventDefault();
+            return true;
+          },
+        },
         attributes: {
           autocapitalize: "none",
           autocorrect: "off",

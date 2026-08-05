@@ -396,14 +396,17 @@ impl RestClient {
                 tokio::time::sleep(jittered).await;
             }
 
-            match build_request().await {
+            // Every arm yields the hint that governs the NEXT sleep, so each
+            // outcome states its own policy instead of inheriting one from
+            // wherever an assignment happens to sit.
+            retry_hint_secs = match build_request().await {
                 Ok(resp) if resp.status().is_success() => return Ok(resp),
                 Ok(resp) if is_retriable_status(resp.status()) => {
                     let status = resp.status();
                     // Read the body on a 429 for the relay's `retry in {N}s`
                     // hint. Only the sleep length depends on it, so a body we
                     // cannot read simply leaves the ladder rung in charge.
-                    retry_hint_secs = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let hint = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         resp.text()
                             .await
                             .ok()
@@ -412,7 +415,7 @@ impl RestClient {
                     } else {
                         None
                     };
-                    if let Some(secs) = retry_hint_secs {
+                    if let Some(secs) = hint {
                         tracing::warn!("{method} {path} rate-limited, relay asked for {secs}s");
                     } else {
                         tracing::warn!("{method} {path} returned retriable HTTP {status}");
@@ -420,6 +423,7 @@ impl RestClient {
                     last_err = Some(RelayError::Http(format!(
                         "{method} {path} returned HTTP {status}"
                     )));
+                    hint
                 }
                 Ok(resp) => {
                     return Err(RelayError::Http(format!(
@@ -431,9 +435,27 @@ impl RestClient {
                 Err(e) if e.is_timeout() || e.is_connect() => {
                     tracing::warn!("{method} {path} network error: {e}");
                     last_err = Some(RelayError::Http(e.to_string()));
+                    // Deliberately keep the previous 429's hint. A network
+                    // error says nothing about the quota window, so dropping
+                    // the hint here would send the next attempt back to a
+                    // sub-2s rung and inside a window the relay already
+                    // closed. The cost is one-sided: over-sleeping wastes
+                    // time we were told to wait anyway, while under-sleeping
+                    // earns a fresh denial that still costs a counter
+                    // increment, because the limiter's `INCR` runs on refused
+                    // checks too.
+                    //
+                    // This is only exactly right for the sleep immediately
+                    // after the 429. If the network error itself burned most
+                    // of the hinted window we over-sleep by up to a second
+                    // window — accepted, same cheap direction. Do not
+                    // "optimize" that by subtracting elapsed time: the
+                    // subtraction reintroduces under-sleep whenever the clock
+                    // arithmetic is off, which is the expensive direction.
+                    retry_hint_secs
                 }
                 Err(e) => return Err(RelayError::Http(e.to_string())),
-            }
+            };
         }
 
         Err(last_err
@@ -6139,6 +6161,81 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(70),
             "slept {elapsed:?}: the hint should be honoured, not compounded"
+        );
+        server.abort();
+    }
+
+    /// A network error after a 429 keeps the relay's hint for the next sleep.
+    ///
+    /// This pins the policy in the `is_timeout() || is_connect()` arm, which
+    /// is otherwise invisible: the arm assigns the hint it already held, so
+    /// deleting the assignment (yielding `None` instead) is a silent revert
+    /// that every pure `rest_retry_delay` test stays green under. The test
+    /// above cannot see it either — it never produces a network error.
+    ///
+    /// Shape: the first attempt is refused with a 51s hint, then the listener
+    /// is dropped so every later attempt is refused at connect. Sleeps are
+    /// therefore hint, hint, hint (~153s) when the hint is carried, and hint,
+    /// 1s rung, 2s rung (~54s) when it is dropped. The assertion sits in the
+    /// gap, so it discriminates on the sleep the ladder actually took rather
+    /// than on any single call's arguments.
+    ///
+    /// A network error says nothing about the quota window, so retrying on a
+    /// sub-2s rung would land inside a window the relay already closed and
+    /// earn a denial that still costs a counter increment.
+    #[tokio::test(start_paused = true)]
+    async fn rest_retry_keeps_the_hint_across_a_network_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // Serve exactly one 429 carrying the hint, then drop the listener
+            // so every subsequent attempt fails at connect.
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let body = r#"{"error":"rate-limited: quota exceeded (api); retry in 51s"}"#;
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+            drop(listener);
+        });
+
+        let client = RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+
+        let start = tokio::time::Instant::now();
+        let resp = client
+            .submit_event(&make_test_event(&Keys::generate(), 1_000))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            resp.is_err(),
+            "every attempt after the 429 is refused at connect, so the call fails: {resp:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(150),
+            "the ladder slept {elapsed:?} across three retries after a 51s hint. \
+             Around 54s means the hint was dropped by the network-error arm and \
+             the last two sleeps fell back to the 1s and 2s rungs, waking inside \
+             a window the relay had already closed"
+        );
+        assert!(
+            elapsed < Duration::from_secs(200),
+            "slept {elapsed:?}: three hint-length sleeps, not a compounding one"
         );
         server.abort();
     }

@@ -13,14 +13,16 @@ import type { MeshFieldNode } from "./ui/MeshRadarField";
  * renders either way, and the earlier "turn on sharing to see who's on the
  * mesh" was simply wrong.
  *
- * The two are not equivalent, and the difference is not cosmetic:
+ * The two are not equivalent, and the difference is expressed in the geometry
+ * rather than in a hedging caption — what we know is shared gets shown either
+ * way, and the drawing simply does not assert more than it can:
  *
  *   - **live**: reachable now, RTT known, adjacency to us is real
- *   - **relay**: last known within 120s, no RTT, adjacency unknown
+ *   - **relay**: published within the last 120s, no RTT, adjacency unknown
  *
  * So relay nodes get no RTT (they land mid-band rather than faking proximity),
- * the caller draws no spokes when we have not joined, and the caption names
- * which view is on screen. Never dress last-known state as live.
+ * and the caller draws no spokes and a hollow centre when we have not joined,
+ * because a spoke would assert a connection we do not have.
  */
 
 export type MeshFieldSource = "live" | "relay" | "none";
@@ -38,7 +40,13 @@ export type MeshFieldModel = {
    * so ghosts never contribute capacity — they are the invitation, not a total.
    */
   ghostCount: number;
-  /** Caption naming the source, or null when there is nothing to qualify. */
+  /**
+   * Short caption, or null.
+   *
+   * Only ever states a fact the field cannot draw — currently just "alone on
+   * the mesh". Never used to hedge the relay view: what we know is shared is
+   * shown as shared, not annotated with doubt.
+   */
   caption: string | null;
 };
 
@@ -68,10 +76,7 @@ export function deriveMeshFieldModel({
       selfParticipating: true,
       selfCapacityGb: view.selfCapacityGb,
       ghostCount,
-      caption:
-        view.peers.length === 0
-          ? "Connected · waiting for another device"
-          : null,
+      caption: view.peers.length === 0 ? "Waiting for another device" : null,
     };
   }
 
@@ -103,6 +108,6 @@ export function deriveMeshFieldModel({
     selfParticipating: false,
     selfCapacityGb: null,
     ghostCount,
-    caption: "Last reported by the community · join to see live detail",
+    caption: null,
   };
 }

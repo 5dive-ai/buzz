@@ -11,9 +11,16 @@ export type MeshMemoryModel = {
 };
 
 /**
- * Approximate model footprint against this machine's shareable AI memory.
- * MeshLLM reports model package size, not live OS GPU allocation, so the UI
- * deliberately says "model uses" rather than claiming real-time utilization.
+ * Approximate model footprint against **this machine's** shareable AI memory.
+ *
+ * Scoped to this node on purpose, and the label says so. It sits directly under
+ * a radar field showing the whole community, so an unqualified "36 of 115 GB"
+ * would read as mesh-wide utilization — a number we do not have and could not
+ * compute, since members publish their own capacity but nothing about each
+ * other's live allocation.
+ *
+ * MeshLLM reports model package size, not live OS GPU allocation, so the label
+ * says the model "uses" rather than claiming real-time utilization.
  */
 export function deriveMeshMemoryModel({
   view,
@@ -47,12 +54,14 @@ export function deriveMeshMemoryModel({
     usedGb,
     usedSegments,
     totalSegments: MEMORY_SEGMENTS,
+    // "This computer" leads, because the meter sits under a community-wide
+    // radar field and must not be read as mesh utilization.
     label:
       usedGb != null && totalGb != null
-        ? `${formatGb(usedGb)} of ${formatGb(totalGb)} AI memory used by model`
+        ? `This computer · model uses ${formatGb(usedGb)} of ${formatGb(totalGb)}`
         : totalGb != null
-          ? `${formatGb(totalGb)} AI memory available`
-          : "Checking available AI memory…",
+          ? `This computer · ${formatGb(totalGb)} AI memory`
+          : "Checking this computer's AI memory…",
   };
 }
 

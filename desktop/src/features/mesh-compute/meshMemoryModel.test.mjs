@@ -33,7 +33,7 @@ test("prefers the runtime's reported model footprint", () => {
     catalog,
     modelRef: "gemma",
   });
-  assert.equal(model.label, "10 GB of 40 GB AI memory used by model");
+  assert.equal(model.label, "This computer · model uses 10 GB of 40 GB");
   assert.equal(model.usedSegments, 3);
 });
 
@@ -43,7 +43,7 @@ test("falls back to the selected catalog model before runtime status arrives", (
     catalog,
     modelRef: "gemma",
   });
-  assert.equal(model.label, "8 GB of 32 GB AI memory used by model");
+  assert.equal(model.label, "This computer · model uses 8 GB of 32 GB");
   assert.equal(model.usedSegments, 3);
 });
 
@@ -53,6 +53,32 @@ test("unknown model size shows available memory without inventing use", () => {
     catalog,
     modelRef: "custom/model",
   });
-  assert.equal(model.label, "32 GB AI memory available");
+  assert.equal(model.label, "This computer · 32 GB AI memory");
   assert.equal(model.usedSegments, 0);
+});
+
+test("every label names this computer, never the mesh", () => {
+  // The meter sits directly under a radar field showing the whole community.
+  // An unqualified "10 of 40 GB" would read as mesh-wide utilization, which is
+  // a number nobody has: members publish their own capacity, not each other's
+  // live allocation.
+  const cases = [
+    {
+      view: {
+        connected: true,
+        selfCapacityGb: 40,
+        selfModelSizeGb: 10,
+        peers: [],
+      },
+      catalog,
+      modelRef: "gemma",
+    },
+    { view: null, catalog, modelRef: "gemma" },
+    { view: null, catalog, modelRef: "custom/model" },
+    { view: null, catalog: null, modelRef: null },
+  ];
+  for (const input of cases) {
+    const model = deriveMeshMemoryModel(input);
+    assert.match(model.label, /this computer/i, model.label);
+  }
 });

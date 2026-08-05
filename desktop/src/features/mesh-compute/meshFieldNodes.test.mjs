@@ -84,7 +84,14 @@ test("relay nodes carry no RTT and claim no membership", () => {
   // A hollow centre and no spokes depend on this staying false.
   assert.equal(field.selfParticipating, false);
   assert.equal(field.selfCapacityGb, null);
-  assert.match(field.caption, /Last reported/);
+});
+
+test("the relay view is not hedged with a caption", () => {
+  // What we know is shared gets shown as shared. Annotating it with "last
+  // reported" hedged a fact we actually have, and the old "join to see live
+  // detail" mislabeled sharing as joining.
+  const field = deriveMeshFieldModel({ view: null, snapshot: snapshot() });
+  assert.equal(field.caption, null);
 });
 
 test("our own note is excluded so we are never drawn twice", () => {
@@ -132,5 +139,5 @@ test("a solo sharer is told it is waiting, not that it is alone in error", () =>
     snapshot: null,
   });
   assert.equal(field.source, "live");
-  assert.match(field.caption, /waiting for another device/);
+  assert.equal(field.caption, "Waiting for another device");
 });

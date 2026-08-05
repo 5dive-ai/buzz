@@ -73,6 +73,46 @@ pub fn seed_confirmed_managed_agent_aggregate(
     Ok(())
 }
 
+/// Persist a confirmed deleted tombstone row as a durable generation floor.
+///
+/// Called from the inbound reconcile deleted branch so a verified tombstone
+/// leaves a durable floor at its coordinate EVEN WHEN no local record exists —
+/// the record-present guards upstream never run in that case, so without this
+/// floor a delayed stale active head at the same-or-lower generation would
+/// reconstruct the deleted agent (including its nsec). The tombstone is already
+/// durable on the relay, so it is seeded confirmed (`pending_sync = 0`) and the
+/// flush lane never touches it. `local_authority_applied` records whether the
+/// local record/key erase was applied here (trivially satisfied when no record
+/// existed). `INSERT OR IGNORE` keeps a re-received tombstone idempotent and
+/// never downgrades a row the flush lane authored.
+pub fn seed_confirmed_managed_agent_tombstone(
+    conn: &Connection,
+    aggregate: &RetainedManagedAgentAggregate,
+) -> Result<(), String> {
+    if aggregate.pending_sync || aggregate.state != "deleted" {
+        return Err(
+            "confirmed managed-agent tombstone seed must be a synced deleted head".to_string(),
+        );
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO managed_agent_aggregates
+            (owner_pubkey, agent_pubkey, generation, private_event_id, state,
+             request_json, pending_sync, last_error, local_authority_applied)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, ?7)",
+        params![
+            aggregate.owner_pubkey,
+            aggregate.agent_pubkey,
+            aggregate.generation as i64,
+            aggregate.private_event_id,
+            aggregate.state,
+            aggregate.request_json,
+            aggregate.local_authority_applied as i32,
+        ],
+    )
+    .map_err(|error| format!("failed to seed confirmed managed-agent tombstone: {error}"))?;
+    Ok(())
+}
+
 /// Insert or idempotently refresh a retained aggregate generation.
 ///
 /// Generation may advance by exactly one. A byte-identical rewrite of the

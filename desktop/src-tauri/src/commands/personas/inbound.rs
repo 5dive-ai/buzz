@@ -235,8 +235,61 @@ fn reconcile_inbound_private_managed_agent(
         }
     }
 
+    // Open the retention store once for both branches. It carries the DURABLE
+    // generation floor per coordinate — the deleted branch persists a tombstone
+    // row here even when no local record exists, and the active branch gates its
+    // no-match insert on it. The in-memory `relay_authority` guard above only
+    // fires for a record that is still present; a delayed stale active head that
+    // arrives after a tombstone erased (or preceded) the record finds no record,
+    // skips that guard, and would otherwise resurrect the deleted agent — nsec
+    // included. The persisted floor closes that window.
+    let scope =
+        crate::managed_agents::retention::arrival_retention_scope(app, state, arrival_relay_url)?
+            .ok_or_else(|| "private aggregate arrival scope changed".to_string())?;
+    let conn = crate::managed_agents::retention::open_retention_db(&scope.db_path)?;
+    let durable_floor = crate::managed_agents::retention::get_retained_managed_agent_aggregate(
+        &conn,
+        &payload.owner_pubkey,
+        &payload.agent_pubkey,
+    )?;
+    // A retained row (active OR deleted) at this generation or newer means this
+    // head is stale relative to durable local authority — drop it. A legitimate
+    // re-creation advances to a strictly higher generation and passes.
+    if durable_floor
+        .as_ref()
+        .is_some_and(|floor| payload.generation <= floor.generation)
+    {
+        return Ok(());
+    }
+
     match payload.state {
         State::Deleted => {
+            // Persist the tombstone as a durable floor FIRST, so even with no
+            // local record a later stale active head at <= this generation is
+            // rejected by the floor gate above. Seeded confirmed (already on the
+            // relay); `local_authority_applied` reflects the record/key erase
+            // this branch performs (trivially true when no record exists).
+            let request_json = serde_json::to_string(&serde_json::json!({
+                "private_event": event,
+                "definition_event": Option::<&nostr::Event>::None,
+                "instance_event": Option::<&nostr::Event>::None,
+                "expected_definition_revision": Option::<u64>::None,
+            }))
+            .map_err(|error| format!("failed to retain inbound private tombstone: {error}"))?;
+            crate::managed_agents::retention::seed_confirmed_managed_agent_tombstone(
+                &conn,
+                &crate::managed_agents::retention::RetainedManagedAgentAggregate {
+                    owner_pubkey: payload.owner_pubkey.clone(),
+                    agent_pubkey: payload.agent_pubkey.clone(),
+                    generation: payload.generation,
+                    private_event_id: event.id.to_hex(),
+                    state: "deleted".to_string(),
+                    request_json,
+                    pending_sync: false,
+                    last_error: None,
+                    local_authority_applied: true,
+                },
+            )?;
             if let Some(index) = existing_index {
                 agents.remove(index);
                 crate::managed_agents::delete_agent_key(&payload.agent_pubkey);
@@ -253,13 +306,6 @@ fn reconcile_inbound_private_managed_agent(
                 "expected_definition_revision": payload.active.as_ref().map(|active| active.definition.revision),
             }))
             .map_err(|error| format!("failed to retain inbound private aggregate: {error}"))?;
-            let scope = crate::managed_agents::retention::arrival_retention_scope(
-                app,
-                state,
-                arrival_relay_url,
-            )?
-            .ok_or_else(|| "private aggregate arrival scope changed".to_string())?;
-            let conn = crate::managed_agents::retention::open_retention_db(&scope.db_path)?;
             crate::managed_agents::retention::seed_confirmed_managed_agent_aggregate(
                 &conn,
                 &crate::managed_agents::retention::RetainedManagedAgentAggregate {

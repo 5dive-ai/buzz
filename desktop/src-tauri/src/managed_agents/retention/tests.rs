@@ -701,3 +701,106 @@ fn deletion_marker_refuses_a_non_deleted_row() {
         .unwrap();
     assert!(!row.local_authority_applied);
 }
+
+/// The durable generation floor for a coordinate: the MAX retained generation
+/// across BOTH active and deleted rows. Mirrors the gate the inbound reconcile
+/// applies before it inserts a no-match active head — `get_retained_...`
+/// returns the latest generation regardless of state, so a persisted tombstone
+/// raises the floor exactly like a persisted active head.
+fn floored(conn: &Connection, incoming_generation: u64) -> bool {
+    get_retained_managed_agent_aggregate(conn, "owner", "agent")
+        .unwrap()
+        .is_some_and(|floor| incoming_generation <= floor.generation)
+}
+
+/// A confirmed tombstone seed persisted with no prior local record raises the
+/// durable floor, so the exact resurrection interleaving is closed:
+/// snapshot active N → live deleted N+1 → replayed active N must stay floored,
+/// while a genuine re-creation at N+2 clears the floor.
+#[test]
+fn confirmed_tombstone_seed_floors_a_replayed_stale_active_head() {
+    let conn = test_db();
+
+    // Snapshot active N=1 seeds a confirmed active floor at 1.
+    let mut active_n = aggregate(1, "event-1", "active", r#"{"generation":1}"#);
+    active_n.pending_sync = false;
+    seed_confirmed_managed_agent_aggregate(&conn, &active_n).unwrap();
+    assert!(floored(&conn, 1), "the replay of active N is floored");
+    assert!(
+        !floored(&conn, 2),
+        "a genuine advance to N+1 is not floored"
+    );
+
+    // Live deleted N+1 seeds a confirmed tombstone floor at 2 — the crux: this
+    // path runs even when NO local record exists, so the floor is durable and a
+    // later stale active head cannot resurrect the deleted agent.
+    let mut tombstone = aggregate(2, "event-2", "deleted", r#"{"generation":2}"#);
+    tombstone.pending_sync = false;
+    tombstone.local_authority_applied = true;
+    seed_confirmed_managed_agent_tombstone(&conn, &tombstone).unwrap();
+    let floor = get_retained_managed_agent_aggregate(&conn, "owner", "agent")
+        .unwrap()
+        .unwrap();
+    assert_eq!(floor.generation, 2);
+    assert_eq!(floor.state, "deleted");
+    assert!(floor.local_authority_applied);
+
+    // Replayed active N=1: floored — the agent stays absent.
+    assert!(
+        floored(&conn, 1),
+        "replayed active N is rejected by the tombstone floor"
+    );
+    // Deleted N+1 replayed: also floored (idempotent re-receive is a no-op).
+    assert!(floored(&conn, 2), "re-received tombstone N+1 is floored");
+    // Genuine re-creation at N+2 clears the floor and is admitted.
+    assert!(
+        !floored(&conn, 3),
+        "a fresh re-creation at N+2 is not floored"
+    );
+}
+
+/// A confirmed tombstone seed with no prior record is idempotent and never
+/// downgrades a row the flush lane authored (`INSERT OR IGNORE`).
+#[test]
+fn confirmed_tombstone_seed_is_idempotent_and_never_downgrades() {
+    let conn = test_db();
+    let mut tombstone = aggregate(2, "event-2", "deleted", r#"{"generation":2}"#);
+    tombstone.pending_sync = false;
+    tombstone.local_authority_applied = true;
+    seed_confirmed_managed_agent_tombstone(&conn, &tombstone).unwrap();
+    // Re-receive: no error, no duplicate row, marker preserved.
+    seed_confirmed_managed_agent_tombstone(&conn, &tombstone).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM managed_agent_aggregates
+              WHERE owner_pubkey = 'owner' AND agent_pubkey = 'agent'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    let row = get_retained_managed_agent_aggregate(&conn, "owner", "agent")
+        .unwrap()
+        .unwrap();
+    assert!(row.local_authority_applied);
+    assert!(!row.pending_sync);
+}
+
+/// The confirmed tombstone seed refuses anything that is not a synced deleted
+/// head — a pending row or an active state would corrupt the floor's meaning.
+#[test]
+fn confirmed_tombstone_seed_refuses_pending_or_non_deleted() {
+    let conn = test_db();
+
+    let mut pending = aggregate(2, "event-2", "deleted", r#"{"generation":2}"#);
+    pending.pending_sync = true;
+    assert!(seed_confirmed_managed_agent_tombstone(&conn, &pending)
+        .unwrap_err()
+        .contains("synced deleted head"));
+
+    let mut active = aggregate(2, "event-2", "active", r#"{"generation":2}"#);
+    active.pending_sync = false;
+    assert!(seed_confirmed_managed_agent_tombstone(&conn, &active)
+        .unwrap_err()
+        .contains("synced deleted head"));
+}

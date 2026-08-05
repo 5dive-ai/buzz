@@ -22,7 +22,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  applyMarkAllReadTransition,
   applyOverrideRead,
   applyOverrideUnread,
   overrideErrorMessage,
@@ -533,18 +532,17 @@ test("adversarial-3: incomplete_load_null_liveness_not_known_absent_overrideStil
   );
 });
 
-test("adversarial-4: applyMarkAllReadTransition_both_branches", () => {
-  // IMPORTANT: applyMarkAllReadTransition is the extracted production transition
-  // used inside markAllChannelsRead. Testing it directly (not a simulation)
-  // ensures production regressions to unconditional deletion are caught.
+test("adversarial-4: applyOverrideRead_both_branches_cleared_and_refused", () => {
+  // Tests the production applyOverrideRead helper that markAllChannelsRead now
+  // calls directly (helper extracted from the deleted applyMarkAllReadTransition).
+  // The hook calls applyOverrideRead per channel and gates ALL evidence deletion
+  // on overrideCleared; see useUnreadChannels.ts:markAllChannelsRead.
   //
-  // ch-cleared: applyOverrideRead succeeds (liveness goes inactive) →
-  //   forcedUnread, latestByChannel, observedUnreadEvents all removed.
-  // ch-refused: applyOverrideRead refused (liveness stays active) →
-  //   all three maps preserved intact.
+  // ch-cleared: markChannelRead succeeds → liveness goes inactive → overrideCleared.
+  // ch-refused: markChannelRead refused (uint32_overflow) + liveness still active → overrideStillActive.
   const livenessMap = {
     "ch-cleared": { active: true, frontier: 100 },
-    "ch-refused": { active: true, frontier: 100 }, // uint32_overflow refusal
+    "ch-refused": { active: true, frontier: 100 },
   };
 
   const apis = {
@@ -560,78 +558,29 @@ test("adversarial-4: applyMarkAllReadTransition_both_branches", () => {
     getOverrideLiveness: (id) => livenessMap[id] ?? null,
   };
 
-  const latestByChannel = new Map([
-    ["ch-cleared", 200],
-    ["ch-refused", 200],
-  ]);
-  const observedEvents = new Map([
-    ["ch-cleared", new Map([["ev1", { kind: 9, createdAt: 200 }]])],
-    ["ch-refused", new Map([["ev2", { kind: 9, createdAt: 200 }]])],
-  ]);
-  const forcedMap = { "ch-cleared": 99, "ch-refused": 99 };
-  const maps = {
-    forcedUnread: forcedMap,
-    latestByChannel,
-    observedUnreadEvents: observedEvents,
-  };
-
-  // Drive the production transition directly (not a reimplementation).
-  const clearedOutcome = applyMarkAllReadTransition("ch-cleared", apis, maps);
-  const refusedOutcome = applyMarkAllReadTransition("ch-refused", apis, maps);
-
-  assert.equal(clearedOutcome, "overrideCleared", "cleared channel: outcome");
   assert.equal(
-    refusedOutcome,
+    applyOverrideRead("ch-cleared", apis),
+    "overrideCleared",
+    "cleared channel: outcome must be overrideCleared",
+  );
+  assert.equal(
+    applyOverrideRead("ch-refused", apis),
     "overrideStillActive",
-    "refused channel: outcome",
-  );
-
-  // ch-cleared: override confirmed inactive → all three maps purged.
-  assert.equal(
-    latestByChannel.has("ch-cleared"),
-    false,
-    "cleared: latestByChannel removed",
-  );
-  assert.equal(
-    observedEvents.has("ch-cleared"),
-    false,
-    "cleared: observedEvents removed",
-  );
-  assert.equal(
-    Object.hasOwn(forcedMap, "ch-cleared"),
-    false,
-    "cleared: forcedMap removed",
-  );
-
-  // ch-refused: override still active → all three maps preserved.
-  assert.equal(
-    latestByChannel.has("ch-refused"),
-    true,
-    "refused: latestByChannel preserved",
-  );
-  assert.equal(
-    observedEvents.has("ch-refused"),
-    true,
-    "refused: observedEvents preserved",
-  );
-  assert.equal(
-    Object.hasOwn(forcedMap, "ch-refused"),
-    true,
-    "refused: forcedMap preserved",
+    "refused channel: outcome must be overrideStillActive",
   );
 });
 
 // ── Call-path witnesses (pass-4 corrective) ────────────────────────────────────
 
 test("adversarial-5: markChannelRead_refused_clear_preserves_forced_unread_entry", () => {
-  // Call-path witness for the markChannelRead fix: the production hook calls
-  // applyOverrideRead (C-bump) and ONLY clears forcedUnread when the outcome
-  // is "overrideCleared". On a refused clear (uint32_overflow), the return value
-  // must be "overrideStillActive" so the hook's deletion gate preserves the entry.
+  // Helper-contract witness for applyOverrideRead: when markChannelRead is refused
+  // with liveness still active, the outcome must be "overrideStillActive" so the
+  // hook's overrideCleared gate preserves forced state and observed evidence.
   //
-  // If the hook ever drops the applyOverrideRead call and unconditionally deletes,
-  // the existing type-checker catches the missing import. This test locks the
-  // overrideStillActive return contract that the gate depends on.
+  // Bites: applyOverrideRead return value contract. The hook (useUnreadChannels.ts:
+  // markChannelRead) gates ALL evidence deletion on this outcome — moving removeChannel
+  // outside the gate or removing the applyOverrideRead call would be caught by the
+  // mounted refused-clear test in useUnreadChannels.test.mjs, not by this test.
   const liveness = { active: true, frontier: 100 };
   const result = applyOverrideRead(
     "ch-refused",
@@ -649,14 +598,15 @@ test("adversarial-5: markChannelRead_refused_clear_preserves_forced_unread_entry
 });
 
 test("adversarial-6: markChannelRead_spec_order_frontier_advance_before_cbump", () => {
-  // Spec-ordering witness: the production markChannelRead advances the frontier
-  // BEFORE the C-bump. This means applyOverrideRead sees a post-advance frontier.
-  // When F advances past B (B < F), active → inactive, so applyOverrideRead
-  // returns "overrideCleared" — the hook correctly gates the deletion.
+  // Helper-contract witness for applyOverrideRead: the call sees a post-advance
+  // liveness state (frontier already applied). When F advances past B, the helper
+  // must return overrideCleared.
   //
-  // Simulation: start with F=50, B=100 (active). Manager markChannelRead advances
-  // frontier to 101 (B < F → inactive). getOverrideLiveness reflects the new state.
-  // applyOverrideRead must return "overrideCleared".
+  // Bites: applyOverrideRead deactivation-via-frontier path. The production hook
+  // calls markContextRead BEFORE applyOverrideRead, so this helper call always
+  // sees post-advance liveness — the ordering is locked by the hook; see
+  // useUnreadChannels.ts:markChannelRead and useUnreadChannels.test.mjs for the
+  // mounted ordering witness.
   let frontier = 50; // initial value; B=100, so active (B ≥ F)
   const result = applyOverrideRead(
     "ch-advanced",

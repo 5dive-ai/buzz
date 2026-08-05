@@ -1266,3 +1266,92 @@ test("fetchCommunityUnread adversarial-7: active fetched register, no complete p
   // Fetched active register (S=5 > C=0, B=100 ≥ F=50) must light the rail.
   assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
 });
+
+test("fetchCommunityUnread adversarial-8: fetched inactive register supersedes qualifying local forced-unread entry → rail stays dark", async () => {
+  // Bites: communityUnreadObserver.ts:else if condition — local forcedUnreadMap
+  // fallback runs ONLY when reg === undefined. An inactive fetched register (a
+  // remote tombstone or F>B deactivation) plus a qualifying local entry must keep
+  // the rail dark — the fetched verdict is final.
+  //
+  // Before the fix, the else-if ran when reg was absent OR inactive:
+  //   } else if (Object.hasOwn(forcedUnreadMap, channel.id)) {
+  // An inactive reg (reg !== undefined, isOverrideActive === false) fell into this
+  // branch and could resurrect the override from stale local state. Fix: the
+  // fallback runs ONLY when reg === undefined.
+  //
+  // Setup: fetched event carries a cleared register (S=5, C=8 → C>S, inactive).
+  // Channel frontier = 50 (from fetched read-state).
+  // Forced-unread entry has markerAtWhenForced=50 (would pass the frontier gate).
+  // Expected: rail stays dark — fetched inactive verdict is final.
+  const SLOT = "d".repeat(32); // valid 32-hex slot, distinct from other tests
+
+  const relay = relayFor([
+    // 1. member events
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["p", PUBKEY],
+        ],
+      }),
+    ],
+    // 2. metadata
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["t", "stream"],
+        ],
+      }),
+    ],
+    // 3. visibility
+    () => [],
+    // 4. read-state: cleared register S=5, C=8, B=100 (C>S → inactive); frontier=50
+    () => [
+      event({
+        pubkey: PUBKEY,
+        created_at: 300,
+        tags: [
+          ["d", `read-state:${SLOT}`],
+          ["t", "read-state"],
+        ],
+        content: JSON.stringify({
+          v: 1,
+          client_id: "client",
+          contexts: {
+            [CHANNEL_ID]: 50, // frontier F=50
+            [`ov_s:${CHANNEL_ID}`]: 5,
+            [`ov_c:${CHANNEL_ID}`]: 8, // C=8 > S=5 → inactive
+            [`ov_b:${CHANNEL_ID}`]: 100,
+          },
+        }),
+      }),
+    ],
+    // 5. mutes
+    () => [],
+    // 6. unread events — none
+    () => [],
+    // 7. mention events — none
+    () => [],
+  ]);
+
+  // Inject a qualifying forced-unread entry: markerAtWhenForced=50 (equals channel
+  // frontier, so readAt <= markerAtWhenForced would pass the gate). Under the old
+  // code this would resurrect the override; under the fix it is suppressed.
+  const result = await fetchCommunityUnread({
+    client: relay,
+    pubkey: PUBKEY,
+    nowSeconds: 400,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships(),
+    readForcedUnread: () => ({
+      [CHANNEL_ID]: { markerAtWhenForced: 50, sources: ["manual"] },
+    }),
+    // No getProjection — fallback path.
+  });
+
+  // Fetched inactive register is authoritative; local forced-unread must not
+  // resurrect it. Rail stays dark.
+  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+});

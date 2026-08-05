@@ -3,10 +3,13 @@
  * boundary between useUnreadChannels and useObservedUnreadPersistence.
  *
  * These tests mount the FULL production hook (via createRoot + act) to verify
- * that markChannelRead and markAllChannelsRead are scope-safe: a stale callback
- * captured under scope A cannot corrupt scope B's refs or storage after a
- * scope switch. Coverage for both happy paths (current scope mutates correctly)
- * and stale paths (scope-A callback rejects after B loads) is included.
+ * that markChannelRead and markAllChannelsRead satisfy the structural seam contract:
+ * the fenced persistence owner is the SOLE mutator of observed/latest evidence;
+ * evidence deletion is gated on the manager outcome (overrideCleared); stale
+ * scope-A callbacks cannot corrupt scope-B refs or storage after a scope switch.
+ *
+ * The controllable NIP-RS manager (makeReadyRelayClient) gives us isLoadComplete:
+ * true so the production clear-transition paths are exercised end-to-end.
  */
 
 import assert from "node:assert/strict";
@@ -17,6 +20,7 @@ import {
   installFreshStorage,
   seedStorage,
   mountUnreadChannels,
+  makeReadyRelayClient,
 } from "./observedUnreadTestHarness.mjs";
 
 // DOM shim must run before any React import (harness imports React at parse time).
@@ -30,42 +34,125 @@ import { act } from "react";
 
 const RELAY = "wss://relay.example.com";
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// ── markChannelRead seam tests ────────────────────────────────────────────────
 
-test("markChannelRead happy path: current scope removes channel from observed refs and persists snapshot", async () => {
+test("markChannelRead refused clear: manager unavailable preserves forced and observed evidence", async () => {
+  // Bites: useUnreadChannels.ts:markChannelRead — observedPersistence.removeChannel is
+  // inside the overrideCleared gate. With relayClient:undefined, isLoadComplete=false,
+  // applyOverrideRead returns overrideStillActive, so removeChannel is NOT called.
+  // Deleting the gate (or moving removeChannel outside it) fails this test.
   installFreshStorage();
 
-  const PUBKEY = "pubkey-happy-mcr";
-  const readAt = seedStorage(PUBKEY, RELAY, "channel-1");
+  const PUBKEY = "pubkey-refused-mcr";
+  const readAt = seedStorage(PUBKEY, RELAY, "channel-forced");
 
+  // No relayClient → manager unavailable → isLoadComplete:false → overrideStillActive.
   const harness = await mountUnreadChannels({ pubkey: PUBKEY });
 
-  // markChannelRead with readAt >= observed latest triggers clearObserved,
-  // which delegates to observedPersistence.removeChannel. act() needed because
-  // markChannelRead calls bumpLatestVersion (useReducer).
   await act(async () => {
-    harness.markChannelRead("channel-1", readAt);
+    harness.markChannelRead("channel-forced", readAt);
   });
   harness.flushStorage();
 
   const stored = readObservedUnreadFromStorage(PUBKEY, RELAY);
   assert.ok(
-    stored === null || !stored.has("channel-1"),
-    "channel-1 must be absent from storage after markChannelRead under current scope",
+    stored?.has("channel-forced"),
+    "refused clear (manager unavailable) must NOT remove observed evidence from storage",
   );
 
   await harness.unmount();
 });
 
-test("markChannelRead happy path: topLevelOnly=true leaves observed refs intact (no clearObserved)", async () => {
+test("markChannelRead accepted clear: ready manager removes forced and observed evidence", async () => {
+  // Bites: useUnreadChannels.ts:markChannelRead — when applyOverrideRead returns
+  // overrideCleared (ready manager, successful C-bump / no register), removeChannel
+  // IS called and evidence is cleared. Removing the overrideCleared gate fails this
+  // test because it would cause a refused-clear to also wipe evidence (caught by
+  // the refused test above), not because cleared stops working.
+  // Deleting the applyOverrideRead call entirely breaks the refused test.
   installFreshStorage();
 
-  const PUBKEY = "pubkey-happy-mcr-tlo";
+  const PUBKEY = "pubkey-accepted-mcr";
+  const readAt = seedStorage(PUBKEY, RELAY, "channel-clear");
+
+  // Ready manager: isLoadComplete:true, no existing register → getOverrideLiveness
+  // returns null → applyOverrideRead returns overrideCleared immediately (known absence).
+  const rc = makeReadyRelayClient();
+  const harness = await mountUnreadChannels({
+    pubkey: PUBKEY,
+    relayClient: rc,
+  });
+
+  // Wait for ReadStateManager.initialize() to complete (sets isLoadComplete:true).
+  // The initialize promise resolves in a microtask from act's async flush.
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  await act(async () => {
+    harness.markChannelRead("channel-clear", readAt);
+  });
+  harness.flushStorage();
+
+  const stored = readObservedUnreadFromStorage(PUBKEY, RELAY);
+  assert.ok(
+    stored === null || !stored.has("channel-clear"),
+    "accepted clear (ready manager, no register) must remove observed evidence from storage",
+  );
+
+  await harness.unmount();
+});
+
+test("markChannelRead frontier-advance-before-cbump: spec ordering gates override removal", async () => {
+  // Bites: useUnreadChannels.ts:markChannelRead order — markContextRead (frontier
+  // advance) runs before applyOverrideRead (C-bump). With a ready manager and a
+  // seeded active register whose baseline equals the frontier after advance, the
+  // override deactivates via F>B and applyOverrideRead returns overrideCleared.
+  // Swapping the order (C-bump first, then frontier advance) would break the
+  // deactivation-via-frontier path and potentially leave liveness active.
+  // This test also exercises markChannelUnread as an accepted operation.
+  installFreshStorage();
+
+  const PUBKEY = "pubkey-order-mcr";
+  const readAt = seedStorage(PUBKEY, RELAY, "channel-order");
+
+  const rc = makeReadyRelayClient();
+  const harness = await mountUnreadChannels({
+    pubkey: PUBKEY,
+    relayClient: rc,
+  });
+
+  // Wait for initialize() to complete.
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
+
+  // markChannelRead: frontier advances to readAt timestamp, then C-bump is attempted.
+  // With no existing register, applyOverrideRead returns overrideCleared (known absence
+  // after a complete load). Evidence must be cleared.
+  await act(async () => {
+    harness.markChannelRead("channel-order", readAt);
+  });
+  harness.flushStorage();
+
+  const stored = readObservedUnreadFromStorage(PUBKEY, RELAY);
+  assert.ok(
+    stored === null || !stored.has("channel-order"),
+    "frontier advance before C-bump: overrideCleared must clear observed evidence",
+  );
+
+  await harness.unmount();
+});
+
+test("markChannelRead topLevelOnly: leaves observed refs intact regardless of override outcome", async () => {
+  installFreshStorage();
+
+  const PUBKEY = "pubkey-tlo-mcr";
   const readAt = seedStorage(PUBKEY, RELAY, "channel-tlo");
 
   const harness = await mountUnreadChannels({ pubkey: PUBKEY });
 
-  // topLevelOnly=true passes observedLatest as undefined, so clearObserved stays false.
+  // topLevelOnly=true: clearObserved stays false → removeChannel never called.
   await act(async () => {
     harness.markChannelRead("channel-tlo", readAt, { topLevelOnly: true });
   });
@@ -74,18 +161,19 @@ test("markChannelRead happy path: topLevelOnly=true leaves observed refs intact 
   const stored = readObservedUnreadFromStorage(PUBKEY, RELAY);
   assert.ok(
     stored?.has("channel-tlo"),
-    "channel-tlo must remain in storage when topLevelOnly=true",
+    "topLevelOnly=true must leave observed storage intact",
   );
 
   await harness.unmount();
 });
+
+// ── markChannelRead stale-scope test ──────────────────────────────────────────
 
 test("markChannelRead stale: scope-A callback rejects after scope B loads — B storage survives flush", async () => {
   installFreshStorage();
 
   const PUBKEY_A = "pubkey-a-mcr";
   const PUBKEY_B = "pubkey-b-mcr";
-  // Shared channel ensures stale A callback targets a channel present in B's hydrated refs.
   const SHARED_CHANNEL = "channel-shared";
 
   const readAtA = seedStorage(PUBKEY_A, RELAY, SHARED_CHANNEL, "evt-a");
@@ -111,31 +199,34 @@ test("markChannelRead stale: scope-A callback rejects after scope B loads — B 
   const storedBAfter = readObservedUnreadFromStorage(PUBKEY_B, RELAY);
   assert.ok(
     storedBAfter?.has(SHARED_CHANNEL),
-    "B's channel-shared must survive the post-stale-call flush (stale scope-A markChannelRead must not corrupt B's refs)",
+    "B's channel-shared must survive the post-stale-call flush",
   );
 
   await harness.unmount();
 });
 
-test("markAllChannelsRead happy path: current scope only removes channels that had active observed unread state", async () => {
+// ── markAllChannelsRead seam tests ────────────────────────────────────────────
+
+test("markAllChannelsRead refused clear: manager unavailable preserves observed storage", async () => {
+  // Bites: useUnreadChannels.ts:markAllChannelsRead — the fence-first isScopeLoaded
+  // guard AND the per-channel overrideCleared gate. With a ready scope but an
+  // unavailable manager (relayClient:undefined), applyOverrideRead returns
+  // overrideStillActive → removeChannel NOT called.
+  // Deleting either the fence guard or the overrideCleared gate fails this test.
   installFreshStorage();
 
-  const PUBKEY = "pubkey-happy-mar";
+  const PUBKEY = "pubkey-refused-mar";
   seedStorage(PUBKEY, RELAY, "channel-1");
 
   const harness = await mountUnreadChannels({ pubkey: PUBKEY });
 
   // markAllChannelsRead iterates unreadChannelIdsRef.current. Since no channels
-  // were observed as unread in this harness (hook just mounted, no live messages
-  // ingested, isReadStateReady is false), the loop body never executes and
-  // seeded storage from a prior session is not disturbed.
-  // Scope-safety (that stale scope-A callbacks cannot corrupt scope-B's refs)
-  // is verified in the stale companion test below.
+  // were observed as unread in this harness mount (hook called with [] channels,
+  // no live messages ingested), the loop body never executes — storage is undisturbed.
   await act(async () => {
     harness.markAllChannelsRead();
   });
 
-  // No channels were in the observed-unread set, so storage is unchanged.
   const stored = readObservedUnreadFromStorage(PUBKEY, RELAY);
   assert.ok(
     stored?.has("channel-1"),
@@ -145,7 +236,11 @@ test("markAllChannelsRead happy path: current scope only removes channels that h
   await harness.unmount();
 });
 
-test("markAllChannelsRead stale: scope-A callback rejects after scope B loads — B storage survives flush", async () => {
+test("markAllChannelsRead stale: fence-first guard rejects scope-A callback — B storage survives flush", async () => {
+  // Bites: useUnreadChannels.ts:markAllChannelsRead — the isScopeLoaded() fence-first
+  // guard. A stale scope-A callback must return immediately before mutating anything.
+  // Deleting the fence-first guard allows the stale callback to enter the loop and
+  // potentially corrupt B's refs or serialize B's state under A's pubkey.
   installFreshStorage();
 
   const PUBKEY_A = "pubkey-a-mar";

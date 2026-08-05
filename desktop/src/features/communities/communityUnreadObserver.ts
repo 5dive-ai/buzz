@@ -300,7 +300,10 @@ export async function fetchCommunityUnread(args: {
         const reg = authoritative.get(channel.id);
         if (reg !== undefined && isOverrideActive(reg, readAt ?? 0)) {
           hasUnread = true;
-        } else if (Object.hasOwn(forcedUnreadMap, channel.id)) {
+        } else if (
+          reg === undefined &&
+          Object.hasOwn(forcedUnreadMap, channel.id)
+        ) {
           // Forced-unread lights the dot without a relay fetch, but only if the
           // synced read marker has NOT advanced past the stored baseline. This
           // prevents stale forced-unread from lighting the rail after a cross-device

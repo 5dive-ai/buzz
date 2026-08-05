@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shlex
 from dataclasses import dataclass, field
@@ -21,11 +22,13 @@ from typing import Any
 import certifi
 from harbor.environments.base import BaseEnvironment
 
-from . import accounting, bundle
+from . import accounting, bundle, trajectory
 from .accounting import TURN_ENDED_MARKERS, USAGE_MARKER
 from .manifest import AgentClass, ExperimentManifest, GenerationConfig
 from .provisioning import AgentCredential, TrialHandle
 from .runtime import RuntimeResult
+
+logger = logging.getLogger(__name__)
 
 
 # Tool/LLM rounds allowed per agent turn (BUZZ_AGENT_MAX_ROUNDS).
@@ -437,6 +440,27 @@ class BuzzContainerRuntime:
                 accounting=trial_accounting,
                 endpoints=self.endpoints,
             )
+            # Last, because it reads what everything above just wrote. Goes
+            # beside `buzz/` rather than inside it: Harbor's uploader publishes
+            # exactly `<trial>/agent/trajectory.json` as the trial's
+            # trajectory_path, and the Terminal-Bench leaderboard rejects a
+            # submission whose rewarded trials lack one.
+            written = trajectory.write(
+                logs_dir=self.logs_dir,
+                trial_dir=trial_dir,
+                manifest=manifest,
+                instruction=instruction,
+                session_id=trial.trial_id,
+                accounting=trial_accounting,
+            )
+            if written is None:
+                # Not fatal to the trial, fatal to submitting it. Say so here
+                # rather than letting CI discover it 445 trials later.
+                logger.warning(
+                    "no ATIF trajectory written for trial %s; this trial cannot "
+                    "be part of a leaderboard submission",
+                    trial.trial_id,
+                )
 
         return RuntimeResult(
             input_tokens=trial_accounting.input_tokens,

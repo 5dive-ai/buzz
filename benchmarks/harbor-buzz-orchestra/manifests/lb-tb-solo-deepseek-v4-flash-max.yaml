@@ -1,0 +1,84 @@
+# LEADERBOARD SUBMISSION CELL -- solo deepseek/deepseek-v4-flash-0731 at
+# reasoning effort `max`, via OpenRouter, for the Terminal-Bench 2.1 board.
+#
+# This is NOT a study cell and must not be pooled with one. Every study
+# manifest raises the container's resources and the wall clock; this one
+# cannot, because the leaderboard rejects both. The `lb-` prefix and the
+# distinct `condition` keep the two from ever hashing together.
+#
+# WHAT MAKES A SUBMISSION VALID (leaderboard/src/leaderboard/ci/static_analysis.py):
+#   * timeout_multiplier unset or 1.0                -- run with `--timeout-multiplier 1.0`
+#   * no agent/verifier timeout overrides
+#   * no environment resource overrides              -- hence NO `environment:` block below
+#   * all 89 tasks, >= 5 trials each                 -- `-k 5`
+#   * every rewarded trial carries an ATIF trajectory
+# The dataset ref our runs already resolve
+# (sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a)
+# is exactly the DATASET_REF the board pins, so the tasks need nothing done to
+# them.
+#
+# THE MISSING `environment:` BLOCK IS THE WHOLE DIFFERENCE, AND IT IS EXPENSIVE.
+# Study cells give every task 4 CPUs and 8 GB. Here Harbor honours each task's
+# own declaration, and across the 89 task.toml files that is 1 vCPU on 83 of
+# them and 2048 MB on 68 -- shared with the task's own work, because the Buzz
+# stack (buzz-acp + buzz-agent + buzz-dev-mcp + the relay forwarder) runs
+# *inside* the task container. The agent clock shrinks the same way: at 1.0x,
+# 48 tasks get 900s where the study gave them 2700s. The `high` cell already
+# timed out on 16 of 89 at 3x. Expect this row to score materially below the
+# 0.618 in tools/table.py, and read a drop as the settings rather than as the
+# model.
+#
+# THE UPSTREAM IS PINNED, AND THE CHOICE IS NOT THE OBVIOUS ONE. OpenRouter
+# serves this model id from nine upstreams spanning fp4 to fp8 quantization,
+# 262K to 1M context, and $0.09-$0.14 per Mtok. Cheapest is deepinfra/fp4 --
+# and it caches well -- but fp4 is a materially more degraded set of weights
+# than the fp8 every other endpoint serves, so benchmarking it and labelling
+# the row "deepseek-v4-flash-0731" would overstate what ran. This pins
+# `gmicloud/fp8`: fp8, the full 1M context, 98.9% uptime, and the cheapest of
+# the fp8 endpoints at $0.133/$0.266. A leaderboard row names a model, so the
+# pin is what makes the name true.
+#
+# EFFORT IS `max`, WHICH IS NOT THIS MODEL'S DEFAULT. deepseek-v4-flash-0731
+# advertises supported_efforts ["max","high","low"] and defaults to "high", so
+# the study's `high` cell measured the provider default and this one does not.
+# The effort also has to reach the leaderboard as a *label*: `lb filter` reads
+# it from the job config's `agents[0].kwargs.reasoning_effort`, and a job that
+# omits it publishes a row saying "none". scripts/lb_job_config.py derives that
+# label from the field below rather than taking one of its own, so the label and
+# the run cannot disagree; `--expect-effort max` asserts the intent against this
+# file for an operator who wants it checked rather than assumed.
+schema_version: "1"
+condition: lb-tb-solo-deepseek-v4-flash-max
+roster:
+  - id: solo
+    kind: orchestrator
+    role: solo
+    count: 1
+    endpoint: deepseek/deepseek-v4-flash-0731
+    model_revision: deepseek/deepseek-v4-flash-20260731
+    prompt:
+      # Byte-identical to every other solo cell in the study.
+      path: personas/bench/solo.md
+      sha256: 61c9ac9dc47cbd3c987a7ee6ceb7397496834df8d3fc284c8fe6980e1d5b4ebe
+    generation:
+      thinking_effort: max
+prices:
+  deepseek/deepseek-v4-flash-0731:
+    # The gmicloud/fp8 endpoint's own rates -- NOT the model id's headline
+    # $0.14/$0.28, which belongs to a different set of upstreams. Pinning is
+    # what makes this row the correct one.
+    input_per_million_usd: 0.133
+    cached_input_per_million_usd: 0.0266
+    output_per_million_usd: 0.266
+    # Fallback only; the pinned route reports the real split and the harness
+    # prefers it. See tb-solo-kimi-k3-high.yaml.
+    cache_read_rate: 0.0
+trial_budget:
+  # The harness's own ceiling, which must clear Harbor's longest task deadline
+  # or check_budget_clears_clock refuses the run. At 1.0x that is the largest
+  # `[agent] timeout_sec` in the dataset, 12000s, unscaled. Harbor's per-task
+  # deadline is always the shorter of the two here (900s on 48 tasks), so it is
+  # Harbor that ends every trial -- which is exactly what the board requires.
+  timeout_seconds: 12000
+
+# No `environment:` block. See the header: adding one disqualifies the run.

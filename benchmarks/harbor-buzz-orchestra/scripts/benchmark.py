@@ -280,6 +280,33 @@ def container_scoring_probe(timeout: float = 180.0) -> tuple[str, str] | None:
     return lines[0], lines[1]
 
 
+# Escape hatch for the container-egress guard below. Deliberately narrow: it
+# only applies to a run that is already too small to be a measurement, so it
+# cannot be used to push a corrupted sweep through. Exists because the guard is
+# also the thing standing between you and testing the harness at all when the
+# proxy is having a bad day, and "score 0 everywhere" is a perfectly good result
+# when what you are checking is whether trajectory.json gets written.
+UNSCOREABLE_BYPASS = "BUZZ_BENCHMARK_ALLOW_UNSCOREABLE"
+# A bypassed run may name at most this many tasks. Four is enough to cover the
+# resource shapes worth smoke-testing and far too few to look like a sweep.
+UNSCOREABLE_BYPASS_MAX_TASKS = 4
+
+
+def unscoreable_bypass_allowed(args: argparse.Namespace) -> bool:
+    """Whether this run may proceed with verifiers that cannot install anything.
+
+    Three conditions, all required: the variable is set, the run names a short
+    explicit task list, and it runs one attempt each. Any of them missing means
+    the run is or could become a real measurement, and a measurement taken
+    through a broken verifier path is worse than no measurement -- it looks like
+    a model that failed.
+    """
+    if os.environ.get(UNSCOREABLE_BYPASS) != "1":
+        return False
+    tasks = list(args.include_task)
+    return 0 < len(tasks) <= UNSCOREABLE_BYPASS_MAX_TASKS and args.attempts == 1
+
+
 def check_container_can_be_scored() -> None:
     """Refuse a sweep whose verifiers will not be able to install pytest.
 
@@ -416,12 +443,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--n-concurrent", "-n", type=int, default=4, help="Concurrent trials")
     parser.add_argument(
-        "--timeout-multiplier", type=float, default=DEFAULT_TIMEOUT_MULTIPLIER,
+        "--timeout-multiplier", type=float, default=None,
         metavar="N",
         help="Scale every Harbor phase deadline (agent, verifier, setup, build) "
-             f"by N (default: {DEFAULT_TIMEOUT_MULTIPLIER}). Pass 1.0 for a run "
-             "that can be submitted to the leaderboard; anything else makes the "
-             "job local-only.",
+             f"by N (default: {DEFAULT_TIMEOUT_MULTIPLIER}, or 1.0 with "
+             "--submission). Pass 1.0 for a run that can be submitted to the "
+             "leaderboard; anything else makes the job local-only.",
     )
     parser.add_argument(
         "--jobs-dir", type=Path, default=PACKAGE_ROOT / "jobs", help="Job output root"
@@ -434,7 +461,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "same manifest, or the two halves will not group together.",
     )
     parser.add_argument(
+        "--submission", action="store_true",
+        help="Produce a job submittable to the public Terminal-Bench "
+             "leaderboard. Forces --timeout-multiplier 1.0, drops the manifest's "
+             "environment resource overrides, and names the agent/model/effort "
+             "through a job config so the published row matches the run. "
+             "Requires a solo manifest that pins its reasoning effort.",
+    )
+    parser.add_argument(
         "--upload", action="store_true", help="Upload to Harbor Hub when the job finishes"
+    )
+    parser.add_argument(
+        "--public", action="store_true",
+        help="Make the uploaded job public (requires --upload). Leaderboard CI "
+             "reads the job through the hub, so a submission has to be public.",
+    )
+    parser.add_argument(
+        "--share-org", action="append", default=[], metavar="ORG",
+        help="Share the uploaded job with a Harbor Hub organization "
+             "(requires --upload, repeatable). Harbor has no upload-as-org: an "
+             "upload belongs to the authenticated user, and sharing is what "
+             "makes it appear under hub.harborframework.com/organizations/<ORG>.",
     )
     parser.add_argument(
         "--gui", action="store_true",
@@ -449,7 +496,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run", action="store_true",
         help="Print the underlying harbor command and exit (no stack bring-up)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # Resolved here rather than as an argparse default so an explicit value and
+    # an inherited one are distinguishable: --submission needs 1.0, and silently
+    # overriding a multiplier someone typed would be worse than refusing it.
+    if args.timeout_multiplier is None:
+        args.timeout_multiplier = 1.0 if args.submission else DEFAULT_TIMEOUT_MULTIPLIER
+    elif args.submission and args.timeout_multiplier != 1.0:
+        parser.error(
+            f"--submission requires --timeout-multiplier 1.0 (got "
+            f"{args.timeout_multiplier}). Terminal-Bench rejects a job whose "
+            "phase deadlines were scaled, so the two cannot both hold."
+        )
+    if (args.public or args.share_org) and not args.upload:
+        parser.error("--public / --share-org requires --upload")
+    return args
 
 
 # -- state: secrets and identities, generated once --------------------------
@@ -1087,6 +1148,24 @@ def qualify_task_pattern(pattern: str, dataset: str) -> str:
     return f"*/{pattern}"
 
 
+def check_submission_manifest(manifest: Path) -> None:
+    """Refuse a manifest whose own settings would disqualify the submission.
+
+    Only the resource block, because that is the one thing the manifest can
+    assert unilaterally. Everything else a submission depends on -- one model, a
+    pinned reasoning effort -- is checked by ``lb_job_config``, which builds the
+    config that publishes them.
+    """
+    declared = environment_override_argv(manifest)
+    if declared:
+        raise DatasetError(
+            f"--submission: {manifest} declares an `environment:` block "
+            f"({' '.join(declared)}), and Terminal-Bench rejects a job carrying "
+            "resource overrides. Use a manifest without one — see "
+            "manifests/lb-*.yaml, whose header explains what that costs."
+        )
+
+
 def leaderboard_argv(
     args: argparse.Namespace, provisioner_config: Path, agent_bin_dir: Path
 ) -> list[str]:
@@ -1117,7 +1196,13 @@ def leaderboard_argv(
         "--n-concurrent", str(args.n_concurrent),
         "--jobs-dir", str(args.jobs_dir),
     ]
-    argv += environment_override_argv(args.manifest)
+    if args.submission:
+        # The manifest's resource block is deliberately not forwarded here;
+        # check_submission_manifest() has already refused a manifest that
+        # declares one, so there is nothing to drop silently.
+        argv.append("--submission")
+    else:
+        argv += environment_override_argv(args.manifest)
     if args.timeout_multiplier != 1.0:
         # Forwarded only when it changes something: Harbor's validator rejects
         # the flag being *set*, not just being non-unity, so a submittable run
@@ -1127,6 +1212,10 @@ def leaderboard_argv(
         argv += ["--job-name", args.job_name]
     if args.upload:
         argv.append("--upload")
+        if args.public:
+            argv.append("--public")
+        for org in args.share_org:
+            argv += ["--share-org", org]
     if args.dry_run:
         argv.append("--dry-run")
     return argv
@@ -1134,6 +1223,12 @@ def leaderboard_argv(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.submission:
+        try:
+            check_submission_manifest(args.manifest)
+        except DatasetError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
     # Before anything expensive: a local --path needs no registry, a registry
     # dataset must resolve.
     if not args.path:
@@ -1184,8 +1279,28 @@ def main(argv: list[str] | None = None) -> int:
         try:
             check_container_can_be_scored()
         except ContainerEgressError as error:
-            print(f"error: {error}", file=sys.stderr)
-            return 2
+            if not unscoreable_bypass_allowed(args):
+                print(f"error: {error}", file=sys.stderr)
+                if os.environ.get(UNSCOREABLE_BYPASS) == "1":
+                    print(
+                        f"  {UNSCOREABLE_BYPASS}=1 is set but this run is not a "
+                        "filtered smoke test, so it does not apply. See the "
+                        "variable's definition for why.",
+                        file=sys.stderr,
+                    )
+                return 2
+            print(
+                "\n"
+                "  !! CONTAINER EGRESS IS BROKEN AND THIS RUN IS PROCEEDING ANYWAY.\n"
+                f"  !! {error}\n"
+                "  !! Every reward from this job is meaningless: the verifiers "
+                "cannot install their own\n"
+                "  !! test dependencies, so tasks the agent solved will still "
+                "record 0. Use this job to\n"
+                "  !! check plumbing (artifacts, config, trajectories) and "
+                "nothing else.\n",
+                file=sys.stderr,
+            )
     state = load_state()
     print_user_identity(state, show_secret=args.gui)
     write_env_file(state)

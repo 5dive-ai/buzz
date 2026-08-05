@@ -18,8 +18,12 @@ from .runtime import OrchestraRuntime
 class BuzzOrchestraAgent(BaseAgent):
     """Coordinate an arbitrary manifest-defined team through a Buzz trial."""
 
-    # Set True only once the runtime writes a validated agent/trajectory.json.
-    SUPPORTS_ATIF = False
+    # The runtime writes agent/trajectory.json and validates it against Harbor's
+    # own ATIF model before writing, so a document the hub would reject fails in
+    # the trial rather than in leaderboard CI. See `trajectory.py` — notably that
+    # tool *results* are not recorded anywhere in the stack, so every step's
+    # `observation` is absent and the trajectory says so in its `notes`.
+    SUPPORTS_ATIF = True
 
     def __init__(
         self,

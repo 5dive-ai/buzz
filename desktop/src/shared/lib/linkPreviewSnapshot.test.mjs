@@ -70,6 +70,7 @@ test("snapshot tags sanitize control characters and enforce UTF-8 byte limits", 
     faviconSha256: "",
   });
 
+  assert.ok(tag);
   for (const value of tag.slice(4, 7)) {
     assert.ok(
       Array.from(value).every((char) => {
@@ -81,6 +82,30 @@ test("snapshot tags sanitize control characters and enforce UTF-8 byte limits", 
   assert.ok(Buffer.byteLength(tag[4], "utf8") <= 300);
   assert.ok(Buffer.byteLength(tag[5], "utf8") <= 100);
   assert.ok(Buffer.byteLength(tag[6], "utf8") <= 1000);
+});
+
+test("snapshot tags omit canonical URLs rejected by native validation", () => {
+  for (const canonicalUrl of [
+    `${URL}#`,
+    `${URL}#details`,
+    `http://linear.app/acme/issue/ABC-123/example`,
+    `https://user@linear.app/acme/issue/ABC-123/example`,
+  ]) {
+    assert.equal(
+      buildLinkPreviewSnapshotTag({
+        canonicalUrl,
+        title: "Example",
+        siteName: "Linear",
+        description: "Description",
+        imageUrl: "",
+        imageSha256: "",
+        faviconUrl: "",
+        faviconSha256: "",
+      }),
+      null,
+      canonicalUrl,
+    );
+  }
 });
 
 test("messages without authored snapshots never create recipient previews", () => {

@@ -532,14 +532,31 @@ for (const [pasteShape, wrapUrl] of [
   });
 }
 
-test("completed link preview sends once and leaves the composer cleared", async ({
+test("completed link previews send when one URL has an unsnapshotable fragment", async ({
   page,
 }) => {
-  const previewUrl = "https://github.com/block/buzz/pull/3246?send=complete";
+  const previewUrls = [
+    "https://twitter.com/tellaho",
+    "https://github.com/block/buzz/pull/3246",
+    "https://x.com/tellaho/status/1884289176381841506#",
+  ];
+  const pastedText = previewUrls.join("\n");
   await page.goto("/");
   await page.getByTestId("channel-general").click();
-  await page.getByTestId("message-input").fill(previewUrl);
-  await waitForReadyComposerSnapshots(page);
+  const input = page.getByTestId("message-input");
+  await input.focus();
+  await input.evaluate((element, text) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", text);
+    element.dispatchEvent(
+      new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData,
+      }),
+    );
+  }, pastedText);
+  await waitForReadyComposerSnapshots(page, 2);
 
   const send = page.getByTestId("send-message");
   await expect(send).toBeEnabled();
@@ -558,8 +575,8 @@ test("completed link preview sends once and leaves the composer cleared", async 
   expect(
     (
       calls[0]?.payload as { linkPreviewTags?: string[][] | null } | undefined
-    )?.linkPreviewTags?.[0]?.slice(0, 4),
-  ).toEqual(["link-preview", "snapshot", "1", previewUrl]);
+    )?.linkPreviewTags?.map((tag) => tag[3]),
+  ).toEqual(previewUrls.slice(0, 2));
 });
 
 test("send does not wait for a pending link preview snapshot", async ({

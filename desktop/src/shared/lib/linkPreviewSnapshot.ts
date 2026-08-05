@@ -9,6 +9,18 @@ const MAX_SNAPSHOTS = 8;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const IMAGE_EXT_RE = /^(?:jpg|png|gif|webp)$/;
 
+export function isValidLinkPreviewSnapshotCanonicalUrl(value: string): boolean {
+  if (value.includes("#")) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" && !url.username && !url.password && !url.hash
+    );
+  } catch {
+    return false;
+  }
+}
+
 export type LinkPreviewSnapshot = {
   canonicalUrl: string;
   title: string;
@@ -40,7 +52,7 @@ function sanitizeSnapshotText(value: string, maxBytes: number): string {
 
 function validText(value: string, max: number): boolean {
   return (
-    value.length <= max &&
+    new TextEncoder().encode(value).length <= max &&
     !Array.from(value).some((char) => {
       const code = char.charCodeAt(0);
       return code <= 0x1f || code === 0x7f;
@@ -144,7 +156,9 @@ export function parseLinkPreviewSnapshots(
 
 export function buildLinkPreviewSnapshotTag(
   snapshot: LinkPreviewSnapshot,
-): string[] {
+): string[] | null {
+  if (!isValidLinkPreviewSnapshotCanonicalUrl(snapshot.canonicalUrl))
+    return null;
   return [
     "link-preview",
     "snapshot",

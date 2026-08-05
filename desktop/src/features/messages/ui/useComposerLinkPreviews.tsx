@@ -192,6 +192,7 @@ export function useComposerLinkPreviews(content: string) {
             faviconUrl: favicon.url,
             faviconSha256: favicon.sha256,
           });
+          if (!tag) return;
           setReadyTags((current) => ({ ...current, [preview.href]: tag }));
         })
         .catch(() => {})

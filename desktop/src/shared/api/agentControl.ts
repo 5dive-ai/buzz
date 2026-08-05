@@ -40,17 +40,23 @@ export async function switchManagedAgentModel(
  * `"thought_level"` for effort picks). The harness uses it as a trust signal
  * during the pre-discovery window (before the first session/new response),
  * ensuring picks during the first turn are stored rather than silently dropped.
+ *
+ * Pass `nonce` to enable per-request correlation. The harness echoes the nonce
+ * in all acks (immediate and final) so the Desktop can reject stale results
+ * from superseded picks without relying on value equality alone.
  */
 export async function sendSetConfigOption(
   pubkey: string,
   configId: string,
   value: string,
   category?: string,
+  nonce?: string,
 ): Promise<void> {
   await sendAgentObserverControl(pubkey, {
     type: "set_config_option",
     configId,
     value,
     ...(category !== undefined ? { category } : {}),
+    ...(nonce !== undefined ? { nonce } : {}),
   });
 }

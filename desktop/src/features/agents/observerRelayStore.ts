@@ -172,6 +172,16 @@ let startPromise: Promise<void> | null = null;
 let eventProcessingQueue: Promise<void> = Promise.resolve();
 let generation = 0;
 
+/**
+ * Tracks the most recently dispatched nonce per agent. The observer persistence
+ * gate for effort acks checks this: only acks whose nonce matches the current
+ * entry are persisted. This prevents a stale ack from a superseded pick (or a
+ * late result after an 8s timeout) from overwriting a newer persisted value.
+ *
+ * Key: normalized agent pubkey. Value: nonce string from the last dispatch.
+ */
+const currentEffortNonce = new Map<string, string>();
+
 function notifyListeners() {
   for (const listener of listeners) {
     listener();
@@ -506,24 +516,40 @@ function dispatchControlResult(agentPubkey: string, payload: unknown) {
   // persist the canonical value. Two persistence triggers:
   //   1. status === "ok" + category === "thought_level": final applied ack from
   //      create_session_and_apply_model — the adapter accepted the value.
-  //   2. status === "cleared" + category === "thought_level": Auto (clear) ack
-  //      from handle_set_config_option_control — persist null (revert to default).
+  //   2. status === "cleared" + category === "thought_level": final clear ack
+  //      from create_session_and_apply_model — session ran without effort override.
   // Gate on `category === "thought_level"` (present only on thought_level acks)
   // so synthetic acks (no category) never trigger persistence.
+  // Gate on nonce: if the harness echoes a nonce, it must match the most recently
+  // dispatched nonce for this agent. Mismatches indicate stale results from
+  // superseded picks (e.g. old `ok` arriving after a newer pick has been sent,
+  // or a late final ack after the 8s timeout).
   if (
     payload.type === "set_config_option" &&
     payload.category === "thought_level"
   ) {
-    if (payload.status === "ok") {
-      void persistAgentEffortLevel(agentPubkey, payload.value || null).catch(
-        (err: unknown) => {
-          console.warn("Failed to persist effort level:", err);
-        },
-      );
-    } else if (payload.status === "cleared") {
-      void persistAgentEffortLevel(agentPubkey, null).catch((err: unknown) => {
-        console.warn("Failed to clear effort level:", err);
-      });
+    const ackNonce = (payload as Record<string, unknown>).nonce;
+    const registered = currentEffortNonce.get(normalizePubkey(agentPubkey));
+    // Only persist when nonces match (or neither the ack nor the registry
+    // carries a nonce — backwards compatibility with tests that don't use nonces).
+    const nonceOk =
+      ackNonce === undefined
+        ? true
+        : registered !== undefined && ackNonce === registered;
+    if (nonceOk) {
+      if (payload.status === "ok") {
+        void persistAgentEffortLevel(agentPubkey, payload.value || null).catch(
+          (err: unknown) => {
+            console.warn("Failed to persist effort level:", err);
+          },
+        );
+      } else if (payload.status === "cleared") {
+        void persistAgentEffortLevel(agentPubkey, null).catch(
+          (err: unknown) => {
+            console.warn("Failed to clear effort level:", err);
+          },
+        );
+      }
     }
   }
   const subscribers = controlResultListeners.get(normalizePubkey(agentPubkey));
@@ -567,6 +593,16 @@ export function subscribeControlResults(
       controlResultListeners.delete(key);
     }
   };
+}
+
+/**
+ * Register the nonce for the most recently dispatched effort pick/clear for a
+ * given agent. The persistence gate in `dispatchControlResult` checks this: only
+ * `ok`/`cleared` acks whose echoed nonce matches the registered one are persisted.
+ * This prevents stale results from superseded picks from clobbering newer values.
+ */
+export function registerEffortNonce(agentPubkey: string, nonce: string): void {
+  currentEffortNonce.set(normalizePubkey(agentPubkey), nonce);
 }
 
 export function getAgentObserverSnapshot(

@@ -14,7 +14,11 @@ import {
   Server,
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useAgentConfigSurface, managedAgentsQueryKey } from "../hooks";
+import {
+  useAgentConfigSurface,
+  managedAgentsQueryKey,
+  agentConfigSurfaceQueryKey,
+} from "../hooks";
 import { cn } from "@/shared/lib/cn";
 import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { Spinner } from "@/shared/ui/spinner";
@@ -28,7 +32,10 @@ import type {
 } from "@/shared/api/types";
 import { providerDisplayLabel } from "./agentConfigOptions";
 import { sendSetConfigOption } from "@/shared/api/agentControl";
-import { subscribeControlResults } from "@/features/agents/observerRelayStore";
+import {
+  subscribeControlResults,
+  registerEffortNonce,
+} from "@/features/agents/observerRelayStore";
 import { awaitEffortOutcome } from "@/features/agents/lib/effortOutcome";
 
 type Props = {
@@ -385,10 +392,16 @@ function EffortPicker({
   const handleChange = async (value: string) => {
     setSaving(true);
     setStatusMsg(null);
+    // Generate a per-request nonce so the harness can echo it in all acks and
+    // the Desktop can reject stale results from superseded picks.
+    const nonce = crypto.randomUUID();
+    // Register with the store so the global persistence gate can validate.
+    registerEffortNonce(pubkey, nonce);
     try {
       const outcome = await awaitEffortOutcome({
         configId: effortConfigId,
         value,
+        nonce,
         subscribe: (listener) => subscribeControlResults(pubkey, listener),
         send: async () => {
           await sendSetConfigOption(
@@ -396,6 +409,7 @@ function EffortPicker({
             effortConfigId,
             value,
             "thought_level",
+            nonce,
           );
         },
         scheduleTimeout: (onTimeout) => {
@@ -405,9 +419,13 @@ function EffortPicker({
       });
 
       if (outcome === "ok" || outcome === "cleared") {
-        // Observer already persisted. Invalidate so the panel refreshes.
+        // Observer already persisted. Invalidate both managed-agents (record
+        // snapshot) and the config surface (source of currentEffort).
         void queryClient.invalidateQueries({
           queryKey: managedAgentsQueryKey,
+        });
+        void queryClient.invalidateQueries({
+          queryKey: agentConfigSurfaceQueryKey(pubkey),
         });
         setStatusMsg(null);
       } else if (outcome === "pending_session") {

@@ -1010,6 +1010,13 @@ fn handle_set_config_option_control(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     let value = payload.get("value").and_then(|v| v.as_str()).unwrap_or("");
+    // Nonce from the Desktop — echoed in all acks so the Desktop can correlate
+    // results to the specific request that generated them, ignoring stale acks
+    // from superseded picks or cleared efforts.
+    let nonce = payload
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     // B5: for the thought_level configId, forward to the pool and report the
     // real outcome. The configId the caller sends must match what the adapter
@@ -1097,9 +1104,11 @@ fn handle_set_config_option_control(
 
         // Empty value = clear (Auto). Bypass set_pool_effort.
         if value.is_empty() {
+            pool.pending_effort_nonce = nonce.clone();
             pool.clear_pool_effort();
-            ("cleared", true)
+            ("pending_session", true)
         } else {
+            pool.pending_effort_nonce = nonce.clone();
             let result = pool.set_pool_effort(config_id, value);
             match result {
                 SetPoolEffortResult::Stored { .. } => ("pending_session", true),
@@ -1121,6 +1130,9 @@ fn handle_set_config_option_control(
     });
     if include_category {
         ack["category"] = serde_json::json!("thought_level");
+    }
+    if let Some(ref n) = nonce {
+        ack["nonce"] = serde_json::json!(n);
     }
 
     obs.emit(
@@ -1991,6 +2003,9 @@ async fn tokio_main() -> Result<()> {
                         model_overridden: false,
                         desired_effort: None,
                         startup_effort: config.effort_level.clone(),
+                        desired_effort_gen: None,
+                        pending_effort_nonce: None,
+                        last_effort_result: None,
                         agent_name,
                         goose_system_prompt_supported: None,
                         protocol_version,
@@ -4076,6 +4091,9 @@ async fn initialize_agent_pool(
                             model_overridden: false,
                             desired_effort: None,
                             startup_effort: startup.startup_effort.clone(),
+                            desired_effort_gen: None,
+                            pending_effort_nonce: None,
+                            last_effort_result: None,
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
@@ -5533,6 +5551,9 @@ mod error_outcome_emission_tests {
             model_overridden: false,
             desired_effort: None,
             startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             // Error branches under test never read this; 1 is the legacy
@@ -6974,6 +6995,9 @@ mod control_result_tests {
             model_overridden: false,
             desired_effort: None,
             startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -7016,10 +7040,13 @@ mod control_result_tests {
         );
     }
 
-    /// B5 I-1: when value is empty (Auto selected), the ack must be "cleared"
-    /// so the Desktop observer persists null and clears the pool-level effort.
+    /// B5 I-1 / I-3: when value is empty (Auto selected), the immediate ack must
+    /// be "pending_session" (non-terminal) — the final "cleared" ack arrives from
+    /// create_session_and_apply_model when the session first runs without effort.
+    /// The pool-level desired_effort is cleared immediately so future sessions do
+    /// not apply a stale value.
     #[tokio::test]
-    async fn test_b5_empty_value_emits_cleared_ack() {
+    async fn test_b5_empty_value_emits_pending_session_ack() {
         use crate::acp::AcpClient;
         use crate::pool::AgentModelCapabilities;
         let acp = AcpClient::spawn(
@@ -7043,6 +7070,9 @@ mod control_result_tests {
             model_overridden: false,
             desired_effort: Some(("effort".to_string(), "high".to_string())),
             startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -7066,15 +7096,15 @@ mod control_result_tests {
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].payload["status"].as_str().unwrap(),
-            "cleared",
-            "empty value must yield cleared ack for Auto path"
+            "pending_session",
+            "empty value must yield pending_session immediate ack (final cleared comes from session creation)"
         );
         assert_eq!(
             events[0].payload["category"].as_str().unwrap(),
             "thought_level",
-            "cleared ack must include thought_level category"
+            "pending_session ack must include thought_level category"
         );
-        // Pool desired_effort must be cleared.
+        // Pool desired_effort must be cleared so future sessions omit effort.
         assert!(
             pool.desired_effort.is_none(),
             "pool desired_effort must be None after Auto"
@@ -7116,6 +7146,9 @@ mod control_result_tests {
             model_overridden: false,
             desired_effort: None,
             startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
@@ -7258,9 +7291,10 @@ mod control_result_tests {
 
     /// Case D: in the pre-first-return window, a clear (empty value) with
     /// `category: "thought_level"` must NOT emit synthetic ok — it must emit
-    /// `cleared` and set `effort_ever_picked`.
+    /// `pending_session` (non-terminal immediate ack) and set `effort_ever_picked`.
+    /// The final `cleared` ack arrives from create_session_and_apply_model.
     #[test]
-    fn test_b5_pre_discovery_clear_with_category_emits_cleared_not_synthetic_ok() {
+    fn test_b5_pre_discovery_clear_with_category_emits_pending_session_not_synthetic_ok() {
         let mut pool = AgentPool::from_slots(vec![]);
         let obs = observer::ObserverHandle::in_process();
         let payload = serde_json::json!({
@@ -7273,11 +7307,11 @@ mod control_result_tests {
         let events = obs.snapshot();
         assert_eq!(events.len(), 1);
         let ev = &events[0];
-        // Must be cleared — not synthetic ok.
+        // Must be pending_session — not synthetic ok (and not immediate cleared).
         assert_eq!(
             ev.payload["status"].as_str().unwrap(),
-            "cleared",
-            "case D: pre-discovery clear with category trust must emit cleared, not synthetic ok"
+            "pending_session",
+            "case D: pre-discovery clear with category trust must emit pending_session, not synthetic ok"
         );
         assert_eq!(ev.payload["category"].as_str().unwrap(), "thought_level");
         assert!(pool.effort_ever_picked, "clear must set effort_ever_picked");
@@ -7288,6 +7322,7 @@ mod control_result_tests {
     }
 
     /// B5 persistence gate — real-forward ack carries `"category": "thought_level"`.
+    /// The Desktop observer gates persistence on this field; renaming the adapter's
     /// configId does not break persistence as long as the category is present.
     #[tokio::test]
     async fn test_b5_real_forward_ack_includes_thought_level_category() {
@@ -7317,6 +7352,9 @@ mod control_result_tests {
             model_overridden: false,
             desired_effort: None,
             startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,

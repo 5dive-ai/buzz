@@ -7,18 +7,21 @@ import type { ControlResultFrame } from "@/shared/api/types";
  * `control_result` from the harness. Two phases:
  *
  *   1. Immediate ack from `handle_set_config_option_control`:
- *      `pending_session` (stored, will apply at next session) or
- *      `cleared` (Auto selected, pool cleared, persist null) or
- *      `invalid_value` (rejected by harness validation).
+ *      `pending_session` (stored, will apply at next session — for both picks
+ *      and clears) or `invalid_value` (rejected by harness validation).
  *
  *   2. Final ack from `create_session_and_apply_model`:
  *      `ok` (adapter accepted; Desktop persists) or
- *      `failure` (adapter rejected or timeout).
+ *      `failure` (adapter rejected or timeout) or
+ *      `cleared` (session ran without effort override; Desktop persists null).
  *
  * The function resolves with the first *terminal* status received:
- *   - `"ok"` / `"failure"` / `"invalid_value"` — terminal.
- *   - `"cleared"` — terminal (clear persists immediately in the observer).
+ *   - `"ok"` / `"failure"` / `"invalid_value"` / `"cleared"` — terminal.
  *   - `"pending_session"` — non-terminal; awaiting final result from the harness.
+ *
+ * Correlation: when `nonce` is provided, only acks carrying the same nonce are
+ * considered. This prevents a stale ack from a superseded pick from settling
+ * the current promise. Without nonce, correlation falls back to configId+value.
  *
  * If no terminal result arrives within the timeout, resolves with
  * `"pending_session"` (the effort will be applied at the next session — the UI
@@ -27,6 +30,7 @@ import type { ControlResultFrame } from "@/shared/api/types";
 export async function awaitEffortOutcome({
   configId,
   value,
+  nonce,
   subscribe,
   send,
   scheduleTimeout,
@@ -35,6 +39,10 @@ export async function awaitEffortOutcome({
   configId: string;
   /** The value being set (or "" for clear). */
   value: string;
+  /** Nonce echoed by the harness in all acks for this request. When provided,
+   *  used as the primary correlation key so stale acks from prior picks are
+   *  ignored even if they share the same configId and value. */
+  nonce?: string;
   /** Register a control-result listener; returns an unsubscribe function. */
   subscribe: (listener: (frame: ControlResultFrame) => void) => () => void;
   /** Fire the set_config_option send. */
@@ -64,10 +72,17 @@ export async function awaitEffortOutcome({
       if (frame.type !== "set_config_option" || frame.configId !== configId) {
         return;
       }
-      // For non-clear picks, correlate by value too so a stale ack from a
-      // previous pick does not mis-resolve the current one.
-      if (value !== "" && frame.value !== value) {
-        return;
+      // Primary correlation: nonce when provided. Rejects stale acks from
+      // superseded picks even when they share configId and value.
+      if (nonce !== undefined) {
+        if ((frame as Record<string, unknown>).nonce !== nonce) {
+          return;
+        }
+      } else {
+        // Fallback: correlate by value for non-clear picks.
+        if (value !== "" && frame.value !== value) {
+          return;
+        }
       }
       const s = frame.status;
       if (

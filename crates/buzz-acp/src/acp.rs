@@ -2101,6 +2101,32 @@ pub fn extract_model_config_options(result: &serde_json::Value) -> Vec<serde_jso
         .unwrap_or_default()
 }
 
+/// Extract `configOptions` entries relevant to agent capability tracking from a
+/// `session/new` result.
+///
+/// Returns entries with `category == "model"` (for model catalog/validation, existing
+/// callers) **and** `category == "thought_level"` (so the pool-level capability cache
+/// can populate `valid_values` and the harness `invalid_value` guard runs in production).
+///
+/// Stored in `AgentModelCapabilities::config_options_raw`; `extract_model_config_options`
+/// is kept as a separate helper for callers that only need the model category.
+pub fn extract_agent_config_options(result: &serde_json::Value) -> Vec<serde_json::Value> {
+    result["configOptions"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|opt| {
+                    matches!(
+                        opt.get("category").and_then(|c| c.as_str()),
+                        Some("model") | Some("thought_level")
+                    )
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extract `SessionModelState` (unstable path) from a `session/new` result.
 ///
 /// Returns the `models` object if present: `{ currentModelId, availableModels: [...] }`.

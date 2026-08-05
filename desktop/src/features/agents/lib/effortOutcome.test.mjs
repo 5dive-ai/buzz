@@ -198,3 +198,101 @@ test("awaitEffortOutcome unsubscribes and cancels timeout exactly once on succes
   h.push(frame("ok"));
   assert.equal(h.unsubscribeCalls, 1, "no double-unsubscribe on late ack");
 });
+
+// ── nonce correlation (IMPORTANT-2) ──────────────────────────────────────────
+
+/**
+ * A controllable harness with nonce support for correlation tests.
+ */
+function harnessWithNonce(value = "high", nonce = "nonce-1") {
+  let listener = null;
+  let timeoutCb = null;
+
+  const outcome = awaitEffortOutcome({
+    configId: CONFIG_ID,
+    value,
+    nonce,
+    subscribe: (fn) => {
+      listener = fn;
+      return () => {
+        listener = null;
+      };
+    },
+    send: () => Promise.resolve(),
+    scheduleTimeout: (cb) => {
+      timeoutCb = cb;
+      return () => {};
+    },
+  });
+
+  return {
+    outcome,
+    push: (f) => listener?.(f),
+    fireTimeout: () => timeoutCb?.(),
+  };
+}
+
+test("awaitEffortOutcome rejects acks with a different nonce (stale superseded pick)", async () => {
+  // Simulates: high→low→high, where the old 'high' ok arrives carrying a stale nonce.
+  const h = harnessWithNonce("high", "nonce-current");
+
+  // Stale ack from a prior 'high' pick — different nonce.
+  h.push(frame("ok", { value: "high", nonce: "nonce-old" }));
+  let settled = false;
+  void h.outcome.then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  assert.equal(
+    settled,
+    false,
+    "stale nonce must not settle the current pick's promise",
+  );
+
+  // Correct nonce — current pick's final result.
+  h.push(frame("ok", { value: "high", nonce: "nonce-current" }));
+  assert.equal(await h.outcome, "ok");
+});
+
+test("awaitEffortOutcome accepts ack with matching nonce regardless of value equality", async () => {
+  // Nonce is the primary key; value equality is fallback-only.
+  const h = harnessWithNonce("high", "nonce-abc");
+  h.push(frame("ok", { value: "high", nonce: "nonce-abc" }));
+  assert.equal(await h.outcome, "ok");
+});
+
+test("awaitEffortOutcome resolves pending_session via timeout (late result after timeout does not re-settle)", async () => {
+  const h = harnessWithNonce("high", "nonce-xyz");
+  h.fireTimeout();
+  // Outcome is now pending_session.
+  assert.equal(await h.outcome, "pending_session");
+
+  // A late final ack arriving after timeout — listener is already detached.
+  // This must be a no-op; since the Promise already resolved, no assertion
+  // is possible on the outcome value, but the push must not throw.
+  h.push(frame("ok", { value: "high", nonce: "nonce-xyz" }));
+  // If we got here without error the post-timeout push was handled safely.
+});
+
+test("awaitEffortOutcome ignores acks from a superseded nonce after clear", async () => {
+  // Simulates: pick 'high' then clear (Auto) while 'high' ok is in flight.
+  // The clear wins; the stale 'high' ok must not settle.
+  const h = harnessWithNonce("high", "nonce-clear");
+
+  // Stale 'high' ok with a different (old) nonce.
+  h.push(frame("ok", { value: "high", nonce: "nonce-old" }));
+  let settled = false;
+  void h.outcome.then(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  assert.equal(
+    settled,
+    false,
+    "stale pick ok must not settle after clear was dispatched",
+  );
+
+  // The clear's final ack arrives with the current nonce.
+  h.push(frame("cleared", { value: "", nonce: "nonce-clear" }));
+  assert.equal(await h.outcome, "cleared");
+});

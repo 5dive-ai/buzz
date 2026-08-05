@@ -9,7 +9,7 @@ import type { MeshRowPulse, MeshRowTone } from "../meshRowModel";
 import { MeshComputePopover } from "./MeshComputePopover";
 
 /**
- * The sidebar Buzz MeshLLM row.
+ * The sidebar MeshLLM row.
  *
  * Replaces the ~120px footer card with one menu line beside Inbox and Agents,
  * because front-page sidebar space is premium. The row carries a single signal
@@ -84,34 +84,29 @@ export function SidebarMeshComputeRow({
             className="flex h-4 w-4 shrink-0 items-center justify-center"
           >
             {/*
-              In the cold state a status dot has nothing to say — there is no
-              capacity to report and nothing running — so the slot carries a
-              Share2 glyph, which names the action instead. Every other state has
-              a real status, and the dot is the more honest signal there.
+              The dot is in every state, without exception. It is the row's
+              reason to exist: hollow when nothing is known, slate when there is
+              capacity to join, green while sharing, blue while consuming. An
+              earlier revision swapped it for a Share2 glyph in the cold state,
+              which threw away the signal and made the row read as a network
+              widget rather than a status line.
             */}
-            {row.callToAction ? (
-              <Share2
-                className="h-3.5 w-3.5 text-muted-foreground"
-                data-testid="mesh-row-share-icon"
-              />
-            ) : (
-              <span className="relative flex h-2 w-2 items-center justify-center">
-                {row.pulse === "none" ? null : (
-                  <span
-                    className={cn(
-                      "absolute h-2 w-2 rounded-full opacity-75 motion-reduce:animate-none",
-                      PULSE_CLASS[row.pulse],
-                      TONE_PING[row.tone],
-                    )}
-                    data-mesh-pulse={row.pulse}
-                  />
-                )}
+            <span className="relative flex h-2 w-2 items-center justify-center">
+              {row.pulse === "none" ? null : (
                 <span
-                  className={cn("h-2 w-2 rounded-full", TONE_DOT[row.tone])}
-                  data-testid="mesh-row-dot"
+                  className={cn(
+                    "absolute h-2 w-2 rounded-full opacity-75 motion-reduce:animate-none",
+                    PULSE_CLASS[row.pulse],
+                    TONE_PING[row.tone],
+                  )}
+                  data-mesh-pulse={row.pulse}
                 />
-              </span>
-            )}
+              )}
+              <span
+                className={cn("h-2 w-2 rounded-full", TONE_DOT[row.tone])}
+                data-testid="mesh-row-dot"
+              />
+            </span>
           </span>
           <SidebarMenuLabel className="opacity-80">
             {row.label}
@@ -134,9 +129,10 @@ export function SidebarMeshComputeRow({
       */}
       {row.callToAction ? (
         <span
-          className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-2xs font-medium text-muted-foreground group-data-[collapsible=icon]:hidden"
+          className="pointer-events-none absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1 text-2xs font-medium text-muted-foreground group-data-[collapsible=icon]:hidden"
           data-testid="mesh-row-cta"
         >
+          <Share2 aria-hidden className="h-3 w-3" />
           {row.callToAction}
         </span>
       ) : row.badge ? (

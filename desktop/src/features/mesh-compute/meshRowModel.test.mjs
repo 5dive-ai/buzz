@@ -223,16 +223,18 @@ test("an empty mesh offers the action instead of sitting inert", () => {
   assert.match(model.tooltip, /share this computer to start the mesh/);
 });
 
-test("the cold state drops the Buzz qualifier to make room", () => {
-  // "Buzz MeshLLM" plus "Share your compute" does not fit 256px. The name is
-  // the part that can afford to lose a word.
-  assert.equal(derive({ snapshot: snapshot() }).label, "MeshLLM");
-  assert.equal(
-    derive({
-      snapshot: snapshot({ sharingDeviceCount: 1, sharedCapacityGb: 36 }),
-    }).label,
-    "Buzz MeshLLM",
-  );
+test("the label is the same in every state", () => {
+  // Two name variants was the source of drift: one surface kept saying "Buzz
+  // MeshLLM" after the other had dropped it.
+  for (const input of [
+    { snapshot: null },
+    { snapshot: snapshot() },
+    { snapshot: snapshot({ sharingDeviceCount: 1, sharedCapacityGb: 36 }) },
+    { toggle: SHARING, view: view() },
+    { toggle: CONSUMING },
+  ]) {
+    assert.equal(derive(input).label, "MeshLLM");
+  }
 });
 
 test("only the cold state invites; every other state reports", () => {

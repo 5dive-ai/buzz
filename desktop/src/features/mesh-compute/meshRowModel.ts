@@ -64,10 +64,7 @@ export type MeshRowPulse = "none" | "activity" | "invite";
 
 export type MeshRowModel = {
   tone: MeshRowTone;
-  /**
-   * Row label. Drops the "Buzz" qualifier in the cold state, where a call to
-   * action shares the same 256px and every character costs.
-   */
+  /** Row label. */
   label: string;
   /** Accessible state sentence, used as the row tooltip. */
   tooltip: string;
@@ -99,8 +96,9 @@ export type MeshRowModel = {
   pulse: MeshRowPulse;
 };
 
-/** Full name. Used everywhere except the cold state, which needs the room. */
-const LABEL = "Buzz MeshLLM";
+/** One name in every state. Two variants was the source of drift, and "Buzz"
+ * adds nothing inside Buzz. */
+const LABEL = "MeshLLM";
 
 /** Live pool capacity: this machine plus every peer that reports a figure. */
 function liveCapacityGb(view: MeshLiveView | null): number {
@@ -234,8 +232,7 @@ export function deriveMeshRowModel({
     // annoyance. The invite throb stays reserved for capacity that exists.
     return {
       tone: "unknown",
-      // "Buzz" is dropped here so the invitation fits beside it.
-      label: "MeshLLM",
+      label: LABEL,
       tooltip: "No shared compute yet — share this computer to start the mesh",
       badge: null,
       callToAction: "Share your compute",

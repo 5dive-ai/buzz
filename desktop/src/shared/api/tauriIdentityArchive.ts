@@ -27,6 +27,17 @@ export type IdentityUnarchiveRequest = {
   reason?: string;
 };
 
+// ── NipIaOwnerProof ──────────────────────────────────────────────────────────
+
+/** Result of verifying NIP-OA ownership. Mirrors the Rust `NipIaOwnerProof` enum. */
+export type NipIaOwnerProof =
+  | { result: "verified" }
+  | { result: "missing_profile" }
+  | { result: "missing_auth" }
+  | { result: "multiple_auth_tags" }
+  | { result: "invalid_auth" }
+  | { result: "owner_mismatch"; declared_owner: string };
+
 // ── Owned-agent relay inventory ─────────────────────────────────────────────
 
 /** Archive tri-state for a single owned-agent instance. */
@@ -41,6 +52,8 @@ export type OwnedAgentInstance = {
   displayName: string | null;
   picture: string | null;
   relayUrl: string;
+  /** NIP-OA owner proof for this instance — never omitted, only null in older responses. */
+  nipIaOwnerProof: NipIaOwnerProof;
   archiveState: OwnedAgentArchiveState;
 };
 
@@ -100,15 +113,10 @@ export async function listArchivedIdentities(): Promise<ArchivedIdentitiesSnapsh
 
 /**
  * Query the relay's `kind:30177` inventory for agents owned by the current
- * user. Applies NIP-33 dedup, NIP-OA reciprocal verification, and an
- * archive-state join from the `kind:13535` snapshot.
+ * user. Pages to exhaustion internally; returns a complete snapshot.
  */
-export async function getOwnedAgentInventory(
-  cursor?: number,
-  pageSize?: number,
-): Promise<OwnedAgentInventorySnapshot> {
+export async function getOwnedAgentInventory(): Promise<OwnedAgentInventorySnapshot> {
   return await invokeTauri<OwnedAgentInventorySnapshot>(
     "get_owned_agent_inventory",
-    { cursor: cursor ?? null, pageSize: pageSize ?? null },
   );
 }

@@ -26,6 +26,19 @@ pub struct ArchiveScope {
     pub workspace_epoch: u64,
 }
 
+/// Deliberately hide the secret key from debug output to prevent accidental
+/// key exposure in logs, panics, or test output.
+impl std::fmt::Debug for ArchiveScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchiveScope")
+            .field("actor", &self.actor)
+            .field("relay_url_override", &self.relay_url_override)
+            .field("workspace_epoch", &self.workspace_epoch)
+            .field("keys", &"<redacted>")
+            .finish()
+    }
+}
+
 /// RAII guard that serializes all production workspace-state writers and
 /// restores the epoch to the next even value on every exit path.
 ///

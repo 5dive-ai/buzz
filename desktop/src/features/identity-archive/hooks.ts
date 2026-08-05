@@ -31,7 +31,8 @@ export function useArchivedIdentitiesQuery(enabled = true) {
 
 /**
  * Query the owner's `kind:30177` relay inventory (NIP-OA–verified agent
- * instances). Tri-state archive join is scoped to this surface only —
+ * instances). Pages to exhaustion; returns a complete snapshot.
+ * Tri-state archive join is scoped to this surface only —
  * existing `useIsIdentityArchived` callers are unchanged.
  */
 export function useOwnedAgentInventoryQuery(enabled = true) {

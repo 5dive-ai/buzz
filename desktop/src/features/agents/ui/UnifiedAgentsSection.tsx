@@ -1,10 +1,11 @@
 import * as React from "react";
-import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, Server } from "lucide-react";
 
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import { InstancesSheet } from "@/features/identity-archive/InstancesSheet";
+import { useOwnedAgentInventoryQuery } from "@/features/identity-archive/hooks";
 import { useUserProfileQuery } from "@/features/profile/hooks";
 import type { AgentPersona, ManagedAgent } from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
@@ -103,8 +104,18 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     [personas, agents],
   );
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
-  // Instances Sheet state: which persona triggered the sheet open.
-  const [instancesSheetOpen, setInstancesSheetOpen] = React.useState(false);
+  // Instances Sheet state: track the persona that opened the sheet and its
+  // associated agent pubkeys (for filtering instances by device).
+  const [instancesSheetPersona, setInstancesSheetPersona] =
+    React.useState<AgentPersona | null>(null);
+  const [instancesSheetPubkeys, setInstancesSheetPubkeys] = React.useState<
+    ReadonlySet<string>
+  >(new Set());
+  const instancesSheetOpen = instancesSheetPersona !== null;
+
+  // Pre-fetch the inventory so the start-control safeguard can consult it
+  // without a per-card fetch. Enabled when the section is visible (agents loaded).
+  const inventoryQuery = useOwnedAgentInventoryQuery(!isAgentsLoading);
   const {
     fileInputRef,
     isDragOver,
@@ -120,6 +131,50 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
       else next.add(key);
       return next;
     });
+  }
+
+  /**
+   * Start-control safeguard (Finding 4): before starting a new instance,
+   * check the relay inventory. If inventory is loading/untrusted OR there is
+   * already an active (non-archived) relay instance, open the Sheet instead
+   * of blindly minting a new one.
+   */
+  function handleStartPersonaWithSafeguard(persona: AgentPersona) {
+    const inventory = inventoryQuery.data;
+    // Find the persona's local agents so the Sheet can mark each row correctly.
+    const groupAgents =
+      groups.find((g) => g.persona.id === persona.id)?.agents ?? [];
+    // If inventory hasn't loaded yet or isn't trusted, show the Sheet so the
+    // user can decide with full information rather than risking a 3rd instance.
+    if (!inventory?.archiveStateTrusted) {
+      openInstancesSheet(persona, groupAgents);
+      return;
+    }
+    // Count active (non-archived) relay instances.
+    const activeRelayInstances = inventory.instances.filter(
+      (i) => i.archiveState.isArchived !== true,
+    );
+    if (activeRelayInstances.length >= 1) {
+      // There is at least one active relay-only instance; open the Sheet to
+      // let the user inspect and decide rather than minting a duplicate.
+      openInstancesSheet(persona, groupAgents);
+      return;
+    }
+    // Safe to start — no active relay-only instance found.
+    onStartPersona(persona);
+  }
+
+  /**
+   * Open the Instances Sheet for `persona`, recording which agent pubkeys
+   * are locally managed so rows can show "Relay only" for orphaned instances.
+   */
+  function openInstancesSheet(
+    persona: AgentPersona,
+    groupAgents: readonly { pubkey: string }[],
+  ) {
+    const pubkeys = new Set(groupAgents.map((a) => a.pubkey.toLowerCase()));
+    setInstancesSheetPubkeys(pubkeys);
+    setInstancesSheetPersona(persona);
   }
 
   useFeedbackToasts(actionNoticeMessage, actionErrorMessage);
@@ -155,25 +210,59 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
           <div className={IDENTITY_CARD_GRID_CLASS}>
             {groups.map((group) => {
               const profileAgent = pickProfileAgent(group.agents);
+              // Count relay instances for this persona's agent (if known).
+              const relayInstanceCount =
+                inventoryQuery.data?.instances.length ?? 0;
+              // Card-level instances indicator id for aria-controls.
+              const instancesButtonId = `instances-sheet-${group.persona.id}`;
               return (
                 <AgentPersonaCard
                   actions={(effectiveAvatarUrl, isEffectiveAvatarLoading) => (
-                    <PersonaActionsMenu
-                      isActionPending={
-                        isActionPending || isEffectiveAvatarLoading
-                      }
-                      isPending={isPersonasPending}
-                      persona={group.persona}
-                      linkedAgent={profileAgent}
-                      onDeactivate={onDeactivatePersona}
-                      onDelete={onDeletePersona}
-                      onDuplicate={onDuplicatePersona}
-                      onEdit={onEditPersona}
-                      onShare={(persona, linkedAgent) =>
-                        onSharePersona(persona, linkedAgent, effectiveAvatarUrl)
-                      }
-                      onViewInstances={() => setInstancesSheetOpen(true)}
-                    />
+                    <div className="flex items-center gap-1">
+                      {/* Card-level focusable Instances action (Finding 3) */}
+                      {relayInstanceCount > 1 ||
+                      (profileAgent == null && relayInstanceCount >= 1) ? (
+                        <button
+                          aria-controls="instances-sheet"
+                          aria-expanded={
+                            instancesSheetOpen &&
+                            instancesSheetPersona?.id === group.persona.id
+                          }
+                          aria-label={`Instances (${relayInstanceCount})`}
+                          className="flex h-7 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                          id={instancesButtonId}
+                          onClick={() =>
+                            openInstancesSheet(group.persona, group.agents)
+                          }
+                          type="button"
+                        >
+                          <Server className="h-3.5 w-3.5" />
+                          {relayInstanceCount}
+                        </button>
+                      ) : null}
+                      <PersonaActionsMenu
+                        isActionPending={
+                          isActionPending || isEffectiveAvatarLoading
+                        }
+                        isPending={isPersonasPending}
+                        persona={group.persona}
+                        linkedAgent={profileAgent}
+                        onDeactivate={onDeactivatePersona}
+                        onDelete={onDeletePersona}
+                        onDuplicate={onDuplicatePersona}
+                        onEdit={onEditPersona}
+                        onShare={(persona, linkedAgent) =>
+                          onSharePersona(
+                            persona,
+                            linkedAgent,
+                            effectiveAvatarUrl,
+                          )
+                        }
+                        onViewInstances={(p) =>
+                          openInstancesSheet(p, group.agents)
+                        }
+                      />
+                    </div>
                   )}
                   agent={profileAgent}
                   defaultModel={defaultModel}
@@ -184,7 +273,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                   onOpenAgentProfile={onOpenAgentProfile}
                   onOpenPersonaProfile={onOpenPersonaProfile}
                   onStartAgent={onStartAgent}
-                  onStartPersona={onStartPersona}
+                  onStartPersona={handleStartPersonaWithSafeguard}
                 />
               );
             })}
@@ -242,7 +331,15 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
 
       <InstancesSheet
         open={instancesSheetOpen}
-        onOpenChange={setInstancesSheetOpen}
+        persona={instancesSheetPersona}
+        personaAgentPubkeys={instancesSheetPubkeys}
+        onOpenChange={(o) => {
+          if (!o) {
+            setInstancesSheetPersona(null);
+            setInstancesSheetPubkeys(new Set());
+          }
+        }}
+        onOpenProfile={onOpenAgentProfile}
       />
     </section>
   );

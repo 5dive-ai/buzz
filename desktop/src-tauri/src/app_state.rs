@@ -372,7 +372,9 @@ impl AppState {
     }
 
     /// Capture an atomic `(keys, relay_url_override)` pair via the seqlock
-    /// protocol. Returns `Err` after `max_retries` exhausted attempts.
+    /// protocol. Returns `Err` after `max_retries` exhausted attempts, or
+    /// immediately when the identity is in recovery mode (`identity_lost` or
+    /// `keyring_locked`) — the same gate enforced by `signing_keys()`.
     pub fn capture_archive_scope(&self, max_retries: u32) -> Result<ArchiveScope, String> {
         for _ in 0..=max_retries {
             // Sample epoch before reads.
@@ -381,6 +383,18 @@ impl AppState {
             if !epoch_before.is_multiple_of(2) {
                 std::thread::yield_now();
                 continue;
+            }
+
+            // Check recovery flags WITHIN the epoch window so the check and
+            // the key clone are consistent with a single generation.
+            if self.identity_lost.load(std::sync::atomic::Ordering::SeqCst)
+                || self
+                    .keyring_locked
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("identity is in recovery mode; event signing is disabled \
+                     until the identity is restored and Buzz is relaunched"
+                    .to_string());
             }
 
             let keys = self

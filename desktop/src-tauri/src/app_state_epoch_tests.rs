@@ -276,3 +276,43 @@ fn epoch_protocol_mixed_generation_rejected_while_mid_transition() {
         "captured epoch must be even"
     );
 }
+
+/// Finding 7: `capture_archive_scope` must fail immediately when
+/// `identity_lost` is set, regardless of epoch parity.
+#[test]
+fn capture_archive_scope_rejects_when_identity_lost() {
+    use std::sync::atomic::Ordering;
+
+    let state = make_epoch_test_state(Keys::generate());
+    state.identity_lost.store(true, Ordering::SeqCst);
+
+    let result = state.capture_archive_scope(8);
+    assert!(
+        result.is_err(),
+        "capture must fail when identity_lost is set"
+    );
+    assert!(
+        result.unwrap_err().contains("recovery mode"),
+        "error must mention recovery mode"
+    );
+}
+
+/// Finding 7: `capture_archive_scope` must fail immediately when
+/// `keyring_locked` is set.
+#[test]
+fn capture_archive_scope_rejects_when_keyring_locked() {
+    use std::sync::atomic::Ordering;
+
+    let state = make_epoch_test_state(Keys::generate());
+    state.keyring_locked.store(true, Ordering::SeqCst);
+
+    let result = state.capture_archive_scope(8);
+    assert!(
+        result.is_err(),
+        "capture must fail when keyring_locked is set"
+    );
+    assert!(
+        result.unwrap_err().contains("recovery mode"),
+        "error must mention recovery mode"
+    );
+}

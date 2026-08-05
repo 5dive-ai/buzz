@@ -13,7 +13,8 @@ import {
   PenOff,
   Server,
 } from "lucide-react";
-import { useAgentConfigSurface } from "../hooks";
+import { useQueryClient } from "@tanstack/react-query";
+import { useAgentConfigSurface, managedAgentsQueryKey } from "../hooks";
 import { cn } from "@/shared/lib/cn";
 import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { Spinner } from "@/shared/ui/spinner";
@@ -27,6 +28,8 @@ import type {
 } from "@/shared/api/types";
 import { providerDisplayLabel } from "./agentConfigOptions";
 import { sendSetConfigOption } from "@/shared/api/agentControl";
+import { subscribeControlResults } from "@/features/agents/observerRelayStore";
+import { awaitEffortOutcome } from "@/features/agents/lib/effortOutcome";
 
 type Props = {
   pubkey: string;
@@ -351,39 +354,84 @@ function AdvancedRow({
 // Renders a live effort control for claude runtimes when the session-level
 // `thought_level` configId is available (i.e. at least one session has been
 // created). Calls `sendSetConfigOption` so the harness forwards the change to
-// the adapter via `session/set_config_option`; the observer's
-// `dispatchControlResult` handler persists the canonical value on real ok.
-
-const CLAUDE_EFFORT_OPTIONS: { label: string; value: string }[] = [
-  { label: "Low", value: "low" },
-  { label: "Medium", value: "medium" },
-  { label: "High", value: "high" },
-];
+// the adapter via `session/set_config_option`.
+//
+// The picker subscribes to `control_result` BEFORE sending and awaits the
+// correlated final result (ok / failure / invalid_value / cleared / timeout
+// resolved as pending_session). Persistence is handled by the observer store
+// on the `ok` and `cleared` acks — the picker only drives UI state.
+//
+// I-7: option values come from the adapter-advertised `effortOptions` rather
+// than a hardcoded list, so model-specific option sets are reflected correctly.
 
 function EffortPicker({
   pubkey,
   effortConfigId,
   currentEffort,
+  effortOptions,
 }: {
   pubkey: string;
   effortConfigId: string;
   currentEffort: string | null;
+  effortOptions: Array<{ value: string; displayName?: string }>;
 }) {
   const [saving, setSaving] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+  const [statusMsg, setStatusMsg] = React.useState<{
+    kind: "info" | "error";
+    text: string;
+  } | null>(null);
+  const queryClient = useQueryClient();
 
   const handleChange = async (value: string) => {
-    if (!value) return;
     setSaving(true);
-    setError(null);
+    setStatusMsg(null);
     try {
-      await sendSetConfigOption(pubkey, effortConfigId, value);
+      const outcome = await awaitEffortOutcome({
+        configId: effortConfigId,
+        value,
+        subscribe: (listener) => subscribeControlResults(pubkey, listener),
+        send: async () => {
+          await sendSetConfigOption(pubkey, effortConfigId, value);
+        },
+        scheduleTimeout: (onTimeout) => {
+          const id = window.setTimeout(onTimeout, 8_000);
+          return () => window.clearTimeout(id);
+        },
+      });
+
+      if (outcome === "ok" || outcome === "cleared") {
+        // Observer already persisted. Invalidate so the panel refreshes.
+        void queryClient.invalidateQueries({
+          queryKey: managedAgentsQueryKey,
+        });
+        setStatusMsg(null);
+      } else if (outcome === "pending_session") {
+        setStatusMsg({ kind: "info", text: "Applies at next session" });
+      } else if (outcome === "failure") {
+        setStatusMsg({ kind: "error", text: "Adapter rejected — try again" });
+      } else if (outcome === "invalid_value") {
+        setStatusMsg({ kind: "error", text: "Value not supported by adapter" });
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setStatusMsg({
+        kind: "error",
+        text: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       setSaving(false);
     }
   };
+
+  // Fall back to low/medium/high when the adapter advertises no options (older
+  // adapters that support thought_level but predate the options field).
+  const options =
+    effortOptions.length > 0
+      ? effortOptions
+      : [
+          { value: "low", displayName: "Low" },
+          { value: "medium", displayName: "Medium" },
+          { value: "high", displayName: "High" },
+        ];
 
   return (
     <div className="mt-3 border-t border-border/50 pt-2 px-4">
@@ -399,17 +447,25 @@ function EffortPicker({
           value={currentEffort ?? ""}
         >
           <option value="">Auto (default)</option>
-          {CLAUDE_EFFORT_OPTIONS.map((opt) => (
+          {options.map((opt) => (
             <option key={opt.value} value={opt.value}>
-              {opt.label}
+              {opt.displayName ?? opt.value}
             </option>
           ))}
         </select>
         {saving ? (
           <span className="text-2xs text-muted-foreground">Setting…</span>
         ) : null}
-        {error ? (
-          <span className="text-2xs text-destructive">{error}</span>
+        {statusMsg ? (
+          <span
+            className={
+              statusMsg.kind === "error"
+                ? "text-2xs text-destructive"
+                : "text-2xs text-muted-foreground"
+            }
+          >
+            {statusMsg.text}
+          </span>
         ) : null}
       </div>
       <p className="mt-0.5 text-2xs text-muted-foreground/70">
@@ -456,6 +512,7 @@ export function AgentConfigPanel({
     isPreSpawn,
     claudeConfigDirCustom,
     effortConfigId,
+    effortOptions = [],
   } = data;
   const configFilePath = sources.configFilePath;
 
@@ -580,6 +637,7 @@ export function AgentConfigPanel({
           pubkey={pubkey}
           effortConfigId={effortConfigId}
           currentEffort={normalized.thinkingEffort?.value ?? null}
+          effortOptions={effortOptions}
         />
       ) : null}
     </div>

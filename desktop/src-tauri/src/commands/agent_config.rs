@@ -307,9 +307,12 @@ pub async fn get_agent_config_surface(
         .is_some_and(|m| m.id == "claude")
     {
         let effective_env = resolve_effective_agent_env(&record, &personas, runtime_meta, &global);
+        // Treat empty or blank CLAUDE_CONFIG_DIR as unset, matching Claude's
+        // `CLAUDE_CONFIG_DIR || homedir()` resolver semantics.
         effective_env
             .env
             .get("CLAUDE_CONFIG_DIR")
+            .filter(|v| !v.trim().is_empty())
             .map(std::path::PathBuf::from)
     } else {
         None

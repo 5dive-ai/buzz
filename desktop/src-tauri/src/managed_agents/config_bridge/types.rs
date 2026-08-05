@@ -188,6 +188,12 @@ pub struct RuntimeConfigSurface {
     /// `set_config_option` without hardcoding the configId.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_config_id: Option<String>,
+    /// B5/I-7: the adapter-advertised option values for the `thought_level`
+    /// config option. Present when `effort_config_id` is Some. The UI renders
+    /// these instead of hardcoded low/medium/high so model-specific option sets
+    /// are reflected correctly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effort_options: Vec<AcpConfigOptionValue>,
 }
 
 /// Raw config values extracted from a runtime's config file.

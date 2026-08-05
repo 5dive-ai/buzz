@@ -209,6 +209,20 @@ pub(crate) fn read_config_surface(
         } else {
             None
         },
+        effort_options: if runtime_meta.map(|m| m.id == "claude").unwrap_or(false) {
+            // I-7: expose the adapter-advertised option values so the UI renders
+            // the real option set instead of hardcoded low/medium/high.
+            session_cache
+                .and_then(|c| {
+                    c.config_options
+                        .iter()
+                        .find(|opt| opt.category.as_deref() == Some("thought_level"))
+                        .map(|opt| opt.options.clone())
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
     }
 }
 

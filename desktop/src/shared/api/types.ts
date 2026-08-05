@@ -460,15 +460,17 @@ export type SwitchManagedAgentModelStatus =
   | "unsupported_model"
   | "no_active_turn";
 
+export type SetConfigOptionResult = {
+  type: "set_config_option";
+  status: string;
+  configId: string;
+  value: string;
+  category?: "thought_level";
+};
+
 export type ControlResultFrame =
   | { type: "cancel_turn" | "switch_model"; status: string; modelId?: string }
-  | {
-      type: "set_config_option";
-      status: "ok" | string;
-      configId: string;
-      value: string;
-      category?: "thought_level";
-    };
+  | SetConfigOptionResult;
 
 export type GitBashPrerequisite = {
   available: boolean;
@@ -670,9 +672,9 @@ export type RuntimeConfigSurface = {
   advanced: ConfigField[];
   extensions: ExtensionEntry[];
   sources: ConfigSourceReport;
-  /** True when the panel is reading from a user-set CLAUDE_CONFIG_DIR (not ~/.claude/). */
   claudeConfigDirCustom?: boolean;
   effortConfigId?: string;
+  effortOptions?: Array<{ value: string; displayName?: string }>;
 };
 
 export type UpdateManagedAgentInput = {

@@ -327,3 +327,58 @@ fn b4_none_canonical_effort_does_not_surface() {
         "effort field must be absent when no tier has a value"
     );
 }
+
+// ── CLAUDE_CONFIG_DIR path resolution ─────────────────────────────────────────
+
+#[test]
+fn claude_mcp_config_path_honors_custom_claude_config_dir() {
+    // M-2: mcp_config_file_path_for_runtime must use the custom dir when
+    // claude_config_dir is Some, not fall back to ~/.claude.json.
+    let record = test_record();
+    let runtime = &KnownAcpRuntime {
+        id: "claude",
+        config_file_path: Some("~/.claude/settings.json"),
+        ..*test_runtime()
+    };
+    let custom_dir = std::path::PathBuf::from("/custom/config/dir");
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), Some(&custom_dir));
+
+    let mcp_path = surface
+        .sources
+        .mcp_config_file_path
+        .expect("mcp_config_file_path must be present for claude runtime");
+    assert_eq!(
+        std::path::Path::new(&mcp_path),
+        custom_dir.join(".claude.json"),
+        "mcp config path must be <custom_dir>/.claude.json when CLAUDE_CONFIG_DIR is set"
+    );
+    assert!(
+        surface.claude_config_dir_custom,
+        "claude_config_dir_custom must be true when a custom dir was passed"
+    );
+}
+
+#[test]
+fn claude_config_dir_none_falls_back_to_home_claude_json() {
+    // M-3: None (i.e. the caller stripped an empty string) must resolve to
+    // the default ~/.claude.json path, matching Claude's `CLAUDE_CONFIG_DIR || homedir()`.
+    let record = test_record();
+    let runtime = &KnownAcpRuntime {
+        id: "claude",
+        config_file_path: Some("~/.claude/settings.json"),
+        ..*test_runtime()
+    };
+    let surface = read_config_surface(&record, Some(runtime), None, &no_tiers(), None);
+    assert!(
+        !surface.claude_config_dir_custom,
+        "claude_config_dir_custom must be false when dir is None (unset)"
+    );
+    assert!(
+        surface
+            .sources
+            .mcp_config_file_path
+            .as_deref()
+            .is_some_and(|p| p.ends_with(".claude.json")),
+        "mcp path must fall back to ~/.claude.json when no custom dir"
+    );
+}

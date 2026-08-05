@@ -502,22 +502,29 @@ function dispatchControlResult(agentPubkey: string, payload: unknown) {
   if (!isControlResultFrame(payload)) {
     return;
   }
-  // B5: on a positive set_config_option ack for a confirmed thought_level
-  // option, persist the canonical value to the agent record so it seeds
-  // settings.json on next spawn (B7).
-  // Gate on `category === "thought_level"` (present only on real-forward acks)
-  // rather than a literal configId — if the adapter renames the configId,
-  // persistence still works; synthetic acks (no category) never persist.
+  // B5: on a positive set_config_option ack for a confirmed thought_level option,
+  // persist the canonical value. Two persistence triggers:
+  //   1. status === "ok" + category === "thought_level": final applied ack from
+  //      create_session_and_apply_model — the adapter accepted the value.
+  //   2. status === "cleared" + category === "thought_level": Auto (clear) ack
+  //      from handle_set_config_option_control — persist null (revert to default).
+  // Gate on `category === "thought_level"` (present only on thought_level acks)
+  // so synthetic acks (no category) never trigger persistence.
   if (
     payload.type === "set_config_option" &&
-    payload.category === "thought_level" &&
-    payload.status === "ok"
+    payload.category === "thought_level"
   ) {
-    void persistAgentEffortLevel(agentPubkey, payload.value || null).catch(
-      (err: unknown) => {
-        console.warn("Failed to persist effort level:", err);
-      },
-    );
+    if (payload.status === "ok") {
+      void persistAgentEffortLevel(agentPubkey, payload.value || null).catch(
+        (err: unknown) => {
+          console.warn("Failed to persist effort level:", err);
+        },
+      );
+    } else if (payload.status === "cleared") {
+      void persistAgentEffortLevel(agentPubkey, null).catch((err: unknown) => {
+        console.warn("Failed to clear effort level:", err);
+      });
+    }
   }
   const subscribers = controlResultListeners.get(normalizePubkey(agentPubkey));
   if (!subscribers) {

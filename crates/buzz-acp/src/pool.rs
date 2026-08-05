@@ -166,15 +166,20 @@ pub struct OwnedAgent {
     /// desktop reader to distinguish a genuine runtime override from a stale
     /// session whose persona model was edited. Reset on spawn/restart.
     pub model_overridden: bool,
-    /// B5: desired effort level `(config_id, value)` for the `thought_level` config
-    /// option. Applied after every `session_new_full()` via `session/set_config_option`.
-    /// `config_id` is the adapter's actual id from `AgentModelCapabilities::thought_level_config_id`;
-    /// it is set here by `set_idle_agent_effort` and never hardcoded in the harness.
+    /// Task-local snapshot of the pool's `desired_effort` at checkout time.
+    /// Applied in every `create_session_and_apply_model` via `session/set_config_option`.
+    /// `config_id` is the adapter's actual id from `AgentModelCapabilities::thought_level_config_id`.
+    ///
+    /// Set to `pool.desired_effort` at checkout. On the first session creation,
+    /// if still `None`, `resolve_startup_effort` may arm it from `startup_effort`
+    /// and the capabilities-derived `thought_level` configId. When the agent is
+    /// returned to the pool, a freshly-resolved startup effort is propagated back
+    /// so the pool-level authority reflects the seeded value.
     pub desired_effort: Option<(String, String)>,
     /// Startup effort value from `BUZZ_ACP_EFFORT_LEVEL` (carried from the Desktop
     /// record). At the first session creation, if `desired_effort` is None, this
     /// value is paired with the capabilities-derived `thought_level` configId to
-    /// form `desired_effort`. Non-fatal when absent or when the adapter does not
+    /// seed `desired_effort`. Non-fatal when absent or when the adapter does not
     /// advertise `thought_level`.
     pub startup_effort: Option<String>,
     /// Normalized agent name from initialize (`agentInfo.name`/`serverInfo.name`).
@@ -235,9 +240,9 @@ impl OwnedAgent {
     /// B5 startup-default: arms `desired_effort` from `startup_effort` + capabilities.
     ///
     /// Called once at first session creation after capabilities are populated.
-    /// No-op when `desired_effort` is already set (live pick takes precedence),
-    /// when `startup_effort` is absent, or when the adapter does not advertise
-    /// a `thought_level` configId for the current model.
+    /// No-op when `desired_effort` is already set (live pick takes precedence,
+    /// via the pool-level value copied at checkout), when `startup_effort` is
+    /// absent, or when the adapter does not advertise a `thought_level` configId.
     pub(crate) fn resolve_startup_effort(&mut self) {
         if self.desired_effort.is_none() {
             if let Some(ref value) = self.startup_effort.clone() {
@@ -264,6 +269,14 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
+    /// Pool-level desired effort `(config_id, value)` for the `thought_level`
+    /// config option. Single authoritative value shared by every worker.
+    ///
+    /// Applied in every `create_session_and_apply_model` call via
+    /// `session/set_config_option`. Set by `set_pool_effort` (live picker) and
+    /// seeded from the first agent's `startup_effort` at first session creation.
+    /// Clearing: `None` means "let the adapter choose its default."
+    pub desired_effort: Option<(String, String)>,
 }
 
 /// Result returned by a completed prompt task.
@@ -616,6 +629,7 @@ impl AgentPool {
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
+            desired_effort: None,
         }
     }
 
@@ -625,6 +639,10 @@ impl AgentPool {
     /// Pass 2: any idle agent.
     ///
     /// Returns `None` if all agents are checked out.
+    ///
+    /// At checkout, the pool's `desired_effort` is copied onto the returned agent
+    /// so it has the current pool-level value for the duration of its task. On
+    /// `return_agent`, a freshly-resolved startup effort is propagated back.
     pub fn try_claim(&mut self, channel_id: Option<Uuid>) -> Option<OwnedAgent> {
         // Pass 1: prefer agent with existing session for this channel.
         if let Some(cid) = channel_id {
@@ -634,18 +652,39 @@ impl AgentPool {
                     .unwrap_or(false)
             });
             if let Some(i) = idx {
-                return self.agents[i].take();
+                let mut agent = self.agents[i].take().unwrap();
+                // Always sync pool's desired_effort onto the agent at checkout so
+                // pool-level clears (clear_pool_effort) and live picks
+                // (set_pool_effort) are both reflected on the claimed agent.
+                agent.desired_effort = self.desired_effort.clone();
+                return Some(agent);
             }
         }
 
         // Pass 2: first idle agent.
         let idx = self.agents.iter().position(|slot| slot.is_some());
-        idx.map(|i| self.agents[i].take().unwrap())
+        idx.map(|i| {
+            let mut agent = self.agents[i].take().unwrap();
+            // Always sync pool's desired_effort (see above).
+            agent.desired_effort = self.desired_effort.clone();
+            agent
+        })
     }
 
     /// Return an agent to its slot after a task completes.
+    ///
+    /// Propagates a startup-resolved effort back to the pool: if the pool's
+    /// `desired_effort` is still None (startup path — no live pick has happened
+    /// yet) and the returned agent acquired one via `resolve_startup_effort`,
+    /// adopt it as the new pool-level authority so future workers use it too.
     pub fn return_agent(&mut self, agent: OwnedAgent) {
         let idx = agent.index;
+        // Propagate startup-resolved effort back to pool level.
+        if self.desired_effort.is_none() {
+            if let Some(ref e) = agent.desired_effort {
+                self.desired_effort = Some(e.clone());
+            }
+        }
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
             // loudly so it shows up in production logs, then overwrite — the
@@ -831,36 +870,65 @@ impl AgentPool {
         IdleSwitchResult::Switched
     }
 
-    /// B5: Idle-path effort switch via `thought_level` configId.
+    /// B5: Set the pool-level desired effort `(config_id, value)`.
     ///
-    /// Stores `(config_id, value)` as `desired_effort` on the idle agent so
-    /// `create_session_and_apply_model` can forward it to the adapter via
-    /// `session_set_config_option` at the next session creation.  The existing
-    /// session is also invalidated so the next turn creates a fresh session and
-    /// applies the effort immediately — mirroring the idle-path model switch.
+    /// Updates `AgentPool::desired_effort` so every subsequent session creation
+    /// (any worker) applies the new effort via `session_set_config_option`.
+    /// Invalidates all idle agents' sessions so the next turn immediately creates
+    /// a fresh session and applies the effort rather than waiting for the
+    /// current session to expire naturally.
     ///
-    /// Unlike model switches there is no busy-path cancel-and-requeue: effort
-    /// changes apply to the next prompt in any case, so queuing on the idle
-    /// agent is the correct semantics.
+    /// Returns the count of idle agents that had active sessions invalidated.
+    /// Callers should emit `"pending_session"` as the immediate ack; the final
+    /// `ok`/`failure` arrives from `create_session_and_apply_model` once a
+    /// session is actually created and the ACP call completes.
     ///
-    /// Returns `IdleEffortResult::NoCatalog` when no session has been created
-    /// yet (the thought_level configId is unknown). In that case the caller
-    /// should treat the request as pending and report it as "pending_session".
-    pub fn set_idle_agent_effort(&mut self, config_id: &str, value: &str) -> IdleEffortResult {
-        let Some(agent) = self.agents.iter_mut().flatten().next() else {
-            return IdleEffortResult::NoIdleAgent;
-        };
-        // Verify the configId matches what the adapter advertised.
-        let caps = agent.model_capabilities.as_ref();
-        if caps.is_none_or(|c| c.thought_level_config_id.is_none()) {
-            return IdleEffortResult::NoCatalog;
+    /// Clearing effort (value == "") is handled by the caller before this is
+    /// reached: the caller sets `desired_effort` to `None` directly and persists
+    /// `None` on the record. This path is the non-empty-value live-pick case.
+    ///
+    /// Returns `SetPoolEffortResult::NoCatalog` when no worker has capabilities
+    /// yet (no session ever created) — the `thought_level` configId is unknown.
+    pub fn set_pool_effort(&mut self, config_id: &str, value: &str) -> SetPoolEffortResult {
+        // Verify at least one worker has capabilities with thought_level.
+        let has_catalog = self.agents.iter().flatten().any(|a| {
+            a.model_capabilities
+                .as_ref()
+                .map(|c| c.thought_level_config_id.is_some())
+                .unwrap_or(false)
+        });
+        if !has_catalog {
+            // No capabilities yet (no session ever created for any worker).
+            return SetPoolEffortResult::NoCatalog;
         }
-        agent.desired_effort = Some((config_id.to_string(), value.to_string()));
-        // Invalidate the current session so the next turn creates a new one
-        // and applies the effort via session_set_config_option immediately,
-        // rather than waiting for the session to be recreated for another reason.
-        agent.state.invalidate_all();
-        IdleEffortResult::Queued
+
+        self.desired_effort = Some((config_id.to_string(), value.to_string()));
+
+        // Invalidate all idle agents' sessions so the next turn applies the
+        // new effort immediately (rather than reusing a stale session).
+        let mut invalidated = 0u32;
+        for agent in self.agents.iter_mut().flatten() {
+            if !agent.state.sessions.is_empty() {
+                agent.state.invalidate_all();
+                invalidated += 1;
+            }
+        }
+        SetPoolEffortResult::Stored { invalidated }
+    }
+
+    /// Clear the pool-level desired effort.
+    ///
+    /// Sets `desired_effort` to `None` (adapter will use its own default) and
+    /// invalidates all idle sessions so the next session creation does not apply
+    /// a stale value. Called when the user selects "Auto (default)" in the
+    /// EffortPicker.
+    pub fn clear_pool_effort(&mut self) {
+        self.desired_effort = None;
+        for agent in self.agents.iter_mut().flatten() {
+            if !agent.state.sessions.is_empty() {
+                agent.state.invalidate_all();
+            }
+        }
     }
 }
 
@@ -876,16 +944,18 @@ pub enum IdleSwitchResult {
     NoIdleAgent,
 }
 
-/// Outcome of [`AgentPool::set_idle_agent_effort`].
+/// Outcome of [`AgentPool::set_pool_effort`].
 #[derive(Debug, PartialEq, Eq)]
-pub enum IdleEffortResult {
-    /// `desired_effort` queued; will be applied at next session creation.
-    Queued,
-    /// No session has been created yet — thought_level configId unknown.
-    /// The caller should surface "pending_session" status to the observer.
+pub enum SetPoolEffortResult {
+    /// Pool-level `desired_effort` stored and idle sessions invalidated.
+    /// `invalidated` is the count of idle agents whose sessions were cleared
+    /// (may be 0 if all agents are either checked out or have no session yet).
+    /// The final result arrives from `create_session_and_apply_model`.
+    Stored { invalidated: u32 },
+    /// No worker has capabilities yet — the `thought_level` configId is unknown
+    /// (no session has ever been created). The caller should surface
+    /// `"pending_session"` status to the observer.
     NoCatalog,
-    /// No idle agent available (all checked out / none spawned).
-    NoIdleAgent,
 }
 
 /// Timeout for a single pre-prompt context fetch attempt (thread/DM history).
@@ -1044,8 +1114,9 @@ async fn create_session_and_apply_model(
     }
 
     // B5 startup-default: arm desired_effort from startup_effort + capabilities.
-    // No-op when desired_effort already set (live pick takes precedence) or when
-    // the adapter does not advertise thought_level for this model.
+    // No-op when desired_effort already set (live pick takes precedence, via the
+    // pool-level value copied at checkout) or when the adapter does not advertise
+    // thought_level for this model.
     agent.resolve_startup_effort();
 
     // Apply desired_model if set, matching against the fresh session/new response.
@@ -1081,10 +1152,16 @@ async fn create_session_and_apply_model(
         false
     };
 
-    // B5: Apply desired_effort if set. Non-fatal — effort is optional capability.
-    // The configId comes from `desired_effort.0` (set by `set_idle_agent_effort`
-    // from the adapter's advertised thought_level configId).
-    if let Some((ref config_id, ref value)) = agent.desired_effort {
+    // B5: Apply desired_effort if set. Non-fatal — effort is optional
+    // capability. The configId comes from `desired_effort.0` (set by
+    // `set_pool_effort` from the adapter's advertised thought_level configId,
+    // or by `resolve_startup_effort` from the startup env).
+    //
+    // After the real ACP call, emit a `control_result` observer frame so the
+    // EffortPicker and the persistence observer learn the true outcome:
+    //   status: "ok"     → adapter accepted; Desktop persists the value.
+    //   status: "failure" → adapter rejected or timed out; Desktop does NOT persist.
+    if let Some((ref config_id, ref value)) = agent.desired_effort.clone() {
         let result = tokio::time::timeout(MODEL_SWITCH_TIMEOUT, async {
             agent
                 .acp
@@ -1092,13 +1169,14 @@ async fn create_session_and_apply_model(
                 .await
         })
         .await;
-        match result {
+        let ack_status = match result {
             Ok(Ok(_)) => {
                 tracing::info!(
                     target: "pool::effort",
                     "applied effort {value} via configId={config_id} on session {}",
                     resp.session_id
                 );
+                "ok"
             }
             Ok(Err(e @ AcpError::Io(_)))
             | Ok(Err(e @ AcpError::WriteTimeout(_)))
@@ -1116,14 +1194,30 @@ async fn create_session_and_apply_model(
                     target: "pool::effort",
                     "non-fatal error applying effort {value}: {e} — proceeding with agent default"
                 );
+                "failure"
             }
             Err(_timeout) => {
                 tracing::warn!(
                     target: "pool::effort",
                     "effort switch {value} timed out — proceeding with agent default"
                 );
+                "failure"
             }
-        }
+        };
+        // Emit honest final ack. The EffortPicker awaits this frame (correlated
+        // by type+configId+value) to learn the real outcome and drive persistence.
+        // category: "thought_level" on both ok and failure so the observer can
+        // gate persistence on ok+thought_level and skip failure.
+        agent.acp.observe(
+            "control_result",
+            serde_json::json!({
+                "type": "set_config_option",
+                "configId": config_id,
+                "value": value,
+                "status": ack_status,
+                "category": "thought_level",
+            }),
+        );
     }
 
     // Emit session config for desktop consumption (config bridge tier 1b).
@@ -7195,22 +7289,23 @@ mod effort_tests {
         assert_eq!(id, None);
     }
 
-    /// `set_idle_agent_effort` returns `NoIdleAgent` when pool has no agents.
+    /// `set_pool_effort` returns `NoCatalog` when the pool has no agents with
+    /// capabilities (empty pool — no session ever created for any worker).
     #[test]
-    fn test_set_idle_agent_effort_returns_no_idle_agent_on_empty_pool() {
+    fn test_set_pool_effort_returns_no_catalog_on_empty_pool() {
         let mut pool = AgentPool::from_slots(vec![]);
-        let result = pool.set_idle_agent_effort("effort", "high");
-        assert_eq!(result, IdleEffortResult::NoIdleAgent);
+        let result = pool.set_pool_effort("effort", "high");
+        assert_eq!(result, SetPoolEffortResult::NoCatalog);
     }
 
-    /// `set_idle_agent_effort` returns `NoCatalog` when agent exists but has
-    /// no `thought_level_config_id` yet (no session created).
+    /// `set_pool_effort` returns `NoCatalog` when agents exist but none has
+    /// `thought_level_config_id` yet (no session has been created).
     #[test]
-    fn test_set_idle_agent_effort_returns_no_catalog_when_no_session_created() {
+    fn test_set_pool_effort_returns_no_catalog_when_no_capabilities() {
         // Pool with a None slot (agent not yet spawned).
         let mut pool = AgentPool::from_slots(vec![None]);
-        let result = pool.set_idle_agent_effort("effort", "high");
-        assert_eq!(result, IdleEffortResult::NoIdleAgent);
+        let result = pool.set_pool_effort("effort", "high");
+        assert_eq!(result, SetPoolEffortResult::NoCatalog);
     }
 
     /// `AgentModelCapabilities::thought_level_config_id` is populated from the
@@ -7225,11 +7320,10 @@ mod effort_tests {
         assert_eq!(caps.thought_level_config_id.as_deref(), Some("effort"));
     }
 
-    /// `set_idle_agent_effort` with `thought_level_config_id` set queues the
-    /// effort AND invalidates all channel sessions so the next turn creates a
-    /// fresh session (mirroring the idle-path model switch).
+    /// `set_pool_effort` stores the pool-level `desired_effort` and invalidates
+    /// all idle agents' sessions so the next turn creates a fresh one.
     #[tokio::test]
-    async fn test_set_idle_agent_effort_queues_and_invalidates_session() {
+    async fn test_set_pool_effort_stores_and_invalidates_all_idle_sessions() {
         let acp = AcpClient::spawn(
             "bash",
             &["-c".to_string(), "sleep 10".to_string()],
@@ -7259,22 +7353,152 @@ mod effort_tests {
             protocol_version: 2,
         };
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
-        let result = pool.set_idle_agent_effort("effort", "high");
-        assert_eq!(result, IdleEffortResult::Queued, "must return Queued");
+        let result = pool.set_pool_effort("effort", "high");
+        assert_eq!(
+            result,
+            SetPoolEffortResult::Stored { invalidated: 1 },
+            "must return Stored with invalidated=1"
+        );
+        // Pool-level desired_effort must be set.
+        assert_eq!(
+            pool.desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("effort", "high")),
+            "pool-level desired_effort must be set"
+        );
         // Session must be invalidated so the next turn creates a fresh one.
         let agent = pool.agents_mut().iter().flatten().next().unwrap();
         assert!(
             agent.state.sessions.is_empty(),
-            "session must be invalidated after effort change"
+            "session must be invalidated after set_pool_effort"
         );
-        // desired_effort must be set for apply at next session creation.
+    }
+
+    /// `set_pool_effort` on a multi-worker pool invalidates ALL idle agents and
+    /// propagates the pool-level value to each worker at checkout via `try_claim`.
+    #[tokio::test]
+    async fn test_set_pool_effort_invalidates_all_workers_and_propagates_at_checkout() {
+        // Build two idle agents, each with a session.
+        let ch_a = uuid::Uuid::new_v4();
+        let ch_b = uuid::Uuid::new_v4();
+
+        async fn make_worker(index: usize, ch: uuid::Uuid, session_id: &str) -> OwnedAgent {
+            let acp = AcpClient::spawn(
+                "bash",
+                &["-c".to_string(), "sleep 10".to_string()],
+                &[],
+                false,
+            )
+            .await
+            .expect("spawn");
+            let mut state = SessionState::default();
+            state.sessions.insert(ch, session_id.to_string());
+            OwnedAgent {
+                index,
+                acp,
+                state,
+                model_capabilities: Some(AgentModelCapabilities {
+                    config_options_raw: vec![],
+                    available_models_raw: None,
+                    thought_level_config_id: Some("effort".to_string()),
+                }),
+                desired_model: None,
+                model_overridden: false,
+                desired_effort: None,
+                startup_effort: None,
+                agent_name: "test".into(),
+                goose_system_prompt_supported: None,
+                protocol_version: 2,
+            }
+        }
+
+        let a = make_worker(0, ch_a, "sess-a").await;
+        let b = make_worker(1, ch_b, "sess-b").await;
+        let mut pool = AgentPool::from_slots(vec![Some(a), Some(b)]);
+
+        // set_pool_effort must invalidate both idle workers.
+        let result = pool.set_pool_effort("effort", "high");
         assert_eq!(
-            agent
+            result,
+            SetPoolEffortResult::Stored { invalidated: 2 },
+            "both idle workers must be invalidated"
+        );
+
+        // Pool-level value set.
+        assert_eq!(
+            pool.desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some(("effort", "high"))
+        );
+
+        // At checkout, the pool's desired_effort is copied onto the claimed agent.
+        let claimed = pool.try_claim(Some(ch_a)).unwrap();
+        assert_eq!(
+            claimed
                 .desired_effort
                 .as_ref()
                 .map(|(id, v)| (id.as_str(), v.as_str())),
             Some(("effort", "high")),
-            "desired_effort must be queued"
+            "checked-out agent must carry pool's desired_effort"
+        );
+    }
+
+    /// `clear_pool_effort` sets pool-level `desired_effort` to None and
+    /// invalidates all idle sessions. A subsequently claimed agent has no
+    /// desired_effort (adapter uses its default).
+    #[tokio::test]
+    async fn test_clear_pool_effort_clears_and_invalidates_sessions() {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        let ch = uuid::Uuid::new_v4();
+        let mut state = SessionState::default();
+        state.sessions.insert(ch, "sess-1".into());
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                thought_level_config_id: Some("effort".to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: Some(("effort".to_string(), "high".to_string())),
+            startup_effort: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        pool.desired_effort = Some(("effort".to_string(), "high".to_string()));
+
+        pool.clear_pool_effort();
+
+        assert!(
+            pool.desired_effort.is_none(),
+            "pool desired_effort must be None after clear"
+        );
+        // Session must be invalidated.
+        let agent = pool.agents_mut().iter().flatten().next().unwrap();
+        assert!(
+            agent.state.sessions.is_empty(),
+            "session must be invalidated after clear"
+        );
+
+        // A claimed agent must not carry a desired_effort.
+        let claimed = pool.try_claim(Some(ch)).unwrap();
+        assert!(
+            claimed.desired_effort.is_none(),
+            "claimed agent must not carry desired_effort after pool clear"
         );
     }
 

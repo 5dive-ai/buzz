@@ -79,6 +79,13 @@ pub(super) fn build_launch_block(
         };
         policy_env.insert(model_key.into(), value.to_string());
     }
+    // I-4: remote parity for persisted startup effort. Mirrors the local spawn
+    // path in runtime.rs. The harness reads BUZZ_ACP_EFFORT_LEVEL into
+    // PoolStartup.startup_effort and applies it at first session creation via
+    // resolve_startup_effort().
+    if let Some(ref value) = record.effort_level {
+        policy_env.insert("BUZZ_ACP_EFFORT_LEVEL".into(), value.clone());
+    }
     if let Some(value) = record.idle_timeout_seconds {
         policy_env.insert("BUZZ_ACP_IDLE_TIMEOUT".into(), value.to_string());
     }
@@ -304,6 +311,39 @@ mod tests {
         assert!(
             launch["policy_env"]["BUZZ_ACP_MODEL"].is_null(),
             "claude remote must NOT receive BUZZ_ACP_MODEL"
+        );
+    }
+
+    #[test]
+    fn launch_block_claude_runtime_injects_effort_level_when_set() {
+        // I-4: remote parity — record.effort_level → BUZZ_ACP_EFFORT_LEVEL in policy_env.
+        let mut record = record();
+        record.effort_level = Some("high".to_string());
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "claude".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
+        assert_eq!(
+            launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"], "high",
+            "claude remote must receive BUZZ_ACP_EFFORT_LEVEL when effort_level is set"
+        );
+    }
+
+    #[test]
+    fn launch_block_does_not_inject_effort_level_when_absent() {
+        // I-4: no BUZZ_ACP_EFFORT_LEVEL in policy_env when record.effort_level is None.
+        let record = record(); // effort_level is None by default
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "claude".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
+        assert!(
+            launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
+            "policy_env must NOT contain BUZZ_ACP_EFFORT_LEVEL when effort_level is None"
         );
     }
 }

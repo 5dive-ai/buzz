@@ -37,8 +37,8 @@ use filter::SubscriptionRule;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentPool, ControlSignal, IdleEffortResult, IdleSwitchResult, OwnedAgent, PromptContext,
-    PromptOutcome, PromptResult, PromptSource, SessionState, TimeoutKind,
+    AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
+    PromptResult, PromptSource, SessionState, SetPoolEffortResult, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
@@ -986,14 +986,19 @@ fn handle_switch_model_control(
 
 /// Handle a `set_config_option` control frame.
 ///
-/// For the `thought_level` category (B5 effort path): discovers the real
-/// configId from the agent's cached capabilities, queues `desired_effort` on
-/// the idle agent, and emits a real-status ack so Desktop persists only on
-/// genuine ok. If no session has been created yet (`NoCatalog`) the harness
-/// emits `"pending_session"` — Desktop must not persist on that status.
+/// For the `thought_level` category (B5 effort path): validates the configId
+/// against the pool's known capabilities, stores the pool-level `desired_effort`,
+/// invalidates all idle sessions, and emits an immediate `"pending_session"` ack.
+/// The final honest ack (`ok` or `failure`) arrives from
+/// `create_session_and_apply_model` once a real session is created and the ACP
+/// call completes.
 ///
 /// Unknown configIds and non-effort options are passed through with a synthetic
 /// `"ok"` ack (the pre-B5 behaviour), so existing callers don't break.
+///
+/// I-7 harness validation: if the incoming value is not in the adapter-advertised
+/// options for the `thought_level` configId, returns `"invalid_value"` immediately
+/// without updating the pool.
 fn handle_set_config_option_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
@@ -1017,15 +1022,73 @@ fn handle_set_config_option_control(
     });
 
     let is_thought_level = thought_level_id.as_deref() == Some(config_id);
-    let status = if is_thought_level {
-        match pool.set_idle_agent_effort(config_id, value) {
-            IdleEffortResult::Queued => "ok",
-            IdleEffortResult::NoCatalog => "pending_session",
-            IdleEffortResult::NoIdleAgent => "no_idle_agent",
+    let (status, include_category) = if is_thought_level {
+        // I-7: validate the incoming value against adapter-advertised options.
+        let valid_values: Option<Vec<String>> = pool.agents_mut().iter().flatten().find_map(|a| {
+            a.model_capabilities.as_ref().and_then(|c| {
+                let opts = c.config_options_raw.iter().find(|opt| {
+                    opt.get("id")
+                        .or_else(|| opt.get("configId"))
+                        .and_then(|v| v.as_str())
+                        == Some(config_id)
+                })?;
+                let vals: Vec<String> = opts
+                    .get("options")
+                    .and_then(|o| o.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| {
+                                v.get("value").and_then(|s| s.as_str()).map(str::to_string)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if vals.is_empty() {
+                    None
+                } else {
+                    Some(vals)
+                }
+            })
+        });
+
+        if let Some(ref vals) = valid_values {
+            if !value.is_empty() && !vals.contains(&value.to_string()) {
+                // Value is not in the adapter's advertised option set.
+                tracing::warn!(
+                    target: "pool::effort",
+                    "effort value {value:?} not in advertised options {vals:?} — rejecting"
+                );
+                let mut ack = serde_json::json!({
+                    "type": "set_config_option",
+                    "configId": config_id,
+                    "status": "invalid_value",
+                    "value": value,
+                });
+                ack["category"] = serde_json::json!("thought_level");
+                obs.emit(
+                    "control_result",
+                    None,
+                    &observer::ObserverContext::default(),
+                    ack,
+                );
+                return;
+            }
+        }
+
+        // Empty value = clear (Auto). Bypass set_pool_effort.
+        if value.is_empty() {
+            pool.clear_pool_effort();
+            ("cleared", true)
+        } else {
+            let result = pool.set_pool_effort(config_id, value);
+            match result {
+                SetPoolEffortResult::Stored { .. } => ("pending_session", true),
+                SetPoolEffortResult::NoCatalog => ("pending_session", true),
+            }
         }
     } else {
         // Not a thought_level option — synthetic ok (no-op behaviour unchanged).
-        "ok"
+        ("ok", false)
     };
 
     // B5: include "category": "thought_level" ONLY on the real-forward branch.
@@ -1037,7 +1100,7 @@ fn handle_set_config_option_control(
         "status": status,
         "value": value,
     });
-    if is_thought_level {
+    if include_category {
         ack["category"] = serde_json::json!("thought_level");
     }
 
@@ -3907,8 +3970,8 @@ struct PoolStartup {
     has_generated_codex_config: bool,
     model: Option<String>,
     /// Persisted effort value to apply at the first session creation by pairing
-    /// with the adapter's advertised 'thought_level' configId. Carried from
-    ///  (the  env var). The configId
+    /// with the adapter's advertised `thought_level` configId. Carried from
+    /// `Config.effort_level` (the `BUZZ_ACP_EFFORT_LEVEL` env var). The configId
     /// is unknown until capabilities arrive at session creation; it is never
     /// hardcoded in the harness.
     startup_effort: Option<String>,
@@ -6845,7 +6908,7 @@ mod control_result_tests {
     // ── B5 harness-level tests for handle_set_config_option_control ──────────
     //
     // These tests verify the ack emitted by handle_set_config_option_control
-    // carries the real outcome from set_idle_agent_effort, not a synthetic "ok".
+    // carries the real pool outcome, not a synthetic "ok".
     //
     // The observer is checked via snapshot() after the call to verify
     // both the kind ("control_result") and the status field.
@@ -6856,14 +6919,15 @@ mod control_result_tests {
     // (backward compatibility — it cannot identify the option as thought_level).
     // The meaningful test cases are therefore:
     //   1. thought_level_config_id IS set and matches → pool outcome reflects reality
+    //      (Stored → "pending_session"; clear → "cleared"; invalid → "invalid_value")
     //   2. thought_level_config_id is NOT set (or pool empty) → synthetic ok
     //   3. unknown configId → synthetic ok regardless
 
     /// B5: when the pool has an agent whose thought_level_config_id matches
     /// the incoming configId, the ack must carry the real pool outcome —
-    /// here Queued → "ok".  Session must also be invalidated.
+    /// here Stored → "pending_session" (final result arrives from session creation).
     #[tokio::test]
-    async fn test_b5_set_config_option_queued_emits_ok_ack_and_invalidates() {
+    async fn test_b5_set_config_option_stored_emits_pending_session_ack_and_invalidates() {
         use crate::acp::AcpClient;
         use crate::pool::AgentModelCapabilities;
         let acp = AcpClient::spawn(
@@ -6908,11 +6972,11 @@ mod control_result_tests {
         let ev = &events[0];
         assert_eq!(ev.kind, "control_result");
         assert_eq!(ev.payload["type"].as_str().unwrap(), "set_config_option");
-        // Queued → "ok" ack — Desktop may persist on this status.
+        // Stored → "pending_session" ack — final result arrives from session creation.
         assert_eq!(
             ev.payload["status"].as_str().unwrap(),
-            "ok",
-            "Queued must yield ok ack"
+            "pending_session",
+            "Stored must yield pending_session ack (not ok — adapter hasn't confirmed yet)"
         );
         // Real-forward ack must carry category so Desktop knows to persist.
         assert_eq!(
@@ -6925,6 +6989,128 @@ mod control_result_tests {
         assert!(
             agent.state.sessions.is_empty(),
             "session must be invalidated after effort queued"
+        );
+    }
+
+    /// B5 I-1: when value is empty (Auto selected), the ack must be "cleared"
+    /// so the Desktop observer persists null and clears the pool-level effort.
+    #[tokio::test]
+    async fn test_b5_empty_value_emits_cleared_ack() {
+        use crate::acp::AcpClient;
+        use crate::pool::AgentModelCapabilities;
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test agent");
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                thought_level_config_id: Some("effort".to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: Some(("effort".to_string(), "high".to_string())),
+            startup_effort: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        pool.desired_effort = Some(("effort".to_string(), "high".to_string()));
+        let obs = observer::ObserverHandle::in_process();
+        // Empty value = Auto (clear path).
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["status"].as_str().unwrap(),
+            "cleared",
+            "empty value must yield cleared ack for Auto path"
+        );
+        assert_eq!(
+            events[0].payload["category"].as_str().unwrap(),
+            "thought_level",
+            "cleared ack must include thought_level category"
+        );
+        // Pool desired_effort must be cleared.
+        assert!(
+            pool.desired_effort.is_none(),
+            "pool desired_effort must be None after Auto"
+        );
+    }
+
+    /// B5 I-7: when the incoming value is not in the adapter-advertised options,
+    /// the ack must be "invalid_value" and the pool must NOT be updated.
+    #[tokio::test]
+    async fn test_b5_invalid_value_emits_invalid_value_ack_and_does_not_update_pool() {
+        use crate::acp::AcpClient;
+        use crate::pool::AgentModelCapabilities;
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test agent");
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![serde_json::json!({
+                    "id": "effort",
+                    "category": "thought_level",
+                    "options": [
+                        { "value": "low" },
+                        { "value": "medium" },
+                        { "value": "high" },
+                    ],
+                })],
+                available_models_raw: None,
+                thought_level_config_id: Some("effort".to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let obs = observer::ObserverHandle::in_process();
+        // "ultra" is not in the advertised options.
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "ultra",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["status"].as_str().unwrap(),
+            "invalid_value",
+            "non-advertised value must yield invalid_value ack"
+        );
+        // Pool must NOT have been updated with the invalid value.
+        assert!(
+            pool.desired_effort.is_none(),
+            "pool must not be updated on invalid_value"
         );
     }
 
@@ -7024,7 +7210,10 @@ mod control_result_tests {
         handle_set_config_option_control(&payload, &mut pool, Some(&obs));
         let events = obs.snapshot();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload["status"].as_str().unwrap(), "ok");
+        assert_eq!(
+            events[0].payload["status"].as_str().unwrap(),
+            "pending_session"
+        );
         // Real-forward ack must carry category so Desktop persists.
         assert_eq!(
             events[0].payload["category"].as_str().unwrap(),

@@ -352,6 +352,17 @@ pub(crate) fn backup_invalid_store(path: &Path) {
 ///   unreachable, leave it inline. This makes the strip deterministic on the
 ///   next reachable boot rather than waiting for a non-deterministic save.
 fn hydrate_keys(records: &mut [ManagedAgentRecord]) {
+    // In test builds skip the OS keychain entirely. Tests use records with
+    // `private_key_nsec` inline (empty or pre-populated), and the testable
+    // core `hydrate_keys_with` is exercised directly with mock stores.
+    // Without this guard `load_managed_agents_at` blocks on a macOS Security
+    // daemon IPC call (`SecKeychainFindGenericPassword`) which hangs in
+    // headless test environments.
+    #[cfg(test)]
+    {
+        let _ = records;
+        return;
+    }
     let Some(store) = agent_secret_store() else {
         return;
     };
@@ -527,6 +538,17 @@ fn write_agent_store_to_path(
 /// in the JSON. Mutates `records` (a save-local clone) — the caller's in-memory
 /// records keep their keys.
 fn persist_agent_keys(records: &mut [ManagedAgentRecord]) {
+    // In test builds skip the OS keychain entirely. Tests exercise the
+    // testable core `persist_agent_keys_with` directly with mock stores;
+    // production-path tests (e.g. concurrency tests) operate on records with
+    // empty `private_key_nsec` where the keyring write is a no-op anyway.
+    // Without this guard `save_managed_agents_at` blocks on a macOS Security
+    // daemon IPC write call in headless test environments.
+    #[cfg(test)]
+    {
+        let _ = records;
+        return;
+    }
     let Some(store) = agent_secret_store() else {
         // No keyring backend: keys stay inline.
         return;

@@ -672,14 +672,17 @@ pub(crate) fn spawn_agent_child_at<R: tauri::Runtime>(
             );
         }
     }
-
+    // Emit BUZZ_ACP_IDLE_TIMEOUT only when explicitly set; the harness
+    // DEFAULT_IDLE_TIMEOUT_SECS is the single source of truth. The deprecated
+    // BUZZ_ACP_TURN_TIMEOUT pinned agents to a stale default (320s).
     if let Some(idle) = record.idle_timeout_seconds {
         command.env("BUZZ_ACP_IDLE_TIMEOUT", idle.to_string());
     }
     if let Some(max_dur) = record.max_turn_duration_seconds {
         command.env("BUZZ_ACP_MAX_TURN_DURATION", max_dur.to_string());
     }
-    command.env("BUZZ_ACP_AGENTS", record.parallelism.to_string());
+    let acp_n = super::acp_agents_value(effective_command, record.parallelism);
+    command.env("BUZZ_ACP_AGENTS", acp_n);
     command.env("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "steer");
     command.env("BUZZ_ACP_DEDUP", "queue");
     if let Some(meta) = runtime_meta {

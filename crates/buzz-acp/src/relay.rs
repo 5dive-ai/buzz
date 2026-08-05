@@ -126,6 +126,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::backoff::{extend_with, jittered_duration};
 use crate::config::ChannelFilter;
 
 /// Metadata about a channel, populated at discovery time.
@@ -1161,15 +1162,31 @@ impl BgState {
     /// the desktop TypeScript client, which uses a 10s no-hint default — both
     /// values are conservative enough; the relay hint wins when present.
     ///
+    /// Jitter here is **one-sided** ([`crate::backoff::extend_with`]): the hint is the
+    /// relay's authoritative window TTL, so the gate may only ever be longer
+    /// than it. Symmetric jitter would wake us inside a window the relay has
+    /// already said is closed, earning a fresh denial plus a wasted counter
+    /// increment (the limiter's `INCR` runs on denied checks too).
+    ///
     /// The gate takes the **maximum** of any existing deadline and the newly
     /// computed one so overlapping CLOSED/NOTICE messages can't shorten a gate
     /// that is already set further out.
     ///
     /// Returns the gate deadline that was set.
     fn set_rate_limit_gate(&mut self, retry_secs: u64) -> tokio::time::Instant {
-        let secs = if retry_secs < 2 { 5 } else { retry_secs };
-        let base = Duration::from_secs(secs);
-        let deadline = tokio::time::Instant::now() + jittered_duration(base);
+        self.set_rate_limit_gate_with(retry_secs, crate::backoff::clock_nanos())
+    }
+
+    /// [`set_rate_limit_gate`] with an explicit jitter sample.
+    ///
+    /// Delegates the arithmetic to the pure [`gate_delay`]; this wrapper exists
+    /// only to apply the result to `self`.
+    fn set_rate_limit_gate_with(
+        &mut self,
+        retry_secs: u64,
+        jitter_nanos: u32,
+    ) -> tokio::time::Instant {
+        let deadline = tokio::time::Instant::now() + gate_delay(retry_secs, jitter_nanos);
         let gate = match self.rate_limit_gate {
             Some(existing) if existing > deadline => existing,
             _ => deadline,
@@ -3345,16 +3362,28 @@ pub(crate) fn parse_rate_limit_retry_secs(msg: &str) -> Option<u64> {
     after[..len].parse::<u64>().ok()
 }
 
-/// Add ±20% jitter to a backoff duration using the nanosecond sub-second
-/// component of the system clock as a cheap entropy source (no `rand` dep).
-fn jittered_duration(base: Duration) -> Duration {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    // factor ∈ [0.8, 1.2)
-    let factor = 0.8 + (nanos as f64 / u32::MAX as f64) * 0.4;
-    base.mul_f64(factor)
+/// Sub-2s hints (including a missing hint parsed as 0) floor to this many
+/// seconds, matching the desktop TypeScript client's no-hint default.
+const RATE_LIMIT_GATE_FLOOR_SECS: u64 = 5;
+
+/// The rate-limit gate delay for a relay hint and an explicit jitter sample.
+///
+/// Pure: entropy enters only as `jitter_nanos`, and the wall clock is acquired
+/// by the caller. That is what makes the gate's safety property testable at
+/// exact endpoints — a helper that reads `SystemTime` internally can only be
+/// sampled, never driven, and paused Tokio time does not freeze `SystemTime`.
+///
+/// Jitter is **one-sided**: the hint is the relay's authoritative window TTL,
+/// so the delay may only ever exceed it. Symmetric jitter would wake us inside
+/// a window the relay has already said is closed, earning a fresh denial plus
+/// a wasted counter increment (the limiter's `INCR` runs on denied checks too).
+fn gate_delay(retry_secs: u64, jitter_nanos: u32) -> Duration {
+    let secs = if retry_secs < 2 {
+        RATE_LIMIT_GATE_FLOOR_SECS
+    } else {
+        retry_secs
+    };
+    extend_with(Duration::from_secs(secs), jitter_nanos)
 }
 
 /// Classify a `RelayError` as a DNS resolution failure.
@@ -5765,7 +5794,7 @@ mod tests {
             "gate must be active immediately after arming"
         );
 
-        // Advance virtual time past the max jitter (1.2 × 5 s = 6 s).
+        // Advance virtual time past the max gate length (1.2 × 5 s = 6 s).
         tokio::time::advance(Duration::from_secs(7)).await;
 
         assert!(
@@ -5776,6 +5805,102 @@ mod tests {
             state.rate_limit_gate.is_none(),
             "check_rate_gate must lazily clear the field on expiry"
         );
+    }
+
+    /// The effective gate base for a hint: sub-2s hints floor to 5s.
+    #[cfg(test)]
+    fn effective_gate_secs(hint: u64) -> u64 {
+        if hint < 2 {
+            5
+        } else {
+            hint
+        }
+    }
+
+    /// `gate_delay` is exact at both endpoints of the jitter domain.
+    ///
+    /// This is the discriminating test, and it is a **pure-function** test for
+    /// a reason. Entropy enters `gate_delay` only as a parameter, so both
+    /// endpoints are driven rather than sampled:
+    ///
+    /// * `nanos = 0` ⇒ one-sided factor exactly 1.0 ⇒ delay is exactly base.
+    ///   A symmetric-jitter regression yields `0.8 * base` here, deterministically.
+    /// * `nanos = 999_999_999` ⇒ factor approaches 1.2 ⇒ delay approaches
+    ///   `1.2 * base`. The `u32::MAX` divisor caps it at `0.893 * base`,
+    ///   so this endpoint is what catches the divisor defect; a range assertion
+    ///   of the form `0.8*base <= d < 1.2*base` cannot, because the broken range
+    ///   is a strict subset of the asserted one. The upper bound is inclusive:
+    ///   `Duration` is nanosecond-resolution, so e.g. `2s * 1.1999999998`
+    ///   rounds to exactly `2.4s` and a strict `<` would be unsatisfiable.
+    ///
+    /// Scope: this kills a swap of one-sided for symmetric *inside* the seam,
+    /// and the divisor defect. A mutation that bypasses the seam entirely (call
+    /// site reverting to a wall-clock helper) is a structural change this unit
+    /// test cannot honestly claim to kill — `#[deny(unused)]` on the parameter
+    /// and the integration test below are what cover that.
+    #[test]
+    fn gate_delay_is_exact_at_both_jitter_endpoints() {
+        for hint in [0u64, 1, 2, 5, 6, 51] {
+            let base = Duration::from_secs(effective_gate_secs(hint));
+
+            assert_eq!(
+                gate_delay(hint, 0),
+                base,
+                "a {hint}s hint at zero jitter must be exactly {base:?}; \
+                 symmetric jitter would yield 0.8 x base here"
+            );
+
+            let ceiling = gate_delay(hint, 999_999_999);
+            assert!(
+                ceiling > base.mul_f64(1.1999) && ceiling <= base.mul_f64(1.2),
+                "a {hint}s hint at max jitter gave {ceiling:?}, which must reach \
+                 1.2 x {base:?} — a value near 0.893 x base means the \
+                 factor is divided by u32::MAX instead of 1e9"
+            );
+        }
+    }
+
+    /// `gate_delay` never returns less than the relay's hint, for any sample.
+    #[test]
+    fn gate_delay_never_falls_below_the_hint() {
+        for hint in [0u64, 1, 2, 5, 6, 51] {
+            let base = Duration::from_secs(effective_gate_secs(hint));
+            for step in 0..=1_000u32 {
+                let nanos = (999_999_999f64 * f64::from(step) / 1_000.0) as u32;
+                let delay = gate_delay(hint, nanos);
+                assert!(
+                    delay >= base && delay <= base.mul_f64(1.2),
+                    "a {hint}s hint with jitter nanos={nanos} gave {delay:?}, \
+                     outside [{base:?}, 1.2 x base]"
+                );
+            }
+        }
+    }
+
+    /// Corroboration: the armed gate honours the computed delay.
+    ///
+    /// Integration-level, so it can only sample the entropy the call site
+    /// actually uses. It states the safety property end to end; the
+    /// deterministic receipts live in the pure-function tests above.
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_gate_arms_for_the_computed_delay() {
+        for hint in [0u64, 1, 2, 5, 6, 51] {
+            let base = Duration::from_secs(effective_gate_secs(hint));
+            for nanos in [0u32, 500_000_000, 999_999_999] {
+                let mut state = BgState::new();
+                let before = tokio::time::Instant::now();
+                let gate = state.set_rate_limit_gate_with(hint, nanos);
+                assert_eq!(
+                    gate - before,
+                    gate_delay(hint, nanos),
+                    "armed gate for a {hint}s hint (nanos={nanos}) must equal gate_delay"
+                );
+                assert!(
+                    gate - before >= base,
+                    "armed gate for a {hint}s hint (nanos={nanos}) fell below the hint"
+                );
+            }
+        }
     }
 
     /// set_rate_limit_gate takes the max of overlapping deadlines.
@@ -6100,7 +6225,7 @@ mod tests {
             "gate must be active while membership sub is pending"
         );
 
-        // Advance past the gate (max jitter: 1.2 × 5s = 6s).
+        // Advance past the gate (max gate length: 1.2 × 5s = 6s).
         tokio::time::advance(Duration::from_secs(7)).await;
 
         assert!(

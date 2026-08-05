@@ -16,7 +16,7 @@ use crate::{
     events,
     relay::{
         classify_request_error, query_relay, query_relay_at_with_keys, relay_http_base_url,
-        relay_ws_url_with_override, submit_event_at_with_keys, SubmitEventResponse,
+        relay_ws_url_with_override, submit_signed_event_at_with_keys, SubmitEventResponse,
     },
 };
 
@@ -336,7 +336,64 @@ pub(crate) async fn scoped_archive_operation(
         }
     };
 
-    submit_event_at_with_keys(builder, state, &api_base_url, &scope.keys).await
+    // Sign here so tests can observe the production event before submission.
+    let signed = builder
+        .sign_with_keys(&scope.keys)
+        .map_err(|e| format!("failed to sign event: {e}"))?;
+
+    #[cfg(test)]
+    test_hooks::notify_submit(&signed);
+
+    submit_signed_event_at_with_keys(&signed, state, &api_base_url, &scope.keys).await
+}
+
+// ── Test-only submit observation hook ────────────────────────────────────────
+//
+// A narrow `#[cfg(test)]` hook that records every signed event just before
+// submission. Production code is unchanged — this is gated out of shipping
+// builds entirely.
+//
+// Call `test_hooks::install(observer)` from the test, then run the operation.
+// The observer closure receives the signed event. An attempt counter increments
+// on every call. Call `test_hooks::reset()` between tests.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::{cell::RefCell, sync::Arc};
+
+    thread_local! {
+        static OBSERVER: RefCell<Option<Arc<dyn Fn(&nostr::Event) + Send + Sync>>> =
+            const { RefCell::new(None) };
+        static ATTEMPT_COUNT: RefCell<u32> = const { RefCell::new(0) };
+    }
+
+    /// Install an observer for the current thread. Replaces any existing one.
+    pub fn install(f: impl Fn(&nostr::Event) + Send + Sync + 'static) {
+        OBSERVER.with(|o| {
+            *o.borrow_mut() = Some(Arc::new(f));
+        });
+        ATTEMPT_COUNT.with(|c| *c.borrow_mut() = 0);
+    }
+
+    /// Remove the observer and reset the attempt counter.
+    pub fn reset() {
+        OBSERVER.with(|o| *o.borrow_mut() = None);
+        ATTEMPT_COUNT.with(|c| *c.borrow_mut() = 0);
+    }
+
+    /// Return the number of production submit calls observed so far.
+    pub fn attempt_count() -> u32 {
+        ATTEMPT_COUNT.with(|c| *c.borrow())
+    }
+
+    /// Called by `scoped_archive_operation` for each signed event.
+    pub fn notify_submit(event: &nostr::Event) {
+        ATTEMPT_COUNT.with(|c| *c.borrow_mut() += 1);
+        OBSERVER.with(|o| {
+            if let Some(f) = o.borrow().as_ref() {
+                f(event);
+            }
+        });
+    }
 }
 
 // ── Archive snapshot ──────────────────────────────────────────────────────────

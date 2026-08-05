@@ -258,8 +258,10 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                             effectiveAvatarUrl,
                           )
                         }
-                        onViewInstances={(p) =>
-                          openInstancesSheet(p, group.agents)
+                        onViewInstances={
+                          relayInstanceCount > 0
+                            ? (p) => openInstancesSheet(p, group.agents)
+                            : undefined
                         }
                       />
                     </div>

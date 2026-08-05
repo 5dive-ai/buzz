@@ -138,7 +138,9 @@ async fn assert_actor_not_relay_member(db_url: &str, actor_pubkey: &str) -> Resu
     });
     let rows = client
         .query(
-            "SELECT 1 FROM relay_members WHERE community_id = $1::uuid AND pubkey = $2",
+            // Cast the UUID column to text so tokio_postgres can bind a &str parameter.
+            // $1::uuid would require a Uuid type; community_id::text = $1 keeps &str.
+            "SELECT 1 FROM relay_members WHERE community_id::text = $1 AND pubkey = $2",
             &[&TEST_COMMUNITY_ID, &actor_pubkey],
         )
         .await
@@ -169,8 +171,9 @@ async fn assert_postgres_consent_path_owner(
     // Scope assertion by community AND pubkey.
     let rows = client
         .query(
+            // Cast the UUID column to text so tokio_postgres can bind a &str parameter.
             "SELECT consent_path FROM archived_identities \
-             WHERE community_id = $1::uuid AND pubkey = $2",
+             WHERE community_id::text = $1 AND pubkey = $2",
             &[&TEST_COMMUNITY_ID, &agent_pubkey],
         )
         .await
@@ -231,132 +234,39 @@ fn extract_consent_actor(event: &nostr::Event) -> Option<String> {
 
 // ── Narrow observation seam ──────────────────────────────────────────────────
 //
-// The seam wraps `submit_event_at_with_keys` with a counter + event capture,
-// without replacing the shipping build/mint function. Production submission
-// goes through unmodified — we only observe what crossed the wire.
+// The seam uses `test_hooks` from the parent module — a `#[cfg(test)]`
+// thread-local hook installed by `test_hooks::install`. `scoped_archive_operation`
+// calls `test_hooks::notify_submit(&signed)` before every relay POST, so the
+// observer sees the PRODUCTION-signed event with the PRODUCTION auth tags.
+// Gutting the fresh-mint in `scoped_archive_operation` → observer sees no auth
+// tag → wire-form assertions fail locally without a live relay.
 
-/// A recording wrapper that captures the last signed event submitted and
-/// the total number of submit attempts.
-#[derive(Clone, Default)]
-struct SubmitObserver {
-    last_event: Arc<Mutex<Option<nostr::Event>>>,
-    attempt_count: Arc<Mutex<u32>>,
-}
-
-impl SubmitObserver {
-    fn new() -> Self {
-        Self {
-            last_event: Arc::new(Mutex::new(None)),
-            attempt_count: Arc::new(Mutex::new(0)),
-        }
-    }
-
-    fn record(&self, event: &nostr::Event) {
-        *self.attempt_count.lock().unwrap() += 1;
-        *self.last_event.lock().unwrap() = Some(event.clone());
-    }
-
-    fn attempts(&self) -> u32 {
-        *self.attempt_count.lock().unwrap()
-    }
-
-    fn last(&self) -> Option<nostr::Event> {
-        self.last_event.lock().unwrap().clone()
-    }
-}
-
-/// Run the scoped archive operation but intercept the final event just before
-/// submission so we can assert on the wire form. Returns `(result, observer)`.
-///
-/// Implementation: we build the event ourselves following the same logic as
-/// `scoped_archive_operation`, capture the built event BEFORE sending, then
-/// send. This does NOT replace the shipping code — production signing happens
-/// in the shipping function.
-async fn scoped_archive_with_observation(
+/// Helper: install the thread-local hook, run the production operation,
+/// remove the hook, and return both the result and the captured event.
+async fn run_with_observation(
     state: &AppState,
     scope: &ArchiveScope,
     kind: ArchiveKind,
     target_pubkey: &str,
-    observer: &SubmitObserver,
-) -> Result<crate::relay::SubmitEventResponse, String> {
-    // Use the production scoped_archive_operation but with an observer hook
-    // injected via a thin wrapper. We re-derive the API URL from scope
-    // to peek at the event we'll send.
-    let api_base_url = match &scope.relay_url_override {
-        Some(url) => crate::relay::relay_http_base_url(url),
-        None => crate::relay::relay_api_base_url(),
-    };
+) -> (
+    Result<crate::relay::SubmitEventResponse, String>,
+    Option<nostr::Event>,
+    u32,
+) {
+    // Capture the production-signed event via the thread-local hook.
+    let captured: Arc<Mutex<Option<nostr::Event>>> = Arc::new(Mutex::new(None));
+    let captured_clone = Arc::clone(&captured);
 
-    // Re-run the auth-tag computation to get the event that will be sent.
-    // This MIRRORS scoped_archive_operation without replacing it — we duplicate
-    // only the auth-tag logic here to capture the signed event shape.
-    let auth_tag: Option<[String; 4]> = if scope.actor.eq_ignore_ascii_case(target_pubkey) {
-        None
-    } else {
-        let kind0_events = crate::relay::query_relay_at_with_keys(
-            state,
-            &api_base_url,
-            &[serde_json::json!({
-                "kinds": [0u32],
-                "authors": [target_pubkey.to_ascii_lowercase()],
-                "limit": 1,
-            })],
-            &scope.keys,
-            None,
-        )
-        .await?;
+    super::test_hooks::install(move |ev| {
+        *captured_clone.lock().unwrap() = Some(ev.clone());
+    });
 
-        match kind0_events.into_iter().next() {
-            None => None,
-            Some(kind0) => match classify_nip_ia_owner_proof(&kind0, &scope.actor) {
-                NipIaOwnerProof::Verified => {
-                    let target_compat = nostr::PublicKey::from_hex(&kind0.pubkey.to_hex())
-                        .map_err(|e| format!("convert target pubkey: {e}"))?;
-                    let owner_secret = scope.keys.secret_key();
-                    let owner_compat = nostr::SecretKey::from_slice(owner_secret.as_secret_bytes())
-                        .map_err(|e| format!("convert owner secret key: {e}"))?;
-                    let owner_compat_keys = nostr::Keys::new(owner_compat);
-                    let tag_json = buzz_sdk_pkg::nip_oa::compute_auth_tag(
-                        &owner_compat_keys,
-                        &target_compat,
-                        "",
-                    )
-                    .map_err(|e| format!("compute_auth_tag: {e}"))?;
-                    let compat_tag = buzz_sdk_pkg::nip_oa::parse_auth_tag(&tag_json)
-                        .map_err(|e| format!("parse_auth_tag: {e}"))?;
-                    let raw: [String; 4] = [
-                        compat_tag.as_slice()[0].clone(),
-                        compat_tag.as_slice()[1].clone(),
-                        compat_tag.as_slice()[2].clone(),
-                        compat_tag.as_slice()[3].clone(),
-                    ];
-                    Some(raw)
-                }
-                _ => None,
-            },
-        }
-    };
-
-    let auth_ref = auth_tag.as_ref();
-    let builder = match kind {
-        ArchiveKind::Archive => {
-            crate::events::build_archive_identity_request(target_pubkey, "", None, None, auth_ref)?
-        }
-        ArchiveKind::Unarchive => {
-            crate::events::build_unarchive_identity_request(target_pubkey, "", None, auth_ref)?
-        }
-    };
-
-    // Sign the event to observe it.
-    let signed_event = builder
-        .clone()
-        .sign_with_keys(&scope.keys)
-        .map_err(|e| format!("sign event for observation: {e}"))?;
-    observer.record(&signed_event);
-
-    // Now run the production operation (which re-signs and submits).
     let result = scoped_archive_operation(state, scope, kind, target_pubkey, "", None, None).await;
-    result
+    let attempts = super::test_hooks::attempt_count();
+    super::test_hooks::reset();
+
+    let event = captured.lock().unwrap().clone();
+    (result, event, attempts)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -390,26 +300,17 @@ async fn owner_consent_archive_9035_records_owner_path() {
         "owner != agent (Self impossible)"
     );
 
-    let observer = SubmitObserver::new();
     let scope = state
         .capture_archive_scope(8)
         .expect("capture_archive_scope");
 
-    // Execute the scoped archive operation with observation.
-    let result = scoped_archive_with_observation(
-        &state,
-        &scope,
-        ArchiveKind::Archive,
-        &agent_pubkey,
-        &observer,
-    )
-    .await
-    .expect("scoped_archive_operation 9035");
+    // Execute the production operation via the seam — captures the production-signed event.
+    let (result, observed_event, _) =
+        run_with_observation(&state, &scope, ArchiveKind::Archive, &agent_pubkey).await;
+    let result = result.expect("scoped_archive_operation 9035");
 
     // ── Assert wire form: exactly one auth tag, empty condition, distinct from profile tag ──
-    let observed_event = observer
-        .last()
-        .expect("must have observed the signed event");
+    let observed_event = observed_event.expect("must have observed the production-signed event");
     let auth_tags: Vec<&[String]> = observed_event
         .tags
         .iter()
@@ -565,22 +466,15 @@ async fn expired_bound_profile_mints_fresh_empty_condition_tag() {
         .expect("submit kind:0 with expired tag");
     assert!(resp.status().is_success(), "kind:0 submit failed");
 
-    // Use the observation wrapper to capture the wire event.
-    let observer = SubmitObserver::new();
+    // Use the production seam to capture the wire event.
     let scope = state.capture_archive_scope(8).unwrap();
 
-    let result = scoped_archive_with_observation(
-        &state,
-        &scope,
-        ArchiveKind::Archive,
-        &agent_pubkey,
-        &observer,
-    )
-    .await;
+    let (result, observed_event, _) =
+        run_with_observation(&state, &scope, ArchiveKind::Archive, &agent_pubkey).await;
 
     // The relay may accept or reject based on condition eval, but the
     // submitted request MUST carry exactly one fresh empty-condition auth tag.
-    let observed_event = observer.last().expect("must have observed an event");
+    let observed_event = observed_event.expect("must have observed a production-signed event");
     let auth_tags: Vec<&[String]> = observed_event
         .tags
         .iter()
@@ -613,22 +507,15 @@ async fn self_requests_are_authless() {
     let owner_pubkey = owner_keys.public_key().to_hex();
 
     let state = make_test_state(&owner_keys, &relay_url);
-    let observer = SubmitObserver::new();
     let scope = state.capture_archive_scope(8).unwrap();
 
     // Self-archive: actor == target → no auth tag.
-    let result = scoped_archive_with_observation(
-        &state,
-        &scope,
-        ArchiveKind::Archive,
-        &owner_pubkey,
-        &observer,
-    )
-    .await;
+    let (result, observed_event, _) =
+        run_with_observation(&state, &scope, ArchiveKind::Archive, &owner_pubkey).await;
 
-    // The observed event must have ZERO auth tags — self path bypasses auth-tag
+    // The observed production event must have ZERO auth tags — self path bypasses auth-tag
     // computation entirely.
-    let observed_event = observer.last().expect("must have observed an event");
+    let observed_event = observed_event.expect("must have observed a production-signed event");
     let auth_tags: Vec<_> = observed_event
         .tags
         .iter()
@@ -642,16 +529,9 @@ async fn self_requests_are_authless() {
 
     // Self-unarchive: also authless.
     let scope2 = state.capture_archive_scope(8).unwrap();
-    let observer2 = SubmitObserver::new();
-    let _ = scoped_archive_with_observation(
-        &state,
-        &scope2,
-        ArchiveKind::Unarchive,
-        &owner_pubkey,
-        &observer2,
-    )
-    .await;
-    let event2 = observer2.last().expect("must have observed event 2");
+    let (_, event2, _) =
+        run_with_observation(&state, &scope2, ArchiveKind::Unarchive, &owner_pubkey).await;
+    let event2 = event2.expect("must have observed event 2");
     let auth_tags2: Vec<_> = event2
         .tags
         .iter()
@@ -677,27 +557,19 @@ async fn relay_rejection_is_direct_no_retry() {
     let unrelated_pubkey = unrelated_keys.public_key().to_hex();
 
     let state = make_test_state(&owner_keys, &relay_url);
-    let observer = SubmitObserver::new();
 
     // Target has no kind:0 → classifier-negative → no auth tag → relay rejects.
     // The operation has NO retry loop — one submit attempt, one result.
     let scope = state.capture_archive_scope(8).unwrap();
-    let result = scoped_archive_with_observation(
-        &state,
-        &scope,
-        ArchiveKind::Archive,
-        &unrelated_pubkey,
-        &observer,
-    )
-    .await;
+    let (result, _, attempts) =
+        run_with_observation(&state, &scope, ArchiveKind::Archive, &unrelated_pubkey).await;
 
     // Assert the relay rejected (no authority).
     assert!(result.is_err(), "expected relay rejection, got success");
 
     // Assert exactly ONE attempt — the observer count proves no retry loop ran.
     assert_eq!(
-        observer.attempts(),
-        1,
+        attempts, 1,
         "relay rejection must produce exactly one submit attempt (no retry)"
     );
 }

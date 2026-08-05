@@ -76,6 +76,16 @@ impl LimitType {
             Self::IpConnections => "conn",
         }
     }
+
+    /// Human-readable name used in rejection messages and metric labels.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::ApiCalls => "api_calls",
+            Self::WsEvents => "ws_events",
+            Self::IpConnections => "ip_connections",
+        }
+    }
 }
 
 /// Per-tier rate limit thresholds.
@@ -96,15 +106,13 @@ pub struct RateLimitConfig {
     /// Maximum messages per minute for standard-tier agent tokens. Default: 120.
     #[serde(default = "default_agent_std_msg")]
     pub agent_standard_messages_per_min: u64,
-    /// Maximum HTTP API calls per minute for standard-tier agent tokens. Default: 600.
-    #[serde(default = "default_agent_std_api")]
-    pub agent_standard_api_calls_per_min: u64,
-    /// Maximum messages per minute for elevated-tier agent tokens. Default: 300.
-    #[serde(default = "default_agent_elev_msg")]
-    pub agent_elevated_messages_per_min: u64,
-    /// Maximum messages per minute for platform-tier agent tokens. Default: 600.
-    #[serde(default = "default_agent_plat_msg")]
-    pub agent_platform_messages_per_min: u64,
+    /// Maximum WebSocket events per second for agent tokens. Default: 10.
+    ///
+    /// Agents inherit the same burst ceiling as humans by default. Tune via
+    /// `BUZZ_RATE_LIMIT_AGENT_WS_EVENTS_PER_SEC` once `limit_type` instrumentation
+    /// data establishes the right operating value.
+    #[serde(default = "default_agent_ws")]
+    pub agent_ws_events_per_sec: u64,
 }
 
 fn default_human_msg() -> u64 {
@@ -119,14 +127,10 @@ fn default_human_ws() -> u64 {
 fn default_agent_std_msg() -> u64 {
     120
 }
-fn default_agent_std_api() -> u64 {
-    600
-}
-fn default_agent_elev_msg() -> u64 {
-    300
-}
-fn default_agent_plat_msg() -> u64 {
-    600
+fn default_agent_ws() -> u64 {
+    // Same as human default: behavior-neutral at merge; tune on builderlab
+    // once limit_type data from instrumented deployments is available.
+    10
 }
 
 impl Default for RateLimitConfig {
@@ -136,9 +140,7 @@ impl Default for RateLimitConfig {
             human_api_calls_per_min: default_human_api(),
             human_ws_events_per_sec: default_human_ws(),
             agent_standard_messages_per_min: default_agent_std_msg(),
-            agent_standard_api_calls_per_min: default_agent_std_api(),
-            agent_elevated_messages_per_min: default_agent_elev_msg(),
-            agent_platform_messages_per_min: default_agent_plat_msg(),
+            agent_ws_events_per_sec: default_agent_ws(),
         }
     }
 }
@@ -322,5 +324,22 @@ mod tests {
             .await
             .unwrap();
         assert!(result.allowed);
+    }
+
+    #[test]
+    fn limit_type_as_str_is_stable() {
+        // These strings appear in relay NOTICE text and metric labels;
+        // changing them is a breaking observability change.
+        assert_eq!(LimitType::Messages.as_str(), "messages");
+        assert_eq!(LimitType::ApiCalls.as_str(), "api_calls");
+        assert_eq!(LimitType::WsEvents.as_str(), "ws_events");
+        assert_eq!(LimitType::IpConnections.as_str(), "ip_connections");
+    }
+
+    #[test]
+    fn rate_limit_config_default_has_agent_ws_field() {
+        let cfg = RateLimitConfig::default();
+        // agent_ws_events_per_sec starts equal to human to be behavior-neutral at merge.
+        assert_eq!(cfg.agent_ws_events_per_sec, cfg.human_ws_events_per_sec);
     }
 }

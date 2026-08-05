@@ -317,17 +317,9 @@ fn rate_limit_config_from_env() -> Result<buzz_auth::RateLimitConfig, ConfigErro
             "BUZZ_RATE_LIMIT_AGENT_STANDARD_MESSAGES_PER_MIN",
             defaults.agent_standard_messages_per_min,
         )?,
-        agent_standard_api_calls_per_min: positive_u64_from_env(
-            "BUZZ_RATE_LIMIT_AGENT_STANDARD_API_CALLS_PER_MIN",
-            defaults.agent_standard_api_calls_per_min,
-        )?,
-        agent_elevated_messages_per_min: positive_u64_from_env(
-            "BUZZ_RATE_LIMIT_AGENT_ELEVATED_MESSAGES_PER_MIN",
-            defaults.agent_elevated_messages_per_min,
-        )?,
-        agent_platform_messages_per_min: positive_u64_from_env(
-            "BUZZ_RATE_LIMIT_AGENT_PLATFORM_MESSAGES_PER_MIN",
-            defaults.agent_platform_messages_per_min,
+        agent_ws_events_per_sec: positive_u64_from_env(
+            "BUZZ_RATE_LIMIT_AGENT_WS_EVENTS_PER_SEC",
+            defaults.agent_ws_events_per_sec,
         )?,
     })
 }
@@ -1346,6 +1338,31 @@ mod tests {
             result,
             Err(ConfigError::InvalidValue(ref message))
                 if message.contains("BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC")
+        ));
+    }
+
+    #[test]
+    fn agent_ws_events_per_sec_can_be_overridden() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_RATE_LIMIT_AGENT_WS_EVENTS_PER_SEC", "25");
+
+        let config = Config::from_env().expect("config");
+
+        std::env::remove_var("BUZZ_RATE_LIMIT_AGENT_WS_EVENTS_PER_SEC");
+        assert_eq!(config.auth.rate_limits.agent_ws_events_per_sec, 25);
+    }
+
+    #[test]
+    fn agent_ws_events_per_sec_override_rejects_zero() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("BUZZ_RATE_LIMIT_AGENT_WS_EVENTS_PER_SEC", "0");
+        let result = Config::from_env();
+        std::env::remove_var("BUZZ_RATE_LIMIT_AGENT_WS_EVENTS_PER_SEC");
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_RATE_LIMIT_AGENT_WS_EVENTS_PER_SEC")
         ));
     }
 

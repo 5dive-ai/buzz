@@ -15,6 +15,7 @@ use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use buzz_auth::{generate_challenge, AuthContext, LimitType};
+use buzz_core::kind::is_ephemeral;
 use buzz_core::tenant::TenantContext;
 use nostr::Filter;
 
@@ -610,8 +611,11 @@ async fn enforce_ws_admission(
     };
 
     let limits = &state.auth.config().rate_limits;
-    let (ws_window_secs, ws_limit) =
-        crate::admission::ws_admission_budget(limits.human_ws_events_per_sec);
+    let (ws_window_secs, ws_limit) = if is_agent {
+        crate::admission::ws_admission_budget(limits.agent_ws_events_per_sec)
+    } else {
+        crate::admission::ws_admission_budget(limits.human_ws_events_per_sec)
+    };
     let ws_result = crate::admission::check_principal(
         state.admission_rate_limiter.as_ref(),
         &conn.tenant,
@@ -625,27 +629,34 @@ async fn enforce_ws_admission(
         ClientMessage::Req { sub_id, .. } => Some(sub_id.as_str()),
         _ => None,
     };
-    if !send_admission_result(conn, ws_result, sub_id) {
+    if !send_admission_result(conn, ws_result, sub_id, LimitType::WsEvents) {
         return false;
     }
 
     if is_event {
-        let message_limit = if is_agent {
-            limits.agent_standard_messages_per_min
-        } else {
-            limits.human_messages_per_min
-        };
-        let message_result = crate::admission::check_principal(
-            state.admission_rate_limiter.as_ref(),
-            &conn.tenant,
-            &pubkey,
-            LimitType::Messages,
-            60,
-            message_limit,
-        )
-        .await;
-        if !send_admission_result(conn, message_result, None) {
-            return false;
+        // Ephemeral events (kinds 20000–29999) are never persisted; billing them
+        // against the durable-message quota allows telemetry (observer frames,
+        // typing indicators, presence) to starve real traffic. They still count
+        // against WsEvents above, so the relay's per-second burst protection holds.
+        let is_ephemeral_event = matches!(msg, ClientMessage::Event(e) if is_ephemeral(buzz_core::kind::event_kind_u32(e)));
+        if !is_ephemeral_event {
+            let message_limit = if is_agent {
+                limits.agent_standard_messages_per_min
+            } else {
+                limits.human_messages_per_min
+            };
+            let message_result = crate::admission::check_principal(
+                state.admission_rate_limiter.as_ref(),
+                &conn.tenant,
+                &pubkey,
+                LimitType::Messages,
+                60,
+                message_limit,
+            )
+            .await;
+            if !send_admission_result(conn, message_result, None, LimitType::Messages) {
+                return false;
+            }
         }
     }
 
@@ -656,19 +667,35 @@ fn send_admission_result(
     conn: &ConnectionState,
     result: Result<(), crate::admission::AdmissionError>,
     sub_id: Option<&str>,
+    limit_type: LimitType,
 ) -> bool {
     match result {
         Ok(()) => true,
         Err(crate::admission::AdmissionError::Exceeded { reset_in_secs }) => {
-            metrics::counter!("buzz_admission_rejections_total", "transport" => "websocket", "reason" => "quota").increment(1);
+            metrics::counter!(
+                "buzz_admission_rejections_total",
+                "transport" => "websocket",
+                "reason" => "quota",
+                "limit_type" => limit_type.as_str(),
+            )
+            .increment(1);
             conn.send(request_rejection_message(
                 sub_id,
-                &format!("rate-limited: quota exceeded; retry in {reset_in_secs}s"),
+                &format!(
+                    "rate-limited: quota exceeded ({}); retry in {reset_in_secs}s",
+                    limit_type.as_str()
+                ),
             ));
             false
         }
         Err(crate::admission::AdmissionError::Unavailable) => {
-            metrics::counter!("buzz_admission_rejections_total", "transport" => "websocket", "reason" => "unavailable").increment(1);
+            metrics::counter!(
+                "buzz_admission_rejections_total",
+                "transport" => "websocket",
+                "reason" => "unavailable",
+                "limit_type" => limit_type.as_str(),
+            )
+            .increment(1);
             conn.send(request_rejection_message(
                 sub_id,
                 "rate-limited: shared admission unavailable",
@@ -783,6 +810,108 @@ mod tests {
         let notice: serde_json::Value =
             serde_json::from_str(&request_rejection_message(None, reason)).expect("parse NOTICE");
         assert_eq!(notice, serde_json::json!(["NOTICE", reason]));
+    }
+
+    /// Build a minimal ConnectionState whose `send_tx` is readable in tests.
+    fn test_connection() -> (ConnectionState, mpsc::Receiver<WsMessage>) {
+        let (send_tx, recv) = mpsc::channel(16);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
+        let conn = ConnectionState {
+            conn_id: Uuid::nil(),
+            tenant: buzz_core::tenant::TenantContext::resolved(
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                "test.local".to_string(),
+            ),
+            remote_addr: "127.0.0.1:9999".parse().unwrap(),
+            auth_state: RwLock::new(AuthState::Failed),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            cancel: CancellationToken::new(),
+            backpressure_count: Arc::new(AtomicU8::new(0)),
+            grace_limit: 10,
+        };
+        (conn, recv)
+    }
+
+    #[test]
+    fn send_admission_result_exceeded_notice_names_limit_type_and_keeps_retry_phrase() {
+        let (conn, mut rx) = test_connection();
+        let err = crate::admission::AdmissionError::Exceeded { reset_in_secs: 42 };
+
+        let result = send_admission_result(&conn, Err(err), None, LimitType::Messages);
+
+        assert!(!result, "exceeded should return false");
+        let msg = rx.try_recv().expect("should have sent one message");
+        let text = match msg {
+            WsMessage::Text(t) => t.to_string(),
+            other => panic!("unexpected frame: {other:?}"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        let notice_text = parsed[1].as_str().expect("NOTICE text");
+        assert!(
+            notice_text.contains("messages"),
+            "NOTICE must name the limit type: {notice_text}"
+        );
+        assert!(
+            notice_text.contains("retry in 42s"),
+            "NOTICE must preserve 'retry in Ns' phrase for client parsers: {notice_text}"
+        );
+    }
+
+    #[test]
+    fn send_admission_result_exceeded_ws_events_names_ws_events() {
+        let (conn, mut rx) = test_connection();
+        let err = crate::admission::AdmissionError::Exceeded { reset_in_secs: 3 };
+
+        send_admission_result(&conn, Err(err), None, LimitType::WsEvents);
+
+        let msg = rx.try_recv().expect("should have sent one message");
+        let text = match msg {
+            WsMessage::Text(t) => t.to_string(),
+            other => panic!("unexpected frame: {other:?}"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        let notice_text = parsed[1].as_str().expect("NOTICE text");
+        assert!(
+            notice_text.contains("ws_events"),
+            "NOTICE for WsEvents must say 'ws_events': {notice_text}"
+        );
+        assert!(
+            notice_text.contains("retry in 3s"),
+            "NOTICE must preserve 'retry in Ns' phrase: {notice_text}"
+        );
+    }
+
+    #[test]
+    fn send_admission_result_exceeded_with_sub_id_emits_closed_not_notice() {
+        let (conn, mut rx) = test_connection();
+        let err = crate::admission::AdmissionError::Exceeded { reset_in_secs: 5 };
+
+        send_admission_result(&conn, Err(err), Some("sub-xyz"), LimitType::WsEvents);
+
+        let msg = rx.try_recv().expect("should have sent one message");
+        let text = match msg {
+            WsMessage::Text(t) => t.to_string(),
+            other => panic!("unexpected frame: {other:?}"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(
+            parsed[0].as_str(),
+            Some("CLOSED"),
+            "sub-scoped rejection should emit CLOSED"
+        );
+        assert_eq!(parsed[1].as_str(), Some("sub-xyz"));
+    }
+
+    #[test]
+    fn send_admission_result_ok_returns_true_and_sends_nothing() {
+        let (conn, mut rx) = test_connection();
+
+        let result = send_admission_result(&conn, Ok(()), None, LimitType::Messages);
+
+        assert!(result, "allowed result should return true");
+        assert!(rx.try_recv().is_err(), "no message should be sent on Ok");
     }
 
     #[tokio::test]

@@ -39,14 +39,29 @@ async fn enforce_http_admission(
     {
         Ok(()) => Ok(()),
         Err(crate::admission::AdmissionError::Exceeded { reset_in_secs }) => {
-            metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "quota").increment(1);
+            metrics::counter!(
+                "buzz_admission_rejections_total",
+                "transport" => "http",
+                "reason" => "quota",
+                "limit_type" => LimitType::ApiCalls.as_str(),
+            )
+            .increment(1);
             Err(api_error(
                 StatusCode::TOO_MANY_REQUESTS,
-                &format!("rate-limited: quota exceeded; retry in {reset_in_secs}s"),
+                &format!(
+                    "rate-limited: quota exceeded ({}); retry in {reset_in_secs}s",
+                    LimitType::ApiCalls.as_str()
+                ),
             ))
         }
         Err(crate::admission::AdmissionError::Unavailable) => {
-            metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "unavailable").increment(1);
+            metrics::counter!(
+                "buzz_admission_rejections_total",
+                "transport" => "http",
+                "reason" => "unavailable",
+                "limit_type" => LimitType::ApiCalls.as_str(),
+            )
+            .increment(1);
             Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "rate-limited: shared admission unavailable",

@@ -9,9 +9,9 @@ use super::*;
 /// Writer-vs-compensation store-lock contention via the `compensate_drain_with_hook` seam.
 ///
 /// Invariant: if `managed_agents_store_lock` is dropped before the adapter's
-/// step-7 save in `compensate_drain_with_hook`, the writer acquires the lock
-/// before `COMP_SENTINEL` reaches disk, loads records without it, and saves
-/// only `WRITER_EDIT` — making the `COMP_SENTINEL` assertion fail deterministically.
+/// `on_after_restore` callback, the writer acquires the lock before `COMP_SENTINEL`
+/// reaches disk, loads records without it, and saves only `WRITER_EDIT` —
+/// making the `COMP_SENTINEL` assertion fail deterministically.
 ///
 /// Flow:
 ///   1. Seed the store with one agent record; seed a live runtime so that
@@ -22,21 +22,20 @@ use super::*;
 ///      a. signals the writer thread (`records_loaded_tx`);
 ///      b. waits for writer's pre-lock signal (`writer_at_store_lock_rx`) — sent
 ///      immediately before `managed_agents_store_lock.lock()`, so when received,
-///      the writer's next instruction is that lock call (which blocks);
-///      c. mutates `COMP_SENTINEL` on the in-memory adapter-loaded records.
-///   4. `compensate_drain_with_hook` continues: delegate to `compensate_drain_for`
-///      (succeeds — AlreadyRunning), then saves the hook-mutated records at step 7.
-///      Store lock held throughout; writer remains blocked on the store lock.
-///   5. Adapter releases the store lock. Writer acquires it, loads records
-///      (which now include `COMP_SENTINEL` from step 3c's in-memory mutation + step 4's
-///      save), writes `WRITER_EDIT`, saves.
-///   6. Final disk record must contain BOTH `COMP_SENTINEL` AND `WRITER_EDIT`.
+///      the writer's next instruction is that lock call (which blocks).
+///   4. `compensate_drain_for` runs under the held store lock (succeeds — AlreadyRunning).
+///   5. `on_after_restore` hook fires while the store lock is STILL held:
+///      mutates `COMP_SENTINEL` on the adapter-loaded records and saves to disk
+///      (assert/unwrap). Writer remains blocked.
+///   6. Adapter releases the store lock. Writer acquires it, loads records
+///      (which now include `COMP_SENTINEL`), writes `WRITER_EDIT`, saves.
+///   7. Final disk record must contain BOTH `COMP_SENTINEL` AND `WRITER_EDIT`.
 ///      `comp_result` must be `None` (compensation succeeded).
 ///
-/// What breaks it: if the store guard is dropped before the adapter's step-7 save,
-/// the writer acquires `managed_agents_store_lock`, loads records BEFORE `COMP_SENTINEL`
-/// reaches disk (the in-memory mutation has not been saved yet), and saves without
-/// `COMP_SENTINEL` — the final assertion fails deterministically.
+/// What breaks it: if the store guard is dropped before `on_after_restore`,
+/// the writer acquires `managed_agents_store_lock` before `COMP_SENTINEL`
+/// reaches disk, loads records without it, and saves only `WRITER_EDIT` —
+/// the first assertion fails deterministically.
 #[test]
 fn test_compensate_drain_writer_vs_compensation_deterministic() {
     use crate::managed_agents::scope::{
@@ -169,8 +168,8 @@ fn test_compensate_drain_writer_vs_compensation_deterministic() {
     let entry1 = make_drain_entry(&pubkey1, "wss://relay.example", true);
     let stopped = vec![entry1];
 
-    // records_loaded:     hook → writer   (compensation holds store lock; writer may proceed)
-    // writer_at_store_lock: writer → hook  (writer is about to call managed_agents_store_lock.lock())
+    // records_loaded:       hook → writer   (compensation holds store lock; writer may proceed)
+    // writer_at_store_lock: writer → hook   (writer is about to call managed_agents_store_lock.lock())
     //
     // The writer sends writer_at_store_lock immediately BEFORE the lock call, so the
     // hook's recv() completing is a happens-before guarantee that the writer's next
@@ -182,8 +181,8 @@ fn test_compensate_drain_writer_vs_compensation_deterministic() {
     // Spawn the writer thread BEFORE acquiring the transition guard.
     // The writer directly acquires managed_agents_store_lock after signalling —
     // no intermediate lock — so its blocking is specifically on the store lock
-    // that compensate_drain_with_hook holds.  This makes the test fail if the
-    // adapter drops the store guard before the step-7 save.
+    // that compensate_drain_with_hook holds. This makes the test fail if the
+    // adapter drops the store guard before on_after_restore saves.
     let tmp_wr = tmp_path.clone();
     let app_handle_wr = app_handle.clone();
     let wr_thread = thread::spawn(move || {
@@ -191,19 +190,19 @@ fn test_compensate_drain_writer_vs_compensation_deterministic() {
         records_loaded_rx.recv().unwrap();
 
         // Signal the hook that we are about to call managed_agents_store_lock.lock().
-        // The hook's recv() will happen-before our lock call, so when on_records_loaded
-        // mutates COMP_SENTINEL and returns, we are guaranteed to be BLOCKED on the
+        // The hook's recv() will happen-before our lock call, so when on_after_restore
+        // mutates COMP_SENTINEL and saves, we are guaranteed to be BLOCKED on the
         // store lock — not merely about to call it.
         writer_at_store_lock_tx.send(()).unwrap();
 
-        // Block on the store lock.  Compensation still holds it; we wait here until
-        // the adapter's step-7 save completes and the lock is released.
+        // Block on the store lock. Compensation still holds it; we wait here until
+        // on_after_restore saves COMP_SENTINEL and the lock is released.
         let writer_state = app_handle_wr.state::<crate::app_state::AppState>();
         let _store = writer_state.managed_agents_store_lock.lock().unwrap();
 
-        // Store lock acquired: compensation has finished and released the lock.
-        // Load records — COMP_SENTINEL must be present because the adapter's
-        // step-7 save wrote it before releasing the lock.
+        // Store lock acquired: on_after_restore has finished and released the lock.
+        // Load records — COMP_SENTINEL must be present because on_after_restore
+        // saved it before releasing the lock.
         let mut records =
             crate::managed_agents::storage::load_managed_agents_at(&tmp_wr).unwrap_or_default();
         for r in &mut records {
@@ -215,38 +214,49 @@ fn test_compensate_drain_writer_vs_compensation_deterministic() {
 
     let rt_guard = state.managed_agent_runtime_transition.lock().unwrap();
 
-    // on_records_loaded hook fires after load, while BOTH locks are held:
+    // on_records_loaded fires after load, while BOTH locks are held:
     //   (a) signal the writer thread that compensation holds the store lock;
     //   (b) wait for the writer to confirm it is at the store-lock boundary —
-    //       the writer sends this signal immediately BEFORE calling
-    //       managed_agents_store_lock.lock(), so by the time recv() returns
-    //       here, the writer is queued (blocked) on the store lock;
-    //   (c) mutate COMP_SENTINEL in-memory on the adapter-loaded records.
-    // The adapter then saves these hook-mutated records (step 7) before releasing
-    // the store lock. Only then does the writer acquire the lock and read records.
+    //       the writer sends this immediately BEFORE managed_agents_store_lock.lock(),
+    //       so by the time recv() returns, the writer's next instruction is that lock
+    //       call (which blocks because compensation holds it).
     //
-    // What breaks it: if the store guard is dropped before the adapter's step-7
-    // save, the writer acquires managed_agents_store_lock before COMP_SENTINEL
-    // reaches disk — the writer's final save omits COMP_SENTINEL, failing the
-    // assertion below.
-    let comp_result =
-        compensate_drain_with_hook(&app_handle, &stopped, &scope, rt_guard, |records| {
+    // on_after_restore fires AFTER compensate_drain_for returns, still under BOTH locks:
+    //   mutates COMP_SENTINEL in-memory and saves to disk (assert/unwrap).
+    //   The store lock is still held — the writer remains blocked until this save returns
+    //   and the lock is released.
+    //
+    // What breaks it: if the store guard is dropped before on_after_restore, the writer
+    // acquires managed_agents_store_lock before COMP_SENTINEL reaches disk — the writer's
+    // final save omits COMP_SENTINEL, and the first assertion below fails.
+    let comp_result = compensate_drain_with_hook(
+        &app_handle,
+        &stopped,
+        &scope,
+        rt_guard,
+        // on_records_loaded: synchronise with the writer — both locks are held here.
+        |_records| {
             // (a) Tell the writer that records are loaded; compensation holds both locks.
             records_loaded_tx.send(()).unwrap();
 
             // (b) Wait for the writer to reach the store-lock boundary.
-            // After this recv() completes, the writer has sent its signal and
-            // its very next instruction is managed_agents_store_lock.lock().
-            // The store lock is held by compensation, so the writer will block.
+            // After recv() completes, the writer's next instruction is
+            // managed_agents_store_lock.lock() — which blocks because we hold it.
             writer_at_store_lock_rx.recv().unwrap();
-
-            // (c) Mutate COMP_SENTINEL in-memory. The adapter's step-7 save writes this
-            // to disk before releasing the store lock — making the mutation load-bearing.
+        },
+        // on_after_restore: save the COMP_SENTINEL mutation while BOTH locks are still held.
+        // The writer is blocked on managed_agents_store_lock. This save reaching disk before
+        // the lock is released is the load-bearing property: shortening the guard before this
+        // callback lets the writer interleave and load records without COMP_SENTINEL.
+        |records| {
             for r in records.iter_mut() {
                 r.env_vars
                     .insert("COMP_SENTINEL".to_string(), "yes".to_string());
             }
-        });
+            crate::managed_agents::storage::save_managed_agents_at(&tmp_path, records)
+                .expect("on_after_restore: save must succeed — store lock held");
+        },
+    );
 
     wr_thread.join().expect("writer thread panicked");
 
@@ -260,21 +270,19 @@ fn test_compensate_drain_writer_vs_compensation_deterministic() {
     }
 
     // Compensation must have succeeded: agent was AlreadyRunning, no errors.
-    // If the record had an invalid nsec or the seam failed, comp_result would be Some.
     assert!(
         comp_result.is_none(),
         "compensation must succeed (AlreadyRunning path): {comp_result:?}"
     );
 
     // ── Final disk state: BOTH effects must be present ───────────────────────
-    // COMP_SENTINEL: set in-memory by the hook, saved by the adapter's step-7 save
-    //               while the store lock was still held — before the writer could load.
-    // WRITER_EDIT:   written by the writer after the adapter released the store lock.
+    // COMP_SENTINEL: mutated and saved by on_after_restore while the store lock
+    //               was still held — before the writer could acquire and load.
+    // WRITER_EDIT:   written by the writer after the adapter released the lock.
     //
-    // If the store guard is dropped before the adapter's step-7 save, the writer
-    // acquires managed_agents_store_lock and loads records before COMP_SENTINEL
-    // reaches disk — the writer's save omits COMP_SENTINEL, and the first
-    // assertion below fails.
+    // If the store guard is dropped before on_after_restore, the writer acquires
+    // managed_agents_store_lock before COMP_SENTINEL reaches disk — the writer's
+    // save omits COMP_SENTINEL, and the first assertion below fails.
     let final_records =
         crate::managed_agents::storage::load_managed_agents_at(&tmp_path).unwrap_or_default();
     let final_rec = final_records
@@ -285,8 +293,8 @@ fn test_compensate_drain_writer_vs_compensation_deterministic() {
     assert_eq!(
         final_rec.env_vars.get("COMP_SENTINEL").map(String::as_str),
         Some("yes"),
-        "COMP_SENTINEL must reach disk via the adapter's step-7 save while the store \
-         lock is held; fails if the store guard is dropped before that save, allowing \
+        "COMP_SENTINEL must reach disk via on_after_restore while the store lock is held; \
+         fails if the store guard is dropped before on_after_restore, allowing \
          the writer to load and save records without COMP_SENTINEL"
     );
     assert_eq!(
@@ -299,6 +307,11 @@ fn test_compensate_drain_writer_vs_compensation_deterministic() {
 /// Production start-path contender is blocked on `managed_agent_runtime_transition`
 /// while `compensate_drain_with_hook` holds it, and the `on_transition_acquired` hook
 /// in `start_pair_lazy_for_with_hook` fires only AFTER the transition lock is released.
+///
+/// `start_pair_lazy_for_with_hook` is the production-callable seam: production
+/// `start_managed_agent_runtime_pair_lazy` → `start_pair_lazy_for` → `start_pair_lazy_for_with_hook`
+/// → `start_pair_for_with_hook`. Removing `managed_agent_runtime_transition` from the
+/// production path also removes it from this test seam, making the test a faithful proxy.
 ///
 /// Invariant: if `managed_agent_runtime_transition` is removed from the start seam,
 /// the contender fires `on_transition_acquired` immediately after `on_before_transition`
@@ -336,8 +349,8 @@ fn test_compensate_drain_writer_vs_compensation_deterministic() {
 ///   7. Test asserts that `contender_transition_acquired` fires within a timeout.
 ///
 /// What breaks it: if `managed_agent_runtime_transition` is removed from
-/// `start_pair_for`, `on_transition_acquired` fires before step 4's assertion (because
-/// the contender fires it in nanoseconds, while compensation needs milliseconds for
+/// `start_pair_for_with_hook`, `on_transition_acquired` fires before step 4's assertion
+/// (the contender fires it in nanoseconds; compensation needs milliseconds for
 /// file I/O before reaching `on_records_loaded`), making both the `try_recv()` and the
 /// atomic check fail.
 #[test]
@@ -451,7 +464,7 @@ fn test_compensate_drain_concurrent_start_is_blocked() {
     let (contender_transition_acquired_tx, contender_transition_acquired_rx) =
         std::sync::mpsc::channel::<()>();
 
-    // Shared flag: set to true when `on_transition_acquired` fires inside start_pair_for.
+    // Shared flag: set to true when `on_transition_acquired` fires inside start_pair_for_with_hook.
     // Belt-and-suspenders companion to the try_recv() check in on_records_loaded.
     let transition_hook_fired = Arc::new(AtomicBool::new(false));
     let transition_hook_fired2 = transition_hook_fired.clone();
@@ -514,13 +527,20 @@ fn test_compensate_drain_concurrent_start_is_blocked() {
     // blocks at managed_agent_runtime_transition.lock(). on_transition_acquired
     // cannot fire until after compensation releases the guard. try_recv() correctly
     // returns Err(Empty).
-    let _comp_result =
-        compensate_drain_with_hook(&app_handle, &stopped, &scope, rt_guard, |_records| {
+    let _comp_result = compensate_drain_with_hook(
+        &app_handle,
+        &stopped,
+        &scope,
+        rt_guard,
+        // on_records_loaded: fires while BOTH locks are held. Checks that
+        // on_transition_acquired has NOT fired — the contender is still blocked
+        // at managed_agent_runtime_transition.lock() because we hold it.
+        |_records| {
             // Check 1: atomic bool.
             assert!(
                 !transition_hook_fired.load(Ordering::SeqCst),
                 "start seam must not acquire the transition guard while compensation holds it; \
-                 fails if managed_agent_runtime_transition is removed from start_pair_for"
+                 fails if managed_agent_runtime_transition is removed from start_pair_for_with_hook"
             );
             // Check 2: channel try_recv — deterministic proof via file-I/O time differential.
             // transition_hook_check_rx is a dedicated receiver that on_transition_acquired
@@ -529,10 +549,15 @@ fn test_compensate_drain_concurrent_start_is_blocked() {
             assert!(
                 transition_hook_check_rx.try_recv().is_err(),
                 "on_transition_acquired must not fire while compensation holds the transition \
-                 guard; fails if managed_agent_runtime_transition is removed from start_pair_for \
+                 guard; fails if managed_agent_runtime_transition is removed from \
+                 start_pair_for_with_hook \
                  (the hook fires in nanoseconds; this check runs after ms of file I/O)"
             );
-        });
+        },
+        // on_after_restore: no-op for the contender test — this test's load-bearing
+        // property is the transition guard, not the store-lock lifetime.
+        |_records| {},
+    );
 
     // After compensation returns, the contender can acquire the transition guard.
     // `on_transition_acquired` fires and sends the signal.
@@ -541,7 +566,7 @@ fn test_compensate_drain_concurrent_start_is_blocked() {
         .expect(
             "contender's on_transition_acquired must fire after compensate_drain_with_hook \
              releases the transition guard; fails if start_pair_for_with_hook does not acquire \
-             managed_agent_runtime_transition before calling the hook",
+             managed_agent_runtime_transition before calling on_transition_acquired",
         );
 
     contender.join().expect("contender thread panicked");

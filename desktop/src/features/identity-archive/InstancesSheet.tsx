@@ -2,6 +2,7 @@ import { Archive, Loader2, Server } from "lucide-react";
 
 import { useOwnedAgentInventoryQuery } from "./hooks";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
+import { truncatePubkey } from "@/shared/lib/pubkey";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import {
@@ -22,7 +23,7 @@ type InstanceRowProps = {
 };
 
 function InstanceRow({ instance }: InstanceRowProps) {
-  const label = instance.displayName ?? `${instance.pubkey.slice(0, 16)}…`;
+  const label = instance.displayName ?? truncatePubkey(instance.pubkey);
   const isArchived = instance.archiveState.isArchived;
 
   return (
@@ -45,7 +46,7 @@ function InstanceRow({ instance }: InstanceRowProps) {
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium leading-5">{label}</p>
         <p className="truncate text-xs text-muted-foreground font-mono">
-          {instance.pubkey.slice(0, 24)}…
+          {truncatePubkey(instance.pubkey)}
         </p>
       </div>
       {isArchived === true ? (

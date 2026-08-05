@@ -303,21 +303,17 @@ pub async fn get_agent_config_surface(
     // Use resolve_effective_agent_env so the lookup covers all tiers (baked
     // floor → definition → global → persona → record) and cannot diverge from
     // what the spawned process actually sees.
-    let claude_config_dir: Option<std::path::PathBuf> =
-        if runtime_meta.is_some_and(|m| m.id == "claude") {
-            let effective_env = resolve_effective_agent_env(
-                &record,
-                &personas,
-                runtime_meta,
-                &global,
-            );
-            effective_env
-                .env
-                .get("CLAUDE_CONFIG_DIR")
-                .map(std::path::PathBuf::from)
-        } else {
-            None
-        };
+    let claude_config_dir: Option<std::path::PathBuf> = if runtime_meta
+        .is_some_and(|m| m.id == "claude")
+    {
+        let effective_env = resolve_effective_agent_env(&record, &personas, runtime_meta, &global);
+        effective_env
+            .env
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    };
 
     Ok(resolve_config_surface(
         record,

@@ -1501,6 +1501,7 @@ mod tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            effort_level: None,
         }
     }
 

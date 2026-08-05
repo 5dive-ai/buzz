@@ -5193,6 +5193,7 @@ mod build_mcp_servers_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            effort_level: None,
         }
     }
 
@@ -5415,6 +5416,7 @@ mod error_outcome_emission_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            effort_level: None,
         }
     }
 

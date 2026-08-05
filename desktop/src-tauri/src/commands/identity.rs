@@ -333,19 +333,9 @@ pub async fn save_ncryptsec_copy(
     Ok(Some(dest.display().to_string()))
 }
 
-/// Drain all live managed-agent runtimes as part of an identity import.
-///
-/// Uses the same journaled drain+compensation protocol as `apply_workspace`
-/// (Layer 2 of the transition state machine). The caller MUST hold
-/// `managed_agent_runtime_transition` before calling this function.
-///
-/// Returns:
-/// - `Ok(stopped)` when all runtimes were stopped (or there were none).
-/// - `Err((stopped, msg))` when the drain failed; `stopped` contains the
-///   entries that were successfully killed before the failure — the caller
-///   MUST pass the `managed_agent_runtime_transition` guard by value into
-///   `compensate_drain`, which holds it continuously through all journal
-///   restarts (no drop-and-reacquire interleave window).
+/// Drain live managed-agent runtimes for identity import (Layer 2 protocol).
+/// Caller must hold `managed_agent_runtime_transition`. Returns stopped entries
+/// or `Err((stopped, msg))` on failure.
 fn drain_managed_agent_runtimes_for_import(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -367,206 +357,243 @@ pub async fn import_identity(
     password: Option<String>,
     app_handle: tauri::AppHandle,
 ) -> Result<IdentityInfo, String> {
-    // ── Layer 1: async serialization lock ────────────────────────────────────
-    // identity_mutation (Layer 1) must be held for the full import to prevent a
-    // concurrent stale persist from overwriting the imported key.
+    // ── Layer 1: identity_mutation (async serialization lock) ────────────────
+    // Held for the full import to prevent a concurrent stale persist from
+    // overwriting the imported key. Lock order: identity_mutation →
+    // workspace_transition (when active scope present).
     //
-    // If there is an active scope, we also take workspace_transition so that
-    // clearing the active scope is serialized against apply_workspace.
-    // Lock order: identity_mutation → workspace_transition.
-    let lock_app = app_handle.clone();
-    let lock_state = lock_app.state::<AppState>();
+    // Use a cloned handle for lock acquisition so the original `app_handle` is
+    // free for the spawned blocking body below (no borrow conflict).
+    let lock_handle = app_handle.clone();
+    let lock_state = lock_handle.state::<AppState>();
     let _mutation_guard = lock_state.identity_mutation.lock().await;
 
-    // Capture whether an active scope exists BEFORE entering spawn_blocking.
+    // Capture whether an active scope exists BEFORE branching.
     let has_active_scope = lock_state.capture_active_scope().is_some();
 
-    // For the live-active path, also hold workspace_transition so that
-    // clearing the active scope is serialized against concurrent apply_workspace
-    // calls. Lock order: identity_mutation → workspace_transition.
-    let _transition_guard = if has_active_scope {
-        Some(lock_state.workspace_transition.lock().await)
+    // ── Layer 1b: workspace_transition + mesh preflight (active-scope path) ──
+    // When a workspace scope is live, route through the production
+    // `with_workspace_transition_preflight` helper (when the `mesh-llm`
+    // feature is enabled): it acquires `workspace_transition`, runs
+    // `fail_if_client_mesh_active`, then invokes the body while the lock
+    // remains held — the same orchestration path used by `apply_workspace`.
+    //
+    // Without `mesh-llm`, manually acquire `workspace_transition` (no mesh
+    // check needed) and invoke the blocking body.
+    //
+    // When no scope is active, skip the lock — there is no workspace to
+    // serialize against.
+    let result = if has_active_scope {
+        let app_for_preflight_body = app_handle.clone();
+        let nsec_for_body = nsec;
+        let password_for_body = password;
+
+        #[cfg(feature = "mesh-llm")]
+        let branch_result =
+            crate::commands::mesh_llm::scope_impl::with_workspace_transition_preflight(
+                &app_handle,
+                move || {
+                    Box::pin(async move {
+                        tokio::task::spawn_blocking(move || {
+                            import_identity_blocking(
+                                app_for_preflight_body,
+                                nsec_for_body,
+                                password_for_body,
+                                true,
+                            )
+                        })
+                        .await
+                        .map_err(|e| format!("spawn_blocking failed: {e}"))?
+                    })
+                },
+            )
+            .await;
+
+        #[cfg(not(feature = "mesh-llm"))]
+        let branch_result = {
+            let _transition_guard = lock_state.workspace_transition.lock().await;
+            tokio::task::spawn_blocking(move || {
+                import_identity_blocking(
+                    app_for_preflight_body,
+                    nsec_for_body,
+                    password_for_body,
+                    true,
+                )
+            })
+            .await
+            .map_err(|e| format!("spawn_blocking failed: {e}"))?
+        };
+
+        branch_result
+    } else {
+        tokio::task::spawn_blocking(move || {
+            import_identity_blocking(app_handle, nsec, password, false)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking failed: {e}"))?
+    };
+
+    // identity_mutation must outlive spawn_blocking — drop explicitly here so
+    // the compiler can see the guard's lifetime covers both branches.
+    drop(_mutation_guard);
+
+    result
+}
+
+/// Blocking body of [`import_identity`]: key recovery, journaled drain (when
+/// `has_active_scope`), identity commit, and scope clear.  The caller has
+/// already acquired `workspace_transition` when `has_active_scope` is true.
+fn import_identity_blocking(
+    app_handle: tauri::AppHandle,
+    nsec: String,
+    password: Option<String>,
+    has_active_scope: bool,
+) -> Result<IdentityInfo, String> {
+    // NIP-49 backups require a passphrase and decrypt entirely in Rust.
+    // Raw nsec/hex input follows the existing parser path unchanged.
+    let password = password.map(zeroize::Zeroizing::new);
+    let keys = crate::key_backup::recover_keys_from_input(
+        &nsec,
+        password.as_ref().map(|value| value.as_str()),
+    )?;
+
+    let state = app_handle.state::<AppState>();
+
+    let data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app data dir: {e}"))?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| format!("create app data dir: {e}"))?;
+    let key_path = data_dir.join("identity.key");
+
+    // ── Live-active path: journaled drain before swapping identity ─────────
+    // Drain all managed-agent runtimes under `managed_agent_runtime_transition`
+    // (Layer 2) BEFORE persisting the new identity — same protocol as
+    // `apply_workspace`.  The store lock is held through drain/save; on drain
+    // failure the transition guard is passed into compensate_drain so
+    // compensation runs without any interleave window.
+    let _rt_transition_guard = if has_active_scope {
+        Some(
+            state
+                .managed_agent_runtime_transition
+                .lock()
+                .map_err(|e| format!("managed_agent_runtime_transition poisoned: {e}"))?,
+        )
     } else {
         None
     };
 
-    // Fail closed if a client-mode Mesh runtime is active when there is an
-    // active scope — a live client-mode runtime would become dangling after the
-    // import (Option A ruling). Called via `run_mesh_transition_preflight` so the
-    // shared preflight logic is not duplicated inline; the guard above is held.
-    #[cfg(feature = "mesh-llm")]
-    if has_active_scope {
-        crate::commands::mesh_llm::scope_impl::run_mesh_transition_preflight(&app_handle).await?;
-    }
+    let _store_guard = if has_active_scope {
+        Some(
+            state
+                .managed_agents_store_lock
+                .lock()
+                .map_err(|e| format!("managed_agents_store_lock poisoned: {e}"))?,
+        )
+    } else {
+        None
+    };
 
-    let result = tokio::task::spawn_blocking(move || {
-        // NIP-49 backups require a passphrase and decrypt entirely in Rust.
-        // Raw nsec/hex input follows the existing parser path unchanged.
-        let password = password.map(zeroize::Zeroizing::new);
-        let keys = crate::key_backup::recover_keys_from_input(
-            &nsec,
-            password.as_ref().map(|value| value.as_str()),
-        )?;
+    // Capture the pre-import scope for compensation validation.
+    let pre_import_scope = state.capture_active_scope();
 
-        let state = app_handle.state::<AppState>();
-
-        let data_dir = app_handle
-            .path()
-            .app_data_dir()
-            .map_err(|e| format!("app data dir: {e}"))?;
-        std::fs::create_dir_all(&data_dir).map_err(|e| format!("create app data dir: {e}"))?;
-        let key_path = data_dir.join("identity.key");
-
-        // ── Live-active path: journaled drain before swapping identity ─────────
-        // When an active scope exists, drain all managed-agent runtimes under
-        // `managed_agent_runtime_transition` (Layer 2) BEFORE persisting the
-        // new identity. This is the same drain-journal protocol used by
-        // `apply_workspace`.
-        //
-        // `managed_agents_store_lock` is acquired at Layer 2 start (same as
-        // apply_workspace) so a concurrent save_managed_agents cannot interleave
-        // with the drain or the scope clear.
-        //
-        // On drain failure: compensate by restarting what was stopped, then
-        // return Err — do NOT proceed with the identity persist. The caller
-        // (frontend membership-denied flow) must handle the Err and retry.
-        //
-        // The store lock must be DROPPED before calling compensate_drain, but
-        // the transition lock is passed INTO compensate_drain so compensation
-        // runs without any interleave window.
-        let _rt_transition_guard = if has_active_scope {
-            Some(
-                state
-                    .managed_agent_runtime_transition
-                    .lock()
-                    .map_err(|e| format!("managed_agent_runtime_transition poisoned: {e}"))?,
-            )
-        } else {
-            None
-        };
-
-        let _store_guard = if has_active_scope {
-            Some(
-                state
-                    .managed_agents_store_lock
-                    .lock()
-                    .map_err(|e| format!("managed_agents_store_lock poisoned: {e}"))?,
-            )
-        } else {
-            None
-        };
-
-        // Capture the pre-import scope for compensation validation.
-        let pre_import_scope = state.capture_active_scope();
-
-        let stopped_entries = if has_active_scope {
-            match drain_managed_agent_runtimes_for_import(&app_handle, &state) {
-                Ok(stopped) => stopped,
-                Err((stopped, drain_err)) => {
-                    // Drain failed — drop the store lock BEFORE compensating
-                    // (compensate_drain re-acquires it), but pass the transition
-                    // guard into compensate_drain so there is no interleave window.
-                    drop(_store_guard);
-                    let comp_err = match (pre_import_scope.as_ref(), _rt_transition_guard) {
-                        (Some(scope), Some(rt_guard)) => crate::managed_agents::compensate_drain(
-                            &app_handle,
-                            &stopped,
-                            scope,
-                            rt_guard,
-                        ),
-                        (_, leftover_guard) => {
-                            drop(leftover_guard);
-                            None
-                        }
-                    };
-                    let msg = match comp_err {
-                        Some(comp) => format!(
-                            "identity import drain failed: {drain_err}; compensation failed: {comp}"
-                        ),
-                        None => format!("identity import drain failed: {drain_err}"),
-                    };
-                    return Err(msg);
-                }
-            }
-        } else {
-            vec![]
-        };
-
-        let commit_result = commit_imported_identity(&state, &data_dir, keys, |keys| {
-            // Persist into the OS keyring first (store → read-back verify →
-            // marker → delete file). Falls back to the 0o600 file when the
-            // keyring is unavailable; returns Err only when both backends fail.
-            let store =
-                crate::secret_store::SecretStore::shared(crate::app_state::keyring_service());
-            crate::app_state::persist_imported_identity(store, keys, &key_path, &data_dir)
-        });
-
-        // If identity persist failed after a successful drain, compensate.
-        // Drop the store lock BEFORE calling compensate_drain; pass the
-        // transition guard into it so there is no interleave window.
-        let (pubkey, storage) = match commit_result {
-            Ok(result) => result,
-            Err(e) => {
-                if !stopped_entries.is_empty() {
-                    drop(_store_guard);
-                    let comp_err = match (pre_import_scope.as_ref(), _rt_transition_guard) {
-                        (Some(scope), Some(rt_guard)) => crate::managed_agents::compensate_drain(
-                            &app_handle,
-                            &stopped_entries,
-                            scope,
-                            rt_guard,
-                        ),
-                        (_, leftover_guard) => {
-                            drop(leftover_guard);
-                            None
-                        }
-                    };
-                    if let Some(comp_err) = comp_err {
-                        eprintln!(
-                            "buzz-desktop: identity import persist failed, compensation failed: {comp_err}"
-                        );
+    let stopped_entries = if has_active_scope {
+        match drain_managed_agent_runtimes_for_import(&app_handle, &state) {
+            Ok(stopped) => stopped,
+            Err((stopped, drain_err)) => {
+                // Drain failed — drop the store lock BEFORE compensating
+                // (compensate_drain re-acquires it), but pass the transition
+                // guard into compensate_drain so there is no interleave window.
+                drop(_store_guard);
+                let comp_err = match (pre_import_scope.as_ref(), _rt_transition_guard) {
+                    (Some(scope), Some(rt_guard)) => crate::managed_agents::compensate_drain(
+                        &app_handle,
+                        &stopped,
+                        scope,
+                        rt_guard,
+                    ),
+                    (_, leftover_guard) => {
+                        drop(leftover_guard);
+                        None
                     }
-                }
-                return Err(e);
+                };
+                let msg = match comp_err {
+                    Some(comp) => format!(
+                        "identity import drain failed: {drain_err}; compensation failed: {comp}"
+                    ),
+                    None => format!("identity import drain failed: {drain_err}"),
+                };
+                return Err(msg);
             }
-        };
+        }
+    } else {
+        vec![]
+    };
 
-        // ── Clear active scope and bump generation ────────────────────────────
-        // For no-active-scope path: no scope was ever set; clearing is a no-op
-        // but bumping generation invalidates any in-flight stale operations.
-        // For live-active path: agents are stopped; clearing scope makes all
-        // agent commands fail closed until the frontend re-applies a workspace.
-        //
-        // Invariant: the fallback relay can never claim legacy data — claims
-        // are only written inside apply_workspace's prepare stage.
-        //
-        // `clear_active_scope()` internally calls `next_scope_generation()` —
-        // no additional bump is needed here.
-        state.clear_active_scope();
+    let commit_result = commit_imported_identity(&state, &data_dir, keys, |keys| {
+        // Persist into the OS keyring first (store → read-back verify →
+        // marker → delete file). Falls back to the 0o600 file when the
+        // keyring is unavailable; returns Err only when both backends fail.
+        let store = crate::secret_store::SecretStore::shared(crate::app_state::keyring_service());
+        crate::app_state::persist_imported_identity(store, keys, &key_path, &data_dir)
+    });
 
-        let pubkey_hex = pubkey.to_hex();
-        let display_name = truncated_display_name(&pubkey)?;
+    // If identity persist failed after a successful drain, compensate.
+    // Drop the store lock BEFORE calling compensate_drain; pass the
+    // transition guard into it so there is no interleave window.
+    let (pubkey, storage) = match commit_result {
+        Ok(result) => result,
+        Err(e) => {
+            if !stopped_entries.is_empty() {
+                drop(_store_guard);
+                let comp_err = match (pre_import_scope.as_ref(), _rt_transition_guard) {
+                    (Some(scope), Some(rt_guard)) => crate::managed_agents::compensate_drain(
+                        &app_handle,
+                        &stopped_entries,
+                        scope,
+                        rt_guard,
+                    ),
+                    (_, leftover_guard) => {
+                        drop(leftover_guard);
+                        None
+                    }
+                };
+                if let Some(comp_err) = comp_err {
+                    eprintln!(
+                        "buzz-desktop: identity import persist failed, compensation failed: {comp_err}"
+                    );
+                }
+            }
+            return Err(e);
+        }
+    };
 
-        eprintln!("buzz-desktop: imported identity pubkey {}", pubkey_hex);
+    // ── Clear active scope and bump generation ────────────────────────────
+    // For no-active-scope path: no scope was ever set; clearing is a no-op
+    // but bumping generation invalidates any in-flight stale operations.
+    // For live-active path: agents are stopped; clearing scope makes all
+    // agent commands fail closed until the frontend re-applies a workspace.
+    //
+    // Invariant: the fallback relay can never claim legacy data — claims
+    // are only written inside apply_workspace's prepare stage.
+    //
+    // `clear_active_scope()` internally calls `next_scope_generation()` —
+    // no additional bump is needed here.
+    state.clear_active_scope();
 
-        Ok(IdentityInfo {
-            pubkey: pubkey_hex,
-            display_name,
-            storage: storage.as_str().to_string(),
-            lost: false,
-            locked: false,
-            reset_failed: false,
-        })
+    let pubkey_hex = pubkey.to_hex();
+    let display_name = truncated_display_name(&pubkey)?;
+
+    eprintln!("buzz-desktop: imported identity pubkey {}", pubkey_hex);
+
+    Ok(IdentityInfo {
+        pubkey: pubkey_hex,
+        display_name,
+        storage: storage.as_str().to_string(),
+        lost: false,
+        locked: false,
+        reset_failed: false,
     })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?;
-
-    // Guards must stay alive until spawn_blocking completes so the serialization
-    // covers the full duration of the import.
-    drop(_transition_guard);
-    drop(_mutation_guard);
-
-    result
 }
 
 /// Commit an imported identity: durably persist, swap in-memory keys, clear

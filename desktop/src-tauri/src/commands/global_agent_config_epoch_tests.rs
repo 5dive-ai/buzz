@@ -15,9 +15,13 @@ use super::*;
 /// and written, runtimes map contains new entry with context.scope.scope_id,
 /// final captured disk record matches."
 ///
-/// Note: to pass the eligibility check we need a record with backend=Local
-/// and a live runtime in the runtimes map. Since we can't inject a real
-/// process, we seed the runtimes map directly via AppState.
+/// Cross-platform process helpers replace `sleep 10000` / `/usr/bin/true`:
+/// - Seed runtime: `spawn_long_lived_child_for_test()` (survives sync eviction).
+/// - Spawn closure: `spawn_noop_child_for_test()` (exits immediately; test only
+///   checks in-memory state, not process liveness).
+///
+/// Non-empty personas, teams, and global are placed in both the context AND
+/// the captured definitions_dir so the spawn_fn can assert they arrive.
 #[tokio::test]
 async fn test_full_tail_stop_spawn_receipt_register_save() {
     use crate::managed_agents::{
@@ -107,21 +111,14 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
     let app = make_mock_app();
     let app_handle = app.handle().clone();
 
-    // Seed a live pair runtime using a long-running process.
-    // `/usr/bin/true` exits immediately and is evicted by
-    // sync_managed_agent_processes before the eligibility check; use `sleep`
-    // to keep the runtime alive through the sync.
+    // Seed a live runtime with a cross-platform long-lived child (avoids sync eviction).
+    // `spawn_long_lived_child_for_test()` replaces `sleep 10000` / `ping -n 100000`.
     let rt_key = ManagedAgentRuntimeKey::new(&pubkey, relay_url).unwrap();
-    {
+    let seeded_pid = {
         let state = app_handle.state::<crate::app_state::AppState>();
         let mut runtimes = state.managed_agent_processes.lock().unwrap();
-        let child = std::process::Command::new("sleep")
-            .arg("10000")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn sleep 10000");
+        let child = spawn_long_lived_child_for_test();
+        let pid = child.id();
         let process = crate::managed_agents::ManagedAgentProcess {
             child,
             log_path: std::path::PathBuf::new(),
@@ -142,7 +139,8 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
             rt_key.clone(),
             ManagedAgentPairRuntime::starting(process, Some(scope_id.to_string())),
         );
-    }
+        pid
+    };
 
     let gen = crate::managed_agents::scope::current_scope_generation();
     let scope = crate::managed_agents::scope::WorkspaceAgentScope {
@@ -153,11 +151,56 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
         generation: gen,
     };
 
+    // Build NON-EMPTY personas, teams, and global so the spawn_fn can assert
+    // they are actually delivered to the captured context.
+    let test_persona = crate::managed_agents::AgentDefinition {
+        id: "test-persona-id".to_string(),
+        display_name: "Test Persona".to_string(),
+        avatar_url: None,
+        system_prompt: "Test persona prompt.".to_string(),
+        runtime: None,
+        model: None,
+        provider: None,
+        name_pool: vec![],
+        is_builtin: false,
+        is_active: true,
+        shared: false,
+        source_team: None,
+        source_team_persona_slug: None,
+        catalog_source: None,
+        env_vars: Default::default(),
+        respond_to: None,
+        respond_to_allowlist: Default::default(),
+        parallelism: None,
+        created_at: crate::util::now_iso(),
+        updated_at: crate::util::now_iso(),
+    };
+    let test_team = crate::managed_agents::TeamRecord {
+        id: "test-team-id".to_string(),
+        name: "Test Team".to_string(),
+        description: None,
+        instructions: None,
+        persona_ids: vec![],
+        is_builtin: false,
+        source_dir: None,
+        is_symlink: false,
+        symlink_target: None,
+        version: None,
+        created_at: crate::util::now_iso(),
+        updated_at: crate::util::now_iso(),
+    };
+    let mut global_env_vars = std::collections::BTreeMap::new();
+    global_env_vars.insert("CAPTURED_GLOBAL_VAR".to_string(), "test-value".to_string());
+    let captured_global = crate::managed_agents::GlobalAgentConfig {
+        env_vars: global_env_vars,
+        ..Default::default()
+    };
+
     let context = CapturedRestartContext {
         scope: scope.clone(),
-        personas: vec![],
-        teams: vec![],
-        global: crate::managed_agents::GlobalAgentConfig::default(),
+        personas: vec![test_persona],
+        teams: vec![test_team],
+        global: captured_global.clone(),
         owner_hex: owner_hex.clone(),
         mesh_model_id: None,
     };
@@ -175,66 +218,77 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
     let stop_called = Arc::new(Mutex::new(false));
     let spawn_relay = Arc::new(Mutex::new(None::<String>));
     let spawn_owner = Arc::new(Mutex::new(None::<String>));
+    let spawn_got_nonempty_personas = Arc::new(Mutex::new(false));
+    let spawn_got_nonempty_teams = Arc::new(Mutex::new(false));
+    let spawn_got_nonempty_global = Arc::new(Mutex::new(false));
     let receipt_called = Arc::new(Mutex::new(false));
 
     let stop_called2 = stop_called.clone();
     let spawn_relay2 = spawn_relay.clone();
     let spawn_owner2 = spawn_owner.clone();
+    let spawn_personas2 = spawn_got_nonempty_personas.clone();
+    let spawn_teams2 = spawn_got_nonempty_teams.clone();
+    let spawn_global2 = spawn_got_nonempty_global.clone();
     let receipt_called2 = receipt_called.clone();
     let pubkey2 = pubkey.clone();
 
-    let result = restart_under_captured_epoch_for(
-        &app_handle,
-        &pubkey,
-        &old_global,
-        &new_global,
-        &[],
-        &context,
-        // stop_fn: record the call, simulate success, remove runtime.
-        move |_app, rec, runtimes| {
-            *stop_called2.lock().unwrap() = true;
-            runtimes.retain(|k, _| k.pubkey != rec.pubkey);
-            Ok(())
-        },
-        // spawn_fn: record captured relay+owner, return a fresh process.
-        move |_app, rec, relay, owner, _personas, global, teams| {
-            *spawn_relay2.lock().unwrap() = Some(relay.to_string());
-            *spawn_owner2.lock().unwrap() = owner.map(str::to_string);
-            // Return an immediately-exiting child as the fake process.
-            let child = std::process::Command::new("/usr/bin/true")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| format!("spawn /usr/bin/true: {e}"))?;
-            Ok(crate::managed_agents::ManagedAgentProcess {
-                child,
-                log_path: std::path::PathBuf::new(),
-                spawn_config:
-                    crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
-                        rec,
-                        &[],
-                        teams,
-                        relay,
-                        global,
-                    ),
-                setup_mode: false,
-                adapter_availability: None,
-                start_nonce: "test-nonce-spawn".to_string(),
-                #[cfg(windows)]
-                job: None,
-            })
-        },
-        // write_receipt_fn: record the call, verify pubkey, succeed.
-        move |_app, receipt| {
-            *receipt_called2.lock().unwrap() = true;
-            assert_eq!(
-                receipt.key.pubkey, pubkey2,
-                "receipt must carry the correct pubkey"
-            );
-            Ok(())
-        },
-    );
+    let app_handle_for_assert = app_handle.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        restart_under_captured_epoch_for(
+            &app_handle,
+            &pubkey,
+            &old_global,
+            &new_global,
+            &[],
+            &context,
+            // stop_fn: record the call, simulate success, remove runtime.
+            move |_app, rec, runtimes| {
+                *stop_called2.lock().unwrap() = true;
+                runtimes.retain(|k, _| k.pubkey != rec.pubkey);
+                Ok(())
+            },
+            // spawn_fn: record captured relay+owner+personas+teams+global, return a noop child.
+            // `spawn_noop_child_for_test()` replaces `/usr/bin/true` — cross-platform.
+            move |_app, rec, relay, owner, personas, global, teams| {
+                *spawn_relay2.lock().unwrap() = Some(relay.to_string());
+                *spawn_owner2.lock().unwrap() = owner.map(str::to_string);
+                *spawn_personas2.lock().unwrap() = !personas.is_empty();
+                *spawn_teams2.lock().unwrap() = !teams.is_empty();
+                *spawn_global2.lock().unwrap() = !global.env_vars.is_empty();
+                Ok(crate::managed_agents::ManagedAgentProcess {
+                    child: spawn_noop_child_for_test(),
+                    log_path: std::path::PathBuf::new(),
+                    spawn_config:
+                        crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+                            rec,
+                            &[],
+                            teams,
+                            relay,
+                            global,
+                        ),
+                    setup_mode: false,
+                    adapter_availability: None,
+                    start_nonce: "test-nonce-spawn".to_string(),
+                    #[cfg(windows)]
+                    job: None,
+                })
+            },
+            // write_receipt_fn: record the call, verify pubkey, succeed.
+            move |_app, receipt| {
+                *receipt_called2.lock().unwrap() = true;
+                assert_eq!(
+                    receipt.key.pubkey, pubkey2,
+                    "receipt must carry the correct pubkey"
+                );
+                Ok(())
+            },
+        )
+    })
+    .await
+    .expect("spawn_blocking must not panic");
+
+    // Kill the seeded long-lived child now that the epoch has consumed it.
+    let _ = crate::managed_agents::terminate_process(seeded_pid);
 
     assert!(
         matches!(result, Ok(())),
@@ -252,12 +306,24 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
         "spawn_fn must receive the captured owner hex"
     );
     assert!(
+        *spawn_got_nonempty_personas.lock().unwrap(),
+        "spawn_fn must receive NON-EMPTY captured personas"
+    );
+    assert!(
+        *spawn_got_nonempty_teams.lock().unwrap(),
+        "spawn_fn must receive NON-EMPTY captured teams"
+    );
+    assert!(
+        *spawn_got_nonempty_global.lock().unwrap(),
+        "spawn_fn must receive a NON-EMPTY captured global env"
+    );
+    assert!(
         *receipt_called.lock().unwrap(),
         "write_receipt_fn must be called"
     );
     // Verify the runtime is registered with the captured scope_id.
     {
-        let state = app_handle.state::<crate::app_state::AppState>();
+        let state = app_handle_for_assert.state::<crate::app_state::AppState>();
         let runtimes = state.managed_agent_processes.lock().unwrap();
         let registered = runtimes
             .values()
@@ -267,26 +333,45 @@ async fn test_full_tail_stop_spawn_receipt_register_save() {
             "runtime must be registered with the captured scope_id"
         );
     }
+    // Verify the final captured disk record: the agent is present in the store.
+    let final_records =
+        crate::managed_agents::storage::load_managed_agents_at(tmp.path()).unwrap_or_default();
+    assert!(
+        final_records.iter().any(|r| r.pubkey == "bb".repeat(32)),
+        "final disk record must contain the restarted agent"
+    );
 }
 
-/// Production driver proves preflight fires before stop.
+/// Production driver proves preflight fires before stop — and with an eligible
+/// runtime seeded both "mesh" and "stop" appear in the log in that order.
 ///
-/// Thufir's test 6: "event log from production driver proves preflight fn
-/// fires before stop fn."
+/// Thufir's test 6: "seed an eligible runtime through the cross-platform child
+/// seam; event log from production driver proves preflight fn fires before stop
+/// fn — unconditionally (both events must be present)."
 ///
-/// The async driver's pre-stop phase requires: personas load, teams load,
-/// global config load, owner key verification, candidate record load, and
-/// mesh preflight (in that order). The mesh_fn is the first outbound async
-/// call. We prove mesh fires before stop by asserting "mesh" appears first
-/// in the event log.
+/// Requirements for the agent to be an eligible restart candidate:
+/// - `backend = Local` with a live pair runtime (seeded with long-lived child).
+/// - `provider = anthropic`, `model = ...`, `ANTHROPIC_API_KEY` in env_vars
+///   → `old_ready = true`.
+/// - `old_global != new_global` (env_vars differ) → `env_changed = true`
+///   → `should_restart_on_config_change = true`.
+/// - `owner_pubkey` matches the mock app's signing key.
+///
+/// The `stop_fn` records "stop" and REMOVES the runtime from the map so the
+/// epoch considers it properly stopped. The `spawn_fn` returns `Err` so the
+/// epoch ends with `FailedAfterStop` — but both "mesh" and "stop" are in the
+/// log before that.
 ///
 /// Owner key must match the app's signing key — use the actual generated key
-/// from the mock app's AppState. The agent pubkey in the store is separate.
+/// from the mock app's AppState.
 #[tokio::test]
 async fn test_relay_mesh_preflight_precedes_stop() {
     use super::super::restart_local_agent_on_config_change_for;
     use crate::commands::global_agent_config::RestartOutcome;
     use crate::managed_agents::storage::save_managed_agents_at;
+    use crate::managed_agents::{
+        BackendKind, ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey,
+    };
     use tauri::Manager;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -307,9 +392,14 @@ async fn test_relay_mesh_preflight_precedes_stop() {
 
     let agent_pubkey = "aa".repeat(32);
 
-    // Write the candidate record so the pre-stop phase can find it.
-    // The agent must exist in the store for the candidate record lookup.
-    let agent_record = crate::managed_agents::ManagedAgentRecord {
+    // Build a Ready record: provider+model set and ANTHROPIC_API_KEY in env_vars.
+    // old_global != new_global (env differ) → env_changed = true → eligible.
+    let mut record_env_vars = std::collections::BTreeMap::new();
+    record_env_vars.insert(
+        "ANTHROPIC_API_KEY".to_string(),
+        "sk-test-key-eligible".to_string(),
+    );
+    let agent_record = ManagedAgentRecord {
         pubkey: agent_pubkey.clone(),
         name: "test-agent-preflight".to_string(),
         display_name: None,
@@ -329,14 +419,14 @@ async fn test_relay_mesh_preflight_precedes_stop() {
         max_turn_duration_seconds: None,
         parallelism: 1,
         system_prompt: None,
-        model: None,
-        provider: None,
+        model: Some("claude-3-5-sonnet-20241022".to_string()),
+        provider: Some("anthropic".to_string()),
         persona_source_version: None,
-        env_vars: Default::default(),
+        env_vars: record_env_vars,
         start_on_app_launch: false,
         auto_restart_on_config_change: false,
         runtime_pid: None,
-        backend: crate::managed_agents::BackendKind::Local,
+        backend: BackendKind::Local,
         backend_agent_id: None,
         provider_binary_path: None,
         team_id: None,
@@ -364,9 +454,40 @@ async fn test_relay_mesh_preflight_precedes_stop() {
         runtime: None,
         name_pool: vec![],
     };
-    save_managed_agents_at(tmp.path(), &[agent_record]).unwrap();
+    save_managed_agents_at(tmp.path(), std::slice::from_ref(&agent_record)).unwrap();
     std::fs::write(tmp.path().join("personas.json"), b"[]").unwrap();
     std::fs::write(tmp.path().join("global-agent-config.json"), b"{}").unwrap();
+
+    // Seed a live runtime for the agent (makes it eligible — avoids the
+    // "no live pair runtime" Skipped path).
+    let rt_key = ManagedAgentRuntimeKey::new(&agent_pubkey, "wss://relay.example").unwrap();
+    let seeded_pid = {
+        let state = app_handle.state::<crate::app_state::AppState>();
+        let mut runtimes = state.managed_agent_processes.lock().unwrap();
+        let child = spawn_long_lived_child_for_test();
+        let pid = child.id();
+        let process = crate::managed_agents::ManagedAgentProcess {
+            child,
+            log_path: std::path::PathBuf::new(),
+            spawn_config: crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+                &agent_record,
+                &[],
+                &[],
+                "wss://relay.example",
+                &Default::default(),
+            ),
+            setup_mode: false,
+            adapter_availability: None,
+            start_nonce: "test-nonce-preflight".to_string(),
+            #[cfg(windows)]
+            job: None,
+        };
+        runtimes.insert(
+            rt_key,
+            ManagedAgentPairRuntime::starting(process, Some("test-scope".to_string())),
+        );
+        pid
+    };
 
     let gen = crate::managed_agents::scope::current_scope_generation();
     let scope = crate::managed_agents::scope::WorkspaceAgentScope {
@@ -378,6 +499,15 @@ async fn test_relay_mesh_preflight_precedes_stop() {
         generation: gen,
     };
 
+    // old_global and new_global differ by one env_var so env_changed = true.
+    let old_global = crate::managed_agents::GlobalAgentConfig::default();
+    let mut new_global_env = std::collections::BTreeMap::new();
+    new_global_env.insert("PREFLIGHT_TEST_VAR".to_string(), "v2".to_string());
+    let new_global = crate::managed_agents::GlobalAgentConfig {
+        env_vars: new_global_env,
+        ..Default::default()
+    };
+
     // Shared event log: "mesh" or "stop" entries in order.
     let event_log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -387,8 +517,8 @@ async fn test_relay_mesh_preflight_precedes_stop() {
     let outcome = restart_local_agent_on_config_change_for(
         &app_handle,
         &agent_pubkey,
-        &crate::managed_agents::GlobalAgentConfig::default(),
-        &crate::managed_agents::GlobalAgentConfig::default(),
+        &old_global,
+        &new_global,
         &[],
         &scope,
         tmp.path(),
@@ -397,39 +527,47 @@ async fn test_relay_mesh_preflight_precedes_stop() {
             log_mesh.lock().unwrap().push("mesh");
             Box::pin(async { Ok(()) })
         },
-        // stop_fn: records "stop". Since there's no live runtime the epoch
-        // will Skipped before stop_fn fires — the ordering assertion is on
-        // the driver phase (mesh before ANY stop attempt).
-        move |_app, _rec, _runtimes| {
+        // stop_fn: records "stop", removes the runtime so spawn fails gracefully.
+        move |_app, rec, runtimes| {
             log_stop.lock().unwrap().push("stop");
+            runtimes.retain(|k, _| k.pubkey != rec.pubkey);
             Ok(())
         },
+        // spawn_fn: returns Err so the epoch ends with FailedAfterStop.
         |_app, _rec, _relay, _owner, _personas, _global, _teams| {
-            Err("spawn not expected".to_string())
+            Err("spawn not available in test".to_string())
         },
         |_app, _receipt| Err("receipt not expected".to_string()),
     )
     .await;
 
-    // The call Skips at the no-live-runtime check, not at preflight.
+    // Kill the seeded process now that the epoch has consumed it.
+    let _ = crate::managed_agents::terminate_process(seeded_pid);
+
+    // With an eligible runtime, the epoch progresses past preflight and stop.
+    // stop_fn removed the runtime → spawn_fn fails → FailedAfterStop.
     assert!(
-        matches!(outcome, RestartOutcome::Skipped),
-        "no live runtime: {outcome:?}"
+        matches!(outcome, RestartOutcome::FailedAfterStop),
+        "with eligible runtime: stop fires and spawn fails → FailedAfterStop: {outcome:?}"
     );
 
     let log = event_log.lock().unwrap();
-    // Mesh must appear before any stop (even if stop never fired).
+    // Both events must be present — mesh fires in the async pre-stop phase,
+    // stop fires inside the epoch.
     let mesh_pos = log.iter().position(|&e| e == "mesh");
     let stop_pos = log.iter().position(|&e| e == "stop");
     assert!(
         mesh_pos.is_some(),
-        "mesh_fn must be called (preflight runs before epoch)"
+        "mesh_fn must be called (preflight runs in async pre-stop phase): {log:?}"
     );
-    if let Some(stop_idx) = stop_pos {
-        let mesh_idx = mesh_pos.unwrap();
-        assert!(
-            mesh_idx < stop_idx,
-            "preflight (mesh at {mesh_idx}) must precede stop (stop at {stop_idx})"
-        );
-    }
+    assert!(
+        stop_pos.is_some(),
+        "stop_fn must be called with an eligible live runtime: {log:?}"
+    );
+    let mesh_idx = mesh_pos.unwrap();
+    let stop_idx = stop_pos.unwrap();
+    assert!(
+        mesh_idx < stop_idx,
+        "preflight (mesh at {mesh_idx}) must precede stop (stop at {stop_idx}): {log:?}"
+    );
 }

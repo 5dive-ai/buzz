@@ -235,6 +235,12 @@ fn minimal_agent_snapshot_json_with_memory(name: &str) -> Vec<u8> {
 /// Uses `tauri::test::mock_builder().manage(state)` so that `app.state::<AppState>()`
 /// works inside `try_regenerate_nest` and other AppHandle users called by the core.
 ///
+/// Uses `WorkspaceAgentScope::new` with `base_dir = tmp.path()` so that
+/// `definitions_dir = <tmp>/scopes/<scope_id>/`.  `retention_scope_from_captured`
+/// derives the agent base two parents above `definitions_dir`, yielding
+/// `<tmp>` — a writable directory — instead of `/` (which causes EPERM on Linux
+/// when `definitions_dir` is set directly to the tempdir root).
+///
 /// Uses `next_scope_generation()` to claim the current generation slot so the
 /// scope's generation matches the global counter at entry, reducing the race
 /// window vs. tests that call `next_scope_generation()` concurrently.
@@ -263,13 +269,19 @@ fn setup_import_app_with_scope(
         // value so capture_agent_snapshot_import_entry sees a matching generation
         // when it reads current_scope_generation() at entry.
         let gen = next_scope_generation();
-        let scope = WorkspaceAgentScope {
-            scope_id: "test-scope".to_string(),
-            relay_url: "wss://captured.example".to_string(),
-            owner_pubkey: owner_keys.public_key().to_hex(),
-            definitions_dir: tmp.path().to_path_buf(),
-            generation: gen,
-        };
+        // Use WorkspaceAgentScope::new so definitions_dir has the production
+        // shape: <tmp>/scopes/<scope_id>/.  retention_scope_from_captured derives
+        // the agent base two parents above definitions_dir — with this layout it
+        // resolves to <tmp> (writable) rather than / (which causes EPERM on Linux).
+        let scope = WorkspaceAgentScope::new(
+            "wss://captured.example".to_string(),
+            owner_keys.public_key().to_hex(),
+            tmp.path(),
+            gen,
+        );
+        // Ensure the definitions directory exists so the core can write into it.
+        std::fs::create_dir_all(&scope.definitions_dir)
+            .expect("failed to create scope definitions dir");
         s.commit_active_scope(scope);
     }
 

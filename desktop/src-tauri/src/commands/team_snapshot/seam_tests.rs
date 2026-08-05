@@ -11,6 +11,42 @@ use super::*;
 /// See the equivalent comment in `import_tests.rs` for rationale.
 use crate::managed_agents::scope::SCOPE_GENERATION_TEST_LOCK as GENERATION_TEST_LOCK;
 
+/// Build a team-member snapshot with a core memory entry.
+///
+/// Used by tests that must exercise the Phase-5 memory loop in the team import
+/// core and assert that `submit_memory` carries the captured relay + owner.
+fn member_with_memory(name: &str) -> AgentSnapshot {
+    use crate::managed_agents::agent_snapshot::{AgentSnapshotMemoryEntry, MemoryLevel};
+    let mut m = member(name);
+    m.memory = crate::managed_agents::agent_snapshot::AgentSnapshotMemory {
+        level: MemoryLevel::Core,
+        entries: vec![AgentSnapshotMemoryEntry {
+            slug: buzz_core_pkg::engram::CORE_SLUG.to_string(),
+            body: format!("# {name}\nTeam member memory body."),
+        }],
+    };
+    m
+}
+
+/// Extract the first `p` tag value from a nostr event JSON byte slice.
+///
+/// Returns `Some(hex_pubkey)` if a `["p", "<hex>"]` tag entry is found,
+/// `None` if the JSON cannot be parsed or has no `p` tag.
+fn extract_p_tag_from_memory_event(event_json: &[u8]) -> Option<String> {
+    let val: serde_json::Value = serde_json::from_slice(event_json).ok()?;
+    let tags = val.get("tags")?.as_array()?;
+    for tag in tags {
+        if let Some(arr) = tag.as_array() {
+            if arr.first().and_then(|v| v.as_str()) == Some("p") {
+                if let Some(hex) = arr.get(1).and_then(|v| v.as_str()) {
+                    return Some(hex.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn setup_team_import_app_with_scope(
     tmp: &tempfile::TempDir,
 ) -> (tauri::App<tauri::test::MockRuntime>, nostr::Keys) {
@@ -32,13 +68,19 @@ fn setup_team_import_app_with_scope(
         use tauri::Manager;
         let s = app.state::<crate::app_state::AppState>();
         let gen = next_scope_generation();
-        let scope = WorkspaceAgentScope {
-            scope_id: "ts-test-scope".to_string(),
-            relay_url: "wss://captured.example".to_string(),
-            owner_pubkey: owner_keys.public_key().to_hex(),
-            definitions_dir: tmp.path().to_path_buf(),
-            generation: gen,
-        };
+        // Use WorkspaceAgentScope::new so definitions_dir has the production
+        // shape: <tmp>/scopes/<scope_id>/.  retention_scope_from_captured derives
+        // the agent base two parents above definitions_dir — with this layout it
+        // resolves to <tmp> (writable) rather than / (which causes EPERM on Linux).
+        let scope = WorkspaceAgentScope::new(
+            "wss://captured.example".to_string(),
+            owner_keys.public_key().to_hex(),
+            tmp.path(),
+            gen,
+        );
+        // Ensure the definitions directory exists so the core can write into it.
+        std::fs::create_dir_all(&scope.definitions_dir)
+            .expect("failed to create team scope definitions dir");
         s.commit_active_scope(scope);
     }
 
@@ -53,6 +95,14 @@ fn setup_team_import_app_with_scope(
 /// scope and owner, not merely increment a counter. We swap the active scope
 /// to a different relay + fresh owner inside the hook; all per-member profile
 /// adapters must receive the old captured relay URL.
+///
+/// One member carries a core memory entry so the Phase-5 memory loop in
+/// `team_snapshot.rs` fires. The memory adapter asserts BOTH the captured
+/// relay URL AND that the built engram event's `p` tag (owner counterpart)
+/// matches the CAPTURED owner's pubkey — not the post-switch owner committed
+/// in `after_store`. This validates the team core's independently implemented
+/// Phase-5 memory loop (`team_snapshot.rs:815-860`) which uses
+/// `captured_owner_keys` at `:553`.
 #[tokio::test]
 // SAFETY: single-threaded tokio runtime; lock held to serialize generation
 // counter mutations — cannot deadlock. See import_tests.rs for full rationale.
@@ -67,21 +117,28 @@ async fn test_confirm_team_snapshot_import_switch_between_store_and_profile() {
     use tauri::Manager;
 
     let tmp = tempfile::tempdir().unwrap();
-    let (app, _owner_keys) = setup_team_import_app_with_scope(&tmp);
+    let (app, owner_keys) = setup_team_import_app_with_scope(&tmp);
     let handle = app.handle();
 
-    let snap = snapshot(vec![member("Alice"), member("Bob")]);
+    // One plain member + one member with a core memory entry so the Phase-5
+    // memory loop fires for the second member.
+    let snap = snapshot(vec![member("Alice"), member_with_memory("Bob")]);
     let encoded = crate::managed_agents::team_snapshot::encode_team_snapshot_json(&snap).unwrap();
     let input = TeamSnapshotImportConfirm {
         file_bytes: encoded,
         keep_allowlist: false,
     };
 
+    // Captured owner pubkey — must appear in the `p` tag of memory events.
+    let captured_owner_pubkey_hex = owner_keys.public_key().to_hex();
     let expected_relay = "wss://captured.example".to_string();
+
     let profile_relays: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let memory_relays: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+    let memory_p_tags: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let pr = profile_relays.clone();
     let mr = memory_relays.clone();
+    let mp = memory_p_tags.clone();
 
     let state = app.state::<crate::app_state::AppState>();
     let handle_for_hook = handle.clone();
@@ -94,13 +151,12 @@ async fn test_confirm_team_snapshot_import_switch_between_store_and_profile() {
         move || {
             // after_store: commit a genuinely DIFFERENT live scope + owner.
             let new_owner = nostr::Keys::generate();
-            let new_scope = WorkspaceAgentScope {
-                scope_id: "switched-scope".to_string(),
-                relay_url: "wss://new-relay-after-switch.example".to_string(),
-                owner_pubkey: new_owner.public_key().to_hex(),
-                definitions_dir: std::path::PathBuf::from("/tmp/switched"),
-                generation: current_scope_generation(),
-            };
+            let new_scope = WorkspaceAgentScope::new(
+                "wss://new-relay-after-switch.example".to_string(),
+                new_owner.public_key().to_hex(),
+                std::path::Path::new("/tmp/switched"),
+                current_scope_generation(),
+            );
             let s = handle_for_hook.state::<crate::app_state::AppState>();
             s.commit_active_scope(new_scope);
         },
@@ -113,12 +169,15 @@ async fn test_confirm_team_snapshot_import_switch_between_store_and_profile() {
             })
         },
         move |m: MemoryPublish<'_>| {
+            // Assert: relay URL contains the captured relay, not the switched one.
             let relay = m.relay_url.to_string();
             mr.lock().unwrap().push(relay.clone());
-            Box::pin(async move {
-                let _ = relay;
-                Ok(())
-            })
+            // Extract the `p` tag — must carry the CAPTURED owner pubkey.
+            let event_bytes = m.event_json.to_vec();
+            if let Some(p_tag) = extract_p_tag_from_memory_event(&event_bytes) {
+                mp.lock().unwrap().push(p_tag);
+            }
+            Box::pin(async move { Ok(()) })
         },
     )
     .await;
@@ -130,19 +189,47 @@ async fn test_confirm_team_snapshot_import_switch_between_store_and_profile() {
     );
 
     // Every member's profile adapter received the captured relay URL.
-    let seen = profile_relays.lock().unwrap();
+    let seen_profiles = profile_relays.lock().unwrap();
     assert_eq!(
-        seen.len(),
+        seen_profiles.len(),
         2,
         "profile adapter must be called once per member"
     );
-    for relay in seen.iter() {
+    for relay in seen_profiles.iter() {
         assert_eq!(
             relay, &expected_relay,
             "profile adapter must receive captured relay, got: {relay}"
         );
     }
-    // No memory entries in these members — memory adapter not called.
+
+    // Memory adapter was called for the member with memory entries.
+    let seen_memory_relays = memory_relays.lock().unwrap();
+    assert!(
+        !seen_memory_relays.is_empty(),
+        "memory adapter must be called for the member with memory entries"
+    );
+    for relay in seen_memory_relays.iter() {
+        assert!(
+            relay.contains("captured.example"),
+            "memory adapter relay_url must contain captured relay 'captured.example', got: {relay}"
+        );
+    }
+
+    // Memory event's `p` tag must equal the CAPTURED owner's pubkey — not the
+    // post-switch owner committed in `after_store`.
+    let seen_p_tags = memory_p_tags.lock().unwrap();
+    assert!(
+        !seen_p_tags.is_empty(),
+        "at least one memory event must carry a `p` tag"
+    );
+    for p_tag in seen_p_tags.iter() {
+        assert_eq!(
+            p_tag.as_str(),
+            captured_owner_pubkey_hex.as_str(),
+            "engram event p-tag must equal the captured owner's pubkey (not post-switch owner); \
+             got: {p_tag}"
+        );
+    }
 }
 
 /// `before_store` hook advances scope generation — Phase 3 must reject BEFORE

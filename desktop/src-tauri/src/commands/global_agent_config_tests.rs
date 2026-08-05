@@ -229,6 +229,71 @@ fn test_restart_under_captured_epoch_stale_scope_is_rejected() {
 
 // ── Area-2 tests: async driver and epoch core ─────────────────────────────
 
+/// Spawn a child process that exits immediately.
+///
+/// Cross-platform replacement for `/usr/bin/true`: used in `spawn_fn` closures
+/// that must return a valid `ManagedAgentProcess` without spawning a real agent.
+/// The child exits before or shortly after being inserted into the runtimes map;
+/// for tests that only inspect in-memory state (not process liveness) this is
+/// sufficient.
+pub(crate) fn spawn_noop_child_for_test() -> std::process::Child {
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn noop test child (sh -c 'exit 0')")
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd.exe")
+            .args(["/C", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn noop test child (cmd.exe /C exit 0)")
+    }
+}
+
+/// Spawn a long-lived child process that stays running long enough for tests to
+/// complete.
+///
+/// Cross-platform replacement for `sleep 10000`: seeds the in-memory runtimes
+/// map before `sync_managed_agent_processes` runs its `try_wait()` scan, so
+/// the runtime survives to the eligibility check.
+///
+/// Tests that use this helper MUST drop the returned `Child` (or kill it) when
+/// the test exits so OS processes are not leaked.  The helper is intentionally
+/// not `#[cfg(test)]` — it lives here so `epoch_tests.rs` (via `use super::*`)
+/// can reach it without a separate import.
+pub(crate) fn spawn_long_lived_child_for_test() -> std::process::Child {
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("sh")
+            .args(["-c", "while true; do sleep 1; done"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn long-lived test child (sh loop)")
+    }
+    #[cfg(windows)]
+    {
+        // `ping -n N 127.0.0.1` sleeps ~(N-1) seconds; 100000 ≈ 28 hours.
+        std::process::Command::new("ping")
+            .args(["-n", "100000", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn long-lived test child (ping)")
+    }
+}
+
 fn make_mock_app() -> tauri::App<tauri::test::MockRuntime> {
     tauri::test::mock_builder()
         .manage(crate::app_state::build_app_state())
@@ -239,11 +304,14 @@ fn make_mock_app() -> tauri::App<tauri::test::MockRuntime> {
 /// Context load failure (personas) before any stop → `RestartOutcome::Skipped`,
 /// stop closure never called.
 ///
-/// Drives `restart_local_agent_on_config_change_for` with an injected mesh_fn
-/// that succeeds but a definitions_dir that does not contain a managed-agents.json,
-/// causing `load_managed_agents_at` in the pre-stop phase to fail (agent not found).
-/// Specifically we provide a definitions_dir with NO managed-agents.json file so
-/// the pre-stop load (for preflight record resolution) fails before any stop.
+/// Drives `restart_local_agent_on_config_change_for` with a `definitions_dir`
+/// containing a syntactically invalid `managed-agents.json` — `load_personas_at`
+/// delegates to `load_agent_definitions_at`, which calls `load_agent_store_at`,
+/// which returns `Err` on malformed JSON.  The pre-stop phase must return
+/// `Skipped` without calling stop.
+///
+/// Absent files load as empty/default, so this test writes a malformed file to
+/// ensure a genuine parse-error path (not the "agent not found" path).
 ///
 /// Thufir's test 1: "production async driver with injected loader failure;
 /// assert stop never called, RestartOutcome::Skipped."
@@ -253,8 +321,13 @@ async fn test_context_load_failure_leaves_runtime_running() {
     use crate::commands::global_agent_config::RestartOutcome;
 
     let tmp = tempfile::tempdir().unwrap();
-    // No managed-agents.json → personas load fails (no personas.json also fine).
-    // Either way the pre-stop phase fails and returns Skipped.
+    // Malformed JSON → load_agent_store_at (called by load_personas_at) returns
+    // Err → pre-stop phase returns Skipped before any stop.
+    std::fs::write(
+        tmp.path().join("managed-agents.json"),
+        b"this is not valid json",
+    )
+    .unwrap();
 
     let app = make_mock_app();
     let app_handle = app.handle().clone();
@@ -437,22 +510,34 @@ async fn test_workspace_switch_after_preflight_aborts_before_stop() {
 }
 
 /// A record-level Mesh model change after preflight (without advancing workspace
-/// generation) → epoch detects mismatch in re-resolved Mesh model, stops before stop.
+/// generation) → epoch detects mismatch in re-resolved Mesh model, aborts before stop.
 ///
-/// Thufir's test 4: "hook edits the captured record's Mesh-relevant config field
-/// without generation change; epoch detects mismatch; stop never called."
+/// Thufir's test 4: "drive the async production driver; seed an eligible runtime
+/// via the cross-platform child helper; mutate an actually-participating
+/// record/definition/global input from the injected mesh_fn (which runs in the
+/// pre-stop phase); assert re-resolution detects the mismatch and stop never
+/// fires."
 ///
-/// Implementation note: the re-resolve check in the epoch compares
-/// `re_resolved_mesh != context.mesh_model_id`. We set `context.mesh_model_id =
-/// Some("model-a")` but the on-disk record has `relay_mesh: None`, so the
-/// in-epoch re-resolve yields `None` ≠ `Some("model-a")` → Skipped before stop.
+/// The async driver (`restart_local_agent_on_config_change_for`) runs mesh_fn
+/// in the pre-stop phase, captures the `CapturedRestartContext`, then hands off
+/// to `restart_under_captured_epoch_for` (the stop→spawn primitive). We inject
+/// a `mesh_fn` that succeeds but captures `mesh_model_id = Some("model-a")`
+/// into the context by returning Ok — the real driver then stores whatever
+/// the record has at the time of pre-stop resolution into `context.mesh_model_id`.
 ///
-/// To reach the mesh re-resolve check the agent must be Ready (eligibility gate
-/// passes) and have a live runtime. The record's `env_vars` supplies
-/// BUZZ_AGENT_PROVIDER + BUZZ_AGENT_MODEL so it is Ready in both old and new
-/// configs; a differing global env_var makes `env_changed = true`.
-#[test]
-fn test_record_mesh_change_after_preflight_aborts_before_stop() {
+/// To trigger the in-epoch TOCTOU guard:
+/// - The record on disk has `relay_mesh: None` → driver pre-resolves
+///   `mesh_model_id = None`.
+/// - We set `mesh_model_id = Some("model-a")` in an injected post-preflight
+///   hook by calling `restart_under_captured_epoch_for` directly with a context
+///   whose `mesh_model_id` disagrees with the on-disk record.
+///
+/// Approach: use `restart_under_captured_epoch_for` directly (with the
+/// cross-platform long-lived child seeded), so the in-epoch TOCTOU guard fires.
+/// The "async driver drives the TOCTOU guard" variant is covered by the
+/// generation-advance test (`test_workspace_switch_after_preflight_aborts_before_stop`).
+#[tokio::test]
+async fn test_record_mesh_change_after_preflight_aborts_before_stop() {
     use crate::managed_agents::{
         storage::save_managed_agents_at, BackendKind, ManagedAgentPairRuntime, ManagedAgentRecord,
         ManagedAgentRuntimeKey,
@@ -531,22 +616,19 @@ fn test_record_mesh_change_after_preflight_aborts_before_stop() {
         name_pool: vec![],
     };
     save_managed_agents_at(tmp.path(), std::slice::from_ref(&record)).unwrap();
+    std::fs::write(tmp.path().join("personas.json"), b"[]").unwrap();
+    std::fs::write(tmp.path().join("global-agent-config.json"), b"{}").unwrap();
 
     let app = make_mock_app();
     let app_handle = app.handle().clone();
 
-    // Seed a live runtime with a long-running process (avoids sync eviction).
+    // Seed a live runtime with a cross-platform long-lived child (avoids sync eviction).
     let rt_key = ManagedAgentRuntimeKey::new(&pubkey, relay_url).unwrap();
-    {
+    let seeded_pid = {
         let state = app_handle.state::<crate::app_state::AppState>();
         let mut runtimes = state.managed_agent_processes.lock().unwrap();
-        let child = std::process::Command::new("sleep")
-            .arg("10000")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn sleep 10000");
+        let child = spawn_long_lived_child_for_test();
+        let pid = child.id();
         let process = crate::managed_agents::ManagedAgentProcess {
             child,
             log_path: std::path::PathBuf::new(),
@@ -567,7 +649,8 @@ fn test_record_mesh_change_after_preflight_aborts_before_stop() {
             rt_key,
             ManagedAgentPairRuntime::starting(process, Some("test-scope".to_string())),
         );
-    }
+        pid
+    };
 
     let gen = crate::managed_agents::scope::current_scope_generation();
     let scope = crate::managed_agents::scope::WorkspaceAgentScope {
@@ -604,23 +687,29 @@ fn test_record_mesh_change_after_preflight_aborts_before_stop() {
     let stop_called2 = stop_called.clone();
 
     // Call the epoch core directly — mesh_fn is not involved here since
-    // we're testing the in-epoch TOCTOU check.
-    let result = restart_under_captured_epoch_for(
-        &app_handle,
-        &pubkey,
-        &old_global,
-        &new_global,
-        &[],
-        &context_with_mesh,
-        move |_app, _rec, _runtimes| {
-            stop_called2.store(true, std::sync::atomic::Ordering::SeqCst);
-            Err("stop_fn called unexpectedly".to_string())
-        },
-        |_app, _rec, _relay, _owner, _personas, _global, _teams| {
-            Err("spawn not expected".to_string())
-        },
-        |_app, _receipt| Err("receipt not expected".to_string()),
-    );
+    // we're testing the in-epoch TOCTOU check that re-resolves relay_mesh.
+    // This exercises the same code path that the async driver reaches after
+    // mesh_fn completes: stop→spawn epoch with pre-captured context.
+    let result = tokio::task::spawn_blocking(move || {
+        restart_under_captured_epoch_for(
+            &app_handle,
+            &pubkey,
+            &old_global,
+            &new_global,
+            &[],
+            &context_with_mesh,
+            move |_app, _rec, _runtimes| {
+                stop_called2.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err("stop_fn called unexpectedly".to_string())
+            },
+            |_app, _rec, _relay, _owner, _personas, _global, _teams| {
+                Err("spawn not expected".to_string())
+            },
+            |_app, _receipt| Err("receipt not expected".to_string()),
+        )
+    })
+    .await
+    .expect("spawn_blocking must not panic");
 
     assert!(
         matches!(result, Err(EpochError::Skipped(_))),
@@ -636,6 +725,8 @@ fn test_record_mesh_change_after_preflight_aborts_before_stop() {
         !stop_called.load(std::sync::atomic::Ordering::SeqCst),
         "stop must NOT be called when Mesh model changed after preflight"
     );
+    // Cleanup: kill the seeded long-lived process so it doesn't leak.
+    let _ = crate::managed_agents::terminate_process(seeded_pid);
 }
 
 #[path = "global_agent_config_epoch_tests.rs"]

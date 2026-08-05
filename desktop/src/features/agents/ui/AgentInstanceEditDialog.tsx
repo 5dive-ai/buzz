@@ -25,6 +25,7 @@ import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
+import { useNamePoolEdit } from "./useNamePoolEdit";
 import {
   ADVANCED_FIELDS_MOTION_TRANSITION,
   AUTO_PROVIDER_DROPDOWN_VALUE,
@@ -153,6 +154,7 @@ export function AgentInstanceEditDialog({
     [agent.personaId, personasQuery.data],
   );
   const inheritedEnvVars = linkedPersona?.envVars ?? {};
+  const namePoolEdit = useNamePoolEdit({ open, linkedPersona });
   const [respondTo, setRespondTo] = React.useState<RespondToMode>(
     agent.respondTo,
   );
@@ -266,10 +268,9 @@ export function AgentInstanceEditDialog({
     return runtimeSupportsLlmProviderSelection(matched?.id ?? "");
   }, [runtimes, originalAgentCommand]);
 
-  // The runtime id active after submit. Inheriting resolves from the LINKED PERSONA's runtime
-  // (that is what runs once the override is cleared, not the current override).
-  // Falls back to dual-match (command path, then id) when no persona or its runtime is unset.
-  // This single prospective id feeds BOTH the block-save gate and submit so they always agree.
+  // The runtime id active after submit. Inheriting resolves from the linked
+  // persona's runtime; falls back to dual-match when no persona exists.
+  // Feeds both the block-save gate and submit so they always agree.
   const prospectiveRuntimeId = React.useMemo(() => {
     if (!inheritHarness) {
       return selectedRuntime?.id ?? selectedRuntimeId;
@@ -394,11 +395,8 @@ export function AgentInstanceEditDialog({
   const { data: bakedEnvKeys } = useBakedBuildEnvKeysQuery({ enabled: open });
 
   // Merge global env as the base layer so credential keys satisfied via global
-  // config (e.g. ANTHROPIC_API_KEY) are available to model discovery. Use
-  // `inheritedSubmission.envVars` (the same snapshot the credential gate
-  // validates) rather than raw `envVars`, so an inherit-transition that layers
-  // in persona env vars is reflected in discovery. Agent-local env takes
-  // precedence, matching the agent → global → file spawn-path precedence.
+  // config are available to model discovery. Agent-local env takes precedence,
+  // matching the agent → global → file spawn-path precedence.
   const envVarsForDiscovery = React.useMemo(
     () => ({ ...globalConfig.env_vars, ...inheritedSubmission.envVars }),
     [globalConfig.env_vars, inheritedSubmission.envVars],
@@ -421,11 +419,8 @@ export function AgentInstanceEditDialog({
     selectedRuntime,
   });
 
-  // D2: derive advancedRequiredEnvKeys for EnvVarsEditor display.
-  // The full requiredEnvKeys/requiredEnvKeyMissing continue driving Save gating.
-  // D2/D3: the top-level API key owns display, while the readiness gate keeps
-  // the complete required-key list. The effective snapshot covers persona
-  // inheritance during an instance inherit transition.
+  // Derive advancedRequiredEnvKeys for EnvVarsEditor display; the top-level
+  // API key owns display while the readiness gate keeps the full required-key list.
   const providerApiKeyEnvVar = getProviderApiKeyEnvVar(effectiveProvider);
   const personaSatisfied =
     providerApiKeyEnvVar != null &&
@@ -610,6 +605,7 @@ export function AgentInstanceEditDialog({
     }) &&
     providerValid &&
     !updateMutation.isPending &&
+    !namePoolEdit.isPending &&
     !isAvatarUploadPending;
 
   async function handleSubmit() {
@@ -732,6 +728,8 @@ export function AgentInstanceEditDialog({
           autoRestartOnConfigChange,
         );
       }
+      // Save name pool changes to the linked definition (handled inside the hook).
+      await namePoolEdit.saveIfChanged();
       showAgentProfileSyncWarning(result.agent.name, result.profileSyncError);
       handleOpenChange(false);
       onUpdated?.(result.agent);
@@ -1194,6 +1192,7 @@ export function AgentInstanceEditDialog({
                       linkedPersona={linkedPersona}
                       model={inheritedSubmission.model ?? ""}
                       modelTuningRuntimeId={prospectiveRuntimeId}
+                      namePoolText={namePoolEdit.namePoolText}
                       parallelism={parallelism}
                       provider={effectiveProvider}
                       requiredEnvKeys={advancedRequiredEnvKeys}
@@ -1205,6 +1204,7 @@ export function AgentInstanceEditDialog({
                       onAutoRestartChange={setAutoRestartOnConfigChange}
                       onEnvVarsChange={setEnvVars}
                       onInheritHarnessChange={setInheritHarness}
+                      onNamePoolTextChange={namePoolEdit.setNamePoolText}
                       onParallelismChange={setParallelism}
                       onSystemPromptChange={setSystemPrompt}
                     />

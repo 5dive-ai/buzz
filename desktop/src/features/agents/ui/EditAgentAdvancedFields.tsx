@@ -43,6 +43,7 @@ export function EditAgentAdvancedFields({
   linkedPersona,
   model,
   modelTuningRuntimeId,
+  namePoolText,
   parallelism,
   provider,
   requiredEnvKeys,
@@ -53,6 +54,7 @@ export function EditAgentAdvancedFields({
   onAgentArgsChange,
   onEnvVarsChange,
   onInheritHarnessChange,
+  onNamePoolTextChange,
   onParallelismChange,
   onAutoRestartChange,
   onSystemPromptChange,
@@ -77,6 +79,12 @@ export function EditAgentAdvancedFields({
    * EditAgentDialog — the resolved runtime, not the "inherit"/"custom" sentinel.
    */
   modelTuningRuntimeId: string;
+  /**
+   * Comma-separated name pool text from the linked definition. When provided
+   * (i.e. linkedPersona is non-null), the name pool field is shown so the user
+   * can edit instance names without needing to open the definition dialog.
+   */
+  namePoolText?: string;
   parallelism: string;
   /** Active LLM provider id — forwarded to BuzzAgentModelTuningFields for effort filtering. */
   provider?: string;
@@ -104,6 +112,8 @@ export function EditAgentAdvancedFields({
   onAgentArgsChange: (value: string) => void;
   onEnvVarsChange: (value: EnvVarsValue) => void;
   onInheritHarnessChange: (value: boolean) => void;
+  /** Called when the user edits the name pool text field. Only relevant when linkedPersona is non-null. */
+  onNamePoolTextChange?: (value: string) => void;
   onParallelismChange: (value: string) => void;
   onAutoRestartChange: (value: boolean) => void;
   onSystemPromptChange: (value: string) => void;
@@ -323,6 +333,44 @@ export function EditAgentAdvancedFields({
           </div>
         </div>
       )}
+
+      {/* Instance name pool — only shown when there is a linked definition.
+          Names are drawn from this pool when spawning new instances; the
+          user can edit the pool here without opening the definition dialog. */}
+      {linkedPersona != null &&
+      namePoolText !== undefined &&
+      onNamePoolTextChange ? (
+        <div className="space-y-1.5">
+          <label
+            className="text-sm font-medium text-foreground"
+            htmlFor="edit-agent-name-pool"
+          >
+            Instance name pool
+            <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
+          </label>
+          <div
+            className={cn(
+              "flex min-h-11 items-center px-3",
+              PERSONA_FIELD_SHELL_CLASS,
+            )}
+          >
+            <Input
+              autoCapitalize="words"
+              autoCorrect="off"
+              className={cn(
+                "h-8 px-0 py-0 leading-6",
+                PERSONA_FIELD_CONTROL_CLASS,
+              )}
+              disabled={disabled}
+              id="edit-agent-name-pool"
+              onChange={(event) => onNamePoolTextChange(event.target.value)}
+              placeholder="Birch, Compass, Ridge, Thistle"
+              spellCheck={false}
+              value={namePoolText}
+            />
+          </div>
+        </div>
+      ) : null}
 
       {/* Env vars */}
       <EnvVarsEditor

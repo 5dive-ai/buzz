@@ -1,8 +1,23 @@
 import * as React from "react";
 import { useReducedMotion } from "motion/react";
 
-import type { MeshPeer } from "@/shared/api/tauriMesh";
+import type { MeshDeviceState } from "@/shared/api/tauriMesh";
 import { cn } from "@/shared/lib/cn";
+
+/**
+ * One node on the ring, from either source.
+ *
+ * Live gossip peers carry an RTT and are reachable *now*. Relay status notes
+ * carry no RTT and are only *last known* (valid 120s), so they land mid-band.
+ * The caller says which it passed via `live`, and the caption names it — the
+ * field never implies reachability it cannot show.
+ */
+export type MeshFieldNode = {
+  id: string;
+  state: MeshDeviceState;
+  capacityGb: number | null;
+  rttMs: number | null;
+};
 
 /**
  * Canvas-2D radar field for the mesh.
@@ -66,7 +81,7 @@ const DARK: Palette = {
   ghost: "148, 163, 184",
 };
 
-function peerColor(state: MeshPeer["state"], palette: Palette): string {
+function peerColor(state: MeshDeviceState, palette: Palette): string {
   if (state === "serving") return palette.serving;
   if (state === "consuming") return palette.consuming;
   return palette.standby;
@@ -87,15 +102,22 @@ function sizeFor(capacityGb: number | null): number {
 }
 
 export function MeshRadarField({
-  peers,
+  nodes,
   selfCapacityGb,
+  selfParticipating,
   ghostCount,
   busyNow,
   className,
   height = 150,
 }: {
-  peers: MeshPeer[];
+  nodes: MeshFieldNode[];
   selfCapacityGb: number | null;
+  /**
+   * Whether this machine is in the mesh. When false the centre is drawn hollow:
+   * we are looking at a pool we have not joined, and a solid centre would claim
+   * membership we do not have.
+   */
+  selfParticipating: boolean;
   /** Community members with no node. Drawn as a dashed band, count only. */
   ghostCount: number;
   busyNow: boolean;
@@ -121,13 +143,21 @@ export function MeshRadarField({
 
   // Snapshot the frame inputs so the draw loop is not re-created per render.
   const frame = React.useRef({
-    peers,
+    nodes,
     selfCapacityGb,
+    selfParticipating,
     ghostCount,
     busyNow,
     isDark,
   });
-  frame.current = { peers, selfCapacityGb, ghostCount, busyNow, isDark };
+  frame.current = {
+    nodes,
+    selfCapacityGb,
+    selfParticipating,
+    ghostCount,
+    busyNow,
+    isDark,
+  };
 
   React.useEffect(() => {
     const canvas = canvasRef.current;
@@ -142,8 +172,9 @@ export function MeshRadarField({
     const draw = (now: number) => {
       if (disposed) return;
       const {
-        peers: livePeers,
+        nodes: fieldNodes,
         selfCapacityGb: selfGb,
+        selfParticipating: joined,
         ghostCount: ghosts,
         busyNow: busy,
         isDark: dark,
@@ -201,8 +232,8 @@ export function MeshRadarField({
       }
 
       // Peers: angle spread evenly, radius from RTT, size from capacity.
-      const count = livePeers.length;
-      livePeers.forEach((peer, index) => {
+      const count = fieldNodes.length;
+      fieldNodes.forEach((peer, index) => {
         const spread = count === 0 ? 0 : (index / count) * Math.PI * 2;
         const angle = spread - Math.PI / 2 + hashUnit(peer.id) * 0.4;
         const radius = radiusFor(peer.rttMs, innerMin, innerMax);
@@ -210,15 +241,20 @@ export function MeshRadarField({
         const y = cy + Math.sin(angle) * radius;
         const rgb = peerColor(peer.state, palette);
 
-        // Edge: real adjacency. Opacity carries RTT — closer reads stronger.
-        const proximity =
-          peer.rttMs === null ? 0.5 : 1 - Math.min(1, peer.rttMs / 120);
-        context.strokeStyle = `rgba(${palette.edge}, ${0.12 + proximity * 0.22})`;
-        context.lineWidth = 1;
-        context.beginPath();
-        context.moveTo(cx, cy);
-        context.lineTo(x, y);
-        context.stroke();
+        // A spoke asserts "this machine is connected to that node". True only
+        // when we have joined; from the outside the nodes are real but our
+        // adjacency to them is not, so the spokes are simply omitted.
+        if (joined) {
+          // Opacity carries RTT — closer reads stronger.
+          const proximity =
+            peer.rttMs === null ? 0.5 : 1 - Math.min(1, peer.rttMs / 120);
+          context.strokeStyle = `rgba(${palette.edge}, ${0.12 + proximity * 0.22})`;
+          context.lineWidth = 1;
+          context.beginPath();
+          context.moveTo(cx, cy);
+          context.lineTo(x, y);
+          context.stroke();
+        }
 
         // Breathing, phase-seeded by id so the field shimmers rather than blinks.
         const phase = hashUnit(`${peer.id}:phase`) * Math.PI * 2;
@@ -262,22 +298,39 @@ export function MeshRadarField({
         cy,
         selfSize * 3.6,
       );
-      selfGlow.addColorStop(0, `rgba(${palette.self}, ${dark ? 0.42 : 0.34})`);
-      selfGlow.addColorStop(1, `rgba(${palette.self}, 0)`);
+      selfGlow.addColorStop(
+        0,
+        joined
+          ? `rgba(${palette.self}, ${dark ? 0.42 : 0.34})`
+          : `rgba(${palette.standby}, ${dark ? 0.16 : 0.12})`,
+      );
+      selfGlow.addColorStop(
+        1,
+        `rgba(${joined ? palette.self : palette.standby}, 0)`,
+      );
       context.fillStyle = selfGlow;
       context.beginPath();
       context.arc(cx, cy, selfSize * 3.6, 0, Math.PI * 2);
       context.fill();
 
-      context.fillStyle = `rgba(${palette.self}, 0.98)`;
-      context.beginPath();
-      context.arc(cx, cy, selfSize, 0, Math.PI * 2);
-      context.fill();
-      context.strokeStyle = dark
-        ? "rgba(255, 255, 255, 0.5)"
-        : "rgba(255, 255, 255, 0.85)";
-      context.lineWidth = 1.4;
-      context.stroke();
+      if (joined) {
+        context.fillStyle = `rgba(${palette.self}, 0.98)`;
+        context.beginPath();
+        context.arc(cx, cy, selfSize, 0, Math.PI * 2);
+        context.fill();
+        context.strokeStyle = dark
+          ? "rgba(255, 255, 255, 0.5)"
+          : "rgba(255, 255, 255, 0.85)";
+        context.lineWidth = 1.4;
+        context.stroke();
+      } else {
+        // Hollow centre: this is a pool we are looking at, not one we are in.
+        context.strokeStyle = `rgba(${palette.standby}, ${dark ? 0.7 : 0.6})`;
+        context.lineWidth = 1.4;
+        context.beginPath();
+        context.arc(cx, cy, selfSize, 0, Math.PI * 2);
+        context.stroke();
+      }
 
       // A frozen field needs no frames; reduced motion draws once and stops.
       if (!shouldReduceMotion) {

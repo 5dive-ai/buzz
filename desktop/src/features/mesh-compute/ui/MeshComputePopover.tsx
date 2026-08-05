@@ -11,6 +11,7 @@ import {
   describeStartupStage,
 } from "../meshCardModel";
 import { deriveMeshDetailModel } from "../meshDetailModel";
+import { deriveMeshFieldModel } from "../meshFieldNodes";
 import { MeshMemoryBulbs } from "./MeshMemoryBulbs";
 import { MeshRadarField } from "./MeshRadarField";
 
@@ -62,12 +63,10 @@ export function MeshComputePopover({
   });
   const isStarting = row.tone === "starting";
   const selectedModel = status?.modelName ?? status?.modelId ?? modelToShare;
-  // Members with no published status note. A count only: a member who never
-  // started a node has disclosed no hardware, so they never imply capacity.
-  const ghostCount = Math.max(
-    0,
-    (snapshot?.memberCount ?? 0) - (snapshot?.sharingDeviceCount ?? 0),
-  );
+  // The field renders from live gossip when a node is up, and from other
+  // members' relay status notes when it is not — the community's shared compute
+  // is knowable either way. See meshFieldNodes.ts.
+  const field = deriveMeshFieldModel({ view, snapshot });
 
   return (
     <Popover>
@@ -108,14 +107,25 @@ export function MeshComputePopover({
             />
           </div>
 
-          {model.connected ? (
-            <MeshRadarField
-              busyNow={model.busyNow}
-              ghostCount={ghostCount}
-              peers={view?.peers ?? []}
-              selfCapacityGb={view?.selfCapacityGb ?? null}
-            />
-          ) : null}
+          {field.source === "none" && field.ghostCount === 0 ? null : (
+            <div className="flex flex-col gap-1">
+              <MeshRadarField
+                busyNow={model.busyNow}
+                ghostCount={field.ghostCount}
+                nodes={field.nodes}
+                selfCapacityGb={field.selfCapacityGb}
+                selfParticipating={field.selfParticipating}
+              />
+              {field.caption ? (
+                <p
+                  className="text-2xs leading-snug text-muted-foreground"
+                  data-testid="mesh-field-caption"
+                >
+                  {field.caption}
+                </p>
+              ) : null}
+            </div>
+          )}
 
           {toggle.isSharing && !isStarting ? (
             <MeshMemoryBulbs memory={memory} />
@@ -171,11 +181,12 @@ export function MeshComputePopover({
             ) : null}
           </div>
 
-          {model.connected ? null : (
+          {field.source === "none" ? (
             <p className="border-border/60 border-t pt-2 text-2xs leading-snug text-muted-foreground">
-              Turn on sharing to see who's on the mesh.
+              No one is sharing compute here yet. Turn on sharing to start the
+              community mesh.
             </p>
-          )}
+          ) : null}
 
           {callToAction.kind === "createAgent" ? (
             // A tip, not a warning: there is compute here and nothing set up to

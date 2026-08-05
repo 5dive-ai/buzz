@@ -38,6 +38,41 @@ test("avatar step always shows Skip for now button without an error", async ({
   });
 });
 
+test("avatar step shares the profile emoji picker controls", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await installMockBridge(page, undefined, { skipOnboardingSeed: true });
+  await page.goto("/");
+
+  await page.getByTestId("onboarding-display-name").fill("Morty QA");
+  await page.getByTestId("onboarding-next").click();
+  await page.getByRole("tab", { name: "Emoji" }).click();
+
+  const picker = page.locator("em-emoji-picker");
+  await expect(picker.locator("input[type='search']")).toBeVisible();
+  await expect(page.getByTestId("onboarding-avatar-emoji-picker")).toHaveCSS(
+    "height",
+    "384px",
+  );
+
+  const controlHeights = await picker.evaluate((element) => {
+    const input = element.shadowRoot?.querySelector<HTMLInputElement>(
+      'input[type="search"]',
+    );
+    const toneControl =
+      element.shadowRoot?.querySelector<HTMLElement>(".search + .flex");
+    if (!input || !toneControl) {
+      throw new Error("Onboarding emoji picker controls did not render.");
+    }
+    return {
+      input: input.getBoundingClientRect().height,
+      tone: toneControl.getBoundingClientRect().height,
+    };
+  });
+  expect(controlHeights).toEqual({ input: 48, tone: 48 });
+});
+
 test("avatar step skip button completes community profile setup", async ({
   page,
 }) => {

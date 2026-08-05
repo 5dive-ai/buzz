@@ -2111,6 +2111,80 @@ test("shows and clears activity indicators for active channel agents", async ({
   await expect(page.getByTestId("bot-activity-composer-trigger")).toBeVisible();
 });
 
+test("thread agent typing promotes only when activity exists", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  await page.getByTestId("channel-agents").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("agents");
+  await waitForMockLiveSubscription(page, "agents", KIND_TYPING_INDICATOR);
+  await page.waitForFunction(
+    () =>
+      typeof window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ === "function" &&
+      typeof window.__BUZZ_E2E_SEED_OBSERVER_EVENTS__ === "function",
+  );
+
+  const threadHeadId = await page.evaluate(() => {
+    const root = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+      channelName: "agents",
+      content: "Thread activity partition root",
+    });
+    if (!root) throw new Error("Failed to seed thread root");
+    window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+      channelName: "agents",
+      content: "Thread activity partition reply",
+      parentEventId: root.id,
+    });
+    return root.id;
+  });
+  const summary = page.locator(
+    `[data-testid="message-thread-summary"][data-thread-head-id="${threadHeadId}"]`,
+  );
+  await expect(summary).toBeVisible();
+  await summary.click();
+
+  const threadPanel = page.getByTestId("message-thread-panel");
+  await expect(threadPanel).toBeVisible();
+  await page.evaluate(
+    ({ pubkey, threadHeadId }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
+        channelName: "agents",
+        pubkey,
+        threadHeadId,
+      });
+    },
+    { pubkey: TEST_IDENTITIES.alice.pubkey, threadHeadId },
+  );
+
+  // Thread-only typing has no observer-backed session to preview, so it joins
+  // the thread typing group and must not manufacture an interactive pill.
+  await expect(
+    threadPanel.getByTestId("message-typing-indicator-label"),
+  ).toContainText("alice");
+  await expect(
+    threadPanel.getByTestId("bot-activity-composer-trigger"),
+  ).toHaveCount(0);
+
+  // Once channel-scoped observer activity exists, the same thread typer earns
+  // a pill and leaves the combined typing group. The explicit thread typing
+  // set keeps the promoted pill truthfully labeled "is typing…" even though
+  // thread typing is intentionally absent from the channel-wide registry.
+  await seedPillActivityMessage(page, {
+    agentPubkey: TEST_IDENTITIES.alice.pubkey,
+    atMs: Date.now(),
+    seq: Date.now(),
+    text: "Alice: inspecting the thread context",
+    turnId: "thread-indicator-turn",
+  });
+  const pill = threadPanel.getByTestId("bot-activity-composer-trigger");
+  await expect(pill).toBeVisible();
+  await expect(pill).toContainText("alice is typing");
+  await expect(threadPanel.getByTestId("message-typing-indicator")).toHaveCount(
+    0,
+  );
+});
+
 test("composer does not shift when the activity row mounts and clears", async ({
   page,
 }) => {

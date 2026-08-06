@@ -12,7 +12,9 @@ use tauri::AppHandle;
 
 use crate::{
     app_state::{AppState, ArchiveScope},
-    managed_agents::{agent_events::managed_agent_content_from_event, load_managed_agents},
+    managed_agents::{
+        agent_events::managed_agent_content_from_event, load_managed_agents, ManagedAgentRecord,
+    },
     relay::{
         classify_request_error, query_relay_at_with_keys, relay_api_base_url, relay_http_base_url,
     },
@@ -392,6 +394,41 @@ pub(super) fn reduce_snapshot_query_result<E>(
     }
 }
 
+// ── Local agent index builder ─────────────────────────────────────────────
+
+/// Build a normalized pubkey → [`LocalAgentSummary`] index from the raw
+/// managed-agent records result.
+///
+/// This is the testable entry point that covers the two local-store arms:
+/// - `Err(e)` → propagated as `Err("managed_agents_store_lock: …")` so the
+///   caller can NEVER produce a successful all-relay-only inventory when the
+///   local store is unreadable.
+/// - `Ok(records)` → deduped, normalised (lowercase pubkey), empty-pubkey
+///   rows filtered out.
+///
+/// The production code calls `build_local_agent_index(load_managed_agents(&app))?`
+/// so a storage failure propagates exactly here. Unit tests inject `Err(…)`
+/// directly to prove the mutation guard without needing a live `AppHandle`.
+pub(super) fn build_local_agent_index<E: std::fmt::Display>(
+    records_result: Result<Vec<ManagedAgentRecord>, E>,
+) -> Result<HashMap<String, LocalAgentSummary>, String> {
+    let records = records_result
+        .map_err(|e| format!("managed_agents_store_lock: failed to load local agents: {e}"))?;
+    Ok(records
+        .into_iter()
+        .filter(|r| !r.pubkey.is_empty())
+        .map(|r| {
+            let norm = r.pubkey.to_ascii_lowercase();
+            let summary = LocalAgentSummary {
+                pubkey: norm.clone(),
+                name: r.name,
+                persona_id: r.persona_id,
+            };
+            (norm, summary)
+        })
+        .collect())
+}
+
 // ── Parse kind:0 content ──────────────────────────────────────────────────
 
 fn parse_display_fields(content: &str) -> (Option<String>, Option<String>) {
@@ -440,23 +477,8 @@ pub async fn get_owned_agent_inventory(
     // storage error here would silently reclassify every local instance as
     // "Relay only", which could steer the archive decision to the wrong
     // duplicate — exactly the scenario this feature exists to prevent.
-    let local_by_pubkey: HashMap<String, LocalAgentSummary> = {
-        let records = load_managed_agents(&app)
-            .map_err(|e| format!("managed_agents_store_lock: failed to load local agents: {e}"))?;
-        records
-            .into_iter()
-            .filter(|r| !r.pubkey.is_empty())
-            .map(|r| {
-                let norm = r.pubkey.to_ascii_lowercase();
-                let summary = LocalAgentSummary {
-                    pubkey: norm.clone(),
-                    name: r.name,
-                    persona_id: r.persona_id,
-                };
-                (norm, summary)
-            })
-            .collect()
-    };
+    let local_by_pubkey: HashMap<String, LocalAgentSummary> =
+        build_local_agent_index(load_managed_agents(&app))?;
 
     // Bounded batch: fetch all kind:0 profiles concurrently but fail the
     // entire snapshot on transport error (a partial inventory is dangerous
@@ -790,35 +812,22 @@ mod tests {
     /// `get_owned_agent_inventory` from silently returning a relay-only snapshot
     /// that mislabels every local instance as "Relay only".
     ///
-    /// The `?` propagation in the production code means: if
-    /// `load_managed_agents` fails, the ENTIRE command fails — it can NEVER
-    /// yield a successful all-relay-only output when the local store is broken.
-    /// This test documents and guards that invariant at the logic level.
+    /// Drives `build_local_agent_index` — the production helper wired via `?` into
+    /// `get_owned_agent_inventory` — with an `Err` result. Mutation guard: restoring
+    /// `unwrap_or_default()` in the helper makes this test fail.
     #[test]
     fn local_store_failure_propagates_not_silently_dropped() {
-        // Simulate the load_managed_agents error path: `Err(msg)` must propagate.
-        let err: Result<Vec<()>, String> = Err("simulated store lock poisoned".to_string());
-        // map_err mirrors the production code's error context annotation.
-        let mapped =
-            err.map_err(|e| format!("managed_agents_store_lock: failed to load local agents: {e}"));
-        // The error must propagate, NOT be converted to an empty default.
+        // Inject the error path directly into the production helper.
+        let result =
+            build_local_agent_index::<String>(Err("simulated store lock poisoned".to_string()));
         assert!(
-            mapped.is_err(),
+            result.is_err(),
             "local store failure must propagate as Err, not unwrap_or_default"
         );
-        let msg = mapped.unwrap_err();
+        let msg = result.unwrap_err();
         assert!(
             msg.contains("managed_agents_store_lock"),
             "error message must include context prefix: got {msg}"
-        );
-        // Prove the complement: the old unwrap_or_default() behaviour would have
-        // silently returned an empty vec here, masking the failure.
-        #[allow(clippy::unnecessary_literal_unwrap)]
-        let silenced: Vec<()> =
-            Err::<Vec<()>, String>("store error".to_string()).unwrap_or_default();
-        assert!(
-            silenced.is_empty(),
-            "unwrap_or_default silently returns empty — this is the behaviour we removed"
         );
     }
 

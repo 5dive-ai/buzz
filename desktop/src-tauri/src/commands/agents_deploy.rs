@@ -101,6 +101,27 @@ pub(super) fn build_launch_block(
         policy_env.insert("BUZZ_ACP_TEAM_INSTRUCTIONS".into(), value);
     }
 
+    // Permission policy: injected into policy_env so the remote process uses the
+    // same resolved value as a local spawn. Because deployed remote agents are
+    // read-only for this field (changing it requires shutdown + redeploy), the
+    // value here is always the record's own field falling back to the built-in
+    // (`ask`). The global config is intentionally not consulted for remote deploy —
+    // the global config is a desktop-local setting, not a per-record contract.
+    {
+        // For remote deploys we resolve directly from the record + built-in.
+        // The global config is not available here (it's a desktop-local fallback);
+        // an empty GlobalAgentConfig has no permission_policy so only the record
+        // and built-in are consulted — correct for a remote agent whose lifetime
+        // outlasts the spawning desktop session.
+        let remote_policy = record
+            .permission_policy
+            .unwrap_or_else(crate::managed_agents::permission_policy::PermissionPolicy::desktop_default);
+        policy_env.insert(
+            "BUZZ_ACP_PERMISSION_POLICY".into(),
+            remote_policy.as_str().to_string(),
+        );
+    }
+
     serde_json::json!({
         "command": descriptor.command,
         "args": descriptor.args,

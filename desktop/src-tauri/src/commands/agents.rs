@@ -913,6 +913,7 @@ pub async fn create_managed_agent(
             } else {
                 relay_mesh.clone()
             },
+            permission_policy: None, // inherits global default or built-in `ask`
         };
 
         records.push(record);

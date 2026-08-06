@@ -384,10 +384,39 @@ export type ManagedAgent = {
    * `"allowlist"`. Preserved across mode toggles.
    */
   respondToAllowlist: string[];
+  /**
+   * Effective permission policy at the last spawn. Determines how the ACP
+   * harness answers `session/request_permission` calls.
+   */
+  permissionPolicy: PermissionPolicy;
+  /**
+   * Where the effective `permissionPolicy` value came from: a per-agent
+   * override, the fleet-wide global default, or the built-in desktop default.
+   */
+  permissionPolicySource: PermissionPolicySource;
 };
 
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */
 export type RespondToMode = "owner-only" | "allowlist" | "anyone";
+
+/**
+ * Permission policy controlling how the ACP harness answers
+ * `session/request_permission` calls.
+ *
+ * - `ask`: Show an actionable Allow/Deny card in the transcript (desktop default).
+ * - `allow`: Auto-approve the unique `allow_once` option (explicit opt-in).
+ * - `reject`: Auto-deny all requests without surfacing a card.
+ */
+export type PermissionPolicy = "ask" | "allow" | "reject";
+
+/**
+ * Where the effective permission policy value came from.
+ *
+ * - `agent`: Per-agent override set on this specific agent record.
+ * - `global_default`: Fleet-wide default from the global agent config.
+ * - `built_in`: Neither layer had a value; the desktop built-in default (`ask`) applies.
+ */
+export type PermissionPolicySource = "agent" | "global_default" | "built_in";
 
 export type BackendProviderCandidate = {
   id: string;
@@ -443,6 +472,8 @@ export type CreateManagedAgentInput = {
    */
   respondToAllowlist?: string[];
   relayMesh?: RelayMeshConfig;
+  /** Per-agent permission policy override. Omitted = inherit from global or built-in default. */
+  permissionPolicy?: PermissionPolicy;
 };
 
 export type CreateManagedAgentResponse = {
@@ -475,9 +506,11 @@ export type SwitchManagedAgentModelStatus =
   | "no_active_turn";
 
 export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model";
+  type: "cancel_turn" | "switch_model" | "permission_decision";
   status: string;
   modelId?: string;
+  /** Present on `permission_decision` results — identifies the request card to retire. */
+  requestNonce?: string;
 };
 
 export type GitBashPrerequisite = {
@@ -706,6 +739,11 @@ export type UpdateManagedAgentInput = {
    * (validated & normalized server-side).
    */
   respondToAllowlist?: string[];
+  /**
+   * Absent = don't touch. Present = override (or `null` to clear back to inherit).
+   * Remote deployed agents: read-only; edit the deploy config and redeploy.
+   */
+  permissionPolicy?: PermissionPolicy | null;
 };
 export type AgentPersona = {
   id: string;

@@ -852,6 +852,18 @@ pub async fn update_managed_agent(
             record.respond_to_allowlist = prospective_allowlist;
         }
 
+        // Per-agent permission policy. `None` = clear override; remote agents are read-only.
+        if let Some(policy_opt) = input.permission_policy {
+            if matches!(
+                record.backend,
+                crate::managed_agents::BackendKind::Provider { .. }
+            ) && record.backend_agent_id.is_some()
+            {
+                return Err("permission_policy is read-only while the agent is deployed remotely; shut down and redeploy to change it".to_string());
+            }
+            record.permission_policy = policy_opt;
+        }
+
         record.updated_at = now_iso();
 
         save_managed_agents(&app, &records)?;

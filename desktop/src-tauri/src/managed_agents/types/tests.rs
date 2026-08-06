@@ -745,7 +745,8 @@ fn summary_fixture(
         respond_to: RespondTo::OwnerOnly,
         respond_to_allowlist: Vec::new(),
         permission_policy: crate::managed_agents::permission_policy::PermissionPolicy::Ask,
-        permission_policy_source: crate::managed_agents::permission_policy::PermissionPolicySource::BuiltIn,
+        permission_policy_source:
+            crate::managed_agents::permission_policy::PermissionPolicySource::BuiltIn,
     }
 }
 

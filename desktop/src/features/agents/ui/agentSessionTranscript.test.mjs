@@ -2077,3 +2077,260 @@ test("buildTranscript session/new bare systemPrompt field takes precedence over 
     "_meta.systemPrompt.append must not appear when bare field is present",
   );
 });
+
+// ── authorization envelope + nonce-keyed cards ────────────────────────────────
+
+/** Build an acp_read permission event with a full authorization envelope. */
+function makePermissionRequestWithAuth(
+  seq,
+  requestId,
+  nonce,
+  { actionable = true, reason, turnId = "turn-1", channelId = "ch-1" } = {},
+) {
+  return {
+    seq,
+    timestamp: "2026-07-01T10:00:00.000Z",
+    kind: "acp_read",
+    agentIndex: 0,
+    channelId,
+    sessionId: "session-1",
+    turnId,
+    payload: {
+      jsonrpc: "2.0",
+      id: requestId,
+      method: "session/request_permission",
+      params: {
+        title: "Confirm push",
+        toolCallId: "tool-1",
+        options: [
+          { optionId: "allow_once", kind: "allow_once", name: "Allow" },
+          { optionId: "reject_once", kind: "reject_once", name: "Reject" },
+        ],
+      },
+    },
+    authorization: { requestNonce: nonce, actionable, reason },
+  };
+}
+
+test("buildTranscript_nonce_keyed_card_is_actionable_with_options", () => {
+  // An acp_read with an authorization envelope should produce one card
+  // keyed by nonce, with actionable=true and the parsed options attached.
+  const transcript = buildTranscript([
+    makePermissionRequestWithAuth(1, "req-n1", "nonce-abc"),
+  ]);
+
+  assert.equal(transcript.length, 1);
+  const item = transcript[0];
+  assert.equal(item.type, "lifecycle");
+  assert.equal(item.renderClass, "permission");
+  assert.equal(item.requestNonce, "nonce-abc");
+  assert.equal(item.actionable, true);
+  assert.equal(item.channelId, "ch-1");
+  assert.ok(Array.isArray(item.options));
+  assert.equal(item.options.length, 2);
+  assert.equal(item.options[0].optionId, "allow_once");
+  // Card is keyed by nonce, not by turn.
+  assert.ok(
+    item.id.includes("nonce-abc"),
+    `expected nonce in id, got ${item.id}`,
+  );
+});
+
+test("buildTranscript_actionable_false_envelope_produces_read_only_card", () => {
+  const transcript = buildTranscript([
+    makePermissionRequestWithAuth(1, "req-n2", "nonce-readonly", {
+      actionable: false,
+      reason: "auto-rejected: reject policy",
+    }),
+  ]);
+
+  assert.equal(transcript.length, 1);
+  const item = transcript[0];
+  assert.equal(item.actionable, false);
+  assert.equal(item.authorizationReason, "auto-rejected: reject policy");
+});
+
+test("buildTranscript_concurrent_requests_same_turn_produce_separate_cards", () => {
+  // Two permission requests in the same turn with different nonces must each
+  // get their own card — nonce is the unique key.
+  const transcript = buildTranscript([
+    makePermissionRequestWithAuth(1, "req-c1", "nonce-c1", {
+      turnId: "turn-1",
+    }),
+    makePermissionRequestWithAuth(2, "req-c2", "nonce-c2", {
+      turnId: "turn-1",
+    }),
+  ]);
+
+  // Two distinct cards.
+  const cards = transcript.filter((i) => i.renderClass === "permission");
+  assert.equal(cards.length, 2, "expected two separate permission cards");
+  const nonces = cards.map((c) => c.requestNonce).sort();
+  assert.deepEqual(nonces, ["nonce-c1", "nonce-c2"]);
+  // Each card id is unique.
+  assert.notEqual(cards[0].id, cards[1].id);
+});
+
+test("buildTranscript_without_auth_envelope_falls_back_to_turn_keyed_card", () => {
+  // A permission request without an authorization envelope (legacy / reject
+  // policy path) still produces a card using the turn-based key.
+  const transcript = buildTranscript([
+    {
+      seq: 1,
+      timestamp: "2026-07-01T10:00:00.000Z",
+      kind: "acp_read",
+      agentIndex: 0,
+      channelId: "ch-1",
+      sessionId: "session-1",
+      turnId: "turn-legacy",
+      payload: {
+        jsonrpc: "2.0",
+        id: "req-leg",
+        method: "session/request_permission",
+        params: {
+          title: "Confirm push",
+          toolCallId: "tool-1",
+          options: [
+            { optionId: "allow_once", kind: "allow_once", name: "Allow" },
+          ],
+        },
+      },
+      // No authorization field.
+    },
+  ]);
+
+  assert.equal(transcript.length, 1);
+  const item = transcript[0];
+  assert.equal(item.renderClass, "permission");
+  assert.equal(item.requestNonce, undefined);
+  assert.equal(item.actionable, undefined);
+  // Fall-back key uses turn id.
+  assert.ok(
+    item.id.includes("turn-legacy"),
+    `expected turn id in fallback key, got ${item.id}`,
+  );
+});
+
+test("buildTranscript_uncertain_outcome_uses_pinned_copy", () => {
+  // The 'uncertain' terminal state must use the verbatim pinned copy, never
+  // "denied" or "failed closed".
+  const transcript = buildTranscript([
+    makePermissionRequest(1, "req-unc"),
+    makePermissionResponse(2, "req-unc", "uncertain"),
+  ]);
+
+  assert.equal(transcript.length, 1);
+  const item = transcript[0];
+  assert.equal(item.renderClass, "permission");
+  assert.match(
+    item.outcome ?? "",
+    /Approval outcome unknown.*agent process stopped/i,
+    "uncertain must use the pinned copy",
+  );
+  // Must not use 'denied' or 'failed closed'.
+  assert.doesNotMatch(item.outcome ?? "", /denied/i);
+  assert.doesNotMatch(item.outcome ?? "", /failed closed/i);
+});
+
+test("buildTranscript_timed_out_outcome_renders_correctly", () => {
+  const transcript = buildTranscript([
+    makePermissionRequest(1, "req-to"),
+    makePermissionResponse(2, "req-to", "timed_out"),
+  ]);
+
+  const item = transcript[0];
+  assert.equal(item.renderClass, "permission");
+  assert.ok(item.outcome, "timed_out should produce an outcome string");
+  assert.doesNotMatch(item.outcome ?? "", /Approved/i);
+});
+
+test("buildTranscript_nonce_card_channelId_is_threaded_from_event", () => {
+  // The channelId on the card must come from the event, not a hard-coded value,
+  // so PermissionDecisionButtons can pass it to sendPermissionDecision.
+  const transcript = buildTranscript([
+    makePermissionRequestWithAuth(1, "req-ch", "nonce-ch", {
+      channelId: "specific-channel-id",
+    }),
+  ]);
+
+  const item = transcript[0];
+  assert.equal(item.channelId, "specific-channel-id");
+});
+
+test("buildTranscript_control_result_non_sent_marks_card_delivery_failed", () => {
+  // A `control_result` with non-`sent` status must set deliveryFailed on the
+  // matching card so PermissionDecisionButtons can re-enable buttons for retry.
+  const nonce = "nonce-delivery-fail";
+  const events = [
+    // First: the permission request that creates the card.
+    makePermissionRequestWithAuth(1, "req-df", nonce),
+    // Second: a control_result with non-sent status.
+    {
+      seq: 2,
+      timestamp: "2026-07-01T10:00:01.000Z",
+      kind: "control_result",
+      agentIndex: 0,
+      channelId: "ch-1",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      payload: {
+        type: "permission_decision",
+        status: "no_active_turn",
+        requestNonce: nonce,
+        optionId: "allow_once",
+      },
+    },
+  ];
+  const transcript = buildTranscript(events);
+
+  const card = transcript.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === nonce,
+  );
+  assert.ok(card, "permission card must exist");
+  assert.equal(
+    card.deliveryFailed,
+    true,
+    "deliveryFailed must be set on non-sent control_result",
+  );
+  // Card must still be actionable so the user can retry.
+  assert.equal(
+    card.actionable,
+    true,
+    "card must remain actionable after delivery failure",
+  );
+});
+
+test("buildTranscript_control_result_sent_does_not_mark_delivery_failed", () => {
+  // A `control_result` with `sent` status must NOT set deliveryFailed — the
+  // click reached the harness successfully.
+  const nonce = "nonce-delivery-ok";
+  const events = [
+    makePermissionRequestWithAuth(1, "req-ok", nonce),
+    {
+      seq: 2,
+      timestamp: "2026-07-01T10:00:01.000Z",
+      kind: "control_result",
+      agentIndex: 0,
+      channelId: "ch-1",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      payload: {
+        type: "permission_decision",
+        status: "sent",
+        requestNonce: nonce,
+        optionId: "allow_once",
+      },
+    },
+  ];
+  const transcript = buildTranscript(events);
+
+  const card = transcript.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === nonce,
+  );
+  assert.ok(card, "permission card must exist");
+  assert.equal(
+    card.deliveryFailed,
+    undefined,
+    "deliveryFailed must not be set on sent control_result",
+  );
+});

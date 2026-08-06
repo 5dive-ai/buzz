@@ -1050,6 +1050,12 @@ export type GlobalAgentConfig = {
   model: string | null;
   /** Preferred ACP runtime for agents without a persona-specific runtime. */
   preferred_runtime: string | null;
+  /**
+   * Fleet-wide permission policy fallback. Null = no fleet default; agents
+   * without a per-agent policy use the built-in desktop default (`ask`).
+   * Mirrors `GlobalAgentConfig.permission_policy` in Rust.
+   */
+  permission_policy: PermissionPolicy | null;
 };
 
 /**

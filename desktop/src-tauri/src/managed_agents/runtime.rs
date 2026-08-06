@@ -7,10 +7,10 @@ use super::agent_env::build_buzz_agent_provider_defaults;
 use crate::{
     managed_agents::{
         append_log_marker, known_acp_runtime, login_shell_path, managed_agent_log_path,
-        missing_command_message, normalize_agent_args, open_log_file, resolve_command,
-        spawn_key_refusal, KnownAcpRuntime, ManagedAgentPairRuntime, ManagedAgentRecord,
-        ManagedAgentRuntimeKey, ManagedAgentSummary,
-        permission_policy::resolve_effective_permission_policy,
+        missing_command_message, normalize_agent_args, open_log_file,
+        permission_policy::resolve_effective_permission_policy, resolve_command, spawn_key_refusal,
+        KnownAcpRuntime, ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey,
+        ManagedAgentSummary,
     },
     util::now_iso,
 };
@@ -769,8 +769,7 @@ pub fn spawn_agent_child(
 
     // Inject BUZZ_ACP_PERMISSION_POLICY — resolved here so the running process
     // and the UI-visible setting are always in sync.
-    let (effective_permission_policy, _) =
-        resolve_effective_permission_policy(record, &global);
+    let (effective_permission_policy, _) = resolve_effective_permission_policy(record, &global);
     command.env(
         "BUZZ_ACP_PERMISSION_POLICY",
         effective_permission_policy.as_str(),

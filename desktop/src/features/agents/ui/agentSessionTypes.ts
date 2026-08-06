@@ -146,6 +146,13 @@ export type TranscriptItem =
        * button rendering.
        */
       options?: Array<{ optionId: string; kind: string; label?: string }>;
+      /**
+       * Set to `true` when a `control_result` frame indicates that the last
+       * `permission_decision` click was not delivered to the harness (status
+       * was non-`sent`). The `PermissionDecisionButtons` component uses this
+       * to re-enable buttons so the user can retry without reloading.
+       */
+      deliveryFailed?: boolean;
     } & TranscriptItemIdentity)
   | ({
       id: string;

@@ -43,17 +43,34 @@ function permissionOutcomeTone(outcome: string): "approve" | "deny" | "cancel" {
  * Allow/Deny buttons for an actionable permission card.
  * Renders the agent's exact options as labeled buttons; a click sends the
  * `permission_decision` control event (fire-and-forget).
+ *
+ * On send failure (relay reject or non-`sent` delivery status), buttons are
+ * re-enabled so the user can retry. The harness's 300 s fail-closed timeout
+ * is the backstop for permanently lost frames.
  */
 function PermissionDecisionButtons({
   agentPubkey,
+  channelId,
   options,
   requestNonce,
+  deliveryFailed,
 }: {
   agentPubkey: string;
+  channelId: string;
   options: Array<{ optionId: string; kind: string; label?: string }>;
   requestNonce: string;
+  deliveryFailed?: boolean;
 }) {
   const [pending, setPending] = React.useState<string | null>(null);
+
+  // Re-enable buttons when the reducer signals delivery failure (non-`sent`
+  // control_result status). The relay send succeeded but the harness couldn't
+  // route the click — the user should be able to retry.
+  React.useEffect(() => {
+    if (deliveryFailed) {
+      setPending(null);
+    }
+  }, [deliveryFailed]);
 
   if (options.length === 0) {
     return null;
@@ -79,11 +96,12 @@ function PermissionDecisionButtons({
               setPending(optionId);
               void sendPermissionDecision(
                 agentPubkey,
+                channelId,
                 requestNonce,
                 optionId,
               ).catch(() => {
-                // Fire-and-forget: harness will time out if the frame is lost.
-                // Reset pending so the user can retry.
+                // Relay rejected the send. Re-enable so the user can retry;
+                // the harness's 300 s fail-closed timeout handles permanent loss.
                 setPending(null);
               });
             }}
@@ -118,6 +136,7 @@ export function LifecycleActivity(props: ActivityRenderClassItemProps) {
     const requestNonce = props.item.requestNonce;
     const options = props.item.options ?? [];
     const authorizationReason = props.item.authorizationReason;
+    const deliveryFailed = props.item.deliveryFailed;
     return (
       <div
         className="rounded-md border border-amber-500/20 bg-amber-500/5 px-2 py-1.5 text-left text-xs text-amber-700 dark:text-amber-400"
@@ -144,8 +163,10 @@ export function LifecycleActivity(props: ActivityRenderClassItemProps) {
         {actionable && requestNonce && !outcome ? (
           <PermissionDecisionButtons
             agentPubkey={props.agentPubkey}
+            channelId={props.item.channelId ?? ""}
             options={options}
             requestNonce={requestNonce}
+            deliveryFailed={deliveryFailed}
           />
         ) : null}
         {/* Row 5: decision — only when outcome is resolved */}

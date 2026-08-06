@@ -162,6 +162,7 @@ impl PermissionMode {
 
     /// Returns `true` when the mode is the agent's built-in default and
     /// therefore doesn't need to be explicitly set.
+    #[cfg(test)]
     pub fn is_default(&self) -> bool {
         matches!(self, Self::Default)
     }
@@ -258,10 +259,12 @@ impl ResolvedPermissionConfig {
     /// - `ask`  + explicit `dontAsk` — harness would want the agent to
     ///   escalate, but `dontAsk` makes the agent self-deny internally.
     /// - `allow` + explicit `dontAsk` — same contradiction.
-    /// - `ask`  + explicit `auto` — adapter self-approves internally, so the
-    ///   card never fires; the `ask` policy becomes a silent dead letter.
     /// - `reject` + explicit `auto` — inverted-security worst case: policy says
     ///   "deny" but the adapter auto-approves everything internally.
+    ///
+    /// Emits a warning (not an error) for `ask + auto`: internally-approved tool
+    /// calls bypass the ask flow silently, but residual escalations still surface
+    /// cards — the combination works, with the caveat that not all requests are seen.
     pub fn resolve(
         policy: PermissionPolicy,
         explicit_mode: Option<PermissionMode>,
@@ -275,19 +278,28 @@ impl ResolvedPermissionConfig {
                  dontAsk makes the agent self-deny internally before Buzz can answer"
             )));
         }
-        // Fail on ask/reject + auto: `auto` makes the adapter self-approve
-        // internally so `session/request_permission` never crosses ACP.
-        // Under `ask` the card never fires; under `reject` the policy is a dead
-        // letter while the adapter silently grants everything (inverted security).
+        // Fail on reject + auto: inverted-security worst case — policy says "deny"
+        // but the adapter auto-approves everything internally.
+        // `ask` + auto is a warning-only case: the adapter MAY still forward residual
+        // permission requests to ACP (auto is a model classifier, not bypass mode);
+        // warn and transmit rather than fail startup.
         // `allow` + auto is compatible: both policies want unattended approval.
-        if matches!(policy, PermissionPolicy::Ask | PermissionPolicy::Reject)
-            && explicit_mode == Some(PermissionMode::Auto)
-        {
+        if policy == PermissionPolicy::Reject && explicit_mode == Some(PermissionMode::Auto) {
             return Err(ConfigError::ConfigFile(format!(
                 "permission_policy={policy} conflicts with permission_mode=auto: \
-                 auto makes the adapter self-approve internally before Buzz can answer \
-                 (ask: card never fires; reject: policy becomes a dead letter)"
+                 auto makes the adapter self-approve internally, which bypasses the \
+                 reject policy — inverted-security worst case"
             )));
+        }
+        // Warn on ask + auto: residual permission requests may still reach ACP
+        // (auto is a model classifier, not bypass mode) so ask can still surface
+        // cards — but internally-approved calls will bypass the ask flow silently.
+        if policy == PermissionPolicy::Ask && explicit_mode == Some(PermissionMode::Auto) {
+            tracing::warn!(
+                "permission_policy=ask with permission_mode=auto: internally-approved \
+                 tool calls bypass Buzz ask flow; residual escalations will still \
+                 surface cards. Consider policy=allow if unattended approval is intended."
+            );
         }
 
         let (effective_mode, mode_source) = match explicit_mode {

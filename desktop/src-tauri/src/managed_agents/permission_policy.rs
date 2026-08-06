@@ -80,3 +80,75 @@ pub fn resolve_effective_permission_policy(
         PermissionPolicySource::BuiltIn,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed_agents::global_config::GlobalAgentConfig;
+
+    fn empty_record() -> ManagedAgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "pubkey": "abcd1234",
+            "name": "test",
+            "display_name": "Test",
+            "private_key_nsec": "nsec1fake",
+            "relay_url": "wss://relay.example",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 300,
+            "idle_timeout_seconds": 900,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("minimal ManagedAgentRecord")
+    }
+
+    #[test]
+    fn test_per_agent_policy_beats_global_and_built_in() {
+        let mut record = empty_record();
+        record.permission_policy = Some(PermissionPolicy::Allow);
+        let mut global = GlobalAgentConfig::default();
+        global.permission_policy = Some(PermissionPolicy::Reject);
+
+        let (policy, source) = resolve_effective_permission_policy(&record, &global);
+        assert_eq!(policy, PermissionPolicy::Allow);
+        assert_eq!(source, PermissionPolicySource::Agent);
+    }
+
+    #[test]
+    fn test_global_policy_beats_built_in_when_no_per_agent() {
+        let mut record = empty_record();
+        record.permission_policy = None;
+        let mut global = GlobalAgentConfig::default();
+        global.permission_policy = Some(PermissionPolicy::Allow);
+
+        let (policy, source) = resolve_effective_permission_policy(&record, &global);
+        assert_eq!(policy, PermissionPolicy::Allow);
+        assert_eq!(source, PermissionPolicySource::GlobalDefault);
+    }
+
+    #[test]
+    fn test_built_in_used_when_neither_per_agent_nor_global_is_set() {
+        let mut record = empty_record();
+        record.permission_policy = None;
+        let global = GlobalAgentConfig::default(); // permission_policy = None
+
+        let (policy, source) = resolve_effective_permission_policy(&record, &global);
+        assert_eq!(policy, PermissionPolicy::Ask); // desktop_default
+        assert_eq!(source, PermissionPolicySource::BuiltIn);
+    }
+
+    #[test]
+    fn test_per_agent_reject_beats_global_allow() {
+        let mut record = empty_record();
+        record.permission_policy = Some(PermissionPolicy::Reject);
+        let mut global = GlobalAgentConfig::default();
+        global.permission_policy = Some(PermissionPolicy::Allow);
+
+        let (policy, source) = resolve_effective_permission_policy(&record, &global);
+        assert_eq!(policy, PermissionPolicy::Reject);
+        assert_eq!(source, PermissionPolicySource::Agent);
+    }
+}

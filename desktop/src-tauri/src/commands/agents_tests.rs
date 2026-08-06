@@ -483,6 +483,7 @@ fn deploy_payload_matches_the_shared_full_launch_fixture() {
         None,
         Some("gpt-5"),
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        None,
     );
     let agent = deploy_payload_json(
         &record,

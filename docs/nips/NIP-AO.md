@@ -175,8 +175,14 @@ Cancel the in-flight agent turn for the given channel.
 
 #### `switch_model`
 
-Switch the active model for the agent session in the given channel. Takes effect on
-the next turn; the current turn is unaffected.
+Switch the active model for the agent session in the given channel.
+
+- **Busy turn:** delivers `ControlSignal::SwitchModel` over the per-turn oneshot,
+  which triggers the harness to cancel the current turn and requeue with the new model.
+  If the oneshot is already consumed (a prior cancel/interrupt is in flight), the
+  switch cannot land and the current turn is left to complete with the old model.
+- **Idle session:** validates the model against the cached catalog and, if valid,
+  invalidates and reapplies the agent's model config immediately.
 
 ```json
 {
@@ -229,7 +235,7 @@ event to confirm receipt. This is an `acp_read`-style telemetry frame (kind =
 
 **`switch_model`:**
 ```json
-{ "type": "switch_model", "status": "queued" | "no_active_session" | ..., "modelId": "..." }
+{ "type": "switch_model", "status": "sent" | "turn_ending" | "switched" | "unsupported_model" | "no_active_turn", "modelId": "..." }
 ```
 
 **`permission_decision`:**
@@ -497,15 +503,20 @@ of decrypted payloads and MUST NOT log them at INFO level or above.
   "turnId":     "turn-xyz",
   "authorization": {
     "requestNonce": "a9f3b2c1d4e5...",
-    "actionable":   true
+    "actionable":   false,
+    "reason":       "applied"
   },
   "payload": {
     "jsonrpc": "2.0",
     "id": "req-17",
-    "result": { "optionId": "opt-allow" }
+    "result": { "outcome": { "outcome": "selected", "optionId": "opt-allow" } }
   }
 }
 ```
+
+Note: `actionable` is `false` on the `acp_write` telemetry frame — the decision has
+been applied and the card is no longer actionable. `reason: "applied"` is the
+standard terminal annotation for a successfully delivered decision.
 
 ## Reference Implementation
 

@@ -258,6 +258,13 @@ function describePermissionOutcome(
   if (outcome === "cancelled") {
     return "Cancelled";
   }
+  if (outcome === "timed_out") {
+    return "Timed out";
+  }
+  if (outcome === "uncertain") {
+    // Pinned verbatim copy — must never say "denied" or "failed closed".
+    return "Approval outcome unknown; agent process stopped before it could continue.";
+  }
   if (outcome === "selected" && optionId) {
     const kind = optionNames.get(optionId) ?? optionId;
     const isDenial = kind.startsWith("reject");
@@ -809,7 +816,13 @@ export function processTranscriptEvent(
 
     if (method === "session/request_permission") {
       const request = describePermissionRequest(payload);
-      const itemId = `permission:${ch}:${event.turnId ?? event.seq}`;
+      // Key by nonce when the authorization envelope is present — this gives
+      // each concurrent ACP request its own card. Fall back to the turn-based
+      // key for legacy/non-ask paths where no nonce is emitted.
+      const auth = event.authorization;
+      const itemId = auth?.requestNonce
+        ? `permission:${ch}:nonce:${auth.requestNonce}`
+        : `permission:${ch}:${event.turnId ?? event.seq}`;
       upsertLifecycleItem(
         d,
         itemId,
@@ -825,7 +838,6 @@ export function processTranscriptEvent(
       // Attach authorization-envelope fields to the item. The `authorization`
       // object is on the ObserverEvent itself (not the payload — payloads are
       // raw ACP with no `_buzz` wrapper).
-      const auth = event.authorization;
       if (auth) {
         const existing = d.itemsById.get(itemId);
         if (existing?.type === "lifecycle") {
@@ -837,7 +849,7 @@ export function processTranscriptEvent(
             options: request.options,
           });
         }
-        // Also index by nonce so control_result frames can retire the card.
+        // Index by nonce so acp_write terminal frames can retire the card.
         d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
         d.pendingPermissionsByNonce.set(auth.requestNonce, itemId);
       }
@@ -1181,20 +1193,31 @@ export function processTranscriptEvent(
     // not a terminal outcome. Status values are: sent | no_active_turn |
     // channel_full | channel_closed | no_channel.
     //
-    // A non-"sent" status means the click did not reach the harness — the card
-    // stays actionable so the user can retry. Terminal outcomes (applied,
-    // denied, timed_out, cancelled, uncertain) arrive as enveloped acp_write
-    // frames correlated by requestNonce (see the acp_write branch above).
-    // That path will be wired once Thufir's review of Duncan's contract lands.
+    // A non-"sent" status means the click did not reach the harness — mark the
+    // card with `deliveryFailed = true` so buttons re-enable for retry. Terminal
+    // outcomes (applied, denied, timed_out, cancelled, uncertain) arrive as
+    // enveloped acp_write frames correlated by requestNonce.
     const payload = asRecord(event.payload);
     const frameType = asString(payload.type);
     if (frameType === "permission_decision") {
       const deliveryStatus = asString(payload.status);
-      // If delivery failed, the PermissionDecisionButtons component handles
-      // button-level pending-state reset via its own catch handler. No card
-      // retirement here — the card stays actionable until a terminal acp_write
-      // frame confirms the outcome.
-      void deliveryStatus; // acknowledged; no card mutation on delivery results
+      if (deliveryStatus !== "sent") {
+        // Delivery failed — find the card by nonce and mark it retryable.
+        const nonce = asString(payload.requestNonce);
+        if (nonce) {
+          const itemId = d.pendingPermissionsByNonce.get(nonce);
+          if (itemId) {
+            const existing = d.itemsById.get(itemId);
+            if (
+              existing?.type === "lifecycle" &&
+              existing.renderClass === "permission" &&
+              existing.actionable
+            ) {
+              replaceItem(d, itemId, { ...existing, deliveryFailed: true });
+            }
+          }
+        }
+      }
     }
   }
 

@@ -159,6 +159,144 @@ impl std::fmt::Display for PermissionMode {
     }
 }
 
+/// How Buzz responds to an ACP `session/request_permission` request.
+///
+/// Injected as `BUZZ_ACP_PERMISSION_POLICY`. Desktop injects the resolved
+/// per-agent or fleet-wide value; headless defaults to `reject`.
+///
+/// - `allow`  — auto-select the unique `allow_once` option; fail closed if
+///              zero or multiple `allow_once` candidates, malformed options,
+///              or any validation error.
+/// - `ask`    — surface the request as an actionable card for the owner;
+///              fail closed on timeout (300 s) or if the observer / owner is
+///              unavailable.
+/// - `reject` — deny every request (today's behaviour, headless default).
+#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum PermissionPolicy {
+    /// Auto-approve via the unique `allow_once` option; fail closed otherwise.
+    #[value(alias = "allow")]
+    Allow,
+    /// Surface as an actionable card; fail closed on timeout or unavailability.
+    #[value(alias = "ask")]
+    Ask,
+    /// Deny all requests — headless default, byte-for-byte today's behaviour.
+    #[value(alias = "reject")]
+    Reject,
+}
+
+impl std::fmt::Display for PermissionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Reject => "reject",
+        })
+    }
+}
+
+/// Whether an effective `PermissionMode` was derived by the harness or
+/// supplied explicitly by the operator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ModeSource {
+    /// No `--permission-mode` was supplied; the harness derived the mode from
+    /// the active `PermissionPolicy`.
+    Derived,
+    /// An explicit `--permission-mode` / `BUZZ_ACP_PERMISSION_MODE` value was
+    /// supplied by the operator.
+    Explicit,
+}
+
+impl std::fmt::Display for ModeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Derived => "derived",
+            Self::Explicit => "explicit",
+        })
+    }
+}
+
+/// Resolved, immutable per-startup permission configuration.
+///
+/// Computed once in `Config::from_args` from `policy` + optional `mode` and
+/// carried through `PromptContext` (via `Arc`) so every task reads the same
+/// value without re-deriving it.
+///
+/// `transmit_mode` — set `session/set_config_option` for this mode whenever
+/// the agent advertises it. **Always set** (including for `PermissionMode::Default`);
+/// the caller decides whether to skip based on advertisement, not derivation.
+#[derive(Debug, Clone)]
+pub struct ResolvedPermissionConfig {
+    /// The high-level policy governing how permission requests are answered.
+    pub policy: PermissionPolicy,
+    /// The ACP mode that will be sent to the agent after session creation.
+    pub effective_mode: PermissionMode,
+    /// Whether `effective_mode` was derived or supplied explicitly.
+    pub mode_source: ModeSource,
+    /// `true` when the effective mode should be transmitted to the agent via
+    /// `session/set_config_option`, i.e. whenever the agent advertises it.
+    pub transmit_mode: bool,
+}
+
+impl ResolvedPermissionConfig {
+    /// Derive the config from a `policy` and an optional explicit `mode`.
+    ///
+    /// Returns `Err` for contradictory combinations:
+    /// - `ask`  + explicit `dontAsk` — harness would want the agent to
+    ///   escalate, but `dontAsk` makes the agent self-deny internally.
+    /// - `allow` + explicit `dontAsk` — same contradiction.
+    pub fn resolve(
+        policy: PermissionPolicy,
+        explicit_mode: Option<PermissionMode>,
+    ) -> Result<Self, ConfigError> {
+        // Fail on contradictory ask/allow + dontAsk combinations.
+        if matches!(policy, PermissionPolicy::Ask | PermissionPolicy::Allow)
+            && explicit_mode == Some(PermissionMode::DontAsk)
+        {
+            return Err(ConfigError::ConfigFile(format!(
+                "permission_policy={policy} conflicts with permission_mode=dontAsk: \
+                 dontAsk makes the agent self-deny internally before Buzz can answer"
+            )));
+        }
+
+        let (effective_mode, mode_source) = match explicit_mode {
+            Some(m) => (m, ModeSource::Explicit),
+            None => {
+                // Mode matrix — derived from policy when no explicit mode given:
+                //   reject → dontAsk  (harness rejects; adapter also self-denies for
+                //                      consistency — byte-for-byte today's behaviour)
+                //   ask    → default  (keep the adapter escalating to Buzz)
+                //   allow  → default  (keep the adapter escalating to Buzz;
+                //                      dontAsk would silently self-deny before we
+                //                      could auto-select allow_once)
+                let derived = match policy {
+                    PermissionPolicy::Reject => PermissionMode::DontAsk,
+                    PermissionPolicy::Ask | PermissionPolicy::Allow => PermissionMode::Default,
+                };
+                (derived, ModeSource::Derived)
+            }
+        };
+
+        Ok(Self {
+            policy,
+            effective_mode,
+            mode_source,
+            // Always transmit — the caller skips based on agent advertisement,
+            // not on whether the mode is the default.
+            transmit_mode: true,
+        })
+    }
+}
+
+impl std::fmt::Display for ResolvedPermissionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "policy={} mode={}({})",
+            self.policy, self.effective_mode, self.mode_source
+        )
+    }
+}
+
 /// CLI args for `buzz-acp models` — query available models from an agent.
 ///
 /// This is a standalone `Parser` (not a subcommand variant) because the
@@ -424,18 +562,32 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_SESSION_TITLE")]
     pub session_title: Option<String>,
 
-    /// Permission mode for agents that support `session/set_config_option`
-    /// with `configId: "mode"` (e.g. `claude-agent-acp`).
+    /// How Buzz responds to ACP `session/request_permission` requests.
     ///
-    /// Defaults to `dontAsk`, which rejects operations that need interactive
-    /// approval because Buzz does not expose a human permission prompt.
+    /// - `reject` (headless default) — deny all permission requests.
+    /// - `ask`    — surface as an actionable card; auto-deny on timeout (300 s)
+    ///              or when the observer / owner is unavailable.
+    /// - `allow`  — auto-approve via the unique `allow_once` option;
+    ///              fail closed if zero or multiple `allow_once` candidates.
+    ///
+    /// Desktop injects the resolved per-agent or fleet-wide value.
+    /// Headless installations should leave this unset (defaults to `reject`).
     #[arg(
         long,
-        env = "BUZZ_ACP_PERMISSION_MODE",
-        default_value = "dont-ask",
+        env = "BUZZ_ACP_PERMISSION_POLICY",
+        default_value = "reject",
         value_enum
     )]
-    pub permission_mode: PermissionMode,
+    pub permission_policy: PermissionPolicy,
+
+    /// ACP permission mode sent to the agent via `session/set_config_option`.
+    ///
+    /// When unset the harness derives a sensible default from `permission_policy`:
+    ///   `reject` → `dontAsk`, `ask` / `allow` → `default`.
+    /// Explicit values are validated: `ask` or `allow` + `dontAsk` is a startup
+    /// error because `dontAsk` makes the agent self-deny before Buzz can answer.
+    #[arg(long, env = "BUZZ_ACP_PERMISSION_MODE", value_enum)]
+    pub permission_mode: Option<PermissionMode>,
 
     /// Inbound author gate: which authors' events the harness forwards.
     /// Modes: owner-only (default), allowlist, anyone, nobody.
@@ -530,8 +682,10 @@ pub struct Config {
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
     /// `None` when unset or when the configured value sanitized to empty.
     pub session_title: Option<String>,
-    /// Permission mode to apply after session creation. `Default` = skip.
-    pub permission_mode: PermissionMode,
+    /// Resolved permission configuration — policy, effective ACP mode, and
+    /// how to transmit it. Computed once from `PermissionPolicy` + optional
+    /// explicit `PermissionMode` in `from_args`.
+    pub permission_config: ResolvedPermissionConfig,
     /// Inbound author gate mode.
     pub respond_to: RespondTo,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
@@ -1054,6 +1208,9 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
+        let permission_config =
+            ResolvedPermissionConfig::resolve(args.permission_policy, args.permission_mode)?;
+
         let config = Config {
             keys,
             relay_url: args.relay_url,
@@ -1092,7 +1249,7 @@ impl Config {
                 .session_title
                 .as_deref()
                 .and_then(sanitize_session_title),
-            permission_mode: args.permission_mode,
+            permission_config,
             respond_to: args.respond_to,
             respond_to_allowlist,
             allowed_respond_to,
@@ -1125,7 +1282,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={}({}) {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1145,7 +1302,8 @@ impl Config {
             self.typing_enabled,
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
-            self.permission_mode,
+            self.permission_config.effective_mode,
+            self.permission_config.mode_source,
             respond_to_detail,
             allowed_respond_to_detail,
         )
@@ -1463,7 +1621,11 @@ mod tests {
             memory_enabled: true,
             model: None,
             session_title: None,
-            permission_mode: PermissionMode::DontAsk,
+            permission_config: ResolvedPermissionConfig::resolve(
+                PermissionPolicy::Reject,
+                Some(PermissionMode::DontAsk),
+            )
+            .expect("test config"),
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: Vec::new(),
@@ -2285,7 +2447,11 @@ channels = "ALL"
     #[test]
     fn test_summary_includes_permission_mode() {
         let mut config = test_config(SubscribeMode::Mentions);
-        config.permission_mode = PermissionMode::DontAsk;
+        config.permission_config = ResolvedPermissionConfig::resolve(
+            PermissionPolicy::Reject,
+            Some(PermissionMode::DontAsk),
+        )
+        .expect("test config");
         let s = config.summary();
         assert!(
             s.contains("permission_mode=dontAsk"),
@@ -2296,7 +2462,8 @@ channels = "ALL"
     #[test]
     fn test_summary_permission_mode_default() {
         let mut config = test_config(SubscribeMode::Mentions);
-        config.permission_mode = PermissionMode::Default;
+        config.permission_config =
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).expect("test config");
         let s = config.summary();
         assert!(
             s.contains("permission_mode=default"),
@@ -2307,7 +2474,10 @@ channels = "ALL"
     #[test]
     fn test_default_config_rejects_interactive_permissions() {
         let config = test_config(SubscribeMode::Mentions);
-        assert_eq!(config.permission_mode, PermissionMode::DontAsk);
+        assert_eq!(
+            config.permission_config.effective_mode,
+            PermissionMode::DontAsk
+        );
     }
 
     #[test]

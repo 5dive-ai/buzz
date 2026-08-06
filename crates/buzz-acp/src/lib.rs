@@ -594,6 +594,7 @@ fn batch_envelope(events: &[observer::ObserverEvent]) -> observer::ObserverEvent
         session_id: last.session_id.clone(),
         turn_id: last.turn_id.clone(),
         started_at: last.started_at.clone(),
+        authorization: None,
         payload: serde_json::json!({
             "events": serde_json::to_value(events).unwrap_or_default(),
         }),
@@ -1116,6 +1117,9 @@ fn handle_relay_observer_control_event(
         Some("switch_model") => {
             handle_switch_model_control(&payload, pool, observer);
         }
+        Some("permission_decision") => {
+            handle_permission_decision_control(&payload, pool, observer);
+        }
         _ => {
             tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
         }
@@ -1230,6 +1234,120 @@ fn handle_switch_model_control(
                 "type": "switch_model",
                 "status": status,
                 "modelId": model_id,
+            }),
+        );
+    }
+}
+
+/// Handle a `permission_decision` control frame.
+///
+/// Extracts `channelId`, `requestNonce`, and `optionId` from the payload and
+/// delivers a [`crate::acp::PermissionDecision`] to the in-flight read loop
+/// via the per-task `permission_decision_tx` mpsc channel.
+///
+/// If there is no in-flight task for the channel, or the sender is gone, the
+/// frame is dropped silently (the per-request 300s timeout will fail the entry
+/// closed on its own).
+fn handle_permission_decision_control(
+    payload: &serde_json::Value,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+) {
+    let Some(channel_id) = payload
+        .get("channelId")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<Uuid>().ok())
+    else {
+        tracing::warn!("observer permission_decision control frame missing valid channelId");
+        return;
+    };
+
+    let Some(request_nonce) = payload
+        .get("requestNonce")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        tracing::warn!("observer permission_decision control frame missing requestNonce");
+        return;
+    };
+
+    let Some(option_id) = payload
+        .get("optionId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        tracing::warn!("observer permission_decision control frame missing optionId");
+        return;
+    };
+
+    let decision = crate::acp::PermissionDecision {
+        request_nonce: request_nonce.to_string(),
+        option_id: option_id.to_string(),
+    };
+
+    // Find the in-flight task for this channel and deliver via its mpsc.
+    let entry = pool
+        .task_map_mut()
+        .values_mut()
+        .find(|m| m.channel_id == Some(channel_id));
+
+    let status = if let Some(meta) = entry {
+        if let Some(tx) = &meta.permission_decision_tx {
+            match tx.try_send(decision) {
+                Ok(()) => {
+                    tracing::info!(
+                        channel = %channel_id,
+                        nonce = %request_nonce,
+                        option_id = %option_id,
+                        "permission_decision delivered to read loop"
+                    );
+                    "sent"
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        channel = %channel_id,
+                        "permission_decision channel full — dropping (will timeout)"
+                    );
+                    "channel_full"
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!(
+                        channel = %channel_id,
+                        "permission_decision channel closed — read loop already exited"
+                    );
+                    "channel_closed"
+                }
+            }
+        } else {
+            tracing::warn!(
+                channel = %channel_id,
+                "permission_decision_tx not installed for in-flight task"
+            );
+            "no_channel"
+        }
+    } else {
+        tracing::warn!(
+            channel = %channel_id,
+            "permission_decision control frame for channel with no in-flight task"
+        );
+        "no_active_turn"
+    };
+
+    if let Some(observer) = observer {
+        observer.emit(
+            "control_result",
+            None,
+            &observer::ObserverContext {
+                channel_id: Some(channel_id.to_string()),
+                session_id: None,
+                turn_id: None,
+                started_at: None,
+            },
+            serde_json::json!({
+                "type": "permission_decision",
+                "status": status,
+                "requestNonce": request_nonce,
+                "optionId": option_id,
             }),
         );
     }
@@ -1835,7 +1953,7 @@ async fn tokio_main() -> Result<()> {
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
-        permission_mode: config.permission_mode,
+        permission_config: config.permission_config.clone(),
         agent_keys: config.keys.clone(),
         agent_owner_pubkey: startup_owner
             .as_deref()
@@ -3290,6 +3408,17 @@ fn dispatch_pending(
         agent.acp.install_steer_rx(rx);
         let steer_tx = Some(tx);
 
+        // Permission decision channel: delivers `permission_decision` control
+        // frames into the read loop's decision arm (spec §4). Installed
+        // per-session (the receiver is taken by the read loop and dropped
+        // when the turn ends; the next turn installs a fresh pair). Capacity
+        // matches PERMISSION_MAP_CAP so each pending entry gets a slot.
+        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel::<crate::acp::PermissionDecision>(
+            crate::acp::PERMISSION_MAP_CAP,
+        );
+        agent.acp.install_permission_decision_rx(perm_rx);
+        let permission_decision_tx = Some(perm_tx);
+
         // Prompt text is now built inside run_prompt_task (needs async for
         // context fetching). Pass None for prompt_text; batch carries the data.
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
@@ -3318,6 +3447,7 @@ fn dispatch_pending(
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
+                permission_decision_tx,
             },
         );
         dispatched_channels.push((channel_id, typing_scope));
@@ -3703,6 +3833,10 @@ fn handle_prompt_result(
                     | acp::AcpError::WriteTimeout(_)
                     | acp::AcpError::Timeout(_)
                     | acp::AcpError::Protocol(_)
+                    // A poisoned process wrote a partial permission response
+                    // and must NOT be returned to the pool — the pipe state is
+                    // uncertain and re-use would corrupt the next turn's writes.
+                    | acp::AcpError::PermissionPoisoned
             );
             let error_code = match &e {
                 acp::AcpError::AgentError { code, .. } => Some(*code),
@@ -3932,6 +4066,7 @@ fn dispatch_heartbeat(
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
+            permission_decision_tx: None,
         },
     );
     *heartbeat_in_flight = true;
@@ -4703,6 +4838,7 @@ mod owner_control_command_tests {
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
+                permission_decision_tx: None,
             },
         );
 
@@ -5208,6 +5344,7 @@ mod observer_publish_queue_tests {
             session_id: Some("session-1".to_string()),
             turn_id: Some("turn-1".to_string()),
             started_at: None,
+            authorization: None,
             payload: serde_json::json!({ "seq": seq }),
         }
     }
@@ -6076,6 +6213,7 @@ mod observer_chunk_coalescer_tests {
             session_id: Some("session-1".to_string()),
             turn_id: Some("turn-1".to_string()),
             started_at: None,
+            authorization: None,
             payload: serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "session/update",
@@ -6104,6 +6242,7 @@ mod observer_chunk_coalescer_tests {
             session_id: Some("session-1".to_string()),
             turn_id: Some("turn-1".to_string()),
             started_at: None,
+            authorization: None,
             payload: serde_json::json!({ "type": "turn_started" }),
         }
     }
@@ -6199,7 +6338,11 @@ mod build_mcp_servers_tests {
             memory_enabled: false,
             model: None,
             session_title: None,
-            permission_mode: config::PermissionMode::DontAsk,
+            permission_config: config::ResolvedPermissionConfig::resolve(
+                config::PermissionPolicy::Reject,
+                None,
+            )
+            .expect("test config"),
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
             allowed_respond_to: vec![],
@@ -6421,7 +6564,11 @@ mod error_outcome_emission_tests {
             memory_enabled: false,
             model: None,
             session_title: None,
-            permission_mode: config::PermissionMode::DontAsk,
+            permission_config: config::ResolvedPermissionConfig::resolve(
+                config::PermissionPolicy::Reject,
+                None,
+            )
+            .expect("test config"),
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: vec![],
@@ -6493,6 +6640,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
             },
         );
 
@@ -6569,6 +6717,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
             },
         );
         started_rx.await.unwrap();
@@ -6661,6 +6810,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    permission_decision_tx: None,
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -6752,6 +6902,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    permission_decision_tx: None,
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -6857,6 +7008,7 @@ mod error_outcome_emission_tests {
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
+                    permission_decision_tx: None,
                 },
             );
             let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -6933,6 +7085,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7027,6 +7180,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
             },
         );
         let config = test_config();
@@ -7143,6 +7297,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7282,6 +7437,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7470,6 +7626,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7555,6 +7712,7 @@ mod error_outcome_emission_tests {
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
+                permission_decision_tx: None,
             },
         );
         let mut queue = EventQueue::new(config::DedupMode::Queue);
@@ -7617,6 +7775,7 @@ mod observer_payload_trim_tests {
             session_id: Some("sess-1".to_string()),
             turn_id: Some("turn-1".to_string()),
             started_at: None,
+            authorization: None,
             payload,
         }
     }

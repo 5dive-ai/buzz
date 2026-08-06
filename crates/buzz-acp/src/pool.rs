@@ -34,7 +34,7 @@ use crate::acp::{
     resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer, ModelSwitchMethod,
     StopReason, SystemPromptTransport,
 };
-use crate::config::{compose_session_title, DedupMode, PermissionMode};
+use crate::config::{compose_session_title, DedupMode, PermissionMode, ResolvedPermissionConfig};
 use crate::observer;
 use crate::queue::{
     CancelReason, ContextMessage, ConversationContext, FlushBatch, PromptChannelInfo,
@@ -67,6 +67,13 @@ pub struct TaskMeta {
     /// tasks only — all prompt tasks install a steer channel regardless
     /// of the agent's name.
     pub steer_tx: Option<tokio::sync::mpsc::Sender<SteerRequest>>,
+    /// Permission decision channel — delivers `permission_decision` control
+    /// frames from the observer dispatch loop into the read loop's decision
+    /// arm. `None` until the first `ask`-policy permission request arrives
+    /// (installed per-session by the pool dispatch path). Cloned from the
+    /// sender end of the channel installed on `AcpClient` via
+    /// `install_permission_decision_rx`.
+    pub permission_decision_tx: Option<tokio::sync::mpsc::Sender<crate::acp::PermissionDecision>>,
 }
 
 /// Agent-level model capabilities. Populated on first session creation.
@@ -543,8 +550,8 @@ pub struct PromptContext {
     pub context_message_limit: u32,
     /// Max turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
-    /// Permission mode to apply after session creation. `Default` = skip.
-    pub permission_mode: PermissionMode,
+    /// Resolved permission configuration — policy, effective ACP mode, and how to transmit.
+    pub permission_config: ResolvedPermissionConfig,
     /// Agent identity — used to derive the NIP-AE conversation key at
     /// session creation for core injection.
     pub agent_keys: nostr::Keys,
@@ -1014,14 +1021,20 @@ async fn create_session_and_apply_model(
         }),
     );
 
-    // Apply permission mode if not the agent's built-in default AND the agent
-    // advertises the requested mode in session/new. Agents that don't support
-    // the mode (e.g., goose crashes on unrecognized set_config_option values)
-    // are safely skipped — the harness rejects interactive permission requests.
-    if !ctx.permission_mode.is_default()
-        && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
+    // Apply permission mode whenever the agent advertises it (including `default`).
+    // The `transmit_mode` flag handles any future cases where transmission should be skipped.
+    if ctx.permission_config.transmit_mode
+        && agent_supports_mode(
+            &resp.raw,
+            ctx.permission_config.effective_mode.as_wire_str(),
+        )
     {
-        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
+        apply_permission_mode(
+            &mut agent.acp,
+            &resp.session_id,
+            &ctx.permission_config.effective_mode,
+        )
+        .await?;
     }
 
     Ok(resp.session_id)
@@ -1412,6 +1425,18 @@ pub async fn run_prompt_task(
         turn_id.clone(),
         turn_started_at.clone(),
     ));
+
+    // Wire permission configuration and owner-knowledge into the ACP client so
+    // `handle_permission_request` can evaluate the ask availability gate. These
+    // values come from `PromptContext` (resolved once at startup from CLI args and
+    // desktop-injected env vars) and are idempotent to re-apply across turns.
+    agent
+        .acp
+        .set_permission_config(ctx.permission_config.clone());
+    agent
+        .acp
+        .set_owner_pubkey_known(ctx.agent_owner_pubkey.is_some());
+
     let triggering_event_ids: Vec<String> = batch
         .as_ref()
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
@@ -6536,7 +6561,11 @@ mod tests {
             ),
             context_message_limit: 0,
             max_turns_per_session: 0,
-            permission_mode: PermissionMode::Default,
+            permission_config: ResolvedPermissionConfig::resolve(
+                crate::config::PermissionPolicy::Reject,
+                None,
+            )
+            .expect("test config"),
             agent_keys: agent_keys.clone(),
             agent_owner_pubkey: owner_pubkey,
             memory_enabled: false,

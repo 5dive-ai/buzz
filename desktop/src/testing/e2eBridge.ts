@@ -379,6 +379,12 @@ type E2eConfig = {
           nipIaOwnerProof: { result: string; declared_owner?: string };
           archiveState: { isArchived: boolean | null };
           personaId: string | null;
+          /** Local managed-agent summary. `null` for relay-only instances. */
+          local?: {
+            pubkey: string;
+            name: string;
+            personaId: string | null;
+          } | null;
         }>
       >;
       /** Instances with no parseable persona ID (standalone agents). */
@@ -390,8 +396,21 @@ type E2eConfig = {
         nipIaOwnerProof: { result: string; declared_owner?: string };
         archiveState: { isArchived: boolean | null };
         personaId: string | null;
+        /** Local managed-agent summary. `null` for relay-only instances. */
+        local?: {
+          pubkey: string;
+          name: string;
+          personaId: string | null;
+        } | null;
       }>;
     };
+    /**
+     * Per-pubkey presence overrides for the instance-sheet tests.
+     * Seeded into the mockPresence map at installMockBridge time, so
+     * `get_presence` returns the specified status for these pubkeys.
+     * Keys are lowercase hex pubkeys; values are "online" | "away" | "offline".
+     */
+    presenceOverrides?: Record<string, "online" | "away" | "offline">;
     // Relay's NIP-11 `self` pubkey (hex) for `get_relay_self`. A DM whose peer
     // equals this is treated as a moderation DM (composer disabled). Absent →
     // fail open (no mod-DM detection), matching the Rust command's contract.
@@ -3800,6 +3819,14 @@ function getMockPresenceStatus(pubkey: string): PresenceStatus {
 
 function setMockPresenceStatus(pubkey: string, status: PresenceStatus) {
   mockPresence.set(pubkey.toLowerCase(), status);
+}
+
+function applyMockPresenceOverrides(config: E2eConfig | undefined) {
+  for (const [pubkey, status] of Object.entries(
+    config?.mock?.presenceOverrides ?? {},
+  )) {
+    mockPresence.set(pubkey.toLowerCase(), status as PresenceStatus);
+  }
 }
 
 function resolveHandler(handler: unknown): WsHandler {
@@ -10024,6 +10051,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPersonaCatalogEvents(config);
   resetMockSaveSubscriptions(config);
   resetMockOwnedInventory(config);
+  applyMockPresenceOverrides(config);
   resetMockPendingCommunityDeepLinks(config);
   initializeMockHuddle(config.mock?.huddle, config);
   mockWebsocketSendMutexWedged = false;

@@ -197,7 +197,9 @@ function InstanceRow({
 type InstancesSheetProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** The persona whose instances to display. Filters by persona coordinate. */
+  /** The persona whose instances to display. Filters by persona coordinate.
+   * Pass `null` to open in "global unknown" mode — shows only the unknown-persona
+   * relay inventory bucket (no persona-scoped rows). */
   persona: AgentPersona | null;
   /**
    * The complete grouped inventory snapshot from the parent. The Sheet uses
@@ -208,6 +210,14 @@ type InstancesSheetProps = {
   inventory: OwnedAgentInventorySnapshot | undefined;
   /** Open the exact-pubkey profile panel. */
   onOpenProfile: (pubkey: string) => void;
+  /**
+   * Whether to render the unknown-persona relay instances section.
+   * Defaults to `true` when `persona` is `null` (global unknown mode) and
+   * `false` when `persona` is set (persona-scoped mode), so unknown relay
+   * instances are only discoverable from the top-level "Unknown relay agents"
+   * entry point in the Agents library, not from every persona's sheet.
+   */
+  showUnknown?: boolean;
 };
 
 /**
@@ -227,6 +237,7 @@ export function InstancesSheet({
   persona,
   inventory,
   onOpenProfile,
+  showUnknown,
 }: InstancesSheetProps) {
   const inventoryQuery = useOwnedAgentInventoryQuery(open);
   const archiveMutation = useArchiveIdentityMutation();
@@ -252,11 +263,15 @@ export function InstancesSheet({
     return effectiveData.byPersonaId[persona.id] ?? [];
   }, [effectiveData, persona]);
 
-  // Unknown-persona instances from the relay inventory (not from local ManagedAgent[]).
+  // Unknown-persona instances from the relay inventory.
+  // Only shown in global unknown mode (persona === null) or when explicitly
+  // enabled. In persona-scoped mode, unknown instances are discoverable from
+  // the top-level "Unknown relay agents" entry in the Agents library.
+  const shouldShowUnknown = showUnknown ?? persona === null;
   const unknownInstances = React.useMemo(() => {
-    if (!effectiveData) return [];
+    if (!shouldShowUnknown || !effectiveData) return [];
     return effectiveData.unknown ?? [];
-  }, [effectiveData]);
+  }, [effectiveData, shouldShowUnknown]);
 
   // Presence query over the merged pubkey set (persona instances + unknown).
   const allPubkeys = React.useMemo(

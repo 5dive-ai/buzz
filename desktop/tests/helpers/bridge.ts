@@ -358,6 +358,13 @@ type MockBridgeOptions = {
     }>;
   };
   /**
+   * Per-pubkey presence overrides for instance-sheet tests.
+   * Seeded into the mock presence map so `get_presence` returns the specified
+   * status for these pubkeys. Keys are lowercase hex pubkeys; values are
+   * "online" | "away" | "offline".
+   */
+  presenceOverrides?: Record<string, "online" | "away" | "offline">;
+  /**
    * Drives the `is_me` field of `resolve_oa_owner`. When true, the harness
    * reports the active identity as the verified NIP-OA owner of the viewee
    * (owner-path branch of the gate).

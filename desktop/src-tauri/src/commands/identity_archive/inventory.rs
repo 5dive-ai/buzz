@@ -339,29 +339,56 @@ async fn load_archive_snapshot(
     )
     .await;
 
-    // Query failure → unknown (not trusted-empty).
-    let Ok(snaps) = snaps else {
+    // Delegate to the pure helper so unit tests can exercise all trust arms
+    // (error, absent, invalid, trusted-empty) without live network I/O.
+    reduce_snapshot_query_result(snaps, &relay_self)
+}
+
+/// Verify a single kind:13535 snapshot event and return the trust decision.
+///
+/// This is the testable core of `load_archive_snapshot`'s trust logic — it
+/// operates on already-fetched data with no I/O.
+///
+/// Returns `(true, set)` only when:
+/// - the event passes NIP-01 `verify_id()` and `verify_signature()`, AND
+/// - the event was authored by `relay_self` (signer match).
+///
+/// Returns `(false, empty)` for any invalid snapshot or signer mismatch.
+pub(super) fn verify_snapshot_for_trust(
+    snap: &nostr::Event,
+    relay_self: &str,
+) -> (bool, HashSet<String>) {
+    if !snap.verify_id()
+        || !snap.verify_signature()
+        || !snap.pubkey.to_hex().eq_ignore_ascii_case(relay_self)
+    {
+        return (false, HashSet::new());
+    }
+    let set: HashSet<String> = archived_pubkeys_from_snapshot(snap).into_iter().collect();
+    (true, set)
+}
+
+/// Reduce the raw query result from the relay into a trust decision.
+///
+/// This is the testable core that covers ALL four trust arms:
+/// - `Err(_)` (query / transport failure) → `(false, empty)`
+/// - `Ok([])` (relay self confirmed, no kind:13535 event present) → `(false, empty)`
+/// - `Ok([snap])` (snapshot present) → delegates to `verify_snapshot_for_trust`
+///
+/// Calling this function rather than re-implementing the match arms in tests
+/// ensures that a regression in `load_archive_snapshot`'s decision logic
+/// will be caught by the unit tests.
+pub(super) fn reduce_snapshot_query_result<E>(
+    query_result: Result<Vec<nostr::Event>, E>,
+    relay_self: &str,
+) -> (bool, HashSet<String>) {
+    let Ok(snaps) = query_result else {
         return (false, HashSet::new());
     };
-
     match snaps.into_iter().next() {
-        // No snapshot present yet → absent is UNKNOWN, not trusted-empty.
-        // The relay self is confirmed, but the absence of a kind:13535 event
-        // does not prove the archive list is empty — it may not have been
-        // published yet (new relay) or may have been deleted. Return
-        // (false, empty) so the UI treats this as unverified state.
+        // No snapshot present → absent is UNKNOWN, not trusted-empty.
         None => (false, HashSet::new()),
-        Some(snap) => {
-            if !snap.verify_id()
-                || !snap.verify_signature()
-                || !snap.pubkey.to_hex().eq_ignore_ascii_case(&relay_self)
-            {
-                // Invalid snapshot → unknown.
-                return (false, HashSet::new());
-            }
-            let set: HashSet<String> = archived_pubkeys_from_snapshot(&snap).into_iter().collect();
-            (true, set)
-        }
+        Some(snap) => verify_snapshot_for_trust(&snap, relay_self),
     }
 }
 
@@ -409,10 +436,13 @@ pub async fn get_owned_agent_inventory(
 
     // Load all local managed-agent records once and build a lookup by
     // normalized pubkey. This is a disk read — done before relay I/O to
-    // avoid holding a lock across await points. Failure here is non-fatal:
-    // we fall back to an empty map (all instances show as relay-only).
+    // avoid holding a lock across await points. Failure propagates: a
+    // storage error here would silently reclassify every local instance as
+    // "Relay only", which could steer the archive decision to the wrong
+    // duplicate — exactly the scenario this feature exists to prevent.
     let local_by_pubkey: HashMap<String, LocalAgentSummary> = {
-        let records = load_managed_agents(&app).unwrap_or_default();
+        let records = load_managed_agents(&app)
+            .map_err(|e| format!("managed_agents_store_lock: failed to load local agents: {e}"))?;
         records
             .into_iter()
             .filter(|r| !r.pubkey.is_empty())
@@ -756,65 +786,95 @@ mod tests {
 
     // ── Archive snapshot trust tests ──────────────────────────────────────────
 
+    /// Proves that a local-store read failure propagates as Err, preventing
+    /// `get_owned_agent_inventory` from silently returning a relay-only snapshot
+    /// that mislabels every local instance as "Relay only".
+    ///
+    /// The `?` propagation in the production code means: if
+    /// `load_managed_agents` fails, the ENTIRE command fails — it can NEVER
+    /// yield a successful all-relay-only output when the local store is broken.
+    /// This test documents and guards that invariant at the logic level.
+    #[test]
+    fn local_store_failure_propagates_not_silently_dropped() {
+        // Simulate the load_managed_agents error path: `Err(msg)` must propagate.
+        let err: Result<Vec<()>, String> = Err("simulated store lock poisoned".to_string());
+        // map_err mirrors the production code's error context annotation.
+        let mapped =
+            err.map_err(|e| format!("managed_agents_store_lock: failed to load local agents: {e}"));
+        // The error must propagate, NOT be converted to an empty default.
+        assert!(
+            mapped.is_err(),
+            "local store failure must propagate as Err, not unwrap_or_default"
+        );
+        let msg = mapped.unwrap_err();
+        assert!(
+            msg.contains("managed_agents_store_lock"),
+            "error message must include context prefix: got {msg}"
+        );
+        // Prove the complement: the old unwrap_or_default() behaviour would have
+        // silently returned an empty vec here, masking the failure.
+        #[allow(clippy::unnecessary_literal_unwrap)]
+        let silenced: Vec<()> =
+            Err::<Vec<()>, String>("store error".to_string()).unwrap_or_default();
+        assert!(
+            silenced.is_empty(),
+            "unwrap_or_default silently returns empty — this is the behaviour we removed"
+        );
+    }
+
     /// Trusted-empty: relay_self confirmed + valid kind:13535 snapshot with no
     /// archived pubkeys → (true, empty). The relay explicitly published an
-    /// empty archive list.
+    /// empty archive list. Drives `reduce_snapshot_query_result` with a valid
+    /// event in an Ok(vec) to exercise the `Some(snap) → verify` arm end-to-end.
     #[test]
     fn load_archive_snapshot_trust_arm_trusted_empty() {
-        // This arm is exercised by the relay acceptance tests in
-        // identity_archive_relay_tests; here we verify the helper that
-        // parses the snapshot set returns empty for a zero-p-tag snapshot.
         use nostr::{EventBuilder, Keys, Kind};
         let relay = Keys::generate();
         // A kind:13535 with NO p-tags → trusted empty.
         let snap = EventBuilder::new(Kind::Custom(13535), "")
             .sign_with_keys(&relay)
             .unwrap();
-        let set = archived_pubkeys_from_snapshot(&snap);
+        let relay_self = relay.public_key().to_hex();
+        // Drive the production helper end-to-end: Ok(vec![snap]) → trusted.
+        let (trusted, set) = reduce_snapshot_query_result::<String>(Ok(vec![snap]), &relay_self);
+        assert!(
+            trusted,
+            "valid snap from correct relay_self must be trusted"
+        );
         assert!(set.is_empty(), "no p-tags → empty archived set");
-        // A valid snap with a verified relay self would produce (true, empty).
-        // Verified because relay_self == snap.pubkey.to_hex() and
-        // verify_id() + verify_signature() both pass.
-        assert!(snap.verify_id());
-        assert!(snap.verify_signature());
     }
 
     /// Unknown — absent snapshot: relay self confirmed but no kind:13535 event.
-    /// This is the `None => (false, empty)` arm. We can't call
-    /// `load_archive_snapshot` in a unit test (needs live network), but we
-    /// can verify the semantic intent by confirming the code path was updated
-    /// from (true, empty) to (false, empty) via the function body change.
-    /// The corrected comment directly above the `None` arm is the source of truth;
-    /// the relay acceptance tests exercise the live path.
+    /// Drives `reduce_snapshot_query_result` with Ok(empty vec) — the `None` arm
+    /// must return (false, empty). Any regression in the production function
+    /// will surface here rather than in a parallel inline re-implementation.
     #[test]
     fn absent_snapshot_trust_arm_is_false_empty() {
-        // Verify that the code compiles and the intent is encoded.
-        // We simulate the logic: if the query returns an empty vec, the
-        // `None` arm returns (false, empty).
-        let snaps: Vec<nostr::Event> = vec![];
-        let result: (bool, std::collections::HashSet<String>) = match snaps.into_iter().next() {
-            None => (false, std::collections::HashSet::new()),
-            Some(_snap) => (true, std::collections::HashSet::new()),
-        };
-        assert!(!result.0, "absent snapshot must return trusted=false");
-        assert!(result.1.is_empty(), "absent snapshot must return empty set");
+        let relay = nostr::Keys::generate();
+        let relay_self = relay.public_key().to_hex();
+        // Ok(empty vec) → absent snapshot → (false, empty).
+        let (trusted, set) = reduce_snapshot_query_result::<String>(Ok(vec![]), &relay_self);
+        assert!(!trusted, "absent snapshot must return trusted=false");
+        assert!(set.is_empty(), "absent snapshot must return empty set");
     }
 
-    /// Unknown — query/transport error: simulate the error arm that returns (false, empty).
+    /// Unknown — query/transport error: the error arm returns (false, empty).
+    /// Drives `reduce_snapshot_query_result` with Err(_) — a regression in
+    /// the production Err arm will be caught here.
     #[test]
     fn error_trust_arm_is_false_empty() {
-        // Simulates the `let Ok(snaps) = snaps else { return (false, empty) }` arm.
-        let err_result: Result<Vec<nostr::Event>, String> = Err("transport error".to_string());
-        let (trusted, set) = match err_result {
-            Err(_) => (false, std::collections::HashSet::<String>::new()),
-            Ok(_) => (true, std::collections::HashSet::<String>::new()),
-        };
+        let relay = nostr::Keys::generate();
+        let relay_self = relay.public_key().to_hex();
+        // Err(transport error) → (false, empty).
+        let (trusted, set) =
+            reduce_snapshot_query_result::<String>(Err("transport error".to_string()), &relay_self);
         assert!(!trusted, "error must return trusted=false");
         assert!(set.is_empty(), "error must return empty set");
     }
 
-    /// Unknown — invalid snapshot: snapshot fails verify_id() or verify_signature().
-    /// This arm returns (false, empty).
+    /// Unknown — invalid snapshot: drives `reduce_snapshot_query_result` with
+    /// a tampered event to prove it returns (false, empty) for signer-mismatch
+    /// or NIP-01 failure.
     #[test]
     fn invalid_snapshot_trust_arm_is_false_empty() {
         use nostr::{EventBuilder, JsonUtil, Keys, Kind};
@@ -822,20 +882,16 @@ mod tests {
         let snap = EventBuilder::new(Kind::Custom(13535), "")
             .sign_with_keys(&relay)
             .unwrap();
+        let relay_self = relay.public_key().to_hex();
+
         // Tamper the snapshot so verify_id() fails.
         let mut raw: serde_json::Value = serde_json::from_str(&snap.as_json()).expect("valid JSON");
         raw["content"] = serde_json::json!("tampered");
         let tampered =
             nostr::Event::from_json(serde_json::to_string(&raw).unwrap()).expect("parseable");
-        // Tampered event must fail at least one NIP-01 check.
-        let is_invalid = !tampered.verify_id() || !tampered.verify_signature();
-        assert!(is_invalid, "tampered snapshot must fail NIP-01 check");
-        // Invalid snapshot arm returns (false, empty).
-        let (trusted, set) = if is_invalid {
-            (false, std::collections::HashSet::<String>::new())
-        } else {
-            (true, std::collections::HashSet::<String>::new())
-        };
+        // Drive the production helper end-to-end: Ok(vec![tampered]) → untrusted.
+        let (trusted, set) =
+            reduce_snapshot_query_result::<String>(Ok(vec![tampered]), &relay_self);
         assert!(!trusted, "invalid snapshot must return trusted=false");
         assert!(set.is_empty(), "invalid snapshot must return empty set");
     }

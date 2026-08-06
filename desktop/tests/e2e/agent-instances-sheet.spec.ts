@@ -555,7 +555,9 @@ test("Archive sends exact targetPubkey, refetch shows Archived, Unarchive sends 
 // ── Test 8: Exact-profile opening ────────────────────────────────────────
 //
 // Clicking the profile button on an instance row opens the profile for that
-// exact pubkey (not another row's pubkey).
+// exact pubkey (not another row's pubkey). Asserts:
+// - `user-profile-panel` becomes visible (navigation occurred)
+// - The e2eBridge recorded a `get_user_profile` command for INSTANCE_PUBKEY_B
 
 test("clicking instance row opens the exact pubkey profile", async ({
   page,
@@ -566,6 +568,18 @@ test("clicking instance row opens the exact pubkey profile", async ({
         id: PERSONA_ID,
         displayName: PERSONA_DISPLAY_NAME,
         systemPrompt: "The incident-shape agent.",
+      },
+    ],
+    searchProfiles: [
+      {
+        pubkey: INSTANCE_PUBKEY_A,
+        displayName: "Duncan (local)",
+        avatarUrl: null,
+      },
+      {
+        pubkey: INSTANCE_PUBKEY_B,
+        displayName: "Duncan (stale relay)",
+        avatarUrl: null,
       },
     ],
     ownedAgentInventory: {
@@ -608,7 +622,6 @@ test("clicking instance row opens the exact pubkey profile", async ({
   await expect(page.getByTestId("instances-sheet")).toBeVisible();
 
   // Click the profile button for instance B specifically.
-  // Use aria-label on the button which contains the label text.
   await page
     .getByTestId(`instance-row-${INSTANCE_PUBKEY_B}`)
     .getByRole("button", { name: /open profile/i })
@@ -616,10 +629,9 @@ test("clicking instance row opens the exact pubkey profile", async ({
     .click();
 
   // The profile panel for instance B's pubkey should open.
-  // The panel renders with a data-testid keyed on the pubkey.
-  // (Tolerant: just verify the sheet closed or profile opened — the exact
-  //  panel testid varies by app version.)
-  // What we definitively assert: the e2eBridge recorded the correct command.
+  await expect(page.getByTestId("user-profile-panel")).toBeVisible();
+
+  // The e2eBridge must have recorded a profile fetch for instance B.
   const profileCmds = await page.evaluate(() => {
     const w = window as Window & {
       __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{
@@ -631,18 +643,20 @@ test("clicking instance row opens the exact pubkey profile", async ({
       (e) => e.command === "get_user_profile",
     );
   });
-  // At least one profile fetch for instance B's pubkey.
   const fetchedB = profileCmds.some((e) => {
     const p = e.payload as { pubkey?: string };
     return p?.pubkey?.toLowerCase() === INSTANCE_PUBKEY_B.toLowerCase();
   });
-  // If no profile fetch command fired (may be cached / different command name),
-  // the test is still valuable for the visual assertion above.
-  // We assert the row opened a profile action (not a crash/no-op).
-  expect(fetchedB || profileCmds.length >= 0).toBeTruthy(); // always passes: proof of attempt
+  expect(fetchedB).toBe(true);
 });
 
-// ── Test 9: Unknown-persona instances render in separate section ──────────
+// ── Test 9: Unknown-persona instances reachable from top-level library ───
+//
+// When the relay inventory has unknown-persona instances, the "Unknown relay
+// agents" group appears in the Agents library at the top level. Clicking it
+// opens the global unknown Sheet without going through any persona's Sheet.
+// This proves the instance is discoverable without opening an unrelated
+// persona's Sheet.
 
 test("unknown-persona instances render in the Unknown agents section", async ({
   page,
@@ -658,22 +672,9 @@ test("unknown-persona instances render in the Unknown agents section", async ({
     ownedAgentInventory: {
       archiveStateTrusted: true,
       byPersonaId: {
-        [PERSONA_ID]: [
-          {
-            pubkey: INSTANCE_PUBKEY_A,
-            displayName: "Duncan (local)",
-            picture: null,
-            relayUrl: RELAY_URL,
-            nipIaOwnerProof: { result: "verified" },
-            archiveState: { isArchived: false },
-            personaId: PERSONA_ID,
-            local: {
-              pubkey: INSTANCE_PUBKEY_A,
-              name: "Duncan A",
-              personaId: PERSONA_ID,
-            },
-          },
-        ],
+        // No instances for the persona — the user must not need to open
+        // Duncan's Sheet to find the unknown instance.
+        [PERSONA_ID]: [],
       },
       // Unknown instance has no persona_id.
       unknown: [
@@ -692,21 +693,101 @@ test("unknown-persona instances render in the Unknown agents section", async ({
   });
   await gotoAgentsView(page);
 
-  // Open the Sheet via the start-button safeguard path (1 active instance).
-  const startButton = page.getByTestId(`persona-runtime-start-${PERSONA_ID}`);
-  await expect(startButton).toBeVisible();
-  await startButton.click();
+  // The top-level "Unknown relay agents" group must appear in the library
+  // WITHOUT opening any persona's Sheet.
+  const relayUnknownGroup = page.getByTestId("relay-unknown-agents-group");
+  await expect(relayUnknownGroup).toBeVisible();
 
+  // Click the group button to open the global unknown sheet.
+  await relayUnknownGroup.getByRole("button").click();
+
+  // The global unknown Sheet must open.
   await expect(page.getByTestId("instances-sheet")).toBeVisible();
 
-  // Unknown section must be visible.
+  // Unknown section must be visible inside the sheet.
   await expect(page.getByTestId("unknown-instances-section")).toBeVisible();
+
   // Unknown instance row must be present.
   await expect(
     page.getByTestId(`instance-row-${UNKNOWN_PUBKEY}`),
   ).toBeVisible();
+
   // Unknown instance must have the relay-only badge (local === null).
   await expect(
     page.getByTestId(`instance-relay-only-${UNKNOWN_PUBKEY}`),
   ).toBeVisible();
+});
+
+// ── Test 10: Presence indicators show distinct Online/Offline per row ─────
+//
+// Seeds presence overrides so instance A is "online" and instance B is
+// "offline". Asserts the per-row Online/Offline badges differ.
+
+test("presence indicators show Online for active instance and Offline for relay-only instance", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: PERSONA_ID,
+        displayName: PERSONA_DISPLAY_NAME,
+        systemPrompt: "The incident-shape agent.",
+      },
+    ],
+    // Seed presence: A is online (the device's managed instance), B is offline
+    // (the stale relay-only duplicate we want to archive).
+    presenceOverrides: {
+      [INSTANCE_PUBKEY_A]: "online",
+      [INSTANCE_PUBKEY_B]: "offline",
+    },
+    ownedAgentInventory: {
+      archiveStateTrusted: true,
+      byPersonaId: {
+        [PERSONA_ID]: [
+          {
+            pubkey: INSTANCE_PUBKEY_A,
+            displayName: "Duncan (local)",
+            picture: null,
+            relayUrl: RELAY_URL,
+            nipIaOwnerProof: { result: "verified" },
+            archiveState: { isArchived: false },
+            personaId: PERSONA_ID,
+            local: {
+              pubkey: INSTANCE_PUBKEY_A,
+              name: "Duncan A",
+              personaId: PERSONA_ID,
+            },
+          },
+          {
+            pubkey: INSTANCE_PUBKEY_B,
+            displayName: "Duncan (stale relay)",
+            picture: null,
+            relayUrl: RELAY_URL,
+            nipIaOwnerProof: { result: "verified" },
+            archiveState: { isArchived: false },
+            personaId: PERSONA_ID,
+            local: null,
+          },
+        ],
+      },
+      unknown: [],
+    },
+  });
+  await gotoAgentsView(page);
+
+  // Open the Sheet for PERSONA_ID.
+  const instancesButton = page.getByLabel(`Instances (2)`);
+  await expect(instancesButton).toBeVisible();
+  await instancesButton.click();
+  await expect(page.getByTestId("instances-sheet")).toBeVisible();
+
+  // Instance A (online): presence badge should say "Online".
+  const presenceA = page.getByTestId(`instance-presence-${INSTANCE_PUBKEY_A}`);
+  await expect(presenceA).toBeVisible();
+  await expect(presenceA).toContainText("Online");
+
+  // Instance B (offline): presence badge should say "Offline".
+  const presenceB = page.getByTestId(`instance-presence-${INSTANCE_PUBKEY_B}`);
+  await expect(presenceB).toBeVisible();
+  await expect(presenceB).toContainText("Offline");
 });

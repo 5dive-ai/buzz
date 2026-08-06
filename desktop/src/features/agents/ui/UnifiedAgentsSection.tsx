@@ -111,6 +111,8 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
   const [instancesSheetPersona, setInstancesSheetPersona] =
     React.useState<AgentPersona | null>(null);
   const instancesSheetOpen = instancesSheetPersona !== null;
+  // Global unknown relay agents sheet — opened from the "Unknown relay agents" group.
+  const [unknownSheetOpen, setUnknownSheetOpen] = React.useState(false);
 
   // Pre-fetch the inventory so the start-control safeguard can consult it
   // without a per-card fetch. Enabled when the section is visible (agents loaded).
@@ -295,6 +297,28 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
               onStartAgent={onStartAgent}
             />
           ) : null}
+          {/* Relay-unknown instances: agents on the relay with no parseable persona_id.
+              These are only discoverable here — not inside any persona's Sheet. */}
+          {(inventoryQuery.data?.unknown ?? []).length > 0 ? (
+            <div
+              className={`${AGENT_CARD_COLUMN_CLASS} space-y-2`}
+              data-testid="relay-unknown-agents-group"
+            >
+              <button
+                className="group flex items-center gap-2 rounded-md px-1 py-1 text-left transition-colors hover:bg-muted/50"
+                onClick={() => setUnknownSheetOpen(true)}
+                type="button"
+              >
+                <Server className="h-4 w-4 shrink-0 text-muted-foreground" />
+                <span className="text-sm font-medium">
+                  Unknown relay agents
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  ({inventoryQuery.data?.unknown.length})
+                </span>
+              </button>
+            </div>
+          ) : null}
           {ungrouped.length > 0 ? (
             <CollapsibleAgentGroup
               agents={ungrouped}
@@ -332,9 +356,19 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
         open={instancesSheetOpen}
         persona={instancesSheetPersona}
         inventory={inventoryQuery.data}
+        showUnknown={false}
         onOpenChange={(o) => {
           if (!o) setInstancesSheetPersona(null);
         }}
+        onOpenProfile={onOpenAgentProfile}
+      />
+      {/* Global unknown relay agents sheet — persona=null shows only the unknown bucket */}
+      <InstancesSheet
+        open={unknownSheetOpen}
+        persona={null}
+        inventory={inventoryQuery.data}
+        showUnknown={true}
+        onOpenChange={setUnknownSheetOpen}
         onOpenProfile={onOpenAgentProfile}
       />
     </section>

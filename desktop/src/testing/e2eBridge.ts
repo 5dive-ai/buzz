@@ -1211,6 +1211,8 @@ declare global {
     ) => void;
     /** Inject CLOSED into every active mock live subscription. */
     __BUZZ_E2E_CLOSE_LIVE_SUBSCRIPTIONS__?: (reason: string) => number;
+    /** Queue CLOSED responses for channel history REQs. */
+    __BUZZ_E2E_QUEUE_CHANNEL_HISTORY_CLOSES__?: (reasons: string[]) => void;
     __BUZZ_E2E_SET_STALL_WEBSOCKET_SENDS__?: (stall: boolean) => void;
     __BUZZ_E2E_DISCONNECT_MOCK_WEBSOCKETS__?: () => number;
     __BUZZ_E2E_RESTART_MOCK_WEBSOCKETS__?: () => number;
@@ -2967,6 +2969,7 @@ const mockPersonaEvents: RelayEvent[] = [];
 let mockRelayMembers: RawRelayMember[] = [];
 const mockSockets = new Map<number, MockSocket>();
 const mockAuthResponses: Array<{ success: boolean; message: string }> = [];
+const mockChannelHistoryCloses: string[] = [];
 let mockWebsocketUnavailable = false;
 const relayWebsocketConnectAttemptStarts: number[] = [];
 let mockWebsocketSendMutexWedged = false;
@@ -7387,6 +7390,10 @@ function withMockRuntimeConfigMetadata(
           : runtime.id === "goose"
             ? "GOOSE_PROVIDER"
             : null,
+    // Effort targets mirror the Rust catalog
+    // (managed_agents/discovery/known_runtimes.rs). Claude Code and Codex must
+    // not default to null here: that made the mock advertise no effort support
+    // for harnesses that do support it, so specs asserted the wrong shape.
     thinking_env_var:
       "thinking_env_var" in runtime
         ? runtime.thinking_env_var
@@ -7394,7 +7401,21 @@ function withMockRuntimeConfigMetadata(
           ? "BUZZ_AGENT_THINKING_EFFORT"
           : runtime.id === "goose"
             ? "GOOSE_THINKING_EFFORT"
-            : null,
+            : runtime.id === "claude"
+              ? "CLAUDE_CODE_EFFORT_LEVEL"
+              : null,
+    thinking_config_json_env_var:
+      "thinking_config_json_env_var" in runtime
+        ? runtime.thinking_config_json_env_var
+        : runtime.id === "codex"
+          ? "CODEX_CONFIG"
+          : null,
+    thinking_config_json_key:
+      "thinking_config_json_key" in runtime
+        ? runtime.thinking_config_json_key
+        : runtime.id === "codex"
+          ? "model_reasoning_effort"
+          : null,
     max_tokens_env_var:
       "max_tokens_env_var" in runtime
         ? runtime.max_tokens_env_var
@@ -9691,6 +9712,13 @@ function sendToMockSocket(args: {
     }
 
     const channelId = filter["#h"]?.[0];
+    if (channelId && subId.startsWith("history-")) {
+      const closeReason = mockChannelHistoryCloses.shift();
+      if (closeReason) {
+        sendWsText(socket.handler, ["CLOSED", subId, closeReason]);
+        return;
+      }
+    }
     if (!channelId) {
       // Aux-backfill filters (reactions/deletions) are `#e`-keyed with no
       // channel tag — serve them across all channel stores like the relay.
@@ -9945,6 +9973,7 @@ export function maybeInstallE2eTauriMocks() {
   mockClosedChannelLiveSubscription = false;
   mockWebsocketUnavailable = false;
   mockAuthResponses.length = 0;
+  mockChannelHistoryCloses.length = 0;
   relayWebsocketConnectAttemptStarts.length = 0;
   deferredSendMessageLiveEchoes.length = 0;
   mockGlobalAgentConfig = config.mock?.globalAgentConfig
@@ -10187,6 +10216,9 @@ export function maybeInstallE2eTauriMocks() {
     relayClient.getConnectionState();
   window.__BUZZ_E2E_QUEUE_AUTH_RESPONSES__ = (responses) => {
     mockAuthResponses.push(...responses);
+  };
+  window.__BUZZ_E2E_QUEUE_CHANNEL_HISTORY_CLOSES__ = (reasons) => {
+    mockChannelHistoryCloses.push(...reasons);
   };
   window.__BUZZ_E2E_CLOSE_LIVE_SUBSCRIPTIONS__ = (reason) => {
     let closed = 0;

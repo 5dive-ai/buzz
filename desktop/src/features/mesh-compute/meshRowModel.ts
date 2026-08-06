@@ -41,26 +41,26 @@ export type MeshRowTone =
 /**
  * Why the dot is moving, not merely whether.
  *
- * Two different facts want motion, and collapsing them into one boolean would
- * make a throb ambiguous:
+ * **Motion means something is happening.** Only two facts qualify:
  *
- *   - `activity` — real work is in flight on this node right now
- *   - `invite`   — there is something worth doing, and nothing is happening
+ *   - `activity` — work is in flight on this node right now
+ *   - `progress` — a start or stop is in flight
  *
- * They are visually distinct (invite breathes slowly; activity uses the quick
- * stock ping) so the same animation never means two things.
+ * Everything else is a *standing state* and must not animate. An earlier
+ * revision pulsed an "act here" invitation — capacity you have not joined, or
+ * sharing with no agent using it — and because those conditions are permanently
+ * true they produced a dot that moved forever beside a perfectly healthy row.
+ * Constant motion is not a signal; it is noise that trains people to ignore the
+ * indicator. Standing states belong in the tone, the tooltip, and the popover's
+ * own prompt, all of which already carry them.
  *
- * `invite` covers two situations that share one meaning — "act here":
- *   - capacity exists and this machine is outside it
- *   - this machine shares, but no agent is set up to use the mesh
- *
- * The second deliberately does **not** get its own colour. Blue already means
- * *consuming*, i.e. taking from the mesh; sharing-with-no-consumer is the
- * opposite, so painting it blue would make blue meaningless. The dot keeps
- * saying what state we are in (green: sharing, truthfully) while the throb says
- * there is an action worth taking, and the tooltip names which.
+ * Both kinds animate brightness only, on the dot itself. No scaling: a growing
+ * dot shifts the row's optical baseline and reads as jitter. Opacity is what
+ * Tailwind's `pulse` animates and what Buzz already uses to mean "working"
+ * (`ChannelWorkingBadge`, `AgentStatusBadge`). They differ in tempo, not
+ * character — 1s for happening-now, 1.8s for in-progress.
  */
-export type MeshRowPulse = "none" | "activity" | "invite";
+export type MeshRowPulse = "none" | "activity" | "progress";
 
 export type MeshRowModel = {
   tone: MeshRowTone;
@@ -108,6 +108,24 @@ function liveCapacityGb(view: MeshLiveView | null): number {
   ].reduce((total, gb) => total + gb, 0);
 }
 
+/**
+ * Which pulse a participating node shows.
+ *
+ * Only real work moves the dot. `recentActivity` is not a second kind of signal:
+ * `inflight` is sampled every few seconds, so a request that starts and finishes
+ * between two polls is never seen at all. Latching the last sighting stops us
+ * forgetting observed work immediately — it never invents any.
+ */
+function pulseForWork({
+  busyNow,
+  recentActivity,
+}: {
+  busyNow: boolean;
+  recentActivity: boolean;
+}): MeshRowPulse {
+  return busyNow || recentActivity ? "activity" : "none";
+}
+
 export function deriveMeshRowModel({
   snapshot,
   status,
@@ -115,6 +133,7 @@ export function deriveMeshRowModel({
   view,
   pendingAction,
   busyNow,
+  recentActivity = false,
   hasMeshAgent,
 }: {
   snapshot: MeshSnapshot | null;
@@ -124,6 +143,16 @@ export function deriveMeshRowModel({
   pendingAction: "start" | "stop" | null;
   /** Work in flight on this node, inbound or outbound. */
   busyNow: boolean;
+  /**
+   * Work was in flight within the last few seconds.
+   *
+   * `busyNow` alone under-reports badly: `inflight` is sampled every 4s, so any
+   * request that starts and finishes between two polls is never seen and the dot
+   * never moves. Latching the last sighting makes real short work visible
+   * instead of silently dropping it. Still a fact about observed work — it never
+   * invents activity, it only stops forgetting it immediately.
+   */
+  recentActivity?: boolean;
   /**
    * Any agent resolves to the shared-compute provider.
    *
@@ -145,7 +174,12 @@ export function deriveMeshRowModel({
         pendingAction === "stop" ? "Stopping sharing…" : "Starting to share…",
       badge: null,
       callToAction: null,
-      pulse: "none",
+      // Loading is exactly when motion earns its keep. `meshStartNode` does not
+      // resolve until the runtime is serving, which on a 17 GB model is minutes;
+      // a still amber dot for that whole stretch reads as stuck rather than
+      // working. `progress` is patient rather than insistent, because nothing is
+      // wrong and nothing needs a decision.
+      pulse: "progress",
     };
   }
 
@@ -175,7 +209,11 @@ export function deriveMeshRowModel({
         tooltip: "Sharing compute · no agent is using it yet",
         badge,
         callToAction: null,
-        pulse: "invite",
+        // Standing state, so it does not animate. This condition stays true for
+        // as long as no agent uses the mesh, and a green dot pulsing forever
+        // beside a healthy row is noise. The tooltip says it, and the popover
+        // offers the fix.
+        pulse: "none",
       };
     }
     return {
@@ -187,7 +225,7 @@ export function deriveMeshRowModel({
           : "Sharing compute · waiting for another device",
       badge,
       callToAction: null,
-      pulse: busyNow ? "activity" : "none",
+      pulse: pulseForWork({ busyNow, recentActivity }),
     };
   }
 
@@ -199,7 +237,7 @@ export function deriveMeshRowModel({
       tooltip: "Using shared compute from the mesh",
       badge: gb > 0 ? formatCapacityGb(gb) : null,
       callToAction: null,
-      pulse: busyNow ? "activity" : "none",
+      pulse: pulseForWork({ busyNow, recentActivity }),
     };
   }
 
@@ -253,6 +291,8 @@ export function deriveMeshRowModel({
         ? `${count} ${plural(count, "device")}`
         : formatCapacityGb(gb),
     callToAction: null,
-    pulse: "invite",
+    // Standing state: this capacity sits there whether or not anyone looks. The
+    // slate tone and the capacity figure in the tooltip are the invitation.
+    pulse: "none",
   };
 }

@@ -126,25 +126,40 @@ test("an activity pulse means real work, nothing else", () => {
   assert.equal(derive({ toggle: CONSUMING, busyNow: true }).pulse, "activity");
 });
 
-test("capacity you have not joined throbs as an invitation", () => {
-  // The one state worth drawing the eye to unprompted: there is compute to tap
-  // into, and this machine is neither using nor adding to it.
+test("capacity you have not joined does not animate", () => {
+  // A standing state: that capacity sits there whether or not anyone looks, so
+  // the condition is permanently true and motion would never stop. The slate
+  // tone and the capacity figure in the tooltip carry it instead.
   const model = derive({
     snapshot: snapshot({ sharingDeviceCount: 3, sharedCapacityGb: 92 }),
   });
-  assert.equal(model.pulse, "invite");
+  assert.equal(model.tone, "available");
+  assert.equal(model.pulse, "none");
+  assert.match(model.tooltip, /92 GB/);
 });
 
-test("an invite is distinct from activity, so one animation never means two things", () => {
-  const invite = derive({
-    snapshot: snapshot({ sharingDeviceCount: 1, sharedCapacityGb: 36 }),
-  });
-  const activity = derive({
-    toggle: SHARING,
-    view: view(),
-    busyNow: true,
-  });
-  assert.notEqual(invite.pulse, activity.pulse);
+test("only something happening moves the dot", () => {
+  // The rule that keeps the indicator worth glancing at. An earlier revision
+  // animated standing states -- capacity not joined, sharing with no consumer --
+  // and because those are permanently true the dot moved forever beside a
+  // healthy row. Constant motion is not a signal.
+  const standing = [
+    derive({
+      snapshot: snapshot({ sharingDeviceCount: 1, sharedCapacityGb: 36 }),
+    }),
+    derive({ toggle: SHARING, view: view(), hasMeshAgent: false }),
+    derive({ toggle: SHARING, view: view() }),
+    derive({ toggle: CONSUMING }),
+  ];
+  for (const model of standing) {
+    assert.equal(model.pulse, "none");
+  }
+  // Only in-flight work and an in-flight start/stop animate.
+  assert.equal(
+    derive({ toggle: SHARING, view: view(), busyNow: true }).pulse,
+    "activity",
+  );
+  assert.equal(derive({ pendingAction: "start" }).pulse, "progress");
 });
 
 test("an empty or unfetched community never throbs", () => {
@@ -175,18 +190,18 @@ test("an unhealthy serve runtime reads failed, and can still be stopped", () => 
   assert.match(model.tooltip, /failed/i);
 });
 
-test("sharing with no agent throbs, but stays green", () => {
-  // Blue already means *consuming* — taking from the mesh. Sharing with no
-  // consumer is the opposite, so reusing blue would make blue meaningless. The
-  // dot keeps stating the truth (we are sharing) and the throb says there is a
-  // step left.
+test("sharing with no agent says so without animating", () => {
+  // Blue already means *consuming* -- taking from the mesh -- so this cannot
+  // borrow blue. It also must not pulse: the condition holds for as long as no
+  // agent uses the mesh, and a green dot moving forever beside a healthy row is
+  // noise. The tooltip states it and the popover offers the fix.
   const model = derive({
     toggle: SHARING,
     view: view(),
     hasMeshAgent: false,
   });
   assert.equal(model.tone, "sharing");
-  assert.equal(model.pulse, "invite");
+  assert.equal(model.pulse, "none");
   assert.match(model.tooltip, /no agent is using it yet/);
 });
 
@@ -254,4 +269,56 @@ test("an empty mesh does not throb, and an unfetched one offers nothing", () => 
   assert.equal(derive({ snapshot: snapshot() }).pulse, "none");
   assert.equal(derive({ snapshot: null }).badge, null);
   assert.equal(derive({ snapshot: null }).pulse, "none");
+});
+
+test("short work is still visible once the poll has passed", () => {
+  // `inflight` is sampled every 4s, so a request that starts and finishes
+  // between two polls is never seen. Without the latch the dot never moves and
+  // real activity looks like nothing happening -- which is exactly how this read
+  // in practice.
+  assert.equal(
+    derive({ toggle: SHARING, view: view(), busyNow: false }).pulse,
+    "none",
+  );
+  assert.equal(
+    derive({
+      toggle: SHARING,
+      view: view(),
+      busyNow: false,
+      recentActivity: true,
+    }).pulse,
+    "activity",
+    "a recent sighting keeps the dot moving",
+  );
+  assert.equal(
+    derive({ toggle: CONSUMING, busyNow: false, recentActivity: true }).pulse,
+    "activity",
+    "consuming latches the same way",
+  );
+});
+
+test("going live needs no pulse of its own", () => {
+  // The tone changing amber -> green IS the confirmation, and it happens at
+  // exactly that moment. A second signal for one transition is redundant motion,
+  // and motion is reserved for work.
+  const live = derive({ toggle: SHARING, view: view() });
+  assert.equal(live.tone, "sharing");
+  assert.equal(live.pulse, "none");
+});
+
+test("a start in flight moves the dot rather than sitting still", () => {
+  // `meshStartNode` does not resolve until the runtime is serving, which on a
+  // large model is minutes. A still amber dot for that whole stretch reads as
+  // stuck, so loading is exactly where motion earns its keep -- patient, because
+  // nothing is wrong and nothing needs a decision.
+  assert.equal(derive({ pendingAction: "start" }).pulse, "progress");
+  assert.equal(
+    derive({ toggle: SHARING, pendingAction: "stop" }).pulse,
+    "progress",
+  );
+  assert.equal(
+    derive({ toggle: SHARING, status: { state: "starting" } }).pulse,
+    "progress",
+    "a loading runtime moves even without a pending action",
+  );
 });

@@ -34,6 +34,14 @@ import { useMeshSnapshot } from "./useMeshSnapshot";
  * "sharing" while the popover it opened still said "starting". So the state is
  * owned here and passed down.
  */
+/**
+ * How long a sighting of in-flight work keeps the dot moving.
+ *
+ * Longer than the 4s usage poll on purpose: a single short request should stay
+ * visible past the sample that caught it, or the pulse is a flicker nobody sees.
+ */
+const ACTIVITY_LATCH_MS = 12_000;
+
 export function useMeshComputeState() {
   const { status, refresh: refreshStatus } = useMeshNodeStatus();
   const selectedModel = useShareComputeModel();
@@ -123,12 +131,45 @@ export function useMeshComputeState() {
   });
   const busyNow = (usage?.inflight ?? 0) > 0;
 
+  /**
+   * Recent work, and the moment sharing went live.
+   *
+   * `busyNow` alone under-reports badly. `inflight` is sampled every 4s, so a
+   * request that starts and finishes between two polls is never seen and the dot
+   * never moves -- which is why real activity looks like nothing is happening.
+   * Latching the last sighting stops us forgetting observed work immediately; it
+   * never invents any.
+   */
+  const [recentActivity, setRecentActivity] = React.useState(false);
+  React.useEffect(() => {
+    if (busyNow) setRecentActivity(true);
+  }, [busyNow]);
+  React.useEffect(() => {
+    if (!recentActivity) return;
+    const timer = setTimeout(() => setRecentActivity(false), ACTIVITY_LATCH_MS);
+    return () => clearTimeout(timer);
+  }, [recentActivity]);
+
   // `undefined` while the query is in flight, so the row can distinguish "no
   // mesh agent" from "not known yet" and never throb a nudge that then vanishes.
   const hasMeshAgent =
     managedAgents === undefined
       ? undefined
       : managedAgents.some(usesMeshCompute);
+
+  /**
+   * What every share switch shows.
+   *
+   * Optimistic on purpose: `meshStartNode` does not resolve until the runtime is
+   * actually serving, which on a 17 GB model is minutes. A switch that springs
+   * back and sits off for that whole time reads as "the click did not work".
+   *
+   * Derived once and shared, because the row and the popover used to compute
+   * this independently -- the row optimistically, the popover from real status --
+   * so the two controls for the same action disagreed for the entire load.
+   */
+  const shareSwitchChecked =
+    pendingAction === "start" || (toggle.isSharing && pendingAction !== "stop");
 
   const row = deriveMeshRowModel({
     snapshot,
@@ -137,6 +178,7 @@ export function useMeshComputeState() {
     view,
     pendingAction,
     busyNow,
+    recentActivity,
     hasMeshAgent,
   });
 
@@ -198,6 +240,7 @@ export function useMeshComputeState() {
     busyNow,
     downloadProgress,
     pendingAction,
+    shareSwitchChecked,
     modelToShare,
     setSharing,
     // A transport failure is worth showing; an empty mesh is not an error and

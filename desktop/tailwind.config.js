@@ -38,19 +38,28 @@ export default {
         4.5: "1.125rem",
       },
       keyframes: {
-        // The mesh-invite pulse: there is shared compute in the community and
-        // this machine is neither using nor adding to it. Deliberately unlike
-        // Tailwind's stock `ping`, which is quick and insistent because it
-        // signals something happening *now*. Nothing is happening here, so this
-        // breathes slowly and never reaches full opacity — noticeable on a
-        // second glance, never competing with unread badges.
-        "mesh-invite": {
-          "0%, 100%": { transform: "scale(1)", opacity: "0.55" },
-          "50%": { transform: "scale(2)", opacity: "0" },
+        // Brightness only, on the dot itself.
+        //
+        // No scaling: a dot that grows shifts the row's optical baseline and
+        // reads as jitter rather than as a signal. Opacity is what Tailwind's own
+        // `pulse` animates, and it is what Buzz already uses to mean "working"
+        // (`ChannelWorkingBadge`, `AgentStatusBadge`). It dips further than stock
+        // `pulse` (0.25 vs 0.5) because 8px of colour needs the extra contrast to
+        // register at a glance.
+        //
+        // Two durations, one curve: the difference between "happening now" and
+        // "in progress" is tempo, not character.
+        "mesh-dim": {
+          "0%, 100%": { opacity: "1" },
+          "50%": { opacity: "0.25" },
         },
       },
       animation: {
-        "mesh-invite": "mesh-invite 2.8s cubic-bezier(0.4, 0, 0.6, 1) infinite",
+        // Work in flight right now.
+        "mesh-activity": "mesh-dim 1s cubic-bezier(0.4, 0, 0.6, 1) infinite",
+        // A start or stop in flight. Slower: nothing is wrong, and nothing needs
+        // a decision.
+        "mesh-progress": "mesh-dim 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite",
       },
       fontFamily: {
         sans: [

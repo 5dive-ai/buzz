@@ -49,6 +49,7 @@ export function MeshComputePopover({
     inboundWork,
     downloadProgress,
     pendingAction,
+    shareSwitchChecked,
     modelToShare,
     setSharing,
     error,
@@ -105,7 +106,9 @@ export function MeshComputePopover({
                   ? "Stop sharing this computer's compute"
                   : "Share this computer's compute"
               }
-              checked={toggle.isSharing}
+              // Shared with the row switch: these are two controls for one
+              // action and must not disagree during a multi-minute model load.
+              checked={shareSwitchChecked}
               className="mt-0.5 shrink-0"
               data-testid="mesh-popover-share-toggle"
               disabled={pendingAction !== null}

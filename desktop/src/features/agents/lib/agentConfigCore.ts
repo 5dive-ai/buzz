@@ -3,8 +3,8 @@ import type {
   GlobalAgentConfig,
 } from "@/shared/api/types";
 import {
-  BUZZ_AGENT_THINKING_EFFORT,
   BUZZ_AGENT_THINKING_EFFORT_VALUES,
+  getProviderEffortConfig,
 } from "../ui/buzzAgentConfig";
 
 /**
@@ -46,16 +46,6 @@ export type StructuredJsonEnvPersistence = {
   jsonKey: string;
 };
 
-type AcpConfigOptionPersistence = {
-  kind: "acpConfigOption";
-  id: string;
-  category: string;
-};
-
-type UnavailablePersistence = {
-  kind: "unavailable";
-};
-
 export type AgentConfigFieldDescriptor =
   | {
       kind: "provider";
@@ -77,20 +67,12 @@ export type AgentConfigFieldDescriptor =
     }
   | {
       kind: "effort";
-      optionSource:
-        | "buzzAgentCatalog"
-        | "legacyProviderModelCatalog"
-        | "harnessNative";
-      currentPersistence:
-        | EnvVarPersistence
-        | StructuredJsonEnvPersistence
-        | AcpConfigOptionPersistence
-        | UnavailablePersistence;
+      optionSource: "buzzAgentCatalog" | "legacyProviderModelCatalog";
+      currentPersistence: EnvVarPersistence | StructuredJsonEnvPersistence;
       targetApplication:
         | { kind: "envVar"; key: string }
-        | { kind: "structuredJsonEnv"; envKey: string; jsonKey: string }
-        | { kind: "acpConfigOption"; id: string; category: string };
-      render: "control" | "deferredUntilNativeOptionsAvailable";
+        | { kind: "structuredJsonEnv"; envKey: string; jsonKey: string };
+      render: "control";
       value: string | null;
     }
   | {
@@ -103,7 +85,7 @@ export type AgentConfigFieldDescriptor =
 
 export type AgentConfigOmission = {
   kind: "effort";
-  reason: "ownedByModelId" | "unsupportedByHarness";
+  reason: "unsupportedByHarness";
 };
 
 /**
@@ -128,47 +110,139 @@ function valueFromEnv(config: GlobalAgentConfig, key: string) {
   return config.env_vars[key]?.trim() || null;
 }
 
-export type StructuredJsonEffortDescriptor = {
+/**
+ * An effort field backed by the environment, in either shape a harness accepts:
+ * a plain variable (`CLAUDE_CODE_EFFORT_LEVEL`, `GOOSE_THINKING_EFFORT`) or one
+ * property inside a structured JSON variable (Codex's `CODEX_CONFIG`).
+ *
+ * Both shapes carry the *same* key in `currentPersistence` and
+ * `targetApplication`: the value is stored exactly where the harness reads it,
+ * so there is no translation step that can silently drop an edit.
+ */
+export type EffortEnvDescriptor = {
   kind: "effort";
   optionSource: "legacyProviderModelCatalog";
-  currentPersistence: StructuredJsonEnvPersistence;
-  targetApplication: {
-    kind: "structuredJsonEnv";
-    envKey: string;
-    jsonKey: string;
-  };
+  currentPersistence: EnvVarPersistence | StructuredJsonEnvPersistence;
+  targetApplication:
+    | { kind: "envVar"; key: string }
+    | { kind: "structuredJsonEnv"; envKey: string; jsonKey: string };
   render: "control";
   value: null;
   values: readonly string[];
 };
 
 /**
- * Derives an effort field for a catalog-declared structured JSON env target.
- * The renderer never needs to know a runtime ID, env name, or JSON property.
+ * Derives an effort field for a catalog-declared environment target. The
+ * renderer never needs to know a runtime ID, env name, or JSON property.
+ *
+ * Returns `undefined` when the runtime declares no environment target for
+ * effort, which is the only reason a surface should render no control.
  */
-export function deriveStructuredJsonEffortDescriptor(
+export function deriveEffortEnvDescriptor(
   runtime: AcpRuntimeCatalogEntry | undefined,
-): StructuredJsonEffortDescriptor | undefined {
-  if (!runtime?.thinkingConfigJsonEnvVar || !runtime.thinkingConfigJsonKey) {
-    return undefined;
-  }
+): EffortEnvDescriptor | undefined {
+  const persistence = effortEnvPersistence(runtime);
+  if (!persistence) return undefined;
   return {
     kind: "effort",
     optionSource: "legacyProviderModelCatalog",
-    currentPersistence: {
-      kind: "structuredJsonEnv",
-      envKey: runtime.thinkingConfigJsonEnvVar,
-      jsonKey: runtime.thinkingConfigJsonKey,
-    },
-    targetApplication: {
-      kind: "structuredJsonEnv",
-      envKey: runtime.thinkingConfigJsonEnvVar,
-      jsonKey: runtime.thinkingConfigJsonKey,
-    },
+    currentPersistence: persistence,
+    targetApplication: persistence,
     render: "control",
     value: null,
-    values: BUZZ_AGENT_THINKING_EFFORT_VALUES,
+    values: effortValuesForRuntime(runtime?.id ?? ""),
   };
+}
+
+/**
+ * The effort levels a generic (non-buzz-agent) control may offer for a harness.
+ *
+ * A harness that locks its provider accepts only that provider's levels, so
+ * offering the full buzz-agent list would let the user pick a value the harness
+ * silently drops. Claude Code is the concrete case: its CLI enum is
+ * `["low","medium","high","xhigh","max"]` (plus the `med`/`ultracode` aliases),
+ * and `CLAUDE_CODE_EFFORT_LEVEL=none` resolves to "unset" rather than an effort
+ * — exactly the silent no-op this module exists to prevent. The Anthropic table
+ * in `getProviderEffortConfig` already encodes that set.
+ *
+ * Harnesses whose provider is user-selectable (Goose) get the full list,
+ * because the accepted set depends on a provider/model this surface does not
+ * know; the per-provider narrowing happens on the surfaces that do know.
+ */
+function effortValuesForRuntime(runtimeId: string): readonly string[] {
+  const provider = implicitEffortProvider(runtimeId);
+  if (!provider) return BUZZ_AGENT_THINKING_EFFORT_VALUES;
+  return getProviderEffortConfig(provider, "").validValues;
+}
+
+function effortEnvPersistence(
+  runtime: AcpRuntimeCatalogEntry | undefined,
+): EnvVarPersistence | StructuredJsonEnvPersistence | undefined {
+  if (runtime?.thinkingConfigJsonEnvVar && runtime.thinkingConfigJsonKey) {
+    return {
+      kind: "structuredJsonEnv",
+      envKey: runtime.thinkingConfigJsonEnvVar,
+      jsonKey: runtime.thinkingConfigJsonKey,
+    };
+  }
+  if (runtime?.thinkingEnvVar) {
+    return { kind: "envVar", key: runtime.thinkingEnvVar };
+  }
+  return undefined;
+}
+
+/**
+ * The provider whose effort table applies when a harness locks its provider and
+ * therefore renders no provider control. Named here rather than in a component
+ * because it is a harness-identity fact, not presentation (see AGENTS.md rule 1).
+ */
+export function implicitEffortProvider(runtimeId: string): string {
+  if (runtimeId === "claude") return "anthropic";
+  if (runtimeId === "codex") return "openai";
+  return "";
+}
+
+/**
+ * Read the effort value from whichever environment shape the target uses.
+ *
+ * `persistence` is optional so surfaces can call this before the catalog has
+ * settled (or for a harness with no effort target) without branching: with no
+ * target there is no stored value, so the answer is `""`.
+ */
+export function readEffortEnvValue(
+  envVars: Record<string, string>,
+  persistence: EffortEnvDescriptor["currentPersistence"] | undefined,
+): string {
+  if (!persistence) return "";
+  return persistence.kind === "structuredJsonEnv"
+    ? readStructuredJsonEnvValue(envVars, persistence)
+    : (envVars[persistence.key] ?? "");
+}
+
+/**
+ * Write (or clear, on `""`) the effort value in whichever environment shape the
+ * target uses. Never mutates the input map.
+ *
+ * With no `persistence` there is nothing to write, so the map is returned
+ * copied and unchanged — callers that clear effort alongside other edits stay
+ * branch-free.
+ */
+export function updateEffortEnvValue(
+  envVars: Record<string, string>,
+  persistence: EffortEnvDescriptor["currentPersistence"] | undefined,
+  value: string,
+): Record<string, string> {
+  if (!persistence) return { ...envVars };
+  if (persistence.kind === "structuredJsonEnv") {
+    return updateStructuredJsonEnvValue(envVars, persistence, value);
+  }
+  const next = { ...envVars };
+  if (value) {
+    next[persistence.key] = value;
+  } else {
+    delete next[persistence.key];
+  }
+  return next;
 }
 
 /** Read one string property from a descriptor-owned JSON env value. */
@@ -317,40 +391,28 @@ export function deriveAgentConfigFieldModel({
     value: config.model,
   });
 
-  if (runtime?.thinkingEnvVar) {
+  const effortPersistence = effortEnvPersistence(runtime);
+  if (effortPersistence) {
     fields.push({
       kind: "effort",
       optionSource:
-        runtime.id === "buzz-agent"
+        runtime?.id === "buzz-agent"
           ? "buzzAgentCatalog"
           : "legacyProviderModelCatalog",
-      currentPersistence: {
-        kind: "envVar",
-        key: BUZZ_AGENT_THINKING_EFFORT,
-      },
-      targetApplication: { kind: "envVar", key: runtime.thinkingEnvVar },
+      // Store the value where the harness reads it. A previous revision pinned
+      // this to BUZZ_AGENT_THINKING_EFFORT for every runtime, which made the
+      // Goose and Claude Code controls write a key their harness ignores.
+      currentPersistence: effortPersistence,
+      targetApplication: effortPersistence,
       render: "control",
-      value: valueFromEnv(config, BUZZ_AGENT_THINKING_EFFORT),
-    });
-  } else if (runtime?.id === "claude") {
-    fields.push({
-      kind: "effort",
-      optionSource: "harnessNative",
-      currentPersistence: { kind: "unavailable" },
-      targetApplication: {
-        kind: "acpConfigOption",
-        id: "effort",
-        category: "thought_level",
-      },
-      render: "deferredUntilNativeOptionsAvailable",
-      value: null,
+      value:
+        effortPersistence.kind === "envVar"
+          ? valueFromEnv(config, effortPersistence.key)
+          : readStructuredJsonEnvValue(config.env_vars, effortPersistence) ||
+            null,
     });
   } else {
-    omissions.push({
-      kind: "effort",
-      reason:
-        runtime?.id === "codex" ? "ownedByModelId" : "unsupportedByHarness",
-    });
+    omissions.push({ kind: "effort", reason: "unsupportedByHarness" });
   }
 
   // Numeric fields — derived from the shared helper, then value-populated

@@ -129,11 +129,18 @@ pub enum PermissionMode {
     Default,
     /// Fully autonomous execution; model-gated (requires `supportsAutoMode`).
     ///
-    /// The adapter self-approves all tool calls internally and never emits
-    /// `session/request_permission`, so this mode is incompatible with
-    /// `ask` (card never fires) and `reject` (policy is a dead letter while
-    /// the adapter auto-approves — the inverted-security worst case).
-    /// Compatible with `allow` (both want unattended approval).
+    /// `auto` is a model-gated classifier — the adapter self-approves most tool
+    /// calls internally, but can fall back to forwarding residual
+    /// `session/request_permission` requests to ACP when the model chooses manual
+    /// approval for a specific call. It is therefore **not** a hard bypass.
+    ///
+    /// Policy compatibility:
+    /// - `allow + auto` — compatible; both want unattended approval.
+    /// - `ask + auto` — compatible with a startup warning; residual escalations
+    ///   still surface permission cards, but internally approved calls bypass the
+    ///   ask flow silently.
+    /// - `reject + auto` — startup contradiction; adapter auto-approves
+    ///   internally while the policy intends to deny — inverted-security worst case.
     #[value(alias = "auto")]
     Auto,
     /// Auto-approve file edits, still ask for other tools.

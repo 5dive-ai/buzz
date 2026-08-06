@@ -147,12 +147,13 @@ export type TranscriptItem =
        */
       options?: Array<{ optionId: string; kind: string; label?: string }>;
       /**
-       * Set to `true` when a `control_result` frame indicates that the last
-       * `permission_decision` click was not delivered to the harness (status
-       * was non-`sent`). The `PermissionDecisionButtons` component uses this
-       * to re-enable buttons so the user can retry without reloading.
+       * Monotonically increasing token incremented on every `control_result`
+       * with a non-`sent` delivery status. The `PermissionDecisionButtons`
+       * component keys its re-enable effect on this value, so a second failure
+       * after a retry (same boolean value would not re-trigger the effect)
+       * still re-enables the buttons. `undefined` when no failure has occurred.
        */
-      deliveryFailed?: boolean;
+      deliveryFailed?: number;
     } & TranscriptItemIdentity)
   | ({
       id: string;

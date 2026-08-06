@@ -59,7 +59,12 @@ function PermissionDecisionButtons({
   channelId: string;
   options: Array<{ optionId: string; kind: string; label?: string }>;
   requestNonce: string;
-  deliveryFailed?: boolean;
+  /**
+   * Monotonically increasing failure token from the reducer — incremented on
+   * every non-`sent` `control_result`. Keying the effect on this number (not a
+   * boolean) ensures a second failure after a retry also re-enables buttons.
+   */
+  deliveryFailed?: number;
 }) {
   const [pending, setPending] = React.useState<string | null>(null);
 

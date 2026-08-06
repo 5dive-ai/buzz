@@ -2289,14 +2289,72 @@ test("buildTranscript_control_result_non_sent_marks_card_delivery_failed", () =>
   assert.ok(card, "permission card must exist");
   assert.equal(
     card.deliveryFailed,
-    true,
-    "deliveryFailed must be set on non-sent control_result",
+    1,
+    "deliveryFailed must be 1 after first non-sent control_result",
   );
   // Card must still be actionable so the user can retry.
   assert.equal(
     card.actionable,
     true,
     "card must remain actionable after delivery failure",
+  );
+});
+
+test("buildTranscript_control_result_second_failure_increments_delivery_failed", () => {
+  // A second non-`sent` control_result must increment deliveryFailed so the
+  // useEffect([deliveryFailed]) dependency in PermissionDecisionButtons
+  // re-fires and re-enables the buttons for a second retry attempt.
+  const nonce = "nonce-delivery-fail-2";
+  const events = [
+    makePermissionRequestWithAuth(1, "req-df2", nonce),
+    // First failure.
+    {
+      seq: 2,
+      timestamp: "2026-07-01T10:00:01.000Z",
+      kind: "control_result",
+      agentIndex: 0,
+      channelId: "ch-1",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      payload: {
+        type: "permission_decision",
+        status: "no_active_turn",
+        requestNonce: nonce,
+        optionId: "allow_once",
+      },
+    },
+    // Second failure (user retried; harness still unavailable).
+    {
+      seq: 3,
+      timestamp: "2026-07-01T10:00:02.000Z",
+      kind: "control_result",
+      agentIndex: 0,
+      channelId: "ch-1",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      payload: {
+        type: "permission_decision",
+        status: "channel_closed",
+        requestNonce: nonce,
+        optionId: "allow_once",
+      },
+    },
+  ];
+  const transcript = buildTranscript(events);
+
+  const card = transcript.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === nonce,
+  );
+  assert.ok(card, "permission card must exist");
+  assert.equal(
+    card.deliveryFailed,
+    2,
+    "deliveryFailed must be 2 after two non-sent control_results — each failure must increment the token",
+  );
+  assert.equal(
+    card.actionable,
+    true,
+    "card must remain actionable after second delivery failure",
   );
 });
 

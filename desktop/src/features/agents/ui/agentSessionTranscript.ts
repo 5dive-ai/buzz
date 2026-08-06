@@ -1213,7 +1213,15 @@ export function processTranscriptEvent(
               existing.renderClass === "permission" &&
               existing.actionable
             ) {
-              replaceItem(d, itemId, { ...existing, deliveryFailed: true });
+              replaceItem(d, itemId, {
+                ...existing,
+                // Increment the failure token so the effect in
+                // PermissionDecisionButtons re-fires even when a prior
+                // failure already set deliveryFailed (a sticky boolean
+                // value would not change on the second failure and the
+                // useEffect dependency would not trigger).
+                deliveryFailed: (existing.deliveryFailed ?? 0) + 1,
+              });
             }
           }
         }

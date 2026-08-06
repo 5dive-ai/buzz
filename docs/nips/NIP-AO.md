@@ -125,8 +125,14 @@ below). It is omitted on all other frame kinds.
 
 Permission `acp_read` frames (carrying `session/request_permission` calls) always
 include an `authorization` envelope. The corresponding `acp_write` (the harness
-response) also includes an `authorization` envelope when the decision was recorded —
+response) also includes an `authorization` envelope correlated by the same nonce —
 this pairs the challenge and answer in the observer log.
+
+**One-write / one-observe contract.** Each pending permission entry produces at most
+one ACP wire write and at most one authorized `acp_write` observer event. The write
+and the observer event are always emitted together; if the write fails the observer
+event is suppressed. The sole exception is the `uncertain` terminal (see below) in
+which neither is emitted.
 
 ### Authorization Envelope
 
@@ -137,7 +143,7 @@ call, the `ObserverEvent` carries an `authorization` field:
 {
   "requestNonce": "<single-use opaque string>",
   "actionable":   true | false,
-  "reason":       "<human-readable string>" | omitted
+  "reason":       "<terminal-reason>" | omitted
 }
 ```
 
@@ -148,9 +154,21 @@ call, the `ObserverEvent` carries an `authorization` field:
   silently ignored. If no matching decision arrives before the per-request timeout,
   the harness fails the request closed.
 - `actionable`: `true` when the owner can act (policy=`ask`, preflight passed, owner
-  and observer available). `false` for auto-deny, fail-closed, and downgrade paths.
-- `reason`: present only when `actionable` is `false`; explains why the request was
-  automatically denied.
+  and observer available). `false` for auto-deny, fail-closed, and terminal outcomes.
+- `reason`: present on every `acp_write` authorization envelope. Identifies the
+  terminal outcome for this request. Defined values:
+
+  | Value | Meaning |
+  |-------|---------|
+  | `"applied"` | Owner decision was received and written to the agent pipe. |
+  | `"timed_out"` | No decision arrived before the 300-second per-request deadline; request failed closed (denial). |
+  | `"cancelled"` | The turn was cancelled while the request was pending; request failed closed (denial). |
+
+  The `uncertain` terminal (cancel arriving while the write is in flight) does NOT
+  produce an `acp_write` observer event — the process is irrecoverably poisoned and
+  will be respawned by the pool. Desktop clients MUST NOT expect an `acp_write` for
+  every `acp_read` they receive; a missing `acp_write` after a `session_resolved`
+  frame with a poisoned outcome indicates the `uncertain` path.
 
 **Nonce binding.** The nonce is bound to the agent, channel, session, turn, request
 ID, and exact option snapshot at generation time. It MUST NOT be reused across
@@ -516,7 +534,10 @@ of decrypted payloads and MUST NOT log them at INFO level or above.
 
 Note: `actionable` is `false` on the `acp_write` telemetry frame — the decision has
 been applied and the card is no longer actionable. `reason: "applied"` is the
-standard terminal annotation for a successfully delivered decision.
+standard terminal annotation for a successfully delivered decision. When the request
+expires without a decision, the harness emits `reason: "timed_out"`. When the turn
+is cancelled while the request is pending, the harness emits `reason: "cancelled"`.
+If the cancel arrives mid-write (`uncertain`), no `acp_write` frame is emitted at all.
 
 ## Reference Implementation
 

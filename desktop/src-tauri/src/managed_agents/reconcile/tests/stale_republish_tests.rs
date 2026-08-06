@@ -702,3 +702,224 @@ fn sami_fix_pair_start_resolve_then_snapshot_keeps_quad_definition_authoritative
         "control: quad still definition-authoritative"
     );
 }
+
+// ── Review item 5: boot reconcile as a stale-republish site ─────────────────
+//
+// `reconcile_agents_in_dir_at` reads `managed-agents.json` raw and cannot
+// resolve the overlay: `hydrate_private_config_overlay` runs AFTER this leg
+// (`event_sync.rs:19-20`) and reads the rows this leg writes. On a following
+// device, disk is stale by construction, so rebuilding the 30179 from disk is
+// the item-2 clobber with no user action at all.
+
+/// Builds the follower fixture: a stale disk store plus a NEWER inbound 30179
+/// head (`pending_sync = 0`, far-future `created_at`). Returns the head event.
+fn seed_follower_with_newer_head(
+    dir: &TempDir,
+    owner_keys: &nostr::Keys,
+    disk: &ManagedAgentRecord,
+    fresh: &ManagedAgentRecord,
+    generation: u64,
+    created_at: i64,
+) -> nostr::Event {
+    let owner_hex = owner_keys.public_key().to_hex();
+    let payload =
+        private_payload_from_record(fresh, &owner_hex, generation, Some("aa".repeat(32))).unwrap();
+    let event =
+        private_managed_agent::build_event(owner_keys, &payload, created_at as u64).unwrap();
+    let conn = open_retention_db(&dir.path().join("retention.db")).unwrap();
+    crate::managed_agents::retention::retain_inbound_event(
+        &conn,
+        &RetainedEvent {
+            kind: KIND_PRIVATE_MANAGED_AGENT,
+            pubkey: owner_hex,
+            d_tag: disk.pubkey.clone(),
+            content: event.content.clone(),
+            created_at,
+            raw_event: event.as_json(),
+            pending_sync: false,
+        },
+    )
+    .unwrap();
+    event
+}
+
+fn retained_private_row(dir: &TempDir, owner_keys: &nostr::Keys, pubkey: &str) -> RetainedEvent {
+    let conn = open_retention_db(&dir.path().join("retention.db")).unwrap();
+    get_retained_event(
+        &conn,
+        KIND_PRIVATE_MANAGED_AGENT,
+        &owner_keys.public_key().to_hex(),
+        pubkey,
+    )
+    .unwrap()
+    .unwrap()
+}
+
+/// Item 5 FIX: boot reconcile must leave an existing 30179 head alone.
+///
+/// Red-first against `retain_agent_record` at boot: the probe measured
+/// `name="stale-disk-name"`, `parallelism=Some(1)`, gen 5→6, `prev` = the
+/// clobbered head, `created_at` = head+1 (so it wins LWW), `pending_sync=true`
+/// — every stale disk field published over device A's newer config at launch,
+/// with no user action.
+#[test]
+fn boot_reconcile_leaves_existing_private_head_intact() {
+    let dir = TempDir::new().unwrap();
+    let owner_keys = nostr::Keys::generate();
+    let agent_keys = nostr::Keys::generate();
+    let pubkey = agent_keys.public_key().to_hex();
+
+    let mut disk = sample_record(&pubkey, "stale-disk-name");
+    disk.private_key_nsec = agent_keys.secret_key().to_bech32().unwrap();
+    disk.system_prompt = Some("STALE disk prompt".into());
+    disk.parallelism = 1;
+    disk.env_vars = BTreeMap::from([("STALE_KEY".to_string(), "stale".to_string())]);
+    write_store(&dir, &[disk.clone()]);
+
+    let mut fresh = disk.clone();
+    fresh.name = "FRESH relay name".into();
+    fresh.system_prompt = Some("FRESH relay prompt".into());
+    fresh.parallelism = 16;
+    fresh.env_vars = BTreeMap::from([("FRESH_KEY".to_string(), "fresh".to_string())]);
+    let head_created_at = nostr::Timestamp::now().as_secs() as i64 + 10_000;
+    let head_event =
+        seed_follower_with_newer_head(&dir, &owner_keys, &disk, &fresh, 5, head_created_at);
+
+    // BOOT. No user action.
+    reconcile_agents_in_dir(dir.path(), &owner_keys).unwrap();
+
+    let row = retained_private_row(&dir, &owner_keys, &pubkey);
+    assert_eq!(
+        row.raw_event,
+        head_event.as_json(),
+        "boot reconcile must not rebuild the 30179 from stale disk over an \
+         existing head — byte-identical, so no gen bump and no re-encryption"
+    );
+    // Not merely equal-by-content: nothing was queued for publish either.
+    let conn = open_retention_db(&dir.path().join("retention.db")).unwrap();
+    assert!(
+        get_pending_sync(&conn)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != KIND_PRIVATE_MANAGED_AGENT),
+        "no stale 30179 enqueued for relay publish"
+    );
+}
+
+/// The requirement item 1 exists to serve, preserved: an agent with NO retained
+/// 30179 head still publishes its first one at boot. Without this arm the fix
+/// above is satisfied by never publishing a 30179 at boot at all — which is the
+/// item-1 bug restored.
+#[test]
+fn boot_reconcile_still_publishes_first_private_config() {
+    let dir = TempDir::new().unwrap();
+    let owner_keys = nostr::Keys::generate();
+    let agent_keys = nostr::Keys::generate();
+    let pubkey = agent_keys.public_key().to_hex();
+
+    let mut record = sample_record(&pubkey, "untouched-agent");
+    record.private_key_nsec = agent_keys.secret_key().to_bech32().unwrap();
+    record.parallelism = 7;
+    write_store(&dir, &[record]);
+
+    assert_eq!(reconcile_agents_in_dir(dir.path(), &owner_keys).unwrap(), 1);
+
+    let row = retained_private_row(&dir, &owner_keys, &pubkey);
+    let (_, payload) = private_managed_agent::validate_and_decrypt(
+        &nostr::Event::from_json(&row.raw_event).unwrap(),
+        &owner_keys,
+    )
+    .unwrap();
+    assert_eq!(payload.generation, 1);
+    assert_eq!(payload.previous_event_id, None);
+    assert_eq!(payload.config.parallelism, Some(7));
+    assert!(row.pending_sync, "first 30179 is queued for publish");
+}
+
+/// The 30177 leg must be untouched by the 30179 gate: an edited record whose
+/// PUBLIC projection changed still republishes at boot even though a private
+/// head exists. This is what keeps the upgrade republish waves
+/// (`slimming_republish_wave_is_one_time`) working, and it fails if the gate is
+/// written at the wrong level (skipping the whole record instead of the 30179).
+#[test]
+fn boot_reconcile_still_republishes_public_projection_with_private_head_present() {
+    let dir = TempDir::new().unwrap();
+    let owner_keys = nostr::Keys::generate();
+    let agent_keys = nostr::Keys::generate();
+    let pubkey = agent_keys.public_key().to_hex();
+
+    let mut disk = sample_record(&pubkey, "public-name-v2");
+    disk.private_key_nsec = agent_keys.secret_key().to_bech32().unwrap();
+    write_store(&dir, &[disk.clone()]);
+
+    let mut fresh = disk.clone();
+    fresh.parallelism = 16;
+    let head_created_at = nostr::Timestamp::now().as_secs() as i64 + 10_000;
+    seed_follower_with_newer_head(&dir, &owner_keys, &disk, &fresh, 5, head_created_at);
+
+    assert_eq!(
+        reconcile_agents_in_dir(dir.path(), &owner_keys).unwrap(),
+        1,
+        "the 30177 identity projection still reconciles at boot"
+    );
+    let conn = open_retention_db(&dir.path().join("retention.db")).unwrap();
+    let public_row = get_retained_event(
+        &conn,
+        KIND_MANAGED_AGENT,
+        &owner_keys.public_key().to_hex(),
+        &pubkey,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(public_row.content.contains("public-name-v2"));
+    assert!(public_row.pending_sync);
+}
+
+/// WRONG-FIX PROBE (permanent): the tempting alternative is to resolve the
+/// overlay inside boot reconcile (swapping the hydrate/reconcile order in
+/// `run_event_sync`). It is wrong for the same reason the centralized resolve
+/// was wrong at the edit site — but with a worse blast radius, because boot
+/// touches EVERY agent rather than the one being edited.
+///
+/// A local edit made while the relay was unreachable lives on disk AND in a
+/// `pending_sync` 30179 that never flushed. Resolving disk through an overlay
+/// hydrated from the last-known head would rebuild the payload from that older
+/// head and discard the edit — at launch, silently, for every agent.
+#[test]
+fn probe_resolving_overlay_at_boot_would_discard_unflushed_local_edits() {
+    use crate::managed_agents::private_config_overlay::{PrivateConfigOverlay, PrivateConfigPatch};
+
+    let owner_keys = nostr::Keys::generate();
+    let agent_keys = nostr::Keys::generate();
+    let pubkey = agent_keys.public_key().to_hex();
+    let owner_hex = owner_keys.public_key().to_hex();
+
+    // The last head this device saw, which is what a boot-time overlay would
+    // hydrate from.
+    let mut head = sample_record(&pubkey, "head-name");
+    head.private_key_nsec = agent_keys.secret_key().to_bech32().unwrap();
+    head.parallelism = 16;
+    let head_payload = private_payload_from_record(&head, &owner_hex, 3, None).unwrap();
+    let mut overlay = PrivateConfigOverlay::default();
+    overlay.insert_patch(PrivateConfigPatch::from_payload(head_payload).unwrap());
+
+    // The user's offline edit, on disk and not yet flushed to the relay.
+    let mut disk = head.clone();
+    disk.parallelism = 2;
+
+    assert_eq!(
+        overlay.resolve_local_record(&disk).parallelism,
+        16,
+        "resolving at boot DISCARDS the unflushed local edit (2 -> 16); this is \
+         why the fix is a head-presence gate, not a resolve"
+    );
+    // Positive control: with no patch the edit survives, so the discard above
+    // is the overlay winning rather than a broken fixture.
+    assert_eq!(
+        PrivateConfigOverlay::default()
+            .resolve_local_record(&disk)
+            .parallelism,
+        2,
+        "control: without an overlay patch the offline edit survives"
+    );
+}

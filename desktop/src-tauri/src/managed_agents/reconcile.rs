@@ -115,12 +115,57 @@ fn reconcile_agents_in_dir_at(
             continue;
         }
 
-        if retain_agent_record(&conn, keys, record)? {
+        if retain_agent_record_at_boot(&conn, keys, record)? {
             reconciled += 1;
         }
     }
 
     Ok(reconciled)
+}
+
+/// Boot-only variant of [`retain_agent_record`]: reconciles the kind:30177
+/// identity record exactly as the interactive paths do, but publishes the
+/// kind:30179 private config **only when no retained head exists**.
+///
+/// Boot reads `managed-agents.json` raw — there is no overlay to resolve
+/// against, because `hydrate_private_config_overlay` runs after this leg and
+/// depends on the very rows written here. On a device that FOLLOWS another
+/// device's config, disk is stale by construction (inbound 30179 updates the
+/// overlay and retention, never the JSON), so rebuilding the 30179 projection
+/// from disk republishes every stale field over a newer head as an audit-clean
+/// gen+1 successor, and `monotonic_created_at` makes it win LWW. That fires at
+/// launch, unprompted, and re-arms on every new head the follower receives.
+///
+/// Restricting boot to the head-absent case keeps the requirement boot exists
+/// to serve — an agent whose nsec lives in the keyring must get its FIRST
+/// 30179 published — while leaving an existing head to the interactive edit
+/// paths, which resolve the overlay before retaining and so author from
+/// relay-fresh state. Every 30177 (no-secrets projection) behaves exactly as
+/// before: the upgrade republish waves run on that kind, not this one.
+fn retain_agent_record_at_boot(
+    conn: &rusqlite::Connection,
+    keys: &nostr::Keys,
+    record: &ManagedAgentRecord,
+) -> Result<bool, String> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin agent retention transaction: {error}"))?;
+    let public_changed = retain_public_agent_record(&transaction, keys, record)?;
+    let private_head = get_retained_event(
+        &transaction,
+        KIND_PRIVATE_MANAGED_AGENT,
+        &keys.public_key().to_hex(),
+        &record.pubkey,
+    )?;
+    let private_changed = if private_head.is_some() {
+        false
+    } else {
+        retain_private_agent_record(&transaction, keys, record)?
+    };
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit agent retention transaction: {error}"))?;
+    Ok(public_changed || private_changed)
 }
 
 /// Retain `record`'s kind:30177 identity record, marking it `pending_sync`

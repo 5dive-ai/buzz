@@ -26,8 +26,12 @@ use super::{
     retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
     ManagedAgentRecord,
 };
-use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
+use buzz_core_pkg::{
+    kind::{KIND_MANAGED_AGENT, KIND_PRIVATE_MANAGED_AGENT},
+    private_managed_agent::{self, Payload, PrivateConfig, PrivateIdentity},
+};
 use nostr::JsonUtil;
+use std::collections::BTreeMap;
 
 /// Reconcile `managed-agents.json` into kind:30177 events in the retention
 /// store. Boot-time entry point, called from `event_sync::run_event_sync`
@@ -127,6 +131,22 @@ pub(crate) fn retain_agent_record(
     keys: &nostr::Keys,
     record: &ManagedAgentRecord,
 ) -> Result<bool, String> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin agent retention transaction: {error}"))?;
+    let public_changed = retain_public_agent_record(&transaction, keys, record)?;
+    let private_changed = retain_private_agent_record(&transaction, keys, record)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit agent retention transaction: {error}"))?;
+    Ok(public_changed || private_changed)
+}
+
+fn retain_public_agent_record(
+    conn: &rusqlite::Connection,
+    keys: &nostr::Keys,
+    record: &ManagedAgentRecord,
+) -> Result<bool, String> {
     let owner_pubkey = keys.public_key().to_hex();
     let existing = get_retained_event(conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
 
@@ -163,6 +183,155 @@ pub(crate) fn retain_agent_record(
     )
     .map_err(|e| format!("failed to retain '{}': {e}", record.name))?;
     Ok(true)
+}
+
+fn retain_private_agent_record(
+    conn: &rusqlite::Connection,
+    keys: &nostr::Keys,
+    record: &ManagedAgentRecord,
+) -> Result<bool, String> {
+    if record.private_key_nsec.is_empty() {
+        return Ok(false);
+    }
+
+    let owner_pubkey = keys.public_key().to_hex();
+    let existing = get_retained_event(
+        conn,
+        KIND_PRIVATE_MANAGED_AGENT,
+        &owner_pubkey,
+        &record.pubkey,
+    )?;
+    let previous_event = existing
+        .as_ref()
+        .and_then(|row| nostr::Event::from_json(&row.raw_event).ok());
+    let generation = previous_event
+        .as_ref()
+        .and_then(event_generation)
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| format!("private config generation overflow for '{}'", record.name))?;
+    let previous_event_id = previous_event.as_ref().map(|event| event.id.to_hex());
+    let created_at = monotonic_created_at(existing.as_ref().map(|row| row.created_at));
+    let mut payload =
+        private_payload_from_record(record, &owner_pubkey, generation, previous_event_id)?;
+
+    // Preserve fields authored by a newer client. This writer owns the known
+    // typed fields only; flatten/extension data must survive an older Desktop
+    // editing one known value.
+    let existing_payload = previous_event.as_ref().and_then(|existing_event| {
+        private_managed_agent::validate_and_decrypt(existing_event, keys)
+            .ok()
+            .map(|(_, payload)| payload)
+    });
+    if let Some(existing_payload) = &existing_payload {
+        payload.extensions.clone_from(&existing_payload.extensions);
+        payload.extra.clone_from(&existing_payload.extra);
+        payload
+            .config
+            .extra
+            .clone_from(&existing_payload.config.extra);
+    }
+
+    // NIP-44 encryption is randomized, so compare the validated plaintext
+    // payload rather than ciphertext. Metadata derived from the retained head
+    // changes only after a meaningful config mutation.
+    if existing_payload
+        .as_ref()
+        .is_some_and(|existing| private_payload_body_eq(existing, &payload))
+    {
+        return Ok(false);
+    }
+
+    let event = private_managed_agent::build_event(keys, &payload, created_at.as_secs())
+        .map_err(|e| format!("failed to build private config for '{}': {e}", record.name))?;
+
+    retain_event(
+        conn,
+        &RetainedEvent {
+            kind: KIND_PRIVATE_MANAGED_AGENT,
+            pubkey: owner_pubkey,
+            d_tag: record.pubkey.clone(),
+            content: event.content.clone(),
+            created_at: event.created_at.as_secs() as i64,
+            raw_event: event.as_json(),
+            pending_sync: true,
+        },
+    )
+    .map_err(|e| format!("failed to retain private config for '{}': {e}", record.name))?;
+    Ok(true)
+}
+
+fn event_generation(event: &nostr::Event) -> Option<u64> {
+    event.tags.iter().find_map(|tag| {
+        let values = tag.as_slice();
+        (values.first().map(String::as_str) == Some("g"))
+            .then(|| values.get(1)?.parse().ok())
+            .flatten()
+    })
+}
+
+fn private_payload_from_record(
+    record: &ManagedAgentRecord,
+    owner_pubkey: &str,
+    generation: u64,
+    previous_event_id: Option<String>,
+) -> Result<Payload, String> {
+    let backend = serde_json::to_value(&record.backend)
+        .map_err(|e| format!("failed to serialize backend for '{}': {e}", record.name))?;
+    let relay_mesh = record
+        .relay_mesh
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| format!("failed to serialize relay mesh for '{}': {e}", record.name))?;
+
+    Ok(Payload {
+        format: private_managed_agent::FORMAT.to_string(),
+        version: private_managed_agent::VERSION,
+        agent_pubkey: record.pubkey.clone(),
+        owner_pubkey: owner_pubkey.to_string(),
+        generation,
+        previous_event_id,
+        updated_at: record.updated_at.clone(),
+        identity: PrivateIdentity {
+            private_key_nsec: record.private_key_nsec.clone(),
+            auth_tag: record.auth_tag.clone(),
+        },
+        config: PrivateConfig {
+            relay_url: record.relay_url.clone(),
+            name: record.name.clone(),
+            persona_id: record.persona_id.clone(),
+            runtime: record.runtime.clone(),
+            model: record.model.clone(),
+            provider: record.provider.clone(),
+            system_prompt: record.system_prompt.clone(),
+            parallelism: Some(record.parallelism),
+            respond_to: Some(record.respond_to.as_str().to_string()),
+            respond_to_allowlist: record.respond_to_allowlist.clone(),
+            agent_command_override: record.agent_command_override.clone(),
+            agent_args: record.agent_args.clone(),
+            idle_timeout_seconds: record.idle_timeout_seconds,
+            max_turn_duration_seconds: record.max_turn_duration_seconds,
+            env_vars: record.env_vars.clone(),
+            backend,
+            backend_agent_id: record.backend_agent_id.clone(),
+            team_id: record.team_id.clone(),
+            persona_name_in_team: record.persona_name_in_team.clone(),
+            relay_mesh,
+            extra: serde_json::Map::new(),
+        },
+        extensions: BTreeMap::new(),
+        extra: serde_json::Map::new(),
+    })
+}
+
+fn private_payload_body_eq(left: &Payload, right: &Payload) -> bool {
+    left.agent_pubkey == right.agent_pubkey
+        && left.owner_pubkey == right.owner_pubkey
+        && left.identity == right.identity
+        && left.config == right.config
+        && left.extensions == right.extensions
+        && left.extra == right.extra
 }
 
 #[cfg(test)]

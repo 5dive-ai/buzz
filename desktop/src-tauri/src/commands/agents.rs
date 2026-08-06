@@ -70,49 +70,12 @@ pub(super) fn retain_managed_agent_pending(
 /// `pending_sync = 1`. The `d_tag` is the agent's pubkey. Best-effort: a
 /// failure is logged and swallowed so a retention hiccup never blocks the
 /// disk-authoritative delete.
-pub(super) fn tombstone_managed_agent_pending(
+pub(crate) fn tombstone_managed_agent_pending(
     app: &AppHandle,
     state: &AppState,
     agent_pubkey: &str,
 ) {
-    use crate::managed_agents::{
-        agent_events::build_agent_delete,
-        retention::{
-            delete_retained_event, open_retention_db, retain_event, tombstone_retention_d_tag,
-            RetainedEvent,
-        },
-    };
-    use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
-    use nostr::JsonUtil;
-
-    const KIND_DELETE: u32 = 5;
-
-    let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        let owner_pubkey = scope.owner_keys.public_key().to_hex();
-        let event = build_agent_delete(agent_pubkey, &owner_pubkey)?
-            .sign_with_keys(&scope.owner_keys)
-            .map_err(|e| format!("failed to sign managed-agent tombstone: {e}"))?;
-        let conn = open_retention_db(&scope.db_path)?;
-        delete_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, agent_pubkey)?;
-        retain_event(
-            &conn,
-            &RetainedEvent {
-                kind: KIND_DELETE,
-                pubkey: owner_pubkey,
-                // Key by the target coordinate so cross-kind d-tag tombstones
-                // occupy distinct rows (F2c).
-                d_tag: tombstone_retention_d_tag(KIND_MANAGED_AGENT, agent_pubkey),
-                content: event.content.to_string(),
-                created_at: event.created_at.as_secs() as i64,
-                raw_event: event.as_json(),
-                pending_sync: true,
-            },
-        )
-    })();
-    if let Err(e) = result {
-        eprintln!("buzz-desktop: agent-tombstone: {e}");
-    }
+    crate::managed_agents::agent_events::tombstone_managed_agent_pending(app, state, agent_pubkey);
 }
 
 /// Build and sign the NIP-IA `kind:9035` archive request enqueued when an
@@ -543,6 +506,11 @@ pub async fn list_managed_agents(app: AppHandle) -> Result<Vec<ManagedAgentSumma
         for pubkey in &exited_pubkeys {
             state.clear_agent_session_caches(pubkey);
         }
+        let records = state
+            .private_managed_agent_overlay
+            .lock()
+            .map_err(|error| error.to_string())?
+            .resolved_records(&records);
 
         let personas = load_personas(&app).unwrap_or_default();
         // One disk read for the whole list — build_managed_agent_summary takes
@@ -1071,6 +1039,27 @@ pub async fn start_managed_agent(
     // Snapshot the workspace owner pubkey for the legacy auth_tag fallback.
     // Read outside the records lock to keep lock ordering simple.
     let owner_hex = workspace_owner_hex(&state)?;
+    let local_records = {
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        load_managed_agents(&app)?
+    };
+    if state
+        .private_managed_agent_overlay
+        .lock()
+        .map_err(|error| error.to_string())?
+        .contains(&pubkey)
+    {
+        return crate::managed_agents::private_config_overlay::start_relay_only_agent(
+            &app,
+            &state,
+            &pubkey,
+            &owner_hex,
+            &local_records,
+        );
+    }
     enum StartTarget {
         Local,
         Provider {

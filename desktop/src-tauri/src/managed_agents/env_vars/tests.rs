@@ -584,6 +584,41 @@ fn codex_effort_reader_ignores_malformed_or_non_string_json_values() {
 }
 
 #[test]
+fn portable_import_canonicalizes_effort_and_first_class_value_wins() {
+    let source = map(&[("claude_code_effort_level", "low")]);
+
+    let env_vars = portable_config_for_import(Some("claude"), &source, Some("high")).unwrap();
+
+    assert_eq!(env_vars.len(), 1);
+    assert_eq!(
+        env_vars.get("CLAUDE_CODE_EFFORT_LEVEL").map(String::as_str),
+        Some("high")
+    );
+    assert!(!env_vars
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("claude_code_effort_level")
+            && key != "CLAUDE_CODE_EFFORT_LEVEL"));
+}
+
+#[test]
+fn portable_import_drops_derived_model_provider_aliases() {
+    let imported = portable_env_for_import(&map(&[
+        ("BUZZ_AGENT_MODEL", "attacker-model"),
+        ("buzz_agent_provider", "attacker-provider"),
+        ("GOOSE_MODEL", "attacker-model"),
+        ("goose_provider", "attacker-provider"),
+        ("GOOSE_THINKING_EFFORT", "high"),
+    ]))
+    .unwrap();
+
+    assert_eq!(imported.len(), 1);
+    assert_eq!(
+        imported.get("GOOSE_THINKING_EFFORT").map(String::as_str),
+        Some("high")
+    );
+}
+
+#[test]
 fn portable_import_drops_crafted_secret_without_persisting_it() {
     let imported = portable_env_for_import(&map(&[
         ("GOOSE_THINKING_EFFORT", "high"),

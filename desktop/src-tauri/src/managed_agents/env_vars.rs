@@ -170,18 +170,38 @@ pub fn validate_user_env_keys(env_vars: &BTreeMap<String, String>) -> Result<(),
     Ok(())
 }
 
+/// Explicitly portable, non-secret settings. Keep this separate from the
+/// structured provider/model fields: those are derived at spawn/deploy time and
+/// therefore must not be imported from a snapshot environment map.
+const PORTABLE_ENV_KEYS: &[&str] = &[
+    "BUZZ_AGENT_THINKING_EFFORT",
+    "CLAUDE_CODE_EFFORT_LEVEL",
+    "GOOSE_THINKING_EFFORT",
+    "DATABRICKS_HOST",
+    "DATABRICKS_MODEL",
+];
+
+/// Returns the canonical spelling of an explicitly portable, non-secret key.
+/// Snapshot input is untrusted and Windows treats environment names
+/// case-insensitively, so callers must not retain a sender-controlled spelling.
+fn portable_env_key(key: &str) -> Option<&'static str> {
+    PORTABLE_ENV_KEYS
+        .iter()
+        .copied()
+        .find(|portable| portable.eq_ignore_ascii_case(key))
+}
+
 /// Returns `true` when `key` is safe to show verbatim — not a credential.
 ///
 /// Default-deny: every key NOT in this explicit allowlist is masked. Callers
 /// that display env values (baked-env UI, spawn-diff tooltip) share this
 /// single authority — no second list.
 ///
-/// Allowlist (case-insensitive):
-/// - `BUZZ_AGENT_PROVIDER`, `BUZZ_AGENT_MODEL` — agent runtime selection
-/// - `BUZZ_AGENT_THINKING_EFFORT` — non-secret enum (none/minimal/low/medium/high/xhigh/max)
-/// - `DATABRICKS_HOST`, `DATABRICKS_MODEL` — Block non-secret defaults
+/// This display policy also includes derived provider/model values so users can
+/// inspect the configuration Buzz supplies from structured fields. Those keys
+/// are intentionally excluded from portable snapshots; see [`portable_env_key`].
 pub(crate) fn is_safe_to_reveal(key: &str) -> bool {
-    const SAFE_KEYS: &[&str] = &[
+    const SAFE_DISPLAY_KEYS: &[&str] = &[
         "BUZZ_AGENT_PROVIDER",
         "BUZZ_AGENT_MODEL",
         "BUZZ_AGENT_THINKING_EFFORT",
@@ -190,8 +210,9 @@ pub(crate) fn is_safe_to_reveal(key: &str) -> bool {
         "DATABRICKS_HOST",
         "DATABRICKS_MODEL",
     ];
-    let upper = key.to_ascii_uppercase();
-    SAFE_KEYS.iter().any(|safe| upper == *safe)
+    SAFE_DISPLAY_KEYS
+        .iter()
+        .any(|safe| safe.eq_ignore_ascii_case(key))
 }
 
 /// Project only explicitly approved, non-secret environment settings for a
@@ -200,16 +221,25 @@ pub(crate) fn is_safe_to_reveal(key: &str) -> bool {
 pub(crate) fn portable_env_for_export(
     env_vars: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    env_vars
-        .iter()
-        .filter(|(key, _)| is_safe_to_reveal(key))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
+    let mut projected = BTreeMap::new();
+    for (key, value) in env_vars {
+        if let Some(canonical_key) = portable_env_key(key) {
+            // Persisted maps should already use canonical spellings. If a legacy
+            // record contains aliases, prefer the canonical key deterministically
+            // rather than exporting two keys that collide on Windows.
+            if key == canonical_key || !projected.contains_key(canonical_key) {
+                projected.insert(canonical_key.to_string(), value.clone());
+            }
+        }
+    }
+    projected
 }
 
-/// Accept the portable snapshot projection only after applying the same
-/// allowlist and normal save-time environment validation used by UI input.
-/// Unsafe crafted keys are dropped rather than becoming configuration.
+/// Accept the portable snapshot projection only after applying the explicit
+/// portable-key allowlist and normal save-time environment validation used by
+/// UI input. Keys are canonicalized to prevent case-insensitive collisions in a
+/// Windows child-process environment; unknown and derived model/provider keys
+/// are dropped rather than becoming persisted configuration.
 pub(crate) fn portable_env_for_import(
     portable_env: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, String> {
@@ -282,6 +312,7 @@ pub(crate) fn portable_config_for_import(
         runtime.thinking_config_json_env_var,
         runtime.thinking_config_json_key,
     ) {
+        remove_env_key_case_insensitive(&mut env_vars, env_key);
         env_vars.insert(
             env_key.to_string(),
             serde_json::json!({ json_key: effort }).to_string(),
@@ -289,10 +320,16 @@ pub(crate) fn portable_config_for_import(
     } else if let Some(env_key) = runtime.thinking_env_var {
         // The first-class snapshot field is authoritative when the two values
         // differ, while the allowlisted env map remains available for all other
-        // non-secret runtime configuration.
+        // non-secret runtime configuration. Remove aliases first because
+        // Windows collapses environment names case-insensitively.
+        remove_env_key_case_insensitive(&mut env_vars, env_key);
         env_vars.insert(env_key.to_string(), effort.to_string());
     }
     Ok(env_vars)
+}
+
+fn remove_env_key_case_insensitive(env_vars: &mut BTreeMap<String, String>, key: &str) {
+    env_vars.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
 }
 
 /// The complete set of effort tiers Buzz will write into a harness variable.

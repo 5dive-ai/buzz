@@ -3,10 +3,9 @@ use std::collections::{BTreeMap, HashMap};
 use buzz_core_pkg::private_managed_agent::Payload;
 
 use super::{
-    build_managed_agent_summary, load_personas, start_managed_agent_process,
     validate_respond_to_allowlist, validate_user_env_keys, BackendKind, ManagedAgentRecord,
-    ManagedAgentSummary, RelayMeshConfig, RespondTo, DEFAULT_ACP_COMMAND,
-    DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+    RelayMeshConfig, RespondTo, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
+    DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
 };
 
 #[derive(Clone)]
@@ -210,22 +209,26 @@ impl PrivateConfigOverlay {
         self.0.remove(pubkey);
     }
 
-    pub(crate) fn contains(&self, pubkey: &str) -> bool {
-        self.0.contains_key(pubkey)
+    pub(crate) fn resolve_local_record(&self, record: &ManagedAgentRecord) -> ManagedAgentRecord {
+        let mut resolved = record.clone();
+        if let Some(patch) = self.0.get(&record.pubkey) {
+            patch.apply(&mut resolved);
+        }
+        resolved
     }
 
-    pub(crate) fn resolved_record(
+    pub(crate) fn materialize_relay_only_record(
         &self,
         pubkey: &str,
         local: &[ManagedAgentRecord],
     ) -> Option<ManagedAgentRecord> {
-        let patch = self.0.get(pubkey)?;
-        let mut record = local
-            .iter()
-            .find(|record| record.pubkey == pubkey)
-            .cloned()
-            .unwrap_or_else(|| patch.fresh_record());
-        patch.apply(&mut record);
+        if local.iter().any(|record| record.pubkey == pubkey) {
+            return None;
+        }
+        let mut record = self.0.get(pubkey)?.fresh_record();
+        // Persona definitions are device-local. A fresh device can still run the
+        // complete relay snapshot, but must not bind it to an absent local persona.
+        record.persona_id = None;
         Some(record)
     }
 
@@ -248,40 +251,66 @@ impl PrivateConfigOverlay {
     }
 }
 
-pub(crate) fn start_relay_only_agent(
+pub(crate) fn resolved_local_record(
+    state: &crate::app_state::AppState,
+    record: &ManagedAgentRecord,
+) -> Result<ManagedAgentRecord, String> {
+    state
+        .private_managed_agent_overlay
+        .lock()
+        .map_err(|error| error.to_string())
+        .map(|overlay| overlay.resolve_local_record(record))
+}
+
+pub(crate) fn copy_lifecycle_state(
+    destination: &mut ManagedAgentRecord,
+    source: &ManagedAgentRecord,
+) {
+    destination.runtime_pid = source.runtime_pid;
+    destination
+        .last_started_at
+        .clone_from(&source.last_started_at);
+    destination
+        .last_stopped_at
+        .clone_from(&source.last_stopped_at);
+    destination.last_exit_code = source.last_exit_code;
+    destination.last_error.clone_from(&source.last_error);
+    destination.last_error_code = source.last_error_code;
+}
+
+pub(crate) fn materialize_relay_only_agent(
     app: &tauri::AppHandle,
     state: &crate::app_state::AppState,
     pubkey: &str,
-    owner_hex: &str,
-    local_records: &[ManagedAgentRecord],
-) -> Result<ManagedAgentSummary, String> {
-    let mut record = state
+) -> Result<(), String> {
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if state
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err("desktop shutdown has started".into());
+    }
+    let _store = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let mut records = super::load_managed_agents(app)?;
+    let relay_only = state
         .private_managed_agent_overlay
         .lock()
         .map_err(|error| error.to_string())?
-        .resolved_record(pubkey, local_records)
-        .ok_or_else(|| format!("agent {pubkey} not found"))?;
-    if local_records.iter().all(|local| local.pubkey != pubkey) {
-        record.persona_id = None;
+        .materialize_relay_only_record(pubkey, &records);
+    if let Some(record) = relay_only {
+        if record.backend != BackendKind::Local {
+            return Err("relay-only provider agents cannot be started on this device".into());
+        }
+        records.push(record);
+        super::save_managed_agents(app, &records)?;
     }
-    if record.backend != BackendKind::Local {
-        return Err("relay-only provider agents cannot be started on this device".into());
-    }
-    let personas = load_personas(app).unwrap_or_default();
-    super::try_record_agent_command(&record, &personas)
-        .map_err(|error| super::user_facing_harness_error(&error))?;
-    let mut runtimes = state
-        .managed_agent_processes
-        .lock()
-        .map_err(|e| e.to_string())?;
-    start_managed_agent_process(app, &mut record, &mut runtimes, Some(owner_hex))?;
-    build_managed_agent_summary(
-        app,
-        &record,
-        &runtimes,
-        &personas,
-        &super::load_global_agent_config(app).unwrap_or_default(),
-    )
+    Ok(())
 }
 
 #[cfg(test)]
@@ -350,6 +379,33 @@ mod tests {
         assert_eq!(resolved[1].pubkey, "bb");
         assert!(!resolved[1].start_on_app_launch);
         assert_eq!(local, original);
+    }
+
+    #[test]
+    fn materializes_only_relay_only_record_and_preserves_disk_overlay() {
+        let mut overlay = PrivateConfigOverlay::default();
+        overlay.insert(payload("aa", "relay local")).unwrap();
+        overlay.insert(payload("bb", "relay only")).unwrap();
+        let mut local = overlay.0["aa"].fresh_record();
+        local.name = "disk".into();
+        local.private_key_nsec = "device-local-key".into();
+
+        let resolved = overlay.resolve_local_record(&local);
+        assert_eq!(resolved.name, "relay local");
+        assert_eq!(resolved.private_key_nsec, "nsec-test");
+        assert_eq!(local.name, "disk");
+        assert_eq!(local.private_key_nsec, "device-local-key");
+        assert!(overlay
+            .materialize_relay_only_record("aa", std::slice::from_ref(&local))
+            .is_none());
+
+        let relay_only = overlay
+            .materialize_relay_only_record("bb", &[local])
+            .unwrap();
+        assert_eq!(relay_only.name, "relay only");
+        assert_eq!(relay_only.private_key_nsec, "nsec-test");
+        assert_eq!(relay_only.backend, BackendKind::Local);
+        assert!(relay_only.persona_id.is_none());
     }
 
     #[test]

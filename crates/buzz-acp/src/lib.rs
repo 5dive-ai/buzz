@@ -1324,6 +1324,13 @@ fn handle_set_config_option_control(
                 "value": value,
             });
             ack["category"] = serde_json::json!("thought_level");
+            // P2-1: echo the nonce on the early-return rejection path, matching
+            // the behaviour of the common ack builder below. Without this the
+            // Desktop's awaitEffortOutcome nonce guard rejects the ack, causing
+            // an 8 s timeout instead of an immediate "invalid_value" outcome.
+            if let Some(ref n) = nonce {
+                ack["nonce"] = serde_json::json!(n);
+            }
             obs.emit(
                 "control_result",
                 None,
@@ -8261,6 +8268,79 @@ mod control_result_tests {
         assert!(
             pool.desired_effort.is_none(),
             "pool must not be updated on invalid_value"
+        );
+    }
+
+    /// P2-1: the invalid_value early-return ack must echo the nonce so the
+    /// Desktop's awaitEffortOutcome nonce guard can match it. Without the
+    /// nonce the guard rejects the ack and the outcome falls through to the
+    /// 8 s timeout, showing "applies at next session" instead of an immediate
+    /// rejection UI.
+    #[tokio::test]
+    async fn test_b5_invalid_value_ack_echoes_nonce() {
+        use crate::acp::AcpClient;
+        use crate::pool::AgentModelCapabilities;
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![serde_json::json!({
+                    "id": "effort",
+                    "category": "thought_level",
+                    "options": [{"value": "low"}, {"value": "high"}],
+                })],
+                available_models_raw: None,
+                thought_level_config_id: Some("effort".to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![serde_json::json!({
+                "id": "effort",
+                "category": "thought_level",
+                "options": [{"value": "low"}, {"value": "high"}],
+            })],
+            available_models_raw: None,
+        });
+        let obs = observer::ObserverHandle::in_process();
+        // "ultra" is not in the advertised options; frame carries a nonce.
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "ultra",
+            "nonce": "abc-123",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["status"].as_str().unwrap(),
+            "invalid_value"
+        );
+        assert_eq!(
+            events[0].payload["nonce"].as_str().unwrap(),
+            "abc-123",
+            "P2-1: invalid_value ack must echo the nonce"
         );
     }
 

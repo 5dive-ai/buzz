@@ -560,12 +560,17 @@ function dispatchControlResult(agentPubkey: string, payload: unknown) {
   ) {
     const ackNonce = (payload as Record<string, unknown>).nonce;
     const registered = currentEffortNonce.get(normalizePubkey(agentPubkey));
-    // Only persist when nonces match (or neither the ack nor the registry
-    // carries a nonce — backwards compatibility with tests that don't use nonces).
+    // Nonce gate: an ack-nonce must match the registered nonce for this agent.
+    // If no nonce has ever been registered (pre-any-pick startup path), a
+    // nonce-less ack passes through — this handles startup-applied effort that
+    // never goes through the Desktop picker.
+    // Once a nonce IS registered, a nonce-less ack is treated as non-matching:
+    // it could be a stale result from before the nonce system was in place or
+    // from a superseded pick that didn't carry a nonce (P3).
     const nonceOk =
-      ackNonce === undefined
-        ? true
-        : registered !== undefined && ackNonce === registered;
+      registered === undefined
+        ? ackNonce === undefined
+        : ackNonce !== undefined && ackNonce === registered;
     if (nonceOk) {
       if (payload.status === "ok") {
         void persistAgentEffortLevel(agentPubkey, payload.value || null).catch(
@@ -848,6 +853,7 @@ export function resetAgentObserverStore() {
   onSessionConfigCaptured = null;
   connectionState = "idle";
   errorMessage = null;
+  currentEffortNonce.clear();
   notifyListeners();
   void unsubscribe?.();
 }
@@ -876,4 +882,27 @@ export function _testGetArchivedChannelEvents(
   return (
     archiveEventsByChannel.get(archiveChannelKey(agentPubkey, channelId)) ?? []
   );
+}
+
+/**
+ * Test-only: evaluate the persistence nonce gate for a given agent and ack
+ * nonce against the current `currentEffortNonce` map state.
+ *
+ * Returns `true` when the ack should be persisted:
+ *   - No nonce ever registered for this agent (startup path): ack-nonce must
+ *     also be absent.
+ *   - A nonce is registered: ack-nonce must be present and match.
+ *
+ * Use `registerEffortNonce` to prime state before calling, and
+ * `resetAgentObserverStore` to clear between tests.
+ * Only call from tests — never from production code.
+ */
+export function _testNonceGate(
+  agentPubkey: string,
+  ackNonce: unknown,
+): boolean {
+  const registered = currentEffortNonce.get(normalizePubkey(agentPubkey));
+  return registered === undefined
+    ? ackNonce === undefined
+    : ackNonce !== undefined && ackNonce === registered;
 }

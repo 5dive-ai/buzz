@@ -347,6 +347,14 @@ pub struct AgentPool {
     /// (capabilities known but cache temporarily empty — case C trust path)
     /// in `handle_set_config_option_control`.
     pub capabilities_ever_discovered: bool,
+    /// Generation of the last effort pick/clear for which a terminal ack
+    /// (ok/failure/cleared) has already been emitted. Used by `return_agent`
+    /// to emit exactly one terminal ack per generation when parallelism > 1:
+    /// the first worker whose result is processed owns the ack; subsequent
+    /// workers with the same generation are silenced.
+    ///
+    /// `None` means no terminal ack has been emitted yet for any generation.
+    pub last_acked_effort_gen: Option<u64>,
 }
 /// Result returned by a completed prompt task.
 pub struct PromptResult {
@@ -705,6 +713,7 @@ impl AgentPool {
             effort_ever_picked: false,
             effort_capabilities: PoolEffortCapabilities::default(),
             capabilities_ever_discovered: false,
+            last_acked_effort_gen: None,
         }
     }
 
@@ -788,9 +797,24 @@ impl AgentPool {
         // when no live pick/clear has ever been made. A live pick/clear is always
         // authoritative over startup seeding, even when pool.desired_effort is None
         // (the user explicitly cleared it).
+        //
+        // P2-2: also seed committed_effort when the startup effort was successfully
+        // applied. Without this, committed_effort stays None after a startup
+        // application, so a subsequent rejected live pick rolls back to None instead
+        // of the confirmed startup value, contradicting the persisted record.
         if !self.effort_ever_picked {
             if let Some(ref e) = agent.desired_effort {
                 self.desired_effort = Some(e.clone());
+                // Seed the committed baseline when this startup application succeeded.
+                // desired_effort_gen is None for startup agents (no live generation
+                // was assigned), so we can safely set committed_effort here without
+                // racing with the generation-based commit/rollback block below.
+                if matches!(
+                    agent.last_effort_result,
+                    Some(EffortApplicationResult::Applied)
+                ) {
+                    self.committed_effort = Some(e.clone());
+                }
             }
         }
 
@@ -826,6 +850,76 @@ impl AgentPool {
                 }
             }
             // Stale gen: discard, touch nothing.
+        }
+
+        // P2-3: emit exactly one terminal effort ack per generation.
+        //
+        // With parallelism > 1, multiple workers check out the same generation
+        // and each calls create_session_and_apply_model independently. The first
+        // worker whose return_agent runs wins the ack; subsequent workers carrying
+        // the same gen are silenced. This makes pool-state and the observable ack
+        // stream order-independent.
+        //
+        // Semantics: first terminal result (Applied / Failed / Cleared) that
+        // matches the current generation emits the ack and marks the gen resolved.
+        // Later same-gen returns still update pool state (commit/rollback already
+        // ran above) but do NOT re-notify the Desktop.
+        //
+        // Startup agents have desired_effort_gen = None so they never enter this
+        // block; their ack path is not needed (startup effort is applied silently).
+        if let Some(checkout_gen) = agent.desired_effort_gen {
+            if checkout_gen == self.effort_generation {
+                // First terminal result for this generation: emit the ack and
+                // record the generation as resolved.
+                if self.last_acked_effort_gen != Some(checkout_gen) {
+                    if let Some(ref result) = agent.last_effort_result {
+                        let nonce_field = agent.pending_effort_nonce.as_deref();
+                        match result {
+                            EffortApplicationResult::Applied | EffortApplicationResult::Failed => {
+                                if let Some((ref config_id, ref value)) = agent.desired_effort {
+                                    let ack_status = match result {
+                                        EffortApplicationResult::Applied => "ok",
+                                        _ => "failure",
+                                    };
+                                    let mut final_ack = serde_json::json!({
+                                        "type": "set_config_option",
+                                        "configId": config_id,
+                                        "value": value,
+                                        "status": ack_status,
+                                        "category": "thought_level",
+                                    });
+                                    if let Some(n) = nonce_field {
+                                        final_ack["nonce"] = serde_json::json!(n);
+                                    }
+                                    agent.acp.observe("control_result", final_ack);
+                                    self.last_acked_effort_gen = Some(checkout_gen);
+                                }
+                            }
+                            EffortApplicationResult::Cleared => {
+                                let cleared_config_id = agent
+                                    .model_capabilities
+                                    .as_ref()
+                                    .and_then(|c| c.thought_level_config_id.as_deref())
+                                    .unwrap_or("effort");
+                                let mut cleared_ack = serde_json::json!({
+                                    "type": "set_config_option",
+                                    "configId": cleared_config_id,
+                                    "value": "",
+                                    "status": "cleared",
+                                    "category": "thought_level",
+                                });
+                                if let Some(n) = nonce_field {
+                                    cleared_ack["nonce"] = serde_json::json!(n);
+                                }
+                                agent.acp.observe("control_result", cleared_ack);
+                                self.last_acked_effort_gen = Some(checkout_gen);
+                            }
+                        }
+                    }
+                }
+                // else: already acked this gen — silently drop.
+            }
+            // Stale gen: already handled above (pool state untouched), no ack.
         }
 
         // V-3: if the worker's checkout snapshot differs from the current pool
@@ -870,6 +964,19 @@ impl AgentPool {
                     valid_values,
                 };
                 self.capabilities_ever_discovered = true;
+            } else if self.capabilities_ever_discovered {
+                // P3: the returning agent has populated capabilities but no
+                // thought_level configId — the model was swapped to one that
+                // does not support effort. Clear the pool-level cache so
+                // subsequent picks are not validated against stale options.
+                //
+                // capabilities_ever_discovered stays true: we have seen at
+                // least one session. This activates case C in
+                // handle_set_config_option_control, letting picks through
+                // without value-validation while the cache is empty (correct
+                // — the user can still send a pick; the adapter will reject
+                // it if the value is unsupported).
+                self.effort_capabilities = PoolEffortCapabilities::default();
             }
         }
 
@@ -1395,10 +1502,6 @@ async fn create_session_and_apply_model(
     //   status: "failure" → adapter rejected or timed out; Desktop does NOT persist.
     //   status: "cleared" → pending-clear confirmed (session ran without effort);
     //                       Desktop persists null.
-    let nonce_field = match &agent.pending_effort_nonce {
-        Some(n) => serde_json::json!(n),
-        None => serde_json::Value::Null,
-    };
     if let Some((ref config_id, ref value)) = agent.desired_effort.clone() {
         let result = tokio::time::timeout(MODEL_SWITCH_TIMEOUT, async {
             agent
@@ -1407,7 +1510,7 @@ async fn create_session_and_apply_model(
                 .await
         })
         .await;
-        let (ack_status, effort_result) = match result {
+        let (_ack_status, effort_result) = match result {
             Ok(Ok(_)) => {
                 tracing::info!(
                     target: "pool::effort",
@@ -1443,45 +1546,14 @@ async fn create_session_and_apply_model(
             }
         };
         agent.last_effort_result = Some(effort_result);
-        // Emit honest final ack with nonce for Desktop correlation.
-        // category: "thought_level" on both ok and failure so the observer can
-        // gate persistence on ok+thought_level and skip failure.
-        let mut final_ack = serde_json::json!({
-            "type": "set_config_option",
-            "configId": config_id,
-            "value": value,
-            "status": ack_status,
-            "category": "thought_level",
-        });
-        if !nonce_field.is_null() {
-            final_ack["nonce"] = nonce_field;
-        }
-        agent.acp.observe("control_result", final_ack);
+        // Terminal ack (ok/failure) for this effort application is emitted in
+        // return_agent where the generation gate prevents duplicate acks when
+        // parallelism > 1 (P2-3). See return_agent's effort ack emission block.
     } else if agent.desired_effort_gen.is_some() {
-        // Pending clear: the session created without an effort override, which
-        // means the adapter is now running on its default. Emit the final
-        // "cleared" ack so the Desktop can persist null and resolve the picker.
-        //
-        // Use the real configId from model_capabilities so awaitEffortOutcome
-        // can correlate by configId+nonce. Falls back to "effort" when the
-        // adapter has not yet populated capabilities (pre-discovery clear).
-        let cleared_config_id = agent
-            .model_capabilities
-            .as_ref()
-            .and_then(|c| c.thought_level_config_id.as_deref())
-            .unwrap_or("effort");
+        // Pending clear: the session ran without an effort override. Record the
+        // result so return_agent can emit the "cleared" ack and update the pool.
         agent.last_effort_result = Some(EffortApplicationResult::Cleared);
-        let mut cleared_ack = serde_json::json!({
-            "type": "set_config_option",
-            "configId": cleared_config_id,
-            "value": "",
-            "status": "cleared",
-            "category": "thought_level",
-        });
-        if !nonce_field.is_null() {
-            cleared_ack["nonce"] = nonce_field;
-        }
-        agent.acp.observe("control_result", cleared_ack);
+        // Cleared ack is emitted in return_agent (P2-3 generation gate).
     }
 
     // Emit session config for desktop consumption (config bridge tier 1b).
@@ -8419,6 +8491,344 @@ mod effort_tests {
         assert!(
             pool.committed_effort.is_none(),
             "cleared confirmation must set committed_effort to None"
+        );
+    }
+
+    // ── P2-2: committed_effort seeded on startup application ─────────────────
+
+    /// P2-2 regression: startup effort is applied → committed baseline is set.
+    /// A subsequent rejected live pick must roll back to the startup value, not
+    /// to None.
+    #[tokio::test]
+    async fn test_startup_success_seeds_committed_effort_for_rollback() {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        // Simulate a worker that resolved startup effort and applied it.
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                thought_level_config_id: Some("effort".to_string()),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: Some(("effort".to_string(), "medium".to_string())),
+            startup_effort: Some("medium".to_string()),
+            desired_effort_gen: None, // startup agent: no live generation
+            pending_effort_nonce: None,
+            last_effort_result: Some(EffortApplicationResult::Applied),
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![None]);
+        assert!(!pool.effort_ever_picked);
+
+        pool.return_agent(agent);
+
+        // V-1 propagation: pool.desired_effort = "medium".
+        assert_eq!(
+            pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("medium"),
+            "startup effort must propagate to desired_effort"
+        );
+        // P2-2: committed_effort must also be seeded from the successful startup
+        // application so a rollback from a later failed live pick lands here.
+        assert_eq!(
+            pool.committed_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("medium"),
+            "P2-2: successful startup application must seed committed_effort"
+        );
+
+        // Now simulate a live pick → failure → rollback must restore "medium",
+        // not roll back to None.
+        pool.set_pool_effort("effort", "high");
+        let gen = pool.effort_generation;
+        let acp2 = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn2");
+        let agent2 = OwnedAgent {
+            index: 0,
+            acp: acp2,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: Some(("effort".to_string(), "high".to_string())),
+            startup_effort: None,
+            desired_effort_gen: Some(gen),
+            pending_effort_nonce: None,
+            last_effort_result: Some(EffortApplicationResult::Failed),
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        // Put agent2 into the pool so try_claim can hand it out (needed for index
+        // tracking), then manually call return_agent to simulate the failed return.
+        pool.agents_mut()[0] = Some(agent2);
+        let mut a = pool.try_claim(None).unwrap();
+        a.last_effort_result = Some(EffortApplicationResult::Failed);
+        pool.return_agent(a);
+
+        assert_eq!(
+            pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("medium"),
+            "P2-2: failed live pick must roll back to startup-seeded committed_effort, not None"
+        );
+    }
+
+    // ── P2-3: first-terminal-result-wins ack gate ─────────────────────────────
+
+    /// P2-3 order-independence A: fail arrives first, then success.
+    ///
+    /// Two workers carry the same generation. Worker A (fail) returns first:
+    /// pool rolls back desired_effort to committed, ack emitted for fail.
+    /// Worker B (Applied) returns second: pool state updates committed but
+    /// no second ack is emitted (last_acked_effort_gen already set).
+    #[tokio::test]
+    async fn test_p2_3_fail_then_success_emits_exactly_one_ack() {
+        let obs = observer::ObserverHandle::in_process();
+        let mut pool = AgentPool::from_slots(vec![None, None]);
+        pool.committed_effort = Some(("effort".to_string(), "low".to_string()));
+        pool.set_pool_effort("effort", "high");
+        let gen = pool.effort_generation;
+
+        // Populate both slots so try_claim hands out two agents.
+        for slot in pool.agents_mut().iter_mut() {
+            let acp = AcpClient::spawn(
+                "bash",
+                &["-c".to_string(), "sleep 10".to_string()],
+                &[],
+                false,
+            )
+            .await
+            .expect("spawn");
+            *slot = Some(OwnedAgent {
+                index: 0, // will be reassigned by try_claim below
+                acp,
+                state: SessionState::default(),
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                desired_effort: None,
+                startup_effort: None,
+                desired_effort_gen: None,
+                pending_effort_nonce: None,
+                last_effort_result: None,
+                agent_name: "test".into(),
+                goose_system_prompt_supported: None,
+                protocol_version: 2,
+            });
+        }
+        // Fix indices.
+        pool.agents_mut()[0].as_mut().unwrap().index = 0;
+        pool.agents_mut()[1].as_mut().unwrap().index = 1;
+
+        let mut worker_a = pool.try_claim(None).unwrap();
+        let mut worker_b = pool.try_claim(None).unwrap();
+        assert_eq!(worker_a.desired_effort_gen, Some(gen));
+        assert_eq!(worker_b.desired_effort_gen, Some(gen));
+
+        // Worker A: failed. Attach the test observer so agent.acp.observe(...)
+        // routes to obs rather than the ACP's default (None) observer.
+        worker_a.last_effort_result = Some(EffortApplicationResult::Failed);
+        worker_a.pending_effort_nonce = Some("nonce-xyz".to_string());
+        worker_a.acp.set_observer(Some(obs.clone()), worker_a.index);
+        pool.return_agent(worker_a);
+
+        let events_after_a = obs.snapshot();
+        assert_eq!(
+            events_after_a.len(),
+            1,
+            "fail→ack expected after first return"
+        );
+        assert_eq!(
+            events_after_a[0].payload["status"].as_str().unwrap(),
+            "failure"
+        );
+        assert_eq!(pool.last_acked_effort_gen, Some(gen));
+
+        // Pool rolled back to committed.
+        assert_eq!(
+            pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("low"),
+            "fail rolls back desired_effort to committed"
+        );
+
+        // Worker B: success — arrives later, same gen.
+        worker_b.last_effort_result = Some(EffortApplicationResult::Applied);
+        worker_b.pending_effort_nonce = Some("nonce-xyz".to_string());
+        // desired_effort was copied from pool at checkout ("high"); keep it.
+        worker_b.acp.set_observer(Some(obs.clone()), worker_b.index);
+        pool.return_agent(worker_b);
+
+        let events_after_b = obs.snapshot();
+        assert_eq!(
+            events_after_b.len(),
+            1,
+            "P2-3: second same-gen return must NOT emit another ack"
+        );
+        // Pool committed updated by Applied (desired_effort was "high" at return).
+        assert_eq!(
+            pool.committed_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("high"),
+            "Applied still updates committed_effort even when ack is suppressed"
+        );
+    }
+
+    /// P2-3 order-independence B: success arrives first, then fail.
+    ///
+    /// Worker A (Applied) emits the ack and commits. Worker B (Failed) rolls
+    /// back desired_effort to committed but emits no second ack.
+    #[tokio::test]
+    async fn test_p2_3_success_then_fail_emits_exactly_one_ack() {
+        let obs = observer::ObserverHandle::in_process();
+        let mut pool = AgentPool::from_slots(vec![None, None]);
+        pool.committed_effort = Some(("effort".to_string(), "low".to_string()));
+        pool.set_pool_effort("effort", "high");
+        let gen = pool.effort_generation;
+
+        for (idx, slot) in pool.agents_mut().iter_mut().enumerate() {
+            let acp = AcpClient::spawn(
+                "bash",
+                &["-c".to_string(), "sleep 10".to_string()],
+                &[],
+                false,
+            )
+            .await
+            .expect("spawn");
+            *slot = Some(OwnedAgent {
+                index: idx,
+                acp,
+                state: SessionState::default(),
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                desired_effort: None,
+                startup_effort: None,
+                desired_effort_gen: None,
+                pending_effort_nonce: None,
+                last_effort_result: None,
+                agent_name: "test".into(),
+                goose_system_prompt_supported: None,
+                protocol_version: 2,
+            });
+        }
+
+        let mut worker_a = pool.try_claim(None).unwrap();
+        let mut worker_b = pool.try_claim(None).unwrap();
+        assert_eq!(worker_a.desired_effort_gen, Some(gen));
+
+        // Worker A: success. Attach test observer so ack routes to obs.
+        worker_a.last_effort_result = Some(EffortApplicationResult::Applied);
+        worker_a.pending_effort_nonce = Some("nonce-abc".to_string());
+        worker_a.acp.set_observer(Some(obs.clone()), worker_a.index);
+        pool.return_agent(worker_a);
+
+        let events_after_a = obs.snapshot();
+        assert_eq!(events_after_a.len(), 1, "ok ack expected from first return");
+        assert_eq!(events_after_a[0].payload["status"].as_str().unwrap(), "ok");
+        assert_eq!(pool.last_acked_effort_gen, Some(gen));
+
+        // Worker B: fail — arrives after, same gen.
+        worker_b.last_effort_result = Some(EffortApplicationResult::Failed);
+        worker_b.pending_effort_nonce = Some("nonce-abc".to_string());
+        worker_b.acp.set_observer(Some(obs.clone()), worker_b.index);
+        pool.return_agent(worker_b);
+
+        let events_after_b = obs.snapshot();
+        assert_eq!(
+            events_after_b.len(),
+            1,
+            "P2-3: second same-gen fail must NOT emit another ack"
+        );
+        // Pool rolled back desired_effort to committed. After worker_a's Applied
+        // result committed "high", worker_b's failure rolls back to "high" (not
+        // the original "low"). This is correct: the committed baseline advanced.
+        assert_eq!(
+            pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("high"),
+            "Failed rolls back desired_effort to committed (now 'high' after worker_a committed it)"
+        );
+    }
+
+    // ── P3: stale capability cache cleared on model swap ─────────────────────
+
+    /// P3: when a returning agent has populated capabilities but no
+    /// thought_level configId (model swapped to non-effort), the pool-level
+    /// effort_capabilities cache is cleared so stale options are not used for
+    /// validation on the next pick.
+    #[tokio::test]
+    async fn test_capability_cache_cleared_when_model_loses_thought_level() {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        let mut pool = AgentPool::from_slots(vec![Some(OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        })]);
+        // Establish a known capabilities state (effort-capable model).
+        pool.notify_capabilities_discovered(&AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![serde_json::json!({"id": "effort", "options": [{"value": "low"}, {"value": "high"}]})],
+            available_models_raw: None,
+        });
+        assert!(pool.effort_capabilities.config_id.is_some());
+        assert!(pool.capabilities_ever_discovered);
+
+        // Worker returns after a model swap — no thought_level in new model.
+        let mut agent = pool.try_claim(None).unwrap();
+        agent.model_capabilities = Some(AgentModelCapabilities {
+            thought_level_config_id: None, // model swapped to non-effort
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
+        pool.return_agent(agent);
+
+        // P3: cache must be cleared.
+        assert!(
+            pool.effort_capabilities.config_id.is_none(),
+            "P3: effort_capabilities must be cleared when model loses thought_level"
+        );
+        assert!(
+            pool.effort_capabilities.valid_values.is_empty(),
+            "P3: valid_values must be cleared"
+        );
+        // capabilities_ever_discovered stays true (case C remains active).
+        assert!(
+            pool.capabilities_ever_discovered,
+            "capabilities_ever_discovered must stay true after cache clear"
         );
     }
 }

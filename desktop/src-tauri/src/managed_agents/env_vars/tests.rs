@@ -527,6 +527,47 @@ fn portable_import_restores_codex_effort_and_drops_crafted_secrets() {
     );
 }
 
+/// A catalog persona event is authored by a stranger, so its `thinking_effort`
+/// is untrusted input that lands in a local environment variable. The env
+/// validator's value rules (no NUL bytes, size caps) must therefore apply to it
+/// — an earlier revision inserted the effort *after* validation had already
+/// run, so a crafted value bypassed the checks entirely.
+#[test]
+fn portable_import_rejects_crafted_effort_values() {
+    let empty = BTreeMap::new();
+
+    // Not one of the documented tiers: dropped rather than written through.
+    for crafted in [
+        "high\0injected",
+        "definitely-not-a-tier",
+        "HIGH; rm -rf /",
+        "high medium",
+    ] {
+        let env_vars = portable_config_for_import(Some("claude"), &empty, Some(crafted)).unwrap();
+        assert!(
+            !env_vars.contains_key("CLAUDE_CODE_EFFORT_LEVEL"),
+            "crafted effort {crafted:?} must not reach the harness variable"
+        );
+    }
+
+    // An oversized value must not slip past the per-value byte cap.
+    let huge = "h".repeat(MAX_ENV_VALUE_BYTES + 1);
+    let env_vars = portable_config_for_import(Some("claude"), &empty, Some(&huge)).unwrap();
+    assert!(!env_vars.contains_key("CLAUDE_CODE_EFFORT_LEVEL"));
+
+    // A real tier still round-trips, for both target shapes.
+    let plain = portable_config_for_import(Some("claude"), &empty, Some("xhigh")).unwrap();
+    assert_eq!(
+        plain.get("CLAUDE_CODE_EFFORT_LEVEL").map(String::as_str),
+        Some("xhigh")
+    );
+    let structured = portable_config_for_import(Some("codex"), &empty, Some("high")).unwrap();
+    assert_eq!(
+        structured.get("CODEX_CONFIG").map(String::as_str),
+        Some(r#"{"model_reasoning_effort":"high"}"#)
+    );
+}
+
 #[test]
 fn codex_effort_reader_ignores_malformed_or_non_string_json_values() {
     let malformed = map(&[("CODEX_CONFIG", "not-json")]);

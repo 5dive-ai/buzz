@@ -237,6 +237,9 @@ pub(crate) fn thinking_effort_from_record(
 /// runtime-specific persisted representation. Catalog sharing uses this
 /// runtime-id-only form because publishing a persona never has an agent command
 /// fallback and must not infer behavior from arbitrary local environment data.
+///
+/// The value is filtered to a recognized tier: this feeds a plaintext public
+/// relay event, so an unrecognized local string is not something to broadcast.
 pub(crate) fn thinking_effort_from_runtime_env(
     runtime_id: Option<&str>,
     env_vars: &BTreeMap<String, String>,
@@ -247,13 +250,16 @@ pub(crate) fn thinking_effort_from_runtime_env(
         runtime.thinking_config_json_env_var,
         runtime.thinking_config_json_key,
     ) {
-        return json_env_string(env_vars, env_key, json_key);
+        return json_env_string(env_vars, env_key, json_key)
+            .as_deref()
+            .and_then(portable_effort_tier);
     }
 
     runtime
         .thinking_env_var
         .and_then(|key| env_vars.get(key))
-        .cloned()
+        .map(String::as_str)
+        .and_then(portable_effort_tier)
 }
 
 /// Restore the safe, portable portion of a snapshot's runtime configuration.
@@ -268,7 +274,7 @@ pub(crate) fn portable_config_for_import(
     let Some(runtime) = runtime_id.and_then(crate::managed_agents::known_acp_runtime_exact) else {
         return Ok(env_vars);
     };
-    let Some(effort) = thinking_effort.filter(|value| !value.is_empty()) else {
+    let Some(effort) = thinking_effort.and_then(portable_effort_tier) else {
         return Ok(env_vars);
     };
 
@@ -287,6 +293,26 @@ pub(crate) fn portable_config_for_import(
         env_vars.insert(env_key.to_string(), effort.to_string());
     }
     Ok(env_vars)
+}
+
+/// The complete set of effort tiers Buzz will write into a harness variable.
+///
+/// Default-deny, and deliberately a closed list: `thinking_effort` arriving from
+/// a catalog persona event or a hand-edited snapshot file is authored by someone
+/// else, and it is written straight into a child process's environment. Anything
+/// outside this set is dropped rather than forwarded. Mirrors
+/// `BUZZ_AGENT_THINKING_EFFORT_VALUES` in `ui/buzzAgentConfig.ts`; the
+/// per-harness narrowing of which tiers are *offered* is a UI concern, while
+/// this is the trust boundary.
+const PORTABLE_EFFORT_TIERS: &[&str] =
+    &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Returns the tier only when it is one Buzz recognizes, lowercased.
+fn portable_effort_tier(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    PORTABLE_EFFORT_TIERS
+        .contains(&normalized.as_str())
+        .then_some(normalized)
 }
 
 fn json_env_string(

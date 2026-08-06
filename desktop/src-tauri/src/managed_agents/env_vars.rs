@@ -230,16 +230,29 @@ pub(crate) fn thinking_effort_from_record(
         .and_then(crate::managed_agents::known_acp_runtime_exact)
         .or_else(|| crate::managed_agents::known_acp_runtime(&record.agent_command))?;
 
+    thinking_effort_from_runtime_env(Some(runtime.id), &record.env_vars)
+}
+
+/// Extract a portable thinking value for a declared runtime from its
+/// runtime-specific persisted representation. Catalog sharing uses this
+/// runtime-id-only form because publishing a persona never has an agent command
+/// fallback and must not infer behavior from arbitrary local environment data.
+pub(crate) fn thinking_effort_from_runtime_env(
+    runtime_id: Option<&str>,
+    env_vars: &BTreeMap<String, String>,
+) -> Option<String> {
+    let runtime = runtime_id.and_then(crate::managed_agents::known_acp_runtime_exact)?;
+
     if let (Some(env_key), Some(json_key)) = (
         runtime.thinking_config_json_env_var,
         runtime.thinking_config_json_key,
     ) {
-        return json_env_string(&record.env_vars, env_key, json_key);
+        return json_env_string(env_vars, env_key, json_key);
     }
 
     runtime
         .thinking_env_var
-        .and_then(|key| record.env_vars.get(key))
+        .and_then(|key| env_vars.get(key))
         .cloned()
 }
 

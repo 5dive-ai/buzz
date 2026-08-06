@@ -115,6 +115,10 @@ impl std::fmt::Display for RespondTo {
 /// `configId: "mode"` (e.g. `claude-agent-acp`).
 ///
 /// - `default` — agent's built-in behaviour (permission requests per tool call).
+/// - `auto` — fully autonomous execution; model-gated (requires `supportsAutoMode`);
+///   the adapter degrades gracefully to `default` when the active model does not
+///   support it. The adapter self-approves all tool calls internally — no
+///   `session/request_permission` ever crosses ACP under this mode.
 /// - `acceptEdits` — auto-approve file edits, still ask for other tools.
 /// - `dontAsk` — never prompt; reject anything that would require permission.
 /// - `plan` — planning-only mode (no tool execution).
@@ -123,6 +127,15 @@ pub enum PermissionMode {
     /// Agent default — permission requests per tool call.
     #[value(alias = "default")]
     Default,
+    /// Fully autonomous execution; model-gated (requires `supportsAutoMode`).
+    ///
+    /// The adapter self-approves all tool calls internally and never emits
+    /// `session/request_permission`, so this mode is incompatible with
+    /// `ask` (card never fires) and `reject` (policy is a dead letter while
+    /// the adapter auto-approves — the inverted-security worst case).
+    /// Compatible with `allow` (both want unattended approval).
+    #[value(alias = "auto")]
+    Auto,
     /// Auto-approve file edits, still ask for other tools.
     #[value(alias = "acceptEdits")]
     AcceptEdits,
@@ -140,6 +153,7 @@ impl PermissionMode {
     pub fn as_wire_str(&self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Auto => "auto",
             Self::AcceptEdits => "acceptEdits",
             Self::DontAsk => "dontAsk",
             Self::Plan => "plan",
@@ -244,6 +258,10 @@ impl ResolvedPermissionConfig {
     /// - `ask`  + explicit `dontAsk` — harness would want the agent to
     ///   escalate, but `dontAsk` makes the agent self-deny internally.
     /// - `allow` + explicit `dontAsk` — same contradiction.
+    /// - `ask`  + explicit `auto` — adapter self-approves internally, so the
+    ///   card never fires; the `ask` policy becomes a silent dead letter.
+    /// - `reject` + explicit `auto` — inverted-security worst case: policy says
+    ///   "deny" but the adapter auto-approves everything internally.
     pub fn resolve(
         policy: PermissionPolicy,
         explicit_mode: Option<PermissionMode>,
@@ -255,6 +273,20 @@ impl ResolvedPermissionConfig {
             return Err(ConfigError::ConfigFile(format!(
                 "permission_policy={policy} conflicts with permission_mode=dontAsk: \
                  dontAsk makes the agent self-deny internally before Buzz can answer"
+            )));
+        }
+        // Fail on ask/reject + auto: `auto` makes the adapter self-approve
+        // internally so `session/request_permission` never crosses ACP.
+        // Under `ask` the card never fires; under `reject` the policy is a dead
+        // letter while the adapter silently grants everything (inverted security).
+        // `allow` + auto is compatible: both policies want unattended approval.
+        if matches!(policy, PermissionPolicy::Ask | PermissionPolicy::Reject)
+            && explicit_mode == Some(PermissionMode::Auto)
+        {
+            return Err(ConfigError::ConfigFile(format!(
+                "permission_policy={policy} conflicts with permission_mode=auto: \
+                 auto makes the adapter self-approve internally before Buzz can answer \
+                 (ask: card never fires; reject: policy becomes a dead letter)"
             )));
         }
 

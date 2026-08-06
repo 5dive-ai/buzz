@@ -6254,4 +6254,51 @@ mod tests {
         let cfg = ResolvedPermissionConfig::resolve(PermissionPolicy::Allow, None).unwrap();
         assert_eq!(cfg.effective_mode.as_wire_str(), "default");
     }
+
+    // ── Pinned amendment: PermissionMode::Auto matrix row ────────────────────
+    //
+    // `auto` = "fully autonomous execution" — the adapter self-approves all
+    // tool calls internally and never emits `session/request_permission`.
+    // - allow + auto → compatible (transmit as-is; both want unattended approval)
+    // - ask   + auto → startup error (card never fires — ask becomes dead letter)
+    // - reject + auto → startup error (inverted security: policy says deny, adapter
+    //                   auto-approves everything)
+
+    #[test]
+    fn resolved_permission_config_allow_plus_explicit_auto_is_ok() {
+        // allow + auto is compatible: both want unattended approval.
+        let cfg =
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Allow, Some(PermissionMode::Auto))
+                .unwrap();
+        assert_eq!(cfg.effective_mode, PermissionMode::Auto);
+        assert_eq!(cfg.effective_mode.as_wire_str(), "auto");
+        assert_eq!(cfg.mode_source, ModeSource::Explicit);
+    }
+
+    #[test]
+    fn resolved_permission_config_ask_plus_explicit_auto_is_startup_error() {
+        // ask + auto: adapter self-approves internally, card never fires.
+        let result =
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, Some(PermissionMode::Auto));
+        assert!(result.is_err(), "ask + auto must be a startup error");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("auto"), "error must mention auto, got: {msg}");
+    }
+
+    #[test]
+    fn resolved_permission_config_reject_plus_explicit_auto_is_startup_error() {
+        // reject + auto: inverted-security worst case — policy says deny but
+        // adapter auto-approves everything internally.
+        let result =
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Reject, Some(PermissionMode::Auto));
+        assert!(result.is_err(), "reject + auto must be a startup error");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("auto"), "error must mention auto, got: {msg}");
+    }
+
+    #[test]
+    fn permission_mode_auto_wire_string_is_correct() {
+        assert_eq!(PermissionMode::Auto.as_wire_str(), "auto");
+        assert!(!PermissionMode::Auto.is_default());
+    }
 }

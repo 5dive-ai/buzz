@@ -3027,6 +3027,25 @@ function resetMockSaveSubscriptions(config: E2eConfig | undefined) {
   }));
 }
 
+// ── Mutable owned-agent inventory (archive/unarchive mutations update it) ───
+
+/**
+ * Mutable clone of `config.mock.ownedAgentInventory`, reset on each
+ * `installMockBridge` call.  `archive_identity` and `unarchive_identity`
+ * mutate this copy so `get_owned_agent_inventory` returns the post-mutation
+ * state, allowing specs to assert the full Archive → refetch → Unarchive flow.
+ */
+let mockOwnedInventory: NonNullable<
+  NonNullable<E2eConfig["mock"]>["ownedAgentInventory"]
+> = { archiveStateTrusted: true, byPersonaId: {}, unknown: [] };
+
+function resetMockOwnedInventory(config: E2eConfig | undefined) {
+  const seed = config?.mock?.ownedAgentInventory;
+  mockOwnedInventory = seed
+    ? JSON.parse(JSON.stringify(seed))
+    : { archiveStateTrusted: true, byPersonaId: {}, unknown: [] };
+}
+
 function resetMockPersonaCatalogEvents(config: E2eConfig | undefined) {
   mockPersonaEvents.length = 0;
   for (const event of config?.mock?.personaCatalogEvents ?? []) {
@@ -9991,6 +10010,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockUserStatuses();
   resetMockPersonaCatalogEvents(config);
   resetMockSaveSubscriptions(config);
+  resetMockOwnedInventory(config);
   resetMockPendingCommunityDeepLinks(config);
   initializeMockHuddle(config.mock?.huddle, config);
   mockWebsocketSendMutexWedged = false;
@@ -12796,13 +12816,7 @@ export function maybeInstallE2eTauriMocks() {
         return { archived };
       }
       case "get_owned_agent_inventory": {
-        return (
-          activeConfig?.mock?.ownedAgentInventory ?? {
-            archiveStateTrusted: true,
-            byPersonaId: {},
-            unknown: [],
-          }
-        );
+        return mockOwnedInventory;
       }
       case "get_relay_self":
         if ((activeConfig?.mock?.relaySelfDelayMs ?? 0) > 0) {
@@ -12814,11 +12828,51 @@ export function maybeInstallE2eTauriMocks() {
           );
         }
         return activeConfig?.mock?.relaySelf ?? null;
-      case "archive_identity":
-      case "unarchive_identity":
-        // The spec only verifies UI state, not the submitted request shape;
-        // returning null mirrors the Rust submit_event success path.
+      case "archive_identity": {
+        // Record the payload (via __BUZZ_E2E_COMMAND_PAYLOADS__ above) and
+        // mutate the mocked inventory snapshot so refetch reflects the change.
+        const archiveReq = payload as { req?: { targetPubkey?: string } };
+        const archivePubkey = archiveReq?.req?.targetPubkey ?? "";
+        if (archivePubkey) {
+          // Mark the instance as archived in all persona groups and unknown.
+          for (const instances of Object.values(
+            mockOwnedInventory.byPersonaId,
+          )) {
+            for (const inst of instances) {
+              if (inst.pubkey === archivePubkey) {
+                inst.archiveState = { isArchived: true };
+              }
+            }
+          }
+          for (const inst of mockOwnedInventory.unknown) {
+            if (inst.pubkey === archivePubkey) {
+              inst.archiveState = { isArchived: true };
+            }
+          }
+        }
         return null;
+      }
+      case "unarchive_identity": {
+        const unarchiveReq = payload as { req?: { targetPubkey?: string } };
+        const unarchivePubkey = unarchiveReq?.req?.targetPubkey ?? "";
+        if (unarchivePubkey) {
+          for (const instances of Object.values(
+            mockOwnedInventory.byPersonaId,
+          )) {
+            for (const inst of instances) {
+              if (inst.pubkey === unarchivePubkey) {
+                inst.archiveState = { isArchived: false };
+              }
+            }
+          }
+          for (const inst of mockOwnedInventory.unknown) {
+            if (inst.pubkey === unarchivePubkey) {
+              inst.archiveState = { isArchived: false };
+            }
+          }
+        }
+        return null;
+      }
       case "set_canvas":
         return { ok: true, event_id: mockEventId() };
       case "get_canvas": {

@@ -6,6 +6,8 @@ import {
   MonitorOff,
   RefreshCw,
   Server,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
 
 import {
@@ -15,13 +17,14 @@ import {
 } from "./hooks";
 import { ArchiveConfirmDialog } from "@/features/profile/ui/ArchiveConfirmDialog";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
+import { usePresenceQuery } from "@/features/presence/hooks";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import type {
   NipIaOwnerProof,
   OwnedAgentInstance,
   OwnedAgentInventorySnapshot,
 } from "@/shared/api/tauriIdentityArchive";
-import type { AgentPersona } from "@/shared/api/types";
+import type { AgentPersona, PresenceLookup } from "@/shared/api/types";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import {
@@ -43,6 +46,8 @@ function canMutate(proof: NipIaOwnerProof): boolean {
 type InstanceRowProps = {
   instance: OwnedAgentInstance;
   archiveStateTrusted: boolean;
+  /** Presence lookup for all instances in the sheet. */
+  presenceLookup: PresenceLookup;
   onOpenProfile: (pubkey: string) => void;
   onArchive: (pubkey: string) => void;
   onUnarchive: (pubkey: string) => void;
@@ -53,6 +58,7 @@ type InstanceRowProps = {
 function InstanceRow({
   instance,
   archiveStateTrusted,
+  presenceLookup,
   onOpenProfile,
   onArchive,
   onUnarchive,
@@ -64,6 +70,15 @@ function InstanceRow({
   const archiveTrustUnknown = !archiveStateTrusted;
   const canAct = canMutate(instance.nipIaOwnerProof) && !archiveTrustUnknown;
   const isPending = archivePending || unarchivePending;
+
+  // "Not managed on this device" keys on local === null, NOT personaId === null.
+  // A stale relay-only duplicate WITH a valid personaId receives the badge.
+  // The badge stays visible even when archived (no isArchived gate).
+  const isRelayOnly = instance.local === null;
+
+  // Presence: "online" or "away" → online, "offline" or absent → offline.
+  const presence = presenceLookup[instance.pubkey.toLowerCase()];
+  const isOnline = presence === "online" || presence === "away";
 
   return (
     <div
@@ -101,6 +116,25 @@ function InstanceRow({
         </button>
       </div>
 
+      {/* Presence indicator — shown regardless of archive state */}
+      <Badge
+        className="shrink-0 gap-1"
+        data-testid={`instance-presence-${instance.pubkey}`}
+        variant="outline"
+      >
+        {isOnline ? (
+          <>
+            <Wifi className="h-3 w-3 text-green-500" />
+            Online
+          </>
+        ) : (
+          <>
+            <WifiOff className="h-3 w-3 text-muted-foreground" />
+            Offline
+          </>
+        )}
+      </Badge>
+
       {/* Archive state badge — only when trusted */}
       {archiveTrustUnknown ? (
         <Badge className="shrink-0" variant="outline">
@@ -113,9 +147,14 @@ function InstanceRow({
         </Badge>
       ) : null}
 
-      {/* "Not managed on this device" badge for relay-only instances */}
-      {instance.personaId === null && !isArchived ? (
-        <Badge className="shrink-0 gap-1" variant="outline">
+      {/* "Not managed on this device" badge for relay-only instances.
+          Keyed on local === null — stays visible even when archived. */}
+      {isRelayOnly ? (
+        <Badge
+          className="shrink-0 gap-1"
+          data-testid={`instance-relay-only-${instance.pubkey}`}
+          variant="outline"
+        >
           <MonitorOff className="h-3 w-3" />
           Relay only
         </Badge>
@@ -175,9 +214,11 @@ type InstancesSheetProps = {
  * Sheet showing the owner's relay inventory of agent instances (`kind:30177`)
  * scoped to the opener's persona via `inventory.byPersonaId[persona.id]`.
  *
- * - Rows link to the exact-pubkey profile panel.
+ * - Rows show presence (online/offline) as a separate signal from local/relay status.
+ * - "Relay only" badge keys on `local === null`, stays visible even when archived.
  * - Archive/Unarchive are offered only for `Verified` instances.
  * - Unknown archive trust shows a retry affordance; mutations are suppressed.
+ * - Unknown-persona instances from the relay inventory render in a separate section.
  * - Tri-state badge is scoped to this surface — `useIsIdentityArchived` elsewhere is unchanged.
  */
 export function InstancesSheet({
@@ -211,6 +252,23 @@ export function InstancesSheet({
     return effectiveData.byPersonaId[persona.id] ?? [];
   }, [effectiveData, persona]);
 
+  // Unknown-persona instances from the relay inventory (not from local ManagedAgent[]).
+  const unknownInstances = React.useMemo(() => {
+    if (!effectiveData) return [];
+    return effectiveData.unknown ?? [];
+  }, [effectiveData]);
+
+  // Presence query over the merged pubkey set (persona instances + unknown).
+  const allPubkeys = React.useMemo(
+    () => [
+      ...instances.map((i) => i.pubkey),
+      ...unknownInstances.map((i) => i.pubkey),
+    ],
+    [instances, unknownInstances],
+  );
+  const presenceQuery = usePresenceQuery(allPubkeys, { enabled: open });
+  const presenceLookup: PresenceLookup = presenceQuery.data ?? {};
+
   function handleArchive(pubkey: string) {
     setConfirmArchivePubkey(pubkey);
   }
@@ -228,6 +286,22 @@ export function InstancesSheet({
   const archivePending = archiveMutation.isPending;
   const unarchivePending = unarchiveMutation.isPending;
   const isLoading = inventoryQuery.isLoading && !effectiveData;
+
+  function renderRows(rows: OwnedAgentInstance[], trusted: boolean) {
+    return rows.map((instance) => (
+      <InstanceRow
+        archivePending={archivePending}
+        archiveStateTrusted={trusted}
+        instance={instance}
+        key={instance.pubkey}
+        presenceLookup={presenceLookup}
+        unarchivePending={unarchivePending}
+        onArchive={handleArchive}
+        onOpenProfile={onOpenProfile}
+        onUnarchive={handleUnarchive}
+      />
+    ));
+  }
 
   return (
     <>
@@ -285,18 +359,7 @@ export function InstancesSheet({
                 </Button>
                 {/* Still render instances for inspection, but with mutations suppressed */}
                 <div className="mt-2 space-y-2">
-                  {instances.map((instance) => (
-                    <InstanceRow
-                      archivePending={archivePending}
-                      archiveStateTrusted={false}
-                      instance={instance}
-                      key={instance.pubkey}
-                      unarchivePending={unarchivePending}
-                      onArchive={handleArchive}
-                      onOpenProfile={onOpenProfile}
-                      onUnarchive={handleUnarchive}
-                    />
-                  ))}
+                  {renderRows(instances, false)}
                 </div>
               </div>
             ) : instances.length === 0 ? (
@@ -304,19 +367,23 @@ export function InstancesSheet({
                 No instances found on this relay.
               </p>
             ) : (
-              instances.map((instance) => (
-                <InstanceRow
-                  archivePending={archivePending}
-                  archiveStateTrusted={archiveStateTrusted}
-                  instance={instance}
-                  key={instance.pubkey}
-                  unarchivePending={unarchivePending}
-                  onArchive={handleArchive}
-                  onOpenProfile={onOpenProfile}
-                  onUnarchive={handleUnarchive}
-                />
-              ))
+              <div className="space-y-2">
+                {renderRows(instances, archiveStateTrusted)}
+              </div>
             )}
+
+            {/* Unknown-persona instances from the relay inventory */}
+            {unknownInstances.length > 0 ? (
+              <div
+                className="mt-4 space-y-2"
+                data-testid="unknown-instances-section"
+              >
+                <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  Unknown agents
+                </p>
+                {renderRows(unknownInstances, archiveStateTrusted)}
+              </div>
+            ) : null}
           </div>
         </SheetContent>
       </Sheet>

@@ -46,17 +46,40 @@ export type OwnedAgentArchiveState = {
   isArchived: boolean | null;
 };
 
+/**
+ * Minimal locally-managed agent fields, present when the pubkey has a local
+ * managed-agent record on this device. `null` on relay-only instances.
+ *
+ * The "Not managed on this device" badge keys on `local === null`, NOT on
+ * `personaId === null`. A stale relay-only duplicate with a valid personaId
+ * receives the badge; a locally managed definition-less agent does not.
+ */
+export type LocalAgentSummary = {
+  pubkey: string;
+  name: string;
+  personaId: string | null;
+};
+
 /** A single owned-agent instance from the relay `kind:30177` inventory. */
 export type OwnedAgentInstance = {
   pubkey: string;
   displayName: string | null;
   picture: string | null;
+  /** Relay URL for this instance. Empty string for local-only instances. */
   relayUrl: string;
   /** NIP-OA owner proof for this instance — never omitted, only null in older responses. */
   nipIaOwnerProof: NipIaOwnerProof;
   archiveState: OwnedAgentArchiveState;
   /** Persona ID parsed from `kind:30177` content. `null` for standalone agents. */
   personaId: string | null;
+  /**
+   * Present when this pubkey has a local managed-agent record on this device.
+   * `null` for relay-only instances (no local record).
+   *
+   * Key the "Not managed on this device" / Relay-only badge on `local === null`,
+   * NOT on `personaId === null`.
+   */
+  local: LocalAgentSummary | null;
 };
 
 /** Complete merged view model returned by `get_owned_agent_inventory`. */

@@ -453,10 +453,7 @@ test("getLatestActivityHeadline prefers latest spine work and scopes by channel"
       timestamp: "2026-06-14T19:00:20.000Z",
     }),
   ];
-  assert.equal(
-    getLatestActivityHeadline(items, "chan-a"),
-    "Send Message · abc",
-  );
+  assert.equal(getLatestActivityHeadline(items, "chan-a"), "Sent abc");
   assert.equal(getLatestActivityHeadline(items, "chan-b"), "Other channel");
   assert.equal(getLatestActivityHeadline(items, "chan-missing"), null);
 });

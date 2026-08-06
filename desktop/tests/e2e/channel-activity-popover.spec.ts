@@ -226,18 +226,61 @@ async function seedChannelActivity(
     );
     await page.evaluate(
       ({ agentPubkey, channelId }) => {
+        const now = Date.now();
         (
           window as Window & {
             __BUZZ_E2E_SEED_ACTIVE_TURNS__?: (input: {
               agentPubkey: string;
               channelId: string;
               turnId: string;
+              atMs?: number;
+            }) => void;
+            __BUZZ_E2E_SEED_OBSERVER_EVENTS__?: (input: {
+              agentPubkey: string;
+              events: Array<Record<string, unknown>>;
             }) => void;
           }
         ).__BUZZ_E2E_SEED_ACTIVE_TURNS__?.({
           agentPubkey,
           channelId,
           turnId: "channel-hover-preview",
+          atMs: now - 92_000,
+        });
+        (
+          window as Window & {
+            __BUZZ_E2E_SEED_OBSERVER_EVENTS__?: (input: {
+              agentPubkey: string;
+              events: Array<Record<string, unknown>>;
+            }) => void;
+          }
+        ).__BUZZ_E2E_SEED_OBSERVER_EVENTS__?.({
+          agentPubkey,
+          events: [
+            {
+              seq: now,
+              timestamp: new Date(now - 2_000).toISOString(),
+              kind: "acp_read",
+              agentIndex: 0,
+              channelId,
+              sessionId: "channel-hover-session",
+              turnId: "channel-hover-preview",
+              payload: {
+                jsonrpc: "2.0",
+                method: "session/update",
+                params: {
+                  sessionId: "channel-hover-session",
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    messageId: "channel-hover-message",
+                    content: {
+                      type: "text",
+                      text: "Updated the channel activity preview",
+                    },
+                  },
+                },
+              },
+            },
+          ],
         });
       },
       { agentPubkey: AGENT_PUBKEY, channelId: CHANNEL_GENERAL },
@@ -338,8 +381,8 @@ test.describe("channel activity hover preview", () => {
       popover.getByTestId(`channel-activity-agent-${AGENT_PUBKEY}`),
     ).toContainText("Charlie");
     await expect(
-      popover.getByTestId(`channel-activity-agent-${AGENT_PUBKEY}`),
-    ).toContainText("Working");
+      popover.getByTestId(`channel-activity-agent-status-${AGENT_PUBKEY}`),
+    ).toHaveText("Working · Updated the channel activity preview");
     const orderedRows = popover.locator(
       '[data-testid^="channel-activity-agent-"], [data-testid^="channel-activity-item-"]',
     );

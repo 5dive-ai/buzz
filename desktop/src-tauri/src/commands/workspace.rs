@@ -403,6 +403,8 @@ async fn apply_workspace_body(
     }
 
     let state = restore_app.state::<AppState>();
+    super::agents::provider_access::reconcile_on_workspace_apply(&restore_app, &state).await?;
+
     match crate::managed_agents::retention::active_retention_scope(&restore_app, &state) {
         Ok(scope) => {
             if let Some(agent_scope) = state.capture_active_scope() {

@@ -612,7 +612,7 @@ fn import_identity_blocking(
 ///    as a command `Err` would claim a half-applied import that actually
 ///    succeeded. The leftover blob is still passphrase-encrypted and is
 ///    replaced by the next backup creation; we log and move on.
-fn commit_imported_identity(
+pub(crate) fn commit_imported_identity(
     state: &AppState,
     data_dir: &std::path::Path,
     keys: nostr::Keys,

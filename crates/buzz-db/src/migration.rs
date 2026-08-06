@@ -668,7 +668,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 28);
+        assert_eq!(migrations.len(), 29);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1062,6 +1062,16 @@ mod tests {
         assert!(deletion.contains("FOREIGN KEY (request_id, community_id, inventory_digest)"));
         assert!(deletion.contains("prevent_community_deletion_request_retargeting"));
         assert!(deletion.contains("prevent_community_deletion_approval_removal"));
+
+        // Bounded deletion retries are an additive migration because 0028 is
+        // already checksum-pinned on deployed candidates.
+        assert_eq!(migrations[28].version, 29);
+        let bounded_retries = migrations[28].sql.as_str();
+        assert!(bounded_retries.contains("ALTER TABLE community_deletion_requests"));
+        assert!(bounded_retries.contains("ADD COLUMN retry_stage"));
+        assert!(bounded_retries.contains("'approved', 'fenced', 'drained'"));
+        assert!(!deletion.contains("retry_stage"));
+        assert!(desired_schema.contains("retry_stage TEXT CHECK"));
     }
 
     #[test]

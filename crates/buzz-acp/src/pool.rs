@@ -818,120 +818,133 @@ impl AgentPool {
             }
         }
 
-        // Commit or roll back the pending effort based on the last session result.
+        // P2-3: commit/rollback and terminal ack are unified under a single
+        // first-terminal-wins gate.
         //
-        // Only act when:
-        //   - the agent carried a live generation (`desired_effort_gen = Some`), AND
-        //   - that generation is still current (not superseded by a newer pick/clear).
+        // With parallelism > 1, multiple workers check out the same generation.
+        // The FIRST worker whose return_agent runs:
+        //   1. Performs the commit or rollback (pool-state resolution).
+        //   2. Emits the terminal ack to the Desktop.
+        //   3. Marks the generation resolved via `last_acked_effort_gen`.
         //
-        // Stale results (gen != pool.effort_generation) are discarded entirely —
+        // All later same-gen returns skip both state change and ack. This
+        // guarantees that the pool state the Desktop sees always matches the
+        // terminal ack it received — the two are resolved atomically by the same
+        // return, so they can never disagree.
+        //
+        // Stale results (gen != pool.effort_generation) are discarded entirely;
         // a newer pick is already pending and must not be clobbered.
+        //
+        // Startup agents carry desired_effort_gen = None and never enter this
+        // block; their effort is applied silently (no ack needed).
         if let Some(checkout_gen) = agent.desired_effort_gen {
-            if checkout_gen == self.effort_generation {
-                match &agent.last_effort_result {
-                    Some(EffortApplicationResult::Applied) => {
-                        // Adapter accepted — commit pending to stable baseline.
-                        self.committed_effort = agent.desired_effort.clone();
-                    }
-                    Some(EffortApplicationResult::Cleared) => {
-                        // Clear confirmed — adapter ran on default; commit None.
-                        self.committed_effort = None;
-                    }
-                    Some(EffortApplicationResult::Failed) => {
-                        // Adapter rejected — roll back to last committed value so
-                        // the failed candidate is never recopied by try_claim.
-                        self.desired_effort = self.committed_effort.clone();
-                    }
-                    None => {
-                        // No session was created (agent returned without applying,
-                        // e.g. process exiting). Leave desired_effort as-is; the
-                        // next session will retry.
-                    }
-                }
-            }
-            // Stale gen: discard, touch nothing.
-        }
-
-        // P2-3: emit exactly one terminal effort ack per generation.
-        //
-        // With parallelism > 1, multiple workers check out the same generation
-        // and each calls create_session_and_apply_model independently. The first
-        // worker whose return_agent runs wins the ack; subsequent workers carrying
-        // the same gen are silenced. This makes pool-state and the observable ack
-        // stream order-independent.
-        //
-        // Semantics: first terminal result (Applied / Failed / Cleared) that
-        // matches the current generation emits the ack and marks the gen resolved.
-        // Later same-gen returns still update pool state (commit/rollback already
-        // ran above) but do NOT re-notify the Desktop.
-        //
-        // Startup agents have desired_effort_gen = None so they never enter this
-        // block; their ack path is not needed (startup effort is applied silently).
-        if let Some(checkout_gen) = agent.desired_effort_gen {
-            if checkout_gen == self.effort_generation {
-                // First terminal result for this generation: emit the ack and
-                // record the generation as resolved.
-                if self.last_acked_effort_gen != Some(checkout_gen) {
-                    if let Some(ref result) = agent.last_effort_result {
-                        let nonce_field = agent.pending_effort_nonce.as_deref();
-                        match result {
-                            EffortApplicationResult::Applied | EffortApplicationResult::Failed => {
-                                if let Some((ref config_id, ref value)) = agent.desired_effort {
-                                    let ack_status = match result {
-                                        EffortApplicationResult::Applied => "ok",
-                                        _ => "failure",
-                                    };
-                                    let mut final_ack = serde_json::json!({
-                                        "type": "set_config_option",
-                                        "configId": config_id,
-                                        "value": value,
-                                        "status": ack_status,
-                                        "category": "thought_level",
-                                    });
-                                    if let Some(n) = nonce_field {
-                                        final_ack["nonce"] = serde_json::json!(n);
-                                    }
-                                    agent.acp.observe("control_result", final_ack);
-                                    self.last_acked_effort_gen = Some(checkout_gen);
-                                }
-                            }
-                            EffortApplicationResult::Cleared => {
-                                let cleared_config_id = agent
-                                    .model_capabilities
-                                    .as_ref()
-                                    .and_then(|c| c.thought_level_config_id.as_deref())
-                                    .unwrap_or("effort");
-                                let mut cleared_ack = serde_json::json!({
+            if checkout_gen == self.effort_generation
+                && self.last_acked_effort_gen != Some(checkout_gen)
+            {
+                // First terminal result for this generation: resolve state and
+                // emit the ack atomically, then mark the gen resolved.
+                if let Some(ref result) = agent.last_effort_result {
+                    let nonce_field = agent.pending_effort_nonce.as_deref();
+                    match result {
+                        EffortApplicationResult::Applied => {
+                            // Adapter accepted — commit pending to stable baseline.
+                            self.committed_effort = agent.desired_effort.clone();
+                            if let Some((ref config_id, ref value)) = agent.desired_effort {
+                                let mut ack = serde_json::json!({
                                     "type": "set_config_option",
-                                    "configId": cleared_config_id,
-                                    "value": "",
-                                    "status": "cleared",
+                                    "configId": config_id,
+                                    "value": value,
+                                    "status": "ok",
                                     "category": "thought_level",
                                 });
                                 if let Some(n) = nonce_field {
-                                    cleared_ack["nonce"] = serde_json::json!(n);
+                                    ack["nonce"] = serde_json::json!(n);
                                 }
-                                agent.acp.observe("control_result", cleared_ack);
+                                agent.acp.observe("control_result", ack);
+                                self.last_acked_effort_gen = Some(checkout_gen);
+                            }
+                        }
+                        EffortApplicationResult::Cleared => {
+                            // Clear confirmed — adapter ran on default; commit None.
+                            self.committed_effort = None;
+                            let cleared_config_id = agent
+                                .model_capabilities
+                                .as_ref()
+                                .and_then(|c| c.thought_level_config_id.as_deref())
+                                .unwrap_or("effort");
+                            let mut ack = serde_json::json!({
+                                "type": "set_config_option",
+                                "configId": cleared_config_id,
+                                "value": "",
+                                "status": "cleared",
+                                "category": "thought_level",
+                            });
+                            if let Some(n) = nonce_field {
+                                ack["nonce"] = serde_json::json!(n);
+                            }
+                            agent.acp.observe("control_result", ack);
+                            self.last_acked_effort_gen = Some(checkout_gen);
+                        }
+                        EffortApplicationResult::Failed => {
+                            // Adapter rejected — roll back desired_effort to the
+                            // last committed value so the failed candidate is
+                            // never recopied by try_claim.
+                            self.desired_effort = self.committed_effort.clone();
+                            if let Some((ref config_id, ref value)) = agent.desired_effort {
+                                let mut ack = serde_json::json!({
+                                    "type": "set_config_option",
+                                    "configId": config_id,
+                                    "value": value,
+                                    "status": "failure",
+                                    "category": "thought_level",
+                                });
+                                if let Some(n) = nonce_field {
+                                    ack["nonce"] = serde_json::json!(n);
+                                }
+                                agent.acp.observe("control_result", ack);
                                 self.last_acked_effort_gen = Some(checkout_gen);
                             }
                         }
                     }
                 }
-                // else: already acked this gen — silently drop.
+                // None result: no session was created (agent returned without
+                // applying, e.g. process exiting). Leave desired_effort as-is;
+                // the next session will retry. No ack emitted.
             }
-            // Stale gen: already handled above (pool state untouched), no ack.
+            // else: gen already resolved (later same-gen return) OR stale gen.
+            // Touch neither pool state nor the ack stream.
         }
 
         // V-3: if the worker's checkout snapshot differs from the current pool
-        // value (i.e. a pick or clear arrived while this worker was busy),
-        // invalidate the worker's sessions so the next claim creates a fresh
-        // session under the current pool value.
+        // value (i.e. a pick or clear arrived while this worker was busy, OR
+        // this worker was discarded by the first-terminal-wins gate), invalidate
+        // the worker's sessions so the next claim creates a fresh session under
+        // the current pool value.
         //
-        // We compare by value: if the pool is Some(x) and agent carried Some(x)
-        // they match — no invalidation needed. Mismatch cases:
-        //   - pool cleared (None) while agent carried Some(_) → sessions stale
-        //   - pool picked Some(y) while agent carried Some(x) or None → stale
-        if agent.desired_effort != self.desired_effort {
+        // Value-comparison covers most cases:
+        //   - pool cleared (None) while agent carried Some(_) → mismatch → invalidate
+        //   - pool picked Some(y) while agent carried Some(x) or None → mismatch → invalidate
+        //
+        // Special case — discarded Failed worker with matching values:
+        //   A worker discarded by the first-terminal-wins gate may carry
+        //   desired_effort == pool.desired_effort (value match), yet its live
+        //   session ran at DEFAULT effort (the adapter rejected the pick). V-3's
+        //   equality check would skip invalidation, leaving a stale-effort session
+        //   alive. We force-invalidate whenever a same-gen return is discarded AND
+        //   the worker's result was Failed — the session is definitely stale
+        //   regardless of the value comparison.
+        let discarded_failed = agent
+            .desired_effort_gen
+            .map(|g| {
+                g == self.effort_generation
+                    && self.last_acked_effort_gen == Some(g)
+                    && matches!(
+                        agent.last_effort_result,
+                        Some(EffortApplicationResult::Failed)
+                    )
+            })
+            .unwrap_or(false);
+        if agent.desired_effort != self.desired_effort || discarded_failed {
             agent.state.invalidate_all();
         }
 
@@ -8591,14 +8604,19 @@ mod effort_tests {
         );
     }
 
-    // ── P2-3: first-terminal-result-wins ack gate ─────────────────────────────
+    // ── P2-3: first-terminal-result-wins ─────────────────────────────────────
 
     /// P2-3 order-independence A: fail arrives first, then success.
     ///
     /// Two workers carry the same generation. Worker A (fail) returns first:
-    /// pool rolls back desired_effort to committed, ack emitted for fail.
-    /// Worker B (Applied) returns second: pool state updates committed but
-    /// no second ack is emitted (last_acked_effort_gen already set).
+    /// pool rolls back desired_effort to committed, emits failure ack, marks
+    /// gen resolved. Worker B (Applied) returns second: gen already resolved —
+    /// no state change, no second ack.
+    ///
+    /// Final state: desired=low, committed=low (matches the failure ack).
+    /// The discarded Applied worker (B) has value-mismatch after rollback:
+    /// its desired_effort("high") != pool.desired_effort("low") → V-3
+    /// invalidates its sessions so it retries at the correct value.
     #[tokio::test]
     async fn test_p2_3_fail_then_success_emits_exactly_one_ack() {
         let obs = observer::ObserverHandle::in_process();
@@ -8643,8 +8661,7 @@ mod effort_tests {
         assert_eq!(worker_a.desired_effort_gen, Some(gen));
         assert_eq!(worker_b.desired_effort_gen, Some(gen));
 
-        // Worker A: failed. Attach the test observer so agent.acp.observe(...)
-        // routes to obs rather than the ACP's default (None) observer.
+        // Worker A: failed — first terminal result, wins the gate.
         worker_a.last_effort_result = Some(EffortApplicationResult::Failed);
         worker_a.pending_effort_nonce = Some("nonce-xyz".to_string());
         worker_a.acp.set_observer(Some(obs.clone()), worker_a.index);
@@ -8661,39 +8678,52 @@ mod effort_tests {
             "failure"
         );
         assert_eq!(pool.last_acked_effort_gen, Some(gen));
-
-        // Pool rolled back to committed.
+        // Fail rolled back desired_effort to committed ("low").
         assert_eq!(
             pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
             Some("low"),
             "fail rolls back desired_effort to committed"
         );
 
-        // Worker B: success — arrives later, same gen.
+        // Worker B: success — arrives later, gen already resolved → no state change, no ack.
+        // worker_b.desired_effort is Some("high") (checked out before rollback).
         worker_b.last_effort_result = Some(EffortApplicationResult::Applied);
         worker_b.pending_effort_nonce = Some("nonce-xyz".to_string());
-        // desired_effort was copied from pool at checkout ("high"); keep it.
         worker_b.acp.set_observer(Some(obs.clone()), worker_b.index);
         pool.return_agent(worker_b);
 
+        // Exactly one ack total.
         let events_after_b = obs.snapshot();
         assert_eq!(
             events_after_b.len(),
             1,
             "P2-3: second same-gen return must NOT emit another ack"
         );
-        // Pool committed updated by Applied (desired_effort was "high" at return).
+
+        // Pool state matches the failure ack: desired=low, committed=low.
+        assert_eq!(
+            pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("low"),
+            "P2-3: desired_effort must stay at rollback value (low) after discarded Applied"
+        );
         assert_eq!(
             pool.committed_effort.as_ref().map(|(_, v)| v.as_str()),
-            Some("high"),
-            "Applied still updates committed_effort even when ack is suppressed"
+            Some("low"),
+            "P2-3: committed_effort unchanged (low) — discarded Applied must not mutate it"
         );
     }
 
     /// P2-3 order-independence B: success arrives first, then fail.
     ///
-    /// Worker A (Applied) emits the ack and commits. Worker B (Failed) rolls
-    /// back desired_effort to committed but emits no second ack.
+    /// Worker A (Applied) emits the ack and commits. Worker B (Failed) is
+    /// discarded — no state change, no second ack.
+    ///
+    /// Final state: desired=high, committed=high (matches the ok ack).
+    ///
+    /// Discarded Failed worker (B): its desired_effort("high") == pool.desired_effort("high"),
+    /// so the value comparison alone would skip V-3. But the worker's live session ran at
+    /// DEFAULT (adapter rejected), not at "high" — the session is stale. The
+    /// discarded-failed special case in V-3 force-invalidates it.
     #[tokio::test]
     async fn test_p2_3_success_then_fail_emits_exactly_one_ack() {
         let obs = observer::ObserverHandle::in_process();
@@ -8733,7 +8763,7 @@ mod effort_tests {
         let mut worker_b = pool.try_claim(None).unwrap();
         assert_eq!(worker_a.desired_effort_gen, Some(gen));
 
-        // Worker A: success. Attach test observer so ack routes to obs.
+        // Worker A: success — first terminal result, wins the gate.
         worker_a.last_effort_result = Some(EffortApplicationResult::Applied);
         worker_a.pending_effort_nonce = Some("nonce-abc".to_string());
         worker_a.acp.set_observer(Some(obs.clone()), worker_a.index);
@@ -8744,25 +8774,47 @@ mod effort_tests {
         assert_eq!(events_after_a[0].payload["status"].as_str().unwrap(), "ok");
         assert_eq!(pool.last_acked_effort_gen, Some(gen));
 
-        // Worker B: fail — arrives after, same gen.
+        // Worker B: fail — arrives after, gen already resolved → no state change, no ack.
+        // worker_b.desired_effort is Some("high"); pool is now committed=high, desired=high.
+        // Value match would skip V-3, but the discarded-failed special case must invalidate.
         worker_b.last_effort_result = Some(EffortApplicationResult::Failed);
         worker_b.pending_effort_nonce = Some("nonce-abc".to_string());
+        // Seed a dummy session so we can observe the invalidation.
+        let dummy_channel = Uuid::new_v4();
+        worker_b
+            .state
+            .sessions
+            .insert(dummy_channel, "old-sess".into());
         worker_b.acp.set_observer(Some(obs.clone()), worker_b.index);
         pool.return_agent(worker_b);
 
+        // Exactly one ack total.
         let events_after_b = obs.snapshot();
         assert_eq!(
             events_after_b.len(),
             1,
             "P2-3: second same-gen fail must NOT emit another ack"
         );
-        // Pool rolled back desired_effort to committed. After worker_a's Applied
-        // result committed "high", worker_b's failure rolls back to "high" (not
-        // the original "low"). This is correct: the committed baseline advanced.
+
+        // Pool state matches the ok ack: desired=high, committed=high.
         assert_eq!(
             pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
             Some("high"),
-            "Failed rolls back desired_effort to committed (now 'high' after worker_a committed it)"
+            "P2-3: desired_effort stays high after discarded Failed"
+        );
+        assert_eq!(
+            pool.committed_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("high"),
+            "P2-3: committed_effort stays high (committed by worker_a Applied)"
+        );
+
+        // V-3 discarded-failed special case: the returned agent's sessions must
+        // have been invalidated even though desired_effort values matched.
+        // invalidate_all() clears the sessions map — verify it's empty.
+        let returned = pool.agents_mut().iter().flatten().next().unwrap();
+        assert!(
+            returned.state.sessions.is_empty(),
+            "P2-3: discarded Failed worker must have its sessions invalidated by V-3 (discarded_failed path)"
         );
     }
 

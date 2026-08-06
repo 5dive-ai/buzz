@@ -521,7 +521,7 @@ function CommunityApp({
     if (community.needsSetup) {
       // Show welcome setup for first-run users with no communities
       appContent = (
-<WelcomeSetup
+        <WelcomeSetup
           canReturnToMachineConfig={!isFindingCommunityAfterLeave}
           initialPage={resumeFirstCommunityPage ?? undefined}
         />

@@ -431,7 +431,7 @@ export function MachineOnboardingFlow({
                 </div>
               </motion.div>
               <div className="buzz-onboarding-key-import-position w-full">
-<div className="flex flex-col items-center">
+                <div className="flex flex-col items-center">
                   <NostrKeyImportForm
                     backLabel="Back"
                     onBack={() => {

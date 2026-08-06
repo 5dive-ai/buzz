@@ -101,10 +101,13 @@ export function OnboardingHistoryProvider({
   const reset = React.useCallback((step: OnboardingRouteStep) => {
     const sessionId = crypto.randomUUID();
     sessionIdRef.current = sessionId;
-    router.history.replace(
-      onboardingRoutePath(step),
-      createOnboardingHistoryState(sessionId, 0),
-    );
+    const path = onboardingRoutePath(step);
+    const state = createOnboardingHistoryState(sessionId, 0);
+    // Replace the route being retired, then leave an equivalent current entry.
+    // Browser Back lands on the fresh session boundary instead of reviving the
+    // app or completed onboarding route that preceded it.
+    router.history.replace(path, state);
+    router.history.push(path, state);
   }, []);
 
   const backBy = React.useCallback(

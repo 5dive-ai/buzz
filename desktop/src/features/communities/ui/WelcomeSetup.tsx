@@ -80,7 +80,14 @@ export function WelcomeSetup({
   React.useEffect(() => {
     const step = onboardingHistory.step;
     if (!step) {
-      onboardingHistory.replace(routeForWelcomePage(page));
+      if (canReturnToMachineConfig) {
+        onboardingHistory.replace(routeForWelcomePage(page));
+      } else {
+        // Leaving the final community starts a new discovery flow. Retire the
+        // app history behind it so browser Back cannot escape to a route that
+        // no longer has an active community.
+        onboardingHistory.reset(routeForWelcomePage(page));
+      }
       return;
     }
     if (isMachineOnboardingRouteStep(step)) return;
@@ -97,8 +104,10 @@ export function WelcomeSetup({
     setIsHostedSignInOpen(false);
     setPage(pageForWelcomeRoute(step));
   }, [
+    canReturnToMachineConfig,
     onboardingHistory.direction,
     onboardingHistory.replace,
+    onboardingHistory.reset,
     onboardingHistory.step,
     page,
   ]);
@@ -209,7 +218,7 @@ export function WelcomeSetup({
                   </button>
                 </Card>
               </div>
-{canReturnToMachineConfig ? (
+              {canReturnToMachineConfig ? (
                 <OnboardingFooter>
                   <Button
                     className="h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"

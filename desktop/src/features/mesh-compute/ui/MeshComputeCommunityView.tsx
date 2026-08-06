@@ -67,10 +67,15 @@ export function MeshComputeCommunityView({
       <div>
         <div className="mb-2 flex items-end justify-between gap-3">
           <div>
-            <h2 className="text-lg font-semibold tracking-tight">Model mesh</h2>
+            <h2 className="text-lg font-semibold tracking-tight">
+              {model.deployments.length === 1
+                ? "Your community’s first compute node"
+                : "Model mesh"}
+            </h2>
             <p className="text-sm text-muted-foreground">
-              Each territory is one ready model on one device. Area reflects its
-              reported model-memory tier.
+              {model.deployments.length === 1
+                ? "This machine is the foundation of the mesh. More contributors add capacity, model choice, and resilience."
+                : "Each territory is one ready model on one device. Area reflects its reported model-memory tier."}
             </p>
           </div>
           {!simulated ? (

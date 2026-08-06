@@ -12,8 +12,10 @@ import {
 import { useMeshComputeState } from "../hooks/useMeshComputeState";
 import { CommunityComputeTutorialPanel } from "./CommunityComputeTutorialPanel";
 import { MeshComputeCommunityView } from "./MeshComputeCommunityView";
+import { MeshComputeImpactReceipt } from "./MeshComputeImpactReceipt";
 import { MeshComputeSettingsCard } from "./MeshComputeSettingsCard";
 import { MeshComputeShareBanner } from "./MeshComputeShareBanner";
+import { MeshComputeTokenLeaderboard } from "./MeshComputeTokenLeaderboard";
 
 export function MeshComputePage() {
   const { activeCommunity } = useCommunities();
@@ -52,7 +54,7 @@ export function MeshComputePage() {
             <BookOpen /> Tutorial
           </Button>
         }
-        description={`See what ${communityName} can run and contribute this machine’s spare capacity.`}
+        description={`Contribute this machine’s spare capacity to unlock more models and keep ${communityName}’s agents available when demand grows.`}
         title="Compute"
       />
 
@@ -80,7 +82,10 @@ export function MeshComputePage() {
                 onStepChange={setTutorialStep}
                 step={tutorialStep}
               />
-            ) : null}
+            ) : (
+              <MeshComputeImpactReceipt mesh={mesh} />
+            )}
+            <MeshComputeTokenLeaderboard mesh={mesh} simulated={tutorialOpen} />
             <MeshComputeCommunityView
               communityName={
                 tutorialOpen ? tutorialFixture.title : communityName

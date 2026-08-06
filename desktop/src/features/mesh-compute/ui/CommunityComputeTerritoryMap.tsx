@@ -90,6 +90,7 @@ export function CommunityComputeTerritoryMap({
   const hoveredDeployment = hoveredId
     ? (deploymentById.get(hoveredId) ?? null)
     : null;
+  const isHeroDeployment = model.deployments.length === 1;
 
   function selectDeployment(deploymentId: string) {
     if (selectedDeploymentId === undefined) {
@@ -193,6 +194,12 @@ export function CommunityComputeTerritoryMap({
             );
           })}
         </svg>
+        {isHeroDeployment && activeDeployment ? (
+          <HeroDeploymentOverlay
+            deployment={activeDeployment}
+            inferenceActive={inferenceIds.has(activeDeployment.id)}
+          />
+        ) : null}
         {hoveredDeployment ? (
           <div
             className="pointer-events-none absolute bottom-3 left-3 max-w-64 rounded-xl border border-border/70 bg-popover/95 px-3 py-2 shadow-lg backdrop-blur-sm"
@@ -232,6 +239,69 @@ export function CommunityComputeTerritoryMap({
         ) : null}
       </div>
     </section>
+  );
+}
+
+function HeroDeploymentOverlay({
+  deployment,
+  inferenceActive,
+}: {
+  deployment: CommunityComputeDeployment;
+  inferenceActive: boolean;
+}) {
+  return (
+    <div
+      className="pointer-events-none absolute left-1/2 top-1/2 w-[min(19rem,calc(100%-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-background/20 bg-background/90 p-3 text-center shadow-xl backdrop-blur-md"
+      data-testid="community-compute-hero-deployment"
+    >
+      <div className="flex items-center justify-center gap-2">
+        <span
+          className={cn(
+            "size-2 rounded-full",
+            deployment.health === "healthy"
+              ? "bg-emerald-500"
+              : "bg-muted-foreground",
+          )}
+        />
+        <span className="text-2xs font-semibold uppercase tracking-wide text-muted-foreground">
+          {inferenceActive ? "Serving now" : deployment.health}
+        </span>
+      </div>
+      <h3
+        className="mt-1 truncate text-sm font-semibold"
+        title={deployment.modelId}
+      >
+        {shortModelName(deployment.modelId)}
+      </h3>
+      <p className="mt-0.5 truncate text-xs text-muted-foreground">
+        {deployment.deviceLabel}
+        {deployment.isSelf ? " · This machine" : ""}
+      </p>
+      <dl className="mt-2 grid grid-cols-3 divide-x divide-border/60 rounded-lg border border-border/60 bg-background/70 py-2">
+        <HeroMetric
+          label="Shared memory"
+          value={formatCapacity(deployment.capacityGb)}
+        />
+        <HeroMetric
+          label="Model footprint"
+          value={formatCapacity(deployment.source.modelSizeGb ?? null)}
+        />
+        <HeroMetric label="Availability" value="Community ready" />
+      </dl>
+    </div>
+  );
+}
+
+function HeroMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 px-2">
+      <dt className="truncate text-3xs uppercase tracking-wide text-muted-foreground">
+        {label}
+      </dt>
+      <dd className="mt-0.5 truncate text-2xs font-semibold" title={value}>
+        {value}
+      </dd>
+    </div>
   );
 }
 

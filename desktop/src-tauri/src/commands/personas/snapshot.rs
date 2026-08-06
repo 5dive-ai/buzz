@@ -56,6 +56,31 @@ pub(crate) fn resolve_from_lists<'a>(
     Err(format!("agent {id:?} not found"))
 }
 
+/// [`resolve_from_lists`] with the relay-primary overlay folded on.
+///
+/// Every export/mint path must use this rather than the raw form. #4999 makes
+/// private managed-agent config relay-primary, and `PrivateConfigPatch::apply`
+/// replaces `env_vars` wholesale rather than merging it — so on a device that
+/// follows another device's relay head, the `env_vars` in `managed-agents.json`
+/// are stale by construction. The portable thinking-effort value lives inside
+/// `env_vars`, so exporting from raw disk emits a stale effort, or none at all
+/// when the effort was only ever set on the other device.
+///
+/// A no-op when the resolved id has no overlay patch: bare definitions always,
+/// and instances on whichever device authored the current head.
+pub(crate) fn resolve_from_lists_folded(
+    state: &AppState,
+    id: &str,
+    instances: &[ManagedAgentRecord],
+    definitions: &[ManagedAgentRecord],
+) -> Result<(ManagedAgentRecord, bool), String> {
+    let (record, is_definition) = resolve_from_lists(id, instances, definitions)?;
+    let folded =
+        crate::managed_agents::private_config_overlay::resolved_local_record(state, record)
+            .unwrap_or_else(|_| record.clone());
+    Ok((folded, is_definition))
+}
+
 /// Validate that `memory_source_pubkey` is an appropriate source for a
 /// memory-bearing snapshot export.
 ///
@@ -247,8 +272,8 @@ pub(crate) async fn materialize_snapshot_bytes(
 
         let instances = load_managed_agents(&app)?;
         let definitions = load_agent_definitions(&app)?;
-        let (def_record, is_definition) = resolve_from_lists(&id, &instances, &definitions)
-            .map(|(r, is_def)| (r.clone(), is_def))?;
+        let (def_record, is_definition) =
+            resolve_from_lists_folded(&state, &id, &instances, &definitions)?;
         let mut def_record = def_record;
         // A snapshot is a verbatim portable copy of the effective runtime,
         // provider, and model configuration, not a pointer to the sender's

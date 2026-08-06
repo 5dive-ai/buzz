@@ -7,6 +7,73 @@ use crate::managed_agents::{
     team_snapshot::{TeamSnapshotMeta, FORMAT_DISCRIMINATOR, FORMAT_VERSION},
 };
 
+/// A team-linked instance record for persona `alice` in team `t1`.
+pub(super) fn sample_team_instance() -> ManagedAgentRecord {
+    ManagedAgentRecord {
+        pubkey: "a".repeat(64),
+        name: "Alice".to_string(),
+        display_name: None,
+        slug: None,
+        persona_id: Some("alice".to_string()),
+        private_key_nsec: String::new(),
+        auth_tag: None,
+        relay_url: String::new(),
+        avatar_url: None,
+        acp_command: crate::managed_agents::DEFAULT_ACP_COMMAND.to_string(),
+        agent_command: String::new(),
+        agent_command_override: None,
+        agent_args: vec![],
+        mcp_command: String::new(),
+        turn_timeout_seconds: 0,
+        idle_timeout_seconds: None,
+        max_turn_duration_seconds: None,
+        parallelism: crate::managed_agents::DEFAULT_AGENT_PARALLELISM,
+        system_prompt: None,
+        model: None,
+        provider: None,
+        persona_source_version: None,
+        env_vars: Default::default(),
+        start_on_app_launch: false,
+        auto_restart_on_config_change: true,
+        runtime_pid: None,
+        backend: crate::managed_agents::BackendKind::Local,
+        backend_agent_id: None,
+        provider_binary_path: None,
+        team_id: Some("t1".to_string()),
+        persona_team_dir: None,
+        persona_name_in_team: None,
+        created_at: "now".to_string(),
+        updated_at: "now".to_string(),
+        last_started_at: None,
+        last_stopped_at: None,
+        last_exit_code: None,
+        last_error: None,
+        last_error_code: None,
+        respond_to: crate::managed_agents::RespondTo::default(),
+        respond_to_allowlist: vec![],
+        is_builtin: false,
+        is_active: true,
+        shared: false,
+        source_team: None,
+        source_team_persona_slug: None,
+        catalog_source: None,
+        definition_respond_to: None,
+        definition_respond_to_allowlist: vec![],
+        definition_parallelism: None,
+        relay_mesh: None,
+        runtime: None,
+        name_pool: vec![],
+    }
+}
+
+/// `ResolvedRecords` for a device with no relay-config overlay patches: the
+/// resolve is the identity there, so this exercises the real constructor rather
+/// than bypassing the type that guards the export path.
+pub(super) fn no_overlay(records: &[ManagedAgentRecord]) -> ResolvedRecords {
+    crate::managed_agents::private_config_overlay::PrivateConfigOverlay::default()
+        .resolve_all(records)
+}
+
 fn member(name: &str) -> AgentSnapshot {
     AgentSnapshot {
         format: crate::managed_agents::agent_snapshot::FORMAT_DISCRIMINATOR.to_string(),
@@ -121,7 +188,7 @@ fn team_export_round_trip_preserves_team_and_excludes_member_memory() {
         &build_team_export_snapshot(
             &team,
             &definitions,
-            &[],
+            &no_overlay(&[]),
             MemoryLevel::None,
             &std::collections::HashMap::new(),
         )
@@ -178,62 +245,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
         updated_at: "now".to_string(),
     };
 
-    // Build a fake instance record tied to this team+persona.
-    let instance = ManagedAgentRecord {
-        pubkey: "a".repeat(64),
-        name: "Alice".to_string(),
-        display_name: None,
-        slug: None,
-        persona_id: Some("alice".to_string()),
-        private_key_nsec: String::new(),
-        auth_tag: None,
-        relay_url: String::new(),
-        avatar_url: None,
-        acp_command: crate::managed_agents::DEFAULT_ACP_COMMAND.to_string(),
-        agent_command: String::new(),
-        agent_command_override: None,
-        agent_args: vec![],
-        mcp_command: String::new(),
-        turn_timeout_seconds: 0,
-        idle_timeout_seconds: None,
-        max_turn_duration_seconds: None,
-        parallelism: crate::managed_agents::DEFAULT_AGENT_PARALLELISM,
-        system_prompt: None,
-        model: None,
-        provider: None,
-        persona_source_version: None,
-        env_vars: Default::default(),
-        start_on_app_launch: false,
-        auto_restart_on_config_change: true,
-        runtime_pid: None,
-        backend: crate::managed_agents::BackendKind::Local,
-        backend_agent_id: None,
-        provider_binary_path: None,
-        team_id: Some("t1".to_string()),
-        persona_team_dir: None,
-        persona_name_in_team: None,
-        created_at: "now".to_string(),
-        updated_at: "now".to_string(),
-        last_started_at: None,
-        last_stopped_at: None,
-        last_exit_code: None,
-        last_error: None,
-        last_error_code: None,
-        respond_to: crate::managed_agents::RespondTo::default(),
-        respond_to_allowlist: vec![],
-        is_builtin: false,
-        is_active: true,
-        shared: false,
-        source_team: None,
-        source_team_persona_slug: None,
-        catalog_source: None,
-        definition_respond_to: None,
-        definition_respond_to_allowlist: vec![],
-        definition_parallelism: None,
-        relay_mesh: None,
-        runtime: None,
-        name_pool: vec![],
-    };
+    let instance = sample_team_instance();
 
     let mut memory_map = std::collections::HashMap::new();
     memory_map.insert(
@@ -254,7 +266,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
     let snap = build_team_export_snapshot(
         &team,
         &definitions,
-        std::slice::from_ref(&instance),
+        &no_overlay(std::slice::from_ref(&instance)),
         MemoryLevel::Everything,
         &memory_map,
     )
@@ -266,7 +278,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
     let snap_none = build_team_export_snapshot(
         &team,
         &definitions,
-        std::slice::from_ref(&instance),
+        &no_overlay(std::slice::from_ref(&instance)),
         MemoryLevel::None,
         &memory_map,
     )
@@ -290,7 +302,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
     let configured = build_team_export_snapshot(
         &team,
         &definitions,
-        std::slice::from_ref(&configured_instance),
+        &no_overlay(std::slice::from_ref(&configured_instance)),
         MemoryLevel::None,
         &memory_map,
     )
@@ -316,7 +328,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
     let snap_no_instance = build_team_export_snapshot(
         &team,
         &definitions,
-        &[],
+        &no_overlay(&[]),
         MemoryLevel::Everything,
         &memory_map,
     )

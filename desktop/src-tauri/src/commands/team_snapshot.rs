@@ -18,8 +18,10 @@ use crate::{
     managed_agents::{
         agent_snapshot::{build_snapshot, AgentSnapshot, AgentSnapshotMemoryEntry, MemoryLevel},
         load_managed_agents, load_personas, load_teams, load_teams_readonly,
-        portable_config_for_import, save_managed_agents, save_personas, save_teams,
-        AgentDefinition, ManagedAgentRecord, TeamRecord,
+        portable_config_for_import,
+        private_config_overlay::ResolvedRecords,
+        save_managed_agents, save_personas, save_teams, AgentDefinition, ManagedAgentRecord,
+        TeamRecord,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -270,13 +272,21 @@ struct MintedMember {
     effective_avatar: Option<String>,
 }
 
+/// Build the exportable team snapshot.
+///
+/// `records` is a [`ResolvedRecords`], not a raw disk slice, on purpose: the
+/// member snapshot serializes portable env (thinking effort included), and the
+/// relay-primary overlay replaces `env_vars` wholesale, so raw disk on a
+/// follower device would export a stale or missing effort value. The newtype
+/// makes that a compile error instead of a silent wrong export.
 fn build_team_export_snapshot(
     team: &TeamRecord,
     personas: &[AgentDefinition],
-    records: &[ManagedAgentRecord],
+    records: &ResolvedRecords,
     memory_level: MemoryLevel,
     memory_entries_by_persona: &std::collections::HashMap<String, Vec<AgentSnapshotMemoryEntry>>,
 ) -> Result<TeamSnapshot, String> {
+    let records = records.as_slice();
     let members = team
         .persona_ids
         .iter()
@@ -342,7 +352,11 @@ async fn materialize_team_snapshot_bytes(
             .find(|team| team.id == id)
             .ok_or_else(|| format!("team {id} not found"))?;
         let personas = load_personas(&app)?;
-        let records = load_managed_agents(&app)?;
+        // Relay-primary resolve before export: see `build_team_export_snapshot`.
+        let records = crate::managed_agents::private_config_overlay::resolved_export_records(
+            &state,
+            &load_managed_agents(&app)?,
+        )?;
         (team, personas, records)
     };
 
@@ -354,7 +368,7 @@ async fn materialize_team_snapshot_bytes(
 
     if effective_memory_level != MemoryLevel::None {
         for persona_id in &team.persona_ids {
-            let instance = records.iter().find(|r| {
+            let instance = records.as_slice().iter().find(|r| {
                 r.team_id.as_deref() == Some(&team.id)
                     && r.persona_id.as_deref() == Some(persona_id.as_str())
             });
@@ -969,5 +983,7 @@ pub(crate) async fn submit_engram_event(
     Ok(())
 }
 
+#[cfg(test)]
+mod overlay_tests;
 #[cfg(test)]
 mod tests;

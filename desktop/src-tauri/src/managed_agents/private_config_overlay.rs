@@ -189,6 +189,20 @@ impl PrivateConfigPatch {
 #[derive(Default)]
 pub(crate) struct PrivateConfigOverlay(HashMap<String, PrivateConfigPatch>);
 
+/// Managed-agent records that have had the relay-primary overlay folded in.
+///
+/// Constructible only via [`PrivateConfigOverlay::resolve_all`] /
+/// [`resolved_export_records`], so a caller that requires resolved input (the
+/// export/snapshot paths) states that requirement in its signature instead of
+/// trusting every call site to remember the resolve.
+pub(crate) struct ResolvedRecords(Vec<ManagedAgentRecord>);
+
+impl ResolvedRecords {
+    pub(crate) fn as_slice(&self) -> &[ManagedAgentRecord] {
+        &self.0
+    }
+}
+
 impl PrivateConfigOverlay {
     #[cfg(test)]
     pub(crate) fn insert(&mut self, payload: Payload) -> Result<(), String> {
@@ -236,6 +250,17 @@ impl PrivateConfigOverlay {
         Some(record)
     }
 
+    /// Overlay-folded records in the newtype the export paths require.
+    ///
+    /// Export serializes portable config (thinking effort lives in `env_vars`,
+    /// which `apply` replaces wholesale), so an export that reads raw disk on a
+    /// follower device emits a stale or missing value. `ResolvedRecords` is only
+    /// constructible here, which makes that mistake a compile error rather than
+    /// a silent wrong export.
+    pub(crate) fn resolve_all(&self, local: &[ManagedAgentRecord]) -> ResolvedRecords {
+        ResolvedRecords(self.resolved_records(local))
+    }
+
     pub(crate) fn resolved_records(&self, local: &[ManagedAgentRecord]) -> Vec<ManagedAgentRecord> {
         let mut resolved = local.to_vec();
         for record in &mut resolved {
@@ -264,6 +289,23 @@ pub(crate) fn resolved_local_record(
         .lock()
         .map_err(|error| error.to_string())
         .map(|overlay| overlay.resolve_local_record(record))
+}
+
+/// Fold the overlay over a freshly loaded disk list for an export/snapshot path.
+///
+/// Export paths must never serialize raw `load_managed_agents` output: on a
+/// device that follows another device's relay head, `env_vars` on disk — where
+/// the portable thinking-effort value lives — is stale by construction, because
+/// `PrivateConfigPatch::apply` replaces `env_vars` wholesale rather than merging.
+pub(crate) fn resolved_export_records(
+    state: &crate::app_state::AppState,
+    records: &[ManagedAgentRecord],
+) -> Result<ResolvedRecords, String> {
+    state
+        .private_managed_agent_overlay
+        .lock()
+        .map_err(|error| error.to_string())
+        .map(|overlay| overlay.resolve_all(records))
 }
 
 pub(crate) fn copy_lifecycle_state(

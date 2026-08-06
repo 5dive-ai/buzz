@@ -1177,35 +1177,24 @@ export function processTranscriptEvent(
       }
     }
   } else if (event.kind === "control_result") {
-    // Retire any pending actionable permission card on a `permission_decision`
-    // control result. All terminal statuses (applied, denied, timed_out,
-    // cancelled, uncertain) close the card. "uncertain" gets the pinned copy:
-    // the agent process stopped before the harness could continue, so the
-    // outcome is genuinely unknown — never "denied", never "failed closed".
+    // `control_result` for `permission_decision` is a **delivery confirmation**,
+    // not a terminal outcome. Status values are: sent | no_active_turn |
+    // channel_full | channel_closed | no_channel.
+    //
+    // A non-"sent" status means the click did not reach the harness — the card
+    // stays actionable so the user can retry. Terminal outcomes (applied,
+    // denied, timed_out, cancelled, uncertain) arrive as enveloped acp_write
+    // frames correlated by requestNonce (see the acp_write branch above).
+    // That path will be wired once Thufir's review of Duncan's contract lands.
     const payload = asRecord(event.payload);
     const frameType = asString(payload.type);
     if (frameType === "permission_decision") {
-      const nonce = asString(payload.requestNonce);
-      const terminalStatus = asString(payload.status);
-      const itemId = nonce ? d.pendingPermissionsByNonce.get(nonce) : null;
-      if (itemId && terminalStatus) {
-        const existing = d.itemsById.get(itemId);
-        if (existing?.type === "lifecycle") {
-          const outcomeText =
-            terminalStatus === "uncertain"
-              ? "Approval outcome unknown; agent process stopped before it could continue."
-              : describePermissionOutcome(terminalStatus, null, new Map());
-          replaceItem(d, itemId, {
-            ...existing,
-            outcome: outcomeText,
-            actionable: false,
-          });
-        }
-        if (nonce) {
-          d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
-          d.pendingPermissionsByNonce.delete(nonce);
-        }
-      }
+      const deliveryStatus = asString(payload.status);
+      // If delivery failed, the PermissionDecisionButtons component handles
+      // button-level pending-state reset via its own catch handler. No card
+      // retirement here — the card stays actionable until a terminal acp_write
+      // frame confirms the outcome.
+      void deliveryStatus; // acknowledged; no card mutation on delivery results
     }
   }
 

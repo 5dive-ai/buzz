@@ -3750,6 +3750,25 @@ impl Db {
         workflow::delete_workflow_for_owner(&self.pool, community_id, id, owner_pubkey).await
     }
 
+    /// Atomically remove a workflow's live kind:30620 definition and runnable
+    /// projection, subject to NIP-09 tombstone ordering and owner scoping.
+    pub async fn delete_workflow_coordinate_for_owner(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        definition_pubkey: &[u8],
+        deletion_created_at_secs: i64,
+    ) -> Result<Option<Uuid>> {
+        workflow::delete_workflow_coordinate_for_owner(
+            &self.pool,
+            community_id,
+            id,
+            definition_pubkey,
+            deletion_created_at_secs,
+        )
+        .await
+    }
+
     /// Find a workflow by owner pubkey and name within a community. Used for
     /// NIP-09 a-tag deletion where the d-tag is the workflow name (not UUID).
     pub async fn find_workflow_by_owner_and_name(

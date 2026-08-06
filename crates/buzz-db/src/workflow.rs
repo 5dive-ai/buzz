@@ -787,6 +787,73 @@ pub async fn delete_workflow_for_owner(
     }
 }
 
+/// Delete the query-visible workflow definition and its runnable workflow row
+/// as one lifecycle transition.
+///
+/// The kind:30620 event is the relay's NIP-33 source of truth while the
+/// `workflows` row is its executable projection. Deleting only one leaves the
+/// CLI and scheduler disagreeing. The timestamp predicate gives the tombstone
+/// NIP-09 ordering semantics: a stale deletion must not remove a newer head or
+/// its runnable projection.
+///
+/// Returns the deleted workflow's `channel_id` for trigger-cache invalidation,
+/// or `None` when no live definition at or before the deletion timestamp
+/// matched (already deleted, absent, or superseded by a newer head).
+#[allow(clippy::too_many_arguments)]
+pub async fn delete_workflow_coordinate_for_owner(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    definition_pubkey: &[u8],
+    deletion_created_at_secs: i64,
+) -> Result<Option<Uuid>> {
+    let deletion_created_at = chrono::DateTime::from_timestamp(deletion_created_at_secs, 0)
+        .ok_or(DbError::InvalidTimestamp(deletion_created_at_secs))?;
+    let mut tx = pool.begin().await?;
+
+    let definition_deleted = sqlx::query(
+        "UPDATE events SET deleted_at = NOW() \
+         WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 \
+           AND deleted_at IS NULL AND created_at <= $5",
+    )
+    .bind(community_id.as_uuid())
+    .bind(buzz_core::kind::KIND_WORKFLOW_DEF as i32)
+    .bind(definition_pubkey)
+    .bind(id.to_string())
+    .bind(deletion_created_at)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+
+    if !definition_deleted {
+        tx.commit().await?;
+        return Ok(None);
+    }
+
+    let row = sqlx::query(
+        "DELETE FROM workflows \
+         WHERE community_id = $1 AND id = $2 AND owner_pubkey = $3 \
+         RETURNING channel_id",
+    )
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .bind(definition_pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let channel_id = match row {
+        Some(row) => row.try_get("channel_id")?,
+        None => {
+            return Err(DbError::NotFound(format!(
+                "workflow {id} for definition owner"
+            )))
+        }
+    };
+    tx.commit().await?;
+    Ok(channel_id)
+}
+
 // -- Workflow Run CRUD --------------------------------------------------------
 
 /// Insert a new workflow run. Returns the new run's UUID.
@@ -1229,6 +1296,7 @@ pub async fn find_by_owner_and_name(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
     // -- WorkflowStatus enum --------------------------------------------------
 
@@ -2156,6 +2224,101 @@ mod tests {
         );
         assert_eq!(listed_a[0].community_id, community_a);
         assert_eq!(listed_a[0].name, "wf-A");
+    }
+
+    /// Workflow deletion is one lifecycle transition across the NIP-33 event
+    /// head (`get`/`list`) and executable projection (scheduler/trigger path).
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn workflow_coordinate_delete_removes_definition_and_runnable_row() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let keys = Keys::generate();
+        let owner = keys.public_key().to_bytes();
+        ensure_user(&pool, community, &owner)
+            .await
+            .expect("ensure owner");
+        let channel_id = make_channel(&pool, community, &owner).await;
+        let workflow_id = Uuid::new_v4();
+        let created_at = Utc::now().timestamp() as u64;
+        let definition = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_WORKFLOW_DEF as u16),
+            "name: lifecycle\ntrigger:\n  on: schedule\n  cron: '0 13 * * *'\nsteps: []\n",
+        )
+        .tags([
+            Tag::parse(["d", &workflow_id.to_string()]).expect("d tag"),
+            Tag::parse(["h", &channel_id.to_string()]).expect("h tag"),
+        ])
+        .custom_created_at(Timestamp::from(created_at))
+        .sign_with_keys(&keys)
+        .expect("sign definition");
+        crate::event::insert_event(&pool, community, &definition, Some(channel_id))
+            .await
+            .expect("insert definition");
+        upsert_workflow(
+            &pool,
+            community,
+            workflow_id,
+            Some(channel_id),
+            &owner,
+            "lifecycle",
+            r#"{"trigger":{"on":"schedule","cron":"0 13 * * *"},"steps":[]}"#,
+            &[0u8; 32],
+        )
+        .await
+        .expect("insert runnable projection");
+
+        let mut query = crate::event::EventQuery::for_community(community);
+        query.kinds = Some(vec![buzz_core::kind::KIND_WORKFLOW_DEF as i32]);
+        query.d_tag = Some(workflow_id.to_string());
+        assert_eq!(
+            crate::event::query_events(&pool, &query)
+                .await
+                .expect("query definition")
+                .len(),
+            1,
+            "get/list source must see the created head"
+        );
+        assert!(
+            list_enabled_channel_workflows(&pool, community, channel_id)
+                .await
+                .expect("list runnable workflows")
+                .iter()
+                .any(|workflow| workflow.id == workflow_id),
+            "scheduler source must see the runnable row"
+        );
+
+        let deleted_channel = delete_workflow_coordinate_for_owner(
+            &pool,
+            community,
+            workflow_id,
+            &owner,
+            created_at as i64 + 1,
+        )
+        .await
+        .expect("delete coordinate");
+        assert_eq!(deleted_channel, Some(channel_id));
+        assert!(
+            crate::event::query_events(&pool, &query)
+                .await
+                .expect("query deleted definition")
+                .is_empty(),
+            "get/list source must not return the deleted head"
+        );
+        assert!(
+            matches!(
+                get_workflow(&pool, community, workflow_id).await,
+                Err(DbError::NotFound(_))
+            ),
+            "runnable projection must be deleted"
+        );
+        assert!(
+            list_enabled_channel_workflows(&pool, community, channel_id)
+                .await
+                .expect("list after deletion")
+                .is_empty(),
+            "scheduler must not retain a runnable row"
+        );
     }
 
     /// Issue 4 (workflow lifecycle): deleting `A/id` must not delete `B/id`

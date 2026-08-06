@@ -2102,19 +2102,30 @@ async fn handle_a_tag_deletion(
             tracing::debug!(d_tag, "NIP-09 deletion ignored for push lease");
         }
         buzz_core::kind::KIND_WORKFLOW_DEF => {
-            // Try UUID first (workflow_id); fall back to name-based lookup.
+            // UUID d-tags are the canonical workflow coordinate. Remove the
+            // NIP-33 head and executable projection atomically; otherwise REQ
+            // and the scheduler can disagree after an accepted deletion.
             if let Ok(wf_id) = uuid::Uuid::parse_str(d_tag) {
+                let definition_pubkey = hex::decode(pubkey_hex)
+                    .map_err(|e| anyhow::anyhow!("invalid workflow pubkey in a-tag: {e}"))?;
                 let channel_id = state
                     .db
-                    .delete_workflow_for_owner(tenant.community(), wf_id, &actor_bytes)
+                    .delete_workflow_coordinate_for_owner(
+                        tenant.community(),
+                        wf_id,
+                        &definition_pubkey,
+                        event.created_at.as_secs() as i64,
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to delete workflow {wf_id}: {e}"))?;
                 if let Some(channel_id) = channel_id {
                     state
                         .workflow_engine
                         .invalidate_channel_workflows(tenant.community(), channel_id);
+                    tracing::info!(workflow_id = %wf_id, "Workflow deleted via NIP-09 a-tag (UUID)");
+                } else {
+                    tracing::debug!(workflow_id = %wf_id, "Workflow deletion did not match a live definition at or before tombstone");
                 }
-                tracing::info!(workflow_id = %wf_id, "Workflow deleted via NIP-09 a-tag (UUID)");
             } else {
                 // Name-based lookup
                 match state
@@ -2150,11 +2161,12 @@ async fn handle_a_tag_deletion(
         }
         // Generic NIP-33 (parameterized-replaceable) soft-delete by coordinate.
         //
-        // Listed after the workflow branch so workflow's bespoke deletion
-        // (which doesn't soft-delete the `events` row by design — that's a
-        // separate concern) takes precedence. For every other addressable
-        // kind, including kind:30023 (NIP-23 long-form), we soft-delete the
-        // live row matching `(kind, pubkey, d_tag)` so REQs stop returning it.
+        // Listed after the workflow branch because UUID workflow coordinates
+        // atomically remove both their live event head and runnable projection;
+        // the legacy name-based workflow path remains projection-only. For
+        // every other addressable kind, including kind:30023 (NIP-23
+        // long-form), we soft-delete the live row matching
+        // `(kind, pubkey, d_tag)` so REQs stop returning it.
         // See https://github.com/block/sprout/issues/714.
         k if is_parameterized_replaceable(k) => {
             let pubkey_bytes = match hex::decode(pubkey_hex) {

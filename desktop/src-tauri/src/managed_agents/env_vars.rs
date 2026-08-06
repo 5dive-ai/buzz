@@ -185,11 +185,111 @@ pub(crate) fn is_safe_to_reveal(key: &str) -> bool {
         "BUZZ_AGENT_PROVIDER",
         "BUZZ_AGENT_MODEL",
         "BUZZ_AGENT_THINKING_EFFORT",
+        "CLAUDE_CODE_EFFORT_LEVEL",
+        "GOOSE_THINKING_EFFORT",
         "DATABRICKS_HOST",
         "DATABRICKS_MODEL",
     ];
     let upper = key.to_ascii_uppercase();
     SAFE_KEYS.iter().any(|safe| upper == *safe)
+}
+
+/// Project only explicitly approved, non-secret environment settings for a
+/// portable agent/team snapshot. This is intentionally separate from the UI
+/// display policy's callers so export never accidentally serializes raw env.
+pub(crate) fn portable_env_for_export(
+    env_vars: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    env_vars
+        .iter()
+        .filter(|(key, _)| is_safe_to_reveal(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Accept the portable snapshot projection only after applying the same
+/// allowlist and normal save-time environment validation used by UI input.
+/// Unsafe crafted keys are dropped rather than becoming configuration.
+pub(crate) fn portable_env_for_import(
+    portable_env: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let projected = portable_env_for_export(portable_env);
+    validate_user_env_keys(&projected)?;
+    Ok(projected)
+}
+
+/// Extract a portable thinking value from the runtime-specific persisted
+/// representation. Plain environment targets store a level directly; structured
+/// JSON targets (currently Codex) store it at their catalog-declared property.
+pub(crate) fn thinking_effort_from_record(
+    record: &crate::managed_agents::types::ManagedAgentRecord,
+) -> Option<String> {
+    let runtime = record
+        .runtime
+        .as_deref()
+        .and_then(crate::managed_agents::known_acp_runtime_exact)
+        .or_else(|| crate::managed_agents::known_acp_runtime(&record.agent_command))?;
+
+    if let (Some(env_key), Some(json_key)) = (
+        runtime.thinking_config_json_env_var,
+        runtime.thinking_config_json_key,
+    ) {
+        return json_env_string(&record.env_vars, env_key, json_key);
+    }
+
+    runtime
+        .thinking_env_var
+        .and_then(|key| record.env_vars.get(key))
+        .cloned()
+}
+
+/// Restore the safe, portable portion of a snapshot's runtime configuration.
+/// A first-class effort value is written to the catalog-declared target: a
+/// direct env var for standard harnesses, or a minimal JSON object for Codex.
+pub(crate) fn portable_config_for_import(
+    runtime_id: Option<&str>,
+    portable_env: &BTreeMap<String, String>,
+    thinking_effort: Option<&str>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut env_vars = portable_env_for_import(portable_env)?;
+    let Some(runtime) = runtime_id.and_then(crate::managed_agents::known_acp_runtime_exact) else {
+        return Ok(env_vars);
+    };
+    let Some(effort) = thinking_effort.filter(|value| !value.is_empty()) else {
+        return Ok(env_vars);
+    };
+
+    if let (Some(env_key), Some(json_key)) = (
+        runtime.thinking_config_json_env_var,
+        runtime.thinking_config_json_key,
+    ) {
+        env_vars.insert(
+            env_key.to_string(),
+            serde_json::json!({ json_key: effort }).to_string(),
+        );
+    } else if let Some(env_key) = runtime.thinking_env_var {
+        // The first-class snapshot field is authoritative when the two values
+        // differ, while the allowlisted env map remains available for all other
+        // non-secret runtime configuration.
+        env_vars.insert(env_key.to_string(), effort.to_string());
+    }
+    Ok(env_vars)
+}
+
+fn json_env_string(
+    env_vars: &BTreeMap<String, String>,
+    env_key: &str,
+    json_key: &str,
+) -> Option<String> {
+    env_vars
+        .get(env_key)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get(json_key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 /// Per-value byte cap for env values. 32 KiB is generous for credentials,

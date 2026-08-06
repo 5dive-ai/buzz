@@ -4,7 +4,10 @@ import test from "node:test";
 import {
   deriveAgentConfigFieldModel,
   deriveNumericDescriptors,
+  deriveStructuredJsonEffortDescriptor,
+  readStructuredJsonEnvValue,
   structuredEnvKeys,
+  updateStructuredJsonEnvValue,
 } from "./agentConfigCore.ts";
 import { NUMERIC_KIND_MIN } from "../ui/buzzAgentModelTuningFields.tsx";
 
@@ -28,6 +31,8 @@ function runtime(id, metadata = {}) {
     modelEnvVar: null,
     providerEnvVar: null,
     thinkingEnvVar: null,
+    thinkingConfigJsonEnvVar: null,
+    thinkingConfigJsonKey: null,
     maxTokensEnvVar: null,
     contextLimitEnvVar: null,
     maxRoundsEnvVar: null,
@@ -45,6 +50,65 @@ function runtime(id, metadata = {}) {
 function field(model, kind) {
   return model.fields.find((candidate) => candidate.kind === kind);
 }
+
+test("structured JSON effort preserves unrelated runtime configuration", () => {
+  const descriptor = deriveStructuredJsonEffortDescriptor(
+    runtime("codex", {
+      thinkingConfigJsonEnvVar: "CODEX_CONFIG",
+      thinkingConfigJsonKey: "model_reasoning_effort",
+    }),
+  );
+  assert.ok(descriptor);
+
+  const initial = {
+    CODEX_CONFIG: JSON.stringify({
+      other_setting: "keep",
+      model_reasoning_effort: "medium",
+    }),
+  };
+  assert.equal(
+    readStructuredJsonEnvValue(initial, descriptor.currentPersistence),
+    "medium",
+  );
+  const updated = updateStructuredJsonEnvValue(
+    initial,
+    descriptor.currentPersistence,
+    "high",
+  );
+  assert.deepEqual(JSON.parse(updated.CODEX_CONFIG), {
+    other_setting: "keep",
+    model_reasoning_effort: "high",
+  });
+  const cleared = updateStructuredJsonEnvValue(
+    updated,
+    descriptor.currentPersistence,
+    "",
+  );
+  assert.deepEqual(JSON.parse(cleared.CODEX_CONFIG), { other_setting: "keep" });
+});
+
+test("structured JSON effort replaces malformed JSON only when edited", () => {
+  const descriptor = deriveStructuredJsonEffortDescriptor(
+    runtime("codex", {
+      thinkingConfigJsonEnvVar: "CODEX_CONFIG",
+      thinkingConfigJsonKey: "model_reasoning_effort",
+    }),
+  );
+  assert.ok(descriptor);
+  const initial = { CODEX_CONFIG: "not-json" };
+  assert.equal(
+    readStructuredJsonEnvValue(initial, descriptor.currentPersistence),
+    "",
+  );
+  const updated = updateStructuredJsonEnvValue(
+    initial,
+    descriptor.currentPersistence,
+    "high",
+  );
+  assert.deepEqual(JSON.parse(updated.CODEX_CONFIG), {
+    model_reasoning_effort: "high",
+  });
+});
 
 test("Buzz Agent exposes provider, model, and Buzz-owned effort", () => {
   const model = deriveAgentConfigFieldModel({

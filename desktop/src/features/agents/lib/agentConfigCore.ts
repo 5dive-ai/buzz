@@ -2,7 +2,10 @@ import type {
   AcpRuntimeCatalogEntry,
   GlobalAgentConfig,
 } from "@/shared/api/types";
-import { BUZZ_AGENT_THINKING_EFFORT } from "../ui/buzzAgentConfig";
+import {
+  BUZZ_AGENT_THINKING_EFFORT,
+  BUZZ_AGENT_THINKING_EFFORT_VALUES,
+} from "../ui/buzzAgentConfig";
 
 /**
  * Lifecycle status of the ACP runtime catalog query on a per-agent surface.
@@ -35,6 +38,12 @@ type NormalizedFieldPersistence = {
 type EnvVarPersistence = {
   kind: "envVar";
   key: string;
+};
+
+export type StructuredJsonEnvPersistence = {
+  kind: "structuredJsonEnv";
+  envKey: string;
+  jsonKey: string;
 };
 
 type AcpConfigOptionPersistence = {
@@ -74,10 +83,12 @@ export type AgentConfigFieldDescriptor =
         | "harnessNative";
       currentPersistence:
         | EnvVarPersistence
+        | StructuredJsonEnvPersistence
         | AcpConfigOptionPersistence
         | UnavailablePersistence;
       targetApplication:
         | { kind: "envVar"; key: string }
+        | { kind: "structuredJsonEnv"; envKey: string; jsonKey: string }
         | { kind: "acpConfigOption"; id: string; category: string };
       render: "control" | "deferredUntilNativeOptionsAvailable";
       value: string | null;
@@ -115,6 +126,109 @@ export type AgentConfigFieldModel = {
 
 function valueFromEnv(config: GlobalAgentConfig, key: string) {
   return config.env_vars[key]?.trim() || null;
+}
+
+export type StructuredJsonEffortDescriptor = {
+  kind: "effort";
+  optionSource: "legacyProviderModelCatalog";
+  currentPersistence: StructuredJsonEnvPersistence;
+  targetApplication: {
+    kind: "structuredJsonEnv";
+    envKey: string;
+    jsonKey: string;
+  };
+  render: "control";
+  value: null;
+  values: readonly string[];
+};
+
+/**
+ * Derives an effort field for a catalog-declared structured JSON env target.
+ * The renderer never needs to know a runtime ID, env name, or JSON property.
+ */
+export function deriveStructuredJsonEffortDescriptor(
+  runtime: AcpRuntimeCatalogEntry | undefined,
+): StructuredJsonEffortDescriptor | undefined {
+  if (!runtime?.thinkingConfigJsonEnvVar || !runtime.thinkingConfigJsonKey) {
+    return undefined;
+  }
+  return {
+    kind: "effort",
+    optionSource: "legacyProviderModelCatalog",
+    currentPersistence: {
+      kind: "structuredJsonEnv",
+      envKey: runtime.thinkingConfigJsonEnvVar,
+      jsonKey: runtime.thinkingConfigJsonKey,
+    },
+    targetApplication: {
+      kind: "structuredJsonEnv",
+      envKey: runtime.thinkingConfigJsonEnvVar,
+      jsonKey: runtime.thinkingConfigJsonKey,
+    },
+    render: "control",
+    value: null,
+    values: BUZZ_AGENT_THINKING_EFFORT_VALUES,
+  };
+}
+
+/** Read one string property from a descriptor-owned JSON env value. */
+export function readStructuredJsonEnvValue(
+  envVars: Record<string, string>,
+  persistence: StructuredJsonEnvPersistence,
+): string {
+  try {
+    const parsed: unknown = JSON.parse(envVars[persistence.envKey] ?? "{}");
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      typeof (parsed as Record<string, unknown>)[persistence.jsonKey] ===
+        "string"
+    ) {
+      return (parsed as Record<string, string>)[persistence.jsonKey];
+    }
+  } catch {
+    // Generic env editing may have left invalid JSON; preserve it until the
+    // user selects an effort rather than hiding or silently discarding it.
+  }
+  return "";
+}
+
+/**
+ * Update one descriptor-owned JSON property without discarding unrelated
+ * configuration. Blank removes only that property, deleting the env key only
+ * when it becomes an empty object.
+ */
+export function updateStructuredJsonEnvValue(
+  envVars: Record<string, string>,
+  persistence: StructuredJsonEnvPersistence,
+  value: string,
+): Record<string, string> {
+  let config: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(envVars[persistence.envKey] ?? "{}");
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+    ) {
+      config = { ...(parsed as Record<string, unknown>) };
+    }
+  } catch {
+    // Selecting a structured value replaces invalid JSON with the minimal
+    // valid object required by this target.
+  }
+  if (value) {
+    config[persistence.jsonKey] = value;
+  } else {
+    delete config[persistence.jsonKey];
+  }
+  const next = { ...envVars };
+  if (Object.keys(config).length === 0) {
+    delete next[persistence.envKey];
+  } else {
+    next[persistence.envKey] = JSON.stringify(config);
+  }
+  return next;
 }
 
 /**
@@ -301,8 +415,12 @@ export function structuredEnvKeys(
   const keys: string[] = [];
   for (const d of renderedDescriptors) {
     if (d.render !== "control") continue;
-    if (d.kind === "effort" && d.currentPersistence.kind === "envVar") {
-      keys.push(d.currentPersistence.key);
+    if (d.kind === "effort") {
+      if (d.currentPersistence.kind === "envVar") {
+        keys.push(d.currentPersistence.key);
+      } else if (d.currentPersistence.kind === "structuredJsonEnv") {
+        keys.push(d.currentPersistence.envKey);
+      }
     } else if (
       d.kind === "maxOutputTokens" ||
       d.kind === "contextLimit" ||

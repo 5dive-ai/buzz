@@ -43,12 +43,14 @@ with a TypeScript lookup table or an id comparison in a component.
    in a component. Components ask the field model what exists
    (`hasRenderableAgentConfigField`, `getRenderableEffortField`).
 2. **Effort reads/writes go through the descriptor.** Use the effort
-   descriptor's `currentPersistence` key — never a raw
-   `BUZZ_AGENT_THINKING_EFFORT` literal in UI code. `currentPersistence` is
-   where the value lives *today*; `targetApplication` is how the harness
-   *should* receive it. They intentionally differ until PR 2.7 migrates
-   Goose/Claude — do not "fix" one to match the other without doing the
-   migration work.
+   descriptor's `currentPersistence` target — never a raw
+   `BUZZ_AGENT_THINKING_EFFORT` literal in UI code. A descriptor may own a
+   direct environment variable, an ACP option, or one field inside a structured
+   JSON environment value; use its target-specific helpers so unrelated JSON
+   configuration survives edits. `currentPersistence` is where the value lives
+   *today*; `targetApplication` is how the harness *should* receive it. They
+   intentionally differ until PR 2.7 migrates Goose/Claude — do not "fix" one
+   to match the other without doing the migration work.
 3. **Field absence has a named reason, not a boolean.** Codex effort is
    `ownedByModelId`; Claude effort is `deferredUntilNativeOptionsAvailable`.
    New absences get new named reasons in `AgentConfigOmission` /

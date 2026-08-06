@@ -9,8 +9,7 @@ import {
   PERSONA_FIELD_SHELL_CLASS,
   PERSONA_LABEL_OPTIONAL_CLASS,
 } from "./agentConfigOptions";
-import type { AgentPersona } from "@/shared/api/types";
-import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
+import type { AgentPersona, AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import {
   BuzzAgentModelTuningFields,
   NumericTuningFields,
@@ -24,8 +23,11 @@ import {
   parallelismCapHint,
 } from "../lib/agentParallelism";
 import {
+  deriveStructuredJsonEffortDescriptor,
   deriveNumericDescriptors,
+  readStructuredJsonEnvValue,
   structuredEnvKeys,
+  updateStructuredJsonEnvValue,
   type RuntimeCatalogStatus,
 } from "../lib/agentConfigCore";
 
@@ -118,8 +120,22 @@ export function EditAgentAdvancedFields({
     [catalogStatus, selectedRuntime],
   );
 
-  // Build the effective hidden-key list: caller's secrets + effort key (when
-  // rendered by BuzzAgentModelTuningFields) + numeric keys via structuredEnvKeys.
+  const structuredEffortDescriptor = React.useMemo(
+    () =>
+      catalogStatus === "ready"
+        ? deriveStructuredJsonEffortDescriptor(selectedRuntime)
+        : undefined,
+    [catalogStatus, selectedRuntime],
+  );
+  const structuredEffort = structuredEffortDescriptor
+    ? readStructuredJsonEnvValue(
+        envVars,
+        structuredEffortDescriptor.currentPersistence,
+      )
+    : "";
+
+  // A structured JSON target has a dedicated selector, so hide its raw env
+  // row only when the catalog is ready and that selector actually renders.
   const effectiveHiddenKeys = React.useMemo(
     () => [
       ...hiddenEnvKeys,
@@ -127,8 +143,16 @@ export function EditAgentAdvancedFields({
         ? [BUZZ_AGENT_THINKING_EFFORT]
         : []),
       ...structuredEnvKeys(numericDescriptors),
+      ...structuredEnvKeys(
+        structuredEffortDescriptor ? [structuredEffortDescriptor] : [],
+      ),
     ],
-    [hiddenEnvKeys, modelTuningRuntimeId, numericDescriptors],
+    [
+      hiddenEnvKeys,
+      modelTuningRuntimeId,
+      numericDescriptors,
+      structuredEffortDescriptor,
+    ],
   );
 
   // Harness cap hint: show only when the selected runtime has a cap and the
@@ -194,6 +218,43 @@ export function EditAgentAdvancedFields({
             : "Configuration changes only show the restart badge; restart manually to apply them."}
         </p>
       </div>
+
+      {/* Catalog-backed structured JSON effort target. */}
+      {structuredEffortDescriptor ? (
+        <div className="space-y-1.5">
+          <label
+            className="text-sm font-medium"
+            htmlFor="edit-agent-thinking-effort"
+          >
+            Thinking / Effort
+          </label>
+          <select
+            className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-xs disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={disabled}
+            id="edit-agent-thinking-effort"
+            onChange={(event) =>
+              onEnvVarsChange(
+                updateStructuredJsonEnvValue(
+                  envVars,
+                  structuredEffortDescriptor.currentPersistence,
+                  event.target.value,
+                ),
+              )
+            }
+            value={structuredEffort}
+          >
+            <option value="">Inherit runtime default</option>
+            {structuredEffortDescriptor.values.map((effort) => (
+              <option key={effort} value={effort}>
+                {effort}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-muted-foreground">
+            Applied through this runtime's structured configuration.
+          </p>
+        </div>
+      ) : null}
 
       {/* Agent runtime args */}
       <div className="space-y-1.5">

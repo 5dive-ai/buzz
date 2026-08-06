@@ -15,6 +15,7 @@ import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOw
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import type {
   ManagedAgent,
+  PermissionPolicy,
   RespondToMode,
   UpdateManagedAgentInput,
 } from "@/shared/api/types";
@@ -160,6 +161,12 @@ export function AgentInstanceEditDialog({
   const [respondToAllowlist, setRespondToAllowlist] = React.useState<string[]>(
     agent.respondToAllowlist,
   );
+  // `null` means "inherit from global/built-in". Local state mirrors the record's
+  // per-agent override field. Remote deployed agents: this is read-only.
+  const [permissionPolicy, setPermissionPolicy] =
+    React.useState<PermissionPolicy | null>(
+      agent.permissionPolicySource === "agent" ? agent.permissionPolicy : null,
+    );
   const [showAdvancedFields, setShowAdvancedFields] = React.useState(false);
   const [avatarUrl, setAvatarUrl] = React.useState(agent.avatarUrl ?? "");
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
@@ -196,6 +203,11 @@ export function AgentInstanceEditDialog({
       setAutoRestartOnConfigChange(agent.autoRestartOnConfigChange);
       setRespondTo(agent.respondTo);
       setRespondToAllowlist(agent.respondToAllowlist);
+      setPermissionPolicy(
+        agent.permissionPolicySource === "agent"
+          ? agent.permissionPolicy
+          : null,
+      );
       setAvatarUrl(agent.avatarUrl ?? "");
       setShowAdvancedFields(false);
       setIsAvatarUploadPending(false);
@@ -725,6 +737,15 @@ export function AgentInstanceEditDialog({
           respondToAllowlist.join(",") !== agent.respondToAllowlist.join(",")
             ? respondToAllowlist
             : undefined,
+        // `null` = clear the per-agent override (revert to global/built-in).
+        // `undefined` = don't touch. Only include when the value actually changed.
+        permissionPolicy: (() => {
+          const saved =
+            agent.permissionPolicySource === "agent"
+              ? agent.permissionPolicy
+              : null;
+          return permissionPolicy !== saved ? permissionPolicy : undefined;
+        })(),
       };
 
       const result = await updateMutation.mutateAsync(input);
@@ -944,6 +965,63 @@ export function AgentInstanceEditDialog({
               onAllowlistChange={setRespondToAllowlist}
               onModeChange={setRespondTo}
             />
+            {/* Permission policy */}
+            {(() => {
+              const isRemoteDeployed =
+                agent.backend.type === "provider" &&
+                agent.backendAgentId !== null;
+              const sourceLabelMap: Record<string, string> = {
+                agent: "agent override",
+                global_default: "global default",
+                built_in: "built-in",
+              };
+              const sourceLabel =
+                sourceLabelMap[agent.permissionPolicySource] ??
+                agent.permissionPolicySource;
+              return (
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <label
+                      className="text-sm font-medium text-foreground"
+                      htmlFor="edit-agent-permission-policy"
+                    >
+                      Permission policy
+                    </label>
+                    <span className="text-xs text-muted-foreground">
+                      ({agent.permissionPolicy} · from {sourceLabel})
+                    </span>
+                  </div>
+                  {isRemoteDeployed ? (
+                    <p className="text-xs text-muted-foreground">
+                      Read-only while deployed. To change, shut down and
+                      redeploy the agent.
+                    </p>
+                  ) : (
+                    <select
+                      className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50"
+                      disabled={updateMutation.isPending}
+                      id="edit-agent-permission-policy"
+                      value={permissionPolicy ?? ""}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setPermissionPolicy(
+                          val === "" ? null : (val as PermissionPolicy),
+                        );
+                      }}
+                    >
+                      <option value="">
+                        Inherit ({agent.permissionPolicy} · from {sourceLabel})
+                      </option>
+                      <option value="ask">Ask — show Allow/Deny card</option>
+                      <option value="allow">
+                        Allow — auto-approve (explicit opt-in)
+                      </option>
+                      <option value="reject">Reject — auto-deny</option>
+                    </select>
+                  )}
+                </div>
+              );
+            })()}
             <RunOnSummarySection backend={agent.backend} />
 
             {/* Provider (runtime) */}

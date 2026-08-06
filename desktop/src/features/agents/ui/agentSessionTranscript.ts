@@ -47,6 +47,13 @@ export type TranscriptState = {
     string,
     { itemId: string; optionNames: Map<string, string> }
   >;
+  /**
+   * Maps `requestNonce` → `itemId` for actionable permission cards.
+   * Populated alongside `pendingPermissions` when the `authorization` envelope
+   * is present on the `acp_read` frame. Used by the `permission_decision`
+   * `control_result` handler to retire the card on any terminal outcome.
+   */
+  pendingPermissionsByNonce: Map<string, string>;
   continuationSeq: number;
   latestSessionId: string | null;
 };
@@ -59,6 +66,7 @@ export function createEmptyTranscriptState(): TranscriptState {
     sealedKeys: new Set(),
     triggeringEventIdsByTurn: new Map(),
     pendingPermissions: new Map(),
+    pendingPermissionsByNonce: new Map(),
     continuationSeq: 0,
     latestSessionId: null,
   };
@@ -79,6 +87,7 @@ type TranscriptDraft = {
     string,
     { itemId: string; optionNames: Map<string, string> }
   >;
+  pendingPermissionsByNonce: Map<string, string>;
   continuationSeq: number;
   latestSessionId: string | null;
   changed: boolean;
@@ -92,6 +101,7 @@ function draftFrom(state: TranscriptState): TranscriptDraft {
     sealedKeys: state.sealedKeys,
     triggeringEventIdsByTurn: state.triggeringEventIdsByTurn,
     pendingPermissions: state.pendingPermissions,
+    pendingPermissionsByNonce: state.pendingPermissionsByNonce,
     continuationSeq: state.continuationSeq,
     latestSessionId: state.latestSessionId,
     changed: false,
@@ -180,40 +190,47 @@ function describePermissionRequest(payload: Record<string, unknown>) {
     "Permission requested";
   const toolCallId =
     asString(params.toolCallId) ?? asString(params.tool_call_id);
-  const options = Array.isArray(params.options)
-    ? params.options
-        .map((option) => {
-          const record = asRecord(option);
-          return (
-            asString(record.name) ??
-            asString(record.kind) ??
-            asString(record.optionId)
-          );
-        })
-        .filter((option): option is string => Boolean(option))
-    : [];
-  const detail: string[] = [];
-  if (title !== "Permission requested") detail.push(title);
-  if (toolCallId) detail.push(`Tool call: ${toolCallId}`);
-  if (options.length > 0) detail.push(`Options: ${options.join(", ")}`);
 
-  // Build optionId → kind map for outcome labeling on the response.
+  // Build both the display-string list and the structured options list in
+  // a single pass over params.options.
   const optionNames = new Map<string, string>();
+  const structuredOptions: Array<{
+    optionId: string;
+    kind: string;
+    label?: string;
+  }> = [];
+  const optionDisplayNames: string[] = [];
   if (Array.isArray(params.options)) {
     for (const option of params.options) {
-      const record = asRecord(option);
-      const optionId = asString(record.optionId);
-      const kind = asString(record.kind);
+      const rec = asRecord(option);
+      const optionId = asString(rec.optionId);
+      const kind = asString(rec.kind);
+      const label = asString(rec.label) ?? asString(rec.name);
+      const displayName =
+        asString(rec.name) ?? asString(rec.kind) ?? asString(rec.optionId);
+      if (displayName) optionDisplayNames.push(displayName);
       if (optionId && kind) {
         optionNames.set(optionId, kind);
+        structuredOptions.push({
+          optionId,
+          kind,
+          ...(label ? { label } : {}),
+        });
       }
     }
   }
+
+  const detail: string[] = [];
+  if (title !== "Permission requested") detail.push(title);
+  if (toolCallId) detail.push(`Tool call: ${toolCallId}`);
+  if (optionDisplayNames.length > 0)
+    detail.push(`Options: ${optionDisplayNames.join(", ")}`);
 
   return {
     title,
     text: detail.join("\n"),
     optionNames,
+    options: structuredOptions,
     descriptor: {
       renderClass: "permission" as const,
       label: "Permission requested",
@@ -804,6 +821,27 @@ export function processTranscriptEvent(
         "permission_request",
         request.descriptor,
       );
+
+      // Attach authorization-envelope fields to the item. The `authorization`
+      // object is on the ObserverEvent itself (not the payload — payloads are
+      // raw ACP with no `_buzz` wrapper).
+      const auth = event.authorization;
+      if (auth) {
+        const existing = d.itemsById.get(itemId);
+        if (existing?.type === "lifecycle") {
+          replaceItem(d, itemId, {
+            ...existing,
+            requestNonce: auth.requestNonce,
+            actionable: auth.actionable,
+            authorizationReason: auth.reason,
+            options: request.options,
+          });
+        }
+        // Also index by nonce so control_result frames can retire the card.
+        d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
+        d.pendingPermissionsByNonce.set(auth.requestNonce, itemId);
+      }
+
       // Index by JSON-RPC id so the response (acp_write with result.outcome,
       // no method) can correlate by id rather than by turn/seq.
       const requestId = jsonRpcId(payload.id);
@@ -1138,6 +1176,37 @@ export function processTranscriptEvent(
         );
       }
     }
+  } else if (event.kind === "control_result") {
+    // Retire any pending actionable permission card on a `permission_decision`
+    // control result. All terminal statuses (applied, denied, timed_out,
+    // cancelled, uncertain) close the card. "uncertain" gets the pinned copy:
+    // the agent process stopped before the harness could continue, so the
+    // outcome is genuinely unknown — never "denied", never "failed closed".
+    const payload = asRecord(event.payload);
+    const frameType = asString(payload.type);
+    if (frameType === "permission_decision") {
+      const nonce = asString(payload.requestNonce);
+      const terminalStatus = asString(payload.status);
+      const itemId = nonce ? d.pendingPermissionsByNonce.get(nonce) : null;
+      if (itemId && terminalStatus) {
+        const existing = d.itemsById.get(itemId);
+        if (existing?.type === "lifecycle") {
+          const outcomeText =
+            terminalStatus === "uncertain"
+              ? "Approval outcome unknown; agent process stopped before it could continue."
+              : describePermissionOutcome(terminalStatus, null, new Map());
+          replaceItem(d, itemId, {
+            ...existing,
+            outcome: outcomeText,
+            actionable: false,
+          });
+        }
+        if (nonce) {
+          d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
+          d.pendingPermissionsByNonce.delete(nonce);
+        }
+      }
+    }
   }
 
   if (!d.changed && d.latestSessionId === state.latestSessionId) {
@@ -1151,6 +1220,7 @@ export function processTranscriptEvent(
     sealedKeys: d.sealedKeys,
     triggeringEventIdsByTurn: d.triggeringEventIdsByTurn,
     pendingPermissions: d.pendingPermissions,
+    pendingPermissionsByNonce: d.pendingPermissionsByNonce,
     continuationSeq: d.continuationSeq,
     latestSessionId: d.latestSessionId,
   };

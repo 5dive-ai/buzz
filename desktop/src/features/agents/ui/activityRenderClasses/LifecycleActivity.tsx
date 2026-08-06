@@ -1,5 +1,7 @@
 import { AlertCircle, CheckCircle2, ShieldCheck, XCircle } from "lucide-react";
+import * as React from "react";
 
+import { sendPermissionDecision } from "@/shared/api/agentControl";
 import { formatTranscriptTimestampTitle } from "../agentSessionUtils";
 import { ActivityRow, ActivityRowLabel } from "./ActivityRow";
 import { ToolActivity } from "./ToolActivity";
@@ -29,12 +31,69 @@ function splitPermissionText(text: string): {
 /**
  * Derive the visual tone and icon for a resolved permission outcome string.
  * Outcome strings come from describePermissionOutcome:
- *   "Approved (...)" | "Denied (...)" | "Cancelled"
+ *   "Approved (...)" | "Denied (...)" | "Cancelled" | "uncertain" pinned copy
  */
 function permissionOutcomeTone(outcome: string): "approve" | "deny" | "cancel" {
   if (outcome.startsWith("Approved")) return "approve";
   if (outcome.startsWith("Denied")) return "deny";
   return "cancel";
+}
+
+/**
+ * Allow/Deny buttons for an actionable permission card.
+ * Renders the agent's exact options as labeled buttons; a click sends the
+ * `permission_decision` control event (fire-and-forget).
+ */
+function PermissionDecisionButtons({
+  agentPubkey,
+  options,
+  requestNonce,
+}: {
+  agentPubkey: string;
+  options: Array<{ optionId: string; kind: string; label?: string }>;
+  requestNonce: string;
+}) {
+  const [pending, setPending] = React.useState<string | null>(null);
+
+  if (options.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="mt-1.5 flex flex-wrap gap-1.5">
+      {options.map(({ optionId, kind, label }) => {
+        const isDeny = kind.startsWith("reject");
+        const displayLabel = label ?? (isDeny ? "Deny" : "Allow");
+        return (
+          <button
+            key={optionId}
+            type="button"
+            className={
+              isDeny
+                ? "rounded px-2 py-0.5 text-xs font-medium border border-destructive/40 text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                : "rounded px-2 py-0.5 text-xs font-medium border border-green-600/40 text-green-700 dark:text-green-400 hover:bg-green-600/10 disabled:opacity-50"
+            }
+            data-testid={`permission-decision-${optionId}`}
+            disabled={pending !== null}
+            onClick={() => {
+              setPending(optionId);
+              void sendPermissionDecision(
+                agentPubkey,
+                requestNonce,
+                optionId,
+              ).catch(() => {
+                // Fire-and-forget: harness will time out if the frame is lost.
+                // Reset pending so the user can retry.
+                setPending(null);
+              });
+            }}
+          >
+            {pending === optionId ? "…" : displayLabel}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 export function LifecycleActivity(props: ActivityRenderClassItemProps) {
@@ -55,6 +114,10 @@ export function LifecycleActivity(props: ActivityRenderClassItemProps) {
     const { requestLines, optionsLine } = splitPermissionText(props.item.text);
     const outcome = props.item.outcome;
     const tone = outcome ? permissionOutcomeTone(outcome) : null;
+    const actionable = props.item.actionable ?? false;
+    const requestNonce = props.item.requestNonce;
+    const options = props.item.options ?? [];
+    const authorizationReason = props.item.authorizationReason;
     return (
       <div
         className="rounded-md border border-amber-500/20 bg-amber-500/5 px-2 py-1.5 text-left text-xs text-amber-700 dark:text-amber-400"
@@ -69,11 +132,23 @@ export function LifecycleActivity(props: ActivityRenderClassItemProps) {
             <span className="opacity-80"> · {requestLines}</span>
           ) : null}
         </div>
-        {/* Row 2: options (muted sub-line) */}
-        {optionsLine ? (
+        {/* Row 2: authorization reason (from envelope), if present */}
+        {authorizationReason ? (
+          <div className="mt-0.5 pl-5 opacity-70">{authorizationReason}</div>
+        ) : null}
+        {/* Row 3: options sub-line (legacy fallback) */}
+        {optionsLine && !authorizationReason ? (
           <div className="mt-0.5 pl-5 opacity-60">{optionsLine}</div>
         ) : null}
-        {/* Row 3: decision — only when outcome is resolved */}
+        {/* Row 4: Allow/Deny buttons (actionable card awaiting decision) */}
+        {actionable && requestNonce && !outcome ? (
+          <PermissionDecisionButtons
+            agentPubkey={props.agentPubkey}
+            options={options}
+            requestNonce={requestNonce}
+          />
+        ) : null}
+        {/* Row 5: decision — only when outcome is resolved */}
         {outcome && tone ? (
           <>
             <div className="my-1 border-t border-amber-500/20" />

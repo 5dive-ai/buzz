@@ -60,13 +60,14 @@ pub(crate) fn reconcile_agents_to_events(
 
 /// Core reconcile logic, decoupled from the Tauri `AppHandle` for testing.
 ///
-/// Reads `managed-agents.json` raw — no keyring hydration: the published
+/// Reads `managed-agents.json` and hydrates keys from the keyring: the 30177
 /// projection ([`super::agent_events::agent_event_content`]) is the opt-IN
-/// no-secrets allowlist, so keys are never needed here. For each record it
-/// compares the freshly built event's content against the retained row at
-/// `(30177, owner, agent_pubkey)` and re-retains (marking `pending_sync = 1`)
-/// only when the row is absent or its content differs — an unchanged agent
-/// never churns `pending_sync`.
+/// no-secrets allowlist and needs no keys, but the 30179 private-config
+/// projection carries the agent nsec, which is keyring-resident on a default
+/// build. For each record it compares the freshly built event's content against
+/// the retained row at `(30177, owner, agent_pubkey)` and re-retains (marking
+/// `pending_sync = 1`) only when the row is absent or its content differs — an
+/// unchanged agent never churns `pending_sync`.
 ///
 /// Returns the number of agents (re)written to the retention store.
 #[cfg(test)]
@@ -87,7 +88,7 @@ fn reconcile_agents_in_dir_at(
     let content = std::fs::read_to_string(&store_path)
         .map_err(|e| format!("failed to read managed-agents.json: {e}"))?;
 
-    let records: Vec<ManagedAgentRecord> = serde_json::from_str(&content).map_err(|e| {
+    let mut records: Vec<ManagedAgentRecord> = serde_json::from_str(&content).map_err(|e| {
         super::storage::backup_invalid_store(&store_path);
         format!("failed to parse managed-agents.json (preserved as .invalid): {e}")
     })?;
@@ -95,6 +96,12 @@ fn reconcile_agents_in_dir_at(
     if records.is_empty() {
         return Ok(0);
     }
+
+    // The 30179 private-config projection carries the agent nsec, which on a
+    // default `system-keyring` build lives in the keyring and NOT in the JSON.
+    // Without this, `retain_private_agent_record`'s empty-nsec skip fires for
+    // every untouched agent and boot reconcile publishes zero 30179s.
+    super::storage::hydrate_keys(&mut records);
 
     let conn =
         open_retention_db(db_path).map_err(|e| format!("failed to open retention db: {e}"))?;

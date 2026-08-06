@@ -554,3 +554,5 @@ fn retain_agent_record_is_noop_when_unchanged() {
         "no pending_sync churn for an unchanged record"
     );
 }
+
+mod stale_republish_tests;

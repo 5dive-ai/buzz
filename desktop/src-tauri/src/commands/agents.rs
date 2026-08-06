@@ -264,6 +264,19 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
             .map_err(|e| e.to_string())?;
         let mut records = load_managed_agents(app)?;
         let record = find_managed_agent_mut(&mut records, pubkey)?;
+        // Item 2: fold the relay-config overlay on BEFORE the persona snapshot
+        // re-apply. Without this, retaining the saved record below republishes
+        // every non-quad field (parallelism, env overrides, name) from stale
+        // disk over a newer relay head, and LWW makes that the new head.
+        // Ordering is load-bearing in the other direction here: resolving
+        // AFTER `apply_persona_snapshot` would let the overlay clobber the
+        // definition quad (system_prompt/model/provider/runtime), so the
+        // snapshot must land last to stay definition-authoritative.
+        if let Ok(resolved) =
+            crate::managed_agents::private_config_overlay::resolved_local_record(state, record)
+        {
+            *record = resolved;
+        }
         let personas = load_personas(app).unwrap_or_default();
         if let Some(persona_id) = record.persona_id.clone() {
             if let Some(persona) = personas.iter().find(|persona| persona.id == persona_id) {

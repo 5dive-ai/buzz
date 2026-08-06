@@ -201,6 +201,10 @@ impl PrivateConfigOverlay {
         self.0.insert(patch.pubkey.clone(), patch);
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub(crate) fn clear(&mut self) {
         self.0.clear();
     }
@@ -430,5 +434,127 @@ mod tests {
             crate::managed_agents::dangling_harness_id(&error),
             Some("missing-custom-harness")
         );
+    }
+}
+
+/// Rebuild the in-memory overlay from the retained kind:30179 rows.
+///
+/// The inbound path only calls `insert_patch` when `retain_inbound_event`
+/// returns `Applied`, i.e. when the event is STRICTLY newer than the retained
+/// row. After a restart the backfill re-delivers the same events, retention
+/// dedupes them to `Skipped`, and the overlay would stay empty for the whole
+/// session — every resolve site silently falling back to stale disk config.
+/// Hydrating from the durable rows at boot makes relay-primary config survive
+/// a restart.
+///
+/// Best-effort per row: a row that fails to parse, decrypt, or validate is
+/// skipped rather than failing the boot, matching the inbound path's
+/// per-record reject.
+pub(crate) fn hydrate_from_retention(
+    conn: &rusqlite::Connection,
+    owner_keys: &nostr::Keys,
+) -> Result<PrivateConfigOverlay, String> {
+    use buzz_core_pkg::{kind::KIND_PRIVATE_MANAGED_AGENT, private_managed_agent};
+    use nostr::JsonUtil;
+
+    let rows = crate::managed_agents::retention::get_retained_events_of_kind(
+        conn,
+        KIND_PRIVATE_MANAGED_AGENT,
+        &owner_keys.public_key().to_hex(),
+    )?;
+
+    let mut overlay = PrivateConfigOverlay::default();
+    for row in rows {
+        let Ok(event) = nostr::Event::from_json(&row.raw_event) else {
+            continue;
+        };
+        let Ok((_, payload)) = private_managed_agent::validate_and_decrypt(&event, owner_keys)
+        else {
+            continue;
+        };
+        if let Ok(patch) = PrivateConfigPatch::from_payload(payload) {
+            overlay.insert_patch(patch);
+        }
+    }
+    Ok(overlay)
+}
+
+/// Guards that each known stale-disk-republish write site actually calls the
+/// overlay resolve. The behavioural tests for these sites (in
+/// `reconcile/tests.rs` and `personas/update/name_propagation_tests.rs`) can
+/// only *model* the ordering: every site is inside a `#[tauri::command]` that
+/// needs a live `AppHandle`, so they call `retain_agent_record` directly and
+/// stay green even when the production call is deleted. Measured, not assumed:
+/// removing the resolve from `agent_models.rs` left the full lib suite at
+/// 2261 passed / 0 failed. This module is the only thing that fails when a
+/// site loses its resolve — or when a NEW site is added without one.
+///
+/// A source assertion is a weak instrument (it cannot see ordering, only
+/// presence), so it is deliberately paired with the behavioural ordering tests
+/// rather than replacing them. It exists because the alternative here is no
+/// coverage at all.
+#[cfg(test)]
+mod write_site_resolve_guard {
+    /// `(file, source, expected_resolve_calls)` — every write site that
+    /// retains a managed-agent record derived from disk.
+    fn sites() -> Vec<(&'static str, &'static str, usize)> {
+        vec![
+            (
+                "commands/agent_models.rs",
+                include_str!("../commands/agent_models.rs"),
+                1,
+            ),
+            // 4 = the 3 sites Carl already resolved correctly (start/stop/
+            // delete, ~:999/:1069/:1149) plus the pair-start snapshot re-apply
+            // fixed here (~:276). The count is deliberately exact rather than
+            // `>= 1`: a lower bound would not notice a site losing its resolve
+            // while another gained one.
+            (
+                "commands/agents.rs",
+                include_str!("../commands/agents.rs"),
+                4,
+            ),
+            (
+                "commands/personas/update.rs",
+                include_str!("../commands/personas/update.rs"),
+                1,
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_stale_republish_write_site_resolves_the_overlay() {
+        for (file, source, expected) in sites() {
+            let found = source.matches("resolved_local_record(").count();
+            assert_eq!(
+                found, expected,
+                "{file}: expected {expected} `resolved_local_record(` call(s), found {found}. \
+                 A write site that retains a disk-derived record without resolving the \
+                 relay overlay republishes stale config over a newer relay head as a \
+                 validly-chained successor event (see \
+                 `sami_probe_2b_stale_disk_republish_over_newer_relay_head`)."
+            );
+        }
+    }
+
+    /// The guard above is a substring count, so prove it can FAIL: a source
+    /// with the call removed must not satisfy it. Without this, a typo in the
+    /// searched string would make every row vacuously pass.
+    #[test]
+    fn guard_detects_a_missing_resolve_call() {
+        for (file, source, _) in sites() {
+            let stripped = source.replace("resolved_local_record(", "REMOVED(");
+            assert_eq!(
+                stripped.matches("resolved_local_record(").count(),
+                0,
+                "{file}: negative control — the guard's search string must actually \
+                 match the production call, or the guard is vacuous"
+            );
+            assert_ne!(
+                source.matches("resolved_local_record(").count(),
+                0,
+                "{file}: positive control — the search string must be present at HEAD"
+            );
+        }
     }
 }

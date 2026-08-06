@@ -264,6 +264,77 @@ fn private_agent_inbound_rejects_before_retain_and_stale_event_preserves_overlay
     assert_eq!(overlay.resolved_records(&[])[0].name, "new");
 }
 
+/// SAMI PROBE: the retention DB survives a restart but the overlay does not.
+/// On the next launch the backfill re-delivers the SAME event, which resolves
+/// to `Skipped` against the retained row — so `insert_patch` never runs and the
+/// overlay stays empty for the whole session.
+#[test]
+fn sami_probe_overlay_does_not_rehydrate_after_restart() {
+    use crate::managed_agents::{
+        private_config_overlay::PrivateConfigOverlay,
+        retention::{open_retention_db, InboundOutcome},
+    };
+    use buzz_core_pkg::private_managed_agent;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("retention.db");
+    let owner_keys = nostr::Keys::generate();
+    let agent_keys = nostr::Keys::generate();
+
+    let payload = private_agent_payload(&owner_keys, &agent_keys, "relay name", 4);
+    let event = private_managed_agent::build_event(&owner_keys, &payload, 20).unwrap();
+
+    // ── Session 1: event arrives, overlay hydrates. ──
+    {
+        let conn = open_retention_db(&db_path).unwrap();
+        let mut overlay = PrivateConfigOverlay::default();
+        assert_eq!(
+            apply_inbound_private_managed_agent_event(&event, &owner_keys, &conn, &mut overlay)
+                .unwrap(),
+            InboundOutcome::Applied
+        );
+        assert_eq!(
+            overlay.resolved_records(&[]).len(),
+            1,
+            "control: overlay hydrates on first arrival"
+        );
+    }
+
+    // ── Session 2: same DB file, fresh in-memory overlay (app restart). ──
+    let conn = open_retention_db(&db_path).unwrap();
+    let mut overlay = PrivateConfigOverlay::default();
+    let outcome =
+        apply_inbound_private_managed_agent_event(&event, &owner_keys, &conn, &mut overlay)
+            .unwrap();
+    assert_eq!(
+        outcome,
+        InboundOutcome::Skipped,
+        "re-delivered event is deduped against the retained row"
+    );
+    assert!(
+        overlay.resolved_records(&[]).is_empty(),
+        "DEFECT: overlay is empty after restart — relay config silently unavailable"
+    );
+
+    // ── Positive control: the probe CAN observe hydration in session 2. ──
+    // A strictly-newer event is the only thing that repopulates the overlay.
+    let mut newer = private_agent_payload(&owner_keys, &agent_keys, "newer name", 4);
+    newer.generation = 2;
+    newer.previous_event_id = Some(event.id.to_hex());
+    let newer_event = private_managed_agent::build_event(&owner_keys, &newer, 30).unwrap();
+    assert_eq!(
+        apply_inbound_private_managed_agent_event(&newer_event, &owner_keys, &conn, &mut overlay)
+            .unwrap(),
+        InboundOutcome::Applied
+    );
+    assert_eq!(
+        overlay.resolved_records(&[])[0].name,
+        "newer name",
+        "positive control: this harness observes hydration when it happens"
+    );
+}
+
 /// A local managed agent carrying every device-local secret that an inbound
 /// event must NEVER be able to overwrite.
 fn local_agent() -> ManagedAgentRecord {
@@ -781,4 +852,53 @@ fn inbound_gate_accepts_validly_signed_event() {
         .unwrap();
     let parsed = parse_verified_inbound_event(&event.as_json()).unwrap();
     assert_eq!(parsed.pubkey, keys.public_key());
+}
+
+/// Item-0 FIX verification: after a "restart" (same retention db, fresh
+/// overlay), `hydrate_from_retention` repopulates the overlay from the durable
+/// rows — so the resolve sites see relay config instead of stale disk.
+#[test]
+fn sami_fix_overlay_rehydrates_from_retention_after_restart() {
+    use crate::managed_agents::{
+        private_config_overlay::{hydrate_from_retention, PrivateConfigOverlay},
+        retention::open_retention_db,
+    };
+    use buzz_core_pkg::private_managed_agent;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("retention.db");
+    let owner_keys = nostr::Keys::generate();
+    let agent_keys = nostr::Keys::generate();
+
+    let payload = private_agent_payload(&owner_keys, &agent_keys, "relay name", 4);
+    let event = private_managed_agent::build_event(&owner_keys, &payload, 20).unwrap();
+
+    // Session 1: the event lands and is retained durably.
+    {
+        let conn = open_retention_db(&db_path).unwrap();
+        let mut overlay = PrivateConfigOverlay::default();
+        apply_inbound_private_managed_agent_event(&event, &owner_keys, &conn, &mut overlay)
+            .unwrap();
+    }
+
+    // Session 2 (restart): hydrate straight from the retained rows — no
+    // inbound event required.
+    let conn = open_retention_db(&db_path).unwrap();
+    let overlay = hydrate_from_retention(&conn, &owner_keys).unwrap();
+    let resolved = overlay.resolved_records(&[]);
+    assert_eq!(resolved.len(), 1, "FIX: overlay rehydrates from retention");
+    assert_eq!(resolved[0].name, "relay name");
+    assert_eq!(resolved[0].parallelism, 4);
+
+    // NEGATIVE CONTROL: a different owner's keys must hydrate NOTHING — proves
+    // the query is scoped by owner pubkey and not just returning every row.
+    let stranger = nostr::Keys::generate();
+    assert!(
+        hydrate_from_retention(&conn, &stranger)
+            .unwrap()
+            .resolved_records(&[])
+            .is_empty(),
+        "control: hydration is owner-scoped"
+    );
 }

@@ -1231,6 +1231,8 @@ declare global {
        */
       nodeMode?: "serve" | "client" | null;
       /** Seed host-side serving usage to exercise the "who's using my compute" indicator. */
+      snapshotDevices?: MockMeshSnapshotDevice[];
+      snapshotMemberCount?: number;
       servingUsage?: Partial<{
         inflight: number;
         peakInflight: number;
@@ -3014,6 +3016,18 @@ function resetMockPersonaCatalogEvents(config: E2eConfig | undefined) {
 // in a browser. They deliberately do NOT model real admission, real inference,
 // or real mesh routing — those are proven by the Rust layer-2 tests and the
 // on-hardware layer-1 example. Do not port any of this into production code.
+type MockMeshSnapshotDevice = {
+  deviceId: string | null;
+  label: string;
+  capacityGb: number | null;
+  models: string[];
+  state: "serving" | "loading" | "standby" | "consuming";
+  isSelf: boolean;
+  memberPubkey?: string | null;
+  reportedAt?: number | null;
+  modelSizeGb?: number | null;
+};
+
 type MockServingUsage = {
   inflight: number;
   peakInflight: number;
@@ -3046,6 +3060,8 @@ const mockMeshState: {
   nodeState: "off" | "running";
   nodeMode: "serve" | "client" | null;
   servingUsage: MockServingUsage;
+  snapshotDevices: MockMeshSnapshotDevice[] | null;
+  snapshotMemberCount: number | null;
 } = {
   admitted: true,
   models: [{ id: "Gemma-4-E4B-it-Q4_K_M", name: "Gemma 4 E4B" }],
@@ -3054,6 +3070,8 @@ const mockMeshState: {
   nodeState: "off",
   nodeMode: null,
   servingUsage: { ...ZERO_SERVING_USAGE },
+  snapshotDevices: null,
+  snapshotMemberCount: null,
 };
 
 function resetMockMesh() {
@@ -3064,6 +3082,8 @@ function resetMockMesh() {
   mockMeshState.nodeState = "off";
   mockMeshState.nodeMode = null;
   mockMeshState.servingUsage = { ...ZERO_SERVING_USAGE };
+  mockMeshState.snapshotDevices = null;
+  mockMeshState.snapshotMemberCount = null;
 }
 let mockPersonas: RawPersona[] = [];
 let mockTeams: RawTeam[] = [];
@@ -10253,6 +10273,10 @@ export function maybeInstallE2eTauriMocks() {
       mockMeshState.denyReason = mesh.denyReason;
     if (mesh.nodeState !== undefined) mockMeshState.nodeState = mesh.nodeState;
     if (mesh.nodeMode !== undefined) mockMeshState.nodeMode = mesh.nodeMode;
+    if (mesh.snapshotDevices !== undefined)
+      mockMeshState.snapshotDevices = mesh.snapshotDevices;
+    if (mesh.snapshotMemberCount !== undefined)
+      mockMeshState.snapshotMemberCount = mesh.snapshotMemberCount;
     if (mesh.servingUsage !== undefined)
       mockMeshState.servingUsage = {
         ...mockMeshState.servingUsage,
@@ -10916,19 +10940,54 @@ export function maybeInstallE2eTauriMocks() {
         return meshNodeStatus(mockMeshState.nodeState, mockMeshState.nodeMode);
       case "mesh_serving_usage":
         return mockMeshState.servingUsage;
-      case "mesh_snapshot":
+      case "mesh_snapshot": {
+        const devices =
+          mockMeshState.snapshotDevices ??
+          (mockMeshState.nodeMode === "serve" && mockMeshState.activeModel
+            ? [
+                {
+                  deviceId: "mock-self",
+                  label: "This machine",
+                  capacityGb: 32,
+                  models: [mockMeshState.activeModel.id],
+                  state: "serving" as const,
+                  isSelf: true,
+                  memberPubkey: MOCK_IDENTITY_PUBKEY,
+                  reportedAt: Math.floor(Date.now() / 1000),
+                  modelSizeGb: 3.5,
+                },
+              ]
+            : []);
+        const serving = devices.filter((device) => device.state === "serving");
         return {
-          sharingDeviceCount: mockMeshState.nodeMode === "serve" ? 1 : 0,
-          sharedCapacityGb: mockMeshState.nodeMode === "serve" ? 32 : null,
-          models: mockMeshState.activeModel
-            ? [mockMeshState.activeModel.id]
-            : [],
-          devices: [],
-          includesSelf: mockMeshState.nodeMode === "serve",
-          memberCount: 1,
-          reason:
-            mockMeshState.nodeMode === "serve" ? null : "No one is sharing",
+          sharingDeviceCount: serving.length,
+          contributorMemberCount: new Set(
+            serving.map((device) => device.memberPubkey ?? device.deviceId),
+          ).size,
+          sharedCapacityGb:
+            serving.length > 0
+              ? serving.reduce(
+                  (total, device) => total + (device.capacityGb ?? 0),
+                  0,
+                )
+              : null,
+          allocatedCapacityGb:
+            serving.length > 0 &&
+            serving.every((device) => device.modelSizeGb != null)
+              ? serving.reduce(
+                  (total, device) => total + (device.modelSizeGb ?? 0),
+                  0,
+                )
+              : null,
+          models: [...new Set(serving.flatMap((device) => device.models))],
+          devices,
+          includesSelf: serving.some((device) => device.isSelf),
+          memberCount: mockMeshState.snapshotMemberCount ?? 1,
+          observedAt: Math.floor(Date.now() / 1000),
+          freshnessSeconds: 120,
+          reason: serving.length > 0 ? null : "No one is sharing",
         };
+      }
       case "mesh_live_view":
         return {
           connected: mockMeshState.nodeState === "running",

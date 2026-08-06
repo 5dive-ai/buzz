@@ -213,6 +213,44 @@ impl PrivateConfigOverlay {
         self.0.remove(pubkey);
     }
 
+    /// Write-through for a SELF-AUTHORED retain: adopt the kind:30179 head this
+    /// device just wrote as the config it is following.
+    ///
+    /// Both existing fill paths are inbound-only — `insert_patch` on an
+    /// `Applied` inbound event (`personas/inbound.rs`) and boot hydration
+    /// below — and neither fires for an event this device authored: the
+    /// relay's echo of our own event dedupes to `Skipped` against the row we
+    /// already retained. So without this the overlay stays pinned at the last
+    /// *received* generation, and the NEXT edit resolves that stale patch on
+    /// top of the fresher disk record, silently reverting the previous edit
+    /// and publishing the reversion as a valid successor.
+    ///
+    /// Absorbing unconditionally (not only when the retain reported a change)
+    /// is safe and strictly convergent: the overlay is never ahead of
+    /// retention — every insert either comes from a row written in the same
+    /// step or is read back out of retention. A missing/undecodable head
+    /// leaves the current entry alone rather than clearing it.
+    pub(crate) fn absorb_retained_head(
+        &mut self,
+        conn: &rusqlite::Connection,
+        owner_keys: &nostr::Keys,
+        agent_pubkey: &str,
+    ) -> Result<(), String> {
+        let row = crate::managed_agents::retention::get_retained_event(
+            conn,
+            buzz_core_pkg::kind::KIND_PRIVATE_MANAGED_AGENT,
+            &owner_keys.public_key().to_hex(),
+            agent_pubkey,
+        )?;
+        if let Some(patch) = row
+            .as_ref()
+            .and_then(|row| patch_from_retained_row(&row.raw_event, owner_keys))
+        {
+            self.insert_patch(patch);
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve_local_record(&self, record: &ManagedAgentRecord) -> ManagedAgentRecord {
         let mut resolved = record.clone();
         if let Some(patch) = self.0.get(&record.pubkey) {
@@ -437,6 +475,23 @@ mod tests {
     }
 }
 
+/// Decode one retained kind:30179 row into a patch. Shared by boot hydration
+/// and the self-authored write-through so both learn config through exactly
+/// one decode path. Best-effort: a row that fails to parse, decrypt, or
+/// validate yields `None` rather than an error, matching the inbound path's
+/// per-record reject.
+fn patch_from_retained_row(
+    raw_event: &str,
+    owner_keys: &nostr::Keys,
+) -> Option<PrivateConfigPatch> {
+    use buzz_core_pkg::private_managed_agent;
+    use nostr::JsonUtil;
+
+    let event = nostr::Event::from_json(raw_event).ok()?;
+    let (_, payload) = private_managed_agent::validate_and_decrypt(&event, owner_keys).ok()?;
+    PrivateConfigPatch::from_payload(payload).ok()
+}
+
 /// Rebuild the in-memory overlay from the retained kind:30179 rows.
 ///
 /// The inbound path only calls `insert_patch` when `retain_inbound_event`
@@ -454,8 +509,7 @@ pub(crate) fn hydrate_from_retention(
     conn: &rusqlite::Connection,
     owner_keys: &nostr::Keys,
 ) -> Result<PrivateConfigOverlay, String> {
-    use buzz_core_pkg::{kind::KIND_PRIVATE_MANAGED_AGENT, private_managed_agent};
-    use nostr::JsonUtil;
+    use buzz_core_pkg::kind::KIND_PRIVATE_MANAGED_AGENT;
 
     let rows = crate::managed_agents::retention::get_retained_events_of_kind(
         conn,
@@ -465,14 +519,7 @@ pub(crate) fn hydrate_from_retention(
 
     let mut overlay = PrivateConfigOverlay::default();
     for row in rows {
-        let Ok(event) = nostr::Event::from_json(&row.raw_event) else {
-            continue;
-        };
-        let Ok((_, payload)) = private_managed_agent::validate_and_decrypt(&event, owner_keys)
-        else {
-            continue;
-        };
-        if let Ok(patch) = PrivateConfigPatch::from_payload(payload) {
+        if let Some(patch) = patch_from_retained_row(&row.raw_event, owner_keys) {
             overlay.insert_patch(patch);
         }
     }

@@ -39,6 +39,16 @@ pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
 /// only runtime fields produces an identical row and never re-enqueues a
 /// publish. Best-effort: a failure here is logged and swallowed so a retention
 /// hiccup never blocks the disk-authoritative write.
+///
+/// Also writes the just-retained kind:30179 head back through to the in-memory
+/// overlay. This is the ONLY path by which the overlay learns config this
+/// device authored — inbound `insert_patch` never fires for our own event
+/// (the relay echo dedupes to `Skipped`) and boot hydration runs once per
+/// launch — so without it a second edit in the same session resolves the
+/// stale patch onto the fresher disk record and publishes a silent revert of
+/// the first edit. Overlay lock is taken UNDER `managed_agents_store_lock`,
+/// which every caller already holds: the established order, same as
+/// `resolved_local_record`.
 pub(super) fn retain_managed_agent_pending(
     app: &AppHandle,
     state: &AppState,
@@ -52,7 +62,12 @@ pub(super) fn retain_managed_agent_pending(
         // Shared engine with the boot-time reconcile: projection content diff
         // (no republish for runtime-only churn) + monotonic created_at bump
         // past the retained head (NIP-AP step 3).
-        retain_agent_record(&conn, &scope.owner_keys, record).map(|_| ())
+        retain_agent_record(&conn, &scope.owner_keys, record)?;
+        state
+            .private_managed_agent_overlay
+            .lock()
+            .map_err(|error| error.to_string())?
+            .absorb_retained_head(&conn, &scope.owner_keys, &record.pubkey)
     })();
     if let Err(e) = result {
         eprintln!("buzz-desktop: agent-retain: {e}");

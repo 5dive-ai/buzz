@@ -555,4 +555,5 @@ fn retain_agent_record_is_noop_when_unchanged() {
     );
 }
 
+mod self_authored_overlay_tests;
 mod stale_republish_tests;

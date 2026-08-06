@@ -1138,7 +1138,11 @@ export async function cancelPairing(): Promise<void> {
   await invokeTauri("cancel_pairing");
 }
 
-type ApplyWorkspaceResult = { applied: boolean; degraded: string[] };
+type ApplyWorkspaceResult = {
+  applied: boolean;
+  degraded: string[];
+  blocked?: string | null;
+};
 export async function applyCommunity(
   relayUrl: string,
   nsec?: string,

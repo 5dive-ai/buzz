@@ -92,8 +92,13 @@ pub async fn validate_repos_dir(dir: String) -> Result<(), String> {
 /// directory.
 ///
 /// Returns `WorkspaceApplyResult`:
-/// - `applied: true` → new scope committed; post-commit failures surface as
-///   `degraded` entries (informational — workspace IS active).
+/// - `applied: true`, `blocked: None` → new scope committed; post-commit
+///   failures surface as `degraded` entries (informational — workspace IS
+///   active).
+/// - `applied: true`, `blocked: Some(reason)` → scope committed, but
+///   post-commit provider-access reconciliation failed hard; dependent
+///   post-commit steps were skipped (fail-closed). Workspace IS active but
+///   caller must park on the loading gate — retry by re-applying.
 /// - `applied: false` → drain failed; old scope still active; `degraded`
 ///   names what could not be stopped or restored by compensation.
 ///
@@ -403,7 +408,22 @@ async fn apply_workspace_body(
     }
 
     let state = restore_app.state::<AppState>();
-    super::agents::provider_access::reconcile_on_workspace_apply(&restore_app, &state).await?;
+    match super::agents::provider_access::reconcile_on_workspace_apply(&restore_app, &state).await {
+        Ok(()) => {}
+        Err(reason) => {
+            // Provider-access reconciliation failed after the scope committed.
+            // Preserves #4053's fail-closed intent: no agents spawn against a
+            // workspace whose provider deployment may not have accepted
+            // owner-only access. Return applied-but-blocked so the frontend
+            // can park on the loading gate with a truthful error rather than
+            // falsely treating the workspace as unapplied.
+            return Ok(
+                crate::managed_agents::scope::WorkspaceApplyResult::applied_but_blocked(
+                    reason, degraded,
+                ),
+            );
+        }
+    }
 
     match crate::managed_agents::retention::active_retention_scope(&restore_app, &state) {
         Ok(scope) => {

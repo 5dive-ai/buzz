@@ -11135,10 +11135,15 @@ export function maybeInstallE2eTauriMocks() {
       case "fetch_join_policy":
         return activeConfig?.mock?.joinPolicy ?? null;
       case "apply_workspace": {
-        // Must return { applied: boolean, degraded: string[] } — useCommunityInit
-        // dereferences .applied and .degraded immediately after the await.
+        // Must return { applied: boolean, degraded: string[], blocked?: string | null }
+        // — useCommunityInit dereferences .applied, .degraded, and .blocked immediately
+        // after the await.
         const applyDelayMs = activeConfig?.mock?.applyCommunityDelayMs ?? 0;
-        const applyResult = { applied: true, degraded: [] as string[] };
+        const applyResult = {
+          applied: true,
+          degraded: [] as string[],
+          blocked: null,
+        };
         if (applyDelayMs > 0) {
           return new Promise((resolve) =>
             window.setTimeout(() => resolve(applyResult), applyDelayMs),

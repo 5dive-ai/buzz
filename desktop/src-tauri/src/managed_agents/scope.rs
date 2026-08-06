@@ -203,6 +203,15 @@ impl WorkspaceAgentScope {
 }
 
 /// Result returned by `apply_workspace` / `import_identity` drain-then-commit.
+///
+/// Three distinct states:
+///
+/// | `applied` | `blocked`    | `degraded` | Meaning |
+/// |-----------|--------------|------------|---------|
+/// | `true`    | `None`       | empty      | Clean success. |
+/// | `true`    | `None`       | non-empty  | Applied with post-commit degradation (workspace IS active; warnings only). |
+/// | `true`    | `Some(msg)`  | any        | Applied but blocked: scope committed, post-commit provider reconciliation failed. Workspace IS active; caller must surface this as a hard gate, not a warning, because dependent post-commit steps were skipped to preserve fail-closed behavior. |
+/// | `false`   | `None`       | non-empty  | Drain failed; old scope still active. |
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkspaceApplyResult {
     /// `true` when the new scope was committed; `false` when drain or
@@ -213,6 +222,16 @@ pub struct WorkspaceApplyResult {
     /// the degradation is informational. Also populated on drain-failure with
     /// the specific runtime(s) that could not be stopped or restored.
     pub degraded: Vec<String>,
+    /// Set when `applied` is `true` but a post-commit provider-access
+    /// reconciliation step failed hard. The workspace scope IS committed (the
+    /// new relay/keys are active), but dependent post-commit steps (event sync,
+    /// agent restore) were skipped to preserve fail-closed behavior. The caller
+    /// must treat this as a gate failure — park on the loading screen and
+    /// surface the reason — because rendering community UI against a workspace
+    /// whose provider deployment may not have accepted owner-only access is
+    /// unsafe. Retry by re-applying the workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<String>,
 }
 
 impl WorkspaceApplyResult {
@@ -220,6 +239,7 @@ impl WorkspaceApplyResult {
         Self {
             applied: true,
             degraded: Vec::new(),
+            blocked: None,
         }
     }
 
@@ -232,6 +252,21 @@ impl WorkspaceApplyResult {
         Self {
             applied: false,
             degraded: vec![msg.into()],
+            blocked: None,
+        }
+    }
+
+    /// Scope committed, but post-commit provider reconciliation failed.
+    ///
+    /// `applied` is `true` (the new workspace IS active); `blocked` carries
+    /// the failure reason. Any `degraded` entries collected before the failure
+    /// (e.g. nest-regen) are preserved. Dependent post-commit steps must be
+    /// skipped by the caller after returning this result.
+    pub fn applied_but_blocked(reason: impl Into<String>, degraded: Vec<String>) -> Self {
+        Self {
+            applied: true,
+            degraded,
+            blocked: Some(reason.into()),
         }
     }
 }

@@ -373,6 +373,64 @@ fn test_workspace_apply_result_degradation_accumulates() {
     assert!(r.degraded[1].contains("sync"));
 }
 
+#[test]
+fn test_workspace_apply_result_applied_but_blocked_sets_fields() {
+    let r = super::super::scope::WorkspaceApplyResult::applied_but_blocked(
+        "provider deploy rejected",
+        Vec::new(),
+    );
+    assert!(r.applied, "applied_but_blocked must report applied: true");
+    assert_eq!(
+        r.blocked.as_deref(),
+        Some("provider deploy rejected"),
+        "blocked must carry the failure reason"
+    );
+    assert!(r.degraded.is_empty(), "degraded must be empty when none passed");
+}
+
+#[test]
+fn test_workspace_apply_result_applied_but_blocked_preserves_degraded_entries() {
+    let prior_degraded = vec!["nest context regeneration failed: io error".to_string()];
+    let r = super::super::scope::WorkspaceApplyResult::applied_but_blocked(
+        "store locked",
+        prior_degraded,
+    );
+    assert!(r.applied, "applied_but_blocked must report applied: true");
+    assert!(r.blocked.is_some(), "blocked must be set");
+    assert_eq!(r.degraded.len(), 1, "pre-failure degraded entries must be preserved");
+    assert!(r.degraded[0].contains("nest"));
+}
+
+#[test]
+fn test_workspace_apply_result_three_state_distinction() {
+    // State 1: clean success — applied true, blocked None, degraded empty.
+    let clean = super::super::scope::WorkspaceApplyResult::success();
+    assert!(clean.applied);
+    assert!(clean.blocked.is_none());
+    assert!(clean.degraded.is_empty());
+
+    // State 2: applied with degradation — applied true, blocked None, degraded non-empty.
+    let degraded = super::super::scope::WorkspaceApplyResult::success()
+        .with_degradation("event sync skipped");
+    assert!(degraded.applied);
+    assert!(degraded.blocked.is_none());
+    assert!(!degraded.degraded.is_empty());
+
+    // State 3: applied but blocked — applied true, blocked Some, any degraded.
+    let blocked = super::super::scope::WorkspaceApplyResult::applied_but_blocked(
+        "provider rejected",
+        Vec::new(),
+    );
+    assert!(blocked.applied);
+    assert!(blocked.blocked.is_some());
+
+    // State 4: drain failed — applied false.
+    let drained = super::super::scope::WorkspaceApplyResult::drain_failed("lock poisoned");
+    assert!(!drained.applied);
+    assert!(drained.blocked.is_none());
+    assert!(!drained.degraded.is_empty());
+}
+
 /// Partial drain: verifies that `execute_drain_journal` delivers the correct
 /// stopped prefix for compensation.
 ///

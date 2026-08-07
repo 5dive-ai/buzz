@@ -553,9 +553,12 @@ mod tests {
             args: vec![],
             env: BTreeMap::new(),
         };
-        let mut global = crate::managed_agents::global_config::GlobalAgentConfig::default();
-        global.permission_policy =
-            Some(crate::managed_agents::permission_policy::PermissionPolicy::Allow);
+        let global = crate::managed_agents::global_config::GlobalAgentConfig {
+            permission_policy: Some(
+                crate::managed_agents::permission_policy::PermissionPolicy::Allow,
+            ),
+            ..Default::default()
+        };
         let (effective_policy, _) =
             crate::managed_agents::permission_policy::resolve_effective_permission_policy(
                 &record, &global,

@@ -131,8 +131,10 @@ mod tests {
     fn test_per_agent_policy_beats_global_and_built_in() {
         let mut record = empty_record();
         record.permission_policy = Some(PermissionPolicy::Allow);
-        let mut global = GlobalAgentConfig::default();
-        global.permission_policy = Some(PermissionPolicy::Reject);
+        let global = GlobalAgentConfig {
+            permission_policy: Some(PermissionPolicy::Reject),
+            ..Default::default()
+        };
 
         let (policy, source) = resolve_effective_permission_policy(&record, &global);
         assert_eq!(policy, PermissionPolicy::Allow);
@@ -143,8 +145,10 @@ mod tests {
     fn test_global_policy_beats_built_in_when_no_per_agent() {
         let mut record = empty_record();
         record.permission_policy = None;
-        let mut global = GlobalAgentConfig::default();
-        global.permission_policy = Some(PermissionPolicy::Allow);
+        let global = GlobalAgentConfig {
+            permission_policy: Some(PermissionPolicy::Allow),
+            ..Default::default()
+        };
 
         let (policy, source) = resolve_effective_permission_policy(&record, &global);
         assert_eq!(policy, PermissionPolicy::Allow);
@@ -166,8 +170,10 @@ mod tests {
     fn test_per_agent_reject_beats_global_allow() {
         let mut record = empty_record();
         record.permission_policy = Some(PermissionPolicy::Reject);
-        let mut global = GlobalAgentConfig::default();
-        global.permission_policy = Some(PermissionPolicy::Allow);
+        let global = GlobalAgentConfig {
+            permission_policy: Some(PermissionPolicy::Allow),
+            ..Default::default()
+        };
 
         let (policy, source) = resolve_effective_permission_policy(&record, &global);
         assert_eq!(policy, PermissionPolicy::Reject);

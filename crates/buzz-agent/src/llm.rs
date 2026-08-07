@@ -1940,9 +1940,29 @@ fn classify_body_read_error(
     }
 }
 
+/// Does this error body mean "the model cannot accept images", as opposed to
+/// any other 4xx?
+///
+/// PROVIDERS PHRASE THIS COMPLETELY DIFFERENTLY, and matching only one of them
+/// is not a cosmetic miss. OpenRouter reports it as a *routing* failure ("No
+/// endpoints found that support image input"); Fireworks reports it as a
+/// *capability* failure ("This model does not support image inputs"). Both must
+/// reach `AgentError::UnsupportedImageInput`, because that is the only error the
+/// turn loop recovers from — it strips the images out of history and continues.
+/// Anything not recognised here is terminal, and a terminal error on a
+/// text-only model is unrecoverable by construction: buzz-acp requeues the
+/// batch with exponential backoff, every retry replays the same image and
+/// fails identically, and after 10 attempts the batch dead-letters. The agent
+/// then has no work left and idles until the harness kills it, so the trial
+/// scores 0 no matter how much budget remained. Measured on the 2026-08-07
+/// Fireworks cell: 6 of the first 66 trials, all 6 scoring 0.0.
+///
+/// Matched case-insensitively on substrings rather than the full sentence so a
+/// singular/plural or punctuation change upstream does not silently reopen this.
 fn is_unsupported_image_input_error(body: &str) -> bool {
-    body.to_ascii_lowercase()
-        .contains("no endpoints found that support image input")
+    let body = body.to_ascii_lowercase();
+    body.contains("no endpoints found that support image input")
+        || body.contains("does not support image input")
 }
 
 /// Build the terminal `AgentError::Llm` for a `post()` exit that has given up
@@ -2136,6 +2156,13 @@ where
                 return Err(PostError::Agent(AgentError::LlmContextExceeded(format!(
                     "{status}: {body}"
                 ))));
+            }
+            // Likewise recoverable, and likewise not only a 404: any
+            // OpenAI-compatible provider serving a text-only model can reject
+            // an image with a plain 400. Without this the turn loop never gets
+            // the chance to strip the image and retry.
+            if is_unsupported_image_input_error(&body) {
+                return Err(PostError::Agent(AgentError::UnsupportedImageInput(body)));
             }
             return Err(PostError::Agent(AgentError::Llm(format!(
                 "{status}: {body}"
@@ -2508,6 +2535,14 @@ async fn openrouter_post(
             // agents keep the permanent context-400 stuck loop.
             if status == 400 && is_context_length_error(&body) {
                 return Err(AgentError::LlmContextExceeded(format!("{status}: {body}")));
+            }
+            // Image rejection is checked on EVERY non-success status, not just
+            // the 404 handled above. OpenRouter reports it as a 404 routing
+            // failure; Fireworks reports it as a plain 400. Checking only the
+            // 404 left the direct-Fireworks route with no recovery path at all
+            // — see `is_unsupported_image_input_error` for what that costs.
+            if is_unsupported_image_input_error(&body) {
+                return Err(AgentError::UnsupportedImageInput(body));
             }
             return Err(AgentError::Llm(format!("{status}: {body}")));
         }
@@ -7720,6 +7755,44 @@ mod tests {
         assert!(
             matches!(&err, AgentError::UnsupportedImageInput(s) if s.contains("support image input")),
             "image rejection must reach the history-recovery path: got {err:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a deterministic capability rejection must not be retried"
+        );
+    }
+
+    /// The same condition, as FIREWORKS words it — a 400 with a capability
+    /// message rather than a 404 with a routing message. This is a regression
+    /// test for a real cell: the detector matched only OpenRouter's sentence, so
+    /// on the direct Fireworks route the rejection stayed terminal, buzz-acp
+    /// requeued and dead-lettered the batch, and the trial idled out its
+    /// deadline at reward 0. Six of the first sixty-six trials went that way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openrouter_post_400_fireworks_unsupported_image_is_typed() {
+        let (url, _captured, attempts) = spawn_openrouter_stub(vec![CannedResponse::new(
+            400,
+            r#"{"error":{"object":"error","type":"invalid_request_error","code":"invalid_request_error","message":"This model does not support image inputs"}}"#,
+        )])
+        .await;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = openrouter_post(
+            &http,
+            &format!("{url}/x"),
+            &json!({}),
+            "key",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, AgentError::UnsupportedImageInput(s) if s.contains("does not support image inputs")),
+            "Fireworks' capability 400 must reach the history-recovery path, \
+             not fall through to a terminal error: got {err:?}"
         );
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),

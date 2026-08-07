@@ -7,18 +7,40 @@ import {
 } from "@/features/channels/readState/readStateManager";
 import type { OverrideLiveness } from "@/features/channels/readState/readStateFormat";
 import type { RelayClient } from "@/shared/api/relayClientSession";
+import { pendingOverrideIntentStore } from "@/features/channels/pendingOverrideIntents";
 
 const noopGetTimestamp = () => null;
 const noopMarkRead = () => {};
 const noopDrainAdvances = (): ReadonlySet<string> => new Set<string>();
 const noopSetResolver = () => {};
-const noopMarkOverride = (): MarkResult => ({
-  status: "refused",
-  reason: "load_incomplete",
-});
 const noopGetOverrideLiveness = (): OverrideLiveness | null => null;
 const noopGetProjection = (): ReadStateProjection | null => null;
 const noopSetOnDrainOutcome = (): void => {};
+
+/**
+ * Enqueue a mark-unread intent with no active manager (no relay client or no
+ * pubkey). The intent is presentation-only — it will be consumed by
+ * `computePreReadyUnread` so the channel appears unread during loading, and
+ * swept / replaced when a real manager hydrates from storage.  Returns the
+ * tri-state `queued` result so `applyOverrideUnread` keeps the forced entry.
+ */
+function noopMarkChannelUnread(channelId: string): MarkResult {
+  pendingOverrideIntentStore.enqueue(channelId, "unread");
+  return { status: "queued" };
+}
+
+/**
+ * Enqueue a mark-read intent with no active manager (no relay client or no
+ * pubkey). The intent is presentation-only — `computePreReadyUnread` will
+ * suppress the channel from the unread set while loading.  Returns `queued`.
+ */
+function noopMarkChannelRead(
+  channelId: string,
+  sourceScope?: string,
+): MarkResult {
+  pendingOverrideIntentStore.enqueue(channelId, "read", sourceScope, undefined);
+  return { status: "queued" };
+}
 
 /**
  * React hook that creates and manages a ReadStateManager instance.
@@ -181,8 +203,12 @@ export function useReadState(
       setContextParentResolver: noopSetResolver,
       readStateVersion: 0,
       getOwnTimestamp: noopGetTimestamp,
-      markChannelUnread: noopMarkOverride,
-      markChannelRead: noopMarkOverride,
+      // Enqueue intents even without a manager so computePreReadyUnread can
+      // apply the pending-read suppression / pending-unread assertion rules.
+      // Intents enqueued here are presentation-only and will be swept when a
+      // real manager initializes and calls restoreFromStorage().
+      markChannelUnread: noopMarkChannelUnread,
+      markChannelRead: noopMarkChannelRead,
       getOverrideLiveness: noopGetOverrideLiveness,
       getProjection: noopGetProjection,
       setOnDrainOutcome: noopSetOnDrainOutcome,

@@ -2626,32 +2626,23 @@ test("drain_crashWindow2_receiptPresent_restartNoRebump", async () => {
 
 // ── Test 26: Amendment C — crash after applied unread, newer remote read ──────
 test("drain_crashAfterAppliedUnread_newerRemoteRead_noRebump", async () => {
-  // Amendment C crash race 1: unread applied (register+receipt durable), then
-  // another device publishes C=6 (read). On restart, the receipt prevents a
-  // second S-bump that would reverse the phone's read.
+  // Amendment C crash race 1 — PRODUCTION LOAD PATH:
+  // Unread applied (register+receipt durable), then another device publishes C=6
+  // (read). On restart, the receipt prevents a second S-bump that would reverse
+  // the phone's read. This test uses the real fetchAndMerge() path — the remote
+  // read is delivered as an encrypted relay event, not a direct register write.
   //
-  // Without Amendment C, restart would replay S=max(S,C)+1 on top of the merged
-  // C=6, computing S=7, undoing the phone's read. With Amendment C, the receipt
-  // proves application; only cleanup+delete runs, so C=6 stands.
+  // Without Amendment C, restart would replay S=max(S,C)+1 on top of merged C=6,
+  // computing S=7, undoing the phone's read. With Amendment C, the receipt proves
+  // application; only cleanup+delete runs, so C=6 stands.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d4".repeat(32);
   const channelId = `amend-c-unread-race-${"d".repeat(44)}`;
 
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
   // Craft the crash state in localStorage:
   // - Register committed with S=5 (unread applied, from S=4, C=3).
   // - Receipt {intentGen:1, op:"unread"} persisted atomically.
-  // - Intent {gen:1, op:"unread"} still alive (crash before delete).
-  // - "Remote device" published C=6: simulate by putting frontier=200,
-  //   and after restart we merge C=6 into the register.
+  // - Intent {gen:1, op:"unread"} still alive (crash before cleanup delete).
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   ls.setItem(
@@ -2664,53 +2655,111 @@ test("drain_crashAfterAppliedUnread_newerRemoteRead_noRebump", async () => {
     }),
   );
 
-  // Session 2 (restart): hydrate, then merge the remote read (C=6).
-  const mgr = new ReadStateManager(pubkey, fakeRelay);
-  mgr.hydrateFromLocalStorage();
+  // Remote device published C=6 (read) and frontier advanced to 200.
+  // Deliver via a real relay event that fetchAndMerge will decrypt and merge.
+  const remoteBlob = JSON.stringify({
+    v: 1,
+    client_id: "remote-device-client",
+    contexts: {
+      [`ov_s:${channelId}`]: 5,
+      [`ov_c:${channelId}`]: 6,
+      [`ov_b:${channelId}`]: 100,
+      [channelId]: 200, // frontier advanced past B=100 → inactive
+    },
+  });
+  const remoteSlotId = "d4".repeat(16);
+  const blobEvent = {
+    id: "d4".repeat(32),
+    pubkey,
+    created_at: 9999,
+    kind: 30078,
+    tags: [
+      ["d", `read-state:${remoteSlotId}`],
+      ["t", "read-state"],
+    ],
+    content: "CIPHER",
+    sig: "s".repeat(128),
+  };
 
-  // Simulate merge of remote C=6: a complete load that brought in C=6.
-  // We do this by directly updating the register to reflect the merged remote.
-  // In production, this would come via fetchAndMerge merging the remote event.
-  mgr.overrideRegisters.set(channelId, { s: 5, c: 6, b: 100 }); // remote C=6 merged
-  mgr.effectiveState.set(channelId, 200); // frontier advanced past baseline → inactive
-  mgr.isLoadComplete = true;
+  let fetchCallCount = 0;
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command) => {
+      if (command === "nip44_decrypt_from_self") return remoteBlob;
+      throw new Error(`Unexpected: ${command}`);
+    },
+  };
 
-  // Receipt must be loaded.
-  const receipt = mgr.appliedReceipts.get(channelId);
-  assert.ok(receipt, "receipt must be loaded on restart");
-  assert.equal(receipt.intentGen, 1);
-  assert.equal(receipt.op, "unread");
+  const fakeRelay = {
+    fetchEvents: async () => {
+      fetchCallCount++;
+      return fetchCallCount === 1 ? [blobEvent] : [];
+    },
+    publishEvent: async () => {},
+    subscribeFenced: async (_filter, handler) => {
+      if (fetchCallCount === 0) handler(blobEvent);
+      return makeFenceHandle({ eose: true });
+    },
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
 
-  // Run drain on restart.
-  await mgr.drainPendingIntents(mgr.loadGeneration);
+  try {
+    // Session 2 (restart): hydrate, then complete load via real fetchAndMerge().
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    mgr.hydrateFromLocalStorage();
 
-  // The alreadyApplied path must have run: no new S-bump.
-  // S must remain 5 (from original unread commit), NOT 7 (which replay would give).
-  const reg = mgr.overrideRegisters.get(channelId);
-  assert.ok(reg, "register must exist");
-  assert.equal(
-    reg.s,
-    5,
-    "S must NOT be re-bumped (would override phone's C=6)",
-  );
-  assert.equal(reg.c, 6, "C must remain 6 (phone's read is preserved)");
+    // Receipt must be loaded from crash state.
+    const receipt = mgr.appliedReceipts.get(channelId);
+    assert.ok(receipt, "receipt must be loaded on restart");
+    assert.equal(receipt.intentGen, 1);
+    assert.equal(receipt.op, "unread");
 
-  // Intent consumed.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "intent must be deleted after alreadyApplied drain",
-  );
+    // Complete load via production path — fetchAndMerge merges the remote C=6.
+    await mgr.fetchAndMerge(mgr.loadGeneration);
+    assert.equal(mgr.isLoadComplete, true, "load must complete");
 
-  mgr.destroy();
+    // The merged register should reflect remote C=6 and frontier 200.
+    const regAfterLoad = mgr.overrideRegisters.get(channelId);
+    assert.ok(regAfterLoad, "register must exist after fetchAndMerge");
+    assert.ok(
+      regAfterLoad.c >= 6,
+      "merged C must be at least 6 (remote C=6 merged)",
+    );
+
+    // Drain via production path — alreadyApplied must fire, no new S-bump.
+    await mgr.drainPendingIntents(mgr.loadGeneration);
+
+    // S must remain 5, NOT 7 (which replay would compute as max(5,6)+1=7).
+    const reg = mgr.overrideRegisters.get(channelId);
+    assert.ok(reg, "register must exist after drain");
+    assert.equal(
+      reg.s,
+      5,
+      "S must NOT be re-bumped (would override phone's C=6)",
+    );
+    assert.ok(reg.c >= 6, "C must reflect remote read (≥6)");
+
+    // Intent consumed — cleanup step ran.
+    assert.equal(
+      pendingOverrideIntentStore.get(channelId),
+      undefined,
+      "intent must be deleted after alreadyApplied drain",
+    );
+
+    mgr.destroy();
+  } finally {
+    delete globalThis.window.__TAURI_INTERNALS__;
+  }
 });
 
 // ── Test 27: Amendment C — crash after applied read, newer remote unread ──────
 test("drain_crashAfterAppliedRead_newerRemoteUnread_noRebump", async () => {
-  // Amendment C crash race 2 (mirror of Test 26): read applied (C-bump
-  // committed + receipt durable), then another device publishes a new S-bump
-  // (marks unread). On restart, the receipt prevents a second C-bump that would
-  // reverse the new unread.
+  // Amendment C crash race 2 — PRODUCTION LOAD PATH (mirror of Test 26):
+  // Read applied (C-bump committed + receipt durable), then another device
+  // publishes S=7 (marks unread). On restart, the receipt prevents a second
+  // C-bump that would reverse the new unread. The remote S=7 is delivered via
+  // a real relay event through fetchAndMerge(), not a direct register write.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d5".repeat(32);
   const channelId = `amend-c-read-race-${"e".repeat(45)}`;
@@ -2729,47 +2778,95 @@ test("drain_crashAfterAppliedRead_newerRemoteUnread_noRebump", async () => {
     }),
   );
 
+  // Remote device published S=7 (marked unread after our crash), C stays 6,
+  // frontier remains at 100 (below B=100 is NOT above B, so override is active).
+  const remoteBlob = JSON.stringify({
+    v: 1,
+    client_id: "remote-device-client",
+    contexts: {
+      [`ov_s:${channelId}`]: 7,
+      [`ov_c:${channelId}`]: 6,
+      [`ov_b:${channelId}`]: 100,
+      [channelId]: 100, // frontier at B → still active (s=7 > c=6, f<=b)
+    },
+  });
+  const remoteSlotId = "d5".repeat(16);
+  const blobEvent = {
+    id: "d5".repeat(32),
+    pubkey,
+    created_at: 9999,
+    kind: 30078,
+    tags: [
+      ["d", `read-state:${remoteSlotId}`],
+      ["t", "read-state"],
+    ],
+    content: "CIPHER",
+    sig: "s".repeat(128),
+  };
+
+  let fetchCallCount = 0;
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command) => {
+      if (command === "nip44_decrypt_from_self") return remoteBlob;
+      throw new Error(`Unexpected: ${command}`);
+    },
+  };
+
   const fakeRelay = {
-    fetchEvents: async () => [],
+    fetchEvents: async () => {
+      fetchCallCount++;
+      return fetchCallCount === 1 ? [blobEvent] : [];
+    },
     publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeFenced: async (_filter, handler) => {
+      if (fetchCallCount === 0) handler(blobEvent);
+      return makeFenceHandle({ eose: true });
+    },
     subscribeLive: async (_f, _h) => () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
   };
 
-  const mgr = new ReadStateManager(pubkey, fakeRelay);
-  mgr.hydrateFromLocalStorage();
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    mgr.hydrateFromLocalStorage();
 
-  // Merge remote S=7 (another device marked unread after our crash).
-  mgr.overrideRegisters.set(channelId, { s: 7, c: 6, b: 100 });
-  mgr.effectiveState.set(channelId, 100); // frontier below S=7 → active (unread)
-  mgr.isLoadComplete = true;
+    const receipt = mgr.appliedReceipts.get(channelId);
+    assert.ok(receipt, "receipt must be loaded on restart");
+    assert.equal(receipt.intentGen, 1);
+    assert.equal(receipt.op, "read");
 
-  const receipt = mgr.appliedReceipts.get(channelId);
-  assert.ok(receipt, "receipt must be loaded on restart");
-  assert.equal(receipt.intentGen, 1);
-  assert.equal(receipt.op, "read");
+    // Complete load via production path — fetchAndMerge merges remote S=7.
+    await mgr.fetchAndMerge(mgr.loadGeneration);
+    assert.equal(mgr.isLoadComplete, true, "load must complete");
 
-  await mgr.drainPendingIntents(mgr.loadGeneration);
+    // Merged register must reflect remote S=7.
+    const regAfterLoad = mgr.overrideRegisters.get(channelId);
+    assert.ok(regAfterLoad, "register must exist after fetchAndMerge");
+    assert.ok(regAfterLoad.s >= 7, "merged S must be at least 7 (remote S=7)");
 
-  // AlreadyApplied path: no new C-bump. C must remain 6, S must remain 7.
-  const reg = mgr.overrideRegisters.get(channelId);
-  assert.ok(reg);
-  assert.equal(
-    reg.c,
-    6,
-    "C must NOT be re-bumped (would erase remote S=7 unread)",
-  );
-  assert.equal(reg.s, 7, "remote S=7 must be preserved");
+    // Drain — alreadyApplied path: no new C-bump (would erase remote unread).
+    await mgr.drainPendingIntents(mgr.loadGeneration);
 
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "intent must be deleted after alreadyApplied drain",
-  );
+    const reg = mgr.overrideRegisters.get(channelId);
+    assert.ok(reg);
+    assert.equal(
+      reg.c,
+      6,
+      "C must NOT be re-bumped (would erase remote S=7 unread)",
+    );
+    assert.ok(reg.s >= 7, "remote S=7 must be preserved");
 
-  mgr.destroy();
+    assert.equal(
+      pendingOverrideIntentStore.get(channelId),
+      undefined,
+      "intent must be deleted after alreadyApplied drain",
+    );
+
+    mgr.destroy();
+  } finally {
+    delete globalThis.window.__TAURI_INTERNALS__;
+  }
 });
 
 // ── Test 28: Amendment C — receipt without matching intent is swept silently ──
@@ -3806,4 +3903,142 @@ test("drain_queuedUnread_refused_surfacesOutcome", async () => {
   );
 
   mgr.destroy();
+});
+
+// ── Test 43: deferred-refusal-after-restart — intent persisted, hydrated, refused ─
+test("drain_deferredRefusalAfterRestart_intentHydratedAndRefused", async () => {
+  // Intent survives a restart: queued during incomplete load, persisted in the
+  // v2 blob, then loaded by the next session and refused by drain.
+  // Verifies the full round-trip: enqueue → persist → hydrate → drain (refused).
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "43".repeat(32);
+  const channelId = `deferred-restart-ch-${"k".repeat(44)}`;
+
+  const ls = globalThis.window.localStorage;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+
+  // Simulate session 1: intent queued and persisted with a uint32-maxed register.
+  // The session closed before the load completed (crash / tab close).
+  ls.setItem(
+    v2Key,
+    JSON.stringify({
+      r: { [channelId]: { s: 0xffffffff, c: 0, b: 50, f: 50 } },
+      pi: { [channelId]: { gen: 1, op: "unread" } },
+      ng: 2,
+    }),
+  );
+
+  // Session 2: new manager hydrates the persisted intent.
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.hydrateFromLocalStorage();
+
+  // Intent must be restored from v2 blob.
+  const hydrated = pendingOverrideIntentStore.get(channelId);
+  assert.ok(hydrated, "intent must be hydrated from v2 blob on restart");
+  assert.equal(hydrated.op, "unread");
+  assert.equal(hydrated.gen, 1);
+
+  // Wire outcome callback to capture the refusal.
+  const outcomes = [];
+  mgr.onDrainOutcome = (chId, op, status, reason) => {
+    outcomes.push({ chId, op, status, reason });
+  };
+
+  // Complete load and drain — the register is still at uint32-max, so S-bump
+  // would overflow → refused (uint32_overflow).
+  await mgr.fetchAndMerge(mgr.loadGeneration);
+  assert.equal(mgr.isLoadComplete, true, "load must complete");
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  // Drain must surface the refusal via onDrainOutcome.
+  assert.equal(outcomes.length, 1, "exactly one outcome must be emitted");
+  assert.equal(outcomes[0].op, "unread");
+  assert.equal(outcomes[0].status, "refused");
+  assert.equal(outcomes[0].reason, "uint32_overflow");
+
+  // Intent consumed even after refusal (genuine, not load_incomplete).
+  assert.equal(
+    pendingOverrideIntentStore.get(channelId),
+    undefined,
+    "intent must be deleted after genuine refusal on restart",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 44: storage_failed — enqueue survives; in-memory intent is live ─────
+test("markChannelUnread_storageFailed_intentInMemoryOnly", () => {
+  // When localStorage.setItem throws (quota exceeded) during persistLocalState()
+  // after enqueueing a pre-ready intent, the intent must remain in-memory so the
+  // current session can still drain it — failing-safe rather than silently losing
+  // the user's action.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "44".repeat(32);
+  const channelId = `storage-fail-ch-${"l".repeat(50)}`;
+
+  // Replace setItem with a throwing version to simulate quota exhaustion.
+  const origSetItem = globalThis.window.localStorage.setItem;
+  globalThis.window.localStorage.setItem = () => {
+    throw new Error("QuotaExceededError");
+  };
+
+  try {
+    const fakeRelay = {
+      fetchEvents: async () => [],
+      publishEvent: async () => {},
+      subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+      subscribeLive: async (_f, _h) => () => {},
+      subscribeToReconnects: () => () => {},
+      getConnectionGeneration: () => 0,
+    };
+
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    mgr.isLoadComplete = false;
+
+    // Pre-ready enqueue — should succeed despite storage failure.
+    const result = mgr.markChannelUnread(channelId);
+    assert.equal(
+      result.status,
+      "queued",
+      "must return queued on incomplete load",
+    );
+
+    // Intent must be alive in-memory even though persist failed.
+    const intent = pendingOverrideIntentStore.get(channelId);
+    assert.ok(intent, "intent must be in-memory even if persist failed");
+    assert.equal(intent.op, "unread");
+
+    // Restore setItem so we can drain.
+    globalThis.window.localStorage.setItem = origSetItem;
+    mgr.isLoadComplete = true;
+
+    // Drain must pick up the in-memory intent and apply it.
+    // (Register is empty → S-bump succeeds.)
+    return mgr.drainPendingIntents(mgr.loadGeneration).then(() => {
+      const reg = mgr.overrideRegisters.get(channelId);
+      assert.ok(reg, "register must exist after drain");
+      assert.ok(reg.s > 0, "S-bump must have been applied by drain");
+
+      // Intent must be consumed.
+      assert.equal(
+        pendingOverrideIntentStore.get(channelId),
+        undefined,
+        "intent must be consumed by drain",
+      );
+
+      mgr.destroy();
+    });
+  } finally {
+    // Ensure setItem is restored even on test failure.
+    globalThis.window.localStorage.setItem = origSetItem;
+  }
 });

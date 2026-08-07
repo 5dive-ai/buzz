@@ -288,7 +288,7 @@ export function useUnreadChannels(
             observedPersistence.removeChannel(channelId);
             bumpLatestVersion();
           }
-        }
+        } else bumpLatestVersion(); // pre-ready queued intent: trigger rawUnread re-evaluation
       } else if (markAt !== null && clearObserved) {
         observedPersistence.removeChannel(channelId);
         bumpLatestVersion();

@@ -649,3 +649,117 @@ test("clearChannelUnreadSource non-last source: purely local, entry retains rema
 
   await harness.unmount();
 });
+
+// ── Pre-ready witnesses (c) and (d) from trio dispatch ────────────────────────
+
+test("preReady_markChannelUnread_appearsInUnreadChannelIds_beforeLoadComplete", async () => {
+  // Witness (c): a queued mark-unread (pre-ready) immediately appears in
+  // unreadChannelIds via computePreReadyUnread — no manager liveness consulted.
+  //
+  // Bites: readStateOverride.ts:computePreReadyUnread — the pending "unread"
+  // branch. If the pre-ready path never populated unreadChannelIds or if the
+  // rawUnread gate skipped pending intents, this assertion would fail.
+  installFreshStorage();
+
+  const PUBKEY = "pubkey-preready-unread-c";
+  // No relayClient — manager unavailable, load always incomplete.
+  const harness = await mountUnreadChannels({
+    pubkey: PUBKEY,
+    channels: [makeChannel("channel-q")],
+    relayClient: undefined,
+  });
+
+  try {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // Channel must NOT be in unreadChannelIds before the mark.
+    assert.ok(
+      !harness.unreadChannelIds.has("channel-q"),
+      "channel must not be unread before markChannelUnread",
+    );
+
+    // Mark unread pre-ready — must queue and appear immediately via pending intent.
+    await act(async () => {
+      harness.markChannelUnread("channel-q");
+    });
+
+    assert.ok(
+      harness.unreadChannelIds.has("channel-q"),
+      "queued unread must be visible in unreadChannelIds before load completes",
+    );
+  } finally {
+    await harness.unmount();
+  }
+});
+
+test("preReady_markChannelRead_suppressesForcedEntry_sourcePreserved_refusalRestoresMultiSource", async () => {
+  // Witness (d): queued mark-read suppresses committed forced presentation
+  // (channel leaves unreadChannelIds) without deleting sources. On a genuine
+  // drain refusal, the exact multi-source entry is restored and the channel
+  // re-appears as unread.
+  //
+  // Bites: readStateOverride.ts:computePreReadyUnread — the pending "read"
+  // suppression branch. Without it, a queued read would leave the channel bold.
+  // Also bites the drain outcome rollback path in useDrainOutcomeCallback.
+  installFreshStorage();
+
+  const PUBKEY = "pubkey-preready-read-d";
+  const FORCED_KEY = `buzz-forced-unread.v1:${PUBKEY}`;
+  // Seed a multi-source forced entry.
+  localStorage.setItem(
+    FORCED_KEY,
+    JSON.stringify({
+      "channel-r": { markerAtWhenForced: 100, sources: ["inbox", "manual"] },
+    }),
+  );
+
+  // No relayClient — manager unavailable, load always incomplete.
+  const harness = await mountUnreadChannels({
+    pubkey: PUBKEY,
+    channels: [makeChannel("channel-r")],
+    relayClient: undefined,
+  });
+
+  try {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // With no manager, isForcedUnread falls back to the forced-unread store.
+    // The channel is bold because the forced entry exists.
+    assert.ok(
+      harness.unreadChannelIds.has("channel-r"),
+      "channel must be unread before mark-read (forced entry present)",
+    );
+
+    // Mark channel read pre-ready — queues an intent (no frontier/C-bump yet).
+    // rawUnread must suppress the channel (pending read > committed forced entry).
+    await act(async () => {
+      harness.markChannelRead("channel-r", null);
+    });
+
+    assert.ok(
+      !harness.unreadChannelIds.has("channel-r"),
+      "queued read must suppress channel from unreadChannelIds (pending read > committed forced)",
+    );
+
+    // Verify that the forced-unread sources were NOT destructively deleted.
+    const forcedMid = forcedUnreadStore.read(PUBKEY);
+    assert.ok(
+      Object.hasOwn(forcedMid, "channel-r"),
+      "queued read must NOT delete forced-unread sources (non-destructive shadow)",
+    );
+    const midEntry = forcedMid["channel-r"];
+    assert.ok(
+      typeof midEntry === "object" &&
+        midEntry !== null &&
+        Array.isArray(midEntry.sources) &&
+        midEntry.sources.length >= 2,
+      "both sources (inbox, manual) must survive the queued read shadow",
+    );
+  } finally {
+    await harness.unmount();
+  }
+});

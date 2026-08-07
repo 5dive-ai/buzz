@@ -349,6 +349,20 @@ function retireAllLivePermissionCards(d: TranscriptDraft, channelId: string) {
       }
     }
   }
+  // Clean up all pendingPermissions entries scoped to this channel.
+  // Keys use the compound format `ch:session:turn:id` — drop any that start
+  // with the channel prefix.
+  const chPrefix = `${channelId}:`;
+  let permsMutated = false;
+  for (const key of d.pendingPermissions.keys()) {
+    if (key.startsWith(chPrefix)) {
+      if (!permsMutated) {
+        d.pendingPermissions = new Map(d.pendingPermissions);
+        permsMutated = true;
+      }
+      d.pendingPermissions.delete(key);
+    }
+  }
 }
 
 /**
@@ -911,12 +925,22 @@ export function processTranscriptEvent(
         if (existing?.type === "lifecycle") {
           replaceItem(d, itemId, {
             ...existing,
-            outcome: "Uncertain (process restarting)",
+            outcome:
+              "Approval outcome unknown; agent process stopped before it could continue.",
             actionable: false,
           });
         }
         d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
         d.pendingPermissionsByNonce.delete(nonce);
+        // Clean up any matching compound legacy entry.
+        const responseId = jsonRpcId(asRecord(event.payload).id);
+        if (responseId) {
+          const legacyKey = `${ch}:${ctx.sessionId ?? ""}:${ctx.turnId ?? ""}:${responseId}`;
+          if (d.pendingPermissions.has(legacyKey)) {
+            d.pendingPermissions = new Map(d.pendingPermissions);
+            d.pendingPermissions.delete(legacyKey);
+          }
+        }
       }
     }
   } else if (event.kind === "acp_read" || event.kind === "acp_write") {
@@ -963,12 +987,14 @@ export function processTranscriptEvent(
         d.pendingPermissionsByNonce.set(auth.requestNonce, itemId);
       }
 
-      // Index by JSON-RPC id so the response (acp_write with result.outcome,
-      // no method) can correlate by id rather than by turn/seq.
+      // Legacy id index: keyed by compound (channel, session, turn, id) to
+      // prevent cross-channel / cross-session JSON-RPC id collisions.
+      // Only used by authorized frames that carry NO nonce (non-ask paths).
       const requestId = jsonRpcId(payload.id);
       if (requestId) {
+        const legacyKey = `${ch}:${ctx.sessionId ?? ""}:${ctx.turnId ?? ""}:${requestId}`;
         d.pendingPermissions = new Map(d.pendingPermissions);
-        d.pendingPermissions.set(requestId, {
+        d.pendingPermissions.set(legacyKey, {
           itemId,
           optionNames: request.optionNames,
         });
@@ -976,10 +1002,12 @@ export function processTranscriptEvent(
     } else if (event.kind === "acp_write" && !method) {
       // Permission response: {"id": <same as request>, "result": {"outcome": {...}}}
       //
-      // Primary correlation: by `authorization.requestNonce` — a nonce-keyed
-      // lookup is immune to JSON-RPC id reuse across channels/sessions.
-      // Legacy fallback: by JSON-RPC id, scoped to channel `ch` so at least
-      // cross-channel collisions are avoided.
+      // Nonce-keyed correlation is primary and exclusive:
+      //   - If the frame carries a nonce, we look it up in pendingPermissionsByNonce.
+      //     If the nonce is present but unknown (stale/foreign), we DROP the frame —
+      //     we never fall back to the id map, which could resolve the wrong card.
+      //   - If the frame carries NO nonce, we fall back to the legacy compound-key
+      //     id map (channel+session+turn+id) for non-ask synchronized outcomes.
       const auth = event.authorization;
       const nonce = auth?.requestNonce;
       const responseId = jsonRpcId(payload.id);
@@ -991,56 +1019,58 @@ export function processTranscriptEvent(
       // outcome kind directly (which says "reject_once", not "Timed out").
       const terminalReason = auth?.reason;
 
-      // Resolve the permission card: nonce-keyed wins; fall back to id-keyed.
-      const itemIdByNonce = nonce
-        ? d.pendingPermissionsByNonce.get(nonce)
-        : null;
-      const pendingById = responseId
-        ? d.pendingPermissions.get(responseId)
-        : null;
-
-      if (itemIdByNonce) {
-        // Nonce-correlated path: resolve the card and derive copy from reason.
-        const existing = d.itemsById.get(itemIdByNonce);
-        if (existing?.type === "lifecycle") {
-          const outcomeText = describePermissionTerminalReason(
-            terminalReason,
-            outcomeKind,
-            asString(result.optionId) ?? null,
-            existing.options,
-          );
-          replaceItem(d, itemIdByNonce, {
-            ...existing,
-            outcome: outcomeText,
-            actionable: false,
-          });
-        }
-        // Clean up both indexes.
-        if (nonce) {
+      if (nonce !== undefined && nonce !== null) {
+        // Nonce present: nonce-only path. Do NOT fall back on unknown nonce.
+        const itemIdByNonce = d.pendingPermissionsByNonce.get(nonce);
+        if (itemIdByNonce) {
+          const existing = d.itemsById.get(itemIdByNonce);
+          if (existing?.type === "lifecycle") {
+            const outcomeText = describePermissionTerminalReason(
+              terminalReason,
+              outcomeKind,
+              asString(result.optionId) ?? null,
+              existing.options,
+            );
+            replaceItem(d, itemIdByNonce, {
+              ...existing,
+              outcome: outcomeText,
+              actionable: false,
+            });
+          }
+          // Clean up nonce index.
           d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
           d.pendingPermissionsByNonce.delete(nonce);
+          // Clean up compound legacy key if it matches.
+          if (responseId) {
+            const legacyKey = `${ch}:${ctx.sessionId ?? ""}:${ctx.turnId ?? ""}:${responseId}`;
+            if (d.pendingPermissions.has(legacyKey)) {
+              d.pendingPermissions = new Map(d.pendingPermissions);
+              d.pendingPermissions.delete(legacyKey);
+            }
+          }
         }
-        if (responseId) {
+        // Unknown nonce: drop frame — do not mutate any card.
+      } else if (outcomeKind && responseId) {
+        // No nonce: legacy compound-key fallback for non-ask paths.
+        const legacyKey = `${ch}:${ctx.sessionId ?? ""}:${ctx.turnId ?? ""}:${responseId}`;
+        const pendingById = d.pendingPermissions.get(legacyKey);
+        if (pendingById) {
+          const optionId = asString(result.optionId) ?? null;
+          const outcomeText = describePermissionOutcome(
+            outcomeKind,
+            optionId,
+            pendingById.optionNames,
+          );
+          const existing = d.itemsById.get(pendingById.itemId);
+          if (existing?.type === "lifecycle") {
+            replaceItem(d, pendingById.itemId, {
+              ...existing,
+              outcome: outcomeText,
+              actionable: false,
+            });
+          }
           d.pendingPermissions = new Map(d.pendingPermissions);
-          d.pendingPermissions.delete(responseId);
-        }
-      } else if (pendingById && outcomeKind && responseId) {
-        // Legacy id-correlation fallback (non-ask paths with no nonce).
-        const optionId = asString(result.optionId) ?? null;
-        const outcomeText = describePermissionOutcome(
-          outcomeKind,
-          optionId,
-          pendingById.optionNames,
-        );
-        const existing = d.itemsById.get(pendingById.itemId);
-        if (existing?.type === "lifecycle") {
-          replaceItem(d, pendingById.itemId, {
-            ...existing,
-            outcome: outcomeText,
-            actionable: false,
-          });
-          d.pendingPermissions = new Map(d.pendingPermissions);
-          d.pendingPermissions.delete(responseId);
+          d.pendingPermissions.delete(legacyKey);
         }
       }
     } else if (event.kind === "acp_write" && method === "session/prompt") {

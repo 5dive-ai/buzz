@@ -124,11 +124,21 @@ below). It is omitted on all other frame kinds.
 | `turn_completed`   | Terminal lifecycle — emitted when a turn ends (success, cancel, or timeout)                  |
 | `turn_error`       | Terminal lifecycle — emitted when a turn ends with an error or process death                  |
 | `control_result`   | Acknowledgement telemetry emitted after processing a control frame |
+| `permission_terminal` | Observer-only terminal for uncertain permission outcomes (process poison or cancel-during-write). No ACP wire response was confirmed. Carries an `authorization` envelope with `reason = "uncertain"`. Desktop uses this to retire the card without a JSON-RPC response. |
 
 Permission `acp_read` frames (carrying `session/request_permission` calls) always
 include an `authorization` envelope. The corresponding `acp_write` (the harness
 response) also includes an `authorization` envelope correlated by the same nonce —
 this pairs the challenge and answer in the observer log.
+
+Synchronous policy outcomes (`reject`, `allow`, preflight denial) also produce
+`acp_write` frames with `authorization` envelopes. Their `reason` values are:
+
+| Policy path | `reason` |
+|-------------|----------|
+| `reject` policy, preflight denial, ask-unavailable downgrade | `"rejected"` |
+| `allow` policy (auto-approval succeeded) | `"allowed"` |
+| `allow` policy (fail-closed, no unique allow_once option) | `"allow_failed_closed"` |
 
 **One-write / one-observe contract.** Each pending permission entry produces at most
 one ACP wire write and at most one authorized `acp_write` observer event. The write
@@ -165,10 +175,16 @@ call, the `ObserverEvent` carries an `authorization` field:
   | `"applied"` | Owner decision was received and written to the agent pipe. |
   | `"timed_out"` | No decision arrived before the 300-second per-request deadline; request failed closed (denial). |
   | `"cancelled"` | The turn was cancelled while the request was pending; request failed closed (denial). |
+  | `"rejected"` | `reject` policy, preflight denial, or ask-unavailable downgrade; request denied synchronously without an actionable card. |
+  | `"allowed"` | `allow` policy auto-approval succeeded; request granted synchronously. |
+  | `"allow_failed_closed"` | `allow` policy but no unique `allow_once` option available; request denied synchronously. |
 
-  The `uncertain` terminal (cancel arriving while the write is in flight) does NOT
-  produce an `acp_write` observer event — instead the harness emits a
-  `permission_terminal` observer event with `authorization.reason = "uncertain"` so
+  `"rejected"`, `"allowed"`, and `"allow_failed_closed"` are emitted on `acp_write` frames
+  for synchronous policy paths (see [Synchronous policy outcomes](#synchronous-policy-outcomes)).
+  They are NOT emitted for `ask`-policy pending-map entries.
+
+  The `uncertain` outcome does NOT produce an `acp_write` observer event — instead the
+  harness emits a `permission_terminal` observer event with `authorization.reason = "uncertain"` so
   Desktop clients can retire the card without an ACP wire response. The process is
   irrecoverably poisoned and will be respawned by the pool. Desktop clients MUST NOT
   expect an `acp_write` for every `acp_read` they receive; the corresponding

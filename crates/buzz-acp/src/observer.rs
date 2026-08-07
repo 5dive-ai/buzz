@@ -73,7 +73,7 @@ fn new_observer_handle() -> ObserverHandle {
 }
 
 /// Event delivered through the in-process observer bus.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObserverEvent {
     /// Monotonic process-local sequence number.

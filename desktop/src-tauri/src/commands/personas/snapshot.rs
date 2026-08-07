@@ -456,6 +456,9 @@ pub async fn encode_agent_snapshot_for_send(
 }
 
 #[cfg(test)]
+#[path = "snapshot/tests_export_resolver_guard.rs"]
+mod export_resolver_guard;
+#[cfg(test)]
 mod fidelity_tests;
 #[cfg(test)]
 mod tests;

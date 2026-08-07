@@ -5,8 +5,10 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Keep only the newest run for each PR and for main. Release runs are never
+  # cancelled: a newer release push must not evict an older release gate.
+  group: ci-${{ github.workflow }}-${{ (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always

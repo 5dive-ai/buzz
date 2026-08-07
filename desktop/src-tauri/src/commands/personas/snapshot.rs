@@ -245,7 +245,17 @@ pub(crate) async fn materialize_snapshot_bytes(
             .lock()
             .map_err(|e| e.to_string())?;
 
+        // Fold the kind:30179 overlay onto the disk records (and synthesize
+        // relay-only entries) so export sees the EFFECTIVE config — the same
+        // resolution the agent list uses. Raw disk here would export stale
+        // values on a follower device and fail with "agent not found" for a
+        // relay-only agent that has never been started on this device.
         let instances = load_managed_agents(&app)?;
+        let instances = state
+            .private_managed_agent_overlay
+            .lock()
+            .map_err(|e| e.to_string())?
+            .resolved_records(&instances);
         let definitions = load_agent_definitions(&app)?;
         let (def_record, is_definition) = resolve_from_lists(&id, &instances, &definitions)
             .map(|(r, is_def)| (r.clone(), is_def))?;

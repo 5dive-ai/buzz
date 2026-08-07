@@ -493,7 +493,14 @@ pub fn card_mint_key_status(
         .lock()
         .map_err(|e| e.to_string())?;
 
+    // Overlay-fold (kind:30179) so the status reflects the agent's effective
+    // config — including relay-only agents with no local record yet.
     let instances = load_managed_agents(&app)?;
+    let instances = state
+        .private_managed_agent_overlay
+        .lock()
+        .map_err(|e| e.to_string())?
+        .resolved_records(&instances);
     let definitions = load_agent_definitions(&app)?;
     let (record, _) = resolve_from_lists(&id, &instances, &definitions)?;
 
@@ -549,7 +556,15 @@ pub async fn mint_agent_card(
             .lock()
             .map_err(|e| e.to_string())?;
 
+        // Overlay-fold (kind:30179) — same resolution as snapshot export and
+        // the agent list: mint sees effective config, and a relay-only agent
+        // resolves before its first START on this device.
         let instances = load_managed_agents(&app)?;
+        let instances = state
+            .private_managed_agent_overlay
+            .lock()
+            .map_err(|e| e.to_string())?
+            .resolved_records(&instances);
         let definitions = load_agent_definitions(&app)?;
         let (record, is_definition) =
             resolve_from_lists(&id, &instances, &definitions).map(|(r, d)| (r.clone(), d))?;

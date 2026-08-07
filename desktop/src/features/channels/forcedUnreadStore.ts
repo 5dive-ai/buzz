@@ -157,17 +157,5 @@ export function useForcedUnreadActions(
     },
     [forcedUnreadRef, getOwnTimestamp, persist],
   );
-  const clearChannelUnreadSource = React.useCallback(
-    (channelId: string, source: ForcedUnreadSource) => {
-      if (!Object.hasOwn(forcedUnreadRef.current, channelId)) return;
-      const current = forcedUnreadRef.current[channelId];
-      const next = removeForcedUnreadSource(current, source);
-      if (next === current) return;
-      if (next === undefined) delete forcedUnreadRef.current[channelId];
-      else forcedUnreadRef.current[channelId] = next;
-      persist();
-    },
-    [forcedUnreadRef, persist],
-  );
-  return { clearChannelUnreadSource, markChannelUnread };
+  return { markChannelUnread };
 }

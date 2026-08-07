@@ -56,6 +56,29 @@ pub(crate) fn resolve_from_lists<'a>(
     Err(format!("agent {id:?} not found"))
 }
 
+/// Load the managed-agent instances with the kind:30179 private-config
+/// overlay folded on — patching disk records and synthesizing relay-only
+/// entries, the same resolution the agent list uses.
+///
+/// Every export/card resolver must read instances through this helper, never
+/// raw `load_managed_agents`: raw disk exports stale values on a follower
+/// device and fails with "agent not found" for a relay-only agent that has
+/// never been started on this device.
+///
+/// Lock order: callers already hold `managed_agents_store_lock` (outer);
+/// this takes only the overlay lock (inner) and releases it before returning.
+pub(crate) fn load_effective_managed_agents(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<Vec<ManagedAgentRecord>, String> {
+    let instances = load_managed_agents(app)?;
+    Ok(state
+        .private_managed_agent_overlay
+        .lock()
+        .map_err(|e| e.to_string())?
+        .resolved_records(&instances))
+}
+
 /// Validate that `memory_source_pubkey` is an appropriate source for a
 /// memory-bearing snapshot export.
 ///
@@ -246,16 +269,9 @@ pub(crate) async fn materialize_snapshot_bytes(
             .map_err(|e| e.to_string())?;
 
         // Fold the kind:30179 overlay onto the disk records (and synthesize
-        // relay-only entries) so export sees the EFFECTIVE config — the same
-        // resolution the agent list uses. Raw disk here would export stale
-        // values on a follower device and fail with "agent not found" for a
-        // relay-only agent that has never been started on this device.
-        let instances = load_managed_agents(&app)?;
-        let instances = state
-            .private_managed_agent_overlay
-            .lock()
-            .map_err(|e| e.to_string())?
-            .resolved_records(&instances);
+        // relay-only entries) so export sees the EFFECTIVE config — see
+        // `load_effective_managed_agents`.
+        let instances = load_effective_managed_agents(&app, &state)?;
         let definitions = load_agent_definitions(&app)?;
         let (def_record, is_definition) = resolve_from_lists(&id, &instances, &definitions)
             .map(|(r, is_def)| (r.clone(), is_def))?;

@@ -24,6 +24,7 @@ import {
 import {
   applyOverrideRead,
   applyOverrideUnread,
+  computePreReadyUnread,
   useClearChannelUnreadSource,
   type OverrideAPIs,
 } from "@/features/channels/readStateOverride";
@@ -267,7 +268,7 @@ export function useUnreadChannels(
         readAt,
         observedLatest,
       );
-      if (markAt !== null) {
+      if (markAt !== null && overrideApis.isReadStateReady) {
         markContextRead(channelId, markAt);
       }
       // C-bump; clear local presentation only when liveness is confirmed inactive
@@ -817,13 +818,7 @@ export function useUnreadChannels(
     // biome-ignore lint/correctness/useExhaustiveDependencies: readStateVersion and latestVersion are intentional invalidation signals
     React.useMemo(() => {
       if (!isReadStateReady || !observedPersistence.isScopeLoaded()) {
-        return {
-          unreadChannelIds: new Set<string>(),
-          topLevelUnreadChannelIds: new Set<string>(),
-          highPriorityUnreadChannelIds: new Set<string>(),
-          unreadChannelCounts: new Map<string, number>(),
-          unreadChannelNotificationCount: 0,
-        };
+        return computePreReadyUnread(Object.keys(forcedUnreadRef.current));
       }
 
       const unread = new Set<string>();
@@ -937,7 +932,7 @@ export function useUnreadChannels(
         latestByChannelRef.current.get(channelId) ??
         getEffectiveTimestamp(channelId) ??
         null;
-      if (unixSeconds !== null) {
+      if (unixSeconds !== null && overrideApis.isReadStateReady) {
         markContextRead(channelId, unixSeconds);
       }
       // Gate ALL evidence clearing on the manager outcome — a refused clear

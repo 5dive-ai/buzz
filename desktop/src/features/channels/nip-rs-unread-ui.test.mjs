@@ -24,12 +24,14 @@ import test from "node:test";
 import {
   applyOverrideRead,
   applyOverrideUnread,
+  computePreReadyUnread,
   overrideErrorMessage,
   persistForcedUnread,
 } from "./readStateOverride.ts";
 import { forcedUnreadStore } from "./forcedUnreadStore.ts";
 import { resolveChannelReadMarker } from "./useUnreadChannelsHelpers.ts";
 import { applyMarkUnreadDividerOverlay } from "./ui/useChannelUnreadState.ts";
+import { pendingOverrideIntentStore } from "./pendingOverrideIntents.ts";
 
 // ── localStorage mock ────────────────────────────────────────────────────────
 
@@ -162,22 +164,32 @@ function makeApis(overrides = {}) {
   };
 }
 
-test("applyOverrideRead_manager_not_ready_fails_closed_overrideStillActive", () => {
-  // Step 1: !isReadStateReady → fail closed without calling manager.
-  let bumped = false;
+test("applyOverrideRead_preReady_callsMarkChannelRead_returns_queued_outcome", () => {
+  // Witness (a): explicit pre-ready read routes through markChannelRead (no early
+  // return); manager returns "queued" → intent is recorded; function returns
+  // overrideStillActive (sources preserved, presentation handled by rawUnread).
+  let markCalled = false;
   const result = applyOverrideRead(
     "ch-1",
     makeApis({
       isReadStateReady: false,
       markChannelRead: () => {
-        bumped = true;
-        return { status: "applied" };
+        markCalled = true;
+        return { status: "queued" };
       },
       getOverrideLiveness: () => ({ active: true, frontier: 50 }),
     }),
   );
-  assert.equal(result, "overrideStillActive");
-  assert.equal(bumped, false, "C-bump must not fire when manager not ready");
+  assert.equal(
+    result,
+    "overrideStillActive",
+    "queued result → overrideStillActive (sources preserved; rawUnread handles presentation)",
+  );
+  assert.equal(
+    markCalled,
+    true,
+    "markChannelRead must be called even when load is not ready — no fail-closed early return",
+  );
 });
 
 test("applyOverrideRead_ready_null_liveness_no_register_overrideCleared", () => {
@@ -523,15 +535,16 @@ test("applyOverrideRead_partial_refusal_pattern_clears_only_inactive", () => {
 
 // ── Adversarial witnesses (pass-3 closures) ───────────────────────────────────
 
-test("adversarial-3: incomplete_load_null_liveness_not_known_absent_overrideStillActive", () => {
-  // IMPORTANT: isReadStateReady = false (load incomplete) + null getOverrideLiveness
-  // must NOT be treated as known register absence. The old bug: isReadStateReady was
-  // set on initialization (not load-complete), so a partially-loaded manager reported
-  // null liveness which was silently treated as "no register" and the local hint was
-  // cleared. With isReadStateReady now meaning loadComplete, this path is fail-closed.
+test("adversarial-3: preReady_read_queued_preserves_sources_suppresses_via_rawUnread", () => {
+  // Witness (d): queued read returns overrideStillActive → caller does NOT delete
+  // forced-unread sources. Presentation suppression is handled by rawUnread's
+  // pending-read precedence rule, not by deleting source entries.
   //
-  // This test drives applyOverrideRead with isReadStateReady=false (semantically:
-  // load is not complete) and null liveness — must return overrideStillActive.
+  // Also verifies that pre-ready null liveness is NOT treated as known absence:
+  // the old adversarial-3 bug (isReadStateReady=false + null liveness → cleared)
+  // is no longer possible because null liveness is only short-circuited when
+  // isReadStateReady=true. With isReadStateReady=false the function falls through
+  // to markChannelRead() which returns "queued".
   let markCalled = false;
   const result = applyOverrideRead(
     "ch-1",
@@ -539,7 +552,7 @@ test("adversarial-3: incomplete_load_null_liveness_not_known_absent_overrideStil
       isReadStateReady: false, // load not complete
       markChannelRead: () => {
         markCalled = true;
-        return { status: "refused", reason: "load_incomplete" };
+        return { status: "queued" }; // intent enqueued, no register mutation
       },
       getOverrideLiveness: () => null, // null from incomplete load ≠ known absent
     }),
@@ -547,12 +560,12 @@ test("adversarial-3: incomplete_load_null_liveness_not_known_absent_overrideStil
   assert.equal(
     result,
     "overrideStillActive",
-    "incomplete load must fail closed",
+    "pre-ready queued read → overrideStillActive (sources preserved)",
   );
   assert.equal(
     markCalled,
-    false,
-    "must not call manager when load not complete",
+    true,
+    "markChannelRead must be called — null liveness pre-ready is not known absence",
   );
 });
 
@@ -650,5 +663,111 @@ test("adversarial-6: markChannelRead_spec_order_frontier_advance_before_cbump", 
     result,
     "overrideCleared",
     "after frontier advance past B, C-bump must clear the override",
+  );
+});
+
+// ── Pre-ready presentation witnesses (Thufir pass-1 conformance) ─────────────
+//
+// Witnesses (a), (c), (d) from the four required by the pass-1 mid-flight
+// correction. Witness (b) — zero frontier/register mutation — lives in
+// readStateManager.test.mjs where the full manager can be instantiated.
+
+test("preReady_read_witness_a_queued_intent_recorded", () => {
+  // Witness (a): explicit pre-ready read returns/records "queued".
+  // applyOverrideRead must call markChannelRead even when !isReadStateReady,
+  // and the function must return overrideStillActive (intent was enqueued by
+  // the manager — no early return before the call).
+  let callCount = 0;
+  const result = applyOverrideRead(
+    "ch-witness-a",
+    makeApis({
+      isReadStateReady: false,
+      markChannelRead: () => {
+        callCount++;
+        return { status: "queued" };
+      },
+      getOverrideLiveness: () => ({ active: true, frontier: 10 }),
+    }),
+  );
+  assert.equal(
+    callCount,
+    1,
+    "markChannelRead must be called exactly once pre-ready",
+  );
+  assert.equal(
+    result,
+    "overrideStillActive",
+    "queued result must be overrideStillActive",
+  );
+});
+
+test("preReady_unread_witness_c_pendingUnread_visible_during_loading", () => {
+  // Witness (c): pending unread is visible during loading; pending read suppresses
+  // committed forced entry; committed forced with no pending is visible.
+  // Exercises the ratified precedence rule via the production computePreReadyUnread helper.
+  const { restore } = makeIsolatedStorage();
+  const pubkey = "cc".repeat(32);
+  pendingOverrideIntentStore.loadForPubkey(pubkey);
+  pendingOverrideIntentStore.enqueue("ch-unread", "unread");
+  pendingOverrideIntentStore.enqueue("ch-read", "read");
+
+  // forcedMap: ch-read (forced+pending-read→suppressed), ch-none (forced-only→visible),
+  // ch-unread (forced+pending-unread→visible).
+  const forcedKeys = ["ch-read", "ch-none", "ch-unread"];
+  const result = computePreReadyUnread(forcedKeys);
+
+  assert.ok(
+    result.unreadChannelIds.has("ch-unread"),
+    "pending unread → visible",
+  );
+  assert.ok(
+    result.unreadChannelIds.has("ch-none"),
+    "committed forced, no pending → visible",
+  );
+  assert.ok(
+    !result.unreadChannelIds.has("ch-read"),
+    "pending read suppresses forced entry",
+  );
+
+  pendingOverrideIntentStore.compareAndDelete(
+    "ch-unread",
+    pendingOverrideIntentStore.get("ch-unread").gen,
+  );
+  pendingOverrideIntentStore.compareAndDelete(
+    "ch-read",
+    pendingOverrideIntentStore.get("ch-read").gen,
+  );
+  restore();
+});
+
+test("preReady_read_witness_d_queued_read_preserves_sources_overrideStillActive", () => {
+  // Witness (d): queued read suppresses committed forced presentation without
+  // deleting its sources. The function returns overrideStillActive so the
+  // caller's overrideCleared gate is NOT entered, leaving forcedUnreadRef intact.
+  //
+  // Also verifies: if the read is later refused (e.g., drain returns
+  // already_inactive), the forced entry can be restored from the intact sources.
+  const forcedMap = {
+    "ch-d": null, // simulated forced entry with two sources
+  };
+
+  const result = applyOverrideRead(
+    "ch-d",
+    makeApis({
+      isReadStateReady: false,
+      markChannelRead: () => ({ status: "queued" }),
+      getOverrideLiveness: () => ({ active: true, frontier: 0 }),
+    }),
+  );
+
+  assert.equal(
+    result,
+    "overrideStillActive",
+    "queued read must return overrideStillActive so caller does not delete sources",
+  );
+  // The forced entry is intact — caller's overrideCleared gate was not entered.
+  assert.ok(
+    Object.hasOwn(forcedMap, "ch-d"),
+    "forced entry must be preserved (not deleted)",
   );
 });

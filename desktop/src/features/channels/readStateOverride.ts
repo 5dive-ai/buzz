@@ -16,6 +16,7 @@ import {
   type ForcedUnreadMap,
   type ForcedUnreadSource,
 } from "@/features/channels/forcedUnreadStore";
+import { pendingOverrideIntentStore } from "@/features/channels/pendingOverrideIntents";
 
 export type { MarkResult, OverrideLiveness };
 
@@ -88,10 +89,11 @@ export function applyOverrideUnread(
  *   exists, the frontier deactivated it, or the C-bump succeeded). Callers
  *   should clear local presentation.
  *
- * `overrideStillActive` — the manager is unavailable (fail-closed) or the
- *   C-bump was refused and liveness remains active. Callers MUST NOT clear
- *   local unread presentation; NIP-RS:537-539 requires success only when
- *   resulting override_active == false.
+ * `overrideStillActive` — the C-bump was refused and liveness remains active,
+ *   or the intent was queued (load incomplete). Callers MUST NOT clear local
+ *   unread presentation or delete forced-unread sources; when queued the
+ *   rawUnread gate suppresses presentation via the pending-read precedence
+ *   rule (pending read > pending unread > committed forced entry).
  */
 export type OverrideReadOutcome = "overrideCleared" | "overrideStillActive";
 
@@ -99,14 +101,15 @@ export type OverrideReadOutcome = "overrideCleared" | "overrideStillActive";
  * Attempt to clear the NIP-RS override for `channelId` as part of an explicit
  * mark-read transition. Models the transition as a single outcome:
  *
- *   1. Load not complete (!isReadStateReady): fail-closed —
- *      return overrideStillActive (null liveness after an incomplete load is
- *      ambiguous, not known absence).
- *   2. liveness === null (load complete, no register): return overrideCleared
- *      (known absence after a complete load; no C-bump needed).
- *   3. liveness exists (active or inactive): always call markChannelRead —
- *      spec NIP-RS:537-539 requires the C-bump even when the frontier already
- *      deactivated the override. Then re-read liveness.
+ *   1. Load complete + null liveness → known absence (overrideCleared, no C-bump).
+ *      NOTE: null liveness is only "known absent" when the load is complete.
+ *      Pre-ready null from partial state is ambiguous — do not short-circuit.
+ *   2. Load incomplete → markChannelRead() queues the intent (returns "queued").
+ *      Sources are preserved; rawUnread suppresses presentation via pending
+ *      precedence. Return overrideStillActive — no deletion at call sites.
+ *   3. liveness exists (active or inactive, load complete): always call
+ *      markChannelRead — spec NIP-RS:537-539 requires the C-bump even when
+ *      the frontier already deactivated the override. Then re-read liveness.
  *      a. Resulting liveness inactive (or already_inactive race): cleared.
  *      b. uint32 refusal AND F > B (frontier already deactivated): cleared,
  *         no error toast (representable C-bump was not possible, frontier
@@ -117,20 +120,29 @@ export function applyOverrideRead(
   channelId: string,
   apis: OverrideAPIs,
 ): OverrideReadOutcome {
-  // Step 1: manager unavailable → fail closed.
-  if (!apis.isReadStateReady) return "overrideStillActive";
+  // Step 1: load complete + no register → known absence, cleared.
+  // Guard: only treat null as "known absent" when the load is complete.
+  // Pre-ready null liveness is ambiguous (partial view), not confirmed absence.
+  if (apis.isReadStateReady) {
+    const liveness = apis.getOverrideLiveness(channelId);
+    if (liveness === null) return "overrideCleared";
+  }
 
-  const liveness = apis.getOverrideLiveness(channelId);
-
-  // Step 2: load complete but no register at all → known absence, cleared.
-  if (liveness === null) return "overrideCleared";
-
-  // Step 3: register exists — always attempt the C-bump (NIP-RS:537-539).
+  // Step 2 / 3: attempt the C-bump (or queue it when load is incomplete).
+  // markChannelRead() returns "queued" on incomplete load, performing no
+  // register or frontier mutation. Sources are preserved; the intent drains
+  // on the next complete-load transition and rawUnread suppresses presentation
+  // via the pending-read precedence rule.
   const result = apis.markChannelRead(channelId);
 
   if (result.status === "queued") {
-    // Intent enqueued — fail-closed: treat load-incomplete as overrideStillActive.
-    // The forced-unread entry is preserved; the intent drains on next complete load.
+    // Intent enqueued — sources preserved, rawUnread handles presentation.
+    return "overrideStillActive";
+  }
+
+  if (result.status === "refused" && result.reason === "load_incomplete") {
+    // Manager unavailable (no relay client) or load truly incomplete — fail closed.
+    // Sources preserved; this is not a successful clear.
     return "overrideStillActive";
   }
 
@@ -139,7 +151,7 @@ export function applyOverrideRead(
     return "overrideCleared";
   }
 
-  // Re-read liveness after the attempt.
+  // Re-read liveness after the attempt (only valid when load complete).
   const afterLiveness = apis.getOverrideLiveness(channelId);
   // Covers: successful C-bump (inactive after), F>B deactivation (inactive after),
   // and uint32 refusal where F>B already deactivated the register.
@@ -204,6 +216,46 @@ export function useClearChannelUnreadSource(
     },
     [apis, forcedUnreadRef, onChange, pubkey],
   );
+}
+
+/**
+ * Compute the pre-ready (incomplete-load) unread set from local-only state.
+ * Precedence: pending read suppresses > pending unread asserts > committed forced.
+ * Never consults partial manager liveness or observed-event state.
+ */
+export function computePreReadyUnread(forcedChannelIds: Iterable<string>): {
+  unreadChannelIds: Set<string>;
+  topLevelUnreadChannelIds: Set<string>;
+  highPriorityUnreadChannelIds: Set<string>;
+  unreadChannelCounts: Map<string, number>;
+  unreadChannelNotificationCount: number;
+} {
+  const unread = new Set<string>();
+  const topLevelUnread = new Set<string>();
+  for (const channelId of forcedChannelIds) {
+    if (pendingOverrideIntentStore.get(channelId)?.op !== "read") {
+      unread.add(channelId);
+      topLevelUnread.add(channelId);
+    }
+  }
+  for (const channelId of pendingOverrideIntentStore.channelIds()) {
+    if (
+      pendingOverrideIntentStore.get(channelId)?.op === "unread" &&
+      !unread.has(channelId)
+    ) {
+      unread.add(channelId);
+      topLevelUnread.add(channelId);
+    }
+  }
+  const counts = new Map<string, number>();
+  for (const channelId of unread) counts.set(channelId, 1);
+  return {
+    unreadChannelIds: unread,
+    topLevelUnreadChannelIds: topLevelUnread,
+    highPriorityUnreadChannelIds: new Set<string>(),
+    unreadChannelCounts: counts,
+    unreadChannelNotificationCount: unread.size,
+  };
 }
 
 /**

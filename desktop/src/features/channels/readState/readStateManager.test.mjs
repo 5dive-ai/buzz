@@ -990,6 +990,69 @@ test("fetchAndMerge_incompleteLoad_blocksGatedOperations", async () => {
   mgr.destroy();
 });
 
+// ── 2i-b: pre-ready read click → zero register/frontier mutation, zero publish ─
+test("preReady_read_witness_b_zeroMutationZeroPublish", async () => {
+  // Witness (b): explicit mark-read during incomplete load causes zero
+  // register mutation, zero frontier advance, and zero publication.
+  //
+  // Verifies:
+  //   - markChannelRead returns "queued" (intent enqueued only, no bump).
+  //   - No publish fires.
+  //   - overrideRegisters is empty (no S/C/B bump).
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "ee".repeat(32);
+  let publishCalls = 0;
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {
+      publishCalls++;
+    },
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    // Force incomplete load by making subscribeFenced throw.
+    subscribeFenced: async () => {
+      throw new Error("fence timeout");
+    },
+    subscribeLive: async (_f, _h) => () => {},
+  };
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  await mgr.fetchAndMerge();
+
+  assert.equal(mgr.isLoadComplete, false, "precondition: load is incomplete");
+
+  const channelId = "witness-b-ch";
+  const regBefore = mgr.overrideRegisters.get(channelId);
+
+  // Simulate the read click: markChannelRead (register path) only.
+  // The frontier advance (markContextRead) is guarded at the hook level, not here.
+  const result = mgr.markChannelRead(channelId);
+  assert.equal(
+    result.status,
+    "queued",
+    "markChannelRead must return queued pre-ready",
+  );
+
+  // Register is untouched — no S/C/B bump.
+  const regAfter = mgr.overrideRegisters.get(channelId);
+  assert.equal(
+    regAfter,
+    regBefore,
+    "override register must be unchanged after queued read",
+  );
+  assert.equal(
+    regAfter,
+    undefined,
+    "no register entry must exist for the channel",
+  );
+
+  // No publication fired.
+  mgr.fetchOwnBlobBeforePublish = async () => true;
+  await mgr.publish();
+  assert.equal(publishCalls, 0, "zero publish allowed before complete load");
+
+  mgr.destroy();
+});
+
 // ── 2j: production retry path fires on reconnect ─────────────────────────────
 test("retryLoad_firesOnReconnect_andClearsIncomplete", async () => {
   // startLiveSubscription wires retryLoad() via subscribeToReconnects.

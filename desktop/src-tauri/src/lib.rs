@@ -312,8 +312,18 @@ pub fn run() {
             let app_handle = app.handle().clone();
             #[cfg(target_os = "macos")]
             {
-                tray_menu::init(&app_handle)?;
-                macos_notifications::init(&app_handle)?;
+                // Native conveniences must not take down the whole app. In
+                // particular, a rapid reset/relaunch can briefly leave macOS
+                // resources from the exiting process unavailable; propagating
+                // either error out of Tauri's setup callback panics across the
+                // Objective-C applicationDidFinishLaunching boundary and macOS
+                // reports the clean relaunch as a crash.
+                if let Err(error) = tray_menu::init(&app_handle) {
+                    eprintln!("buzz-desktop: failed to initialize tray menu: {error}");
+                }
+                if let Err(error) = macos_notifications::init(&app_handle) {
+                    eprintln!("buzz-desktop: failed to initialize notifications: {error}");
+                }
             }
 
             // ── Phase 2: boot-time sentinel wipe ──────────────────────────────

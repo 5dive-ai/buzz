@@ -2726,3 +2726,76 @@ test("buildTranscript_permission_terminal_in_archive_replay_retires_card", () =>
     "nonce index must be clean after archive replay",
   );
 });
+
+// ─── Sync denial: acp_write with matching nonce retires the acp_read card ─────
+// These tests verify the nonce-threading fix: before the fix, sync denial paths
+// generated two different nonces (one for acp_read, a second for acp_write),
+// so Desktop's nonce-only correlation could never find the read card.
+
+test("buildTranscript_sync_denial_write_with_matching_nonce_retires_card", () => {
+  // Non-actionable acp_read (sync denial — reject/preflight path) followed by
+  // acp_write carrying the SAME nonce. The write must retire the card and clear
+  // both indexes.
+  const nonce = "nonce-sync-deny";
+  const events = [
+    // Non-actionable read: card is created but not user-interactive.
+    makePermissionRequestWithAuth(1, "req-sd", nonce, {
+      actionable: false,
+      reason: "rejected",
+    }),
+    // Write with the same nonce — this is the fix under test.
+    makePermissionWriteWithNonce(2, "req-sd", nonce, "rejected", "reject_once"),
+  ];
+  const state = buildTranscriptState(events);
+
+  // Card must be retired (not actionable, outcome set).
+  const card = state.items.find(
+    (i) => i.renderClass === "permission" && i.requestNonce === nonce,
+  );
+  assert.ok(card, "permission card must exist after sync denial");
+  assert.equal(
+    card.actionable,
+    false,
+    "card must be non-actionable after matching-nonce acp_write",
+  );
+
+  // Both indexes must be cleared.
+  assert.ok(
+    !state.pendingPermissionsByNonce.has(nonce),
+    "nonce index must be cleared after matching-nonce acp_write",
+  );
+  const legacyKey = `ch-1:session-1:turn-1:${JSON.stringify("req-sd")}`;
+  assert.ok(
+    !state.pendingPermissions.has(legacyKey),
+    "legacy index must be cleared after matching-nonce acp_write",
+  );
+});
+
+test("buildTranscript_sync_denial_write_with_mismatched_nonce_leaves_card_live", () => {
+  // Regression guard: if the nonce on the acp_write does NOT match the acp_read,
+  // Desktop's nonce-only rule must drop the write — the read card stays live.
+  // (This is the broken-before-fix scenario the nonce-threading corrects.)
+  const readNonce = "nonce-read-mismatch";
+  const writeNonce = "nonce-write-different"; // intentionally different
+  const events = [
+    makePermissionRequestWithAuth(1, "req-mm", readNonce, {
+      actionable: false,
+      reason: "rejected",
+    }),
+    makePermissionWriteWithNonce(
+      2,
+      "req-mm",
+      writeNonce,
+      "rejected",
+      "reject_once",
+    ),
+  ];
+  const state = buildTranscriptState(events);
+
+  // The write carried an unknown nonce → dropped per nonce-only rule.
+  // The read card remains in the nonce index.
+  assert.ok(
+    state.pendingPermissionsByNonce.has(readNonce),
+    "nonce index must still contain the read card when write nonce does not match",
+  );
+});

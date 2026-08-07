@@ -111,7 +111,11 @@ ignored.
 
 `authorization` is present only on `acp_read` and `acp_write` frames that correspond
 to `session/request_permission` calls (see [Authorization Envelope](#authorization-envelope)
-below). It is omitted on all other frame kinds.
+below). It is omitted on all other frame kinds — with one exception: the observer-only
+`permission_terminal` kind also carries `authorization` (with `reason = "uncertain"`) to
+signal an unconfirmed outcome. `permission_terminal` is never an ACP wire frame; it is
+emitted by the harness solely for Desktop card retirement when no confirmed `acp_write`
+response was possible.
 
 ### Frame Kinds
 

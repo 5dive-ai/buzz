@@ -94,7 +94,9 @@ pub struct ObserverEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     /// Authorization envelope — present only on permission `acp_read` /
-    /// `acp_write` frames. `None` on all other event kinds.
+    /// `acp_write` frames, and on the observer-only `permission_terminal` frame
+    /// (which carries `reason = "uncertain"` and is never sent on the ACP wire).
+    /// `None` on all other event kinds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization: Option<AuthorizationEnvelope>,
     /// Raw or semantic event payload.

@@ -307,6 +307,11 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Test-only: count every write attempt (before the actual I/O). Incremented
+    /// at the top of `write_ndjson_inner` so callers can assert "exactly N attempts"
+    /// independently of whether the writes succeeded.
+    #[cfg(test)]
+    write_attempt_count: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -656,6 +661,8 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            #[cfg(test)]
+            write_attempt_count: None,
         })
     }
 
@@ -695,6 +702,19 @@ impl AcpClient {
     /// Update metadata that will be attached to subsequent raw wire events.
     pub fn set_observer_context(&mut self, context: ObserverContext) {
         self.observer_context = context;
+    }
+
+    /// Install a write-attempt counter for tests.
+    ///
+    /// When set, every call to `write_ndjson_inner` (regardless of success or failure)
+    /// atomically increments the counter before attempting the I/O. Tests can use this
+    /// to assert "exactly one attempt was made" even when the write fails.
+    #[cfg(test)]
+    pub fn set_write_attempt_count(
+        &mut self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.write_attempt_count = Some(counter);
     }
 
     /// Return a clone of the observer handle, if attached.
@@ -1301,6 +1321,10 @@ impl AcpClient {
         value: &serde_json::Value,
         emit_observe: bool,
     ) -> Result<(), AcpError> {
+        #[cfg(test)]
+        if let Some(counter) = &self.write_attempt_count {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let line = serde_json::to_string(value)?;
         tokio::time::timeout(WRITE_TIMEOUT, async {
@@ -1650,12 +1674,12 @@ impl AcpClient {
                             );
                             let deadline = tokio::time::Instant::now()
                                 + std::time::Duration::from_secs(PERMISSION_ASK_TIMEOUT_SECS);
-                            let _ = self.handle_permission_request(&msg, true, deadline).await;
+                            let _ = self.handle_permission_request(&msg, deadline).await;
                             self.permission_config.policy = saved;
                         } else {
                             let deadline = tokio::time::Instant::now()
                                 + std::time::Duration::from_secs(PERMISSION_ASK_TIMEOUT_SECS);
-                            self.handle_permission_request(&msg, true, deadline).await?;
+                            self.handle_permission_request(&msg, deadline).await?;
                         }
                     }
                     other => {
@@ -2307,12 +2331,7 @@ impl AcpClient {
                                 self.handle_goose_usage_update(&msg);
                             }
                             "session/request_permission" => {
-                                self.handle_permission_request(
-                                    &msg,
-                                    is_ask_permission_request,
-                                    hard_deadline,
-                                )
-                                .await?;
+                                self.handle_permission_request(&msg, hard_deadline).await?;
                             }
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.
@@ -2525,11 +2544,6 @@ impl AcpClient {
     pub(crate) async fn handle_permission_request(
         &mut self,
         msg: &serde_json::Value,
-        // When `true`, caller has NOT yet emitted acp_read for this message —
-        // this method emits it (enveloped) for permission frames under `ask`.
-        // When `false` (read_until_response, non-idle path), the caller already
-        // emitted it; we must not double-emit.
-        caller_will_emit_read: bool,
         // Hard deadline for the current turn. Used to bound per-request ask timeouts.
         hard_deadline: tokio::time::Instant,
     ) -> Result<bool, AcpError> {
@@ -2546,7 +2560,7 @@ impl AcpClient {
                 let reason = "missing or non-array options field";
                 tracing::warn!(target: "acp::permission", "{reason}, id={id}");
                 let nonce = new_permission_nonce();
-                self.emit_permission_read_non_actionable(&id, msg, reason, caller_will_emit_read);
+                self.emit_permission_read_non_actionable(&id, msg, &nonce, reason);
                 let response = permission_denial_response(&id, &[])?;
                 self.finish_permission_sync(&id, &nonce, "rejected", response)
                     .await?;
@@ -2587,7 +2601,7 @@ impl AcpClient {
         if let Err(reason) = preflight_result {
             tracing::warn!(target: "acp::permission", "preflight failed: {reason}, id={id}");
             let nonce = new_permission_nonce();
-            self.emit_permission_read_non_actionable(&id, msg, &reason, caller_will_emit_read);
+            self.emit_permission_read_non_actionable(&id, msg, &nonce, &reason);
             let response = permission_denial_response(&id, &options)?;
             self.finish_permission_sync(&id, &nonce, "rejected", response)
                 .await?;
@@ -2617,7 +2631,6 @@ impl AcpClient {
                     &nonce,
                     false,
                     Some("policy=reject"),
-                    caller_will_emit_read,
                 );
 
                 let response = permission_denial_response(&id, &options)?;
@@ -2646,7 +2659,6 @@ impl AcpClient {
                             &nonce,
                             false,
                             Some("policy=allow; auto-approved"),
-                            caller_will_emit_read,
                         );
                         let response = permission_response_selected(&id, &option_id);
                         self.finish_permission_sync(&id, &nonce, "allowed", response)
@@ -2667,7 +2679,6 @@ impl AcpClient {
                             &nonce,
                             false,
                             Some(&format!("policy=allow; fail closed: {reason}")),
-                            caller_will_emit_read,
                         );
                         let response = permission_denial_response(&id, &options)?;
                         self.finish_permission_sync(&id, &nonce, "allow_failed_closed", response)
@@ -2700,7 +2711,6 @@ impl AcpClient {
                         &nonce,
                         false,
                         Some("policy=ask unavailable (no observer/owner); downgraded to reject"),
-                        caller_will_emit_read,
                     );
                     let response = permission_denial_response(&id, &options)?;
                     self.finish_permission_sync(&id, &nonce, "rejected", response)
@@ -2751,18 +2761,22 @@ impl AcpClient {
     }
 
     /// Emit a non-actionable `acp_read` authorization frame for a permission request.
+    ///
+    /// The caller is responsible for generating the nonce and passing the same
+    /// value to the corresponding `finish_permission_sync` call so that both the
+    /// `acp_read` and `acp_write` telemetry frames share one nonce — required for
+    /// Desktop's nonce-only correlation to retire the card.
     fn emit_permission_read_non_actionable(
         &self,
         id: &serde_json::Value,
         msg: &serde_json::Value,
+        nonce: &str,
         reason: &str,
-        _caller_will_emit_read: bool,
     ) {
-        let nonce = new_permission_nonce();
         self.observe_authorized(
             "acp_read",
             AuthorizationEnvelope {
-                request_nonce: nonce,
+                request_nonce: nonce.to_string(),
                 actionable: false,
                 reason: Some(reason.to_string()),
             },
@@ -2772,10 +2786,6 @@ impl AcpClient {
     }
 
     /// Emit an `acp_read` with an authorization envelope.
-    ///
-    /// When `caller_will_emit_read` is `false` the caller already emitted the
-    /// raw `acp_read`; we emit only the enveloped version. When `true` we emit
-    /// the enveloped version (the caller suppresses its normal emit).
     fn emit_permission_read_with_nonce(
         &self,
         _id: &serde_json::Value,
@@ -2783,7 +2793,6 @@ impl AcpClient {
         nonce: &str,
         actionable: bool,
         reason: Option<&str>,
-        _caller_will_emit_read: bool,
     ) {
         self.observe_authorized(
             "acp_read",
@@ -5861,9 +5870,7 @@ mod tests {
         );
         let msg = perm_request(1, default_opts());
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let result = client
-            .handle_permission_request(&msg, true, hard_deadline)
-            .await;
+        let result = client.handle_permission_request(&msg, hard_deadline).await;
         // Must succeed (Ok) — denial was written and the call itself doesn't error.
         assert!(
             result.is_ok(),
@@ -6073,9 +6080,7 @@ mod tests {
         // One more request with a new id → must be denied.
         let msg = perm_request(99, default_opts());
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let result = client
-            .handle_permission_request(&msg, true, hard_deadline)
-            .await;
+        let result = client.handle_permission_request(&msg, hard_deadline).await;
         assert!(
             result.is_ok(),
             "map-at-cap must not propagate Err, got {result:?}"
@@ -6196,9 +6201,7 @@ mod tests {
 
         let msg = perm_request(1, default_opts());
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let result = client
-            .handle_permission_request(&msg, true, hard_deadline)
-            .await;
+        let result = client.handle_permission_request(&msg, hard_deadline).await;
         // Denial was written — Ok(true) means caller should suppress generic emit.
         assert!(
             result.is_ok(),
@@ -6221,9 +6224,7 @@ mod tests {
 
         let msg = perm_request(2, default_opts());
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let result = client
-            .handle_permission_request(&msg, true, hard_deadline)
-            .await;
+        let result = client.handle_permission_request(&msg, hard_deadline).await;
         assert!(result.is_ok());
         assert!(client.pending_permissions.is_empty());
     }
@@ -6413,7 +6414,7 @@ mod tests {
             let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
             let msg = perm_request(i, default_opts());
             client
-                .handle_permission_request(&msg, true, hard_deadline)
+                .handle_permission_request(&msg, hard_deadline)
                 .await
                 .expect("ask registration must succeed");
             // Capture the nonce that was bound to this entry.
@@ -6562,7 +6563,7 @@ mod tests {
         let hard_deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(PERMISSION_ASK_TIMEOUT_SECS + 10);
         client
-            .handle_permission_request(&msg, true, hard_deadline)
+            .handle_permission_request(&msg, hard_deadline)
             .await
             .expect("ask registration must succeed");
         assert_eq!(client.pending_permissions.len(), 1, "entry registered");
@@ -6643,7 +6644,7 @@ mod tests {
         // Use the same deadline for both the entry and the hard deadline.
         let msg = perm_request(1, default_opts());
         client
-            .handle_permission_request(&msg, true, perm_deadline)
+            .handle_permission_request(&msg, perm_deadline)
             .await
             .expect("ask registration must succeed");
         assert_eq!(client.pending_permissions.len(), 1, "entry registered");
@@ -6733,9 +6734,21 @@ mod tests {
     /// The pre-select check must NOT return `HardTimeout` before processing the
     /// expired entry — it must write the fail-closed denial first, THEN return
     /// `HardTimeout`.  This test proves the fix: equal deadlines → denial written.
+    ///
+    /// Wire-level proof: the denial line is captured from child stdin NDJSON and
+    /// parsed to confirm it contains exactly one `timed_out` response for id=1
+    /// before `HardTimeout` is returned.
     #[tokio::test(start_paused = true)]
     async fn ask_permission_entry_deadline_equal_to_loop_hard_deadline_writes_denial_before_exit() {
-        let mut client = spawn_script("sleep 600").await;
+        // Script: read one line from stdin (the timed-out denial), save it to a
+        // capture file, then sleep forever so the loop can advance to HardTimeout.
+        let capture_file =
+            std::env::temp_dir().join(format!("buzz-acp-eq-{}.ndjson", uuid::Uuid::new_v4()));
+        let script = format!(
+            "read -r line; printf '%s' \"$line\" > {capture}; sleep 600",
+            capture = capture_file.display(),
+        );
+        let mut client = spawn_script(&script).await;
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
         client.set_permission_config(config);
         client.set_owner_pubkey_known(true);
@@ -6751,7 +6764,7 @@ mod tests {
 
         let msg = perm_request(1, default_opts());
         client
-            .handle_permission_request(&msg, true, shared_deadline)
+            .handle_permission_request(&msg, shared_deadline)
             .await
             .expect("ask registration must succeed");
         assert_eq!(client.pending_permissions.len(), 1, "entry registered");
@@ -6786,27 +6799,47 @@ mod tests {
             };
         }
 
-        // The entry must have been processed (removed) and a timed_out denial written.
+        // The entry must have been processed (removed).
         assert!(
             !client.pending_permissions.contains_key("1"),
             "entry must be removed after equality deadline fires"
         );
 
-        let events = obs.snapshot();
-        let timeout_writes: Vec<_> = events
-            .iter()
-            .filter(|e| {
-                e.kind == "acp_write"
-                    && e.authorization
-                        .as_ref()
-                        .map(|a| a.reason.as_deref() == Some("timed_out"))
-                        .unwrap_or(false)
-            })
-            .collect();
+        // Wire-level proof: read what the harness actually wrote on the pipe.
+        let wire_line = tokio::task::spawn_blocking({
+            let capture_file = capture_file.clone();
+            move || {
+                for _ in 0..40 {
+                    if let Ok(s) = std::fs::read_to_string(&capture_file) {
+                        if !s.is_empty() {
+                            return s;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                String::new()
+            }
+        })
+        .await
+        .expect("spawn_blocking failed");
+
+        let _ = std::fs::remove_file(&capture_file);
+
+        assert!(
+            !wire_line.is_empty(),
+            "harness must write a timed-out denial on the pipe before HardTimeout"
+        );
+        let wire_json: serde_json::Value =
+            serde_json::from_str(&wire_line).expect("wire denial must be valid JSON");
         assert_eq!(
-            timeout_writes.len(),
-            1,
-            "exactly one timed_out denial must be written before HardTimeout return; got: {timeout_writes:?}"
+            wire_json["id"],
+            serde_json::json!(1),
+            "wire denial id must match the permission request id=1"
+        );
+        // The response must be a valid permission result (non-null result field).
+        assert!(
+            !wire_json["result"].is_null(),
+            "wire denial must carry a result field; got {wire_json}"
         );
     }
 
@@ -6959,7 +6992,7 @@ mod tests {
 
             let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
             let msg = perm_request(i + 100, default_opts());
-            let result = client.handle_permission_request(&msg, true, hard).await;
+            let result = client.handle_permission_request(&msg, hard).await;
             assert!(
                 result.as_ref().is_ok_and(|v| *v),
                 "request {i} must register successfully (capacity not exhausted), got: {result:?}"
@@ -7109,9 +7142,7 @@ mod tests {
 
         let msg = perm_request(42, default_opts());
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let result = client
-            .handle_permission_request(&msg, true, hard_deadline)
-            .await;
+        let result = client.handle_permission_request(&msg, hard_deadline).await;
         assert!(
             result.is_ok(),
             "ask must return Ok to suppress generic emit"
@@ -7209,9 +7240,10 @@ mod tests {
     /// and the cancel loop must return `Err(PermissionPoisoned)` immediately — zero
     /// bytes are written for the second entry.
     ///
-    /// Observable: exactly ONE `permission_terminal` uncertain event is emitted
-    /// (for the first entry whose write failed) and ZERO `acp_write` events (no
-    /// successful cancel write for either entry).
+    /// Uses an instrumented write-attempt counter to assert exactly ONE attempt was
+    /// made (the first, which failed), not just that no successful writes occurred.
+    /// The counter distinguishes "stopped after first attempt" from "tried all and
+    /// all failed" — the latter would allow the loop to continue past the poison.
     #[tokio::test]
     async fn cancel_first_write_fails_stops_immediately_no_second_write() {
         // Script: exit immediately without reading stdin.
@@ -7226,12 +7258,17 @@ mod tests {
         let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
         client.install_permission_decision_rx(perm_rx);
 
+        // Install the write-attempt counter BEFORE registration so all writes
+        // (including the registration acks and the cancel responses) are counted.
+        let attempt_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        client.set_write_attempt_count(attempt_counter.clone());
+
         // Register two Pending entries.
         let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
         for i in 0..2u64 {
             let msg = perm_request(i, default_opts());
             client
-                .handle_permission_request(&msg, true, hard)
+                .handle_permission_request(&msg, hard)
                 .await
                 .expect("ask registration must succeed");
         }
@@ -7244,6 +7281,9 @@ mod tests {
 
         // Wait briefly for the script to exit and close its stdin read-end.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Snapshot the attempt count before cancel so we can count only cancel writes.
+        let attempts_before_cancel = attempt_counter.load(std::sync::atomic::Ordering::Relaxed);
 
         // Cancel: the first finish_permission() write must fail (BrokenPipe),
         // poison the process, and return Err(PermissionPoisoned) immediately.
@@ -7260,7 +7300,18 @@ mod tests {
             "poisoned flag must be set after cancel write failure"
         );
 
-        // No successful cancel writes — the first write failed.
+        // Exactly ONE write attempt during the cancel phase.
+        // If the loop stopped after the first failed attempt, count = 1.
+        // If it continued and tried the second entry, count = 2.
+        let attempts_during_cancel =
+            attempt_counter.load(std::sync::atomic::Ordering::Relaxed) - attempts_before_cancel;
+        assert_eq!(
+            attempts_during_cancel, 1,
+            "cancel must attempt exactly one write (for the first entry) then stop; \
+             attempted {attempts_during_cancel} times"
+        );
+
+        // No successful cancel writes.
         let events = obs.snapshot();
         let cancel_writes = events
             .iter()
@@ -7277,8 +7328,7 @@ mod tests {
             "no successful cancel writes must be emitted when first write fails; got {cancel_writes}"
         );
 
-        // At least one `permission_terminal` uncertain event must be emitted
-        // (for the failed entry).
+        // At least one `permission_terminal` uncertain event must be emitted.
         let uncertain_events = events
             .iter()
             .filter(|e| {
@@ -7385,9 +7435,7 @@ mod tests {
 
         let msg = perm_request(7, default_opts());
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let result = client
-            .handle_permission_request(&msg, true, hard_deadline)
-            .await;
+        let result = client.handle_permission_request(&msg, hard_deadline).await;
         // Reject is synchronous — no pending entry, Ok(true) to suppress generic emit.
         assert!(result.is_ok(), "reject must return Ok");
         assert!(result.unwrap(), "reject must return Ok(true)");
@@ -7415,9 +7463,7 @@ mod tests {
 
         let msg = perm_request(8, default_opts());
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let result = client
-            .handle_permission_request(&msg, true, hard_deadline)
-            .await;
+        let result = client.handle_permission_request(&msg, hard_deadline).await;
         assert!(result.is_ok(), "allow auto-select must return Ok");
         assert!(result.unwrap(), "allow auto-select must return Ok(true)");
         // No pending entries — handled synchronously.
@@ -7432,9 +7478,7 @@ mod tests {
         // Only reject_once offered — allow policy must fail closed.
         let msg = perm_request(9, &[("opt-r", "reject_once", "Reject")]);
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let result = client
-            .handle_permission_request(&msg, true, hard_deadline)
-            .await;
+        let result = client.handle_permission_request(&msg, hard_deadline).await;
         // Fail closed: denial written, Ok(true) returned.
         assert!(result.is_ok(), "fail-closed allow must return Ok");
         assert!(result.unwrap(), "fail-closed allow must return Ok(true)");
@@ -7583,5 +7627,116 @@ mod tests {
     fn permission_mode_auto_wire_string_is_correct() {
         assert_eq!(PermissionMode::Auto.as_wire_str(), "auto");
         assert!(!PermissionMode::Auto.is_default());
+    }
+
+    /// Synchronous denial (missing options): `acp_read` and `acp_write` must share one nonce.
+    ///
+    /// Before the nonce-threading fix, `emit_permission_read_non_actionable` generated
+    /// its own nonce independently of the nonce passed to `finish_permission_sync`, so
+    /// the two telemetry frames carried different nonces. Desktop's nonce-only rule then
+    /// left the read card live because the write could never find it.
+    #[tokio::test]
+    async fn sync_denial_malformed_options_read_and_write_carry_same_nonce() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+
+        // Request with no options field — triggers the malformed path.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess",
+                "subject": "read a file"
+                // "options" deliberately omitted
+            }
+        });
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        client
+            .handle_permission_request(&msg, hard)
+            .await
+            .expect("malformed denial must not error");
+
+        let events = obs.snapshot();
+
+        let read_nonce = events
+            .iter()
+            .find(|e| e.kind == "acp_read" && e.authorization.is_some())
+            .and_then(|e| e.authorization.as_ref())
+            .map(|a| a.request_nonce.clone())
+            .expect("acp_read with authorization must be emitted");
+
+        let write_nonce = events
+            .iter()
+            .find(|e| e.kind == "acp_write" && e.authorization.is_some())
+            .and_then(|e| e.authorization.as_ref())
+            .map(|a| a.request_nonce.clone())
+            .expect("acp_write with authorization must be emitted");
+
+        assert_eq!(
+            read_nonce, write_nonce,
+            "acp_read and acp_write must carry the same nonce so Desktop can retire the card; \
+             read={read_nonce}, write={write_nonce}"
+        );
+    }
+
+    /// Synchronous denial (preflight failure): `acp_read` and `acp_write` must share one nonce.
+    #[tokio::test]
+    async fn sync_denial_preflight_failure_read_and_write_carry_same_nonce() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+
+        // Oversize subject triggers admission preflight failure.
+        let oversize_subject = "x".repeat(OBSERVER_MAX_PLAINTEXT_LEN + 1);
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 88,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess",
+                "subject": oversize_subject,
+                "options": [
+                    {"optionId": "opt-allow", "kind": "allow_once", "name": "Allow"},
+                    {"optionId": "opt-deny",  "kind": "reject_once", "name": "Deny"}
+                ]
+            }
+        });
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        client
+            .handle_permission_request(&msg, hard)
+            .await
+            .expect("preflight denial must not error");
+
+        let events = obs.snapshot();
+
+        let read_nonce = events
+            .iter()
+            .find(|e| e.kind == "acp_read" && e.authorization.is_some())
+            .and_then(|e| e.authorization.as_ref())
+            .map(|a| a.request_nonce.clone())
+            .expect("acp_read with authorization must be emitted");
+
+        let write_nonce = events
+            .iter()
+            .find(|e| e.kind == "acp_write" && e.authorization.is_some())
+            .and_then(|e| e.authorization.as_ref())
+            .map(|a| a.request_nonce.clone())
+            .expect("acp_write with authorization must be emitted");
+
+        assert_eq!(
+            read_nonce, write_nonce,
+            "acp_read and acp_write must carry the same nonce so Desktop can retire the card; \
+             read={read_nonce}, write={write_nonce}"
+        );
     }
 }

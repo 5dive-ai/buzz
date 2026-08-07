@@ -8143,8 +8143,9 @@ mod control_result_tests {
     }
 
     /// B5 I-1 / I-3: when value is empty (Auto selected), the immediate ack must
-    /// be "pending_session" (non-terminal) — the final "cleared" ack arrives from
-    /// create_session_and_apply_model when the session first runs without effort.
+    /// be "pending_session" (non-terminal) — the final "cleared" ack arrives via
+    /// `PoolEvent::EffortReport` → `resolve_effort_report` when the session first
+    /// runs without effort.
     /// The pool-level desired_effort is cleared immediately so future sessions do
     /// not apply a stale value.
     #[tokio::test]
@@ -8467,7 +8468,7 @@ mod control_result_tests {
     /// Case D: in the pre-first-return window, a clear (empty value) with
     /// `category: "thought_level"` must NOT emit synthetic ok — it must emit
     /// `pending_session` (non-terminal immediate ack) and set `effort_ever_picked`.
-    /// The final `cleared` ack arrives from create_session_and_apply_model.
+    /// The final `cleared` ack arrives via `PoolEvent::EffortReport` → `resolve_effort_report`.
     #[test]
     fn test_b5_pre_discovery_clear_with_category_emits_pending_session_not_synthetic_ok() {
         let mut pool = AgentPool::from_slots(vec![]);

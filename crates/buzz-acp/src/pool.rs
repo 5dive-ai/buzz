@@ -887,8 +887,7 @@ impl AgentPool {
         }
 
         // V-3: if the worker's checkout snapshot differs from the current pool
-        // value (i.e. a pick or clear arrived while this worker was busy, OR
-        // this worker was discarded by the first-terminal-wins gate), invalidate
+        // value (i.e. a pick or clear arrived while this worker was busy), invalidate
         // the worker's sessions so the next claim creates a fresh session under
         // the current pool value.
         //
@@ -896,26 +895,19 @@ impl AgentPool {
         //   - pool cleared (None) while agent carried Some(_) → mismatch → invalidate
         //   - pool picked Some(y) while agent carried Some(x) or None → mismatch → invalidate
         //
-        // Special case — discarded Failed worker with matching values:
-        //   A worker discarded by the first-terminal-wins gate may carry
-        //   desired_effort == pool.desired_effort (value match), yet its live
-        //   session ran at DEFAULT effort (the adapter rejected the pick). V-3's
-        //   equality check would skip invalidation, leaving a stale-effort session
-        //   alive. We force-invalidate whenever a same-gen return is discarded AND
-        //   the worker's result was Failed — the session is definitely stale
-        //   regardless of the value comparison.
-        let discarded_failed = agent
-            .desired_effort_gen
-            .map(|g| {
-                g == self.effort_generation
-                    && self.last_acked_effort_gen == Some(g)
-                    && matches!(
-                        agent.last_effort_result,
-                        Some(EffortApplicationResult::Failed)
-                    )
-            })
-            .unwrap_or(false);
-        if agent.desired_effort != self.desired_effort || discarded_failed {
+        // Unconditional Failed invalidation (subsumes the old discarded_failed predicate):
+        //   A Failed application means session_set_config_option rejected the pick,
+        //   so the live session ran at the agent default — not at the requested value.
+        //   The session is stale regardless of value equality AND regardless of whether
+        //   resolve_effort_report has already run (the return→report ordering race).
+        //   We force-invalidate any returned worker whose last_effort_result is Failed.
+        //   Worst case is one redundant session re-creation when the rollback target
+        //   happens to equal the default.
+        let failed_application = matches!(
+            agent.last_effort_result,
+            Some(EffortApplicationResult::Failed)
+        );
+        if agent.desired_effort != self.desired_effort || failed_application {
             agent.state.invalidate_all();
         }
 
@@ -1281,8 +1273,8 @@ impl AgentPool {
     ///
     /// Returns the count of idle agents that had active sessions invalidated.
     /// Callers should emit `"pending_session"` as the immediate ack; the final
-    /// `ok`/`failure` arrives from `create_session_and_apply_model` once a
-    /// session is actually created and the ACP call completes.
+    /// `ok`/`failure` arrives via `PoolEvent::EffortReport` → `resolve_effort_report`
+    /// once a session is actually created and the ACP call completes.
     ///
     /// Clearing effort (value == "") is handled by the caller before this is
     /// reached: the caller calls `clear_pool_effort` directly. This path is the
@@ -1377,7 +1369,7 @@ pub enum SetPoolEffortResult {
     /// Pool-level `desired_effort` stored and idle sessions invalidated.
     /// `invalidated` is the count of idle agents whose sessions were cleared
     /// (may be 0 if all agents are either checked out or have no session yet).
-    /// The final result arrives from `create_session_and_apply_model`.
+    /// The final result arrives via `PoolEvent::EffortReport` → `resolve_effort_report`.
     Stored { invalidated: u32 },
 }
 
@@ -9045,6 +9037,191 @@ mod effort_tests {
         );
     }
 
+    // ── Failed-worker ordering tests ─────────────────────────────────────────
+
+    /// Return→report ordering (the failure race):
+    ///
+    /// Worker sends EffortReport::Failed pre-prompt but the main loop polls the
+    /// PromptResult first (biased select), so return_agent runs while
+    /// last_acked_effort_gen is still None. The discarded_failed predicate
+    /// requires last_acked_effort_gen == Some(g) — false here — and the value
+    /// comparison passes (high == high), so the failed session would survive
+    /// under the old code. The fix: any returned worker with
+    /// last_effort_result == Some(Failed) invalidates unconditionally.
+    ///
+    /// After fix: failed worker's sessions empty; then resolve_effort_report
+    /// acks failure and rolls back pool state; both orderings converge.
+    #[tokio::test]
+    async fn test_failed_worker_return_before_report_invalidates_session() {
+        let obs = observer::ObserverHandle::in_process();
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        let mut pool = AgentPool::from_slots(vec![Some(OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        })]);
+        pool.committed_effort = Some(("effort".into(), "low".into()));
+        pool.set_pool_effort("effort", "high");
+        let gen = pool.effort_generation;
+
+        let mut worker = pool.try_claim(None).unwrap();
+        worker.last_effort_result = Some(EffortApplicationResult::Failed);
+        worker.pending_effort_nonce = Some("nonce-r".to_string());
+        // Seed a session — this session ran at DEFAULT (adapter rejected "high").
+        let ch = Uuid::new_v4();
+        worker.state.sessions.insert(ch, "default-sess".into());
+
+        // RETURN FIRST (before resolve_effort_report):
+        // This is the race ordering — generation still unresolved.
+        assert_eq!(pool.last_acked_effort_gen, None);
+        pool.return_agent(worker);
+
+        // Fix: returned Failed worker must have sessions invalidated unconditionally.
+        let returned = pool.agents_mut()[0].as_ref().unwrap();
+        assert!(
+            returned.state.sessions.is_empty(),
+            "return-before-report: Failed worker session must be invalidated even before ack"
+        );
+
+        // THEN resolve_effort_report (as the main loop would, moments later):
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen),
+                result: EffortApplicationResult::Failed,
+                nonce: Some("nonce-r".to_string()),
+                config_id: "effort".into(),
+                value: "high".into(),
+            },
+            Some(&obs),
+        );
+
+        // One terminal failure ack.
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1, "exactly one failure ack");
+        assert_eq!(events[0].payload["status"].as_str().unwrap(), "failure");
+        assert_eq!(events[0].payload["nonce"].as_str().unwrap(), "nonce-r");
+
+        // Pool state: desired rolled back to committed ("low"), last_acked resolved.
+        assert_eq!(
+            pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("low"),
+            "return-before-report: desired_effort rolled back to committed"
+        );
+        assert_eq!(pool.last_acked_effort_gen, Some(gen));
+    }
+
+    /// Report→return ordering (the normal path — should also converge):
+    ///
+    /// resolve_effort_report fires first (pre-prompt, as intended). The main loop
+    /// processes it, emits the failure ack, rolls back pool state. Then
+    /// return_agent runs. The session must still be invalidated: the failed
+    /// application means the live session ran at DEFAULT regardless of timing.
+    ///
+    /// Both orderings must end with: failed worker's sessions empty, exactly one
+    /// terminal failure ack, pool state matching that ack.
+    #[tokio::test]
+    async fn test_failed_worker_report_before_return_invalidates_session() {
+        let obs = observer::ObserverHandle::in_process();
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        let mut pool = AgentPool::from_slots(vec![Some(OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        })]);
+        pool.committed_effort = Some(("effort".into(), "low".into()));
+        pool.set_pool_effort("effort", "high");
+        let gen = pool.effort_generation;
+
+        let mut worker = pool.try_claim(None).unwrap();
+        worker.last_effort_result = Some(EffortApplicationResult::Failed);
+        worker.pending_effort_nonce = Some("nonce-rp".to_string());
+        let ch = Uuid::new_v4();
+        worker.state.sessions.insert(ch, "default-sess".into());
+
+        // REPORT FIRST (normal pre-prompt path):
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen),
+                result: EffortApplicationResult::Failed,
+                nonce: Some("nonce-rp".to_string()),
+                config_id: "effort".into(),
+                value: "high".into(),
+            },
+            Some(&obs),
+        );
+
+        // One terminal failure ack.
+        let events_pre = obs.snapshot();
+        assert_eq!(events_pre.len(), 1, "exactly one failure ack pre-return");
+        assert_eq!(events_pre[0].payload["status"].as_str().unwrap(), "failure");
+        assert_eq!(pool.last_acked_effort_gen, Some(gen));
+
+        // THEN return_agent (after the turn finishes):
+        pool.return_agent(worker);
+
+        // No second ack.
+        let events_post = obs.snapshot();
+        assert_eq!(
+            events_post.len(),
+            1,
+            "report-before-return: no second ack after return_agent"
+        );
+
+        // Failed worker's session invalidated.
+        let returned = pool.agents_mut()[0].as_ref().unwrap();
+        assert!(
+            returned.state.sessions.is_empty(),
+            "report-before-return: Failed worker session must be invalidated"
+        );
+
+        // Pool state: desired=low (rolled back), committed=low.
+        assert_eq!(
+            pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("low"),
+            "report-before-return: desired rolled back to committed"
+        );
+        assert_eq!(
+            pool.committed_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("low")
+        );
+    }
+
     // ── P3: stale capability cache cleared on model swap ─────────────────────
 
     /// P3: when a returning agent has populated capabilities but no
@@ -9123,6 +9300,7 @@ mod effort_tests {
     /// the terminal ack for g3's nonce.
     #[tokio::test]
     async fn test_f1_stale_gen_force_invalidates_when_current_gen_unresolved() {
+        let obs = observer::ObserverHandle::in_process();
         let acp = AcpClient::spawn(
             "bash",
             &["-c".to_string(), "sleep 10".to_string()],
@@ -9156,6 +9334,7 @@ mod effort_tests {
 
         // While worker runs: user picks "medium" (gen 2) then "high" again (gen 3).
         pool.set_pool_effort("effort", "medium");
+        pool.pending_effort_nonce = Some("nonce-g3".into());
         pool.set_pool_effort("effort", "high");
         let gen3 = pool.effort_generation;
         assert_eq!(gen3, 3);
@@ -9177,6 +9356,52 @@ mod effort_tests {
             returned.state.sessions.is_empty(),
             "F1: stale-gen return with value match must invalidate sessions when current gen is unresolved"
         );
+
+        // Convergence: the next claim gets the newest-gen worker and the newest nonce.
+        let mut new_worker = pool.try_claim(None).unwrap();
+        assert_eq!(
+            new_worker.desired_effort_gen,
+            Some(gen3),
+            "F1: next claim must be at gen3"
+        );
+        assert_eq!(
+            new_worker.pending_effort_nonce.as_deref(),
+            Some("nonce-g3"),
+            "F1: next claim must carry the newest nonce"
+        );
+
+        // Simulate the new session applying the effort successfully.
+        new_worker.last_effort_result = Some(EffortApplicationResult::Applied);
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen3),
+                result: EffortApplicationResult::Applied,
+                nonce: Some("nonce-g3".into()),
+                config_id: "effort".into(),
+                value: "high".into(),
+            },
+            Some(&obs),
+        );
+
+        // Exactly one terminal ack, carrying the newest nonce.
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1, "F1: exactly one terminal ack for gen3");
+        assert_eq!(events[0].payload["status"].as_str().unwrap(), "ok");
+        assert_eq!(
+            events[0].payload["nonce"].as_str().unwrap(),
+            "nonce-g3",
+            "F1: ack must carry the newest nonce"
+        );
+        // Persistence-eligible: desired=high, committed=high.
+        assert_eq!(
+            pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("high")
+        );
+        assert_eq!(
+            pool.committed_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("high")
+        );
+        assert_eq!(pool.last_acked_effort_gen, Some(gen3));
     }
 
     /// F1 B: repeated clears — None==None hole.
@@ -9187,6 +9412,7 @@ mod effort_tests {
     /// V-3. But g2 is unresolved: F1 must force-invalidate.
     #[tokio::test]
     async fn test_f1_repeated_clear_none_none_value_match_invalidates() {
+        let obs = observer::ObserverHandle::in_process();
         let acp = AcpClient::spawn(
             "bash",
             &["-c".to_string(), "sleep 10".to_string()],
@@ -9219,6 +9445,7 @@ mod effort_tests {
         assert_eq!(worker.desired_effort_gen, Some(gen1));
 
         // User clears again while worker is running — gen 2, still unresolved.
+        pool.pending_effort_nonce = Some("nonce-g2".into());
         pool.clear_pool_effort();
         let gen2 = pool.effort_generation;
         assert_eq!(gen2, 2);
@@ -9238,6 +9465,34 @@ mod effort_tests {
             returned.state.sessions.is_empty(),
             "F1: repeated-clear None==None match must invalidate sessions when current gen is unresolved"
         );
+
+        // Convergence: next claim at gen2 with the newest nonce.
+        let mut new_worker = pool.try_claim(None).unwrap();
+        assert_eq!(new_worker.desired_effort_gen, Some(gen2));
+        assert_eq!(new_worker.pending_effort_nonce.as_deref(), Some("nonce-g2"));
+
+        // Simulate the new session confirming the clear.
+        new_worker.last_effort_result = Some(EffortApplicationResult::Cleared);
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen2),
+                result: EffortApplicationResult::Cleared,
+                nonce: Some("nonce-g2".into()),
+                config_id: "effort".into(),
+                value: "".into(),
+            },
+            Some(&obs),
+        );
+
+        // Exactly one terminal cleared ack with the newest nonce.
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1, "F1 B: exactly one terminal ack for gen2");
+        assert_eq!(events[0].payload["status"].as_str().unwrap(), "cleared");
+        assert_eq!(events[0].payload["nonce"].as_str().unwrap(), "nonce-g2");
+        assert_eq!(pool.last_acked_effort_gen, Some(gen2));
+        // Persistence-eligible: desired=None, committed=None.
+        assert!(pool.desired_effort.is_none());
+        assert!(pool.committed_effort.is_none());
     }
 
     /// F1 C: stale-gen Failed with value match — session ran at DEFAULT.

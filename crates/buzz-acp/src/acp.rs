@@ -6740,15 +6740,24 @@ mod tests {
     /// before `HardTimeout` is returned.
     #[tokio::test(start_paused = true)]
     async fn ask_permission_entry_deadline_equal_to_loop_hard_deadline_writes_denial_before_exit() {
-        // Script: read one line from stdin (the timed-out denial), save it to a
-        // capture file, then sleep forever so the loop can advance to HardTimeout.
-        let capture_file =
-            std::env::temp_dir().join(format!("buzz-acp-eq-{}.ndjson", uuid::Uuid::new_v4()));
-        let script = format!(
-            "read -r line; printf '%s' \"$line\" > {capture}; sleep 600",
-            capture = capture_file.display(),
-        );
-        let mut client = spawn_script(&script).await;
+        // Proves: when entry.deadline == loop_hard_deadline, the fail-closed denial
+        // is written to the pipe exactly once BEFORE HardTimeout is returned.
+        //
+        // Proof strategy:
+        //   1. tokio::spawn keeps the loop future alive continuously (no drops/restarts).
+        //   2. Virtual time advances past the shared deadline; loop returns HardTimeout.
+        //   3. Attempt counter (incremented before I/O in write_ndjson_inner) asserts
+        //      exactly one write attempt — distinguishes "stopped after first" from
+        //      "tried all and all failed".
+        //   4. Observer payload asserts the exact fail-closed JSON written to the pipe:
+        //      the observer records the same serde_json::Value that is serialised and
+        //      written; with emit_observe=true in write_ndjson_inner this is identical
+        //      to what the adapter receives.
+        //
+        // File-capture is not used because start_paused = true makes real-time I/O
+        // between the harness and the shell subprocess unreliable for test assertions
+        // (virtual-time advance does not advance wall-clock for OS file flushing).
+        let mut client = spawn_script("sleep 600").await;
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
         client.set_permission_config(config);
         client.set_owner_pubkey_known(true);
@@ -6757,8 +6766,13 @@ mod tests {
         let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
         client.install_permission_decision_rx(perm_rx);
 
+        // Install the attempt counter — proves exactly one write attempt.
+        let attempt_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        client.set_write_attempt_count(attempt_counter.clone());
+
         // Set entry.deadline == loop_hard_deadline.
-        // With PERMISSION_ASK_TIMEOUT_SECS = 300, entry.deadline = min(now+300s, now+300s) = now+300s.
+        // With PERMISSION_ASK_TIMEOUT_SECS = 300:
+        //   entry.deadline = min(now + 300s, hard_deadline) = now + 300s = hard_deadline.
         let now = tokio::time::Instant::now();
         let shared_deadline = now + std::time::Duration::from_secs(PERMISSION_ASK_TIMEOUT_SECS);
 
@@ -6769,77 +6783,89 @@ mod tests {
             .expect("ask registration must succeed");
         assert_eq!(client.pending_permissions.len(), 1, "entry registered");
 
-        // Loop: hard_deadline == entry.deadline (the equality case).
+        // Move the client into a spawned task so it stays alive across the
+        // virtual-time advance — mirrors the idle-rearm test pattern.  The task
+        // owns the loop future continuously from start to finish (no drops, no
+        // restarts) while the test body drives time from the outside.
         let idle = std::time::Duration::from_secs(5);
         let max_dur = std::time::Duration::from_secs(PERMISSION_ASK_TIMEOUT_SECS);
+        let loop_task = tokio::spawn(async move {
+            client
+                .read_until_response_with_idle_timeout(
+                    "sess-eq",
+                    999,
+                    idle,
+                    shared_deadline,
+                    max_dur,
+                )
+                .await
+        });
 
-        // Advance 300s + 1ms to trigger both the permission deadline and the hard deadline.
-        let loop_result = tokio::select! {
-            r = client.read_until_response_with_idle_timeout(
-                "sess-eq", 999, idle, shared_deadline, max_dur
-            ) => Some(r),
-            _ = async {
-                tokio::time::advance(
-                    std::time::Duration::from_secs(PERMISSION_ASK_TIMEOUT_SECS)
-                        + std::time::Duration::from_millis(1),
-                ).await;
-            } => None,
-        };
+        // Advance virtual time past the shared deadline.  The loop task wakes,
+        // processes the expired entry (writes the fail-closed denial), and then
+        // returns HardTimeout because entry.deadline == hard_deadline.
+        tokio::time::advance(
+            std::time::Duration::from_secs(PERMISSION_ASK_TIMEOUT_SECS)
+                + std::time::Duration::from_millis(1),
+        )
+        .await;
 
-        // If advance won the select, drive one more iteration so the loop
-        // processes the expiry block.
-        if loop_result.is_none() {
-            let _ = tokio::select! {
-                r = client.read_until_response_with_idle_timeout(
-                    "sess-eq", 999, idle, shared_deadline, max_dur
-                ) => Some(r),
-                _ = async {
-                    tokio::time::advance(std::time::Duration::from_millis(100)).await;
-                } => None,
-            };
-        }
-
-        // The entry must have been processed (removed).
+        // Await the continuously running loop and assert HardTimeout — not any
+        // other error and not Ok (Ok would mean a terminal session/prompt response
+        // was read instead of the hard deadline firing).
+        let loop_result = loop_task.await.expect("loop task must not panic");
         assert!(
-            !client.pending_permissions.contains_key("1"),
-            "entry must be removed after equality deadline fires"
+            matches!(loop_result, Err(AcpError::HardTimeout { .. })),
+            "loop must exit with HardTimeout after equality deadline fires; got: {loop_result:?}"
         );
 
-        // Wire-level proof: read what the harness actually wrote on the pipe.
-        let wire_line = tokio::task::spawn_blocking({
-            let capture_file = capture_file.clone();
-            move || {
-                for _ in 0..40 {
-                    if let Ok(s) = std::fs::read_to_string(&capture_file) {
-                        if !s.is_empty() {
-                            return s;
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                String::new()
-            }
-        })
-        .await
-        .expect("spawn_blocking failed");
-
-        let _ = std::fs::remove_file(&capture_file);
-
-        assert!(
-            !wire_line.is_empty(),
-            "harness must write a timed-out denial on the pipe before HardTimeout"
-        );
-        let wire_json: serde_json::Value =
-            serde_json::from_str(&wire_line).expect("wire denial must be valid JSON");
+        // Assert exactly ONE write attempt — the fail-closed denial for id=1.
+        // Counter increments at the top of write_ndjson_inner before I/O;
+        // a value > 1 would mean a duplicate write escaped the expiry block.
+        let attempts = attempt_counter.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            wire_json["id"],
-            serde_json::json!(1),
-            "wire denial id must match the permission request id=1"
+            attempts, 1,
+            "exactly one write attempt must be made (the timed-out denial for id=1); \
+             got {attempts} attempts"
         );
-        // The response must be a valid permission result (non-null result field).
-        assert!(
-            !wire_json["result"].is_null(),
-            "wire denial must carry a result field; got {wire_json}"
+
+        // Exact payload proof via observer telemetry.
+        // write_ndjson_inner calls observe("acp_write", value) with emit_observe=true
+        // using the same serde_json::Value that was serialised to the pipe — the
+        // observer record IS the wire content for virtual-time tests.
+        // Assert: exactly one timed_out acp_write, id=1, outcome=selected, optionId=opt-reject.
+        // (permission_denial_response selects the reject_once option from default_opts.)
+        let events = obs.snapshot();
+        let timed_out_writes: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.kind == "acp_write"
+                    && e.authorization
+                        .as_ref()
+                        .map(|a| a.reason.as_deref() == Some("timed_out"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            timed_out_writes.len(),
+            1,
+            "exactly one timed_out acp_write must be observed; got: {timed_out_writes:?}"
+        );
+        let payload = &timed_out_writes[0].payload;
+        assert_eq!(
+            payload["id"],
+            serde_json::json!(1),
+            "denial payload id must be 1; got {payload}"
+        );
+        assert_eq!(
+            payload["result"]["outcome"]["outcome"].as_str(),
+            Some("selected"),
+            "denial payload must carry outcome=selected; got {payload}"
+        );
+        assert_eq!(
+            payload["result"]["outcome"]["optionId"].as_str(),
+            Some("opt-reject"),
+            "denial optionId must be opt-reject (reject_once from default_opts); got {payload}"
         );
     }
 

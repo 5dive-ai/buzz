@@ -13,6 +13,7 @@ import {
   type OnboardingTransitionDirection,
   OnboardingSlideTransition,
 } from "@/features/onboarding/ui/OnboardingSlideTransition";
+import { DeleteDataAction } from "@/features/settings/ui/DeleteDataAction";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { writeTextToClipboard } from "@/shared/lib/clipboard";
 import { pubkeyToNpub } from "@/shared/lib/nostrUtils";
@@ -164,8 +165,15 @@ export function WelcomeSetup({
                   </button>
                 </Card>
               </div>
-              {onBack ? (
-                <OnboardingFooter>
+              <OnboardingFooter>
+                <DeleteDataAction
+                  className="h-auto px-2 py-1 text-xs font-normal text-foreground/60 hover:bg-transparent hover:text-foreground/80"
+                  label="Sign out"
+                  pendingLabel="Starting fresh…"
+                  testId="welcome-delete-data"
+                  variant="ghost"
+                />
+                {onBack ? (
                   <Button
                     className="h-9 rounded-full bg-foreground/10 px-6 hover:bg-foreground/15"
                     data-testid="welcome-setup-back"
@@ -175,8 +183,8 @@ export function WelcomeSetup({
                   >
                     Back
                   </Button>
-                </OnboardingFooter>
-              ) : null}
+                ) : null}
+              </OnboardingFooter>
             </OnboardingSlideTransition>
           ) : page === "existing" ? (
             <OnboardingSlideTransition

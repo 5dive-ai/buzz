@@ -853,6 +853,17 @@ test.describe("community rail", () => {
     await expect(page.getByText("Join or create a community")).toBeVisible();
     await expect(page.getByTestId("welcome-setup-back")).toHaveCount(0);
     await expect(page.getByTestId("community-choice-join")).toBeVisible();
+    const deleteData = page.getByTestId("welcome-delete-data");
+    await expect(deleteData).toHaveText("Sign out");
+    await deleteData.click();
+    await expect(
+      page.getByRole("heading", { name: "Sign out and wipe all data?" }),
+    ).toBeVisible();
+    await expect(page.getByTestId("signout-confirm")).toBeDisabled();
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(
+      page.getByRole("heading", { name: "Sign out and wipe all data?" }),
+    ).toHaveCount(0);
     await expect
       .poll(() =>
         page.evaluate(() => window.localStorage.getItem("buzz-communities")),

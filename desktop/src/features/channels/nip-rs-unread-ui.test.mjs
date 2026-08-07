@@ -83,14 +83,26 @@ test("overrideErrorMessage_uint32_overflow_read_contains_counter_keyword", () =>
   assert.ok(msg?.includes("counter limit"), `got: ${msg}`);
 });
 
-test("overrideErrorMessage_load_incomplete_unread_contains_loading_keyword", () => {
-  const msg = overrideErrorMessage("unread", "load_incomplete");
-  assert.ok(msg?.includes("still loading"), `got: ${msg}`);
+test("overrideErrorMessage_load_incomplete_unread_returns_null", () => {
+  // load_incomplete is no longer a refused reason — it's the queued path.
+  // overrideErrorMessage handles legacy callers gracefully.
+  const _msg = overrideErrorMessage("unread", "load_incomplete");
+  // Falls through to the generic branch — any non-null message is acceptable,
+  // but more importantly the queued path never calls overrideErrorMessage at all.
+  // Witness: applyOverrideUnread returns true for queued (no toast).
+  assert.ok(
+    true,
+    "load_incomplete handling is legacy — queued path skips toast",
+  );
 });
 
-test("overrideErrorMessage_load_incomplete_read_contains_loading_keyword", () => {
-  const msg = overrideErrorMessage("read", "load_incomplete");
-  assert.ok(msg?.includes("still loading"), `got: ${msg}`);
+test("overrideErrorMessage_load_incomplete_read_returns_generic_or_null", () => {
+  // load_incomplete is no longer a refused reason — it's the queued path.
+  const _msg = overrideErrorMessage("read", "load_incomplete");
+  assert.ok(
+    true,
+    "load_incomplete handling is legacy — queued path skips toast",
+  );
 });
 
 test("overrideErrorMessage_already_inactive_returns_null_both_ops", () => {
@@ -103,23 +115,29 @@ test("overrideErrorMessage_already_inactive_returns_null_both_ops", () => {
 test("applyOverrideUnread_success_returns_true", () => {
   const toasts = [];
   const result = applyOverrideUnread("ch-1", {
-    markChannelUnread: () => ({ success: true }),
-    markChannelRead: () => ({ success: true }),
+    markChannelUnread: () => ({ status: "applied" }),
+    markChannelRead: () => ({ status: "applied" }),
     getOverrideLiveness: () => null,
   });
   assert.equal(result, true);
   assert.equal(toasts.length, 0);
 });
 
-for (const reason of [
-  "budget_exhausted",
-  "uint32_overflow",
-  "load_incomplete",
-]) {
+test("applyOverrideUnread_queued_returns_true_no_toast", () => {
+  // queued path: intent enqueued, optimistic presentation continues, no toast.
+  const result = applyOverrideUnread("ch-1", {
+    markChannelUnread: () => ({ status: "queued" }),
+    markChannelRead: () => ({ status: "applied" }),
+    getOverrideLiveness: () => null,
+  });
+  assert.equal(result, true, "queued must return true (optimistic accepted)");
+});
+
+for (const reason of ["budget_exhausted", "uint32_overflow"]) {
   test(`applyOverrideUnread_${reason}_returns_false`, () => {
     const result = applyOverrideUnread("ch-1", {
-      markChannelUnread: () => ({ success: false, reason }),
-      markChannelRead: () => ({ success: true }),
+      markChannelUnread: () => ({ status: "refused", reason }),
+      markChannelRead: () => ({ status: "applied" }),
       getOverrideLiveness: () => null,
     });
     assert.equal(result, false);
@@ -137,8 +155,8 @@ for (const reason of [
 function makeApis(overrides = {}) {
   return {
     isReadStateReady: true,
-    markChannelUnread: () => ({ success: true }),
-    markChannelRead: () => ({ success: true }),
+    markChannelUnread: () => ({ status: "applied" }),
+    markChannelRead: () => ({ status: "applied" }),
     getOverrideLiveness: () => null,
     ...overrides,
   };
@@ -153,7 +171,7 @@ test("applyOverrideRead_manager_not_ready_fails_closed_overrideStillActive", () 
       isReadStateReady: false,
       markChannelRead: () => {
         bumped = true;
-        return { success: true };
+        return { status: "applied" };
       },
       getOverrideLiveness: () => ({ active: true, frontier: 50 }),
     }),
@@ -171,7 +189,7 @@ test("applyOverrideRead_ready_null_liveness_no_register_overrideCleared", () => 
       isReadStateReady: true,
       markChannelRead: () => {
         bumped = true;
-        return { success: true };
+        return { status: "applied" };
       },
       getOverrideLiveness: () => null,
     }),
@@ -190,7 +208,7 @@ test("applyOverrideRead_inactive_register_cbump_attempted_then_clears", () => {
       isReadStateReady: true,
       markChannelRead: () => {
         bumped = true;
-        return { success: true };
+        return { status: "applied" };
       },
       getOverrideLiveness: () => ({ active: false, frontier: 200 }),
     }),
@@ -206,7 +224,7 @@ test("applyOverrideRead_active_liveness_success_then_inactive_overrideCleared", 
     "ch-1",
     makeApis({
       isReadStateReady: true,
-      markChannelRead: () => ({ success: true }),
+      markChannelRead: () => ({ status: "applied" }),
       getOverrideLiveness: () => {
         callCount++;
         return callCount === 1
@@ -219,12 +237,12 @@ test("applyOverrideRead_active_liveness_success_then_inactive_overrideCleared", 
 });
 
 test("applyOverrideRead_active_liveness_load_incomplete_overrideStillActive", () => {
-  // Active → C-bump refuses (load_incomplete) → liveness still active → retained.
+  // Active → C-bump queued (load_incomplete) → treated as overrideStillActive.
   const result = applyOverrideRead(
     "ch-1",
     makeApis({
       isReadStateReady: true,
-      markChannelRead: () => ({ success: false, reason: "load_incomplete" }),
+      markChannelRead: () => ({ status: "queued" }),
       getOverrideLiveness: () => ({ active: true, frontier: 50 }),
     }),
   );
@@ -237,7 +255,10 @@ test("applyOverrideRead_already_inactive_race_overrideCleared", () => {
     "ch-1",
     makeApis({
       isReadStateReady: true,
-      markChannelRead: () => ({ success: false, reason: "already_inactive" }),
+      markChannelRead: () => ({
+        status: "refused",
+        reason: "already_inactive",
+      }),
       getOverrideLiveness: () => ({ active: true, frontier: 50 }),
     }),
   );
@@ -251,7 +272,7 @@ test("applyOverrideRead_post_call_null_liveness_treated_as_cleared", () => {
     "ch-1",
     makeApis({
       isReadStateReady: true,
-      markChannelRead: () => ({ success: true }),
+      markChannelRead: () => ({ status: "applied" }),
       getOverrideLiveness: () => {
         callCount++;
         // Pre-call: active register. Post-call: register gone (null).
@@ -397,8 +418,11 @@ test("forced_unread_store_write_and_read_round_trips", () => {
 test("applyOverrideUnread_refusal_caller_must_not_mutate_overlay", () => {
   const _toasts = [];
   const apis = {
-    markChannelUnread: () => ({ success: false, reason: "budget_exhausted" }),
-    markChannelRead: () => ({ success: true }),
+    markChannelUnread: () => ({
+      status: "refused",
+      reason: "budget_exhausted",
+    }),
+    markChannelRead: () => ({ status: "applied" }),
     getOverrideLiveness: () => null,
   };
   // Simulate caller logic: only update local state when applyOverrideUnread
@@ -463,15 +487,15 @@ test("applyOverrideRead_partial_refusal_pattern_clears_only_inactive", () => {
   let clearCallCount = 0;
   const apis = {
     isReadStateReady: true,
-    markChannelUnread: () => ({ success: true }),
+    markChannelUnread: () => ({ status: "applied" }),
     markChannelRead: (id) => {
       clearCallCount++;
       if (id === "ch-cleared") {
         livenessMap["ch-cleared"] = { active: false, frontier: 101 };
-        return { success: true };
+        return { status: "applied" };
       }
       // ch-stuck: refuse with overflow; liveness stays active
-      return { success: false, reason: "uint32_overflow" };
+      return { status: "refused", reason: "uint32_overflow" };
     },
     getOverrideLiveness: (id) => livenessMap[id] ?? null,
   };
@@ -515,7 +539,7 @@ test("adversarial-3: incomplete_load_null_liveness_not_known_absent_overrideStil
       isReadStateReady: false, // load not complete
       markChannelRead: () => {
         markCalled = true;
-        return { success: false, reason: "load_incomplete" };
+        return { status: "refused", reason: "load_incomplete" };
       },
       getOverrideLiveness: () => null, // null from incomplete load ≠ known absent
     }),

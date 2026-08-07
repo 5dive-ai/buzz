@@ -13,7 +13,7 @@ const noopMarkRead = () => {};
 const noopDrainAdvances = (): ReadonlySet<string> => new Set<string>();
 const noopSetResolver = () => {};
 const noopMarkOverride = (): MarkResult => ({
-  success: false,
+  status: "refused",
   reason: "load_incomplete",
 });
 const noopGetOverrideLiveness = (): OverrideLiveness | null => null;
@@ -107,7 +107,7 @@ export function useReadState(
     (channelId: string): MarkResult => {
       return (
         managerRef.current?.markChannelUnread(channelId) ?? {
-          success: false,
+          status: "refused",
           reason: "load_incomplete",
         }
       );
@@ -118,7 +118,7 @@ export function useReadState(
   const markChannelRead = React.useCallback((channelId: string): MarkResult => {
     return (
       managerRef.current?.markChannelRead(channelId) ?? {
-        success: false,
+        status: "refused",
         reason: "load_incomplete",
       }
     );

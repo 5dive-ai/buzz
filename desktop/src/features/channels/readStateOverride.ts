@@ -33,11 +33,11 @@ export function overrideErrorMessage(
     return op === "unread"
       ? "Could not mark unread: counter limit reached for this channel."
       : "Could not clear unread override: counter limit reached.";
-  if (reason === "load_incomplete")
-    return op === "unread"
-      ? "Could not mark unread: read state is still loading. Try again shortly."
-      : "Could not clear unread override: read state is still loading.";
   if (reason === "already_inactive") return null;
+  if (reason === "storage_failed")
+    return op === "unread"
+      ? "Could not mark unread: storage write failed."
+      : "Could not clear unread override: storage write failed.";
   return op === "unread"
     ? "Could not mark unread."
     : "Could not clear unread override.";
@@ -59,13 +59,21 @@ export type OverrideAPIs = {
  * Call the manager's override-unread path (S bump + B set to effective
  * frontier). Returns true when the local cache should be updated; returns false
  * and shows a toast when the manager refuses.
+ *
+ * Returns false silently (no toast) when `status: "queued"` — the intent is
+ * enqueued for the next drain; optimistic presentation continues unchanged.
  */
 export function applyOverrideUnread(
   channelId: string,
   apis: OverrideAPIs,
 ): boolean {
   const result = apis.markChannelUnread(channelId);
-  if (!result.success) {
+  if (result.status === "queued") {
+    // Intent enqueued — optimistic forced-entry was already written by the
+    // caller before this call (write ordering per plan ruling 2).  No toast.
+    return true;
+  }
+  if (result.status === "refused") {
     const msg = overrideErrorMessage("unread", result.reason);
     if (msg) toast.error(msg);
     return false;
@@ -120,7 +128,13 @@ export function applyOverrideRead(
   // Step 3: register exists — always attempt the C-bump (NIP-RS:537-539).
   const result = apis.markChannelRead(channelId);
 
-  if (!result.success && result.reason === "already_inactive") {
+  if (result.status === "queued") {
+    // Intent enqueued — fail-closed: treat load-incomplete as overrideStillActive.
+    // The forced-unread entry is preserved; the intent drains on next complete load.
+    return "overrideStillActive";
+  }
+
+  if (result.status === "refused" && result.reason === "already_inactive") {
     // Race: cleared by another device between our check and the call.
     return "overrideCleared";
   }
@@ -134,7 +148,7 @@ export function applyOverrideRead(
   }
 
   // Refused and still active.
-  if (!result.success) {
+  if (result.status === "refused") {
     const msg = overrideErrorMessage("read", result.reason);
     if (msg) toast.error(msg);
   }

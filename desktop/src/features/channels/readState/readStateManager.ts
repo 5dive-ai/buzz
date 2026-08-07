@@ -28,21 +28,29 @@ import {
 import {
   readStoredReadState,
   writeStoredReadState,
+  type AppliedReceipt,
 } from "@/features/channels/readState/readStateStorage";
 import {
   fencedEnumerationLoad,
   deduplicateByCoordinate,
 } from "@/features/channels/readState/readStateFencedLoader";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
-
+import { pendingOverrideIntentStore } from "@/features/channels/pendingOverrideIntents";
+import {
+  drainPendingIntents as drainPendingIntentsImpl,
+  markChannelUnread as markChannelUnreadImpl,
+  markChannelRead as markChannelReadImpl,
+  type DrainContext,
+} from "@/features/channels/readState/readStateDrain";
 const CLIENT_ID_KEY_PREFIX = "buzz.nip-rs.client-id";
 const SLOT_ID_KEY_PREFIX = "buzz.nip-rs.slot-id";
 const DEBOUNCE_MS = 5_000;
 
 export type MarkResult =
-  | { success: true }
+  | { status: "applied" }
+  | { status: "queued" }
   | {
-      success: false;
+      status: "refused";
       reason:
         | "uint32_overflow"
         | "budget_exhausted"
@@ -53,9 +61,7 @@ export type MarkResult =
 
 /** Explicit delta returned by `ingest()`. */
 export type IngestDelta = {
-  /** Contexts whose frontier or override register changed. */
   changedContexts: Set<string>;
-  /** True if any canonical form changed (triggers convergence publish). */
   canonicalChanged: boolean;
 };
 
@@ -99,7 +105,7 @@ export type ApplyRemoteContextResult = "unchanged" | "advanced";
 
 export type ContextParentResolver = (contextId: string) => string | null;
 
-/** Coherent projection (completeness + frontiers + overrides) for UI consumption via `getProjection()`. */
+/** Coherent projection of completeness + frontiers + overrides for UI consumption. */
 export type ReadStateProjection = {
   loadComplete: boolean;
   frontiers: ReadonlyMap<string, number>;
@@ -147,13 +153,13 @@ export function applyRemoteContextTimestamp(args: {
   return result;
 }
 
-/** Result of `splitContextsIntoBudgetedSlots`. */
+/** Slot split result. */
 export interface SlotSplitResult {
   slots: Array<Record<string, number>>;
   extraSlotIds: string[];
 }
 
-/** Partition `channelEntries` across slots, override groups pinned to slot 0. Exported for testing. */
+/** Partition channelEntries across slots; override groups pinned to slot 0. Exported for testing. */
 export function splitContextsIntoBudgetedSlots(args: {
   channelEntries: [string, number][];
   threadMsgEntries: [string, number][];
@@ -226,7 +232,7 @@ export interface TrimResult {
   fitsAfterTrim: boolean;
 }
 
-/** Trim a contexts map to fit within `maxBytes`. Evicts oldest msg:, then thread:. Channel keys and ov_* entries are never evicted. Mutates in place. Returns `{ evicted, fitsAfterTrim }`. */
+/** Trim a contexts map to fit within `maxBytes`. Evicts oldest msg:/thread: entries; channel/ov_* keys never evicted. */
 export function trimContextsToBudget(
   contexts: Record<string, number>,
   clientId: string,
@@ -281,6 +287,11 @@ export class ReadStateManager {
   private parentResolver: ContextParentResolver | null = null;
   private overrideRegisters = new Map<string, OverrideRegister>();
   private isLoadComplete = false;
+  private appliedReceipts = new Map<string, AppliedReceipt>(); // co-committed with register (Amendment C)
+  private loadGeneration = 0; // single-flight controller
+  private loadInFlight = false;
+  private retryBackoffTimer: number | null = null;
+  private drainScheduled = false;
 
   constructor(pubkey: string, relayClient: RelayClient) {
     this.pubkey = pubkey;
@@ -293,13 +304,24 @@ export class ReadStateManager {
       generateHex(16),
     );
     this.extraSlotIds = loadExtraSlotIds(pubkey);
+    pendingOverrideIntentStore.loadForPubkey(pubkey);
   }
 
   async initialize(): Promise<void> {
     if (this.initialized || this.destroyed) return;
     this.hydrateFromLocalStorage();
-    await this.fetchAndMerge();
+    this.loadInFlight = true;
+    const gen = ++this.loadGeneration;
+    try {
+      await this.fetchAndMerge();
+    } finally {
+      if (gen === this.loadGeneration) this.loadInFlight = false;
+    }
     if (this.destroyed) return;
+    if (this.isLoadComplete && !this.drainScheduled) {
+      this.drainScheduled = true;
+      void this.drainPendingIntents(gen);
+    }
     await this.startLiveSubscription();
     if (this.destroyed) return;
     const initContexts = this.currentContexts();
@@ -371,6 +393,13 @@ export class ReadStateManager {
 
   destroy(): void {
     this.destroyed = true;
+    this.loadGeneration++;
+    this.loadInFlight = false;
+    this.drainScheduled = false;
+    if (this.retryBackoffTimer !== null) {
+      window.clearTimeout(this.retryBackoffTimer);
+      this.retryBackoffTimer = null;
+    }
     if (this.debounceTimer !== null) {
       window.clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
@@ -399,11 +428,43 @@ export class ReadStateManager {
     this.notifyListeners();
   }
 
-  /** Retry a failed load: resets isLoadComplete, re-runs the full enumeration. */
+  /** Retry load: generation-fenced, coalesces in-flight loads, resets backoff. */
   async retryLoad(): Promise<void> {
     if (this.destroyed) return;
-    this.isLoadComplete = false;
-    await this.fetchAndMerge();
+    if (this.retryBackoffTimer !== null) {
+      window.clearTimeout(this.retryBackoffTimer);
+      this.retryBackoffTimer = null;
+    }
+    if (this.loadInFlight) return;
+    this.loadInFlight = true;
+    const gen = ++this.loadGeneration;
+    try {
+      this.isLoadComplete = false;
+      await this.fetchAndMerge();
+      if (this.destroyed || gen !== this.loadGeneration) return;
+      if (!this.drainScheduled) {
+        this.drainScheduled = true;
+        void this.drainPendingIntents(gen);
+      }
+    } finally {
+      if (gen === this.loadGeneration) {
+        this.loadInFlight = false;
+      }
+    }
+  }
+
+  /** Drain pending override intents. See readStateDrain.ts for the full implementation. */
+  private async drainPendingIntents(drainGen: number): Promise<void> {
+    await drainPendingIntentsImpl(this as unknown as DrainContext, drainGen);
+    this.drainScheduled = false;
+  }
+
+  markChannelUnread(channelId: string): MarkResult {
+    return markChannelUnreadImpl(this as unknown as DrainContext, channelId);
+  }
+
+  markChannelRead(channelId: string): MarkResult {
+    return markChannelReadImpl(this as unknown as DrainContext, channelId);
   }
 
   /** Shared ingest: accept pre-merged state and return semantic delta (changed contexts, canonical flip). */
@@ -413,7 +474,7 @@ export class ReadStateManager {
       canonicalChanged: false,
     };
 
-    // Snapshot canonical forms before frontier merge (a frontier advance can flip live→tombstone).
+    // Snapshot canonical forms before frontier merge.
     const prevCanonicalByCtx = new Map<string, string>();
     for (const rawCtx of merged.frontiers.keys()) {
       const reg = this.overrideRegisters.get(rawCtx);
@@ -484,7 +545,7 @@ export class ReadStateManager {
         if (parsed.createdAt > src)
           this.contextSourceCreatedAt.set(rawCtx, parsed.createdAt);
       }
-      // Slot-conflict rotation (spec MUST NOT, NIP-RS.md:55-64,402-406).
+      // Slot-conflict rotation (NIP-RS.md:55-64,402-406).
       if (
         parsed.dTag === `read-state:${this.slotId}` &&
         parsed.blob.client_id !== this.clientId
@@ -496,7 +557,6 @@ export class ReadStateManager {
         );
       }
       if (parsed.blob.client_id === this.clientId) {
-        // Own-blob: union lastPublishedContexts and mark publishable.
         const unionContexts: Record<string, number> = {
           ...this.lastPublishedContexts,
         };
@@ -547,7 +607,7 @@ export class ReadStateManager {
       };
     } catch {
       unsubReconnect();
-      // Live subscription is best-effort; missed events will be caught on reconnect.
+      // Live subscription is best-effort; missed events caught on reconnect.
     }
   }
 
@@ -685,7 +745,6 @@ export class ReadStateManager {
         limit: READ_STATE_FETCH_LIMIT,
       });
       const deduped = deduplicateByCoordinate(events);
-      // Parse once: use same path as full-state load (Contract 2 — metadata/conflict).
       const parsed: ParsedReadStateEvent[] = [];
       for (const ev of deduped) {
         const p = await parseReadStateEvent(ev, this.pubkey);
@@ -724,11 +783,7 @@ export class ReadStateManager {
     );
   }
 
-  /**
-   * Build the single-slot contexts record. Uses `channelFrontier()` for
-   * canonical serialization — same resolver as `getOverrideLiveness()`.
-   * Returns null when the record doesn't fit in one slot.
-   */
+  /** Build the single-slot contexts record; returns null if it doesn't fit. */
   private currentContexts(): Record<string, number> | null {
     const contexts: Record<string, number> = {};
     for (const [ctx, ts] of this.effectiveState) {
@@ -737,7 +792,6 @@ export class ReadStateManager {
     }
     for (const [rawCtx, reg] of this.overrideRegisters) {
       if (!this.publishableContextIds.has(rawCtx)) continue;
-      // Use channelFrontier — same resolver as getOverrideLiveness.
       const frontier = this.channelFrontier(rawCtx);
       const wireEntries = encodeOverrideGroup(rawCtx, reg, frontier);
       for (const [key, val] of Object.entries(wireEntries)) contexts[key] = val;
@@ -810,7 +864,7 @@ export class ReadStateManager {
     };
   }
 
-  /** Coherent snapshot of completeness + frontiers + overrides. Maps are live read-only views — re-read on manager notifications; clone for snapshot semantics. */
+  /** Coherent snapshot of completeness + frontiers + overrides. */
   getProjection(): ReadStateProjection {
     return {
       loadComplete: this.isLoadComplete,
@@ -819,8 +873,8 @@ export class ReadStateManager {
     };
   }
 
-  /** Candidate planner: trials candidate against single- and multi-slot paths. May mutate extraSlotIds as a side effect — caller must snapshot and restore on failure. */
-  private tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean {
+  /** Trial candidate plan; may mutate extraSlotIds — caller must restore on failure. */
+  tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean {
     const prev = this.overrideRegisters.get(rawCtxId);
     const wasPublishable = this.publishableContextIds.has(rawCtxId);
     this.overrideRegisters.set(rawCtxId, reg);
@@ -836,8 +890,8 @@ export class ReadStateManager {
     return fits;
   }
 
-  /** Restore extra slot IDs (action rollback). If prior was empty, removes the key (absent → absent). */
-  private restoreExtraSlotIds(prev: string[]): void {
+  /** Restore extra slot IDs on rollback. Removes localStorage key when array empties. */
+  restoreExtraSlotIds(prev: string[]): void {
     const changed =
       prev.length !== this.extraSlotIds.length ||
       prev.some((id, i) => id !== this.extraSlotIds[i]);
@@ -846,72 +900,6 @@ export class ReadStateManager {
       prev.length === 0
         ? localStorage.removeItem(localExtraSlotIdsKey(this.pubkey))
         : saveExtraSlotIds(this.pubkey, this.extraSlotIds);
-  }
-
-  markChannelUnread(channelId: string): MarkResult {
-    if (!this.isLoadComplete)
-      return { success: false, reason: "load_incomplete" };
-    const existing = this.overrideRegisters.get(channelId);
-    const s = existing?.s ?? 0;
-    const c = existing?.c ?? 0;
-    const b = existing?.b ?? 0;
-    const newS = Math.max(s, c) + 1;
-    if (newS > 0xffffffff) return { success: false, reason: "uint32_overflow" };
-    const newReg: OverrideRegister = {
-      s: newS,
-      c,
-      b: Math.max(b, this.channelFrontier(channelId)),
-    };
-    // Snapshot extraSlotIds before the probe (probe mutates it via splitContextsIntoSlots).
-    const prevExtraSlotIds = this.extraSlotIds.slice();
-    if (!this.tryCandidatePlan(channelId, newReg)) {
-      this.restoreExtraSlotIds(prevExtraSlotIds);
-      return { success: false, reason: "budget_exhausted" };
-    }
-    const prevReg = this.overrideRegisters.get(channelId);
-    const wasPublishable = this.publishableContextIds.has(channelId);
-    this.overrideRegisters.set(channelId, newReg);
-    this.publishableContextIds.add(channelId);
-    if (!this.persistLocalState()) {
-      if (prevReg === undefined) this.overrideRegisters.delete(channelId);
-      else this.overrideRegisters.set(channelId, prevReg);
-      if (!wasPublishable) this.publishableContextIds.delete(channelId);
-      this.restoreExtraSlotIds(prevExtraSlotIds);
-      return { success: false, reason: "storage_failed" };
-    }
-    this.notifyListeners();
-    this.schedulePublish();
-    return { success: true };
-  }
-
-  markChannelRead(channelId: string): MarkResult {
-    if (!this.isLoadComplete)
-      return { success: false, reason: "load_incomplete" };
-    const reg = this.overrideRegisters.get(channelId);
-    const effectiveFrontier = this.channelFrontier(channelId);
-    if (!reg) return { success: false, reason: "already_inactive" };
-    // Always attempt C-bump (spec NIP-RS.md:537-539).
-    const newC = Math.max(reg.s, reg.c) + 1;
-    if (newC > 0xffffffff) return { success: false, reason: "uint32_overflow" };
-    const newReg: OverrideRegister = { s: reg.s, c: newC, b: reg.b };
-    if (isOverrideActive(newReg, effectiveFrontier)) {
-      console.error(
-        "[ReadStateManager] markChannelRead: override still active after bump",
-      );
-      return { success: false, reason: "already_inactive" };
-    }
-    const wasPublishable = this.publishableContextIds.has(channelId);
-    this.overrideRegisters.set(channelId, newReg);
-    this.publishableContextIds.add(channelId);
-    if (!this.persistLocalState()) {
-      // v2 write failed — roll back.
-      this.overrideRegisters.set(channelId, reg);
-      if (!wasPublishable) this.publishableContextIds.delete(channelId);
-      return { success: false, reason: "storage_failed" };
-    }
-    this.notifyListeners();
-    this.schedulePublish();
-    return { success: true };
   }
 
   private hydrateFromLocalStorage(): void {
@@ -939,6 +927,17 @@ export class ReadStateManager {
         );
       this.publishableContextIds.add(ctx); // v2 entry is inherently publishable
     }
+    // Amendment C hydration: load receipts; orphan sweep for receipts with no matching intent.
+    for (const [channelId, receipt] of stored.appliedReceipts) {
+      const intent = pendingOverrideIntentStore.get(channelId);
+      if (
+        intent !== undefined &&
+        intent.gen === receipt.intentGen &&
+        intent.op === receipt.op
+      ) {
+        this.appliedReceipts.set(channelId, receipt);
+      }
+    }
     this.persistLocalState();
   }
 
@@ -956,6 +955,7 @@ export class ReadStateManager {
       this.publishableContextIds,
       this.contextSourceCreatedAt,
       entries,
+      this.appliedReceipts,
     );
   }
 

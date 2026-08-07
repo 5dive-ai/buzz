@@ -98,6 +98,7 @@ test("writeStoredReadState prunes all three keys consistently", () => {
       [freshThread, nowSeconds],
     ]),
     new Map(),
+    new Map(),
   );
 
   const state = JSON.parse(
@@ -130,6 +131,7 @@ test("writeStoredReadState round-trips through readStoredReadState", () => {
     new Set(["channel-9"]),
     new Map([["channel-9", nowSeconds]]),
     new Map([["channel-9", { s: 3, c: 1, b: nowSeconds, f: nowSeconds }]]),
+    new Map(),
   );
 
   const stored = readStoredReadState(pubkey);
@@ -158,6 +160,7 @@ test("writeStoredReadState_survives_throwing_localStorage_and_returns_false", ()
       new Map([["channel-1", nowSeconds]]),
       new Set(["channel-1"]),
       new Map([["channel-1", nowSeconds]]),
+      new Map(),
       new Map(),
     );
   });

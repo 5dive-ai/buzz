@@ -260,7 +260,6 @@ export function useUnreadChannels(
       } = {},
     ) => {
       // Frontier advance first (spec order: advance → C-bump → inspect liveness).
-      // The advance may make F > B, so applyOverrideRead sees an inactive override.
       const observedLatest = topLevelOnly
         ? undefined
         : latestByChannelRef.current.get(channelId);
@@ -272,8 +271,7 @@ export function useUnreadChannels(
         markContextRead(channelId, markAt);
       }
       // C-bump; clear local presentation only when liveness is confirmed inactive
-      // AND the caller has not opted to preserve the forced-unread state.
-      // null ≠ inactive — pre-init fails closed.
+      // and the caller has not opted to preserve the forced-unread state.
       if (!preserveForcedUnread) {
         const outcome = applyOverrideRead(channelId, overrideApis);
         if (outcome === "overrideCleared") {
@@ -284,20 +282,13 @@ export function useUnreadChannels(
             }
             bumpLatestVersion();
           }
-          // Route observed-evidence deletion through the fenced owner — the parent
-          // must not delete from latestByChannelRef or observedUnreadEventsByChannelRef
-          // directly, or a stale scope-A callback could corrupt scope B before the
-          // fence rejects. Only clear on an accepted override outcome so a refused
-          // C-bump (load_incomplete, budget_exhausted, uint32_overflow) does not
-          // destroy evidence while the authoritative override remains active.
+          // Clear observed evidence only on accepted outcome (refused C-bump must not destroy evidence).
           if (markAt !== null && clearObserved) {
             observedPersistence.removeChannel(channelId);
             bumpLatestVersion();
           }
         }
       } else if (markAt !== null && clearObserved) {
-        // preserveForcedUnread path: no C-bump attempted, so no override outcome
-        // to gate on. Route through the same fenced API to preserve scope safety.
         observedPersistence.removeChannel(channelId);
         bumpLatestVersion();
       }
@@ -319,16 +310,25 @@ export function useUnreadChannels(
     bumpLatestVersion,
   );
 
-  // Manually mark a channel unread (right-click / Inbox). Gates the local
-  // persistence on NIP-RS manager acceptance so budget_exhausted / load_incomplete
-  // refusals prevent a phantom unread state. Returns true when accepted.
+  // Mark channel unread: write forced entry first (write ordering), then apply override.
+  // Refused results undo the forced entry. Returns true when accepted (applied or queued).
   const markChannelUnread = React.useCallback(
     (channelId: string, source?: ForcedUnreadSource): boolean => {
-      if (!applyOverrideUnread(channelId, overrideApis)) return false;
+      // Step 1: write the forced entry first (write ordering).
       forcedMarkChannelUnread(channelId, source);
+      // Step 2: apply override (may enqueue intent or apply immediately).
+      if (!applyOverrideUnread(channelId, overrideApis)) {
+        // Refused — undo the forced entry.
+        if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
+          delete forcedUnreadRef.current[channelId];
+          if (pubkey) forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+          bumpLatestVersion();
+        }
+        return false;
+      }
       return true;
     },
-    [forcedMarkChannelUnread, overrideApis],
+    [forcedMarkChannelUnread, overrideApis, pubkey],
   );
 
   // Record the thread root of an EXTERNAL message that @-mentioned the user.

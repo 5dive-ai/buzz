@@ -11,12 +11,31 @@ import {
   type OverrideRegister,
 } from "@/features/channels/readState/readStateFormat";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
+import type { PendingIntentOp } from "@/features/channels/pendingOverrideIntents";
 
 export type StoredReadState = {
   contexts: Map<string, number>;
   publishableContextIds: Set<string>;
   contextSourceCreatedAt: Map<string, number>;
   overrideRegisters: Map<string, StoredOverrideEntry>;
+  appliedReceipts: Map<string, AppliedReceipt>;
+};
+
+/**
+ * Applied receipt — co-committed with the register mutation in
+ * `persistLocalState()` (Amendment C).
+ *
+ * A surviving intent whose `{intentGen, op}` matches a receipt is
+ * *already applied*: hydration completes cleanup + compare-delete WITHOUT
+ * another S/C bump.
+ *
+ * Lifetime: receipt lifetime ⊆ intent lifetime.  The receipt is deleted in
+ * the same store transaction as its intent (both are in the same v2 blob).
+ * Receipts cannot accumulate.
+ */
+export type AppliedReceipt = {
+  intentGen: number;
+  op: PendingIntentOp;
 };
 
 function mergeLocalStorageKey(
@@ -98,11 +117,13 @@ export function readStoredReadState(pubkey: string): StoredReadState {
   const contexts = new Map<string, number>();
   mergeLocalStorageKey(contexts, localReadStateKey(pubkey));
 
+  const overrideState = readOverrideState(pubkey);
   return {
     contexts,
     publishableContextIds: readPublishableContextIds(pubkey),
     contextSourceCreatedAt: readContextSourceCreatedAt(pubkey),
-    overrideRegisters: readOverrideState(pubkey),
+    overrideRegisters: overrideState.registers,
+    appliedReceipts: overrideState.receipts,
   };
 }
 
@@ -125,14 +146,24 @@ function localOverrideRegistersKeyLegacy(pubkey: string): string {
 
 export type StoredOverrideEntry = OverrideRegister & { f: number };
 
-function readOverrideState(pubkey: string): Map<string, StoredOverrideEntry> {
-  const result = new Map<string, StoredOverrideEntry>();
+type OverrideStateBlob = {
+  registers: Map<string, StoredOverrideEntry>;
+  receipts: Map<string, AppliedReceipt>;
+};
+
+function readOverrideState(pubkey: string): OverrideStateBlob {
+  const registers = new Map<string, StoredOverrideEntry>();
+  const receipts = new Map<string, AppliedReceipt>();
   const raw = localStorage.getItem(localOverrideStateKey(pubkey));
   if (raw) {
     try {
       const parsed = JSON.parse(raw);
       if (isPlainRecord(parsed)) {
-        for (const [rawCtx, value] of Object.entries(parsed)) {
+        // Registers are stored under the "r" key (or top-level for compat).
+        const registersObj = isPlainRecord(parsed.r) ? parsed.r : parsed;
+        for (const [rawCtx, value] of Object.entries(registersObj)) {
+          // Skip the reserved "receipts" key.
+          if (rawCtx === "receipts") continue;
           if (!isPlainRecord(value)) continue;
           const { s, c, b, f } = value;
           if (
@@ -151,23 +182,41 @@ function readOverrideState(pubkey: string): Map<string, StoredOverrideEntry> {
             Number.isInteger(f) &&
             f >= 0
           ) {
-            result.set(rawCtx, { s, c, b, f });
+            registers.set(rawCtx, { s, c, b, f });
+          }
+        }
+        // Parse receipts from the "receipts" sub-object.
+        if (isPlainRecord(parsed.receipts)) {
+          for (const [channelId, receipt] of Object.entries(parsed.receipts)) {
+            if (!isPlainRecord(receipt)) continue;
+            const { intentGen, op } = receipt as {
+              intentGen?: unknown;
+              op?: unknown;
+            };
+            if (
+              typeof intentGen !== "number" ||
+              !Number.isInteger(intentGen) ||
+              intentGen < 1
+            )
+              continue;
+            if (op !== "unread" && op !== "read") continue;
+            receipts.set(channelId, { intentGen, op });
           }
         }
       }
     } catch {
       // Corrupt storage — return empty; repopulated on next ingest.
     }
-    return result;
+    return { registers, receipts };
   }
   // Migration: read from legacy v1 key if v2 key absent.
   const legacyRaw = localStorage.getItem(
     localOverrideRegistersKeyLegacy(pubkey),
   );
-  if (!legacyRaw) return result;
+  if (!legacyRaw) return { registers, receipts };
   try {
     const parsed = JSON.parse(legacyRaw);
-    if (!isPlainRecord(parsed)) return result;
+    if (!isPlainRecord(parsed)) return { registers, receipts };
     for (const [rawCtx, value] of Object.entries(parsed)) {
       if (!isPlainRecord(value)) continue;
       const { s, c, b } = value;
@@ -184,13 +233,13 @@ function readOverrideState(pubkey: string): Map<string, StoredOverrideEntry> {
         Number.isInteger(b) &&
         b >= 0
       ) {
-        result.set(rawCtx, { s, c, b, f: 0 }); // frontier unknown from legacy key
+        registers.set(rawCtx, { s, c, b, f: 0 }); // frontier unknown from legacy key
       }
     }
   } catch {
     // Corrupt legacy storage — ignore.
   }
-  return result;
+  return { registers, receipts };
 }
 
 /**
@@ -232,6 +281,7 @@ export function writeStoredReadState(
   publishableContextIds: ReadonlySet<string>,
   contextSourceCreatedAt: ReadonlyMap<string, number>,
   overrideRegisters: ReadonlyMap<string, StoredOverrideEntry>,
+  appliedReceipts: ReadonlyMap<string, AppliedReceipt>,
 ): boolean {
   const pruned = pruneStaleContexts(contexts, Math.floor(Date.now() / 1_000));
 
@@ -240,22 +290,37 @@ export function writeStoredReadState(
     state[contextId] = new Date(timestamp * 1_000).toISOString();
   }
 
-  // Persist override registers atomically with their frontier timestamps (v2).
-  // Registers and frontiers in one JSON blob — a single write ensures they are
-  // never torn: a register cannot be present without its associated frontier.
+  // Persist override registers atomically with their frontier timestamps and
+  // applied receipts (Amendment C) in one JSON blob — a single write ensures
+  // they are never torn.  The receipt lives alongside the register it proves
+  // was applied, so "register committed ↔ receipt committed" is a storage
+  // invariant.
+  //
+  // Format: { r: { <channelId>: {s,c,b,f}, ... }, receipts: { <channelId>: {intentGen,op}, ... } }
+  //
   // This is the ACTION COMMIT POINT: if ok4 is true the action is durably
   // committed; ancillary frontier/cache write failures (ok1-ok3) do not fail
   // the action.  If ok4 is false, the caller must roll back ALL state.
-  const overrideState: Record<
+  const registersObj: Record<
     string,
     { s: number; c: number; b: number; f: number }
   > = {};
   for (const [rawCtx, entry] of overrideRegisters) {
-    overrideState[rawCtx] = { s: entry.s, c: entry.c, b: entry.b, f: entry.f };
+    registersObj[rawCtx] = { s: entry.s, c: entry.c, b: entry.b, f: entry.f };
+  }
+  const receiptsObj: Record<
+    string,
+    { intentGen: number; op: PendingIntentOp }
+  > = {};
+  for (const [channelId, receipt] of appliedReceipts) {
+    receiptsObj[channelId] = { intentGen: receipt.intentGen, op: receipt.op };
   }
   const ok4 = setLocalStorageItemWithRecovery(
     localOverrideStateKey(pubkey),
-    JSON.stringify(overrideState),
+    JSON.stringify({
+      r: registersObj,
+      ...(Object.keys(receiptsObj).length > 0 ? { receipts: receiptsObj } : {}),
+    }),
   );
 
   // If the commit-point write failed, return immediately — do NOT write any

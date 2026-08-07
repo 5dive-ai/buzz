@@ -1254,6 +1254,11 @@ fn databricks_v2_path(route: DatabricksV2Route) -> &'static str {
 }
 
 fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
+    let max_tokens = v.get("status").and_then(Value::as_str) == Some("incomplete")
+        && v.get("incomplete_details")
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some("max_output_tokens");
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
@@ -1284,7 +1289,7 @@ fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
                     }
                 }
             }
-            Some("function_call") => {
+            Some("function_call") if !max_tokens => {
                 saw_function_call = true;
                 let raw = item
                     .get("arguments")
@@ -1304,6 +1309,9 @@ fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
                     Default::default(),
                 )?);
             }
+            // Incomplete Responses output can carry a partial function call.
+            // It is intentionally discarded by the in-turn recovery path.
+            Some("function_call") => {}
             Some("reasoning") => {
                 // Reasoning summary items from the Responses API. Each item has a
                 // `summary` array of `{"type": "summary_text", "text": "..."}` objects.
@@ -1576,13 +1584,19 @@ fn parse_anthropic(v: Value) -> Result<LlmResponse, AgentError> {
                         reasoning.push_str(t);
                     }
                 }
-                // Anthropic's replay shape is fully modelled, so nothing to keep.
-                Some("tool_use") => tool_calls.push(make_tool_call(
-                    str_field(b, "id"),
-                    str_field(b, "name"),
-                    b.get("input").cloned().unwrap_or(Value::Null),
-                    Default::default(),
-                )?),
+                // A max-token response may end in the middle of a tool input.
+                // The agent discards all calls from truncated responses, so do
+                // not reject the whole response trying to parse an input that
+                // can never be executed.
+                Some("tool_use") if stop != ProviderStop::MaxTokens => {
+                    tool_calls.push(make_tool_call(
+                        str_field(b, "id"),
+                        str_field(b, "name"),
+                        b.get("input").cloned().unwrap_or(Value::Null),
+                        Default::default(),
+                    )?)
+                }
+                Some("tool_use") => {}
                 _ => {}
             }
         }
@@ -1670,30 +1684,33 @@ fn parse_openai(v: Value) -> Result<LlmResponse, AgentError> {
         }
     };
     let mut tool_calls = Vec::new();
-    if let Some(arr) = msg.get("tool_calls").and_then(Value::as_array) {
-        for tc in arr {
-            let f = tc
-                .get("function")
-                .ok_or_else(|| AgentError::Llm("tool_call missing function".into()))?;
-            let raw = f.get("arguments").and_then(Value::as_str).unwrap_or("{}");
-            let args: Value = serde_json::from_str(raw)
-                .map_err(|e| AgentError::Llm(format!("tool_call.arguments not valid JSON: {e}")))?;
-            // Everything on the wire object we do not model, kept for replay.
-            let extra = tc
-                .as_object()
-                .map(|o| {
-                    o.iter()
-                        .filter(|(k, _)| !matches!(k.as_str(), "id" | "type" | "function"))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            tool_calls.push(make_tool_call(
-                str_field(tc, "id"),
-                str_field(f, "name"),
-                args,
-                extra,
-            )?);
+    if stop != ProviderStop::MaxTokens {
+        if let Some(arr) = msg.get("tool_calls").and_then(Value::as_array) {
+            for tc in arr {
+                let f = tc
+                    .get("function")
+                    .ok_or_else(|| AgentError::Llm("tool_call missing function".into()))?;
+                let raw = f.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                let args: Value = serde_json::from_str(raw).map_err(|e| {
+                    AgentError::Llm(format!("tool_call.arguments not valid JSON: {e}"))
+                })?;
+                // Everything on the wire object we do not model, kept for replay.
+                let extra = tc
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .filter(|(k, _)| !matches!(k.as_str(), "id" | "type" | "function"))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                tool_calls.push(make_tool_call(
+                    str_field(tc, "id"),
+                    str_field(f, "name"),
+                    args,
+                    extra,
+                )?);
+            }
         }
     }
     dedupe_provider_ids(&mut tool_calls);
@@ -3666,10 +3683,51 @@ mod tests {
         let v = serde_json::json!({
             "status": "incomplete",
             "incomplete_details": {"reason": "max_output_tokens"},
-            "output": [],
+            "output": [{
+                "type": "function_call",
+                "call_id": "partial",
+                "name": "dev__shell",
+                "arguments": "{\"command\":\"unterminated",
+            }],
         });
         let r = parse_responses(v).unwrap();
         assert_eq!(r.stop, ProviderStop::MaxTokens);
+        assert!(r.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn truncated_openai_tool_arguments_are_discarded_not_rejected() {
+        let v = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": "partial text",
+                    "tool_calls": [{
+                        "id": "partial",
+                        "type": "function",
+                        "function": {
+                            "name": "dev__shell",
+                            "arguments": "{\"command\":\"unterminated",
+                        },
+                    }],
+                },
+            }],
+        });
+        let r = parse_openai(v).unwrap();
+        assert_eq!(r.stop, ProviderStop::MaxTokens);
+        assert_eq!(r.text, "partial text");
+        assert!(r.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn truncated_anthropic_tool_use_is_discarded_not_rejected() {
+        let v = serde_json::json!({
+            "stop_reason": "max_tokens",
+            "content": [{"type": "tool_use", "id": "", "name": "", "input": null}],
+        });
+        let r = parse_anthropic(v).unwrap();
+        assert_eq!(r.stop, ProviderStop::MaxTokens);
+        assert!(r.tool_calls.is_empty());
     }
 
     #[test]

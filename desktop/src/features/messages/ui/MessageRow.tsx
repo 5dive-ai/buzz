@@ -246,7 +246,7 @@ export const MessageRow = React.memo(
       message.body,
       message.tags,
     );
-    const bodyOffsetClass = emojiOnly ? "mt-1" : "-mt-0.5";
+    const bodyOffsetClass = "mt-1";
 
     const { nonDmChannelNames: channelNames } = useChannelNavigation();
     const openVideoReviewAt = useOpenVideoReviewAt();
@@ -367,7 +367,7 @@ export const MessageRow = React.memo(
             <Markdown
               channelNames={channelNames}
               className={cn(
-                "max-w-full text-sm",
+                "max-w-full leading-relaxed [&>p+p]:mt-2 [&>ol]:space-y-1.5 [&>ul]:space-y-1.5",
                 emojiOnly &&
                   "text-4xl leading-tight [&_p]:leading-tight [&_img[data-custom-emoji]]:h-[1.45em] [&_img[data-custom-emoji]]:align-middle [&_button:has(img[data-custom-emoji])]:align-middle",
               )}
@@ -823,7 +823,7 @@ export const MessageRow = React.memo(
           className={cn(
             "group/message relative z-10 rounded-2xl transition-colors",
             playEntrance && "motion-enter-conversation",
-            "py-1",
+            isThreadReplyLayout ? "py-2" : "py-1.5",
             hoverBackground
               ? "mx-1 px-2 hover:bg-muted/50 focus-within:bg-muted/50"
               : isThreadReplyLayout

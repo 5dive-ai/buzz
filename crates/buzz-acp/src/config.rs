@@ -115,10 +115,11 @@ impl std::fmt::Display for RespondTo {
 /// `configId: "mode"` (e.g. `claude-agent-acp`).
 ///
 /// - `default` — agent's built-in behaviour (permission requests per tool call).
-/// - `auto` — fully autonomous execution; model-gated (requires `supportsAutoMode`);
+/// - `auto` — fully autonomous execution; model-gated classifier (requires `supportsAutoMode`);
 ///   the adapter degrades gracefully to `default` when the active model does not
-///   support it. The adapter self-approves all tool calls internally — no
-///   `session/request_permission` ever crosses ACP under this mode.
+///   support it. The adapter auto-approves most tool calls internally, but residual
+///   `session/request_permission` escalations may still cross ACP when the model
+///   chooses manual approval for a specific call.
 /// - `acceptEdits` — auto-approve file edits, still ask for other tools.
 /// - `dontAsk` — never prompt; reject anything that would require permission.
 /// - `plan` — planning-only mode (no tool execution).
@@ -187,11 +188,11 @@ impl std::fmt::Display for PermissionMode {
 /// per-agent or fleet-wide value; headless defaults to `reject`.
 ///
 /// - `allow`  — auto-select the unique `allow_once` option; fail closed if
-///              zero or multiple `allow_once` candidates, malformed options,
-///              or any validation error.
+///   zero or multiple `allow_once` candidates, malformed options,
+///   or any validation error.
 /// - `ask`    — surface the request as an actionable card for the owner;
-///              fail closed on timeout (300 s) or if the observer / owner is
-///              unavailable.
+///   fail closed on timeout (300 s) or if the observer / owner is
+///   unavailable.
 /// - `reject` — deny every request (today's behaviour, headless default).
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum PermissionPolicy {
@@ -617,9 +618,9 @@ pub struct CliArgs {
     ///
     /// - `reject` (headless default) — deny all permission requests.
     /// - `ask`    — surface as an actionable card; auto-deny on timeout (300 s)
-    ///              or when the observer / owner is unavailable.
+    ///   or when the observer / owner is unavailable.
     /// - `allow`  — auto-approve via the unique `allow_once` option;
-    ///              fail closed if zero or multiple `allow_once` candidates.
+    ///   fail closed if zero or multiple `allow_once` candidates.
     ///
     /// Desktop injects the resolved per-agent or fleet-wide value.
     /// Headless installations should leave this unset (defaults to `reject`).

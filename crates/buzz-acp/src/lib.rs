@@ -453,7 +453,19 @@ impl ObserverPublishQueue {
         // Pre-trim at enqueue so (a) byte accounting reflects what will ship
         // and (b) one oversized leaf cannot force every frame it touches into
         // whole-envelope elision downstream.
+        //
+        // Authorization frames must not be leaf-trimmed (NIP-AO §3 requires
+        // byte-for-byte reproduction). `fit_observer_event_to_budget` returns
+        // without mutating them; if they are still over-cap after that guard,
+        // suppress entirely rather than enqueue an over-budget frame.
         fit_observer_event_to_budget(&mut event);
+        if event.authorization.is_some() && serialized_len(&event) > OBSERVER_MAX_PLAINTEXT_LEN {
+            tracing::warn!(
+                kind = %event.kind,
+                "suppressing authorized observer frame at enqueue: over-cap after fit"
+            );
+            return;
+        }
         let bytes = serialized_len(&event);
         self.pending_bytes += bytes;
         self.events.push_back((bytes, source_events, event));
@@ -892,6 +904,19 @@ const OBSERVER_LEAF_RETAIN_BYTES: usize = 3_000;
 /// signature with one cheap redundant serialize is the deliberate tradeoff.
 fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
     if serialized_len(event) <= OBSERVER_MAX_PLAINTEXT_LEN {
+        return;
+    }
+
+    // Authorization frames carry byte-for-byte raw ACP that must not be
+    // rewritten — NIP-AO §3 requires the payload to be reproduced exactly as
+    // received. If the annotated event is still over-cap after the early-return
+    // above, suppress it entirely rather than mutate the ACP bytes.
+    if event.authorization.is_some() {
+        tracing::warn!(
+            kind = %event.kind,
+            "dropping authorized observer frame: annotated size exceeds cap \
+             and payload must not be trimmed"
+        );
         return;
     }
 
@@ -8008,5 +8033,42 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+
+    /// Authorized observer frames must never be leaf-trimmed or stubbed.
+    /// `fit_observer_event_to_budget` must leave the payload untouched when
+    /// `authorization` is present, even if the serialized frame is over-cap.
+    #[test]
+    fn test_authorized_frame_payload_is_never_trimmed() {
+        // Build an over-cap authorized frame (big payload, authorization present).
+        let big = "x".repeat(OBSERVER_MAX_PLAINTEXT_LEN + 1000);
+        let mut event = event_with_payload(
+            "acp_read",
+            serde_json::json!({ "method": "session/request_permission", "body": big }),
+        );
+        event.authorization = Some(crate::observer::AuthorizationEnvelope {
+            request_nonce: "test-nonce".to_string(),
+            actionable: true,
+            reason: None,
+        });
+
+        let payload_before = event.payload.clone();
+        assert!(
+            serialized(&event).len() > OBSERVER_MAX_PLAINTEXT_LEN,
+            "precondition: authorized frame is over-cap"
+        );
+
+        fit_observer_event_to_budget(&mut event);
+
+        // Payload must be byte-for-byte identical — no leaf trim, no stub.
+        assert_eq!(
+            event.payload, payload_before,
+            "authorized frame payload must not be mutated by fit_observer_event_to_budget"
+        );
+        // Authorization envelope must still be present and intact.
+        assert!(
+            event.authorization.is_some(),
+            "authorization envelope must survive fit_observer_event_to_budget"
+        );
     }
 }

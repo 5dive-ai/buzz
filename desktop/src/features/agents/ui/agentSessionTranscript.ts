@@ -50,8 +50,9 @@ export type TranscriptState = {
   /**
    * Maps `requestNonce` → `itemId` for actionable permission cards.
    * Populated alongside `pendingPermissions` when the `authorization` envelope
-   * is present on the `acp_read` frame. Used by the `permission_decision`
-   * `control_result` handler to retire the card on any terminal outcome.
+   * is present on the `acp_read` frame. Used by the nonce-correlated `acp_write`
+   * terminal handler and the `permission_terminal` event handler to retire the
+   * card on any terminal outcome (applied, timed_out, cancelled, uncertain).
    */
   pendingPermissionsByNonce: Map<string, string>;
   continuationSeq: number;
@@ -275,8 +276,83 @@ function describePermissionOutcome(
 }
 
 /**
+ * Derive human-readable outcome copy from the `authorization.reason` field
+ * that accompanies terminal `acp_write` events. This is preferred over
+ * deriving copy from the ACP `result.outcome` field directly because the
+ * `reason` values are harness-level semantics (applied / timed_out /
+ * cancelled) whereas `result.outcome` is adapter-level (selected / reject_once
+ * etc.) and does not distinguish timeout from explicit denial.
+ *
+ * Falls back to `describePermissionOutcome` when `reason` is absent (legacy
+ * paths that predate the authorization envelope).
+ */
+function describePermissionTerminalReason(
+  reason: string | undefined,
+  outcomeKind: string | null | undefined,
+  optionId: string | null,
+  options:
+    | Array<{ optionId: string; kind: string; label?: string }>
+    | undefined,
+): string {
+  if (reason === "applied") {
+    // Build optionNames map from the card's options array.
+    const optionNames = new Map(
+      (options ?? []).map((o) => [o.optionId, o.kind]),
+    );
+    return describePermissionOutcome(
+      outcomeKind ?? "selected",
+      optionId,
+      optionNames,
+    );
+  }
+  if (reason === "timed_out") return "Timed out";
+  if (reason === "cancelled") return "Cancelled";
+  if (reason === "uncertain") {
+    return "Approval outcome unknown; agent process stopped before it could continue.";
+  }
+  // No reason: fall back to ACP outcome-level copy.
+  const optionNames = new Map((options ?? []).map((o) => [o.optionId, o.kind]));
+  return describePermissionOutcome(outcomeKind ?? "", optionId, optionNames);
+}
+
+/**
+ * Retire all live (actionable) permission cards for a given channel.
+ * Called on terminal turn/process events (`turn_error`, `agent_panic`,
+ * `turn_completed`) as a backstop so cards do not remain clickable after
+ * the turn that owned them has ended.
+ */
+function retireAllLivePermissionCards(d: TranscriptDraft, channelId: string) {
+  const prefix = `permission:${channelId}:`;
+  let retired = false;
+  for (const [id, item] of d.itemsById) {
+    if (
+      id.startsWith(prefix) &&
+      item.type === "lifecycle" &&
+      item.renderClass === "permission" &&
+      item.actionable
+    ) {
+      if (!retired) {
+        // Copy on first mutation.
+        d.items = [...d.items];
+        d.itemsById = new Map(d.itemsById);
+        retired = true;
+        d.changed = true;
+      }
+      const updated = { ...item, actionable: false };
+      d.itemsById.set(id, updated);
+      const idx = d.items.findIndex((i) => i.id === id);
+      if (idx !== -1) d.items[idx] = updated;
+      // Clean up nonce index if present.
+      if (item.requestNonce) {
+        d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
+        d.pendingPermissionsByNonce.delete(item.requestNonce);
+      }
+    }
+  }
+}
+
+/**
  * Stable map key for a JSON-RPC id, which may be a string or a finite number
- * per the spec. Using JSON.stringify avoids collisions between the number 1 and
  * the string "1". Returns null for null, undefined, or non-id values (objects,
  * booleans) so callers can gate on presence without a separate type check.
  */
@@ -810,6 +886,39 @@ export function processTranscriptEvent(
       ctx,
       event.kind,
     );
+    // Backstop: retire any still-live permission cards for this channel so
+    // missing telemetry and archive replay never reconstruct live controls
+    // after a terminal turn/process state.
+    retireAllLivePermissionCards(d, ch);
+  } else if (event.kind === "turn_completed") {
+    // Backstop: retire any still-live permission cards for this channel.
+    // Applied/timed-out/cancelled cards should already be retired via their
+    // nonce-correlated acp_write frames, but uncertain (process-poison) cards
+    // may only receive a turn_completed — this ensures they are not left
+    // actionable in live state or archive replay.
+    retireAllLivePermissionCards(d, ch);
+  } else if (event.kind === "permission_terminal") {
+    // Observer-only terminal event for uncertain outcomes (process poison,
+    // cancel-during-write). No ACP wire response was confirmed; the harness
+    // emits this so Desktop can retire the card without a JSON-RPC response.
+    // Carry the nonce from the authorization envelope.
+    const auth = event.authorization;
+    const nonce = auth?.requestNonce;
+    if (nonce) {
+      const itemId = d.pendingPermissionsByNonce.get(nonce);
+      if (itemId) {
+        const existing = d.itemsById.get(itemId);
+        if (existing?.type === "lifecycle") {
+          replaceItem(d, itemId, {
+            ...existing,
+            outcome: "Uncertain (process restarting)",
+            actionable: false,
+          });
+        }
+        d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
+        d.pendingPermissionsByNonce.delete(nonce);
+      }
+    }
   } else if (event.kind === "acp_read" || event.kind === "acp_write") {
     const payload = asRecord(event.payload);
     const method = asString(payload.method);
@@ -866,24 +975,70 @@ export function processTranscriptEvent(
       }
     } else if (event.kind === "acp_write" && !method) {
       // Permission response: {"id": <same as request>, "result": {"outcome": {...}}}
+      //
+      // Primary correlation: by `authorization.requestNonce` — a nonce-keyed
+      // lookup is immune to JSON-RPC id reuse across channels/sessions.
+      // Legacy fallback: by JSON-RPC id, scoped to channel `ch` so at least
+      // cross-channel collisions are avoided.
+      const auth = event.authorization;
+      const nonce = auth?.requestNonce;
       const responseId = jsonRpcId(payload.id);
       const result = asRecord(asRecord(payload.result).outcome);
       const outcomeKind = asString(result.outcome);
-      const pending = responseId ? d.pendingPermissions.get(responseId) : null;
-      if (pending && outcomeKind && responseId) {
+
+      // Derive terminal label from authorization.reason when present; this
+      // gives "Timed out" for timed_out rather than rendering the ACP
+      // outcome kind directly (which says "reject_once", not "Timed out").
+      const terminalReason = auth?.reason;
+
+      // Resolve the permission card: nonce-keyed wins; fall back to id-keyed.
+      const itemIdByNonce = nonce
+        ? d.pendingPermissionsByNonce.get(nonce)
+        : null;
+      const pendingById = responseId
+        ? d.pendingPermissions.get(responseId)
+        : null;
+
+      if (itemIdByNonce) {
+        // Nonce-correlated path: resolve the card and derive copy from reason.
+        const existing = d.itemsById.get(itemIdByNonce);
+        if (existing?.type === "lifecycle") {
+          const outcomeText = describePermissionTerminalReason(
+            terminalReason,
+            outcomeKind,
+            asString(result.optionId) ?? null,
+            existing.options,
+          );
+          replaceItem(d, itemIdByNonce, {
+            ...existing,
+            outcome: outcomeText,
+            actionable: false,
+          });
+        }
+        // Clean up both indexes.
+        if (nonce) {
+          d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
+          d.pendingPermissionsByNonce.delete(nonce);
+        }
+        if (responseId) {
+          d.pendingPermissions = new Map(d.pendingPermissions);
+          d.pendingPermissions.delete(responseId);
+        }
+      } else if (pendingById && outcomeKind && responseId) {
+        // Legacy id-correlation fallback (non-ask paths with no nonce).
         const optionId = asString(result.optionId) ?? null;
         const outcomeText = describePermissionOutcome(
           outcomeKind,
           optionId,
-          pending.optionNames,
+          pendingById.optionNames,
         );
-        const existing = d.itemsById.get(pending.itemId);
+        const existing = d.itemsById.get(pendingById.itemId);
         if (existing?.type === "lifecycle") {
-          replaceItem(d, pending.itemId, {
+          replaceItem(d, pendingById.itemId, {
             ...existing,
             outcome: outcomeText,
+            actionable: false,
           });
-          // Remove from pending map — the outcome is now recorded.
           d.pendingPermissions = new Map(d.pendingPermissions);
           d.pendingPermissions.delete(responseId);
         }

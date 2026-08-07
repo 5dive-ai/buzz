@@ -120,7 +120,9 @@ below). It is omitted on all other frame kinds.
 | `acp_read`         | Inbound ACP protocol frame (model → harness)                       |
 | `acp_write`        | Outbound ACP protocol frame (harness → model)                      |
 | `turn_started`     | A new agent turn has begun                                         |
-| `session_resolved` | Session completed or terminated                                    |
+| `session_resolved` | Session ready — emitted once when the agent session is established (before the first prompt) |
+| `turn_completed`   | Terminal lifecycle — emitted when a turn ends (success, cancel, or timeout)                  |
+| `turn_error`       | Terminal lifecycle — emitted when a turn ends with an error or process death                  |
 | `control_result`   | Acknowledgement telemetry emitted after processing a control frame |
 
 Permission `acp_read` frames (carrying `session/request_permission` calls) always
@@ -165,10 +167,12 @@ call, the `ObserverEvent` carries an `authorization` field:
   | `"cancelled"` | The turn was cancelled while the request was pending; request failed closed (denial). |
 
   The `uncertain` terminal (cancel arriving while the write is in flight) does NOT
-  produce an `acp_write` observer event — the process is irrecoverably poisoned and
-  will be respawned by the pool. Desktop clients MUST NOT expect an `acp_write` for
-  every `acp_read` they receive; a missing `acp_write` after a `session_resolved`
-  frame with a poisoned outcome indicates the `uncertain` path.
+  produce an `acp_write` observer event — instead the harness emits a
+  `permission_terminal` observer event with `authorization.reason = "uncertain"` so
+  Desktop clients can retire the card without an ACP wire response. The process is
+  irrecoverably poisoned and will be respawned by the pool. Desktop clients MUST NOT
+  expect an `acp_write` for every `acp_read` they receive; the corresponding
+  `turn_error` and `turn_completed` events are the reliable terminal lifecycle signals.
 
 **Nonce binding.** The nonce is bound to the agent, channel, session, turn, request
 ID, and exact option snapshot at generation time. It MUST NOT be reused across

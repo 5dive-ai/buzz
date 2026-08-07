@@ -7,13 +7,17 @@ export async function editMessage(
   mediaTags?: string[][],
   emojiTags?: string[][],
   mentionPubkeys?: string[],
+  suppressLinkPreviews?: boolean,
 ): Promise<void> {
   await invokeTauri("edit_message", {
-    channelId,
-    eventId,
-    content,
-    mediaTags: mediaTags ?? [],
-    emojiTags: emojiTags ?? [],
-    mentionPubkeys: mentionPubkeys ?? null,
+    input: {
+      channelId,
+      eventId,
+      content,
+      mediaTags: mediaTags ?? [],
+      emojiTags: emojiTags ?? [],
+      mentionPubkeys: mentionPubkeys ?? [],
+      suppressLinkPreviews: suppressLinkPreviews ?? false,
+    },
   });
 }

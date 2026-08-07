@@ -10,7 +10,9 @@ import type { ControlResultFrame } from "@/shared/api/types";
  *      `pending_session` (stored, will apply at next session — for both picks
  *      and clears) or `invalid_value` (rejected by harness validation).
  *
- *   2. Final ack from `create_session_and_apply_model`:
+ *   2. Final ack from the harness (`pool.resolve_effort_report`, emitted via the
+ *      main loop's `PoolEvent::EffortReport` arm immediately after
+ *      `session_set_config_option` resolves — before the prompt is sent):
  *      `ok` (adapter accepted; Desktop persists) or
  *      `failure` (adapter rejected or timeout) or
  *      `cleared` (session ran without effort override; Desktop persists null).

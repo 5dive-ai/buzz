@@ -37,8 +37,8 @@ use filter::SubscriptionRule;
 use futures_util::FutureExt;
 use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
-    PromptResult, PromptSource, SessionState, SetPoolEffortResult, TimeoutKind,
+    AgentPool, ControlSignal, EffortReport, IdleSwitchResult, OwnedAgent, PromptContext,
+    PromptOutcome, PromptResult, PromptSource, SessionState, SetPoolEffortResult, TimeoutKind,
 };
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
@@ -1220,9 +1220,11 @@ fn handle_switch_model_control(
 /// For the `thought_level` category (B5 effort path): validates the configId
 /// against the pool's known capabilities, stores the pool-level `desired_effort`,
 /// invalidates all idle sessions, and emits an immediate `"pending_session"` ack.
-/// The final honest ack (`ok` or `failure`) arrives from
-/// `create_session_and_apply_model` once a real session is created and the ACP
-/// call completes.
+/// The final honest ack (`ok`, `failure`, or `cleared`) is emitted by the main
+/// loop's `PoolEvent::EffortReport` arm via `pool.resolve_effort_report(...)`,
+/// which runs immediately after `create_session_and_apply_model` sends the
+/// `EffortReport` — before the prompt is issued — satisfying the Desktop's
+/// 8-second `awaitEffortOutcome` window (F2).
 ///
 /// Unknown configIds and non-effort options are passed through with a synthetic
 /// `"ok"` ack (the pre-B5 behaviour), so existing callers don't break.
@@ -2146,6 +2148,7 @@ async fn tokio_main() -> Result<()> {
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
         Wake(u32, Box<Result<AgentPool, String>>),
+        EffortReport(Box<EffortReport>),
     }
 
     loop {
@@ -2271,7 +2274,7 @@ async fn tokio_main() -> Result<()> {
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         let pool_event: Option<PoolEvent> = {
-            let (result_rx, join_set) = pool.rx_and_join_set();
+            let (result_rx, join_set, effort_report_rx) = pool.rx_and_join_set();
             tokio::select! {
                 biased;
                 // recv() returning None means all senders dropped (pool was torn down).
@@ -2299,6 +2302,12 @@ async fn tokio_main() -> Result<()> {
                 }
                 Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
                     Some(PoolEvent::Wake(attempt, Box::new(result)))
+                }
+                // Pre-prompt effort application results from worker tasks. Processed
+                // here — before turn completion — so the ack reaches the Desktop
+                // within the 8-second awaitEffortOutcome window (F2).
+                Some(report) = effort_report_rx.recv() => {
+                    Some(PoolEvent::EffortReport(Box::new(report)))
                 }
                 // Gated on pending work: with an empty queue there is nothing
                 // for the retry to dispatch, and a past `retry_at` would
@@ -3077,6 +3086,13 @@ async fn tokio_main() -> Result<()> {
                     }
                 }
             }
+            Some(PoolEvent::EffortReport(report)) => {
+                // Pre-prompt effort result from a worker task: apply the
+                // first-terminal-wins gate and emit the terminal ack before the
+                // prompt is sent, so the Desktop receives it within the 8-second
+                // awaitEffortOutcome window (F2).
+                pool.resolve_effort_report(*report, observer.as_ref());
+            }
             None => {} // relay/heartbeat/shutdown branches handled inline above
         }
     }
@@ -3114,7 +3130,7 @@ async fn tokio_main() -> Result<()> {
     // explicitly shut them down here to reap child processes. If the grace
     // period expires, remaining tasks are aborted and fall back to
     // AcpClient::Drop (start_kill + try_wait — best-effort, not guaranteed).
-    let (rx_ref, js_ref) = pool.rx_and_join_set();
+    let (rx_ref, js_ref, _effort_report_rx) = pool.rx_and_join_set();
     let shutdown_result = tokio::time::timeout(grace, async {
         loop {
             tokio::select! {
@@ -3426,6 +3442,7 @@ fn dispatch_pending(
         };
 
         let result_tx = pool.result_tx();
+        let effort_report_tx = pool.effort_report_tx();
         let ctx_clone = Arc::clone(ctx);
         let agent_index = agent.index;
 
@@ -3455,6 +3472,7 @@ fn dispatch_pending(
                 None,
                 ctx_clone,
                 result_tx,
+                effort_report_tx,
                 Some(control_rx),
                 task_turn_id,
             )
@@ -4057,6 +4075,7 @@ fn dispatch_heartbeat(
         .clone()
         .unwrap_or_else(default_heartbeat_prompt);
     let result_tx = pool.result_tx();
+    let effort_report_tx = pool.effort_report_tx();
     let ctx_clone = Arc::clone(ctx);
     let agent_index = agent.index;
     let turn_id = Uuid::new_v4().to_string();
@@ -4069,6 +4088,7 @@ fn dispatch_heartbeat(
             Some(prompt_text),
             ctx_clone,
             result_tx,
+            effort_report_tx,
             None,
             task_turn_id,
         )

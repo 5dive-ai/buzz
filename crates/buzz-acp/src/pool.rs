@@ -191,14 +191,16 @@ pub struct OwnedAgent {
     /// touching the pool's committed state.
     pub desired_effort_gen: Option<u64>,
     /// Nonce echoed in all effort acks for this checkout. Populated from the
-    /// incoming control frame in `handle_set_config_option_control` and emitted
-    /// in both the immediate ack and the final ack from `create_session_and_apply_model`.
+    /// incoming control frame in `handle_set_config_option_control` and forwarded
+    /// via `EffortReport` to `resolve_effort_report` (the main loop's
+    /// `PoolEvent::EffortReport` arm), which emits the terminal ack pre-prompt.
     /// Desktop correlates acks by nonce to prevent stale results from settling a
     /// newer pick's promise or persisting an overwritten value.
     pub pending_effort_nonce: Option<String>,
     /// Result of applying `desired_effort` at the most recent session creation.
-    /// Set in `create_session_and_apply_model`; read by `return_agent` to commit
-    /// or roll back the pool-level `committed_effort`.
+    /// Set in `create_session_and_apply_model`; forwarded via `EffortReport` to
+    /// `resolve_effort_report` for commit/rollback and ack emission pre-prompt.
+    /// Also read by `return_agent` for V-3 discarded-failed invalidation.
     pub last_effort_result: Option<EffortApplicationResult>,
     /// Normalized agent name from initialize (`agentInfo.name`/`serverInfo.name`).
     pub agent_name: String,
@@ -295,6 +297,27 @@ pub struct PoolEffortCapabilities {
     pub valid_values: Vec<String>,
 }
 
+/// Pre-prompt effort application result sent from a worker task to the main loop
+/// immediately after `session_set_config_option` resolves, before the prompt is
+/// sent. The main loop processes this via `resolve_effort_report` under pool
+/// authority so the first-terminal-wins gate, commit/rollback, and ack emission
+/// all happen at a single site with the pool lock held — satisfying the 8-second
+/// `awaitEffortOutcome` window in AgentConfigPanel regardless of turn duration.
+#[derive(Debug)]
+pub struct EffortReport {
+    /// Generation at checkout (`OwnedAgent::desired_effort_gen`). `None` for
+    /// startup-seeded effort; those are resolved via V-1 in `return_agent`.
+    pub checkout_gen: Option<u64>,
+    /// Outcome of the `session_set_config_option` call.
+    pub result: EffortApplicationResult,
+    /// Nonce from the originating control frame, echoed in all acks.
+    pub nonce: Option<String>,
+    /// The configId used in the `session_set_config_option` call.
+    pub config_id: String,
+    /// The value submitted (empty string for a clear).
+    pub value: String,
+}
+
 /// Pool of agents with take-and-return ownership semantics.
 ///
 /// Agents are either idle (sitting in `agents[i]`) or checked out
@@ -304,6 +327,12 @@ pub struct AgentPool {
     agents: Vec<Option<OwnedAgent>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
+    /// Pre-prompt effort reports from worker tasks. Workers send here
+    /// immediately after `session_set_config_option` resolves (before
+    /// the prompt is issued), allowing the main loop to emit the terminal
+    /// ack well within the Desktop's 8-second `awaitEffortOutcome` window.
+    effort_report_tx: mpsc::UnboundedSender<EffortReport>,
+    effort_report_rx: mpsc::UnboundedReceiver<EffortReport>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
     /// Pool-level desired effort `(config_id, value)` for the `thought_level`
@@ -700,10 +729,13 @@ impl AgentPool {
     /// the index invariant.
     pub fn from_slots(slots: Vec<Option<OwnedAgent>>) -> Self {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
+        let (effort_report_tx, effort_report_rx) = mpsc::unbounded_channel();
         Self {
             agents: slots,
             result_tx,
             result_rx,
+            effort_report_tx,
+            effort_report_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
             desired_effort: None,
@@ -818,101 +850,40 @@ impl AgentPool {
             }
         }
 
-        // P2-3: commit/rollback and terminal ack are unified under a single
-        // first-terminal-wins gate.
+        // P2-3 (F2): terminal acks are now emitted by `resolve_effort_report`
+        // (called from the main loop's `PoolEvent::EffortReport` arm) immediately
+        // after `session_set_config_option` resolves — before the prompt is sent.
+        // This ensures acks arrive well within the Desktop's 8-second
+        // `awaitEffortOutcome` window regardless of turn duration. The
+        // first-terminal-wins gate and state resolution (commit/rollback +
+        // last_acked_effort_gen) all happen there.
         //
-        // With parallelism > 1, multiple workers check out the same generation.
-        // The FIRST worker whose return_agent runs:
-        //   1. Performs the commit or rollback (pool-state resolution).
-        //   2. Emits the terminal ack to the Desktop.
-        //   3. Marks the generation resolved via `last_acked_effort_gen`.
+        // This block retains only what resolve_effort_report cannot: the
+        // none-result path (no session created, skip everything) and the
+        // already-resolved skips for same-gen and stale-gen returns.
+
+        // F1: stale-gen force-invalidation.
         //
-        // All later same-gen returns skip both state change and ack. This
-        // guarantees that the pool state the Desktop sees always matches the
-        // terminal ack it received — the two are resolved atomically by the same
-        // return, so they can never disagree.
+        // When a worker returns with a stale checkout generation (checkout_gen !=
+        // effort_generation) while the CURRENT generation is still unresolved
+        // (last_acked_effort_gen != Some(effort_generation)), force-invalidate the
+        // agent's sessions regardless of value equality. This ensures the next
+        // claim creates a fresh session under the current pool value and produces
+        // the terminal ack for the newest nonce.
         //
-        // Stale results (gen != pool.effort_generation) are discarded entirely;
-        // a newer pick is already pending and must not be clobbered.
-        //
-        // Startup agents carry desired_effort_gen = None and never enter this
-        // block; their effort is applied silently (no ack needed).
+        // Without this fix: rapid high→medium→high picks on one worker leave g3
+        // permanently unresolved when the worker returns for g1 with a value match
+        // (V-3's equality check skips invalidation, so no new session is created,
+        // so no ack is ever emitted for g3). The same None==None hole applies to
+        // repeated clears.
         if let Some(checkout_gen) = agent.desired_effort_gen {
-            if checkout_gen == self.effort_generation
-                && self.last_acked_effort_gen != Some(checkout_gen)
+            if checkout_gen != self.effort_generation
+                && self.last_acked_effort_gen != Some(self.effort_generation)
             {
-                // First terminal result for this generation: resolve state and
-                // emit the ack atomically, then mark the gen resolved.
-                if let Some(ref result) = agent.last_effort_result {
-                    let nonce_field = agent.pending_effort_nonce.as_deref();
-                    match result {
-                        EffortApplicationResult::Applied => {
-                            // Adapter accepted — commit pending to stable baseline.
-                            self.committed_effort = agent.desired_effort.clone();
-                            if let Some((ref config_id, ref value)) = agent.desired_effort {
-                                let mut ack = serde_json::json!({
-                                    "type": "set_config_option",
-                                    "configId": config_id,
-                                    "value": value,
-                                    "status": "ok",
-                                    "category": "thought_level",
-                                });
-                                if let Some(n) = nonce_field {
-                                    ack["nonce"] = serde_json::json!(n);
-                                }
-                                agent.acp.observe("control_result", ack);
-                                self.last_acked_effort_gen = Some(checkout_gen);
-                            }
-                        }
-                        EffortApplicationResult::Cleared => {
-                            // Clear confirmed — adapter ran on default; commit None.
-                            self.committed_effort = None;
-                            let cleared_config_id = agent
-                                .model_capabilities
-                                .as_ref()
-                                .and_then(|c| c.thought_level_config_id.as_deref())
-                                .unwrap_or("effort");
-                            let mut ack = serde_json::json!({
-                                "type": "set_config_option",
-                                "configId": cleared_config_id,
-                                "value": "",
-                                "status": "cleared",
-                                "category": "thought_level",
-                            });
-                            if let Some(n) = nonce_field {
-                                ack["nonce"] = serde_json::json!(n);
-                            }
-                            agent.acp.observe("control_result", ack);
-                            self.last_acked_effort_gen = Some(checkout_gen);
-                        }
-                        EffortApplicationResult::Failed => {
-                            // Adapter rejected — roll back desired_effort to the
-                            // last committed value so the failed candidate is
-                            // never recopied by try_claim.
-                            self.desired_effort = self.committed_effort.clone();
-                            if let Some((ref config_id, ref value)) = agent.desired_effort {
-                                let mut ack = serde_json::json!({
-                                    "type": "set_config_option",
-                                    "configId": config_id,
-                                    "value": value,
-                                    "status": "failure",
-                                    "category": "thought_level",
-                                });
-                                if let Some(n) = nonce_field {
-                                    ack["nonce"] = serde_json::json!(n);
-                                }
-                                agent.acp.observe("control_result", ack);
-                                self.last_acked_effort_gen = Some(checkout_gen);
-                            }
-                        }
-                    }
-                }
-                // None result: no session was created (agent returned without
-                // applying, e.g. process exiting). Leave desired_effort as-is;
-                // the next session will retry. No ack emitted.
+                // Stale return while current gen is unresolved — force a fresh
+                // session so the current pick can be applied and acked.
+                agent.state.invalidate_all();
             }
-            // else: gen already resolved (later same-gen return) OR stale gen.
-            // Touch neither pool state nor the ack stream.
         }
 
         // V-3: if the worker's checkout snapshot differs from the current pool
@@ -1082,19 +1053,137 @@ impl AgentPool {
         self.result_tx.clone()
     }
 
-    /// Split-borrow: returns mutable refs to `result_rx` and `join_set`
-    /// simultaneously. This lets callers poll both in a single `select!`
-    /// without a double-borrow error on `&mut AgentPool`.
+    pub fn effort_report_tx(&self) -> mpsc::UnboundedSender<EffortReport> {
+        self.effort_report_tx.clone()
+    }
+
+    /// Split-borrow: returns mutable refs to `result_rx`, `join_set`, and
+    /// `effort_report_rx` simultaneously. This lets callers poll all three in a
+    /// single `select!` without double-borrow errors on `&mut AgentPool`.
     pub fn rx_and_join_set(
         &mut self,
-    ) -> (&mut mpsc::UnboundedReceiver<PromptResult>, &mut JoinSet<()>) {
-        (&mut self.result_rx, &mut self.join_set)
+    ) -> (
+        &mut mpsc::UnboundedReceiver<PromptResult>,
+        &mut JoinSet<()>,
+        &mut mpsc::UnboundedReceiver<EffortReport>,
+    ) {
+        (
+            &mut self.result_rx,
+            &mut self.join_set,
+            &mut self.effort_report_rx,
+        )
     }
 
     /// Non-blocking drain of the result channel. Used during shutdown to
     /// collect agents that completed while join_set was being drained.
     pub fn result_rx_try_recv(&mut self) -> Result<PromptResult, mpsc::error::TryRecvError> {
         self.result_rx.try_recv()
+    }
+
+    /// Resolve an effort application result reported pre-prompt from a worker task.
+    ///
+    /// This is the first-terminal-wins P2-3 gate that was previously embedded in
+    /// `return_agent`. Moving it here (called from the main loop's
+    /// `PoolEvent::EffortReport` arm) ensures the terminal ack is emitted
+    /// immediately after `session_set_config_option` resolves — before the prompt
+    /// is sent — satisfying the Desktop's 8-second `awaitEffortOutcome` window
+    /// regardless of how long the turn takes.
+    ///
+    /// `return_agent` retains V-1 (startup propagation), V-3 (convergence
+    /// invalidation), and capability refresh, but no longer emits effort acks.
+    ///
+    /// Startup reports (`checkout_gen == None`) are no-ops here: startup effort
+    /// is applied silently, resolved via V-1 at return_agent time.
+    pub fn resolve_effort_report(
+        &mut self,
+        report: EffortReport,
+        observer: Option<&observer::ObserverHandle>,
+    ) {
+        let Some(checkout_gen) = report.checkout_gen else {
+            // Startup agent — no ack needed.
+            return;
+        };
+        let Some(obs) = observer else { return };
+
+        // Same first-terminal-wins gate as before (P2-3): only the FIRST same-gen
+        // report resolves state and emits the ack; later ones are silenced.
+        if checkout_gen != self.effort_generation
+            || self.last_acked_effort_gen == Some(checkout_gen)
+        {
+            return;
+        }
+
+        let nonce_field = report.nonce.as_deref();
+        match report.result {
+            EffortApplicationResult::Applied => {
+                self.committed_effort = self.desired_effort.clone();
+                let mut ack = serde_json::json!({
+                    "type": "set_config_option",
+                    "configId": report.config_id,
+                    "value": report.value,
+                    "status": "ok",
+                    "category": "thought_level",
+                });
+                if let Some(n) = nonce_field {
+                    ack["nonce"] = serde_json::json!(n);
+                }
+                obs.emit(
+                    "control_result",
+                    None,
+                    &observer::ObserverContext::default(),
+                    ack,
+                );
+                self.last_acked_effort_gen = Some(checkout_gen);
+            }
+            EffortApplicationResult::Cleared => {
+                self.committed_effort = None;
+                let mut ack = serde_json::json!({
+                    "type": "set_config_option",
+                    "configId": report.config_id,
+                    "value": "",
+                    "status": "cleared",
+                    "category": "thought_level",
+                });
+                if let Some(n) = nonce_field {
+                    ack["nonce"] = serde_json::json!(n);
+                }
+                obs.emit(
+                    "control_result",
+                    None,
+                    &observer::ObserverContext::default(),
+                    ack,
+                );
+                self.last_acked_effort_gen = Some(checkout_gen);
+            }
+            EffortApplicationResult::Failed => {
+                // Roll back desired_effort to committed so the failed candidate
+                // is never recopied by try_claim.
+                self.desired_effort = self.committed_effort.clone();
+                // Report the current committed value (post-rollback) in the ack.
+                let (ack_config_id, ack_value) = self
+                    .desired_effort
+                    .as_ref()
+                    .map(|(cid, v)| (cid.as_str(), v.as_str()))
+                    .unwrap_or((report.config_id.as_str(), ""));
+                let mut ack = serde_json::json!({
+                    "type": "set_config_option",
+                    "configId": ack_config_id,
+                    "value": ack_value,
+                    "status": "failure",
+                    "category": "thought_level",
+                });
+                if let Some(n) = nonce_field {
+                    ack["nonce"] = serde_json::json!(n);
+                }
+                obs.emit(
+                    "control_result",
+                    None,
+                    &observer::ObserverContext::default(),
+                    ack,
+                );
+                self.last_acked_effort_gen = Some(checkout_gen);
+            }
+        }
     }
 
     /// Check whether a slot is alive: either idle in the pool or checked out
@@ -1380,6 +1469,7 @@ async fn resolve_new_session_channel_context(
 /// On error from `session_new_full()`, returns the `AcpError` — caller handles
 /// error reporting. Model-switch failures are logged and gracefully ignored
 /// (the agent proceeds with its default model).
+#[allow(clippy::too_many_arguments)]
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
@@ -1388,6 +1478,7 @@ async fn create_session_and_apply_model(
     channel_name: Option<&str>,
     channel_id: Option<Uuid>,
     channel_type: Option<&str>,
+    effort_report_tx: &mpsc::UnboundedSender<EffortReport>,
 ) -> Result<String, AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
@@ -1501,15 +1592,15 @@ async fn create_session_and_apply_model(
         false
     };
 
-    // B5: Apply desired_effort if set, or emit the final "cleared" ack if this
-    // checkout carries a pending clear (desired_effort = None AND desired_effort_gen
-    // is Some, meaning a live clear was stored while this agent was busy).
+    // B5: Apply desired_effort if set, or report a pending clear.
     //
-    // After the real ACP call (or clear confirmation), emit a `control_result`
-    // observer frame so the EffortPicker and the persistence observer learn the
-    // true outcome. The `nonce` from the original control frame is echoed in all
-    // acks so the Desktop can reject stale results that were superseded by a newer
-    // pick/clear between send and final ack.
+    // After the real ACP call (or clear confirmation), send an `EffortReport`
+    // to the main loop via `effort_report_tx`. The main loop processes this in
+    // `PoolEvent::EffortReport` → `pool.resolve_effort_report(...)`, which emits
+    // the terminal `control_result` ack (ok/failure/cleared) under pool authority
+    // with the first-terminal-wins gate. Because this send happens here — before
+    // the prompt is issued — the ack arrives at the Desktop well within its
+    // 8-second `awaitEffortOutcome` window regardless of turn duration (F2).
     //
     //   status: "ok"      → adapter accepted; Desktop persists the value.
     //   status: "failure" → adapter rejected or timed out; Desktop does NOT persist.
@@ -1523,14 +1614,14 @@ async fn create_session_and_apply_model(
                 .await
         })
         .await;
-        let (_ack_status, effort_result) = match result {
+        let effort_result = match result {
             Ok(Ok(_)) => {
                 tracing::info!(
                     target: "pool::effort",
                     "applied effort {value} via configId={config_id} on session {}",
                     resp.session_id
                 );
-                ("ok", EffortApplicationResult::Applied)
+                EffortApplicationResult::Applied
             }
             Ok(Err(e @ AcpError::Io(_)))
             | Ok(Err(e @ AcpError::WriteTimeout(_)))
@@ -1548,25 +1639,48 @@ async fn create_session_and_apply_model(
                     target: "pool::effort",
                     "non-fatal error applying effort {value}: {e} — proceeding with agent default"
                 );
-                ("failure", EffortApplicationResult::Failed)
+                EffortApplicationResult::Failed
             }
             Err(_timeout) => {
                 tracing::warn!(
                     target: "pool::effort",
                     "effort switch {value} timed out — proceeding with agent default"
                 );
-                ("failure", EffortApplicationResult::Failed)
+                EffortApplicationResult::Failed
             }
         };
-        agent.last_effort_result = Some(effort_result);
-        // Terminal ack (ok/failure) for this effort application is emitted in
-        // return_agent where the generation gate prevents duplicate acks when
-        // parallelism > 1 (P2-3). See return_agent's effort ack emission block.
+        // Record for V-3 (return_agent convergence check) and send the pre-prompt
+        // EffortReport so the main loop can ack before the turn starts.
+        agent.last_effort_result = Some(effort_result.clone());
+        // Fire-and-forget: the receiver is the main loop which always outlives
+        // worker tasks. A send error here would mean the pool was torn down, in
+        // which case the turn itself is also about to fail.
+        let _ = effort_report_tx.send(EffortReport {
+            checkout_gen: agent.desired_effort_gen,
+            result: effort_result,
+            nonce: agent.pending_effort_nonce.clone(),
+            config_id: config_id.clone(),
+            value: value.clone(),
+        });
     } else if agent.desired_effort_gen.is_some() {
-        // Pending clear: the session ran without an effort override. Record the
-        // result so return_agent can emit the "cleared" ack and update the pool.
+        // Pending clear: the session ran without an effort override.
+        // Report via EffortReport so the main loop emits the "cleared" ack.
         agent.last_effort_result = Some(EffortApplicationResult::Cleared);
-        // Cleared ack is emitted in return_agent (P2-3 generation gate).
+        // For the cleared config_id, use the agent's capabilities if available,
+        // falling back to "effort" (same fallback as the former return_agent path).
+        let cleared_config_id = agent
+            .model_capabilities
+            .as_ref()
+            .and_then(|c| c.thought_level_config_id.as_deref())
+            .unwrap_or("effort")
+            .to_string();
+        let _ = effort_report_tx.send(EffortReport {
+            checkout_gen: agent.desired_effort_gen,
+            result: EffortApplicationResult::Cleared,
+            nonce: agent.pending_effort_nonce.clone(),
+            config_id: cleared_config_id,
+            value: String::new(),
+        });
     }
 
     // Emit session config for desktop consumption (config bridge tier 1b).
@@ -1960,12 +2074,14 @@ fn send_prompt_result(
 ///
 /// The agent is ALWAYS returned — even on panic the `JoinSet` detects the
 /// abort and the caller uses `task_map` to recover the agent index.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_prompt_task(
     mut agent: OwnedAgent,
     batch: Option<FlushBatch>,
     prompt_text: Option<String>,
     ctx: Arc<PromptContext>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
+    effort_report_tx: mpsc::UnboundedSender<EffortReport>,
     control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
     turn_id: String,
 ) {
@@ -2183,6 +2299,7 @@ pub async fn run_prompt_task(
                     title_channel.as_deref(),
                     Some(*cid),
                     origin_channel_type.as_deref(),
+                    &effort_report_tx,
                 )
                 .await
                 {
@@ -2230,8 +2347,17 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
-                    .await
+                match create_session_and_apply_model(
+                    &mut agent,
+                    &ctx,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &effort_report_tx,
+                )
+                .await
                 {
                     Ok(sid) => {
                         tracing::info!(
@@ -8282,11 +8408,12 @@ mod effort_tests {
     // ── Generation-based commit/rollback ──────────────────────────────────────
 
     /// IMPORTANT-1: when the adapter rejects a pick (EffortApplicationResult::Failed)
-    /// and the agent's checkout generation is still current, return_agent must roll
-    /// back desired_effort to committed_effort so the failed candidate is never
+    /// and the agent's checkout generation is still current, resolve_effort_report
+    /// rolls back desired_effort to committed_effort so the failed candidate is never
     /// recopied by try_claim or retried at the next session creation.
     #[tokio::test]
     async fn test_failure_rolls_back_desired_effort_to_committed() {
+        let obs = observer::ObserverHandle::in_process();
         let acp = AcpClient::spawn(
             "bash",
             &["-c".to_string(), "sleep 10".to_string()],
@@ -8317,15 +8444,24 @@ mod effort_tests {
         pool.set_pool_effort("effort", "high");
         let gen = pool.effort_generation;
         // Check out the worker (desired_effort = Some("high"), gen = 1).
-        let mut agent = pool.try_claim(None).unwrap();
+        let agent = pool.try_claim(None).unwrap();
         assert_eq!(agent.desired_effort_gen, Some(gen));
         assert_eq!(
             agent.desired_effort.as_ref().map(|(_, v)| v.as_str()),
             Some("high")
         );
-        // Simulate adapter rejecting the pick.
-        agent.last_effort_result = Some(EffortApplicationResult::Failed);
-        // Return the agent; return_agent must roll back to committed.
+        // resolve_effort_report (pre-prompt) must roll back to committed.
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen),
+                result: EffortApplicationResult::Failed,
+                nonce: None,
+                config_id: "effort".to_string(),
+                value: "high".to_string(),
+            },
+            Some(&obs),
+        );
+        // Return the agent; return_agent handles V-3/V-1.
         pool.return_agent(agent);
         assert_eq!(
             pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
@@ -8341,10 +8477,11 @@ mod effort_tests {
     }
 
     /// IMPORTANT-1: when the adapter accepts a pick (EffortApplicationResult::Applied)
-    /// and the generation is current, return_agent must commit desired_effort to
-    /// committed_effort.
+    /// and the generation is current, resolve_effort_report must commit
+    /// desired_effort to committed_effort.
     #[tokio::test]
     async fn test_applied_commits_desired_effort_to_committed() {
+        let obs = observer::ObserverHandle::in_process();
         let acp = AcpClient::spawn(
             "bash",
             &["-c".to_string(), "sleep 10".to_string()],
@@ -8370,8 +8507,21 @@ mod effort_tests {
             protocol_version: 2,
         })]);
         pool.set_pool_effort("effort", "high");
+        let gen = pool.effort_generation;
         let mut agent = pool.try_claim(None).unwrap();
         agent.last_effort_result = Some(EffortApplicationResult::Applied);
+        // F2: resolve_effort_report emits the terminal ack pre-prompt and commits
+        // desired_effort to committed_effort under pool authority.
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen),
+                result: EffortApplicationResult::Applied,
+                nonce: None,
+                config_id: "effort".to_string(),
+                value: "high".to_string(),
+            },
+            Some(&obs),
+        );
         pool.return_agent(agent);
         assert_eq!(
             pool.committed_effort.as_ref().map(|(_, v)| v.as_str()),
@@ -8380,9 +8530,10 @@ mod effort_tests {
         );
     }
 
-    /// IMPORTANT-2: a stale generation (agent gen < pool gen due to a newer pick
-    /// superseding it) must be discarded — desired_effort must not be rolled back
-    /// to the committed baseline even though last_effort_result is Failed.
+    /// IMPORTANT-2: a stale generation must not touch pool state — desired_effort
+    /// must not be rolled back even though last_effort_result is Failed.
+    /// resolve_effort_report gates on checkout_gen == effort_generation, so it is
+    /// a no-op for stale results; return_agent handles only V-3 convergence.
     #[tokio::test]
     async fn test_stale_gen_failure_does_not_rollback_pending_pick() {
         let acp = AcpClient::spawn(
@@ -8461,9 +8612,11 @@ mod effort_tests {
     }
 
     /// IMPORTANT-3: when a pending clear is confirmed (EffortApplicationResult::Cleared)
-    /// and the generation is current, return_agent must commit committed_effort = None.
+    /// and the generation is current, resolve_effort_report must commit
+    /// committed_effort = None.
     #[tokio::test]
     async fn test_cleared_commits_none_to_committed_effort() {
+        let obs = observer::ObserverHandle::in_process();
         let acp = AcpClient::spawn(
             "bash",
             &["-c".to_string(), "sleep 10".to_string()],
@@ -8500,6 +8653,17 @@ mod effort_tests {
             "clear checkout carries None"
         );
         agent.last_effort_result = Some(EffortApplicationResult::Cleared);
+        // F2: resolve_effort_report emits the "cleared" ack and commits None.
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen),
+                result: EffortApplicationResult::Cleared,
+                nonce: None,
+                config_id: "effort".to_string(),
+                value: String::new(),
+            },
+            Some(&obs),
+        );
         pool.return_agent(agent);
         assert!(
             pool.committed_effort.is_none(),
@@ -8595,6 +8759,19 @@ mod effort_tests {
         pool.agents_mut()[0] = Some(agent2);
         let mut a = pool.try_claim(None).unwrap();
         a.last_effort_result = Some(EffortApplicationResult::Failed);
+        // F2: resolve_effort_report runs pre-prompt, rolling back desired_effort
+        // to committed ("medium"). return_agent then handles V-3.
+        let obs = observer::ObserverHandle::in_process();
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen),
+                result: EffortApplicationResult::Failed,
+                nonce: None,
+                config_id: "effort".to_string(),
+                value: "high".to_string(),
+            },
+            Some(&obs),
+        );
         pool.return_agent(a);
 
         assert_eq!(
@@ -8609,9 +8786,10 @@ mod effort_tests {
     /// P2-3 order-independence A: fail arrives first, then success.
     ///
     /// Two workers carry the same generation. Worker A (fail) returns first:
-    /// pool rolls back desired_effort to committed, emits failure ack, marks
-    /// gen resolved. Worker B (Applied) returns second: gen already resolved —
-    /// no state change, no second ack.
+    /// resolve_effort_report rolls back desired_effort to committed, emits failure
+    /// ack, marks gen resolved. return_agent then handles V-3. Worker B (Applied)
+    /// fires resolve_effort_report second: gen already resolved → no state change,
+    /// no second ack. return_agent handles V-3 for the discarded worker.
     ///
     /// Final state: desired=low, committed=low (matches the failure ack).
     /// The discarded Applied worker (B) has value-mismatch after rollback:
@@ -8664,6 +8842,17 @@ mod effort_tests {
         // Worker A: failed — first terminal result, wins the gate.
         worker_a.last_effort_result = Some(EffortApplicationResult::Failed);
         worker_a.pending_effort_nonce = Some("nonce-xyz".to_string());
+        // F2: resolve_effort_report fires pre-prompt with the terminal ack.
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen),
+                result: EffortApplicationResult::Failed,
+                nonce: Some("nonce-xyz".to_string()),
+                config_id: "effort".to_string(),
+                value: "high".to_string(),
+            },
+            Some(&obs),
+        );
         worker_a.acp.set_observer(Some(obs.clone()), worker_a.index);
         pool.return_agent(worker_a);
 
@@ -8671,7 +8860,7 @@ mod effort_tests {
         assert_eq!(
             events_after_a.len(),
             1,
-            "fail→ack expected after first return"
+            "fail→ack expected after first resolve_effort_report"
         );
         assert_eq!(
             events_after_a[0].payload["status"].as_str().unwrap(),
@@ -8689,6 +8878,17 @@ mod effort_tests {
         // worker_b.desired_effort is Some("high") (checked out before rollback).
         worker_b.last_effort_result = Some(EffortApplicationResult::Applied);
         worker_b.pending_effort_nonce = Some("nonce-xyz".to_string());
+        // F2: resolve_effort_report is silenced by the first-terminal-wins gate.
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen),
+                result: EffortApplicationResult::Applied,
+                nonce: Some("nonce-xyz".to_string()),
+                config_id: "effort".to_string(),
+                value: "high".to_string(),
+            },
+            Some(&obs),
+        );
         worker_b.acp.set_observer(Some(obs.clone()), worker_b.index);
         pool.return_agent(worker_b);
 
@@ -8715,8 +8915,9 @@ mod effort_tests {
 
     /// P2-3 order-independence B: success arrives first, then fail.
     ///
-    /// Worker A (Applied) emits the ack and commits. Worker B (Failed) is
-    /// discarded — no state change, no second ack.
+    /// Worker A (Applied) fires resolve_effort_report first — emits the ack and
+    /// commits. Worker B (Failed) fires resolve_effort_report second — gen already
+    /// resolved: no state change, no second ack. return_agent handles V-3 for both.
     ///
     /// Final state: desired=high, committed=high (matches the ok ack).
     ///
@@ -8762,15 +8963,31 @@ mod effort_tests {
         let mut worker_a = pool.try_claim(None).unwrap();
         let mut worker_b = pool.try_claim(None).unwrap();
         assert_eq!(worker_a.desired_effort_gen, Some(gen));
+        let worker_b_index = worker_b.index;
 
         // Worker A: success — first terminal result, wins the gate.
         worker_a.last_effort_result = Some(EffortApplicationResult::Applied);
         worker_a.pending_effort_nonce = Some("nonce-abc".to_string());
+        // F2: resolve_effort_report fires pre-prompt with the terminal ack.
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen),
+                result: EffortApplicationResult::Applied,
+                nonce: Some("nonce-abc".to_string()),
+                config_id: "effort".to_string(),
+                value: "high".to_string(),
+            },
+            Some(&obs),
+        );
         worker_a.acp.set_observer(Some(obs.clone()), worker_a.index);
         pool.return_agent(worker_a);
 
         let events_after_a = obs.snapshot();
-        assert_eq!(events_after_a.len(), 1, "ok ack expected from first return");
+        assert_eq!(
+            events_after_a.len(),
+            1,
+            "ok ack expected from first resolve_effort_report"
+        );
         assert_eq!(events_after_a[0].payload["status"].as_str().unwrap(), "ok");
         assert_eq!(pool.last_acked_effort_gen, Some(gen));
 
@@ -8785,6 +9002,17 @@ mod effort_tests {
             .state
             .sessions
             .insert(dummy_channel, "old-sess".into());
+        // F2: resolve_effort_report is silenced by the first-terminal-wins gate.
+        pool.resolve_effort_report(
+            EffortReport {
+                checkout_gen: Some(gen),
+                result: EffortApplicationResult::Failed,
+                nonce: Some("nonce-abc".to_string()),
+                config_id: "effort".to_string(),
+                value: "high".to_string(),
+            },
+            Some(&obs),
+        );
         worker_b.acp.set_observer(Some(obs.clone()), worker_b.index);
         pool.return_agent(worker_b);
 
@@ -8808,12 +9036,11 @@ mod effort_tests {
             "P2-3: committed_effort stays high (committed by worker_a Applied)"
         );
 
-        // V-3 discarded-failed special case: the returned agent's sessions must
-        // have been invalidated even though desired_effort values matched.
-        // invalidate_all() clears the sessions map — verify it's empty.
-        let returned = pool.agents_mut().iter().flatten().next().unwrap();
+        // V-3 discarded-failed special case: worker B's slot must have been
+        // invalidated even though desired_effort values matched.
+        let returned_b = pool.agents_mut()[worker_b_index].as_ref().unwrap();
         assert!(
-            returned.state.sessions.is_empty(),
+            returned_b.state.sessions.is_empty(),
             "P2-3: discarded Failed worker must have its sessions invalidated by V-3 (discarded_failed path)"
         );
     }
@@ -8881,6 +9108,202 @@ mod effort_tests {
         assert!(
             pool.capabilities_ever_discovered,
             "capabilities_ever_discovered must stay true after cache clear"
+        );
+    }
+
+    // ── F1: stale-generation force-invalidation ───────────────────────────────
+
+    /// F1 A: rapid high→medium→high picks on one worker.
+    ///
+    /// Worker checks out at gen g1 ("high"), user picks "medium" (g2) then "high"
+    /// again (g3) while the worker runs. Worker returns stale (g1) with
+    /// Applied and value "high" — value matches pool.desired_effort("high") so
+    /// V-3 alone would skip invalidation. But g3 is unresolved: F1 must
+    /// force-invalidate so the next claim creates a fresh session and produces
+    /// the terminal ack for g3's nonce.
+    #[tokio::test]
+    async fn test_f1_stale_gen_force_invalidates_when_current_gen_unresolved() {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        let mut pool = AgentPool::from_slots(vec![Some(OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        })]);
+
+        // Pick "high" — gen 1.
+        pool.set_pool_effort("effort", "high");
+        let gen1 = pool.effort_generation;
+        let mut worker = pool.try_claim(None).unwrap();
+        assert_eq!(worker.desired_effort_gen, Some(gen1));
+
+        // While worker runs: user picks "medium" (gen 2) then "high" again (gen 3).
+        pool.set_pool_effort("effort", "medium");
+        pool.set_pool_effort("effort", "high");
+        let gen3 = pool.effort_generation;
+        assert_eq!(gen3, 3);
+        // g3 is unresolved (no ack yet).
+        assert_eq!(pool.last_acked_effort_gen, None);
+
+        // Seed a session on the worker so we can verify it gets invalidated.
+        let ch = Uuid::new_v4();
+        worker.state.sessions.insert(ch, "stale-sess".into());
+
+        // Worker returns stale (gen 1), Applied, value "high" — matches pool value.
+        worker.last_effort_result = Some(EffortApplicationResult::Applied);
+        pool.return_agent(worker);
+
+        // F1: stale gen while current gen is unresolved → force-invalidated.
+        // Session must be cleared so the next claim starts fresh and produces the g3 ack.
+        let returned = pool.agents_mut()[0].as_ref().unwrap();
+        assert!(
+            returned.state.sessions.is_empty(),
+            "F1: stale-gen return with value match must invalidate sessions when current gen is unresolved"
+        );
+    }
+
+    /// F1 B: repeated clears — None==None hole.
+    ///
+    /// Pool is at gen g1 (clear: desired=None). Worker checks out at g1,
+    /// user clears again (g2) while the worker runs. Worker returns stale (g1)
+    /// with Cleared and desired_effort=None — None==None value match would skip
+    /// V-3. But g2 is unresolved: F1 must force-invalidate.
+    #[tokio::test]
+    async fn test_f1_repeated_clear_none_none_value_match_invalidates() {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        let mut pool = AgentPool::from_slots(vec![Some(OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        })]);
+
+        // First clear — gen 1.
+        pool.clear_pool_effort();
+        let gen1 = pool.effort_generation;
+        let mut worker = pool.try_claim(None).unwrap();
+        assert_eq!(worker.desired_effort_gen, Some(gen1));
+
+        // User clears again while worker is running — gen 2, still unresolved.
+        pool.clear_pool_effort();
+        let gen2 = pool.effort_generation;
+        assert_eq!(gen2, 2);
+        assert_eq!(pool.last_acked_effort_gen, None);
+
+        // Seed a session so we can observe invalidation.
+        let ch = Uuid::new_v4();
+        worker.state.sessions.insert(ch, "stale-sess".into());
+
+        // Worker returns stale (gen 1), Cleared, desired_effort=None — None==None match.
+        worker.last_effort_result = Some(EffortApplicationResult::Cleared);
+        pool.return_agent(worker);
+
+        // F1: stale gen while current gen unresolved → force-invalidated.
+        let returned = pool.agents_mut()[0].as_ref().unwrap();
+        assert!(
+            returned.state.sessions.is_empty(),
+            "F1: repeated-clear None==None match must invalidate sessions when current gen is unresolved"
+        );
+    }
+
+    /// F1 C: stale-gen Failed with value match — session ran at DEFAULT.
+    ///
+    /// Pool picks "high" (g1). Worker A checks out at g1. Pool then picks "high"
+    /// again (g2, same value, unresolved). Worker A returns stale (g1) with
+    /// Failed and desired_effort="high" — value matches pool. Its session ran at
+    /// DEFAULT (adapter rejected g1 pick). Without F1: the session survives, so
+    /// the pool silently serves a DEFAULT-effort session for g2.
+    /// With F1: stale gen + g2 unresolved → force-invalidate.
+    #[tokio::test]
+    async fn test_f1_stale_gen_failed_session_invalidated_when_current_gen_unresolved() {
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn");
+        let mut pool = AgentPool::from_slots(vec![Some(OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        })]);
+
+        // Gen 1: pick "high".
+        pool.set_pool_effort("effort", "high");
+        let gen1 = pool.effort_generation;
+        let mut worker = pool.try_claim(None).unwrap();
+        assert_eq!(worker.desired_effort_gen, Some(gen1));
+
+        // Gen 2: pick "high" again (same value, different generation, unresolved).
+        pool.set_pool_effort("effort", "high");
+        let gen2 = pool.effort_generation;
+        assert_eq!(gen2, 2);
+        assert_eq!(pool.last_acked_effort_gen, None);
+
+        // Seed a session — the session ran at DEFAULT (adapter rejected g1 pick).
+        let ch = Uuid::new_v4();
+        worker
+            .state
+            .sessions
+            .insert(ch, "default-effort-sess".into());
+
+        // Worker returns stale (gen 1), Failed, value "high" — matches pool value.
+        worker.last_effort_result = Some(EffortApplicationResult::Failed);
+        pool.return_agent(worker);
+
+        // F1: stale gen while current gen is unresolved → force-invalidate.
+        // The DEFAULT-effort session must be cleared.
+        let returned = pool.agents_mut()[0].as_ref().unwrap();
+        assert!(
+            returned.state.sessions.is_empty(),
+            "F1: stale-gen Failed with value match must invalidate sessions when current gen is unresolved"
         );
     }
 }

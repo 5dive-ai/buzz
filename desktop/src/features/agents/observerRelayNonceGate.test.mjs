@@ -5,12 +5,37 @@ import {
   registerEffortNonce,
   resetAgentObserverStore,
   _testNonceGate,
+  _testClearEffortNonceStorage,
 } from "./observerRelayStore.ts";
 
 const PUBKEY = "aabb";
 
-// Reset store state before each test so nonce map is clean.
+// Minimal localStorage stub for the nonce-persistence tests.
+function makeLocalStorage() {
+  const store = new Map();
+  return {
+    get length() {
+      return store.size;
+    },
+    key: (i) => [...store.keys()][i] ?? null,
+    getItem: (key) => store.get(key) ?? null,
+    setItem: (key, value) => store.set(key, String(value)),
+    removeItem: (key) => {
+      store.delete(key);
+    },
+  };
+}
+
+// Reset store state AND localStorage before each test so nonce map is clean.
 function setup() {
+  // Install a fresh localStorage stub so each test has an isolated store.
+  globalThis.localStorage = makeLocalStorage();
+  resetAgentObserverStore();
+}
+
+// Full teardown: clear both the in-memory map and localStorage entries.
+function fullReset() {
+  _testClearEffortNonceStorage();
   resetAgentObserverStore();
 }
 
@@ -63,15 +88,63 @@ test("nonce gate: different agents are isolated — no cross-registration", () =
   assert.equal(_testNonceGate("agent-b", "nonce-a"), false);
 });
 
-// ── reset clears nonce state ──────────────────────────────────────────────────
+// ── reset restores from localStorage (F3 durability) ─────────────────────────
 
-test("resetAgentObserverStore clears currentEffortNonce so startup path is restored", () => {
+test("resetAgentObserverStore restores nonce from localStorage — replay accepted post-reset", () => {
+  setup();
+  registerEffortNonce(PUBKEY, "nonce-durable");
+  // Before reset: matching ack passes.
+  assert.equal(_testNonceGate(PUBKEY, "nonce-durable"), true);
+
+  // Reset clears the in-memory map, then immediately restores from localStorage.
+  // An ack arriving after reset (e.g. a remote agent ack replayed after
+  // community switch) should still be accepted.
+  resetAgentObserverStore();
+  assert.equal(
+    _testNonceGate(PUBKEY, "nonce-durable"),
+    true,
+    "post-reset: matching nonce must pass (restored from localStorage)",
+  );
+  // A nonce-less ack must still be rejected (nonce is registered in storage).
+  assert.equal(
+    _testNonceGate(PUBKEY, undefined),
+    false,
+    "post-reset: nonce-less ack must be rejected when nonce is in storage",
+  );
+});
+
+test("Desktop restart simulation — nonce persists, matching ack accepted", () => {
+  setup();
+  registerEffortNonce(PUBKEY, "nonce-restart");
+
+  // Simulate Desktop restart: clear the in-memory map without touching
+  // localStorage (the process dies and a new one starts, which calls
+  // loadNoncesFromStorage on module init). Here we simulate that init by
+  // calling _testClearEffortNonceStorage first to prove it's the storage that
+  // provides the restoration, then calling fullReset + re-init via reset.
+  //
+  // Pattern: clear in-memory only, then reset (which calls loadNoncesFromStorage).
+  resetAgentObserverStore();
+  // localStorage still has the nonce — gate must accept the matching ack.
+  assert.equal(
+    _testNonceGate(PUBKEY, "nonce-restart"),
+    true,
+    "restart-simulation: matching nonce from localStorage must pass the gate",
+  );
+});
+
+test("full reset (in-memory + storage) restores startup path", () => {
   setup();
   registerEffortNonce(PUBKEY, "nonce-registered");
-  // Before reset: nonce-less ack is blocked.
+  // Before clear: nonce-less ack is blocked.
   assert.equal(_testNonceGate(PUBKEY, undefined), false);
 
-  resetAgentObserverStore();
-  // After reset: no nonce registered → startup path active again.
-  assert.equal(_testNonceGate(PUBKEY, undefined), true);
+  // Clear both in-memory and storage — simulates a full logout/re-auth.
+  fullReset();
+  // After full reset: no nonce registered → startup path active again.
+  assert.equal(
+    _testNonceGate(PUBKEY, undefined),
+    true,
+    "full reset: startup path must be restored after clearing both memory and storage",
+  );
 });

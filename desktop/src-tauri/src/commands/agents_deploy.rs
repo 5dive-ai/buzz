@@ -119,10 +119,28 @@ pub(super) fn build_launch_block(
         policy_env.insert("BUZZ_ACP_TEAM_INSTRUCTIONS".into(), value);
     }
 
+    // B5 remote parity: when a canonical effort_level is persisted, strip
+    // BUZZ_ACP_EFFORT_LEVEL from launch.env so it cannot shadow the canonical
+    // value in policy_env (tier 1). In the k8s three-tier model tier 2
+    // (launch.env) overwrites tier 1 (policy_env) — later-wins — so the key
+    // must be absent from tier 2 whenever a canonical value is present.
+    // When effort_level is None there is no canonical to protect, so user
+    // env passthrough stands (env may legitimately seed startup effort).
+    let launch_env: BTreeMap<String, String> = if record.effort_level.is_some() {
+        descriptor
+            .env
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("BUZZ_ACP_EFFORT_LEVEL"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    } else {
+        descriptor.env.clone()
+    };
+
     serde_json::json!({
         "command": descriptor.command,
         "args": descriptor.args,
-        "env": descriptor.env,
+        "env": launch_env,
         "policy_env": policy_env,
         "owner_pubkey": owner_pubkey,
     })
@@ -373,6 +391,61 @@ mod tests {
         assert!(
             launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
             "policy_env must NOT contain BUZZ_ACP_EFFORT_LEVEL when effort_level is None"
+        );
+    }
+
+    /// B5 remote parity: when a canonical effort_level is persisted, a conflicting
+    /// user-supplied BUZZ_ACP_EFFORT_LEVEL in descriptor.env must NOT shadow it.
+    /// The canonical value in policy_env (tier 1) must win in the final build_env
+    /// output — the key must be absent from launch.env (tier 2) so tier 1 is
+    /// authoritative.
+    #[test]
+    fn launch_block_canonical_effort_strips_user_env_collision() {
+        let mut record = record();
+        record.effort_level = Some("high".to_string());
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "claude".into(),
+            args: vec![],
+            // User-supplied conflicting value in descriptor.env.
+            env: BTreeMap::from([("BUZZ_ACP_EFFORT_LEVEL".to_string(), "low".to_string())]),
+        };
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
+
+        // Canonical must be in policy_env (tier 1).
+        assert_eq!(
+            launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"], "high",
+            "canonical effort must be in policy_env when record.effort_level is Some"
+        );
+        // Conflicting user value must be absent from launch.env (tier 2) so it
+        // cannot shadow the canonical tier-1 value in build_env.
+        assert!(
+            launch["env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
+            "user BUZZ_ACP_EFFORT_LEVEL must be stripped from launch.env when canonical is present"
+        );
+    }
+
+    /// B5 remote parity: when no canonical effort is persisted (effort_level is
+    /// None), a user-supplied BUZZ_ACP_EFFORT_LEVEL in descriptor.env survives
+    /// into launch.env — passthrough preserved for startup seeding.
+    #[test]
+    fn launch_block_user_effort_env_survives_when_no_canonical_value() {
+        let record = record(); // effort_level is None
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "claude".into(),
+            args: vec![],
+            env: BTreeMap::from([("BUZZ_ACP_EFFORT_LEVEL".to_string(), "low".to_string())]),
+        };
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner-hex");
+
+        // No canonical — key must NOT appear in policy_env.
+        assert!(
+            launch["policy_env"]["BUZZ_ACP_EFFORT_LEVEL"].is_null(),
+            "policy_env must NOT contain BUZZ_ACP_EFFORT_LEVEL when effort_level is None"
+        );
+        // User value must survive in launch.env so the harness can use it.
+        assert_eq!(
+            launch["env"]["BUZZ_ACP_EFFORT_LEVEL"], "low",
+            "user-supplied effort must survive in launch.env when no canonical value"
         );
     }
 

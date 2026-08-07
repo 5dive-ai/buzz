@@ -14,7 +14,7 @@ use crate::{
     util::now_iso,
 };
 
-use super::claude_config::apply_claude_model_env;
+use super::claude_config::{apply_claude_model_env, apply_effort_env};
 mod path;
 pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::{compose_path_entries, should_skip_claude_executable, should_use_inherited};
@@ -719,12 +719,6 @@ pub fn spawn_agent_child(
     } else {
         command.env_remove("BUZZ_ACP_MODEL");
     }
-    // B5: carry persisted effort; harness resolves thought_level configId at first session.
-    if let Some(ref effort) = record.effort_level {
-        command.env("BUZZ_ACP_EFFORT_LEVEL", effort);
-    } else {
-        command.env_remove("BUZZ_ACP_EFFORT_LEVEL");
-    }
     // Session title for the harness to pass out-of-band on `session/new`. The
     // adapter names the session after it; it never reaches the prompt, so this
     // is display metadata only. The spawn-config snapshot records the same
@@ -801,6 +795,14 @@ pub fn spawn_agent_child(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+
+    // B5: carry persisted effort; harness resolves thought_level configId at first session.
+    // Written AFTER descriptor.env so the canonical persisted value wins over any
+    // user-supplied BUZZ_ACP_EFFORT_LEVEL entry, mirroring the A1 model-authority pattern
+    // (ANTHROPIC_MODEL is applied post-loop for the same reason). When effort_level is
+    // None there is no canonical value to assert, so env passthrough stands — user env
+    // legitimately seeds startup effort in that case.
+    apply_effort_env(&mut command, record.effort_level.as_deref());
 
     // A1: for local claude agents, ANTHROPIC_MODEL is the single startup model authority.
     // BUZZ_ACP_MODEL is removed (live ACP switches only; two authorities in the same env

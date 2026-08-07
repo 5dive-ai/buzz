@@ -28,6 +28,13 @@ import {
   parseSystemPromptSections,
 } from "./agentSessionTranscriptHelpers";
 import { friendlyTurnErrorCopy } from "../lib/friendlyAgentLastError";
+import {
+  describePermissionRequest,
+  retireAllLivePermissionCards,
+  handlePermissionTerminal,
+  handlePermissionWrite,
+  handlePermissionDecisionResult,
+} from "./agentSessionTranscriptPermissions";
 
 export { describeRawEvent } from "./agentSessionTranscriptHelpers";
 
@@ -179,189 +186,6 @@ function stringifyPayload(value: unknown) {
     return JSON.stringify(value, null, 2) ?? String(value);
   } catch {
     return String(value);
-  }
-}
-
-function describePermissionRequest(payload: Record<string, unknown>) {
-  const params = asRecord(payload.params);
-  const title =
-    asString(params.title) ??
-    asString(params.message) ??
-    asString(params.reason) ??
-    "Permission requested";
-  const toolCallId =
-    asString(params.toolCallId) ?? asString(params.tool_call_id);
-
-  // Build both the display-string list and the structured options list in
-  // a single pass over params.options.
-  const optionNames = new Map<string, string>();
-  const structuredOptions: Array<{
-    optionId: string;
-    kind: string;
-    label?: string;
-  }> = [];
-  const optionDisplayNames: string[] = [];
-  if (Array.isArray(params.options)) {
-    for (const option of params.options) {
-      const rec = asRecord(option);
-      const optionId = asString(rec.optionId);
-      const kind = asString(rec.kind);
-      const label = asString(rec.label) ?? asString(rec.name);
-      const displayName =
-        asString(rec.name) ?? asString(rec.kind) ?? asString(rec.optionId);
-      if (displayName) optionDisplayNames.push(displayName);
-      if (optionId && kind) {
-        optionNames.set(optionId, kind);
-        structuredOptions.push({
-          optionId,
-          kind,
-          ...(label ? { label } : {}),
-        });
-      }
-    }
-  }
-
-  const detail: string[] = [];
-  if (title !== "Permission requested") detail.push(title);
-  if (toolCallId) detail.push(`Tool call: ${toolCallId}`);
-  if (optionDisplayNames.length > 0)
-    detail.push(`Options: ${optionDisplayNames.join(", ")}`);
-
-  return {
-    title,
-    text: detail.join("\n"),
-    optionNames,
-    options: structuredOptions,
-    descriptor: {
-      renderClass: "permission" as const,
-      label: "Permission requested",
-      preview: title,
-      action: { verb: "Requested", object: title },
-      tone: "admin" as const,
-      operation: "session/request_permission",
-      object: title,
-      source: "acp" as const,
-      groupKey: "permission:request",
-    },
-  };
-}
-
-/**
- * Format a human-readable outcome label from a permission response.
- * kind values from ACP: allow_once, allow_always, reject_once, reject_always.
- * "reject_*" kinds are denials; anything else that is selected is an approval.
- */
-function describePermissionOutcome(
-  outcome: string,
-  optionId: string | null,
-  optionNames: Map<string, string>,
-): string {
-  if (outcome === "cancelled") {
-    return "Cancelled";
-  }
-  if (outcome === "timed_out") {
-    return "Timed out";
-  }
-  if (outcome === "uncertain") {
-    // Pinned verbatim copy — must never say "denied" or "failed closed".
-    return "Approval outcome unknown; agent process stopped before it could continue.";
-  }
-  if (outcome === "selected" && optionId) {
-    const kind = optionNames.get(optionId) ?? optionId;
-    const isDenial = kind.startsWith("reject");
-    const verb = isDenial ? "Denied" : "Approved";
-    return `${verb} (${kind})`;
-  }
-  return outcome;
-}
-
-/**
- * Derive human-readable outcome copy from the `authorization.reason` field
- * that accompanies terminal `acp_write` events. This is preferred over
- * deriving copy from the ACP `result.outcome` field directly because the
- * `reason` values are harness-level semantics (applied / timed_out /
- * cancelled) whereas `result.outcome` is adapter-level (selected / reject_once
- * etc.) and does not distinguish timeout from explicit denial.
- *
- * Falls back to `describePermissionOutcome` when `reason` is absent (legacy
- * paths that predate the authorization envelope).
- */
-function describePermissionTerminalReason(
-  reason: string | undefined,
-  outcomeKind: string | null | undefined,
-  optionId: string | null,
-  options:
-    | Array<{ optionId: string; kind: string; label?: string }>
-    | undefined,
-): string {
-  if (reason === "applied") {
-    // Build optionNames map from the card's options array.
-    const optionNames = new Map(
-      (options ?? []).map((o) => [o.optionId, o.kind]),
-    );
-    return describePermissionOutcome(
-      outcomeKind ?? "selected",
-      optionId,
-      optionNames,
-    );
-  }
-  if (reason === "timed_out") return "Timed out";
-  if (reason === "cancelled") return "Cancelled";
-  if (reason === "uncertain") {
-    return "Approval outcome unknown; agent process stopped before it could continue.";
-  }
-  // No reason: fall back to ACP outcome-level copy.
-  const optionNames = new Map((options ?? []).map((o) => [o.optionId, o.kind]));
-  return describePermissionOutcome(outcomeKind ?? "", optionId, optionNames);
-}
-
-/**
- * Retire all live (actionable) permission cards for a given channel.
- * Called on terminal turn/process events (`turn_error`, `agent_panic`,
- * `turn_completed`) as a backstop so cards do not remain clickable after
- * the turn that owned them has ended.
- */
-function retireAllLivePermissionCards(d: TranscriptDraft, channelId: string) {
-  const prefix = `permission:${channelId}:`;
-  let retired = false;
-  for (const [id, item] of d.itemsById) {
-    if (
-      id.startsWith(prefix) &&
-      item.type === "lifecycle" &&
-      item.renderClass === "permission" &&
-      item.actionable
-    ) {
-      if (!retired) {
-        // Copy on first mutation.
-        d.items = [...d.items];
-        d.itemsById = new Map(d.itemsById);
-        retired = true;
-        d.changed = true;
-      }
-      const updated = { ...item, actionable: false };
-      d.itemsById.set(id, updated);
-      const idx = d.items.findIndex((i) => i.id === id);
-      if (idx !== -1) d.items[idx] = updated;
-      // Clean up nonce index if present.
-      if (item.requestNonce) {
-        d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
-        d.pendingPermissionsByNonce.delete(item.requestNonce);
-      }
-    }
-  }
-  // Clean up all pendingPermissions entries scoped to this channel.
-  // Keys use the compound format `ch:session:turn:id` — drop any that start
-  // with the channel prefix.
-  const chPrefix = `${channelId}:`;
-  let permsMutated = false;
-  for (const key of d.pendingPermissions.keys()) {
-    if (key.startsWith(chPrefix)) {
-      if (!permsMutated) {
-        d.pendingPermissions = new Map(d.pendingPermissions);
-        permsMutated = true;
-      }
-      d.pendingPermissions.delete(key);
-    }
   }
 }
 
@@ -912,37 +736,7 @@ export function processTranscriptEvent(
     // actionable in live state or archive replay.
     retireAllLivePermissionCards(d, ch);
   } else if (event.kind === "permission_terminal") {
-    // Observer-only terminal event for uncertain outcomes (process poison,
-    // cancel-during-write). No ACP wire response was confirmed; the harness
-    // emits this so Desktop can retire the card without a JSON-RPC response.
-    // Carry the nonce from the authorization envelope.
-    const auth = event.authorization;
-    const nonce = auth?.requestNonce;
-    if (nonce) {
-      const itemId = d.pendingPermissionsByNonce.get(nonce);
-      if (itemId) {
-        const existing = d.itemsById.get(itemId);
-        if (existing?.type === "lifecycle") {
-          replaceItem(d, itemId, {
-            ...existing,
-            outcome:
-              "Approval outcome unknown; agent process stopped before it could continue.",
-            actionable: false,
-          });
-        }
-        d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
-        d.pendingPermissionsByNonce.delete(nonce);
-        // Clean up any matching compound legacy entry.
-        const responseId = jsonRpcId(asRecord(event.payload).id);
-        if (responseId) {
-          const legacyKey = `${ch}:${ctx.sessionId ?? ""}:${ctx.turnId ?? ""}:${responseId}`;
-          if (d.pendingPermissions.has(legacyKey)) {
-            d.pendingPermissions = new Map(d.pendingPermissions);
-            d.pendingPermissions.delete(legacyKey);
-          }
-        }
-      }
-    }
+    handlePermissionTerminal(d, event.authorization, event.payload, ch, ctx);
   } else if (event.kind === "acp_read" || event.kind === "acp_write") {
     const payload = asRecord(event.payload);
     const method = asString(payload.method);
@@ -1000,79 +794,7 @@ export function processTranscriptEvent(
         });
       }
     } else if (event.kind === "acp_write" && !method) {
-      // Permission response: {"id": <same as request>, "result": {"outcome": {...}}}
-      //
-      // Nonce-keyed correlation is primary and exclusive:
-      //   - If the frame carries a nonce, we look it up in pendingPermissionsByNonce.
-      //     If the nonce is present but unknown (stale/foreign), we DROP the frame —
-      //     we never fall back to the id map, which could resolve the wrong card.
-      //   - If the frame carries NO nonce, we fall back to the legacy compound-key
-      //     id map (channel+session+turn+id) for non-ask synchronized outcomes.
-      const auth = event.authorization;
-      const nonce = auth?.requestNonce;
-      const responseId = jsonRpcId(payload.id);
-      const result = asRecord(asRecord(payload.result).outcome);
-      const outcomeKind = asString(result.outcome);
-
-      // Derive terminal label from authorization.reason when present; this
-      // gives "Timed out" for timed_out rather than rendering the ACP
-      // outcome kind directly (which says "reject_once", not "Timed out").
-      const terminalReason = auth?.reason;
-
-      if (nonce !== undefined && nonce !== null) {
-        // Nonce present: nonce-only path. Do NOT fall back on unknown nonce.
-        const itemIdByNonce = d.pendingPermissionsByNonce.get(nonce);
-        if (itemIdByNonce) {
-          const existing = d.itemsById.get(itemIdByNonce);
-          if (existing?.type === "lifecycle") {
-            const outcomeText = describePermissionTerminalReason(
-              terminalReason,
-              outcomeKind,
-              asString(result.optionId) ?? null,
-              existing.options,
-            );
-            replaceItem(d, itemIdByNonce, {
-              ...existing,
-              outcome: outcomeText,
-              actionable: false,
-            });
-          }
-          // Clean up nonce index.
-          d.pendingPermissionsByNonce = new Map(d.pendingPermissionsByNonce);
-          d.pendingPermissionsByNonce.delete(nonce);
-          // Clean up compound legacy key if it matches.
-          if (responseId) {
-            const legacyKey = `${ch}:${ctx.sessionId ?? ""}:${ctx.turnId ?? ""}:${responseId}`;
-            if (d.pendingPermissions.has(legacyKey)) {
-              d.pendingPermissions = new Map(d.pendingPermissions);
-              d.pendingPermissions.delete(legacyKey);
-            }
-          }
-        }
-        // Unknown nonce: drop frame — do not mutate any card.
-      } else if (outcomeKind && responseId) {
-        // No nonce: legacy compound-key fallback for non-ask paths.
-        const legacyKey = `${ch}:${ctx.sessionId ?? ""}:${ctx.turnId ?? ""}:${responseId}`;
-        const pendingById = d.pendingPermissions.get(legacyKey);
-        if (pendingById) {
-          const optionId = asString(result.optionId) ?? null;
-          const outcomeText = describePermissionOutcome(
-            outcomeKind,
-            optionId,
-            pendingById.optionNames,
-          );
-          const existing = d.itemsById.get(pendingById.itemId);
-          if (existing?.type === "lifecycle") {
-            replaceItem(d, pendingById.itemId, {
-              ...existing,
-              outcome: outcomeText,
-              actionable: false,
-            });
-          }
-          d.pendingPermissions = new Map(d.pendingPermissions);
-          d.pendingPermissions.delete(legacyKey);
-        }
-      }
+      handlePermissionWrite(d, event.authorization, payload, ch, ctx);
     } else if (event.kind === "acp_write" && method === "session/prompt") {
       const promptText = extractPromptText(payload);
       if (promptText) {
@@ -1374,44 +1096,7 @@ export function processTranscriptEvent(
       }
     }
   } else if (event.kind === "control_result") {
-    // `control_result` for `permission_decision` is a **delivery confirmation**,
-    // not a terminal outcome. Status values are: sent | no_active_turn |
-    // channel_full | channel_closed | no_channel.
-    //
-    // A non-"sent" status means the click did not reach the harness — mark the
-    // card with `deliveryFailed = true` so buttons re-enable for retry. Terminal
-    // outcomes (applied, denied, timed_out, cancelled, uncertain) arrive as
-    // enveloped acp_write frames correlated by requestNonce.
-    const payload = asRecord(event.payload);
-    const frameType = asString(payload.type);
-    if (frameType === "permission_decision") {
-      const deliveryStatus = asString(payload.status);
-      if (deliveryStatus !== "sent") {
-        // Delivery failed — find the card by nonce and mark it retryable.
-        const nonce = asString(payload.requestNonce);
-        if (nonce) {
-          const itemId = d.pendingPermissionsByNonce.get(nonce);
-          if (itemId) {
-            const existing = d.itemsById.get(itemId);
-            if (
-              existing?.type === "lifecycle" &&
-              existing.renderClass === "permission" &&
-              existing.actionable
-            ) {
-              replaceItem(d, itemId, {
-                ...existing,
-                // Increment the failure token so the effect in
-                // PermissionDecisionButtons re-fires even when a prior
-                // failure already set deliveryFailed (a sticky boolean
-                // value would not change on the second failure and the
-                // useEffect dependency would not trigger).
-                deliveryFailed: (existing.deliveryFailed ?? 0) + 1,
-              });
-            }
-          }
-        }
-      }
-    }
+    handlePermissionDecisionResult(d, asRecord(event.payload));
   }
 
   if (!d.changed && d.latestSessionId === state.latestSessionId) {

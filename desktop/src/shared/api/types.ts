@@ -305,6 +305,10 @@ export type ManagedAgentBackend =
   | { type: "provider"; id: string; config: Record<string, unknown> };
 
 import type { RestartDiffEntry } from "./restartDiff";
+import type {
+  PermissionPolicy,
+  PermissionPolicySource,
+} from "./permissionPolicy";
 export type { JsonValue, RestartChange, RestartDiffEntry } from "./restartDiff";
 export type ManagedAgent = {
   pubkey: string;
@@ -384,44 +388,20 @@ export type ManagedAgent = {
    * `"allowlist"`. Preserved across mode toggles.
    */
   respondToAllowlist: string[];
-  /**
-   * Effective permission policy at the last spawn. Determines how the ACP
-   * harness answers `session/request_permission` calls.
-   */
+  /** Effective permission policy at the last spawn. */
   permissionPolicy: PermissionPolicy;
-  /**
-   * Where the effective `permissionPolicy` value came from: a per-agent
-   * override, the fleet-wide global default, or the built-in desktop default.
-   */
+  /** Where `permissionPolicy` came from: agent, global_default, or built_in. */
   permissionPolicySource: PermissionPolicySource;
 };
 
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */
 export type RespondToMode = "owner-only" | "allowlist" | "anyone";
 
-/**
- * Permission policy controlling how the ACP harness answers
- * `session/request_permission` calls.
- *
- * - `ask`: Show an actionable Allow/Deny card in the transcript (desktop default).
- * - `allow`: Auto-approve the unique `allow_once` option (explicit opt-in).
- * - `reject`: Auto-deny all requests without surfacing a card.
- */
-export type PermissionPolicy = "ask" | "allow" | "reject";
-
-/**
- * Where the effective permission policy value came from.
- *
- * - `agent`: Per-agent override set on this specific agent record.
- * - `global_default`: Fleet-wide default from the global agent config.
- * - `built_in`: Neither layer had a value; the desktop built-in default (`ask`) applies.
- */
-export type PermissionPolicySource = "agent" | "global_default" | "built_in";
-
-export type BackendProviderCandidate = {
-  id: string;
-  binaryPath: string;
-};
+export type {
+  PermissionPolicy,
+  PermissionPolicySource,
+  BackendProviderCandidate,
+} from "./permissionPolicy";
 
 export type BackendProviderProbeResult = {
   ok: boolean;
@@ -488,30 +468,11 @@ export type ManagedAgentLog = {
   logPath: string;
 };
 
-export type CancelManagedAgentTurnResult = {
-  status: "sent" | "no_active_turn";
-};
-
-/**
- * Outcome of a live `switch_model` control frame, surfaced asynchronously via
- * the agent's `control_result` observer frame. Busy path: `sent` (cancel +
- * requeue on the new model) or `turn_ending` (oneshot already consumed this
- * turn). Idle path: `switched`, `unsupported_model`, or `no_active_turn`.
- */
-export type SwitchManagedAgentModelStatus =
-  | "sent"
-  | "turn_ending"
-  | "switched"
-  | "unsupported_model"
-  | "no_active_turn";
-
-export type ControlResultFrame = {
-  type: "cancel_turn" | "switch_model" | "permission_decision";
-  status: string;
-  modelId?: string;
-  /** Present on `permission_decision` results — identifies the request card to retire. */
-  requestNonce?: string;
-};
+export type {
+  CancelManagedAgentTurnResult,
+  SwitchManagedAgentModelStatus,
+  ControlResultFrame,
+} from "./permissionPolicy";
 
 export type GitBashPrerequisite = {
   available: boolean;
@@ -739,10 +700,7 @@ export type UpdateManagedAgentInput = {
    * (validated & normalized server-side).
    */
   respondToAllowlist?: string[];
-  /**
-   * Absent = don't touch. Present = override (or `null` to clear back to inherit).
-   * Remote deployed agents: read-only; edit the deploy config and redeploy.
-   */
+  /** Absent = don't touch. `null` = clear to inherit. Remote: read-only. */
   permissionPolicy?: PermissionPolicy | null;
 };
 export type AgentPersona = {
@@ -1050,11 +1008,7 @@ export type GlobalAgentConfig = {
   model: string | null;
   /** Preferred ACP runtime for agents without a persona-specific runtime. */
   preferred_runtime: string | null;
-  /**
-   * Fleet-wide permission policy fallback. Null = no fleet default; agents
-   * without a per-agent policy use the built-in desktop default (`ask`).
-   * Mirrors `GlobalAgentConfig.permission_policy` in Rust.
-   */
+  /** Fleet-wide policy fallback. `null` = no fleet default; `ask` applies. */
   permission_policy: PermissionPolicy | null;
 };
 

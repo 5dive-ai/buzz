@@ -92,10 +92,8 @@ pub struct AgentDefinition {
 }
 
 impl AgentDefinition {
-    /// Project this persona onto a key-less unified [`ManagedAgentRecord`]
-    /// (Phase 1A store fold). Identity fields stay empty — keys are minted on
-    /// first start. `AgentDefinition.id` becomes `slug`, preserving the 30175
-    /// event coordinate (`d_tag = slug`) across the fold.
+    /// Project this persona onto a key-less unified [`ManagedAgentRecord`] (Phase 1A store fold).
+    /// Identity fields are empty; keys are minted on first start.
     pub fn into_agent_record(self) -> ManagedAgentRecord {
         ManagedAgentRecord {
             pubkey: String::new(),

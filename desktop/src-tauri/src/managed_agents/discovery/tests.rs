@@ -222,8 +222,7 @@ fn effective_agent_command_explicit_override_wins() {
     );
 }
 
-/// Minimal record for `record_agent_command` tests. Only the resolution
-/// inputs (runtime / persona_id / agent_command_override) vary.
+/// Minimal record for `record_agent_command` tests.
 fn record_with(
     runtime: Option<&str>,
     persona_id: Option<&str>,

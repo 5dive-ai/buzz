@@ -13,12 +13,10 @@ import {
 } from "@/features/agents/hooks";
 import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOwnerOnly";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
-import type {
-  ManagedAgent,
-  PermissionPolicy,
-  RespondToMode,
-  UpdateManagedAgentInput,
-} from "@/shared/api/types";
+import { AgentPermissionPolicyField } from "./AgentPermissionPolicyField";
+import type { AgentPermissionPolicyFieldHandle } from "./AgentPermissionPolicyField";
+import { useRespondToField } from "./OwnerOnlyAccessField";
+import type { ManagedAgent, UpdateManagedAgentInput } from "@/shared/api/types";
 import type { EditAgentFocusTarget } from "@/features/agents/openEditAgentEvent";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -36,6 +34,8 @@ import {
   getDefaultLlmModelLabel,
   getDefaultPersonaRuntime,
   getPersonaProviderOptions,
+  getProviderApiKeyEnvVar,
+  getProviderApiKeyLabel,
   isMissingRequiredDropdownField,
   NO_RUNTIME_DROPDOWN_VALUE,
   PERSONA_FIELD_CONTROL_CLASS,
@@ -79,10 +79,6 @@ import {
   getBakedModelInheritLabel,
   getBakedProviderInheritLabel,
 } from "./bakedEnvHelpers";
-import {
-  getProviderApiKeyEnvVar,
-  getProviderApiKeyLabel,
-} from "./agentConfigOptions";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentAiDefaultsNotice } from "./AgentAiDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
@@ -155,18 +151,9 @@ export function AgentInstanceEditDialog({
     [agent.personaId, personasQuery.data],
   );
   const inheritedEnvVars = linkedPersona?.envVars ?? {};
-  const [respondTo, setRespondTo] = React.useState<RespondToMode>(
-    agent.respondTo,
-  );
-  const [respondToAllowlist, setRespondToAllowlist] = React.useState<string[]>(
-    agent.respondToAllowlist,
-  );
-  // `null` means "inherit from global/built-in". Local state mirrors the record's
-  // per-agent override field. Remote deployed agents: this is read-only.
-  const [permissionPolicy, setPermissionPolicy] =
-    React.useState<PermissionPolicy | null>(
-      agent.permissionPolicySource === "agent" ? agent.permissionPolicy : null,
-    );
+  const rto = useRespondToField(agent);
+  const permissionPolicyRef =
+    React.useRef<AgentPermissionPolicyFieldHandle>(null);
   const [showAdvancedFields, setShowAdvancedFields] = React.useState(false);
   const [avatarUrl, setAvatarUrl] = React.useState(agent.avatarUrl ?? "");
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
@@ -174,11 +161,9 @@ export function AgentInstanceEditDialog({
   const [isAddHarnessOpen, setIsAddHarnessOpen] = React.useState(false);
   const shouldReduceMotion = useReducedMotion();
 
-  // Runtime selector: defaults to "custom" until the dialog opens and the
-  // catalog loads. The open-effect re-derives the correct id from the catalog.
+  // Runtime selector: defaults to "custom"; open-effect re-derives from catalog.
   const [selectedRuntimeId, setSelectedRuntimeId] = React.useState("custom");
 
-  // Tracks whether the user has made an in-dialog runtime selection.
   const runtimeTouched = React.useRef(false);
 
   // Reset form state only when the dialog opens or when switching to a different agent.
@@ -201,13 +186,8 @@ export function AgentInstanceEditDialog({
       setIsCustomProviderEditing(false);
       setEnvVars(agent.envVars);
       setAutoRestartOnConfigChange(agent.autoRestartOnConfigChange);
-      setRespondTo(agent.respondTo);
-      setRespondToAllowlist(agent.respondToAllowlist);
-      setPermissionPolicy(
-        agent.permissionPolicySource === "agent"
-          ? agent.permissionPolicy
-          : null,
-      );
+      rto.reset();
+      permissionPolicyRef.current?.reset();
       setAvatarUrl(agent.avatarUrl ?? "");
       setShowAdvancedFields(false);
       setIsAvatarUploadPending(false);
@@ -617,8 +597,8 @@ export function AgentInstanceEditDialog({
       parallelism,
       agentAcpCommand: agent.acpCommand,
       acpCommand,
-      respondTo,
-      respondToAllowlistLength: respondToAllowlist.length,
+      respondTo: rto.respondTo,
+      respondToAllowlistLength: rto.respondToAllowlist.length,
       selectedRuntimeId,
       inheritHarness,
       agentCommand,
@@ -725,7 +705,8 @@ export function AgentInstanceEditDialog({
         envVars: envVarsEqual(submitEnvVars, agent.envVars)
           ? undefined
           : submitEnvVars,
-        respondTo: respondTo !== agent.respondTo ? respondTo : undefined,
+        respondTo:
+          rto.respondTo !== agent.respondTo ? rto.respondTo : undefined,
         // The allowlist is preserved across mode toggles in local UI state
         // (so a user can flip away from allowlist and back without losing
         // their entries), but we only send it on the wire when (a) it
@@ -733,19 +714,12 @@ export function AgentInstanceEditDialog({
         // an allowlist while switching to a non-allowlist mode would be
         // harmless server-side, but it's noise in the persisted record.
         respondToAllowlist:
-          respondTo === "allowlist" &&
-          respondToAllowlist.join(",") !== agent.respondToAllowlist.join(",")
-            ? respondToAllowlist
+          rto.respondTo === "allowlist" &&
+          rto.respondToAllowlist.join(",") !==
+            agent.respondToAllowlist.join(",")
+            ? rto.respondToAllowlist
             : undefined,
-        // `null` = clear the per-agent override (revert to global/built-in).
-        // `undefined` = don't touch. Only include when the value actually changed.
-        permissionPolicy: (() => {
-          const saved =
-            agent.permissionPolicySource === "agent"
-              ? agent.permissionPolicy
-              : null;
-          return permissionPolicy !== saved ? permissionPolicy : undefined;
-        })(),
+        permissionPolicy: permissionPolicyRef.current?.getUpdate(),
       };
 
       const result = await updateMutation.mutateAsync(input);
@@ -959,69 +933,17 @@ export function AgentInstanceEditDialog({
             </div>
             <OwnerOnlyAccessField
               accessLocked={agentAccessOwnerOnly === true}
-              allowlist={respondToAllowlist}
+              allowlist={rto.respondToAllowlist}
               disabled={updateMutation.isPending}
-              mode={respondTo}
-              onAllowlistChange={setRespondToAllowlist}
-              onModeChange={setRespondTo}
+              mode={rto.respondTo}
+              onAllowlistChange={rto.setRespondToAllowlist}
+              onModeChange={rto.setRespondTo}
             />
-            {/* Permission policy */}
-            {(() => {
-              const isRemoteDeployed =
-                agent.backend.type === "provider" &&
-                agent.backendAgentId !== null;
-              const sourceLabelMap: Record<string, string> = {
-                agent: "agent override",
-                global_default: "global default",
-                built_in: "built-in",
-              };
-              const sourceLabel =
-                sourceLabelMap[agent.permissionPolicySource] ??
-                agent.permissionPolicySource;
-              return (
-                <div className="space-y-1.5">
-                  <div className="flex items-center gap-1.5">
-                    <label
-                      className="text-sm font-medium text-foreground"
-                      htmlFor="edit-agent-permission-policy"
-                    >
-                      Permission policy
-                    </label>
-                    <span className="text-xs text-muted-foreground">
-                      ({agent.permissionPolicy} · from {sourceLabel})
-                    </span>
-                  </div>
-                  {isRemoteDeployed ? (
-                    <p className="text-xs text-muted-foreground">
-                      Read-only while deployed. To change, shut down and
-                      redeploy the agent.
-                    </p>
-                  ) : (
-                    <select
-                      className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50"
-                      disabled={updateMutation.isPending}
-                      id="edit-agent-permission-policy"
-                      value={permissionPolicy ?? ""}
-                      onChange={(e) => {
-                        const val = e.target.value;
-                        setPermissionPolicy(
-                          val === "" ? null : (val as PermissionPolicy),
-                        );
-                      }}
-                    >
-                      <option value="">
-                        Inherit ({agent.permissionPolicy} · from {sourceLabel})
-                      </option>
-                      <option value="ask">Ask — show Allow/Deny card</option>
-                      <option value="allow">
-                        Allow — auto-approve (explicit opt-in)
-                      </option>
-                      <option value="reject">Reject — auto-deny</option>
-                    </select>
-                  )}
-                </div>
-              );
-            })()}
+            <AgentPermissionPolicyField
+              ref={permissionPolicyRef}
+              agent={agent}
+              disabled={updateMutation.isPending}
+            />
             <RunOnSummarySection backend={agent.backend} />
 
             {/* Provider (runtime) */}

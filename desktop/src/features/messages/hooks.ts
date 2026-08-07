@@ -39,10 +39,10 @@ import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 import {
   addReaction,
   deleteMessage,
-  editMessage,
   removeReaction,
   sendChannelMessage,
 } from "@/shared/api/tauri";
+import { editMessage } from "@/shared/api/tauriEditMessage";
 import { getChannelWindowEvents } from "@/shared/api/channelWindow";
 import type { Channel, Identity, RelayEvent } from "@/shared/api/types";
 // Same .mjs the renderer uses, so the cache-update projection can't drift

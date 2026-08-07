@@ -81,6 +81,28 @@ pub fn resolve_effective_permission_policy(
     )
 }
 
+/// Apply a permission-policy update from an agent-update request.
+///
+/// Returns `Ok(())` when the field was updated (or there was nothing to do).
+/// Returns `Err(message)` when the update is rejected because the agent is
+/// deployed remotely and its policy is therefore read-only.
+///
+/// `update` is the two-layer optional: `None` = don't touch, `Some(None)` =
+/// clear the per-agent override, `Some(Some(policy))` = set the override.
+pub fn apply_permission_policy_update(
+    record: &mut ManagedAgentRecord,
+    update: Option<Option<PermissionPolicy>>,
+) -> Result<(), String> {
+    let Some(policy) = update else { return Ok(()) };
+    if matches!(record.backend, super::BackendKind::Provider { .. })
+        && record.backend_agent_id.is_some()
+    {
+        return Err("permission_policy is read-only while the agent is deployed remotely; shut down and redeploy to change it".to_string());
+    }
+    record.permission_policy = policy;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -688,6 +688,26 @@ pub enum Provider {
     DatabricksV2,
     /// OpenRouter multi-provider gateway. Routes to `{base_url}/chat/completions` with bearer auth. Wire format is OpenAI-chat-compatible.
     OpenRouter,
+    /// Fireworks AI, called directly rather than through a gateway. Routes to
+    /// `{base_url}/chat/completions` with bearer auth, OpenAI-chat-compatible.
+    ///
+    /// It is a separate variant rather than an `OPENAI_COMPAT_BASE_URL` override
+    /// because the wire contract genuinely differs from OpenAI's in two ways
+    /// that break the shared route (both measured 2026-08-07):
+    ///
+    /// 1. **Unknown fields are rejected**, not ignored — a stray key returns
+    ///    HTTP 400 `Extra inputs are not permitted`. `openai_body` round-trips
+    ///    every unmodelled tool-call key through `ToolCall::provider_extra`
+    ///    (kept for Gemini's `thoughtSignature`), and Fireworks' own tool-call
+    ///    responses carry `index` and `name`. Replaying those on the next turn
+    ///    is a guaranteed 400, so the route strips them.
+    /// 2. **The reasoning enum is its own**: `low|medium|high|xhigh|max|none|
+    ///    adaptive`. Every [`ThinkingEffort`] level maps through unchanged
+    ///    except `Minimal`, which Fireworks rejects. The OpenAI route's
+    ///    per-model normalization must NOT apply here — it clamps `max` to
+    ///    `xhigh` for anything that is not gpt-5.6, which would silently
+    ///    downgrade a benchmark cell asking for `max`.
+    Fireworks,
 }
 
 /// Which OpenAI-family HTTP API to call. Set via `OPENAI_COMPAT_API`
@@ -800,6 +820,17 @@ pub struct Config {
     /// Set with `allow_fallbacks: false` in the request, so an unavailable pin
     /// fails loudly instead of silently redefining the condition mid-run.
     pub openrouter_provider_order: Vec<String>,
+    /// Fireworks serving tier, from `FIREWORKS_SERVICE_TIER`. `None` (unset)
+    /// omits the field, which Fireworks reads as its own default.
+    ///
+    /// Only sent on [`Provider::Fireworks`]. Deliberately not forwarded to
+    /// OpenRouter: measured 2026-08-07, OpenRouter accepts a deliberately
+    /// invalid `service_tier` without error and prices the request identically,
+    /// i.e. it drops the field silently. Fireworks instead validates it against
+    /// `auto|default|flex|priority` and 400s on anything else — which is the
+    /// only reason a tier setting is worth wiring at all, since a silently
+    /// dropped one is indistinguishable from not asking.
+    pub fireworks_service_tier: Option<String>,
 }
 
 impl Config {
@@ -811,6 +842,7 @@ impl Config {
             env("ANTHROPIC_API_KEY").as_deref(),
             env("OPENAI_COMPAT_API_KEY").as_deref(),
             env("OPENROUTER_API_KEY").as_deref(),
+            env("FIREWORKS_API_KEY").as_deref(),
         )?;
 
         // Universal model override — takes priority over provider-specific model
@@ -863,6 +895,19 @@ impl Config {
                 env_or("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
                 OpenAiApi::Chat, // OpenRouter uses Chat Completions only
             ),
+            Provider::Fireworks => (
+                req("FIREWORKS_API_KEY")?,
+                resolve_model(
+                    buzz_agent_model.as_deref(),
+                    env("FIREWORKS_MODEL").as_deref(),
+                )
+                .ok_or_else(|| "config: FIREWORKS_MODEL required".to_string())?,
+                env_or(
+                    "FIREWORKS_BASE_URL",
+                    "https://api.fireworks.ai/inference/v1",
+                ),
+                OpenAiApi::Chat, // Fireworks serves Chat Completions only
+            ),
         };
         let system_prompt = match (env("BUZZ_AGENT_SYSTEM_PROMPT"), env("BUZZ_AGENT_SYSTEM_PROMPT_FILE")) {
             (Some(_), Some(_)) => return Err(
@@ -911,6 +956,7 @@ impl Config {
             openrouter_provider_order: parse_provider_order(
                 env("OPENROUTER_PROVIDER_ORDER").as_deref(),
             ),
+            fireworks_service_tier: parse_service_tier(env("FIREWORKS_SERVICE_TIER").as_deref())?,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -955,6 +1001,7 @@ impl Config {
             thinking_effort: None,
             prompt_caching: false,
             openrouter_provider_order: Vec::new(),
+            fireworks_service_tier: None,
         }
     }
 
@@ -1075,6 +1122,7 @@ fn resolve_provider(
     anthropic_key: Option<&str>,
     openai_key: Option<&str>,
     openrouter_key: Option<&str>,
+    fireworks_key: Option<&str>,
 ) -> Result<Provider, String> {
     match requested.map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => {
@@ -1092,6 +1140,8 @@ fn resolve_provider(
                 "databricks_v2" | "databricks-v2" => Ok(Provider::DatabricksV2),
                 "openrouter" if present_nonempty(openrouter_key) => Ok(Provider::OpenRouter),
                 "openrouter" => Err("config: OPENROUTER_API_KEY required".into()),
+                "fireworks" if present_nonempty(fireworks_key) => Ok(Provider::Fireworks),
+                "fireworks" => Err("config: FIREWORKS_API_KEY required".into()),
                 _ => Err(format!(
                     "config: BUZZ_AGENT_PROVIDER={raw} not supported"
                 )),
@@ -1183,6 +1233,28 @@ fn parse_hook_servers_env(key: &str) -> HookServers {
 /// Blank entries are dropped rather than passed through, so a trailing comma or
 /// an accidentally-empty variable degrades to "no pin" instead of asking
 /// OpenRouter to route to a provider named "".
+/// Parse `FIREWORKS_SERVICE_TIER` into the Fireworks `service_tier` field.
+///
+/// Validated here rather than passed through so a typo fails at startup instead
+/// of 400ing on the first live call — a benchmark run that dies on request one
+/// has already burned its container setup. The accepted set is Fireworks' own,
+/// read off its 400 response (measured 2026-08-07): `auto`, `default`, `flex`,
+/// `priority`.
+///
+/// Unset or blank yields `None`, which omits the field entirely and lets
+/// Fireworks apply its account default.
+pub fn parse_service_tier(raw: Option<&str>) -> Result<Option<String>, String> {
+    let trimmed = raw.unwrap_or("").trim().to_ascii_lowercase();
+    match trimmed.as_str() {
+        "" => Ok(None),
+        "auto" | "default" | "flex" | "priority" => Ok(Some(trimmed)),
+        other => Err(format!(
+            "config: FIREWORKS_SERVICE_TIER={other} not supported \
+             (use auto|default|flex|priority)"
+        )),
+    }
+}
+
 pub fn parse_provider_order(raw: Option<&str>) -> Vec<String> {
     raw.unwrap_or("")
         .split(',')
@@ -1329,11 +1401,11 @@ mod tests {
     #[test]
     fn resolve_provider_keeps_requested_provider_when_token_present() {
         assert_eq!(
-            resolve_provider(Some("anthropic"), Some("sk-ant"), None, None).unwrap(),
+            resolve_provider(Some("anthropic"), Some("sk-ant"), None, None, None).unwrap(),
             Provider::Anthropic
         );
         assert_eq!(
-            resolve_provider(Some("openai"), None, Some("sk-openai"), None).unwrap(),
+            resolve_provider(Some("openai"), None, Some("sk-openai"), None, None).unwrap(),
             Provider::OpenAi
         );
     }
@@ -1341,17 +1413,18 @@ mod tests {
     #[test]
     fn resolve_provider_errors_when_requested_provider_key_missing() {
         // No fallback — missing key returns an error regardless of Databricks availability.
-        let err = resolve_provider(Some("anthropic"), None, None, None).unwrap_err();
+        let err = resolve_provider(Some("anthropic"), None, None, None, None).unwrap_err();
         assert!(err.contains("ANTHROPIC_API_KEY required"), "{err}");
 
-        let err = resolve_provider(Some("openai-compat"), None, Some("   "), None).unwrap_err();
+        let err =
+            resolve_provider(Some("openai-compat"), None, Some("   "), None, None).unwrap_err();
         assert!(err.contains("OPENAI_COMPAT_API_KEY required"), "{err}");
     }
 
     #[test]
     fn resolve_provider_errors_when_provider_env_absent() {
         // No implicit inference — absent BUZZ_AGENT_PROVIDER is an error.
-        let err = resolve_provider(None, None, None, None).unwrap_err();
+        let err = resolve_provider(None, None, None, None, None).unwrap_err();
         assert!(err.contains("BUZZ_AGENT_PROVIDER is required"), "{err}");
     }
 
@@ -1361,19 +1434,19 @@ mod tests {
         // When BUZZ_AGENT_PROVIDER=databricks, resolve_provider succeeds regardless
         // of DATABRICKS_HOST/MODEL (those are validated later in from_env()).
         assert_eq!(
-            resolve_provider(Some("databricks"), None, None, None).unwrap(),
+            resolve_provider(Some("databricks"), None, None, None, None).unwrap(),
             Provider::Databricks
         );
         // Missing key for other providers still errors — no Databricks fallback.
-        let err = resolve_provider(Some("openai"), None, None, None).unwrap_err();
+        let err = resolve_provider(Some("openai"), None, None, None, None).unwrap_err();
         assert!(err.contains("OPENAI_COMPAT_API_KEY required"), "{err}");
-        let err = resolve_provider(None, None, None, None).unwrap_err();
+        let err = resolve_provider(None, None, None, None, None).unwrap_err();
         assert!(err.contains("BUZZ_AGENT_PROVIDER is required"), "{err}");
     }
 
     #[test]
     fn resolve_provider_unsupported_error_preserves_user_casing() {
-        let err = resolve_provider(Some("OpenAIish"), None, None, None).unwrap_err();
+        let err = resolve_provider(Some("OpenAIish"), None, None, None, None).unwrap_err();
         assert!(err.contains("BUZZ_AGENT_PROVIDER=OpenAIish"));
     }
 
@@ -2894,14 +2967,40 @@ mod tests {
     #[test]
     fn resolve_provider_openrouter_with_key() {
         assert_eq!(
-            resolve_provider(Some("openrouter"), None, None, Some("sk-or-123")).unwrap(),
+            resolve_provider(Some("openrouter"), None, None, Some("sk-or-123"), None).unwrap(),
             Provider::OpenRouter
         );
     }
 
     #[test]
     fn resolve_provider_openrouter_missing_key() {
-        let err = resolve_provider(Some("openrouter"), None, None, None).unwrap_err();
+        let err = resolve_provider(Some("openrouter"), None, None, None, None).unwrap_err();
         assert!(err.contains("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn resolve_provider_fireworks_with_key() {
+        assert_eq!(
+            resolve_provider(Some("fireworks"), None, None, None, Some("fw-123")).unwrap(),
+            Provider::Fireworks
+        );
+    }
+
+    #[test]
+    fn resolve_provider_fireworks_missing_key() {
+        let err = resolve_provider(Some("fireworks"), None, None, None, None).unwrap_err();
+        assert!(err.contains("FIREWORKS_API_KEY"));
+    }
+
+    /// Fireworks must not be reachable by pointing the OpenAI-compat route at
+    /// its host. That path looks like it would work — the wire format is
+    /// OpenAI-chat — but it replays tool-call fields Fireworks 400s on and
+    /// clamps `max` effort down to `xhigh`, so it fails in ways that read as
+    /// model behaviour rather than misconfiguration.
+    #[test]
+    fn openai_compat_key_does_not_satisfy_fireworks() {
+        let err =
+            resolve_provider(Some("fireworks"), None, Some("sk-openai"), None, None).unwrap_err();
+        assert!(err.contains("FIREWORKS_API_KEY"), "got {err}");
     }
 }

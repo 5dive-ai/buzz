@@ -1,0 +1,9 @@
+{
+  "accounts/fireworks/models/deepseek-v4-flash-0731": {
+    "provider": "fireworks",
+    "api_key_env": "FIREWORKS_API_KEY",
+    "env": {
+      "FIREWORKS_SERVICE_TIER": "priority"
+    }
+  }
+}

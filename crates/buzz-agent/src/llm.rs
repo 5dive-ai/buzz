@@ -158,9 +158,23 @@ impl Llm {
                     cfg.prompt_caching,
                     &cfg.openrouter_provider_order,
                 );
-                self.post_openrouter(cfg, &body)
+                self.post_chat_completions(cfg, &body)
                     .await
                     .and_then(parse_openai_with_reasoning_details)
+            }
+            Provider::Fireworks => {
+                // `effort` is passed through raw, NOT through
+                // `normalize_effort_for_openai_route`: that table is keyed on
+                // OpenAI model names and clamps `max` to `xhigh` for anything
+                // other than gpt-5.6, which would silently downgrade the level
+                // an operator asked for. Fireworks accepts the whole ladder
+                // except `minimal` (see `Provider::Fireworks`).
+                let mut body =
+                    openai_body(cfg, system_prompt, history, tools, effective_model, effort);
+                apply_fireworks_mutations(&mut body, cfg.fireworks_service_tier.as_deref());
+                self.post_chat_completions(cfg, &body)
+                    .await
+                    .and_then(parse_openai)
             }
             Provider::OpenAi | Provider::Databricks => {
                 self.openai_request(
@@ -294,14 +308,24 @@ impl Llm {
                     });
                     Ok(parse_anthropic(self.post_anthropic(cfg, &body).await?)?.text)
                 }
-                Provider::OpenRouter => {
-                    let body = openrouter_summary_body(
+                Provider::OpenRouter | Provider::Fireworks => {
+                    let mut body = chat_summary_body(
                         effective_model,
                         system_prompt,
                         user_prompt,
                         max_output_tokens,
                     );
-                    let v = self.post_openrouter(cfg, &body).await?;
+                    // The summary body is already Fireworks-legal (no tool
+                    // calls, no reasoning), so it needs none of the stripping
+                    // `apply_fireworks_mutations` does — only the tier, so a
+                    // handoff summary bills and queues like the turn that
+                    // triggered it instead of silently dropping to the default.
+                    if cfg.provider == Provider::Fireworks {
+                        if let Some(tier) = cfg.fireworks_service_tier.as_deref() {
+                            body["service_tier"] = json!(tier);
+                        }
+                    }
+                    let v = self.post_chat_completions(cfg, &body).await?;
                     Ok(parse_openai(v)?.text)
                 }
                 Provider::OpenAi | Provider::Databricks => {
@@ -721,7 +745,7 @@ impl Llm {
         }
     }
 
-    async fn post_openrouter(&self, cfg: &Config, body: &Value) -> Result<Value, AgentError> {
+    async fn post_chat_completions(&self, cfg: &Config, body: &Value) -> Result<Value, AgentError> {
         let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
         let mut bearer = self.auth.bearer().await?;
         let mut refreshed = false;
@@ -2204,7 +2228,7 @@ pub(crate) fn databricks_pkce_config(host: &str) -> PkceOAuthConfig {
 ///   flow; subsequent requests use the cache + refresh transparently.
 pub(crate) fn build_token_source(cfg: &Config) -> Result<Arc<dyn TokenSource>, AgentError> {
     match cfg.provider {
-        Provider::Anthropic | Provider::OpenAi | Provider::OpenRouter => {
+        Provider::Anthropic | Provider::OpenAi | Provider::OpenRouter | Provider::Fireworks => {
             Ok(Arc::new(StaticTokenSource::new(cfg.api_key.clone())))
         }
         Provider::Databricks | Provider::DatabricksV2 => {
@@ -2224,7 +2248,7 @@ pub(crate) fn build_token_source(cfg: &Config) -> Result<Arc<dyn TokenSource>, A
 /// `apply_openrouter_mutations`, which the summary path never calls).
 /// It spells the token limit `max_tokens` directly for the same reason: the
 /// mutation that renames it is never applied here.
-fn openrouter_summary_body(
+fn chat_summary_body(
     effective_model: &str,
     system_prompt: &str,
     user_prompt: &str,
@@ -2538,6 +2562,62 @@ async fn openrouter_post(
     ))
 }
 
+/// Adapt an `openai_body` to Fireworks' Chat Completions contract.
+///
+/// Fireworks rejects unknown fields with HTTP 400 (`Extra inputs are not
+/// permitted`) instead of ignoring them the way OpenAI does, so this is not
+/// cosmetic tidying — every key below is one the shared body emits and
+/// Fireworks refuses. Measured against the live API 2026-08-07.
+fn apply_fireworks_mutations(body: &mut Value, service_tier: Option<&str>) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+
+    // Fireworks accepts both spellings today, but `max_tokens` is the
+    // documented one; `max_completion_tokens` reads as an undocumented alias,
+    // and an output cap that gets dropped on the floor is an expensive way to
+    // find out it was never load-bearing.
+    if let Some(max_tokens) = obj.remove("max_completion_tokens") {
+        obj.insert("max_tokens".into(), max_tokens);
+    }
+
+    // Strip the OpenRouter/Gemini replay fields off the history. `openai_body`
+    // writes back every unmodelled tool-call key that `parse_openai` captured
+    // into `ToolCall::provider_extra` — which exists so Gemini gets its
+    // `thoughtSignature` back — plus `reasoning_details` on assistant turns.
+    // Fireworks' own tool-call responses carry `index` and `name` beside
+    // `function`, so without this the *second* turn of any tool-using session
+    // 400s on a key Fireworks itself sent us. `reasoning_details` is only
+    // populated by `parse_openai_with_reasoning_details` (OpenRouter), so on
+    // this route it should never appear; it is stripped anyway because a
+    // history handed over from another provider would otherwise poison the
+    // first call.
+    if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+        for msg in messages.iter_mut() {
+            let Some(m) = msg.as_object_mut() else {
+                continue;
+            };
+            m.remove("reasoning_details");
+            if let Some(calls) = m.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in calls.iter_mut() {
+                    if let Some(c) = call.as_object_mut() {
+                        c.retain(|k, _| matches!(k.as_str(), "id" | "type" | "function"));
+                    }
+                }
+            }
+        }
+    }
+
+    // Serving tier. Unlike OpenRouter — which accepts any string here and
+    // silently discards it — Fireworks validates against
+    // `auto|default|flex|priority`, so asking for `priority` actually means
+    // something. `Config::fireworks_service_tier` is already validated, and
+    // `None` omits the field so the account default applies.
+    if let Some(tier) = service_tier {
+        obj.insert("service_tier".into(), json!(tier));
+    }
+}
+
 fn apply_openrouter_mutations(
     body: &mut Value,
     effort: Option<ThinkingEffort>,
@@ -2706,6 +2786,7 @@ mod tests {
             // Unpinned by default so the existing "no body shape adds a
             // provider routing filter" assertions keep testing what they say.
             openrouter_provider_order: Vec::new(),
+            fireworks_service_tier: None,
         }
     }
 
@@ -6077,6 +6158,117 @@ mod tests {
         );
     }
 
+    /// The regression this route exists for. `parse_openai` keeps every
+    /// unmodelled tool-call key in `ToolCall::provider_extra` so Gemini gets
+    /// its `thoughtSignature` back, and `openai_body` replays them beside
+    /// `function`. Fireworks' own tool-call responses carry `index` and `name`
+    /// there, and Fireworks 400s on unknown fields — so without the strip, the
+    /// *second* turn of every tool-using session dies on a key Fireworks itself
+    /// sent us, and it dies at exactly the point a benchmark trial has already
+    /// paid for its container.
+    #[test]
+    fn fireworks_body_strips_replayed_tool_call_extras() {
+        let c = cfg(Provider::Fireworks);
+        let mut extra = Map::new();
+        extra.insert("index".into(), json!(0));
+        extra.insert("name".into(), Value::Null);
+        let history = vec![HistoryItem::Assistant {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                provider_id: "call_1".into(),
+                name: "shell".into(),
+                arguments: json!({ "cmd": "ls" }),
+                provider_extra: extra,
+            }],
+            reasoning_details: Some(json!([{ "type": "reasoning.text", "text": "t" }])),
+        }];
+        let mut body = openai_body(
+            &c,
+            "system",
+            &history,
+            &tools_vec(),
+            "accounts/fireworks/models/deepseek-v4-flash-0731",
+            None,
+        );
+        // Precondition: the shared body really does emit both, so this test
+        // fails loudly if `openai_body` ever stops and the strip goes stale.
+        let before = &body["messages"][1];
+        assert!(before.get("reasoning_details").is_some());
+        assert!(before["tool_calls"][0].get("index").is_some());
+
+        apply_fireworks_mutations(&mut body, None);
+
+        let call = &body["messages"][1]["tool_calls"][0];
+        assert!(
+            body["messages"][1].get("reasoning_details").is_none(),
+            "reasoning_details is an OpenRouter-ism Fireworks 400s on"
+        );
+        assert!(call.get("index").is_none() && call.get("name").is_none());
+        // Only the strip — the call itself must survive intact.
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "shell");
+    }
+
+    #[test]
+    fn fireworks_body_renames_token_cap_and_sets_tier() {
+        let c = cfg(Provider::Fireworks);
+        let mut body = openai_body(
+            &c,
+            "system",
+            &[HistoryItem::User("hi".into())],
+            &[],
+            "accounts/fireworks/models/deepseek-v4-flash-0731",
+            Some(ThinkingEffort::Max),
+        );
+        apply_fireworks_mutations(&mut body, Some("priority"));
+        assert!(body.get("max_completion_tokens").is_none());
+        assert_eq!(body["max_tokens"], json!(c.max_output_tokens));
+        assert_eq!(body["service_tier"], "priority");
+        // `max` must reach the wire as `max`. The OpenAI route's per-model
+        // normalization clamps it to `xhigh` for anything but gpt-5.6, and
+        // silently running a "max effort" cell at xhigh would be a fabricated
+        // condition rather than a bug you can see.
+        assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    /// The tier stays strictly opt-in: unset means the field is absent, not
+    /// `"default"`, so the account's own setting decides.
+    #[test]
+    fn fireworks_body_omits_tier_when_unset() {
+        let c = cfg(Provider::Fireworks);
+        let mut body = openai_body(
+            &c,
+            "system",
+            &[HistoryItem::User("hi".into())],
+            &[],
+            "accounts/fireworks/models/deepseek-v4-flash-0731",
+            None,
+        );
+        apply_fireworks_mutations(&mut body, None);
+        assert!(body.get("service_tier").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    /// Validated at parse time, not on the wire: Fireworks 400s a bad tier, and
+    /// a benchmark trial that dies on request one has already paid for its
+    /// container setup. The accepted set is Fireworks' own, read off its 400.
+    #[test]
+    fn fireworks_service_tier_parsing() {
+        use crate::config::parse_service_tier;
+        assert_eq!(parse_service_tier(None).unwrap(), None);
+        assert_eq!(parse_service_tier(Some("  ")).unwrap(), None);
+        assert_eq!(
+            parse_service_tier(Some(" Priority ")).unwrap(),
+            Some("priority".to_string())
+        );
+        for ok in ["auto", "default", "flex", "priority"] {
+            assert_eq!(parse_service_tier(Some(ok)).unwrap(), Some(ok.to_string()));
+        }
+        let err = parse_service_tier(Some("turbo")).unwrap_err();
+        assert!(err.contains("auto|default|flex|priority"), "got {err}");
+    }
+
     #[test]
     fn openrouter_body_empty_tools_no_effort() {
         let c = cfg(Provider::OpenRouter);
@@ -6235,7 +6427,7 @@ mod tests {
 
     #[test]
     fn openrouter_summary_carries_neither_reasoning_nor_provider() {
-        let body = openrouter_summary_body(
+        let body = chat_summary_body(
             "anthropic/claude-opus-4-7",
             "summarize",
             "text to summarize",
@@ -7831,7 +8023,7 @@ mod tests {
         let mut c = cfg(Provider::OpenRouter);
         c.base_url = url;
 
-        let err = llm.post_openrouter(&c, &json!({})).await.unwrap_err();
+        let err = llm.post_chat_completions(&c, &json!({})).await.unwrap_err();
         assert!(
             matches!(&err, AgentError::LlmAuth(s) if s.contains("static key rejected")),
             "static 401 must surface as LlmAuth with 'static key rejected': got {err:?}"
@@ -7865,7 +8057,7 @@ mod tests {
         let mut c = cfg(Provider::OpenRouter);
         c.base_url = base;
 
-        let result = llm.post_openrouter(&c, &json!({})).await;
+        let result = llm.post_chat_completions(&c, &json!({})).await;
         // `spawn_auth_stub` returns `{"ok":true}` on success.
         assert!(
             result.is_ok(),

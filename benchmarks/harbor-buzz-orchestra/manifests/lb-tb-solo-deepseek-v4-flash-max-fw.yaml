@@ -1,0 +1,79 @@
+# LEADERBOARD SUBMISSION CELL -- solo deepseek-v4-flash-0731 at reasoning
+# effort `max`, served by FIREWORKS DIRECTLY at the `priority` service tier.
+#
+# Same model and same effort as lb-tb-solo-deepseek-v4-flash-max.yaml; the only
+# deliberate difference is the route. Read the header of that file first -- every
+# leaderboard-validity constraint it documents (no `environment:` block, 1.0x
+# timeouts, 89 tasks x 5 trials, ATIF trajectory on every passing trial) applies
+# here unchanged and is not repeated.
+#
+# WHY A SECOND ROUTE EXISTS. The 2026-08-06 high-effort cell took 3596 `429`s
+# over 20 hours, 13 of its 20 hours throttled, and the damage was not lost
+# trials but eaten deadlines: buzz-acp answers a 429 with exponential requeue
+# backoff, so throttled trials timed out at 57.6% against 31.2% on calm hours.
+# Every one of those 429s said `limit_source: upstream_provider_shared_pool` /
+# `provider_name: Fireworks` -- OpenRouter's *shared* capacity for that upstream,
+# which our own key's headroom cannot influence. This cell removes the shared
+# pool from the path entirely.
+#
+# `service_tier` IS THE POINT, AND IT ONLY WORKS ON THIS ROUTE. Measured
+# 2026-08-07: OpenRouter accepts a deliberately invalid `service_tier` without
+# error, prices the request identically, and echoes nothing -- it drops the
+# field. Fireworks validates against `auto|default|flex|priority` and 400s on
+# anything else. The tier is set per-endpoint in the endpoint config
+# (`FIREWORKS_SERVICE_TIER=priority`), NOT here, because it is deployment
+# config rather than part of the condition's identity -- same reasoning as the
+# OpenRouter upstream pin.
+#
+# THE ROW LABEL IS THE PROVIDER-FACING ID. `lb_job_config.model_name` publishes
+# the roster `endpoint` verbatim, so this row would read
+# `accounts/fireworks/models/deepseek-v4-flash-0731` where the OpenRouter cell
+# reads `deepseek/deepseek-v4-flash-0731`. That is the honest id for what ran;
+# change it only with a deliberate model-naming rule, not by editing the
+# endpoint string, which is the join key into the endpoint config.
+#
+# COST IS 1.58x THE OPENROUTER CELL, NOT COMPARABLE WITHOUT SAYING SO. Fireworks
+# lists this model at $0.14/$0.028/$0.28 standard, and `priority` is a flat 1.5x
+# on all three: $0.21/$0.042/$0.42. The OpenRouter cell is pinned to
+# `gmicloud/fp8` at $0.133/$0.0266/$0.266. So a cost delta between these two
+# rows is mostly price sheet and tier, not serving-stack efficiency -- do not
+# quote one against the other without decomposing it.
+schema_version: "1"
+condition: lb-tb-solo-deepseek-v4-flash-max-fw
+roster:
+  - id: solo
+    kind: orchestrator
+    role: solo
+    count: 1
+    # Fireworks' fully-qualified model id. Doubles as the key into
+    # endpoints/fireworks-live.json and as the published row label.
+    endpoint: accounts/fireworks/models/deepseek-v4-flash-0731
+    model_revision: deepseek/deepseek-v4-flash-20260731
+    prompt:
+      # Byte-identical to every other solo cell in the study.
+      path: personas/bench/solo.md
+      sha256: 61c9ac9dc47cbd3c987a7ee6ceb7397496834df8d3fc284c8fe6980e1d5b4ebe
+    generation:
+      # Fireworks' own effort enum is low|medium|high|xhigh|max|none|adaptive,
+      # so `max` reaches the wire as `max`. The OpenAI-compat route would have
+      # clamped it to `xhigh`; Provider::Fireworks deliberately skips that
+      # normalization table, which is keyed on OpenAI model names.
+      thinking_effort: max
+prices:
+  accounts/fireworks/models/deepseek-v4-flash-0731:
+    # Fireworks serverless `priority` tier = 1.5x its standard sheet
+    # ($0.14/$0.028/$0.28). These are the priority numbers, because that is what
+    # the endpoint config asks for; running this manifest at the default tier
+    # would overstate the bill by 1.5x.
+    input_per_million_usd: 0.21
+    cached_input_per_million_usd: 0.042
+    output_per_million_usd: 0.42
+    # Fallback only; Fireworks reports the real cached split per request
+    # (`prompt_tokens_details.cached_tokens`) and the harness prefers it.
+    cache_read_rate: 0.0
+trial_budget:
+  # Unchanged from the OpenRouter cell: must clear Harbor's longest task
+  # deadline at 1.0x or check_budget_clears_clock refuses the run.
+  timeout_seconds: 12000
+
+# No `environment:` block. See the header: adding one disqualifies the run.

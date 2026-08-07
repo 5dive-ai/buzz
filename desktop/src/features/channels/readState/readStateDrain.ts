@@ -14,6 +14,7 @@ import {
 } from "@/features/channels/readState/readStateFormat";
 import type { AppliedReceipt } from "@/features/channels/readState/readStateStorage";
 import { pendingOverrideIntentStore } from "@/features/channels/pendingOverrideIntents";
+import { toast } from "sonner";
 import type { MarkResult } from "@/features/channels/readState/readStateManager";
 
 /** Subset of ReadStateManager state and methods needed for drain operations. */
@@ -33,8 +34,97 @@ export interface DrainContext {
   schedulePublish(): void;
   notifyListeners(): void;
   channelFrontier(channelId: string): number;
+  markContextRead(channelId: string, unixTimestamp: number): void;
   tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean;
   restoreExtraSlotIds(prev: string[]): void;
+  /** Drain outcome callback — wired by the hook for toast/rollback routing.
+   *  `sourceScope` is set for `read+applied` outcomes; it carries the source
+   *  that was being cleared so the hook can remove exactly that source from the
+   *  forced-unread entry rather than deleting the whole entry. */
+  onDrainOutcome:
+    | ((
+        channelId: string,
+        op: string,
+        status: string,
+        reason?: string,
+        sourceScope?: string,
+      ) => void)
+    | null;
+}
+
+/**
+ * Shape of ReadStateManager internals accessed by createDrainContext.
+ * Listed explicitly so TypeScript validates the access at the factory site.
+ */
+interface ManagerInternals {
+  readonly pubkey: string;
+  readonly destroyed: boolean;
+  isLoadComplete: boolean;
+  readonly loadGeneration: number;
+  readonly overrideRegisters: Map<string, OverrideRegister>;
+  readonly appliedReceipts: Map<string, AppliedReceipt>;
+  readonly publishableContextIds: Set<string>;
+  readonly extraSlotIds: string[];
+  onDrainOutcome:
+    | ((
+        channelId: string,
+        op: string,
+        status: string,
+        reason?: string,
+        sourceScope?: string,
+      ) => void)
+    | null;
+  persistLocalState(): boolean;
+  schedulePublish(): void;
+  notifyListeners(): void;
+  channelFrontier(channelId: string): number;
+  markContextRead(channelId: string, unixTimestamp: number): void;
+  tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean;
+  restoreExtraSlotIds(prev: string[]): void;
+}
+
+/**
+ * Build a typed DrainContext adapter from the manager's internals.
+ * This is the single place where the manager exposes its internals to the
+ * drain layer — no cast required.
+ */
+export function createDrainContext(mgr: ManagerInternals): DrainContext {
+  return {
+    get pubkey() {
+      return mgr.pubkey;
+    },
+    get destroyed() {
+      return mgr.destroyed;
+    },
+    get isLoadComplete() {
+      return mgr.isLoadComplete;
+    },
+    get loadGeneration() {
+      return mgr.loadGeneration;
+    },
+    get overrideRegisters() {
+      return mgr.overrideRegisters;
+    },
+    get appliedReceipts() {
+      return mgr.appliedReceipts;
+    },
+    get publishableContextIds() {
+      return mgr.publishableContextIds;
+    },
+    get extraSlotIds() {
+      return mgr.extraSlotIds;
+    },
+    get onDrainOutcome() {
+      return mgr.onDrainOutcome;
+    },
+    persistLocalState: () => mgr.persistLocalState(),
+    schedulePublish: () => mgr.schedulePublish(),
+    notifyListeners: () => mgr.notifyListeners(),
+    channelFrontier: (id) => mgr.channelFrontier(id),
+    markContextRead: (id, ts) => mgr.markContextRead(id, ts),
+    tryCandidatePlan: (id, reg) => mgr.tryCandidatePlan(id, reg),
+    restoreExtraSlotIds: (prev) => mgr.restoreExtraSlotIds(prev),
+  };
 }
 
 /**
@@ -42,7 +132,7 @@ export interface DrainContext {
  * Implements plan phase 4 / Amendments A + B + C.
  *
  * Normative drain sequence per intent:
- *  1. Capture — snapshot intent (op, gen, sourceScope) and pubkey fence.
+ *  1. Capture — snapshot intent (op, gen, sourceScope, readTarget) and pubkey fence.
  *  2. Replay — perform the register action against the complete-load state.
  *             For applied: co-commit register + receipt atomically (Amendment C).
  *  3. Re-check (Amendment A whole-transaction fence) — compare captured gen
@@ -69,6 +159,7 @@ export async function drainPendingIntents(
     const capturedGen = captured.gen;
     const capturedOp = captured.op;
     const capturedSourceScope = captured.sourceScope;
+    const capturedReadTarget = captured.readTarget;
     const capturedPubkey = ctx.pubkey;
 
     // Pubkey fence: abort if identity changed mid-drain.
@@ -97,7 +188,13 @@ export async function drainPendingIntents(
       replayResult =
         capturedOp === "unread"
           ? markChannelUnreadDirect(ctx, channelId, capturedGen, capturedOp)
-          : markChannelReadDirect(ctx, channelId, capturedGen, capturedOp);
+          : markChannelReadDirect(
+              ctx,
+              channelId,
+              capturedGen,
+              capturedOp,
+              capturedReadTarget,
+            );
     }
 
     // Amendment A whole-transaction fence: re-check gen under store owner.
@@ -129,25 +226,34 @@ export async function drainPendingIntents(
         else ctx.appliedReceipts.set(channelId, prevReceipt);
         if (!wasPublishable) ctx.publishableContextIds.delete(channelId);
         ctx.restoreExtraSlotIds(prevExtraSlotIds);
-        console.warn(
-          `[ReadStateManager] drain: register+receipt commit failed for ${channelId}, intent preserved`,
-        );
         continue;
       }
       ctx.schedulePublish();
     }
 
-    // Step 2: source cleanup (idempotent).
-    void capturedSourceScope; // reserved for future UI-layer cleanup hook
+    // Step 2: source cleanup (idempotent) — capturedSourceScope scopes removal.
+    // The sourceScope is forwarded to the onDrainOutcome callback so the hook
+    // layer can remove exactly the right source from the forced-unread entry.
 
-    // Step 3: toast for genuine refusals.
+    // Step 3: surface outcomes — toast genuine refusals, route to hook callback.
     if (replayResult.status === "refused") {
       const reason = replayResult.reason;
       if (reason !== "already_inactive" && reason !== "load_incomplete") {
-        console.warn(
-          `[ReadStateManager] drain: intent ${capturedOp} for ${channelId} refused: ${reason}`,
-        );
+        // Genuine refusal (uint32_overflow, budget_exhausted, storage_failed):
+        // show toast and surface to hook for forced-entry rollback.
+        const msg = toastForDrainRefusal(capturedOp, reason);
+        if (msg) toast.error(msg);
+        ctx.onDrainOutcome?.(channelId, capturedOp, "refused", reason);
       }
+      // already_inactive: silent definitive success — no badge, no toast.
+    } else if (replayResult.status === "applied") {
+      ctx.onDrainOutcome?.(
+        channelId,
+        capturedOp,
+        "applied",
+        undefined,
+        capturedSourceScope,
+      );
     }
 
     // Step 4: atomic cleanup commit — delete receipt + compare-and-delete intent.
@@ -161,6 +267,21 @@ export async function drainPendingIntents(
     }
     ctx.notifyListeners();
   }
+}
+
+/** Human-readable toast for a genuine drain refusal. Returns null for silent reasons. */
+function toastForDrainRefusal(op: string, reason: string): string | null {
+  if (reason === "budget_exhausted")
+    return "Could not mark unread: override budget exhausted.";
+  if (reason === "uint32_overflow")
+    return op === "unread"
+      ? "Could not mark unread: counter limit reached."
+      : "Could not clear unread override: counter limit reached.";
+  if (reason === "storage_failed")
+    return op === "unread"
+      ? "Could not mark unread: storage write failed."
+      : "Could not clear unread override: storage write failed.";
+  return null;
 }
 
 /**
@@ -205,6 +326,9 @@ export function markChannelUnreadDirect(
 
 /**
  * Replay a mark-read directly against the complete-load state (drain path).
+ * Advances the frontier to `readTarget` (captured at click time) before the
+ * C-bump so the read lands at the correct logical position even when the load
+ * completed later.
  * Sets ctx.appliedReceipts so the subsequent atomic persistLocalState() call
  * in drainPendingIntents includes the receipt (Amendment C).
  * Does NOT persist or enqueue — only called from drainPendingIntents.
@@ -214,9 +338,14 @@ export function markChannelReadDirect(
   channelId: string,
   capturedGen: number,
   capturedOp: "read",
+  readTarget?: number,
 ): MarkResult {
   if (!ctx.isLoadComplete)
     return { status: "refused", reason: "load_incomplete" };
+  // Advance frontier to readTarget first (spec order: frontier → C-bump).
+  if (readTarget !== undefined && readTarget > 0) {
+    ctx.markContextRead(channelId, readTarget);
+  }
   const reg = ctx.overrideRegisters.get(channelId);
   const effectiveFrontier = ctx.channelFrontier(channelId);
   if (!reg) return { status: "refused", reason: "already_inactive" };
@@ -242,6 +371,7 @@ export function markChannelReadDirect(
 /**
  * Public mark-unread: write-ordered forced entry then queue/apply the override.
  * Queues an intent when load is incomplete; applies immediately otherwise.
+ * Persists the intent atomically in the v2 blob via persistLocalState().
  */
 export function markChannelUnread(
   ctx: DrainContext,
@@ -249,6 +379,10 @@ export function markChannelUnread(
 ): MarkResult {
   if (!ctx.isLoadComplete) {
     pendingOverrideIntentStore.enqueue(channelId, "unread");
+    if (!ctx.persistLocalState()) {
+      // Storage failure — intent is in-memory only; session drain still works.
+      // Optimistic presentation continues (forced entry already written).
+    }
     return { status: "queued" };
   }
   const existing = ctx.overrideRegisters.get(channelId);
@@ -286,13 +420,27 @@ export function markChannelUnread(
 
 /**
  * Public mark-read: queues an intent when load is incomplete; C-bumps otherwise.
+ * Captures the current frontier as readTarget when queuing, so the drain can
+ * advance the frontier to the correct position later.
+ * Captures sourceScope when provided so the drain can perform exact source cleanup.
+ * Persists the intent atomically in the v2 blob via persistLocalState().
  */
 export function markChannelRead(
   ctx: DrainContext,
   channelId: string,
+  sourceScope?: string,
 ): MarkResult {
   if (!ctx.isLoadComplete) {
-    pendingOverrideIntentStore.enqueue(channelId, "read", undefined);
+    const readTarget = ctx.channelFrontier(channelId);
+    pendingOverrideIntentStore.enqueue(
+      channelId,
+      "read",
+      sourceScope,
+      readTarget > 0 ? readTarget : undefined,
+    );
+    if (!ctx.persistLocalState()) {
+      // Storage failure — intent is in-memory only; session drain still works.
+    }
     return { status: "queued" };
   }
   const reg = ctx.overrideRegisters.get(channelId);

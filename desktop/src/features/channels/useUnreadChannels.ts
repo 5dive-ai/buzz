@@ -61,6 +61,7 @@ import {
   mutedStore,
   resolveChannelReadMarker,
   resolveObservedUnreadRootId,
+  useDrainOutcomeCallback,
 } from "@/features/channels/useUnreadChannelsHelpers";
 
 export function useUnreadChannels(
@@ -82,10 +83,8 @@ export function useUnreadChannels(
   const normalizedRelayUrl = relayUrlOption
     ? normalizeRelayUrl(relayUrlOption)
     : "";
-  // Single identity for the in-memory thread-activity buffer — computed once
-  // per render and used at reset, both writers, and the return fence. The
-  // helper returns "" when either value is absent, which never matches a valid
-  // loaded scope, so the fence returns [] until the buffer is seeded.
+  // Single identity for the in-memory thread-activity buffer — reset/return fence;
+  // empty string never matches a valid loaded scope, so the fence returns [] until seeded.
   const currentActivityScope = activityScopeKey(
     normalizedPubkey,
     normalizedRelayUrl,
@@ -104,6 +103,7 @@ export function useUnreadChannels(
     markChannelRead: markChannelOverrideRead,
     getOverrideLiveness,
     getProjection,
+    setOnDrainOutcome,
   } = useReadState(pubkey, relayClient);
   const overrideApis = React.useMemo<OverrideAPIs>(
     () => ({
@@ -159,17 +159,12 @@ export function useUnreadChannels(
   }, [readStateVersion, drainSyncedAdvances]);
 
   // Root event IDs of threads where the current user has replied at least once.
-  // Used to determine if thread replies should trigger unread notifications.
   const participatedRootIdsRef = React.useRef(new Set<string>());
   // Root event IDs of top-level messages authored by the current user.
-  // Used to notify the author when someone replies to their posts.
   const authoredRootIdsRef = React.useRef(new Set<string>());
-  // Root event IDs of threads where an external message @-mentioned the user.
-  // ORed into the badge gate so a mention recipient who never participated,
-  // authored, or followed the thread still gets the thread-unread badge.
+  // Root event IDs of threads @-mentioning the user — ORed into the badge gate.
   const mentionedRootIdsRef = React.useRef(new Set<string>());
-  // Root event IDs of threads the user has explicitly muted. Takes precedence
-  // over participation, follow, and authorship for notification suppression.
+  // Root event IDs of threads the user muted — overrides participation/follow.
   const mutedRootIdsRef = React.useRef(new Set<string>());
 
   // Stable ref for the caller-supplied muted channel IDs. Updated every render
@@ -177,12 +172,9 @@ export function useUnreadChannels(
   const mutedChannelIdsRef = React.useRef<ReadonlySet<string>>(new Set());
   mutedChannelIdsRef.current = mutedChannelIdsOption ?? new Set();
 
-  // Thread reply events that triggered notifications — surfaced in the Home
-  // activity feed as synthetic FeedItems.
+  // Thread reply events that triggered notifications — surfaced in the Home activity feed.
   const threadActivityRef = React.useRef<ThreadActivityItem[]>([]);
-  // Tracks the (pubkey:relayUrl) scope currently loaded into threadActivityRef.
-  // Writers guard against this before merging so in-flight writes from a prior
-  // scope cannot corrupt the new one; renders return [] until it matches.
+  // Scope key for threadActivityRef; guards against cross-scope writes.
   const threadActivityScopeRef = React.useRef<string>("");
 
   // Tracks which channels we've already issued a catch-up REQ for this
@@ -202,6 +194,14 @@ export function useUnreadChannels(
   const [membershipVersion, bumpMembershipVersion] = React.useReducer(
     (x: number) => x + 1,
     0,
+  );
+
+  // Wire drain outcome callback; returns the pending-unread-snapshots ref.
+  const pendingUnreadSnapshotsRef = useDrainOutcomeCallback(
+    setOnDrainOutcome,
+    forcedUnreadRef,
+    pubkey,
+    bumpLatestVersion,
   );
 
   // Persistence layer: hydration, pagehide flush, scope fence, write-through, marker-prune.
@@ -313,20 +313,26 @@ export function useUnreadChannels(
 
   // Mark channel unread: write forced entry first (write ordering), then apply override.
   // Refused results undo the forced entry. Returns true when accepted (applied or queued).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: pendingUnreadSnapshotsRef is a stable ref; .current.set is Map.prototype.set (stable identity)
   const markChannelUnread = React.useCallback(
     (channelId: string, source?: ForcedUnreadSource): boolean => {
-      // Step 1: write the forced entry first (write ordering).
+      // Snapshot the prior entry before the optimistic write for drain rollback.
+      const priorEntry = Object.hasOwn(forcedUnreadRef.current, channelId)
+        ? forcedUnreadRef.current[channelId]
+        : undefined;
+      // Write forced entry first (write ordering), then apply override.
       forcedMarkChannelUnread(channelId, source);
-      // Step 2: apply override (may enqueue intent or apply immediately).
       if (!applyOverrideUnread(channelId, overrideApis)) {
-        // Refused — undo the forced entry.
-        if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
-          delete forcedUnreadRef.current[channelId];
-          if (pubkey) forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
-          bumpLatestVersion();
-        }
+        // Refused immediately — restore exact prior entry (or remove if none existed).
+        if (priorEntry !== undefined)
+          forcedUnreadRef.current[channelId] = priorEntry;
+        else delete forcedUnreadRef.current[channelId];
+        if (pubkey) forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+        bumpLatestVersion();
         return false;
       }
+      // Store snapshot; drain will call onDrainOutcome to commit or rollback.
+      pendingUnreadSnapshotsRef.current.set(channelId, priorEntry);
       return true;
     },
     [forcedMarkChannelUnread, overrideApis, pubkey],
@@ -990,10 +996,8 @@ export function useUnreadChannels(
     markChannelRead,
     markChannelUnread,
     clearChannelUnreadSource,
-    // Exposed so other surfaces (e.g. Home) can project per-item read state
-    // off the same NIP-RS read marker without instantiating a second
-    // ReadStateManager. readStateVersion is the invalidation signal callers
-    // should include in memo deps.
+    // Exposed for other surfaces (e.g. Home) to project read state off the same
+    // NIP-RS marker; readStateVersion is the invalidation signal for memo deps.
     getEffectiveTimestamp,
     getOwnTimestamp,
     readStateVersion,

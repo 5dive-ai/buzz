@@ -536,13 +536,20 @@ Every action below requires a complete full-state load (see Full-State Load). On
 
 - (a) **`applied`** — the action was applied against a complete full-state load; the register was mutated, the canonical form was updated, and publication was scheduled.
 - (b) **`queued`** — the action was accepted as a pending intent; the register was NOT mutated; a forced local presentation MAY be shown optimistically; the client MUST drain the intent on the next complete-load transition and surface the definitive `applied` or `refused` result then.
-- (c) **`refused`** — the action was rejected; neither the register nor local presentation was modified; a reason MUST be provided (see reasons below).
+- (c) **`refused`** — the action was rejected; neither the register nor local presentation was modified; a reason MUST be provided (one of the refusal reasons below).
+
+**Refusal reasons:**
+
+- `load_incomplete` — the full-state load was not proven complete; no register mutation was performed.
+- `already_inactive` — the override register was already inactive (or absent) at the time of the mark-read; no C-bump was needed. This is a definitive success condition: the channel is already cleared.
+- `uint32_overflow` — `max(S, C)` has reached the uint32 maximum (4294967295); no representable counter increment exists.
+- `budget_exhausted` — the new register would exceed the encoding budget; the client MUST refuse rather than silently drop other channels' overrides.
 
 A client that does not implement pending intents MUST report the action as `refused` with reason `load_incomplete` rather than act on a partial view of its own override state.
 
 **Mark-unread:** increment S to `max(S, C) + 1`; set B to the current effective frontier value for the context. C is unchanged. If `max(S, C) == 4294967295` (uint32 maximum), the client MUST refuse the mark-unread action and leave the register unchanged; wrapping or resetting to zero is prohibited.
 
-**Mark-read (explicit):** advance the frontier to cover the context as normal; increment C to `max(S, C) + 1`. S and B are unchanged. If `max(S, C) == 4294967295`, no representable counter increment exists; wrapping or resetting to zero is prohibited. The client MUST then complete the action only if the resulting state satisfies `override_active == false` — i.e. the frontier advance alone deactivates the override, or the override was already inactive. Otherwise the counters MUST be left unchanged and the client MUST NOT report the mark-read as `applied` while `override_active` remains true; instead the client MUST report the outcome as `refused` (see reason `already_inactive` and other reasons above). A client MAY report `queued` for a mark-read on an incomplete load per (b) above, but MUST NOT apply the counter mutation until a complete load is available.
+**Mark-read (explicit):** advance the frontier to cover the context as normal; increment C to `max(S, C) + 1`. S and B are unchanged. If `max(S, C) == 4294967295`, no representable counter increment exists; wrapping or resetting to zero is prohibited. The client MUST then complete the action only if the resulting state satisfies `override_active == false` — i.e. the frontier advance alone deactivates the override, or the override was already inactive. Otherwise the counters MUST be left unchanged and the client MUST NOT report the mark-read as `applied` while `override_active` remains true; instead the client MUST report the outcome as `refused` with reason `already_inactive`. A client MAY report `queued` for a mark-read on an incomplete load per (b) above, but MUST NOT apply the counter mutation until a complete load is available.
 
 **Natural read (frontier advance):** advance the frontier past B. No counter update is needed — the liveness predicate's `F <= B` condition automatically deactivates the override when the frontier dominates the baseline.
 

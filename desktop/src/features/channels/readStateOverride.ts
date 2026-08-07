@@ -52,7 +52,7 @@ export type OverrideAPIs = {
    *  in a partial view", not "known absent register". */
   isReadStateReady: boolean;
   markChannelUnread: (channelId: string) => MarkResult;
-  markChannelRead: (channelId: string) => MarkResult;
+  markChannelRead: (channelId: string, sourceScope?: string) => MarkResult;
   getOverrideLiveness: (channelId: string) => OverrideLiveness | null;
 };
 
@@ -115,10 +115,15 @@ export type OverrideReadOutcome = "overrideCleared" | "overrideStillActive";
  *         no error toast (representable C-bump was not possible, frontier
  *         already provides the inactive verdict).
  *      c. Other refusal keeping liveness active: show toast, overrideStillActive.
+ *
+ * `sourceScope` is forwarded to markChannelRead so the intent can carry the
+ * exact source being cleared; the drain surfaces it to onDrainOutcome for
+ * exact hook-layer source cleanup (rather than whole-entry deletion).
  */
 export function applyOverrideRead(
   channelId: string,
   apis: OverrideAPIs,
+  sourceScope?: string,
 ): OverrideReadOutcome {
   // Step 1: load complete + no register → known absence, cleared.
   // Guard: only treat null as "known absent" when the load is complete.
@@ -133,7 +138,7 @@ export function applyOverrideRead(
   // register or frontier mutation. Sources are preserved; the intent drains
   // on the next complete-load transition and rawUnread suppresses presentation
   // via the pending-read precedence rule.
-  const result = apis.markChannelRead(channelId);
+  const result = apis.markChannelRead(channelId, sourceScope);
 
   if (result.status === "queued") {
     // Intent enqueued — sources preserved, rawUnread handles presentation.
@@ -206,7 +211,7 @@ export function useClearChannelUnreadSource(
         return;
       }
       // Last-source removal: route through the mark-read seam.
-      const outcome = applyOverrideRead(channelId, apis);
+      const outcome = applyOverrideRead(channelId, apis, source);
       if (outcome === "overrideCleared") {
         delete forcedUnreadRef.current[channelId];
         if (pubkey) forcedUnreadStore.write(pubkey, forcedUnreadRef.current);

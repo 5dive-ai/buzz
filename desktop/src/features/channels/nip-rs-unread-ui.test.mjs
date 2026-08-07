@@ -706,8 +706,8 @@ test("preReady_unread_witness_c_pendingUnread_visible_during_loading", () => {
   // committed forced entry; committed forced with no pending is visible.
   // Exercises the ratified precedence rule via the production computePreReadyUnread helper.
   const { restore } = makeIsolatedStorage();
-  const pubkey = "cc".repeat(32);
-  pendingOverrideIntentStore.loadForPubkey(pubkey);
+  const _pubkey = "cc".repeat(32);
+  pendingOverrideIntentStore.restoreFromStorage(new Map(), 1);
   pendingOverrideIntentStore.enqueue("ch-unread", "unread");
   pendingOverrideIntentStore.enqueue("ch-read", "read");
 

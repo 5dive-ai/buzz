@@ -9,11 +9,9 @@ import {
   READ_STATE_MAX_SLOTS,
   MSG_PREFIX,
   THREAD_PREFIX,
-  isOverrideKey,
   encodeOverrideGroup,
   isOverrideActive,
   escapeFrontierKey,
-  unescapeFrontierKey,
   localExtraSlotIdsKey,
   type ReadStateBlob,
   type OverrideRegister,
@@ -31,6 +29,12 @@ import {
   type AppliedReceipt,
 } from "@/features/channels/readState/readStateStorage";
 import {
+  splitContextsIntoBudgetedSlots,
+  trimContextsToBudget,
+  type SlotSplitResult,
+  type TrimResult,
+} from "@/features/channels/readState/readStateSlotUtils";
+import {
   fencedEnumerationLoad,
   deduplicateByCoordinate,
 } from "@/features/channels/readState/readStateFencedLoader";
@@ -40,8 +44,12 @@ import {
   drainPendingIntents as drainPendingIntentsImpl,
   markChannelUnread as markChannelUnreadImpl,
   markChannelRead as markChannelReadImpl,
-  type DrainContext,
+  createDrainContext,
 } from "@/features/channels/readState/readStateDrain";
+
+export type { SlotSplitResult, TrimResult };
+export { splitContextsIntoBudgetedSlots, trimContextsToBudget };
+
 const CLIENT_ID_KEY_PREFIX = "buzz.nip-rs.client-id";
 const SLOT_ID_KEY_PREFIX = "buzz.nip-rs.slot-id";
 const DEBOUNCE_MS = 5_000;
@@ -153,128 +161,14 @@ export function applyRemoteContextTimestamp(args: {
   return result;
 }
 
-/** Slot split result. */
-export interface SlotSplitResult {
-  slots: Array<Record<string, number>>;
-  extraSlotIds: string[];
-}
-
-/** Partition channelEntries across slots; override groups pinned to slot 0. Exported for testing. */
-export function splitContextsIntoBudgetedSlots(args: {
-  channelEntries: [string, number][];
-  threadMsgEntries: [string, number][];
-  clientId: string;
-  initialSlotCount: number;
-  maxSlots: number;
-  maxBytes: number;
-  slotIdGenerator: () => string;
-}): SlotSplitResult | null {
-  const {
-    channelEntries,
-    threadMsgEntries,
-    clientId,
-    initialSlotCount,
-    maxSlots,
-    maxBytes,
-    slotIdGenerator,
-  } = args;
-
-  const encoder = new TextEncoder();
-  const blobFor = (c: Record<string, number>) =>
-    JSON.stringify({ v: 1, client_id: clientId, contexts: c });
-
-  const overrideRawIds = new Set<string>();
-  for (const [key] of channelEntries) {
-    if (isOverrideKey(key)) overrideRawIds.add(key.slice(5));
-  }
-  const pinnedEntries: [string, number][] = [];
-  const roundRobinEntries: [string, number][] = [];
-  for (const [key, ts] of channelEntries) {
-    if (isOverrideKey(key) || overrideRawIds.has(unescapeFrontierKey(key))) {
-      pinnedEntries.push([key, ts]);
-    } else {
-      roundRobinEntries.push([key, ts]);
-    }
-  }
-  let slotCount = initialSlotCount;
-  const extraSlotIds: string[] = [];
-  const distribute = (count: number): Array<Record<string, number>> => {
-    const slotContexts: Array<Record<string, number>> = Array.from(
-      { length: count },
-      () => ({}),
-    );
-    for (let i = 0; i < roundRobinEntries.length; i++) {
-      const [key, ts] = roundRobinEntries[i];
-      slotContexts[i % count][key] = ts;
-    }
-    for (const [key, ts] of pinnedEntries) slotContexts[0][key] = ts;
-    return slotContexts;
-  };
-
-  let slotContexts = distribute(slotCount);
-  while (
-    slotContexts.some((c) => encoder.encode(blobFor(c)).length > maxBytes) &&
-    slotCount < maxSlots
-  ) {
-    extraSlotIds.push(slotIdGenerator());
-    slotCount++;
-    slotContexts = distribute(slotCount);
-  }
-  if (slotContexts.some((c) => encoder.encode(blobFor(c)).length > maxBytes))
-    return null;
-  for (const [key, ts] of threadMsgEntries) slotContexts[0][key] = ts;
-  trimContextsToBudget(slotContexts[0], clientId, maxBytes);
-  return { slots: slotContexts, extraSlotIds };
-}
-
-export interface TrimResult {
-  evicted: number;
-  fitsAfterTrim: boolean;
-}
-
-/** Trim a contexts map to fit within `maxBytes`. Evicts oldest msg:/thread: entries; channel/ov_* keys never evicted. */
-export function trimContextsToBudget(
-  contexts: Record<string, number>,
-  clientId: string,
-  maxBytes: number,
-): TrimResult {
-  const encoder = new TextEncoder();
-  const blobFor = (c: Record<string, number>) =>
-    JSON.stringify({ v: 1, client_id: clientId, contexts: c });
-
-  let currentBytes = encoder.encode(blobFor(contexts)).length;
-  if (currentBytes <= maxBytes) {
-    return { evicted: 0, fitsAfterTrim: true };
-  }
-
-  const msgEntries: [string, number][] = [];
-  const threadEntries: [string, number][] = [];
-  for (const [key, ts] of Object.entries(contexts)) {
-    if (isOverrideKey(key)) continue;
-    if (key.startsWith(MSG_PREFIX)) msgEntries.push([key, ts]);
-    else if (key.startsWith(THREAD_PREFIX)) threadEntries.push([key, ts]);
-  }
-  msgEntries.sort((a, b) => a[1] - b[1]);
-  threadEntries.sort((a, b) => a[1] - b[1]);
-  const toEvict: string[] = [];
-  for (const [key, ts] of [...msgEntries, ...threadEntries]) {
-    if (currentBytes <= maxBytes) break;
-    currentBytes -= key.length + 3 + String(ts).length + 1;
-    toEvict.push(key);
-  }
-  for (const key of toEvict) delete contexts[key];
-  const fitsAfterTrim = encoder.encode(blobFor(contexts)).length <= maxBytes;
-  return { evicted: toEvict.length, fitsAfterTrim };
-}
-
 export class ReadStateManager {
-  private pubkey: string;
+  readonly pubkey: string;
   private relayClient: RelayClient;
-  private clientId: string;
+  readonly clientId: string;
   private slotId: string;
-  private extraSlotIds: string[];
-  private effectiveState = new Map<string, number>();
-  private publishableContextIds = new Set<string>();
+  extraSlotIds: string[];
+  readonly effectiveState = new Map<string, number>();
+  readonly publishableContextIds = new Set<string>();
   private lastPublishedContexts: Record<string, number> = {};
   private debounceTimer: number | null = null;
   private listeners = new Set<() => void>();
@@ -283,15 +177,27 @@ export class ReadStateManager {
   private maxFetchedCreatedAt = 0;
   private contextSourceCreatedAt = new Map<string, number>();
   private pendingSyncedAdvances = new Set<string>();
-  private destroyed = false;
+  destroyed = false;
   private parentResolver: ContextParentResolver | null = null;
-  private overrideRegisters = new Map<string, OverrideRegister>();
-  private isLoadComplete = false;
-  private appliedReceipts = new Map<string, AppliedReceipt>(); // co-committed with register (Amendment C)
-  private loadGeneration = 0; // single-flight controller
-  private loadInFlight = false;
-  private retryBackoffTimer: number | null = null;
-  private drainScheduled = false;
+  readonly overrideRegisters = new Map<string, OverrideRegister>();
+  isLoadComplete = false;
+  readonly appliedReceipts = new Map<string, AppliedReceipt>(); // co-committed with register (Amendment C)
+  loadGeneration = 0; // single-flight controller
+  loadInFlight = false;
+  retryBackoffTimer: number | null = null;
+  retryAttempt = 0; // bounded exponential backoff attempt counter
+  pendingRetryOnComplete = false; // reconnect arrived during loadInFlight
+  drainScheduled = false;
+  /** Called after each drain intent is settled; wired by the hook for outcome routing. */
+  onDrainOutcome:
+    | ((
+        channelId: string,
+        op: string,
+        status: string,
+        reason?: string,
+        sourceScope?: string,
+      ) => void)
+    | null = null;
 
   constructor(pubkey: string, relayClient: RelayClient) {
     this.pubkey = pubkey;
@@ -304,7 +210,7 @@ export class ReadStateManager {
       generateHex(16),
     );
     this.extraSlotIds = loadExtraSlotIds(pubkey);
-    pendingOverrideIntentStore.loadForPubkey(pubkey);
+    // pendingOverrideIntentStore is restored from v2 blob in hydrateFromLocalStorage.
   }
 
   async initialize(): Promise<void> {
@@ -313,7 +219,7 @@ export class ReadStateManager {
     this.loadInFlight = true;
     const gen = ++this.loadGeneration;
     try {
-      await this.fetchAndMerge();
+      await this.fetchAndMerge(gen);
     } finally {
       if (gen === this.loadGeneration) this.loadInFlight = false;
     }
@@ -395,6 +301,7 @@ export class ReadStateManager {
     this.destroyed = true;
     this.loadGeneration++;
     this.loadInFlight = false;
+    this.pendingRetryOnComplete = false;
     this.drainScheduled = false;
     if (this.retryBackoffTimer !== null) {
       window.clearTimeout(this.retryBackoffTimer);
@@ -412,10 +319,10 @@ export class ReadStateManager {
     this.listeners.clear();
   }
 
-  private async fetchAndMerge(): Promise<void> {
-    if (this.destroyed) return;
+  async fetchAndMerge(gen: number = this.loadGeneration): Promise<void> {
+    if (this.destroyed || gen !== this.loadGeneration) return;
     const result = await fencedEnumerationLoad(this.relayClient, this.pubkey);
-    if (this.destroyed) return;
+    if (this.destroyed || gen !== this.loadGeneration) return;
     this.isLoadComplete = result.complete;
     if (!result.complete)
       console.warn(
@@ -424,47 +331,82 @@ export class ReadStateManager {
     this.processLoadedParsedEvents(result.events);
     const merged = mergeParsedEvents(result.events);
     await this.ingest(merged);
+    if (this.destroyed || gen !== this.loadGeneration) return;
     this.persistLocalState();
     this.notifyListeners();
   }
 
-  /** Retry load: generation-fenced, coalesces in-flight loads, resets backoff. */
+  /**
+   * Retry load: generation-fenced, coalesces in-flight loads.
+   * Implements bounded exponential backoff (1s→2s→4s…capped at 60s).
+   * A reconnect during loadInFlight sets pendingRetryOnComplete so the next
+   * complete/incomplete verdict triggers exactly one fresh generation rather
+   * than dropping the reconnect signal.
+   */
   async retryLoad(): Promise<void> {
     if (this.destroyed) return;
     if (this.retryBackoffTimer !== null) {
       window.clearTimeout(this.retryBackoffTimer);
       this.retryBackoffTimer = null;
     }
-    if (this.loadInFlight) return;
+    if (this.loadInFlight) {
+      // Reconnect arrived while a load is in flight — coalesce into a required
+      // fresh generation rather than dropping the signal.
+      this.pendingRetryOnComplete = true;
+      return;
+    }
+    const delayMs =
+      this.retryAttempt === 0
+        ? 0
+        : Math.min(1_000 * 2 ** (this.retryAttempt - 1), 60_000);
+    if (delayMs > 0) {
+      await new Promise<void>((resolve) => {
+        this.retryBackoffTimer = window.setTimeout(() => {
+          this.retryBackoffTimer = null;
+          resolve();
+        }, delayMs);
+      });
+    }
+    if (this.destroyed || this.loadInFlight) return;
+    this.retryAttempt++;
     this.loadInFlight = true;
     const gen = ++this.loadGeneration;
     try {
       this.isLoadComplete = false;
-      await this.fetchAndMerge();
+      await this.fetchAndMerge(gen);
       if (this.destroyed || gen !== this.loadGeneration) return;
-      if (!this.drainScheduled) {
+      if (this.isLoadComplete) this.retryAttempt = 0;
+      if (!this.drainScheduled && this.isLoadComplete) {
         this.drainScheduled = true;
         void this.drainPendingIntents(gen);
       }
     } finally {
       if (gen === this.loadGeneration) {
         this.loadInFlight = false;
+        if (this.pendingRetryOnComplete && !this.destroyed) {
+          this.pendingRetryOnComplete = false;
+          void this.retryLoad();
+        }
       }
     }
   }
 
   /** Drain pending override intents. See readStateDrain.ts for the full implementation. */
-  private async drainPendingIntents(drainGen: number): Promise<void> {
-    await drainPendingIntentsImpl(this as unknown as DrainContext, drainGen);
+  async drainPendingIntents(drainGen: number): Promise<void> {
+    await drainPendingIntentsImpl(createDrainContext(this), drainGen);
     this.drainScheduled = false;
   }
 
   markChannelUnread(channelId: string): MarkResult {
-    return markChannelUnreadImpl(this as unknown as DrainContext, channelId);
+    return markChannelUnreadImpl(createDrainContext(this), channelId);
   }
 
-  markChannelRead(channelId: string): MarkResult {
-    return markChannelReadImpl(this as unknown as DrainContext, channelId);
+  markChannelRead(channelId: string, sourceScope?: string): MarkResult {
+    return markChannelReadImpl(
+      createDrainContext(this),
+      channelId,
+      sourceScope,
+    );
   }
 
   /** Shared ingest: accept pre-merged state and return semantic delta (changed contexts, canonical flip). */
@@ -625,7 +567,7 @@ export class ReadStateManager {
     }
   }
 
-  private schedulePublish(): void {
+  schedulePublish(): void {
     if (this.debounceTimer !== null) window.clearTimeout(this.debounceTimer);
     this.debounceTimer = window.setTimeout(() => {
       this.debounceTimer = null;
@@ -633,7 +575,7 @@ export class ReadStateManager {
     }, DEBOUNCE_MS);
   }
 
-  private async publish(): Promise<void> {
+  async publish(): Promise<void> {
     if (!this.isLoadComplete) return;
     if (!(await this.fetchOwnBlobBeforePublish())) {
       console.warn(
@@ -710,7 +652,7 @@ export class ReadStateManager {
       await this.publishOneSlot(slotId, contexts);
   }
 
-  private async deleteExtraSlots(): Promise<void> {
+  async deleteExtraSlots(): Promise<void> {
     if (!this.isLoadComplete) return;
     for (const slotId of this.extraSlotIds) {
       try {
@@ -733,7 +675,7 @@ export class ReadStateManager {
     saveExtraSlotIds(this.pubkey, []);
   }
 
-  private async fetchOwnBlobBeforePublish(): Promise<boolean> {
+  async fetchOwnBlobBeforePublish(): Promise<boolean> {
     const dTags = [this.slotId, ...this.extraSlotIds].map(
       (id) => `${READ_STATE_D_TAG_PREFIX}${id}`,
     );
@@ -773,7 +715,7 @@ export class ReadStateManager {
   }
 
   /** Effective frontier including parent resolver. */
-  private channelFrontier(channelId: string): number {
+  channelFrontier(channelId: string): number {
     return (
       resolveEffectiveTimestamp({
         effectiveState: this.effectiveState,
@@ -902,7 +844,7 @@ export class ReadStateManager {
         : saveExtraSlotIds(this.pubkey, this.extraSlotIds);
   }
 
-  private hydrateFromLocalStorage(): void {
+  hydrateFromLocalStorage(): void {
     const stored = readStoredReadState(this.pubkey);
     for (const [contextId, timestamp] of stored.contexts)
       this.effectiveState.set(contextId, timestamp);
@@ -927,6 +869,11 @@ export class ReadStateManager {
         );
       this.publishableContextIds.add(ctx); // v2 entry is inherently publishable
     }
+    // Restore pending intents from v2 blob (consolidation: no separate key).
+    pendingOverrideIntentStore.restoreFromStorage(
+      stored.pendingIntents,
+      stored.nextGen,
+    );
     // Amendment C hydration: load receipts; orphan sweep for receipts with no matching intent.
     for (const [channelId, receipt] of stored.appliedReceipts) {
       const intent = pendingOverrideIntentStore.get(channelId);
@@ -942,7 +889,7 @@ export class ReadStateManager {
   }
 
   /** Persist local state. Returns false only if the v2 override write failed (commit point). */
-  private persistLocalState(): boolean {
+  persistLocalState(): boolean {
     const entries = new Map(
       [...this.overrideRegisters].map(([ctx, r]) => [
         ctx,
@@ -956,6 +903,8 @@ export class ReadStateManager {
       this.contextSourceCreatedAt,
       entries,
       this.appliedReceipts,
+      pendingOverrideIntentStore.all,
+      pendingOverrideIntentStore.nextGen,
     );
   }
 
@@ -965,7 +914,7 @@ export class ReadStateManager {
     return drained;
   }
 
-  private notifyListeners(): void {
+  notifyListeners(): void {
     for (const listener of this.listeners) {
       try {
         listener();

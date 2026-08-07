@@ -11,7 +11,10 @@ import {
   type OverrideRegister,
 } from "@/features/channels/readState/readStateFormat";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
-import type { PendingIntentOp } from "@/features/channels/pendingOverrideIntents";
+import type {
+  PendingIntent,
+  PendingIntentOp,
+} from "@/features/channels/pendingOverrideIntents";
 
 export type StoredReadState = {
   contexts: Map<string, number>;
@@ -19,6 +22,10 @@ export type StoredReadState = {
   contextSourceCreatedAt: Map<string, number>;
   overrideRegisters: Map<string, StoredOverrideEntry>;
   appliedReceipts: Map<string, AppliedReceipt>;
+  /** Pending intents from the v2 blob (consolidated from pending-intents.v1). */
+  pendingIntents: Map<string, PendingIntent>;
+  /** Next generation counter for the pending intent queue. */
+  nextGen: number;
 };
 
 /**
@@ -124,6 +131,8 @@ export function readStoredReadState(pubkey: string): StoredReadState {
     contextSourceCreatedAt: readContextSourceCreatedAt(pubkey),
     overrideRegisters: overrideState.registers,
     appliedReceipts: overrideState.receipts,
+    pendingIntents: overrideState.pendingIntents,
+    nextGen: overrideState.nextGen,
   };
 }
 
@@ -149,11 +158,15 @@ export type StoredOverrideEntry = OverrideRegister & { f: number };
 type OverrideStateBlob = {
   registers: Map<string, StoredOverrideEntry>;
   receipts: Map<string, AppliedReceipt>;
+  pendingIntents: Map<string, PendingIntent>;
+  nextGen: number;
 };
 
 function readOverrideState(pubkey: string): OverrideStateBlob {
   const registers = new Map<string, StoredOverrideEntry>();
   const receipts = new Map<string, AppliedReceipt>();
+  const pendingIntents = new Map<string, PendingIntent>();
+  let nextGen = 1;
   const raw = localStorage.getItem(localOverrideStateKey(pubkey));
   if (raw) {
     try {
@@ -162,8 +175,9 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
         // Registers are stored under the "r" key (or top-level for compat).
         const registersObj = isPlainRecord(parsed.r) ? parsed.r : parsed;
         for (const [rawCtx, value] of Object.entries(registersObj)) {
-          // Skip the reserved "receipts" key.
-          if (rawCtx === "receipts") continue;
+          // Skip reserved top-level keys.
+          if (rawCtx === "receipts" || rawCtx === "pi" || rawCtx === "ng")
+            continue;
           if (!isPlainRecord(value)) continue;
           const { s, c, b, f } = value;
           if (
@@ -203,20 +217,55 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
             receipts.set(channelId, { intentGen, op });
           }
         }
+        // Parse pending intents from the "pi" sub-object.
+        if (isPlainRecord(parsed.pi)) {
+          for (const [channelId, entry] of Object.entries(parsed.pi)) {
+            if (!isPlainRecord(entry)) continue;
+            const { gen, op, sourceScope, readTarget } = entry as {
+              gen?: unknown;
+              op?: unknown;
+              sourceScope?: unknown;
+              readTarget?: unknown;
+            };
+            if (typeof gen !== "number" || !Number.isInteger(gen) || gen < 1)
+              continue;
+            if (op !== "unread" && op !== "read") continue;
+            if (sourceScope !== undefined && typeof sourceScope !== "string")
+              continue;
+            if (readTarget !== undefined && typeof readTarget !== "number")
+              continue;
+            const intent: PendingIntent = {
+              gen,
+              op,
+              ...(sourceScope !== undefined ? { sourceScope } : {}),
+              ...(readTarget !== undefined ? { readTarget } : {}),
+            };
+            pendingIntents.set(channelId, intent);
+          }
+        }
+        // Parse nextGen.
+        if (
+          typeof parsed.ng === "number" &&
+          Number.isInteger(parsed.ng) &&
+          parsed.ng >= 1
+        ) {
+          nextGen = parsed.ng;
+        }
       }
     } catch {
       // Corrupt storage — return empty; repopulated on next ingest.
     }
-    return { registers, receipts };
+    return { registers, receipts, pendingIntents, nextGen };
   }
   // Migration: read from legacy v1 key if v2 key absent.
   const legacyRaw = localStorage.getItem(
     localOverrideRegistersKeyLegacy(pubkey),
   );
-  if (!legacyRaw) return { registers, receipts };
+  if (!legacyRaw) return { registers, receipts, pendingIntents, nextGen };
   try {
     const parsed = JSON.parse(legacyRaw);
-    if (!isPlainRecord(parsed)) return { registers, receipts };
+    if (!isPlainRecord(parsed))
+      return { registers, receipts, pendingIntents, nextGen };
     for (const [rawCtx, value] of Object.entries(parsed)) {
       if (!isPlainRecord(value)) continue;
       const { s, c, b } = value;
@@ -239,7 +288,7 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
   } catch {
     // Corrupt legacy storage — ignore.
   }
-  return { registers, receipts };
+  return { registers, receipts, pendingIntents, nextGen };
 }
 
 /**
@@ -282,6 +331,8 @@ export function writeStoredReadState(
   contextSourceCreatedAt: ReadonlyMap<string, number>,
   overrideRegisters: ReadonlyMap<string, StoredOverrideEntry>,
   appliedReceipts: ReadonlyMap<string, AppliedReceipt>,
+  pendingIntents: ReadonlyMap<string, PendingIntent>,
+  nextGen: number,
 ): boolean {
   const pruned = pruneStaleContexts(contexts, Math.floor(Date.now() / 1_000));
 
@@ -290,17 +341,19 @@ export function writeStoredReadState(
     state[contextId] = new Date(timestamp * 1_000).toISOString();
   }
 
-  // Persist override registers atomically with their frontier timestamps and
-  // applied receipts (Amendment C) in one JSON blob — a single write ensures
-  // they are never torn.  The receipt lives alongside the register it proves
-  // was applied, so "register committed ↔ receipt committed" is a storage
-  // invariant.
+  // Persist override registers, applied receipts, and pending intents atomically
+  // in one JSON blob — a single write ensures they are never torn.
   //
-  // Format: { r: { <channelId>: {s,c,b,f}, ... }, receipts: { <channelId>: {intentGen,op}, ... } }
+  // Format: {
+  //   r:        { <channelId>: {s,c,b,f} },
+  //   receipts: { <channelId>: {intentGen, op} },  // omitted when empty
+  //   pi:       { <channelId>: {gen, op, sourceScope?, readTarget?} },  // omitted when empty
+  //   ng:       <number>,  // next generation counter; omitted when 1
+  // }
   //
-  // This is the ACTION COMMIT POINT: if ok4 is true the action is durably
-  // committed; ancillary frontier/cache write failures (ok1-ok3) do not fail
-  // the action.  If ok4 is false, the caller must roll back ALL state.
+  // This is the ACTION + INTENT COMMIT POINT: if ok4 is true, the action,
+  // receipt, and pending intent state are all durably committed together.
+  // If ok4 is false, the caller must roll back ALL state.
   const registersObj: Record<
     string,
     { s: number; c: number; b: number; f: number }
@@ -315,11 +368,37 @@ export function writeStoredReadState(
   for (const [channelId, receipt] of appliedReceipts) {
     receiptsObj[channelId] = { intentGen: receipt.intentGen, op: receipt.op };
   }
+  const piObj: Record<
+    string,
+    {
+      gen: number;
+      op: PendingIntentOp;
+      sourceScope?: string;
+      readTarget?: number;
+    }
+  > = {};
+  for (const [channelId, intent] of pendingIntents) {
+    const entry: {
+      gen: number;
+      op: PendingIntentOp;
+      sourceScope?: string;
+      readTarget?: number;
+    } = {
+      gen: intent.gen,
+      op: intent.op,
+    };
+    if (intent.sourceScope !== undefined)
+      entry.sourceScope = intent.sourceScope;
+    if (intent.readTarget !== undefined) entry.readTarget = intent.readTarget;
+    piObj[channelId] = entry;
+  }
   const ok4 = setLocalStorageItemWithRecovery(
     localOverrideStateKey(pubkey),
     JSON.stringify({
       r: registersObj,
       ...(Object.keys(receiptsObj).length > 0 ? { receipts: receiptsObj } : {}),
+      ...(Object.keys(piObj).length > 0 ? { pi: piObj } : {}),
+      ...(nextGen > 1 ? { ng: nextGen } : {}),
     }),
   );
 

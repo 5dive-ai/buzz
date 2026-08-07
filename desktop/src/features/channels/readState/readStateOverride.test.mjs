@@ -729,7 +729,7 @@ test("roundTrip_escapedRawCtx_survivesEncodeAndParse", () => {
 
 test("parseContexts_tombstoneFloor_multibyte_exactly256Bytes_accepted", () => {
   // 'é' × 125 = 250 bytes, + 'a' = 251 bytes suffix → wire key exactly 256 bytes.
-  const suffix = "\u00e9".repeat(125) + "a";
+  const suffix = `${"\u00e9".repeat(125)}a`;
   const raw = {
     [suffix]: 0,
     [`${OV_C_PREFIX}${suffix}`]: 7,
@@ -740,7 +740,7 @@ test("parseContexts_tombstoneFloor_multibyte_exactly256Bytes_accepted", () => {
 
 test("parseContexts_tombstoneFloor_multibyte_exactly257Bytes_dropped", () => {
   // 'é' × 125 = 250 bytes, + 'aa' = 252 bytes suffix → wire key exactly 257 bytes.
-  const suffix = "\u00e9".repeat(125) + "aa";
+  const suffix = `${"\u00e9".repeat(125)}aa`;
   const raw = {
     [suffix]: 0,
     [`${OV_C_PREFIX}${suffix}`]: 7,
@@ -751,7 +751,7 @@ test("parseContexts_tombstoneFloor_multibyte_exactly257Bytes_dropped", () => {
 
 test("parseContexts_liveGroup_multibyte_exactly256Bytes_accepted", () => {
   // Same suffix construction: 'é' × 125 + 'a' = 251 bytes → ov_s: wire key 256 bytes.
-  const suffix = "\u00e9".repeat(125) + "a";
+  const suffix = `${"\u00e9".repeat(125)}a`;
   const raw = {
     [suffix]: 10,
     [`${OV_S_PREFIX}${suffix}`]: 2,
@@ -764,7 +764,7 @@ test("parseContexts_liveGroup_multibyte_exactly256Bytes_accepted", () => {
 
 test("parseContexts_liveGroup_multibyte_exactly257Bytes_dropped", () => {
   // 'é' × 125 + 'aa' = 252 bytes → ov_s: wire key 257 bytes → group dropped.
-  const suffix = "\u00e9".repeat(125) + "aa";
+  const suffix = `${"\u00e9".repeat(125)}aa`;
   const raw = {
     [suffix]: 10,
     [`${OV_S_PREFIX}${suffix}`]: 2,
@@ -1020,9 +1020,9 @@ for (const [name, input, expected] of [
   // 'g' and 'z' are not hexadecimal.
   ["nonHexChars_returnsFalse", "read-state:gggggggggggggggggggggggggggggggg", false],
   // One char short — must be exactly 32.
-  ["31HexChars_returnsFalse", "read-state:" + "a".repeat(31), false],
+  ["31HexChars_returnsFalse", `read-state:${"a".repeat(31)}`, false],
   // One char over — must be exactly 32.
-  ["33HexChars_returnsFalse", "read-state:" + "a".repeat(33), false],
+  ["33HexChars_returnsFalse", `read-state:${"a".repeat(33)}`, false],
   ["missingPrefix_returnsFalse", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", false],
   ["emptySlot_returnsFalse", "read-state:", false],
   ["undefined_returnsFalse", undefined, false],

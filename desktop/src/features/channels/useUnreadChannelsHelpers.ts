@@ -3,6 +3,7 @@
  * useUnreadChannels to keep that file within the repository size ratchet.
  * All exports are load-bearing for useUnreadChannels.ts.
  */
+import * as React from "react";
 import type { UseLiveChannelUpdatesOptions } from "@/features/channels/useLiveChannelUpdates";
 import { makeRootIdStore } from "@/features/channels/unreadRootIdStore";
 import {
@@ -13,6 +14,13 @@ import type { RelayClient } from "@/shared/api/relayClientSession";
 import type { Channel } from "@/shared/api/types";
 import { CHANNEL_MESSAGE_EVENT_KINDS } from "@/shared/constants/kinds";
 import { DM_NOTIFIABLE_EVENT_KINDS } from "./isDmNotifiableKind";
+import {
+  forcedUnreadStore,
+  removeForcedUnreadSource,
+  type ForcedUnreadEntry,
+  type ForcedUnreadMap,
+  type ForcedUnreadSource,
+} from "@/features/channels/forcedUnreadStore";
 
 export type UseUnreadChannelsOptions = UseLiveChannelUpdatesOptions & {
   pubkey?: string;
@@ -86,4 +94,85 @@ export function resolveChannelReadMarker(
 
 export function resolveObservedUnreadRootId(tags: string[][]): string | null {
   return isBroadcastReply(tags) ? null : getThreadReference(tags).rootId;
+}
+
+/**
+ * Hook that builds and wires the drain outcome callback into the ReadStateManager
+ * via `setOnDrainOutcome`. Creates and owns the pending-unread-snapshots map.
+ * Returns the snapshots ref for use in markChannelUnread.
+ *
+ * Handles:
+ *  - `unread + refused` → restore forced-unread entry to its pre-mark snapshot
+ *  - `unread + applied` → discard snapshot (intent succeeded)
+ *  - `read + applied`  → remove forced-unread entry (or specific source), mirroring
+ *                        the synchronous overrideCleared path
+ *
+ * Genuine refusal toasts are fired in the drain itself and not repeated here.
+ */
+export function useDrainOutcomeCallback(
+  setOnDrainOutcome: (
+    cb:
+      | ((
+          channelId: string,
+          op: string,
+          status: string,
+          reason?: string,
+          sourceScope?: string,
+        ) => void)
+      | null,
+  ) => void,
+  forcedUnreadRef: React.MutableRefObject<ForcedUnreadMap>,
+  pubkey: string | undefined,
+  bumpLatestVersion: () => void,
+): React.MutableRefObject<Map<string, ForcedUnreadEntry | undefined>> {
+  const pendingUnreadSnapshotsRef = React.useRef(
+    new Map<string, ForcedUnreadEntry | undefined>(),
+  );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: stable refs; setOnDrainOutcome is stable
+  React.useEffect(() => {
+    setOnDrainOutcome((channelId, op, status, _reason, sourceScope) => {
+      if (op === "unread" && status === "refused") {
+        // Roll back the optimistic forced-unread entry to its exact prior state.
+        const prior = pendingUnreadSnapshotsRef.current.get(channelId);
+        pendingUnreadSnapshotsRef.current.delete(channelId);
+        if (prior === undefined) {
+          if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
+            delete forcedUnreadRef.current[channelId];
+            if (pubkey)
+              forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+            bumpLatestVersion();
+          }
+        } else {
+          forcedUnreadRef.current[channelId] = prior;
+          if (pubkey) forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+          bumpLatestVersion();
+        }
+      } else if (op === "unread" && status === "applied") {
+        pendingUnreadSnapshotsRef.current.delete(channelId);
+      } else if (op === "read" && status === "applied") {
+        if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
+          if (sourceScope !== undefined) {
+            const current = forcedUnreadRef.current[channelId];
+            const next = removeForcedUnreadSource(
+              current,
+              sourceScope as ForcedUnreadSource,
+            );
+            if (next !== undefined) {
+              forcedUnreadRef.current[channelId] = next;
+            } else {
+              delete forcedUnreadRef.current[channelId];
+            }
+          } else {
+            delete forcedUnreadRef.current[channelId];
+          }
+          if (pubkey) forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+          bumpLatestVersion();
+        }
+      }
+    });
+    return () => {
+      setOnDrainOutcome(null);
+    };
+  }, [pubkey, setOnDrainOutcome]);
+  return pendingUnreadSnapshotsRef;
 }

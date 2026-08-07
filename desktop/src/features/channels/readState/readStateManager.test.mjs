@@ -2379,7 +2379,7 @@ test("drain_sameSourceReincarnation_genFenceZeroLocalEffects", async () => {
   // observable as read. This asserts that never happens.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d1".repeat(32);
-  const channelId = "reincarnation-channel-" + "a".repeat(40);
+  const channelId = `reincarnation-channel-${"a".repeat(40)}`;
 
   const fakeRelay = {
     fetchEvents: async () => [],
@@ -2469,7 +2469,7 @@ test("drain_crashWindow1_restartReplaysOnce_extraBumpOnly", async () => {
   // before step 1) to confirm restart does replay exactly once.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d2".repeat(32);
-  const channelId = "crash-window-1-ch-" + "b".repeat(44);
+  const channelId = `crash-window-1-ch-${"b".repeat(44)}`;
 
   const fakeRelay = {
     fetchEvents: async () => [],
@@ -2493,13 +2493,8 @@ test("drain_crashWindow1_restartReplaysOnce_extraBumpOnly", async () => {
   );
 
   // The intent is now persisted (gen=1). Simulate a crash: destroy manager
-  // without draining — intent stays in localStorage, no register committed.
+  // without draining — intent stays in the v2 blob, no register committed.
   mgr1.destroy();
-
-  // Verify: intent is persisted (survived the "crash").
-  const _survivingIntent = pendingOverrideIntentStore.get(channelId);
-  // Note: pendingOverrideIntentStore is a singleton; loadForPubkey reloads on
-  // the new manager construction below.
 
   // ── Session 2: restart. Intent present, no receipt → replay fires once ────
   const mgr2 = new ReadStateManager(pubkey, fakeRelay);
@@ -2507,7 +2502,7 @@ test("drain_crashWindow1_restartReplaysOnce_extraBumpOnly", async () => {
   mgr2.effectiveState.set(channelId, 100);
   mgr2.isLoadComplete = true;
 
-  // Confirm intent survived (reloaded from localStorage by constructor's loadForPubkey).
+  // Confirm intent survived (reloaded from v2 blob by hydrateFromLocalStorage).
   const intentAfterRestart = pendingOverrideIntentStore.get(channelId);
   assert.ok(
     intentAfterRestart,
@@ -2558,11 +2553,10 @@ test("drain_crashWindow2_receiptPresent_restartNoRebump", async () => {
   // register is unchanged from the original single commit.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d3".repeat(32);
-  const channelId = "crash-window-2-ch-" + "c".repeat(44);
+  const channelId = `crash-window-2-ch-${"c".repeat(44)}`;
 
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-  const intentKey = `buzz.nip-rs.pending-intents.v1:${pubkey}`;
 
   // Craft the crash state directly in localStorage.
   // Register committed with S=2 (unread applied: max(0,0)+1=1... let's use S=2 for clarity),
@@ -2574,13 +2568,8 @@ test("drain_crashWindow2_receiptPresent_restartNoRebump", async () => {
     JSON.stringify({
       r: { [channelId]: { s: sSingleCommit, c: 0, b: 100, f: 100 } },
       receipts: { [channelId]: { intentGen: 1, op: "unread" } },
-    }),
-  );
-  ls.setItem(
-    intentKey,
-    JSON.stringify({
-      nextGen: 2,
-      intents: { [channelId]: { gen: 1, op: "unread" } },
+      pi: { [channelId]: { gen: 1, op: "unread" } },
+      ng: 2,
     }),
   );
 
@@ -2646,7 +2635,7 @@ test("drain_crashAfterAppliedUnread_newerRemoteRead_noRebump", async () => {
   // proves application; only cleanup+delete runs, so C=6 stands.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d4".repeat(32);
-  const channelId = "amend-c-unread-race-" + "d".repeat(44);
+  const channelId = `amend-c-unread-race-${"d".repeat(44)}`;
 
   const fakeRelay = {
     fetchEvents: async () => [],
@@ -2665,19 +2654,13 @@ test("drain_crashAfterAppliedUnread_newerRemoteRead_noRebump", async () => {
   //   and after restart we merge C=6 into the register.
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-  const intentKey = `buzz.nip-rs.pending-intents.v1:${pubkey}`;
   ls.setItem(
     v2Key,
     JSON.stringify({
       r: { [channelId]: { s: 5, c: 3, b: 100, f: 100 } },
       receipts: { [channelId]: { intentGen: 1, op: "unread" } },
-    }),
-  );
-  ls.setItem(
-    intentKey,
-    JSON.stringify({
-      nextGen: 2,
-      intents: { [channelId]: { gen: 1, op: "unread" } },
+      pi: { [channelId]: { gen: 1, op: "unread" } },
+      ng: 2,
     }),
   );
 
@@ -2730,11 +2713,10 @@ test("drain_crashAfterAppliedRead_newerRemoteUnread_noRebump", async () => {
   // reverse the new unread.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d5".repeat(32);
-  const channelId = "amend-c-read-race-" + "e".repeat(45);
+  const channelId = `amend-c-read-race-${"e".repeat(45)}`;
 
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-  const intentKey = `buzz.nip-rs.pending-intents.v1:${pubkey}`;
 
   // Crash state: read C-bump committed (S=5, C=6), receipt present, intent alive.
   ls.setItem(
@@ -2742,13 +2724,8 @@ test("drain_crashAfterAppliedRead_newerRemoteUnread_noRebump", async () => {
     JSON.stringify({
       r: { [channelId]: { s: 5, c: 6, b: 100, f: 200 } },
       receipts: { [channelId]: { intentGen: 1, op: "read" } },
-    }),
-  );
-  ls.setItem(
-    intentKey,
-    JSON.stringify({
-      nextGen: 2,
-      intents: { [channelId]: { gen: 1, op: "read" } },
+      pi: { [channelId]: { gen: 1, op: "read" } },
+      ng: 2,
     }),
   );
 
@@ -2807,7 +2784,7 @@ test("drain_receiptWithoutMatchingIntent_sweptWithoutRegisterEffect", async () =
   // receipt persists across sessions" invariant.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d6".repeat(32);
-  const channelId = "receipt-sweep-ch-" + "f".repeat(46);
+  const channelId = `receipt-sweep-ch-${"f".repeat(46)}`;
 
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
@@ -2890,7 +2867,7 @@ test("drain_registerReceiptAtomicity_noStateWhereOnePersistsWithoutOther", async
   // asserts the combined single-write invariant.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d7".repeat(32);
-  const channelId = "atomicity-ch-" + "a".repeat(51);
+  const channelId = `atomicity-ch-${"a".repeat(51)}`;
 
   const ls = globalThis.window.localStorage;
   let blockV2Writes = false;
@@ -3022,4 +2999,811 @@ test("fetchOwnBlobBeforePublish_foreignClientId_rotatesSlotAndUpdatesMetadata", 
   } finally {
     delete globalThis.window.__TAURI_INTERNALS__;
   }
+});
+
+// ── Test 30: Amendment A biting — gen2 enqueued DURING replay ─────────────────
+test("drain_gen2EnqueuedDuringReplay_rollsBackGen1Register", async () => {
+  // Biting Amendment A: gen2 is enqueued DURING replay of gen1 (not before drain
+  // starts). The re-check sees gen2 != capturedGen1 and rolls back all mutations.
+  //
+  // Injection point: override mgr.tryCandidatePlan to enqueue gen2 inside
+  // markChannelUnreadDirect's budget check — the register write follows, but
+  // the subsequent re-check must detect the gen change and roll it back.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "30".repeat(32);
+  const channelId = `amend-a-biting-ch-${"b".repeat(46)}`;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.effectiveState.set(channelId, 50);
+
+  // Queue gen1 (unread) during incomplete load.
+  mgr.isLoadComplete = false;
+  const q = mgr.markChannelUnread(channelId);
+  assert.equal(q.status, "queued", "gen1 must be queued");
+  const gen1 = pendingOverrideIntentStore.get(channelId).gen;
+  assert.ok(gen1 >= 1, "gen1 must be a positive generation number");
+
+  // Override tryCandidatePlan to enqueue gen2 DURING replay of gen1.
+  const origTry = mgr.tryCandidatePlan.bind(mgr);
+  let injected = false;
+  mgr.tryCandidatePlan = (id, reg) => {
+    const ok = origTry(id, reg);
+    if (!injected && id === channelId) {
+      injected = true;
+      // This fires inside markChannelUnreadDirect, during gen1's replay.
+      // After tryCandidatePlan returns, the register is written temporarily.
+      // The Amendment A re-check must still roll it back.
+      pendingOverrideIntentStore.enqueue(channelId, "unread");
+    }
+    return ok;
+  };
+
+  // Complete load and drain gen1. The override fires gen2 mid-replay.
+  mgr.isLoadComplete = true;
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  // Gen2 was enqueued during gen1's replay → Amendment A re-check fires.
+  // Gen1 committed zero local effects: register must still be absent (rolled back).
+  const reg = mgr.overrideRegisters.get(channelId);
+  assert.equal(
+    reg,
+    undefined,
+    "register must be rolled back by gen-fence (gen2 was enqueued during gen1 replay)",
+  );
+
+  // Gen2 must still be alive in the intent store — it was not consumed.
+  const gen2Intent = pendingOverrideIntentStore.get(channelId);
+  assert.ok(gen2Intent, "gen2 intent must still be in the queue");
+  assert.ok(
+    gen2Intent.gen > gen1,
+    "gen2 must have a higher generation than gen1",
+  );
+
+  // Clean up gen2.
+  pendingOverrideIntentStore.compareAndDelete(channelId, gen2Intent.gen);
+  mgr.destroy();
+});
+
+// ── Test 31: unread→read inversion — read gen replaces unread gen ─────────────
+test("drain_unreadToReadInversion_onlyReadApplied", async () => {
+  // Both inversion directions: unread gen1, then read gen2 replaces it.
+  // Drain must apply only gen2 (read = C-bump), not gen1 (unread = S-bump).
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "31".repeat(32);
+  const channelId = `inversion-ur-ch-${"c".repeat(48)}`;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  // Pre-seed an existing unread register so C-bump has something to work with.
+  mgr.effectiveState.set(channelId, 50);
+  mgr.overrideRegisters.set(channelId, { s: 1, c: 0, b: 50 });
+  mgr.publishableContextIds.add(channelId);
+  mgr.isLoadComplete = false;
+
+  // Step 1: queue unread (gen1).
+  const r1 = mgr.markChannelUnread(channelId);
+  assert.equal(r1.status, "queued");
+  const gen1 = pendingOverrideIntentStore.get(channelId).gen;
+
+  // Step 2: queue read (gen2) — replaces gen1.
+  const r2 = mgr.markChannelRead(channelId);
+  assert.equal(r2.status, "queued");
+  const intent = pendingOverrideIntentStore.get(channelId);
+  assert.equal(intent.op, "read", "current intent must be read (gen2)");
+  assert.ok(intent.gen > gen1, "gen2 must exceed gen1");
+
+  // Complete load and drain.
+  mgr.isLoadComplete = true;
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  // Gen2 (read) must have applied: C bumped, S unchanged at 1.
+  const reg = mgr.overrideRegisters.get(channelId);
+  assert.ok(reg, "register must exist after read drain");
+  assert.equal(
+    reg.s,
+    1,
+    "S must be unchanged — unread gen1 was replaced, not applied",
+  );
+  assert.ok(reg.c > 0, "C must be bumped by the read drain (gen2)");
+
+  // Gen2 intent consumed.
+  assert.equal(
+    pendingOverrideIntentStore.get(channelId),
+    undefined,
+    "gen2 intent must be deleted after drain",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 32: read→unread inversion — unread gen replaces read gen ─────────────
+test("drain_readToUnreadInversion_onlySBumpApplied", async () => {
+  // Mirror of Test 31: read gen1 queued, then unread gen2 replaces it.
+  // Drain applies only gen2 (S-bump), not gen1 (C-bump).
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "32".repeat(32);
+  const channelId = `inversion-ru-ch-${"d".repeat(48)}`;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.effectiveState.set(channelId, 50);
+  mgr.isLoadComplete = false;
+
+  // Queue read (gen1) — no existing register, will be already_inactive after drain.
+  const r1 = mgr.markChannelRead(channelId);
+  assert.equal(r1.status, "queued");
+
+  // Queue unread (gen2) — replaces read.
+  const r2 = mgr.markChannelUnread(channelId);
+  assert.equal(r2.status, "queued");
+  const intent = pendingOverrideIntentStore.get(channelId);
+  assert.equal(intent.op, "unread", "current intent must be unread (gen2)");
+
+  // Complete load and drain.
+  mgr.isLoadComplete = true;
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  // Gen2 (unread) applied: S bumped.
+  const reg = mgr.overrideRegisters.get(channelId);
+  assert.ok(reg, "register must exist after unread drain");
+  assert.ok(reg.s > 0, "S must be bumped by unread drain (gen2)");
+  assert.equal(
+    reg.c,
+    0,
+    "C must be zero — read gen1 was replaced, not applied",
+  );
+
+  // Consumed.
+  assert.equal(
+    pendingOverrideIntentStore.get(channelId),
+    undefined,
+    "gen2 intent consumed",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 33: compare-delete preserves newer intent ────────────────────────────
+test("drain_compareDeletePreservesNewerIntent", async () => {
+  // compare-and-delete for gen1 must fail if gen2 was enqueued before the
+  // compare-delete step. The drain's cleanup commit must not consume gen2.
+  //
+  // We inject gen2 via onDrainOutcome (fires just before compare-delete).
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "33".repeat(32);
+  const channelId = `cmp-del-newer-ch-${"e".repeat(47)}`;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.effectiveState.set(channelId, 50);
+  mgr.isLoadComplete = false;
+
+  // Queue gen1 (unread).
+  mgr.markChannelUnread(channelId);
+  const gen1 = pendingOverrideIntentStore.get(channelId).gen;
+
+  // Wire onDrainOutcome to enqueue gen2 BEFORE compare-and-delete runs.
+  // The onDrainOutcome fires at step 3 (surface outcomes), before step 4 (cleanup commit).
+  mgr.onDrainOutcome = (chId, _op, _status) => {
+    if (chId === channelId) {
+      // Enqueue gen2 between outcome surfacing and compare-delete.
+      pendingOverrideIntentStore.enqueue(channelId, "unread");
+    }
+  };
+
+  mgr.isLoadComplete = true;
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  // Gen2 must still be in the queue (compare-delete for gen1 preserved gen2).
+  const remaining = pendingOverrideIntentStore.get(channelId);
+  assert.ok(
+    remaining,
+    "gen2 intent must survive compare-delete targeting gen1",
+  );
+  assert.ok(
+    remaining.gen > gen1,
+    "surviving intent must be gen2 (newer than gen1)",
+  );
+
+  // Clean up.
+  pendingOverrideIntentStore.compareAndDelete(channelId, remaining.gen);
+  mgr.destroy();
+});
+
+// ── Test 34: Amendment C via production load — restart + fetchAndMerge ────────
+test("drain_amendmentC_restart_fetchAndMerge_noBumpAfterReceipt", async () => {
+  // Amendment C via the PRODUCTION load path: after a crash-in-cleanup, the
+  // next session hydrates from storage and runs fetchAndMerge() (not a direct
+  // register write). The receipt must prevent a second S-bump.
+  //
+  // Thufir's finding: Tests 26/27 directly set isLoadComplete=true and write
+  // overrideRegisters directly — they bypass the production load path.
+  // This test uses the actual fetchAndMerge() flow via fakeRelay event delivery.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "34".repeat(32);
+  const channelId = `amend-c-prod-ch-${"f".repeat(48)}`;
+
+  // Craft crash-state in localStorage: unread applied (S=5), receipt intact.
+  const ls = globalThis.window.localStorage;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  ls.setItem(
+    v2Key,
+    JSON.stringify({
+      r: { [channelId]: { s: 5, c: 3, b: 100, f: 100 } },
+      receipts: { [channelId]: { intentGen: 1, op: "unread" } },
+      pi: { [channelId]: { gen: 1, op: "unread" } },
+      ng: 2,
+    }),
+  );
+
+  // A remote device published C=6 (read). Simulate via a fetched event that,
+  // when decrypted, delivers C=6 for the channel via the standard merge path.
+  const remoteBlob = JSON.stringify({
+    v: 1,
+    client_id: "remote-device-client",
+    contexts: {
+      [`ov_s:${channelId}`]: 5,
+      [`ov_c:${channelId}`]: 6,
+      [`ov_b:${channelId}`]: 100,
+      [channelId]: 200, // frontier advanced past B → override inactive
+    },
+  });
+  // Slot ID must match /^[0-9a-f]{32}$/ to pass isValidReadStateDTag.
+  const remoteSlotId = "0d".repeat(16);
+  const blobEvent = {
+    id: "ab".repeat(32),
+    pubkey,
+    created_at: 9999,
+    kind: 30078,
+    tags: [
+      ["d", `read-state:${remoteSlotId}`],
+      ["t", "read-state"],
+    ],
+    content: "CIPHER",
+    sig: "s".repeat(128),
+  };
+
+  let fetchCallCount = 0;
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke: async (command) => {
+      if (command === "nip44_decrypt_from_self") return remoteBlob;
+      throw new Error(`Unexpected: ${command}`);
+    },
+  };
+
+  const fakeRelay = {
+    fetchEvents: async () => {
+      fetchCallCount++;
+      return fetchCallCount === 1 ? [blobEvent] : [];
+    },
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_filter, handler) => {
+      // Deliver the event synchronously before EOSE.
+      if (fetchCallCount === 0) {
+        handler(blobEvent);
+      }
+      return makeFenceHandle({ eose: true });
+    },
+    subscribeLive: async (_f, _h) => () => {},
+  };
+
+  try {
+    // Session 2: hydrate, then complete load via real fetchAndMerge().
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    mgr.hydrateFromLocalStorage();
+
+    // Receipt must be loaded.
+    const receipt = mgr.appliedReceipts.get(channelId);
+    assert.ok(receipt, "receipt must be loaded on restart");
+    assert.equal(receipt.intentGen, 1);
+
+    // Run fetchAndMerge via the production path.
+    await mgr.fetchAndMerge(mgr.loadGeneration);
+    assert.equal(mgr.isLoadComplete, true, "load must complete");
+
+    // Drain via production path.
+    await mgr.drainPendingIntents(mgr.loadGeneration);
+
+    // The alreadyApplied path must have run: no new S-bump.
+    // C must reflect the merged remote (max(3,6)=6).
+    const reg = mgr.overrideRegisters.get(channelId);
+    assert.ok(reg, "register must exist");
+    assert.equal(
+      reg.s,
+      5,
+      "S must NOT be re-bumped by drain (receipt prevents it)",
+    );
+    assert.ok(reg.c >= 6, "C must reflect remote C=6 merge");
+
+    // Intent consumed.
+    assert.equal(
+      pendingOverrideIntentStore.get(channelId),
+      undefined,
+      "intent must be consumed after drain",
+    );
+  } finally {
+    delete globalThis.window.__TAURI_INTERNALS__;
+  }
+});
+
+// ── Test 35: atomic deletion — intent + receipt deleted in one persist ─────────
+test("drain_cleanupCommit_intentAndReceiptDeletedAtomically", async () => {
+  // Atomic deletion witness: after successful drain, both the intent AND the
+  // receipt are absent from the v2 blob in a single commit (same persist call).
+  // If they were deleted in separate writes, there would be a window where one
+  // survives without the other.
+  //
+  // Verify: after drain, the v2 blob contains neither pi nor receipts entry.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "35".repeat(32);
+  const channelId = `atomic-del-ch-${"g".repeat(50)}`;
+
+  const ls = globalThis.window.localStorage;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.effectiveState.set(channelId, 50);
+  mgr.isLoadComplete = false;
+
+  // Queue the intent.
+  mgr.markChannelUnread(channelId);
+
+  // Drain: apply the intent (receipt gets co-committed with register).
+  mgr.isLoadComplete = true;
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  // After successful drain, check the persisted v2 blob.
+  const rawAfter = ls.getItem(v2Key);
+  const blobAfter = rawAfter ? JSON.parse(rawAfter) : {};
+
+  // Both intent (pi) and receipt (receipts) must be absent — single cleanup commit.
+  const piEntry = blobAfter?.pi?.[channelId];
+  assert.equal(
+    piEntry,
+    undefined,
+    "intent must be deleted from pi in cleanup commit",
+  );
+
+  const receiptEntry = blobAfter?.receipts?.[channelId];
+  assert.equal(
+    receiptEntry,
+    undefined,
+    "receipt must be deleted from receipts in cleanup commit",
+  );
+
+  // The register IS present (drain succeeded, override applied).
+  const regEntry = blobAfter?.r?.[channelId];
+  assert.ok(regEntry, "register must persist after successful drain");
+
+  mgr.destroy();
+});
+
+// ── Test 36: controller — automatic backoff after incomplete verdict ───────────
+test("retryLoad_incompleteVerdictAdvancesRetryAttempt", async () => {
+  // After an incomplete verdict, retryAttempt increments so the next retry
+  // will use exponential backoff. Destroy/cancel before the delayed retry fires.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "36".repeat(32);
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async () => {
+      throw new Error("fence timeout");
+    },
+    subscribeLive: async (_f, _h) => () => {},
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  assert.equal(mgr.retryAttempt, 0, "precondition: retryAttempt is 0");
+
+  // First retry (immediate — attempt 0 means delayMs=0).
+  await mgr.retryLoad();
+
+  // After incomplete verdict, retryAttempt must be incremented.
+  assert.ok(
+    mgr.retryAttempt > 0,
+    "retryAttempt must be > 0 after incomplete verdict",
+  );
+
+  // Second retry would use backoff. Destroy before it fires.
+  mgr.destroy();
+  assert.equal(mgr.retryBackoffTimer, null, "timer must be cleared on destroy");
+});
+
+// ── Test 37: controller — reconnect during loadInFlight → pendingRetryOnComplete
+test("retryLoad_reconnectDuringLoadInFlight_coalescesToPendingRetry", async () => {
+  // When retryLoad() is called while a load is already in flight,
+  // pendingRetryOnComplete must be set (not dropped). The pending flag
+  // triggers a fresh generation after the in-flight load completes.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "37".repeat(32);
+
+  let resolveFetch;
+  const fetchBarrier = new Promise((r) => {
+    resolveFetch = r;
+  });
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => {
+      // Block until barrier released.
+      await fetchBarrier;
+      return makeFenceHandle({ eose: true });
+    },
+    subscribeLive: async (_f, _h) => () => {},
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+
+  // Start a load that won't complete until we release the barrier.
+  const loadPromise = mgr.retryLoad();
+  // Give the async function time to enter the subscribeFenced await.
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(
+    mgr.loadInFlight,
+    true,
+    "loadInFlight must be true while fetch is blocked",
+  );
+
+  // Simulate reconnect arriving while load is in flight.
+  mgr.retryLoad(); // synchronous entry → sets pendingRetryOnComplete
+  assert.equal(
+    mgr.pendingRetryOnComplete,
+    true,
+    "reconnect during loadInFlight must set pendingRetryOnComplete",
+  );
+
+  // Release the barrier so the first retryLoad() can complete.
+  resolveFetch();
+  await loadPromise;
+
+  mgr.destroy();
+});
+
+// ── Test 38: controller — stale-completion ordering via gen check ──────────────
+test("fetchAndMerge_staleGeneration_doesNotSetLoadComplete", async () => {
+  // If loadGeneration advances while fetchAndMerge is in flight, the stale
+  // generation's complete verdict must NOT mark the manager as load-complete.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "38".repeat(32);
+
+  let resolveFirst;
+  const firstBarrier = new Promise((r) => {
+    resolveFirst = r;
+  });
+  let callCount = 0;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => {
+      callCount++;
+      if (callCount === 1) {
+        // First call: wait for barrier before returning EOSE.
+        await firstBarrier;
+        return makeFenceHandle({ eose: true });
+      }
+      return makeFenceHandle({ eose: true });
+    },
+    subscribeLive: async (_f, _h) => () => {},
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+
+  // Start gen=1 fetch; it blocks at subscribeFenced.
+  const gen1 = mgr.loadGeneration;
+  const firstFetch = mgr.fetchAndMerge(gen1);
+  await new Promise((r) => setTimeout(r, 0));
+
+  // Advance the generation by starting a new fetch.
+  ++mgr.loadGeneration;
+  const gen2 = mgr.loadGeneration;
+  await mgr.fetchAndMerge(gen2);
+  assert.equal(mgr.isLoadComplete, true, "gen2 load must complete");
+
+  // Now release the blocked gen1 fetch.
+  resolveFirst();
+  await firstFetch;
+
+  // Gen1's verdict should not have mutated isLoadComplete back to stale state.
+  // (Gen2 left it true; gen1 must not interfere.)
+  assert.equal(
+    mgr.isLoadComplete,
+    true,
+    "gen1 stale verdict must not corrupt gen2's complete state",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 39: controller — destroy cancels backoff timer ───────────────────────
+test("retryLoad_destroyWhileTimerPending_cancelsTimer", async () => {
+  // destroy() must cancel any pending retryBackoffTimer so no stale retry fires.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "39".repeat(32);
+
+  let timerSet = false;
+  let pendingTimerResolve = null; // captured so we can drain after destroy
+  const origSetTimeout = globalThis.window.setTimeout;
+  const origClearTimeout = globalThis.window.clearTimeout;
+
+  // Track active backoff timers by real ID so clearTimeout works correctly.
+  // When ms > 0 we wrap the fn to capture state, but still use the real timer
+  // (with a large delay so it doesn't fire during the test) so origClearTimeout
+  // can cancel it.  After destroy() we must resolve the pending await manually
+  // to let retryLoad's finally-block run and the promise settle.
+  const activeTimerIds = new Set();
+  globalThis.window.setTimeout = (fn, ms) => {
+    if (ms > 0) {
+      timerSet = true;
+      // Schedule with origSetTimeout at a safe delay so clearTimeout works.
+      const id = origSetTimeout(() => {
+        activeTimerIds.delete(id);
+        pendingTimerResolve = null;
+        fn();
+      }, 60_000); // long enough never to fire during test
+      // Capture resolve so we can drain manually after destroy().
+      pendingTimerResolve = fn;
+      activeTimerIds.add(id);
+      return id;
+    }
+    return origSetTimeout(fn, ms);
+  };
+  globalThis.window.clearTimeout = (id) => {
+    activeTimerIds.delete(id);
+    origClearTimeout(id);
+  };
+
+  try {
+    const fakeRelay = {
+      fetchEvents: async () => [],
+      publishEvent: async () => {},
+      subscribeToReconnects: () => () => {},
+      getConnectionGeneration: () => 0,
+      subscribeFenced: async () => {
+        throw new Error("lapse");
+      },
+      subscribeLive: async (_f, _h) => () => {},
+    };
+
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+
+    // First retry (immediate, attempt=0 → no timer).
+    await mgr.retryLoad();
+    // retryAttempt is now 1; next retry will schedule a timer.
+
+    // Start second retry asynchronously — it will set a timer.
+    const retryPromise = mgr.retryLoad();
+    // Give async fn time to reach the timer await.
+    await new Promise((r) => origSetTimeout(r, 0));
+
+    assert.equal(timerSet, true, "a backoff timer must have been scheduled");
+    assert.ok(
+      mgr.retryBackoffTimer !== null,
+      "retryBackoffTimer must be non-null while waiting",
+    );
+
+    // Destroy must cancel the timer.
+    mgr.destroy();
+    assert.equal(
+      mgr.retryBackoffTimer,
+      null,
+      "retryBackoffTimer must be null after destroy",
+    );
+    assert.equal(
+      activeTimerIds.size,
+      0,
+      "backoff timer must be cleared by destroy()",
+    );
+
+    // retryLoad is still awaiting its backoff Promise. Fire the pending resolve
+    // manually (the real timer was cleared so it won't auto-fire) so the
+    // finally-block in retryLoad runs and retryPromise settles. Since
+    // mgr.destroyed===true, retryLoad returns immediately after the resolve.
+    if (pendingTimerResolve) pendingTimerResolve();
+    await retryPromise;
+  } finally {
+    globalThis.window.setTimeout = origSetTimeout;
+    globalThis.window.clearTimeout = origClearTimeout;
+  }
+});
+
+// ── Test 40: controller — exactly one drain per complete-load generation ───────
+test("retryLoad_exactlyOneDrainPerCompleteGeneration", async () => {
+  // A single complete-load transition must trigger exactly one drain.
+  // Multiple retryLoad() calls for the same complete generation must not
+  // enqueue a second drain.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "40".repeat(32);
+  const channelId = `one-drain-ch-${"h".repeat(51)}`;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.isLoadComplete = false;
+
+  // Queue an intent that will be consumed by the drain.
+  mgr.markChannelUnread(channelId);
+
+  // First retryLoad → complete → drain fires.
+  await mgr.retryLoad();
+  assert.equal(mgr.isLoadComplete, true, "load must be complete");
+
+  // Record register state after first drain.
+  const regAfterFirst = mgr.overrideRegisters.get(channelId);
+  const sAfterFirst = regAfterFirst?.s ?? 0;
+
+  // Second retryLoad on an already-complete manager: drainScheduled is false
+  // (already consumed), so a second drain must NOT re-bump the register.
+  await mgr.retryLoad();
+
+  const regAfterSecond = mgr.overrideRegisters.get(channelId);
+  assert.equal(
+    regAfterSecond?.s ?? 0,
+    sAfterFirst,
+    "S must NOT be re-bumped by a second retryLoad (exactly-one-drain invariant)",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 41: store/UI — identity swap during drain cancels stale gen ──────────
+test("drain_identitySwapDuringDrain_staleGenCancelled", async () => {
+  // If the manager is destroyed and recreated for a new pubkey, the stale
+  // generation's drain must be cancelled. Verify via the pubkey fence inside
+  // drainPendingIntents: pubkeyFence !== ctx.pubkey → break.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkeyA = "41".repeat(32);
+  const channelId = `identity-swap-ch-${"i".repeat(47)}`;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgrA = new ReadStateManager(pubkeyA, fakeRelay);
+  mgrA.effectiveState.set(channelId, 50);
+  mgrA.isLoadComplete = false;
+
+  // Queue intent for pubkeyA.
+  mgrA.markChannelUnread(channelId);
+  const intentA = pendingOverrideIntentStore.get(channelId);
+  assert.ok(intentA, "intent must exist for pubkeyA");
+
+  // Destroy mgrA before drain (simulates identity swap).
+  mgrA.destroy();
+
+  // The drainPendingIntents call with mgrA's context should be cancelled
+  // because mgrA.destroyed === true.
+  // Verify by running the drain and asserting the intent is NOT consumed.
+  // (The drain early-exits on ctx.destroyed.)
+  await mgrA.drainPendingIntents(mgrA.loadGeneration);
+
+  // The intent must still be alive — drain was no-op because destroyed.
+  const intentAfter = pendingOverrideIntentStore.get(channelId);
+  assert.ok(intentAfter, "intent must survive drain when manager is destroyed");
+
+  // Clean up.
+  pendingOverrideIntentStore.compareAndDelete(channelId, intentAfter.gen);
+});
+
+// ── Test 42: deferred refusal — queued unread intent refused by drain ─────────
+test("drain_queuedUnread_refused_surfacesOutcome", async () => {
+  // When a queued unread intent is refused by drain (e.g., budget_exhausted),
+  // onDrainOutcome must be called with (channelId, "unread", "refused", reason).
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "42".repeat(32);
+  const channelId = `deferred-refusal-ch-${"j".repeat(44)}`;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.effectiveState.set(channelId, 50);
+  mgr.isLoadComplete = false;
+
+  // Queue an unread intent with uint32 overflow condition: S is at max.
+  mgr.overrideRegisters.set(channelId, { s: 0xffffffff, c: 0, b: 50 });
+  mgr.publishableContextIds.add(channelId);
+  const q = mgr.markChannelUnread(channelId);
+  assert.equal(q.status, "queued", "must queue pre-ready");
+
+  // Wire outcome callback.
+  const outcomes = [];
+  mgr.onDrainOutcome = (chId, op, status, reason) => {
+    outcomes.push({ chId, op, status, reason });
+  };
+
+  // Complete load and drain.
+  mgr.isLoadComplete = true;
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  // Drain must have surfaced the refusal.
+  assert.equal(outcomes.length, 1, "exactly one outcome must be emitted");
+  assert.equal(outcomes[0].chId, channelId);
+  assert.equal(outcomes[0].op, "unread");
+  assert.equal(outcomes[0].status, "refused");
+  assert.equal(
+    outcomes[0].reason,
+    "uint32_overflow",
+    "refusal reason must be uint32_overflow",
+  );
+
+  // Intent must be cleaned up even after refusal (it's a genuine refusal, not load_incomplete).
+  assert.equal(
+    pendingOverrideIntentStore.get(channelId),
+    undefined,
+    "intent must be deleted after genuine refusal",
+  );
+
+  mgr.destroy();
 });

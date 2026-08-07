@@ -18,6 +18,7 @@ const noopMarkOverride = (): MarkResult => ({
 });
 const noopGetOverrideLiveness = (): OverrideLiveness | null => null;
 const noopGetProjection = (): ReadStateProjection | null => null;
+const noopSetOnDrainOutcome = (): void => {};
 
 /**
  * React hook that creates and manages a ReadStateManager instance.
@@ -115,14 +116,17 @@ export function useReadState(
     [],
   );
 
-  const markChannelRead = React.useCallback((channelId: string): MarkResult => {
-    return (
-      managerRef.current?.markChannelRead(channelId) ?? {
-        status: "refused",
-        reason: "load_incomplete",
-      }
-    );
-  }, []);
+  const markChannelRead = React.useCallback(
+    (channelId: string, sourceScope?: string): MarkResult => {
+      return (
+        managerRef.current?.markChannelRead(channelId, sourceScope) ?? {
+          status: "refused",
+          reason: "load_incomplete",
+        }
+      );
+    },
+    [],
+  );
 
   const getOverrideLiveness = React.useCallback(
     (channelId: string): OverrideLiveness | null => {
@@ -134,6 +138,27 @@ export function useReadState(
   const getProjection = React.useCallback((): ReadStateProjection | null => {
     return managerRef.current?.getProjection() ?? null;
   }, []);
+
+  // Wire the drain outcome callback into the current manager.
+  // Called by useUnreadChannels to route rollback/cleanup through the hook layer.
+  const setOnDrainOutcome = React.useCallback(
+    (
+      callback:
+        | ((
+            channelId: string,
+            op: string,
+            status: string,
+            reason?: string,
+            sourceScope?: string,
+          ) => void)
+        | null,
+    ): void => {
+      if (managerRef.current) {
+        managerRef.current.onDrainOutcome = callback;
+      }
+    },
+    [],
+  );
 
   const isReady = Boolean(
     pubkey && relayClient && initializedPubkey === pubkey,
@@ -160,6 +185,7 @@ export function useReadState(
       markChannelRead: noopMarkOverride,
       getOverrideLiveness: noopGetOverrideLiveness,
       getProjection: noopGetProjection,
+      setOnDrainOutcome: noopSetOnDrainOutcome,
     };
   }
 
@@ -177,5 +203,6 @@ export function useReadState(
     markChannelRead,
     getOverrideLiveness,
     getProjection,
+    setOnDrainOutcome,
   };
 }

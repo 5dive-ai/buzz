@@ -34,6 +34,7 @@ import {
   AuxiliaryPanelTitle,
 } from "@/shared/layout/AuxiliaryPanel";
 import {
+  THREAD_FOCUS_MESSAGE_GUTTER_CLASS,
   THREAD_PANEL_COLUMN_CLASS,
   THREAD_PANEL_COMPOSER_GUTTER_CLASS,
   THREAD_PANEL_MESSAGE_GUTTER_CLASS,
@@ -255,6 +256,9 @@ export function MessageThreadPanel({
     !isHuddleTranscript && (isOverlay || isSinglePanelView || isFocusMode),
   );
   const hasConstrainedColumn = columnMaxWidthPx != null;
+  const messageGutterClass = hasConstrainedColumn
+    ? THREAD_FOCUS_MESSAGE_GUTTER_CLASS
+    : THREAD_PANEL_MESSAGE_GUTTER_CLASS;
   // Whether the composer dock trades its quiet-state spacer for the
   // conditional activity accessory (agent working and/or someone typing).
   const hasComposerBottomActivity =
@@ -569,12 +573,12 @@ export function MessageThreadPanel({
         }
       >
         {isHuddleTranscript ? (
-          <div className={cn(THREAD_PANEL_MESSAGE_GUTTER_CLASS, "pb-2 pt-4")}>
+          <div className={cn(messageGutterClass, "pb-2 pt-4")}>
             <HuddleTranscriptIntro />
           </div>
         ) : (
           <div
-            className={cn(THREAD_PANEL_MESSAGE_GUTTER_CLASS, "pb-2 pt-1")}
+            className={cn(messageGutterClass, "pb-2 pt-1")}
             data-testid="message-thread-head"
           >
             <div className="rounded-2xl">
@@ -631,7 +635,7 @@ export function MessageThreadPanel({
 
         {showThreadHeadDivider ? (
           <div
-            className={cn(THREAD_PANEL_MESSAGE_GUTTER_CLASS, "pb-4 pt-3")}
+            className={cn(messageGutterClass, "pb-4 pt-3")}
             data-testid="message-thread-head-divider"
           >
             <Separator className="bg-border/60" />
@@ -639,7 +643,7 @@ export function MessageThreadPanel({
         ) : null}
 
         <div
-          className={cn(THREAD_PANEL_MESSAGE_GUTTER_CLASS, "pb-4 pt-0")}
+          className={cn(messageGutterClass, "pb-4 pt-0")}
           data-testid="message-thread-replies"
         >
           {threadRepliesPending && !isHuddleTranscript ? (

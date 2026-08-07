@@ -1,5 +1,6 @@
 import type { ThreadPanelLayoutProps } from "@/features/channels/lib/threadPanelLayout";
 import {
+  THREAD_FOCUS_MESSAGE_GUTTER_CLASS,
   THREAD_PANEL_COLUMN_CLASS,
   THREAD_PANEL_COMPOSER_GUTTER_CLASS,
   THREAD_PANEL_MESSAGE_GUTTER_CLASS,
@@ -106,6 +107,9 @@ export function MessageThreadPanelSkeleton({
 }: MessageThreadPanelSkeletonProps) {
   const isOverlay = useIsThreadPanelOverlay();
   const hasConstrainedColumn = columnMaxWidthPx != null;
+  const messageGutterClass = hasConstrainedColumn
+    ? THREAD_FOCUS_MESSAGE_GUTTER_CLASS
+    : THREAD_PANEL_MESSAGE_GUTTER_CLASS;
   useEscapeKey(onClose, isOverlay || isSinglePanelView || isFocusMode);
 
   const threadHeaderContent = (
@@ -131,17 +135,12 @@ export function MessageThreadPanelSkeleton({
         }
       >
         <div
-          className={cn(THREAD_PANEL_MESSAGE_GUTTER_CLASS, "pb-1 pt-0")}
+          className={cn(messageGutterClass, "pb-1 pt-0")}
           data-testid="message-thread-head-loading"
         >
           <ThreadMessageSkeleton isHead />
         </div>
-        <div
-          className={cn(
-            "space-y-2.5 pb-3 pt-1",
-            THREAD_PANEL_MESSAGE_GUTTER_CLASS,
-          )}
-        >
+        <div className={cn("space-y-2.5 pb-3 pt-1", messageGutterClass)}>
           <ThreadMessageSkeleton />
           <ThreadMessageSkeleton />
           <div className="ml-[58px] flex items-center gap-1.5 pt-0.5">

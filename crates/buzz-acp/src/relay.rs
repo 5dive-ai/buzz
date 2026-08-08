@@ -624,33 +624,6 @@ impl RelayEventPublisher {
             .map_err(|_| RelayError::ConnectionClosed)
     }
 
-    /// Publish a signed event and await the relay's `OK` acknowledgement.
-    ///
-    /// Returns the [`AckOutcome`] once the background task resolves the waiter
-    /// (on `OK`, socket failure, or disconnect). The waiter is registered by
-    /// the background task **before** the EVENT frame is sent, satisfying the
-    /// registration-before-send contract.
-    ///
-    /// # Errors
-    /// Returns `RelayError::ConnectionClosed` if the command channel is closed
-    /// (background task has exited).
-    #[allow(dead_code)]
-    pub async fn publish_event_acked(&self, event: Event) -> Result<AckOutcome, RelayError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(crate::acp::SENTINEL_PUBLISH_TIMEOUT_SECS);
-        self.cmd_tx
-            .send(RelayCommand::PublishEventAcked {
-                event: Box::new(event),
-                ack_tx,
-                deadline,
-            })
-            .await
-            .map_err(|_| RelayError::ConnectionClosed)?;
-        // If the background task exits without resolving the waiter, treat as uncertain.
-        Ok(ack_rx.await.unwrap_or(AckOutcome::Uncertain))
-    }
-
     /// Register an ACK waiter for a signed event and return the receiver
     /// **without** awaiting the outcome.
     ///

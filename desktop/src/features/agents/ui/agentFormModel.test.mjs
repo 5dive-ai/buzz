@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { seedAgentFormModel, emitAgentFormDiff } from "./agentFormModel.ts";
+import {
+  seedAgentFormModel,
+  emitAgentFormDiff,
+  fieldOwner,
+  FIELD_OWNERS,
+} from "./agentFormModel.ts";
 
 // ── Shared fixtures ────────────────────────────────────────────────────────────
 
@@ -459,4 +464,137 @@ test("test_r6_respond_to_override_only_no_other_fields_emitted", () => {
     "systemPrompt carries the unchanged seed value in the full-write snapshot",
   );
   assert.equal(emit.personaInput.behavior?.respondTo, "owner-only");
+});
+
+// ── fieldOwner load-bearing tests ─────────────────────────────────────────────
+//
+// Verifies that fieldOwner() is the actual routing mechanism consumed by
+// emitAgentFormDiff. Each test confirms that (a) fieldOwner returns the right
+// owner for a context, and (b) emitAgentFormDiff routes to the correct layer.
+
+test("test_fieldOwner_respondTo_is_instance_in_linked_context", () => {
+  const definition = makeDefinition();
+  const instance = makeInstance({ respondTo: "owner-only" });
+  const ctx = { kind: "instance-with-definition", definition, instance };
+
+  // fieldOwner must resolve to "instance" for linked context.
+  assert.equal(
+    fieldOwner("respondTo", ctx),
+    "instance",
+    "respondTo is I-owned in instance-with-definition context",
+  );
+});
+
+test("test_fieldOwner_respondTo_is_definition_in_definition_only_context", () => {
+  const definition = makeDefinition();
+  const ctx = { kind: "definition-only", definition };
+
+  // fieldOwner must resolve to "definition" for definition-only context (rows 9–10).
+  assert.equal(
+    fieldOwner("respondTo", ctx),
+    "definition",
+    "respondTo is D-owned in definition-only context",
+  );
+});
+
+test("test_fieldOwner_parallelism_follows_same_contract_as_respondTo", () => {
+  const definition = makeDefinition();
+  const instance = makeInstance({ parallelism: 3 });
+  const linked = { kind: "instance-with-definition", definition, instance };
+  const defOnly = { kind: "definition-only", definition };
+
+  assert.equal(fieldOwner("parallelism", linked), "instance");
+  assert.equal(fieldOwner("parallelism", defOnly), "definition");
+});
+
+test("test_fieldOwner_systemPrompt_is_instance_in_instance_only_context", () => {
+  const instance = makeInstance();
+  const ctx = { kind: "instance-only", instance };
+
+  // systemPrompt is D-owned when a definition is present, I-owned for unlinked agents.
+  assert.equal(fieldOwner("systemPrompt", ctx), "instance");
+});
+
+test("test_fieldOwner_model_and_provider_are_instance_in_instance_only_context", () => {
+  const instance = makeInstance();
+  const ctx = { kind: "instance-only", instance };
+
+  assert.equal(fieldOwner("model", ctx), "instance");
+  assert.equal(fieldOwner("provider", ctx), "instance");
+});
+
+test("test_fieldOwner_all_definition_fields_map_back_to_FIELD_OWNERS", () => {
+  // Spot-check that fieldOwner delegates to FIELD_OWNERS for static fields.
+  const definition = makeDefinition();
+  const ctx = { kind: "definition-only", definition };
+
+  // displayName, avatarUrl, runtime, envVars, namePool are always D.
+  for (const field of [
+    "displayName",
+    "avatarUrl",
+    "runtime",
+    "envVars",
+    "namePool",
+  ]) {
+    assert.equal(
+      fieldOwner(field, ctx),
+      "definition",
+      `${field} must be D-owned`,
+    );
+    assert.equal(
+      FIELD_OWNERS[field],
+      "definition",
+      `FIELD_OWNERS[${field}] must be definition`,
+    );
+  }
+});
+
+test("test_emitAgentFormDiff_routes_respondTo_change_to_agentInput_via_fieldOwner", () => {
+  // Verify that emitAgentFormDiff uses fieldOwner to route respondTo for linked context.
+  const definition = makeDefinition({ respondTo: "anyone" });
+  const instance = makeInstance({ respondTo: "anyone" });
+  const ctx = { kind: "instance-with-definition", definition, instance };
+
+  const seed = seedAgentFormModel(ctx);
+  const changed = { ...seed, respondTo: "owner-only" };
+  const emit = emitAgentFormDiff(seed, changed, ctx);
+
+  // respondTo change must land in agentInput (I-owned), NOT personaInput.
+  assert.ok(emit.agentInput, "agentInput must be present for respondTo change");
+  assert.equal(
+    emit.agentInput.respondTo,
+    "owner-only",
+    "changed respondTo must appear in agentInput",
+  );
+  assert.equal(
+    emit.personaInput,
+    null,
+    "personaInput must be null — respondTo is I-owned in linked context",
+  );
+});
+
+test("test_emitAgentFormDiff_routes_respondTo_change_to_personaInput_via_fieldOwner_in_definition_only", () => {
+  // In definition-only context, fieldOwner returns "definition" for respondTo.
+  const definition = makeDefinition({ respondTo: "anyone" });
+  const ctx = { kind: "definition-only", definition };
+
+  const seed = seedAgentFormModel(ctx);
+  const changed = { ...seed, respondTo: "owner-only" };
+  const emit = emitAgentFormDiff(seed, changed, ctx);
+
+  // respondTo change must land in personaInput (D-owned in definition-only context).
+  assert.ok(
+    emit.personaInput,
+    "personaInput must be present for respondTo change in definition-only",
+  );
+  assert.equal(
+    emit.personaInput.behavior?.respondTo,
+    "owner-only",
+    "changed respondTo must appear in personaInput.behavior",
+  );
+  assert.equal(
+    emit.agentInput,
+    null,
+    "agentInput must be null — no instance in definition-only context",
+  );
 });

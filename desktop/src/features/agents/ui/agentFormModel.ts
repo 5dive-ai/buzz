@@ -144,15 +144,12 @@ export type AgentFormModel = {
 /**
  * Source-of-truth field ownership map (Artifact 4).
  *
- * Every AgentFormModel field is tagged with its FieldOwner. The emit function
- * (`emitAgentFormDiff`) and the dialog's editability predicates derive their
- * routing decisions from these ownership assignments — this map is the single
- * authoritative statement of which layer owns each field.
- *
- * Ownership rules per spec rows 9–10:
- *   respondTo / parallelism — I-owned when an instance is in context;
- *                              D-owned only in definition-only (zero-instance) context.
- *   All other D-fields        — always D-owned.
+ * Declares the base FieldOwner for every AgentFormModel field. Two fields
+ * (respondTo, parallelism) have context-dependent ownership per rows 9–10:
+ * they are I-owned when an instance is in context, and D-owned only in
+ * definition-only (zero-instance) context. `fieldOwner()` resolves this
+ * context dependence and is the single function consulted by `emitAgentFormDiff`
+ * and the dialog's editability gates for all routing decisions.
  */
 export const FIELD_OWNERS: Record<keyof AgentFormModel, FieldOwner> = {
   // Identity
@@ -175,6 +172,57 @@ export const FIELD_OWNERS: Record<keyof AgentFormModel, FieldOwner> = {
   autoRestartOnConfigChange: "local-policy",
   startOnAppLaunch: "local-policy",
 };
+
+/**
+ * Resolve the effective FieldOwner for a field given the current edit context.
+ *
+ * For most fields this is a direct lookup into FIELD_OWNERS. Two sets of
+ * context-dependent overrides apply:
+ *
+ * 1. Rows 9–10 dual-owner fields (respondTo, respondToAllowlist, parallelism):
+ *    base entry is "instance", but in definition-only context (no instance) they
+ *    are D-owned (definition default).
+ *
+ * 2. Definition-or-instance fields (systemPrompt, model, provider): base entry
+ *    is "definition" (D-field when a definition is present), but in instance-only
+ *    context (no definition) they fall back to I-owned.
+ *
+ * `emitAgentFormDiff` consults this function for every routing decision;
+ * the dialog's editability predicates call it to determine which layer a
+ * control belongs to, making FIELD_OWNERS the single authoritative source.
+ */
+export function fieldOwner(
+  field: keyof AgentFormModel,
+  ctx: AgentEditContext,
+): FieldOwner {
+  const base = FIELD_OWNERS[field];
+
+  // Rows 9–10: respondTo/respondToAllowlist/parallelism are I-owned when an
+  // instance is present. In definition-only context (no instance) they are
+  // D-owned (definition default).
+  if (
+    base === "instance" &&
+    (field === "respondTo" ||
+      field === "respondToAllowlist" ||
+      field === "parallelism") &&
+    ctx.kind === "definition-only"
+  ) {
+    return "definition";
+  }
+
+  // Definition-fallback fields: D-owned when a definition is present, I-owned
+  // in instance-only context (no definition). systemPrompt, model, provider are
+  // "definition" in the base map, but must be treated as I-owned for unlinked agents.
+  if (
+    base === "definition" &&
+    (field === "systemPrompt" || field === "model" || field === "provider") &&
+    ctx.kind === "instance-only"
+  ) {
+    return "instance";
+  }
+
+  return base;
+}
 
 /** Which coordinator outputs changed vs. last saved state. */
 export type AgentFormEmit = {
@@ -284,6 +332,11 @@ export function seedAgentFormModel(ctx: AgentEditContext): AgentFormModel {
  * Returns agentInput when an I-field changed.
  * Returns policySets for any L-field changed.
  *
+ * Routing decisions — which layer each field's change belongs to — are made
+ * via `fieldOwner(field, ctx)`, which reads from `FIELD_OWNERS` and handles
+ * the rows-9–10 context dependence. This makes `FIELD_OWNERS` the single
+ * authoritative source for ownership routing in this function.
+ *
  * The caller (save coordinator) calls this after re-fetching observed state,
  * so "previous" is the re-fetched stored state and "next" is what the user
  * submitted — the diff is exactly what hasn't been persisted yet.
@@ -298,26 +351,35 @@ export function emitAgentFormDiff(
   const inst = editContextInstance(ctx);
   const defReadOnly = isDefinitionReadOnly(ctx);
 
+  // Helper: is a field D-owned in this context?
+  const isD = (field: keyof AgentFormModel) =>
+    fieldOwner(field, ctx) === "definition";
+  // Helper: is a field I-owned in this context?
+  const isI = (field: keyof AgentFormModel) =>
+    fieldOwner(field, ctx) === "instance";
+
   // D-field diff — only when definition is present and NOT team-managed
   let personaInput: UpdatePersonaInput | null = null;
   if (def !== null && !defReadOnly) {
-    // Rows 9–10: respondTo and parallelism are I-owned when an instance is
-    // present — they NEVER go into personaInput in that context. They are
-    // D-owned (definition defaults) only in definition-only (zero-instance) context.
-    const hasInst = inst !== null;
-
     const dChanged =
-      next.displayName.trim() !== saved.displayName.trim() ||
-      (next.avatarUrl ?? "") !== (saved.avatarUrl ?? "") ||
-      next.systemPrompt.trim() !== saved.systemPrompt.trim() ||
-      next.runtime !== saved.runtime ||
-      (next.model ?? null) !== (saved.model ?? null) ||
-      (next.provider ?? null) !== (saved.provider ?? null) ||
-      !envVarsMapEqual(next.envVars ?? {}, saved.envVars ?? {}) ||
-      !namePoolEqual(next.namePool ?? [], saved.namePool ?? []) ||
-      // Only include respondTo/parallelism in D-diff when NO instance (definition-only context)
-      (!hasInst && (next.respondTo ?? null) !== (saved.respondTo ?? null)) ||
-      (!hasInst &&
+      (isD("displayName") &&
+        next.displayName.trim() !== saved.displayName.trim()) ||
+      (isD("avatarUrl") &&
+        (next.avatarUrl ?? "") !== (saved.avatarUrl ?? "")) ||
+      (isD("systemPrompt") &&
+        next.systemPrompt.trim() !== saved.systemPrompt.trim()) ||
+      (isD("runtime") && next.runtime !== saved.runtime) ||
+      (isD("model") && (next.model ?? null) !== (saved.model ?? null)) ||
+      (isD("provider") &&
+        (next.provider ?? null) !== (saved.provider ?? null)) ||
+      (isD("envVars") &&
+        !envVarsMapEqual(next.envVars ?? {}, saved.envVars ?? {})) ||
+      (isD("namePool") &&
+        !namePoolEqual(next.namePool ?? [], saved.namePool ?? [])) ||
+      // respondTo/parallelism: D-owned only in definition-only context (rows 9–10)
+      (isD("respondTo") &&
+        (next.respondTo ?? null) !== (saved.respondTo ?? null)) ||
+      (isD("respondToAllowlist") &&
         next.respondTo === "allowlist" &&
         next.respondToAllowlist.join(",") !==
           (saved.respondToAllowlist ?? []).join(","));
@@ -333,17 +395,19 @@ export function emitAgentFormDiff(
         provider: next.provider ?? undefined,
         namePool: next.namePool ?? [],
         envVars: next.envVars ?? {},
-        // Include behavior block only in definition-only context (rows 9–10:
-        // when instance is present, respondTo/parallelism go to agentInput).
+        // Include behavior block only when respondTo/parallelism are D-owned
+        // (definition-only context per rows 9–10).
         behavior:
-          !hasInst && next.respondTo != null
+          isD("respondTo") && next.respondTo != null
             ? {
                 respondTo: next.respondTo,
                 respondToAllowlist:
                   next.respondTo === "allowlist"
                     ? next.respondToAllowlist
                     : undefined,
-                parallelism: next.parallelism ?? undefined,
+                parallelism: isD("parallelism")
+                  ? (next.parallelism ?? undefined)
+                  : undefined,
               }
             : undefined,
       };
@@ -359,31 +423,35 @@ export function emitAgentFormDiff(
     // Row 8 contract: instance env edit goes to instance, NOT wholesale-replace from definition.
     // When a definition is present, instanceEnvVars holds the per-instance overlay.
     const instanceEnvChanged =
-      next.instanceEnvVars !== undefined
+      isI("instanceEnvVars") && next.instanceEnvVars !== undefined
         ? !envVarsMapEqual(next.instanceEnvVars ?? {}, inst.envVars ?? {})
         : false;
 
     const nameChanged =
+      isI("instanceName") &&
       !hasNamePool &&
       (next.instanceName ?? next.displayName.trim()) !== inst.name;
     const systemPromptChanged =
-      def === null &&
+      isI("systemPrompt") &&
       (next.systemPrompt.trim() || null) !== (inst.systemPrompt ?? null);
     const modelChanged =
-      def === null && (next.model ?? null) !== (inst.model ?? null);
+      isI("model") && (next.model ?? null) !== (inst.model ?? null);
     const providerChanged =
-      def === null && (next.provider ?? null) !== (inst.provider ?? null);
-    // Rows 9–10: respondTo/parallelism are always I-owned when an instance is
-    // present. Changes always emit to agentInput, regardless of whether a
-    // definition is present or team-managed.
+      isI("provider") && (next.provider ?? null) !== (inst.provider ?? null);
+    // Rows 9–10: respondTo/parallelism are I-owned when an instance is present.
+    // fieldOwner("respondTo", ctx) returns "instance" for instance-with-definition
+    // and instance-only contexts, so these always emit to agentInput here.
     // Normalize null → "anyone" in the comparison to avoid phantom writes
     // when the DB stores null but the UI defaults to "anyone".
     const respondToChanged =
+      isI("respondTo") &&
       (next.respondTo ?? "anyone") !== (inst.respondTo ?? "anyone");
     const allowlistChanged =
+      isI("respondToAllowlist") &&
       next.respondTo === "allowlist" &&
       next.respondToAllowlist.join(",") !== inst.respondToAllowlist.join(",");
     const parallelismChanged =
+      isI("parallelism") &&
       (next.parallelism ?? null) !== (inst.parallelism ?? null);
 
     const iChanged =

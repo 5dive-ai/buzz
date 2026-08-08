@@ -44,7 +44,7 @@ const PERMISSION_ASK_TIMEOUT_SECS: u64 = 300;
 /// card. If the relay does not acknowledge within this window the request is
 /// denied immediately (fail closed). The publish deadline is
 /// `min(now + SENTINEL_PUBLISH_TIMEOUT_SECS, expiresAt)`.
-const SENTINEL_PUBLISH_TIMEOUT_SECS: u64 = 10;
+pub(crate) const SENTINEL_PUBLISH_TIMEOUT_SECS: u64 = 10;
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -308,9 +308,11 @@ pub struct AcpClient {
     /// the relay responds or the publish deadline fires. Exactly one entry can
     /// be in `Publishing` state at a time (capacity-guarded).
     ///
-    /// A background task awaits the `oneshot::Receiver<AckOutcome>` (with
-    /// a timeout) and forwards the `(entry_id, outcome)` pair here via mpsc,
-    /// decoupling the borrow from the read loop's `self` reference.
+    /// A background task awaits the `oneshot::Receiver<AckOutcome>` and forwards
+    /// the `(entry_id, outcome)` pair here via mpsc, decoupling the borrow from
+    /// the read loop's `self` reference. The relay background task owns deadline
+    /// enforcement — it sweeps expired waiters with `Uncertain`, so `ack_rx`
+    /// always resolves before the deadline without any caller-side timeout.
     sentinel_ack_result_rx: Option<tokio::sync::mpsc::Receiver<(String, crate::relay::AckOutcome)>>,
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
@@ -3287,21 +3289,25 @@ impl AcpClient {
                         let publish_deadline = (tokio::time::Instant::now()
                             + std::time::Duration::from_secs(SENTINEL_PUBLISH_TIMEOUT_SECS))
                         .min(entry_deadline);
-                        match publisher.register_publish_ack(event).await {
+                        match publisher
+                            .register_publish_ack(event, publish_deadline)
+                            .await
+                        {
                             Ok(ack_rx) => {
-                                // Spawn a task that awaits the ACK with a timeout and
-                                // forwards the result via mpsc to the read loop's arm.
+                                // Spawn a task that awaits the relay ACK and forwards
+                                // the result via mpsc to the read loop's select! arm.
+                                //
+                                // The background relay task owns the `publish_deadline`
+                                // — it sweeps expired waiters with `Uncertain` so
+                                // `ack_rx` always resolves before the deadline. No
+                                // caller-side timeout is needed here.
                                 let (ack_result_tx, ack_result_rx) = tokio::sync::mpsc::channel(1);
                                 let entry_id_for_task = id_str.clone();
                                 tokio::spawn(async move {
-                                    let outcome = tokio::time::timeout_at(publish_deadline, ack_rx)
-                                        .await
-                                        .ok() // timeout → None
-                                        .and_then(|r| r.ok()) // channel closed → None
-                                        .unwrap_or(crate::relay::AckOutcome::Uncertain);
+                                    let outcome =
+                                        ack_rx.await.unwrap_or(crate::relay::AckOutcome::Uncertain);
                                     // Best-effort send: if the read loop already
-                                    // cleaned up (publish deadline pre-select), the
-                                    // send fails harmlessly.
+                                    // cleaned up, the send fails harmlessly.
                                     let _ = ack_result_tx.send((entry_id_for_task, outcome)).await;
                                 });
                                 self.sentinel_ack_result_rx = Some(ack_result_rx);
@@ -8774,6 +8780,95 @@ mod tests {
             "exactly one applied write after early decision + ACK; got: {applied_writes:?}"
         );
         let _ = std::fs::remove_file(&capture_file);
+    }
+
+    /// Deadline-during-publish: an entry whose publish deadline has passed while
+    /// still in `Publishing` state is denied and never transitions to `Pending`.
+    ///
+    /// Uses `test_pair_silent` (drops ack_tx immediately) to simulate a relay
+    /// that never sends OK. With `start_paused = true` we advance time past
+    /// `SENTINEL_PUBLISH_TIMEOUT_SECS` so the relay background task's deadline
+    /// arm fires, sweeping the waiter as `Uncertain`, which the ACP loop processes
+    /// as a denial — the entry must not enter `Pending` and the map must be empty.
+    #[tokio::test(start_paused = true)]
+    async fn sentinel_ack_deadline_during_publishing_never_admitted() {
+        let mut client = spawn_script("sleep 600").await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        let keys = Keys::generate();
+        let owner_hex = keys.public_key().to_hex();
+        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair_silent();
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while rx.recv().await.is_some() {}
+        });
+        client.set_relay_publisher(publisher, keys.clone());
+        client.set_agent_owner_pubkey_hex(Some(owner_hex));
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        client.set_turn_channel_context(
+            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000006").unwrap()),
+            None,
+        );
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        let msg = perm_request(99, default_opts());
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        client
+            .handle_permission_request(&msg, hard)
+            .await
+            .expect("registration must succeed");
+
+        // Entry is in Publishing state. Advance past the publish deadline.
+        tokio::time::advance(std::time::Duration::from_secs(
+            SENTINEL_PUBLISH_TIMEOUT_SECS + 1,
+        ))
+        .await;
+
+        // Drive the loop — ack_result_rx receives Uncertain (from the dropped
+        // sender), the ACK arm fires, the entry is denied, and the map empties.
+        let hard2 = tokio::time::Instant::now() + std::time::Duration::from_secs(290);
+        let _ = tokio::select! {
+            r = client.read_until_response_with_idle_timeout(
+                "sess-deadline-during-publishing", 999,
+                std::time::Duration::from_secs(5),
+                hard2,
+                std::time::Duration::from_secs(290),
+            ) => r,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                Err(AcpError::IdleTimeout(std::time::Duration::from_millis(100)))
+            }
+        };
+
+        assert!(
+            client.pending_permissions.is_empty(),
+            "map must be empty — deadline-during-publish must deny, never admit to Pending"
+        );
+
+        // A denial write must have been emitted (publish timeout → fail closed).
+        // No Pending transition occurred — the entry went Publishing → denied.
+        let events = obs.snapshot();
+        let denial_writes: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.kind == "acp_write"
+                    && e.authorization
+                        .as_ref()
+                        .map(|a| {
+                            a.reason.as_deref() == Some("timed_out")
+                                || a.reason.as_deref() == Some("rejected")
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !denial_writes.is_empty(),
+            "a denial write must be emitted after deadline fires during Publishing; events: {events:?}"
+        );
     }
 
     // ── Item 5: exact kind-9 content string from build_sentinel_pending_payload ─

@@ -559,10 +559,17 @@ enum RelayCommand {
     ///
     /// The waiter is registered in `BgState::ack_waiters` keyed by event ID
     /// **before** the EVENT frame is sent — this is required by the spec.
+    ///
+    /// `deadline` is the per-waiter expiry instant (`min(fixed_publish_timeout,
+    /// expiresAt)`). The background task enforces this deadline itself — sweeping
+    /// the waiter entry and sending `Uncertain` when it fires — so the map is
+    /// provably empty on every path without requiring the caller to participate.
     #[allow(dead_code)]
     PublishEventAcked {
         event: Box<Event>,
         ack_tx: oneshot::Sender<AckOutcome>,
+        /// Per-waiter expiry enforced by the background task.
+        deadline: tokio::time::Instant,
     },
     /// Floor `since` for membership notification replay; events before startup are never re-delivered.
     SetStartupWatermark { ts: u64 },
@@ -630,10 +637,13 @@ impl RelayEventPublisher {
     #[allow(dead_code)]
     pub async fn publish_event_acked(&self, event: Event) -> Result<AckOutcome, RelayError> {
         let (ack_tx, ack_rx) = oneshot::channel();
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(crate::acp::SENTINEL_PUBLISH_TIMEOUT_SECS);
         self.cmd_tx
             .send(RelayCommand::PublishEventAcked {
                 event: Box::new(event),
                 ack_tx,
+                deadline,
             })
             .await
             .map_err(|_| RelayError::ConnectionClosed)?;
@@ -652,17 +662,23 @@ impl RelayEventPublisher {
     /// Registration-before-send is guaranteed: the background task inserts the
     /// waiter into `ack_waiters` before writing the EVENT frame.
     ///
+    /// `deadline` is the per-waiter expiry instant (`min(fixed_publish_timeout,
+    /// expiresAt)`). The background task enforces this deadline itself so the
+    /// `ack_waiters` map is provably empty on every path.
+    ///
     /// # Errors
     /// Returns `RelayError::ConnectionClosed` if the command channel is closed.
     pub async fn register_publish_ack(
         &self,
         event: Event,
+        deadline: tokio::time::Instant,
     ) -> Result<oneshot::Receiver<AckOutcome>, RelayError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.cmd_tx
             .send(RelayCommand::PublishEventAcked {
                 event: Box::new(event),
                 ack_tx,
+                deadline,
             })
             .await
             .map_err(|_| RelayError::ConnectionClosed)?;
@@ -684,7 +700,7 @@ impl RelayEventPublisher {
                             break;
                         }
                     }
-                    RelayCommand::PublishEventAcked { event, ack_tx } => {
+                    RelayCommand::PublishEventAcked { event, ack_tx, .. } => {
                         let _ = event_tx.send(*event).await;
                         let _ = ack_tx.send(AckOutcome::Accepted);
                     }
@@ -710,7 +726,7 @@ impl RelayEventPublisher {
                             break;
                         }
                     }
-                    RelayCommand::PublishEventAcked { event, ack_tx } => {
+                    RelayCommand::PublishEventAcked { event, ack_tx, .. } => {
                         let _ = event_tx.send(*event).await;
                         let _ = ack_tx.send(AckOutcome::Rejected {
                             message: "rate-limited".to_string(),
@@ -739,7 +755,9 @@ impl RelayEventPublisher {
                             break;
                         }
                     }
-                    RelayCommand::PublishEventAcked { event, ack_tx: _ } => {
+                    RelayCommand::PublishEventAcked {
+                        event, ack_tx: _, ..
+                    } => {
                         // Intentionally drop ack_tx without sending — simulates
                         // a relay that never confirms the event.
                         let _ = event_tx.send(*event).await;
@@ -1227,8 +1245,11 @@ struct BgState {
     /// Pending `OK` acknowledgement waiters for `PublishEventAcked` commands.
     ///
     /// Keyed by event ID (hex). Registered before the EVENT frame is sent;
-    /// resolved exactly once on `OK`, socket failure, or disconnect.
-    ack_waiters: HashMap<String, oneshot::Sender<AckOutcome>>,
+    /// resolved exactly once on `OK`, socket failure, disconnect, or per-waiter
+    /// deadline expiry. The deadline (`min(fixed_publish_timeout, expiresAt)`)
+    /// is stored alongside the sender so the background task can sweep expired
+    /// waiters without relying on the caller side for cleanup.
+    ack_waiters: HashMap<String, (oneshot::Sender<AckOutcome>, tokio::time::Instant)>,
     /// Channels whose REQ failed during `resubscribe_after_reconnect`.
     ///
     /// A single failed channel REQ is parked here instead of aborting the whole
@@ -1399,9 +1420,42 @@ impl BgState {
     /// indefinitely. A dropped sender (receiver already gone) is silently
     /// discarded.
     fn drain_ack_waiters_uncertain(&mut self) {
-        for (event_id, ack_tx) in self.ack_waiters.drain() {
+        for (event_id, (ack_tx, _deadline)) in self.ack_waiters.drain() {
             debug!("ack waiter for event {event_id} drained as uncertain (disconnect)");
             let _ = ack_tx.send(AckOutcome::Uncertain);
+        }
+    }
+
+    /// Return the earliest per-waiter deadline, or `None` if there are no waiters.
+    ///
+    /// Used by the main event loop to arm a select arm that fires when the
+    /// soonest waiter deadline expires, ensuring the background task — not the
+    /// caller — owns expiry.
+    fn next_ack_deadline(&self) -> Option<tokio::time::Instant> {
+        self.ack_waiters
+            .values()
+            .map(|(_, deadline)| *deadline)
+            .min()
+    }
+
+    /// Sweep all waiters whose deadline has passed, resolving each with `Uncertain`.
+    ///
+    /// Called from the main event loop's deadline select arm. After this call
+    /// every expired entry is removed from the map and its sender has been
+    /// consumed, so the map shrinks monotonically toward empty.
+    fn sweep_expired_ack_waiters(&mut self) {
+        let now = tokio::time::Instant::now();
+        let expired: Vec<String> = self
+            .ack_waiters
+            .iter()
+            .filter(|(_, (_, deadline))| now >= *deadline)
+            .map(|(event_id, _)| event_id.clone())
+            .collect();
+        for event_id in expired {
+            if let Some((ack_tx, _)) = self.ack_waiters.remove(&event_id) {
+                debug!("ack waiter for event {event_id} expired — resolved as uncertain");
+                let _ = ack_tx.send(AckOutcome::Uncertain);
+            }
         }
     }
 
@@ -1721,18 +1775,24 @@ async fn execute_connected_command(
             debug!("startup watermark set to {ts}");
             true
         }
-        RelayCommand::PublishEventAcked { event, ack_tx } => {
+        RelayCommand::PublishEventAcked {
+            event,
+            ack_tx,
+            deadline,
+        } => {
             // Register the waiter BEFORE sending the EVENT frame — if the relay
             // sends OK before our next select! tick, the waiter must already be
             // present or the resolution is lost.
             let event_id = event.id.to_hex();
-            state.ack_waiters.insert(event_id.clone(), ack_tx);
+            state
+                .ack_waiters
+                .insert(event_id.clone(), (ack_tx, deadline));
             if send_publish_event_frame(ws, &event).await {
                 true
             } else {
                 // Send failed — drain the waiter we just registered so the
                 // caller is not left waiting indefinitely.
-                if let Some(ack_tx) = state.ack_waiters.remove(&event_id) {
+                if let Some((ack_tx, _)) = state.ack_waiters.remove(&event_id) {
                     let _ = ack_tx.send(AckOutcome::Uncertain);
                 }
                 false
@@ -2242,6 +2302,25 @@ async fn run_background_task(
                    } => {
                        drain_pacing_next = None;
                    }
+
+                   // ACK-waiter deadline arm — the background task owns expiry.
+                   //
+                   // Fires at the earliest per-waiter deadline stored in
+                   // `ack_waiters`. When it fires, `sweep_expired_ack_waiters`
+                   // removes every expired entry and sends `Uncertain`, so the
+                   // map is provably empty after every deadline regardless of
+                   // whether the relay ever sends an OK.
+                   //
+                   // `pending()` when there are no waiters so this arm is
+                   // always dormant in the common case and never blocks.
+                   _ = async {
+                       match state.next_ack_deadline() {
+                           Some(t) => tokio::time::sleep_until(t).await,
+                           None => std::future::pending::<()>().await,
+                       }
+                   } => {
+                       state.sweep_expired_ack_waiters();
+                   }
                }
 
         // Reset backoff_step on a long healthy run so a subsequent brief drop
@@ -2585,7 +2664,7 @@ async fn handle_ws_message(
                         return false;
                     }
                     // Resolve any ack waiter registered by PublishEventAcked.
-                    if let Some(ack_tx) = state.ack_waiters.remove(&event_id) {
+                    if let Some((ack_tx, _)) = state.ack_waiters.remove(&event_id) {
                         let outcome = if accepted {
                             AckOutcome::Accepted
                         } else {
@@ -6468,6 +6547,121 @@ mod tests {
         assert!(
             !state.channel_dropped_since.contains_key(&channel_id),
             "channel_dropped_since must be cleared on successful drain"
+        );
+    }
+
+    // ── ACK-waiter cleanup contract (frozen named tests) ─────────────────────
+
+    /// Disconnect drain: all registered ack waiters are resolved `Uncertain`
+    /// and the map is empty after `drain_ack_waiters_uncertain`.
+    #[test]
+    fn ack_waiter_disconnect_drain_all_uncertain_map_empty() {
+        let keys = nostr::Keys::generate();
+        let mut state = BgState::new();
+
+        // Register three waiters with distinct event IDs.
+        let mut outcomes: Vec<tokio::sync::oneshot::Receiver<AckOutcome>> = Vec::new();
+        for i in 1u64..=3 {
+            let event = make_test_event(&keys, i);
+            let event_id = event.id.to_hex();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state.ack_waiters.insert(event_id, (tx, deadline));
+            outcomes.push(rx);
+        }
+        assert_eq!(state.ack_waiters.len(), 3, "three waiters registered");
+
+        // Simulate disconnect: drain all waiters.
+        state.drain_ack_waiters_uncertain();
+
+        assert!(
+            state.ack_waiters.is_empty(),
+            "map must be empty after disconnect drain"
+        );
+
+        // Every receiver must have been resolved with Uncertain.
+        for mut rx in outcomes {
+            match rx.try_recv() {
+                Ok(AckOutcome::Uncertain) => {}
+                other => panic!("expected Uncertain, got {other:?}"),
+            }
+        }
+    }
+
+    /// Late OK after cleanup: an OK arrives for an event ID that has already
+    /// been removed from ack_waiters (e.g., swept by deadline or disconnect).
+    /// The map lookup finds nothing — no panic, no insertion, map stays empty,
+    /// the late OK is silently discarded.
+    #[test]
+    fn ack_waiter_late_ok_after_cleanup_is_noop_map_stays_empty() {
+        let mut state = BgState::new();
+
+        // Simulate a waiter that was already removed (timeout/disconnect/sweep).
+        // The map is empty — no prior state.
+        assert!(state.ack_waiters.is_empty(), "map starts empty");
+
+        // Apply an OK for an event ID that has no registered waiter.
+        let phantom_event_id = "a".repeat(64);
+        let removed = state.ack_waiters.remove(&phantom_event_id);
+        assert!(
+            removed.is_none(),
+            "remove on absent key must return None — no panic, no side effect"
+        );
+        assert!(
+            state.ack_waiters.is_empty(),
+            "map must remain empty after late OK for unknown event ID"
+        );
+    }
+
+    /// Sweep expired waiters: `sweep_expired_ack_waiters` removes only entries
+    /// whose deadline has passed, resolves them `Uncertain`, and leaves
+    /// non-expired entries intact.
+    #[tokio::test(start_paused = true)]
+    async fn ack_waiter_sweep_removes_expired_leaves_live() {
+        let keys = nostr::Keys::generate();
+        let mut state = BgState::new();
+
+        // One waiter with a deadline 1s out.
+        let event_soon = make_test_event(&keys, 1);
+        let id_soon = event_soon.id.to_hex();
+        let deadline_soon = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let (tx_soon, mut rx_soon) = tokio::sync::oneshot::channel::<AckOutcome>();
+        state
+            .ack_waiters
+            .insert(id_soon.clone(), (tx_soon, deadline_soon));
+
+        // One waiter with a deadline 10s out.
+        let event_later = make_test_event(&keys, 2);
+        let id_later = event_later.id.to_hex();
+        let deadline_later = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (tx_later, mut rx_later) = tokio::sync::oneshot::channel::<AckOutcome>();
+        state
+            .ack_waiters
+            .insert(id_later.clone(), (tx_later, deadline_later));
+
+        // Advance time past the first deadline but not the second.
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+
+        state.sweep_expired_ack_waiters();
+
+        // The soon-deadline waiter must be gone and resolved Uncertain.
+        assert!(
+            !state.ack_waiters.contains_key(&id_soon),
+            "expired waiter must be removed"
+        );
+        match rx_soon.try_recv() {
+            Ok(AckOutcome::Uncertain) => {}
+            other => panic!("expired waiter must be resolved Uncertain, got {other:?}"),
+        }
+
+        // The later-deadline waiter must still be present and unresolved.
+        assert!(
+            state.ack_waiters.contains_key(&id_later),
+            "live waiter must remain in map"
+        );
+        assert!(
+            rx_later.try_recv().is_err(),
+            "live waiter must not be resolved yet"
         );
     }
 }

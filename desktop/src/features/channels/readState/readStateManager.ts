@@ -397,21 +397,23 @@ export class ReadStateManager {
   async drainPendingIntents(drainGen: number): Promise<void> {
     try {
       await drainPendingIntentsImpl(createDrainContext(this), drainGen);
-      // Reset only on a successful pass; abort paths set drainRetryTimer first.
-      if (this.drainRetryTimer === null) {
-        this.drainRetryAttempt = 0;
-      }
-      this.drainScheduled = false;
-      if (this.pendingFreshDrain && !this.destroyed) {
-        this.pendingFreshDrain = false;
-        if (!this.drainScheduled && this.isLoadComplete) {
-          this.drainScheduled = true;
-          void this.drainPendingIntents(this.loadGeneration);
-        }
-      }
     } finally {
-      // Always clear drainScheduled even if the impl throws.
+      // Always clear drainScheduled even if the impl throws, so the manager
+      // is never permanently latched.
       this.drainScheduled = false;
+    }
+    // Success path: only reached when the impl returned without throwing.
+    // Reset the retry counter (abort paths set drainRetryTimer before returning,
+    // so timer !== null means the pass aborted and the counter must be preserved).
+    if (this.drainRetryTimer === null) {
+      this.drainRetryAttempt = 0;
+    }
+    if (this.pendingFreshDrain && !this.destroyed) {
+      this.pendingFreshDrain = false;
+      if (!this.drainScheduled && this.isLoadComplete) {
+        this.drainScheduled = true;
+        void this.drainPendingIntents(this.loadGeneration);
+      }
     }
   }
 

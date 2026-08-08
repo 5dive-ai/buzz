@@ -362,6 +362,12 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
         //
         // This guarantees no allocation can produce a gen that matches a
         // retained receipt, since all receipts are renumbered in the same step.
+        //
+        // Invariant: after any hydration, at least GEN_REBASE_HEADROOM
+        // allocations succeed before exhaustion, so allocateGeneration()'s
+        // throw is unreachable from any valid persisted state and remains
+        // defense in depth only.
+        const GEN_REBASE_HEADROOM = 2 ** 32; // ≈4.3e9 — at 100 actions/sec, >1 year without restart
         {
           let maxObservedGen = 0;
           for (const intent of pendingIntents.values()) {
@@ -374,17 +380,17 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
           const requiredNextGen = maxObservedGen + 1;
           if (
             !Number.isSafeInteger(requiredNextGen) ||
-            requiredNextGen >= Number.MAX_SAFE_INTEGER
+            requiredNextGen >= Number.MAX_SAFE_INTEGER - GEN_REBASE_HEADROOM
           ) {
-            // Allocator exhausted — rebase all intent gens and matching receipt
-            // gens into a compact safe range [1..N].  intents is keyed by
-            // channelId with at most one entry per channel, so sorting is
-            // deterministic and produces a stable assignment.
+            // Allocator exhausted or near-ceiling — rebase all intent gens and
+            // matching receipt gens into a compact safe range [1..N].  intents
+            // is keyed by channelId with at most one entry per channel, so
+            // sorting is deterministic and produces a stable assignment.
             //
-            // The ceiling check (`requiredNextGen >= MAX_SAFE_INTEGER`) catches the
-            // valid one-below-ceiling state (`maxObservedGen = MAX_SAFE_INTEGER - 1`)
-            // before `allocateGeneration()` can mint `MAX_SAFE_INTEGER` and leave
-            // `_nextGen` at the unsafe value.
+            // The headroom trigger fires when requiredNextGen is within
+            // GEN_REBASE_HEADROOM of MAX_SAFE_INTEGER, ensuring that after any
+            // hydration at least GEN_REBASE_HEADROOM fresh allocations succeed
+            // before allocateGeneration() can throw.
             const sorted = [...pendingIntents.entries()].sort(
               ([, a], [, b]) => a.gen - b.gen,
             );

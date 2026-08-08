@@ -6427,25 +6427,27 @@ test("identitySwap_aDeferredMidTransaction_bHydrates_bSeesNoAState", async () =>
   mgrB.destroy();
 });
 
-// ── Test 60: MAX-1 boundary — two enqueues from valid one-below-ceiling hydration ──
-test("hydrate_maxMinusOneState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe", async () => {
-  // Thufir's exact repro: blob with pi.gen = MAX_SAFE_INTEGER-1 and ng = MAX_SAFE_INTEGER-1.
-  // Before the fix, hydration accepted this verbatim (requiredNextGen = MAX_SAFE_INTEGER,
-  // which isSafeInteger), set nextGen=MAX_SAFE_INTEGER via clamp, and the first enqueue
-  // minted gen=MAX_SAFE_INTEGER while leaving _nextGen=MAX_SAFE_INTEGER+1 (unsafe).
-  // The second enqueue then threw synchronously.
+// ── Test 60: MAX-2 boundary — two enqueues from valid two-below-ceiling hydration ──
+test("hydrate_maxMinusTwoState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe", async () => {
+  // Paul's exact repro: blob with pi.gen = MAX_SAFE_INTEGER-2 and ng = MAX_SAFE_INTEGER-2.
+  // Before the headroom fix, the boundary was requiredNextGen >= MAX_SAFE_INTEGER (one notch):
+  //   requiredNextGen = MAX-1 → safe, < MAX → no rebase; clamp sets nextGen = MAX-1.
+  //   Click 1 mints gen=MAX-1, _nextGen=MAX (safe, persisted).
+  //   Click 2 preflight: next=MAX+1 unsafe → THROWS synchronously up markChannelRead.
   //
-  // After the fix: requiredNextGen >= MAX_SAFE_INTEGER triggers rebase instead of clamp.
+  // After the headroom fix: rebase triggers when requiredNextGen >= MAX - GEN_REBASE_HEADROOM
+  // (i.e. within 2**32 of MAX_SAFE_INTEGER).  MAX-1 is well within that window, so the
+  // rebase fires on the MAX-2 blob just as it did on the MAX-1 blob.
   // The single pending intent is rebased to gen=1, nextGen=2.  Both enqueues get safe
   // distinct gens; neither throws; the persisted ng after each enqueue is safe.
   //
-  // Failure branch: rebase boundary (maxObservedGen = MAX_SAFE_INTEGER-1, requiredNextGen
-  //   = MAX_SAFE_INTEGER triggers rebase rather than clamp).
+  // Failure branch: rebase boundary (maxObservedGen = MAX_SAFE_INTEGER-2, requiredNextGen
+  //   = MAX-1 >= MAX - GEN_REBASE_HEADROOM → rebase rather than clamp).
   // Durable surface: v2 blob after each enqueue has safe ng; fresh-manager hydration
   //   succeeds and sees both intents.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "60".repeat(32);
-  const channelId = `max-minus-one-ch-${"\u006d".repeat(47)}`;
+  const channelId = `max-minus-two-ch-${"\u006d".repeat(47)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
   const MAX = Number.MAX_SAFE_INTEGER;
@@ -6459,12 +6461,12 @@ test("hydrate_maxMinusOneState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe",
     getConnectionGeneration: () => 0,
   };
 
-  // Plant blob: one intent at gen=MAX_SAFE_INTEGER-1, ng=MAX_SAFE_INTEGER-1.
+  // Plant blob: one intent at gen=MAX_SAFE_INTEGER-2, ng=MAX_SAFE_INTEGER-2.
   ls.setItem(
     v2Key,
     JSON.stringify({
-      pi: { [channelId]: { gen: MAX - 1, op: "unread" } },
-      ng: MAX - 1,
+      pi: { [channelId]: { gen: MAX - 2, op: "unread" } },
+      ng: MAX - 2,
     }),
   );
 
@@ -6472,7 +6474,7 @@ test("hydrate_maxMinusOneState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe",
   mgr.hydrateFromLocalStorage();
 
   // After hydration: rebase must have fired.
-  // maxObservedGen = MAX-1 → requiredNextGen = MAX → >= MAX_SAFE_INTEGER → rebase.
+  // maxObservedGen = MAX-2 → requiredNextGen = MAX-1 → >= MAX - 2**32 → rebase.
   // One intent rebased to gen=1; nextGen=2.
   const ngAfterHydrate = pendingOverrideIntentStore.nextGen;
   assert.ok(
@@ -6485,7 +6487,7 @@ test("hydrate_maxMinusOneState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe",
   );
   assert.equal(ngAfterHydrate, 2, "nextGen must be 2 after rebase of 1 intent");
 
-  const ch2 = `max-minus-one-ch2-${"n".repeat(46)}`;
+  const ch2 = `max-minus-two-ch2-${"n".repeat(46)}`;
 
   // First enqueue — must NOT throw, must produce safe gen.
   mgr.isLoadComplete = false;
@@ -6516,7 +6518,7 @@ test("hydrate_maxMinusOneState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe",
     `persisted ng must be below MAX_SAFE_INTEGER; got ${ng1}`,
   );
 
-  const ch3 = `max-minus-one-ch3-${"o".repeat(46)}`;
+  const ch3 = `max-minus-two-ch3-${"o".repeat(46)}`;
 
   // Second enqueue — must NOT throw, must produce distinct safe gen.
   let r2;
@@ -6753,4 +6755,62 @@ test("drain_promoteDeferredAllocExhausted_noStrandedLock_retryScheduled_drainSch
     globalThis.window.setTimeout = origSetTimeout;
     globalThis.window.clearTimeout = origClearTimeout;
   }
+});
+
+// ── Test 62: normal blob — no rebase fires on healthy state ──────────────────
+test("hydrate_normalBlob_noRebase_verbatimNextGen", () => {
+  // Control witness for the GEN_REBASE_HEADROOM trigger.  A blob with gens
+  // well below the ceiling (e.g. gen=1000, ng=1001) must NOT trigger a rebase.
+  // The headroom boundary (requiredNextGen >= MAX_SAFE_INTEGER - 2**32) is
+  // ~4.3e9 away from MAX_SAFE_INTEGER.  At ng=1001 the trigger cannot fire.
+  //
+  // Failure branch: clamp/normalize only — requiredNextGen = 1001, nextGen
+  //   must be exactly 1001 after hydration (verbatim, no rebase).
+  // Durable surface: nextGen equals requiredNextGen exactly; rebase was not
+  //   invoked (intents retain their original gen identities).
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "62".repeat(32);
+  const channelId = `normal-blob-ch-${"n".repeat(49)}`;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const ls = globalThis.window.localStorage;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  // Plant a normal blob: one intent at gen=1000, ng=1001.
+  ls.setItem(
+    v2Key,
+    JSON.stringify({
+      pi: { [channelId]: { gen: 1000, op: "unread" } },
+      ng: 1001,
+    }),
+  );
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.hydrateFromLocalStorage();
+
+  // nextGen must equal requiredNextGen = 1001, verbatim — no rebase.
+  const ngAfterHydrate = pendingOverrideIntentStore.nextGen;
+  assert.equal(
+    ngAfterHydrate,
+    1001,
+    `nextGen must be verbatim 1001 for healthy blob; got ${ngAfterHydrate}`,
+  );
+
+  // The single intent must retain its original gen=1000.
+  const intent = pendingOverrideIntentStore.get(channelId);
+  assert.ok(intent, "intent must be present after hydration");
+  assert.equal(
+    intent.gen,
+    1000,
+    `intent gen must remain 1000 (no rebase); got ${intent.gen}`,
+  );
+
+  mgr.destroy();
 });

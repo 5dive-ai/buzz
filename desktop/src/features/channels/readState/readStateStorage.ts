@@ -278,7 +278,7 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
             };
             if (
               typeof intentGen !== "number" ||
-              !Number.isInteger(intentGen) ||
+              !Number.isSafeInteger(intentGen) ||
               intentGen < 1
             )
               continue;
@@ -298,7 +298,11 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
                 readTarget?: unknown;
                 priorForcedEntry?: unknown;
               };
-            if (typeof gen !== "number" || !Number.isInteger(gen) || gen < 1)
+            if (
+              typeof gen !== "number" ||
+              !Number.isSafeInteger(gen) ||
+              gen < 1
+            )
               continue;
             if (op !== "unread" && op !== "read") continue;
             // sourceScope must be a valid ForcedUnreadSource or absent.
@@ -339,10 +343,41 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
         // Parse nextGen.
         if (
           typeof parsed.ng === "number" &&
-          Number.isInteger(parsed.ng) &&
+          Number.isSafeInteger(parsed.ng) &&
           parsed.ng >= 1
         ) {
           nextGen = parsed.ng;
+        }
+        // Normalize nextGen to be strictly greater than all valid intent and
+        // receipt generations so a corrupt or reused `ng` cannot cause a new
+        // enqueue to receive a generation that matches an existing receipt,
+        // which would silently discard the fresh action via the Amendment C
+        // already-applied check.
+        //
+        // If the increment would be unrepresentable (> Number.MAX_SAFE_INTEGER),
+        // fall back to a fresh safe value — any safe value above existing gens
+        // is acceptable; we prefer the smallest representable one.
+        {
+          let maxObservedGen = 0;
+          for (const intent of pendingIntents.values()) {
+            if (intent.gen > maxObservedGen) maxObservedGen = intent.gen;
+          }
+          for (const receipt of receipts.values()) {
+            if (receipt.intentGen > maxObservedGen)
+              maxObservedGen = receipt.intentGen;
+          }
+          const requiredNextGen = maxObservedGen + 1;
+          if (
+            Number.isSafeInteger(requiredNextGen) &&
+            requiredNextGen > nextGen
+          ) {
+            nextGen = requiredNextGen;
+          } else if (!Number.isSafeInteger(requiredNextGen)) {
+            // maxObservedGen is already at or near MAX_SAFE_INTEGER — reset to
+            // a fresh safe value.  Existing gens become unreachable for amendment-C
+            // matching (intentionally: the corrupt blob is untrustworthy).
+            nextGen = 1;
+          }
         }
       }
     } catch {

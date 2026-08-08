@@ -191,9 +191,14 @@ export async function drainPendingIntents(
     if (capturedPubkey !== ctx.pubkey) break;
 
     // Open drain transaction — any enqueue() for this channel during the
-    // remainder of this iteration is buffered until commitTransaction().
+    // remainder of this iteration is buffered until commitTransaction() or
+    // abortTransaction().
     pendingOverrideIntentStore.beginTransaction(channelId);
 
+    // Tracks whether step-3 succeeded so the finally block knows whether to
+    // commitTransaction (success) or skip (abort paths close the transaction
+    // themselves and use `continue` to skip to finally — which still runs).
+    let transactionCommitted = false;
     try {
       // Amendment C hydration rule: matching receipt → already applied, skip replay.
       const existingReceipt = ctx.appliedReceipts.get(channelId);
@@ -246,7 +251,10 @@ export async function drainPendingIntents(
           ctx.appliedReceipts.delete(channelId);
           if (!wasPublishable) ctx.publishableContextIds.delete(channelId);
           ctx.restoreExtraSlotIds(prevExtraSlotIds);
-          continue; // skip to commitTransaction in finally
+          // Abort: gen1 restored as live intent, gen2 stays buffered for retry.
+          pendingOverrideIntentStore.abortTransaction(channelId);
+          if (!ctx.destroyed) ctx.scheduleDrain();
+          continue; // transaction closed via abort; finally is a no-op (transactionCommitted=false)
         }
         ctx.schedulePublish();
       }
@@ -309,26 +317,35 @@ export async function drainPendingIntents(
       //   • gen1 cleanup (intent + receipt removed)
       //   • gen2 `pi`/`ng` (if a deferred enqueue was buffered during this pass)
       //
-      // Failure semantics for the cleanup write:
+      // Failure semantics (round-6 ruling):
       //   • gen1 register is already durably committed (step-1 write succeeded).
-      //   • If this write fails: the blob still carries gen1 intent + receipt;
-      //     on restart the receipt prevents a re-bump and cleanup runs next drain.
-      //     If gen2 was promoted in-memory, it will drain this session from memory
-      //     but is lost on restart — this is explicitly acceptable (same lossiness
-      //     as a crash between the register commit and the cleanup write).
-      //   • Promoted gen2 is NEVER silently lost in-session: it is in the live map
-      //     and will drain from memory even if the cleanup write fails.
+      //   • On cleanup-write failure: abortTransaction restores gen1 as the live
+      //     intent and keeps gen2 buffered.  The receipt is also restored so the
+      //     next retry drain sees alreadyApplied=true and performs cleanup-only.
+      //     scheduleDrain retries in the next pass.
+      //   • On restart: blob still has gen1 intent + receipt; receipt prevents a
+      //     re-bump and cleanup runs next drain.  Gen2 is preserved for retry.
+      const capturedReceipt = ctx.appliedReceipts.get(channelId);
       const gen2Promoted =
         pendingOverrideIntentStore.promoteDeferred(channelId);
       ctx.appliedReceipts.delete(channelId);
       pendingOverrideIntentStore.compareAndDelete(channelId, capturedGen);
       if (!ctx.persistLocalState()) {
-        // Best-effort: register already committed. Orphaned receipt swept on restart.
-        // Gen2 (if promoted) remains in-memory and drains this session.
+        // Cleanup write failed — abort: gen1 restored as live, gen2 stays buffered.
+        // Also restore the receipt so the retry drain sees alreadyApplied=true and
+        // does not re-apply the register mutation (which already succeeded in step-1).
         console.warn(
           `[ReadStateManager] drain: cleanup commit failed for ${channelId}`,
         );
-      } else if (gen2Promoted && !ctx.destroyed) {
+        if (capturedReceipt !== undefined) {
+          ctx.appliedReceipts.set(channelId, capturedReceipt);
+        }
+        pendingOverrideIntentStore.abortTransaction(channelId);
+        if (!ctx.destroyed) ctx.scheduleDrain();
+        continue; // transaction closed via abort; finally is a no-op
+      }
+      transactionCommitted = true;
+      if (gen2Promoted && !ctx.destroyed) {
         // Gen2 was durably committed — schedule a fresh drain pass so it drains
         // immediately rather than waiting for an unrelated future complete-load
         // generation.
@@ -336,13 +353,13 @@ export async function drainPendingIntents(
       }
       ctx.notifyListeners();
     } finally {
-      // Always release the transaction latch.
-      // If promoteDeferred() was already called above (normal path), this is a
-      // no-op unlock.  If the storage-failure `continue` path skipped the normal
-      // cleanup flow, commitTransaction() promotes any buffered enqueue as a
-      // fallback so it is not silently discarded — it will drain from in-memory
-      // state in the next pass.
-      pendingOverrideIntentStore.commitTransaction(channelId);
+      // Release the transaction latch only on the success path.
+      // Failure paths (step-1 and step-3) call abortTransaction() and `continue`.
+      // Even though `continue` runs the finally block, transactionCommitted=false
+      // means the transaction is already closed — take no action here.
+      if (transactionCommitted) {
+        pendingOverrideIntentStore.commitTransaction(channelId);
+      }
     }
   }
 }

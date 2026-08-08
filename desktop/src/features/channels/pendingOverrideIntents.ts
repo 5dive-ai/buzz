@@ -31,13 +31,14 @@
  *   `restoreFromStorage` replaces the in-memory map with the stored data.
  *   Old pubkey data is NOT wiped from the v2 blob — the manager owns that.
  *
- * • **Non-reentrant drain transaction** (round-4 ruling):
+ * • **Non-reentrant drain transaction** (round-4 ruling, round-6 completed):
  *   While the drain is processing channel X (beginTransaction → commitTransaction),
  *   any `enqueue()` for X is buffered rather than applied immediately.  On
- *   `commitTransaction` the buffer is flushed as the new queue entry.  This
- *   prevents a generation change from occurring inside the drain's transaction
- *   window (between the gen check and the cleanup commit), making the Amendment A
- *   fence hold structurally rather than by post-callback compensation.
+ *   `promoteDeferred` (called BEFORE the cleanup persist) + `commitTransaction`,
+ *   gen1 cleanup and gen2 `pi`/`ng` land in ONE v2-blob write.  On any storage
+ *   failure, `abortTransaction` restores gen1 as the live intent and keeps gen2
+ *   buffered; the caller schedules a retry drain pass.  Promotion only inside a
+ *   successful commit — durable gen1 and in-memory gen2 never silently diverge.
  */
 
 import type { ForcedUnreadEntry } from "@/features/channels/forcedUnreadStore";
@@ -88,10 +89,19 @@ export type PendingIntent = {
  *
  * ### Drain transaction latch
  * The drain calls `beginTransaction(channelId)` before processing a channel and
- * `commitTransaction(channelId)` after the cleanup commit (or abort).  While a
- * transaction is open, `enqueue()` for that channel buffers the intent instead
- * of applying it immediately.  `commitTransaction` flushes the buffer as the
- * new queue entry, so it becomes visible for the *next* drain pass.
+ * `commitTransaction(channelId)` (or `abortTransaction(channelId)`) after.
+ * While a transaction is open, `enqueue()` for that channel buffers the intent
+ * instead of applying it immediately.
+ *
+ * **Normal (success) path**: drain calls `promoteDeferred()` BEFORE the step-3
+ * cleanup persist, then `commitTransaction()` simply unlocks.  Gen1 cleanup +
+ * gen2 `pi`/`ng` land in one v2-blob write.  A fresh drain pass is scheduled.
+ *
+ * **Abort (failure) path**: drain calls `abortTransaction()` on any storage
+ * failure.  `abortTransaction` restores the live intent from the snapshot taken
+ * at `beginTransaction`, keeps the deferred enqueue buffered (NOT promoted), and
+ * unlocks the channel.  A retry drain pass is scheduled by the caller so gen1 is
+ * re-attempted in the next pass with gen2 still buffered.
  *
  * This ensures no generation change can occur between the gen check and the
  * cleanup commit — the Amendment A fence holds structurally.
@@ -101,8 +111,25 @@ export class PendingOverrideIntentStore {
   private intents = new Map<string, PendingIntent>();
   /** Channels currently inside a drain transaction. */
   private lockedChannels = new Set<string>();
+  /** Snapshot of the live intent at beginTransaction time (for abortTransaction restore). */
+  private intentSnapshots = new Map<string, PendingIntent | undefined>();
   /** Buffered enqueues for locked channels (last-write-wins, same as live enqueue). */
   private deferredEnqueues = new Map<
+    string,
+    {
+      op: PendingIntentOp;
+      sourceScope?: string;
+      readTarget?: number;
+      priorForcedEntry?: ForcedUnreadEntry;
+    }
+  >();
+  /**
+   * Payload of a deferred enqueue that was promoted via `promoteDeferred` during
+   * the current transaction.  Stored so `abortTransaction` can re-buffer it if the
+   * cleanup persist fails — preventing silent loss of a promoted gen2 intent.
+   * Keyed by channelId; cleared on `commitTransaction` or `abortTransaction`.
+   */
+  private promotedDeferredPayloads = new Map<
     string,
     {
       op: PendingIntentOp;
@@ -179,10 +206,57 @@ export class PendingOverrideIntentStore {
   /**
    * Open a drain transaction for `channelId`.
    * While open, `enqueue()` for this channel buffers rather than applying.
-   * Must be paired with exactly one `commitTransaction(channelId)` call.
+   * Snapshots the current live intent for use by `abortTransaction`.
+   * Must be paired with exactly one `commitTransaction(channelId)` or
+   * `abortTransaction(channelId)` call.
    */
   beginTransaction(channelId: string): void {
     this.lockedChannels.add(channelId);
+    // Snapshot the live intent so abortTransaction can restore it exactly.
+    this.intentSnapshots.set(channelId, this.intents.get(channelId));
+    // Clear any stale promoted-deferred payload from a prior transaction.
+    this.promotedDeferredPayloads.delete(channelId);
+  }
+
+  /**
+   * Abort a drain transaction for `channelId` — called on storage failure.
+   *
+   * Restores the live intent to the snapshot captured at `beginTransaction`
+   * (gen1 stays durable and live).  Keeps the deferred enqueue buffered so it
+   * is available for the next drain pass (NOT promoted).  If `promoteDeferred`
+   * was called during this transaction, re-buffers the promoted payload back
+   * into the deferred queue so it is not silently lost on the next drain pass.
+   * Unlocks the channel.
+   *
+   * The caller MUST schedule a retry drain pass after calling `abortTransaction`
+   * so gen1 is reattempted with gen2 still buffered.
+   *
+   * Safe to call even if no transaction was open (idempotent).
+   */
+  abortTransaction(channelId: string): void {
+    this.lockedChannels.delete(channelId);
+    // Restore the live intent from the snapshot.
+    const snapshot = this.intentSnapshots.get(channelId);
+    this.intentSnapshots.delete(channelId);
+    if (snapshot === undefined) {
+      this.intents.delete(channelId);
+    } else {
+      this.intents.set(channelId, snapshot);
+    }
+    // If promoteDeferred() ran during this transaction, re-buffer the promoted
+    // payload back into the deferred queue.  This ensures gen2 is not silently
+    // lost when the cleanup persist fails — it will be re-promoted on the next
+    // successful drain pass.
+    const promoted = this.promotedDeferredPayloads.get(channelId);
+    this.promotedDeferredPayloads.delete(channelId);
+    if (promoted !== undefined) {
+      // Re-buffer the payload using the original deferred-enqueue shape.
+      // A new gen will be assigned when promoteDeferred is next called.
+      this.deferredEnqueues.set(channelId, promoted);
+    }
+    // NOTE: if there was already a newer deferredEnqueue entry (user re-enqueued
+    // between promoteDeferred and abortTransaction), it wins (last-write-wins).
+    // This is intentional: the newer user action supersedes the promoted one.
   }
 
   /**
@@ -193,6 +267,10 @@ export class PendingOverrideIntentStore {
    * durable blob in the same commit as gen1's cleanup.  The transaction latch
    * remains held after this call; `commitTransaction` then simply unlocks.
    *
+   * Saves the promoted payload in `promotedDeferredPayloads` so that if the
+   * subsequent persist fails and `abortTransaction` is called, the payload can
+   * be re-buffered back into the deferred queue (preventing silent gen2 loss).
+   *
    * Returns `true` if a deferred enqueue was promoted (caller must persist and
    * schedule a fresh drain pass); `false` if no enqueue was pending.
    *
@@ -202,6 +280,8 @@ export class PendingOverrideIntentStore {
     const deferred = this.deferredEnqueues.get(channelId);
     if (deferred === undefined) return false;
     this.deferredEnqueues.delete(channelId);
+    // Save the payload before promoting so abortTransaction can re-buffer it.
+    this.promotedDeferredPayloads.set(channelId, deferred);
     const gen = this._nextGen++;
     const intent: PendingIntent = {
       gen,
@@ -221,38 +301,26 @@ export class PendingOverrideIntentStore {
   }
 
   /**
-   * Close a drain transaction for `channelId`.
+   * Close a drain transaction for `channelId` on the SUCCESS path.
    *
    * If `promoteDeferred` was already called, the deferred map is clear and this
-   * call simply releases the lock — no-op flush.  If `promoteDeferred` was NOT
-   * called (e.g. the storage-failure `continue` path skipped the normal cleanup
-   * flow), any remaining buffered enqueue is promoted here so it is not silently
-   * discarded; it will drain in the next pass from in-memory state.
+   * call simply releases the lock and clears the snapshots — no-op flush.
+   *
+   * On the FAILURE path, call `abortTransaction` instead: it restores gen1 and
+   * re-buffers any promoted deferred payload so the next drain can retry.
+   * Do NOT call `commitTransaction` after a storage failure — that would silently
+   * discard the snapshots and leave the state inconsistent.
    *
    * Safe to call even if no transaction was open (idempotent unlock).
    */
   commitTransaction(channelId: string): void {
     this.lockedChannels.delete(channelId);
-    // Fallback flush: promote any enqueue that was not already promoted by
-    // promoteDeferred() (e.g. storage-failure continue path).
-    const deferred = this.deferredEnqueues.get(channelId);
-    if (deferred === undefined) return;
-    this.deferredEnqueues.delete(channelId);
-    const gen = this._nextGen++;
-    const intent: PendingIntent = {
-      gen,
-      op: deferred.op,
-      ...(deferred.sourceScope !== undefined
-        ? { sourceScope: deferred.sourceScope }
-        : {}),
-      ...(deferred.readTarget !== undefined
-        ? { readTarget: deferred.readTarget }
-        : {}),
-      ...(deferred.priorForcedEntry !== undefined
-        ? { priorForcedEntry: deferred.priorForcedEntry }
-        : {}),
-    };
-    this.intents.set(channelId, intent);
+    this.intentSnapshots.delete(channelId);
+    this.promotedDeferredPayloads.delete(channelId);
+    // If promoteDeferred() was already called above (normal success path), the
+    // deferred map is already clear — nothing to flush.
+    // NOTE: no fallback promotion. The drain must call abortTransaction() on any
+    // failure path so the deferred enqueue stays buffered for retry.
   }
 
   /**

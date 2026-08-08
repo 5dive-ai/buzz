@@ -6369,6 +6369,7 @@ mod build_mcp_servers_tests {
                 None,
             )
             .expect("test config"),
+
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
             allowed_respond_to: vec![],
@@ -6595,6 +6596,7 @@ mod error_outcome_emission_tests {
                 None,
             )
             .expect("test config"),
+
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: vec![],

@@ -40,6 +40,12 @@ const PERMISSION_OPTIONS_MAX: usize = 16;
 /// fails closed with the denial response.
 const PERMISSION_ASK_TIMEOUT_SECS: u64 = 300;
 
+/// Maximum time to wait for a relay `OK` after publishing the kind-9 sentinel
+/// card. If the relay does not acknowledge within this window the request is
+/// denied immediately (fail closed). The publish deadline is
+/// `min(now + SENTINEL_PUBLISH_TIMEOUT_SECS, expiresAt)`.
+const SENTINEL_PUBLISH_TIMEOUT_SECS: u64 = 10;
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -177,7 +183,12 @@ pub struct PermissionDecision {
 /// the `ask` policy.
 #[derive(Debug, Clone)]
 enum PermissionEntryState {
-    /// Registered and waiting for an owner decision.
+    /// Kind-9 sentinel published; waiting for relay `OK accepted=true`.
+    /// An authorized early decision arriving in this state is buffered in
+    /// `PermissionEntry::early_decision` and applied on admission.
+    Publishing,
+    /// Relay confirmed the sentinel (`OK accepted=true`). Waiting for an
+    /// owner decision via the `permission_decision` control channel.
     Pending,
     /// A decision arrived; we are in the process of writing the response.
     /// Cancel during this state → `PermissionPoisoned`.
@@ -189,7 +200,7 @@ enum PermissionEntryState {
 /// Entries are **removed** from the map on every terminal transition
 /// (applied/timed_out/cancelled). The absence of a nonce from the map is the
 /// replay guard — no `Resolved` tombstone is kept, so capacity measures only
-/// live (Pending or Writing) requests.
+/// live (Publishing, Pending, or Writing) requests.
 #[derive(Debug)]
 struct PermissionEntry {
     /// Nonce bound to this request — must match the desktop's decision.
@@ -201,11 +212,18 @@ struct PermissionEntry {
     /// Per-request hard deadline: `min(registered_at + 300s, turn hard deadline)`.
     /// Expiry → fail closed (denial + `timed_out` outcome).
     deadline: tokio::time::Instant,
+    /// Unix timestamp of `expiresAt` included in both the pending and resolved
+    /// sentinel payloads. Stored once at build time so the resolved edit reuses
+    /// the exact same value (no recompute drift).
+    expiry_unix_secs: u64,
     /// Event ID of the kind-9 sentinel card published into the thread.
-    /// `None` when the sentinel was not published (relay unavailable, keys
-    /// absent, or D7-final admission failed before this was set). The
-    /// kind-40003 edit is skipped when this is `None`.
+    /// `None` while still in `Publishing` state (set on `Accepted`).
+    /// The kind-40003 edit is skipped when this is `None`.
     sentinel_event_id: Option<String>,
+    /// An authorized decision that arrived while the entry was still in
+    /// `Publishing` state. Applied immediately on `Accepted`; discarded on
+    /// any non-accepted outcome (entry is denied instead).
+    early_decision: Option<PermissionDecision>,
 }
 
 /// ACP client that owns an agent subprocess and communicates over its stdio.
@@ -283,6 +301,17 @@ pub struct AcpClient {
     /// Event ID of the triggering turn event for the kind-9 sentinel reply tag.
     /// Set per-turn by `set_turn_channel_context`.
     sentinel_thread_reply_id: Option<String>,
+    /// In-flight ACK receiver for the currently-publishing sentinel.
+    ///
+    /// Set by `handle_permission_request` when a kind-9 is sent via
+    /// `register_publish_ack`. The read loop's select! arm polls this until
+    /// the relay responds or the publish deadline fires. Exactly one entry can
+    /// be in `Publishing` state at a time (capacity-guarded).
+    ///
+    /// A background task awaits the `oneshot::Receiver<AckOutcome>` (with
+    /// a timeout) and forwards the `(entry_id, outcome)` pair here via mpsc,
+    /// decoupling the borrow from the read loop's `self` reference.
+    sentinel_ack_result_rx: Option<tokio::sync::mpsc::Receiver<(String, crate::relay::AckOutcome)>>,
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
@@ -687,6 +716,7 @@ impl AcpClient {
             turn_initiator_pubkey: None,
             sentinel_channel_id: None,
             sentinel_thread_reply_id: None,
+            sentinel_ack_result_rx: None,
             last_prompt_id: None,
             current_hard_deadline: None,
             observer: None,
@@ -1278,6 +1308,31 @@ impl AcpClient {
                 .get(&req_id_str)
                 .map(|e| e.state.clone());
             match state {
+                Some(PermissionEntryState::Publishing) => {
+                    // Cancel during Publishing: drop the ACK receiver and deny with
+                    // cancelled outcome. finish_permission will attempt a kind-40003
+                    // edit if sentinel_event_id is set (it is — stored at build time).
+                    self.sentinel_ack_result_rx = None; // drop background task receiver
+                    let perm_id: serde_json::Value = serde_json::from_str(&req_id_str)
+                        .unwrap_or_else(|_| serde_json::Value::String(req_id_str.clone()));
+                    let nonce = self
+                        .pending_permissions
+                        .get(&req_id_str)
+                        .map(|e| e.nonce.clone())
+                        .unwrap_or_default();
+                    let response = permission_response_cancelled(&perm_id);
+                    let ok = self
+                        .finish_permission(
+                            (&req_id_str, &perm_id),
+                            (&nonce, "cancelled", response),
+                            None,
+                            None,
+                        )
+                        .await;
+                    if !ok {
+                        return Err(AcpError::PermissionPoisoned);
+                    }
+                }
                 Some(PermissionEntryState::Writing) => {
                     let entry = self.pending_permissions.remove(&req_id_str).unwrap();
                     tracing::error!(
@@ -1471,17 +1526,19 @@ impl AcpClient {
                         e.sentinel_event_id.clone(),
                         e.options_snapshot.clone(),
                         e.nonce.clone(),
-                        e.deadline,
+                        e.expiry_unix_secs,
                     )
                 });
                 // Remove entry — absence of the nonce is the replay guard.
                 self.pending_permissions.remove(id_str);
-                // Re-arm idle if no live (Pending|Writing) entries remain.
+                // Re-arm idle if no live (Publishing|Pending|Writing) entries remain.
                 if let Some((idle_deadline, idle_timeout)) = idle_deadline_and_timeout {
                     let live = self.pending_permissions.values().any(|e| {
                         matches!(
                             e.state,
-                            PermissionEntryState::Pending | PermissionEntryState::Writing
+                            PermissionEntryState::Publishing
+                                | PermissionEntryState::Pending
+                                | PermissionEntryState::Writing
                         )
                     });
                     if !live {
@@ -1495,7 +1552,7 @@ impl AcpClient {
                     Some(original_event_id),
                     options_snapshot,
                     entry_nonce,
-                    entry_deadline,
+                    expiry_unix_secs,
                 )) = sentinel_context
                 {
                     // Clone all relay context upfront to avoid holding &mut self borrows
@@ -1518,15 +1575,7 @@ impl AcpClient {
                         } else {
                             None
                         };
-                        // Recover expiry_unix_secs from the entry deadline.
-                        let expiry_unix_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                            + entry_deadline
-                                .checked_duration_since(tokio::time::Instant::now())
-                                .unwrap_or_default()
-                                .as_secs();
+                        // Use the stored wire expiry_unix_secs — no recompute.
                         if let Some(content) = build_sentinel_resolved_payload(
                             &entry_nonce,
                             &original_event_id,
@@ -1895,6 +1944,14 @@ impl AcpClient {
         // borrowed inside `select!` via `self`.
         let mut decision_rx = self.permission_decision_rx.take();
 
+        // Receiver for sentinel publish ACK results. Set after
+        // `handle_permission_request` installs a sentinel; moved here from
+        // `self.sentinel_ack_result_rx` at the top of each loop iteration so
+        // it can be polled inside `select!` independently of `self`.
+        let mut ack_result_rx: Option<
+            tokio::sync::mpsc::Receiver<(String, crate::relay::AckOutcome)>,
+        > = None;
+
         // Tracks the in-flight steer write: `(request_id, transport, ack_tx)`.
         // While `Some`, the steer arm is gated off so we don't stack writes,
         // and a response matching `id` is routed to the ack_tx instead
@@ -1914,6 +1971,14 @@ impl AcpClient {
         let mut last_activity_at = now;
 
         loop {
+            // Move any newly-set sentinel ACK receiver from self to the local,
+            // so it can be polled inside select! without conflicting with self.
+            if ack_result_rx.is_none() {
+                if let Some(rx) = self.sentinel_ack_result_rx.take() {
+                    ack_result_rx = Some(rx);
+                }
+            }
+
             // If the process was poisoned by a cancel-during-write, surface the
             // error immediately so the caller can respawn.
             if self.permission_poisoned {
@@ -1931,21 +1996,33 @@ impl AcpClient {
             //   deadline (owner is deciding; agent silence is expected) and
             //   wake on the earliest permission deadline instead.
             // - Otherwise wake on min(idle, hard) as normal.
-            let has_pending_permissions = self
-                .pending_permissions
-                .values()
-                .any(|e| matches!(e.state, PermissionEntryState::Pending));
+            let has_pending_permissions = self.pending_permissions.values().any(|e| {
+                matches!(
+                    e.state,
+                    PermissionEntryState::Publishing | PermissionEntryState::Pending
+                )
+            });
             let next_deadline;
             let idle_fires_first;
             if has_pending_permissions {
                 // Suspend idle; find earliest permission deadline (capped by hard).
+                // Publishing entries use their publish_deadline (in sentinel_ack_rx)
+                // or their entry deadline — we use entry.deadline for both states.
                 let earliest_perm = self
                     .pending_permissions
                     .values()
-                    .filter(|e| matches!(e.state, PermissionEntryState::Pending))
+                    .filter(|e| {
+                        matches!(
+                            e.state,
+                            PermissionEntryState::Publishing | PermissionEntryState::Pending
+                        )
+                    })
                     .map(|e| e.deadline)
                     .min()
                     .unwrap_or(hard_deadline);
+                // Also factor in the publish deadline for the in-flight ACK.
+                // The background task enforces publish_deadline itself; for the
+                // select! wakeup we rely on earliest_perm (the entry.deadline).
                 next_deadline = earliest_perm.min(hard_deadline);
                 idle_fires_first = false; // hard deadline governs if we wake
             } else {
@@ -1994,6 +2071,60 @@ impl AcpClient {
             // and emits `permission_terminal` + poisons on write failure.
             {
                 let now = Instant::now();
+
+                // Publishing entries whose publish deadline has passed: the
+                // background task handles the publish timeout and sends an
+                // Uncertain outcome via sentinel_ack_result_rx. No action
+                // needed here — the select! arm will process it on next iteration.
+                // However, if the entry deadline (300s) has also passed while
+                // still in Publishing (very unusual), deny it directly.
+                {
+                    let publishing_expired: Vec<_> = self
+                        .pending_permissions
+                        .iter()
+                        .filter(|(_, e)| {
+                            matches!(e.state, PermissionEntryState::Publishing) && now >= e.deadline
+                        })
+                        .map(|(k, e)| {
+                            (
+                                k.clone(),
+                                serde_json::from_str(k)
+                                    .unwrap_or_else(|_| serde_json::Value::String(k.clone())),
+                                e.options_snapshot.clone(),
+                                e.nonce.clone(),
+                            )
+                        })
+                        .collect();
+                    for (id_str, id_val, opts, nonce) in publishing_expired {
+                        tracing::warn!(
+                            target: "acp::permission",
+                            "Publishing entry hard deadline for id={id_val} — failing closed"
+                        );
+                        // Drop the ACK result channel if it matches.
+                        if self
+                            .sentinel_ack_result_rx
+                            .as_ref()
+                            .map(|_| true)
+                            .unwrap_or(false)
+                        {
+                            self.sentinel_ack_result_rx = None;
+                        }
+                        if let Ok(response) = permission_denial_response(&id_val, &opts) {
+                            let ok = self
+                                .finish_permission(
+                                    (&id_str, &id_val),
+                                    (&nonce, "timed_out", response),
+                                    None,
+                                    Some((&mut idle_deadline, idle_timeout)),
+                                )
+                                .await;
+                            if !ok {
+                                return Err(AcpError::PermissionPoisoned);
+                            }
+                        }
+                    }
+                }
+
                 let expired: Vec<(String, serde_json::Value, Vec<serde_json::Value>, String)> =
                     self.pending_permissions
                         .iter()
@@ -2037,10 +2168,12 @@ impl AcpClient {
             // case where entry.deadline == hard_deadline: we wrote the fail-closed
             // response above, now exit with HardTimeout.
             if Instant::now() >= hard_deadline
-                && !self
-                    .pending_permissions
-                    .values()
-                    .any(|e| matches!(e.state, PermissionEntryState::Pending))
+                && !self.pending_permissions.values().any(|e| {
+                    matches!(
+                        e.state,
+                        PermissionEntryState::Publishing | PermissionEntryState::Pending
+                    )
+                })
             {
                 if let Some((_, _, ack_tx)) = pending_steer.take() {
                     let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
@@ -2064,11 +2197,15 @@ impl AcpClient {
                     }
                 } => {
                     // Find the pending entry by nonce match.
+                    // A decision arriving during Publishing is buffered; it will
+                    // be applied immediately when the relay ACK is received.
                     let entry_id = self.pending_permissions
                         .iter()
                         .find(|(_, e)| {
-                            matches!(e.state, PermissionEntryState::Pending)
-                                && e.nonce == decision.request_nonce
+                            matches!(
+                                e.state,
+                                PermissionEntryState::Publishing | PermissionEntryState::Pending
+                            ) && e.nonce == decision.request_nonce
                         })
                         .map(|(k, _)| k.clone());
 
@@ -2092,41 +2229,68 @@ impl AcpClient {
                                 decision.option_id
                             );
                         } else {
-                            // Transition Pending → Writing.
-                            let (nonce, id_val) = {
-                                let entry = self.pending_permissions.get_mut(&id_str).unwrap();
-                                entry.state = PermissionEntryState::Writing;
-                                (
-                                    entry.nonce.clone(),
-                                    serde_json::from_str::<serde_json::Value>(&id_str)
-                                        .unwrap_or_else(|_| serde_json::Value::String(id_str.clone())),
-                                )
-                            };
+                            let entry_state = self
+                                .pending_permissions
+                                .get(&id_str)
+                                .map(|e| e.state.clone());
 
-                            let response = permission_response_selected(&id_val, &decision.option_id);
-                            let write_deadline = (Instant::now()
-                                + std::time::Duration::from_secs(30))
-                            .min(hard_deadline);
-                            let ok = self
-                                .finish_permission(
-                                    (&id_str, &id_val),
-                                    (&nonce, "applied", response),
-                                    Some(write_deadline),
-                                    Some((&mut idle_deadline, idle_timeout)),
-                                )
-                                .await;
-                            if ok {
-                                tracing::info!(
-                                    target: "acp::permission",
-                                    "permission id={id_val} answered: optionId={:?}",
-                                    decision.option_id
-                                );
-                            } else {
-                                // Write failed → process poisoned; break out immediately.
-                                if let Some((_, _, ack_tx)) = pending_steer.take() {
-                                    let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
+                            match entry_state {
+                                Some(PermissionEntryState::Publishing) => {
+                                    // Buffer the decision; apply on ACK.
+                                    if let Some(entry) =
+                                        self.pending_permissions.get_mut(&id_str)
+                                    {
+                                        entry.early_decision = Some(decision);
+                                        tracing::debug!(
+                                            target: "acp::permission",
+                                            "permission_decision buffered during Publishing for id={id_str}"
+                                        );
+                                    }
                                 }
-                                return Err(AcpError::PermissionPoisoned);
+                                Some(PermissionEntryState::Pending) => {
+                                    // Transition Pending → Writing.
+                                    let (nonce, id_val) = {
+                                        let entry =
+                                            self.pending_permissions.get_mut(&id_str).unwrap();
+                                        entry.state = PermissionEntryState::Writing;
+                                        (
+                                            entry.nonce.clone(),
+                                            serde_json::from_str::<serde_json::Value>(&id_str)
+                                                .unwrap_or_else(|_| {
+                                                    serde_json::Value::String(id_str.clone())
+                                                }),
+                                        )
+                                    };
+
+                                    let response =
+                                        permission_response_selected(&id_val, &decision.option_id);
+                                    let write_deadline = (Instant::now()
+                                        + std::time::Duration::from_secs(30))
+                                    .min(hard_deadline);
+                                    let ok = self
+                                        .finish_permission(
+                                            (&id_str, &id_val),
+                                            (&nonce, "applied", response),
+                                            Some(write_deadline),
+                                            Some((&mut idle_deadline, idle_timeout)),
+                                        )
+                                        .await;
+                                    if ok {
+                                        tracing::info!(
+                                            target: "acp::permission",
+                                            "permission id={id_val} answered: optionId={:?}",
+                                            decision.option_id
+                                        );
+                                    } else {
+                                        // Write failed → process poisoned; break out immediately.
+                                        if let Some((_, _, ack_tx)) = pending_steer.take() {
+                                            let _ = ack_tx
+                                                .send(crate::pool::SteerAck::PromptCompletedNeutral);
+                                        }
+                                        return Err(AcpError::PermissionPoisoned);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     } else {
@@ -2137,6 +2301,143 @@ impl AcpClient {
                         );
                     }
                     None // loop back; don't set read_result
+                }
+                // Sentinel ACK arm: fires when the relay responds to the kind-9 publish.
+                // Publishing → Pending on Accepted (apply any buffered early decision).
+                // Any other outcome → deny synchronously and remove the entry.
+                // Cancel-safe: mpsc::Receiver::recv does not lose messages on drop.
+                Some((pub_id, ack_result)) = async {
+                    match ack_result_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                } => {
+                    // Received one ACK result; the channel is now drained (capacity=1).
+                    ack_result_rx = None;
+                    match ack_result {
+                        crate::relay::AckOutcome::Accepted => {
+                            // Transition Publishing → Pending and take any buffered
+                            // early decision in one mutable access.
+                            // sentinel_event_id is already stored at build time.
+                            let early_decision =
+                                if let Some(entry) = self
+                                    .pending_permissions
+                                    .get_mut(&pub_id)
+                                    .filter(|e| matches!(e.state, PermissionEntryState::Publishing))
+                                {
+                                    entry.state = PermissionEntryState::Pending;
+                                    tracing::debug!(
+                                        target: "acp::permission",
+                                        "sentinel ACK accepted for id={pub_id} — transitioning to Pending"
+                                    );
+                                    entry.early_decision.take()
+                                } else {
+                                    None
+                                };
+                            // Apply buffered early decision if present.
+                            if let Some(decision) = early_decision {
+                                let id_str = pub_id.clone();
+                                let opt_valid = self
+                                    .pending_permissions
+                                    .get(&id_str)
+                                    .map(|e| {
+                                        e.options_snapshot.iter().any(|opt| {
+                                            opt.get("optionId")
+                                                .and_then(|v| v.as_str())
+                                                == Some(decision.option_id.as_str())
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                if opt_valid {
+                                    let (nonce, id_val) = {
+                                        let entry = self
+                                            .pending_permissions
+                                            .get_mut(&id_str)
+                                            .unwrap();
+                                        entry.state = PermissionEntryState::Writing;
+                                        (
+                                            entry.nonce.clone(),
+                                            serde_json::from_str::<serde_json::Value>(&id_str)
+                                                .unwrap_or_else(|_| {
+                                                    serde_json::Value::String(id_str.clone())
+                                                }),
+                                        )
+                                    };
+                                    let response = permission_response_selected(
+                                        &id_val,
+                                        &decision.option_id,
+                                    );
+                                    let write_deadline = (Instant::now()
+                                        + std::time::Duration::from_secs(30))
+                                    .min(hard_deadline);
+                                    let ok = self
+                                        .finish_permission(
+                                            (&id_str, &id_val),
+                                            (&nonce, "applied", response),
+                                            Some(write_deadline),
+                                            Some((&mut idle_deadline, idle_timeout)),
+                                        )
+                                        .await;
+                                    if ok {
+                                        tracing::info!(
+                                            target: "acp::permission",
+                                            "permission id={id_val} answered (early decision applied): optionId={:?}",
+                                            decision.option_id
+                                        );
+                                    } else {
+                                        if let Some((_, _, ack_tx)) = pending_steer.take() {
+                                            let _ = ack_tx.send(
+                                                crate::pool::SteerAck::PromptCompletedNeutral,
+                                            );
+                                        }
+                                        return Err(AcpError::PermissionPoisoned);
+                                    }
+                                }
+                            }
+                        }
+                        outcome => {
+                            // Rejected or Uncertain: deny and remove the entry.
+                            let reason_str = match &outcome {
+                                crate::relay::AckOutcome::Rejected { message } => {
+                                    format!("rejected by relay: {message}")
+                                }
+                                _ => "relay delivery uncertain".to_string(),
+                            };
+                            tracing::warn!(
+                                target: "acp::permission",
+                                "sentinel publish not accepted for id={pub_id}: {reason_str} — failing closed"
+                            );
+                            if let Some(entry) = self
+                                .pending_permissions
+                                .get(&pub_id)
+                                .filter(|e| matches!(e.state, PermissionEntryState::Publishing))
+                            {
+                                let id_val: serde_json::Value = serde_json::from_str(&pub_id)
+                                    .unwrap_or_else(|_| serde_json::Value::String(pub_id.clone()));
+                                let opts = entry.options_snapshot.clone();
+                                let nonce = entry.nonce.clone();
+                                if let Ok(response) = permission_denial_response(&id_val, &opts) {
+                                    let ok = self
+                                        .finish_permission(
+                                            (&pub_id, &id_val),
+                                            (&nonce, "timed_out", response),
+                                            None,
+                                            Some((&mut idle_deadline, idle_timeout)),
+                                        )
+                                        .await;
+                                    if !ok {
+                                        if let Some((_, _, ack_tx)) = pending_steer.take() {
+                                            let _ = ack_tx.send(
+                                                crate::pool::SteerAck::PromptCompletedNeutral,
+                                            );
+                                        }
+                                        return Err(AcpError::PermissionPoisoned);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None // loop back
                 }
                 read_result = self.reader.next() => Some(read_result),
                 // Steer arm: gated off whenever a steer write is already in
@@ -2865,25 +3166,24 @@ impl AcpClient {
                 let id_str = id.to_string();
                 let nonce = new_permission_nonce();
 
-                // D7-final admission check: `ask` only fires for turns initiated by
-                // the agent owner. A turn started by a non-owner (another agent,
-                // an automated relay event) cannot present an actionable card because
-                // the owner isn't watching — downgrade silently to reject.
-                // This check is only enforced when a relay publisher is available (i.e.,
-                // we are in a live session that can post sentinel cards). Without a
-                // publisher, the ask proceeds normally (test environments and sessions
-                // without relay context are unaffected).
-                let relay_active = self.relay_publisher.is_some();
-                let owner_initiated = !relay_active
-                    || match (&self.turn_initiator_pubkey, &self.agent_owner_pubkey_hex) {
-                        (Some(initiator), Some(owner_hex)) => initiator.to_hex() == *owner_hex,
-                        // Relay is active but owner/initiator not set: conservative reject.
-                        _ => false,
-                    };
+                // D7-final admission check: `ask` only proceeds when a relay
+                // publisher is available AND the turn was initiated by the agent
+                // owner. Without either, deny synchronously with zero card events.
+                // There is no bypass for sessions without relay context — a request
+                // that cannot present a card to the owner is always denied.
+                let owner_initiated = match (
+                    &self.relay_publisher,
+                    &self.turn_initiator_pubkey,
+                    &self.agent_owner_pubkey_hex,
+                ) {
+                    (Some(_), Some(initiator), Some(owner_hex)) => initiator.to_hex() == *owner_hex,
+                    // No publisher, or owner/initiator not set: deny.
+                    _ => false,
+                };
                 if !owner_initiated {
                     tracing::warn!(
                         target: "acp::permission",
-                        "ask D7-final: turn not owner-initiated — downgrading to reject for id={id}"
+                        "ask D7-final: turn not owner-initiated (or no relay context) — downgrading to reject for id={id}"
                     );
                     self.pending_permission_id = Some(id.clone());
                     self.permission_responded = false;
@@ -2893,7 +3193,7 @@ impl AcpClient {
                         msg,
                         &nonce,
                         false,
-                        Some("policy=ask; D7-final: non-owner turn; downgraded to reject"),
+                        Some("policy=ask; D7-final: non-owner turn or no relay context; downgraded to reject"),
                     );
                     let response = permission_denial_response(&id, &options)?;
                     self.finish_permission_sync(&id, &nonce, "rejected", response)
@@ -2919,7 +3219,8 @@ impl AcpClient {
                 let ask_deadline = tokio::time::Instant::now()
                     + std::time::Duration::from_secs(PERMISSION_ASK_TIMEOUT_SECS);
                 let entry_deadline = ask_deadline.min(hard_deadline);
-                // Convert the deadline to Unix seconds for the sentinel payload.
+                // Compute and store expiry_unix_secs once — both the pending and
+                // resolved payloads reuse this value (no recompute drift).
                 let expiry_unix_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -2929,56 +3230,129 @@ impl AcpClient {
                         .unwrap_or_default()
                         .as_secs();
 
-                self.pending_permissions.insert(
-                    id_str.clone(),
-                    PermissionEntry {
-                        nonce: nonce.clone(),
-                        options_snapshot: options.clone(),
-                        state: PermissionEntryState::Pending,
-                        deadline: entry_deadline,
-                        sentinel_event_id: None,
-                    },
-                );
-
-                // Publish the kind-9 sentinel card into the channel thread.
-                // Best-effort: if any piece is absent the permission flow continues
-                // without a UI card (the observer feed path remains).
-                {
-                    // Clone relay context upfront so no &mut self borrows cross the await.
+                // Build and sign the kind-9 sentinel event ONCE before inserting
+                // the entry — the resolved edit retransmits the same signed event
+                // on retry, matching the spec requirement.
+                let sentinel_event = {
                     let keys_opt = self.agent_relay_keys.clone();
                     let channel_id_opt = self.sentinel_channel_id;
                     let owner_hex_opt = self.agent_owner_pubkey_hex.clone();
-                    let publisher_opt = self.relay_publisher.clone();
                     let turn_id = self.observer_context.turn_id.clone().unwrap_or_default();
                     let session_id_owned = self.observer_context.session_id.clone();
                     let reply_id = self.sentinel_thread_reply_id.clone();
 
-                    if let (Some(keys), Some(channel_id), Some(owner_hex), Some(publisher)) =
-                        (keys_opt, channel_id_opt, owner_hex_opt, publisher_opt)
-                    {
-                        if let Some(content) = build_sentinel_pending_payload(
-                            &nonce,
-                            &options,
-                            expiry_unix_secs,
-                            session_id_owned.as_deref(),
-                            &turn_id,
-                        ) {
-                            if let Some(event) = build_kind9_sentinel(
+                    keys_opt.zip(channel_id_opt).zip(owner_hex_opt).and_then(
+                        |((keys, channel_id), owner_hex)| {
+                            let content = build_sentinel_pending_payload(
+                                &nonce,
+                                &options,
+                                expiry_unix_secs,
+                                session_id_owned.as_deref(),
+                                &turn_id,
+                            )?;
+                            build_kind9_sentinel(
                                 &keys,
                                 channel_id,
                                 &owner_hex,
                                 reply_id.as_deref(),
                                 &content,
-                            ) {
-                                let sentinel_id = event.id.to_hex();
-                                // Fire-and-forget: permission flow must not block on relay acceptance.
-                                let _ = publisher.publish_event(event).await;
-                                // Store the sentinel event ID for the kind-40003 edit on resolution.
-                                if let Some(entry) = self.pending_permissions.get_mut(&id_str) {
-                                    entry.sentinel_event_id = Some(sentinel_id);
-                                }
+                            )
+                        },
+                    )
+                };
+
+                // Insert entry as Publishing. The relay ACK transitions it to Pending.
+                // If the sentinel event could not be built (keys/channel absent even
+                // after the D7 check passes — shouldn't happen in production), skip
+                // the ACK path and fall through to deny.
+                let publisher_opt = self.relay_publisher.clone();
+                match (sentinel_event, publisher_opt) {
+                    (Some(event), Some(publisher)) => {
+                        let sentinel_id = event.id.to_hex();
+                        self.pending_permissions.insert(
+                            id_str.clone(),
+                            PermissionEntry {
+                                nonce: nonce.clone(),
+                                options_snapshot: options.clone(),
+                                state: PermissionEntryState::Publishing,
+                                deadline: entry_deadline,
+                                expiry_unix_secs,
+                                // Store the event ID at build time so the resolved edit
+                                // can reference it even if the ACK arm hasn't fired yet.
+                                sentinel_event_id: Some(sentinel_id),
+                                early_decision: None,
+                            },
+                        );
+                        // Publish deadline: min(fixed publish timeout, entry deadline).
+                        let publish_deadline = (tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(SENTINEL_PUBLISH_TIMEOUT_SECS))
+                        .min(entry_deadline);
+                        match publisher.register_publish_ack(event).await {
+                            Ok(ack_rx) => {
+                                // Spawn a task that awaits the ACK with a timeout and
+                                // forwards the result via mpsc to the read loop's arm.
+                                let (ack_result_tx, ack_result_rx) = tokio::sync::mpsc::channel(1);
+                                let entry_id_for_task = id_str.clone();
+                                tokio::spawn(async move {
+                                    let outcome = tokio::time::timeout_at(publish_deadline, ack_rx)
+                                        .await
+                                        .ok() // timeout → None
+                                        .and_then(|r| r.ok()) // channel closed → None
+                                        .unwrap_or(crate::relay::AckOutcome::Uncertain);
+                                    // Best-effort send: if the read loop already
+                                    // cleaned up (publish deadline pre-select), the
+                                    // send fails harmlessly.
+                                    let _ = ack_result_tx.send((entry_id_for_task, outcome)).await;
+                                });
+                                self.sentinel_ack_result_rx = Some(ack_result_rx);
+                            }
+                            Err(_) => {
+                                // Command channel closed — relay unavailable.
+                                // Remove the Publishing entry and deny synchronously.
+                                self.pending_permissions.remove(&id_str);
+                                tracing::warn!(
+                                    target: "acp::permission",
+                                    "sentinel publish channel closed for id={id} — downgrading to reject"
+                                );
+                                self.pending_permission_id = Some(id.clone());
+                                self.permission_responded = false;
+                                let deny_nonce = new_permission_nonce();
+                                self.emit_permission_read_with_nonce(
+                                    &id,
+                                    msg,
+                                    &deny_nonce,
+                                    false,
+                                    Some("policy=ask; relay channel closed; downgraded to reject"),
+                                );
+                                let response = permission_denial_response(&id, &options)?;
+                                self.finish_permission_sync(&id, &deny_nonce, "rejected", response)
+                                    .await?;
+                                self.permission_responded = true;
+                                self.pending_permission_id = None;
                             }
                         }
+                    }
+                    _ => {
+                        // Keys or channel absent despite D7 passing — deny.
+                        tracing::warn!(
+                            target: "acp::permission",
+                            "sentinel event could not be built for id={id} — downgrading to reject"
+                        );
+                        self.pending_permission_id = Some(id.clone());
+                        self.permission_responded = false;
+                        let deny_nonce = new_permission_nonce();
+                        self.emit_permission_read_with_nonce(
+                            &id,
+                            msg,
+                            &deny_nonce,
+                            false,
+                            Some("policy=ask; sentinel build failed; downgraded to reject"),
+                        );
+                        let response = permission_denial_response(&id, &options)?;
+                        self.finish_permission_sync(&id, &deny_nonce, "rejected", response)
+                            .await?;
+                        self.permission_responded = true;
+                        self.pending_permission_id = None;
                     }
                 }
 
@@ -6163,6 +6537,35 @@ mod tests {
         client.set_owner_pubkey_known(true);
     }
 
+    /// Install a matching owner/initiator relay context on `client` so that the
+    /// D7-final admission check passes and `handle_permission_request` inserts an
+    /// entry as `Publishing` instead of denying synchronously.
+    ///
+    /// The test_pair publisher auto-ACKs every `PublishEventAcked` command with
+    /// `AckOutcome::Accepted`. A background task drains the event receiver so the
+    /// channel never fills and blocks the background task inside the publisher.
+    ///
+    /// Returns the matching owner `Keys` so callers that need a non-owner pubkey
+    /// can derive a different key for negative tests.
+    fn install_test_relay_context(client: &mut AcpClient) -> Keys {
+        let keys = Keys::generate();
+        let owner_hex = keys.public_key().to_hex();
+        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair();
+        // Drain published events so the channel never fills.
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while rx.recv().await.is_some() {}
+        });
+        client.set_relay_publisher(publisher, keys.clone());
+        client.set_agent_owner_pubkey_hex(Some(owner_hex));
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        client.set_turn_channel_context(
+            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()),
+            None,
+        );
+        keys
+    }
+
     // ── Pinned §2: allow selector — unique/zero/multiple/malformed ────────────
 
     #[test]
@@ -6264,7 +6667,9 @@ mod tests {
                 options_snapshot: vec![],
                 state: PermissionEntryState::Pending,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                expiry_unix_secs: 0,
                 sentinel_event_id: None,
+                early_decision: None,
             },
         );
         let msg = perm_request(1, default_opts());
@@ -6471,7 +6876,9 @@ mod tests {
                     options_snapshot: vec![],
                     state: PermissionEntryState::Pending,
                     deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                    expiry_unix_secs: 0,
                     sentinel_event_id: None,
+                    early_decision: None,
                 },
             );
         }
@@ -6665,6 +7072,7 @@ mod tests {
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
         client.set_permission_config(config);
         client.set_owner_pubkey_known(true);
+        install_test_relay_context(&mut client);
 
         // Subscribe to the observer BEFORE starting the loop so we capture all events.
         let obs = crate::observer::ObserverHandle::in_process();
@@ -6799,6 +7207,7 @@ mod tests {
             ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
         );
         client.set_owner_pubkey_known(true);
+        install_test_relay_context(&mut client);
 
         // Subscribe to observer to capture writes.
         let obs = crate::observer::ObserverHandle::in_process();
@@ -6953,6 +7362,7 @@ mod tests {
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
         client.set_permission_config(config);
         client.set_owner_pubkey_known(true);
+        install_test_relay_context(&mut client);
         let obs = crate::observer::ObserverHandle::in_process();
         client.set_observer(Some(obs.clone()), 0);
         let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
@@ -7032,6 +7442,7 @@ mod tests {
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
         client.set_permission_config(config);
         client.set_owner_pubkey_known(true);
+        install_test_relay_context(&mut client);
         let obs = crate::observer::ObserverHandle::in_process();
         client.set_observer(Some(obs.clone()), 0);
         let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
@@ -7161,6 +7572,7 @@ mod tests {
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
         client.set_permission_config(config);
         client.set_owner_pubkey_known(true);
+        install_test_relay_context(&mut client);
         let obs = crate::observer::ObserverHandle::in_process();
         client.set_observer(Some(obs.clone()), 0);
         let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
@@ -7292,6 +7704,7 @@ mod tests {
         let config = ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap();
         client.set_permission_config(config);
         client.set_owner_pubkey_known(true);
+        install_test_relay_context(&mut client);
         let obs = crate::observer::ObserverHandle::in_process();
         let mut obs_rx = obs.subscribe();
         client.set_observer(Some(obs.clone()), 0);
@@ -7399,6 +7812,7 @@ mod tests {
             ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
         );
         client.set_owner_pubkey_known(true);
+        install_test_relay_context(&mut client);
         let obs = crate::observer::ObserverHandle::in_process();
         client.set_observer(Some(obs.clone()), 0);
 
@@ -7565,6 +7979,8 @@ mod tests {
         // Install a permission decision channel (must be installed or take() panics).
         let (_perm_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
         client.install_permission_decision_rx(perm_rx);
+        // Install relay context so D7 passes and the entry is inserted.
+        install_test_relay_context(&mut client);
 
         let msg = perm_request(42, default_opts());
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -7587,8 +8003,11 @@ mod tests {
             .get("42")
             .expect("entry under id=42");
         assert!(
-            matches!(entry.state, PermissionEntryState::Pending),
-            "entry must start in Pending state"
+            matches!(
+                entry.state,
+                PermissionEntryState::Publishing | PermissionEntryState::Pending
+            ),
+            "entry must start in Publishing or Pending state (relay ACK may arrive before assertion)"
         );
     }
 
@@ -7619,7 +8038,9 @@ mod tests {
                     options_snapshot: vec![],
                     state: PermissionEntryState::Writing,
                     deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                    expiry_unix_secs: 0,
                     sentinel_event_id: None,
+                    early_decision: None,
                 },
             );
             // cancel_with_cleanup needs last_prompt_id to be Some.
@@ -7684,6 +8105,7 @@ mod tests {
         client.set_observer(Some(obs.clone()), 0);
         let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
         client.install_permission_decision_rx(perm_rx);
+        install_test_relay_context(&mut client);
 
         // Install the write-attempt counter BEFORE registration so all writes
         // (including the registration acks and the cancel responses) are counted.
@@ -7829,7 +8251,9 @@ mod tests {
                         ],
                         state: PermissionEntryState::Pending,
                         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                        expiry_unix_secs: 0,
                         sentinel_event_id: None,
+                        early_decision: None,
                     },
                 );
             }
@@ -7852,6 +8276,587 @@ mod tests {
                 "all Pending entries must be removed from the map after cancel"
             );
         });
+    }
+
+    // ── D7-final admission: named tests (owner / non-owner / no-publisher / unresolved) ─
+
+    /// D7: owner-initiated turn + matching owner hex → entry inserted as Publishing.
+    #[tokio::test]
+    async fn d7_owner_initiated_turn_inserts_publishing_entry() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs), 0);
+        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+        // Owner-initiated: initiator == owner.
+        install_test_relay_context(&mut client);
+
+        let msg = perm_request(1, default_opts());
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let result = client.handle_permission_request(&msg, hard).await;
+        assert!(result.is_ok_and(|v| v), "owner-initiated ask must succeed");
+        assert_eq!(
+            client.pending_permissions.len(),
+            1,
+            "entry must be inserted for owner-initiated turn"
+        );
+    }
+
+    /// D7: non-owner-initiated turn → request denied synchronously, no entry inserted.
+    #[tokio::test]
+    async fn d7_non_owner_initiated_turn_denied_no_entry() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs), 0);
+        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        // Install relay context but set a DIFFERENT initiator (non-owner).
+        let owner_keys = install_test_relay_context(&mut client);
+        let non_owner_keys = Keys::generate();
+        assert_ne!(
+            owner_keys.public_key(),
+            non_owner_keys.public_key(),
+            "keys must be different"
+        );
+        // Override the initiator with a different pubkey.
+        client.set_turn_initiator_pubkey(Some(non_owner_keys.public_key()));
+
+        let msg = perm_request(1, default_opts());
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let result = client.handle_permission_request(&msg, hard).await;
+        assert!(
+            result.is_ok(),
+            "non-owner ask must return Ok (not propagate error)"
+        );
+        assert!(
+            client.pending_permissions.is_empty(),
+            "non-owner ask must not insert a pending entry"
+        );
+    }
+
+    /// D7: no relay publisher → request denied synchronously, no entry inserted.
+    #[tokio::test]
+    async fn d7_no_relay_publisher_denied_no_entry() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs), 0);
+        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+        // Intentionally set owner/initiator WITHOUT installing a relay publisher.
+        let keys = Keys::generate();
+        let owner_hex = keys.public_key().to_hex();
+        client.set_agent_owner_pubkey_hex(Some(owner_hex));
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        // No relay publisher → D7 denies.
+
+        let msg = perm_request(1, default_opts());
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let result = client.handle_permission_request(&msg, hard).await;
+        assert!(
+            result.is_ok(),
+            "no-publisher ask must return Ok (not propagate error)"
+        );
+        assert!(
+            client.pending_permissions.is_empty(),
+            "no-publisher ask must not insert a pending entry"
+        );
+    }
+
+    /// D7: unresolved owner (relay present but owner hex absent) → denied, no entry.
+    #[tokio::test]
+    async fn d7_unresolved_owner_denied_no_entry() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs), 0);
+        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        // Install publisher and initiator but NO owner hex.
+        let keys = Keys::generate();
+        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair();
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while rx.recv().await.is_some() {}
+        });
+        client.set_relay_publisher(publisher, keys.clone());
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        client.set_turn_channel_context(
+            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap()),
+            None,
+        );
+        // owner_hex deliberately NOT set → D7 denies.
+
+        let msg = perm_request(1, default_opts());
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let result = client.handle_permission_request(&msg, hard).await;
+        assert!(result.is_ok(), "unresolved-owner ask must return Ok");
+        assert!(
+            client.pending_permissions.is_empty(),
+            "unresolved-owner ask must not insert a pending entry"
+        );
+    }
+
+    // ── ACK lifecycle tests (frozen named list) ───────────────────────────────
+
+    /// Positive OK: relay accepts → entry transitions Publishing → Pending,
+    /// then a decision drives it to Writing/terminal. Map empty after resolution.
+    #[tokio::test]
+    async fn sentinel_ack_accepted_transitions_to_pending_and_decision_applies() {
+        // Script: read one line (the permission response), then exit.
+        let capture_file =
+            std::env::temp_dir().join(format!("buzz-acp-ack-ok-{}.json", uuid::Uuid::new_v4()));
+        let script = format!(
+            r#"read -r resp; printf '%s' "$resp" > {capture}"#,
+            capture = capture_file.display(),
+        );
+        let mut client = spawn_script(&script).await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        install_test_relay_context(&mut client); // auto-accepts
+        let obs = crate::observer::ObserverHandle::in_process();
+        let mut obs_rx = obs.subscribe();
+        client.set_observer(Some(obs.clone()), 0);
+        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        // Background task: wait for actionable acp_read, then deliver decision.
+        let decision_task = tokio::spawn(async move {
+            let mut found_nonce: Option<String> = None;
+            while let Ok(Ok(event)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), obs_rx.recv()).await
+            {
+                if event.kind == "acp_read" {
+                    if let Some(auth) = &event.authorization {
+                        if auth.actionable {
+                            found_nonce = Some(auth.request_nonce.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            let nonce = found_nonce.expect("actionable acp_read must be emitted after ACK");
+            perm_tx
+                .send(PermissionDecision {
+                    request_nonce: nonce,
+                    option_id: "opt-allow".to_string(),
+                })
+                .await
+                .expect("decision send must succeed");
+        });
+
+        let _ = decision_task.await;
+
+        // Run the loop briefly — it should process the ACK (Accepted), transition to Pending,
+        // then apply the decision via the observer-based task above.
+        // We use a short-lived inert script since we only care about the permission write.
+        let idle = std::time::Duration::from_secs(5);
+        let max_dur = std::time::Duration::from_secs(10);
+        let hard = tokio::time::Instant::now() + max_dur;
+
+        // Drive the loop; it will exit via IdleTimeout after the decision is applied.
+        let result = tokio::time::timeout(
+            max_dur,
+            client.read_until_response_with_idle_timeout("sess-ack-ok", 999, idle, hard, max_dur),
+        )
+        .await;
+
+        // Map must be empty after the decision is applied.
+        assert!(
+            client.pending_permissions.is_empty(),
+            "map must be empty after ACK+decision cycle; result: {result:?}"
+        );
+        let _ = std::fs::remove_file(&capture_file);
+    }
+
+    /// Rejected OK: relay rejects sentinel → entry denied immediately, map empty, no card shown.
+    #[tokio::test]
+    async fn sentinel_ack_rejected_denies_immediately_map_empty() {
+        let mut client = spawn_script("sleep 600").await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        // Install a rejecting publisher.
+        let keys = Keys::generate();
+        let owner_hex = keys.public_key().to_hex();
+        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair_rejecting();
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while rx.recv().await.is_some() {}
+        });
+        client.set_relay_publisher(publisher, keys.clone());
+        client.set_agent_owner_pubkey_hex(Some(owner_hex));
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        client.set_turn_channel_context(
+            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap()),
+            None,
+        );
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        let msg = perm_request(1, default_opts());
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        client
+            .handle_permission_request(&msg, hard)
+            .await
+            .expect("registration must succeed");
+        assert_eq!(
+            client.pending_permissions.len(),
+            1,
+            "entry must be inserted as Publishing before ACK"
+        );
+
+        // Drive the loop: relay task runs, sends Rejected, ACK arm fires, entry denied.
+        // Use a real-time timeout — the rejecting publisher fires immediately.
+        let max_dur = std::time::Duration::from_secs(5);
+        let hard2 = tokio::time::Instant::now() + max_dur;
+        let loop_result = tokio::time::timeout(
+            max_dur,
+            client.read_until_response_with_idle_timeout(
+                "sess-ack-reject",
+                999,
+                std::time::Duration::from_secs(5),
+                hard2,
+                max_dur,
+            ),
+        )
+        .await;
+
+        assert!(
+            client.pending_permissions.is_empty(),
+            "map must be empty after relay rejection; loop_result={loop_result:?}"
+        );
+
+        // A timed_out write must have been emitted by the reject path.
+        let events = obs.snapshot();
+        let timeout_or_denied_writes: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.kind == "acp_write"
+                    && e.authorization
+                        .as_ref()
+                        .map(|a| {
+                            a.reason.as_deref() == Some("timed_out")
+                                || a.reason.as_deref() == Some("rejected")
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !timeout_or_denied_writes.is_empty(),
+            "a denial write must be emitted after relay rejection; events: {events:?}"
+        );
+    }
+
+    /// Timeout with map empty: relay never ACKs within SENTINEL_PUBLISH_TIMEOUT_SECS →
+    /// entry denied, map provably empty before the 300s turn deadline.
+    #[tokio::test(start_paused = true)]
+    async fn sentinel_ack_timeout_denies_and_map_empty() {
+        let mut client = spawn_script("sleep 600").await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        // Install a silent publisher — never sends an ACK.
+        let keys = Keys::generate();
+        let owner_hex = keys.public_key().to_hex();
+        let (publisher, event_rx) = crate::relay::RelayEventPublisher::test_pair_silent();
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while rx.recv().await.is_some() {}
+        });
+        client.set_relay_publisher(publisher, keys.clone());
+        client.set_agent_owner_pubkey_hex(Some(owner_hex));
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        client.set_turn_channel_context(
+            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap()),
+            None,
+        );
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        let msg = perm_request(1, default_opts());
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        client
+            .handle_permission_request(&msg, hard)
+            .await
+            .expect("registration must succeed");
+        assert_eq!(
+            client.pending_permissions.len(),
+            1,
+            "entry must be inserted as Publishing"
+        );
+
+        // Advance past SENTINEL_PUBLISH_TIMEOUT_SECS (10s) so the background task's
+        // timeout fires and sends Uncertain to ack_result_rx.
+        tokio::time::advance(std::time::Duration::from_secs(
+            SENTINEL_PUBLISH_TIMEOUT_SECS + 1,
+        ))
+        .await;
+
+        // Drive the loop to process the timeout outcome.
+        let hard2 = tokio::time::Instant::now() + std::time::Duration::from_secs(290);
+        let _ = tokio::select! {
+            r = client.read_until_response_with_idle_timeout(
+                "sess-ack-timeout", 999,
+                std::time::Duration::from_secs(5),
+                hard2,
+                std::time::Duration::from_secs(290),
+            ) => r,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => Err(AcpError::IdleTimeout(std::time::Duration::from_millis(100))),
+        };
+
+        assert!(
+            client.pending_permissions.is_empty(),
+            "map must be empty after publish timeout"
+        );
+
+        // A denial write must have been emitted.
+        let events = obs.snapshot();
+        let denial_writes: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "acp_write" && e.authorization.is_some())
+            .collect();
+        assert!(
+            !denial_writes.is_empty(),
+            "a denial write must be emitted after publish timeout; events: {events:?}"
+        );
+    }
+
+    /// Socket failure (channel closed): relay command channel closes → `register_publish_ack`
+    /// returns Err → entry denied synchronously, map empty immediately.
+    #[tokio::test]
+    async fn sentinel_ack_socket_failure_denies_synchronously_map_empty() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs), 0);
+        let (_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        // Build a publisher whose cmd_tx is immediately dropped so any send returns Err.
+        let keys = Keys::generate();
+        let owner_hex = keys.public_key().to_hex();
+        // Create a publisher with a dead (closed) command channel.
+        let publisher = crate::relay::RelayEventPublisher::test_pair_dead();
+        client.set_relay_publisher(publisher, keys.clone());
+        client.set_agent_owner_pubkey_hex(Some(owner_hex));
+        client.set_turn_initiator_pubkey(Some(keys.public_key()));
+        client.set_turn_channel_context(
+            Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000005").unwrap()),
+            None,
+        );
+
+        let msg = perm_request(1, default_opts());
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        // register_publish_ack will fail → deny path runs synchronously.
+        let result = client.handle_permission_request(&msg, hard).await;
+        assert!(
+            result.is_ok(),
+            "socket-failure ask must return Ok (deny path)"
+        );
+        assert!(
+            client.pending_permissions.is_empty(),
+            "map must be empty after socket failure — entry was removed before returning"
+        );
+    }
+
+    /// Early decision buffered then applied: a decision arrives while the entry is
+    /// still in Publishing state; it is buffered and applied immediately on ACK.
+    #[tokio::test]
+    async fn sentinel_ack_early_decision_buffered_then_applied_on_accepted() {
+        // Script: read one permission response line (from the early-decision path), exit.
+        let capture_file =
+            std::env::temp_dir().join(format!("buzz-acp-early-{}.json", uuid::Uuid::new_v4()));
+        let script = format!(
+            r#"read -r resp; printf '%s' "$resp" > {capture}; sleep 2"#,
+            capture = capture_file.display(),
+        );
+        let mut client = spawn_script(&script).await;
+        client.set_permission_config(
+            ResolvedPermissionConfig::resolve(PermissionPolicy::Ask, None).unwrap(),
+        );
+        client.set_owner_pubkey_known(true);
+        // Use the auto-accepting test_pair.
+        install_test_relay_context(&mut client);
+        let obs = crate::observer::ObserverHandle::in_process();
+        client.set_observer(Some(obs.clone()), 0);
+        let (perm_tx, perm_rx) = tokio::sync::mpsc::channel::<PermissionDecision>(8);
+        client.install_permission_decision_rx(perm_rx);
+
+        let msg = perm_request(77, default_opts());
+        let hard = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        client
+            .handle_permission_request(&msg, hard)
+            .await
+            .expect("registration must succeed");
+
+        // Read the nonce from the Publishing entry (before ACK arrives).
+        let nonce = client
+            .pending_permissions
+            .get("77")
+            .expect("entry must be in map")
+            .nonce
+            .clone();
+
+        // Send a decision NOW — the entry is still in Publishing state.
+        // This decision should be buffered in early_decision and applied on ACK.
+        perm_tx
+            .send(PermissionDecision {
+                request_nonce: nonce,
+                option_id: "opt-allow".to_string(),
+            })
+            .await
+            .expect("decision send must succeed");
+
+        // Drive the loop — ACK fires (Accepted), buffered decision applied, map empties.
+        let idle = std::time::Duration::from_millis(200);
+        let max_dur = std::time::Duration::from_secs(5);
+        let hard2 = tokio::time::Instant::now() + max_dur;
+        let _ = tokio::time::timeout(
+            max_dur,
+            client.read_until_response_with_idle_timeout(
+                "sess-early-decision",
+                999,
+                idle,
+                hard2,
+                max_dur,
+            ),
+        )
+        .await;
+
+        assert!(
+            client.pending_permissions.is_empty(),
+            "map must be empty after early-decision + ACK cycle"
+        );
+
+        // Observer must show an applied write.
+        let events = obs.snapshot();
+        let applied_writes: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.kind == "acp_write"
+                    && e.authorization
+                        .as_ref()
+                        .map(|a| a.reason.as_deref() == Some("applied"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            applied_writes.len(),
+            1,
+            "exactly one applied write after early decision + ACK; got: {applied_writes:?}"
+        );
+        let _ = std::fs::remove_file(&capture_file);
+    }
+
+    // ── Item 5: exact kind-9 content string from build_sentinel_pending_payload ─
+
+    /// Emit the exact JSON string that `build_sentinel_pending_payload` produces
+    /// for a canonical 3-option request with a fixed nonce, session, turn, and
+    /// expiry. This string is the cross-boundary fixture Hayt uses to verify the
+    /// Desktop parser against real harness output (no fence wrapper).
+    ///
+    /// The test asserts structural invariants rather than byte equality so it does
+    /// not break if field ordering changes, but the `println!` output is the
+    /// canonical fixture string.
+    #[test]
+    fn kind9_content_fixture_structural_invariants() {
+        let nonce = "test-nonce-fixture-abc123";
+        let options: Vec<serde_json::Value> = vec![
+            serde_json::json!({"optionId":"opt-allow","kind":"allow_once","name":"Allow once"}),
+            serde_json::json!({"optionId":"opt-reject","kind":"reject_once","name":"Reject"}),
+            serde_json::json!({"optionId":"opt-always","kind":"allow_always","name":"Always allow"}),
+        ];
+        let expiry_unix_secs: u64 = 1_700_000_300; // fixed for reproducibility
+        let session_id = Some("sess-fixture-001");
+        let turn_id = "turn-fixture-xyz";
+
+        let content =
+            build_sentinel_pending_payload(nonce, &options, expiry_unix_secs, session_id, turn_id)
+                .expect("build_sentinel_pending_payload must succeed");
+
+        // Print the canonical fixture string for Hayt to embed as the Desktop fixture.
+        println!("kind-9 content fixture:\n{content}");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&content).expect("content must be valid JSON");
+
+        // Structural invariants required by the Desktop parser (b31c716e schema).
+        assert_eq!(v["v"], serde_json::json!(1), "v must be 1");
+        assert_eq!(v["state"], "pending", "state must be 'pending'");
+        assert_eq!(v["requestNonce"], nonce, "requestNonce must match");
+        assert_eq!(
+            v["expiresAt"], expiry_unix_secs,
+            "expiresAt must be the supplied unix seconds"
+        );
+        assert_eq!(
+            v["sessionId"],
+            serde_json::json!("sess-fixture-001"),
+            "sessionId must match"
+        );
+        assert_eq!(v["turnId"], turn_id, "turnId must match");
+
+        // optionIds must contain exactly the three option IDs in order.
+        let option_ids = v["optionIds"]
+            .as_array()
+            .expect("optionIds must be an array");
+        assert_eq!(option_ids.len(), 3, "optionIds must have 3 entries");
+        assert_eq!(option_ids[0], "opt-allow");
+        assert_eq!(option_ids[1], "opt-reject");
+        assert_eq!(option_ids[2], "opt-always");
+
+        // labels must be an object with one key per optionId.
+        let labels = v["labels"].as_object().expect("labels must be an object");
+        assert_eq!(labels.len(), 3, "labels must have 3 entries");
+        assert_eq!(labels["opt-allow"], "Allow once");
+        assert_eq!(labels["opt-reject"], "Reject");
+        assert_eq!(labels["opt-always"], "Always allow");
+
+        // D5: allow_always option → hasDurableRule true, durableRuleNote non-null.
+        assert_eq!(
+            v["hasDurableRule"], true,
+            "hasDurableRule must be true (allow_always present)"
+        );
+        assert!(
+            v["durableRuleNote"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "durableRuleNote must be a non-empty string when hasDurableRule is true"
+        );
+
+        // originalEventId must NOT be present in a pending payload.
+        assert!(
+            v.get("originalEventId").is_none() || v["originalEventId"].is_null(),
+            "pending payload must not contain a non-null originalEventId"
+        );
     }
 
     // ── Pinned §2: reject policy is byte-for-byte unchanged ───────────────────
@@ -7944,7 +8949,9 @@ mod tests {
                 ],
                 state: PermissionEntryState::Pending,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                expiry_unix_secs: 0,
                 sentinel_event_id: None,
+                early_decision: None,
             },
         );
 

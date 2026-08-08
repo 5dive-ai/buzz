@@ -641,6 +641,34 @@ impl RelayEventPublisher {
         Ok(ack_rx.await.unwrap_or(AckOutcome::Uncertain))
     }
 
+    /// Register an ACK waiter for a signed event and return the receiver
+    /// **without** awaiting the outcome.
+    ///
+    /// The background task sends the EVENT frame and resolves the waiter
+    /// exactly once (accepted, rejected, or uncertain). The caller owns the
+    /// returned [`oneshot::Receiver`] and must poll or await it — typically
+    /// in a `tokio::select!` arm alongside other loop futures.
+    ///
+    /// Registration-before-send is guaranteed: the background task inserts the
+    /// waiter into `ack_waiters` before writing the EVENT frame.
+    ///
+    /// # Errors
+    /// Returns `RelayError::ConnectionClosed` if the command channel is closed.
+    pub async fn register_publish_ack(
+        &self,
+        event: Event,
+    ) -> Result<oneshot::Receiver<AckOutcome>, RelayError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(RelayCommand::PublishEventAcked {
+                event: Box::new(event),
+                ack_tx,
+            })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)?;
+        Ok(ack_rx)
+    }
+
     /// Test-only publisher pair: published events are forwarded to the
     /// returned receiver instead of a live relay socket.
     #[cfg(test)]
@@ -666,7 +694,77 @@ impl RelayEventPublisher {
         });
         (Self { cmd_tx }, event_rx)
     }
-}
+
+    /// Test publisher that rejects every `PublishEventAcked` command with
+    /// `AckOutcome::Rejected`. Used to test the rejected-ACK deny path.
+    #[cfg(test)]
+    #[allow(clippy::collapsible_match)]
+    pub(crate) fn test_pair_rejecting() -> (Self, mpsc::Receiver<Event>) {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<RelayCommand>(64);
+        let (event_tx, event_rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    RelayCommand::PublishEvent { event } => {
+                        if event_tx.send(*event).await.is_err() {
+                            break;
+                        }
+                    }
+                    RelayCommand::PublishEventAcked { event, ack_tx } => {
+                        let _ = event_tx.send(*event).await;
+                        let _ = ack_tx.send(AckOutcome::Rejected {
+                            message: "rate-limited".to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (Self { cmd_tx }, event_rx)
+    }
+
+    /// Test publisher that never sends an ACK for `PublishEventAcked` commands
+    /// (simulates a relay that accepts the command but never responds with OK).
+    /// Used to test the timeout path.
+    #[cfg(test)]
+    #[allow(clippy::collapsible_match)]
+    pub(crate) fn test_pair_silent() -> (Self, mpsc::Receiver<Event>) {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<RelayCommand>(64);
+        let (event_tx, event_rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    RelayCommand::PublishEvent { event } => {
+                        if event_tx.send(*event).await.is_err() {
+                            break;
+                        }
+                    }
+                    RelayCommand::PublishEventAcked { event, ack_tx: _ } => {
+                        // Intentionally drop ack_tx without sending — simulates
+                        // a relay that never confirms the event.
+                        let _ = event_tx.send(*event).await;
+                        // ack_tx is dropped here → ack_rx.await returns Err(RecvError) → Uncertain
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (Self { cmd_tx }, event_rx)
+    }
+
+    /// Test publisher whose command channel is dead on arrival (receiver dropped
+    /// before the first send). Any [`RelayCommand`] sent through this publisher
+    /// returns `Err(SendError)`, which the production code maps to
+    /// [`RelayError::ConnectionClosed`] — the same error path as a real socket failure.
+    ///
+    /// Used by `sentinel_ack_socket_failure_denies_synchronously_map_empty`.
+    #[cfg(test)]
+    pub(crate) fn test_pair_dead() -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<RelayCommand>(1);
+        drop(cmd_rx); // close the channel immediately
+        Self { cmd_tx }
+    }
+} // end impl RelayEventPublisher
 
 impl HarnessRelay {
     /// Connect to relay and authenticate via NIP-42.

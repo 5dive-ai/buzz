@@ -334,8 +334,18 @@ observer feed. The sentinel lifecycle is:
 
 ### Sentinel event structure
 
-**PENDING card (kind 9)** — published immediately when the harness registers the
-request in the pending map.
+**PENDING card (kind 9)** — published after the relay acknowledges the event with
+`OK accepted=true`. The harness registers the request in the `Publishing` state and
+sends the event to the relay; only on relay `OK accepted=true` does the entry
+transition to `Pending` and the card become visible to the owner.
+
+If the relay rejects the publish (`OK accepted=false`), the relay does not respond
+within `min(10 s, expiresAt)`, or the relay connection fails, the request is denied
+immediately with no card shown (fail closed).
+
+An authorized owner decision that arrives while the entry is still in `Publishing`
+state is buffered and applied as soon as the relay `OK` is received, with no
+additional round trip.
 
 The event content is a compact JSON object that matches the D6 frozen schema
 (`requestNonce`, `optionIds`, `labels`, `expiresAt`, `hasDurableRule`, …). Desktop

@@ -47,8 +47,10 @@ import type {
 } from "@/shared/api/types";
 import type { EditAgentFocusTarget } from "@/features/agents/openEditAgentEvent";
 import type { AgentDefinitionSubmitOptions } from "./AgentDefinitionDialog";
+import { runLocationForBackend } from "@/features/agents/lib/agentAccessWarning";
 import { AgentDefinitionDialog } from "./AgentDefinitionDialog";
 import { AgentInstanceEditDialog } from "./AgentInstanceEditDialog";
+import { AgentRunLocationProvider } from "./AgentRunLocationContext";
 import { editPersonaDialogState } from "./personaDialogState";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -103,18 +105,26 @@ export function AgentEditDialog({
   // parallelism, env vars, harness pin, auto-restart, start-on-launch, instance
   // name) and owns a well-tested save path. Route all instance-present contexts
   // here so no I/L field is accidentally omitted.
+  //
+  // Wrap in AgentRunLocationProvider so RespondToField's access warning can
+  // name the machine the agent actually runs on (mirrors AgentDialog's instance-
+  // edit arm — backend → run location for the remote-backend warning path).
   if (ctx.kind === "instance-with-definition" || ctx.kind === "instance-only") {
     return (
-      <AgentInstanceEditDialog
-        agent={ctx.instance}
-        initialFocus={initialFocus}
-        open={open}
-        onOpenChange={onOpenChange}
-        onUpdated={onUpdated}
-        // R4 back-door deleted: avatar lives on the merged surface (definition
-        // section is visible in the profile panel when a definition exists).
-        onEditLinkedPersona={undefined}
-      />
+      <AgentRunLocationProvider
+        runLocation={runLocationForBackend(ctx.instance.backend)}
+      >
+        <AgentInstanceEditDialog
+          agent={ctx.instance}
+          initialFocus={initialFocus}
+          open={open}
+          onOpenChange={onOpenChange}
+          onUpdated={onUpdated}
+          // R4 back-door deleted: avatar lives on the merged surface (definition
+          // section is visible in the profile panel when a definition exists).
+          onEditLinkedPersona={undefined}
+        />
+      </AgentRunLocationProvider>
     );
   }
 

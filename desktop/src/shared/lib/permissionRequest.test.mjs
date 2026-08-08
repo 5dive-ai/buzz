@@ -369,3 +369,37 @@ describe("isPermissionRequestSentinel", () => {
     );
   });
 });
+
+// ── Harness integration fixture ───────────────────────────────────────────────
+// This exact string is produced by `build_sentinel_pending_payload` in
+// crates/buzz-acp/src/acp.rs (captured by `kind9_content_fixture_structural_invariants`).
+// It validates that the Desktop parser accepts the exact bytes the harness emits.
+describe("harness integration fixture", () => {
+  // The em-dash character in durableRuleNote is U+2014 — identical to harness output
+  const HARNESS_KIND9_CONTENT =
+    '{"durableRuleNote":"Includes an \'Always allow\' option \u2014 creates a machine-wide durable rule in Codex.","expiresAt":1700000300,"hasDurableRule":true,"labels":{"opt-allow":"Allow once","opt-always":"Always allow","opt-reject":"Reject"},"optionIds":["opt-allow","opt-reject","opt-always"],"requestNonce":"test-nonce-fixture-abc123","sessionId":"sess-fixture-001","state":"pending","turnId":"turn-fixture-xyz","v":1}';
+
+  it("test_harness_kind9_content_parses_to_pending_payload", () => {
+    const result = extractPermissionRequest(HARNESS_KIND9_CONTENT);
+    assert.ok(
+      result !== null,
+      "harness fixture must parse to a non-null payload",
+    );
+    assert.equal(result.state, "pending");
+    assert.equal(result.v, 1);
+    assert.equal(result.requestNonce, "test-nonce-fixture-abc123");
+    assert.equal(result.expiresAt, 1700000300);
+    assert.deepEqual(result.optionIds, [
+      "opt-allow",
+      "opt-reject",
+      "opt-always",
+    ]);
+    assert.equal(result.hasDurableRule, true);
+    assert.equal(result.sessionId, "sess-fixture-001");
+    assert.equal(result.turnId, "turn-fixture-xyz");
+  });
+
+  it("test_harness_kind9_content_identified_as_sentinel", () => {
+    assert.equal(isPermissionRequestSentinel(HARNESS_KIND9_CONTENT), true);
+  });
+});

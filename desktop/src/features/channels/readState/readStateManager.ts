@@ -190,6 +190,8 @@ export class ReadStateManager {
   retryAttempt = 0; // bounded exponential backoff attempt counter
   pendingRetryOnComplete = false; // reconnect arrived during loadInFlight
   drainScheduled = false;
+  /** Set by scheduleDrain() when a drain is in-progress; honoured after the pass ends. */
+  pendingFreshDrain = false;
   /** Called after each drain intent is settled; wired by the hook for outcome routing. */
   onDrainOutcome: ((outcome: DrainOutcome) => void) | null = null;
 
@@ -222,12 +224,9 @@ export class ReadStateManager {
       this.drainScheduled = true;
       void this.drainPendingIntents(gen);
     } else if (!this.isLoadComplete && this.retryBackoffTimer === null) {
-      // Initial load was incomplete — schedule the first automatic retry with
-      // bounded backoff so pending intents eventually drain without needing an
-      // external reconnect signal.  Treat initialize() as attempt 0 consumed,
-      // so the first timed retry uses the attempt-1 delay (1 s).
+      // Incomplete — schedule first automatic retry (attempt 1 = 1 s delay).
       this.retryAttempt = 1;
-      const delayMs = 1_000; // Math.min(1000 * 2^0, 60000)
+      const delayMs = 1_000;
       this.retryBackoffTimer = window.setTimeout(() => {
         this.retryBackoffTimer = null;
         if (!this.destroyed) void this.retryLoad();
@@ -308,6 +307,7 @@ export class ReadStateManager {
     this.loadInFlight = false;
     this.pendingRetryOnComplete = false;
     this.drainScheduled = false;
+    this.pendingFreshDrain = false;
     if (this.retryBackoffTimer !== null) {
       window.clearTimeout(this.retryBackoffTimer);
       this.retryBackoffTimer = null;
@@ -411,6 +411,29 @@ export class ReadStateManager {
   async drainPendingIntents(drainGen: number): Promise<void> {
     await drainPendingIntentsImpl(createDrainContext(this), drainGen);
     this.drainScheduled = false;
+    // Honor a scheduleDrain() request that arrived during the impl (deferred gen2 promotion).
+    if (this.pendingFreshDrain && !this.destroyed) {
+      this.pendingFreshDrain = false;
+      if (!this.drainScheduled && this.isLoadComplete) {
+        this.drainScheduled = true;
+        void this.drainPendingIntents(this.loadGeneration);
+      }
+    }
+  }
+
+  /**
+   * Schedule a fresh drain pass if none is in-flight.  Called by the drain after
+   * a deferred gen2 promotion so the new intent drains immediately.
+   * While a drain is in-progress, sets `pendingFreshDrain` instead.
+   */
+  scheduleDrain(): void {
+    if (this.destroyed || !this.isLoadComplete) return;
+    if (this.drainScheduled) {
+      this.pendingFreshDrain = true;
+      return;
+    }
+    this.drainScheduled = true;
+    void this.drainPendingIntents(this.loadGeneration);
   }
 
   markChannelUnread(

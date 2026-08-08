@@ -176,24 +176,31 @@ type OverrideStateBlob = {
 /**
  * Parse and validate a raw JSON value as a `ForcedUnreadEntry`.
  *
- * Returns the validated entry on success, `null` if the value is present but
- * malformed (caller should reject the whole intent), or `undefined` if the
- * value is `undefined` (absent field — no prior entry).
+ * Returns `{ ok: true, value: ForcedUnreadEntry }` on success or
+ * `{ ok: false }` if the value is present but malformed.
+ * Returns `{ ok: true, value: undefined }` if the raw value is `undefined`
+ * (absent field — no prior entry stored).
+ *
+ * `null` is a valid legacy v1 null marker and is returned as
+ * `{ ok: true, value: null }` — NOT as a failure sentinel.
  *
  * Valid shapes (matching the `ForcedUnreadEntry` union):
  *  - `number`                                        — legacy v1 scalar marker
  *  - `null`                                          — legacy v1 null marker
  *  - `{ markerAtWhenForced: number | null, sources: ForcedUnreadSource[] }`
+ *
+ * Structured entries are accepted only when ALL members of `sources` are
+ * valid ForcedUnreadSource values — no silent filtering of partial arrays.
  */
 function parseForcedUnreadEntry(
   raw: unknown,
-): ForcedUnreadEntry | null | undefined {
-  if (raw === undefined) return undefined;
-  if (raw === null) return null;
+): { ok: true; value: ForcedUnreadEntry | undefined } | { ok: false } {
+  if (raw === undefined) return { ok: true, value: undefined };
+  if (raw === null) return { ok: true, value: null };
   if (typeof raw === "number") {
     if (Number.isFinite(raw) && raw >= 0 && raw <= MAX_PROTOCOL_TIMESTAMP)
-      return raw;
-    return null; // invalid numeric marker
+      return { ok: true, value: raw };
+    return { ok: false }; // invalid numeric marker
   }
   if (typeof raw === "object" && !Array.isArray(raw)) {
     const obj = raw as Record<string, unknown>;
@@ -205,19 +212,23 @@ function parseForcedUnreadEntry(
         marker < 0 ||
         marker > MAX_PROTOCOL_TIMESTAMP)
     )
-      return null;
+      return { ok: false };
     const sources = obj.sources;
-    if (!Array.isArray(sources)) return null;
-    const validSources: ForcedUnreadSource[] = sources.filter(
-      (s): s is ForcedUnreadSource => s === "inbox" || s === "manual",
-    );
-    if (validSources.length === 0) return null;
+    if (!Array.isArray(sources)) return { ok: false };
+    // All members must be valid — no silent partial filtering.
+    for (const s of sources) {
+      if (s !== "inbox" && s !== "manual") return { ok: false };
+    }
+    if (sources.length === 0) return { ok: false };
     return {
-      markerAtWhenForced: (marker as number | null) ?? null,
-      sources: validSources,
+      ok: true,
+      value: {
+        markerAtWhenForced: (marker as number | null) ?? null,
+        sources: sources as ForcedUnreadSource[],
+      },
     };
   }
-  return null; // unrecognised shape
+  return { ok: false }; // unrecognised shape
 }
 
 function readOverrideState(pubkey: string): OverrideStateBlob {
@@ -310,8 +321,7 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
             }
             // priorForcedEntry must be a valid ForcedUnreadEntry or absent.
             const parsedPrior = parseForcedUnreadEntry(priorForcedEntry);
-            if (priorForcedEntry !== undefined && parsedPrior === null)
-              continue;
+            if (!parsedPrior.ok) continue;
             const intent: PendingIntent = {
               gen,
               op,
@@ -319,8 +329,8 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
                 ? { sourceScope: sourceScope as string }
                 : {}),
               ...(readTarget !== undefined ? { readTarget } : {}),
-              ...(parsedPrior !== undefined
-                ? { priorForcedEntry: parsedPrior }
+              ...(parsedPrior.value !== undefined
+                ? { priorForcedEntry: parsedPrior.value }
                 : {}),
             };
             pendingIntents.set(channelId, intent);

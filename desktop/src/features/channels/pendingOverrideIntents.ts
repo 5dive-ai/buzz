@@ -186,16 +186,55 @@ export class PendingOverrideIntentStore {
   }
 
   /**
-   * Close a drain transaction for `channelId` and flush any buffered enqueue.
+   * Promote a buffered (deferred) enqueue into the live queue for `channelId`.
    *
-   * If an enqueue was buffered during the transaction, it is applied now with a
-   * fresh generation — it becomes the active queue entry for the next drain pass.
-   * Calling `persistLocalState()` after this method captures the flushed intent.
+   * Called INSIDE the drain transaction — BEFORE the step-3 cleanup
+   * `persistLocalState()` — so the promoted gen2 `pi`/`ng` is written to the
+   * durable blob in the same commit as gen1's cleanup.  The transaction latch
+   * remains held after this call; `commitTransaction` then simply unlocks.
+   *
+   * Returns `true` if a deferred enqueue was promoted (caller must persist and
+   * schedule a fresh drain pass); `false` if no enqueue was pending.
+   *
+   * Must only be called while a transaction is open for `channelId`.
+   */
+  promoteDeferred(channelId: string): boolean {
+    const deferred = this.deferredEnqueues.get(channelId);
+    if (deferred === undefined) return false;
+    this.deferredEnqueues.delete(channelId);
+    const gen = this._nextGen++;
+    const intent: PendingIntent = {
+      gen,
+      op: deferred.op,
+      ...(deferred.sourceScope !== undefined
+        ? { sourceScope: deferred.sourceScope }
+        : {}),
+      ...(deferred.readTarget !== undefined
+        ? { readTarget: deferred.readTarget }
+        : {}),
+      ...(deferred.priorForcedEntry !== undefined
+        ? { priorForcedEntry: deferred.priorForcedEntry }
+        : {}),
+    };
+    this.intents.set(channelId, intent);
+    return true;
+  }
+
+  /**
+   * Close a drain transaction for `channelId`.
+   *
+   * If `promoteDeferred` was already called, the deferred map is clear and this
+   * call simply releases the lock — no-op flush.  If `promoteDeferred` was NOT
+   * called (e.g. the storage-failure `continue` path skipped the normal cleanup
+   * flow), any remaining buffered enqueue is promoted here so it is not silently
+   * discarded; it will drain in the next pass from in-memory state.
    *
    * Safe to call even if no transaction was open (idempotent unlock).
    */
   commitTransaction(channelId: string): void {
     this.lockedChannels.delete(channelId);
+    // Fallback flush: promote any enqueue that was not already promoted by
+    // promoteDeferred() (e.g. storage-failure continue path).
     const deferred = this.deferredEnqueues.get(channelId);
     if (deferred === undefined) return;
     this.deferredEnqueues.delete(channelId);

@@ -72,6 +72,7 @@ export interface DrainContext {
   markContextRead(channelId: string, unixTimestamp: number): void;
   tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean;
   restoreExtraSlotIds(prev: string[]): void;
+  scheduleDrain(): void;
   /** Drain outcome callback — typed discriminated union for exhaustive handling
    *  in the hook layer. */
   onDrainOutcome: ((outcome: DrainOutcome) => void) | null;
@@ -98,6 +99,7 @@ interface ManagerInternals {
   markContextRead(channelId: string, unixTimestamp: number): void;
   tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean;
   restoreExtraSlotIds(prev: string[]): void;
+  scheduleDrain(): void;
 }
 
 /**
@@ -141,6 +143,7 @@ export function createDrainContext(mgr: ManagerInternals): DrainContext {
     markContextRead: (id, ts) => mgr.markContextRead(id, ts),
     tryCandidatePlan: (id, reg) => mgr.tryCandidatePlan(id, reg),
     restoreExtraSlotIds: (prev) => mgr.restoreExtraSlotIds(prev),
+    scheduleDrain: () => mgr.scheduleDrain(),
   };
 }
 
@@ -299,20 +302,46 @@ export async function drainPendingIntents(
         ctx.onDrainOutcome(outcome);
       }
 
-      // Step 3: atomic cleanup commit — delete receipt + compare-and-delete intent.
+      // Step 3: atomic cleanup commit — promote any deferred gen2 enqueue, then
+      // delete receipt + compare-and-delete gen1 intent in ONE v2-blob write.
+      //
+      // Promotion happens BEFORE persist so the blob atomically captures:
+      //   • gen1 cleanup (intent + receipt removed)
+      //   • gen2 `pi`/`ng` (if a deferred enqueue was buffered during this pass)
+      //
+      // Failure semantics for the cleanup write:
+      //   • gen1 register is already durably committed (step-1 write succeeded).
+      //   • If this write fails: the blob still carries gen1 intent + receipt;
+      //     on restart the receipt prevents a re-bump and cleanup runs next drain.
+      //     If gen2 was promoted in-memory, it will drain this session from memory
+      //     but is lost on restart — this is explicitly acceptable (same lossiness
+      //     as a crash between the register commit and the cleanup write).
+      //   • Promoted gen2 is NEVER silently lost in-session: it is in the live map
+      //     and will drain from memory even if the cleanup write fails.
+      const gen2Promoted =
+        pendingOverrideIntentStore.promoteDeferred(channelId);
       ctx.appliedReceipts.delete(channelId);
       pendingOverrideIntentStore.compareAndDelete(channelId, capturedGen);
       if (!ctx.persistLocalState()) {
         // Best-effort: register already committed. Orphaned receipt swept on restart.
+        // Gen2 (if promoted) remains in-memory and drains this session.
         console.warn(
           `[ReadStateManager] drain: cleanup commit failed for ${channelId}`,
         );
+      } else if (gen2Promoted && !ctx.destroyed) {
+        // Gen2 was durably committed — schedule a fresh drain pass so it drains
+        // immediately rather than waiting for an unrelated future complete-load
+        // generation.
+        ctx.scheduleDrain();
       }
       ctx.notifyListeners();
     } finally {
-      // Always release the transaction latch — flush any deferred enqueue.
-      // If an enqueue was buffered during this iteration, it becomes the new
-      // queue entry and will be drained in the next pass.
+      // Always release the transaction latch.
+      // If promoteDeferred() was already called above (normal path), this is a
+      // no-op unlock.  If the storage-failure `continue` path skipped the normal
+      // cleanup flow, commitTransaction() promotes any buffered enqueue as a
+      // fallback so it is not silently discarded — it will drain from in-memory
+      // state in the next pass.
       pendingOverrideIntentStore.commitTransaction(channelId);
     }
   }
@@ -399,15 +428,22 @@ export function markChannelReadDirect(
   const effectiveFrontier = ctx.channelFrontier(channelId);
   if (!reg) return { status: "refused", reason: "already_inactive" };
   const newC = Math.max(reg.s, reg.c) + 1;
-  if (newC > 0xffffffff)
+  if (newC > 0xffffffff) {
+    // C-bump is unrepresentable.  Re-evaluate register liveness against the
+    // post-advance frontier before emitting a genuine refusal.
+    //
+    // Parity with the sync applyOverrideRead() path at readStateOverride.ts
+    // which already treats a post-advance inactive register as cleared:
+    //   inactive → emit `already_inactive` (maps to silent-inactive outcome;
+    //              toast-free, triggers exact source cleanup via hook)
+    //   still active → genuine uint32_overflow refusal
+    if (!isOverrideActive(reg, effectiveFrontier)) {
+      // Frontier advance made the register inactive — treat as silent success.
+      return { status: "refused", reason: "already_inactive" };
+    }
     return { status: "refused", reason: "uint32_overflow" };
-  const newReg: OverrideRegister = { s: reg.s, c: newC, b: reg.b };
-  if (isOverrideActive(newReg, effectiveFrontier)) {
-    console.error(
-      "[ReadStateManager] markChannelReadDirect: override still active after bump",
-    );
-    return { status: "refused", reason: "already_inactive" };
   }
+  const newReg: OverrideRegister = { s: reg.s, c: newC, b: reg.b };
   ctx.overrideRegisters.set(channelId, newReg);
   ctx.publishableContextIds.add(channelId);
   ctx.appliedReceipts.set(channelId, {

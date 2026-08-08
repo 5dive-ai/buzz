@@ -235,7 +235,7 @@ pub struct AcpClient {
     /// Under `ask` the full map is `pending_permissions` below.
     pending_permission_id: Option<serde_json::Value>,
     /// Whether we have already sent a response to the pending permission request.
-    /// Guards against double-response if a timeout fires after the allow_once
+    /// Guards against double-response if a timeout fires after the rejection
     /// response was written but before `pending_permission_id` was cleared.
     permission_responded: bool,
     /// Pending `session/request_permission` entries under the `ask` policy.
@@ -1724,7 +1724,8 @@ impl AcpClient {
     ///
     /// While waiting, handles:
     /// - `session/update` notifications → logged via tracing
-    /// - `session/request_permission` requests → auto-approved with `allow_once`
+    /// - `session/request_permission` requests → rejected unless an owner has
+    ///   already selected a non-interactive permission mode at session setup
     /// - Any other messages → debug-logged and ignored; if they carry an `id`
     ///   (i.e. they are requests, not notifications), a JSON-RPC -32601 error is sent.
     ///
@@ -3761,42 +3762,53 @@ mod tests {
         assert_eq!(StopReason::from_str("Refusal"), Some(StopReason::Refusal));
     }
 
+    fn options(json: &str) -> Vec<serde_json::Value> {
+        serde_json::from_str(json).expect("option list")
+    }
+
+    fn outcome(response: &serde_json::Value) -> Option<&str> {
+        response["result"]["outcome"]["outcome"].as_str()
+    }
+
+    /// The offered `allow_once` and `allow_always` options must be ignored:
+    /// there is no human to click them, so choosing either would make every
+    /// admitted prompt an implicit approval. `optionId`s are deliberately
+    /// non-obvious to prove they are matched by `kind`, never hardcoded.
     #[test]
-    fn find_allow_once_by_kind_not_by_option_id() {
-        // optionId values are intentionally non-obvious to prove we don't hardcode them.
-        let options: Vec<serde_json::Value> = serde_json::from_str(
+    fn permission_requests_select_reject_once_not_allow_once() {
+        let options = options(
             r#"[
             {"optionId": "opt-reject-42",  "name": "Reject",       "kind": "reject_once"},
             {"optionId": "opt-allow-99",   "name": "Allow once",   "kind": "allow_once"},
             {"optionId": "opt-always-7",   "name": "Always allow", "kind": "allow_always"}
         ]"#,
-        )
-        .unwrap();
+        );
 
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
+        let response =
+            permission_denial_response(&serde_json::json!(7), &options).expect("denial response");
 
-        assert!(allow_once.is_some(), "should find allow_once option");
-        let opt = allow_once.unwrap();
-        // Found by kind, not by hardcoded optionId
-        assert_eq!(opt["kind"].as_str(), Some("allow_once"));
-        assert_eq!(opt["optionId"].as_str(), Some("opt-allow-99"));
+        assert_eq!(outcome(&response), Some("selected"));
+        assert_eq!(
+            response["result"]["outcome"]["optionId"].as_str(),
+            Some("opt-reject-42"),
+            "must select reject_once even when allow options are offered"
+        );
     }
 
+    /// Fail-closed backstop: an adapter that offers no `reject_once` must still
+    /// be denied, via the protocol's cancelled outcome rather than an error or
+    /// an approval.
     #[test]
-    fn find_allow_once_returns_none_when_absent() {
-        let options: Vec<serde_json::Value> = serde_json::from_str(
+    fn permission_request_without_reject_once_is_cancelled() {
+        let options = options(
             r#"[
-            {"optionId": "reject-1",      "name": "Reject",        "kind": "reject_once"},
-            {"optionId": "reject-always", "name": "Always reject", "kind": "reject_always"}
+            {"optionId": "opt-allow-99", "name": "Allow once",   "kind": "allow_once"},
+            {"optionId": "opt-always-7", "name": "Always allow", "kind": "allow_always"}
         ]"#,
-        )
-        .unwrap();
+        );
 
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
+        let response = permission_denial_response(&serde_json::json!("req-1"), &options)
+            .expect("cancelled response");
 
         assert_eq!(outcome(&response), Some("cancelled"));
         assert_eq!(
@@ -3833,22 +3845,17 @@ mod tests {
     }
 
     #[test]
-    fn find_reject_once_fallback_when_no_allow_once() {
-        let options: Vec<serde_json::Value> = serde_json::from_str(
-            r#"[{"optionId": "rej-x", "name": "Reject", "kind": "reject_once"}]"#,
-        )
-        .unwrap();
+    fn find_reject_once_by_kind() {
+        let options =
+            options(r#"[{"optionId": "rej-x", "name": "Reject", "kind": "reject_once"}]"#);
 
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
-        assert!(allow_once.is_none());
+        let response =
+            permission_denial_response(&serde_json::json!(1), &options).expect("denial response");
 
-        let reject_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
-        assert!(reject_once.is_some());
-        assert_eq!(reject_once.unwrap()["optionId"].as_str(), Some("rej-x"));
+        assert_eq!(
+            response["result"]["outcome"]["optionId"].as_str(),
+            Some("rej-x")
+        );
     }
 
     #[test]

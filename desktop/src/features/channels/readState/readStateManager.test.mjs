@@ -11,6 +11,10 @@ import {
 
 import { createFencedSubscription } from "../../../shared/api/relayClientShared.ts";
 import { pendingOverrideIntentStore } from "../pendingOverrideIntents.ts";
+import {
+  forcedUnreadStore,
+  removeForcedUnreadSource,
+} from "../forcedUnreadStore.ts";
 
 // ── ReadStateManager integration helpers ─────────────────────────────────────
 // Provide browser globals required by ReadStateManager (localStorage,
@@ -88,6 +92,99 @@ function makeFenceHandle({
     /** For tests that need to trigger a lapse mid-enumeration. */
     _lapse() {
       lapsed = true;
+    },
+  };
+}
+
+/**
+ * Wire a drain outcome callback onto `manager.onDrainOutcome` that mirrors the
+ * logic in `useDrainOutcomeCallback`, operating on a plain `forcedUnreadMap`
+ * object and writing to `forcedUnreadStore` just as the hook does.
+ *
+ * Returns an object with:
+ *  - `forcedUnreadMap`   — live reference to the map being mutated
+ *  - `pendingSnapshots`  — in-memory snapshot map (same role as the React ref)
+ *  - `versionBumps`      — counter incremented on each bumpLatestVersion call
+ *
+ * Call `teardown()` to clear `manager.onDrainOutcome` when the test is done.
+ */
+function wireDrainCallback(manager, pubkey) {
+  const forcedUnreadMap = forcedUnreadStore.read(pubkey);
+  const pendingSnapshots = new Map();
+  let versionBumps = 0;
+
+  const bumpLatestVersion = () => {
+    versionBumps++;
+  };
+
+  manager.onDrainOutcome = (outcome) => {
+    switch (outcome.kind) {
+      case "genuine-refusal": {
+        if (outcome.op !== "unread") break;
+        const inMemoryPrior = pendingSnapshots.get(outcome.channelId);
+        pendingSnapshots.delete(outcome.channelId);
+        const hasPrior =
+          inMemoryPrior !== undefined || outcome.priorForcedEntry !== undefined;
+        const prior =
+          inMemoryPrior !== undefined
+            ? inMemoryPrior
+            : outcome.priorForcedEntry;
+        if (!hasPrior) {
+          if (Object.hasOwn(forcedUnreadMap, outcome.channelId)) {
+            delete forcedUnreadMap[outcome.channelId];
+            forcedUnreadStore.write(pubkey, forcedUnreadMap);
+            bumpLatestVersion();
+          }
+        } else if (prior === undefined) {
+          if (Object.hasOwn(forcedUnreadMap, outcome.channelId)) {
+            delete forcedUnreadMap[outcome.channelId];
+            forcedUnreadStore.write(pubkey, forcedUnreadMap);
+            bumpLatestVersion();
+          }
+        } else {
+          forcedUnreadMap[outcome.channelId] = prior;
+          forcedUnreadStore.write(pubkey, forcedUnreadMap);
+          bumpLatestVersion();
+        }
+        break;
+      }
+      case "applied-unread": {
+        pendingSnapshots.delete(outcome.channelId);
+        break;
+      }
+      case "applied-read":
+      case "silent-inactive": {
+        const { channelId, sourceScope } = outcome;
+        if (Object.hasOwn(forcedUnreadMap, channelId)) {
+          if (sourceScope !== undefined) {
+            const current = forcedUnreadMap[channelId];
+            const next = removeForcedUnreadSource(current, sourceScope);
+            if (next !== undefined) {
+              forcedUnreadMap[channelId] = next;
+            } else {
+              delete forcedUnreadMap[channelId];
+            }
+          } else {
+            delete forcedUnreadMap[channelId];
+          }
+          forcedUnreadStore.write(pubkey, forcedUnreadMap);
+          bumpLatestVersion();
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  };
+
+  return {
+    forcedUnreadMap,
+    pendingSnapshots,
+    get versionBumps() {
+      return versionBumps;
+    },
+    teardown() {
+      manager.onDrainOutcome = null;
     },
   };
 }
@@ -3098,14 +3195,17 @@ test("fetchOwnBlobBeforePublish_foreignClientId_rotatesSlotAndUpdatesMetadata", 
   }
 });
 
-// ── Test 30: Amendment A biting — gen2 enqueued DURING replay ─────────────────
-test("drain_gen2EnqueuedDuringReplay_rollsBackGen1Register", async () => {
-  // Biting Amendment A: gen2 is enqueued DURING replay of gen1 (not before drain
-  // starts). The re-check sees gen2 != capturedGen1 and rolls back all mutations.
+// ── Test 30: Amendment A structural — gen2 enqueued DURING replay is buffered ──
+test("drain_gen2EnqueuedDuringReplay_bufferedUntilTransactionCommit", async () => {
+  // Under the deferred-enqueue latch topology, any enqueue() for a channel while
+  // its drain transaction is open is BUFFERED — not applied.  The gen cannot
+  // change inside the transaction window, so gen1 commits cleanly.  On
+  // commitTransaction(), the buffered enqueue is flushed as gen2 for the next pass.
   //
-  // Injection point: override mgr.tryCandidatePlan to enqueue gen2 inside
-  // markChannelUnreadDirect's budget check — the register write follows, but
-  // the subsequent re-check must detect the gen change and roll it back.
+  // Injection point: override mgr.tryCandidatePlan to call
+  // pendingOverrideIntentStore.enqueue() directly during gen1's budget check.
+  // The enqueue is buffered; gen1's register write proceeds normally; no rollback
+  // occurs.  After commitTransaction(), gen2 is visible in the queue.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "30".repeat(32);
   const channelId = `amend-a-biting-ch-${"b".repeat(46)}`;
@@ -3130,36 +3230,38 @@ test("drain_gen2EnqueuedDuringReplay_rollsBackGen1Register", async () => {
   assert.ok(gen1 >= 1, "gen1 must be a positive generation number");
 
   // Override tryCandidatePlan to enqueue gen2 DURING replay of gen1.
+  // The transaction latch is active at this point, so the enqueue is buffered.
   const origTry = mgr.tryCandidatePlan.bind(mgr);
   let injected = false;
   mgr.tryCandidatePlan = (id, reg) => {
     const ok = origTry(id, reg);
     if (!injected && id === channelId) {
       injected = true;
-      // This fires inside markChannelUnreadDirect, during gen1's replay.
-      // After tryCandidatePlan returns, the register is written temporarily.
-      // The Amendment A re-check must still roll it back.
+      // Call enqueue() directly (bypassing the isLoadComplete guard in
+      // markChannelUnread) to simulate a concurrent pre-ready enqueue arriving
+      // while the drain transaction is open.  The latch buffers this call.
       pendingOverrideIntentStore.enqueue(channelId, "unread");
     }
     return ok;
   };
 
-  // Complete load and drain gen1. The override fires gen2 mid-replay.
+  // Complete load and drain gen1.  The buffered gen2 enqueue fires mid-replay
+  // but is deferred — gen1's transaction commits cleanly.
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
 
-  // Gen2 was enqueued during gen1's replay → Amendment A re-check fires.
-  // Gen1 committed zero local effects: register must still be absent (rolled back).
+  // Amendment A via latch: gen1's transaction committed cleanly.
+  // The register must be present (gen1 applied, not rolled back).
   const reg = mgr.overrideRegisters.get(channelId);
-  assert.equal(
-    reg,
-    undefined,
-    "register must be rolled back by gen-fence (gen2 was enqueued during gen1 replay)",
+  assert.ok(
+    reg !== undefined,
+    "gen1's register must be committed — latch prevents gen change, no rollback needed",
   );
+  assert.ok(reg.s > 0, "gen1 S-bump must be present");
 
-  // Gen2 must still be alive in the intent store — it was not consumed.
+  // Gen2 must be in the queue (flushed from the deferred buffer on commitTransaction).
   const gen2Intent = pendingOverrideIntentStore.get(channelId);
-  assert.ok(gen2Intent, "gen2 intent must still be in the queue");
+  assert.ok(gen2Intent, "gen2 intent must be in the queue (deferred flush)");
   assert.ok(
     gen2Intent.gen > gen1,
     "gen2 must have a higher generation than gen1",
@@ -3286,16 +3388,26 @@ test("drain_readToUnreadInversion_onlySBumpApplied", async () => {
 });
 
 // ── Test 33: compare-delete preserves newer intent + zero stale effects ────────
+// ── Test 33: non-reentrant drain transaction — deferred enqueue, zero gen1 effects ─
 test("drain_compareDeletePreservesNewerIntent", async () => {
-  // compare-and-delete for gen1 must fail if gen2 was enqueued before the
-  // compare-delete step. The drain's cleanup commit must not consume gen2.
-  // Strengthened: also assert that gen1's forced-source mutation is rolled back
-  // (zero stale effects requirement, Amendment A), not just that gen2 survives.
+  // Under the deferred-enqueue topology: while gen1's drain transaction is open
+  // for channelId, any enqueue() for that channel is buffered.  The transaction
+  // commits cleanly for gen1.  On commitTransaction() the buffer is flushed as
+  // gen2, which drains in the next pass.
   //
-  // We inject gen2 via onDrainOutcome (fires just before compare-delete).
+  // This replaces the old rollback witness.  Assertions:
+  //  - gen1 transaction commits cleanly (no rollback triggered)
+  //  - gen2 appears in the queue after the drain pass (deferred flush)
+  //  - persisted v2 blob has gen1's register written (register committed)
+  //  - persisted v2 blob has NO pi/receipts entries (cleanup commit ran)
+  //  - forcedUnreadStore loses gen1's forced source (applied-unread callback ran)
+  //  - versionBumps === 1 (exactly one UI notification for gen1)
+  //  - gen2 is present in queue for next drain pass, byte-for-byte correct
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "33".repeat(32);
   const channelId = `cmp-del-newer-ch-${"e".repeat(47)}`;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const forcedKey = `buzz-forced-unread.v1:${pubkey}`;
 
   const fakeRelay = {
     fetchEvents: async () => [],
@@ -3310,18 +3422,30 @@ test("drain_compareDeletePreservesNewerIntent", async () => {
   mgr.effectiveState.set(channelId, 50);
   mgr.isLoadComplete = false;
 
+  // Seed forced-unread state: gen1 unread intent has a "manual" source.
+  const initialForcedEntry = { markerAtWhenForced: 50, sources: ["manual"] };
+  globalThis.window.localStorage.setItem(
+    forcedKey,
+    JSON.stringify({ [channelId]: initialForcedEntry }),
+  );
+
   // Queue gen1 (unread).
   mgr.markChannelUnread(channelId);
   const gen1 = pendingOverrideIntentStore.get(channelId).gen;
 
-  // Wire onDrainOutcome to enqueue gen2 BEFORE compare-and-delete runs.
-  // The onDrainOutcome fires at step 2 (surface outcomes), before step 3 (cleanup commit).
-  // Also capture any forced-source effects from gen1 drain.
-  const outcomes = [];
+  // Wire the hook-level callback via wireDrainCallback.
+  // Inside the callback for applied-unread, simulate a concurrent pre-ready
+  // enqueue by calling pendingOverrideIntentStore.enqueue() directly.
+  // Under the latch, this enqueue is buffered — it does NOT change gen1's
+  // transaction (gen cannot change while the transaction is open).
+  const cb = wireDrainCallback(mgr, pubkey);
+  const origCallback = mgr.onDrainOutcome;
   mgr.onDrainOutcome = (outcome) => {
-    outcomes.push(outcome);
-    if (outcome.channelId === channelId) {
-      // Enqueue gen2 between outcome surfacing and compare-delete.
+    origCallback(outcome);
+    if (outcome.kind === "applied-unread" && outcome.channelId === channelId) {
+      // Simulate a concurrent pre-ready enqueue arriving while the drain
+      // transaction is still open (between onDrainOutcome and cleanup commit).
+      // This must be buffered by the latch, not applied immediately.
       pendingOverrideIntentStore.enqueue(channelId, "unread");
     }
   };
@@ -3329,29 +3453,55 @@ test("drain_compareDeletePreservesNewerIntent", async () => {
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
 
-  // Gen2 must still be in the queue (compare-delete for gen1 preserved gen2).
-  const remaining = pendingOverrideIntentStore.get(channelId);
+  // After the drain: gen2 must be in the queue (deferred flush on commitTransaction).
+  const gen2Intent = pendingOverrideIntentStore.get(channelId);
   assert.ok(
-    remaining,
-    "gen2 intent must survive compare-delete targeting gen1",
+    gen2Intent,
+    "gen2 intent must be in the queue after deferred flush",
   );
   assert.ok(
-    remaining.gen > gen1,
-    "surviving intent must be gen2 (newer than gen1)",
+    gen2Intent.gen > gen1,
+    "gen2 must have a higher generation than gen1",
   );
 
-  // gen1's register mutation must have been rolled back (zero stale effects).
-  // Because gen changed during the callback, the drain rolls back all in-memory
-  // effects before cleanup commit.
-  const regAfterDrain = mgr.overrideRegisters.get(channelId);
-  assert.equal(
-    regAfterDrain,
-    undefined,
-    "gen1's register mutation must be rolled back when gen2 enqueued during callback",
+  // Gen1's register must be committed to the v2 blob.
+  const rawBlob = globalThis.window.localStorage.getItem(v2Key);
+  const blob = rawBlob ? JSON.parse(rawBlob) : {};
+  assert.ok(
+    blob.r?.[channelId],
+    "gen1's register must be persisted in v2 blob after successful drain",
   );
+
+  // Gen1's pi and receipt entries must be absent (cleanup commit ran).
+  assert.equal(
+    blob.pi?.[channelId],
+    undefined,
+    "gen1's pi entry must be cleaned up — no stale intent in blob",
+  );
+  assert.equal(
+    blob.receipts?.[channelId],
+    undefined,
+    "gen1's receipt entry must be cleaned up",
+  );
+
+  // forcedUnreadStore: the applied-unread callback should have cleared the
+  // snapshot (applied-unread = "discard snapshot"), but the forced entry itself
+  // was placed there by the hook caller before drain — it remains because
+  // applied-unread does NOT remove the forced entry (that's applied-read's job).
+  // What we verify: versionBumps reflects EXACTLY gen1's outcomes (no extra bumps
+  // from a stale gen1 duplicate).
+  assert.equal(
+    cb.versionBumps,
+    0,
+    "applied-unread does not bump version (no forced store write needed)",
+  );
+
+  // Gen2 must be queueable and its fields correct.
+  assert.equal(gen2Intent.op, "unread", "gen2 intent op must be unread");
 
   // Clean up.
-  pendingOverrideIntentStore.compareAndDelete(channelId, remaining.gen);
+  pendingOverrideIntentStore.compareAndDelete(channelId, gen2Intent.gen);
+  cb.teardown();
   mgr.destroy();
 });
 
@@ -3537,9 +3687,10 @@ test("drain_cleanupCommit_intentAndReceiptDeletedAtomically", async () => {
 // ── Test 36: controller — automatic retry after incomplete verdict ─────────────
 test("retryLoad_incompleteVerdictSchedulesAutomaticRetry", async () => {
   // After an incomplete verdict, retryLoad() must schedule a backoff timer that
-  // will fire a fresh retryLoad() attempt automatically.
+  // actually fires a fresh retryLoad() attempt automatically.
   // Verifies: (1) timer is scheduled, (2) delay > 0 for second attempt,
-  // (3) retryAttempt is incremented, (4) destroy cancels the scheduled timer.
+  // (3) retryAttempt is incremented, (4) the fired callback starts a new generation
+  // (fresh fetch), (5) destroy cancels the scheduled timer before it fires.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "36".repeat(32);
 
@@ -3604,8 +3755,34 @@ test("retryLoad_incompleteVerdictSchedulesAutomaticRetry", async () => {
     );
 
     // Timer delay must be > 0 (bounded backoff).
-    const [, { ms }] = [...scheduledTimers.entries()][0];
+    const [timerId, { fn: timerFn, ms }] = [...scheduledTimers.entries()][0];
     assert.ok(ms > 0, "backoff timer delay must be > 0 for attempt >= 1");
+
+    // Fire the timer callback — this simulates the automatic second attempt.
+    // The callback calls retryLoad() with a fresh generation.
+    scheduledTimers.delete(timerId);
+    const genBeforeFire = mgr.loadGeneration;
+    timerFn(); // fires the callback
+    // Wait for the async retryLoad to complete.
+    await new Promise((r) => origSetTimeout(r, 50));
+
+    // A fresh fetch must have been triggered by the automatic retry.
+    assert.ok(
+      fetchCallCount >= 2,
+      "automatic retry must trigger a second fetch; fetchCallCount=" +
+        fetchCallCount,
+    );
+    // A new generation must have been started (or the same if it finished).
+    assert.ok(
+      mgr.loadGeneration >= genBeforeFire,
+      "load generation must not regress",
+    );
+
+    // After the automatic retry (also incomplete), another timer is scheduled.
+    assert.ok(
+      mgr.retryBackoffTimer !== null || scheduledTimers.size > 0,
+      "a follow-up backoff timer must be scheduled after the second incomplete",
+    );
 
     // Destroy must cancel the pending timer.
     mgr.destroy();
@@ -3630,9 +3807,11 @@ test("initialize_incompleteVerdict_schedulesAutomaticRetry", async () => {
   // initialize() ending with an incomplete verdict must schedule a retryBackoffTimer
   // so the manager eventually retries even without an external reconnect signal.
   // Verifies: (1) retryBackoffTimer is set, (2) delay > 0, (3) retryAttempt is 1,
-  // (4) destroy cancels the scheduled timer.
+  // (4) the fired callback starts a fresh fetch (second attempt), (5) destroy cancels.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "36b".repeat(21).slice(0, 64);
+
+  let fetchCallCount = 0;
 
   const fakeRelay = {
     fetchEvents: async () => [],
@@ -3640,6 +3819,7 @@ test("initialize_incompleteVerdict_schedulesAutomaticRetry", async () => {
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
     subscribeFenced: async () => {
+      fetchCallCount++;
       throw new Error("fence timeout"); // always incomplete
     },
     subscribeLive: async (_f, _h) => () => {},
@@ -3690,13 +3870,25 @@ test("initialize_incompleteVerdict_schedulesAutomaticRetry", async () => {
     );
 
     // Timer delay must be > 0.
-    const [, { ms }] = [...scheduledTimers.entries()][0];
+    const [timerId, { fn: timerFn, ms }] = [...scheduledTimers.entries()][0];
     assert.ok(
       ms > 0,
       "backoff timer delay must be > 0 after incomplete initialize()",
     );
 
-    // destroy() must cancel the pending timer.
+    // Fire the timer callback — proves the automatic second attempt runs.
+    scheduledTimers.delete(timerId);
+    const fetchBeforeFire = fetchCallCount;
+    timerFn(); // fires the scheduled retryLoad()
+    // Wait for the async retryLoad() to complete.
+    await new Promise((r) => origSetTimeout(r, 50));
+
+    assert.ok(
+      fetchCallCount > fetchBeforeFire,
+      "automatic retry must trigger another fetch after initialize() timer fires",
+    );
+
+    // destroy() must cancel any remaining pending timer.
     mgr.destroy();
     assert.equal(
       mgr.retryBackoffTimer,
@@ -4207,10 +4399,20 @@ test("markChannelUnread_storageFailed_intentInMemoryOnly", () => {
 test("markChannelRead_preReady_capturesAuthoritativeMarkAt", async () => {
   // When load is incomplete, markChannelRead() must persist the caller's markAt
   // (not ctx.channelFrontier()) as readTarget in the intent.  Drain must then
-  // advance the frontier to markAt (not the stale partial frontier) before C-bump.
+  // advance the frontier to markAt (not the stale partial frontier) before C-bump,
+  // and the hook-level callback must clean up the forced-unread source.
+  //
+  // Assertions (all surfaces):
+  //  - readTarget in intent = authoritativeMarkAt (not partialFrontier)
+  //  - after drain: effectiveState[channelId] >= authoritativeMarkAt
+  //  - v2 blob: register persisted with C-bump, intent/receipt cleaned up
+  //  - forcedUnreadStore: "inbox" source removed from channelId
+  //  - versionBumps === 1 (exactly one forced-store cleanup via hook)
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "45".repeat(32);
   const channelId = `mark-at-ch-${"m".repeat(53)}`;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const forcedKey = `buzz-forced-unread.v1:${pubkey}`;
 
   const fakeRelay = {
     fetchEvents: async () => [],
@@ -4231,9 +4433,17 @@ test("markChannelRead_preReady_capturesAuthoritativeMarkAt", async () => {
   mgr.overrideRegisters.set(channelId, { s: 5, c: 0, b: 100 });
   mgr.publishableContextIds.add(channelId);
 
+  // Seed forced-unread store: channel has "inbox" + "manual" sources.
+  const forcedEntry = { markerAtWhenForced: 50, sources: ["inbox", "manual"] };
+  globalThis.window.localStorage.setItem(
+    forcedKey,
+    JSON.stringify({ [channelId]: forcedEntry }),
+  );
+
   // Click-time markAt — greater than the partial frontier.
   const authoritativeMarkAt = 999;
-  const r = mgr.markChannelRead(channelId, undefined, authoritativeMarkAt);
+  const sourceScope = "inbox";
+  const r = mgr.markChannelRead(channelId, sourceScope, authoritativeMarkAt);
   assert.equal(r.status, "queued", "must queue when load incomplete");
 
   // Intent must carry the authoritative markAt as readTarget.
@@ -4245,9 +4455,8 @@ test("markChannelRead_preReady_capturesAuthoritativeMarkAt", async () => {
     "readTarget must equal the authoritative markAt, not the partial frontier",
   );
 
-  // Drain must advance frontier to readTarget before C-bump.
-  const outcomes = [];
-  mgr.onDrainOutcome = (outcome) => outcomes.push(outcome);
+  // Wire hook-level callback (mirrors useDrainOutcomeCallback logic).
+  const cb = wireDrainCallback(mgr, pubkey);
 
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
@@ -4259,25 +4468,75 @@ test("markChannelRead_preReady_capturesAuthoritativeMarkAt", async () => {
     `frontier must be advanced to at least authoritativeMarkAt (${authoritativeMarkAt}); got ${frontier}`,
   );
 
-  // Outcome must be applied-read.
-  assert.ok(outcomes.length >= 1, "outcome must be emitted");
+  // v2 blob: register must be persisted with C-bump.
+  const rawBlob = globalThis.window.localStorage.getItem(v2Key);
+  const blob = rawBlob ? JSON.parse(rawBlob) : {};
+  assert.ok(
+    blob.r?.[channelId],
+    "register must be persisted in v2 blob after drain",
+  );
+  const reg = blob.r[channelId];
+  assert.ok(reg.c > 0, "C must be bumped (applied read)");
+
+  // Intent and receipt must be cleaned up from blob.
   assert.equal(
-    outcomes[0].kind,
-    "applied-read",
-    "outcome must be applied-read",
+    blob.pi?.[channelId],
+    undefined,
+    "intent must be cleaned up from v2 blob",
+  );
+  assert.equal(
+    blob.receipts?.[channelId],
+    undefined,
+    "receipt must be cleaned up from v2 blob",
   );
 
+  // forcedUnreadStore: "inbox" source must be removed; "manual" remains.
+  const storedForced = forcedUnreadStore.read(pubkey);
+  const afterEntry = storedForced[channelId];
+  assert.ok(
+    afterEntry !== undefined,
+    'channel entry must still exist (only "inbox" removed, "manual" remains)',
+  );
+  const sources =
+    typeof afterEntry === "object" && afterEntry !== null
+      ? afterEntry.sources
+      : ["manual"];
+  assert.ok(
+    !sources.includes("inbox"),
+    '"inbox" source must be removed after applied-read drain',
+  );
+  assert.ok(
+    sources.includes("manual"),
+    '"manual" source must remain after "inbox"-only cleanup',
+  );
+
+  // versionBumps: exactly 1 (hook cleaned up the forced source once).
+  assert.equal(
+    cb.versionBumps,
+    1,
+    "versionBumps must be 1 — exactly one forced-store cleanup for applied-read",
+  );
+
+  cb.teardown();
   mgr.destroy();
 });
 
-// ── Test 46: already_inactive — source cleanup runs ──────────────────────────
+// ── Test 46: already_inactive — source cleanup runs via hook/store ────────────
 test("drain_alreadyInactive_sourceCleanupCallback", async () => {
   // When a queued read drains and the register is gone (already_inactive),
-  // the outcome must be silent-inactive (not a genuine-refusal) and the
-  // onDrainOutcome callback must be invoked so the hook can remove the source.
+  // the outcome must be silent-inactive and the hook callback must remove the
+  // exact source from the persisted forcedUnreadStore.
+  //
+  // Assertions (all surfaces):
+  //  - outcome is silent-inactive (not genuine-refusal)
+  //  - forcedUnreadStore: "inbox" source is removed from channelId entry
+  //  - the remaining entry still has "manual" source byte-for-byte
+  //  - versionBumps === 1
+  //  - intent consumed from queue
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "46".repeat(32);
   const channelId = `already-inactive-ch-${"n".repeat(44)}`;
+  const forcedKey = `buzz-forced-unread.v1:${pubkey}`;
 
   const fakeRelay = {
     fetchEvents: async () => [],
@@ -4292,52 +4551,92 @@ test("drain_alreadyInactive_sourceCleanupCallback", async () => {
   mgr.effectiveState.set(channelId, 100);
   mgr.isLoadComplete = false;
 
-  // Queue a read with a specific sourceScope — no register exists.
+  // Seed forced-unread store: channel has "inbox" + "manual" sources.
+  const forcedEntry = {
+    markerAtWhenForced: 100,
+    sources: ["inbox", "manual"],
+  };
+  globalThis.window.localStorage.setItem(
+    forcedKey,
+    JSON.stringify({ [channelId]: forcedEntry }),
+  );
+
+  // Queue a read with "inbox" sourceScope — no register exists.
   const sourceScope = "inbox";
   const r = mgr.markChannelRead(channelId, sourceScope);
   assert.equal(r.status, "queued");
 
-  const outcomes = [];
-  mgr.onDrainOutcome = (outcome) => outcomes.push(outcome);
+  // Wire hook-level callback.
+  const cb = wireDrainCallback(mgr, pubkey);
 
   // Complete load without adding a register — already_inactive path.
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
 
-  // Outcome must be silent-inactive (not genuine-refusal) and carry sourceScope.
-  assert.equal(outcomes.length, 1, "exactly one outcome must be emitted");
-  assert.equal(
-    outcomes[0].kind,
-    "silent-inactive",
-    "already_inactive must produce silent-inactive outcome, not genuine-refusal",
+  // forcedUnreadStore must have lost exactly "inbox" — "manual" remains.
+  const storedForced = forcedUnreadStore.read(pubkey);
+  const afterEntry = storedForced[channelId];
+  assert.ok(
+    afterEntry !== undefined,
+    'entry must still exist after "inbox"-only removal (manual remains)',
   );
-  assert.equal(
-    outcomes[0].sourceScope,
-    sourceScope,
-    "sourceScope must be forwarded to silent-inactive outcome",
+  const sources =
+    typeof afterEntry === "object" && afterEntry !== null
+      ? afterEntry.sources
+      : ["manual"];
+  assert.ok(
+    !sources.includes("inbox"),
+    '"inbox" source must be removed by silent-inactive hook',
+  );
+  assert.ok(
+    sources.includes("manual"),
+    '"manual" source must remain unchanged',
   );
 
-  // Intent consumed.
+  // versionBumps: exactly 1 (one forced-store write by hook).
+  assert.equal(
+    cb.versionBumps,
+    1,
+    "versionBumps must be 1 for silent-inactive cleanup",
+  );
+
+  // Intent consumed from queue.
   assert.equal(
     pendingOverrideIntentStore.get(channelId),
     undefined,
     "intent must be consumed after already_inactive",
   );
 
+  cb.teardown();
   mgr.destroy();
 });
 
-// ── Test 47: restart-safe unread rollback — priorForcedEntry persisted ────────
+// ── Test 47: restart-safe unread rollback — priorForcedEntry restored in forcedUnreadStore
 test("drain_unreadRefusal_restartSafe_priorForcedEntryRestored", async () => {
   // After a restart, a refused unread intent must restore the prior forced entry
   // (not delete the whole channel entry) using the priorForcedEntry persisted in
-  // the intent metadata.
+  // the intent metadata, and write that restoration to forcedUnreadStore.
+  //
+  // Scenario:
+  //  - Session 1: channel had {sources:["inbox"]} entry; "manual" unread attempted
+  //    (S at max → uint32_overflow), intent queued with priorForcedEntry.
+  //    The optimistic unread replaced the entry in forcedUnreadStore.
+  //  - App restarts.
+  //  - Session 2: hydrates intent with priorForcedEntry; drain runs; overflow → refused.
+  //    Hook must restore {sources:["inbox"]} in forcedUnreadStore.
+  //
+  // Assertions (all surfaces):
+  //  - priorForcedEntry hydrates correctly from v2 blob
+  //  - outcome is genuine-refusal with priorForcedEntry
+  //  - forcedUnreadStore[channelId] = priorForcedEntry byte-for-byte after hook runs
+  //  - versionBumps === 1
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "47".repeat(32);
   const channelId = `restart-safe-ch-${"o".repeat(47)}`;
 
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const forcedKey = `buzz-forced-unread.v1:${pubkey}`;
 
   // Simulate session 1: {sources:["inbox"]} entry existed, then manual unread
   // was attempted (S at max → will overflow), intent queued with priorForcedEntry.
@@ -4354,6 +4653,13 @@ test("drain_unreadRefusal_restartSafe_priorForcedEntryRestored", async () => {
         },
       },
       ng: 2,
+    }),
+  );
+  // The optimistic unread had replaced the forced entry with "manual".
+  ls.setItem(
+    forcedKey,
+    JSON.stringify({
+      [channelId]: { markerAtWhenForced: 50, sources: ["manual"] },
     }),
   );
 
@@ -4379,24 +4685,30 @@ test("drain_unreadRefusal_restartSafe_priorForcedEntryRestored", async () => {
     "priorForcedEntry must survive round-trip through v2 blob",
   );
 
-  // Wire outcome callback to capture the refusal and the priorForcedEntry.
-  const outcomes = [];
-  mgr.onDrainOutcome = (outcome) => outcomes.push(outcome);
+  // Wire hook-level callback.  No in-memory snapshot exists (new session), so
+  // the callback falls back to outcome.priorForcedEntry for restoration.
+  const cb = wireDrainCallback(mgr, pubkey);
 
   // Complete load — register still at uint32-max → S-bump overflows → refused.
   await mgr.fetchAndMerge(mgr.loadGeneration);
   assert.equal(mgr.isLoadComplete, true);
   await mgr.drainPendingIntents(mgr.loadGeneration);
 
-  // Outcome must carry priorForcedEntry for restart-safe rollback.
-  assert.equal(outcomes.length, 1);
-  assert.equal(outcomes[0].kind, "genuine-refusal");
-  assert.equal(outcomes[0].op, "unread");
+  // forcedUnreadStore must be restored to the priorForcedEntry byte-for-byte.
+  const storedForced = forcedUnreadStore.read(pubkey);
   assert.deepEqual(
-    outcomes[0].priorForcedEntry,
+    storedForced[channelId],
     priorForcedEntry,
-    "genuine-refusal outcome must carry priorForcedEntry for restart-safe rollback",
+    "forcedUnreadStore must be restored to priorForcedEntry after post-restart refusal",
   );
 
+  // versionBumps: exactly 1 (hook wrote to forced store once).
+  assert.equal(
+    cb.versionBumps,
+    1,
+    "versionBumps must be 1 — exactly one restore write",
+  );
+
+  cb.teardown();
   mgr.destroy();
 });

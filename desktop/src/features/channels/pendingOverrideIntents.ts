@@ -30,6 +30,14 @@
  * • **Identity swap** (plan phase 1):
  *   `restoreFromStorage` replaces the in-memory map with the stored data.
  *   Old pubkey data is NOT wiped from the v2 blob — the manager owns that.
+ *
+ * • **Non-reentrant drain transaction** (round-4 ruling):
+ *   While the drain is processing channel X (beginTransaction → commitTransaction),
+ *   any `enqueue()` for X is buffered rather than applied immediately.  On
+ *   `commitTransaction` the buffer is flushed as the new queue entry.  This
+ *   prevents a generation change from occurring inside the drain's transaction
+ *   window (between the gen check and the cleanup commit), making the Amendment A
+ *   fence hold structurally rather than by post-callback compensation.
  */
 
 import type { ForcedUnreadEntry } from "@/features/channels/forcedUnreadStore";
@@ -77,10 +85,32 @@ export type PendingIntent = {
  *
  * Persistence is exclusively through the manager's `persistLocalState()` which
  * serialises the in-memory map into the v2 blob's `pendingIntents` sub-object.
+ *
+ * ### Drain transaction latch
+ * The drain calls `beginTransaction(channelId)` before processing a channel and
+ * `commitTransaction(channelId)` after the cleanup commit (or abort).  While a
+ * transaction is open, `enqueue()` for that channel buffers the intent instead
+ * of applying it immediately.  `commitTransaction` flushes the buffer as the
+ * new queue entry, so it becomes visible for the *next* drain pass.
+ *
+ * This ensures no generation change can occur between the gen check and the
+ * cleanup commit — the Amendment A fence holds structurally.
  */
 export class PendingOverrideIntentStore {
   private _nextGen = 1;
   private intents = new Map<string, PendingIntent>();
+  /** Channels currently inside a drain transaction. */
+  private lockedChannels = new Set<string>();
+  /** Buffered enqueues for locked channels (last-write-wins, same as live enqueue). */
+  private deferredEnqueues = new Map<
+    string,
+    {
+      op: PendingIntentOp;
+      sourceScope?: string;
+      readTarget?: number;
+      priorForcedEntry?: ForcedUnreadEntry;
+    }
+  >();
 
   /**
    * Restore in-memory state from deserialized storage (called by manager
@@ -101,6 +131,12 @@ export class PendingOverrideIntentStore {
    * The generation is monotonically increasing per-channel-session, making
    * every intent distinguishable from predecessors.
    *
+   * **If `channelId` is currently inside a drain transaction** (between
+   * `beginTransaction` and `commitTransaction`), the intent is buffered and
+   * will be applied as the queue entry when `commitTransaction` is called.
+   * The method still returns a synthetic intent object reflecting the buffered
+   * parameters; callers that just check `status: "queued"` need not change.
+   *
    * Does NOT persist — the caller (drain or manager) calls persistLocalState().
    */
   enqueue(
@@ -110,6 +146,24 @@ export class PendingOverrideIntentStore {
     readTarget?: number,
     priorForcedEntry?: ForcedUnreadEntry,
   ): PendingIntent {
+    if (this.lockedChannels.has(channelId)) {
+      // Channel is in a drain transaction — buffer the enqueue.
+      this.deferredEnqueues.set(channelId, {
+        op,
+        ...(sourceScope !== undefined ? { sourceScope } : {}),
+        ...(readTarget !== undefined ? { readTarget } : {}),
+        ...(priorForcedEntry !== undefined ? { priorForcedEntry } : {}),
+      });
+      // Return a synthetic placeholder — gen will be assigned on commitTransaction.
+      // Callers checking status="queued" are unaffected; they do not inspect gen.
+      return {
+        gen: -1, // placeholder; replaced on flush
+        op,
+        ...(sourceScope !== undefined ? { sourceScope } : {}),
+        ...(readTarget !== undefined ? { readTarget } : {}),
+        ...(priorForcedEntry !== undefined ? { priorForcedEntry } : {}),
+      };
+    }
     const gen = this._nextGen++;
     const intent: PendingIntent = {
       gen,
@@ -120,6 +174,46 @@ export class PendingOverrideIntentStore {
     };
     this.intents.set(channelId, intent);
     return intent;
+  }
+
+  /**
+   * Open a drain transaction for `channelId`.
+   * While open, `enqueue()` for this channel buffers rather than applying.
+   * Must be paired with exactly one `commitTransaction(channelId)` call.
+   */
+  beginTransaction(channelId: string): void {
+    this.lockedChannels.add(channelId);
+  }
+
+  /**
+   * Close a drain transaction for `channelId` and flush any buffered enqueue.
+   *
+   * If an enqueue was buffered during the transaction, it is applied now with a
+   * fresh generation — it becomes the active queue entry for the next drain pass.
+   * Calling `persistLocalState()` after this method captures the flushed intent.
+   *
+   * Safe to call even if no transaction was open (idempotent unlock).
+   */
+  commitTransaction(channelId: string): void {
+    this.lockedChannels.delete(channelId);
+    const deferred = this.deferredEnqueues.get(channelId);
+    if (deferred === undefined) return;
+    this.deferredEnqueues.delete(channelId);
+    const gen = this._nextGen++;
+    const intent: PendingIntent = {
+      gen,
+      op: deferred.op,
+      ...(deferred.sourceScope !== undefined
+        ? { sourceScope: deferred.sourceScope }
+        : {}),
+      ...(deferred.readTarget !== undefined
+        ? { readTarget: deferred.readTarget }
+        : {}),
+      ...(deferred.priorForcedEntry !== undefined
+        ? { priorForcedEntry: deferred.priorForcedEntry }
+        : {}),
+    };
+    this.intents.set(channelId, intent);
   }
 
   /**

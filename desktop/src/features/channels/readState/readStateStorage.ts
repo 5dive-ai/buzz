@@ -15,7 +15,17 @@ import type {
   PendingIntent,
   PendingIntentOp,
 } from "@/features/channels/pendingOverrideIntents";
-import type { ForcedUnreadEntry } from "@/features/channels/forcedUnreadStore";
+import type {
+  ForcedUnreadEntry,
+  ForcedUnreadSource,
+} from "@/features/channels/forcedUnreadStore";
+
+/**
+ * Maximum valid protocol timestamp (unix seconds): uint32 ceiling (year 2106).
+ * Matches the limit used for override counters so a stored readTarget that
+ * overflows uint32 is silently rejected before it can reach Date.toISOString().
+ */
+const MAX_PROTOCOL_TIMESTAMP = 0xffffffff;
 
 export type StoredReadState = {
   contexts: Map<string, number>;
@@ -163,6 +173,53 @@ type OverrideStateBlob = {
   nextGen: number;
 };
 
+/**
+ * Parse and validate a raw JSON value as a `ForcedUnreadEntry`.
+ *
+ * Returns the validated entry on success, `null` if the value is present but
+ * malformed (caller should reject the whole intent), or `undefined` if the
+ * value is `undefined` (absent field — no prior entry).
+ *
+ * Valid shapes (matching the `ForcedUnreadEntry` union):
+ *  - `number`                                        — legacy v1 scalar marker
+ *  - `null`                                          — legacy v1 null marker
+ *  - `{ markerAtWhenForced: number | null, sources: ForcedUnreadSource[] }`
+ */
+function parseForcedUnreadEntry(
+  raw: unknown,
+): ForcedUnreadEntry | null | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  if (typeof raw === "number") {
+    if (Number.isFinite(raw) && raw >= 0 && raw <= MAX_PROTOCOL_TIMESTAMP)
+      return raw;
+    return null; // invalid numeric marker
+  }
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    const obj = raw as Record<string, unknown>;
+    const marker = obj.markerAtWhenForced;
+    if (
+      marker !== null &&
+      (typeof marker !== "number" ||
+        !Number.isFinite(marker) ||
+        marker < 0 ||
+        marker > MAX_PROTOCOL_TIMESTAMP)
+    )
+      return null;
+    const sources = obj.sources;
+    if (!Array.isArray(sources)) return null;
+    const validSources: ForcedUnreadSource[] = sources.filter(
+      (s): s is ForcedUnreadSource => s === "inbox" || s === "manual",
+    );
+    if (validSources.length === 0) return null;
+    return {
+      markerAtWhenForced: (marker as number | null) ?? null,
+      sources: validSources,
+    };
+  }
+  return null; // unrecognised shape
+}
+
 function readOverrideState(pubkey: string): OverrideStateBlob {
   const registers = new Map<string, StoredOverrideEntry>();
   const receipts = new Map<string, AppliedReceipt>();
@@ -233,19 +290,37 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
             if (typeof gen !== "number" || !Number.isInteger(gen) || gen < 1)
               continue;
             if (op !== "unread" && op !== "read") continue;
-            if (sourceScope !== undefined && typeof sourceScope !== "string")
+            // sourceScope must be a valid ForcedUnreadSource or absent.
+            if (
+              sourceScope !== undefined &&
+              sourceScope !== "inbox" &&
+              sourceScope !== "manual"
+            )
               continue;
-            if (readTarget !== undefined && typeof readTarget !== "number")
+            // readTarget must be a finite integer in protocol timestamp range.
+            if (readTarget !== undefined) {
+              if (
+                typeof readTarget !== "number" ||
+                !Number.isFinite(readTarget) ||
+                !Number.isInteger(readTarget) ||
+                readTarget < 0 ||
+                readTarget > MAX_PROTOCOL_TIMESTAMP
+              )
+                continue;
+            }
+            // priorForcedEntry must be a valid ForcedUnreadEntry or absent.
+            const parsedPrior = parseForcedUnreadEntry(priorForcedEntry);
+            if (priorForcedEntry !== undefined && parsedPrior === null)
               continue;
             const intent: PendingIntent = {
               gen,
               op,
-              ...(sourceScope !== undefined ? { sourceScope } : {}),
+              ...(sourceScope !== undefined
+                ? { sourceScope: sourceScope as string }
+                : {}),
               ...(readTarget !== undefined ? { readTarget } : {}),
-              // priorForcedEntry is stored as-is (number | null | object);
-              // accept any JSON-round-trippable value — type-check at use site.
-              ...(priorForcedEntry !== undefined
-                ? { priorForcedEntry: priorForcedEntry as ForcedUnreadEntry }
+              ...(parsedPrior !== undefined
+                ? { priorForcedEntry: parsedPrior }
                 : {}),
             };
             pendingIntents.set(channelId, intent);

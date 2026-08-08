@@ -152,11 +152,15 @@ export function createDrainContext(mgr: ManagerInternals): DrainContext {
  *  1. Capture — snapshot intent (op, gen, sourceScope, readTarget) and pubkey fence.
  *  2. Replay — perform the register action against the complete-load state.
  *             For applied: co-commit register + receipt atomically (Amendment C).
- *  3. Re-check (Amendment A whole-transaction fence) — compare captured gen
- *     against current queue gen under the store owner.
- *     - Gen unchanged → commit (Amendment B order):
+ *  3. Transaction gate (Amendment A) — the drain holds a per-channel transaction
+ *     latch from before the gen check through the cleanup commit.  Any enqueue()
+ *     for channel X inside this window is buffered, not applied.  The buffer is
+ *     flushed on commitTransaction() so it drains in the next pass.  Because the
+ *     generation cannot change inside the window, no post-callback re-check is
+ *     needed and no rollback is required.
+ *     - Gen unchanged at capture time → commit (Amendment B order):
  *         source cleanup (idempotent), compare-and-delete intent.
- *     - Gen changed → zero local effects; published action stands as CRDT race.
+ *     - loadGeneration changed (identity swap / destroy) → break loop.
  */
 export async function drainPendingIntents(
   ctx: DrainContext,
@@ -183,150 +187,134 @@ export async function drainPendingIntents(
     // Pubkey fence: abort if identity changed mid-drain.
     if (capturedPubkey !== ctx.pubkey) break;
 
-    // Amendment C hydration rule: matching receipt → already applied, skip replay.
-    const existingReceipt = ctx.appliedReceipts.get(channelId);
-    const alreadyApplied =
-      existingReceipt !== undefined &&
-      existingReceipt.intentGen === capturedGen &&
-      existingReceipt.op === capturedOp;
+    // Open drain transaction — any enqueue() for this channel during the
+    // remainder of this iteration is buffered until commitTransaction().
+    pendingOverrideIntentStore.beginTransaction(channelId);
 
-    // Snapshot in-memory state before replay so we can roll back on gen-changed.
-    const prevReg = ctx.overrideRegisters.get(channelId);
-    const prevReceipt = ctx.appliedReceipts.get(channelId);
-    const wasPublishable = ctx.publishableContextIds.has(channelId);
-    const prevExtraSlotIds = ctx.extraSlotIds.slice();
+    try {
+      // Amendment C hydration rule: matching receipt → already applied, skip replay.
+      const existingReceipt = ctx.appliedReceipts.get(channelId);
+      const alreadyApplied =
+        existingReceipt !== undefined &&
+        existingReceipt.intentGen === capturedGen &&
+        existingReceipt.op === capturedOp;
 
-    let replayResult: MarkResult;
+      // Snapshot in-memory register state before replay for step-1 rollback on
+      // storage failure.  (The frontier advance from markContextRead is monotone
+      // and safe to leave; only register+receipt+publishable+extraSlots need undo.)
+      const prevReg = ctx.overrideRegisters.get(channelId);
+      const wasPublishable = ctx.publishableContextIds.has(channelId);
+      const prevExtraSlotIds = ctx.extraSlotIds.slice();
 
-    if (alreadyApplied) {
-      // Receipt proves application — no re-bump (Amendment C hydration rule).
-      replayResult = { status: "applied" };
-    } else {
-      // Replay the register action against the complete-load state.
-      replayResult =
-        capturedOp === "unread"
-          ? markChannelUnreadDirect(ctx, channelId, capturedGen, capturedOp)
-          : markChannelReadDirect(
-              ctx,
-              channelId,
-              capturedGen,
-              capturedOp,
-              capturedReadTarget,
-            );
-    }
+      let replayResult: MarkResult;
 
-    // Amendment A whole-transaction fence: re-check gen under store owner.
-    const currentIntent = pendingOverrideIntentStore.get(channelId);
-    const genUnchanged =
-      currentIntent !== undefined && currentIntent.gen === capturedGen;
+      if (alreadyApplied) {
+        // Receipt proves application — no re-bump (Amendment C hydration rule).
+        replayResult = { status: "applied" };
+      } else {
+        // Replay the register action against the complete-load state.
+        replayResult =
+          capturedOp === "unread"
+            ? markChannelUnreadDirect(ctx, channelId, capturedGen, capturedOp)
+            : markChannelReadDirect(
+                ctx,
+                channelId,
+                capturedGen,
+                capturedOp,
+                capturedReadTarget,
+              );
+      }
 
-    if (!genUnchanged) {
-      // Gen changed — zero local effects; roll back any in-memory mutations.
-      if (prevReg === undefined) ctx.overrideRegisters.delete(channelId);
-      else ctx.overrideRegisters.set(channelId, prevReg);
-      if (prevReceipt === undefined) ctx.appliedReceipts.delete(channelId);
-      else ctx.appliedReceipts.set(channelId, prevReceipt);
-      if (!wasPublishable) ctx.publishableContextIds.delete(channelId);
-      ctx.restoreExtraSlotIds(prevExtraSlotIds);
-      continue;
-    }
+      // Gen unchanged at capture time (transaction latch prevents any enqueue
+      // from changing the gen; loadGeneration guard above catches identity swap).
+      // Proceed to commit local effects (Amendment B+C order).
 
-    // Gen unchanged — commit local effects (Amendment B+C order).
+      // Step 1: atomic register+receipt commit (Amendment C).
+      // For already-applied, register is durable; skip persist, proceed to cleanup.
+      if (!alreadyApplied && replayResult.status === "applied") {
+        if (!ctx.persistLocalState()) {
+          // Storage failure — roll back register+receipt+publishable+extraSlots,
+          // keep intent alive for next drain.
+          // The frontier advance from markContextRead (read path) is idempotent
+          // and safe to leave in-memory; it will be re-persisted on the next
+          // successful persistLocalState() call.
+          if (prevReg === undefined) ctx.overrideRegisters.delete(channelId);
+          else ctx.overrideRegisters.set(channelId, prevReg);
+          ctx.appliedReceipts.delete(channelId);
+          if (!wasPublishable) ctx.publishableContextIds.delete(channelId);
+          ctx.restoreExtraSlotIds(prevExtraSlotIds);
+          continue; // skip to commitTransaction in finally
+        }
+        ctx.schedulePublish();
+      }
 
-    // Step 1: atomic register+receipt commit (Amendment C).
-    // For already-applied, register is durable; skip persist, proceed to cleanup.
-    if (!alreadyApplied && replayResult.status === "applied") {
+      // Step 2: surface outcomes — toast genuine refusals, route to hook callback.
+      // Build the typed outcome before invoking the callback so the callback
+      // receives a single structured value (exhaustive switch at call site).
+      // `already_inactive` is modelled as silent successful read so source
+      // cleanup still runs.
+      let outcome: DrainOutcome | null = null;
+      if (replayResult.status === "refused") {
+        const reason = replayResult.reason;
+        if (reason === "already_inactive") {
+          // Silent definitive success — override was already gone, but any
+          // forced-entry source must still be removed exactly.
+          outcome = {
+            kind: "silent-inactive",
+            channelId,
+            sourceScope: capturedSourceScope,
+          };
+        } else if (reason !== "load_incomplete") {
+          // Genuine refusal (uint32_overflow, budget_exhausted, storage_failed):
+          // show toast and surface to hook for forced-entry rollback.
+          const msg = toastForDrainRefusal(capturedOp, reason);
+          if (msg) toast.error(msg);
+          outcome = {
+            kind: "genuine-refusal",
+            channelId,
+            op: capturedOp,
+            reason,
+            ...(capturedOp === "unread" &&
+            capturedPriorForcedEntry !== undefined
+              ? { priorForcedEntry: capturedPriorForcedEntry }
+              : {}),
+          };
+        }
+        // load_incomplete: never reaches the user; no outcome emitted.
+      } else if (replayResult.status === "applied") {
+        outcome =
+          capturedOp === "unread"
+            ? { kind: "applied-unread", channelId }
+            : {
+                kind: "applied-read",
+                channelId,
+                sourceScope: capturedSourceScope,
+              };
+      }
+
+      // Fire the typed callback.
+      // The transaction latch ensures no enqueue() for this channel can change
+      // the generation inside this callback — Amendment A holds structurally.
+      if (outcome !== null && ctx.onDrainOutcome !== null) {
+        ctx.onDrainOutcome(outcome);
+      }
+
+      // Step 3: atomic cleanup commit — delete receipt + compare-and-delete intent.
+      ctx.appliedReceipts.delete(channelId);
+      pendingOverrideIntentStore.compareAndDelete(channelId, capturedGen);
       if (!ctx.persistLocalState()) {
-        // Storage failure — roll back, keep intent alive for next drain.
-        if (prevReg === undefined) ctx.overrideRegisters.delete(channelId);
-        else ctx.overrideRegisters.set(channelId, prevReg);
-        if (prevReceipt === undefined) ctx.appliedReceipts.delete(channelId);
-        else ctx.appliedReceipts.set(channelId, prevReceipt);
-        if (!wasPublishable) ctx.publishableContextIds.delete(channelId);
-        ctx.restoreExtraSlotIds(prevExtraSlotIds);
-        continue;
+        // Best-effort: register already committed. Orphaned receipt swept on restart.
+        console.warn(
+          `[ReadStateManager] drain: cleanup commit failed for ${channelId}`,
+        );
       }
-      ctx.schedulePublish();
+      ctx.notifyListeners();
+    } finally {
+      // Always release the transaction latch — flush any deferred enqueue.
+      // If an enqueue was buffered during this iteration, it becomes the new
+      // queue entry and will be drained in the next pass.
+      pendingOverrideIntentStore.commitTransaction(channelId);
     }
-
-    // Step 2: surface outcomes — toast genuine refusals, route to hook callback.
-    // Build the typed outcome before invoking the callback so the callback
-    // receives a single structured value (exhaustive switch at call site).
-    // `already_inactive` is modelled as silent successful read so source
-    // cleanup still runs (fix for pass-2 finding 2).
-    let outcome: DrainOutcome | null = null;
-    if (replayResult.status === "refused") {
-      const reason = replayResult.reason;
-      if (reason === "already_inactive") {
-        // Silent definitive success — override was already gone, but any
-        // forced-entry source must still be removed exactly.
-        outcome = {
-          kind: "silent-inactive",
-          channelId,
-          sourceScope: capturedSourceScope,
-        };
-      } else if (reason !== "load_incomplete") {
-        // Genuine refusal (uint32_overflow, budget_exhausted, storage_failed):
-        // show toast and surface to hook for forced-entry rollback.
-        const msg = toastForDrainRefusal(capturedOp, reason);
-        if (msg) toast.error(msg);
-        outcome = {
-          kind: "genuine-refusal",
-          channelId,
-          op: capturedOp,
-          reason,
-          ...(capturedOp === "unread" && capturedPriorForcedEntry !== undefined
-            ? { priorForcedEntry: capturedPriorForcedEntry }
-            : {}),
-        };
-      }
-      // load_incomplete: never reaches the user; no outcome emitted.
-    } else if (replayResult.status === "applied") {
-      outcome =
-        capturedOp === "unread"
-          ? { kind: "applied-unread", channelId }
-          : {
-              kind: "applied-read",
-              channelId,
-              sourceScope: capturedSourceScope,
-            };
-    }
-
-    // Fire the typed callback.  After the callback re-check generation to
-    // detect a newer intent enqueued inside the callback (Amendment A
-    // non-reentrant fence, fix for pass-2 finding 5).
-    if (outcome !== null && ctx.onDrainOutcome !== null) {
-      ctx.onDrainOutcome(outcome);
-      // Re-check: if gen changed inside the callback, roll back all local
-      // effects from this drain step — zero effects for the stale intent.
-      const postCallbackIntent = pendingOverrideIntentStore.get(channelId);
-      if (
-        postCallbackIntent === undefined ||
-        postCallbackIntent.gen !== capturedGen
-      ) {
-        // Gen changed during callback — roll back.
-        if (prevReg === undefined) ctx.overrideRegisters.delete(channelId);
-        else ctx.overrideRegisters.set(channelId, prevReg);
-        if (prevReceipt === undefined) ctx.appliedReceipts.delete(channelId);
-        else ctx.appliedReceipts.set(channelId, prevReceipt);
-        if (!wasPublishable) ctx.publishableContextIds.delete(channelId);
-        ctx.restoreExtraSlotIds(prevExtraSlotIds);
-        // Leave the newer intent untouched — it will be drained in a fresh pass.
-        ctx.notifyListeners();
-        continue;
-      }
-    }
-
-    // Step 3: atomic cleanup commit — delete receipt + compare-and-delete intent.
-    ctx.appliedReceipts.delete(channelId);
-    pendingOverrideIntentStore.compareAndDelete(channelId, capturedGen);
-    if (!ctx.persistLocalState()) {
-      // Best-effort: register already committed. Orphaned receipt swept on restart.
-      console.warn(
-        `[ReadStateManager] drain: cleanup commit failed for ${channelId}`,
-      );
-    }
-    ctx.notifyListeners();
   }
 }
 

@@ -408,3 +408,134 @@ test.describe("edit agent dialog", () => {
     );
   });
 });
+
+test.describe("merged dialog — team-linked and D+I wiring", () => {
+  const TEAM_PERSONA_ID = "persona-team-e2e";
+  const TEAM_AGENT_PUBKEY = TEST_IDENTITIES.tyler.pubkey;
+  const TEAM_AGENT_NAME = "Tyler Agent";
+
+  test("team-linked instance: D-fields render disabled in the merged dialog", async ({
+    page,
+  }) => {
+    // Seed a team-managed persona so the merged dialog shows D-fields as read-only.
+    await installMockBridge(page, {
+      managedAgents: [
+        {
+          pubkey: TEAM_AGENT_PUBKEY,
+          name: TEAM_AGENT_NAME,
+          personaId: TEAM_PERSONA_ID,
+          status: "stopped",
+          channelNames: ["agents"],
+        },
+      ],
+      personas: [
+        {
+          id: TEAM_PERSONA_ID,
+          displayName: "Team Bot",
+          systemPrompt: "Team-managed agent.",
+          sourceTeam: "team-acme",
+        },
+      ],
+    });
+
+    await page.goto("/");
+    await page.getByTestId("open-agents-view").click();
+
+    const agentButton = page.getByRole("button", {
+      name: "Team Bot agent profile",
+    });
+    await expect(agentButton).toBeVisible({ timeout: 10_000 });
+    await agentButton.click();
+
+    await expect(page.getByTestId("user-profile-panel")).toBeVisible({
+      timeout: 10_000,
+    });
+    await page.getByTestId("user-profile-edit-agent").click();
+
+    await expect(page.getByTestId("edit-agent-dialog")).toBeVisible({
+      timeout: 10_000,
+    });
+
+    // D-fields must be disabled for team-managed definitions.
+    await expect(page.locator("#edit-agent-display-name")).toBeDisabled();
+    await expect(page.locator("#edit-agent-system-prompt")).toBeDisabled();
+
+    // The "Managed by team X" notice must identify the team.
+    await expect(page.getByTestId("team-managed-notice")).toBeVisible();
+    await expect(page.getByTestId("team-managed-notice")).toContainText(
+      "team-acme",
+    );
+
+    // I-fields (instance name, respond-to) remain editable.
+    await expect(page.locator("#edit-agent-name")).not.toBeDisabled();
+  });
+
+  test("linked agent: edit D-field and I-field, one Save persists both layers", async ({
+    page,
+  }) => {
+    // Seed a persona-linked agent. The merged dialog must write both the
+    // D-layer (persona displayName) and I-layer (instance name) in a single Save.
+    const LINKED_PERSONA_ID = "persona-linked-e2e";
+    const LINKED_PUBKEY = TEST_IDENTITIES.tyler.pubkey;
+
+    await installMockBridge(page, {
+      managedAgents: [
+        {
+          pubkey: LINKED_PUBKEY,
+          name: "Original Instance Name",
+          personaId: LINKED_PERSONA_ID,
+          status: "stopped",
+          channelNames: ["agents"],
+        },
+      ],
+      personas: [
+        {
+          id: LINKED_PERSONA_ID,
+          displayName: "Original Definition Name",
+          systemPrompt: "Original prompt.",
+        },
+      ],
+    });
+
+    await page.goto("/");
+    await page.getByTestId("open-agents-view").click();
+
+    const agentButton = page.getByRole("button", {
+      name: "Original Definition Name agent profile",
+    });
+    await expect(agentButton).toBeVisible({ timeout: 10_000 });
+    await agentButton.click();
+
+    await expect(page.getByTestId("user-profile-panel")).toBeVisible({
+      timeout: 10_000,
+    });
+    await page.getByTestId("user-profile-edit-agent").click();
+
+    await expect(page.getByTestId("edit-agent-dialog")).toBeVisible({
+      timeout: 10_000,
+    });
+
+    // Edit a D-field (definition display name) and an I-field (instance name)
+    // in the same dialog open.
+    await page.locator("#edit-agent-display-name").fill("Renamed Definition");
+    await page.locator("#edit-agent-name").fill("Renamed Instance");
+
+    // One Save click — both layers must be persisted.
+    await page.getByTestId("edit-agent-dialog-submit").click();
+    await expect(page.getByTestId("edit-agent-dialog")).not.toBeVisible();
+
+    // Reopen and verify both changes persisted (mock bridge echoes saves to store).
+    await page.getByTestId("user-profile-edit-agent").click();
+    await expect(page.getByTestId("edit-agent-dialog")).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(page.locator("#edit-agent-display-name")).toHaveValue(
+      "Renamed Definition",
+      { timeout: 10_000 },
+    );
+    await expect(page.locator("#edit-agent-name")).toHaveValue(
+      "Renamed Instance",
+      { timeout: 10_000 },
+    );
+  });
+});

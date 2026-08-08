@@ -304,15 +304,11 @@ export function UserProfilePanel({
   // Does THIS desktop hold the agent's seckey (or is this an editable persona)?
   // Gates edit (which needs the key) and grants owner access when managed locally.
   const isOwner = resolvedPersona ? true : managedAgentOwner;
-  // Is the viewer the agent's declared owner (NIP-OA `ownerPubkey == me`)? This
-  // is the right signal for viewing owner-scoped data (activity feed, memory):
-  // the relay routes and the client decrypts those frames with the owner's OWN
-  // key, so the agent's seckey is never needed. Computed here (before the gates
-  // that consume it) so visibility keys off declared ownership, not key custody.
+  // Is the viewer the agent's declared owner (NIP-OA `ownerPubkey == me`)?
+  // Visibility keys off declared ownership, not key custody.
   const isCurrentUserOwner = ownsAuthorAgent(profile, currentPubkey);
-  // The viewer may see owner-scoped data if they declared-own the agent OR they
-  // manage it locally (older agents may not advertise an owner pubkey). Every
-  // real boundary is server-side, so this only controls what UI we paint.
+  // Viewer may see owner-scoped data if declared-owner OR locally managed;
+  // real boundaries are server-side.
   const viewerIsOwner = isCurrentUserOwner || isOwner === true;
 
   const activityAgent = React.useMemo(
@@ -327,9 +323,7 @@ export function UserProfilePanel({
       }),
     [effectivePubkey, isBot, managedAgent, profile, relayAgent, viewerIsOwner],
   );
-  // Observer ingestion (frame decryption + derived active-turn liveness) is
-  // owner-global — mounted once in AppShell via useAgentObserverIngestion —
-  // covering both locally managed agents and declared-owned relay agents.
+  // Observer ingestion is owner-global — mounted once in AppShell.
   const canEditAgent =
     isOwner === true &&
     (managedAgent !== undefined || resolvedPersona !== undefined);
@@ -633,9 +627,7 @@ export function UserProfilePanel({
 
   const handleAddedToChannel = React.useCallback(
     (channel: Channel, result: AttachManagedAgentToChannelResult) => {
-      if (result.started) {
-        toast.success(`Added ${result.agent.name} to ${channel.name}.`);
-      } else if (result.membershipAdded) {
+      if (result.started || result.membershipAdded) {
         toast.success(`Added ${result.agent.name} to ${channel.name}.`);
       } else {
         toast.success(`${result.agent.name} is already in ${channel.name}.`);
@@ -920,10 +912,18 @@ export function UserProfilePanel({
       <AgentEditDialog
         ctx={editCtx}
         initialFocus={editAgentFocus}
+        isIdentityArchived={archiveActions.isArchived === true}
+        linkedInstanceCount={personaInstances.length}
+        onDeleteDefinition={
+          resolvedPersona?.isBuiltIn ? undefined : handleDeletePersona
+        }
         onOpenChange={(next) => {
           setEditAgentOpen(next);
           if (!next) setEditAgentFocus(undefined);
         }}
+        onRemoveFromMyAgents={
+          resolvedPersona?.isBuiltIn ? handleDeletePersona : undefined
+        }
         open={editAgentOpen}
       />
     ) : null;

@@ -384,3 +384,79 @@ test("test_untouched_parallelism_on_linked_agent_emits_no_diff", () => {
   assert.equal(emit.personaInput, null, "untouched parallelism: no D-write");
   assert.equal(emit.agentInput, null, "untouched parallelism: no I-write");
 });
+
+// ── R6 respondTo carry (Thufir pass-2 IMPORTANT-4 regression) ────────────────
+//
+// When an R6 agent-origin owner-review update request carries a `respondTo`
+// change, the coordinator must:
+//   1. Seed the definition-only form model with the overridden value.
+//   2. Emit it through the coordinator as a D-owned field in `personaInput`
+//      (definition-only context: no instance → respondTo goes to D).
+// This tests the pure model chain: seedAgentFormModel + override applied
+// (mirrors AgentEditMergedDialog's useEffect at line 294–297) + emitAgentFormDiff.
+//
+// Production flow:
+//   useAgentManagement.reviewOverrides.respondTo → initialValueOverrides.respondTo
+//   → dialog useEffect seeds setRespondTo → emitAgentFormDiff routes to personaInput.
+
+test("test_r6_respond_to_override_seeds_form_and_emits_through_coordinator", () => {
+  // A definition with current respondTo = null (DB default → "anyone").
+  const definition = makeDefinition({ respondTo: null });
+  const ctx = { kind: "definition-only", definition };
+
+  // Step 1: seed the form model from the definition.
+  const seed = seedAgentFormModel(ctx);
+
+  // Step 2: apply the R6 override (mirrors the dialog's useEffect that sets
+  // respondTo from initialValueOverrides.respondTo).
+  const withOverride = { ...seed, respondTo: "owner-only" };
+
+  // Step 3: emit the diff — the form changed respondTo from the seed value.
+  const emit = emitAgentFormDiff(seed, withOverride, ctx);
+
+  // For definition-only context, respondTo is D-owned → must land in personaInput.
+  assert.ok(
+    emit.personaInput,
+    "R6 respondTo override must produce a personaInput diff",
+  );
+  assert.equal(
+    emit.personaInput.behavior?.respondTo,
+    "owner-only",
+    "personaInput.behavior must carry the agent-requested respondTo",
+  );
+  // No instance in context → agentInput must be null.
+  assert.equal(emit.agentInput, null, "definition-only context: no agentInput");
+});
+
+test("test_r6_respond_to_override_only_no_other_fields_emitted", () => {
+  // A respond-to-only R6 request must NOT dirty any other field.
+  const definition = makeDefinition({
+    displayName: "Research bot",
+    systemPrompt: "Original prompt.",
+    respondTo: "anyone",
+  });
+  const ctx = { kind: "definition-only", definition };
+  const seed = seedAgentFormModel(ctx);
+
+  // Only respondTo changes — all other fields stay at seed values.
+  const withOverride = { ...seed, respondTo: "owner-only" };
+  const emit = emitAgentFormDiff(seed, withOverride, ctx);
+
+  assert.ok(
+    emit.personaInput,
+    "personaInput present for respondTo-only change",
+  );
+  // The personaInput is a full-write snapshot — all definition fields are included.
+  // The display name and system prompt are unchanged from the seed.
+  assert.equal(
+    emit.personaInput.displayName,
+    "Research bot",
+    "displayName carries the unchanged seed value in the full-write snapshot",
+  );
+  assert.equal(
+    emit.personaInput.systemPrompt,
+    "Original prompt.",
+    "systemPrompt carries the unchanged seed value in the full-write snapshot",
+  );
+  assert.equal(emit.personaInput.behavior?.respondTo, "owner-only");
+});

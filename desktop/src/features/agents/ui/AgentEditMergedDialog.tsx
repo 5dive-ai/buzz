@@ -102,6 +102,11 @@ export type AgentEditMergedDialogProps = {
    */
   onRemoveFromMyAgents?: () => void;
   /**
+   * Called to open the share/catalog dialog (row 15 — not shown for built-ins).
+   * When provided, a "Share agent" action renders in the definition admin section.
+   */
+  onShare?: () => void;
+  /**
    * Number of linked instances for blast-radius copy in the delete confirmation.
    * Only relevant when onDeleteDefinition is provided.
    */
@@ -123,6 +128,7 @@ export function AgentEditMergedDialog({
   initialValueOverrides,
   onDeleteDefinition,
   onRemoveFromMyAgents,
+  onShare,
   linkedInstanceCount = 0,
   isIdentityArchived = false,
 }: AgentEditMergedDialogProps) {
@@ -879,7 +885,23 @@ export function AgentEditMergedDialog({
             {/* Definition admin section (Artifact 4) — rendered when a definition exists */}
             {showDef && !defReadOnly && def ? (
               <div className="space-y-2 border-t pt-4">
-                {/* Share action (row 15 — not shown for built-ins) */}
+                {/* Share / catalog publish (row 15 — not shown for built-ins) */}
+                {onShare && !def.isBuiltIn ? (
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-muted-foreground">
+                      Share this agent in the catalog.
+                    </span>
+                    <Button
+                      disabled={isSaving}
+                      onClick={onShare}
+                      type="button"
+                      variant="outline"
+                    >
+                      Share agent
+                    </Button>
+                  </div>
+                ) : null}
+                {/* Custom definition delete with blast-radius copy */}
                 {onDeleteDefinition && !def.isBuiltIn ? (
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-muted-foreground">

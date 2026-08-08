@@ -141,6 +141,41 @@ export type AgentFormModel = {
   startOnAppLaunch: boolean | undefined;
 };
 
+/**
+ * Source-of-truth field ownership map (Artifact 4).
+ *
+ * Every AgentFormModel field is tagged with its FieldOwner. The emit function
+ * (`emitAgentFormDiff`) and the dialog's editability predicates derive their
+ * routing decisions from these ownership assignments — this map is the single
+ * authoritative statement of which layer owns each field.
+ *
+ * Ownership rules per spec rows 9–10:
+ *   respondTo / parallelism — I-owned when an instance is in context;
+ *                              D-owned only in definition-only (zero-instance) context.
+ *   All other D-fields        — always D-owned.
+ */
+export const FIELD_OWNERS: Record<keyof AgentFormModel, FieldOwner> = {
+  // Identity
+  displayName: "definition",
+  avatarUrl: "definition",
+  // Behavior
+  systemPrompt: "definition",
+  respondTo: "instance", // rows 9–10: I when instance present, D in definition-only
+  respondToAllowlist: "instance",
+  parallelism: "instance", // rows 9–10: same contract as respondTo
+  // Runtime — D preferred-id; per-instance env overlay is I
+  runtime: "definition",
+  model: "definition",
+  provider: "definition",
+  envVars: "definition",
+  instanceEnvVars: "instance",
+  namePool: "definition",
+  instanceName: "instance",
+  // Device policy
+  autoRestartOnConfigChange: "local-policy",
+  startOnAppLaunch: "local-policy",
+};
+
 /** Which coordinator outputs changed vs. last saved state. */
 export type AgentFormEmit = {
   /** D-field update payload, present iff a D-field changed AND the definition is editable. */

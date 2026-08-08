@@ -50,6 +50,15 @@ export type AgentEditDialogProps = {
     model: string | undefined;
     respondTo: string | undefined;
   }>;
+  /**
+   * Definition admin actions forwarded to AgentEditMergedDialog (Artifact 4).
+   * Omit when the host does not own those actions.
+   */
+  onDeleteDefinition?: () => void;
+  onRemoveFromMyAgents?: () => void;
+  onShare?: () => void;
+  linkedInstanceCount?: number;
+  isIdentityArchived?: boolean;
 };
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -62,6 +71,11 @@ export function AgentEditDialog({
   onValidate,
   initialValueOverrides,
   initialFocus,
+  onDeleteDefinition,
+  onRemoveFromMyAgents,
+  onShare,
+  linkedInstanceCount,
+  isIdentityArchived,
 }: AgentEditDialogProps) {
   // All contexts route to the merged surface. The run-location provider wraps
   // instance-present paths so RespondToField's remote-backend warning can name
@@ -74,7 +88,12 @@ export function AgentEditDialog({
       ctx={ctx}
       initialFocus={initialFocus}
       initialValueOverrides={initialValueOverrides}
+      isIdentityArchived={isIdentityArchived}
+      linkedInstanceCount={linkedInstanceCount}
+      onDeleteDefinition={onDeleteDefinition}
       onOpenChange={onOpenChange}
+      onRemoveFromMyAgents={onRemoveFromMyAgents}
+      onShare={onShare}
       onUpdated={onUpdated}
       onValidate={onValidate}
       open={open}

@@ -177,7 +177,10 @@ test("AgentEditDialog: definition-only routes to AgentEditMergedDialog (D sectio
   assert.equal(element.props.open, true);
 });
 
-test("AgentEditDialog: AgentInstanceEditDialog is NOT reachable from any R1–R7 context", () => {
+test("AgentEditDialog: all R1–R7 contexts route to AgentEditMergedDialog (AgentInstanceEditDialog deleted)", () => {
+  // AgentInstanceEditDialog was deleted in Phase 1 round 4 (zero production consumers
+  // on any R1–R7 route). This test verifies all contexts produce an AgentEditMergedDialog
+  // at the root of the element tree.
   const contexts = [
     {
       kind: "instance-with-definition",
@@ -191,24 +194,24 @@ test("AgentEditDialog: AgentInstanceEditDialog is NOT reachable from any R1–R7
   for (const ctx of contexts) {
     const element = AgentEditDialog({ ctx, open: true, onOpenChange: noop });
 
-    // Walk the element tree: neither AgentEditDialog nor its children should
-    // be AgentInstanceEditDialog on any R1–R7 route.
-    function findType(el, target) {
+    // Instance contexts are wrapped in AgentRunLocationProvider; definition-only is not.
+    // Either way, the innermost dialog element must be AgentEditMergedDialog.
+    function findMergedDialog(el) {
       if (!el || typeof el !== "object") return false;
-      if (el.type === target) return true;
+      if (el.type === AgentEditMergedDialog) return true;
       if (el.props?.children) {
         const children = Array.isArray(el.props.children)
           ? el.props.children
           : [el.props.children];
-        return children.some((c) => findType(c, target));
+        return children.some((c) => findMergedDialog(c));
       }
       return false;
     }
 
     assert.equal(
-      findType(element, AgentInstanceEditDialog),
-      false,
-      `ctx.kind=${ctx.kind}: AgentInstanceEditDialog must NOT appear in the rendered tree`,
+      findMergedDialog(element),
+      true,
+      `ctx.kind=${ctx.kind}: AgentEditMergedDialog must appear in the rendered tree`,
     );
   }
 });
@@ -253,7 +256,6 @@ test("AgentEditDialog: single Save wires through coordinator — no instance dia
 import { AgentEditMergedDSection } from "./AgentEditMergedDialogDSection.tsx";
 import { AgentEditMergedInstanceSection } from "./AgentEditMergedDialogInstanceSection.tsx";
 import { hasDefinitionContext, hasInstanceContext } from "./agentFormModel.ts";
-import { AgentInstanceEditDialog } from "./AgentInstanceEditDialog.tsx";
 
 test("hasDefinitionContext returns true for instance-with-definition and definition-only", () => {
   assert.equal(

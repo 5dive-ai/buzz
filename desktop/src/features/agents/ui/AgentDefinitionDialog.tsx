@@ -102,8 +102,6 @@ type AgentDefinitionDialogProps = {
   isPending: boolean;
   runtimes: AcpRuntimeCatalogEntry[];
   runtimeCatalogStatus?: "loading" | "ready" | "error";
-  /** When true, D-fields render disabled + "Managed by team" notice; submit blocked. */
-  definitionReadOnly?: boolean;
   onDirtyChange?: (dirty: boolean) => void;
   onOpenChange: (open: boolean) => void;
   onSubmit: (
@@ -132,7 +130,6 @@ export function AgentDefinitionDialog({
   isPending,
   runtimes,
   runtimeCatalogStatus = "ready" as const,
-  definitionReadOnly = false,
   onDirtyChange,
   onOpenChange,
   onSubmit,
@@ -494,7 +491,6 @@ export function AgentDefinitionDialog({
   // Gate model/provider validity through missingNormalizedFields — single
   // source of truth with the readiness gate so display and Save can't drift.
   const canSubmit =
-    !definitionReadOnly &&
     canSubmitPersonaDialog({ displayName, isPending }) &&
     (!isCreateMode || runtime.trim().length > 0) &&
     (!isCreateMode || selectedRuntimeIsAvailable) &&
@@ -746,7 +742,7 @@ export function AgentDefinitionDialog({
     >
       <AgentCreationPreview
         avatarUrl={previewAvatarUrl}
-        disabled={isPending || isAvatarUploadPending || definitionReadOnly}
+        disabled={isPending || isAvatarUploadPending}
         label={previewLabel}
         onClearAvatar={() => {
           setHasUserChanges(true);
@@ -760,12 +756,6 @@ export function AgentDefinitionDialog({
       />
 
       <div className="space-y-5">
-        {definitionReadOnly ? (
-          <p className="text-sm text-muted-foreground">
-            This agent is managed by a team. Its configuration cannot be edited
-            here.
-          </p>
-        ) : null}
         <div className="space-y-1.5">
           <label
             className="text-sm font-medium text-foreground"
@@ -785,7 +775,7 @@ export function AgentDefinitionDialog({
                 "h-8 px-0 py-0 leading-6",
                 PERSONA_FIELD_CONTROL_CLASS,
               )}
-              disabled={isPending || definitionReadOnly}
+              disabled={isPending}
               id="persona-display-name"
               onChange={(event) => setDisplayName(event.target.value)}
               placeholder="Fizz"
@@ -807,7 +797,7 @@ export function AgentDefinitionDialog({
                 "min-h-40 resize-y px-3 py-3 leading-5",
                 PERSONA_FIELD_CONTROL_CLASS,
               )}
-              disabled={isPending || definitionReadOnly}
+              disabled={isPending}
               id="persona-system-prompt"
               onChange={(event) => setSystemPrompt(event.target.value)}
               placeholder="Describe what this agent should do."
@@ -830,7 +820,7 @@ export function AgentDefinitionDialog({
         >
           {aiConfigurationMode === "custom" ? (
             <AgentHarnessField
-              disabled={isPending || runtimesLoading || definitionReadOnly}
+              disabled={isPending || runtimesLoading}
               onValueChange={handleRuntimeDropdownChange}
               options={runtimeDropdownOptions}
               placeholder={blankRuntimeOptionLabel}
@@ -851,7 +841,7 @@ export function AgentDefinitionDialog({
                 ) : null}
               </RequiredFieldLabel>
               <PersonaDropdownField
-                disabled={isPending || definitionReadOnly}
+                disabled={isPending}
                 id="persona-llm-provider"
                 onValueChange={handleProviderDropdownChange}
                 options={providerDropdownOptions}
@@ -872,7 +862,7 @@ export function AgentDefinitionDialog({
                       "h-8 px-0 py-0 leading-6",
                       PERSONA_FIELD_CONTROL_CLASS,
                     )}
-                    disabled={isPending || definitionReadOnly}
+                    disabled={isPending}
                     id="persona-custom-provider"
                     onChange={(event) => setProvider(event.target.value)}
                     placeholder="Custom provider ID"
@@ -887,7 +877,7 @@ export function AgentDefinitionDialog({
           aiConfigurationMode === "custom" &&
           topLevelSecretEnvVar ? (
             <PersonaProviderApiKeyField
-              disabled={isPending || definitionReadOnly}
+              disabled={isPending}
               envVarName={topLevelSecretEnvVar}
               isInherited={apiKeyIsInherited}
               inheritedLabel={apiKeyInheritedLabel}
@@ -906,7 +896,7 @@ export function AgentDefinitionDialog({
           <AnimatePresence initial={false}>
             {modelFieldVisible && aiConfigurationMode === "custom" ? (
               <PersonaModelField
-                disabled={isPending || definitionReadOnly}
+                disabled={isPending}
                 isExplicitModelRequired={isExplicitModelRequired}
                 model={model}
                 modelDiscoveryStatus={modelDiscoveryStatus}
@@ -989,7 +979,7 @@ export function AgentDefinitionDialog({
                 <PersonaAdvancedFields
                   afterRespondTo={isCreateMode ? createRunSection : undefined}
                   behaviorDraft={behaviorDraft}
-                  disabled={isPending || definitionReadOnly}
+                  disabled={isPending}
                   envVars={envVars}
                   fileSatisfiedEnvKeys={localModeGate.fileSatisfiedEnvKeys}
                   hiddenEnvKeys={

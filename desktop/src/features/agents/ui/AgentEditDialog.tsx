@@ -6,21 +6,18 @@
  * kept as separate paths and are not affected here.
  *
  * Architecture:
- *   For agents backed by a definition: opens AgentDefinitionDialog in
- *   edit mode, but intercepts onSubmit to run the Artifact 3 coordinator,
- *   which also writes any I-field diff (device policy setters: auto-restart,
- *   start-on-launch).
+ *   instance-with-definition or instance-only:
+ *     → AgentInstanceEditDialog (all I/L fields, correct edit-agent-dialog
+ *       testid, linked-runtime awareness, auto-restart setter, saved-while-
+ *       stopped affordance).
  *
- *   For unlinked agents: delegates to AgentDefinitionDialog with the agent's
- *   own fields, routed to updateManagedAgent by the coordinator (personaInput
- *   will be null; agentInput carries the diff).
+ *   definition-only (zero-instance definitions — R5 library card, R6 review):
+ *     → AgentDefinitionDialog, wired through the Artifact 3 coordinator.
+ *       Team-managed definitions render fields disabled with a "Managed by
+ *       team" note (D-fields structurally unemittable per the spec).
  *
- * The coordinator implements:
- *   0. Validate (linked runtime availability, credential gate)
- *   1. Definition write (D-fields, only when changed and definition is editable)
- *   2. Instance write (I-fields, only when changed)
- *   3. Policy setters (auto-restart, start-on-launch, only on change)
- *   4. Settlement (re-fetch both stores, toast from observed state)
+ * The Artifact 3 coordinator is invoked for the definition-only path only.
+ * Instance paths use AgentInstanceEditDialog's own well-tested save path.
  *
  * S5 "Instances" vocabulary rename is deferred to Phase 3. Built-in agents
  * are fully editable (Artifact 1 corrected matrix).
@@ -34,16 +31,14 @@ import {
   managedAgentsQueryKey,
   personasQueryKey,
   useAcpRuntimesQuery,
-  useSetManagedAgentAutoRestartMutation,
-  useSetManagedAgentStartOnAppLaunchMutation,
-  useUpdateManagedAgentMutation,
-  useUpdatePersonaMutation,
   useStartManagedAgentMutation,
+  useUpdatePersonaMutation,
 } from "@/features/agents/hooks";
 import { useUpdatePersonaAndPublishMutation } from "@/features/agents/lib/usePersonaCatalogRelay";
 import { runAgentSaveCoordinator } from "./agentSaveCoordinator";
 import type { AgentEditContext } from "./agentFormModel";
 export type { AgentEditContext };
+import { isDefinitionReadOnly } from "./agentFormModel";
 import type {
   AgentPersona,
   CreatePersonaInput,
@@ -53,6 +48,7 @@ import type {
 import type { EditAgentFocusTarget } from "@/features/agents/openEditAgentEvent";
 import type { AgentDefinitionSubmitOptions } from "./AgentDefinitionDialog";
 import { AgentDefinitionDialog } from "./AgentDefinitionDialog";
+import { AgentInstanceEditDialog } from "./AgentInstanceEditDialog";
 import { editPersonaDialogState } from "./personaDialogState";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -65,14 +61,15 @@ export type AgentEditDialogProps = {
    */
   ctx: AgentEditContext;
   /**
-   * Optional field to focus when the dialog opens from a card deep-link.
+   * Optional field to focus when the dialog opens from a card deep-link
+   * (instance paths only — AgentInstanceEditDialog honors this).
    */
   initialFocus?: EditAgentFocusTarget;
   onUpdated?: (agent: ManagedAgent) => void;
   /**
    * Optional pre-save validator (R6 origin permission check).
-   * Called before the coordinator's step 0. Return a non-null string to abort
-   * with an error toast; return null to proceed.
+   * Fires before the coordinator's step 0 on definition-only paths.
+   * Return a non-null string to abort with an error toast; return null to proceed.
    */
   onValidate?: () => string | null;
   /**
@@ -98,13 +95,60 @@ export function AgentEditDialog({
   onUpdated,
   onValidate,
   initialValueOverrides,
+  initialFocus,
 }: AgentEditDialogProps) {
+  // ── Instance paths: delegate entirely to AgentInstanceEditDialog ──────────
+  //
+  // AgentInstanceEditDialog renders the full I+L field set (respondTo/allowlist,
+  // parallelism, env vars, harness pin, auto-restart, start-on-launch, instance
+  // name) and owns a well-tested save path. Route all instance-present contexts
+  // here so no I/L field is accidentally omitted.
+  if (ctx.kind === "instance-with-definition" || ctx.kind === "instance-only") {
+    return (
+      <AgentInstanceEditDialog
+        agent={ctx.instance}
+        initialFocus={initialFocus}
+        open={open}
+        onOpenChange={onOpenChange}
+        onUpdated={onUpdated}
+        // R4 back-door deleted: avatar lives on the merged surface (definition
+        // section is visible in the profile panel when a definition exists).
+        onEditLinkedPersona={undefined}
+      />
+    );
+  }
+
+  // ── Definition-only path: AgentDefinitionDialog + Artifact 3 coordinator ──
+  return (
+    <AgentEditDefinitionOnlyDialog
+      ctx={ctx}
+      open={open}
+      onOpenChange={onOpenChange}
+      onUpdated={onUpdated}
+      onValidate={onValidate}
+      initialValueOverrides={initialValueOverrides}
+    />
+  );
+}
+
+// ── Definition-only edit: coordinator-wired AgentDefinitionDialog ─────────────
+//
+// Separated into its own component so React hook ordering is stable across
+// the instance/definition-only branch above. All hooks run unconditionally here.
+
+function AgentEditDefinitionOnlyDialog({
+  ctx,
+  open,
+  onOpenChange,
+  // onUpdated is intentionally omitted: definition-only has no ManagedAgent to
+  // return. Instance paths surface onUpdated via AgentInstanceEditDialog.
+  onValidate,
+  initialValueOverrides,
+}: Omit<AgentEditDialogProps, "initialFocus" | "ctx"> & {
+  ctx: Extract<AgentEditContext, { kind: "definition-only" }>;
+}) {
   const queryClient = useQueryClient();
   const updatePersonaMutation = useUpdatePersonaMutation();
-  const updateManagedAgentMutation = useUpdateManagedAgentMutation();
-  const setAutoRestartMutation = useSetManagedAgentAutoRestartMutation();
-  const setStartOnAppLaunchMutation =
-    useSetManagedAgentStartOnAppLaunchMutation();
   const startMutation = useStartManagedAgentMutation();
   const runtimesQuery = useAcpRuntimesQuery({ enabled: open });
 
@@ -120,14 +164,16 @@ export function AgentEditDialog({
     if (open) setSaveError(null);
   }, [open]);
 
-  const def = ctx.kind !== "instance-only" ? ctx.definition : null;
-  const inst = ctx.kind !== "definition-only" ? ctx.instance : null;
+  const def = ctx.definition;
   const runtimes = runtimesQuery.data ?? [];
   const runtimeCatalogStatus = runtimesQuery.isLoading
     ? ("loading" as const)
     : runtimesQuery.isError
       ? ("error" as const)
       : ("ready" as const);
+
+  // Team-managed: D-fields render disabled (structurally unemittable per spec).
+  const defReadOnly = isDefinitionReadOnly(ctx);
 
   // ── Settlement helper ──────────────────────────────────────────────────────
   async function refetchStores(): Promise<{
@@ -140,27 +186,13 @@ export function AgentEditDialog({
     ]);
     const personas =
       queryClient.getQueryData<AgentPersona[]>(personasQueryKey) ?? [];
-    const agents =
-      queryClient.getQueryData<ManagedAgent[]>(managedAgentsQueryKey) ?? [];
     return {
-      persona: def ? (personas.find((p) => p.id === def.id) ?? null) : null,
-      agent: inst
-        ? (agents.find((a) => a.pubkey === inst.pubkey) ?? null)
-        : null,
+      persona: personas.find((p) => p.id === def.id) ?? null,
+      agent: null, // definition-only: no instance to settle
     };
   }
 
   // ── onSubmit ── called by AgentDefinitionDialog when the user clicks Save ─
-  //
-  // `input` is the UpdatePersonaInput computed by AgentDefinitionDialog.
-  // For instance-with-definition contexts, the coordinator:
-  //   1. Writes the definition (personaInput = input)
-  //   2. Writes the instance diff (agentInput = null — D-field changes propagate
-  //      live per the matrix; row 1/8 materializations are dropped)
-  //   3. Runs policy setters (auto-restart/start-on-launch if changed)
-  //
-  // For instance-only contexts, the definition dialog's input represents the
-  // instance state, so the coordinator routes it to agentInput instead.
   async function handleSubmit(
     input: CreatePersonaInput | UpdatePersonaInput,
     options: AgentDefinitionSubmitOptions,
@@ -174,7 +206,6 @@ export function AgentEditDialog({
       );
       return undefined;
     }
-    const updateInput: UpdatePersonaInput = input;
 
     // Pre-save validation (e.g. R6 origin-permission check).
     if (onValidate) {
@@ -185,49 +216,37 @@ export function AgentEditDialog({
       }
     }
 
+    // Team-managed: D-fields are structurally unemittable; form renders read-only.
+    // Guard here too so a misconfigured call path cannot bypass the UI gate.
+    if (defReadOnly) {
+      return undefined;
+    }
+
     setSaveError(null);
     setIsSaving(true);
 
     try {
-      // Build coordinator inputs
-      const personaInput: UpdatePersonaInput | null =
-        def !== null ? updateInput : null;
-
-      // Compute I-field policy diff from current instance state.
-      // The dialog does not expose per-instance auto-restart/start-on-launch
-      // from AgentDefinitionDialog state directly — those are L-fields handled
-      // via dedicated setters. For Phase 1, policy setters are triggered only
-      // if the instance has changed these values (which means they must be
-      // surfaced elsewhere — Phase 1 defers in-form policy toggles to Phase 2;
-      // the setter mechanism is wired and ready here). No policySets for now.
-      const policySets: Parameters<
-        typeof runAgentSaveCoordinator
-      >[0]["policySets"] = [];
+      const personaInput: UpdatePersonaInput = input;
 
       const success = await runAgentSaveCoordinator({
         ctx,
         personaInput,
         agentInput: null,
-        policySets,
+        policySets: [],
         publishCatalogUpdates: options.publishCatalogUpdates,
         runtimes: runtimes.length > 0 ? runtimes : undefined,
         updatePersona: (p) => updatePersonaMutation.mutateAsync(p),
         updatePersonaAndPublish: (p) =>
           updatePersonaAndPublishMutation.mutateAsync(p),
-        updateManagedAgent: (a) => updateManagedAgentMutation.mutateAsync(a),
-        setAutoRestart: (pubkey, value) =>
-          setAutoRestartMutation.mutateAsync({
-            pubkey,
-            autoRestartOnConfigChange: value,
-          }),
-        setStartOnAppLaunch: (pubkey, value) =>
-          setStartOnAppLaunchMutation.mutateAsync({
-            pubkey,
-            startOnAppLaunch: value,
-          }),
+        updateManagedAgent: (_a) => {
+          throw new Error("No instance in definition-only context");
+        },
+        setAutoRestart: (_pubkey, _value) => Promise.resolve(),
+        setStartOnAppLaunch: (_pubkey, _value) => Promise.resolve(),
         refetchStores,
         onDone: () => onOpenChange(false),
         onSavedWhileStopped: (agent) => {
+          // definition-only: no instance, but preserve the affordance contract
           const savedName = agent.name;
           toast(`${savedName} saved while stopped.`, {
             action: {
@@ -248,18 +267,13 @@ export function AgentEditDialog({
         },
       });
 
-      if (success) {
-        const agents =
-          queryClient.getQueryData<ManagedAgent[]>(managedAgentsQueryKey) ?? [];
-        const updated = inst
-          ? (agents.find((a) => a.pubkey === inst.pubkey) ?? undefined)
-          : undefined;
-        if (updated) onUpdated?.(updated);
-      } else {
+      if (!success) {
         setSaveError(
           new Error("Some changes may not have persisted. Reopen to retry."),
         );
       }
+      // definition-only: no ManagedAgent to surface; onUpdated is not called.
+      // Instance paths call onUpdated via AgentInstanceEditDialog directly.
     } finally {
       setIsSaving(false);
     }
@@ -268,13 +282,7 @@ export function AgentEditDialog({
   }
 
   // ── Build initial values for AgentDefinitionDialog ─────────────────────────
-  //
-  // Always seed from the definition when one is present — that is the
-  // authoritative source for D-fields. editPersonaDialogState() handles the
-  // round-trip of namePool/envVars/behavior that prevents accidental clears.
-  // initialValueOverrides are applied on top for R6 review mode (agent-requested
-  // field changes pre-filled for user approval).
-  const baseDialogState = def ? editPersonaDialogState(def) : null;
+  const baseDialogState = editPersonaDialogState(def);
   const dialogState =
     baseDialogState && initialValueOverrides
       ? {
@@ -285,50 +293,22 @@ export function AgentEditDialog({
           },
         }
       : baseDialogState;
-  const initialValues =
-    dialogState?.initialValues ??
-    (inst
-      ? {
-          // Instance-only fallback: no definition present, expose instance
-          // fields so the user can edit them.
-          displayName: inst.name,
-          avatarUrl: inst.avatarUrl ?? "",
-          systemPrompt: inst.systemPrompt ?? "",
-          runtime: undefined,
-          model: inst.model ?? undefined,
-          provider: inst.provider ?? undefined,
-          envVars: inst.envVars ?? {},
-          behavior:
-            inst.respondTo != null
-              ? {
-                  respondTo: inst.respondTo,
-                  respondToAllowlist:
-                    inst.respondTo === "allowlist"
-                      ? inst.respondToAllowlist
-                      : undefined,
-                  parallelism: inst.parallelism ?? undefined,
-                }
-              : undefined,
-        }
-      : null);
-
-  const title =
-    dialogState?.title ?? (inst ? `Edit ${inst.name}` : "Edit agent");
 
   return (
     <AgentDefinitionDialog
       description={dialogState?.description ?? ""}
       error={saveError}
-      initialValues={initialValues}
+      initialValues={dialogState?.initialValues ?? null}
       isPending={isSaving}
+      definitionReadOnly={defReadOnly}
       onOpenChange={onOpenChange}
       onSubmit={handleSubmit}
       open={open}
-      publishCatalogUpdatesOnSave={def?.shared ?? false}
+      publishCatalogUpdatesOnSave={def.shared && !defReadOnly}
       runtimes={runtimes}
       runtimeCatalogStatus={runtimeCatalogStatus}
       submitLabel={dialogState?.submitLabel ?? "Save changes"}
-      title={title}
+      title={dialogState?.title ?? `Edit ${def.displayName}`}
     />
   );
 }

@@ -212,3 +212,88 @@ test("test_env_clobber_dropped_even_when_definition_env_differs_from_instance_en
   assert.ok(emit.personaInput, "definition should be updated");
   assert.equal(emit.agentInput, null, "instance env must not be clobbered");
 });
+
+// ── Regression test 3 (AC5): team D-field emits no personaInput ──────────────
+//
+// Spec pass-4 amendment: team-managed D-fields are structurally unemittable.
+// emitAgentFormDiff with a definition-only context whose definition has a
+// sourceTeam set must return personaInput:null even when D-fields differ.
+
+test("test_team_definition_emits_no_personaInput_even_when_fields_differ", () => {
+  // Team-managed definition: sourceTeam is set.
+  const definition = makeDefinition({
+    sourceTeam: "team-acme",
+    displayName: "Team Bot",
+    systemPrompt: "Team-managed instructions.",
+  });
+
+  const ctx = { kind: "definition-only", definition };
+  const saved = seedAgentFormModel(ctx);
+
+  // Simulate user attempting to change D-fields (should be blocked structurally,
+  // but the diff function is the last defence if the UI layer fails to block it).
+  const next = {
+    ...saved,
+    displayName: "Tampered Name",
+    systemPrompt: "Tampered prompt.",
+  };
+
+  const emit = emitAgentFormDiff(saved, next, ctx);
+
+  assert.equal(
+    emit.personaInput,
+    null,
+    "personaInput must be null for team-managed definition-only contexts",
+  );
+  assert.equal(
+    emit.agentInput,
+    null,
+    "agentInput must be null for definition-only contexts",
+  );
+  assert.deepEqual(
+    emit.policySets,
+    [],
+    "policySets must be empty for definition-only contexts without an instance",
+  );
+});
+
+test("test_team_definition_with_instance_emits_no_personaInput_but_allows_instance_diff", () => {
+  // Team-managed definition linked to an instance: D-fields must be unemittable
+  // but I/L fields (respondTo, etc.) are still editable.
+  const definition = makeDefinition({
+    sourceTeam: "team-acme",
+    displayName: "Team Bot",
+    systemPrompt: "Team-managed instructions.",
+  });
+  const instance = makeInstance({
+    respondTo: "owner-only",
+    parallelism: 1,
+  });
+
+  const ctx = { kind: "instance-with-definition", definition, instance };
+  const saved = seedAgentFormModel(ctx);
+
+  // User tries to edit a D-field AND an I-field simultaneously.
+  const next = {
+    ...saved,
+    displayName: "Tampered Name", // D-field — team-managed, must not emit
+    respondTo: "anyone", // I-field — instance-owned, must emit
+  };
+
+  const emit = emitAgentFormDiff(saved, next, ctx);
+
+  assert.equal(
+    emit.personaInput,
+    null,
+    "personaInput must be null even when D-field differs for team-managed definition",
+  );
+  assert.ok(
+    emit.agentInput,
+    "agentInput must be emitted when an I-field changed",
+  );
+  assert.equal(
+    emit.agentInput.respondTo,
+    "anyone",
+    "agentInput should carry the updated respondTo",
+  );
+});

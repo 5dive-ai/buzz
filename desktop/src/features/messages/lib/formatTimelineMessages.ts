@@ -43,6 +43,7 @@ import { formatTime } from "@/features/messages/lib/dateFormatters";
 // can exercise the exact same source the renderer uses.
 import { applyEditTagOverlay } from "@/features/messages/lib/applyEditTagOverlay.mjs";
 import { truncatePubkey } from "@/shared/lib/pubkey";
+import { isPermissionRequestSentinel } from "@/shared/lib/permissionRequest";
 
 const HEX_RE = /^[0-9a-f]+$/i;
 
@@ -285,6 +286,19 @@ export function formatTimelineMessages(
     if (
       !target ||
       !isAuthorizedMessageEdit(event, target, profiles, relaySelfPubkey)
+    ) {
+      continue;
+    }
+
+    // Sentinel-specific edit gate: permission-request sentinels may only be
+    // overlaid by an edit signed by the ORIGINAL AGENT (byte-equal to the
+    // target's signer). Owner-signed or attacker-signed edits of sentinels
+    // are silently dropped here so the authenticated pending card is preserved
+    // intact. Generic owner-edit behavior for non-sentinel messages is
+    // unchanged.
+    if (
+      isPermissionRequestSentinel(target.content) &&
+      normalizePubkey(event.pubkey) !== normalizePubkey(target.pubkey)
     ) {
       continue;
     }

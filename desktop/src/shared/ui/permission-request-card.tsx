@@ -1,12 +1,19 @@
 /**
- * Inline card rendered when the desktop detects a `buzz:permission-request`
- * sentinel in a kind:9 message body. Mirrors the `ConfigNudgeCard` pattern.
+ * Inline card rendered when the desktop detects a version-1 bare-JSON
+ * permission-request sentinel in a kind:9 message body. Mirrors the
+ * `ConfigNudgeCard` pattern.
+ *
+ * Wire format: the harness signs a bare JSON object `{"v":1,"state":"pending",…}`
+ * as the kind:9 event content. No code-fence wrapper — non-JSON content and
+ * JSON without `"v":1` render as ordinary markdown.
  *
  * Security invariants enforced by the caller (`MessageRow`):
  * - `request` is only non-null when the kind-9 signer equals the known agent
  *   pubkey for this channel (D1 signer gate in `computePermissionRequest`).
  * - Resolved state (`state === "resolved"`) requires the edit to have been
  *   signed by the original agent (edit authenticity gate).
+ * - Only an agent-signed kind-40003 edit may overlay the sentinel body —
+ *   enforced in `formatTimelineMessages` before `computePermissionRequest` runs.
  *
  * Actionable buttons render ONLY when:
  *   (a) `request.state === "pending"` AND

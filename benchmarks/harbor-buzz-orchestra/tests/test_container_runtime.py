@@ -641,9 +641,12 @@ async def _value(value):
     return value
 
 
-def test_runtime_rejects_unbounded_agent_rounds(tmp_path):
-    with pytest.raises(ValueError, match="positive"):
-        runtime(tmp_path, max_agent_rounds=0)
+def test_runtime_validates_construction_bounds(tmp_path):
+    # 0 is legal and means unbounded (BUZZ_AGENT_MAX_ROUNDS=0); the trial
+    # budget is the clock. Only negatives are rejected.
+    runtime(tmp_path, max_agent_rounds=0)
+    with pytest.raises(ValueError, match="unbounded"):
+        runtime(tmp_path, max_agent_rounds=-1)
     with pytest.raises(ValueError, match="positive"):
         runtime(tmp_path, readiness_timeout_seconds=0)
     with pytest.raises(ValueError, match="negative"):

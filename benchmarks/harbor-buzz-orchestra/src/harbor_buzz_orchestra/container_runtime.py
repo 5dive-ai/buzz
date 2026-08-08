@@ -27,17 +27,16 @@ from .manifest import AgentClass, ExperimentManifest, GenerationConfig
 from .provisioning import AgentCredential, TrialHandle
 from .runtime import RuntimeResult
 
-
 # Tool/LLM rounds allowed per agent turn (BUZZ_AGENT_MAX_ROUNDS).
 #
-# Deliberately set high enough that no condition reaches it, because the cap is
-# per *turn* and the counter resets on every wake (buzz-agent agent.rs:82). A
-# solo agent is woken exactly once, so its cap is its whole budget for the task;
-# a team member gets the same cap per assignment, across arbitrarily many
-# assignments. Any value a real task can hit therefore handicaps the solo
+# 0 = unbounded, buzz-agent's own documented "no cap" value. The cap is per
+# *turn* and the counter resets on every wake (buzz-agent agent.rs:82). A
+# solo agent is woken exactly once, so any finite cap is its whole budget for
+# the task; a team member gets the same cap per assignment, across arbitrarily
+# many assignments. Any value a real task can hit therefore handicaps the solo
 # baseline for a reason unrelated to team shape. Let the trial timeout and the
 # cost ceiling bind instead — those apply to every condition equally.
-DEFAULT_MAX_AGENT_ROUNDS = 300
+DEFAULT_MAX_AGENT_ROUNDS = 0
 # buzz-acp logs each agent's cumulative token counters under this tracing
 # target. It is the harness's only token source, so the directive is not
 # optional decoration — without it every trial reports zero cost. See
@@ -284,8 +283,8 @@ class BuzzContainerRuntime:
         usage_settle_seconds: float = 60.0,
         poll_seconds: float = 1.0,
     ) -> None:
-        if max_agent_rounds <= 0:
-            raise ValueError("max_agent_rounds must be positive")
+        if max_agent_rounds < 0:
+            raise ValueError("max_agent_rounds must be >= 0 (0 = unbounded)")
         if readiness_timeout_seconds <= 0:
             raise ValueError("readiness_timeout_seconds must be positive")
         if usage_settle_seconds < 0:

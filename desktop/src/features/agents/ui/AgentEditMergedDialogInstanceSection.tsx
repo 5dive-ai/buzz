@@ -111,6 +111,7 @@ export type AgentEditMergedISectionProps = {
   acpCommand: string;
   agentArgs: string;
   autoRestartOnConfigChange: boolean;
+  startOnAppLaunch?: boolean;
   instanceEnvVars: Record<string, string>;
   fileSatisfiedEnvKeys: string[];
   advancedRequiredEnvKeys: readonly string[];
@@ -123,6 +124,7 @@ export type AgentEditMergedISectionProps = {
   onAcpCommandChange: (value: string) => void;
   onAgentArgsChange: (value: string) => void;
   onAutoRestartChange: (value: boolean) => void;
+  onStartOnAppLaunchChange?: (value: boolean) => void;
   onEnvVarsChange: (value: Record<string, string>) => void;
   onInheritHarnessChange: (value: boolean) => void;
   onParallelismChange: (value: string) => void;
@@ -191,6 +193,7 @@ export function AgentEditMergedInstanceSection({
   acpCommand,
   agentArgs,
   autoRestartOnConfigChange,
+  startOnAppLaunch,
   instanceEnvVars,
   fileSatisfiedEnvKeys,
   advancedRequiredEnvKeys,
@@ -203,6 +206,7 @@ export function AgentEditMergedInstanceSection({
   onAcpCommandChange,
   onAgentArgsChange,
   onAutoRestartChange,
+  onStartOnAppLaunchChange,
   onEnvVarsChange,
   onInheritHarnessChange,
   onParallelismChange,
@@ -490,6 +494,7 @@ export function AgentEditMergedInstanceSection({
                 acpCommand={acpCommand}
                 agentArgs={agentArgs}
                 autoRestartOnConfigChange={autoRestartOnConfigChange}
+                startOnAppLaunch={startOnAppLaunch}
                 disabled={isSaving}
                 envVars={instanceEnvVars}
                 fileSatisfiedEnvKeys={fileSatisfiedEnvKeys}
@@ -517,6 +522,7 @@ export function AgentEditMergedInstanceSection({
                 onAcpCommandChange={onAcpCommandChange}
                 onAgentArgsChange={onAgentArgsChange}
                 onAutoRestartChange={onAutoRestartChange}
+                onStartOnAppLaunchChange={onStartOnAppLaunchChange}
                 onEnvVarsChange={onEnvVarsChange}
                 onInheritHarnessChange={onInheritHarnessChange}
                 onParallelismChange={onParallelismChange}

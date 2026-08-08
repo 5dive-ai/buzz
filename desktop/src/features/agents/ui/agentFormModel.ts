@@ -34,7 +34,11 @@ import type {
 
 // ── Field ownership ─────────────────────────────────────────────────────────
 
-export type FieldOwner = "definition" | "instance" | "local-policy";
+export type FieldOwner =
+  | "definition"
+  | "instance"
+  | "local-policy"
+  | "create-only";
 
 // ── Context shape that drives editability ───────────────────────────────────
 
@@ -92,19 +96,25 @@ export function hasInstanceContext(ctx: AgentEditContext): boolean {
  * Fields absent for a given context are undefined. Editability is determined
  * by AgentEditContext + the isDefinitionReadOnly predicate, NOT by AgentFormModel
  * itself — the model just holds current values.
+ *
+ * Ownership by context (rows 9–10 contract):
+ *   respondTo / allowlist / parallelism:
+ *     instance-with-definition / instance-only → I-owned; edits go to agentInput only.
+ *     definition-only (zero-instance)          → D-owned; edits go to personaInput.
  */
 export type AgentFormModel = {
   // Identity (D when linked, I when unlinked)
   displayName: string;
   avatarUrl: string;
 
-  // Behavior (D when linked, I when unlinked)
+  // Behavior — D when linked for prompt; respondTo/parallelism always I when instance present
   systemPrompt: string;
+  /** Rows 9–10: seeds from instance when instance is present; definition default only for definition-only. */
   respondTo: ManagedAgent["respondTo"] | AgentPersona["respondTo"] | null;
   respondToAllowlist: string[];
 
-  // Runtime (D when linked, I when unlinked) — harness pins are I
-  /** Preferred runtime id from the definition. */
+  // Runtime — D preferred-id field (definition runtime); harness pin is I (tracked separately in dialog)
+  /** Preferred runtime id from the definition. Only used in definition-only context for definition runtime edits. */
   runtime: string | undefined;
   model: string | null;
   provider: string | null;
@@ -123,6 +133,7 @@ export type AgentFormModel = {
    * additions/overrides. Undefined when no instance context.
    */
   instanceEnvVars: Record<string, string> | undefined;
+  /** Rows 9–10: I-owned when instance present; D-owned (definition default) in definition-only context. */
   parallelism: number | null;
 
   // Device policy (L-fields)
@@ -179,9 +190,16 @@ export function seedAgentFormModel(ctx: AgentEditContext): AgentFormModel {
   const displayName = def?.displayName ?? inst?.name ?? "";
   const avatarUrl = def?.avatarUrl ?? inst?.avatarUrl ?? "";
   const systemPrompt = def?.systemPrompt ?? inst?.systemPrompt ?? "";
-  const respondTo = def?.respondTo ?? inst?.respondTo ?? null;
+  // Rows 9–10: respondTo/allowlist/parallelism seed from INSTANCE when present;
+  // only fall back to definition default in definition-only (zero-instance) context.
+  // Normalize null → "anyone" so the diff doesn't produce a false phantom write
+  // when the DB stores null and the UI shows "anyone" as the default.
+  const respondTo =
+    inst != null ? (inst.respondTo ?? "anyone") : (def?.respondTo ?? null);
   const respondToAllowlist =
-    def?.respondToAllowlist ?? inst?.respondToAllowlist ?? [];
+    inst != null
+      ? (inst.respondToAllowlist ?? [])
+      : (def?.respondToAllowlist ?? []);
   const runtime = def?.runtime ?? undefined;
   const model = def !== null ? (def.model ?? null) : (inst?.model ?? null);
   const provider =
@@ -197,7 +215,9 @@ export function seedAgentFormModel(ctx: AgentEditContext): AgentFormModel {
   // overlay that does NOT wholesale-replace the definition env. Seed from
   // inst.envVars directly (not the merged/inherited snapshot).
   const instanceEnvVars = inst != null ? (inst.envVars ?? {}) : undefined;
-  const parallelism = inst?.parallelism ?? def?.parallelism ?? null;
+  // Rows 9–10: parallelism seeds from instance when present; definition default for definition-only.
+  const parallelism =
+    inst != null ? (inst.parallelism ?? null) : (def?.parallelism ?? null);
 
   // L-fields
   const autoRestartOnConfigChange = inst?.autoRestartOnConfigChange;
@@ -246,14 +266,10 @@ export function emitAgentFormDiff(
   // D-field diff — only when definition is present and NOT team-managed
   let personaInput: UpdatePersonaInput | null = null;
   if (def !== null && !defReadOnly) {
-    // respondTo is a D-field when definition is present: changes are written
-    // to the definition, not to the instance. Include it in the D-diff check.
-    const respondToChanged =
-      (next.respondTo ?? null) !== (saved.respondTo ?? null);
-    const allowlistChanged =
-      next.respondTo === "allowlist" &&
-      next.respondToAllowlist.join(",") !==
-        (saved.respondToAllowlist ?? []).join(",");
+    // Rows 9–10: respondTo and parallelism are I-owned when an instance is
+    // present — they NEVER go into personaInput in that context. They are
+    // D-owned (definition defaults) only in definition-only (zero-instance) context.
+    const hasInst = inst !== null;
 
     const dChanged =
       next.displayName.trim() !== saved.displayName.trim() ||
@@ -264,8 +280,12 @@ export function emitAgentFormDiff(
       (next.provider ?? null) !== (saved.provider ?? null) ||
       !envVarsMapEqual(next.envVars ?? {}, saved.envVars ?? {}) ||
       !namePoolEqual(next.namePool ?? [], saved.namePool ?? []) ||
-      respondToChanged ||
-      allowlistChanged;
+      // Only include respondTo/parallelism in D-diff when NO instance (definition-only context)
+      (!hasInst && (next.respondTo ?? null) !== (saved.respondTo ?? null)) ||
+      (!hasInst &&
+        next.respondTo === "allowlist" &&
+        next.respondToAllowlist.join(",") !==
+          (saved.respondToAllowlist ?? []).join(","));
 
     if (dChanged) {
       personaInput = {
@@ -278,10 +298,10 @@ export function emitAgentFormDiff(
         provider: next.provider ?? undefined,
         namePool: next.namePool ?? [],
         envVars: next.envVars ?? {},
-        // Always emit behavior block when definition is present — respondTo
-        // is a D-field and must travel with the persona write.
+        // Include behavior block only in definition-only context (rows 9–10:
+        // when instance is present, respondTo/parallelism go to agentInput).
         behavior:
-          next.respondTo != null
+          !hasInst && next.respondTo != null
             ? {
                 respondTo: next.respondTo,
                 respondToAllowlist:
@@ -318,15 +338,14 @@ export function emitAgentFormDiff(
       def === null && (next.model ?? null) !== (inst.model ?? null);
     const providerChanged =
       def === null && (next.provider ?? null) !== (inst.provider ?? null);
-    // respondTo is a D-field when a definition is present AND editable.
-    // When the definition is team-managed (read-only) or absent, changes fall
-    // through to the instance so they are never silently dropped.
-    const respondToInstanceOwned = def === null || defReadOnly;
+    // Rows 9–10: respondTo/parallelism are always I-owned when an instance is
+    // present. Changes always emit to agentInput, regardless of whether a
+    // definition is present or team-managed.
+    // Normalize null → "anyone" in the comparison to avoid phantom writes
+    // when the DB stores null but the UI defaults to "anyone".
     const respondToChanged =
-      respondToInstanceOwned &&
-      (next.respondTo ?? null) !== (inst.respondTo ?? null);
+      (next.respondTo ?? "anyone") !== (inst.respondTo ?? "anyone");
     const allowlistChanged =
-      respondToInstanceOwned &&
       next.respondTo === "allowlist" &&
       next.respondToAllowlist.join(",") !== inst.respondToAllowlist.join(",");
     const parallelismChanged =

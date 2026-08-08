@@ -396,13 +396,14 @@ test.describe("edit agent dialog", () => {
     });
     await page.getByTestId("user-profile-edit-agent").click();
 
-    // Definition editor opens; the instance editor does not.
-    await expect(page.getByTestId("persona-dialog")).toBeVisible({
+    // Merged dialog opens with D+I sections together — the old routing that
+    // preferred the definition dialog over the instance dialog is fixed.
+    await expect(page.getByTestId("edit-agent-dialog")).toBeVisible({
       timeout: 10_000,
     });
-    await expect(page.getByTestId("edit-agent-dialog")).not.toBeVisible();
-    // And it is the persona's record that's being edited.
-    await expect(page.locator("#persona-display-name")).toHaveValue(
+    await expect(page.getByTestId("persona-dialog")).not.toBeVisible();
+    // Both D-fields (agent name from definition) and I-fields are accessible.
+    await expect(page.locator("#edit-agent-display-name")).toHaveValue(
       "Edit E2E Persona",
     );
   });

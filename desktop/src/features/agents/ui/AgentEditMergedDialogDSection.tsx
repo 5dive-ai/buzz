@@ -1,15 +1,19 @@
 /**
  * AgentEditMergedDialogDSection.tsx — Definition-field section for the merged edit surface.
  *
- * Renders agent name, system prompt, and (for definition-only contexts)
- * runtime, LLM provider, and model. Team-managed fields render read-only.
+ * Renders agent name, system prompt, name pool, D-env vars, and (for all definition
+ * contexts) runtime, LLM provider, and model. Team-managed fields render read-only.
  *
  * Extracted from AgentEditMergedDialog to satisfy the desktop file-size gate.
  */
 
+import * as React from "react";
+import { AnimatePresence, motion } from "motion/react";
+
 import { cn } from "@/shared/lib/cn";
 import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
+import { Button } from "@/shared/ui/button";
 
 import {
   PERSONA_FIELD_CONTROL_CLASS,
@@ -19,6 +23,9 @@ import {
 } from "./agentConfigOptions";
 import { AgentHarnessField } from "./AgentHarnessField";
 import { PersonaDropdownField } from "./PersonaDropdownField";
+import { EnvVarsEditor, type EnvVarsValue } from "./EnvVarsEditor";
+
+const advancedFieldsTransition = { duration: 0.18, ease: "easeInOut" } as const;
 
 // ── Props ─────────────────────────────────────────────────────────────────────
 
@@ -32,13 +39,19 @@ export type AgentEditMergedDSectionProps = {
   // Behavior
   systemPrompt: string;
   onSystemPromptChange: (value: string) => void;
-  // Runtime (definition-only — hidden when showInst)
+  // Definition admin: name pool (D-field, must round-trip)
+  namePoolText: string;
+  onNamePoolTextChange: (value: string) => void;
+  // Definition env vars (D-field, row 8 — separate from instance overlay)
+  envVars: EnvVarsValue;
+  onEnvVarsChange: (value: EnvVarsValue) => void;
+  // Runtime (definition runtime D-field — shown for all definition contexts)
   runtimeCatalogStatus: "loading" | "error" | "ready";
   runtimeDropdownValue: string;
   defRuntimeDropdownOptions: PersonaDropdownOption[];
   defBlankLabel: string;
   onRuntimeChange: (value: string) => void;
-  // LLM provider (definition-only — hidden when showInst)
+  // LLM provider (D-field)
   llmProviderFieldVisible: boolean;
   providerSelectValue: string;
   providerDropdownOptions: PersonaDropdownOption[];
@@ -46,7 +59,7 @@ export type AgentEditMergedDSectionProps = {
   isCustomProviderEditing: boolean;
   provider: string;
   onProviderTextChange: (value: string) => void;
-  // Model (definition-only — hidden when showInst)
+  // Model (D-field)
   modelSelectValue: string;
   modelDropdownOptions: PersonaDropdownOption[];
   onModelChange: (value: string) => void;
@@ -66,6 +79,10 @@ export function AgentEditMergedDSection({
   onDisplayNameChange,
   systemPrompt,
   onSystemPromptChange,
+  namePoolText,
+  onNamePoolTextChange,
+  envVars,
+  onEnvVarsChange,
   runtimeCatalogStatus,
   runtimeDropdownValue,
   defRuntimeDropdownOptions,
@@ -87,6 +104,8 @@ export function AgentEditMergedDSection({
   onModelTextChange,
   modelStatusMessage,
 }: AgentEditMergedDSectionProps) {
+  const [showAdvanced, setShowAdvanced] = React.useState(false);
+
   return (
     <>
       {/* Agent name */}
@@ -236,6 +255,71 @@ export function AgentEditMergedDSection({
         {modelStatusMessage ? (
           <p className="text-xs text-muted-foreground">{modelStatusMessage}</p>
         ) : null}
+      </div>
+
+      {/* Advanced section toggle (name pool + D-env vars) */}
+      <div className="space-y-2">
+        <Button
+          className="flex items-center gap-1 px-0 text-sm text-muted-foreground hover:text-foreground"
+          disabled={isSaving || defReadOnly}
+          onClick={() => setShowAdvanced((v) => !v)}
+          type="button"
+          variant="ghost"
+        >
+          Advanced
+        </Button>
+        <AnimatePresence initial={false}>
+          {showAdvanced ? (
+            <motion.div
+              animate={{ height: "auto", opacity: 1, scale: 1 }}
+              className="origin-top overflow-hidden space-y-4"
+              exit={{ height: 0, opacity: 0, scale: 0.98 }}
+              initial={{ height: 0, opacity: 0, scale: 0.98 }}
+              key="d-advanced-fields"
+              transition={advancedFieldsTransition}
+            >
+              {/* Name pool — D-field */}
+              <div className="space-y-1.5">
+                <label
+                  className="text-sm font-medium text-foreground"
+                  htmlFor="edit-agent-name-pool"
+                >
+                  Name pool
+                  <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
+                </label>
+                <div className={PERSONA_FIELD_SHELL_CLASS}>
+                  <Textarea
+                    className={cn(
+                      "min-h-20 resize-y px-3 py-3 leading-5",
+                      PERSONA_FIELD_CONTROL_CLASS,
+                    )}
+                    disabled={isSaving || defReadOnly}
+                    id="edit-agent-name-pool"
+                    onChange={(e) => onNamePoolTextChange(e.target.value)}
+                    placeholder={"Alice\nBob\nCarol"}
+                    value={namePoolText}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  One name per line. Linked agents draw from this pool at spawn.
+                </p>
+              </div>
+
+              {/* Definition env vars — D-field (row 8) */}
+              <div className="space-y-1.5">
+                <p className="text-sm font-medium text-foreground">
+                  Environment variables
+                  <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
+                </p>
+                <EnvVarsEditor
+                  disabled={isSaving || defReadOnly}
+                  onChange={onEnvVarsChange}
+                  value={envVars}
+                />
+              </div>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
       </div>
     </>
   );

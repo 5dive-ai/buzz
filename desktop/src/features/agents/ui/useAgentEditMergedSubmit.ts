@@ -51,6 +51,10 @@ export type AgentEditSubmitState = {
   instanceEnvVars: Record<string, string>;
   instanceName: string;
   autoRestartOnConfigChange: boolean;
+  startOnAppLaunch: boolean | undefined;
+  /** D-field: definition runtime id (independent of I-harness pin). */
+  definitionRuntimeId: string;
+  /** I-field: harness pin runtime id (instance only). */
   selectedRuntimeId: string;
   inheritHarness: boolean;
   agentCommand: string;
@@ -59,8 +63,6 @@ export type AgentEditSubmitState = {
   showInst: boolean;
   defReadOnly: boolean;
   inheritedSubmissionProvider: string | null;
-  inheritedSubmissionEnvVars: Record<string, string>;
-  linkedPersonaEnvVars: Record<string, string> | undefined;
   runtimes: readonly AcpRuntimeCatalogEntry[];
   updatePersona: (input: UpdatePersonaInput) => Promise<unknown>;
   updatePersonaAndPublish: (
@@ -133,18 +135,19 @@ export function useAgentEditMergedSubmit(
           systemPrompt: s.systemPrompt.trim(),
           respondTo: s.respondTo as typeof seed.respondTo,
           respondToAllowlist: s.respondToAllowlist,
+          // D-field: use definitionRuntimeId (independent of I-harness pin)
           runtime:
-            s.selectedRuntimeId === "custom" ? undefined : s.selectedRuntimeId,
+            s.definitionRuntimeId === "custom"
+              ? undefined
+              : s.definitionRuntimeId,
           model: normalizedModel,
           provider: normalizedProvider,
-          envVars: s.showInst
-            ? (s.linkedPersonaEnvVars ?? def?.envVars ?? {})
-            : s.envVars,
+          // D-field env: use the definition env from the form state (not the
+          // live linkedPersonaEnvVars, which would bypass user edits).
+          envVars: s.envVars,
           namePool,
           instanceName: s.instanceName.trim() || undefined,
-          instanceEnvVars: s.showInst
-            ? (s.inheritedSubmissionEnvVars as Record<string, string>)
-            : undefined,
+          instanceEnvVars: s.showInst ? s.instanceEnvVars : undefined,
           parallelism:
             s.parsedParallelism > 0
               ? s.parsedParallelism
@@ -152,7 +155,9 @@ export function useAgentEditMergedSubmit(
           autoRestartOnConfigChange: s.showInst
             ? s.autoRestartOnConfigChange
             : undefined,
-          startOnAppLaunch: seed.startOnAppLaunch,
+          startOnAppLaunch: s.showInst
+            ? s.startOnAppLaunch
+            : seed.startOnAppLaunch,
         };
 
         const {

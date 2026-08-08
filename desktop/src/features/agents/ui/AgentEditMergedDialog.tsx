@@ -40,24 +40,14 @@ import { useAgentEditMergedSubmit } from "./useAgentEditMergedSubmit";
 import { AgentEditMergedDSection } from "./AgentEditMergedDialogDSection";
 import { AgentEditMergedInstanceSection } from "./AgentEditMergedDialogInstanceSection";
 import {
-  ADD_CUSTOM_HARNESS_OPTION,
   runtimeDropdownAction,
   usePendingHarnessSelection,
 } from "./addCustomHarness";
 import {
   AUTO_PROVIDER_DROPDOWN_VALUE,
-  BLOCK_BUILD_HIDDEN_PROVIDER_IDS,
-  CUSTOM_PROVIDER_DROPDOWN_VALUE,
-  formatRuntimeOptionLabel,
   getDefaultPersonaRuntime,
-  getPersonaProviderOptions,
   isMissingRequiredDropdownField,
-  NO_RUNTIME_DROPDOWN_VALUE,
-  buildPersonaRuntimeDropdownOptions,
   runtimeSupportsLlmProviderSelection,
-  shouldClearKnownModelForSelectionScope,
-  sortPersonaRuntimes,
-  type PersonaDropdownOption,
 } from "./agentConfigOptions";
 import {
   selectionOnModelDropdownChange,
@@ -65,29 +55,12 @@ import {
   selectionOnRuntimeChange,
   type RuntimeModelProviderSelection,
 } from "./runtimeModelProviderSelection";
-import {
-  MODEL_DISCOVERY_LOADING_VALUE,
-  usePersonaModelDiscovery,
-} from "./usePersonaModelDiscovery";
-import {
-  modelDropdownOptions as buildModelDropdownOptions,
-  relayMeshModelPickerState,
-} from "./relayMeshModelPicker";
 import { AgentCreationPreview } from "./AgentCreationPreview";
-import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
-import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
-import { useRequiredCredentialState } from "./useRequiredCredentialState";
-import { getBakedProviderInheritLabel } from "./bakedEnvHelpers";
-import { getProviderApiKeyEnvVar } from "./agentConfigOptions";
-import { resolveModelFieldStatusMessage } from "./agentConfigControls";
 import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOwnerOnly";
-import {
-  resolveInheritedRuntimeSubmission,
-  isEditAgentProviderSaveValid,
-} from "./personaRuntimeModel";
+import { isEditAgentProviderSaveValid } from "./personaRuntimeModel";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { formatPersonaNamePoolText } from "./personaDialogState";
-import { useRuntimeFileConfigQuery } from "../hooks";
+import { useAgentEditRuntimeState } from "./useAgentEditRuntimeState";
 
 // ── Types / Component ────────────────────────────────────────────────────────
 
@@ -112,7 +85,32 @@ export type AgentEditMergedDialogProps = {
     runtime: string | undefined;
     provider: string | undefined;
     model: string | undefined;
+    respondTo: string | undefined;
   }>;
+  /**
+   * Definition admin actions (Definition admin section, Artifact 4).
+   * These are optional — omit when the host doesn't support the action.
+   */
+  /**
+   * Called to delete the definition (custom definition delete).
+   * When provided, a "Delete agent" action renders in the definition admin section.
+   */
+  onDeleteDefinition?: () => void;
+  /**
+   * For built-in definitions: called to remove from My Agents (14a deactivate).
+   * When provided and definition isBuiltIn, "Remove from My Agents" renders.
+   */
+  onRemoveFromMyAgents?: () => void;
+  /**
+   * Number of linked instances for blast-radius copy in the delete confirmation.
+   * Only relevant when onDeleteDefinition is provided.
+   */
+  linkedInstanceCount?: number;
+  /**
+   * Whether the definition's identity is archived (14b). When true, an
+   * "Archived" flair renders. Save does not unarchive.
+   */
+  isIdentityArchived?: boolean;
 };
 
 export function AgentEditMergedDialog({
@@ -123,6 +121,10 @@ export function AgentEditMergedDialog({
   onUpdated,
   onValidate,
   initialValueOverrides,
+  onDeleteDefinition,
+  onRemoveFromMyAgents,
+  linkedInstanceCount = 0,
+  isIdentityArchived = false,
 }: AgentEditMergedDialogProps) {
   const def = editContextDefinition(ctx);
   const inst = editContextInstance(ctx);
@@ -165,8 +167,12 @@ export function AgentEditMergedDialog({
   const [avatarUrl, setAvatarUrl] = React.useState("");
   const [systemPrompt, setSystemPrompt] = React.useState("");
   const [namePoolText, setNamePoolText] = React.useState("");
-  // Runtime/model/provider
+  // Definition runtime (D-field) — separate from instance harness pin (I-field)
+  const [definitionRuntimeId, setDefinitionRuntimeId] =
+    React.useState("custom");
+  // I-fields — harness pin state (I-section only, independent of D-runtime)
   const [selectedRuntimeId, setSelectedRuntimeId] = React.useState("custom");
+  // LLM model/provider (shared between D and I sections; which store they target is context-dependent)
   const [model, setModel] = React.useState("");
   const [provider, setProvider] = React.useState("");
   const [isCustomModelEditing, setIsCustomModelEditing] = React.useState(false);
@@ -209,6 +215,9 @@ export function AgentEditMergedDialog({
   // L-fields
   const [autoRestartOnConfigChange, setAutoRestartOnConfigChange] =
     React.useState(inst?.autoRestartOnConfigChange ?? false);
+  const [startOnAppLaunch, setStartOnAppLaunch] = React.useState(
+    inst?.startOnAppLaunch ?? false,
+  );
 
   // UI state
   const [showAdvancedFields, setShowAdvancedFields] = React.useState(false);
@@ -217,6 +226,9 @@ export function AgentEditMergedDialog({
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
   const aiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const [isAddHarnessOpen, setIsAddHarnessOpen] = React.useState(false);
+  // Track whether any D-field has been dirtied so the catalog publish affordance
+  // activates only after the user makes a change (matching AgentDefinitionDialog).
+  const [dFieldsDirty, setDFieldsDirty] = React.useState(false);
 
   // ── Seed form on open ─────────────────────────────────────────────────────
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional — only re-seed on open/entity-switch
@@ -239,9 +251,14 @@ export function AgentEditMergedDialog({
     setInstanceEnvVars(seed.instanceEnvVars ?? {});
     setInstanceName(seed.instanceName ?? "");
     setAutoRestartOnConfigChange(seed.autoRestartOnConfigChange ?? false);
+    setStartOnAppLaunch(seed.startOnAppLaunch ?? false);
     setShowAdvancedFields(false);
     setIsAvatarUploadPending(false);
     runtimeTouched.current = false;
+
+    // Seed definition runtime (D-field) from definition record.
+    const defRuntimeId = def?.runtime?.trim() ?? "";
+    setDefinitionRuntimeId(defRuntimeId || "custom");
 
     if (inst) {
       setAgentCommand(inst.agentCommand);
@@ -251,13 +268,14 @@ export function AgentEditMergedDialog({
       );
       setAgentArgs(inst.agentArgs.join(","));
       setAcpCommand(inst.acpCommand);
+      // I-harness pin: match instance agentCommand to catalog entry
       const matched =
         runtimes.find((r) => r.command?.trim() === inst.agentCommand.trim()) ??
         runtimes.find((r) => r.id === inst.agentCommand.trim());
       setSelectedRuntimeId(matched ? matched.id : "custom");
     } else if (def) {
-      // definition-only: seed runtime from definition
-      const defRuntimeId = def.runtime?.trim() ?? "";
+      // definition-only: also seed I-harness selectedRuntimeId from definition for the
+      // D-section dropdown (no instance, so both are the same)
       setSelectedRuntimeId(defRuntimeId || "custom");
     }
 
@@ -272,9 +290,32 @@ export function AgentEditMergedDialog({
       if (initialValueOverrides.provider !== undefined)
         setProvider(initialValueOverrides.provider ?? "");
       if (initialValueOverrides.runtime !== undefined)
-        setSelectedRuntimeId(initialValueOverrides.runtime ?? "custom");
+        setDefinitionRuntimeId(initialValueOverrides.runtime ?? "custom");
+      // R6: carry agent-requested respondTo into definition-only form (IMPORTANT-4)
+      if (initialValueOverrides.respondTo !== undefined)
+        setRespondTo(
+          (initialValueOverrides.respondTo ?? "anyone") as RespondToMode,
+        );
     }
+    setDFieldsDirty(false);
   }, [open, inst?.pubkey, def?.id]);
+
+  // Auto-seed D-section runtime when the definition has no runtime configured
+  // and the catalog has loaded. Matches AgentDefinitionDialog's auto-seed logic.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional — only re-seed when catalog loads or dialog opens
+  React.useEffect(() => {
+    if (
+      !open ||
+      !showDef ||
+      runtimes.length === 0 ||
+      definitionRuntimeId !== "custom" || // already set by the user or seed
+      (def?.runtime?.trim() ?? "").length > 0 // definition already has a runtime
+    )
+      return;
+    const defaultRuntime = getDefaultPersonaRuntime(runtimes);
+    if (!defaultRuntime) return;
+    setDefinitionRuntimeId(defaultRuntime.id);
+  }, [open, runtimes.length, showDef]);
 
   // Re-derive runtime id when catalog loads
   React.useEffect(() => {
@@ -287,286 +328,59 @@ export function AgentEditMergedDialog({
   }, [open, runtimes, inst?.agentCommand, inst]);
 
   // ── Runtime / model / provider machinery ──────────────────────────────────
-  const sortedRuntimes = React.useMemo(
-    () => sortPersonaRuntimes(runtimes),
-    [runtimes],
-  );
-  const selectedRuntime = runtimes.find((r) => r.id === selectedRuntimeId);
-  const runtimeDropdownValue = selectedRuntimeId || NO_RUNTIME_DROPDOWN_VALUE;
-
-  // Instance-path runtime dropdown options
-  const instanceRuntimeDropdownOptions: PersonaDropdownOption[] =
-    React.useMemo(() => {
-      const options: PersonaDropdownOption[] = [
-        ...sortedRuntimes.map((r) => ({
-          label: formatRuntimeOptionLabel(r),
-          value: r.id,
-        })),
-        { label: "Custom command", value: "custom" },
-      ];
-      if (
-        selectedRuntimeId &&
-        selectedRuntimeId !== "custom" &&
-        !options.some((o) => o.value === selectedRuntimeId)
-      ) {
-        options.push({
-          label: `${selectedRuntimeId} (current)`,
-          value: selectedRuntimeId,
-        });
-      }
-      options.push(ADD_CUSTOM_HARNESS_OPTION);
-      return options;
-    }, [sortedRuntimes, selectedRuntimeId]);
-
-  // Definition path: uses buildPersonaRuntimeDropdownOptions (supports loading/blank)
   const {
-    blankRuntimeOptionLabel: defBlankLabel,
-    runtimeDropdownOptions: defRuntimeDropdownOptions,
-  } = React.useMemo(() => {
-    const result = buildPersonaRuntimeDropdownOptions({
-      defaultRuntimeId: getDefaultPersonaRuntime(runtimes)?.id,
-      isCreateMode: false,
-      runtime: selectedRuntimeId === "custom" ? "" : selectedRuntimeId,
-      runtimes,
-      runtimesLoading: runtimeCatalogStatus === "loading",
-    });
-    result.runtimeDropdownOptions.push(ADD_CUSTOM_HARNESS_OPTION);
-    return result;
-  }, [runtimes, runtimeCatalogStatus, selectedRuntimeId]);
-
-  const originalRuntimeSupportsProvider = React.useMemo(() => {
-    if (!inst) return false;
-    const originalCommand = originalAgentCommand.trim();
-    const matched =
-      runtimes.find((r) => r.command?.trim() === originalCommand) ??
-      runtimes.find((r) => r.id === originalCommand);
-    return runtimeSupportsLlmProviderSelection(matched?.id ?? "");
-  }, [runtimes, originalAgentCommand, inst]);
-
-  // Prospective runtime after submit (for gate + discovery)
-  const prospectiveRuntimeId = React.useMemo(() => {
-    if (!inst) return selectedRuntimeId || "";
-    if (!inheritHarness) return selectedRuntime?.id ?? selectedRuntimeId;
-    const personaRuntimeId = linkedPersona?.runtime?.trim();
-    if (personaRuntimeId) {
-      return (
-        runtimes.find((r) => r.id === personaRuntimeId)?.id ?? personaRuntimeId
-      );
-    }
-    return (
-      runtimes.find((r) => r.command?.trim() === inst.agentCommand.trim())
-        ?.id ??
-      runtimes.find((r) => r.id === inst.agentCommand.trim())?.id ??
-      getDefaultPersonaRuntime(runtimes)?.id ??
-      ""
-    );
-  }, [
-    inheritHarness,
-    linkedPersona?.runtime,
+    selectedRuntime,
+    runtimeDropdownValue,
+    defRuntimeDropdownValue,
+    instanceRuntimeDropdownOptions,
+    defRuntimeDropdownOptions,
+    defBlankLabel,
+    originalRuntimeSupportsProvider,
+    prospectiveRuntimeId,
+    prospectiveRuntime,
+    llmProviderFieldVisible,
+    inheritedSubmission,
+    inheritedModelDefault,
+    inheritedProviderDefault,
+    inheritedEnvVarsForAdvanced,
+    fileSatisfiedEnvKeys,
+    requiredEnvKeyMissing,
+    effectiveProvider,
+    providerDropdownOptions,
+    providerSelectValue,
+    modelDropdownOptions,
+    modelSelectValue,
+    showCustomModelInput,
+    modelStatusMessage,
+    modelDiscoveryLoading,
+    apiKeyValue,
+    apiKeyIsInherited,
+    apiKeyInheritedLabel,
+    apiKeyIsRequired,
+    topLevelSecretEnvVar,
+    advancedRequiredEnvKeys,
+  } = useAgentEditRuntimeState({
+    open,
+    showDef,
+    showInst,
     runtimes,
-    inst?.agentCommand,
-    selectedRuntime?.id,
+    runtimeCatalogStatus,
     selectedRuntimeId,
-    inst,
-  ]);
-
-  const llmProviderFieldVisible = runtimeSupportsLlmProviderSelection(
-    showInst ? prospectiveRuntimeId : selectedRuntimeId,
-  );
-
-  const prospectiveRuntime = runtimes.find(
-    (r) => r.id === prospectiveRuntimeId,
-  );
-
-  // Resolve inherited env / provider for credential gate
-  const inheritedEnvVars = linkedPersona?.envVars ?? {};
-  const inheritedSubmission = React.useMemo(() => {
-    if (!inst)
-      return { provider: provider || null, model: model || null, envVars };
-    return resolveInheritedRuntimeSubmission({
-      inheritHarness,
-      agentWasHarnessPinned: inst.agentCommandOverride != null,
-      provider,
-      personaProvider: linkedPersona?.provider ?? "",
-      model,
-      personaModel: linkedPersona?.model ?? null,
-      envVars: showDef ? envVars : instanceEnvVars,
-      personaEnvVars: inheritedEnvVars,
-    });
-  }, [
+    definitionRuntimeId,
+    model,
+    provider,
+    isCustomModelEditing,
+    isCustomProviderEditing,
+    envVars,
+    instanceEnvVars,
     inheritHarness,
     inst,
     linkedPersona,
-    provider,
-    model,
-    envVars,
-    instanceEnvVars,
-    inheritedEnvVars,
-    showDef,
-  ]);
-
-  const {
-    globalConfig,
-    inheritedDefaults: {
-      provider: inheritedProviderDefault,
-      model: inheritedModelDefault,
-    },
-    inheritedEnvVars: inheritedEnvVarsForAdvanced,
-  } = useAgentDialogDefaults({ inheritedEnvVars, open });
-
-  const { requiredEnvKeys, fileSatisfiedEnvKeys, requiredEnvKeyMissing } =
-    useRequiredCredentialState({
-      open: open && showInst,
-      prospectiveRuntimeId,
-      provider: inheritedSubmission.provider ?? "",
-      globalProvider: inheritedProviderDefault.value,
-      envVars: inheritedSubmission.envVars,
-      globalEnvVars: globalConfig.env_vars,
-      personaEnvVars: inheritHarness ? inheritedEnvVars : undefined,
-    });
-
-  // runtimeFileConfig is used by localModeGate (definition-only). For the
-  // merged surface, the credential gate drives Save readiness on instance paths.
-  useRuntimeFileConfigQuery(
-    showInst ? prospectiveRuntimeId : selectedRuntimeId,
-    { enabled: open },
-  );
-
-  // Model discovery
-  const effectiveProvider =
-    (inheritedSubmission.provider ?? "").trim() ||
-    inheritedProviderDefault.value;
-  const providerForDiscovery = llmProviderFieldVisible ? effectiveProvider : "";
-  const envVarsForDiscovery = React.useMemo(
-    () => ({ ...globalConfig.env_vars, ...inheritedSubmission.envVars }),
-    [globalConfig.env_vars, inheritedSubmission.envVars],
-  );
-
-  const {
-    discoveredModelOptions,
-    modelDiscoveryLoading,
-    modelDiscoveryStatus,
-  } = usePersonaModelDiscovery({
-    envVars: envVarsForDiscovery,
-    isCustomProviderEditing,
-    modelFieldVisible: true,
-    open,
-    provider: providerForDiscovery,
-    selectedRuntime: showInst ? prospectiveRuntime : selectedRuntime,
-  });
-
-  const hideProviderIds = React.useMemo(
-    () =>
-      (bakedEnvKeys ?? []).includes("BUZZ_AGENT_PROVIDER")
-        ? BLOCK_BUILD_HIDDEN_PROVIDER_IDS
-        : new Set<string>(),
-    [bakedEnvKeys],
-  );
-
-  const providerOptions = getPersonaProviderOptions(
-    provider.trim(),
-    showInst ? (selectedRuntime?.id ?? "") : selectedRuntimeId,
-    inheritedProviderDefault.source === "global"
-      ? inheritedProviderDefault.value
-      : "",
-    hideProviderIds,
-  );
-  const providerSelectValue = isCustomProviderEditing
-    ? CUSTOM_PROVIDER_DROPDOWN_VALUE
-    : provider.trim() || AUTO_PROVIDER_DROPDOWN_VALUE;
-  const providerDropdownOptions: PersonaDropdownOption[] = [
-    ...providerOptions.map((opt) => ({
-      label:
-        opt.id === "" && inheritedProviderDefault.source === "build"
-          ? getBakedProviderInheritLabel(
-              inheritedProviderDefault.value,
-              providerOptions,
-            )
-          : opt.label,
-      value: opt.id || AUTO_PROVIDER_DROPDOWN_VALUE,
-    })),
-    { label: "Custom provider...", value: CUSTOM_PROVIDER_DROPDOWN_VALUE },
-  ];
-
-  const {
-    isRelayMesh,
-    options: effectiveModelOptions,
-    selectValue: modelSelectValue,
-    showCustomInput: showCustomModelInput,
-  } = relayMeshModelPickerState({
-    discoveredOptions: discoveredModelOptions,
-    fallbackOptions: [
-      { id: "", label: getDefaultLlmModelLabel(inheritedModelDefault.value) },
-    ],
-    isCustomEditing: isCustomModelEditing,
-    model,
-    provider: providerForDiscovery,
-  });
-
-  const modelDropdownOptions = buildModelDropdownOptions({
-    allowCustom: !isRelayMesh,
-    globalModel: isRelayMesh ? undefined : inheritedModelDefault.value,
-    globalModelLabel: isRelayMesh
-      ? undefined
-      : getDefaultLlmModelLabel(inheritedModelDefault.value),
-    loading: modelDiscoveryLoading && discoveredModelOptions === null,
-    loadingValue: MODEL_DISCOVERY_LOADING_VALUE,
-    options: effectiveModelOptions,
-  });
-
-  const modelStatusMessage = resolveModelFieldStatusMessage({
-    discoveredModelOptions,
-    loading: modelDiscoveryLoading,
-    status: modelDiscoveryStatus,
-  });
-
-  const providerApiKeyEnvVar = getProviderApiKeyEnvVar(effectiveProvider);
-  const personaSatisfied =
-    providerApiKeyEnvVar != null &&
-    !(providerApiKeyEnvVar in (showInst ? instanceEnvVars : envVars)) &&
-    (inheritedEnvVars[providerApiKeyEnvVar] ?? "").length > 0;
-  const apiKeyFieldState = useProviderApiKeyFieldState({
     bakedEnvKeys,
-    effectiveEnvVars: inheritedSubmission.envVars,
-    envVars: showInst ? instanceEnvVars : envVars,
-    fileSatisfiedEnvKeys,
-    globalEnvVars: globalConfig.env_vars,
-    personaSatisfied,
-    provider: effectiveProvider,
-    requiredEnvKeys,
+    originalAgentCommand,
+    setModel,
+    setIsCustomModelEditing,
   });
-  const {
-    advancedRequiredEnvKeys,
-    inheritedLabel: apiKeyInheritedLabel,
-    isInherited: apiKeyIsInherited,
-    isRequired: apiKeyIsRequired,
-    secretEnvVar: topLevelSecretEnvVar,
-    value: apiKeyValue,
-  } = apiKeyFieldState;
-
-  // Clear model when provider scope changes
-  React.useEffect(() => {
-    if (
-      !open ||
-      isCustomModelEditing ||
-      !shouldClearKnownModelForSelectionScope({
-        model,
-        provider: providerForDiscovery,
-        runtime: showInst ? prospectiveRuntimeId : selectedRuntimeId,
-      })
-    )
-      return;
-    setModel("");
-    setIsCustomModelEditing(false);
-  }, [
-    isCustomModelEditing,
-    model,
-    open,
-    providerForDiscovery,
-    selectedRuntimeId,
-    prospectiveRuntimeId,
-    showInst,
-  ]);
 
   // ── Submit validity ────────────────────────────────────────────────────────
   const modelRequired = React.useMemo(
@@ -578,15 +392,17 @@ export function AgentEditMergedDialog({
     [provider],
   );
 
-  const providerValid = showInst
-    ? isEditAgentProviderSaveValid({
-        llmProviderFieldVisible,
-        currentProvider: provider,
-        originalProvider: inst?.provider ?? null,
-        globalProvider: inheritedProviderDefault.value,
-        originalRuntimeSupportsProvider,
-      })
-    : true;
+  const providerValid = isEditAgentProviderSaveValid({
+    llmProviderFieldVisible,
+    currentProvider: provider,
+    originalProvider: showInst
+      ? (inst?.provider ?? null)
+      : (def?.provider ?? null),
+    globalProvider: inheritedProviderDefault.value,
+    originalRuntimeSupportsProvider: showInst
+      ? originalRuntimeSupportsProvider
+      : llmProviderFieldVisible, // for D-only: picker is visible → was already editable
+  });
 
   const parsedParallelism = parseInt(parallelism, 10);
 
@@ -611,6 +427,8 @@ export function AgentEditMergedDialog({
     instanceEnvVars,
     instanceName,
     autoRestartOnConfigChange,
+    startOnAppLaunch: showInst ? startOnAppLaunch : undefined,
+    definitionRuntimeId,
     selectedRuntimeId,
     inheritHarness,
     agentCommand,
@@ -619,11 +437,6 @@ export function AgentEditMergedDialog({
     showInst,
     defReadOnly,
     inheritedSubmissionProvider: inheritedSubmission.provider ?? null,
-    inheritedSubmissionEnvVars: inheritedSubmission.envVars as Record<
-      string,
-      string
-    >,
-    linkedPersonaEnvVars: linkedPersona?.envVars,
     runtimes,
     updatePersona: (p) => updatePersonaMutation.mutateAsync(p),
     updatePersonaAndPublish: (p) =>
@@ -639,9 +452,9 @@ export function AgentEditMergedDialog({
     !isSaving &&
     !isAvatarUploadPending &&
     displayName.trim().length > 0 &&
+    providerValid &&
     (showInst
-      ? providerValid &&
-        !requiredEnvKeyMissing &&
+      ? !requiredEnvKeyMissing &&
         (parsedParallelism > 0 || parallelism === "") &&
         (selectedRuntimeId !== "custom" ||
           inheritHarness ||
@@ -669,6 +482,28 @@ export function AgentEditMergedDialog({
     }
   }
 
+  // D-section runtime change (definition runtime, D-field)
+  function handleDefinitionRuntimeChange(nextValue: string) {
+    const action = runtimeDropdownAction(nextValue);
+    if (action.kind === "add-custom-harness") {
+      setIsAddHarnessOpen(true);
+      return;
+    }
+    const nextRuntimeId = action.runtimeId;
+    const previousRuntimeId = definitionRuntimeId;
+    setDefinitionRuntimeId(nextRuntimeId || "custom");
+    applySelection(
+      selectionOnRuntimeChange(selection, {
+        previousRuntime: previousRuntimeId,
+        nextRuntime: nextRuntimeId,
+        nextRuntimeCanChooseProvider:
+          runtimeSupportsLlmProviderSelection(nextRuntimeId),
+        lockedRuntimeReset: "full",
+      }),
+    );
+  }
+
+  // I-section runtime change (instance harness pin, I-field)
   function handleRuntimeDropdownChange(nextValue: string) {
     const action = runtimeDropdownAction(nextValue);
     if (action.kind === "add-custom-harness") {
@@ -678,20 +513,16 @@ export function AgentEditMergedDialog({
     const nextRuntimeId = action.runtimeId;
     const previousRuntimeId = selectedRuntimeId;
 
-    if (showInst) {
-      runtimeTouched.current = true;
-      const nextRuntime = runtimes.find((r) => r.id === nextRuntimeId);
-      const resolvedRuntimeId = nextRuntimeId || "custom";
-      setSelectedRuntimeId(resolvedRuntimeId);
-      if (resolvedRuntimeId === "custom" || nextRuntime?.command) {
-        setInheritHarness(false);
-      }
-      if (nextRuntime?.command) {
-        setAgentCommand(nextRuntime.command);
-        setAgentArgs(nextRuntime.defaultArgs.join(","));
-      }
-    } else {
-      setSelectedRuntimeId(nextRuntimeId || "custom");
+    runtimeTouched.current = true;
+    const nextRuntime = runtimes.find((r) => r.id === nextRuntimeId);
+    const resolvedRuntimeId = nextRuntimeId || "custom";
+    setSelectedRuntimeId(resolvedRuntimeId);
+    if (resolvedRuntimeId === "custom" || nextRuntime?.command) {
+      setInheritHarness(false);
+    }
+    if (nextRuntime?.command) {
+      setAgentCommand(nextRuntime.command);
+      setAgentArgs(nextRuntime.defaultArgs.join(","));
     }
 
     applySelection(
@@ -781,6 +612,22 @@ export function AgentEditMergedDialog({
       ? `Edit ${def.displayName}`
       : "Edit agent";
 
+  // Catalog publish affordance: only shown when the definition is shared
+  // and the user has made at least one D-field change.
+  const publishesCatalogUpdates = !!(
+    def?.shared &&
+    !defReadOnly &&
+    dFieldsDirty
+  );
+
+  // Helper: wrap a D-section setter to also mark D-fields dirty.
+  function dChange<T>(setter: (v: T) => void): (v: T) => void {
+    return (v: T) => {
+      setter(v);
+      setDFieldsDirty(true);
+    };
+  }
+
   return (
     <Dialog
       onOpenChange={(next) => {
@@ -796,37 +643,73 @@ export function AgentEditMergedDialog({
         headerClassName="pb-2"
         title={dialogTitle}
         footer={
-          <div className="flex w-full items-center justify-end gap-2">
-            <Button
-              disabled={isSaving || isAvatarUploadPending}
-              onClick={() => onOpenChange(false)}
-              type="button"
-              variant="outline"
-            >
-              Cancel
-            </Button>
-            <Button
-              data-testid="edit-agent-dialog-submit"
-              disabled={!canSubmit}
-              onClick={() => void handleSubmit()}
-              type="button"
-            >
-              {isSaving ? "Saving..." : "Save changes"}
-            </Button>
+          <div className="flex w-full flex-wrap items-center justify-between gap-3">
+            <div className="flex min-h-9 min-w-0 flex-wrap items-center gap-3">
+              {publishesCatalogUpdates ? (
+                <p
+                  className="max-w-sm text-xs text-muted-foreground"
+                  data-testid="edit-agent-dialog-catalog-publish-notice"
+                >
+                  This agent is in the community catalog. Your changes will be
+                  published when you save.
+                </p>
+              ) : null}
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                disabled={isSaving || isAvatarUploadPending}
+                onClick={() => onOpenChange(false)}
+                type="button"
+                variant="outline"
+              >
+                Cancel
+              </Button>
+              <Button
+                data-testid="edit-agent-dialog-submit"
+                disabled={!canSubmit}
+                onClick={() => void handleSubmit()}
+                type="button"
+              >
+                {isSaving
+                  ? "Saving..."
+                  : publishesCatalogUpdates
+                    ? "Save and publish"
+                    : "Save changes"}
+              </Button>
+            </div>
           </div>
         }
       >
         <div className="grid gap-5 lg:grid-cols-[220px_minmax(0,1fr)]">
           {/* ── Identity column: avatar + preview ────────────────────── */}
           <div className="flex flex-col items-center gap-2">
-            <AgentCreationPreview
-              avatarUrl={previewAvatarUrl}
-              disabled={isSaving || isAvatarUploadPending || defReadOnly}
-              label={previewLabel}
-              onClearAvatar={() => setAvatarUrl("")}
-              onUploadPendingChange={setIsAvatarUploadPending}
-              onSelectAvatar={setAvatarUrl}
-            />
+            {/* Row 2 contract: unlinked agent (instance-only) → avatar is read-only.
+                Backend has no avatarUrl on UpdateManagedAgentInput, so editing is
+                impossible. Show disabled avatar + tooltip explaining the gap. */}
+            {!showDef ? (
+              <div className="flex flex-col items-center gap-1">
+                <AgentCreationPreview
+                  avatarUrl={previewAvatarUrl}
+                  disabled
+                  label={previewLabel}
+                  onClearAvatar={() => {}}
+                  onUploadPendingChange={() => {}}
+                  onSelectAvatar={() => {}}
+                />
+                <p className="text-xs text-muted-foreground text-center">
+                  Avatar is shared identity — edit via the agent definition.
+                </p>
+              </div>
+            ) : (
+              <AgentCreationPreview
+                avatarUrl={previewAvatarUrl}
+                disabled={isSaving || isAvatarUploadPending || defReadOnly}
+                label={previewLabel}
+                onClearAvatar={() => setAvatarUrl("")}
+                onUploadPendingChange={setIsAvatarUploadPending}
+                onSelectAvatar={setAvatarUrl}
+              />
+            )}
           </div>
 
           {/* ── Main form column ──────────────────────────────────────── */}
@@ -837,8 +720,8 @@ export function AgentEditMergedDialog({
                 className="text-sm text-muted-foreground"
                 data-testid="team-managed-notice"
               >
-                This agent is managed by a team. Its configuration cannot be
-                edited here.
+                Managed by team{def?.sourceTeam ? ` ${def.sourceTeam}` : ""}.
+                Its configuration cannot be edited here.
               </p>
             ) : null}
 
@@ -852,34 +735,58 @@ export function AgentEditMergedDialog({
               </p>
             ) : null}
 
+            {/* Identity-archived flair (14b) — fields remain editable; Save does not unarchive */}
+            {isIdentityArchived && showDef ? (
+              <p
+                className="text-sm font-medium text-amber-600 dark:text-amber-400"
+                data-testid="identity-archived-flair"
+              >
+                Archived — this agent's identity is archived on the relay. Save
+                will update its profile but will not unarchive.
+              </p>
+            ) : null}
+
             {/* ── D-section: Identity + Behavior + Runtime ──────────── */}
             {showDef ? (
               <AgentEditMergedDSection
                 defReadOnly={defReadOnly}
                 isSaving={isSaving}
                 displayName={displayName}
-                onDisplayNameChange={setDisplayName}
+                onDisplayNameChange={dChange(setDisplayName)}
                 systemPrompt={systemPrompt}
-                onSystemPromptChange={setSystemPrompt}
+                onSystemPromptChange={dChange(setSystemPrompt)}
+                namePoolText={namePoolText}
+                onNamePoolTextChange={dChange(setNamePoolText)}
+                envVars={envVars}
+                onEnvVarsChange={dChange(setEnvVars)}
                 runtimeCatalogStatus={runtimeCatalogStatus}
-                runtimeDropdownValue={runtimeDropdownValue}
+                runtimeDropdownValue={defRuntimeDropdownValue}
                 defRuntimeDropdownOptions={defRuntimeDropdownOptions}
                 defBlankLabel={defBlankLabel}
-                onRuntimeChange={handleRuntimeDropdownChange}
+                onRuntimeChange={(v) => {
+                  setDFieldsDirty(true);
+                  handleDefinitionRuntimeChange(v);
+                }}
                 llmProviderFieldVisible={llmProviderFieldVisible}
                 providerSelectValue={providerSelectValue}
                 providerDropdownOptions={providerDropdownOptions}
-                onProviderChange={handleProviderDropdownChange}
+                onProviderChange={(v) => {
+                  setDFieldsDirty(true);
+                  handleProviderDropdownChange(v);
+                }}
                 isCustomProviderEditing={isCustomProviderEditing}
                 provider={provider}
-                onProviderTextChange={setProvider}
+                onProviderTextChange={dChange(setProvider)}
                 modelSelectValue={modelSelectValue}
                 modelDropdownOptions={modelDropdownOptions}
-                onModelChange={handleModelDropdownChange}
+                onModelChange={(v) => {
+                  setDFieldsDirty(true);
+                  handleModelDropdownChange(v);
+                }}
                 modelDiscoveryLoading={modelDiscoveryLoading}
                 showCustomModelInput={showCustomModelInput}
                 model={model}
-                onModelTextChange={setModel}
+                onModelTextChange={dChange(setModel)}
                 modelStatusMessage={modelStatusMessage}
               />
             ) : null}
@@ -959,12 +866,56 @@ export function AgentEditMergedDialog({
                 onAcpCommandChange={setAcpCommand}
                 onAgentArgsChange={setAgentArgs}
                 onAutoRestartChange={setAutoRestartOnConfigChange}
+                onStartOnAppLaunchChange={setStartOnAppLaunch}
                 onEnvVarsChange={setInstanceEnvVars}
                 onInheritHarnessChange={setInheritHarness}
                 onParallelismChange={setParallelism}
+                startOnAppLaunch={startOnAppLaunch}
                 systemPrompt={systemPrompt}
                 onSystemPromptChange={setSystemPrompt}
               />
+            ) : null}
+
+            {/* Definition admin section (Artifact 4) — rendered when a definition exists */}
+            {showDef && !defReadOnly && def ? (
+              <div className="space-y-2 border-t pt-4">
+                {/* Share action (row 15 — not shown for built-ins) */}
+                {onDeleteDefinition && !def.isBuiltIn ? (
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-muted-foreground">
+                      Delete this agent and all{" "}
+                      {linkedInstanceCount > 0
+                        ? `${linkedInstanceCount} linked agent${linkedInstanceCount === 1 ? "" : "s"}`
+                        : "linked agents"}
+                      .
+                    </span>
+                    <Button
+                      disabled={isSaving}
+                      onClick={onDeleteDefinition}
+                      type="button"
+                      variant="destructive"
+                    >
+                      Delete agent
+                    </Button>
+                  </div>
+                ) : null}
+                {/* Built-in: Remove from My Agents (14a deactivate) */}
+                {onRemoveFromMyAgents && def.isBuiltIn ? (
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-muted-foreground">
+                      Remove this built-in agent from My Agents.
+                    </span>
+                    <Button
+                      disabled={isSaving}
+                      onClick={onRemoveFromMyAgents}
+                      type="button"
+                      variant="outline"
+                    >
+                      Remove from My Agents
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
             ) : null}
 
             {/* Save error */}
@@ -976,10 +927,4 @@ export function AgentEditMergedDialog({
       </ChooserDialogContent>
     </Dialog>
   );
-}
-
-// ── Local helpers ─────────────────────────────────────────────────────────────
-
-function getDefaultLlmModelLabel(model: string): string {
-  return model ? `Default (${model})` : "Default model";
 }

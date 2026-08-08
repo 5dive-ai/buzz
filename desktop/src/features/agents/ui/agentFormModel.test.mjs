@@ -297,3 +297,90 @@ test("test_team_definition_with_instance_emits_no_personaInput_but_allows_instan
     "agentInput should carry the updated respondTo",
   );
 });
+
+// ── Phantom-write probes (Thufir pass-2 CRITICAL-1 corrective action) ─────────
+//
+// An untouched linked agent save must emit zero changes. These probe the three
+// phantom writes Thufir found at 3a2806c06c:
+// 1. Linked access (respondTo null vs. "anyone" seed default)
+// 2. Instance parallelism serialized into definition behavior
+// 3. Linked access overwrite on an untouched linked agent
+
+test("test_untouched_linked_agent_emits_no_diff", () => {
+  // Agent with null respondTo and parallelism (DB defaults).
+  const definition = makeDefinition({
+    displayName: "Alice",
+    systemPrompt: "Be helpful.",
+    respondTo: null,
+    parallelism: null,
+  });
+  const instance = makeInstance({
+    respondTo: null,
+    parallelism: null,
+  });
+  const ctx = { kind: "instance-with-definition", definition, instance };
+  const seed = seedAgentFormModel(ctx);
+  // Simulate dialog seeding: respondTo null → "anyone" (normalized in seedAgentFormModel)
+  // but since we now normalize in seed itself, seed.respondTo should be "anyone"
+  assert.equal(
+    seed.respondTo,
+    "anyone",
+    "seed normalizes null respondTo to anyone",
+  );
+
+  // Diff against itself — nothing changed.
+  const emit = emitAgentFormDiff(seed, seed, ctx);
+  assert.equal(emit.personaInput, null, "untouched linked: no D-write");
+  assert.equal(emit.agentInput, null, "untouched linked: no I-write");
+  assert.deepEqual(emit.policySets, [], "untouched linked: no policy writes");
+});
+
+test("test_untouched_team_linked_agent_emits_no_diff", () => {
+  const definition = makeDefinition({
+    sourceTeam: "team-acme",
+    respondTo: null,
+  });
+  const instance = makeInstance({ respondTo: null, parallelism: null });
+  const ctx = { kind: "instance-with-definition", definition, instance };
+  const seed = seedAgentFormModel(ctx);
+
+  const emit = emitAgentFormDiff(seed, seed, ctx);
+  assert.equal(emit.personaInput, null, "untouched team: no D-write");
+  assert.equal(emit.agentInput, null, "untouched team: no I-write");
+});
+
+test("test_linked_access_edit_emits_only_agentInput_not_personaInput", () => {
+  // Changing respondTo on a linked agent must go to agentInput only,
+  // never to personaInput (D-owned default stays untouched).
+  const definition = makeDefinition({ respondTo: "anyone" });
+  const instance = makeInstance({ respondTo: "anyone" });
+  const ctx = { kind: "instance-with-definition", definition, instance };
+  const seed = seedAgentFormModel(ctx);
+
+  const next = { ...seed, respondTo: "owner-only" };
+  const emit = emitAgentFormDiff(seed, next, ctx);
+
+  assert.equal(emit.personaInput, null, "linked respondTo change: no D-write");
+  assert.ok(
+    emit.agentInput,
+    "linked respondTo change: agentInput must be emitted",
+  );
+  assert.equal(emit.agentInput.respondTo, "owner-only");
+});
+
+test("test_untouched_parallelism_on_linked_agent_emits_no_diff", () => {
+  // Parallelism is I-owned for linked agents. Seeding and re-diffing without
+  // change must not emit to definition behavior.
+  const definition = makeDefinition({ parallelism: 2 });
+  const instance = makeInstance({ parallelism: 5 });
+  const ctx = { kind: "instance-with-definition", definition, instance };
+  const seed = seedAgentFormModel(ctx);
+
+  // seed.parallelism should come from instance (5), not definition (2)
+  assert.equal(seed.parallelism, 5, "parallelism seeds from instance");
+
+  // Untouched diff.
+  const emit = emitAgentFormDiff(seed, seed, ctx);
+  assert.equal(emit.personaInput, null, "untouched parallelism: no D-write");
+  assert.equal(emit.agentInput, null, "untouched parallelism: no I-write");
+});

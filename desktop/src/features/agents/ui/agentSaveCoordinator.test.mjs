@@ -194,6 +194,11 @@ test("test_write_ordering_instance_write_runs_after_definition_write_succeeds", 
 
 test("test_write_ordering_policy_setters_run_only_after_both_data_writes_succeed", async () => {
   const calls = { updatePersona: 0, updateManagedAgent: 0, setAutoRestart: 0 };
+  // The refetchStores must reflect each write as it happens so per-boundary
+  // settlement passes and the coordinator can advance through all steps.
+  // After I-write the agent has name "Alice-renamed"; after autoRestart the
+  // agent also has autoRestartOnConfigChange: true.
+  let refetchCount = 0;
 
   const opts = makeOpts({
     personaInput: makePersonaInput(),
@@ -223,10 +228,21 @@ test("test_write_ordering_policy_setters_run_only_after_both_data_writes_succeed
       );
       calls.setAutoRestart++;
     },
-    refetchStores: async () => ({
-      persona: makeDefinition(),
-      agent: makeInstance({ name: "Alice-renamed" }),
-    }),
+    refetchStores: async () => {
+      refetchCount++;
+      // After D-write (refetch 1): persona matches, agent has original name.
+      // After I-write (refetch 2): agent now has renamed name.
+      // After autoRestart setter (refetch 3 + final): agent also has autoRestart=true.
+      const agentName = refetchCount >= 2 ? "Alice-renamed" : "Alice";
+      const autoRestart = refetchCount >= 3;
+      return {
+        persona: makeDefinition(),
+        agent: makeInstance({
+          name: agentName,
+          autoRestartOnConfigChange: autoRestart,
+        }),
+      };
+    },
   });
 
   const result = await runAgentSaveCoordinator(opts);
@@ -379,6 +395,12 @@ test("test_partial_policy_failure_first_succeeds_second_fails_returns_false", as
     startOnAppLaunch: false,
   });
 
+  // Per-boundary settlement: after the first policy setter (autoRestart) succeeds,
+  // refetchStores must return autoRestartOnConfigChange: true for the check to
+  // pass and the coordinator to advance to the second setter. The second setter
+  // throws, so the second policy is attempted but fails.
+  let refetchCount = 0;
+
   const opts = makeOpts({
     ctx: {
       kind: "instance-with-definition",
@@ -396,7 +418,19 @@ test("test_partial_policy_failure_first_succeeds_second_fails_returns_false", as
       calls.setStartOnAppLaunch++;
       throw new Error("Permission denied");
     },
-    refetchStores: async () => ({ persona: makeDefinition(), agent: inst }),
+    refetchStores: async () => {
+      refetchCount++;
+      // After first policy setter (autoRestart=true) succeeds, reflect it.
+      // startOnAppLaunch stays false throughout (second setter throws).
+      const autoRestart = refetchCount >= 1 && calls.setAutoRestart > 0;
+      return {
+        persona: makeDefinition(),
+        agent: makeInstance({
+          autoRestartOnConfigChange: autoRestart,
+          startOnAppLaunch: false,
+        }),
+      };
+    },
   });
 
   const result = await runAgentSaveCoordinator(opts);
@@ -478,5 +512,139 @@ test("test_settlement_always_runs_even_when_no_writes_attempted", async () => {
     settlementCalled,
     true,
     "settlement must always run regardless of writes",
+  );
+});
+
+// -- CRITICAL-3: per-boundary mismatch tests --
+//
+// These verify Thufir's two probes: successful harness command whose refetched
+// agent retains old harness fields must NOT call onDone; successful auto-restart
+// setter whose refetched agent remains false must NOT call onDone.
+
+test("test_harness_command_success_but_observed_mismatch_returns_false", async () => {
+  // Thufir probe 1: agentCommand submitted, command returns success, but the
+  // refetched agent still has the old command. Must NOT call onDone.
+  let doneCalled = false;
+
+  const staleAgent = makeInstance({
+    agentCommand: "/old/harness",
+    agentCommandOverride: null,
+    agentArgs: [],
+    acpCommand: "",
+  });
+  const opts = makeOpts({
+    agentInput: { pubkey: "pk-abc", agentCommand: "/new/harness" },
+    updateManagedAgent: async () => ({
+      agent: staleAgent,
+      profileSyncError: null,
+    }),
+    refetchStores: async () => ({
+      persona: null,
+      agent: staleAgent, // old command -- mismatch with submitted
+    }),
+    onDone: () => {
+      doneCalled = true;
+    },
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(result, false, "mismatch must return false");
+  assert.equal(
+    doneCalled,
+    false,
+    "onDone must NOT be called on harness mismatch",
+  );
+});
+
+test("test_auto_restart_success_but_observed_unchanged_returns_false", async () => {
+  // Thufir probe 2: autoRestart setter returns success (no throw), but the
+  // refetched agent still has the old value (false). Must NOT call onDone.
+  let doneCalled = false;
+
+  const unchangedAgent = makeInstance({ autoRestartOnConfigChange: false });
+  const opts = makeOpts({
+    policySets: [{ type: "autoRestart", pubkey: "pk-abc", value: true }],
+    setAutoRestart: async () => {},
+    refetchStores: async () => ({
+      persona: null,
+      agent: unchangedAgent, // still false -- mismatch with submitted true
+    }),
+    onDone: () => {
+      doneCalled = true;
+    },
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(result, false, "auto-restart mismatch must return false");
+  assert.equal(
+    doneCalled,
+    false,
+    "onDone must NOT be called when policy did not persist",
+  );
+});
+
+test("test_start_on_app_launch_success_and_observed_match_calls_onDone", async () => {
+  // Positive case: startOnAppLaunch setter succeeds AND observed state matches.
+  let doneCalled = false;
+
+  const updatedAgent = makeInstance({ startOnAppLaunch: true });
+  const opts = makeOpts({
+    policySets: [{ type: "startOnAppLaunch", pubkey: "pk-abc", value: true }],
+    setStartOnAppLaunch: async () => {},
+    refetchStores: async () => ({
+      persona: null,
+      agent: updatedAgent, // matches submitted value
+    }),
+    onDone: () => {
+      doneCalled = true;
+    },
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(result, true, "matching policy must return true");
+  assert.equal(doneCalled, true, "onDone must be called on policy success");
+});
+
+test("test_definition_write_not_persisted_stops_instance_write", async () => {
+  // Per-boundary: if D-write succeeds but observed persona does not match,
+  // the coordinator must not advance to the I-write.
+  let instanceWriteCalled = false;
+
+  const stalePersona = makeDefinition({
+    displayName: "Old Name",
+    systemPrompt: "Be helpful.",
+  });
+  const opts = makeOpts({
+    personaInput: {
+      id: "def-1",
+      displayName: "Updated Name",
+      systemPrompt: "Updated prompt.",
+      namePool: [],
+      envVars: {},
+    },
+    agentInput: { pubkey: "pk-abc", name: "updated-name" },
+    updatePersona: async () => {},
+    updateManagedAgent: async () => {
+      instanceWriteCalled = true;
+      return { agent: makeInstance(), profileSyncError: null };
+    },
+    refetchStores: async () => ({
+      // Persona with OLD displayName = mismatch after D-write.
+      persona: stalePersona,
+      agent: makeInstance(),
+    }),
+    onDone: () => {},
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(result, false, "D-write mismatch must return false");
+  assert.equal(
+    instanceWriteCalled,
+    false,
+    "instance write must NOT be attempted when D-write did not persist",
   );
 });

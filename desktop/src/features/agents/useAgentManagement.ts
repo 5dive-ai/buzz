@@ -212,28 +212,6 @@ export function useAgentManagement() {
     }
   }
 
-  async function submitUpdate(input: CreatePersonaInput | UpdatePersonaInput) {
-    if (request?.action !== "update" || !("id" in input)) {
-      return false;
-    }
-    setError(null);
-    try {
-      assertAgentCanActFromOrigin(request.request.channelId);
-      await updatePersonaMutation.mutateAsync(input);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: personasQueryKey }),
-        queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
-      ]);
-      dismiss();
-      return true;
-    } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : "Could not save this agent.",
-      );
-      return false;
-    }
-  }
-
   function dismiss() {
     pendingRequestId.current = null;
     sourceAgentPubkey.current = null;
@@ -273,7 +251,6 @@ export function useAgentManagement() {
         ? ("error" as const)
         : ("ready" as const),
     submitCreate,
-    submitUpdate,
     dismiss,
     /** Returns an error string if the requesting agent lacks origin permission, null if OK. */
     verifyOriginPermission(): string | null {
@@ -297,6 +274,7 @@ export function useAgentManagement() {
         runtime: string | undefined;
         provider: string | undefined;
         model: string | undefined;
+        respondTo: string | undefined;
       }> = {};
       if (changes.displayName != null)
         overrides.displayName = changes.displayName;
@@ -306,6 +284,8 @@ export function useAgentManagement() {
       if (changes.provider != null)
         overrides.provider = changes.provider ?? undefined;
       if (changes.model != null) overrides.model = changes.model ?? undefined;
+      // IMPORTANT-4: carry agent-requested respondTo into definition-only review mode.
+      if (changes.respondTo != null) overrides.respondTo = changes.respondTo;
       return Object.keys(overrides).length > 0 ? overrides : undefined;
     },
   };

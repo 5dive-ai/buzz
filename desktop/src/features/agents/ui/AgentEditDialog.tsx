@@ -48,6 +48,7 @@ export type AgentEditDialogProps = {
     runtime: string | undefined;
     provider: string | undefined;
     model: string | undefined;
+    respondTo: string | undefined;
   }>;
 };
 

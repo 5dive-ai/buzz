@@ -125,7 +125,10 @@ export async function runAgentSaveCoordinator(
     }
   }
 
-  // ── Steps 1–3: Writes ─────────────────────────────────────────────────────
+  // ── Steps 1–3: Writes (per-boundary settlement) ───────────────────────────
+  // Contract: settle after EACH attempted boundary. Stop advancing when the
+  // preceding step did not persist to disk (observed-state check, not command
+  // result). Never trust `written` booleans for policy success.
   let firstError: string | null = null;
   let profileSyncError: string | null = null;
   let latestAgent: ManagedAgent | null = inst;
@@ -134,14 +137,8 @@ export async function runAgentSaveCoordinator(
     | PersonaSharePublicationResult["publicationStatus"]
     | null = null;
 
-  // Per-policy failure tracking: track which policies succeeded individually.
-  const policyResults: Array<{
-    policy: (typeof policySets)[number];
-    written: boolean;
-  }> = [];
-
-  // Step 1: Definition write
-  if (personaInput && !firstError) {
+  // Step 1: Definition write — settle immediately, stop if not persisted.
+  if (personaInput) {
     try {
       if (publishCatalogUpdates) {
         const result = await updatePersonaAndPublish(personaInput);
@@ -153,9 +150,19 @@ export async function runAgentSaveCoordinator(
       firstError =
         err instanceof Error ? err.message : "Failed to save agent profile.";
     }
+    // Settle after definition write — verify the write persisted before advancing.
+    if (!firstError) {
+      const { persona: settled } = await refetchStores();
+      if (
+        settled === null ||
+        !observedStateMatchesPersonaInput(settled, personaInput)
+      ) {
+        firstError = "Agent profile did not persist — reopen to retry.";
+      }
+    }
   }
 
-  // Step 2: Instance write
+  // Step 2: Instance write — only if definition step passed.
   if (agentInput && !firstError) {
     try {
       const result = await updateManagedAgent(agentInput);
@@ -165,9 +172,24 @@ export async function runAgentSaveCoordinator(
       firstError =
         err instanceof Error ? err.message : "Failed to save agent settings.";
     }
+    // Settle after instance write.
+    if (!firstError) {
+      const { agent: settled } = await refetchStores();
+      if (
+        settled === null ||
+        !observedStateMatchesAgentInput(settled, agentInput)
+      ) {
+        firstError = "Agent settings did not persist — reopen to retry.";
+      }
+    }
   }
 
-  // Step 3: Policy setters — run each independently, stop at first failure.
+  // Step 3: Policy setters — run each independently, settle after each,
+  // stop at first policy that did not observe as persisted.
+  const policyResults: Array<{
+    policy: (typeof policySets)[number];
+    written: boolean;
+  }> = [];
   if (!firstError) {
     for (const policy of policySets) {
       try {
@@ -176,7 +198,15 @@ export async function runAgentSaveCoordinator(
         } else {
           await setStartOnAppLaunch(policy.pubkey, policy.value);
         }
-        policyResults.push({ policy, written: true });
+        // Settle: verify policy persisted from observed state.
+        const { agent: settled } = await refetchStores();
+        const persisted =
+          settled !== null && observedPolicyMatches(settled, policy);
+        policyResults.push({ policy, written: persisted });
+        if (!persisted) {
+          firstError = `${policy.type === "autoRestart" ? "Auto-restart" : "Start on launch"} policy did not persist.`;
+          break;
+        }
       } catch (err) {
         policyResults.push({ policy, written: false });
         firstError =
@@ -186,16 +216,14 @@ export async function runAgentSaveCoordinator(
     }
   }
 
-  // ── Step 4: Settlement — re-fetch both stores ─────────────────────────────
-  // Always runs (success or error) so the toast and retry-remainder are derived
-  // from actual observed state, not from command-level booleans.
+  // ── Step 4: Final settlement — re-fetch both stores ──────────────────────
+  // Runs after all writes (success or partial/full error). Per-boundary
+  // settlement above stopped advancing on any observed mismatch; this final
+  // refetch establishes the definitive post-write state for toasts and retry.
   const { persona: observedPersona, agent: observedAgent } =
     await refetchStores();
 
   // ── Derive what persisted from observed state ─────────────────────────────
-  // Both success and error paths settle from observed state — command result
-  // booleans are never the authority. The observed remainder is the set of
-  // submitted changes that did not reach the store.
   const persistedParts: string[] = [];
   const failedParts: string[] = [];
 
@@ -223,22 +251,33 @@ export async function runAgentSaveCoordinator(
     }
   }
 
-  // Per-policy observed check: track each policy individually.
-  for (const { policy, written } of policyResults) {
-    if (!written) {
+  // Per-policy observed check: use observed state from the final refetch,
+  // not the policyResults.written boolean (which was set by per-boundary checks).
+  // Policies not in policyResults were not attempted (stopped early).
+  for (const policy of policySets) {
+    const result = policyResults.find((r) => r.policy === policy);
+    if (!result) {
+      // Not attempted.
       failedParts.push(
         policy.type === "autoRestart" ? "auto-restart policy" : "launch policy",
       );
-    }
-  }
-  // Policies not yet attempted (stopped early at an error) also failed.
-  const attemptedCount = policyResults.length;
-  for (let i = attemptedCount; i < policySets.length; i++) {
-    const policy = policySets[i];
-    if (policy) {
-      failedParts.push(
-        policy.type === "autoRestart" ? "auto-restart policy" : "launch policy",
-      );
+    } else {
+      // Settle from observed agent (not written boolean) if available.
+      const observedPersisted =
+        observedAgent !== null && observedPolicyMatches(observedAgent, policy);
+      if (observedPersisted) {
+        persistedParts.push(
+          policy.type === "autoRestart"
+            ? "auto-restart policy"
+            : "launch policy",
+        );
+      } else {
+        failedParts.push(
+          policy.type === "autoRestart"
+            ? "auto-restart policy"
+            : "launch policy",
+        );
+      }
     }
   }
 
@@ -393,7 +432,49 @@ function observedStateMatchesAgentInput(
   ) {
     return false;
   }
+  // Harness-pin fields (Artifact 3 / Thufir pass-2 CRITICAL-3)
+  if (
+    submitted.agentCommand !== undefined &&
+    (submitted.agentCommand ?? "") !== (observed.agentCommand ?? "")
+  ) {
+    return false;
+  }
+  if (submitted.harnessOverride !== undefined) {
+    // harnessOverride=true means agentCommand is a pin (agentCommandOverride non-null).
+    // harnessOverride=false means inherit (agentCommandOverride null).
+    const submittedIsPinned = submitted.harnessOverride === true;
+    const observedIsPinned = (observed.agentCommandOverride ?? null) !== null;
+    if (submittedIsPinned !== observedIsPinned) return false;
+  }
+  if (
+    submitted.agentArgs !== undefined &&
+    submitted.agentArgs.join(",") !== (observed.agentArgs ?? []).join(",")
+  ) {
+    return false;
+  }
+  if (
+    submitted.acpCommand !== undefined &&
+    (submitted.acpCommand ?? "") !== (observed.acpCommand ?? "")
+  ) {
+    return false;
+  }
   return true;
+}
+
+/**
+ * Check whether a single policy setter reached the observed agent state.
+ * Used for per-boundary and final settlement of L-field writes.
+ */
+function observedPolicyMatches(
+  observed: ManagedAgent,
+  policy:
+    | { type: "autoRestart"; pubkey: string; value: boolean }
+    | { type: "startOnAppLaunch"; pubkey: string; value: boolean },
+): boolean {
+  if (policy.type === "autoRestart") {
+    return observed.autoRestartOnConfigChange === policy.value;
+  }
+  return observed.startOnAppLaunch === policy.value;
 }
 
 function capitalizeFirst(s: string): string {

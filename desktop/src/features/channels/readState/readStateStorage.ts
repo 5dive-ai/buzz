@@ -374,8 +374,14 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
           const requiredNextGen = maxObservedGen + 1;
           if (
             Number.isSafeInteger(requiredNextGen) &&
-            requiredNextGen > nextGen
+            nextGen !== requiredNextGen
           ) {
+            // Clamp nextGen to exactly the required value — both upward (corrupt
+            // ng too low, e.g. ng=7 with existing gen-7 receipt) and downward
+            // (corrupt ng too high, e.g. ng=MAX_SAFE_INTEGER with low gens, which
+            // would cause the first enqueue to mint gen=MAX_SAFE_INTEGER and the
+            // second to throw from isSafeInteger guard).  No retained identity
+            // sits at or above requiredNextGen, so no collision is possible.
             nextGen = requiredNextGen;
           } else if (!Number.isSafeInteger(requiredNextGen)) {
             // Allocator exhausted — rebase all intent gens and matching receipt

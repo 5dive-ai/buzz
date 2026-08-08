@@ -396,7 +396,12 @@ export class ReadStateManager {
 
   async drainPendingIntents(drainGen: number): Promise<void> {
     await drainPendingIntentsImpl(createDrainContext(this), drainGen);
-    this.drainRetryAttempt = 0; // successful pass resets the abort-retry counter
+    // Reset the attempt counter only on a successful pass (no abort-retry timer
+    // was scheduled during the impl).  Abort paths call scheduleAbortRetry() which
+    // sets drainRetryTimer; if it's still null here the pass committed cleanly.
+    if (this.drainRetryTimer === null) {
+      this.drainRetryAttempt = 0;
+    }
     this.drainScheduled = false;
     if (this.pendingFreshDrain && !this.destroyed) {
       this.pendingFreshDrain = false;
@@ -422,12 +427,7 @@ export class ReadStateManager {
     void this.drainPendingIntents(this.loadGeneration);
   }
 
-  /**
-   * Schedule a bounded-backoff abort-retry drain pass (on storage failure or thrown callback).
-   * One pending timer, escalating backoff (1s→2s→4s…60s), coalesced per manager,
-   * cancelled on destroy() and identity change.  Only abort paths call this; success-path
-   * gen2 promotion uses scheduleDrain() (immediate pendingFreshDrain) for no-delay draining.
-   */
+  /** Bounded-backoff abort-retry timer (1s→2s→4s…60s). Only abort paths use this. */
   scheduleAbortRetry(): void {
     if (this.destroyed || !this.isLoadComplete) return;
     if (this.drainRetryTimer !== null) {

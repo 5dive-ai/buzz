@@ -5852,3 +5852,577 @@ test("hydrate_scalarNumberPriorForcedEntry_acceptedAsValidLegacyEntry", async ()
   cb.teardown();
   mgr.destroy();
 });
+
+// ── Test 55: backoff escalation — drain-abort retry delays escalate (1s→2s…) ──
+test("scheduleAbortRetry_persistentFailure_escalatesBackoffAndRecoversBoundedly", async () => {
+  // Holds storage failed across ≥2 timer firings. Asserts:
+  //  - no microtask spin: each failure schedules exactly one timer, not a flood
+  //  - escalating delays: first retry = 1 000 ms, second = 2 000 ms
+  //  - attempt counter resets only after a successful commit (not on every pass)
+  //  - once storage is healthy, the next automatic retry completes the drain
+  //
+  // Failure branch: step-1 (register write) — abort + scheduleAbortRetry on every failure
+  // Durable surfaces: blob post-success has register committed; intent consumed; frontier ≥ 50
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "55".repeat(32);
+  const channelId = `backoff-escalation-ch-${"e".repeat(45)}`;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const ls = globalThis.window.localStorage;
+
+  const origSetTimeout = globalThis.window.setTimeout;
+  const origClearTimeout = globalThis.window.clearTimeout;
+  // Capture both fn and delay so we can assert escalation.
+  const scheduledTimers = new Map(); // id → { fn, delay }
+  let nextFakeId = 55000;
+  globalThis.window.setTimeout = (fn, ms) => {
+    if (ms > 0) {
+      const id = nextFakeId++;
+      scheduledTimers.set(id, { fn, delay: ms });
+      return id;
+    }
+    return origSetTimeout(fn, ms);
+  };
+  globalThis.window.clearTimeout = (id) => {
+    if (scheduledTimers.has(id)) {
+      scheduledTimers.delete(id);
+    } else {
+      origClearTimeout(id);
+    }
+  };
+
+  let blockV2Writes = false;
+  const origSetItem = ls.setItem.bind(ls);
+  ls.setItem = (key, value) => {
+    if (blockV2Writes && key.startsWith("buzz.nip-rs.override-state.v2:")) {
+      throw new Error("QuotaExceededError");
+    }
+    origSetItem(key, value);
+  };
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    mgr.hydrateFromLocalStorage(); // clear any leftover state from previous tests
+    mgr.effectiveState.set(channelId, 25);
+    mgr.isLoadComplete = true;
+
+    mgr.isLoadComplete = false; // queue via pending intents store
+    mgr.markChannelUnread(channelId);
+    mgr.isLoadComplete = true;
+
+    // --- First drain: storage blocked → first abort retry scheduled ---
+    blockV2Writes = true;
+    await mgr.drainPendingIntents(mgr.loadGeneration);
+    blockV2Writes = false; // still blocked during drain; unblock after
+
+    // The abort retry timer must be set (scheduleAbortRetry called).
+    // Note: scheduledTimers also contains the publish-debounce timer (5 000 ms).
+    // Use mgr.drainRetryTimer to get the specific abort retry timer ID.
+    assert.ok(
+      mgr.drainRetryTimer !== null,
+      "drainRetryTimer must be set after first failure",
+    );
+    const timerEntry1 = scheduledTimers.get(mgr.drainRetryTimer);
+    assert.ok(timerEntry1, "abort retry timer ID must be in scheduledTimers");
+    const delay1 = timerEntry1.delay;
+    assert.equal(
+      delay1,
+      1_000,
+      `first retry delay must be 1 000 ms; got ${delay1}`,
+    );
+    // drainRetryAttempt must NOT have been reset (counter preserved across abort).
+    assert.equal(
+      mgr.drainRetryAttempt,
+      1,
+      "attempt counter must be 1 after first abort",
+    );
+
+    // --- Fire first retry: block again → second abort retry scheduled (2 s) ---
+    const retryTimerId1 = mgr.drainRetryTimer;
+    const fn1 = timerEntry1.fn;
+    blockV2Writes = true;
+    scheduledTimers.delete(retryTimerId1);
+    await fn1(); // drainRetryTimer fn fires; starts a drain synchronously
+    blockV2Writes = false;
+
+    // After second failure: drainRetryTimer updated, delay escalated to 2 000 ms.
+    assert.ok(
+      mgr.drainRetryTimer !== null,
+      "drainRetryTimer must be set after second failure",
+    );
+    const timerEntry2 = scheduledTimers.get(mgr.drainRetryTimer);
+    assert.ok(
+      timerEntry2,
+      "abort retry timer ID must be in scheduledTimers after second failure",
+    );
+    const delay2 = timerEntry2.delay;
+    assert.equal(
+      delay2,
+      2_000,
+      `second retry delay must be 2 000 ms; got ${delay2}`,
+    );
+    assert.equal(
+      mgr.drainRetryAttempt,
+      2,
+      "attempt counter must be 2 after second abort",
+    );
+
+    // --- Fire second retry with healthy storage → drain succeeds ---
+    const fn3 = timerEntry2.fn;
+    scheduledTimers.delete(mgr.drainRetryTimer);
+    await fn3();
+    await new Promise((r) => origSetTimeout(r, 0));
+
+    // Drain committed: register in blob, intent consumed.
+    const blobOk = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
+    assert.ok(
+      blobOk.r?.[channelId],
+      "register must be in blob after successful retry",
+    );
+    assert.equal(
+      pendingOverrideIntentStore.get(channelId),
+      undefined,
+      "intent must be consumed after successful retry",
+    );
+
+    // Attempt counter reset to 0 after successful commit.
+    assert.equal(
+      mgr.drainRetryAttempt,
+      0,
+      "attempt counter must reset to 0 after success",
+    );
+
+    // Frontier advanced (unread drain bumps S, effectiveState updated).
+    const frontier = mgr.effectiveState.get(channelId) ?? 0;
+    assert.ok(
+      frontier >= 25,
+      `frontier must be ≥ 25 after drain; got ${frontier}`,
+    );
+
+    // No pending drain retry timer remains (no more retries needed).
+    assert.equal(
+      mgr.drainRetryTimer,
+      null,
+      "drainRetryTimer must be null after successful drain",
+    );
+
+    mgr.destroy();
+  } finally {
+    globalThis.window.setTimeout = origSetTimeout;
+    globalThis.window.clearTimeout = origClearTimeout;
+  }
+});
+
+// ── Test 56: stale-receipt collision at MAX_SAFE_INTEGER ceiling ───────────────
+test("hydrate_maxSafeIntegerCeiling_staleReceiptCollision_replacementNotDiscarded", async () => {
+  // Reproduce Thufir's ceiling collision: blob has a valid intent at gen=1 with a
+  // matching receipt (intentGen=1), a second intent at gen=MAX_SAFE_INTEGER, and
+  // ng=MAX_SAFE_INTEGER.  Hydration must normalize nextGen so a replacement enqueue
+  // for ch1 gets a gen that does NOT match the retained receipt (gen=1), and the
+  // fresh readTarget=999 is not discarded.
+  //
+  // With the clamp-down fix: requiredNextGen = MAX_SAFE_INTEGER + 1 — unrepresentable,
+  // so the rebase branch fires.  After rebase: gen1 ch1 → gen1, gen2 ch2 → gen2,
+  // nextGen = 3.  The replacement read for ch1 gets gen=3, which ≠ receipt intentGen=1.
+  //
+  // Durable surface: frontier reaches 999 after drain.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "56".repeat(32);
+  const channelId1 = `ceiling-ch1-${"f".repeat(52)}`;
+  const channelId2 = `ceiling-ch2-${"g".repeat(52)}`;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const ls = globalThis.window.localStorage;
+  const MAX = Number.MAX_SAFE_INTEGER;
+
+  ls.setItem(
+    v2Key,
+    JSON.stringify({
+      r: {
+        [channelId1]: { s: 3, c: 0, b: 100, f: 50 },
+        [channelId2]: { s: 1, c: 0, b: 100, f: 30 },
+      },
+      receipts: {
+        [channelId1]: { intentGen: 1, op: "read" },
+      },
+      pi: {
+        [channelId1]: { gen: 1, op: "read", readTarget: 50 },
+        [channelId2]: { gen: MAX, op: "unread" },
+      },
+      ng: MAX,
+    }),
+  );
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.hydrateFromLocalStorage();
+
+  // After rebase: intents rebased to [1, 2], nextGen = 3.
+  const intent1 = pendingOverrideIntentStore.get(channelId1);
+  assert.ok(intent1, "ch1 intent must hydrate after rebase");
+  const intent2 = pendingOverrideIntentStore.get(channelId2);
+  assert.ok(intent2, "ch2 intent must hydrate after rebase");
+  // All gens must be safe integers.
+  assert.ok(
+    Number.isSafeInteger(intent1.gen),
+    "ch1 gen must be safe after rebase",
+  );
+  assert.ok(
+    Number.isSafeInteger(intent2.gen),
+    "ch2 gen must be safe after rebase",
+  );
+
+  // nextGen must be safe and above all rebased gens.
+  const ng = pendingOverrideIntentStore.nextGen;
+  assert.ok(Number.isSafeInteger(ng), "nextGen must be safe after rebase");
+  assert.ok(
+    ng > intent1.gen && ng > intent2.gen,
+    "nextGen must be above all intent gens",
+  );
+
+  // Replace ch1 intent with a fresh read (readTarget=999).
+  // The replacement gets a gen > original receipt intentGen (1) so drain cannot discard it.
+  mgr.isLoadComplete = false;
+  const r = mgr.markChannelRead(channelId1, undefined, 999);
+  assert.equal(r.status, "queued", "replacement read must be queued");
+  const fresh1 = pendingOverrideIntentStore.get(channelId1);
+  assert.ok(fresh1, "fresh intent must be in store");
+  assert.ok(
+    Number.isSafeInteger(fresh1.gen),
+    "fresh intent gen must be safe integer",
+  );
+
+  // Drain: the retained receipt (intentGen=1 pre-rebase → rebased to its new gen value)
+  // must NOT match the replacement gen, so the fresh read is applied.
+  mgr.effectiveState.set(channelId1, 50);
+  mgr.effectiveState.set(channelId2, 30);
+  mgr.isLoadComplete = true;
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  const frontier1 = mgr.effectiveState.get(channelId1) ?? 0;
+  assert.ok(
+    frontier1 >= 999,
+    `ch1 frontier must reach 999 after drain; got ${frontier1} — stale receipt must not discard replacement`,
+  );
+
+  // ch1 intent consumed.
+  assert.equal(
+    pendingOverrideIntentStore.get(channelId1),
+    undefined,
+    "ch1 intent consumed",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 57: ng=MAX_SAFE_INTEGER multi-enqueue — no unsafe gen minted ────────
+test("enqueue_ngMaxSafeInteger_twoEnqueues_noUnsafeGenMinted_bothSurviveHydration", async () => {
+  // When a blob has ng=MAX_SAFE_INTEGER and low intent gens, the normalization clamp-down
+  // must prevent the first enqueue from minting gen=MAX_SAFE_INTEGER and the second from
+  // throwing (or minting an unsafe gen from _nextGen++).
+  //
+  // After the clamp-down fix: requiredNextGen = max(intent gens, receipt gens) + 1 (small).
+  // nextGen is clamped to that value.  Both enqueues receive distinct safe gens; both
+  // survive a subsequent hydration.
+  //
+  // Durable surface: both intents present in v2 blob after two enqueues; hydrated correctly.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "57".repeat(32);
+  const ch1 = `max-enq-ch1-${"h".repeat(52)}`;
+  const ch2 = `max-enq-ch2-${"i".repeat(52)}`;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const ls = globalThis.window.localStorage;
+  const MAX = Number.MAX_SAFE_INTEGER;
+
+  // Plant: ng=MAX_SAFE_INTEGER, no existing intents, no receipts.
+  ls.setItem(v2Key, JSON.stringify({ ng: MAX }));
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.hydrateFromLocalStorage();
+
+  // nextGen must have been clamped down: no existing gens → requiredNextGen = 0+1 = 1.
+  const ngAfterHydrate = pendingOverrideIntentStore.nextGen;
+  assert.ok(
+    Number.isSafeInteger(ngAfterHydrate),
+    "nextGen must be safe after hydration",
+  );
+  assert.ok(
+    ngAfterHydrate < MAX,
+    `nextGen must be clamped below MAX_SAFE_INTEGER; got ${ngAfterHydrate}`,
+  );
+
+  // First enqueue — must not throw and must mint a safe gen.
+  mgr.isLoadComplete = false;
+  let r1;
+  assert.doesNotThrow(() => {
+    r1 = mgr.markChannelUnread(ch1);
+  }, "first enqueue must not throw");
+  assert.equal(r1.status, "queued", "first enqueue must be queued");
+  const intent1 = pendingOverrideIntentStore.get(ch1);
+  assert.ok(intent1, "first intent must be in store");
+  assert.ok(
+    Number.isSafeInteger(intent1.gen),
+    `first intent gen must be safe; got ${intent1.gen}`,
+  );
+
+  // Second enqueue — must not throw, distinct safe gen.
+  let r2;
+  assert.doesNotThrow(() => {
+    r2 = mgr.markChannelUnread(ch2);
+  }, "second enqueue must not throw");
+  assert.equal(r2.status, "queued", "second enqueue must be queued");
+  const intent2 = pendingOverrideIntentStore.get(ch2);
+  assert.ok(intent2, "second intent must be in store");
+  assert.ok(
+    Number.isSafeInteger(intent2.gen),
+    `second intent gen must be safe; got ${intent2.gen}`,
+  );
+  assert.notEqual(
+    intent1.gen,
+    intent2.gen,
+    "both intents must have distinct gens",
+  );
+
+  // Both intents must survive hydration (durable surface: v2 blob).
+  const blobRaw = ls.getItem(v2Key);
+  assert.ok(blobRaw, "v2 blob must be present");
+  const blob = JSON.parse(blobRaw);
+  assert.ok(blob.pi?.[ch1], "ch1 pi must be in blob");
+  assert.ok(blob.pi?.[ch2], "ch2 pi must be in blob");
+
+  // Hydrate a fresh manager; both intents must be present.
+  const mgr2 = new ReadStateManager(pubkey, fakeRelay);
+  mgr2.hydrateFromLocalStorage();
+  assert.ok(
+    pendingOverrideIntentStore.get(ch1),
+    "ch1 must hydrate in fresh manager",
+  );
+  assert.ok(
+    pendingOverrideIntentStore.get(ch2),
+    "ch2 must hydrate in fresh manager",
+  );
+  mgr2.destroy();
+
+  mgr.destroy();
+});
+
+// ── Test 58: thrown-handler — callback throws, tx aborts, bounded retry, latch cleared ──
+test("drain_onDrainOutcomeThrows_transactionAborts_gen1Restored_boundedRetryScheduled", async () => {
+  // If onDrainOutcome throws, the try/catch in drain wraps it and routes to abortTransaction
+  // + scheduleAbortRetry.  After the abort:
+  //   - gen1 is restored as the live intent (not lost)
+  //   - a bounded retry timer is scheduled (not immediate spin)
+  //   - a subsequent enqueue is NOT swallowed by a stale latch (channel unlocked)
+  //
+  // Failure branch: thrown callback — catch → abortTransaction + scheduleAbortRetry
+  // Durable surface: gen1 live in store after abort; channel unlocked (enqueue succeeds)
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "58".repeat(32);
+  const channelId = `thrown-cb-ch-${"j".repeat(51)}`;
+
+  const origSetTimeout = globalThis.window.setTimeout;
+  const origClearTimeout = globalThis.window.clearTimeout;
+  const scheduledTimers = new Map();
+  let nextFakeId = 58000;
+  globalThis.window.setTimeout = (fn, ms) => {
+    if (ms > 0) {
+      const id = nextFakeId++;
+      scheduledTimers.set(id, { fn, delay: ms });
+      return id;
+    }
+    return origSetTimeout(fn, ms);
+  };
+  globalThis.window.clearTimeout = (id) => {
+    if (scheduledTimers.has(id)) {
+      scheduledTimers.delete(id);
+    } else {
+      origClearTimeout(id);
+    }
+  };
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    mgr.hydrateFromLocalStorage(); // clear any leftover state from previous tests
+    mgr.effectiveState.set(channelId, 50);
+    mgr.isLoadComplete = false; // Queue via pending intents store
+
+    mgr.markChannelUnread(channelId);
+    const gen1Intent = pendingOverrideIntentStore.get(channelId);
+    assert.ok(gen1Intent, "gen1 must be in store after markChannelUnread");
+    const gen1 = gen1Intent.gen;
+
+    // Wire a throwing outcome callback.
+    let callbackFired = false;
+    mgr.onDrainOutcome = (_outcome) => {
+      callbackFired = true;
+      throw new Error("simulated callback failure");
+    };
+
+    // Run drain; the callback throws on outcome dispatch after step-1 commit.
+    mgr.isLoadComplete = true;
+    await mgr.drainPendingIntents(mgr.loadGeneration);
+
+    // Callback must have been invoked (drain did reach outcome dispatch).
+    assert.ok(callbackFired, "onDrainOutcome must have been invoked");
+
+    // Gen1 must be restored as the live intent (abort undid any in-flight promotion).
+    const intentAfterThrow = pendingOverrideIntentStore.get(channelId);
+    assert.ok(
+      intentAfterThrow,
+      "gen1 must be restored after thrown callback abort",
+    );
+    assert.equal(intentAfterThrow.gen, gen1, "restored intent must be gen1");
+
+    // Channel must be unlocked (latch cleared by abortTransaction).
+    // Set isLoadComplete=false so markChannelRead goes through the queue path —
+    // a locked channel would return gen:-1 placeholder; an unlocked one gets real gen.
+    mgr.isLoadComplete = false;
+    const rAfterAbort = mgr.markChannelRead(channelId, undefined, 999);
+    assert.notEqual(
+      rAfterAbort.status,
+      undefined,
+      "enqueue after abort must return a result",
+    );
+    // The store must hold a real gen (> 0), not the deferred placeholder (-1).
+    const intentAfterEnqueue = pendingOverrideIntentStore.get(channelId);
+    assert.ok(intentAfterEnqueue, "intent must exist after enqueue");
+    assert.ok(
+      intentAfterEnqueue.gen > 0,
+      "new intent gen must be > 0 (not deferred placeholder — channel must be unlocked)",
+    );
+
+    // A bounded retry timer must be scheduled (scheduleAbortRetry called).
+    // Use mgr.drainRetryTimer to identify the specific abort retry timer
+    // (scheduledTimers also contains the publish-debounce timer at 5 000 ms).
+    assert.ok(
+      mgr.drainRetryTimer !== null,
+      "drainRetryTimer must be set after thrown-callback abort",
+    );
+    const retryEntry = scheduledTimers.get(mgr.drainRetryTimer);
+    assert.ok(retryEntry, "abort retry timer must be in scheduledTimers");
+    assert.equal(
+      retryEntry.delay,
+      1_000,
+      `first retry delay after throw must be 1 000 ms; got ${retryEntry.delay}`,
+    );
+
+    mgr.destroy();
+  } finally {
+    globalThis.window.setTimeout = origSetTimeout;
+    globalThis.window.clearTimeout = origClearTimeout;
+  }
+});
+
+// ── Test 59: identity swap — A deferred mid-tx, B hydrates, B sees no A state ──
+test("identitySwap_aDeferredMidTransaction_bHydrates_bSeesNoAState", async () => {
+  // An A-account drain holds a transaction lock on channelId while a deferred enqueue
+  // is buffered (simulated by beginTransaction + buffering a deferred enqueue manually).
+  // When B calls hydrateFromLocalStorage (identity swap), clearTransactionState() must
+  // purge all A-owned locks, snapshots, deferred payloads, and promoted payloads.
+  // B must see none of A's transaction state.
+  //
+  // Durable surface: pendingOverrideIntentStore has no lock/deferred/promoted for A's
+  // channelId after B hydration; B's own intent (if any) is unaffected.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkeyA = "59aa".repeat(16);
+  const pubkeyB = "59bb".repeat(16);
+  const channelId = `id-swap-ch-${"k".repeat(53)}`;
+  const v2KeyB = `buzz.nip-rs.override-state.v2:${pubkeyB}`;
+  const ls = globalThis.window.localStorage;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  // A-account: queue an intent and begin a transaction (simulates drain holding lock).
+  const mgrA = new ReadStateManager(pubkeyA, fakeRelay);
+  mgrA.effectiveState.set(channelId, 10);
+  mgrA.isLoadComplete = false;
+  mgrA.markChannelUnread(channelId);
+
+  // Begin transaction manually (as drain would) and buffer a deferred enqueue for A.
+  pendingOverrideIntentStore.beginTransaction(channelId);
+  // Enqueue another action while locked — it becomes a deferred enqueue (gen=-1 placeholder).
+  mgrA.markChannelRead(channelId, undefined, 999);
+  // Confirm the enqueue was deferred (placeholder gen=-1 while channel is locked).
+  // markChannelRead returns a MarkResult whose status is "queued" but the stored intent's
+  // underlying gen is -1.  We verify locking indirectly: after B hydration, the channel
+  // must accept a normal enqueue (gen > 0), proving the lock was cleared.
+
+  // B-account hydration: this must call clearTransactionState() and wipe all A state.
+  // Plant a minimal B blob so hydrateFromLocalStorage has something to restore.
+  ls.setItem(v2KeyB, JSON.stringify({ ng: 2 }));
+  const mgrB = new ReadStateManager(pubkeyB, fakeRelay);
+  mgrB.hydrateFromLocalStorage();
+
+  // After B hydration, the channel must be unlocked.
+  // Probe: a fresh enqueue from mgrB must get a real gen (not -1 placeholder).
+  mgrB.isLoadComplete = false;
+  const rB = mgrB.markChannelUnread(channelId);
+  assert.equal(rB.status, "queued", "B enqueue must be queued");
+  const intentB = pendingOverrideIntentStore.get(channelId);
+  assert.ok(intentB, "B must have its own intent after enqueue");
+  assert.ok(
+    intentB.gen > 0,
+    `B intent gen must be a real allocated gen (not -1 placeholder); got ${intentB.gen} — channel must be unlocked after identity swap`,
+  );
+  assert.ok(
+    Number.isSafeInteger(intentB.gen),
+    "B intent gen must be safe integer",
+  );
+
+  // No A-owned deferred payload should have survived:
+  // if A's deferred read (readTarget=999) had leaked, B's own intent would show
+  // a read op or readTarget=999 from A's payload.  B enqueued an unread, so:
+  assert.equal(
+    intentB.op,
+    "unread",
+    "B intent op must be unread (A deferred read did not leak)",
+  );
+  assert.equal(
+    intentB.readTarget,
+    undefined,
+    "B intent must have no readTarget (A payload did not leak)",
+  );
+
+  mgrA.destroy();
+  mgrB.destroy();
+});

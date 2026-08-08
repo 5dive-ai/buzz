@@ -143,7 +143,7 @@ function PermissionButtons({
         })}
       </div>
       {request.hasDurableRule && request.durableRuleNote !== null ? (
-        <p className="max-w-[28rem] text-[11px] leading-4 text-amber-700 dark:text-amber-400 opacity-80">
+        <p className="max-w-[28rem] text-2xs leading-4 text-amber-700 dark:text-amber-400 opacity-80">
           ⚠ {request.durableRuleNote}
         </p>
       ) : null}
@@ -175,7 +175,7 @@ function ExpiryCountdown({ expiresAt }: { expiresAt: number }) {
   const secs = secsLeft % 60;
   const label = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
   return (
-    <span className="text-[11px] text-muted-foreground opacity-70">
+    <span className="text-2xs text-muted-foreground opacity-70">
       {" "}
       · expires in {label}
     </span>

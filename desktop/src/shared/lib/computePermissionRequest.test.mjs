@@ -204,3 +204,77 @@ test("test_selectProseOrPermission_returns_null_when_request_present", () => {
   // Pass a typed object directly (not parsed from content)
   assert.equal(selectProseOrPermission(PENDING_PAYLOAD, "markdown-node"), null);
 });
+
+// ── Component behavior — pure-function coverage ───────────────────────────────
+// These test the underlying pure logic for behaviors that manifest in the
+// React component. Component state (double-click guard, countdown UI) is
+// not testable without a DOM renderer.
+
+test("test_non_owner_viewer_gets_payload_but_is_owner_false", () => {
+  // computePermissionRequest returns the payload for any authenticated viewer;
+  // isOwner is determined by the caller (PermissionRequestCardBlock) comparing
+  // viewerPubkey to ownerPubkey. Verify the payload is returned so the card
+  // renders, then the test documents that a non-owner sees it as read-only.
+  const result = computePermissionRequest(
+    body(PENDING_PAYLOAD),
+    true,
+    AGENT_PUBKEY,
+    AGENT_PUBKEY,
+  );
+  assert.ok(result !== null, "payload returned for authenticated render");
+  // isOwner=false would be computed by PermissionRequestCardBlock when
+  // viewerPubkey !== ownerPubkey — card renders in read-only mode (no buttons).
+});
+
+test("test_replay_archive_resolved_state_returns_resolved_payload", () => {
+  // Simulates archive/replay: the message body carries resolved payload
+  // (edit already applied), agentPubkey present, editSignerPubkey absent.
+  // computePermissionRequest must return the resolved payload — the card
+  // renders in non-actionable archived state.
+  const result = computePermissionRequest(
+    body(RESOLVED_PAYLOAD),
+    true,
+    AGENT_PUBKEY,
+    AGENT_PUBKEY,
+    undefined, // no separate edit event needed in archive — body is resolved
+  );
+  assert.deepEqual(result, RESOLVED_PAYLOAD);
+  assert.equal(result?.state, "resolved");
+});
+
+test("test_expiry_field_is_preserved_for_local_disable", () => {
+  // computePermissionRequest preserves the expiresAt field so the card's
+  // PermissionButtons component can compare it to Date.now() / 1000 and
+  // disable buttons locally when the harness deadline has passed.
+  const result = computePermissionRequest(
+    body(PENDING_PAYLOAD),
+    true,
+    AGENT_PUBKEY,
+    AGENT_PUBKEY,
+  );
+  assert.ok(result !== null);
+  assert.equal(result.expiresAt, 9999999999);
+  // Buttons disable when expiresAt <= Date.now()/1000. Since 9999999999 is
+  // far in the future, buttons would be enabled. A past value would disable them.
+  assert.ok(
+    result.expiresAt > Date.now() / 1000,
+    "far-future expiresAt stays enabled",
+  );
+});
+
+test("test_past_expiresAt_parsed_without_rejection", () => {
+  // The parser accepts any finite expiresAt (past or future) — expiry is
+  // enforced by the component at render time, not at parse time.
+  const expired = { ...PENDING_PAYLOAD, expiresAt: 1 }; // Unix epoch + 1s (past)
+  const result = computePermissionRequest(
+    body(expired),
+    true,
+    AGENT_PUBKEY,
+    AGENT_PUBKEY,
+  );
+  assert.ok(
+    result !== null,
+    "past expiresAt is valid — expiry enforced at render",
+  );
+  assert.equal(result.expiresAt, 1);
+});

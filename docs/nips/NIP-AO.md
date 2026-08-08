@@ -326,6 +326,61 @@ subscribe attempts MUST be rejected with `AUTH required`.
 The harness additionally enforces a ±5-minute `created_at` freshness window on
 incoming control frames as defense-in-depth against relay-captured replay.
 
+## Permission Sentinel Cards
+
+When the permission policy is `ask`, the harness publishes a **sentinel card** into
+the channel thread so the owner can act on the permission request without reading the
+observer feed. The sentinel lifecycle is:
+
+### Sentinel event structure
+
+**PENDING card (kind 9)** — published immediately when the harness registers the
+request in the pending map.
+
+The event content is a compact JSON object that matches the D6 frozen schema
+(`requestNonce`, `optionIds`, `labels`, `expiresAt`, `hasDurableRule`, …). Desktop
+identifies it via `"v":1` + `"state":"pending"` in the content. Key properties:
+
+- Signed by the **agent's relay keys** (not the agent's ACP identity).
+- `h` tag: channel UUID.
+- `e ["e", <turn_event_id>, "", "reply"]` tag: thread-reply to the triggering turn event.
+- `p` tag: owner pubkey. Desktop renders actionable buttons only when the current viewer pubkey matches.
+
+**RESOLVED edit (kind 40003)** — published by the harness on every terminal outcome
+(applied, timed_out, cancelled). The edit targets the kind-9 event and carries the
+same JSON payload with `"state":"resolved"`, the `outcome` field, `chosenOptionId`
+(non-null only for `applied`), and `originalEventId` (the kind-9 event ID).
+
+### D7-final admission
+
+The `ask` path includes a **D7-final admission check**: the harness compares the
+`pubkey` of the first event in the turn batch against the resolved agent owner pubkey.
+
+- If `turn_initiator_pubkey == agent_owner_pubkey`: the card is posted and the request
+  is held pending a decision.
+- If they differ (non-owner-initiated turn): the request is silently downgraded to
+  `reject` — no card is posted, no interactive prompt is shown. This closes the
+  gap where a peer agent could trigger a permission request the owner never sees.
+
+Heartbeat turns and turns without a resolved owner always downgrade to reject.
+
+### D5 durable-rule disclosure
+
+If any option in the request has `kind = "allow_always"`, the sentinel sets
+`hasDurableRule: true` and populates `durableRuleNote` with a disclosure string.
+Desktop MUST render this note visibly before the owner confirms an `allow_always`
+selection. The label value in the sentinel comes directly from the ACP option's
+`name` field, capped at 200 characters; render it verbatim.
+
+### Sentinel authenticity
+
+Desktop MUST verify:
+1. `event.pubkey` (kind-9) matches the agent's known public key.
+2. The kind-40003 edit is signed by the same pubkey as the kind-9.
+
+Cards signed by any other key MUST be treated as untrusted and not rendered as
+actionable permission prompts.
+
 ## Relay Behavior
 
 On receiving a kind 24200 event, a relay MUST:

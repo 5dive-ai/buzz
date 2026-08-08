@@ -13,8 +13,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
+use nostr::{EventBuilder, Keys, Kind, PublicKey, Tag};
+use uuid::Uuid;
+
 use crate::config::{PermissionMode, PermissionPolicy, ResolvedPermissionConfig};
 use crate::observer::{AuthorizationEnvelope, ObserverContext, ObserverEvent, ObserverHandle};
+use crate::relay::RelayEventPublisher;
 use crate::usage::{TurnUsage, UsageTracker};
 use buzz_core::observer::OBSERVER_MAX_PLAINTEXT_LEN;
 
@@ -197,6 +201,11 @@ struct PermissionEntry {
     /// Per-request hard deadline: `min(registered_at + 300s, turn hard deadline)`.
     /// Expiry → fail closed (denial + `timed_out` outcome).
     deadline: tokio::time::Instant,
+    /// Event ID of the kind-9 sentinel card published into the thread.
+    /// `None` when the sentinel was not published (relay unavailable, keys
+    /// absent, or D7-final admission failed before this was set). The
+    /// kind-40003 edit is skipped when this is `None`.
+    sentinel_event_id: Option<String>,
 }
 
 /// ACP client that owns an agent subprocess and communicates over its stdio.
@@ -254,6 +263,26 @@ pub struct AcpClient {
     /// observer dispatch loop into the read loop's decision arm.
     /// Installed by `install_permission_decision_rx`; consumed by the read loop.
     permission_decision_rx: Option<tokio::sync::mpsc::Receiver<PermissionDecision>>,
+    /// Publisher for kind-9 sentinel cards and kind-40003 edits.
+    /// Set via `set_relay_publisher`. When `None`, sentinel publishing is skipped
+    /// (permission flow continues without a UI card).
+    relay_publisher: Option<RelayEventPublisher>,
+    /// Agent signing keys for building sentinel Nostr events.
+    /// Set via `set_agent_relay_keys`. Must be set alongside `relay_publisher`.
+    agent_relay_keys: Option<Keys>,
+    /// Agent owner pubkey (hex). p-tagged on the kind-9 sentinel so the
+    /// desktop routes the card to the correct viewer. Set via `set_agent_owner_pubkey_hex`.
+    agent_owner_pubkey_hex: Option<String>,
+    /// Pubkey of the first event in the current turn's batch.
+    /// Used by the D7-final admission check: `ask` only proceeds for turns
+    /// initiated by the agent owner. Set per-turn by `set_turn_initiator_pubkey`.
+    turn_initiator_pubkey: Option<PublicKey>,
+    /// Channel UUID for the `h` tag on the kind-9 sentinel.
+    /// Set per-turn by `set_turn_channel_context`.
+    sentinel_channel_id: Option<Uuid>,
+    /// Event ID of the triggering turn event for the kind-9 sentinel reply tag.
+    /// Set per-turn by `set_turn_channel_context`.
+    sentinel_thread_reply_id: Option<String>,
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
@@ -652,6 +681,12 @@ impl AcpClient {
             },
             owner_pubkey_known: false,
             permission_decision_rx: None,
+            relay_publisher: None,
+            agent_relay_keys: None,
+            agent_owner_pubkey_hex: None,
+            turn_initiator_pubkey: None,
+            sentinel_channel_id: None,
+            sentinel_thread_reply_id: None,
             last_prompt_id: None,
             current_hard_deadline: None,
             observer: None,
@@ -697,6 +732,41 @@ impl AcpClient {
         rx: tokio::sync::mpsc::Receiver<PermissionDecision>,
     ) {
         self.permission_decision_rx = Some(rx);
+    }
+
+    /// Install the relay publisher and agent signing keys for sentinel card publishing.
+    ///
+    /// Both must be set together. When either is absent, sentinel publishing is
+    /// skipped; the permission flow continues without a UI card.
+    pub fn set_relay_publisher(&mut self, publisher: RelayEventPublisher, keys: Keys) {
+        self.relay_publisher = Some(publisher);
+        self.agent_relay_keys = Some(keys);
+    }
+
+    /// Set the agent owner pubkey hex for the sentinel p-tag.
+    pub fn set_agent_owner_pubkey_hex(&mut self, hex: Option<String>) {
+        self.agent_owner_pubkey_hex = hex;
+    }
+
+    /// Set the turn initiator pubkey for the D7-final admission check.
+    ///
+    /// Must be called at the start of each turn (before `session_prompt_with_idle_timeout`).
+    /// The `ask` policy rejects requests for turns NOT initiated by the agent owner.
+    pub fn set_turn_initiator_pubkey(&mut self, pubkey: Option<PublicKey>) {
+        self.turn_initiator_pubkey = pubkey;
+    }
+
+    /// Set the per-turn channel context for sentinel card routing.
+    ///
+    /// `channel_id` — the `h` tag on the kind-9.
+    /// `thread_reply_event_id` — the `e` reply tag (triggering turn event).
+    pub fn set_turn_channel_context(
+        &mut self,
+        channel_id: Option<Uuid>,
+        thread_reply_event_id: Option<String>,
+    ) {
+        self.sentinel_channel_id = channel_id;
+        self.sentinel_thread_reply_id = thread_reply_event_id;
     }
 
     /// Update metadata that will be attached to subsequent raw wire events.
@@ -1392,8 +1462,18 @@ impl AcpClient {
                         actionable: false,
                         reason: Some(reason.to_string()),
                     },
-                    response,
+                    response.clone(),
                 );
+                // Extract sentinel data before removing the entry — used to
+                // publish the kind-40003 edit that resolves the UI card.
+                let sentinel_context = self.pending_permissions.get(id_str).map(|e| {
+                    (
+                        e.sentinel_event_id.clone(),
+                        e.options_snapshot.clone(),
+                        e.nonce.clone(),
+                        e.deadline,
+                    )
+                });
                 // Remove entry — absence of the nonce is the replay guard.
                 self.pending_permissions.remove(id_str);
                 // Re-arm idle if no live (Pending|Writing) entries remain.
@@ -1406,6 +1486,66 @@ impl AcpClient {
                     });
                     if !live {
                         *idle_deadline = tokio::time::Instant::now() + idle_timeout;
+                    }
+                }
+                // Publish the kind-40003 resolved edit if a sentinel was published.
+                // Best-effort: a failure here is logged but does not fail the permission
+                // resolution — the agent has already received the ACP response.
+                if let Some((
+                    Some(original_event_id),
+                    options_snapshot,
+                    entry_nonce,
+                    entry_deadline,
+                )) = sentinel_context
+                {
+                    // Clone all relay context upfront to avoid holding &mut self borrows
+                    // across the async publish call.
+                    let keys_opt = self.agent_relay_keys.clone();
+                    let channel_id_opt = self.sentinel_channel_id;
+                    let publisher_opt = self.relay_publisher.clone();
+                    let session_id_owned = self.observer_context.session_id.clone();
+                    let turn_id = self.observer_context.turn_id.clone().unwrap_or_default();
+
+                    if let (Some(keys), Some(channel_id), Some(publisher)) =
+                        (keys_opt, channel_id_opt, publisher_opt)
+                    {
+                        // `reason` maps directly to the schema's `outcome` field.
+                        let chosen_option_id: Option<String> = if reason == "applied" {
+                            response
+                                .pointer("/result/outcome/optionId")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        } else {
+                            None
+                        };
+                        // Recover expiry_unix_secs from the entry deadline.
+                        let expiry_unix_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                            + entry_deadline
+                                .checked_duration_since(tokio::time::Instant::now())
+                                .unwrap_or_default()
+                                .as_secs();
+                        if let Some(content) = build_sentinel_resolved_payload(
+                            &entry_nonce,
+                            &original_event_id,
+                            &options_snapshot,
+                            expiry_unix_secs,
+                            session_id_owned.as_deref(),
+                            &turn_id,
+                            reason,
+                            chosen_option_id.as_deref(),
+                        ) {
+                            if let Some(event) = build_kind40003_sentinel(
+                                &keys,
+                                channel_id,
+                                &original_event_id,
+                                &content,
+                            ) {
+                                let _ = publisher.publish_event(event).await;
+                            }
+                        }
                     }
                 }
                 tracing::debug!(
@@ -2725,6 +2865,44 @@ impl AcpClient {
                 let id_str = id.to_string();
                 let nonce = new_permission_nonce();
 
+                // D7-final admission check: `ask` only fires for turns initiated by
+                // the agent owner. A turn started by a non-owner (another agent,
+                // an automated relay event) cannot present an actionable card because
+                // the owner isn't watching — downgrade silently to reject.
+                // This check is only enforced when a relay publisher is available (i.e.,
+                // we are in a live session that can post sentinel cards). Without a
+                // publisher, the ask proceeds normally (test environments and sessions
+                // without relay context are unaffected).
+                let relay_active = self.relay_publisher.is_some();
+                let owner_initiated = !relay_active
+                    || match (&self.turn_initiator_pubkey, &self.agent_owner_pubkey_hex) {
+                        (Some(initiator), Some(owner_hex)) => initiator.to_hex() == *owner_hex,
+                        // Relay is active but owner/initiator not set: conservative reject.
+                        _ => false,
+                    };
+                if !owner_initiated {
+                    tracing::warn!(
+                        target: "acp::permission",
+                        "ask D7-final: turn not owner-initiated — downgrading to reject for id={id}"
+                    );
+                    self.pending_permission_id = Some(id.clone());
+                    self.permission_responded = false;
+                    let nonce = new_permission_nonce();
+                    self.emit_permission_read_with_nonce(
+                        &id,
+                        msg,
+                        &nonce,
+                        false,
+                        Some("policy=ask; D7-final: non-owner turn; downgraded to reject"),
+                    );
+                    let response = permission_denial_response(&id, &options)?;
+                    self.finish_permission_sync(&id, &nonce, "rejected", response)
+                        .await?;
+                    self.permission_responded = true;
+                    self.pending_permission_id = None;
+                    return Ok(true);
+                }
+
                 // Emit the single enveloped acp_read — suppresses the caller's
                 // generic emit via the Ok(true) return.
                 self.observe_authorized(
@@ -2741,16 +2919,68 @@ impl AcpClient {
                 let ask_deadline = tokio::time::Instant::now()
                     + std::time::Duration::from_secs(PERMISSION_ASK_TIMEOUT_SECS);
                 let entry_deadline = ask_deadline.min(hard_deadline);
+                // Convert the deadline to Unix seconds for the sentinel payload.
+                let expiry_unix_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    + entry_deadline
+                        .checked_duration_since(tokio::time::Instant::now())
+                        .unwrap_or_default()
+                        .as_secs();
 
                 self.pending_permissions.insert(
-                    id_str,
+                    id_str.clone(),
                     PermissionEntry {
-                        nonce,
+                        nonce: nonce.clone(),
                         options_snapshot: options.clone(),
                         state: PermissionEntryState::Pending,
                         deadline: entry_deadline,
+                        sentinel_event_id: None,
                     },
                 );
+
+                // Publish the kind-9 sentinel card into the channel thread.
+                // Best-effort: if any piece is absent the permission flow continues
+                // without a UI card (the observer feed path remains).
+                {
+                    // Clone relay context upfront so no &mut self borrows cross the await.
+                    let keys_opt = self.agent_relay_keys.clone();
+                    let channel_id_opt = self.sentinel_channel_id;
+                    let owner_hex_opt = self.agent_owner_pubkey_hex.clone();
+                    let publisher_opt = self.relay_publisher.clone();
+                    let turn_id = self.observer_context.turn_id.clone().unwrap_or_default();
+                    let session_id_owned = self.observer_context.session_id.clone();
+                    let reply_id = self.sentinel_thread_reply_id.clone();
+
+                    if let (Some(keys), Some(channel_id), Some(owner_hex), Some(publisher)) =
+                        (keys_opt, channel_id_opt, owner_hex_opt, publisher_opt)
+                    {
+                        if let Some(content) = build_sentinel_pending_payload(
+                            &nonce,
+                            &options,
+                            expiry_unix_secs,
+                            session_id_owned.as_deref(),
+                            &turn_id,
+                        ) {
+                            if let Some(event) = build_kind9_sentinel(
+                                &keys,
+                                channel_id,
+                                &owner_hex,
+                                reply_id.as_deref(),
+                                &content,
+                            ) {
+                                let sentinel_id = event.id.to_hex();
+                                // Fire-and-forget: permission flow must not block on relay acceptance.
+                                let _ = publisher.publish_event(event).await;
+                                // Store the sentinel event ID for the kind-40003 edit on resolution.
+                                if let Some(entry) = self.pending_permissions.get_mut(&id_str) {
+                                    entry.sentinel_event_id = Some(sentinel_id);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Do NOT set pending_permission_id for ask — the map is the
                 // sole source of truth. The legacy single-id slot is only used
@@ -2944,6 +3174,174 @@ fn permission_denial_response(
 /// The nonce is single-use and bound to a specific permission request.
 fn new_permission_nonce() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Maximum length of a label string in a sentinel card.
+///
+/// Matches the D6 frozen schema: labels come from untrusted agent-supplied ACP
+/// options and must be capped before embedding in the Nostr event content.
+const SENTINEL_LABEL_MAX: usize = 200;
+
+/// Build the JSON payload for a kind-9 PENDING sentinel card.
+///
+/// Returns `None` only when `serde_json::to_string` fails (unreachable in
+/// practice). The `expiry_unix_secs` is `min(registered_at + 300, hard_deadline)`.
+fn build_sentinel_pending_payload(
+    nonce: &str,
+    options: &[serde_json::Value],
+    expiry_unix_secs: u64,
+    session_id: Option<&str>,
+    turn_id: &str,
+) -> Option<String> {
+    // Extract opaque optionIds and capped labels from the ACP options.
+    let option_ids: Vec<serde_json::Value> = options
+        .iter()
+        .filter_map(|o| o.get("optionId").and_then(|v| v.as_str()))
+        .map(|s| serde_json::Value::String(s.to_string()))
+        .collect();
+    let labels: serde_json::Value = options
+        .iter()
+        .filter_map(|o| {
+            let id = o.get("optionId")?.as_str()?;
+            let name = o.get("name")?.as_str().unwrap_or("");
+            let capped: String = name.chars().take(SENTINEL_LABEL_MAX).collect();
+            Some((id.to_string(), serde_json::Value::String(capped)))
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+
+    // Detect if any option has kind = "allow_always" (D5 durable-rule disclosure).
+    let has_durable_rule = options.iter().any(|o| {
+        o.get("kind")
+            .and_then(|k| k.as_str())
+            .map(|k| k == "allow_always")
+            .unwrap_or(false)
+    });
+    let durable_rule_note = if has_durable_rule {
+        serde_json::Value::String(
+            "Includes an 'Always allow' option — creates a machine-wide durable rule in Codex."
+                .to_string(),
+        )
+    } else {
+        serde_json::Value::Null
+    };
+
+    let payload = serde_json::json!({
+        "v": 1,
+        "state": "pending",
+        "requestNonce": nonce,
+        "sessionId": session_id,
+        "turnId": turn_id,
+        "expiresAt": expiry_unix_secs,
+        "optionIds": option_ids,
+        "labels": labels,
+        "hasDurableRule": has_durable_rule,
+        "durableRuleNote": durable_rule_note,
+    });
+    serde_json::to_string(&payload).ok()
+}
+
+/// Build the JSON payload for a kind-40003 RESOLVED sentinel card edit.
+#[allow(clippy::too_many_arguments)]
+fn build_sentinel_resolved_payload(
+    nonce: &str,
+    original_event_id: &str,
+    options: &[serde_json::Value],
+    expiry_unix_secs: u64,
+    session_id: Option<&str>,
+    turn_id: &str,
+    outcome: &str,
+    chosen_option_id: Option<&str>,
+) -> Option<String> {
+    let option_ids: Vec<serde_json::Value> = options
+        .iter()
+        .filter_map(|o| o.get("optionId").and_then(|v| v.as_str()))
+        .map(|s| serde_json::Value::String(s.to_string()))
+        .collect();
+    let labels: serde_json::Value = options
+        .iter()
+        .filter_map(|o| {
+            let id = o.get("optionId")?.as_str()?;
+            let name = o.get("name")?.as_str().unwrap_or("");
+            let capped: String = name.chars().take(SENTINEL_LABEL_MAX).collect();
+            Some((id.to_string(), serde_json::Value::String(capped)))
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+
+    let has_durable_rule = options.iter().any(|o| {
+        o.get("kind")
+            .and_then(|k| k.as_str())
+            .map(|k| k == "allow_always")
+            .unwrap_or(false)
+    });
+    let durable_rule_note = if has_durable_rule {
+        serde_json::Value::String(
+            "Includes an 'Always allow' option — creates a machine-wide durable rule in Codex."
+                .to_string(),
+        )
+    } else {
+        serde_json::Value::Null
+    };
+
+    let payload = serde_json::json!({
+        "v": 1,
+        "state": "resolved",
+        "requestNonce": nonce,
+        "originalEventId": original_event_id,
+        "sessionId": session_id,
+        "turnId": turn_id,
+        "expiresAt": expiry_unix_secs,
+        "optionIds": option_ids,
+        "labels": labels,
+        "hasDurableRule": has_durable_rule,
+        "durableRuleNote": durable_rule_note,
+        "outcome": outcome,
+        "chosenOptionId": chosen_option_id,
+    });
+    serde_json::to_string(&payload).ok()
+}
+
+/// Build and sign a kind-9 sentinel card event.
+///
+/// Returns `None` when required context is absent (relay keys, channel ID, or
+/// payload serialization fails). The event is signed by the agent's relay keys.
+fn build_kind9_sentinel(
+    keys: &Keys,
+    channel_id: Uuid,
+    owner_pubkey_hex: &str,
+    thread_reply_event_id: Option<&str>,
+    content: &str,
+) -> Option<nostr::Event> {
+    let mut tags = vec![
+        Tag::parse(["h", &channel_id.to_string()]).ok()?,
+        Tag::parse(["p", owner_pubkey_hex]).ok()?,
+    ];
+    if let Some(reply_id) = thread_reply_event_id {
+        // NIP-10 reply tag: ["e", <id>, "", "reply"]
+        tags.push(Tag::parse(["e", reply_id, "", "reply"]).ok()?);
+    }
+    EventBuilder::new(Kind::Custom(9), content)
+        .tags(tags)
+        .sign_with_keys(keys)
+        .ok()
+}
+
+/// Build and sign a kind-40003 edit event targeting a kind-9 sentinel.
+fn build_kind40003_sentinel(
+    keys: &Keys,
+    channel_id: Uuid,
+    target_event_id: &str,
+    content: &str,
+) -> Option<nostr::Event> {
+    let tags = vec![
+        Tag::parse(["h", &channel_id.to_string()]).ok()?,
+        Tag::parse(["e", target_event_id]).ok()?,
+    ];
+    EventBuilder::new(Kind::Custom(40003), content)
+        .tags(tags)
+        .sign_with_keys(keys)
+        .ok()
 }
 
 /// Select the unique `allow_once` option from a permission request's option list.
@@ -5866,6 +6264,7 @@ mod tests {
                 options_snapshot: vec![],
                 state: PermissionEntryState::Pending,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                sentinel_event_id: None,
             },
         );
         let msg = perm_request(1, default_opts());
@@ -6072,6 +6471,7 @@ mod tests {
                     options_snapshot: vec![],
                     state: PermissionEntryState::Pending,
                     deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                    sentinel_event_id: None,
                 },
             );
         }
@@ -7219,6 +7619,7 @@ mod tests {
                     options_snapshot: vec![],
                     state: PermissionEntryState::Writing,
                     deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                    sentinel_event_id: None,
                 },
             );
             // cancel_with_cleanup needs last_prompt_id to be Some.
@@ -7428,6 +7829,7 @@ mod tests {
                         ],
                         state: PermissionEntryState::Pending,
                         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                        sentinel_event_id: None,
                     },
                 );
             }
@@ -7542,6 +7944,7 @@ mod tests {
                 ],
                 state: PermissionEntryState::Pending,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+                sentinel_event_id: None,
             },
         );
 

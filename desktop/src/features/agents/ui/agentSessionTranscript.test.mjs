@@ -776,7 +776,7 @@ test("buildTranscript appends Approved outcome when allow_once is selected", () 
   const item = transcript[0];
   assert.equal(item.type, "lifecycle");
   assert.equal(item.renderClass, "permission");
-  assert.equal(item.outcome, "Approved (allow_once)");
+  assert.equal(item.outcome, "Approved");
   assert.doesNotMatch(item.text ?? "", /Approved/);
 });
 
@@ -788,7 +788,7 @@ test("buildTranscript appends Denied outcome when reject_once is selected", () =
 
   const item = transcript[0];
   assert.equal(item.type, "lifecycle");
-  assert.equal(item.outcome, "Denied (reject_once)");
+  assert.equal(item.outcome, "Denied");
   assert.doesNotMatch(item.text ?? "", /Denied/);
 });
 
@@ -834,7 +834,7 @@ test("buildTranscript appends Approved outcome for a numeric JSON-RPC id (select
   const item = transcript[0];
   assert.equal(item.type, "lifecycle");
   assert.equal(item.renderClass, "permission");
-  assert.equal(item.outcome, "Approved (allow_once)");
+  assert.equal(item.outcome, "Approved");
   assert.doesNotMatch(item.text ?? "", /Approved/);
 });
 
@@ -862,8 +862,8 @@ test('buildTranscript does not collide between numeric id 1 and string id "1"', 
     makePermissionResponse(2, "1", "selected", "reject_once"),
   ]);
 
-  assert.equal(transcriptNumeric[0].outcome, "Approved (allow_once)");
-  assert.equal(transcriptString[0].outcome, "Denied (reject_once)");
+  assert.equal(transcriptNumeric[0].outcome, "Approved");
+  assert.equal(transcriptString[0].outcome, "Denied");
 });
 
 // ─── observer parity: new session/update classifier cases ────────────────────

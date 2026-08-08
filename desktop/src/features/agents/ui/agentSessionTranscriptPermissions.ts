@@ -137,11 +137,17 @@ export function describePermissionRequest(payload: Record<string, unknown>) {
  * Format a human-readable outcome label from a permission response.
  * kind values from ACP: allow_once, allow_always, reject_once, reject_always.
  * "reject_*" kinds are denials; anything else that is selected is an approval.
+ *
+ * `optionLabels` maps optionId → harness-provided display label (e.g. "Allow once").
+ * `optionKinds`  maps optionId → ACP kind (e.g. "allow_once"), used only to
+ * determine the deny/approve verb when no label is available. The raw kind
+ * string is NEVER rendered to the user.
  */
 export function describePermissionOutcome(
   outcome: string,
   optionId: string | null,
-  optionNames: Map<string, string>,
+  optionLabels: Map<string, string>,
+  optionKinds?: Map<string, string>,
 ): string {
   if (outcome === "cancelled") {
     return "Cancelled";
@@ -154,10 +160,12 @@ export function describePermissionOutcome(
     return "Approval outcome unknown; agent process stopped before it could continue.";
   }
   if (outcome === "selected" && optionId) {
-    const kind = optionNames.get(optionId) ?? optionId;
+    const label = optionLabels.get(optionId);
+    const kind = optionKinds?.get(optionId) ?? optionId;
     const isDenial = kind.startsWith("reject");
     const verb = isDenial ? "Denied" : "Approved";
-    return `${verb} (${kind})`;
+    // Render the harness-provided label, never the raw ACP kind string.
+    return label ?? `${verb}`;
   }
   return outcome;
 }
@@ -178,18 +186,31 @@ export function describePermissionTerminalReason(
   outcomeKind: string | null | undefined,
   optionId: string | null,
   options:
-    | Array<{ optionId: string; kind: string; label?: string }>
+    | Array<{ optionId: string; kind: string; label?: string; name?: string }>
     | undefined,
 ): string {
   if (reason === "applied") {
-    // Build optionNames map from the card's options array.
-    const optionNames = new Map(
+    // Build label map (harness-provided display strings) and kind map (for
+    // deny/approve verb fallback only). Labels are preferred; raw kind strings
+    // are never rendered to the user.
+    // `label` is used by sentinel-format options; `name` is used by ACP
+    // JSON-RPC options. Fall back to undefined (verb-only) if neither is set.
+    const optionLabels = new Map<string, string>(
+      (options ?? [])
+        .map(
+          (o) =>
+            [o.optionId, o.label ?? o.name] as [string, string | undefined],
+        )
+        .filter((entry): entry is [string, string] => entry[1] !== undefined),
+    );
+    const optionKinds = new Map(
       (options ?? []).map((o) => [o.optionId, o.kind]),
     );
     return describePermissionOutcome(
       outcomeKind ?? "selected",
       optionId,
-      optionNames,
+      optionLabels,
+      optionKinds,
     );
   }
   if (reason === "timed_out") return "Timed out";
@@ -198,8 +219,20 @@ export function describePermissionTerminalReason(
     return "Approval outcome unknown; agent process stopped before it could continue.";
   }
   // No reason: fall back to ACP outcome-level copy.
-  const optionNames = new Map((options ?? []).map((o) => [o.optionId, o.kind]));
-  return describePermissionOutcome(outcomeKind ?? "", optionId, optionNames);
+  const optionLabels = new Map<string, string>(
+    (options ?? [])
+      .map(
+        (o) => [o.optionId, o.label ?? o.name] as [string, string | undefined],
+      )
+      .filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
+  const optionKinds = new Map((options ?? []).map((o) => [o.optionId, o.kind]));
+  return describePermissionOutcome(
+    outcomeKind ?? "",
+    optionId,
+    optionLabels,
+    optionKinds,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +390,10 @@ export function handlePermissionWrite(
       const outcomeText = describePermissionOutcome(
         outcomeKind,
         optionId,
+        // Legacy path: no harness labels available (non-ask path).
+        // Pass an empty labels map so the verb-only fallback ("Approved" /
+        // "Denied") renders rather than a raw kind string.
+        new Map(),
         pendingById.optionNames,
       );
       const existing = d.itemsById.get(pendingById.itemId);

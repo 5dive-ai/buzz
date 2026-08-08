@@ -571,6 +571,11 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Publisher for kind-9 sentinel cards and kind-40003 edits.
+    /// When set, `run_prompt_task` wires it into `AcpClient` so permission
+    /// cards appear in the channel thread. `None` disables sentinel publishing
+    /// (observer feed path remains).
+    pub relay_event_publisher: Option<crate::relay::RelayEventPublisher>,
 }
 
 impl AgentPool {
@@ -1436,6 +1441,32 @@ pub async fn run_prompt_task(
     agent
         .acp
         .set_owner_pubkey_known(ctx.agent_owner_pubkey.is_some());
+
+    // Wire sentinel card publisher, agent signing keys, owner pubkey, and
+    // per-turn context for D7-final admission and kind-9/40003 publishing.
+    if let Some(publisher) = ctx.relay_event_publisher.clone() {
+        agent
+            .acp
+            .set_relay_publisher(publisher, ctx.agent_keys.clone());
+    }
+    agent
+        .acp
+        .set_agent_owner_pubkey_hex(ctx.agent_owner_pubkey.as_ref().map(|pk| pk.to_hex()));
+    // D7-final: record the turn initiator from the first event in the batch.
+    let turn_initiator = batch
+        .as_ref()
+        .and_then(|b| b.events.first())
+        .map(|be| be.event.pubkey);
+    agent.acp.set_turn_initiator_pubkey(turn_initiator);
+    // Sentinel routing: channel UUID and reply anchor from batch.
+    let batch_channel_id = batch.as_ref().map(|b| b.channel_id);
+    let thread_reply_event_id = batch
+        .as_ref()
+        .and_then(|b| b.events.first())
+        .map(|be| be.event.id.to_hex());
+    agent
+        .acp
+        .set_turn_channel_context(batch_channel_id, thread_reply_event_id);
 
     let triggering_event_ids: Vec<String> = batch
         .as_ref()
@@ -6571,6 +6602,7 @@ mod tests {
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            relay_event_publisher: None,
         }
     }
 

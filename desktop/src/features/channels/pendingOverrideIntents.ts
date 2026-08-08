@@ -142,6 +142,9 @@ export class PendingOverrideIntentStore {
   /**
    * Restore in-memory state from deserialized storage (called by manager
    * during `hydrateFromLocalStorage`).  Replaces any in-memory state.
+   *
+   * Clears ALL transaction-only maps so no lock, snapshot, deferred payload,
+   * or promoted payload from a prior identity can survive a hydration/swap.
    */
   restoreFromStorage(
     intents: ReadonlyMap<string, PendingIntent>,
@@ -149,6 +152,8 @@ export class PendingOverrideIntentStore {
   ): void {
     this.intents = new Map(intents);
     this._nextGen = nextGen;
+    // Clear transaction-only state — identity swap must not inherit A's locks.
+    this.clearTransactionState();
   }
 
   /**
@@ -192,6 +197,13 @@ export class PendingOverrideIntentStore {
       };
     }
     const gen = this._nextGen++;
+    if (!Number.isSafeInteger(gen)) {
+      // Allocation exhausted — this should never happen in practice (the store
+      // is rebased at hydration when near the ceiling), but guard defensively.
+      throw new Error(
+        "[PendingOverrideIntentStore] generation counter exhausted (unsafe)",
+      );
+    }
     const intent: PendingIntent = {
       gen,
       op,
@@ -283,6 +295,12 @@ export class PendingOverrideIntentStore {
     // Save the payload before promoting so abortTransaction can re-buffer it.
     this.promotedDeferredPayloads.set(channelId, deferred);
     const gen = this._nextGen++;
+    if (!Number.isSafeInteger(gen)) {
+      // Guard: rebase at hydration prevents this in practice, but fail safely.
+      throw new Error(
+        "[PendingOverrideIntentStore] generation counter exhausted (unsafe)",
+      );
+    }
     const intent: PendingIntent = {
       gen,
       op: deferred.op,
@@ -367,6 +385,22 @@ export class PendingOverrideIntentStore {
   /** Number of pending intents.  Used by tests and diagnostics. */
   get size(): number {
     return this.intents.size;
+  }
+
+  /**
+   * Clear all transaction-only state.
+   *
+   * Called by `restoreFromStorage` (identity swap) and `ReadStateManager.destroy()`
+   * so no lock, snapshot, deferred payload, or promoted payload can escape past a
+   * manager lifecycle boundary on the shared module singleton.
+   *
+   * Does NOT touch the `intents` map or `_nextGen` — caller owns those.
+   */
+  clearTransactionState(): void {
+    this.lockedChannels.clear();
+    this.intentSnapshots.clear();
+    this.deferredEnqueues.clear();
+    this.promotedDeferredPayloads.clear();
   }
 }
 

@@ -354,9 +354,14 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
         // which would silently discard the fresh action via the Amendment C
         // already-applied check.
         //
-        // If the increment would be unrepresentable (> Number.MAX_SAFE_INTEGER),
-        // fall back to a fresh safe value — any safe value above existing gens
-        // is acceptable; we prefer the smallest representable one.
+        // If all loaded generations are at or near MAX_SAFE_INTEGER (allocator
+        // exhausted), rebase: atomically compact all intent gens and their
+        // matching receipt gens into a fresh range [1..N] and persist the
+        // normalized blob.  N is bounded by the number of channels in the map
+        // (at most one intent per channel), so rebasing is always deterministic.
+        //
+        // This guarantees no allocation can produce a gen that matches a
+        // retained receipt, since all receipts are renumbered in the same step.
         {
           let maxObservedGen = 0;
           for (const intent of pendingIntents.values()) {
@@ -373,10 +378,26 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
           ) {
             nextGen = requiredNextGen;
           } else if (!Number.isSafeInteger(requiredNextGen)) {
-            // maxObservedGen is already at or near MAX_SAFE_INTEGER — reset to
-            // a fresh safe value.  Existing gens become unreachable for amendment-C
-            // matching (intentionally: the corrupt blob is untrustworthy).
-            nextGen = 1;
+            // Allocator exhausted — rebase all intent gens and matching receipt
+            // gens into a compact safe range [1..N].  intents is keyed by
+            // channelId with at most one entry per channel, so sorting is
+            // deterministic and produces a stable assignment.
+            const sorted = [...pendingIntents.entries()].sort(
+              ([, a], [, b]) => a.gen - b.gen,
+            );
+            let newGen = 1;
+            for (const [chId, intent] of sorted) {
+              const oldGen = intent.gen;
+              const rebasedIntent: PendingIntent = { ...intent, gen: newGen };
+              pendingIntents.set(chId, rebasedIntent);
+              // Re-key the matching receipt (same channelId + old gen).
+              const receipt = receipts.get(chId);
+              if (receipt !== undefined && receipt.intentGen === oldGen) {
+                receipts.set(chId, { ...receipt, intentGen: newGen });
+              }
+              newGen++;
+            }
+            nextGen = newGen; // first free gen after the rebased range
           }
         }
       }

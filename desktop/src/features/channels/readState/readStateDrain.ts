@@ -73,6 +73,13 @@ export interface DrainContext {
   tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean;
   restoreExtraSlotIds(prev: string[]): void;
   scheduleDrain(): void;
+  /**
+   * Schedule a bounded-backoff abort retry drain pass.
+   * Used on storage-failure and thrown-callback abort paths — these must NOT
+   * use the immediate `pendingFreshDrain` path to prevent a hot spin loop
+   * under persistent storage failure.  Mirrors the load retry controller.
+   */
+  scheduleAbortRetry(): void;
   /** Drain outcome callback — typed discriminated union for exhaustive handling
    *  in the hook layer. */
   onDrainOutcome: ((outcome: DrainOutcome) => void) | null;
@@ -100,6 +107,7 @@ interface ManagerInternals {
   tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean;
   restoreExtraSlotIds(prev: string[]): void;
   scheduleDrain(): void;
+  scheduleAbortRetry(): void;
 }
 
 /**
@@ -144,6 +152,7 @@ export function createDrainContext(mgr: ManagerInternals): DrainContext {
     tryCandidatePlan: (id, reg) => mgr.tryCandidatePlan(id, reg),
     restoreExtraSlotIds: (prev) => mgr.restoreExtraSlotIds(prev),
     scheduleDrain: () => mgr.scheduleDrain(),
+    scheduleAbortRetry: () => mgr.scheduleAbortRetry(),
   };
 }
 
@@ -253,7 +262,7 @@ export async function drainPendingIntents(
           ctx.restoreExtraSlotIds(prevExtraSlotIds);
           // Abort: gen1 restored as live intent, gen2 stays buffered for retry.
           pendingOverrideIntentStore.abortTransaction(channelId);
-          if (!ctx.destroyed) ctx.scheduleDrain();
+          if (!ctx.destroyed) ctx.scheduleAbortRetry();
           continue; // transaction closed via abort; finally is a no-op (transactionCommitted=false)
         }
         ctx.schedulePublish();
@@ -306,8 +315,22 @@ export async function drainPendingIntents(
       // Fire the typed callback.
       // The transaction latch ensures no enqueue() for this channel can change
       // the generation inside this callback — Amendment A holds structurally.
+      // Wrap in try-catch: a thrown callback must not leave the channel latched
+      // forever.  On throw, treat the same as a storage-failure abort: restore
+      // gen1 as live intent, keep gen2 buffered, schedule a bounded retry.
       if (outcome !== null && ctx.onDrainOutcome !== null) {
-        ctx.onDrainOutcome(outcome);
+        try {
+          ctx.onDrainOutcome(outcome);
+        } catch (err) {
+          console.warn(
+            `[ReadStateManager] drain: onDrainOutcome threw for ${channelId}:`,
+            err,
+          );
+          // Abort the transaction: gen1 restored, gen2 stays buffered.
+          pendingOverrideIntentStore.abortTransaction(channelId);
+          if (!ctx.destroyed) ctx.scheduleAbortRetry();
+          continue; // transaction closed via abort; finally is a no-op
+        }
       }
 
       // Step 3: atomic cleanup commit — promote any deferred gen2 enqueue, then
@@ -341,7 +364,7 @@ export async function drainPendingIntents(
           ctx.appliedReceipts.set(channelId, capturedReceipt);
         }
         pendingOverrideIntentStore.abortTransaction(channelId);
-        if (!ctx.destroyed) ctx.scheduleDrain();
+        if (!ctx.destroyed) ctx.scheduleAbortRetry();
         continue; // transaction closed via abort; finally is a no-op
       }
       transactionCommitted = true;

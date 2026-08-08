@@ -4075,24 +4075,46 @@ test("retryLoad_reconnectDuringLoadInFlight_coalescesToPendingRetry", async () =
     );
     assert.equal(fetchCallCount, 2, "exactly two fetches must have occurred");
 
-    // ── Phase 5: gen-2 fetch is in-flight — reconnect coalesces unconditionally ─
+    // ── Phase 5: gen-2 fetch is in-flight — multiple reconnects coalesce ─────────
     // loadInFlight must still be true because secondBarrier has not been released.
     assert.equal(
       mgr.loadInFlight,
       true,
       "gen-2 load must still be in-flight (secondBarrier not released)",
     );
-    // This reconnect MUST always be asserted — no `if (loadInFlight)` guard.
+    // First reconnect — unconditional, no `if (loadInFlight)` guard.
     mgr.retryLoad();
     assert.equal(
       mgr.pendingRetryOnComplete,
       true,
-      "reconnect during gen-2 load must unconditionally set pendingRetryOnComplete",
+      "first reconnect during gen-2 load must unconditionally set pendingRetryOnComplete",
+    );
+    // Second reconnect — must also coalesce (not start a third fetch immediately).
+    mgr.retryLoad();
+    assert.equal(
+      mgr.pendingRetryOnComplete,
+      true,
+      "second reconnect during gen-2 load must keep pendingRetryOnComplete set",
+    );
+    assert.equal(
+      mgr.loadGeneration,
+      gen1 + 1,
+      "gen must not advance on coalesced reconnects during gen-2 in-flight",
     );
 
-    // ── Phase 6: release gen-2 fetch and destroy ──────────────────────────────
+    // ── Phase 6: release gen-2 fetch — pending retry fires gen-3 load ─────────
+    // The pending retry means the finally-block fires retryLoad() immediately after
+    // gen-2 resolves, starting a gen-3 fetch.  Assert gen-3 fires BEFORE destroy.
     resolveSecond();
     await new Promise((r) => origSetTimeout(r, 0));
+
+    // Gen-3 fetch must be in-flight (started by the pending retry on gen-2 complete).
+    assert.equal(
+      mgr.loadGeneration,
+      gen1 + 2,
+      "gen must advance to gen1+2 when pending retry fires after gen-2 complete",
+    );
+    assert.equal(fetchCallCount, 3, "exactly three fetches must have occurred");
 
     mgr.destroy();
     assert.equal(
@@ -5181,29 +5203,51 @@ test("markChannelReadDirect_uint32overflow_frontierDeactivated_silentSuccess", a
 // ── Test 51: abort/retry on step-1 storage failure — gen1 survives, retry drains ──
 test("drain_step1StorageFailure_abortRetry_gen1SurvivesAndRetrains", async () => {
   // If the step-1 register+receipt persist fails, the drain aborts the transaction:
-  // gen1 stays live in the store, deferred gen2 stays buffered, and scheduleDrain()
-  // fires a retry pass.  On the retry, storage is healthy and the drain completes.
+  // gen1 stays live, no outcome callback fires (step-1 abort skips steps 2-3 via `continue`),
+  // and scheduleAbortRetry() fires a bounded-backoff timer.  When the timer fires, storage is
+  // healthy: gen1 drains fully; the outcome callback enqueues gen2 (deferred while channel is
+  // locked); promoteDeferred() commits gen1-cleanup + gen2-pi atomically; scheduleDrain() fires
+  // gen2 drain immediately; gen2 applies (frontier=999).
+  //
+  // Failure branches covered:
+  //  - step-1 failure path: abort + bounded retry timer (no immediate spin)
   //
   // Assertions (durable surfaces):
-  //  - blob has gen1 pi at the start (from enqueue persist before drain)
-  //  - restart witness: hydrating after step-1 failure sees gen1 (not gen2)
-  //  - after the retry pass: register committed, gen1+gen2 cleaned up, queue empty,
-  //    blob has no pi
-  //
-  // Timing note: the abort path schedules a retry drain as a microtask continuation
-  // inside the same awaited drain call.  We suppress the auto-retry by momentarily
-  // clearing pendingFreshDrain after the failing drain, verify durability and restart,
-  // then manually fire the retry to prove gen1 actually drains successfully.
+  //  - blob pre-drain: gen1 pi (no register)
+  //  - post-fail: blob unchanged (step-1 abort rolled back register), gen1 live in memory
+  //  - restart witness 1: blob has gen1 pi; fresh mgr hydrates gen1 (gen2 not yet durable)
+  //  - scheduleAbortRetry sets mgr.drainRetryTimer (bounded backoff, NOT immediate pendingFreshDrain)
+  //  - retry fires: gen1 drains + gen2 auto-drains (scheduleDrain path)
+  //  - post-retry: register committed (from gen1), frontier ≥ 999 (gen2 applied), no pending intent
+  //  - restart witness 2: fresh mgr hydrates frontier ≥ 999; no stale gen1 intent
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "51".repeat(32);
   const channelId = `abort-step1-ch-${"w".repeat(49)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
 
-  // Block ALL writes to the v2 key until `unblockV2Write()` is called.
-  // setLocalStorageItemWithRecovery retries after catching, so we must block
-  // both the initial write AND the recovery retry — a single-shot flag is not
-  // enough.  A persistent-block flag is cleared explicitly by the test.
+  // Fake timer: intercept ms>0 timers for scheduleAbortRetry control.
+  const origSetTimeout = globalThis.window.setTimeout;
+  const origClearTimeout = globalThis.window.clearTimeout;
+  const scheduledTimers = new Map(); // id → fn
+  let nextFakeId = 51000;
+  globalThis.window.setTimeout = (fn, ms) => {
+    if (ms > 0) {
+      const id = nextFakeId++;
+      scheduledTimers.set(id, fn);
+      return id;
+    }
+    return origSetTimeout(fn, ms);
+  };
+  globalThis.window.clearTimeout = (id) => {
+    if (scheduledTimers.has(id)) {
+      scheduledTimers.delete(id);
+    } else {
+      origClearTimeout(id);
+    }
+  };
+
+  // Block ALL v2 writes until explicitly unblocked (step-1 fail simulation).
   let blockV2Writes = false;
   const origSetItem = ls.setItem.bind(ls);
   ls.setItem = (key, value) => {
@@ -5222,150 +5266,231 @@ test("drain_step1StorageFailure_abortRetry_gen1SurvivesAndRetrains", async () =>
     getConnectionGeneration: () => 0,
   };
 
-  const mgr = new ReadStateManager(pubkey, fakeRelay);
-  mgr.effectiveState.set(channelId, 50);
-  mgr.isLoadComplete = false;
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    mgr.effectiveState.set(channelId, 50);
+    mgr.isLoadComplete = false;
 
-  // Queue gen1 (unread).
-  mgr.markChannelUnread(channelId);
-  const gen1Intent = pendingOverrideIntentStore.get(channelId);
-  assert.ok(gen1Intent, "gen1 must be queued");
-  const gen1 = gen1Intent.gen;
+    // Queue gen1 (unread) — also persists initial pi (write 0).
+    mgr.markChannelUnread(channelId);
+    const gen1 = pendingOverrideIntentStore.get(channelId).gen;
 
-  // The v2 blob must have gen1 pi from the initial enqueue persist (write 0).
-  // Check this BEFORE the failing drain so we know the baseline durable state.
-  const blobBeforeDrain = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-  assert.ok(
-    blobBeforeDrain.pi?.[channelId],
-    "v2 blob must carry gen1 pi before drain",
-  );
-  assert.equal(
-    blobBeforeDrain.pi[channelId].gen,
-    gen1,
-    "blob pi gen must match gen1",
-  );
-
-  // Intercept scheduleDrain to capture any auto-retry fired by the abort path.
-  // The step-1 abort calls scheduleDrain(), which the manager honors by firing a
-  // fire-and-forget retry drain.  We capture it here to prevent it from running
-  // before we check intermediate state.
-  let capturedRetryFn = null;
-  const origScheduleDrain = mgr.scheduleDrain.bind(mgr);
-  mgr.scheduleDrain = () => {
-    // Save the retry request — fire it manually after intermediate assertions.
-    capturedRetryFn = () => {
-      mgr.scheduleDrain = origScheduleDrain;
-      origScheduleDrain();
-    };
-  };
-
-  // Complete load, but fail the step-1 register+receipt write by blocking ALL
-  // v2 writes (setLocalStorageItemWithRecovery would retry after eviction, so
-  // a single-shot flag is insufficient — a persistent block is required).
-  mgr.isLoadComplete = true;
-  blockV2Writes = true;
-  await mgr.drainPendingIntents(mgr.loadGeneration);
-  // Unblock writes so subsequent operations can persist.
-  blockV2Writes = false;
-
-  // The v2 blob must still have gen1 pi (step-1 write failed — blob unchanged from write 0).
-  const blobAfterFail = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-  assert.ok(
-    blobAfterFail.pi?.[channelId],
-    "v2 blob must still carry gen1 pi after step-1 failure",
-  );
-  assert.equal(
-    blobAfterFail.pi[channelId].gen,
-    gen1,
-    "blob gen must still be gen1 after failure",
-  );
-
-  // The register must NOT be committed (step-1 failed before persist).
-  assert.equal(
-    mgr.overrideRegisters.get(channelId),
-    undefined,
-    "register must not be committed after step-1 failure",
-  );
-
-  // Restart witness: a fresh manager sees gen1 (not a stale or promoted gen2).
-  {
-    const mgr2 = new ReadStateManager(pubkey, fakeRelay);
-    mgr2.hydrateFromLocalStorage();
-    const hydratedIntent = pendingOverrideIntentStore.get(channelId);
-    assert.ok(hydratedIntent, "gen1 must be hydrated from blob on restart");
+    // Confirm v2 blob has gen1 pi from write 0.
+    const blobBefore = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
     assert.equal(
-      hydratedIntent.gen,
+      blobBefore.pi?.[channelId]?.gen,
       gen1,
-      "hydrated gen must be gen1 (abort preserved durable state)",
+      "blob must carry gen1 pi before drain",
     );
-    mgr2.destroy();
+
+    // Wire drain callback: enqueue gen2 (read, readTarget=999) from inside the transaction.
+    // Force isLoadComplete=false temporarily so markChannelRead goes through the latch buffer
+    // (deferred enqueue path) — the channel is locked at callback time, so the enqueue is
+    // buffered as deferred rather than applied immediately.  This is the scenario the latch
+    // is designed for: a user action arrives mid-transaction while the drain holds the lock.
+    mgr.onDrainOutcome = (outcome) => {
+      if (
+        outcome.kind === "applied-unread" &&
+        outcome.channelId === channelId
+      ) {
+        const prev = mgr.isLoadComplete;
+        mgr.isLoadComplete = false; // route through deferred latch path
+        mgr.markChannelRead(channelId, undefined, 999);
+        mgr.isLoadComplete = prev;
+        // The enqueue returned gen:-1 (buffered placeholder); real gen assigned on promote.
+      }
+    };
+
+    // NOTE: step-1 failure skips the outcome callback entirely (abort + continue before step 2).
+    // The callback only fires during the retry drain (when step-1 succeeds).
+
+    // Drain with step-1 blocked.
+    mgr.isLoadComplete = true;
+    blockV2Writes = true;
+    await mgr.drainPendingIntents(mgr.loadGeneration);
+    blockV2Writes = false;
+
+    // After failing drain: register NOT committed (step-1 rolled back), gen1 live.
+    assert.equal(
+      mgr.overrideRegisters.get(channelId),
+      undefined,
+      "register must not be committed after step-1 failure",
+    );
+
+    // v2 blob must still be write-0 state: gen1 pi, no register.
+    const blobAfterFail = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
+    assert.equal(
+      blobAfterFail.pi?.[channelId]?.gen,
+      gen1,
+      "blob must still have gen1 pi after step-1 failure",
+    );
+    assert.equal(
+      blobAfterFail.r?.[channelId],
+      undefined,
+      "register must not be in blob after step-1 failure",
+    );
+
+    // Gen1 must be live in the store (abort restored it).
+    const intentAfterFail = pendingOverrideIntentStore.get(channelId);
+    assert.ok(intentAfterFail, "gen1 must be live after abort");
+    assert.equal(
+      intentAfterFail.gen,
+      gen1,
+      "live intent must be gen1 after step-1 abort",
+    );
+
+    // scheduleAbortRetry must have set mgr.drainRetryTimer (bounded backoff timer).
+    // Step-1 fail skips schedulePublish (step-1 is the register write — on failure,
+    // the register is rolled back and no publish is scheduled).  Exactly one timer.
+    assert.equal(
+      scheduledTimers.size,
+      1,
+      "exactly one abort retry timer after step-1 failure",
+    );
+    assert.ok(
+      mgr.drainRetryTimer !== null,
+      "mgr.drainRetryTimer must be set by scheduleAbortRetry",
+    );
+    assert.ok(
+      scheduledTimers.has(mgr.drainRetryTimer),
+      "abort retry timer ID must be in scheduledTimers",
+    );
+
+    // Restart witness 1: blob has gen1 pi; hydrating sees gen1 (gen2 not yet durable).
+    {
+      const mgr2 = new ReadStateManager(pubkey, fakeRelay);
+      mgr2.hydrateFromLocalStorage();
+      const hydratedIntent = pendingOverrideIntentStore.get(channelId);
+      assert.ok(
+        hydratedIntent,
+        "gen1 must hydrate from blob (step-1 fail leaves gen1 pi in blob)",
+      );
+      assert.equal(hydratedIntent.gen, gen1, "hydrated intent must be gen1");
+      mgr2.destroy();
+    }
+    // Restore for original mgr (hydration above replaced singleton state).
+    mgr.hydrateFromLocalStorage();
+
+    // Fire the abort retry timer — storage is healthy now.
+    // Use mgr.drainRetryTimer to get the specific abort retry timer (not publish debounce).
+    const drainRetryTimerId = mgr.drainRetryTimer;
+    const retryFn = scheduledTimers.get(drainRetryTimerId);
+    assert.ok(retryFn, "abort retry timer fn must be in scheduledTimers");
+    scheduledTimers.clear(); // clear all before firing
+    await retryFn(); // fires the drain retry
+    // The retry drain is async but has no awaits internally — drainPendingIntentsImpl runs
+    // synchronously.  The gen2 auto-drain (via scheduleDrain/pendingFreshDrain) also runs
+    // synchronously within the outer drainPendingIntents wrapper microtask.
+    // One setTimeout(0) macrotask is sufficient to let all microtasks settle.
+    await new Promise((r) => origSetTimeout(r, 0));
+
+    // After retry + auto-drain:
+    //  - gen1 register committed (S-bumped from gen1 unread drain)
+    //  - gen2 (read, readTarget=999) promoted, committed atomically with gen1 cleanup,
+    //    then auto-drained via scheduleDrain → frontier advances to 999
+    //  - no pending intent remains (both gen1 and gen2 consumed)
+    //  - blob: register with C-bumped (from gen2 read drain), no pi, no receipt
+    const regAfterRetry = mgr.overrideRegisters.get(channelId);
+    assert.ok(regAfterRetry, "register must be committed after retry");
+    assert.ok(regAfterRetry.s > 0, "S must be bumped (gen1 unread applied)");
+
+    // Receipt must be gone (step-3 cleanup succeeded).
+    const blobAfterRetry = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
+    assert.equal(
+      blobAfterRetry.receipts?.[channelId],
+      undefined,
+      "receipt must be cleaned up after retry",
+    );
+
+    // Frontier must have advanced to 999 (gen2 read applied).
+    const frontierAfterRetry = mgr.effectiveState.get(channelId) ?? 0;
+    assert.ok(
+      frontierAfterRetry >= 999,
+      `frontier must be ≥ 999 after gen2 drain; got ${frontierAfterRetry}`,
+    );
+
+    // No pending intent (both gen1 and gen2 consumed by drain).
+    assert.equal(
+      pendingOverrideIntentStore.get(channelId),
+      undefined,
+      "no pending intent after gen1+gen2 drain",
+    );
+
+    // Restart witness 2: fresh manager sees frontier ≥ 999 (gen2 durably applied);
+    // no stale gen1 intent.  Restart parity: durable state reflects what memory holds.
+    {
+      const mgr3 = new ReadStateManager(pubkey, fakeRelay);
+      mgr3.hydrateFromLocalStorage();
+      // No pending intent (both drained).
+      assert.equal(
+        pendingOverrideIntentStore.get(channelId),
+        undefined,
+        "fresh manager: no pending intent after full drain",
+      );
+      // Frontier must be persisted at ≥ 999 (stored in blob.r[channelId].f).
+      const f3 = mgr3.effectiveState.get(channelId) ?? 0;
+      assert.ok(
+        f3 >= 999,
+        `fresh manager must hydrate frontier ≥ 999; got ${f3}`,
+      );
+      mgr3.destroy();
+    }
+
+    mgr.destroy();
+  } finally {
+    globalThis.window.setTimeout = origSetTimeout;
+    globalThis.window.clearTimeout = origClearTimeout;
   }
-
-  // Manually fire the retry drain (storage is healthy now — no more blocks).
-  assert.ok(
-    capturedRetryFn,
-    "scheduleDrain must have been called by the abort path",
-  );
-  mgr.scheduleDrain = origScheduleDrain; // restore before firing
-  mgr.isLoadComplete = true;
-  await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // After retry: register committed, queue empty, blob cleaned.
-  const regAfterRetry = mgr.overrideRegisters.get(channelId);
-  assert.ok(regAfterRetry, "register must be committed after retry drain");
-  assert.ok(regAfterRetry.s > 0, "S must be bumped after retry");
-
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "gen1 must be consumed after retry drain",
-  );
-
-  const blobAfterRetry = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-  assert.equal(
-    blobAfterRetry.pi?.[channelId],
-    undefined,
-    "v2 blob must have no pi entry after retry cleanup",
-  );
-
-  mgr.destroy();
 });
 
 // ── Test 52: abort/retry on step-3 cleanup failure — gen1 stays live, retry cleans up ──
 test("drain_step3CleanupFailure_abortRetry_gen1StaysLiveAndRetrains", async () => {
   // If the step-3 cleanup write fails (after step-1 register+receipt committed),
-  // abortTransaction restores gen1 as the live intent and keeps gen2 buffered.
-  // The in-memory receipt is also restored so the retry drain's alreadyApplied
-  // check fires (cleanup-only, no re-bump).  scheduleDrain fires a retry.
+  // abortTransaction restores gen1 as the live intent and re-buffers gen2 (enqueued
+  // from onDrainOutcome during the transaction).  The in-memory receipt is also
+  // restored so the retry drain's alreadyApplied check fires (cleanup-only, no re-bump).
+  // scheduleAbortRetry fires a bounded-backoff timer.  On retry: combined gen1-cleanup
+  // + gen2-pi committed atomically.  Restart must see gen2.
   //
   // Assertions (durable surfaces):
-  //  - after failing pass (auto-retry suppressed): register in blob (step-1 ok),
-  //    gen1 pi still in blob (cleanup write failed), gen1 pi+receipt in blob
-  //  - gen1 restored as live in-memory intent (abortTransaction)
-  //  - restart witness: gen1 pi+receipt in blob; hydration sees gen1 as pending
-  //  - after retry pass: pi cleaned, queue empty, blob has no pi
-  //
-  // Timing: same as Test 51 — we intercept scheduleDrain to prevent the auto-retry
-  // from running before intermediate assertions, then manually fire the retry.
+  //  - after failing pass: register in blob (step-1 ok), gen1 pi + receipt still in blob
+  //    (cleanup write failed), gen1 live in memory
+  //  - restart witness: gen1 + receipt in blob; hydration sees gen1 pending
+  //  - timer fires: retry drain runs alreadyApplied (no re-bump), gen1-cleanup + gen2-pi atomic
+  //  - post-retry: pi cleaned, receipt cleaned, queue has gen2, blob has gen2 pi
+  //  - restart witness 2: fresh manager hydrates gen2 from blob
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "52".repeat(32);
   const channelId = `abort-step3-ch-${"x".repeat(49)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
 
-  // We need to fail exactly write 2 (step-3 cleanup) while writes 0 and 1 succeed.
-  // setLocalStorageItemWithRecovery catches throws and retries once after cache eviction.
-  // In our clean test environment eviction returns 0 entries, so no retry occurs —
-  // a single throw per write attempt is sufficient for the specific numbered-write approach.
-  // BUT: the throw-on-count approach only works because our test localStorage has no
-  // pure-cache keys (evictPureCacheEntries returns 0).
-  //
-  // Write ordering:
-  //  Write 0: enqueue persist (markChannelUnread, incomplete load) ← succeeds
-  //  Write 1: step-1 register+receipt commit (drain) ← succeeds
-  //  Write 2: step-3 cleanup commit (drain) ← FAILS (persistent block from this index)
+  // Fake timer for scheduleAbortRetry.
+  const origSetTimeout = globalThis.window.setTimeout;
+  const origClearTimeout = globalThis.window.clearTimeout;
+  const scheduledTimers = new Map();
+  let nextFakeId = 52000;
+  globalThis.window.setTimeout = (fn, ms) => {
+    if (ms > 0) {
+      const id = nextFakeId++;
+      scheduledTimers.set(id, fn);
+      return id;
+    }
+    return origSetTimeout(fn, ms);
+  };
+  globalThis.window.clearTimeout = (id) => {
+    if (scheduledTimers.has(id)) {
+      scheduledTimers.delete(id);
+    } else {
+      origClearTimeout(id);
+    }
+  };
+
+  // Write 0: enqueue persist (succeeds)
+  // Write 1: step-1 register+receipt commit (succeeds)
+  // Write 2: step-3 cleanup commit (FAILS once, then succeeds)
   let v2WriteCount = 0;
-  let blockFromWriteIndex = -1; // block all v2 writes from this index onward; -1 = unblocked
+  let blockFromWriteIndex = -1;
   const origSetItem = ls.setItem.bind(ls);
   ls.setItem = (key, value) => {
     if (key.startsWith("buzz.nip-rs.override-state.v2:")) {
@@ -5386,95 +5511,153 @@ test("drain_step3CleanupFailure_abortRetry_gen1StaysLiveAndRetrains", async () =
     getConnectionGeneration: () => 0,
   };
 
-  const mgr = new ReadStateManager(pubkey, fakeRelay);
-  mgr.effectiveState.set(channelId, 50);
-  mgr.isLoadComplete = false;
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    mgr.effectiveState.set(channelId, 50);
+    mgr.isLoadComplete = false;
 
-  // Queue gen1 (unread). This persists the initial pi (write 0).
-  mgr.markChannelUnread(channelId);
-  const gen1 = pendingOverrideIntentStore.get(channelId).gen;
+    // Queue gen1 (unread) — write 0 (enqueue persist).
+    mgr.markChannelUnread(channelId);
+    const gen1 = pendingOverrideIntentStore.get(channelId).gen;
 
-  // Intercept scheduleDrain to prevent the auto-retry from running before we
-  // check intermediate state.  Same pattern as Test 51.
-  let capturedRetryFn = null;
-  const origScheduleDrain = mgr.scheduleDrain.bind(mgr);
-  mgr.scheduleDrain = () => {
-    capturedRetryFn = () => {
-      mgr.scheduleDrain = origScheduleDrain;
-      origScheduleDrain();
+    // Wire callback: enqueue gen2 (read, readTarget=999) from inside the transaction.
+    // Force isLoadComplete=false temporarily so markChannelRead goes through the
+    // deferred latch path (enqueue() with locked channel → deferredEnqueues buffer).
+    // Without this toggle, markChannelRead uses the direct path (isLoadComplete=true),
+    // bypasses enqueue(), and applies the register change immediately outside the latch.
+    mgr.onDrainOutcome = (outcome) => {
+      if (
+        outcome.kind === "applied-unread" &&
+        outcome.channelId === channelId
+      ) {
+        const prev = mgr.isLoadComplete;
+        mgr.isLoadComplete = false; // route through deferred latch path
+        mgr.markChannelRead(channelId, undefined, 999);
+        mgr.isLoadComplete = prev;
+        // The enqueue returned gen:-1 (buffered placeholder); real gen assigned on promote.
+      }
     };
-  };
 
-  // Enable failure from write index 2 (step-3 cleanup).
-  // Write 1 (step-1 register+receipt) must still succeed.
-  blockFromWriteIndex = 2;
-  mgr.isLoadComplete = true;
-  await mgr.drainPendingIntents(mgr.loadGeneration);
-  // Unblock writes so subsequent operations can persist.
-  blockFromWriteIndex = -1;
+    // Block writes starting at write index 2 (step-3 cleanup).
+    blockFromWriteIndex = 2;
+    mgr.isLoadComplete = true;
+    await mgr.drainPendingIntents(mgr.loadGeneration);
+    blockFromWriteIndex = -1;
 
-  // After failing pass: register must be committed (step-1 succeeded).
-  const reg = mgr.overrideRegisters.get(channelId);
-  assert.ok(reg, "register must be committed after step-1 succeeds");
-  assert.ok(reg.s > 0, "S must be bumped");
+    // After failing pass: register committed (step-1 ok), gen1 pi + receipt in blob (cleanup failed).
+    const reg = mgr.overrideRegisters.get(channelId);
+    assert.ok(reg, "register must be committed after step-1 succeeds");
+    assert.ok(reg.s > 0, "S must be bumped");
 
-  // Blob must have the register but gen1 pi must still be present (cleanup failed).
-  // The blob reflects write 1 (register + receipt + pi) since write 2 was blocked.
-  const blobAfterFail = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-  assert.ok(
-    blobAfterFail.r?.[channelId],
-    "register must be in blob after step-1 success",
-  );
-  assert.ok(
-    blobAfterFail.pi?.[channelId],
-    "gen1 pi must still be in blob (cleanup write failed)",
-  );
-  // The receipt must also be in the blob (write 1 included it; write 2 failed to remove it).
-  assert.ok(
-    blobAfterFail.receipts?.[channelId],
-    "receipt must still be in blob (cleanup write failed)",
-  );
+    const blobAfterFail = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
+    assert.ok(
+      blobAfterFail.r?.[channelId],
+      "register must be in blob after step-1 success",
+    );
+    assert.ok(
+      blobAfterFail.pi?.[channelId],
+      "gen1 pi must still be in blob (cleanup write failed)",
+    );
+    assert.ok(
+      blobAfterFail.receipts?.[channelId],
+      "receipt must still be in blob (cleanup write failed)",
+    );
 
-  // Gen1 must be restored as the live intent (abortTransaction).
-  const intentAfterFail = pendingOverrideIntentStore.get(channelId);
-  assert.ok(intentAfterFail, "gen1 must be live after step-3 abort");
-  assert.equal(intentAfterFail.gen, gen1, "live intent must be gen1");
+    // Gen1 must be live in memory (abortTransaction restored it).
+    const intentAfterFail = pendingOverrideIntentStore.get(channelId);
+    assert.ok(intentAfterFail, "gen1 must be live after step-3 abort");
+    assert.equal(intentAfterFail.gen, gen1, "live intent must be gen1");
 
-  // Restart witness: hydrating sees gen1 pi + receipt; next drain runs Amendment C
-  // cleanup without re-bumping (register already committed).
-  {
-    const mgr2 = new ReadStateManager(pubkey, fakeRelay);
-    mgr2.hydrateFromLocalStorage();
-    const hydratedIntent = pendingOverrideIntentStore.get(channelId);
-    assert.ok(hydratedIntent, "gen1 must be hydrated from blob on restart");
-    assert.equal(hydratedIntent.gen, gen1, "hydrated gen must be gen1");
-    mgr2.destroy();
+    // scheduleAbortRetry must have set the drain retry timer.
+    // Note: schedulePublish() also fires after step-1 success, so scheduledTimers
+    // may contain a debounce timer in addition to the abort retry timer.
+    // Use mgr.drainRetryTimer to identify the specific abort retry timer.
+    const drainRetryTimerId = mgr.drainRetryTimer;
+    assert.ok(
+      drainRetryTimerId !== null,
+      "scheduleAbortRetry must set mgr.drainRetryTimer",
+    );
+    assert.ok(
+      scheduledTimers.has(drainRetryTimerId),
+      "abort retry timer ID must be in scheduledTimers",
+    );
+
+    // Restart witness 1: gen1 pi + receipt in blob; hydration sees gen1.
+    {
+      const mgr2 = new ReadStateManager(pubkey, fakeRelay);
+      mgr2.hydrateFromLocalStorage();
+      const hydratedIntent = pendingOverrideIntentStore.get(channelId);
+      assert.ok(hydratedIntent, "gen1 must hydrate from blob");
+      assert.equal(hydratedIntent.gen, gen1, "hydrated must be gen1");
+      mgr2.destroy();
+    }
+    // Restore mgr's intent store state (hydration above replaced singleton).
+    mgr.hydrateFromLocalStorage();
+
+    // Fire the abort retry timer specifically (not the publish debounce timer).
+    // Storage is healthy (blockFromWriteIndex = -1).
+    const retryFn = scheduledTimers.get(drainRetryTimerId);
+    assert.ok(retryFn, "retry timer fn must still be pending");
+    scheduledTimers.clear(); // clear all (publish debounce + retry) before firing
+    await retryFn();
+    await new Promise((r) => origSetTimeout(r, 0));
+
+    // After retry: gen1 cleaned up (alreadyApplied path), gen2 promoted+committed atomically,
+    // gen2 auto-drained via scheduleDrain (frontier advances to 999), then gen2 cleaned up.
+    // The blob now has: register (C-bumped from gen2 read drain), no pi, no receipt.
+    // Gen2 pi was in the blob briefly (after atomic gen1-cleanup+gen2-pi commit) but was
+    // consumed synchronously by the gen2 auto-drain within the same microtask chain.
+    const blobAfterRetry = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
+    assert.equal(
+      blobAfterRetry.pi?.[channelId],
+      undefined,
+      "pi must be cleaned after retry + gen2 auto-drain",
+    );
+    assert.equal(
+      blobAfterRetry.receipts?.[channelId],
+      undefined,
+      "receipt must be cleaned after retry",
+    );
+
+    // Frontier must have advanced to 999 (gen2 read applied by auto-drain).
+    const frontierAfterRetry = mgr.effectiveState.get(channelId) ?? 0;
+    assert.ok(
+      frontierAfterRetry >= 999,
+      `frontier must be ≥ 999 after gen2 auto-drain; got ${frontierAfterRetry}`,
+    );
+
+    // No pending intent (gen1 + gen2 both consumed).
+    assert.equal(
+      pendingOverrideIntentStore.get(channelId),
+      undefined,
+      "no pending intent after gen1+gen2 drain",
+    );
+
+    // Restart witness 2: fresh manager sees frontier ≥ 999 (gen2 durably applied);
+    // no stale gen1 intent.  Restart parity: durable state reflects what memory holds.
+    {
+      const mgr3 = new ReadStateManager(pubkey, fakeRelay);
+      mgr3.hydrateFromLocalStorage();
+      // No pending intent (both drained).
+      assert.equal(
+        pendingOverrideIntentStore.get(channelId),
+        undefined,
+        "fresh manager: no pending intent after full drain",
+      );
+      // Frontier must be persisted at ≥ 999 (stored in blob.r[channelId].f).
+      const f3 = mgr3.effectiveState.get(channelId) ?? 0;
+      assert.ok(
+        f3 >= 999,
+        `fresh manager must hydrate frontier ≥ 999; got ${f3}`,
+      );
+      mgr3.destroy();
+    }
+
+    mgr.destroy();
+  } finally {
+    globalThis.window.setTimeout = origSetTimeout;
+    globalThis.window.clearTimeout = origClearTimeout;
   }
-
-  // Manually fire the retry drain (storage healthy — block is lifted).
-  assert.ok(
-    capturedRetryFn,
-    "scheduleDrain must have been called by the step-3 abort path",
-  );
-  mgr.scheduleDrain = origScheduleDrain; // restore before firing
-  mgr.isLoadComplete = true;
-  await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // After retry: gen1 cleaned up, queue empty.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "gen1 must be consumed after retry cleanup drain",
-  );
-
-  const blobAfterRetry = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-  assert.equal(
-    blobAfterRetry.pi?.[channelId],
-    undefined,
-    "v2 blob must have no pi entry after retry",
-  );
-
-  mgr.destroy();
 });
 
 // ── Test 53: ng normalization — gen7 collision cannot discard a fresh action ──

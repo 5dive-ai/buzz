@@ -69,7 +69,6 @@ export type MarkResult =
         | "storage_failed";
     };
 
-/** Explicit delta returned by `ingest()`. */
 export type IngestDelta = {
   changedContexts: Set<string>;
   canonicalChanged: boolean;
@@ -190,9 +189,10 @@ export class ReadStateManager {
   retryAttempt = 0; // bounded exponential backoff attempt counter
   pendingRetryOnComplete = false; // reconnect arrived during loadInFlight
   drainScheduled = false;
-  /** Set by scheduleDrain() when a drain is in-progress; honoured after the pass ends. */
-  pendingFreshDrain = false;
-  /** Called after each drain intent is settled; wired by the hook for outcome routing. */
+  pendingFreshDrain = false; // set by scheduleDrain() when a drain is in-progress
+  /** Bounded-backoff drain-abort retry timer — distinct from scheduleDrain. */
+  drainRetryTimer: number | null = null;
+  drainRetryAttempt = 0;
   onDrainOutcome: ((outcome: DrainOutcome) => void) | null = null;
 
   constructor(pubkey: string, relayClient: RelayClient) {
@@ -206,7 +206,6 @@ export class ReadStateManager {
       generateHex(16),
     );
     this.extraSlotIds = loadExtraSlotIds(pubkey);
-    // pendingOverrideIntentStore is restored from v2 blob in hydrateFromLocalStorage.
   }
 
   async initialize(): Promise<void> {
@@ -224,13 +223,11 @@ export class ReadStateManager {
       this.drainScheduled = true;
       void this.drainPendingIntents(gen);
     } else if (!this.isLoadComplete && this.retryBackoffTimer === null) {
-      // Incomplete — schedule first automatic retry (attempt 1 = 1 s delay).
       this.retryAttempt = 1;
-      const delayMs = 1_000;
       this.retryBackoffTimer = window.setTimeout(() => {
         this.retryBackoffTimer = null;
         if (!this.destroyed) void this.retryLoad();
-      }, delayMs);
+      }, 1_000);
     }
     await this.startLiveSubscription();
     if (this.destroyed) return;
@@ -312,6 +309,12 @@ export class ReadStateManager {
       window.clearTimeout(this.retryBackoffTimer);
       this.retryBackoffTimer = null;
     }
+    if (this.drainRetryTimer !== null) {
+      window.clearTimeout(this.drainRetryTimer);
+      this.drainRetryTimer = null;
+    }
+    this.drainRetryAttempt = 0;
+    pendingOverrideIntentStore.clearTransactionState();
     if (this.debounceTimer !== null) {
       window.clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
@@ -341,27 +344,14 @@ export class ReadStateManager {
     this.notifyListeners();
   }
 
-  /**
-   * Retry load: generation-fenced, coalesces in-flight loads.
-   * Always starts immediately (no entry delay).  After an incomplete verdict
-   * this method schedules itself via `retryBackoffTimer` with bounded
-   * exponential backoff (1 s, 2 s, 4 s … 60 s) so pending intents eventually
-   * drain even without an external reconnect signal.
-   *
-   * A reconnect during loadInFlight sets pendingRetryOnComplete so the next
-   * complete/incomplete verdict triggers exactly one fresh generation rather
-   * than dropping the reconnect signal.
-   */
+  /** Retry load: generation-fenced, coalesces in-flight loads; bounded backoff on incomplete. */
   async retryLoad(): Promise<void> {
     if (this.destroyed) return;
-    // Cancel any pending backoff timer — this call supersedes it.
     if (this.retryBackoffTimer !== null) {
       window.clearTimeout(this.retryBackoffTimer);
       this.retryBackoffTimer = null;
     }
     if (this.loadInFlight) {
-      // Reconnect arrived while a load is in flight — coalesce into a required
-      // fresh generation rather than dropping the signal.
       this.pendingRetryOnComplete = true;
       return;
     }
@@ -378,25 +368,22 @@ export class ReadStateManager {
           void this.drainPendingIntents(gen);
         }
       } else {
-        // Incomplete verdict — schedule automatic retry with bounded backoff
-        // so pending intents drain eventually even without a reconnect signal.
-        // Backoff: 1 s, 2 s, 4 s, … capped at 60 s.
+        // Incomplete verdict — schedule automatic retry with bounded backoff.
         this.retryAttempt++;
-        const nextDelayMs = Math.min(
-          1_000 * 2 ** (this.retryAttempt - 1),
-          60_000,
+        this.retryBackoffTimer = window.setTimeout(
+          () => {
+            this.retryBackoffTimer = null;
+            if (!this.destroyed) void this.retryLoad();
+          },
+          Math.min(1_000 * 2 ** (this.retryAttempt - 1), 60_000),
         );
-        this.retryBackoffTimer = window.setTimeout(() => {
-          this.retryBackoffTimer = null;
-          if (!this.destroyed) void this.retryLoad();
-        }, nextDelayMs);
       }
     } finally {
       if (gen === this.loadGeneration) {
         this.loadInFlight = false;
         if (this.pendingRetryOnComplete && !this.destroyed) {
           this.pendingRetryOnComplete = false;
-          // Cancel any scheduled backoff timer — reconnect triggers immediate retry.
+          // Cancel scheduled backoff — reconnect triggers immediate retry.
           if (this.retryBackoffTimer !== null) {
             window.clearTimeout(this.retryBackoffTimer);
             this.retryBackoffTimer = null;
@@ -407,11 +394,10 @@ export class ReadStateManager {
     }
   }
 
-  /** Drain pending override intents. See readStateDrain.ts for the full implementation. */
   async drainPendingIntents(drainGen: number): Promise<void> {
     await drainPendingIntentsImpl(createDrainContext(this), drainGen);
+    this.drainRetryAttempt = 0; // successful pass resets the abort-retry counter
     this.drainScheduled = false;
-    // Honor a scheduleDrain() request that arrived during the impl (deferred gen2 promotion).
     if (this.pendingFreshDrain && !this.destroyed) {
       this.pendingFreshDrain = false;
       if (!this.drainScheduled && this.isLoadComplete) {
@@ -422,8 +408,8 @@ export class ReadStateManager {
   }
 
   /**
-   * Schedule a fresh drain pass if none is in-flight.  Called by the drain after
-   * a deferred gen2 promotion so the new intent drains immediately.
+   * Schedule a fresh drain pass if none is in-flight.  Called after deferred gen2
+   * promotion so the new intent drains immediately without waiting for a reconnect.
    * While a drain is in-progress, sets `pendingFreshDrain` instead.
    */
   scheduleDrain(): void {
@@ -434,6 +420,31 @@ export class ReadStateManager {
     }
     this.drainScheduled = true;
     void this.drainPendingIntents(this.loadGeneration);
+  }
+
+  /**
+   * Schedule a bounded-backoff abort-retry drain pass (on storage failure or thrown callback).
+   * One pending timer, escalating backoff (1s→2s→4s…60s), coalesced per manager,
+   * cancelled on destroy() and identity change.  Only abort paths call this; success-path
+   * gen2 promotion uses scheduleDrain() (immediate pendingFreshDrain) for no-delay draining.
+   */
+  scheduleAbortRetry(): void {
+    if (this.destroyed || !this.isLoadComplete) return;
+    if (this.drainRetryTimer !== null) {
+      window.clearTimeout(this.drainRetryTimer);
+      this.drainRetryTimer = null;
+    }
+    this.drainRetryAttempt++;
+    this.drainRetryTimer = window.setTimeout(
+      () => {
+        this.drainRetryTimer = null;
+        if (!this.destroyed && this.isLoadComplete && !this.drainScheduled) {
+          this.drainScheduled = true;
+          void this.drainPendingIntents(this.loadGeneration);
+        }
+      },
+      Math.min(1_000 * 2 ** (this.drainRetryAttempt - 1), 60_000),
+    );
   }
 
   markChannelUnread(
@@ -460,14 +471,12 @@ export class ReadStateManager {
     );
   }
 
-  /** Shared ingest: accept pre-merged state and return semantic delta (changed contexts, canonical flip). */
   private async ingest(merged: MergedReadState): Promise<IngestDelta> {
     const delta: IngestDelta = {
       changedContexts: new Set(),
       canonicalChanged: false,
     };
 
-    // Snapshot canonical forms before frontier merge.
     const prevCanonicalByCtx = new Map<string, string>();
     for (const rawCtx of merged.frontiers.keys()) {
       const reg = this.overrideRegisters.get(rawCtx);
@@ -526,7 +535,6 @@ export class ReadStateManager {
     return delta;
   }
 
-  /** Process already-parsed events for metadata, conflict rotation, and maxFetchedCreatedAt. */
   private processLoadedParsedEvents(events: ParsedReadStateEvent[]): void {
     for (const parsed of events) {
       this.maxFetchedCreatedAt = Math.max(
@@ -538,7 +546,6 @@ export class ReadStateManager {
         if (parsed.createdAt > src)
           this.contextSourceCreatedAt.set(rawCtx, parsed.createdAt);
       }
-      // Slot-conflict rotation (NIP-RS.md:55-64,402-406).
       if (
         parsed.dTag === `read-state:${this.slotId}` &&
         parsed.blob.client_id !== this.clientId
@@ -564,7 +571,6 @@ export class ReadStateManager {
     }
   }
 
-  /** Ingest parsed events: process metadata then merge into frontier/override maps. */
   private async ingestParsedEvents(
     events: ParsedReadStateEvent[],
   ): Promise<IngestDelta> {
@@ -765,7 +771,6 @@ export class ReadStateManager {
     return true;
   }
 
-  /** Effective frontier including parent resolver. */
   channelFrontier(channelId: string): number {
     return (
       resolveEffectiveTimestamp({
@@ -776,7 +781,6 @@ export class ReadStateManager {
     );
   }
 
-  /** Build the single-slot contexts record; returns null if it doesn't fit. */
   private currentContexts(): Record<string, number> | null {
     const contexts: Record<string, number> = {};
     for (const [ctx, ts] of this.effectiveState) {
@@ -857,7 +861,6 @@ export class ReadStateManager {
     };
   }
 
-  /** Coherent snapshot of completeness + frontiers + overrides. */
   getProjection(): ReadStateProjection {
     return {
       loadComplete: this.isLoadComplete,
@@ -866,7 +869,6 @@ export class ReadStateManager {
     };
   }
 
-  /** Trial candidate plan; may mutate extraSlotIds — caller must restore on failure. */
   tryCandidatePlan(rawCtxId: string, reg: OverrideRegister): boolean {
     const prev = this.overrideRegisters.get(rawCtxId);
     const wasPublishable = this.publishableContextIds.has(rawCtxId);
@@ -883,7 +885,6 @@ export class ReadStateManager {
     return fits;
   }
 
-  /** Restore extra slot IDs on rollback. Removes localStorage key when array empties. */
   restoreExtraSlotIds(prev: string[]): void {
     const changed =
       prev.length !== this.extraSlotIds.length ||
@@ -918,14 +919,12 @@ export class ReadStateManager {
           ctx,
           Math.max(this.effectiveState.get(ctx) ?? 0, e.f),
         );
-      this.publishableContextIds.add(ctx); // v2 entry is inherently publishable
+      this.publishableContextIds.add(ctx);
     }
-    // Restore pending intents from v2 blob (consolidation: no separate key).
     pendingOverrideIntentStore.restoreFromStorage(
       stored.pendingIntents,
       stored.nextGen,
     );
-    // Amendment C hydration: load receipts; orphan sweep for receipts with no matching intent.
     for (const [channelId, receipt] of stored.appliedReceipts) {
       const intent = pendingOverrideIntentStore.get(channelId);
       if (

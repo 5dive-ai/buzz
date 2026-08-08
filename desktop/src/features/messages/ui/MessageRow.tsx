@@ -29,6 +29,8 @@ import {
   KIND_STREAM_MESSAGE_DIFF,
 } from "@/shared/constants/kinds";
 import { getConfigNudgeAuthorPubkey } from "@/features/messages/ui/configNudgeAuthPubkey";
+import { getPermissionRequestAgentPubkey } from "@/features/messages/ui/permissionRequestAuthPubkey";
+import { PermissionRequestCardBlock } from "@/features/messages/ui/PermissionRequestCardBlock";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
@@ -647,6 +649,20 @@ export const MessageRow = React.memo(
     const messageBodyNode = (
       <>
         {renderBody()}
+        {channelId && message.isAgent ? (
+          <PermissionRequestCardBlock
+            agentPubkey={getPermissionRequestAgentPubkey(
+              message,
+              isKnownAgentPubkey,
+            )}
+            channelId={channelId}
+            content={message.body}
+            editSignerPubkey={message.editSignerPubkey}
+            interactive
+            ownerPubkey={message.ownerPubkey}
+            signerPubkey={message.signerPubkey}
+          />
+        ) : null}
         {continuationMetadataNode}
         <MessageReactions
           messageId={message.id}
@@ -909,6 +925,7 @@ export const MessageRow = React.memo(
     prev.message.kind === next.message.kind &&
     prev.message.pending === next.message.pending &&
     prev.message.edited === next.message.edited &&
+    prev.message.editSignerPubkey === next.message.editSignerPubkey &&
     // Value comparisons, not identity: these arrays are rebuilt with fresh
     // identities on every ingest/refetch even when unchanged — identity
     // checks made every row re-render on every streamed event in an open

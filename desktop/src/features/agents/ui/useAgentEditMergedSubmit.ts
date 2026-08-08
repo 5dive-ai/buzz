@@ -207,9 +207,14 @@ export function useAgentEditMergedSubmit(
         }
 
         const refetchStores = async () => {
+          // Use refetchQueries (not invalidateQueries) so the await resolves only
+          // after the fresh data has been written to the cache. invalidateQueries
+          // only marks the query stale; getQueryData immediately after still returns
+          // the pre-save value, causing the coordinator's observed-state check to
+          // see a phantom mismatch and leave the dialog open.
           await Promise.all([
-            queryClient.invalidateQueries({ queryKey: personasQueryKey }),
-            queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
+            queryClient.refetchQueries({ queryKey: personasQueryKey }),
+            queryClient.refetchQueries({ queryKey: managedAgentsQueryKey }),
           ]);
           const personas =
             queryClient.getQueryData<AgentPersona[]>(personasQueryKey) ?? [];

@@ -56,6 +56,7 @@ import {
   type RuntimeModelProviderSelection,
 } from "./runtimeModelProviderSelection";
 import { AgentCreationPreview } from "./AgentCreationPreview";
+import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOwnerOnly";
 import { isEditAgentProviderSaveValid } from "./personaRuntimeModel";
 import type { EnvVarsValue } from "./EnvVarsEditor";
@@ -820,9 +821,6 @@ export function AgentEditMergedDialog({
                 inheritHarness={inheritHarness}
                 agentCommand={agentCommand}
                 onAgentCommandChange={setAgentCommand}
-                isAddHarnessOpen={isAddHarnessOpen}
-                onAddHarnessOpenChange={setIsAddHarnessOpen}
-                onSelectSavedHarness={selectSavedHarness}
                 llmProviderFieldVisible={llmProviderFieldVisible}
                 providerSelectValue={providerSelectValue}
                 providerDropdownOptions={providerDropdownOptions}
@@ -947,6 +945,14 @@ export function AgentEditMergedDialog({
           </div>
         </div>
       </ChooserDialogContent>
+
+      {/* AddCustomHarnessDialog at dialog level so it renders in all contexts,
+          including definition-only edit where the instance section is absent. */}
+      <AddCustomHarnessDialog
+        onOpenChange={setIsAddHarnessOpen}
+        onSaved={selectSavedHarness}
+        open={isAddHarnessOpen}
+      />
     </Dialog>
   );
 }

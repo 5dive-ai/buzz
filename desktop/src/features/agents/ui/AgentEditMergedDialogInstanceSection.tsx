@@ -31,10 +31,10 @@ import type { InheritedDefault } from "./bakedEnvHelpers";
 import { AgentAiDefaultsNotice } from "./AgentAiDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
-import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import { OwnerOnlyAccessField } from "./OwnerOnlyAccessField";
 import { PersonaDropdownField } from "./PersonaDropdownField";
+import { PersonaModelCombobox } from "./PersonaModelCombobox";
 import { PersonaProviderApiKeyField } from "./PersonaProviderApiKeyField";
 import { RunOnSummarySection } from "./RunOnSummarySection";
 
@@ -64,9 +64,6 @@ export type AgentEditMergedISectionProps = {
   inheritHarness: boolean;
   agentCommand: string;
   onAgentCommandChange: (value: string) => void;
-  isAddHarnessOpen: boolean;
-  onAddHarnessOpenChange: (value: boolean) => void;
-  onSelectSavedHarness: (value: string) => void;
   // LLM provider
   llmProviderFieldVisible: boolean;
   providerSelectValue: string;
@@ -155,9 +152,6 @@ export function AgentEditMergedInstanceSection({
   inheritHarness,
   agentCommand,
   onAgentCommandChange,
-  isAddHarnessOpen,
-  onAddHarnessOpenChange,
-  onSelectSavedHarness,
   llmProviderFieldVisible,
   providerSelectValue,
   providerDropdownOptions,
@@ -288,11 +282,6 @@ export function AgentEditMergedInstanceSection({
             </span>
           </p>
         ) : null}
-        <AddCustomHarnessDialog
-          onOpenChange={onAddHarnessOpenChange}
-          onSaved={onSelectSavedHarness}
-          open={isAddHarnessOpen}
-        />
       </div>
 
       {selectedRuntimeId === "custom" && !inheritHarness ? (
@@ -407,7 +396,7 @@ export function AgentEditMergedInstanceSection({
               <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
             )}
           </label>
-          <PersonaDropdownField
+          <PersonaModelCombobox
             disabled={isSaving || modelDiscoveryLoading}
             id="edit-agent-model"
             onValueChange={onModelChange}

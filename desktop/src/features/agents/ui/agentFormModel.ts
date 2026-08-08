@@ -148,8 +148,13 @@ export type AgentFormModel = {
  * (respondTo, parallelism) have context-dependent ownership per rows 9–10:
  * they are I-owned when an instance is in context, and D-owned only in
  * definition-only (zero-instance) context. `fieldOwner()` resolves this
- * context dependence and is the single function consulted by `emitAgentFormDiff`
- * and the dialog's editability gates for all routing decisions.
+ * context dependence and is consulted by `emitAgentFormDiff` for all emit
+ * routing decisions.
+ *
+ * Editability (which controls are enabled/disabled) is handled separately by
+ * context-specific predicates in the dialog (`isDefinitionReadOnly`,
+ * `dFieldsDirty`). Those predicates operate at the section level rather than
+ * per-field, which is sufficient for the current two-section (D/I) layout.
  */
 export const FIELD_OWNERS: Record<keyof AgentFormModel, FieldOwner> = {
   // Identity
@@ -187,9 +192,10 @@ export const FIELD_OWNERS: Record<keyof AgentFormModel, FieldOwner> = {
  *    is "definition" (D-field when a definition is present), but in instance-only
  *    context (no definition) they fall back to I-owned.
  *
- * `emitAgentFormDiff` consults this function for every routing decision;
- * the dialog's editability predicates call it to determine which layer a
- * control belongs to, making FIELD_OWNERS the single authoritative source.
+ * `emitAgentFormDiff` consults this function for every emit routing decision.
+ * Dialog editability (enabled/disabled controls) is handled by section-level
+ * predicates (`isDefinitionReadOnly`, `dFieldsDirty`) and does not call this
+ * function — see FIELD_OWNERS JSDoc for the Artifact 4 editability disposition.
  */
 export function fieldOwner(
   field: keyof AgentFormModel,

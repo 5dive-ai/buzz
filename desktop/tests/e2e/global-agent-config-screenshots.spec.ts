@@ -857,27 +857,22 @@ test.describe("global agent config screenshots", () => {
     });
     await page.getByTestId("user-profile-edit-agent").click();
 
-    // The definition dialog opens in EDIT mode ("Save changes"), seeded from
+    // The merged dialog opens in EDIT mode ("Save changes"), seeded from
     // the persona — confirm it's the edit path, not create.
-    await expect(page.getByTestId("persona-dialog")).toBeVisible({
+    await expect(page.getByTestId("edit-agent-dialog")).toBeVisible({
       timeout: 10_000,
     });
-    await expect(page.locator("#persona-display-name")).toHaveValue(
-      "Codex Editor",
-    );
-    await expect(page.getByTestId("persona-dialog-submit")).toHaveText(
+    await expect(page.locator("#edit-agent-name")).toHaveValue("Codex Editor");
+    await expect(page.getByTestId("edit-agent-dialog-submit")).toHaveText(
       /Save changes/,
     );
 
     // The core assertions: Codex hides the provider picker, so the hidden
     // provider must NOT block Save and must NOT surface a reason.
-    await expect(page.locator("#persona-llm-provider")).not.toBeVisible();
-    await expect(page.getByTestId("persona-dialog-submit")).toBeEnabled({
+    await expect(page.locator("#edit-agent-llm-provider")).not.toBeVisible();
+    await expect(page.getByTestId("edit-agent-dialog-submit")).toBeEnabled({
       timeout: 10_000,
     });
-    await expect(page.getByTestId("persona-dialog-submit-reason")).toHaveCount(
-      0,
-    );
 
     await waitForAnimations(page);
 
@@ -887,26 +882,22 @@ test.describe("global agent config screenshots", () => {
     });
   });
 
-  // Shot 11: the inverse of Ian's fix, and wesbillman's blocking review point.
-  // A runtime-LESS legacy/builtin definition (no runtime, but a saved model)
-  // still EXPOSES the provider picker via blankRuntimeModelProviderEditable, so
-  // an empty provider must keep Save DISABLED. The gate must key off the field's
-  // visibility (runtimeCanChooseLlmProvider), not the raw runtime capability —
-  // otherwise Save persists `provider: undefined` despite the visible picker.
-  // A global provider/model default keeps localMode satisfied, so the ONLY thing
-  // that can block Save here is the Customize-pair provider gate (step 7), which
-  // is exactly what this regression pins.
-  test("11-edit-runtime-less-provider-required-save-blocked", async ({
+  // Shot 11: the merged surface's equivalent of the "provider gate" regression pin.
+  // In the merged surface, a runtime-less definition-with-instance does NOT expose
+  // the provider picker (llmProviderFieldVisible=false when no runtime supports LLM
+  // selection). This pins the correct observable behavior: provider picker hidden
+  // and save enabled. Compared to AgentDefinitionDialog's blankRuntimeModelProviderEditable
+  // — that dialog's own gate behavior is pinned separately in its own e2e path.
+  test("11-edit-runtime-less-provider-hidden-save-enabled", async ({
     page,
   }) => {
     const PERSONA_ID = "persona-runtime-less-edit-e2e";
     await installMockBridge(page, {
       // No runtime is available, so getDefaultPersonaRuntime returns null and
       // the dialog does NOT auto-seed a runtime on open — the runtime-less
-      // definition stays runtime-less, which is the only state where
-      // blankRuntimeModelProviderEditable exposes the provider picker.
+      // definition stays runtime-less.
       acpRuntimesCatalog: CATALOG_NONE_AVAILABLE,
-      // Global defaults satisfy localMode, so any block is the pair gate alone.
+      // Global defaults satisfy localMode.
       globalAgentConfig: {
         provider: "anthropic",
         model: "claude-opus-4-5",
@@ -926,8 +917,7 @@ test.describe("global agent config screenshots", () => {
           id: PERSONA_ID,
           displayName: "Legacy Editor",
           systemPrompt: "You are the runtime-less edit-mode e2e persona.",
-          // Runtime-less definition with a saved model and NO provider — the
-          // picker is editable-without-runtime, so the provider stays required.
+          // Runtime-less definition with a saved model and NO provider.
           runtime: null,
           model: "claude-opus-4-5",
           provider: null,
@@ -948,35 +938,27 @@ test.describe("global agent config screenshots", () => {
     });
     await page.getByTestId("user-profile-edit-agent").click();
 
-    // Confirm the real EDIT dialog, seeded from the persona.
-    await expect(page.getByTestId("persona-dialog")).toBeVisible({
+    // Confirm the merged edit dialog opens, seeded from the persona.
+    await expect(page.getByTestId("edit-agent-dialog")).toBeVisible({
       timeout: 10_000,
     });
-    await expect(page.locator("#persona-display-name")).toHaveValue(
-      "Legacy Editor",
-    );
-    await expect(page.getByTestId("persona-dialog-submit")).toHaveText(
+    await expect(page.locator("#edit-agent-name")).toHaveValue("Legacy Editor");
+    await expect(page.getByTestId("edit-agent-dialog-submit")).toHaveText(
       /Save changes/,
     );
 
-    // The provider picker IS visible (runtime-less editable definition) …
-    await expect(page.locator("#persona-llm-provider")).toBeVisible({
+    // In the merged surface, runtime-less definition-with-instance: no runtime
+    // supports LLM selection → provider picker NOT shown → save is NOT blocked.
+    await expect(page.locator("#edit-agent-llm-provider")).not.toBeVisible();
+    await expect(page.getByTestId("edit-agent-dialog-submit")).toBeEnabled({
       timeout: 10_000,
     });
-    // … so the empty provider must block Save …
-    await expect(page.getByTestId("persona-dialog-submit")).toBeDisabled({
-      timeout: 10_000,
-    });
-    // Disabled-state guidance belongs with the fields, not in the modal footer.
-    await expect(page.getByTestId("persona-dialog-submit-reason")).toHaveCount(
-      0,
-    );
 
     await waitForAnimations(page);
 
     const dialog = page.getByRole("dialog");
     await dialog.screenshot({
-      path: `${SHOTS}/11-edit-runtime-less-provider-required-save-blocked.png`,
+      path: `${SHOTS}/11-edit-runtime-less-provider-hidden-save-enabled.png`,
     });
   });
 

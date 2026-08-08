@@ -23,6 +23,7 @@ import {
 } from "./agentConfigOptions";
 import { AgentHarnessField } from "./AgentHarnessField";
 import { PersonaDropdownField } from "./PersonaDropdownField";
+import { PersonaModelCombobox } from "./PersonaModelCombobox";
 import { EnvVarsEditor, type EnvVarsValue } from "./EnvVarsEditor";
 
 const advancedFieldsTransition = { duration: 0.18, ease: "easeInOut" } as const;
@@ -222,7 +223,7 @@ export function AgentEditMergedDSection({
           Model
           <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
         </label>
-        <PersonaDropdownField
+        <PersonaModelCombobox
           disabled={isSaving || modelDiscoveryLoading || defReadOnly}
           id="edit-agent-model"
           onValueChange={onModelChange}

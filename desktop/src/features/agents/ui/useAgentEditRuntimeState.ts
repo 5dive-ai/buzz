@@ -12,7 +12,10 @@ import * as React from "react";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { useRequiredCredentialState } from "./useRequiredCredentialState";
-import { getBakedProviderInheritLabel } from "./bakedEnvHelpers";
+import {
+  getBakedProviderInheritLabel,
+  getBakedModelInheritLabel,
+} from "./bakedEnvHelpers";
 import { ADD_CUSTOM_HARNESS_OPTION } from "./addCustomHarness";
 import {
   AUTO_PROVIDER_DROPDOWN_VALUE,
@@ -338,7 +341,7 @@ export function useAgentEditRuntimeState({
   } = relayMeshModelPickerState({
     discoveredOptions: discoveredModelOptions,
     fallbackOptions: [
-      { id: "", label: getDefaultLlmModelLabel(inheritedModelDefault.value) },
+      { id: "", label: resolveInheritedModelLabel(inheritedModelDefault) },
     ],
     isCustomEditing: isCustomModelEditing,
     model,
@@ -350,7 +353,7 @@ export function useAgentEditRuntimeState({
     globalModel: isRelayMesh ? undefined : inheritedModelDefault.value,
     globalModelLabel: isRelayMesh
       ? undefined
-      : getDefaultLlmModelLabel(inheritedModelDefault.value),
+      : resolveInheritedModelLabel(inheritedModelDefault),
     loading: modelDiscoveryLoading && discoveredModelOptions === null,
     loadingValue: MODEL_DISCOVERY_LOADING_VALUE,
     options: effectiveModelOptions,
@@ -451,6 +454,11 @@ export function useAgentEditRuntimeState({
   };
 }
 
-function getDefaultLlmModelLabel(model: string): string {
-  return model ? `Default (${model})` : "Default model";
+function resolveInheritedModelLabel(
+  inherited: import("./bakedEnvHelpers").InheritedDefault,
+): string {
+  const model = inherited.value;
+  if (!model) return "Default model";
+  if (inherited.source === "build") return getBakedModelInheritLabel(model);
+  return `Default (${model})`;
 }

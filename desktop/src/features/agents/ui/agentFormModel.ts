@@ -117,6 +117,12 @@ export type AgentFormModel = {
   // Instance-level fields
   /** Instance name (per-pool override of displayName). */
   instanceName: string | undefined;
+  /**
+   * Instance-level env-var overlay (row 8 contract). When a definition is
+   * present the definition env is inherited; this field holds the per-instance
+   * additions/overrides. Undefined when no instance context.
+   */
+  instanceEnvVars: Record<string, string> | undefined;
   parallelism: number | null;
 
   // Device policy (L-fields)
@@ -187,6 +193,10 @@ export function seedAgentFormModel(ctx: AgentEditContext): AgentFormModel {
 
   // I-fields
   const instanceName = inst?.name;
+  // Row 8 contract: when a definition is present, instance env is a per-agent
+  // overlay that does NOT wholesale-replace the definition env. Seed from
+  // inst.envVars directly (not the merged/inherited snapshot).
+  const instanceEnvVars = inst != null ? (inst.envVars ?? {}) : undefined;
   const parallelism = inst?.parallelism ?? def?.parallelism ?? null;
 
   // L-fields
@@ -205,6 +215,7 @@ export function seedAgentFormModel(ctx: AgentEditContext): AgentFormModel {
     envVars,
     namePool,
     instanceName,
+    instanceEnvVars,
     parallelism,
     autoRestartOnConfigChange,
     startOnAppLaunch,
@@ -235,6 +246,15 @@ export function emitAgentFormDiff(
   // D-field diff — only when definition is present and NOT team-managed
   let personaInput: UpdatePersonaInput | null = null;
   if (def !== null && !defReadOnly) {
+    // respondTo is a D-field when definition is present: changes are written
+    // to the definition, not to the instance. Include it in the D-diff check.
+    const respondToChanged =
+      (next.respondTo ?? null) !== (saved.respondTo ?? null);
+    const allowlistChanged =
+      next.respondTo === "allowlist" &&
+      next.respondToAllowlist.join(",") !==
+        (saved.respondToAllowlist ?? []).join(",");
+
     const dChanged =
       next.displayName.trim() !== saved.displayName.trim() ||
       (next.avatarUrl ?? "") !== (saved.avatarUrl ?? "") ||
@@ -243,7 +263,9 @@ export function emitAgentFormDiff(
       (next.model ?? null) !== (saved.model ?? null) ||
       (next.provider ?? null) !== (saved.provider ?? null) ||
       !envVarsMapEqual(next.envVars ?? {}, saved.envVars ?? {}) ||
-      !namePoolEqual(next.namePool ?? [], saved.namePool ?? []);
+      !namePoolEqual(next.namePool ?? [], saved.namePool ?? []) ||
+      respondToChanged ||
+      allowlistChanged;
 
     if (dChanged) {
       personaInput = {
@@ -256,18 +278,19 @@ export function emitAgentFormDiff(
         provider: next.provider ?? undefined,
         namePool: next.namePool ?? [],
         envVars: next.envVars ?? {},
-        ...(next.respondTo != null
-          ? {
-              behavior: {
+        // Always emit behavior block when definition is present — respondTo
+        // is a D-field and must travel with the persona write.
+        behavior:
+          next.respondTo != null
+            ? {
                 respondTo: next.respondTo,
                 respondToAllowlist:
                   next.respondTo === "allowlist"
                     ? next.respondToAllowlist
                     : undefined,
                 parallelism: next.parallelism ?? undefined,
-              },
-            }
-          : {}),
+              }
+            : undefined,
       };
     }
   }
@@ -278,17 +301,11 @@ export function emitAgentFormDiff(
     // Row 1 contract: stop materializing displayName→name when a name pool exists
     const hasNamePool = (def?.namePool?.length ?? 0) > 0;
 
-    // Row 8 contract: instance env edit goes to instance, NOT wholesale-replace from definition
+    // Row 8 contract: instance env edit goes to instance, NOT wholesale-replace from definition.
+    // When a definition is present, instanceEnvVars holds the per-instance overlay.
     const instanceEnvChanged =
-      "instanceEnvVars" in next
-        ? !envVarsMapEqual(
-            (
-              next as AgentFormModel & {
-                instanceEnvVars?: Record<string, string>;
-              }
-            ).instanceEnvVars ?? {},
-            inst.envVars ?? {},
-          )
+      next.instanceEnvVars !== undefined
+        ? !envVarsMapEqual(next.instanceEnvVars ?? {}, inst.envVars ?? {})
         : false;
 
     const nameChanged =
@@ -301,9 +318,15 @@ export function emitAgentFormDiff(
       def === null && (next.model ?? null) !== (inst.model ?? null);
     const providerChanged =
       def === null && (next.provider ?? null) !== (inst.provider ?? null);
+    // respondTo is a D-field when a definition is present AND editable.
+    // When the definition is team-managed (read-only) or absent, changes fall
+    // through to the instance so they are never silently dropped.
+    const respondToInstanceOwned = def === null || defReadOnly;
     const respondToChanged =
+      respondToInstanceOwned &&
       (next.respondTo ?? null) !== (inst.respondTo ?? null);
     const allowlistChanged =
+      respondToInstanceOwned &&
       next.respondTo === "allowlist" &&
       next.respondToAllowlist.join(",") !== inst.respondToAllowlist.join(",");
     const parallelismChanged =
@@ -327,6 +350,7 @@ export function emitAgentFormDiff(
         agentInput.systemPrompt = next.systemPrompt.trim() || null;
       if (modelChanged) agentInput.model = next.model ?? null;
       if (providerChanged) agentInput.provider = next.provider ?? null;
+      if (instanceEnvChanged) agentInput.envVars = next.instanceEnvVars ?? {};
       if (respondToChanged) agentInput.respondTo = next.respondTo ?? undefined;
       if (allowlistChanged)
         agentInput.respondToAllowlist = next.respondToAllowlist;

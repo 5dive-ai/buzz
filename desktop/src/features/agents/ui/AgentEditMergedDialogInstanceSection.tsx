@@ -26,7 +26,8 @@ import {
   type PersonaDropdownOption,
 } from "./agentConfigOptions";
 import { getProviderApiKeyLabel } from "./agentConfigOptions";
-import type { AcpRuntime } from "@/features/agents/hooks";
+import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
+import type { InheritedDefault } from "./bakedEnvHelpers";
 import { AgentAiDefaultsNotice } from "./AgentAiDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AdvancedRequiredBadge } from "./AdvancedRequiredBadge";
@@ -59,7 +60,7 @@ export type AgentEditMergedISectionProps = {
   runtimeDropdownValue: string;
   instanceRuntimeDropdownOptions: PersonaDropdownOption[];
   onRuntimeChange: (value: string) => void;
-  selectedRuntime: AcpRuntime | undefined;
+  selectedRuntime: AcpRuntimeCatalogEntry | undefined;
   inheritHarness: boolean;
   agentCommand: string;
   onAgentCommandChange: (value: string) => void;
@@ -99,11 +100,11 @@ export type AgentEditMergedISectionProps = {
     provider: string | null;
     envVars: Record<string, string>;
   };
-  inheritedModelDefault: { value: string; source: string };
-  inheritedProviderDefault: { value: string; source: string };
+  inheritedModelDefault: InheritedDefault;
+  inheritedProviderDefault: InheritedDefault;
   aiDefaultsOpen: boolean;
   onAiDefaultsOpenChange: (value: boolean) => void;
-  aiDefaultsTriggerRef: React.RefObject<HTMLButtonElement>;
+  aiDefaultsTriggerRef: React.RefObject<HTMLButtonElement | null>;
   // Advanced
   showAdvancedFields: boolean;
   onShowAdvancedFieldsChange: (value: boolean) => void;
@@ -112,12 +113,12 @@ export type AgentEditMergedISectionProps = {
   autoRestartOnConfigChange: boolean;
   instanceEnvVars: Record<string, string>;
   fileSatisfiedEnvKeys: string[];
-  advancedRequiredEnvKeys: string[];
+  advancedRequiredEnvKeys: readonly string[];
   initialFocus?: EditAgentFocusTarget;
   inheritedEnvVarsForAdvanced: Record<string, string>;
   linkedPersona: AgentPersona | null;
   prospectiveRuntimeId: string;
-  prospectiveRuntime: AcpRuntime | undefined;
+  prospectiveRuntime: AcpRuntimeCatalogEntry | undefined;
   parallelism: string;
   onAcpCommandChange: (value: string) => void;
   onAgentArgsChange: (value: string) => void;

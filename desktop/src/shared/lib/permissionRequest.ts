@@ -1,17 +1,18 @@
 /**
- * Utilities for extracting and parsing the `buzz:permission-request` sentinel
- * that `buzz-acp` publishes as a kind:9 reply into the triggering thread when
- * an `ask`-policy permission request is admitted.
+ * Utilities for extracting and parsing the permission-request sentinel that
+ * `buzz-acp` publishes as a kind:9 reply into the triggering thread when an
+ * `ask`-policy permission request is admitted.
  *
  * Wire format (versioned discriminated union, schema v1 — frozen at event
  * b31c716e):
  *
- * ```buzz:permission-request
- * {"v":1,"state":"pending", … }
- * ```
+ * The harness serialises a bare JSON object as the kind:9 event content:
  *
- * The prose above the fence is the plaintext fallback for non-card clients.
- * Desktop strips the sentinel and renders a `PermissionRequestCard` instead.
+ *   {"v":1,"state":"pending","requestNonce":"…", …}
+ *
+ * Desktop identifies a sentinel by `"v":1` in the top-level JSON object.
+ * Non-JSON content and JSON objects without `"v":1` are left untouched.
+ * There is no fenced wire format — non-sentinel kind:9s must NOT be modified.
  *
  * Security invariants:
  * - `agentPubkey` and `channelId` are derived from the SIGNED EVENT ENVELOPE,
@@ -71,8 +72,8 @@ export type PermissionRequestResolved = {
   labels: Record<string, string>;
   hasDurableRule: boolean;
   durableRuleNote: string | null;
-  /** One of "applied" | "timed_out" | "cancelled" | "rejected". */
-  outcome: string;
+  /** Outcome of the permission request. */
+  outcome: "applied" | "timed_out" | "cancelled" | "rejected";
   /** Non-null only when outcome === "applied". */
   chosenOptionId: string | null;
 };
@@ -83,67 +84,63 @@ export type PermissionRequestPayload =
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const FENCE_OPEN = "```buzz:permission-request";
-const FENCE_CLOSE = "```";
-
 /** Maximum character length for any untrusted display string in the sentinel. */
 const MAX_LABEL_CHARS = 200;
 
 /** Maximum number of option IDs in a sentinel (PERMISSION_OPTIONS_MAX). */
 const MAX_OPTION_IDS = 10;
 
+/** Regex for a valid 64-character lowercase hex Nostr event ID. */
+const HEX64_RE = /^[0-9a-f]{64}$/;
+
+/** The four valid outcome strings. */
+const VALID_OUTCOMES = new Set([
+  "applied",
+  "timed_out",
+  "cancelled",
+  "rejected",
+]);
+
 // ── Extractor ─────────────────────────────────────────────────────────────────
 
 /**
- * Extract the `PermissionRequestPayload` from a message body, if present.
+ * Extract the `PermissionRequestPayload` from a kind:9 event content string,
+ * if present.
+ *
+ * The harness signs bare JSON as the event content — no fence wrapper. Desktop
+ * identifies sentinels by `"v":1` at the top level. Non-JSON content and JSON
+ * objects that do not carry `"v":1` are returned as `null`; `MessageRow` renders
+ * them as ordinary markdown.
  *
  * Returns `null` when:
- * - the sentinel fence is absent
- * - the JSON inside is malformed
- * - the parsed value does not match the expected shape
+ * - the content is not valid JSON
+ * - the parsed value is not a sentinel object (missing `v:1`)
+ * - the parsed value does not match the expected shape or invariants
  *
  * Never throws — all errors are swallowed so this is safe in the render path.
  */
 export function extractPermissionRequest(
   content: string,
 ): PermissionRequestPayload | null {
-  const openIdx = content.indexOf(FENCE_OPEN);
-  if (openIdx === -1) return null;
-
-  const jsonStart = content.indexOf("\n", openIdx);
-  if (jsonStart === -1) return null;
-
-  const closeIdx = content.indexOf(`\n${FENCE_CLOSE}`, jsonStart);
-  if (closeIdx === -1) return null;
-
-  const json = content.slice(jsonStart + 1, closeIdx).trim();
-  if (!json) return null;
-
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(json);
-    return isPermissionRequestPayload(parsed) ? parsed : null;
+    parsed = JSON.parse(content.trim());
   } catch {
     return null;
   }
+  return isPermissionRequestPayload(parsed) ? parsed : null;
 }
 
 /**
- * Strip the `buzz:permission-request` sentinel block (and any preceding blank
- * line) from a message body. Returns the original string unchanged when no
- * sentinel is present.
+ * Returns `true` when the kind:9 content is a permission-request sentinel.
+ * Used by `MessageRow` to decide whether to suppress markdown rendering.
  *
- * Used so the prose fallback renders without the raw code block.
+ * When `extractPermissionRequest` returns a non-null value the content IS the
+ * sentinel; the entire string is consumed by the card. Non-sentinel kind:9s are
+ * rendered as ordinary markdown, unchanged.
  */
-export function stripPermissionRequestSentinel(content: string): string {
-  const openIdx = content.indexOf(FENCE_OPEN);
-  if (openIdx === -1) return content;
-
-  const closeIdx = content.indexOf(`\n${FENCE_CLOSE}`, openIdx);
-  if (closeIdx === -1) return content;
-
-  const afterFence = closeIdx + `\n${FENCE_CLOSE}`.length;
-  const prose = content.slice(0, openIdx).replace(/\n{2,}$/, "\n");
-  return prose + content.slice(afterFence);
+export function isPermissionRequestSentinel(content: string): boolean {
+  return extractPermissionRequest(content) !== null;
 }
 
 // ── Type guards ────────────────────────────────────────────────────────────────
@@ -162,7 +159,7 @@ function isLabelsRecord(v: unknown): v is Record<string, string> {
 }
 
 function isPermissionRequestPayload(v: unknown): v is PermissionRequestPayload {
-  if (typeof v !== "object" || v === null) return false;
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const p = v as Record<string, unknown>;
   if (p.v !== 1) return false;
 
@@ -172,7 +169,13 @@ function isPermissionRequestPayload(v: unknown): v is PermissionRequestPayload {
   }
   if (!isNullableString(p.sessionId)) return false;
   if (!isNullableString(p.turnId)) return false;
-  if (typeof p.expiresAt !== "number" || !Number.isFinite(p.expiresAt)) {
+  // expiresAt must be an integer (no fractional seconds, no negative values)
+  if (
+    typeof p.expiresAt !== "number" ||
+    !Number.isFinite(p.expiresAt) ||
+    !Number.isInteger(p.expiresAt) ||
+    p.expiresAt < 0
+  ) {
     return false;
   }
   if (
@@ -184,6 +187,14 @@ function isPermissionRequestPayload(v: unknown): v is PermissionRequestPayload {
     return false;
   }
   if (!isLabelsRecord(p.labels)) return false;
+  // Every advertised optionId must have a label entry
+  if (
+    !(p.optionIds as string[]).every(
+      (id) => typeof (p.labels as Record<string, unknown>)[id] === "string",
+    )
+  ) {
+    return false;
+  }
   if (typeof p.hasDurableRule !== "boolean") return false;
   if (!isNullableString(p.durableRuleNote)) return false;
 
@@ -192,17 +203,21 @@ function isPermissionRequestPayload(v: unknown): v is PermissionRequestPayload {
   }
 
   if (p.state === "resolved") {
-    // originalEventId: 64-char hex string
+    // originalEventId: 64-char lowercase hex string
     if (
       typeof p.originalEventId !== "string" ||
-      p.originalEventId.length !== 64
+      !HEX64_RE.test(p.originalEventId)
     ) {
       return false;
     }
-    if (typeof p.outcome !== "string" || p.outcome.length === 0) return false;
-    // chosenOptionId: string or null (non-null only on "applied")
-    if (p.chosenOptionId !== null && typeof p.chosenOptionId !== "string") {
-      return false;
+    // outcome: exactly one of the four literals
+    if (!VALID_OUTCOMES.has(p.outcome as string)) return false;
+    // chosenOptionId: non-null ⟺ outcome === "applied"
+    if (p.outcome === "applied") {
+      if (typeof p.chosenOptionId !== "string" || p.chosenOptionId.length === 0)
+        return false;
+    } else {
+      if (p.chosenOptionId !== null) return false;
     }
     return true;
   }

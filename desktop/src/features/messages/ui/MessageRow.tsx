@@ -33,6 +33,7 @@ import { getPermissionRequestAgentPubkey } from "@/features/messages/ui/permissi
 import { PermissionRequestCardBlock } from "@/features/messages/ui/PermissionRequestCardBlock";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { isPermissionRequestSentinel } from "@/shared/lib/permissionRequest";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
 import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
@@ -385,6 +386,14 @@ export const MessageRow = React.memo(
                 huddleMemberPubkeysPending={huddleMemberPubkeysPending}
               />
             );
+          }
+
+          // Suppress prose for permission-request sentinels. The harness
+          // encodes the sentinel as bare JSON in the event content — the
+          // PermissionRequestCardBlock below renders the card; there is no
+          // separate prose to preserve.
+          if (message.isAgent && isPermissionRequestSentinel(message.body)) {
+            return null;
           }
 
           const reviewRootEventId = videoReviewCommentRootId;

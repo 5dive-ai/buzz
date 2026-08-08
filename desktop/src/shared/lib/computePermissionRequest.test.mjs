@@ -50,12 +50,10 @@ const RESOLVED_PAYLOAD = {
   chosenOptionId: "opt-allow",
 };
 
-function fence(payload) {
-  return `\`\`\`buzz:permission-request\n${JSON.stringify(payload)}\n\`\`\``;
-}
-
-function body(payload) {
-  return `May I?\n\n${fence(payload)}`;
+// Wire contract: the harness signs bare JSON as the kind:9 event content.
+// computePermissionRequest receives the raw event content string — no fence.
+function raw(payload) {
+  return JSON.stringify(payload);
 }
 
 // ── computePermissionRequest ──────────────────────────────────────────────────
@@ -63,7 +61,7 @@ function body(payload) {
 test("test_not_interactive_returns_null", () => {
   assert.equal(
     computePermissionRequest(
-      body(PENDING_PAYLOAD),
+      raw(PENDING_PAYLOAD),
       false,
       AGENT_PUBKEY,
       AGENT_PUBKEY,
@@ -75,7 +73,7 @@ test("test_not_interactive_returns_null", () => {
 test("test_missing_agentPubkey_returns_null", () => {
   assert.equal(
     computePermissionRequest(
-      body(PENDING_PAYLOAD),
+      raw(PENDING_PAYLOAD),
       true,
       undefined,
       AGENT_PUBKEY,
@@ -87,7 +85,7 @@ test("test_missing_agentPubkey_returns_null", () => {
 test("test_missing_signerPubkey_returns_null", () => {
   assert.equal(
     computePermissionRequest(
-      body(PENDING_PAYLOAD),
+      raw(PENDING_PAYLOAD),
       true,
       AGENT_PUBKEY,
       undefined,
@@ -100,7 +98,7 @@ test("test_forged_card_wrong_signer_returns_null", () => {
   // agentPubkey (channel's known agent) ≠ signerPubkey (event signer)
   assert.equal(
     computePermissionRequest(
-      body(PENDING_PAYLOAD),
+      raw(PENDING_PAYLOAD),
       true,
       AGENT_PUBKEY,
       ATTACKER_PUBKEY,
@@ -111,7 +109,7 @@ test("test_forged_card_wrong_signer_returns_null", () => {
 
 test("test_valid_signer_returns_payload", () => {
   const result = computePermissionRequest(
-    body(PENDING_PAYLOAD),
+    raw(PENDING_PAYLOAD),
     true,
     AGENT_PUBKEY,
     AGENT_PUBKEY,
@@ -121,7 +119,7 @@ test("test_valid_signer_returns_payload", () => {
 
 test("test_signer_check_is_case_insensitive", () => {
   const result = computePermissionRequest(
-    body(PENDING_PAYLOAD),
+    raw(PENDING_PAYLOAD),
     true,
     AGENT_PUBKEY.toUpperCase(),
     AGENT_PUBKEY.toLowerCase(),
@@ -143,7 +141,7 @@ test("test_no_sentinel_returns_null", () => {
 
 test("test_agent_signed_edit_resolves_card", () => {
   const result = computePermissionRequest(
-    body(RESOLVED_PAYLOAD),
+    raw(RESOLVED_PAYLOAD),
     true,
     AGENT_PUBKEY,
     AGENT_PUBKEY, // original event signer
@@ -155,7 +153,7 @@ test("test_agent_signed_edit_resolves_card", () => {
 test("test_owner_signed_edit_does_not_resolve", () => {
   assert.equal(
     computePermissionRequest(
-      body(RESOLVED_PAYLOAD),
+      raw(RESOLVED_PAYLOAD),
       true,
       AGENT_PUBKEY,
       AGENT_PUBKEY,
@@ -168,7 +166,7 @@ test("test_owner_signed_edit_does_not_resolve", () => {
 test("test_attacker_signed_edit_does_not_resolve", () => {
   assert.equal(
     computePermissionRequest(
-      body(RESOLVED_PAYLOAD),
+      raw(RESOLVED_PAYLOAD),
       true,
       AGENT_PUBKEY,
       AGENT_PUBKEY,
@@ -184,7 +182,7 @@ test("test_resolved_body_with_no_edit_arrived_parses_body_directly", () => {
   // return it. This handles the edge case where the edit arrives before we
   // query the original event.
   const result = computePermissionRequest(
-    body(RESOLVED_PAYLOAD),
+    raw(RESOLVED_PAYLOAD),
     true,
     AGENT_PUBKEY,
     AGENT_PUBKEY,
@@ -216,7 +214,7 @@ test("test_non_owner_viewer_gets_payload_but_is_owner_false", () => {
   // viewerPubkey to ownerPubkey. Verify the payload is returned so the card
   // renders, then the test documents that a non-owner sees it as read-only.
   const result = computePermissionRequest(
-    body(PENDING_PAYLOAD),
+    raw(PENDING_PAYLOAD),
     true,
     AGENT_PUBKEY,
     AGENT_PUBKEY,
@@ -232,7 +230,7 @@ test("test_replay_archive_resolved_state_returns_resolved_payload", () => {
   // computePermissionRequest must return the resolved payload — the card
   // renders in non-actionable archived state.
   const result = computePermissionRequest(
-    body(RESOLVED_PAYLOAD),
+    raw(RESOLVED_PAYLOAD),
     true,
     AGENT_PUBKEY,
     AGENT_PUBKEY,
@@ -247,7 +245,7 @@ test("test_expiry_field_is_preserved_for_local_disable", () => {
   // PermissionButtons component can compare it to Date.now() / 1000 and
   // disable buttons locally when the harness deadline has passed.
   const result = computePermissionRequest(
-    body(PENDING_PAYLOAD),
+    raw(PENDING_PAYLOAD),
     true,
     AGENT_PUBKEY,
     AGENT_PUBKEY,
@@ -267,7 +265,7 @@ test("test_past_expiresAt_parsed_without_rejection", () => {
   // enforced by the component at render time, not at parse time.
   const expired = { ...PENDING_PAYLOAD, expiresAt: 1 }; // Unix epoch + 1s (past)
   const result = computePermissionRequest(
-    body(expired),
+    raw(expired),
     true,
     AGENT_PUBKEY,
     AGENT_PUBKEY,

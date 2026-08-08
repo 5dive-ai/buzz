@@ -91,15 +91,17 @@ function PermissionButtons({
   agentPubkey,
   channelId,
   request,
+  nowSecs,
 }: {
   agentPubkey: string;
   channelId: string;
   request: PermissionRequestPending;
+  /** Current time in seconds (driven by a parent ticking state). */
+  nowSecs: number;
 }) {
   const [submitted, setSubmitted] = React.useState<string | null>(null);
 
-  const now = Date.now() / 1000;
-  const expired = request.expiresAt <= now;
+  const expired = request.expiresAt <= nowSecs;
 
   if (expired) {
     return (
@@ -125,6 +127,9 @@ function PermissionButtons({
               className={buttonClass(isDenyLabel(label))}
               data-testid={`permission-decision-${optionId}`}
               onClick={() => {
+                // Recheck expiry at click time — prevents submitting a
+                // decision on a card that expired between renders.
+                if (request.expiresAt <= Date.now() / 1000) return;
                 setSubmitted(optionId);
                 void sendPermissionDecision(
                   agentPubkey,
@@ -152,23 +157,18 @@ function PermissionButtons({
 }
 
 /**
- * Countdown display for a pending card. Updates every second until expiry.
- * Returns null when already expired (buttons handle that state).
+ * Countdown display for a pending card. Updates the shared `now` state
+ * every second until expiry so that both the countdown and the button
+ * actionability are driven by the same tick.
  */
-function ExpiryCountdown({ expiresAt }: { expiresAt: number }) {
-  const [secsLeft, setSecsLeft] = React.useState(() =>
-    Math.max(0, Math.round(expiresAt - Date.now() / 1000)),
-  );
-
-  React.useEffect(() => {
-    if (secsLeft <= 0) return;
-    const id = setInterval(() => {
-      const remaining = Math.max(0, Math.round(expiresAt - Date.now() / 1000));
-      setSecsLeft(remaining);
-      if (remaining <= 0) clearInterval(id);
-    }, 1000);
-    return () => clearInterval(id);
-  }, [expiresAt, secsLeft]);
+function ExpiryCountdown({
+  expiresAt,
+  nowSecs,
+}: {
+  expiresAt: number;
+  nowSecs: number;
+}) {
+  const secsLeft = Math.max(0, Math.round(expiresAt - nowSecs));
 
   if (secsLeft <= 0) return null;
   const mins = Math.floor(secsLeft / 60);
@@ -219,9 +219,51 @@ export function PermissionRequestCard({
     );
   }
 
-  // Pending state
-  const pending = request as PermissionRequestPending;
-  const expired = pending.expiresAt <= Date.now() / 1000;
+  // Pending state — one ticking `nowSecs` drives both the countdown display
+  // and button actionability so expiry is observed atomically.
+  return (
+    <PendingPermissionRequestCard
+      agentPubkey={agentPubkey}
+      channelId={channelId}
+      className={className}
+      isOwner={isOwner}
+      request={request}
+    />
+  );
+}
+
+/**
+ * Pending-state card. Owns the ticking `nowSecs` state so that
+ * `ExpiryCountdown` and `PermissionButtons` always see the same clock value.
+ */
+function PendingPermissionRequestCard({
+  className,
+  request,
+  agentPubkey,
+  channelId,
+  isOwner,
+}: {
+  className?: string;
+  request: PermissionRequestPending;
+  agentPubkey: string;
+  channelId: string;
+  isOwner?: boolean;
+}) {
+  const [nowSecs, setNowSecs] = React.useState(() => Date.now() / 1000);
+
+  React.useEffect(() => {
+    const id = setInterval(() => {
+      const now = Date.now() / 1000;
+      setNowSecs(now);
+      if (now >= request.expiresAt) clearInterval(id);
+    }, 1000);
+    // In Node test environments (not browsers), intervals can keep the process
+    // alive. Call unref() when available to allow clean test exits.
+    (id as unknown as { unref?: () => void }).unref?.();
+    return () => clearInterval(id);
+  }, [request.expiresAt]);
+
+  const expired = request.expiresAt <= nowSecs;
 
   return (
     <Attachment
@@ -235,13 +277,16 @@ export function PermissionRequestCard({
       <AttachmentContent>
         <AttachmentTitle className="whitespace-normal text-amber-700 dark:text-amber-400 line-clamp-2">
           Permission request
-          {!expired ? <ExpiryCountdown expiresAt={pending.expiresAt} /> : null}
+          {!expired ? (
+            <ExpiryCountdown expiresAt={request.expiresAt} nowSecs={nowSecs} />
+          ) : null}
         </AttachmentTitle>
         {isOwner ? (
           <PermissionButtons
             agentPubkey={agentPubkey}
             channelId={channelId}
-            request={pending}
+            nowSecs={nowSecs}
+            request={request}
           />
         ) : (
           <div className="mt-1 text-xs text-muted-foreground">

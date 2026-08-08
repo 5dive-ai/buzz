@@ -349,8 +349,20 @@ export async function drainPendingIntents(
       //   • On restart: blob still has gen1 intent + receipt; receipt prevents a
       //     re-bump and cleanup runs next drain.  Gen2 is preserved for retry.
       const capturedReceipt = ctx.appliedReceipts.get(channelId);
-      const gen2Promoted =
-        pendingOverrideIntentStore.promoteDeferred(channelId);
+      let gen2Promoted: boolean;
+      try {
+        gen2Promoted = pendingOverrideIntentStore.promoteDeferred(channelId);
+      } catch (err) {
+        // Allocation exhausted — treat the same as a storage-failure abort.
+        // promoteDeferred() preflights before mutating, so no map was touched.
+        console.warn(
+          `[ReadStateManager] drain: allocateGeneration failed in promoteDeferred for ${channelId}:`,
+          err,
+        );
+        pendingOverrideIntentStore.abortTransaction(channelId);
+        if (!ctx.destroyed) ctx.scheduleAbortRetry();
+        continue; // transaction closed via abort; finally is a no-op
+      }
       ctx.appliedReceipts.delete(channelId);
       pendingOverrideIntentStore.compareAndDelete(channelId, capturedGen);
       if (!ctx.persistLocalState()) {

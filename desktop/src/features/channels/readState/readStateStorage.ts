@@ -373,21 +373,18 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
           }
           const requiredNextGen = maxObservedGen + 1;
           if (
-            Number.isSafeInteger(requiredNextGen) &&
-            nextGen !== requiredNextGen
+            !Number.isSafeInteger(requiredNextGen) ||
+            requiredNextGen >= Number.MAX_SAFE_INTEGER
           ) {
-            // Clamp nextGen to exactly the required value — both upward (corrupt
-            // ng too low, e.g. ng=7 with existing gen-7 receipt) and downward
-            // (corrupt ng too high, e.g. ng=MAX_SAFE_INTEGER with low gens, which
-            // would cause the first enqueue to mint gen=MAX_SAFE_INTEGER and the
-            // second to throw from isSafeInteger guard).  No retained identity
-            // sits at or above requiredNextGen, so no collision is possible.
-            nextGen = requiredNextGen;
-          } else if (!Number.isSafeInteger(requiredNextGen)) {
             // Allocator exhausted — rebase all intent gens and matching receipt
             // gens into a compact safe range [1..N].  intents is keyed by
             // channelId with at most one entry per channel, so sorting is
             // deterministic and produces a stable assignment.
+            //
+            // The ceiling check (`requiredNextGen >= MAX_SAFE_INTEGER`) catches the
+            // valid one-below-ceiling state (`maxObservedGen = MAX_SAFE_INTEGER - 1`)
+            // before `allocateGeneration()` can mint `MAX_SAFE_INTEGER` and leave
+            // `_nextGen` at the unsafe value.
             const sorted = [...pendingIntents.entries()].sort(
               ([, a], [, b]) => a.gen - b.gen,
             );
@@ -404,6 +401,14 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
               newGen++;
             }
             nextGen = newGen; // first free gen after the rebased range
+          } else if (nextGen !== requiredNextGen) {
+            // Clamp nextGen to exactly the required value — both upward (corrupt
+            // ng too low, e.g. ng=7 with existing gen-7 receipt) and downward
+            // (corrupt ng too high, e.g. ng=MAX_SAFE_INTEGER with low gens, which
+            // would cause the first enqueue to mint gen=MAX_SAFE_INTEGER and the
+            // second to throw from the allocator guard).  No retained identity
+            // sits at or above requiredNextGen, so no collision is possible.
+            nextGen = requiredNextGen;
           }
         }
       }
@@ -557,7 +562,7 @@ export function writeStoredReadState(
       r: registersObj,
       ...(Object.keys(receiptsObj).length > 0 ? { receipts: receiptsObj } : {}),
       ...(Object.keys(piObj).length > 0 ? { pi: piObj } : {}),
-      ...(nextGen > 1 ? { ng: nextGen } : {}),
+      ...(nextGen > 1 && Number.isSafeInteger(nextGen) ? { ng: nextGen } : {}),
     }),
   );
 

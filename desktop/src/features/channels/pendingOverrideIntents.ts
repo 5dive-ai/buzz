@@ -196,14 +196,7 @@ export class PendingOverrideIntentStore {
         ...(priorForcedEntry !== undefined ? { priorForcedEntry } : {}),
       };
     }
-    const gen = this._nextGen++;
-    if (!Number.isSafeInteger(gen)) {
-      // Allocation exhausted — this should never happen in practice (the store
-      // is rebased at hydration when near the ceiling), but guard defensively.
-      throw new Error(
-        "[PendingOverrideIntentStore] generation counter exhausted (unsafe)",
-      );
-    }
+    const gen = this.allocateGeneration();
     const intent: PendingIntent = {
       gen,
       op,
@@ -213,6 +206,29 @@ export class PendingOverrideIntentStore {
     };
     this.intents.set(channelId, intent);
     return intent;
+  }
+
+  /**
+   * Allocate the next generation number.
+   *
+   * Preflights BOTH the generation that will be emitted (the current `_nextGen`)
+   * AND the resulting `_nextGen` after increment.  Both must be safe integers
+   * before any mutation occurs — this ensures the allocator can never enter a
+   * state where it has emitted the last safe value and left `_nextGen` poisoned.
+   *
+   * Throws if either value is unsafe (allocator exhausted).  The rebase path in
+   * `readStateStorage.ts` prevents this during normal operation.
+   */
+  private allocateGeneration(): number {
+    const gen = this._nextGen;
+    const next = this._nextGen + 1;
+    if (!Number.isSafeInteger(gen) || !Number.isSafeInteger(next)) {
+      throw new Error(
+        "[PendingOverrideIntentStore] generation counter exhausted (unsafe)",
+      );
+    }
+    this._nextGen = next;
+    return gen;
   }
 
   /**
@@ -291,16 +307,14 @@ export class PendingOverrideIntentStore {
   promoteDeferred(channelId: string): boolean {
     const deferred = this.deferredEnqueues.get(channelId);
     if (deferred === undefined) return false;
+    // Preflight allocation BEFORE mutating any map.  If the allocator is
+    // exhausted, the throw propagates without touching deferredEnqueues or
+    // promotedDeferredPayloads, so abortTransaction can safely re-buffer.
+    const gen = this.allocateGeneration();
+    // Allocation succeeded — now mutate the maps.
     this.deferredEnqueues.delete(channelId);
     // Save the payload before promoting so abortTransaction can re-buffer it.
     this.promotedDeferredPayloads.set(channelId, deferred);
-    const gen = this._nextGen++;
-    if (!Number.isSafeInteger(gen)) {
-      // Guard: rebase at hydration prevents this in practice, but fail safely.
-      throw new Error(
-        "[PendingOverrideIntentStore] generation counter exhausted (unsafe)",
-      );
-    }
     const intent: PendingIntent = {
       gen,
       op: deferred.op,

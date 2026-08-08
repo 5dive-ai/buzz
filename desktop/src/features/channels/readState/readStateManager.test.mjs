@@ -6426,3 +6426,331 @@ test("identitySwap_aDeferredMidTransaction_bHydrates_bSeesNoAState", async () =>
   mgrA.destroy();
   mgrB.destroy();
 });
+
+// ── Test 60: MAX-1 boundary — two enqueues from valid one-below-ceiling hydration ──
+test("hydrate_maxMinusOneState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe", async () => {
+  // Thufir's exact repro: blob with pi.gen = MAX_SAFE_INTEGER-1 and ng = MAX_SAFE_INTEGER-1.
+  // Before the fix, hydration accepted this verbatim (requiredNextGen = MAX_SAFE_INTEGER,
+  // which isSafeInteger), set nextGen=MAX_SAFE_INTEGER via clamp, and the first enqueue
+  // minted gen=MAX_SAFE_INTEGER while leaving _nextGen=MAX_SAFE_INTEGER+1 (unsafe).
+  // The second enqueue then threw synchronously.
+  //
+  // After the fix: requiredNextGen >= MAX_SAFE_INTEGER triggers rebase instead of clamp.
+  // The single pending intent is rebased to gen=1, nextGen=2.  Both enqueues get safe
+  // distinct gens; neither throws; the persisted ng after each enqueue is safe.
+  //
+  // Failure branch: rebase boundary (maxObservedGen = MAX_SAFE_INTEGER-1, requiredNextGen
+  //   = MAX_SAFE_INTEGER triggers rebase rather than clamp).
+  // Durable surface: v2 blob after each enqueue has safe ng; fresh-manager hydration
+  //   succeeds and sees both intents.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "60".repeat(32);
+  const channelId = `max-minus-one-ch-${"\u006d".repeat(47)}`;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const ls = globalThis.window.localStorage;
+  const MAX = Number.MAX_SAFE_INTEGER;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  // Plant blob: one intent at gen=MAX_SAFE_INTEGER-1, ng=MAX_SAFE_INTEGER-1.
+  ls.setItem(
+    v2Key,
+    JSON.stringify({
+      pi: { [channelId]: { gen: MAX - 1, op: "unread" } },
+      ng: MAX - 1,
+    }),
+  );
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.hydrateFromLocalStorage();
+
+  // After hydration: rebase must have fired.
+  // maxObservedGen = MAX-1 → requiredNextGen = MAX → >= MAX_SAFE_INTEGER → rebase.
+  // One intent rebased to gen=1; nextGen=2.
+  const ngAfterHydrate = pendingOverrideIntentStore.nextGen;
+  assert.ok(
+    Number.isSafeInteger(ngAfterHydrate),
+    `nextGen must be safe after hydration; got ${ngAfterHydrate}`,
+  );
+  assert.ok(
+    ngAfterHydrate < MAX,
+    `nextGen must be well below MAX_SAFE_INTEGER after rebase; got ${ngAfterHydrate}`,
+  );
+  assert.equal(ngAfterHydrate, 2, "nextGen must be 2 after rebase of 1 intent");
+
+  const ch2 = `max-minus-one-ch2-${"n".repeat(46)}`;
+
+  // First enqueue — must NOT throw, must produce safe gen.
+  mgr.isLoadComplete = false;
+  let r1;
+  assert.doesNotThrow(() => {
+    r1 = mgr.markChannelUnread(ch2);
+  }, "first enqueue must not throw");
+  assert.equal(r1.status, "queued", "first enqueue must be queued");
+  const intent1 = pendingOverrideIntentStore.get(ch2);
+  assert.ok(intent1, "first intent must be in store");
+  assert.ok(
+    Number.isSafeInteger(intent1.gen),
+    `first intent gen must be safe; got ${intent1.gen}`,
+  );
+  assert.ok(intent1.gen > 0, "first intent gen must be positive");
+
+  // Persisted ng after first enqueue must be safe.
+  const blob1Raw = ls.getItem(v2Key);
+  assert.ok(blob1Raw, "v2 blob must be present after first enqueue");
+  const blob1 = JSON.parse(blob1Raw);
+  const ng1 = blob1.ng ?? 1; // ng omitted when === 1 (the `ng > 1` condition)
+  assert.ok(
+    Number.isSafeInteger(ng1),
+    `persisted ng after first enqueue must be safe; got ${ng1}`,
+  );
+  assert.ok(
+    ng1 < MAX,
+    `persisted ng must be below MAX_SAFE_INTEGER; got ${ng1}`,
+  );
+
+  const ch3 = `max-minus-one-ch3-${"o".repeat(46)}`;
+
+  // Second enqueue — must NOT throw, must produce distinct safe gen.
+  let r2;
+  assert.doesNotThrow(() => {
+    r2 = mgr.markChannelRead(ch3, undefined, 500);
+  }, "second enqueue must not throw");
+  assert.equal(r2.status, "queued", "second enqueue must be queued");
+  const intent2 = pendingOverrideIntentStore.get(ch3);
+  assert.ok(intent2, "second intent must be in store");
+  assert.ok(
+    Number.isSafeInteger(intent2.gen),
+    `second intent gen must be safe; got ${intent2.gen}`,
+  );
+  assert.notEqual(
+    intent1.gen,
+    intent2.gen,
+    "both enqueues must have distinct gens",
+  );
+
+  // Persisted ng after second enqueue must be safe.
+  const blob2Raw = ls.getItem(v2Key);
+  assert.ok(blob2Raw, "v2 blob must be present after second enqueue");
+  const blob2 = JSON.parse(blob2Raw);
+  const ng2 = blob2.ng ?? 1;
+  assert.ok(
+    Number.isSafeInteger(ng2),
+    `persisted ng after second enqueue must be safe; got ${ng2}`,
+  );
+  assert.ok(
+    ng2 < MAX,
+    `persisted ng must be below MAX_SAFE_INTEGER; got ${ng2}`,
+  );
+
+  // Both intents survive hydration on a fresh manager.
+  const mgr2 = new ReadStateManager(pubkey, fakeRelay);
+  mgr2.hydrateFromLocalStorage();
+  assert.ok(
+    pendingOverrideIntentStore.get(ch2),
+    "ch2 intent must survive hydration",
+  );
+  assert.ok(
+    pendingOverrideIntentStore.get(ch3),
+    "ch3 intent must survive hydration",
+  );
+  mgr2.destroy();
+
+  mgr.destroy();
+});
+
+// ── Test 61: promotion allocation failure — no stranded lock, retry scheduled ──
+test("drain_promoteDeferredAllocExhausted_noStrandedLock_retryScheduled_drainScheduledCleared", async () => {
+  // Forces allocateGeneration() to throw during promoteDeferred() inside the drain.
+  // Achieved by: restoreFromStorage with _nextGen=MAX_SAFE_INTEGER (artificially exhausted),
+  // plus a gen1 intent and a deferred gen2 enqueue buffered mid-transaction.
+  // The promoteDeferred() call preflights BEFORE mutating — when it throws:
+  //   • deferredEnqueues still has the gen2 payload (not deleted before throw)
+  //   • abortTransaction() is called: gen1 restored as live intent, channel unlocked
+  //   • scheduleAbortRetry() fires: drainRetryTimer set
+  //   • continue → finally clears drainScheduled via the manager's try-finally
+  //
+  // After the drain:
+  //   • drainScheduled = false (future scheduleDrain() calls will not be lost)
+  //   • drainRetryTimer != null (bounded retry scheduled)
+  //   • Channel is unlocked (gen1 live in store, gen > 0)
+  //   • Deferred payload not lost (still in deferredEnqueues; confirmed by
+  //     hydrateFromLocalStorage re-normalizing _nextGen then re-draining successfully)
+  //
+  // Failure branch: promoteDeferred() allocation exhaustion → catch in step-3.
+  // Durable surface: after fresh hydration (normalizes _nextGen) + retry drain,
+  //   gen1+gen2 committed; frontier ≥ 999; no pending intent.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "61".repeat(32);
+  const channelId = `promo-alloc-ch-${"p".repeat(50)}`;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+  const ls = globalThis.window.localStorage;
+  const MAX = Number.MAX_SAFE_INTEGER;
+
+  const origSetTimeout = globalThis.window.setTimeout;
+  const origClearTimeout = globalThis.window.clearTimeout;
+  const scheduledTimers = new Map(); // id → fn
+  let nextFakeId = 61000;
+  globalThis.window.setTimeout = (fn, ms) => {
+    if (ms > 0) {
+      const id = nextFakeId++;
+      scheduledTimers.set(id, fn);
+      return id;
+    }
+    return origSetTimeout(fn, ms);
+  };
+  globalThis.window.clearTimeout = (id) => {
+    if (scheduledTimers.has(id)) {
+      scheduledTimers.delete(id);
+    } else {
+      origClearTimeout(id);
+    }
+  };
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    mgr.effectiveState.set(channelId, 50);
+
+    // Plant a gen1 intent and set ng = MAX_SAFE_INTEGER directly via restoreFromStorage.
+    // This bypasses hydration normalization to simulate an exhausted allocator.
+    // (In production, the rebase boundary prevents _nextGen from ever reaching MAX in-session.)
+    const gen1Intent = { gen: 1, op: /** @type {"unread"} */ ("unread") };
+    pendingOverrideIntentStore.restoreFromStorage(
+      new Map([[channelId, gen1Intent]]),
+      MAX,
+    );
+    // Write a matching v2 blob so hydrateFromLocalStorage (used for restart witness) can
+    // normalize _nextGen via the readStateStorage normalizer.
+    ls.setItem(
+      v2Key,
+      JSON.stringify({
+        pi: { [channelId]: { gen: 1, op: "unread" } },
+        ng: MAX,
+      }),
+    );
+
+    // Wire the drain callback: enqueue gen2 (read, readTarget=999) from inside the
+    // outcome callback.  The channel is locked at callback time, so the enqueue is
+    // buffered as deferred.  The promoteDeferred() call will then exhaust the allocator.
+    mgr.onDrainOutcome = (outcome) => {
+      if (
+        outcome.kind === "applied-unread" &&
+        outcome.channelId === channelId
+      ) {
+        const prev = mgr.isLoadComplete;
+        mgr.isLoadComplete = false; // route through deferred latch path
+        mgr.markChannelRead(channelId, undefined, 999);
+        mgr.isLoadComplete = prev;
+      }
+    };
+
+    // Drain with _nextGen = MAX_SAFE_INTEGER: step1 succeeds (register + receipt written),
+    // step2 callback fires (deferred enqueue buffered), step3 promoteDeferred() throws.
+    mgr.isLoadComplete = true;
+    await mgr.drainPendingIntents(mgr.loadGeneration);
+
+    // ── drainScheduled must be false (manager's try-finally always clears it) ──
+    assert.equal(
+      mgr.drainScheduled,
+      false,
+      "drainScheduled must be false after allocation throw (finally path)",
+    );
+
+    // ── drainRetryTimer must be set (scheduleAbortRetry called from catch) ──
+    assert.ok(
+      mgr.drainRetryTimer !== null,
+      "drainRetryTimer must be set after allocation failure",
+    );
+    assert.ok(
+      scheduledTimers.has(mgr.drainRetryTimer),
+      "abort retry timer ID must be in scheduledTimers",
+    );
+
+    // ── Channel is unlocked: gen1 is the live intent (abortTransaction ran) ──
+    const intentAfterFail = pendingOverrideIntentStore.get(channelId);
+    assert.ok(
+      intentAfterFail,
+      "gen1 must be live in store after allocation failure",
+    );
+    assert.equal(
+      intentAfterFail.gen,
+      gen1Intent.gen,
+      "live intent gen must be gen1 after abort",
+    );
+    assert.ok(
+      intentAfterFail.gen > 0,
+      "live intent must not be the -1 placeholder",
+    );
+
+    // ── Deferred payload not lost ──
+    // The deferred gen2 payload was NOT deleted by promoteDeferred() (it threw before
+    // touching deferredEnqueues).  Verify indirectly: after re-normalizing _nextGen via
+    // hydrateFromLocalStorage, fire the retry timer, and confirm gen2 promotes + drains.
+    //
+    // Hydrate: readStateStorage normalizer sees ng=MAX and gen1 intent → clamp or rebase.
+    // maxObservedGen = max(gen1=1, receipt.intentGen from step1 write).
+    // After step1 in the failed drain, v2 blob was updated with register+receipt+pi+ng=MAX.
+    // On hydration: maxObservedGen = 1, requiredNextGen = 2, 2 < MAX → clamp → _nextGen=2.
+    mgr.hydrateFromLocalStorage();
+    // Restore callback on the original mgr (hydration replaces the singleton).
+    mgr.onDrainOutcome = (outcome) => {
+      if (
+        outcome.kind === "applied-unread" &&
+        outcome.channelId === channelId
+      ) {
+        const prev = mgr.isLoadComplete;
+        mgr.isLoadComplete = false;
+        mgr.markChannelRead(channelId, undefined, 999);
+        mgr.isLoadComplete = prev;
+      }
+    };
+
+    // Fire the retry timer — _nextGen is now 2 (normalized), allocation will succeed.
+    const retryTimerId = mgr.drainRetryTimer;
+    const retryFn = scheduledTimers.get(retryTimerId);
+    assert.ok(retryFn, "retry timer fn must be in scheduledTimers");
+    scheduledTimers.clear();
+    await retryFn();
+    await new Promise((r) => origSetTimeout(r, 0));
+
+    // ── After retry + auto-drain: gen1+gen2 committed, frontier ≥ 999 ──
+    const frontierAfterRetry = mgr.effectiveState.get(channelId) ?? 0;
+    assert.ok(
+      frontierAfterRetry >= 999,
+      `frontier must be ≥ 999 after gen1+gen2 drain; got ${frontierAfterRetry}`,
+    );
+    assert.equal(
+      pendingOverrideIntentStore.get(channelId),
+      undefined,
+      "no pending intent after successful retry drain",
+    );
+
+    // drainScheduled must still be false (no new drain was needed).
+    assert.equal(
+      mgr.drainScheduled,
+      false,
+      "drainScheduled must be false after successful retry",
+    );
+
+    mgr.destroy();
+  } finally {
+    globalThis.window.setTimeout = origSetTimeout;
+    globalThis.window.clearTimeout = origClearTimeout;
+  }
+});

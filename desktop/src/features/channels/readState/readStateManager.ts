@@ -395,28 +395,27 @@ export class ReadStateManager {
   }
 
   async drainPendingIntents(drainGen: number): Promise<void> {
-    await drainPendingIntentsImpl(createDrainContext(this), drainGen);
-    // Reset the attempt counter only on a successful pass (no abort-retry timer
-    // was scheduled during the impl).  Abort paths call scheduleAbortRetry() which
-    // sets drainRetryTimer; if it's still null here the pass committed cleanly.
-    if (this.drainRetryTimer === null) {
-      this.drainRetryAttempt = 0;
-    }
-    this.drainScheduled = false;
-    if (this.pendingFreshDrain && !this.destroyed) {
-      this.pendingFreshDrain = false;
-      if (!this.drainScheduled && this.isLoadComplete) {
-        this.drainScheduled = true;
-        void this.drainPendingIntents(this.loadGeneration);
+    try {
+      await drainPendingIntentsImpl(createDrainContext(this), drainGen);
+      // Reset only on a successful pass; abort paths set drainRetryTimer first.
+      if (this.drainRetryTimer === null) {
+        this.drainRetryAttempt = 0;
       }
+      this.drainScheduled = false;
+      if (this.pendingFreshDrain && !this.destroyed) {
+        this.pendingFreshDrain = false;
+        if (!this.drainScheduled && this.isLoadComplete) {
+          this.drainScheduled = true;
+          void this.drainPendingIntents(this.loadGeneration);
+        }
+      }
+    } finally {
+      // Always clear drainScheduled even if the impl throws.
+      this.drainScheduled = false;
     }
   }
 
-  /**
-   * Schedule a fresh drain pass if none is in-flight.  Called after deferred gen2
-   * promotion so the new intent drains immediately without waiting for a reconnect.
-   * While a drain is in-progress, sets `pendingFreshDrain` instead.
-   */
+  /** Schedule a fresh drain pass; sets `pendingFreshDrain` if already in-flight. */
   scheduleDrain(): void {
     if (this.destroyed || !this.isLoadComplete) return;
     if (this.drainScheduled) {

@@ -218,7 +218,7 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
     refresh_agents_md_if_stale(root)?;
     refresh_skill_md_if_stale(root)?;
 
-    // Seed the nest's project-level Claude settings with an allowlist for
+    // Seed the nest's local Claude settings with an allowlist for
     // the bundled `buzz` CLI, so managed Claude sessions (which run in
     // `dontAsk` mode with all permission requests rejected — see #4609)
     // can still reach the relay. See claude_settings.rs for the rationale.

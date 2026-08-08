@@ -13,6 +13,7 @@ import type { MarkResult } from "@/features/channels/readState/readStateManager"
 import {
   forcedUnreadStore,
   removeForcedUnreadSource,
+  type ForcedUnreadEntry,
   type ForcedUnreadMap,
   type ForcedUnreadSource,
 } from "@/features/channels/forcedUnreadStore";
@@ -51,8 +52,15 @@ export type OverrideAPIs = {
    *  treated as ready — null liveness after an incomplete load means "not found
    *  in a partial view", not "known absent register". */
   isReadStateReady: boolean;
-  markChannelUnread: (channelId: string) => MarkResult;
-  markChannelRead: (channelId: string, sourceScope?: string) => MarkResult;
+  markChannelUnread: (
+    channelId: string,
+    priorForcedEntry?: ForcedUnreadEntry,
+  ) => MarkResult;
+  markChannelRead: (
+    channelId: string,
+    sourceScope?: string,
+    markAt?: number,
+  ) => MarkResult;
   getOverrideLiveness: (channelId: string) => OverrideLiveness | null;
 };
 
@@ -63,12 +71,16 @@ export type OverrideAPIs = {
  *
  * Returns false silently (no toast) when `status: "queued"` — the intent is
  * enqueued for the next drain; optimistic presentation continues unchanged.
+ *
+ * `priorForcedEntry` is the forced-unread entry that existed before the
+ * optimistic write; forwarded into the intent for restart-safe rollback.
  */
 export function applyOverrideUnread(
   channelId: string,
   apis: OverrideAPIs,
+  priorForcedEntry?: ForcedUnreadEntry,
 ): boolean {
-  const result = apis.markChannelUnread(channelId);
+  const result = apis.markChannelUnread(channelId, priorForcedEntry);
   if (result.status === "queued") {
     // Intent enqueued — optimistic forced-entry was already written by the
     // caller before this call (write ordering per plan ruling 2).  No toast.
@@ -119,11 +131,17 @@ export type OverrideReadOutcome = "overrideCleared" | "overrideStillActive";
  * `sourceScope` is forwarded to markChannelRead so the intent can carry the
  * exact source being cleared; the drain surfaces it to onDrainOutcome for
  * exact hook-layer source cleanup (rather than whole-entry deletion).
+ *
+ * `markAt` is the authoritative read target computed at click time (e.g., the
+ * newest observed message timestamp).  It is passed to the intent so the drain
+ * can advance the frontier to the correct logical position even when the load
+ * completes after the click.
  */
 export function applyOverrideRead(
   channelId: string,
   apis: OverrideAPIs,
   sourceScope?: string,
+  markAt?: number,
 ): OverrideReadOutcome {
   // Step 1: load complete + no register → known absence, cleared.
   // Guard: only treat null as "known absent" when the load is complete.
@@ -138,7 +156,7 @@ export function applyOverrideRead(
   // register or frontier mutation. Sources are preserved; the intent drains
   // on the next complete-load transition and rawUnread suppresses presentation
   // via the pending-read precedence rule.
-  const result = apis.markChannelRead(channelId, sourceScope);
+  const result = apis.markChannelRead(channelId, sourceScope, markAt);
 
   if (result.status === "queued") {
     // Intent enqueued — sources preserved, rawUnread handles presentation.

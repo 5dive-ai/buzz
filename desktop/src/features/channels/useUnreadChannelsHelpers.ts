@@ -21,6 +21,7 @@ import {
   type ForcedUnreadMap,
   type ForcedUnreadSource,
 } from "@/features/channels/forcedUnreadStore";
+import type { DrainOutcome } from "@/features/channels/readState/readStateDrain";
 
 export type UseUnreadChannelsOptions = UseLiveChannelUpdatesOptions & {
   pubkey?: string;
@@ -101,26 +102,17 @@ export function resolveObservedUnreadRootId(tags: string[][]): string | null {
  * via `setOnDrainOutcome`. Creates and owns the pending-unread-snapshots map.
  * Returns the snapshots ref for use in markChannelUnread.
  *
- * Handles:
- *  - `unread + refused` → restore forced-unread entry to its pre-mark snapshot
- *  - `unread + applied` → discard snapshot (intent succeeded)
- *  - `read + applied`  → remove forced-unread entry (or specific source), mirroring
- *                        the synchronous overrideCleared path
+ * Handles outcomes via exhaustive switch on the typed DrainOutcome union:
+ *  - `genuine-refusal (unread)` → restore forced-unread entry to its pre-mark snapshot
+ *  - `applied-unread`           → discard snapshot (intent succeeded)
+ *  - `applied-read`             → remove forced-unread entry (or specific source)
+ *  - `silent-inactive`          → same source cleanup as applied-read, no toast
+ *  - `genuine-refusal (read)`   → toast already fired in drain; no entry mutation
  *
  * Genuine refusal toasts are fired in the drain itself and not repeated here.
  */
 export function useDrainOutcomeCallback(
-  setOnDrainOutcome: (
-    cb:
-      | ((
-          channelId: string,
-          op: string,
-          status: string,
-          reason?: string,
-          sourceScope?: string,
-        ) => void)
-      | null,
-  ) => void,
+  setOnDrainOutcome: (cb: ((outcome: DrainOutcome) => void) | null) => void,
   forcedUnreadRef: React.MutableRefObject<ForcedUnreadMap>,
   pubkey: string | undefined,
   bumpLatestVersion: () => void,
@@ -130,43 +122,85 @@ export function useDrainOutcomeCallback(
   );
   // biome-ignore lint/correctness/useExhaustiveDependencies: stable refs; setOnDrainOutcome is stable
   React.useEffect(() => {
-    setOnDrainOutcome((channelId, op, status, _reason, sourceScope) => {
-      if (op === "unread" && status === "refused") {
-        // Roll back the optimistic forced-unread entry to its exact prior state.
-        const prior = pendingUnreadSnapshotsRef.current.get(channelId);
-        pendingUnreadSnapshotsRef.current.delete(channelId);
-        if (prior === undefined) {
-          if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
-            delete forcedUnreadRef.current[channelId];
+    setOnDrainOutcome((outcome) => {
+      switch (outcome.kind) {
+        case "genuine-refusal": {
+          if (outcome.op !== "unread") break;
+          // Roll back the optimistic forced-unread entry to its exact prior state.
+          // For same-session rollbacks, use the in-memory snapshot.
+          // For post-restart rollbacks, fall back to the persisted priorForcedEntry
+          // from the intent (restart-safe rollback, fix for pass-2 finding 3).
+          const inMemoryPrior = pendingUnreadSnapshotsRef.current.get(
+            outcome.channelId,
+          );
+          pendingUnreadSnapshotsRef.current.delete(outcome.channelId);
+          // Pick: in-memory snapshot if present (same session); otherwise use
+          // persisted priorForcedEntry; otherwise treat as "no prior entry".
+          const hasPrior =
+            inMemoryPrior !== undefined ||
+            outcome.priorForcedEntry !== undefined;
+          const prior =
+            inMemoryPrior !== undefined
+              ? inMemoryPrior
+              : outcome.priorForcedEntry;
+          if (!hasPrior) {
+            // No prior entry existed — remove the whole entry if present.
+            if (Object.hasOwn(forcedUnreadRef.current, outcome.channelId)) {
+              delete forcedUnreadRef.current[outcome.channelId];
+              if (pubkey)
+                forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+              bumpLatestVersion();
+            }
+          } else if (prior === undefined) {
+            // Prior was explicitly "no entry" — delete.
+            if (Object.hasOwn(forcedUnreadRef.current, outcome.channelId)) {
+              delete forcedUnreadRef.current[outcome.channelId];
+              if (pubkey)
+                forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+              bumpLatestVersion();
+            }
+          } else {
+            // Restore exact prior entry byte-for-byte.
+            forcedUnreadRef.current[outcome.channelId] = prior;
             if (pubkey)
               forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
             bumpLatestVersion();
           }
-        } else {
-          forcedUnreadRef.current[channelId] = prior;
-          if (pubkey) forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
-          bumpLatestVersion();
+          break;
         }
-      } else if (op === "unread" && status === "applied") {
-        pendingUnreadSnapshotsRef.current.delete(channelId);
-      } else if (op === "read" && status === "applied") {
-        if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
-          if (sourceScope !== undefined) {
-            const current = forcedUnreadRef.current[channelId];
-            const next = removeForcedUnreadSource(
-              current,
-              sourceScope as ForcedUnreadSource,
-            );
-            if (next !== undefined) {
-              forcedUnreadRef.current[channelId] = next;
+        case "applied-unread": {
+          pendingUnreadSnapshotsRef.current.delete(outcome.channelId);
+          break;
+        }
+        case "applied-read":
+        case "silent-inactive": {
+          // Both cases: remove the exact source (or whole entry) from forced store.
+          const { channelId, sourceScope } = outcome;
+          if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
+            if (sourceScope !== undefined) {
+              const current = forcedUnreadRef.current[channelId];
+              const next = removeForcedUnreadSource(
+                current,
+                sourceScope as ForcedUnreadSource,
+              );
+              if (next !== undefined) {
+                forcedUnreadRef.current[channelId] = next;
+              } else {
+                delete forcedUnreadRef.current[channelId];
+              }
             } else {
               delete forcedUnreadRef.current[channelId];
             }
-          } else {
-            delete forcedUnreadRef.current[channelId];
+            if (pubkey)
+              forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
+            bumpLatestVersion();
           }
-          if (pubkey) forcedUnreadStore.write(pubkey, forcedUnreadRef.current);
-          bumpLatestVersion();
+          break;
+        }
+        default: {
+          // Exhaustiveness check — TypeScript ensures all cases are handled.
+          const _exhaustive: never = outcome;
+          void _exhaustive;
         }
       }
     });

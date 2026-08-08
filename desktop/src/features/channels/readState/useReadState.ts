@@ -8,6 +8,8 @@ import {
 import type { OverrideLiveness } from "@/features/channels/readState/readStateFormat";
 import type { RelayClient } from "@/shared/api/relayClientSession";
 import { pendingOverrideIntentStore } from "@/features/channels/pendingOverrideIntents";
+import type { DrainOutcome } from "@/features/channels/readState/readStateDrain";
+import type { ForcedUnreadEntry } from "@/features/channels/forcedUnreadStore";
 
 const noopGetTimestamp = () => null;
 const noopMarkRead = () => {};
@@ -24,7 +26,10 @@ const noopSetOnDrainOutcome = (): void => {};
  * swept / replaced when a real manager hydrates from storage.  Returns the
  * tri-state `queued` result so `applyOverrideUnread` keeps the forced entry.
  */
-function noopMarkChannelUnread(channelId: string): MarkResult {
+function noopMarkChannelUnread(
+  channelId: string,
+  _priorForcedEntry?: ForcedUnreadEntry,
+): MarkResult {
   pendingOverrideIntentStore.enqueue(channelId, "unread");
   return { status: "queued" };
 }
@@ -37,6 +42,7 @@ function noopMarkChannelUnread(channelId: string): MarkResult {
 function noopMarkChannelRead(
   channelId: string,
   sourceScope?: string,
+  _markAt?: number,
 ): MarkResult {
   pendingOverrideIntentStore.enqueue(channelId, "read", sourceScope, undefined);
   return { status: "queued" };
@@ -127,9 +133,9 @@ export function useReadState(
 
   // Override APIs for the NIP-RS manual-unread layer (slice 3 seam).
   const markChannelUnread = React.useCallback(
-    (channelId: string): MarkResult => {
+    (channelId: string, priorForcedEntry?: ForcedUnreadEntry): MarkResult => {
       return (
-        managerRef.current?.markChannelUnread(channelId) ?? {
+        managerRef.current?.markChannelUnread(channelId, priorForcedEntry) ?? {
           status: "refused",
           reason: "load_incomplete",
         }
@@ -139,9 +145,9 @@ export function useReadState(
   );
 
   const markChannelRead = React.useCallback(
-    (channelId: string, sourceScope?: string): MarkResult => {
+    (channelId: string, sourceScope?: string, markAt?: number): MarkResult => {
       return (
-        managerRef.current?.markChannelRead(channelId, sourceScope) ?? {
+        managerRef.current?.markChannelRead(channelId, sourceScope, markAt) ?? {
           status: "refused",
           reason: "load_incomplete",
         }
@@ -164,17 +170,7 @@ export function useReadState(
   // Wire the drain outcome callback into the current manager.
   // Called by useUnreadChannels to route rollback/cleanup through the hook layer.
   const setOnDrainOutcome = React.useCallback(
-    (
-      callback:
-        | ((
-            channelId: string,
-            op: string,
-            status: string,
-            reason?: string,
-            sourceScope?: string,
-          ) => void)
-        | null,
-    ): void => {
+    (callback: ((outcome: DrainOutcome) => void) | null): void => {
       if (managerRef.current) {
         managerRef.current.onDrainOutcome = callback;
       }

@@ -15,6 +15,7 @@ import type {
   PendingIntent,
   PendingIntentOp,
 } from "@/features/channels/pendingOverrideIntents";
+import type { ForcedUnreadEntry } from "@/features/channels/forcedUnreadStore";
 
 export type StoredReadState = {
   contexts: Map<string, number>;
@@ -221,12 +222,14 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
         if (isPlainRecord(parsed.pi)) {
           for (const [channelId, entry] of Object.entries(parsed.pi)) {
             if (!isPlainRecord(entry)) continue;
-            const { gen, op, sourceScope, readTarget } = entry as {
-              gen?: unknown;
-              op?: unknown;
-              sourceScope?: unknown;
-              readTarget?: unknown;
-            };
+            const { gen, op, sourceScope, readTarget, priorForcedEntry } =
+              entry as {
+                gen?: unknown;
+                op?: unknown;
+                sourceScope?: unknown;
+                readTarget?: unknown;
+                priorForcedEntry?: unknown;
+              };
             if (typeof gen !== "number" || !Number.isInteger(gen) || gen < 1)
               continue;
             if (op !== "unread" && op !== "read") continue;
@@ -239,6 +242,11 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
               op,
               ...(sourceScope !== undefined ? { sourceScope } : {}),
               ...(readTarget !== undefined ? { readTarget } : {}),
+              // priorForcedEntry is stored as-is (number | null | object);
+              // accept any JSON-round-trippable value — type-check at use site.
+              ...(priorForcedEntry !== undefined
+                ? { priorForcedEntry: priorForcedEntry as ForcedUnreadEntry }
+                : {}),
             };
             pendingIntents.set(channelId, intent);
           }
@@ -375,6 +383,7 @@ export function writeStoredReadState(
       op: PendingIntentOp;
       sourceScope?: string;
       readTarget?: number;
+      priorForcedEntry?: ForcedUnreadEntry;
     }
   > = {};
   for (const [channelId, intent] of pendingIntents) {
@@ -383,6 +392,7 @@ export function writeStoredReadState(
       op: PendingIntentOp;
       sourceScope?: string;
       readTarget?: number;
+      priorForcedEntry?: ForcedUnreadEntry;
     } = {
       gen: intent.gen,
       op: intent.op,
@@ -390,6 +400,8 @@ export function writeStoredReadState(
     if (intent.sourceScope !== undefined)
       entry.sourceScope = intent.sourceScope;
     if (intent.readTarget !== undefined) entry.readTarget = intent.readTarget;
+    if (intent.priorForcedEntry !== undefined)
+      entry.priorForcedEntry = intent.priorForcedEntry;
     piObj[channelId] = entry;
   }
   const ok4 = setLocalStorageItemWithRecovery(

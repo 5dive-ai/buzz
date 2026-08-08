@@ -3285,10 +3285,12 @@ test("drain_readToUnreadInversion_onlySBumpApplied", async () => {
   mgr.destroy();
 });
 
-// ── Test 33: compare-delete preserves newer intent ────────────────────────────
+// ── Test 33: compare-delete preserves newer intent + zero stale effects ────────
 test("drain_compareDeletePreservesNewerIntent", async () => {
   // compare-and-delete for gen1 must fail if gen2 was enqueued before the
   // compare-delete step. The drain's cleanup commit must not consume gen2.
+  // Strengthened: also assert that gen1's forced-source mutation is rolled back
+  // (zero stale effects requirement, Amendment A), not just that gen2 survives.
   //
   // We inject gen2 via onDrainOutcome (fires just before compare-delete).
   globalThis.window.localStorage = makeLocalStorage();
@@ -3313,9 +3315,12 @@ test("drain_compareDeletePreservesNewerIntent", async () => {
   const gen1 = pendingOverrideIntentStore.get(channelId).gen;
 
   // Wire onDrainOutcome to enqueue gen2 BEFORE compare-and-delete runs.
-  // The onDrainOutcome fires at step 3 (surface outcomes), before step 4 (cleanup commit).
-  mgr.onDrainOutcome = (chId, _op, _status) => {
-    if (chId === channelId) {
+  // The onDrainOutcome fires at step 2 (surface outcomes), before step 3 (cleanup commit).
+  // Also capture any forced-source effects from gen1 drain.
+  const outcomes = [];
+  mgr.onDrainOutcome = (outcome) => {
+    outcomes.push(outcome);
+    if (outcome.channelId === channelId) {
       // Enqueue gen2 between outcome surfacing and compare-delete.
       pendingOverrideIntentStore.enqueue(channelId, "unread");
     }
@@ -3333,6 +3338,16 @@ test("drain_compareDeletePreservesNewerIntent", async () => {
   assert.ok(
     remaining.gen > gen1,
     "surviving intent must be gen2 (newer than gen1)",
+  );
+
+  // gen1's register mutation must have been rolled back (zero stale effects).
+  // Because gen changed during the callback, the drain rolls back all in-memory
+  // effects before cleanup commit.
+  const regAfterDrain = mgr.overrideRegisters.get(channelId);
+  assert.equal(
+    regAfterDrain,
+    undefined,
+    "gen1's register mutation must be rolled back when gen2 enqueued during callback",
   );
 
   // Clean up.
@@ -3519,12 +3534,16 @@ test("drain_cleanupCommit_intentAndReceiptDeletedAtomically", async () => {
   mgr.destroy();
 });
 
-// ── Test 36: controller — automatic backoff after incomplete verdict ───────────
-test("retryLoad_incompleteVerdictAdvancesRetryAttempt", async () => {
-  // After an incomplete verdict, retryAttempt increments so the next retry
-  // will use exponential backoff. Destroy/cancel before the delayed retry fires.
+// ── Test 36: controller — automatic retry after incomplete verdict ─────────────
+test("retryLoad_incompleteVerdictSchedulesAutomaticRetry", async () => {
+  // After an incomplete verdict, retryLoad() must schedule a backoff timer that
+  // will fire a fresh retryLoad() attempt automatically.
+  // Verifies: (1) timer is scheduled, (2) delay > 0 for second attempt,
+  // (3) retryAttempt is incremented, (4) destroy cancels the scheduled timer.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "36".repeat(32);
+
+  let fetchCallCount = 0;
 
   const fakeRelay = {
     fetchEvents: async () => [],
@@ -3532,26 +3551,167 @@ test("retryLoad_incompleteVerdictAdvancesRetryAttempt", async () => {
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
     subscribeFenced: async () => {
-      throw new Error("fence timeout");
+      fetchCallCount++;
+      throw new Error("fence timeout"); // always incomplete
     },
     subscribeLive: async (_f, _h) => () => {},
   };
 
-  const mgr = new ReadStateManager(pubkey, fakeRelay);
-  assert.equal(mgr.retryAttempt, 0, "precondition: retryAttempt is 0");
+  const origSetTimeout = globalThis.window.setTimeout;
+  const origClearTimeout = globalThis.window.clearTimeout;
 
-  // First retry (immediate — attempt 0 means delayMs=0).
-  await mgr.retryLoad();
+  const scheduledTimers = new Map();
+  let nextFakeId = 10000;
 
-  // After incomplete verdict, retryAttempt must be incremented.
-  assert.ok(
-    mgr.retryAttempt > 0,
-    "retryAttempt must be > 0 after incomplete verdict",
-  );
+  globalThis.window.setTimeout = (fn, ms) => {
+    if (ms > 0) {
+      const id = nextFakeId++;
+      scheduledTimers.set(id, { fn, ms });
+      return id;
+    }
+    return origSetTimeout(fn, ms);
+  };
+  globalThis.window.clearTimeout = (id) => {
+    if (scheduledTimers.has(id)) {
+      scheduledTimers.delete(id);
+    } else {
+      origClearTimeout(id);
+    }
+  };
 
-  // Second retry would use backoff. Destroy before it fires.
-  mgr.destroy();
-  assert.equal(mgr.retryBackoffTimer, null, "timer must be cleared on destroy");
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+    assert.equal(mgr.retryAttempt, 0, "precondition: retryAttempt is 0");
+
+    // First retry (immediate — attempt 0 means delayMs=0).
+    await mgr.retryLoad();
+    assert.equal(fetchCallCount, 1, "first fetch must have been called");
+
+    // After first incomplete verdict, retryAttempt must be > 0.
+    assert.ok(
+      mgr.retryAttempt > 0,
+      "retryAttempt must be > 0 after first incomplete",
+    );
+
+    // A backoff timer must have been scheduled (automatic retry loop).
+    assert.ok(
+      mgr.retryBackoffTimer !== null,
+      "retryBackoffTimer must be set — automatic retry was scheduled",
+    );
+    assert.ok(
+      scheduledTimers.size > 0,
+      "a timer must be pending in the fake scheduler",
+    );
+
+    // Timer delay must be > 0 (bounded backoff).
+    const [, { ms }] = [...scheduledTimers.entries()][0];
+    assert.ok(ms > 0, "backoff timer delay must be > 0 for attempt >= 1");
+
+    // Destroy must cancel the pending timer.
+    mgr.destroy();
+    assert.equal(
+      mgr.retryBackoffTimer,
+      null,
+      "destroy must clear retryBackoffTimer",
+    );
+    assert.equal(
+      scheduledTimers.size,
+      0,
+      "fake scheduler must have no pending timers after destroy",
+    );
+  } finally {
+    globalThis.window.setTimeout = origSetTimeout;
+    globalThis.window.clearTimeout = origClearTimeout;
+  }
+});
+
+// ── Test 36b: controller — initialize() incomplete → schedules automatic retry
+test("initialize_incompleteVerdict_schedulesAutomaticRetry", async () => {
+  // initialize() ending with an incomplete verdict must schedule a retryBackoffTimer
+  // so the manager eventually retries even without an external reconnect signal.
+  // Verifies: (1) retryBackoffTimer is set, (2) delay > 0, (3) retryAttempt is 1,
+  // (4) destroy cancels the scheduled timer.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "36b".repeat(21).slice(0, 64);
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    subscribeFenced: async () => {
+      throw new Error("fence timeout"); // always incomplete
+    },
+    subscribeLive: async (_f, _h) => () => {},
+  };
+
+  const origSetTimeout = globalThis.window.setTimeout;
+  const origClearTimeout = globalThis.window.clearTimeout;
+
+  const scheduledTimers = new Map();
+  let nextFakeId = 20000;
+
+  globalThis.window.setTimeout = (fn, ms) => {
+    if (ms > 0) {
+      const id = nextFakeId++;
+      scheduledTimers.set(id, { fn, ms });
+      return id;
+    }
+    return origSetTimeout(fn, ms);
+  };
+  globalThis.window.clearTimeout = (id) => {
+    if (scheduledTimers.has(id)) {
+      scheduledTimers.delete(id);
+    } else {
+      origClearTimeout(id);
+    }
+  };
+
+  try {
+    const mgr = new ReadStateManager(pubkey, fakeRelay);
+
+    await mgr.initialize();
+
+    // initialize() must have scheduled a retry timer.
+    assert.ok(
+      mgr.retryBackoffTimer !== null,
+      "retryBackoffTimer must be set after incomplete initialize()",
+    );
+    assert.ok(
+      scheduledTimers.size > 0,
+      "a timer must be pending in the fake scheduler after incomplete initialize()",
+    );
+
+    // retryAttempt must be 1 (initialize = attempt 0 consumed).
+    assert.equal(
+      mgr.retryAttempt,
+      1,
+      "retryAttempt must be 1 after incomplete initialize()",
+    );
+
+    // Timer delay must be > 0.
+    const [, { ms }] = [...scheduledTimers.entries()][0];
+    assert.ok(
+      ms > 0,
+      "backoff timer delay must be > 0 after incomplete initialize()",
+    );
+
+    // destroy() must cancel the pending timer.
+    mgr.destroy();
+    assert.equal(
+      mgr.retryBackoffTimer,
+      null,
+      "destroy must clear retryBackoffTimer",
+    );
+    assert.equal(
+      scheduledTimers.size,
+      0,
+      "fake scheduler must have no pending timers after destroy",
+    );
+  } finally {
+    globalThis.window.setTimeout = origSetTimeout;
+    globalThis.window.clearTimeout = origClearTimeout;
+  }
 });
 
 // ── Test 37: controller — reconnect during loadInFlight → pendingRetryOnComplete
@@ -3876,8 +4036,8 @@ test("drain_queuedUnread_refused_surfacesOutcome", async () => {
 
   // Wire outcome callback.
   const outcomes = [];
-  mgr.onDrainOutcome = (chId, op, status, reason) => {
-    outcomes.push({ chId, op, status, reason });
+  mgr.onDrainOutcome = (outcome) => {
+    outcomes.push(outcome);
   };
 
   // Complete load and drain.
@@ -3886,9 +4046,9 @@ test("drain_queuedUnread_refused_surfacesOutcome", async () => {
 
   // Drain must have surfaced the refusal.
   assert.equal(outcomes.length, 1, "exactly one outcome must be emitted");
-  assert.equal(outcomes[0].chId, channelId);
+  assert.equal(outcomes[0].channelId, channelId);
+  assert.equal(outcomes[0].kind, "genuine-refusal");
   assert.equal(outcomes[0].op, "unread");
-  assert.equal(outcomes[0].status, "refused");
   assert.equal(
     outcomes[0].reason,
     "uint32_overflow",
@@ -3949,8 +4109,8 @@ test("drain_deferredRefusalAfterRestart_intentHydratedAndRefused", async () => {
 
   // Wire outcome callback to capture the refusal.
   const outcomes = [];
-  mgr.onDrainOutcome = (chId, op, status, reason) => {
-    outcomes.push({ chId, op, status, reason });
+  mgr.onDrainOutcome = (outcome) => {
+    outcomes.push(outcome);
   };
 
   // Complete load and drain — the register is still at uint32-max, so S-bump
@@ -3961,8 +4121,8 @@ test("drain_deferredRefusalAfterRestart_intentHydratedAndRefused", async () => {
 
   // Drain must surface the refusal via onDrainOutcome.
   assert.equal(outcomes.length, 1, "exactly one outcome must be emitted");
+  assert.equal(outcomes[0].kind, "genuine-refusal");
   assert.equal(outcomes[0].op, "unread");
-  assert.equal(outcomes[0].status, "refused");
   assert.equal(outcomes[0].reason, "uint32_overflow");
 
   // Intent consumed even after refusal (genuine, not load_incomplete).
@@ -4041,4 +4201,202 @@ test("markChannelUnread_storageFailed_intentInMemoryOnly", () => {
     // Ensure setItem is restored even on test failure.
     globalThis.window.localStorage.setItem = origSetItem;
   }
+});
+
+// ── Test 45: authoritative queued-read target captured at click time ──────────
+test("markChannelRead_preReady_capturesAuthoritativeMarkAt", async () => {
+  // When load is incomplete, markChannelRead() must persist the caller's markAt
+  // (not ctx.channelFrontier()) as readTarget in the intent.  Drain must then
+  // advance the frontier to markAt (not the stale partial frontier) before C-bump.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "45".repeat(32);
+  const channelId = `mark-at-ch-${"m".repeat(53)}`;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  // Partial frontier (simulates what's visible pre-ready).
+  const partialFrontier = 100;
+  mgr.effectiveState.set(channelId, partialFrontier);
+  mgr.isLoadComplete = false;
+
+  // Simulate a register so the read is not already_inactive.
+  mgr.overrideRegisters.set(channelId, { s: 5, c: 0, b: 100 });
+  mgr.publishableContextIds.add(channelId);
+
+  // Click-time markAt — greater than the partial frontier.
+  const authoritativeMarkAt = 999;
+  const r = mgr.markChannelRead(channelId, undefined, authoritativeMarkAt);
+  assert.equal(r.status, "queued", "must queue when load incomplete");
+
+  // Intent must carry the authoritative markAt as readTarget.
+  const intent = pendingOverrideIntentStore.get(channelId);
+  assert.ok(intent, "intent must exist");
+  assert.equal(
+    intent.readTarget,
+    authoritativeMarkAt,
+    "readTarget must equal the authoritative markAt, not the partial frontier",
+  );
+
+  // Drain must advance frontier to readTarget before C-bump.
+  const outcomes = [];
+  mgr.onDrainOutcome = (outcome) => outcomes.push(outcome);
+
+  mgr.isLoadComplete = true;
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  // Frontier must have advanced to authoritativeMarkAt.
+  const frontier = mgr.effectiveState.get(channelId) ?? 0;
+  assert.ok(
+    frontier >= authoritativeMarkAt,
+    `frontier must be advanced to at least authoritativeMarkAt (${authoritativeMarkAt}); got ${frontier}`,
+  );
+
+  // Outcome must be applied-read.
+  assert.ok(outcomes.length >= 1, "outcome must be emitted");
+  assert.equal(
+    outcomes[0].kind,
+    "applied-read",
+    "outcome must be applied-read",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 46: already_inactive — source cleanup runs ──────────────────────────
+test("drain_alreadyInactive_sourceCleanupCallback", async () => {
+  // When a queued read drains and the register is gone (already_inactive),
+  // the outcome must be silent-inactive (not a genuine-refusal) and the
+  // onDrainOutcome callback must be invoked so the hook can remove the source.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "46".repeat(32);
+  const channelId = `already-inactive-ch-${"n".repeat(44)}`;
+
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.effectiveState.set(channelId, 100);
+  mgr.isLoadComplete = false;
+
+  // Queue a read with a specific sourceScope — no register exists.
+  const sourceScope = "inbox";
+  const r = mgr.markChannelRead(channelId, sourceScope);
+  assert.equal(r.status, "queued");
+
+  const outcomes = [];
+  mgr.onDrainOutcome = (outcome) => outcomes.push(outcome);
+
+  // Complete load without adding a register — already_inactive path.
+  mgr.isLoadComplete = true;
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  // Outcome must be silent-inactive (not genuine-refusal) and carry sourceScope.
+  assert.equal(outcomes.length, 1, "exactly one outcome must be emitted");
+  assert.equal(
+    outcomes[0].kind,
+    "silent-inactive",
+    "already_inactive must produce silent-inactive outcome, not genuine-refusal",
+  );
+  assert.equal(
+    outcomes[0].sourceScope,
+    sourceScope,
+    "sourceScope must be forwarded to silent-inactive outcome",
+  );
+
+  // Intent consumed.
+  assert.equal(
+    pendingOverrideIntentStore.get(channelId),
+    undefined,
+    "intent must be consumed after already_inactive",
+  );
+
+  mgr.destroy();
+});
+
+// ── Test 47: restart-safe unread rollback — priorForcedEntry persisted ────────
+test("drain_unreadRefusal_restartSafe_priorForcedEntryRestored", async () => {
+  // After a restart, a refused unread intent must restore the prior forced entry
+  // (not delete the whole channel entry) using the priorForcedEntry persisted in
+  // the intent metadata.
+  globalThis.window.localStorage = makeLocalStorage();
+  const pubkey = "47".repeat(32);
+  const channelId = `restart-safe-ch-${"o".repeat(47)}`;
+
+  const ls = globalThis.window.localStorage;
+  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+
+  // Simulate session 1: {sources:["inbox"]} entry existed, then manual unread
+  // was attempted (S at max → will overflow), intent queued with priorForcedEntry.
+  const priorForcedEntry = { markerAtWhenForced: 50, sources: ["inbox"] };
+  ls.setItem(
+    v2Key,
+    JSON.stringify({
+      r: { [channelId]: { s: 0xffffffff, c: 0, b: 50, f: 50 } },
+      pi: {
+        [channelId]: {
+          gen: 1,
+          op: "unread",
+          priorForcedEntry: priorForcedEntry,
+        },
+      },
+      ng: 2,
+    }),
+  );
+
+  // Session 2: new manager hydrates.
+  const fakeRelay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+  };
+
+  const mgr = new ReadStateManager(pubkey, fakeRelay);
+  mgr.hydrateFromLocalStorage();
+
+  // Verify intent restored with priorForcedEntry.
+  const hydrated = pendingOverrideIntentStore.get(channelId);
+  assert.ok(hydrated, "intent must be hydrated");
+  assert.deepEqual(
+    hydrated.priorForcedEntry,
+    priorForcedEntry,
+    "priorForcedEntry must survive round-trip through v2 blob",
+  );
+
+  // Wire outcome callback to capture the refusal and the priorForcedEntry.
+  const outcomes = [];
+  mgr.onDrainOutcome = (outcome) => outcomes.push(outcome);
+
+  // Complete load — register still at uint32-max → S-bump overflows → refused.
+  await mgr.fetchAndMerge(mgr.loadGeneration);
+  assert.equal(mgr.isLoadComplete, true);
+  await mgr.drainPendingIntents(mgr.loadGeneration);
+
+  // Outcome must carry priorForcedEntry for restart-safe rollback.
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].kind, "genuine-refusal");
+  assert.equal(outcomes[0].op, "unread");
+  assert.deepEqual(
+    outcomes[0].priorForcedEntry,
+    priorForcedEntry,
+    "genuine-refusal outcome must carry priorForcedEntry for restart-safe rollback",
+  );
+
+  mgr.destroy();
 });

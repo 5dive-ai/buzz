@@ -45,7 +45,9 @@ import {
   markChannelUnread as markChannelUnreadImpl,
   markChannelRead as markChannelReadImpl,
   createDrainContext,
+  type DrainOutcome,
 } from "@/features/channels/readState/readStateDrain";
+import type { ForcedUnreadEntry } from "@/features/channels/forcedUnreadStore";
 
 export type { SlotSplitResult, TrimResult };
 export { splitContextsIntoBudgetedSlots, trimContextsToBudget };
@@ -189,15 +191,7 @@ export class ReadStateManager {
   pendingRetryOnComplete = false; // reconnect arrived during loadInFlight
   drainScheduled = false;
   /** Called after each drain intent is settled; wired by the hook for outcome routing. */
-  onDrainOutcome:
-    | ((
-        channelId: string,
-        op: string,
-        status: string,
-        reason?: string,
-        sourceScope?: string,
-      ) => void)
-    | null = null;
+  onDrainOutcome: ((outcome: DrainOutcome) => void) | null = null;
 
   constructor(pubkey: string, relayClient: RelayClient) {
     this.pubkey = pubkey;
@@ -227,6 +221,17 @@ export class ReadStateManager {
     if (this.isLoadComplete && !this.drainScheduled) {
       this.drainScheduled = true;
       void this.drainPendingIntents(gen);
+    } else if (!this.isLoadComplete && this.retryBackoffTimer === null) {
+      // Initial load was incomplete — schedule the first automatic retry with
+      // bounded backoff so pending intents eventually drain without needing an
+      // external reconnect signal.  Treat initialize() as attempt 0 consumed,
+      // so the first timed retry uses the attempt-1 delay (1 s).
+      this.retryAttempt = 1;
+      const delayMs = 1_000; // Math.min(1000 * 2^0, 60000)
+      this.retryBackoffTimer = window.setTimeout(() => {
+        this.retryBackoffTimer = null;
+        if (!this.destroyed) void this.retryLoad();
+      }, delayMs);
     }
     await this.startLiveSubscription();
     if (this.destroyed) return;
@@ -338,13 +343,18 @@ export class ReadStateManager {
 
   /**
    * Retry load: generation-fenced, coalesces in-flight loads.
-   * Implements bounded exponential backoff (1s→2s→4s…capped at 60s).
+   * Always starts immediately (no entry delay).  After an incomplete verdict
+   * this method schedules itself via `retryBackoffTimer` with bounded
+   * exponential backoff (1 s, 2 s, 4 s … 60 s) so pending intents eventually
+   * drain even without an external reconnect signal.
+   *
    * A reconnect during loadInFlight sets pendingRetryOnComplete so the next
    * complete/incomplete verdict triggers exactly one fresh generation rather
    * than dropping the reconnect signal.
    */
   async retryLoad(): Promise<void> {
     if (this.destroyed) return;
+    // Cancel any pending backoff timer — this call supersedes it.
     if (this.retryBackoffTimer !== null) {
       window.clearTimeout(this.retryBackoffTimer);
       this.retryBackoffTimer = null;
@@ -355,36 +365,42 @@ export class ReadStateManager {
       this.pendingRetryOnComplete = true;
       return;
     }
-    const delayMs =
-      this.retryAttempt === 0
-        ? 0
-        : Math.min(1_000 * 2 ** (this.retryAttempt - 1), 60_000);
-    if (delayMs > 0) {
-      await new Promise<void>((resolve) => {
-        this.retryBackoffTimer = window.setTimeout(() => {
-          this.retryBackoffTimer = null;
-          resolve();
-        }, delayMs);
-      });
-    }
-    if (this.destroyed || this.loadInFlight) return;
-    this.retryAttempt++;
     this.loadInFlight = true;
     const gen = ++this.loadGeneration;
     try {
       this.isLoadComplete = false;
       await this.fetchAndMerge(gen);
       if (this.destroyed || gen !== this.loadGeneration) return;
-      if (this.isLoadComplete) this.retryAttempt = 0;
-      if (!this.drainScheduled && this.isLoadComplete) {
-        this.drainScheduled = true;
-        void this.drainPendingIntents(gen);
+      if (this.isLoadComplete) {
+        this.retryAttempt = 0;
+        if (!this.drainScheduled) {
+          this.drainScheduled = true;
+          void this.drainPendingIntents(gen);
+        }
+      } else {
+        // Incomplete verdict — schedule automatic retry with bounded backoff
+        // so pending intents drain eventually even without a reconnect signal.
+        // Backoff: 1 s, 2 s, 4 s, … capped at 60 s.
+        this.retryAttempt++;
+        const nextDelayMs = Math.min(
+          1_000 * 2 ** (this.retryAttempt - 1),
+          60_000,
+        );
+        this.retryBackoffTimer = window.setTimeout(() => {
+          this.retryBackoffTimer = null;
+          if (!this.destroyed) void this.retryLoad();
+        }, nextDelayMs);
       }
     } finally {
       if (gen === this.loadGeneration) {
         this.loadInFlight = false;
         if (this.pendingRetryOnComplete && !this.destroyed) {
           this.pendingRetryOnComplete = false;
+          // Cancel any scheduled backoff timer — reconnect triggers immediate retry.
+          if (this.retryBackoffTimer !== null) {
+            window.clearTimeout(this.retryBackoffTimer);
+            this.retryBackoffTimer = null;
+          }
           void this.retryLoad();
         }
       }
@@ -397,15 +413,27 @@ export class ReadStateManager {
     this.drainScheduled = false;
   }
 
-  markChannelUnread(channelId: string): MarkResult {
-    return markChannelUnreadImpl(createDrainContext(this), channelId);
+  markChannelUnread(
+    channelId: string,
+    priorForcedEntry?: ForcedUnreadEntry,
+  ): MarkResult {
+    return markChannelUnreadImpl(
+      createDrainContext(this),
+      channelId,
+      priorForcedEntry,
+    );
   }
 
-  markChannelRead(channelId: string, sourceScope?: string): MarkResult {
+  markChannelRead(
+    channelId: string,
+    sourceScope?: string,
+    markAt?: number,
+  ): MarkResult {
     return markChannelReadImpl(
       createDrainContext(this),
       channelId,
       sourceScope,
+      markAt,
     );
   }
 

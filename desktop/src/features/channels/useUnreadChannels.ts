@@ -196,7 +196,6 @@ export function useUnreadChannels(
     0,
   );
 
-  // Wire drain outcome callback; returns the pending-unread-snapshots ref.
   const pendingUnreadSnapshotsRef = useDrainOutcomeCallback(
     setOnDrainOutcome,
     forcedUnreadRef,
@@ -260,7 +259,6 @@ export function useUnreadChannels(
         topLevelOnly?: boolean;
       } = {},
     ) => {
-      // Frontier advance first (spec order: advance → C-bump → inspect liveness).
       const observedLatest = topLevelOnly
         ? undefined
         : latestByChannelRef.current.get(channelId);
@@ -274,7 +272,12 @@ export function useUnreadChannels(
       // C-bump; clear local presentation only when liveness is confirmed inactive
       // and the caller has not opted to preserve the forced-unread state.
       if (!preserveForcedUnread) {
-        const outcome = applyOverrideRead(channelId, overrideApis);
+        const outcome = applyOverrideRead(
+          channelId,
+          overrideApis,
+          undefined,
+          markAt ?? undefined,
+        );
         if (outcome === "overrideCleared") {
           if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
             delete forcedUnreadRef.current[channelId];
@@ -311,18 +314,14 @@ export function useUnreadChannels(
     bumpLatestVersion,
   );
 
-  // Mark channel unread: write forced entry first (write ordering), then apply override.
-  // Refused results undo the forced entry. Returns true when accepted (applied or queued).
   // biome-ignore lint/correctness/useExhaustiveDependencies: pendingUnreadSnapshotsRef is a stable ref; .current.set is Map.prototype.set (stable identity)
   const markChannelUnread = React.useCallback(
     (channelId: string, source?: ForcedUnreadSource): boolean => {
-      // Snapshot the prior entry before the optimistic write for drain rollback.
       const priorEntry = Object.hasOwn(forcedUnreadRef.current, channelId)
         ? forcedUnreadRef.current[channelId]
         : undefined;
-      // Write forced entry first (write ordering), then apply override.
       forcedMarkChannelUnread(channelId, source);
-      if (!applyOverrideUnread(channelId, overrideApis)) {
+      if (!applyOverrideUnread(channelId, overrideApis, priorEntry)) {
         // Refused immediately — restore exact prior entry (or remove if none existed).
         if (priorEntry !== undefined)
           forcedUnreadRef.current[channelId] = priorEntry;
@@ -331,7 +330,6 @@ export function useUnreadChannels(
         bumpLatestVersion();
         return false;
       }
-      // Store snapshot; drain will call onDrainOutcome to commit or rollback.
       pendingUnreadSnapshotsRef.current.set(channelId, priorEntry);
       return true;
     },
@@ -834,10 +832,8 @@ export function useUnreadChannels(
       let unreadChannelNotificationCount = 0;
 
       for (const channel of channels) {
-        const isForcedUnread =
-          // Manager liveness is authoritative (isReadStateReady). Use
-          // getOverrideLiveness, not forcedUnreadRef which may be stale.
-          getOverrideLiveness(channel.id)?.active === true;
+        // getOverrideLiveness is authoritative when load is complete; forcedUnreadRef may be stale.
+        const isForcedUnread = getOverrideLiveness(channel.id)?.active === true;
         if (channel.id === activeChannelId && !isForcedUnread) continue;
 
         const observedEvents = observedUnreadEventsByChannelRef.current.get(
@@ -946,7 +942,12 @@ export function useUnreadChannels(
       // observed state. applyOverrideRead returns overrideStillActive on refusal;
       // only overrideCleared triggers deletion. removeChannel is the sole mutator
       // of latestByChannelRef and observedUnreadEventsByChannelRef.
-      const outcome = applyOverrideRead(channelId, overrideApis);
+      const outcome = applyOverrideRead(
+        channelId,
+        overrideApis,
+        undefined,
+        unixSeconds ?? undefined,
+      );
       if (outcome === "overrideCleared") {
         if (Object.hasOwn(forcedUnreadRef.current, channelId)) {
           delete forcedUnreadRef.current[channelId];

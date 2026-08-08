@@ -32,6 +32,8 @@
  *   Old pubkey data is NOT wiped from the v2 blob — the manager owns that.
  */
 
+import type { ForcedUnreadEntry } from "@/features/channels/forcedUnreadStore";
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /** The operation the user intended. */
@@ -40,22 +42,28 @@ export type PendingIntentOp = "unread" | "read";
 /**
  * One pending intent for a channel.
  *
- * `gen`         — monotonically increasing per-channel generation counter.
- *                 Incremented each time a new intent replaces the previous one.
- * `op`          — the user's intended action.
- * `sourceScope` — for `read` intents, the exact source (or undefined = all
- *                 sources) whose removal scope was captured at click time.
- *                 Used by the drain to apply source cleanup idempotently.
- * `readTarget`  — for `read` intents, the frontier value captured at click
- *                 time.  Drain advances the frontier to this value before the
- *                 C-bump so that an incomplete-load read later applies at the
- *                 correct logical position.
+ * `gen`               — monotonically increasing per-channel generation counter.
+ *                       Incremented each time a new intent replaces the previous one.
+ * `op`                — the user's intended action.
+ * `sourceScope`       — for `read` intents, the exact source (or undefined = all
+ *                       sources) whose removal scope was captured at click time.
+ *                       Used by the drain to apply source cleanup idempotently.
+ * `readTarget`        — for `read` intents, the frontier value captured at click
+ *                       time.  Drain advances the frontier to this value before the
+ *                       C-bump so that an incomplete-load read later applies at the
+ *                       correct logical position.
+ * `priorForcedEntry`  — for `unread` intents, the exact forced-unread entry that
+ *                       existed before the optimistic write.  Persisted in the v2
+ *                       blob so a post-restart refusal can restore byte-for-byte
+ *                       rather than deleting the whole multi-source entry.
+ *                       `undefined` means no prior entry existed.
  */
 export type PendingIntent = {
   gen: number;
   op: PendingIntentOp;
   sourceScope?: string;
   readTarget?: number;
+  priorForcedEntry?: ForcedUnreadEntry;
 };
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -100,6 +108,7 @@ export class PendingOverrideIntentStore {
     op: PendingIntentOp,
     sourceScope?: string,
     readTarget?: number,
+    priorForcedEntry?: ForcedUnreadEntry,
   ): PendingIntent {
     const gen = this._nextGen++;
     const intent: PendingIntent = {
@@ -107,6 +116,7 @@ export class PendingOverrideIntentStore {
       op,
       ...(sourceScope !== undefined ? { sourceScope } : {}),
       ...(readTarget !== undefined ? { readTarget } : {}),
+      ...(priorForcedEntry !== undefined ? { priorForcedEntry } : {}),
     };
     this.intents.set(channelId, intent);
     return intent;

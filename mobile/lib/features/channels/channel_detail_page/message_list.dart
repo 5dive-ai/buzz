@@ -574,7 +574,7 @@ class _JumpToLatestButton extends StatelessWidget {
       child: ClipRRect(
         borderRadius: borderRadius,
         child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+          filter: ui.ImageFilter.blur(sigmaX: 20, sigmaY: 20),
           child: Container(
             key: const ValueKey('channel-jump-to-latest-surface'),
             decoration: BoxDecoration(

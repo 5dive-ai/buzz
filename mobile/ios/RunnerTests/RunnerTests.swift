@@ -7,6 +7,289 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  @available(iOS 16.0, *)
+  @MainActor
+  func testNativeMessageActionsUseTheComposedNativeSurfaceLayout() throws {
+    let definitions = try [
+      makeNativeMessageAction(
+        id: "reply",
+        title: "Reply",
+        symbol: "arrowshape.turn.up.left",
+        group: "promoted"
+      ),
+      makeNativeMessageAction(
+        id: "copyLink",
+        title: "Copy link",
+        symbol: "link",
+        group: "promoted"
+      ),
+      makeNativeMessageAction(
+        id: "remindMe",
+        title: "Remind me",
+        symbol: "bell",
+        group: "promoted"
+      ),
+      makeNativeMessageAction(
+        id: "markUnread",
+        title: "Mark unread",
+        symbol: "envelope.badge",
+        group: "triage"
+      ),
+      makeNativeMessageAction(
+        id: "copyText",
+        title: "Copy text",
+        symbol: "doc.on.doc",
+        group: "export"
+      ),
+      makeNativeMessageAction(
+        id: "edit",
+        title: "Edit message",
+        symbol: "pencil",
+        group: "manage"
+      ),
+      makeNativeMessageAction(
+        id: "delete",
+        title: "Delete message",
+        symbol: "trash",
+        group: "manage",
+        destructive: true
+      ),
+    ]
+
+    XCTAssertEqual(
+      NativeMessageActionSurfaceLayout.preferredHeight(actions: definitions),
+      281.5
+    )
+    XCTAssertEqual(NativeMessageActionSurfaceLayout.surfaceWidth, 288)
+    XCTAssertEqual(
+      NativeMessageActionSurfaceLayout.populatedGroups(actions: definitions),
+      [.promoted, .triage, .export, .manage]
+    )
+    XCTAssertEqual(
+      NativeMessageActionSurfaceLayout.separatorCount(actions: definitions),
+      3
+    )
+    XCTAssertEqual(definitions.first?.group, .promoted)
+    XCTAssertTrue(definitions.last?.isDestructive == true)
+  }
+
+  func testNativeMessageActionSurfaceUsesDynamicSystemTypographyAndSymbols() {
+    XCTAssertEqual(
+      NativeMessageActionSurfaceStyle.promotedTextStyle,
+      .footnote
+    )
+    XCTAssertEqual(NativeMessageActionSurfaceStyle.rowTextStyle, .body)
+    XCTAssertEqual(
+      NativeMessageActionSurfaceStyle.promotedFont.fontDescriptor.object(
+        forKey: .textStyle
+      ) as? String,
+      UIFont.TextStyle.footnote.rawValue
+    )
+    XCTAssertEqual(
+      NativeMessageActionSurfaceStyle.rowFont.fontDescriptor.object(
+        forKey: .textStyle
+      ) as? String,
+      UIFont.TextStyle.body.rawValue
+    )
+    XCTAssertNil(NativeMessageActionSurfaceStyle.defaultSymbolConfiguration)
+  }
+
+  @available(iOS 16.0, *)
+  @MainActor
+  func testNativeMessageActionRowsShareIconAndTextColumns() throws {
+    let definitions = try [
+      makeNativeMessageAction(
+        id: "markUnread",
+        title: "Mark unread",
+        symbol: "envelope.badge",
+        group: "triage"
+      ),
+      makeNativeMessageAction(
+        id: "followThread",
+        title: "Follow thread",
+        symbol: "bell",
+        group: "triage"
+      ),
+      makeNativeMessageAction(
+        id: "copyText",
+        title: "Copy text",
+        symbol: "doc.on.doc",
+        group: "export"
+      ),
+    ]
+    let rows = definitions.map {
+      NativeMessageActionRowControl(definition: $0, onSelected: {})
+    }
+
+    for row in rows {
+      row.frame = CGRect(
+        x: 0,
+        y: 0,
+        width: NativeMessageActionSurfaceLayout.surfaceWidth,
+        height: NativeMessageActionSurfaceLayout.rowHeight
+      )
+      row.layoutIfNeeded()
+    }
+
+    let iconAlignmentCenters = rows.map {
+      let frame = $0.actionImageView.convert($0.actionImageView.bounds, to: $0)
+      return frame.inset(by: $0.actionImageView.alignmentRectInsets).midX
+    }
+    let textLeadingEdges = rows.map {
+      $0.actionTitleLabel.convert($0.actionTitleLabel.bounds, to: $0).minX
+    }
+    let expectedIconCenter =
+      NativeMessageActionSurfaceLayout.rowHorizontalInset
+      + (NativeMessageActionSurfaceLayout.rowIconColumnWidth / 2)
+    let expectedTextLeading =
+      NativeMessageActionSurfaceLayout.rowHorizontalInset
+      + NativeMessageActionSurfaceLayout.rowIconColumnWidth
+      + NativeMessageActionSurfaceLayout.rowIconToTextSpacing
+
+    for iconCenter in iconAlignmentCenters {
+      XCTAssertEqual(iconCenter, expectedIconCenter, accuracy: 0.01)
+    }
+    for textLeadingEdge in textLeadingEdges {
+      XCTAssertEqual(textLeadingEdge, expectedTextLeading, accuracy: 0.01)
+    }
+    XCTAssertTrue(
+      rows.allSatisfy {
+        $0.actionTitleLabel.adjustsFontForContentSizeCategory
+      })
+  }
+
+  @available(iOS 16.0, *)
+  @MainActor
+  func testNativeMessageActionSeparatorsShareGeometry() {
+    let separators = [
+      NativeMessageActionSeparatorView(),
+      NativeMessageActionSeparatorView(),
+      NativeMessageActionSeparatorView(),
+    ]
+
+    for separator in separators {
+      separator.frame = CGRect(
+        x: 0,
+        y: 0,
+        width: NativeMessageActionSurfaceLayout.surfaceWidth,
+        height: NativeMessageActionSurfaceLayout.separatorHeight
+      )
+      separator.layoutIfNeeded()
+    }
+
+    let lineFrames = separators.map { $0.lineView.frame }
+    XCTAssertTrue(lineFrames.dropFirst().allSatisfy { $0 == lineFrames.first })
+    XCTAssertEqual(
+      lineFrames.first?.minX,
+      NativeMessageActionSurfaceLayout.separatorHorizontalInset
+    )
+    XCTAssertEqual(
+      lineFrames.first?.width,
+      NativeMessageActionSurfaceLayout.surfaceWidth
+        - (NativeMessageActionSurfaceLayout.separatorHorizontalInset * 2)
+    )
+    XCTAssertEqual(
+      lineFrames.first?.height,
+      NativeMessageActionSurfaceLayout.separatorHeight
+    )
+  }
+
+  @available(iOS 16.0, *)
+  @MainActor
+  func testPromotedActionsStayInsideTheDividerBoundsAndShareWidth() throws {
+    let definitions = try [
+      makeNativeMessageAction(
+        id: "reply",
+        title: "Reply",
+        symbol: "arrowshape.turn.up.left",
+        group: "promoted"
+      ),
+      makeNativeMessageAction(
+        id: "copyLink",
+        title: "Copy link",
+        symbol: "link",
+        group: "promoted"
+      ),
+      makeNativeMessageAction(
+        id: "remindMe",
+        title: "Remind me",
+        symbol: "bell",
+        group: "promoted"
+      ),
+    ]
+    let row = NativeMessageActionPromotedRow(
+      actions: definitions,
+      onSelected: { _ in }
+    )
+    row.frame = CGRect(
+      x: 0,
+      y: 0,
+      width: NativeMessageActionSurfaceLayout.surfaceWidth,
+      height: NativeMessageActionSurfaceLayout.promotedHeight
+    )
+    row.layoutIfNeeded()
+
+    let buttonFrames = row.buttons.map { button in
+      button.convert(button.bounds, to: row)
+    }
+    let firstFrame = try XCTUnwrap(buttonFrames.first)
+    let lastFrame = try XCTUnwrap(buttonFrames.last)
+    let expectedWidth =
+      (NativeMessageActionSurfaceLayout.surfaceWidth
+        - (NativeMessageActionSurfaceLayout.promotedHorizontalInset * 2))
+      / CGFloat(definitions.count)
+
+    XCTAssertEqual(
+      firstFrame.minX,
+      NativeMessageActionSurfaceLayout.separatorHorizontalInset,
+      accuracy: 0.01
+    )
+    XCTAssertEqual(
+      lastFrame.maxX,
+      NativeMessageActionSurfaceLayout.surfaceWidth
+        - NativeMessageActionSurfaceLayout.separatorHorizontalInset,
+      accuracy: 0.01
+    )
+    for frame in buttonFrames {
+      XCTAssertEqual(frame.width, expectedWidth, accuracy: 0.01)
+    }
+    let remindMeLabel = try XCTUnwrap(row.buttons.last?.titleLabel)
+    let remindMeInsets = try XCTUnwrap(row.buttons.last?.configuration).contentInsets
+    XCTAssertLessThanOrEqual(
+      remindMeLabel.intrinsicContentSize.width
+        + remindMeInsets.leading
+        + remindMeInsets.trailing,
+      lastFrame.width
+    )
+    for index in 0..<(buttonFrames.count - 1) {
+      XCTAssertEqual(
+        buttonFrames[index].maxX,
+        buttonFrames[index + 1].minX,
+        accuracy: 0.01
+      )
+    }
+  }
+
+  private func makeNativeMessageAction(
+    id: String,
+    title: String,
+    symbol: String,
+    group: String,
+    destructive: Bool = false
+  ) throws -> NativeMessageActionDefinition {
+    try XCTUnwrap(
+      NativeMessageActionDefinition(
+        arguments: [
+          "id": id,
+          "title": title,
+          "symbol": symbol,
+          "group": group,
+          "destructive": destructive,
+        ]
+      )
+    )
+  }
+
   func testRelativeTrackInsertionTimesPreserveAudioDelay() {
     let times = AppDelegate.relativeTrackInsertionTimes(
       videoStart: CMTime(seconds: 1, preferredTimescale: 600),

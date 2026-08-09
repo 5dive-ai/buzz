@@ -37,6 +37,9 @@ import 'package:buzz/shared/widgets/skeleton.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 const _channelId = 'test-channel';
+const _nativeMessageActionSurfaceChannel = MethodChannel(
+  'buzz/native_message_action_surface',
+);
 
 /// Shared mock prefs for providers that read [savedPrefsProvider]
 /// (e.g. the compose bar's draft store). Initialized in [main].
@@ -183,6 +186,7 @@ Widget _buildTestable({
   Map<String, Future<List<NostrEvent>>> pendingThreadReplies = const {},
   TextScaler textScaler = TextScaler.noScaling,
   bool disableAnimations = false,
+  TargetPlatform platform = TargetPlatform.android,
   RelaySessionNotifier? relaySessionNotifier,
 }) {
   final resolvedChannel = channel ?? _testChannel;
@@ -241,7 +245,7 @@ Widget _buildTestable({
       savedPrefsProvider.overrideWithValue(_testPrefs),
     ],
     child: MaterialApp(
-      theme: AppTheme.light(),
+      theme: AppTheme.light().copyWith(platform: platform),
       builder: (context, child) => MediaQuery(
         data: MediaQuery.of(context).copyWith(
           textScaler: textScaler,
@@ -1085,6 +1089,367 @@ void main() {
       expect(hapticCalls, hasLength(1));
       expect(hapticCalls.single.arguments, 'HapticFeedbackType.mediumImpact');
     });
+
+    testWidgets(
+      'iOS reaction-only messages use the lifted preview without actions',
+      (tester) async {
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [
+              _systemMsg(
+                id: 'ios-reaction-only-target',
+                payload: {
+                  'type': 'member_joined',
+                  'actor': 'alice',
+                  'target': 'alice',
+                },
+              ),
+            ],
+            users: const {
+              'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            },
+            platform: TargetPlatform.iOS,
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.longPress(
+          find.byKey(
+            const ValueKey('system-message-row-ios-reaction-only-target'),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(const ValueKey('reaction-popover-tray')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('message-action-preview-container')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('ios-native-message-action-surface')),
+          findsNothing,
+        );
+        expect(
+          tester
+              .widget<Opacity>(
+                find.byKey(
+                  const ValueKey(
+                    'system-message-native-source-ios-reaction-only-target',
+                  ),
+                ),
+              )
+              .opacity,
+          0,
+        );
+
+        Navigator.of(
+          tester.element(
+            find.byKey(const ValueKey('message-action-preview-container')),
+          ),
+        ).pop();
+        await tester.pumpAndSettle();
+        expect(
+          tester
+              .widget<Opacity>(
+                find.byKey(
+                  const ValueKey(
+                    'system-message-native-source-ios-reaction-only-target',
+                  ),
+                ),
+              )
+              .opacity,
+          1,
+        );
+      },
+    );
+
+    testWidgets('iOS composes its tray, lifted message, and native actions', (
+      tester,
+    ) async {
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        _nativeMessageActionSurfaceChannel,
+        (call) async => call.method == 'isSupported' ? true : null,
+      );
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          _nativeMessageActionSurfaceChannel,
+          null,
+        ),
+      );
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [
+            _textMsg(
+              id: 'native-context-target',
+              pubkey: 'alice',
+              content: 'Native context menu',
+              createdAt: 1000,
+            ),
+          ],
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+          platform: TargetPlatform.iOS,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final row = find.byKey(
+        const ValueKey('message-row-native-context-target'),
+      );
+      await tester.longPress(row);
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const ValueKey('reaction-popover-tray')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('message-action-preview-container')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('ios-native-message-action-surface')),
+        findsOneWidget,
+      );
+      expect(
+        tester
+            .widget<Opacity>(
+              find.byKey(
+                const ValueKey('message-native-source-native-context-target'),
+              ),
+            )
+            .opacity,
+        0,
+      );
+
+      Navigator.of(
+        tester.element(
+          find.byKey(const ValueKey('ios-native-message-action-surface')),
+        ),
+      ).pop();
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<Opacity>(
+              find.byKey(
+                const ValueKey('message-native-source-native-context-target'),
+              ),
+            )
+            .opacity,
+        1,
+      );
+    });
+
+    testWidgets('message snapshot matches a message without reactions', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [
+            _textMsg(
+              id: 'bare-snapshot-target',
+              pubkey: 'alice',
+              content: 'Message without reactions',
+            ),
+          ],
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+          platform: TargetPlatform.iOS,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final rowRect = tester.getRect(
+        find.byKey(const ValueKey('message-row-bare-snapshot-target')),
+      );
+      final snapshotRect = tester.getRect(
+        find.byKey(
+          const ValueKey('message-action-snapshot-bare-snapshot-target'),
+        ),
+      );
+
+      expect(snapshotRect, rowRect);
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('message-row-bare-snapshot-target')),
+          matching: find.byType(ReactionRow),
+        ),
+        findsNothing,
+      );
+    });
+
+    testWidgets('iOS lifted snapshot excludes attached reactions', (
+      tester,
+    ) async {
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        _nativeMessageActionSurfaceChannel,
+        (call) async => call.method == 'isSupported' ? true : null,
+      );
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          _nativeMessageActionSurfaceChannel,
+          null,
+        ),
+      );
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [
+            _textMsg(
+              id: 'reacted-snapshot-target',
+              pubkey: 'alice',
+              content: 'Message with an attached reaction',
+            ),
+            _reaction(
+              id: 'attached-reaction',
+              targetId: 'reacted-snapshot-target',
+            ),
+          ],
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+          platform: TargetPlatform.iOS,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final row = find.byKey(
+        const ValueKey('message-row-reacted-snapshot-target'),
+      );
+      final snapshot = find.byKey(
+        const ValueKey('message-action-snapshot-reacted-snapshot-target'),
+      );
+      final attachedReactions = find.descendant(
+        of: row,
+        matching: find.byType(ReactionRow),
+      );
+      final rowRect = tester.getRect(row);
+      final snapshotRect = tester.getRect(snapshot);
+      final reactionRect = tester.getRect(attachedReactions);
+
+      expect(snapshotRect.bottom, lessThanOrEqualTo(reactionRect.top));
+      expect(rowRect.height, greaterThan(snapshotRect.height));
+
+      await tester.longPress(row);
+      await tester.pumpAndSettle();
+
+      final rawPreview = tester.widget<RawImage>(
+        find.descendant(
+          of: find.byKey(const ValueKey('message-action-preview-container')),
+          matching: find.byType(RawImage),
+        ),
+      );
+      expect(
+        rawPreview.image?.width,
+        (snapshotRect.width * tester.view.devicePixelRatio).round(),
+      );
+      expect(
+        rawPreview.image?.height,
+        (snapshotRect.height * tester.view.devicePixelRatio).round(),
+      );
+      expect(
+        find.byKey(const ValueKey('reaction-popover-tray')),
+        findsOneWidget,
+      );
+
+      Navigator.of(
+        tester.element(
+          find.byKey(const ValueKey('ios-native-message-action-surface')),
+        ),
+      ).pop();
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets(
+      'iOS long press survives a pending support check and reliably reopens',
+      (tester) async {
+        final firstSupport = Completer<bool>();
+        var supportRequests = 0;
+        tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          _nativeMessageActionSurfaceChannel,
+          (call) async {
+            if (call.method != 'isSupported') return null;
+            supportRequests += 1;
+            if (supportRequests == 1) return firstSupport.future;
+            return true;
+          },
+        );
+        addTearDown(
+          () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+            _nativeMessageActionSurfaceChannel,
+            null,
+          ),
+        );
+        final userCache = _FakeUserCacheNotifier({
+          'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
+        });
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [
+              _textMsg(
+                id: 'native-rebuild-target',
+                pubkey: 'alice',
+                content: 'Reliable native context menu',
+                createdAt: 1000,
+              ),
+            ],
+            userCacheNotifier: userCache,
+            platform: TargetPlatform.iOS,
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final row = find.byKey(
+          const ValueKey('message-row-native-rebuild-target'),
+        );
+        final firstGesture = await tester.startGesture(tester.getCenter(row));
+        await tester.pump(const Duration(milliseconds: 600));
+        expect(supportRequests, 1);
+        await firstGesture.up();
+
+        userCache.replace(
+          const UserProfile(pubkey: 'alice', displayName: 'Alice Updated'),
+        );
+        await tester.pump();
+        firstSupport.complete(true);
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(const ValueKey('ios-native-message-action-surface')),
+          findsOneWidget,
+        );
+        expect(find.byType(BottomSheet), findsNothing);
+
+        for (var attempt = 0; attempt < 3; attempt++) {
+          Navigator.of(
+            tester.element(
+              find.byKey(const ValueKey('ios-native-message-action-surface')),
+            ),
+          ).pop();
+          await tester.pumpAndSettle();
+
+          await tester.longPress(row);
+          await tester.pumpAndSettle();
+          expect(
+            find.byKey(const ValueKey('ios-native-message-action-surface')),
+            findsOneWidget,
+          );
+          expect(find.byType(BottomSheet), findsNothing);
+        }
+
+        Navigator.of(
+          tester.element(
+            find.byKey(const ValueKey('ios-native-message-action-surface')),
+          ),
+        ).pop();
+        await tester.pumpAndSettle();
+        expect(supportRequests, 4);
+      },
+    );
 
     testWidgets('reaction popover leaves existing reactions in the blur', (
       tester,

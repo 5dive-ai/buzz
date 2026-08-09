@@ -1,8 +1,4 @@
-import 'dart:async';
-
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_hooks/flutter_hooks.dart';
 
 /// An [InkWell] whose long press is observed above interactive descendants.
 class MessageLongPressInkWell extends StatelessWidget {
@@ -35,12 +31,12 @@ class MessageLongPressInkWell extends StatelessWidget {
   }
 }
 
-/// Detects a message long press without competing with interactive descendants.
+/// Detects a message long press through Flutter's gesture arena.
 ///
 /// Links, media, reactions, and other nested controls keep their normal tap
-/// gestures. Moving far enough to scroll cancels the timer; recognizing the
-/// hold cancels the pointer so a descendant tap cannot fire on release.
-class _MessageLongPressRegion extends HookWidget {
+/// gestures. A drag lets the surrounding scrollable win, while a completed
+/// hold rejects descendant taps without manually cancelling the pointer.
+class _MessageLongPressRegion extends StatelessWidget {
   final ValueChanged<Rect> onLongPress;
   final Widget child;
 
@@ -51,60 +47,17 @@ class _MessageLongPressRegion extends HookWidget {
 
   @override
   Widget build(BuildContext context) {
-    final activePointer = useRef<int?>(null);
-    final origin = useRef<Offset?>(null);
-    final timer = useRef<Timer?>(null);
-
-    void cancel() {
-      timer.value?.cancel();
-      timer.value = null;
-      activePointer.value = null;
-      origin.value = null;
-    }
-
-    useEffect(() => cancel, const []);
-
     void recognize() {
       final renderObject = context.findRenderObject();
       if (renderObject is! RenderBox || !renderObject.hasSize) return;
       onLongPress(renderObject.localToGlobal(Offset.zero) & renderObject.size);
     }
 
-    void handlePointerDown(PointerDownEvent event) {
-      if (activePointer.value != null) return;
-      activePointer.value = event.pointer;
-      origin.value = event.position;
-      timer.value = Timer(kLongPressTimeout, () {
-        final pointer = activePointer.value;
-        if (pointer == null) return;
-        timer.value = null;
-        activePointer.value = null;
-        origin.value = null;
-        GestureBinding.instance.cancelPointer(pointer);
-        recognize();
-      });
-    }
-
-    void handlePointerMove(PointerMoveEvent event) {
-      if (event.pointer != activePointer.value) return;
-      final start = origin.value;
-      if (start == null) return;
-      final delta = event.position - start;
-      if (delta.distanceSquared > kTouchSlop * kTouchSlop) cancel();
-    }
-
-    void handlePointerEnd(PointerEvent event) {
-      if (event.pointer == activePointer.value) cancel();
-    }
-
     return Semantics(
       onLongPress: recognize,
-      child: Listener(
+      child: GestureDetector(
         behavior: HitTestBehavior.translucent,
-        onPointerDown: handlePointerDown,
-        onPointerMove: handlePointerMove,
-        onPointerUp: handlePointerEnd,
-        onPointerCancel: handlePointerEnd,
+        onLongPressStart: (_) => recognize(),
         child: child,
       ),
     );

@@ -21,9 +21,28 @@ class _SystemMessageRow extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final spotlightKey = useMemoized(() => GlobalKey());
+    final actionSnapshotKey = useMemoized(GlobalKey.new, const []);
+    final actionSnapshotPixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final popoverPresented = useState(false);
     final systemEvent = message.systemEvent;
     if (systemEvent == null) return const SizedBox.shrink();
+
+    Future<ui.Image> captureActionSnapshot() async {
+      await WidgetsBinding.instance.endOfFrame;
+      final renderObject = actionSnapshotKey.currentContext?.findRenderObject();
+      if (renderObject is! RenderRepaintBoundary) {
+        throw StateError('System message snapshot is unavailable');
+      }
+      return renderObject.toImage(pixelRatio: actionSnapshotPixelRatio);
+    }
+
+    Rect? actionSnapshotRect() {
+      final renderObject = actionSnapshotKey.currentContext?.findRenderObject();
+      if (renderObject is! RenderRepaintBoundary || !renderObject.hasSize) {
+        return null;
+      }
+      return renderObject.localToGlobal(Offset.zero) & renderObject.size;
+    }
 
     final userCache = ref.watch(userCacheProvider);
     final sourceMessages = groupedMessages ?? [message];
@@ -79,13 +98,7 @@ class _SystemMessageRow extends HookConsumerWidget {
     }
 
     void openReactionPopover(Rect anchorRect) {
-      final spotlightRenderObject = spotlightKey.currentContext
-          ?.findRenderObject();
-      final spotlightRect =
-          spotlightRenderObject is RenderBox && spotlightRenderObject.hasSize
-          ? spotlightRenderObject.localToGlobal(Offset.zero) &
-                spotlightRenderObject.size
-          : anchorRect;
+      final spotlightRect = actionSnapshotRect() ?? anchorRect;
       showMessageActions(
         context: context,
         ref: ref,
@@ -97,12 +110,15 @@ class _SystemMessageRow extends HookConsumerWidget {
         isMember: isMember,
         isArchived: isArchived,
         anchorRect: spotlightRect,
+        captureAnchorSnapshot: captureActionSnapshot,
         popoverSpotlightPadding: EdgeInsets.fromLTRB(
           Grid.xxs,
           Grid.xxs,
           Grid.xxs,
           reactions.isEmpty ? Grid.xxs : Grid.quarter,
         ),
+        onPopoverPresented: () => popoverPresented.value = true,
+        onPopoverDismissed: () => popoverPresented.value = false,
       );
     }
 
@@ -110,78 +126,82 @@ class _SystemMessageRow extends HookConsumerWidget {
       color: Colors.transparent,
       borderRadius: BorderRadius.circular(Radii.md),
       clipBehavior: Clip.antiAlias,
-      child: MessageLongPressInkWell(
-        key: ValueKey('system-message-row-${message.id}'),
-        onLongPress: openReactionPopover,
-        borderRadius: BorderRadius.circular(Radii.md),
-        highlightColor: context.colors.primary.withValues(alpha: 0.1),
-        child: Padding(
-          padding: EdgeInsets.only(
-            top: usesMessageStyleLayout ? Grid.xs : Grid.xxs,
-            bottom: usesMessageStyleLayout ? 0 : Grid.xxs,
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              KeyedSubtree(
-                key: spotlightKey,
-                child: groupedMembership != null
-                    ? _MembershipSystemMessageContent(
-                        event: groupedMembership,
-                        createdAt: message.createdAt,
-                        resolveLabel: resolveLabel,
-                        userCache: userCache,
-                      )
-                    : messageStyleActor != null &&
-                          messageStyleActor.isNotEmpty &&
-                          messageStyleAction != null
-                    ? _MessageStyleSystemMessageContent(
-                        displayPubkey: messageStyleActor,
-                        createdAt: message.createdAt,
-                        resolveLabel: resolveLabel,
-                        userCache: userCache,
-                        actionSpans: [TextSpan(text: messageStyleAction)],
-                      )
-                    : Row(
-                        children: [
-                          _systemEventAvatar(context, systemEvent, userCache),
-                          const SizedBox(width: Grid.xxs),
-                          Expanded(
-                            child: Text(
-                              systemEvent.describe(resolveLabel),
-                              style: systemMessageBodyTextStyle.copyWith(
-                                color: context.colors.onSurfaceVariant,
+      child: Opacity(
+        key: ValueKey('system-message-native-source-${message.id}'),
+        opacity: popoverPresented.value ? 0 : 1,
+        child: MessageLongPressInkWell(
+          key: ValueKey('system-message-row-${message.id}'),
+          onLongPress: openReactionPopover,
+          borderRadius: BorderRadius.circular(Radii.md),
+          highlightColor: context.colors.primary.withValues(alpha: 0.1),
+          child: Padding(
+            padding: EdgeInsets.only(
+              top: usesMessageStyleLayout ? Grid.xs : Grid.xxs,
+              bottom: usesMessageStyleLayout ? 0 : Grid.xxs,
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                RepaintBoundary(
+                  key: actionSnapshotKey,
+                  child: groupedMembership != null
+                      ? _MembershipSystemMessageContent(
+                          event: groupedMembership,
+                          createdAt: message.createdAt,
+                          resolveLabel: resolveLabel,
+                          userCache: userCache,
+                        )
+                      : messageStyleActor != null &&
+                            messageStyleActor.isNotEmpty &&
+                            messageStyleAction != null
+                      ? _MessageStyleSystemMessageContent(
+                          displayPubkey: messageStyleActor,
+                          createdAt: message.createdAt,
+                          resolveLabel: resolveLabel,
+                          userCache: userCache,
+                          actionSpans: [TextSpan(text: messageStyleAction)],
+                        )
+                      : Row(
+                          children: [
+                            _systemEventAvatar(context, systemEvent, userCache),
+                            const SizedBox(width: Grid.xxs),
+                            Expanded(
+                              child: Text(
+                                systemEvent.describe(resolveLabel),
+                                style: systemMessageBodyTextStyle.copyWith(
+                                  color: context.colors.onSurfaceVariant,
+                                ),
                               ),
                             ),
-                          ),
-                          _messageTimestamp(
-                            context,
-                            message.createdAt,
-                            key: ValueKey(
-                              'system-message-timestamp-${message.id}',
+                            _messageTimestamp(
+                              context,
+                              message.createdAt,
+                              key: ValueKey(
+                                'system-message-timestamp-${message.id}',
+                              ),
                             ),
-                          ),
-                        ],
-                      ),
-              ),
-              if (reactions.isNotEmpty)
-                Padding(
-                  padding: EdgeInsets.only(
-                    left:
-                        (usesMessageStyleLayout ? messageAvatarSize : 36) +
-                        (usesMessageStyleLayout
-                            ? messageAvatarContentGap
-                            : Grid.xxs),
-                  ),
-                  child: ReactionRow(
-                    messageId: message.id,
-                    reactions: reactions,
-                    onToggle: groupedMessages == null
-                        ? (emoji) => toggleReaction(ref, message, emoji)
-                        : toggleGroupedReaction,
-                  ),
+                          ],
+                        ),
                 ),
-            ],
+                if (reactions.isNotEmpty)
+                  Padding(
+                    padding: EdgeInsets.only(
+                      left:
+                          (usesMessageStyleLayout ? messageAvatarSize : 36) +
+                          (usesMessageStyleLayout
+                              ? messageAvatarContentGap
+                              : Grid.xxs),
+                    ),
+                    child: ReactionRow(
+                      messageId: message.id,
+                      reactions: reactions,
+                      onToggle: groupedMessages == null
+                          ? (emoji) => toggleReaction(ref, message, emoji)
+                          : toggleGroupedReaction,
+                    ),
+                  ),
+              ],
+            ),
           ),
         ),
       ),

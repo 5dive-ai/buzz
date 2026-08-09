@@ -1,12 +1,13 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:ui';
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:path_provider/path_provider.dart';
@@ -37,6 +38,9 @@ import 'thread_follows/thread_follows_provider.dart';
 import 'timeline_message.dart';
 
 part 'message_actions/reaction_popover.dart';
+part 'message_actions/ios_native_message_actions.dart';
+part 'message_actions/ios_message_actions_popover.dart';
+part 'message_actions/message_actions_sheet.dart';
 
 /// Preview length for reminder targets — matches desktop's
 /// `msg.body.slice(0, 100)`.
@@ -53,10 +57,38 @@ void showMessageActions({
   bool isMember = false,
   bool isArchived = false,
   Rect? anchorRect,
+  Future<ui.Image> Function()? captureAnchorSnapshot,
   EdgeInsets popoverSpotlightPadding = const EdgeInsets.all(Grid.xxs),
+  VoidCallback? onPopoverPresented,
+  VoidCallback? onPopoverDismissed,
 }) {
   final hasReactionOnlyActions = message.isSystem && !canManageMessage;
   if (anchorRect != null && hasReactionOnlyActions) {
+    if (Theme.of(context).platform == TargetPlatform.iOS &&
+        captureAnchorSnapshot != null) {
+      unawaited(
+        _showIosReactionOnlyPopover(
+          context: context,
+          ref: ref,
+          message: message,
+          anchorRect: anchorRect,
+          captureAnchorSnapshot: captureAnchorSnapshot,
+          spotlightPadding: popoverSpotlightPadding,
+          onPopoverPresented: onPopoverPresented,
+          onPopoverDismissed: onPopoverDismissed,
+        ).then((shown) {
+          if (shown || !context.mounted) return;
+          _showMessageReactionPopover(
+            context: context,
+            ref: ref,
+            message: message,
+            anchorRect: anchorRect,
+            spotlightPadding: popoverSpotlightPadding,
+          );
+        }),
+      );
+      return;
+    }
     _showMessageReactionPopover(
       context: context,
       ref: ref,
@@ -67,109 +99,53 @@ void showMessageActions({
     return;
   }
 
-  showBuzzModalBottomSheet<void>(
+  if (anchorRect != null &&
+      Theme.of(context).platform == TargetPlatform.iOS &&
+      captureAnchorSnapshot != null) {
+    unawaited(
+      _showIosMessageActionsPopover(
+        context: context,
+        ref: ref,
+        message: message,
+        channelId: channelId,
+        canManageMessage: canManageMessage,
+        allMessages: allMessages,
+        currentPubkey: currentPubkey,
+        isMember: isMember,
+        isArchived: isArchived,
+        anchorRect: anchorRect,
+        captureAnchorSnapshot: captureAnchorSnapshot,
+        spotlightPadding: popoverSpotlightPadding,
+        onPopoverPresented: onPopoverPresented,
+        onPopoverDismissed: onPopoverDismissed,
+      ).then((shown) {
+        if (shown || !context.mounted) return;
+        _showMessageActionsSheet(
+          context: context,
+          ref: ref,
+          message: message,
+          channelId: channelId,
+          canManageMessage: canManageMessage,
+          allMessages: allMessages,
+          currentPubkey: currentPubkey,
+          isMember: isMember,
+          isArchived: isArchived,
+        );
+      }),
+    );
+    return;
+  }
+
+  _showMessageActionsSheet(
     context: context,
-    isScrollControlled: true,
-    showDragHandle: true,
-    showCloseButton: false,
-    builder: (sheetContext) => SafeArea(
-      child: IconTheme.merge(
-        data: const IconThemeData(size: 22),
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.7,
-          ),
-          child: SingleChildScrollView(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(
-                Grid.gutter,
-                0,
-                Grid.gutter,
-                Grid.xs,
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _QuickReactionRow(
-                    message: message,
-                    sheetContext: sheetContext,
-                    pageContext: context,
-                    pageRef: ref,
-                  ),
-                  const SizedBox(height: Grid.xs),
-                  if (!message.isSystem) ...[
-                    // Fast actions: respond now, hand off context, defer.
-                    _FastActionsRow(
-                      message: message,
-                      channelId: channelId,
-                      allMessages: allMessages,
-                      currentPubkey: currentPubkey,
-                      isMember: isMember,
-                      isArchived: isArchived,
-                      pageContext: context,
-                    ),
-                    const SizedBox(height: Grid.xs),
-                    // Triage: come back to this message later.
-                    _MarkReadUnreadTile(message: message, channelId: channelId),
-                    _FollowThreadTile(message: message),
-                    const SheetDivider(),
-                    // Export: take the content out of the conversation.
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      leading: const Icon(LucideIcons.copy),
-                      title: const Text('Copy text'),
-                      onTap: () {
-                        Navigator.of(sheetContext).pop();
-                        // Copy to clipboard
-                        final data = ClipboardData(text: message.content);
-                        Clipboard.setData(data);
-                      },
-                    ),
-                  ],
-                  if (canManageMessage) ...[
-                    if (!message.isSystem) const SheetDivider(),
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      leading: const Icon(LucideIcons.pencil),
-                      title: const Text('Edit message'),
-                      onTap: () {
-                        Navigator.of(sheetContext).pop();
-                        _showEditSheet(
-                          context: context,
-                          ref: ref,
-                          message: message,
-                          channelId: channelId,
-                        );
-                      },
-                    ),
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      leading: Icon(
-                        LucideIcons.trash2,
-                        color: sheetContext.colors.error,
-                      ),
-                      title: Text(
-                        'Delete message',
-                        style: TextStyle(color: sheetContext.colors.error),
-                      ),
-                      onTap: () {
-                        Navigator.of(sheetContext).pop();
-                        _confirmDelete(
-                          context: context,
-                          ref: ref,
-                          channelId: channelId,
-                          messageId: message.id,
-                        );
-                      },
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    ),
+    ref: ref,
+    message: message,
+    channelId: channelId,
+    canManageMessage: canManageMessage,
+    allMessages: allMessages,
+    currentPubkey: currentPubkey,
+    isMember: isMember,
+    isArchived: isArchived,
   );
 }
 
@@ -644,6 +620,11 @@ class _FastActionTile extends StatelessWidget {
 /// The emoji shown are the user's own frequently-used set (desktop's
 /// `useQuickReactionEmojis` behaviour), topped up with [defaultQuickEmojis] so
 /// the row is full on a fresh install.
+const _quickReactionEmojiLimit = 5;
+const _quickReactionDesiredTargetSize = 52.0;
+const _quickReactionMinimumTargetSize = 44.0;
+const _quickReactionGlyphSize = 28.0;
+
 class _QuickReactionRow extends ConsumerWidget {
   final TimelineMessage message;
 
@@ -672,22 +653,26 @@ class _QuickReactionRow extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final usesPopoverTreatment = presentationAnimation != null;
     final customEmoji = ref.watch(customEmojiListProvider);
     final emoji = quickReactionEmoji(
       ref.watch(recentEmojiProvider),
       customShortcodes: {
         for (final entry in customEmoji) entry.shortcode.toLowerCase(),
       },
+      limit: _quickReactionEmojiLimit,
     );
     final customByShortcode = {
       for (final entry in customEmoji) entry.shortcode.toLowerCase(): entry,
     };
 
     void react(String value) {
-      // The generic picker is also used for composing and statuses. Record
-      // recency here, at the reaction call site, so only reactions drive the
-      // quick-reaction row.
-      pageRef.read(recentEmojiProvider.notifier).record(value);
+      // Keep the composed popover's tray stable across repeated opens. The
+      // existing sheet continues to update the frequently-used ranking exactly
+      // as it did before the iOS presentation was introduced.
+      if (!usesPopoverTreatment) {
+        pageRef.read(recentEmojiProvider.notifier).record(value);
+      }
       // The sheet is on its way out, so the burst can't come from this tile —
       // hand it to the pill that's about to appear in the timeline.
       armReactionBurst(pageRef, message, value);
@@ -696,17 +681,19 @@ class _QuickReactionRow extends ConsumerWidget {
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        const desiredCircleSize = 52.0;
-        const minimumCircleSize = 44.0;
+        final maximumGap = usesPopoverTreatment ? 0.0 : Grid.twelve;
         final itemCount = emoji.length + 1;
         final gapCount = itemCount - 1;
         final circleSize =
-            ((constraints.maxWidth - (Grid.twelve * gapCount)) / itemCount)
-                .clamp(minimumCircleSize, desiredCircleSize)
+            ((constraints.maxWidth - (maximumGap * gapCount)) / itemCount)
+                .clamp(
+                  _quickReactionMinimumTargetSize,
+                  _quickReactionDesiredTargetSize,
+                )
                 .toDouble();
         final gap =
             ((constraints.maxWidth - (circleSize * itemCount)) / gapCount)
-                .clamp(0.0, Grid.twelve)
+                .clamp(0.0, maximumGap)
                 .toDouble();
         final circles = <Widget>[
           for (var index = 0; index < emoji.length; index++)
@@ -716,6 +703,8 @@ class _QuickReactionRow extends ConsumerWidget {
               index: index,
               child: _QuickReactionCircle(
                 size: circleSize,
+                semanticLabel: emoji[index],
+                showIdleBackground: !usesPopoverTreatment,
                 onTap: () {
                   Navigator.of(sheetContext).pop();
                   react(emoji[index]);
@@ -732,12 +721,14 @@ class _QuickReactionRow extends ConsumerWidget {
             index: emoji.length,
             child: _QuickReactionCircle(
               size: circleSize,
+              semanticLabel: 'Add reaction',
+              showIdleBackground: !usesPopoverTreatment,
               onTap: () {
                 Navigator.of(sheetContext).pop();
                 showEmojiPicker(context: pageContext, onSelect: react);
               },
               child: Icon(
-                LucideIcons.plus,
+                LucideIcons.smilePlus,
                 size: 24,
                 color: context.colors.onSurfaceVariant,
               ),
@@ -817,47 +808,60 @@ class _QuickReactionGlyph extends StatelessWidget {
         return CustomEmojiImage(
           shortcode: custom.shortcode,
           url: custom.url,
-          size: 24,
+          size: _quickReactionGlyphSize,
         );
       }
     }
-    return NativeEmojiGlyph(emoji: value, size: 24);
+    return NativeEmojiGlyph(emoji: value, size: _quickReactionGlyphSize);
   }
 }
 
-/// Circular filled tap target shared by the quick-reaction emojis and the
-/// "+" emoji-picker tile — one treatment, one place to change it.
+/// Circular tap target shared by the quick-reaction emojis and the "+"
+/// emoji-picker tile. Popovers keep the idle surface transparent while sheets
+/// retain their filled treatment; both preserve the same hit and press areas.
 class _QuickReactionCircle extends StatelessWidget {
   final VoidCallback onTap;
   final Widget child;
   final double size;
+  final String semanticLabel;
+  final bool showIdleBackground;
 
   const _QuickReactionCircle({
     required this.onTap,
     required this.child,
     required this.size,
+    required this.semanticLabel,
+    required this.showIdleBackground,
   });
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: () {
-        unawaited(HapticFeedback.lightImpact());
-        onTap();
-      },
-      child: Container(
-        width: size,
-        height: size,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: Color.lerp(
-            context.colors.surface,
-            context.colors.primaryContainer,
-            0.78,
+    final filledColor = Color.lerp(
+      context.colors.surface,
+      context.colors.primaryContainer,
+      0.78,
+    );
+    return Semantics(
+      button: true,
+      label: semanticLabel,
+      excludeSemantics: true,
+      child: SizedBox.square(
+        dimension: size,
+        child: Material(
+          color: showIdleBackground ? filledColor : Colors.transparent,
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            highlightColor: context.colors.primary.withValues(alpha: 0.12),
+            splashColor: context.colors.primary.withValues(alpha: 0.14),
+            onTap: () {
+              unawaited(HapticFeedback.lightImpact());
+              onTap();
+            },
+            child: Center(child: child),
           ),
-          shape: BoxShape.circle,
         ),
-        child: child,
       ),
     );
   }

@@ -1,8 +1,11 @@
 part of '../message_actions.dart';
 
-const _reactionTrayMaxWidth = (52.0 * 6) + (Grid.twelve * 5) + (Grid.xxs * 2);
+const _reactionTrayMaxWidth =
+    (_quickReactionDesiredTargetSize * (_quickReactionEmojiLimit + 1)) +
+    (Grid.xxs * 2);
 const _reactionTrayMaxHeight = 52.0 + (Grid.xxs * 2);
 const _reactionTraySpringAllowance = 16.0;
+const _reactionTrayMessageGap = Grid.twelve;
 const _reactionPopoverDuration = Duration(milliseconds: 320);
 final _reactionSpringCurve = _SpringEaseOutCurve(
   duration: const Duration(milliseconds: 260),
@@ -13,37 +16,75 @@ final _reactionSpringCurve = _SpringEaseOutCurve(
 ///
 /// The conversation is frosted around [anchorRect] so the selected message
 /// remains visually connected to the tray.
-void _showMessageReactionPopover({
+_MessageReactionPopoverHandle _showMessageReactionPopover({
   required BuildContext context,
   required WidgetRef ref,
   required TimelineMessage message,
   required Rect anchorRect,
+  Rect? originalAnchorRect,
+  ui.Image? anchorSnapshot,
   required EdgeInsets spotlightPadding,
+  bool alignTrayToAnchorStart = false,
+  bool triggerHaptic = true,
 }) {
-  unawaited(HapticFeedback.mediumImpact());
+  if (triggerHaptic) unawaited(HapticFeedback.mediumImpact());
   final reduceMotion = MediaQuery.disableAnimationsOf(context);
-  showGeneralDialog<void>(
+  final contextReady = Completer<BuildContext>();
+  final closed = showGeneralDialog<void>(
     context: context,
     barrierDismissible: true,
     barrierLabel: 'Dismiss reaction picker',
     barrierColor: Colors.transparent,
     transitionDuration: reduceMotion ? Duration.zero : _reactionPopoverDuration,
     transitionBuilder: (context, animation, secondaryAnimation, child) => child,
-    pageBuilder: (dialogContext, animation, secondaryAnimation) =>
-        _MessageReactionPopover(
-          anchorRect: anchorRect,
-          spotlightPadding: spotlightPadding,
-          animation: animation,
-          message: message,
-          pageContext: context,
-          pageRef: ref,
-        ),
+    pageBuilder: (dialogContext, animation, secondaryAnimation) {
+      if (!contextReady.isCompleted) contextReady.complete(dialogContext);
+      return _MessageReactionPopover(
+        anchorRect: anchorRect,
+        originalAnchorRect: originalAnchorRect ?? anchorRect,
+        anchorSnapshot: anchorSnapshot,
+        spotlightPadding: spotlightPadding,
+        alignTrayToAnchorStart: alignTrayToAnchorStart,
+        animation: animation,
+        message: message,
+        pageContext: context,
+        pageRef: ref,
+      );
+    },
+  );
+  return _MessageReactionPopoverHandle(
+    contextReady: contextReady.future,
+    closed: closed,
   );
 }
 
-class _MessageReactionPopover extends StatelessWidget {
+class _MessageReactionPopoverHandle {
+  final Future<BuildContext> contextReady;
+  final Future<void> closed;
+  bool _isOpen = true;
+
+  _MessageReactionPopoverHandle({
+    required this.contextReady,
+    required this.closed,
+  }) {
+    unawaited(closed.whenComplete(() => _isOpen = false));
+  }
+
+  Future<void> close() async {
+    if (!_isOpen) return;
+    _isOpen = false;
+    final context = await contextReady;
+    if (context.mounted) Navigator.of(context).pop();
+    await closed;
+  }
+}
+
+class _MessageReactionPopover extends HookWidget {
   final Rect anchorRect;
+  final Rect originalAnchorRect;
+  final ui.Image? anchorSnapshot;
   final EdgeInsets spotlightPadding;
+  final bool alignTrayToAnchorStart;
   final Animation<double> animation;
   final TimelineMessage message;
   final BuildContext pageContext;
@@ -51,7 +92,10 @@ class _MessageReactionPopover extends StatelessWidget {
 
   const _MessageReactionPopover({
     required this.anchorRect,
+    required this.originalAnchorRect,
+    required this.anchorSnapshot,
     required this.spotlightPadding,
+    required this.alignTrayToAnchorStart,
     required this.animation,
     required this.message,
     required this.pageContext,
@@ -60,6 +104,11 @@ class _MessageReactionPopover extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    useEffect(() {
+      // The popover owns the transient snapshot. Releasing it when this widget
+      // unmounts keeps the image alive through the complete dismissal paint.
+      return () => anchorSnapshot?.dispose();
+    }, [anchorSnapshot]);
     final mediaQuery = MediaQuery.of(context);
 
     return LayoutBuilder(
@@ -69,15 +118,17 @@ class _MessageReactionPopover extends StatelessWidget {
             constraints.maxHeight -
             mediaQuery.padding.bottom -
             mediaQuery.viewInsets.bottom;
-        final availableAbove = anchorRect.top - Grid.xxs - safeTop;
-        final availableBelow = safeBottom - anchorRect.bottom - Grid.xxs;
+        final availableAbove =
+            anchorRect.top - _reactionTrayMessageGap - safeTop;
+        final availableBelow =
+            safeBottom - anchorRect.bottom - _reactionTrayMessageGap;
         final showAbove =
             availableAbove >= _reactionTrayMaxHeight ||
             (availableBelow < _reactionTrayMaxHeight &&
                 availableAbove >= availableBelow);
         final proposedTop = showAbove
-            ? anchorRect.top - _reactionTrayMaxHeight - Grid.xxs
-            : anchorRect.bottom + Grid.xxs;
+            ? anchorRect.top - _reactionTrayMaxHeight - _reactionTrayMessageGap
+            : anchorRect.bottom + _reactionTrayMessageGap;
         final maxTop = math.max(safeTop, safeBottom - _reactionTrayMaxHeight);
         final top = proposedTop.clamp(safeTop, maxTop).toDouble();
         final trayScaleAlignment = showAbove
@@ -88,9 +139,10 @@ class _MessageReactionPopover extends StatelessWidget {
           constraints.maxWidth - (Grid.xxs * 2),
         );
         final maxLeft = constraints.maxWidth - trayWidth - Grid.xxs;
-        final left = (anchorRect.center.dx - (trayWidth / 2))
-            .clamp(Grid.xxs, maxLeft)
-            .toDouble();
+        final preferredLeft = alignTrayToAnchorStart
+            ? anchorRect.left
+            : anchorRect.center.dx - (trayWidth / 2);
+        final left = preferredLeft.clamp(Grid.xxs, maxLeft).toDouble();
 
         return Stack(
           children: [
@@ -104,24 +156,81 @@ class _MessageReactionPopover extends StatelessWidget {
                     curve: Curves.easeOutCubic,
                   ).transform(animation.value);
                   final sigma = 20 * blurProgress;
+                  final background = BackdropFilter(
+                    filter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+                    child: ColoredBox(
+                      color: context.colors.inverseSurface.withValues(
+                        alpha: 0.10 * blurProgress,
+                      ),
+                    ),
+                  );
+                  if (anchorSnapshot != null) return background;
                   return ClipPath(
                     key: const ValueKey('reaction-popover-background'),
                     clipper: _OutsideAnchorClipper(
                       anchorRect,
                       spotlightPadding,
                     ),
-                    child: BackdropFilter(
-                      filter: ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
-                      child: ColoredBox(
-                        color: context.colors.inverseSurface.withValues(
-                          alpha: 0.10 * blurProgress,
-                        ),
-                      ),
-                    ),
+                    child: background,
                   );
                 },
               ),
             ),
+            if (anchorSnapshot != null)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: AnimatedBuilder(
+                    animation: animation,
+                    builder: (context, child) {
+                      final movement = const Interval(
+                        0,
+                        0.56,
+                        curve: Curves.easeInOutCubic,
+                      ).transform(animation.value);
+                      final displayRect = Rect.lerp(
+                        originalAnchorRect,
+                        anchorRect,
+                        movement,
+                      )!;
+                      return Stack(
+                        children: [
+                          Positioned.fromRect(
+                            rect: displayRect,
+                            child: DecoratedBox(
+                              key: const ValueKey(
+                                'message-action-preview-container',
+                              ),
+                              decoration: BoxDecoration(
+                                color: context.colors.surfaceContainerHigh,
+                                borderRadius: BorderRadius.circular(Radii.md),
+                                border: Border.all(
+                                  color: context.colors.outlineVariant
+                                      .withValues(alpha: 0.65),
+                                ),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.12),
+                                    blurRadius: 16,
+                                    offset: const Offset(0, 6),
+                                  ),
+                                ],
+                              ),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(Radii.md),
+                                child: RawImage(
+                                  image: anchorSnapshot,
+                                  fit: BoxFit.fill,
+                                  filterQuality: FilterQuality.medium,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              ),
             Positioned.fill(
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
@@ -162,7 +271,7 @@ class _MessageReactionPopover extends StatelessWidget {
                   final springExpansion = _reactionSpringCurve.transform(
                     expansion,
                   );
-                  final width = lerpDouble(
+                  final width = ui.lerpDouble(
                     _reactionTrayMaxHeight,
                     trayWidth,
                     springExpansion,
@@ -172,7 +281,7 @@ class _MessageReactionPopover extends StatelessWidget {
                     opacity: appearance,
                     child: Transform.scale(
                       alignment: trayScaleAlignment,
-                      scale: lerpDouble(0.95, 1, appearance)!,
+                      scale: ui.lerpDouble(0.95, 1, appearance)!,
                       child: Align(
                         alignment: Alignment.centerLeft,
                         child: SizedBox(

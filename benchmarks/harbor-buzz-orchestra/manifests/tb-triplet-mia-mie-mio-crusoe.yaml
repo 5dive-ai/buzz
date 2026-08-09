@@ -12,7 +12,10 @@
 # preview — NOT the 0731 our other runs use; that comparison is the point).
 # Model id is case-exact: lowercase 's' in "Deepseek". Endpoint config:
 # testbed/endpoints/crusoe-live.json (OPENAI_COMPAT_BASE_URL
-# https://api.inference.crusoecloud.com/v1, key env CRUSOE_INFERENCE_API_KEY).
+# https://api.inference.crusoecloud.com/v1). api_key_env must be
+# OPENAI_COMPAT_API_KEY — the runtime injects the key under exactly that
+# name and buzz-agent's provider=openai reads only OPENAI_COMPAT_API_KEY
+# (config.rs req()); a vendor-named var dies at agent config parse.
 # Pricing: crusoe.ai/cloud/pricing 2026-08-07 snapshot, $0.14/$0.28 per M.
 schema_version: "1"
 condition: tb-triplet-mia-mie-mio-crusoe

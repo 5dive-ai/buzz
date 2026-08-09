@@ -93,14 +93,15 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     RelayRateLimitGate? rateLimitGate,
     RelayTimerFactory retryTimerFactory = Timer.new,
     Future<void> Function(Duration) replayDelay = Future.delayed,
-  }) : _httpClient = httpClient,
+  }) : _injectedHttpClient = httpClient,
        _socketFactory = socketFactory,
        _now = now ?? DateTime.now,
        _rateLimitGate = rateLimitGate ?? RelayRateLimitGate(),
        _retryTimerFactory = retryTimerFactory,
        _replayDelay = replayDelay;
 
-  final http.Client? _httpClient;
+  final http.Client? _injectedHttpClient;
+  http.Client? _ownedHttpClient;
   final RelaySocketFactory _socketFactory;
   final DateTime Function() _now;
   final RelayRateLimitGate _rateLimitGate;
@@ -168,8 +169,10 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     final bodyBytes = utf8.encode(
       jsonEncode(filters.map((filter) => filter.toJson()).toList()),
     );
-    final client = _httpClient ?? http.Client();
-    final shouldCloseClient = _httpClient == null;
+    // Keep one transport for the session so repeated channel-window and feed
+    // reads reuse their TLS connection instead of handshaking on every query.
+    // Provider rebuilds dispose the owned client and lazily create a fresh one.
+    final client = _injectedHttpClient ?? (_ownedHttpClient ??= http.Client());
     final response = await client
         .post(
           Uri.parse(url),
@@ -184,10 +187,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
           },
           body: bodyBytes,
         )
-        .timeout(timeout)
-        .whenComplete(() {
-          if (shouldCloseClient) client.close();
-        });
+        .timeout(timeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       _activateRateLimitGateFromHttpError(response.body);
       throw RelayException(response.statusCode, response.body);
@@ -936,7 +936,9 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     _recentDeliveryKeys.clear();
     _socket?.dispose();
     _socket = null;
-    _httpClient?.close();
+    _ownedHttpClient?.close();
+    _ownedHttpClient = null;
+    _injectedHttpClient?.close();
   }
 }
 

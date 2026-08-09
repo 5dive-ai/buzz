@@ -55,13 +55,18 @@ class UserStatusNotifier extends AsyncNotifier<UserStatus?> {
         (a, b) => a.createdAt >= b.createdAt ? a : b,
       );
       final status = UserStatus.fromEvent(latest);
-      return status.isEmpty ? null : status;
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      return status.isEmpty || status.isExpiredAt(now) ? null : status;
     } catch (_) {
       return null;
     }
   }
 
-  Future<void> setStatus(String text, String emoji) async {
+  Future<void> setStatus(
+    String text,
+    String emoji, {
+    DateTime? expiresAt,
+  }) async {
     final trimmed = text.trim();
     final config = ref.read(relayConfigProvider);
     final nsec = config.nsec;
@@ -72,6 +77,9 @@ class UserStatusNotifier extends AsyncNotifier<UserStatus?> {
     ];
     if (emoji.isNotEmpty) {
       tags.add(['emoji', emoji]);
+    }
+    if (expiresAt != null) {
+      tags.add(['expiration', '${expiresAt.millisecondsSinceEpoch ~/ 1000}']);
     }
 
     final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
@@ -92,6 +100,9 @@ class UserStatusNotifier extends AsyncNotifier<UserStatus?> {
             text: trimmed,
             emoji: emoji,
             updatedAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+            expiresAt: expiresAt == null
+                ? null
+                : expiresAt.millisecondsSinceEpoch ~/ 1000,
           )
         : null;
     state = AsyncValue.data(newStatus);

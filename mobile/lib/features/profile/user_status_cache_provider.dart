@@ -104,7 +104,8 @@ class UserStatusCacheNotifier extends Notifier<Map<String, UserStatus?>> {
     // Staleness guard: discard if we already have a newer-or-equal event.
     if (existing != null && existing.updatedAt >= parsed.updatedAt) return;
 
-    final status = parsed.isEmpty ? null : parsed;
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final status = parsed.isEmpty || parsed.isExpiredAt(now) ? null : parsed;
     final updated = Map<String, UserStatus?>.from(state);
     updated[pubkey] = status;
     state = updated;
@@ -164,7 +165,8 @@ class UserStatusCacheNotifier extends Notifier<Map<String, UserStatus?>> {
         if (existing != null && existing.updatedAt >= parsed.updatedAt) {
           continue;
         }
-        updated[pk] = parsed.isEmpty ? null : parsed;
+        final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        updated[pk] = parsed.isEmpty || parsed.isExpiredAt(now) ? null : parsed;
       }
 
       state = updated;

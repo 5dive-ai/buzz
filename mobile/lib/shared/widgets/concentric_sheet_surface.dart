@@ -20,6 +20,12 @@ class ConcentricSheetSurface extends HookWidget {
   final bool enabled;
   final Color? color;
 
+  static bool providesSurfaceOf(BuildContext context) =>
+      context
+          .dependOnInheritedWidgetOfExactType<_ConcentricSheetSurfaceScope>()
+          ?.providesSurface ??
+      false;
+
   static const _surfaceChannel = MethodChannel('buzz/concentric_sheet_surface');
 
   Future<bool> _checkNativeSurfaceSupport() async {
@@ -48,7 +54,7 @@ class ConcentricSheetSurface extends HookWidget {
     final nativeSurfaceSupported = useFuture(supportFuture).data ?? false;
 
     if (!shouldCheckNativeSurface) {
-      return child;
+      return _ConcentricSheetSurfaceScope(providesSurface: false, child: child);
     }
 
     final surfaceColor = color ?? context.colors.surface;
@@ -83,9 +89,22 @@ class ConcentricSheetSurface extends HookWidget {
                 clipBehavior: Clip.antiAlias,
               ),
             ),
-          child,
+          _ConcentricSheetSurfaceScope(providesSurface: true, child: child),
         ],
       ),
     );
   }
+}
+
+class _ConcentricSheetSurfaceScope extends InheritedWidget {
+  const _ConcentricSheetSurfaceScope({
+    required this.providesSurface,
+    required super.child,
+  });
+
+  final bool providesSurface;
+
+  @override
+  bool updateShouldNotify(_ConcentricSheetSurfaceScope oldWidget) =>
+      oldWidget.providesSurface != providesSurface;
 }

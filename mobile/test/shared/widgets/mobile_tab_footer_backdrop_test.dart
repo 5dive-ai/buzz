@@ -24,6 +24,7 @@ void main() {
     expect(gradient?.colors[1].a, closeTo(0.03, 0.01));
     expect(gradient?.colors[3].a, closeTo(0.34, 0.01));
     expect(gradient?.colors.last.a, 1);
+    expect(mobileTabBackdropBlurSigma, 18);
   });
 
   testWidgets('uses a fixed 180px footer backdrop height', (tester) async {

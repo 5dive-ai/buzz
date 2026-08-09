@@ -10,6 +10,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 /// Records subscriptions and DM history queries for Activity projection tests.
 class _RecordingSessionNotifier extends RelaySessionNotifier {
   final List<List<String>> dmQueries = [];
+  final List<int> queryFilterCounts = [];
   final List<NostrEvent> _history = [];
   final List<({NostrFilter filter, void Function(NostrEvent) onEvent})>
   _subscriptions = [];
@@ -49,6 +50,41 @@ class _RecordingSessionNotifier extends RelaySessionNotifier {
       }
     }
     return _history.where((event) => _matches(filter, event)).toList();
+  }
+
+  @override
+  Future<List<NostrEvent>> queryRelay(
+    List<NostrFilter> filters, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    queryFilterCounts.add(filters.length);
+    for (final filter in filters) {
+      final h = filter.tags['#h'];
+      if (h != null) dmQueries.add(h);
+    }
+    final isMentionFetch = filters.any(
+      (filter) => filter.tags.containsKey('#p') && filter.kinds.contains(40002),
+    );
+    if (isMentionFetch) {
+      mentionFetchCount += 1;
+      activeMentionFetches += 1;
+      if (activeMentionFetches > maxActiveMentionFetches) {
+        maxActiveMentionFetches = activeMentionFetches;
+      }
+      try {
+        final gate = mentionFetchGate;
+        if (gate != null) await gate.future;
+        if (failNextMentionFetch) {
+          failNextMentionFetch = false;
+          throw StateError('transient mention history failure');
+        }
+      } finally {
+        activeMentionFetches -= 1;
+      }
+    }
+    return _history
+        .where((event) => filters.any((filter) => _matches(filter, event)))
+        .toList();
   }
 
   @override
@@ -159,6 +195,7 @@ void main() {
     // Cold start: channels still loading, so the first fetch has no DM ids.
     await container.read(activityProvider.future);
     expect(session.dmQueries, isEmpty);
+    expect(session.queryFilterCounts, [3]);
 
     // Channel list resolves with a DM → Activity must rebuild and query it.
     channels.resolve([_dmChannel('dm1')]);
@@ -167,6 +204,7 @@ void main() {
 
     expect(session.dmQueries, hasLength(1));
     expect(session.dmQueries.single, ['dm1']);
+    expect(session.queryFilterCounts, [3, 4]);
   });
 
   test('does not query DMs when the resolved channel list has none', () async {

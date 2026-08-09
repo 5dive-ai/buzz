@@ -23,7 +23,7 @@ roster:
     model_revision: deepseek/deepseek-v4-flash-20260731
     prompt:
       path: personas/bench/mia.md
-      sha256: 58cf178abf919d40b992280144b4b340cf1a50889b75de27eb72c869cfbd9622
+      sha256: bdda429b6248305ac43c44a5f585ee7b03bcd97bb1bc3b8be2ba6933787fa12f
     generation:
       thinking_effort: high
   - id: mie

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   __linkPreviewMetadataTest,
   resolveLinkPreview,
+  withEntityFallbacks,
 } from "./useResolvedLinkPreviews.ts";
 
 const preview = {
@@ -179,4 +180,49 @@ test("metadata loader coalesces fragment variants and bounds concurrency", async
 
   assert.equal(calls, 3);
   assert.equal(maxActive, 2);
+});
+
+test("withEntityFallbacks re-adds previews dropped by null metadata", () => {
+  const entityPreview = {
+    kind: "buzz-pull-request",
+    href: `buzz://pr?id=${"ab".repeat(32)}&owner=${"cd".repeat(32)}&d=buzz`,
+    provider: "Buzz",
+    title: `buzz #${"ab".repeat(4)}`,
+    typeLabel: "PR",
+  };
+
+  assert.deepEqual(withEntityFallbacks([entityPreview], []), [
+    { ...entityPreview, imageState: "none" },
+  ]);
+});
+
+test("withEntityFallbacks keeps resolved previews and preserves order", () => {
+  const first = {
+    kind: "buzz-repository",
+    href: `buzz://repo?owner=${"cd".repeat(32)}&d=buzz`,
+    provider: "Buzz",
+    title: "buzz",
+    typeLabel: "repo",
+  };
+  const second = {
+    kind: "buzz-issue",
+    href: `buzz://issue?id=${"ef".repeat(32)}&owner=${"cd".repeat(32)}&d=buzz`,
+    provider: "Buzz",
+    title: `buzz #${"ef".repeat(4)}`,
+    typeLabel: "issue",
+  };
+  const resolvedSecond = {
+    ...second,
+    title: "Fix the preview cards",
+    imageState: "none",
+  };
+
+  assert.deepEqual(withEntityFallbacks([first, second], [resolvedSecond]), [
+    { ...first, imageState: "none" },
+    resolvedSecond,
+  ]);
+});
+
+test("withEntityFallbacks still drops unresolved external links", () => {
+  assert.deepEqual(withEntityFallbacks([preview], []), []);
 });

@@ -50,7 +50,7 @@ Future<bool> _showIosReactionOnlyPopover({
         transitionBuilder: (context, animation, secondaryAnimation, child) =>
             child,
         pageBuilder: (dialogContext, animation, secondaryAnimation) =>
-            _IosMessageActionsPopover(
+            _MessageActionsPopover(
               anchorRect: anchorRect,
               anchorSnapshot: snapshot,
               spotlightPadding: spotlightPadding,
@@ -59,6 +59,7 @@ Future<bool> _showIosReactionOnlyPopover({
               pageContext: context,
               pageRef: ref,
               actions: const [],
+              actionSurfaceKind: _MessageActionSurfaceKind.iosNative,
             ),
       );
     } finally {
@@ -131,7 +132,7 @@ Future<bool> _presentIosMessageActionsPopover({
     return false;
   }
 
-  final actions = _buildIosNativeMessageActions(
+  final actions = _buildMessageActions(
     context: context,
     ref: ref,
     message: message,
@@ -171,7 +172,7 @@ Future<bool> _presentIosMessageActionsPopover({
       transitionBuilder: (context, animation, secondaryAnimation, child) =>
           child,
       pageBuilder: (dialogContext, animation, secondaryAnimation) =>
-          _IosMessageActionsPopover(
+          _MessageActionsPopover(
             anchorRect: anchorRect,
             anchorSnapshot: snapshot,
             spotlightPadding: spotlightPadding,
@@ -180,6 +181,7 @@ Future<bool> _presentIosMessageActionsPopover({
             pageContext: context,
             pageRef: ref,
             actions: actions,
+            actionSurfaceKind: _MessageActionSurfaceKind.iosNative,
           ),
     );
   } finally {
@@ -194,7 +196,9 @@ Future<bool> _presentIosMessageActionsPopover({
   return true;
 }
 
-class _IosMessageActionsPopover extends StatelessWidget {
+enum _MessageActionSurfaceKind { iosNative, androidFlutter }
+
+class _MessageActionsPopover extends StatelessWidget {
   final Rect anchorRect;
   final ui.Image anchorSnapshot;
   final EdgeInsets spotlightPadding;
@@ -202,9 +206,10 @@ class _IosMessageActionsPopover extends StatelessWidget {
   final TimelineMessage message;
   final BuildContext pageContext;
   final WidgetRef pageRef;
-  final List<_IosNativeMessageAction> actions;
+  final List<_MessageAction> actions;
+  final _MessageActionSurfaceKind actionSurfaceKind;
 
-  const _IosMessageActionsPopover({
+  const _MessageActionsPopover({
     required this.anchorRect,
     required this.anchorSnapshot,
     required this.spotlightPadding,
@@ -213,6 +218,7 @@ class _IosMessageActionsPopover extends StatelessWidget {
     required this.pageContext,
     required this.pageRef,
     required this.actions,
+    required this.actionSurfaceKind,
   });
 
   @override
@@ -231,13 +237,22 @@ class _IosMessageActionsPopover extends StatelessWidget {
         final hasActionMenu = actions.isNotEmpty;
         final trayWidth = math.min(_reactionTrayMaxWidth, availableWidth);
         final menuWidth = hasActionMenu
-            ? math.min(_iosContextMenuMaxWidth, availableWidth)
+            ? math.min(
+                actionSurfaceKind == _MessageActionSurfaceKind.androidFlutter
+                    ? _androidContextMenuMaxWidth
+                    : _iosContextMenuMaxWidth,
+                availableWidth,
+              )
             : 0.0;
         final menuHeight = hasActionMenu
             ? math.min(
-                _iosActionSurfacePreferredHeight(actions),
+                actionSurfaceKind == _MessageActionSurfaceKind.androidFlutter
+                    ? _androidActionSurfacePreferredHeight(actions)
+                    : _iosActionSurfacePreferredHeight(actions),
                 math.max(
-                  _iosActionRowHeight * 3,
+                  actionSurfaceKind == _MessageActionSurfaceKind.androidFlutter
+                      ? _androidActionRowMinHeight * 3
+                      : _iosActionRowHeight * 3,
                   availableHeight -
                       _reactionTrayMaxHeight -
                       (_iosContextGap * 2) -
@@ -384,11 +399,19 @@ class _IosMessageActionsPopover extends StatelessWidget {
                 rect: menuRect,
                 child: AnimatedBuilder(
                   animation: animation,
-                  child: _IosNativeMessageActionSurface(
-                    actions: actions,
-                    onSelected: (actionId) =>
-                        Navigator.of(context).pop(actionId),
-                  ),
+                  child:
+                      actionSurfaceKind ==
+                          _MessageActionSurfaceKind.androidFlutter
+                      ? _AndroidMessageActionSurface(
+                          actions: actions,
+                          onSelected: (actionId) =>
+                              Navigator.of(context).pop(actionId),
+                        )
+                      : _IosNativeMessageActionSurface(
+                          actions: actions,
+                          onSelected: (actionId) =>
+                              Navigator.of(context).pop(actionId),
+                        ),
                   builder: (context, child) {
                     final appearance = const Interval(
                       0.12,
@@ -398,7 +421,11 @@ class _IosMessageActionsPopover extends StatelessWidget {
                     return Opacity(
                       opacity: appearance,
                       child: Transform.scale(
-                        alignment: Alignment.topLeft,
+                        alignment:
+                            actionSurfaceKind ==
+                                _MessageActionSurfaceKind.androidFlutter
+                            ? Alignment.topCenter
+                            : Alignment.topLeft,
                         scale: ui.lerpDouble(0.96, 1, appearance)!,
                         child: child,
                       ),
@@ -492,7 +519,7 @@ class _IosReactionTray extends StatelessWidget {
 }
 
 class _IosNativeMessageActionSurface extends HookWidget {
-  final List<_IosNativeMessageAction> actions;
+  final List<_MessageAction> actions;
   final ValueChanged<String> onSelected;
 
   const _IosNativeMessageActionSurface({
@@ -540,7 +567,7 @@ class _IosNativeMessageActionSurface extends HookWidget {
 }
 
 class _TestIosNativeMessageActionSurface extends StatelessWidget {
-  final List<_IosNativeMessageAction> actions;
+  final List<_MessageAction> actions;
   final ValueChanged<String> onSelected;
 
   const _TestIosNativeMessageActionSurface({
@@ -561,7 +588,7 @@ class _TestIosNativeMessageActionSurface extends StatelessWidget {
           children: [
             for (final action in actions)
               SizedBox(
-                height: action.group == _IosNativeMessageActionGroup.promoted
+                height: action.group == _MessageActionGroup.promoted
                     ? _iosActionPromotedHeight
                     : _iosActionRowHeight,
                 child: ListTile(
@@ -577,11 +604,11 @@ class _TestIosNativeMessageActionSurface extends StatelessWidget {
   }
 }
 
-double _iosActionSurfacePreferredHeight(List<_IosNativeMessageAction> actions) {
+double _iosActionSurfacePreferredHeight(List<_MessageAction> actions) {
   final groups = {for (final action in actions) action.group};
-  final promoted = groups.contains(_IosNativeMessageActionGroup.promoted);
+  final promoted = groups.contains(_MessageActionGroup.promoted);
   final rowCount = actions
-      .where((action) => action.group != _IosNativeMessageActionGroup.promoted)
+      .where((action) => action.group != _MessageActionGroup.promoted)
       .length;
   return (_iosActionVerticalInset * 2) +
       (promoted ? _iosActionPromotedHeight : 0) +

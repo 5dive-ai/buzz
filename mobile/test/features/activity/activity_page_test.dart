@@ -683,15 +683,120 @@ void main() {
 
     await tester.longPress(find.byKey(const ValueKey('inbox-row-m1')));
     await tester.pumpAndSettle();
+    final preview = find.byKey(
+      const ValueKey('activity-row-action-preview-container'),
+    );
+    final menu = find.byKey(const ValueKey('activity-android-action-surface'));
+    expect(preview, findsOneWidget);
+    expect(menu, findsOneWidget);
+    expect(find.byType(BottomSheet), findsNothing);
+    expect(find.byKey(const ValueKey('reaction-popover-tray')), findsNothing);
+    expect(
+      tester.getTopLeft(menu).dy,
+      greaterThan(tester.getBottomLeft(preview).dy),
+    );
+
+    final source = tester.widget<Opacity>(
+      find.byKey(const ValueKey('activity-row-action-source-m1')),
+    );
+    expect(source.opacity, 0);
+
     await tester.tap(
-      find.descendant(
-        of: find.byType(BottomSheet),
-        matching: find.text('Mark unread'),
-      ),
+      find.byKey(const ValueKey('activity-row-action-markUnread')),
     );
     await tester.pumpAndSettle();
 
     expect(find.byKey(const ValueKey('inbox-unread-dot-m1')), findsOneWidget);
+  });
+
+  testWidgets('iOS long press removes native header views above the overlay', (
+    tester,
+  ) async {
+    final previousPlatform = debugDefaultTargetPlatformOverride;
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    const menuButtonChannel = MethodChannel('buzz/native_menu_button');
+    const actionSurfaceChannel = MethodChannel(
+      'buzz/native_message_action_surface',
+    );
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      menuButtonChannel,
+      (call) async => call.method == 'isSupported' ? true : null,
+    );
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      actionSurfaceChannel,
+      (call) async => call.method == 'isSupported' ? true : null,
+    );
+
+    try {
+      await tester.pumpWidget(await buildTestable());
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const ValueKey('activity-native-filter')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('activity-native-options')),
+        findsOneWidget,
+      );
+
+      await tester.longPress(find.byKey(const ValueKey('inbox-row-m1')));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const ValueKey('activity-native-action-surface')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('activity-native-filter')),
+        findsNothing,
+      );
+      expect(
+        find.byKey(const ValueKey('activity-native-options')),
+        findsNothing,
+      );
+      expect(find.byType(UiKitView), findsOneWidget);
+
+      await tester.tapAt(const Offset(10, 300));
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey('activity-native-filter')),
+        findsNothing,
+      );
+      expect(
+        find.byKey(const ValueKey('activity-native-options')),
+        findsNothing,
+      );
+      await tester.pump(const Duration(milliseconds: 120));
+      expect(
+        find.byKey(const ValueKey('activity-native-filter')),
+        findsNothing,
+      );
+      expect(
+        find.byKey(const ValueKey('activity-native-options')),
+        findsNothing,
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('activity-native-filter')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('activity-native-options')),
+        findsOneWidget,
+      );
+    } finally {
+      await tester.pumpWidget(const SizedBox.shrink());
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        menuButtonChannel,
+        null,
+      );
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        actionSurfaceChannel,
+        null,
+      );
+      debugDefaultTargetPlatformOverride = previousPlatform;
+    }
   });
 
   testWidgets('swiping an inbox row reveals and runs its row actions', (

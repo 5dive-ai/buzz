@@ -69,6 +69,9 @@ class _InboxRow extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     const restingRevealWidth = 132.0;
     const commitThreshold = 0.58;
+    final actionSnapshotKey = useMemoized(GlobalKey.new, const []);
+    final actionSnapshotPixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final actionPopoverPresented = useState(false);
     final revealAmount = useState(0.0);
     final isDragging = useState(false);
     final labelHapticFired = useRef(false);
@@ -124,6 +127,56 @@ class _InboxRow extends HookConsumerWidget {
       isDone ? onMarkUnread() : onMarkRead();
     }
 
+    Future<ui.Image> captureActionSnapshot() async {
+      await WidgetsBinding.instance.endOfFrame;
+      final renderObject = actionSnapshotKey.currentContext?.findRenderObject();
+      if (renderObject is! RenderRepaintBoundary) {
+        throw StateError('Activity row snapshot is unavailable');
+      }
+      return renderObject.toImage(pixelRatio: actionSnapshotPixelRatio);
+    }
+
+    Rect? actionSnapshotRect() {
+      final renderObject = actionSnapshotKey.currentContext?.findRenderObject();
+      if (renderObject is! RenderRepaintBoundary || !renderObject.hasSize) {
+        return null;
+      }
+      return renderObject.localToGlobal(Offset.zero) & renderObject.size;
+    }
+
+    Future<void> openRowActions() async {
+      if (isDragging.value) return;
+      final anchorRect = actionSnapshotRect();
+      if (anchorRect == null) {
+        _showRowActionsSheet(context);
+        return;
+      }
+      final presented = await _showActivityRowActionsPopover(
+        context: context,
+        anchorRect: anchorRect,
+        captureAnchorSnapshot: captureActionSnapshot,
+        actions: [
+          _ActivityRowAction(
+            id: isDone ? 'markUnread' : 'markRead',
+            title: isDone ? 'Mark unread' : 'Mark as read',
+            symbol: isDone ? 'envelope.badge' : 'envelope.open',
+            icon: isDone ? LucideIcons.mailOpen : LucideIcons.mailCheck,
+            onSelected: isDone ? onMarkUnread : onMarkRead,
+          ),
+          _ActivityRowAction(
+            id: 'openConversation',
+            title: 'Open conversation',
+            symbol: 'arrow.up.right.square',
+            icon: LucideIcons.externalLink,
+            onSelected: onTap,
+          ),
+        ],
+        onPopoverPresented: () => actionPopoverPresented.value = true,
+        onPopoverDismissed: () => actionPopoverPresented.value = false,
+      );
+      if (!presented && context.mounted) _showRowActionsSheet(context);
+    }
+
     return LayoutBuilder(
       builder: (context, constraints) {
         final actionExtent = constraints.maxWidth;
@@ -164,168 +217,186 @@ class _InboxRow extends HookConsumerWidget {
                     ? Duration.zero
                     : const Duration(milliseconds: 160),
                 curve: Curves.easeOutCubic,
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onHorizontalDragStart: (_) {
-                    isDragging.value = true;
-                    labelHapticFired.value = false;
-                  },
-                  onHorizontalDragUpdate: (details) {
-                    isDragging.value = true;
-                    final previous = revealAmount.value;
-                    final next =
-                        (previous - (details.delta.dx * swipeDirection))
-                            .clamp(0, actionExtent)
-                            .toDouble();
-                    if (!labelHapticFired.value &&
-                        previous < _inboxSwipeLabelRevealWidth &&
-                        next >= _inboxSwipeLabelRevealWidth) {
-                      labelHapticFired.value = true;
-                      unawaited(HapticFeedback.selectionClick());
-                    }
-                    revealAmount.value = next;
-                  },
-                  onHorizontalDragEnd: (details) {
-                    isDragging.value = false;
-                    final velocity = details.primaryVelocity ?? 0;
-                    final shouldCommit =
-                        (velocity * swipeDirection) < -900 ||
-                        revealAmount.value >= actionExtent * commitThreshold;
-                    if (shouldCommit) {
-                      toggleReadState();
-                    } else {
-                      revealAmount.value =
-                          (velocity * swipeDirection) < -200 ||
-                              revealAmount.value >= restingRevealWidth / 2
-                          ? restingRevealWidth
-                          : 0;
-                    }
-                  },
-                  child: Material(
-                    color: context.colors.surface,
-                    child: InkWell(
-                      key: ValueKey('inbox-row-${item.id}'),
-                      onTap: onTap,
-                      onLongPress: () => _showRowActions(context),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: Grid.gutter,
-                          vertical: Grid.twelve,
-                        ),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            _RowAvatar(
-                              pubkey: item.item.pubkey,
-                              profile: profile,
+                child: Opacity(
+                  key: ValueKey('activity-row-action-source-${item.id}'),
+                  opacity: actionPopoverPresented.value ? 0 : 1,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onHorizontalDragStart: (_) {
+                      isDragging.value = true;
+                      labelHapticFired.value = false;
+                    },
+                    onHorizontalDragUpdate: (details) {
+                      isDragging.value = true;
+                      final previous = revealAmount.value;
+                      final next =
+                          (previous - (details.delta.dx * swipeDirection))
+                              .clamp(0, actionExtent)
+                              .toDouble();
+                      if (!labelHapticFired.value &&
+                          previous < _inboxSwipeLabelRevealWidth &&
+                          next >= _inboxSwipeLabelRevealWidth) {
+                        labelHapticFired.value = true;
+                        unawaited(HapticFeedback.selectionClick());
+                      }
+                      revealAmount.value = next;
+                    },
+                    onHorizontalDragEnd: (details) {
+                      isDragging.value = false;
+                      final velocity = details.primaryVelocity ?? 0;
+                      final shouldCommit =
+                          (velocity * swipeDirection) < -900 ||
+                          revealAmount.value >= actionExtent * commitThreshold;
+                      if (shouldCommit) {
+                        toggleReadState();
+                      } else {
+                        revealAmount.value =
+                            (velocity * swipeDirection) < -200 ||
+                                revealAmount.value >= restingRevealWidth / 2
+                            ? restingRevealWidth
+                            : 0;
+                      }
+                    },
+                    child: RepaintBoundary(
+                      key: actionSnapshotKey,
+                      child: Material(
+                        color: context.colors.surface,
+                        child: _ActivityLongPressInkWell(
+                          key: ValueKey('inbox-row-${item.id}'),
+                          onTap: onTap,
+                          onLongPress: () => unawaited(openRowActions()),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: Grid.gutter,
+                              vertical: Grid.twelve,
                             ),
-                            const SizedBox(width: messageAvatarContentGap),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  // Sender + unread dot + timestamp.
-                                  Row(
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                _RowAvatar(
+                                  pubkey: item.item.pubkey,
+                                  profile: profile,
+                                ),
+                                const SizedBox(width: messageAvatarContentGap),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
                                     children: [
-                                      Expanded(
-                                        child: MessageAuthorMeta(
-                                          displayName: senderLabel,
-                                          username: messageUsernameLabel(
-                                            profile,
-                                          ),
-                                          timestamp: _inboxTimestamp(
-                                            item.latestActivityAt,
-                                          ),
-                                          nameColor: context.colors.onSurface,
-                                          metadataColor: mutedColor,
-                                          nameStyle: activityUsernameTextStyle,
-                                          metadataStyle:
-                                              activityTimestampTextStyle,
-                                          displayNameKey: ValueKey(
-                                            'activity-author-${item.id}',
-                                          ),
-                                          usernameKey: ValueKey(
-                                            'activity-username-${item.id}',
-                                          ),
-                                          timestampKey: ValueKey(
-                                            'activity-timestamp-${item.id}',
-                                          ),
-                                        ),
-                                      ),
-                                      if (!isDone) ...[
-                                        const SizedBox(width: Grid.xxs),
-                                        Container(
-                                          key: ValueKey(
-                                            'inbox-unread-dot-${item.id}',
-                                          ),
-                                          width: 6,
-                                          height: 6,
-                                          decoration: BoxDecoration(
-                                            shape: BoxShape.circle,
-                                            color: context.colors.primary,
-                                          ),
-                                        ),
-                                      ],
-                                    ],
-                                  ),
-                                  const SizedBox(height: Grid.quarter),
-                                  // Contextual label: "Mentioned in #channel" etc.
-                                  Row(
-                                    children: [
-                                      Flexible(
-                                        child: Text(
-                                          label.text,
-                                          style: activityContextTextStyle
-                                              .copyWith(color: labelColor),
-                                          overflow: TextOverflow.ellipsis,
-                                        ),
-                                      ),
-                                      if (label.channelLabel != null) ...[
-                                        const SizedBox(width: Grid.half),
-                                        Flexible(
-                                          child: Container(
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal:
-                                                  Grid.half + Grid.quarter,
-                                              vertical: Grid.quarter / 2,
+                                      // Sender + unread dot + timestamp.
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: MessageAuthorMeta(
+                                              displayName: senderLabel,
+                                              username: messageUsernameLabel(
+                                                profile,
+                                              ),
+                                              timestamp: _inboxTimestamp(
+                                                item.latestActivityAt,
+                                              ),
+                                              nameColor:
+                                                  context.colors.onSurface,
+                                              metadataColor: mutedColor,
+                                              nameStyle:
+                                                  activityUsernameTextStyle,
+                                              metadataStyle:
+                                                  activityTimestampTextStyle,
+                                              displayNameKey: ValueKey(
+                                                'activity-author-${item.id}',
+                                              ),
+                                              usernameKey: ValueKey(
+                                                'activity-username-${item.id}',
+                                              ),
+                                              timestampKey: ValueKey(
+                                                'activity-timestamp-${item.id}',
+                                              ),
                                             ),
-                                            decoration: BoxDecoration(
-                                              color: context
-                                                  .colors
-                                                  .surfaceContainerHighest,
-                                              borderRadius:
-                                                  BorderRadius.circular(
-                                                    Grid.half,
-                                                  ),
+                                          ),
+                                          if (!isDone) ...[
+                                            const SizedBox(width: Grid.xxs),
+                                            Container(
+                                              key: ValueKey(
+                                                'inbox-unread-dot-${item.id}',
+                                              ),
+                                              width: 6,
+                                              height: 6,
+                                              decoration: BoxDecoration(
+                                                shape: BoxShape.circle,
+                                                color: context.colors.primary,
+                                              ),
                                             ),
+                                          ],
+                                        ],
+                                      ),
+                                      const SizedBox(height: Grid.quarter),
+                                      // Contextual label: "Mentioned in #channel" etc.
+                                      Row(
+                                        children: [
+                                          Flexible(
                                             child: Text(
-                                              '#${label.channelLabel}',
+                                              label.text,
                                               style: activityContextTextStyle
-                                                  .copyWith(color: mutedColor),
+                                                  .copyWith(color: labelColor),
                                               overflow: TextOverflow.ellipsis,
                                             ),
                                           ),
-                                        ),
-                                      ],
+                                          if (label.channelLabel != null) ...[
+                                            const SizedBox(width: Grid.half),
+                                            Flexible(
+                                              child: Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                      horizontal:
+                                                          Grid.half +
+                                                          Grid.quarter,
+                                                      vertical:
+                                                          Grid.quarter / 2,
+                                                    ),
+                                                decoration: BoxDecoration(
+                                                  color: context
+                                                      .colors
+                                                      .surfaceContainerHighest,
+                                                  borderRadius:
+                                                      BorderRadius.circular(
+                                                        Grid.half,
+                                                      ),
+                                                ),
+                                                child: Text(
+                                                  '#${label.channelLabel}',
+                                                  style:
+                                                      activityContextTextStyle
+                                                          .copyWith(
+                                                            color: mutedColor,
+                                                          ),
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                      const SizedBox(height: Grid.half),
+                                      // Message preview.
+                                      MessageContent(
+                                        content: item.item.displayContent,
+                                        mentionNames: mentionNames,
+                                        agentMentionPubkeys:
+                                            agentMentionPubkeys,
+                                        tags: item.item.tags,
+                                        maxLines: 2,
+                                        baseStyle: activityPreviewTextStyle
+                                            .copyWith(
+                                              color: context.colors.onSurface,
+                                            ),
+                                      ),
                                     ],
                                   ),
-                                  const SizedBox(height: Grid.half),
-                                  // Message preview.
-                                  MessageContent(
-                                    content: item.item.displayContent,
-                                    mentionNames: mentionNames,
-                                    agentMentionPubkeys: agentMentionPubkeys,
-                                    tags: item.item.tags,
-                                    maxLines: 2,
-                                    baseStyle: activityPreviewTextStyle
-                                        .copyWith(
-                                          color: context.colors.onSurface,
-                                        ),
-                                  ),
-                                ],
-                              ),
+                                ),
+                              ],
                             ),
-                          ],
+                          ),
                         ),
                       ),
                     ),
@@ -339,7 +410,7 @@ class _InboxRow extends HookConsumerWidget {
     );
   }
 
-  void _showRowActions(BuildContext context) {
+  void _showRowActionsSheet(BuildContext context) {
     showBuzzModalBottomSheet<void>(
       context: context,
       builder: (sheetContext) => SafeArea(
@@ -377,6 +448,31 @@ class _InboxRow extends HookConsumerWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _ActivityLongPressInkWell extends StatelessWidget {
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+  final Widget child;
+
+  const _ActivityLongPressInkWell({
+    super.key,
+    required this.onTap,
+    required this.onLongPress,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      onLongPress: onLongPress,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onLongPressStart: (_) => onLongPress(),
+        child: InkWell(onTap: onTap, child: child),
       ),
     );
   }

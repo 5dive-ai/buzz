@@ -418,6 +418,161 @@ void main() {
 
   group('showMessageActions', () {
     testWidgets(
+      'Android composes the existing tray, lifted preview, and curved actions',
+      (tester) async {
+        final prefs = await _mockPrefs();
+        await _pumpSheet(
+          tester,
+          message: _message(),
+          prefs: prefs,
+          canManageMessage: true,
+          allMessages: [_message()],
+          reminderService: _stubReminderService(),
+          anchorRect: const Rect.fromLTWH(32, 260, 300, 72),
+        );
+
+        expect(
+          find.byKey(const ValueKey('reaction-popover-tray')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('message-action-preview-container')),
+          findsOneWidget,
+        );
+        final surface = find.byKey(
+          const ValueKey('android-message-action-surface'),
+        );
+        expect(surface, findsOneWidget);
+        expect(find.byType(BottomSheet), findsNothing);
+
+        const actionIds = [
+          'reply',
+          'copyLink',
+          'remind',
+          'markUnread',
+          'followThread',
+          'copyText',
+          'edit',
+          'delete',
+        ];
+        const actionTitles = [
+          'Reply',
+          'Copy link',
+          'Remind me',
+          'Mark unread',
+          'Follow thread',
+          'Copy text',
+          'Edit message',
+          'Delete message',
+        ];
+        for (var index = 0; index < actionIds.length; index++) {
+          expect(
+            find.byKey(ValueKey('android-message-action-${actionIds[index]}')),
+            findsOneWidget,
+          );
+          expect(
+            tester
+                .widget<Text>(
+                  find.byKey(
+                    ValueKey(
+                      'android-message-action-label-${actionIds[index]}',
+                    ),
+                  ),
+                )
+                .data,
+            actionTitles[index],
+          );
+        }
+
+        final surfaceRect = tester.getRect(surface);
+        final previewRect = tester.getRect(
+          find.byKey(const ValueKey('message-action-preview-container')),
+        );
+        final trayRect = tester.getRect(
+          find.byKey(const ValueKey('reaction-popover-tray')),
+        );
+        expect(surfaceRect.width, 288);
+        expect(surfaceRect.center.dx, closeTo(previewRect.center.dx, 0.01));
+        expect(surfaceRect.center.dx, closeTo(trayRect.center.dx, 0.01));
+        expect(
+          tester.widget<Material>(surface).shape,
+          isA<RoundedRectangleBorder>().having(
+            (shape) => shape.borderRadius,
+            'border radius',
+            BorderRadius.circular(26),
+          ),
+        );
+        expect(
+          find.byKey(const ValueKey('android-message-action-divider-triage')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('android-message-action-divider-export')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('android-message-action-divider-manage')),
+          findsOneWidget,
+        );
+
+        final iconCenters = [
+          for (final id in actionIds)
+            tester
+                .getRect(
+                  find.byKey(ValueKey('android-message-action-icon-$id')),
+                )
+                .center
+                .dx,
+        ];
+        final labelLefts = [
+          for (final id in actionIds)
+            tester
+                .getRect(
+                  find.byKey(ValueKey('android-message-action-label-$id')),
+                )
+                .left,
+        ];
+        for (final center in iconCenters.skip(1)) {
+          expect(center, closeTo(iconCenters.first, 0.01));
+        }
+        for (final left in labelLefts.skip(1)) {
+          expect(left, closeTo(labelLefts.first, 0.01));
+        }
+
+        Navigator.of(tester.element(surface)).pop();
+        await tester.pumpAndSettle();
+      },
+    );
+
+    testWidgets('Android runs its selected action after dismissing the menu', (
+      tester,
+    ) async {
+      final prefs = await _mockPrefs();
+      await _pumpSheet(
+        tester,
+        message: _message(rootId: 'android-root'),
+        prefs: prefs,
+        anchorRect: const Rect.fromLTWH(32, 260, 300, 72),
+      );
+      final container = ProviderScope.containerOf(
+        tester.element(find.text('open')),
+      );
+
+      await tester.tap(
+        find.byKey(const ValueKey('android-message-action-followThread')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const ValueKey('android-message-action-surface')),
+        findsNothing,
+      );
+      expect(container.read(threadFollowsProvider).followedRootIds, {
+        'android-root',
+      });
+    });
+
+    testWidgets(
       'composes the Flutter tray, lifted preview, and native actions',
       (tester) async {
         final prefs = await _mockPrefs();

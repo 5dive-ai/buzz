@@ -430,3 +430,179 @@ final class NativeMessageActionSurfacePlatformView: NSObject,
     channel.invokeMethod("selected", arguments: ["id": definition.id])
   }
 }
+
+struct NativeMenuButtonItemDefinition {
+  let id: String
+  let title: String
+  let systemImage: String?
+  let group: String
+  let checked: Bool
+  let enabled: Bool
+  let destructive: Bool
+
+  init?(arguments: [String: Any]) {
+    guard
+      let id = arguments["id"] as? String,
+      let title = arguments["title"] as? String
+    else {
+      return nil
+    }
+    self.id = id
+    self.title = title
+    systemImage = arguments["systemImage"] as? String
+    group = arguments["group"] as? String ?? "primary"
+    checked = arguments["checked"] as? Bool ?? false
+    enabled = arguments["enabled"] as? Bool ?? true
+    destructive = arguments["destructive"] as? Bool ?? false
+  }
+}
+
+@available(iOS 16.0, *)
+final class NativeMenuButtonFactory: NSObject, FlutterPlatformViewFactory {
+  private let messenger: FlutterBinaryMessenger
+
+  init(messenger: FlutterBinaryMessenger) {
+    self.messenger = messenger
+    super.init()
+  }
+
+  func createArgsCodec() -> FlutterMessageCodec & NSObjectProtocol {
+    FlutterStandardMessageCodec.sharedInstance()
+  }
+
+  func create(
+    withFrame frame: CGRect,
+    viewIdentifier viewId: Int64,
+    arguments args: Any?
+  ) -> FlutterPlatformView {
+    NativeMenuButtonPlatformView(
+      frame: frame,
+      viewIdentifier: viewId,
+      messenger: messenger,
+      arguments: args
+    )
+  }
+}
+
+@available(iOS 16.0, *)
+final class NativeMenuButtonPlatformView: NSObject, FlutterPlatformView {
+  private let button = UIButton(type: .system)
+  private let channel: FlutterMethodChannel
+
+  init(
+    frame: CGRect,
+    viewIdentifier viewId: Int64,
+    messenger: FlutterBinaryMessenger,
+    arguments args: Any?
+  ) {
+    channel = FlutterMethodChannel(
+      name: "buzz/native_menu_button/\(viewId)",
+      binaryMessenger: messenger
+    )
+    super.init()
+
+    button.frame = frame
+    button.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    button.showsMenuAsPrimaryAction = true
+    button.changesSelectionAsPrimaryAction = false
+    update(arguments: args)
+
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard call.method == "update" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      DispatchQueue.main.async {
+        self?.update(arguments: call.arguments)
+        result(nil)
+      }
+    }
+  }
+
+  func view() -> UIView {
+    button
+  }
+
+  private func update(arguments args: Any?) {
+    guard let arguments = args as? [String: Any] else { return }
+
+    let title = arguments["title"] as? String
+    let systemImage = arguments["systemImage"] as? String
+    let accessibilityLabel = arguments["accessibilityLabel"] as? String
+    let foregroundColor = color(arguments["foregroundColor"] as? NSNumber)
+    let itemArguments = arguments["items"] as? [[String: Any]] ?? []
+    let items = itemArguments.compactMap(
+      NativeMenuButtonItemDefinition.init(arguments:)
+    )
+
+    var configuration = UIButton.Configuration.plain()
+    configuration.title = title
+    configuration.image = systemImage.flatMap(UIImage.init(systemName:))
+    configuration.imagePlacement = title == nil ? .leading : .trailing
+    configuration.imagePadding = title == nil ? 0 : 4
+    configuration.baseForegroundColor = foregroundColor
+    configuration.contentInsets = .zero
+    configuration.titleTextAttributesTransformer =
+      UIConfigurationTextAttributesTransformer { incoming in
+        var outgoing = incoming
+        outgoing.font = UIFont.preferredFont(forTextStyle: .subheadline)
+          .withWeight(.semibold)
+        return outgoing
+      }
+    button.configuration = configuration
+    button.accessibilityLabel = accessibilityLabel
+    button.menu = makeMenu(items: items)
+  }
+
+  private func makeMenu(items: [NativeMenuButtonItemDefinition]) -> UIMenu {
+    var groupOrder: [String] = []
+    for item in items where !groupOrder.contains(item.group) {
+      groupOrder.append(item.group)
+    }
+
+    let groups = groupOrder.map { group -> UIMenu in
+      let actions = items
+        .filter { $0.group == group }
+        .map { definition in
+          var attributes = UIMenuElement.Attributes()
+          if !definition.enabled { attributes.insert(.disabled) }
+          if definition.destructive { attributes.insert(.destructive) }
+          let image = definition.systemImage.flatMap(UIImage.init(systemName:))
+          return UIAction(
+            title: definition.title,
+            image: image,
+            attributes: attributes,
+            state: definition.checked ? .on : .off
+          ) { [weak self] _ in
+            self?.channel.invokeMethod(
+              "selected",
+              arguments: ["id": definition.id]
+            )
+          }
+        }
+      return UIMenu(options: .displayInline, children: actions)
+    }
+    return UIMenu(children: groups)
+  }
+
+  private func color(_ number: NSNumber?) -> UIColor {
+    guard let number else { return .label }
+    let argb = UInt32(truncating: number)
+    return UIColor(
+      red: CGFloat((argb >> 16) & 0xFF) / 255,
+      green: CGFloat((argb >> 8) & 0xFF) / 255,
+      blue: CGFloat(argb & 0xFF) / 255,
+      alpha: CGFloat((argb >> 24) & 0xFF) / 255
+    )
+  }
+}
+
+private extension UIFont {
+  func withWeight(_ weight: UIFont.Weight) -> UIFont {
+    let traits = [UIFontDescriptor.TraitKey.weight: weight]
+    let descriptor = fontDescriptor.addingAttributes([
+      UIFontDescriptor.AttributeName.traits: traits
+    ])
+    return UIFont(descriptor: descriptor, size: pointSize)
+  }
+}

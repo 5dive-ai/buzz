@@ -4,7 +4,7 @@ const _nativeMessageActionSurfaceChannel = MethodChannel(
   'buzz/native_message_action_surface',
 );
 
-List<_IosNativeMessageAction> _buildIosNativeMessageActions({
+List<_MessageAction> _buildMessageActions({
   required BuildContext context,
   required WidgetRef ref,
   required TimelineMessage message,
@@ -15,18 +15,18 @@ List<_IosNativeMessageAction> _buildIosNativeMessageActions({
   required bool isMember,
   required bool isArchived,
 }) {
-  final actions = <_IosNativeMessageAction>[];
+  final actions = <_MessageAction>[];
   final messages = allMessages;
   final canRemind = ref.read(reminderServiceProvider) != null;
 
   if (!message.isSystem) {
     if (messages != null) {
       actions.add(
-        _IosNativeMessageAction(
+        _MessageAction(
           id: 'reply',
           title: 'Reply',
           symbol: 'arrowshape.turn.up.left',
-          group: _IosNativeMessageActionGroup.promoted,
+          group: _MessageActionGroup.promoted,
           onSelected: () {
             if (!context.mounted) return;
             Navigator.of(context).push(
@@ -46,11 +46,11 @@ List<_IosNativeMessageAction> _buildIosNativeMessageActions({
       );
     }
     actions.add(
-      _IosNativeMessageAction(
+      _MessageAction(
         id: 'copyLink',
         title: 'Copy link',
         symbol: 'link',
-        group: _IosNativeMessageActionGroup.promoted,
+        group: _MessageActionGroup.promoted,
         onSelected: () {
           if (!context.mounted) return;
           copyToClipboard(
@@ -63,11 +63,11 @@ List<_IosNativeMessageAction> _buildIosNativeMessageActions({
     );
     if (canRemind) {
       actions.add(
-        _IosNativeMessageAction(
+        _MessageAction(
           id: 'remind',
           title: 'Remind me',
           symbol: 'clock',
-          group: _IosNativeMessageActionGroup.promoted,
+          group: _MessageActionGroup.promoted,
           onSelected: () {
             if (!context.mounted) return;
             showRemindMeLaterSheet(
@@ -97,11 +97,11 @@ List<_IosNativeMessageAction> _buildIosNativeMessageActions({
         threadRootId: message.rootId,
       );
       actions.add(
-        _IosNativeMessageAction(
+        _MessageAction(
           id: unread ? 'markRead' : 'markUnread',
           title: unread ? 'Mark read' : 'Mark unread',
           symbol: unread ? 'envelope.open' : 'envelope.badge',
-          group: _IosNativeMessageActionGroup.triage,
+          group: _MessageActionGroup.triage,
           onSelected: () {
             final notifier = ref.read(readStateProvider.notifier);
             if (unread) {
@@ -123,11 +123,11 @@ List<_IosNativeMessageAction> _buildIosNativeMessageActions({
     final rootId = message.rootId ?? message.id;
     final following = ref.read(threadFollowsProvider).isFollowing(rootId);
     actions.add(
-      _IosNativeMessageAction(
+      _MessageAction(
         id: following ? 'unfollowThread' : 'followThread',
         title: following ? 'Unfollow thread' : 'Follow thread',
         symbol: following ? 'bell.slash' : 'bell',
-        group: _IosNativeMessageActionGroup.triage,
+        group: _MessageActionGroup.triage,
         onSelected: () {
           final notifier = ref.read(threadFollowsProvider.notifier);
           if (following) {
@@ -139,11 +139,11 @@ List<_IosNativeMessageAction> _buildIosNativeMessageActions({
       ),
     );
     actions.add(
-      _IosNativeMessageAction(
+      _MessageAction(
         id: 'copyText',
         title: 'Copy text',
         symbol: 'doc.on.doc',
-        group: _IosNativeMessageActionGroup.export,
+        group: _MessageActionGroup.export,
         onSelected: () =>
             Clipboard.setData(ClipboardData(text: message.content)),
       ),
@@ -152,11 +152,11 @@ List<_IosNativeMessageAction> _buildIosNativeMessageActions({
 
   if (canManageMessage) {
     actions.add(
-      _IosNativeMessageAction(
+      _MessageAction(
         id: 'edit',
         title: 'Edit message',
         symbol: 'pencil',
-        group: _IosNativeMessageActionGroup.manage,
+        group: _MessageActionGroup.manage,
         onSelected: () {
           if (!context.mounted) return;
           _showEditSheet(
@@ -169,11 +169,11 @@ List<_IosNativeMessageAction> _buildIosNativeMessageActions({
       ),
     );
     actions.add(
-      _IosNativeMessageAction(
+      _MessageAction(
         id: 'delete',
         title: 'Delete message',
         symbol: 'trash',
-        group: _IosNativeMessageActionGroup.manage,
+        group: _MessageActionGroup.manage,
         destructive: true,
         onSelected: () {
           if (!context.mounted) return;
@@ -191,17 +191,17 @@ List<_IosNativeMessageAction> _buildIosNativeMessageActions({
   return actions;
 }
 
-enum _IosNativeMessageActionGroup { promoted, triage, export, manage }
+enum _MessageActionGroup { promoted, triage, export, manage }
 
-class _IosNativeMessageAction {
+class _MessageAction {
   final String id;
   final String title;
   final String symbol;
-  final _IosNativeMessageActionGroup group;
+  final _MessageActionGroup group;
   final bool destructive;
   final FutureOr<void> Function() onSelected;
 
-  const _IosNativeMessageAction({
+  const _MessageAction({
     required this.id,
     required this.title,
     required this.symbol,
@@ -209,6 +209,20 @@ class _IosNativeMessageAction {
     required this.onSelected,
     this.destructive = false,
   });
+
+  IconData get flutterIcon => switch (id) {
+    'reply' => LucideIcons.messageSquareReply,
+    'copyLink' => LucideIcons.link2,
+    'remind' => LucideIcons.clock,
+    'markRead' => LucideIcons.mailCheck,
+    'markUnread' => LucideIcons.mailOpen,
+    'followThread' => LucideIcons.bellRing,
+    'unfollowThread' => LucideIcons.bellOff,
+    'copyText' => LucideIcons.copy,
+    'edit' => LucideIcons.pencil,
+    'delete' => LucideIcons.trash2,
+    _ => LucideIcons.ellipsis,
+  };
 
   Map<String, Object> toPlatformArguments() => {
     'id': id,

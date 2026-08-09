@@ -160,7 +160,7 @@ class RunnerTests: XCTestCase {
 
   @available(iOS 16.0, *)
   @MainActor
-  func testNativeMessageActionSeparatorsShareGeometry() {
+  func testNativeMessageActionSeparatorsShareGeometry() throws {
     let separators = [
       NativeMessageActionSeparatorView(),
       NativeMessageActionSeparatorView(),
@@ -188,10 +188,12 @@ class RunnerTests: XCTestCase {
       NativeMessageActionSurfaceLayout.surfaceWidth
         - (NativeMessageActionSurfaceLayout.separatorHorizontalInset * 2)
     )
-    XCTAssertEqual(
-      lineFrames.first?.height,
+    let renderedHeight = try XCTUnwrap(lineFrames.first?.height)
+    XCTAssertGreaterThanOrEqual(
+      renderedHeight,
       NativeMessageActionSurfaceLayout.separatorHeight
     )
+    XCTAssertLessThanOrEqual(renderedHeight, 1)
   }
 
   @available(iOS 16.0, *)

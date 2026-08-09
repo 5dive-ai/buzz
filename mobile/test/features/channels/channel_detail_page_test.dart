@@ -1625,8 +1625,19 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.byKey(const ValueKey('reaction-popover-tray')), findsNothing);
-      expect(find.byType(BottomSheet), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('reaction-popover-tray')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('message-action-preview-container')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('android-message-action-surface')),
+        findsOneWidget,
+      );
+      expect(find.byType(BottomSheet), findsNothing);
       expect(find.text('Copy text'), findsOneWidget);
     });
 

@@ -11,6 +11,7 @@ import UserNotifications
   private var concentricSheetSurfaceChannel: FlutterMethodChannel?
   private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
   private var nativeMessageActionSurfaceSupportChannel: FlutterMethodChannel?
+  private var nativeMenuButtonSupportChannel: FlutterMethodChannel?
 
   override func application(
     _ application: UIApplication,
@@ -109,6 +110,27 @@ import UserNotifications
         binaryMessenger: messenger
       )
       nativeMessageActionSurfaceSupportChannel?.setMethodCallHandler { call, result in
+        guard call.method == "isSupported" else {
+          result(FlutterMethodNotImplemented)
+          return
+        }
+        result(true)
+      }
+    }
+
+    if #available(iOS 16.0, *),
+      let nativeMenuButtonRegistrar = engineBridge.pluginRegistry.registrar(
+        forPlugin: "BuzzNativeMenuButton"
+      ) {
+      nativeMenuButtonRegistrar.register(
+        NativeMenuButtonFactory(messenger: messenger),
+        withId: "buzz/native_menu_button"
+      )
+      nativeMenuButtonSupportChannel = FlutterMethodChannel(
+        name: "buzz/native_menu_button",
+        binaryMessenger: messenger
+      )
+      nativeMenuButtonSupportChannel?.setMethodCallHandler { call, result in
         guard call.method == "isSupported" else {
           result(FlutterMethodNotImplemented)
           return

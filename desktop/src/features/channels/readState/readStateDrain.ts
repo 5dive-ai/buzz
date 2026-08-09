@@ -387,6 +387,19 @@ export async function drainPendingIntents(
         ctx.scheduleDrain();
       }
       ctx.notifyListeners();
+    } catch (err) {
+      // Unexpected exception — every expected failure path calls abortTransaction()
+      // + `continue` before reaching here, so a catch means the transaction is
+      // still open.  Close it now so the channel is not permanently latched, and
+      // schedule a bounded retry identical to any other non-success exit.
+      if (!transactionCommitted) {
+        console.warn(
+          `[ReadStateManager] drain: unexpected exception for ${channelId}:`,
+          err,
+        );
+        pendingOverrideIntentStore.abortTransaction(channelId);
+        if (!ctx.destroyed) ctx.scheduleAbortRetry();
+      }
     } finally {
       // Release the transaction latch only on the success path.
       // Failure paths (step-1 and step-3) call abortTransaction() and `continue`.

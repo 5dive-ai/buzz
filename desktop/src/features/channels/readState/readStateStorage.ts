@@ -354,11 +354,32 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
         // which would silently discard the fresh action via the Amendment C
         // already-applied check.
         //
+        // Pre-rebase receipt sweep: retain a receipt only when the same channel
+        // has an intent with an IDENTICAL pre-rebase {gen, op}.  This must run
+        // BEFORE maxObservedGen is computed and before any generation is
+        // reassigned, so that compaction cannot manufacture a false
+        // alreadyApplied match between a rebased intent and an orphan or
+        // operation-mismatched receipt that happened to share a compact gen.
+        for (const [chId, receipt] of receipts) {
+          const intent = pendingIntents.get(chId);
+          if (
+            intent === undefined ||
+            intent.gen !== receipt.intentGen ||
+            intent.op !== receipt.op
+          ) {
+            receipts.delete(chId);
+          }
+        }
+        //
         // If all loaded generations are at or near MAX_SAFE_INTEGER (allocator
         // exhausted), rebase: atomically compact all intent gens and their
         // matching receipt gens into a fresh range [1..N] and persist the
         // normalized blob.  N is bounded by the number of channels in the map
         // (at most one intent per channel), so rebasing is always deterministic.
+        //
+        // maxObservedGen is computed from intents only (after the sweep,
+        // receipts are guaranteed to match their intent and will be rebased in
+        // the same step, so including them would be redundant).
         //
         // This guarantees no allocation can produce a gen that matches a
         // retained receipt, since all receipts are renumbered in the same step.
@@ -372,10 +393,6 @@ function readOverrideState(pubkey: string): OverrideStateBlob {
           let maxObservedGen = 0;
           for (const intent of pendingIntents.values()) {
             if (intent.gen > maxObservedGen) maxObservedGen = intent.gen;
-          }
-          for (const receipt of receipts.values()) {
-            if (receipt.intentGen > maxObservedGen)
-              maxObservedGen = receipt.intentGen;
           }
           const requiredNextGen = maxObservedGen + 1;
           if (

@@ -1,0 +1,9 @@
+{
+  "deepseek-ai/Deepseek-V4-Flash": {
+    "provider": "openai",
+    "api_key_env": "CRUSOE_INFERENCE_API_KEY",
+    "env": {
+      "OPENAI_COMPAT_BASE_URL": "https://api.inference.crusoecloud.com/v1"
+    }
+  }
+}

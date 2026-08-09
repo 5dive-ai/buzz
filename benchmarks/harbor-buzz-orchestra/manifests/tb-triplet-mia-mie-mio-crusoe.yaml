@@ -1,0 +1,60 @@
+# Triplet: Mia (conn) + Mie (adaptive worker) + Mio (independent verifier) —
+# smoke of the verify-as-gate composition from the Eva/Wren joint rec
+# (buzz-benchmarking thread b6cdc4df, Tyler order bc37c9e7, 2026-08-09).
+# Mio = the "Vera" design renamed per Tyler: verification-first, matrix+probes
+# to .scratch/mio/ on first wake (stateless, never polls), evidence-bearing
+# PASS/FAIL/BLOCKED verdicts, read-only outside her scratch, never repairs
+# what she certifies. Mia carries the collapsed dispatch protocol + Mio
+# verdict gate, variant B (no timing injection). Mie unchanged from twins-2.
+# Known hazard, accepted: mio-1 is edit-distance 1 from mia-1/mie-1 — if a
+# lane goes silent, suspect a misrouted wake first (Mia has the resend rule).
+# Model/provider: Crusoe serverless deepseek-ai/Deepseek-V4-Flash (0423
+# preview — NOT the 0731 our other runs use; that comparison is the point).
+# Model id is case-exact: lowercase 's' in "Deepseek". Endpoint config:
+# testbed/endpoints/crusoe-live.json (OPENAI_COMPAT_BASE_URL
+# https://api.inference.crusoecloud.com/v1, key env CRUSOE_INFERENCE_API_KEY).
+# Pricing: crusoe.ai/cloud/pricing 2026-08-07 snapshot, $0.14/$0.28 per M.
+schema_version: "1"
+condition: tb-triplet-mia-mie-mio-crusoe
+roster:
+  - id: mia
+    kind: orchestrator
+    role: conn
+    count: 1
+    endpoint: deepseek-ai/Deepseek-V4-Flash
+    model_revision: deepseek-ai/DeepSeek-V4-Flash-20260423
+    prompt:
+      path: personas/bench/mia.md
+      sha256: 5a41ba0cd0eb39165a91bc75e2104a54fa76464a40ea58ec3e1eba39148e1101
+    generation:
+      thinking_effort: high
+  - id: mie
+    kind: worker
+    role: twin
+    count: 1
+    endpoint: deepseek-ai/Deepseek-V4-Flash
+    model_revision: deepseek-ai/DeepSeek-V4-Flash-20260423
+    prompt:
+      path: personas/bench/mie.md
+      sha256: a4924e4c4507ac466a7500bb34a04a782618df41dba850b6f0f729787c48439b
+    generation:
+      thinking_effort: high
+  - id: mio
+    kind: worker
+    role: verifier
+    count: 1
+    endpoint: deepseek-ai/Deepseek-V4-Flash
+    model_revision: deepseek-ai/DeepSeek-V4-Flash-20260423
+    prompt:
+      path: personas/bench/mio.md
+      sha256: d20169133d8ac869809c47efa120d4999d4ebd44e29f75a5f832a99181fa1b72
+    generation:
+      thinking_effort: high
+prices:
+  deepseek-ai/Deepseek-V4-Flash:
+    input_per_million_usd: 0.14
+    cached_input_per_million_usd: 0.14
+    output_per_million_usd: 0.28
+    cache_read_rate: 0.0
+trial_budget:
+  timeout_seconds: 36000

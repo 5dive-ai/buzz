@@ -78,6 +78,21 @@ Save these. Losing any of them is data loss. See NOTES.txt printed by `helm inst
 4. Git PVC — repo on-disk state served by the relay's git endpoint.
 5. Owner private key — held by the operator, not by this chart. Restore by re-installing with the same `ownerPubkey`.
 
+## NIP-FI readiness
+
+This chart does not expose a NIP-FI runtime adapter, policy schema, trusted-edge
+topology, secret keys, or conformance runner. Do not advertise or enforce
+NIP-FI from this chart, and do not use an ingress identity header or
+provider-specific sidecar as a fallback authority.
+
+A later chart release must pin an implementation with an exact adapter and
+configuration version, keep policy separate from secret values, isolate
+verifier ingress for `trusted-proxy-hmac-v1`, include every fail-closed
+dependency in readiness, and link an immutable exact-head behavioral report.
+A rendered chart and healthy pod do not prove those behaviors. See the
+[provider-neutral deployment guide](../../../docs/NIP_FI_DEPLOYMENT.md) and
+[runtime operations guide](../../../docs/NIP_FI_RUNTIME_OPERATIONS.md).
+
 ## Honest limitations (v1)
 
 - **Bundled MinIO is eval-only.** The quickstart profile runs an in-cluster

@@ -41,6 +41,21 @@ keypair.
 
 Run `./run.sh backup-hint` for the backup checklist.
 
+## NIP-FI readiness
+
+This Compose bundle does not wire a NIP-FI runtime adapter, policy schema,
+trusted edge, or conformance runner. Do not advertise or enforce NIP-FI from
+this bundle, and do not add a provider-specific sidecar or unsigned corporate
+identity header as a substitute.
+
+A later implementation release must pin an exact image, document its supported
+configuration and adapter version, isolate verifier ingress when
+`trusted-proxy-hmac-v1` is enabled, deliver HMAC keys through a secret store,
+and pass the complete exact-head behavioral matrix before activation. A valid
+Compose render or healthy relay does not close those gates. See the
+[provider-neutral deployment guide](../../docs/NIP_FI_DEPLOYMENT.md) and
+[runtime operations guide](../../docs/NIP_FI_RUNTIME_OPERATIONS.md).
+
 ## Validation
 
 Before sharing an install link publicly, verify a fresh install with:

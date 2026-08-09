@@ -1377,6 +1377,14 @@ pub struct FormatPromptArgs<'a> {
     /// For legacy agents it rides in the user message on every turn of the
     /// session, alongside `[Base]`/`[System]`/`[Agent Memory — core]`.
     pub agent_canvas: Option<&'a str>,
+    /// Channel-scoped standing instructions from a kind:48106 event — today
+    /// the huddle voice-mode guidelines.
+    ///
+    /// Sent on every turn rather than once at `session/new`, for two reasons:
+    /// guidelines can arrive after a session already exists, and sessions are
+    /// rotated on token limits or `!rotate`, which would silently drop a
+    /// one-shot injection mid-huddle.
+    pub channel_guidelines: Option<&'a str>,
 }
 
 /// Format the `[Base]` section for the base prompt.
@@ -1395,8 +1403,9 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
 /// 1. `[System]` — system prompt (only for legacy agents without systemPrompt support)
 /// 2. `[Agent Memory — core]` — if agent core memory is set
 /// 3. `[Context]` — scope, channel name, and contextual hints for the agent
-/// 4. `[Thread Context]` or `[Conversation Context]` — if fetched
-/// 5. `[Event]` / `[Buzz events]` — the triggering event(s)
+/// 4. `[Channel Guidelines]` — standing per-channel instructions, if any
+/// 5. `[Thread Context]` or `[Conversation Context]` — if fetched
+/// 6. `[Event]` / `[Buzz events]` — the triggering event(s)
 ///
 /// Each section is returned as its own block rather than one joined string so
 /// the observer frame's size trimmer (`fit_observer_event_to_budget`) elides
@@ -1491,6 +1500,16 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         args.conversation_context.is_some(),
         reply_anchor.as_deref(),
     ));
+
+    // Channel guidelines sit directly after the context hints so they frame
+    // the conversation and the triggering event that follow.
+    if let Some(guidelines) = args
+        .channel_guidelines
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        sections.push(format!("[Channel Guidelines]\n{guidelines}"));
+    }
 
     // 3. Conversation context (thread or DM).
     if let Some(ctx) = args.conversation_context {
@@ -2962,6 +2981,66 @@ mod tests {
         let tags = parse_thread_tags(&event);
         assert_eq!(tags.root_event_id.as_deref(), Some("root123"));
         assert_eq!(tags.parent_event_id.as_deref(), Some("root123"));
+    }
+
+    /// Voice-mode guidelines must reach the model on the turn they apply to,
+    /// framed as standing instructions rather than as another chat message.
+    #[test]
+    fn test_format_prompt_renders_channel_guidelines() {
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event: make_event("how long will the migration take?"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                channel_guidelines: Some("Answer in one sentence."),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+
+        assert!(prompt.contains("[Channel Guidelines]\nAnswer in one sentence."));
+        // Guidelines frame the turn, so they precede the event they apply to.
+        let guidelines_at = prompt.find("[Channel Guidelines]").expect("guidelines");
+        let event_at = prompt.find("[Buzz event").expect("event section");
+        assert!(guidelines_at < event_at);
+    }
+
+    /// A channel with no guidelines must render exactly as before — the
+    /// section is absent rather than present and empty.
+    #[test]
+    fn test_format_prompt_omits_absent_or_blank_guidelines() {
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event: make_event("hello"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let absent = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+        assert!(!absent.contains("[Channel Guidelines]"));
+
+        let blank = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                channel_guidelines: Some("   \n  "),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+        assert!(!blank.contains("[Channel Guidelines]"));
     }
 
     #[test]

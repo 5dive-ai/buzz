@@ -21,7 +21,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -511,6 +511,42 @@ impl ChannelInfoResolver {
     }
 }
 
+/// Standing per-channel instructions delivered by kind:48106 events.
+///
+/// Shared with the harness event loop, which records guidelines as they
+/// arrive rather than queueing them: a guidelines event must never become a
+/// turn of its own, because an agent that acknowledges one says so out loud
+/// over TTS at the start of every huddle.
+#[derive(Clone, Default)]
+pub struct ChannelGuidelinesStore {
+    guidelines: Arc<RwLock<HashMap<Uuid, String>>>,
+}
+
+impl ChannelGuidelinesStore {
+    /// Record (or replace) the guidelines for `channel_id`.
+    pub fn set(&self, channel_id: Uuid, guidelines: String) {
+        if let Ok(mut map) = self.guidelines.write() {
+            map.insert(channel_id, guidelines);
+        }
+    }
+
+    /// Guidelines for `channel_id`, if any have been received.
+    pub fn get(&self, channel_id: Uuid) -> Option<String> {
+        self.guidelines
+            .read()
+            .ok()
+            .and_then(|map| map.get(&channel_id).cloned())
+    }
+
+    /// Forget `channel_id` — called when the agent loses membership, which for
+    /// a huddle's ephemeral channel is how the huddle ends.
+    pub fn remove(&self, channel_id: Uuid) {
+        if let Ok(mut map) = self.guidelines.write() {
+            map.remove(&channel_id);
+        }
+    }
+}
+
 pub struct PromptContext {
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
@@ -539,6 +575,8 @@ pub struct PromptContext {
     pub rest_client: RestClient,
     /// Shared channel metadata for startup-known and dynamically joined channels.
     pub channel_info: ChannelInfoResolver,
+    /// Standing per-channel instructions (kind:48106), shared with the event loop.
+    pub channel_guidelines: ChannelGuidelinesStore,
     /// Max messages to include in thread/DM context. 0 = disabled.
     pub context_message_limit: u32,
     /// Max turns per session before proactive rotation. 0 = disabled.
@@ -1904,6 +1942,8 @@ pub async fn run_prompt_task(
             );
         }
 
+        let channel_guidelines = ctx.channel_guidelines.get(b.channel_id);
+
         crate::queue::format_prompt(
             b,
             &crate::queue::FormatPromptArgs {
@@ -1916,6 +1956,7 @@ pub async fn run_prompt_task(
                 system_prompt: ctx.system_prompt.as_deref(),
                 team_instructions: ctx.team_instructions.as_deref(),
                 agent_canvas: agent_canvas.as_deref(),
+                channel_guidelines: channel_guidelines.as_deref(),
             },
         )
     } else {
@@ -6534,6 +6575,7 @@ mod tests {
                     auth_tag_json: None,
                 },
             ),
+            channel_guidelines: ChannelGuidelinesStore::default(),
             context_message_limit: 0,
             max_turns_per_session: 0,
             permission_mode: PermissionMode::Default,
@@ -6543,6 +6585,40 @@ mod tests {
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
         }
+    }
+
+    // ── ChannelGuidelinesStore ───────────────────────────────────────────────
+
+    #[test]
+    fn guidelines_are_scoped_per_channel_and_replaced_in_place() {
+        let store = ChannelGuidelinesStore::default();
+        let huddle = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        store.set(huddle, "Answer in one sentence.".to_string());
+        assert_eq!(
+            store.get(huddle).as_deref(),
+            Some("Answer in one sentence.")
+        );
+        assert!(store.get(other).is_none());
+
+        // A re-post for a late-joining agent supersedes rather than appends.
+        store.set(huddle, "Answer in one word.".to_string());
+        assert_eq!(store.get(huddle).as_deref(), Some("Answer in one word."));
+    }
+
+    /// Guidelines must not outlive the huddle: the ephemeral channel is gone,
+    /// and a stale entry would silently apply voice brevity to a later channel
+    /// that happened to reuse the id.
+    #[test]
+    fn guidelines_are_dropped_when_the_channel_goes_away() {
+        let store = ChannelGuidelinesStore::default();
+        let channel = Uuid::new_v4();
+
+        store.set(channel, "Answer in one sentence.".to_string());
+        store.remove(channel);
+
+        assert!(store.get(channel).is_none());
     }
 
     // ── render_canvas_section ────────────────────────────────────────────────

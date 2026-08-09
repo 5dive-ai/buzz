@@ -549,16 +549,24 @@ pub fn build_huddle_ended(
 
 /// Kind 48106 — voice-mode guidelines for agents in a huddle.
 ///
-/// Posted to the **ephemeral** channel (not the parent) so agents see it
-/// via EOSE replay when they subscribe. Uses a dedicated kind so the TTS
-/// pipeline can filter it out without fragile content-prefix matching.
+/// Posted to the **ephemeral** channel (not the parent). Uses a dedicated kind
+/// so the TTS pipeline can filter it out without fragile content-prefix
+/// matching.
+///
+/// `agent_pubkeys` must list every agent the guidelines are meant for. The
+/// harness subscribes to one merged filter per channel, so a `#p` mention is
+/// the only way to reach a mention-gated agent without relaxing that filter
+/// for ordinary messages too — an untagged guidelines event is silently
+/// dropped by the relay.
 pub fn build_huddle_guidelines(
     ephemeral_channel_id: &str,
     guidelines_text: &str,
+    agent_pubkeys: &[&str],
 ) -> Result<EventBuilder, String> {
     validate_channel_id(ephemeral_channel_id)?;
     check_content(guidelines_text)?;
-    let tags = vec![tag(vec!["h", ephemeral_channel_id])?];
+    let mut tags = vec![tag(vec!["h", ephemeral_channel_id])?];
+    tags.extend(mention_tags(agent_pubkeys)?);
     Ok(EventBuilder::new(Kind::Custom(48106), guidelines_text).tags(tags))
 }
 
@@ -855,6 +863,38 @@ mod tests {
         assert!(build_create_channel(channel_id, "###", "open", "stream", None, None).is_err());
         assert!(build_update_channel(channel_id, Some("###"), None, None, None).is_err());
     }
+    /// The harness subscribes with one mention-gated filter per channel, so
+    /// guidelines reach agents only when each is named in a `p` tag. Losing
+    /// these tags silently reverts agents to their text-chat persona in voice.
+    #[test]
+    fn huddle_guidelines_mention_every_agent() {
+        const ALICE: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        const BOB: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        let channel_id = Uuid::new_v4().to_string();
+
+        let builder = build_huddle_guidelines(
+            &channel_id,
+            "Keep replies to one sentence.",
+            &[ALICE, &BOB.to_ascii_uppercase()],
+        )
+        .expect("build_huddle_guidelines");
+        let event = builder
+            .sign_with_keys(&Keys::generate())
+            .expect("sign guidelines");
+
+        let tags: Vec<Vec<String>> = event.tags.iter().map(|t| t.as_slice().to_vec()).collect();
+
+        assert_eq!(event.kind, Kind::Custom(48106));
+        assert_eq!(
+            tags,
+            vec![
+                vec!["h".to_string(), channel_id],
+                vec!["p".to_string(), ALICE.to_string()],
+                vec!["p".to_string(), BOB.to_string()],
+            ]
+        );
+    }
+
     /// Builder layout regression for the NIP-IA owner-of-agent archive flow.
     /// Compares against `docs/nips/NIP-IA.md` §Vector 1.
     #[test]

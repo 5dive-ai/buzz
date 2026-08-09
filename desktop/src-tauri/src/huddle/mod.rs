@@ -171,8 +171,8 @@ pub fn get_voice_input_mode(state: State<'_, AppState>) -> Result<VoiceInputMode
 ///
 /// Steps:
 /// 1. Create an ephemeral channel (kind 9007, ttl=3600).
-/// 2. Post voice-mode guidelines (kind 48106).
-/// 3. Add each invited member to the ephemeral channel (kind 9000).
+/// 2. Add each invited member to the ephemeral channel (kind 9000).
+/// 3. Post voice-mode guidelines (kind 48106) mentioning the enrolled agents.
 /// 4. Emit KIND_HUDDLE_STARTED to the parent channel (kind 48100).
 /// 5. Store state and return join info.
 ///
@@ -250,20 +250,7 @@ pub async fn start_huddle(
         submit_event(create_builder, &state).await?;
         channel_was_created = true;
 
-        // 2. Post voice-mode guidelines as kind:48106 BEFORE adding agents.
-        //    Agents auto-subscribe on membership notification (kind:9000) and may
-        //    complete EOSE before guidelines are stored if we post them after.
-        //    Best-effort: don't fail the huddle if this fails.
-        let guidelines = agents::voice_mode_guidelines(&parent_channel_id);
-        if let Ok(guidelines_builder) =
-            events::build_huddle_guidelines(&ephemeral_channel_id, &guidelines)
-        {
-            if let Err(e) = submit_event(guidelines_builder, &state).await {
-                eprintln!("buzz-desktop: huddle guidelines (kind:48106) failed: {e}");
-            }
-        }
-
-        // 3. Add members to the ephemeral channel; only keep successfully enrolled ones.
+        // 2. Add members to the ephemeral channel; only keep successfully enrolled ones.
         let mut successful_agents: Vec<String> = Vec::new();
         for pubkey in &member_pubkeys {
             let add_builder = events::build_add_member(ephemeral_uuid, pubkey, Some("bot"))?;
@@ -275,6 +262,20 @@ pub async fn start_huddle(
                 }
             }
         }
+
+        // 3. Post voice-mode guidelines as kind:48106, mentioning the agents
+        //    that actually enrolled. Posting after the adds keeps the event
+        //    newer than each membership: an agent that has already subscribed
+        //    receives it live, and one still subscribing picks it up in the
+        //    membership replay window.
+        //    Best-effort: don't fail the huddle if this fails.
+        agents::publish_voice_mode_guidelines(
+            &ephemeral_channel_id,
+            &parent_channel_id,
+            &successful_agents,
+            &state,
+        )
+        .await;
 
         // 4. Emit HUDDLE_STARTED to parent channel.
         let started_builder =
@@ -987,8 +988,8 @@ pub async fn add_agent_to_huddle(
         hs.maybe_auto_enable_transcription_for_agents()
     };
 
-    // No guidelines re-post needed — the agent sees the original kind:48106
-    // guidelines via EOSE replay when it subscribes to the ephemeral channel.
+    // add_agent_to_huddle re-posts the kind:48106 guidelines mentioning this
+    // agent, so no separate publish is needed here.
     if transcription_auto_enabled {
         start_auto_enabled_transcription(&state, &eph_id).await;
     } else {

@@ -1809,6 +1809,9 @@ async fn tokio_main() -> Result<()> {
     }
 
     let base_prompt_content = config.base_prompt_content.take();
+    // Shared with the event loop, which records kind:48106 guidelines as they
+    // arrive; `ctx` reads them when building each prompt.
+    let channel_guidelines = pool::ChannelGuidelinesStore::default();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
@@ -1833,6 +1836,7 @@ async fn tokio_main() -> Result<()> {
             .to_string(),
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
+        channel_guidelines: channel_guidelines.clone(),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
         permission_mode: config.permission_mode,
@@ -2290,6 +2294,10 @@ async fn tokio_main() -> Result<()> {
                                     // complete normally (the relay may reject actions if
                                     // the agent lost access).
                                     let drained_ids = queue.drain_channel(ch);
+                                    // A huddle ends by removing the agent from
+                                    // its ephemeral channel, so this is also
+                                    // where voice-mode guidelines expire.
+                                    channel_guidelines.remove(ch);
                                     let invalidated = if pool_ready {
                                         pool.invalidate_channel_sessions(ch)
                                     } else {
@@ -2471,6 +2479,23 @@ async fn tokio_main() -> Result<()> {
                                     );
                                     continue;
                                 }
+                            }
+
+                            // Standing channel guidelines (kind:48106) are
+                            // recorded as context for subsequent turns, never
+                            // queued as one. Prompting on them would have the
+                            // agent acknowledge its own instructions out loud
+                            // over TTS every time a huddle starts.
+                            if buzz_event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_HUDDLE_GUIDELINES {
+                                tracing::info!(
+                                    channel_id = %buzz_event.channel_id,
+                                    "recording channel guidelines for subsequent turns"
+                                );
+                                channel_guidelines.set(
+                                    buzz_event.channel_id,
+                                    buzz_event.event.content.clone(),
+                                );
+                                continue;
                             }
 
                             let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;

@@ -48,22 +48,55 @@ pub fn voice_mode_guidelines(parent_channel_id: &str) -> String {
 You are in a live voice huddle attached to channel {parent_channel_id}.
 Your text is read aloud via TTS, message by message, in the order sent.
 
-Latency matters most: reply IMMEDIATELY — do not compose your full reply
-before sending anything. The moment your first sentence is formed, send it
-as its own `buzz messages send` tool call: it is what breaks the silence.
-Then send each following sentence the same way — one sentence per separate
-`buzz messages send` call. Never hold a finished sentence back to bundle it
-with the next one.
+DEFAULT TO ONE SENTENCE. Answer in a single sentence and then stop. This is a
+conversation, not a report — the person can always ask you to go on, and they
+will interrupt you if you run long. Only exceed one sentence when the answer is
+genuinely impossible to give in one, and even then stop at two or three.
+
+Latency matters as much as brevity: reply IMMEDIATELY — do not compose your
+full reply before sending anything. The moment your first sentence is formed,
+send it as its own `buzz messages send` tool call: it is what breaks the
+silence. On the rare occasion you need another sentence, send it the same way,
+one sentence per separate call. Never hold a finished sentence back to bundle
+it with the next one.
 
 - If not addressed or relevant: do nothing. Do not respond.
-- Keep the whole reply short — a few sentences at most. Start with the answer, no preamble.
+- Lead with the answer. No preamble, no restating the question, no summarizing what you just did, no offers of further help.
 - No markdown, code blocks, lists, or structured data — say it naturally.
 - To share code or detailed data: say \"I'll post that in the main channel\" and do so.
-- When you need a tool, say one short sentence first (e.g. \"Let me check.\"), then run it, then summarize the key finding verbally.
+- When you need a tool, say one short sentence first (e.g. \"Let me check.\"), then run it, then give the finding in one sentence.
 - If a new human message arrives mid-reply, you were interrupted: drop your unsent sentences and respond to the new message instead.
 - In multi-agent huddles, identify yourself only when needed.
 - Use your Buzz tools proactively when asked."
     )
+}
+
+/// Publish the voice-mode guidelines to `ephemeral_channel_id`, mentioning
+/// each agent so the harness's mention-gated subscription delivers them.
+///
+/// Best-effort: a huddle without guidelines is degraded (agents fall back to
+/// their text-chat persona) but still usable, so failures are logged rather
+/// than propagated. No-op when no agents are present — the guidelines exist
+/// only to be read by agents.
+pub(crate) async fn publish_voice_mode_guidelines(
+    ephemeral_channel_id: &str,
+    parent_channel_id: &str,
+    agent_pubkeys: &[String],
+    state: &AppState,
+) {
+    if agent_pubkeys.is_empty() {
+        return;
+    }
+    let mentions: Vec<&str> = agent_pubkeys.iter().map(String::as_str).collect();
+    let guidelines = voice_mode_guidelines(parent_channel_id);
+    match events::build_huddle_guidelines(ephemeral_channel_id, &guidelines, &mentions) {
+        Ok(builder) => {
+            if let Err(e) = submit_event(builder, state).await {
+                eprintln!("buzz-desktop: huddle guidelines (kind:48106) failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("buzz-desktop: huddle guidelines (kind:48106) build failed: {e}"),
+    }
 }
 
 // ── Agent enrollment ──────────────────────────────────────────────────────────
@@ -151,6 +184,18 @@ pub async fn add_agent_to_huddle(
             }
         }
     };
+
+    // Re-post the guidelines mentioning this agent. The huddle-start event
+    // named only the agents present then, and the harness subscribes from the
+    // membership timestamp forward, so a late joiner can neither match nor
+    // replay that earlier event.
+    publish_voice_mode_guidelines(
+        &ephemeral_channel_id.to_string(),
+        &parent_channel_id_string,
+        &[agent_pubkey.to_string()],
+        state,
+    )
+    .await;
 
     Ok(AgentAddResult {
         ephemeral_added: true,

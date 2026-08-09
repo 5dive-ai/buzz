@@ -49,7 +49,7 @@ Two transport profiles are defined. A service MUST advertise and accept only pro
 
 ### Client-attached profile
 
-This profile's discovery identifier is `client-attached`. The client sends exactly one `Nostr-Federated-Identity: Bearer <JWT>` field and no assertion-provenance field. A documented WebSocket profile MAY use `Authorization: Bearer`, but a NIP-98 HTTP request MUST reserve `Authorization` for its `Nostr` proof. Missing, repeated, comma-combined, malformed, empty, non-Bearer, or mixed-profile assertion fields are rejected.
+This profile's discovery identifier is `client-attached`. The client sends exactly one `Nostr-Federated-Identity: Bearer <JWT>` field and no assertion-provenance field. The same field is used on WebSocket upgrades and NIP-98 HTTP requests; `Authorization` remains reserved for the Nostr proof where that protocol requires it. Missing, repeated, comma-combined, malformed, empty, non-Bearer, or mixed-profile assertion fields are rejected.
 
 ### Trusted-proxy HMAC profile
 

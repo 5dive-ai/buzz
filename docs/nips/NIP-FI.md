@@ -1,210 +1,324 @@
 NIP-FI
 ======
 
-Federated Identity Authorization
+Federated identity authorization
 --------------------------------
 
 `draft` `optional` `relay`
 
-**Depends on**: NIP-01 (basic event format), NIP-42 (Authentication of Clients to Relays). **Composes with**: NIP-98 (HTTP Auth), NIP-11 (Relay Information Document), and optionally the draft NIP-OA (Owner Attestation) as one delegation-proof format.
+**Protocol dependencies**: NIP-01, plus NIP-42 for WebSocket authorization or NIP-98 for HTTP authorization. **Optional composition**: NIP-11 discovery and a separately validated delegation protocol such as NIP-OA.
 
 ## Abstract
 
-This NIP defines how a relay or Nostr-adjacent HTTP service authorizes an already-authenticated Nostr key only when a valid federated identity assertion resolves to the same principal and key. It specifies assertion transport, validation, an identity-to-key binding lifecycle (enroll, conflict, retire, disable, revoke, recover, rotate, and re-enable), session semantics, and failure behavior. A separately validated delegation MAY derive narrower authority from a bound owner as described below; that exception does not turn the delegate into the federated principal.
+This NIP defines how a relay or Nostr-adjacent HTTP service authorizes a Nostr key only when a valid federated identity assertion, fresh Nostr proof, current identity-to-key binding state, and the requested operation's local admission policy all agree. It defines cryptographically bound assertion transport, assertion and proof validation, read-only authorization preparation, final admission, enrollment, lifecycle state, bounded sessions, delegation, rejection behavior, discovery, and privacy.
 
-The identity provider never becomes a Nostr signing authority, and the assertion never substitutes for Nostr proof of key control. This NIP is an authorization layer above NIP-42 and NIP-98, not a replacement for either.
+The identity provider never becomes a Nostr signing authority. A bearer assertion never substitutes for Nostr proof of key control. Binding lifetime is independent of assertion lifetime: a fresh assertion can authorize an existing eligible binding after an earlier assertion expires, while every authorization lease remains bounded by the assertion used to create it.
 
 ## Motivation
 
-Organizations deploying Nostr internally need relay access tied to their workforce identity system: an employee's relay privileges should follow their corporate identity, survive Nostr key rotation, and end at offboarding. Existing primitives each solve part of this:
+Organizations may need relay access tied to an external identity system while preserving Nostr key ownership. NIP-42 proves control of a key on a relay connection, and NIP-98 proves control of a key for an HTTP request, but neither binds that key to an issuer-qualified external principal. Without a shared contract, deployments can disagree about assertion transport, key rotation, enrollment, lifecycle denial, and the point at which authorization may mutate state.
 
-- NIP-42 proves control of a Nostr key to a connection but carries no external identity.
-- NIP-05 maps an organization-controlled identifier to a pubkey, but by public DNS/HTTPS polling, not by a credential presented on the request being authorized.
-- NIP-46 lets a signer demand out-of-band authentication (`auth_url`) but does not bind the resulting external subject to a key at the relay.
-
-Without a standard, each deployment invents an incompatible binding scheme, and the first large deployment's configuration becomes an accidental protocol. This NIP defines the contract so that any relay behind any OIDC-capable identity provider or generic OAuth2 reverse proxy (Okta, Auth0, Keycloak, oauth2-proxy, etc.) can interoperate with any conforming client.
+This NIP defines a provider-neutral contract. It does not standardize an identity vendor, database schema, operator API, public identity projection, or application-specific membership policy.
 
 ## Definitions
 
-- **assertion**: a JWT issued by a configured identity provider, presented alongside (never instead of) Nostr authentication.
-- **federated identity** (`i`): the tuple `(iss, sub)` from a validated assertion. The `iss` value MUST be the exact validated issuer identifier and `sub` the exact non-empty subject string. A username, email, display name, or bare `sub` MUST NOT be used as a federated identity.
-- **authorization domain** (`D`): the scope within which bindings apply, resolved by the verifier from authenticated server routing or configuration (an entire relay, or one tenant of a multi-tenant relay). An assertion, proof, header value, or other untrusted request input MUST NOT select or rewrite `D`, and bindings MUST NOT cross domains implicitly.
-- **binding**: an active record associating exactly one federated identity with exactly one 32-byte Nostr public key within a domain. A binding MAY carry an authoritative expiry.
-- **retired pair**: a durable denial selector recording that one exact `(identity, key)` pair MUST NOT be recreated by ordinary authorization.
-- **disabled identity**: a durable denial selector preventing an identity from authorizing or enrolling any key.
-- **revoked key**: a durable denial selector preventing a key from authorizing or binding to any identity.
-- **pending replacement**: lifecycle state recording that an identity whose prior key was retired MUST use a separately authorized recovery transition, or re-enablement when disabled, before another key can become active.
-- **enrollment mode**: the domain's policy for creating bindings — `attested-key`, `provisioned`, or `tofu` (defined below).
-- **Nostr proof**: a valid NIP-42 AUTH event (WebSocket) or NIP-98 event (HTTP) proving control of a key on the current connection or request.
-- **direct lease**: a cached direct authorization decision for one `(domain, identity, key)`, bounded by the assertion's expiry and every shorter known binding, policy, or implementation limit.
-- **delegated lease**: a cached delegated authorization decision for a delegate key, dependent on an active owner binding and bounded by a mandatory finite configured implementation limit and every shorter known owner-binding, delegation, or policy limit. It has no independent assertion-expiry bound unless a stronger deployment policy requires a current owner assertion or direct lease.
+- **assertion** (`A`): a JWT issued under an accepted verifier policy and presented as independent evidence alongside Nostr proof.
+- **federated identity** (`i`): the exact tuple `(iss, sub)` from a validated assertion. `iss` is the exact accepted issuer identifier. `sub` is the exact non-empty subject string. A username, email address, display name, employee number, mutable profile field, or bare `sub` is not a federated identity.
+- **authorization domain** (`D`): a boundary selected from authenticated server routing and configuration. A client-supplied domain, forwarded host value, assertion claim, or unsigned header cannot select `D`.
+- **target context** (`R_t`): the server-resolved method, authority, path and query, body digest, transport, operation, and resource for the request being admitted.
+- **request context** (`R`): `R_t` sealed with the acting key returned by Nostr-proof validation. Client input cannot supply or replace that key.
+- **verifier policy identity** (`policy_id`): a stable identifier for assertion semantics, including issuer, audience, allowed algorithms, authenticated key-source identity, claim and normalization rules, and time bounds. It MUST change when those semantics change and MUST NOT include transport, rotating signing-key contents, key-set order, cache timestamps, or a JWKS generation.
+- **JWKS generation** (`g`): an opaque identifier for one effective verification-key snapshot. It MUST change whenever the accepted key identifiers or key material change.
+- **binding**: a durable, versioned record associating one identity with one 32-byte Nostr public key in `D`. Its immutable provenance is `attested-key`, `provisioned`, or `tofu`. It MAY carry a separately authorized administrative `binding_not_after` bound. It MUST NOT derive that bound from assertion `exp` or `iat`.
+- **retired pair**: a durable denial fact for one exact `(D, i, k)` pair. Ordinary authorization can never recreate that pair.
+- **disabled identity**: a durable denial fact that prevents an identity from authorizing or enrolling a key.
+- **revoked key**: a durable denial fact that prevents a key from authorizing or binding to any identity in `D`.
+- **pending replacement**: durable lineage identifying an old key and binding version that a separately authorized recovery or re-enablement transition may consume once.
+- **Nostr proof**: a valid NIP-42 AUTH event or NIP-98 event proving control of a key for the current connection or request.
+- **prepared authorization**: an immutable, non-authoritative, read-only result that seals verified evidence, server-owned context, state and policy witnesses, a possible enrollment proposal, and every expiry and invalidation dependency. Preparation creates no binding, lifecycle fact, replay claim, receipt, audit event, publication, lease, or application mutation.
+- **committed authorization**: the result of revalidating a prepared authorization at final admission and atomically committing any allowed enrollment, replay claim, receipt, and required authorization audit evidence.
+- **lease**: a cached committed decision for one actor, domain, operation set, and exact dependency versions. A lease is never a binding and cannot extend one.
+
+Within a domain, active bindings form a partial bijection: one identity has at most one active key, and one key has at most one active identity.
 
 ## Assertion transport
 
-An assertion reaches the verifier in an HTTP header on the request being authorized: the WebSocket upgrade request for relay connections, or each individual request for NIP-98-authenticated HTTP endpoints. Two transport profiles are defined; a service MUST document which it accepts.
+An assertion is captured on the request being authorized: the WebSocket upgrade for NIP-42 connections or the same HTTP request as its NIP-98 proof. Assertions MUST NOT appear in URLs, query parameters, Nostr events, tags, filters, application history, or public identity projections.
 
-1. **Trusted proxy**: an authenticating reverse proxy (for example oauth2-proxy or an SSO-aware ingress) injects the assertion after authenticating the user. The injected header name is deployment configuration. This profile is conforming only if untrusted clients cannot reach the verifier directly and the proxy strips every inbound copy of that header before setting it. This is the recommended profile for browser-based clients, which cannot attach arbitrary WebSocket upgrade headers.
-2. **Client-attached**: the client sends the assertion itself in `Nostr-Federated-Identity: Bearer <JWT>`. A verifier MAY additionally accept another documented header on WebSocket upgrades, including `Authorization: Bearer`; HTTP requests using NIP-98 MUST use `Nostr-Federated-Identity` because their `Authorization` header carries the `Nostr` proof.
+Two transport profiles are defined. A service MUST advertise and accept only profiles it implements completely.
 
-Assertion acquisition and interactive OIDC login are outside this NIP. A client-attached assertion value MUST use the `Bearer` scheme; after removing that scheme, the value MUST contain exactly one JWT and no comma-separated alternatives.
+### Client-attached profile
 
-Normal browser WebSocket APIs cannot attach the client-attached header. Browser deployments therefore require the trusted-proxy profile or a separately standardized assertion transport. Bearer assertions MUST NOT be placed in WebSocket URLs or query strings.
+This profile's discovery identifier is `client-attached`. The client sends exactly one `Nostr-Federated-Identity: Bearer <JWT>` field and no assertion-provenance field. A documented WebSocket profile MAY use `Authorization: Bearer`, but a NIP-98 HTTP request MUST reserve `Authorization` for its `Nostr` proof. Missing, repeated, comma-combined, malformed, empty, non-Bearer, or mixed-profile assertion fields are rejected.
 
-On a WebSocket connection, the assertion captured at upgrade is evaluated when a key performs NIP-42 AUTH — each authenticating key is authorized against that assertion independently. On HTTP, the assertion and the NIP-98 proof MUST arrive on the same request they authorize.
+### Trusted-proxy HMAC profile
 
-Assertions MUST NOT be carried inside Nostr events, event tags, or subscription filters, and MUST NOT be written to relay-visible event history.
+This profile's discovery identifier is `trusted-proxy-hmac-v1`. The trusted proxy strips every inbound copy of all assertion and provenance fields, inserts exactly one `Nostr-Federated-Identity: Bearer <JWT>` field, and inserts exactly one `Nostr-Federated-Identity-Provenance` field. Header presence, source IP, or network topology alone is not trusted-proxy provenance. Unsigned forwarded identity MUST be rejected.
+
+The provenance field has this exact ASCII form:
+
+```text
+v1.<timestamp>.<nonce>.<mac>
+```
+
+`timestamp` is canonical unsigned decimal without leading zeroes, except that zero is `0`. `nonce` and `mac` are canonical unpadded base64url. The trusted proxy generates each nonce with at least 128 bits from a cryptographically secure random source. A decoded nonce contains at least 16 bytes, and a decoded MAC contains exactly 32 bytes. The verifier applies configured finite maximum provenance-field and nonce sizes before decoding, lookup, or replay storage. Missing, repeated, comma-combined, oversized, non-canonical, or extra components are malformed.
+
+The stock profile uses HMAC-SHA-256 with a deployment secret of at least 256 bits. Let `LP(x)` be the eight-byte unsigned big-endian length of byte string `x`, followed by `x`. The MAC input is:
+
+```text
+"NIP-FI-PROXY-1" ||
+LP(timestamp) || LP(nonce) || LP(assertion_digest) ||
+LP(method) || LP(authority) || LP(path_and_query) || LP(body_digest)
+```
+
+For the MAC, parsed `timestamp` is encoded as an eight-byte unsigned big-endian value. `nonce`, `assertion_digest`, `body_digest`, and `mac` are their decoded bytes. `assertion_digest` is SHA-256 over the exact JWT octets after the Bearer scheme. `method` is the exact uppercase ASCII method token accepted by the endpoint. `authority` is the server-configured lowercase ASCII host, with an explicit decimal effective port and brackets around IPv6. `path_and_query` is the exact ASCII origin-form received after trusted routing: an empty path becomes `/`, the query includes its leading `?`, and percent-encoding, parameter order, and repeated parameters are preserved. It contains no fragment. A proxy rewrite is complete before these values are computed. Ambiguous or non-canonical values are rejected. `body_digest` is SHA-256 over the exact request body, including the empty body used by a WebSocket upgrade. The verifier compares the MAC in constant time.
+
+The profile configures a positive finite `maximum_provenance_age` and a non-negative finite `future_skew`. It accepts time only when `timestamp <= now + future_skew` and `now < timestamp + maximum_provenance_age`, using overflow-safe comparisons. Equality at the age bound is expired.
+
+The verifier MUST reject an absent, repeated, malformed, stale, future-dated, wrong-key, or mismatched provenance value. It MUST reject a committed nonce. A committed nonce is retained through at least `timestamp + maximum_provenance_age`; an applicable Nostr-proof replay identity is retained through its entire acceptance window. The nonce and proof replay identity become consumed only during final admission. The MAC therefore cannot be replayed across an assertion, method, authority, path, query, or body. Secret selection and rotation may try only a configured finite set of active secrets and fail closed when none verifies.
+
+The proxy-to-verifier hop still requires confidentiality and integrity. Trusted listener and route configuration selects the profile in `R_t`. Direct ingress to a listener configured for this profile MUST reject assertion-bearing requests that lack valid provenance and MUST NOT fall back to `client-attached` after missing or rejected provenance.
 
 ## Assertion validation
 
-The verifier is configured, per accepted issuer, with: the issuer identifier, a signing-key source (a JWKS endpoint, discoverable via OIDC `/.well-known/openid-configuration`), accepted audience values, and optional Nostr-key and display-name claim mappings. Validation MUST enforce all of the following; any failure MUST reject the assertion:
+For each accepted issuer, the verifier has authenticated configuration for the exact issuer identifier, accepted audiences, allowed asymmetric algorithms, key source, required `sub` semantics, optional Nostr-key claim, finite maximum assertion age, and bounded clock skew. Transport adapters supply assertion bytes but cannot change this contract. Validation enforces all of the following:
 
-1. The JWT signature verifies under a currently trusted key for an explicitly allowed **asymmetric** algorithm. Symmetric (HS*) and `none` algorithms MUST be rejected before any key lookup.
-2. `iss` exactly equals the configured issuer identifier used to select the verification key.
-3. At least one `aud` value exactly equals a configured audience.
-4. `exp` is present and in the future; `nbf` and `iat`, when present, are no later than verifier time plus a bounded, configured clock skew. An `iat` beyond that allowed skew is future-dated and fails validation.
-5. The JWT `sub` claim is present, a non-empty string, and unambiguously a single value. Base V1 always defines `i = (iss, sub)`; mapping another claim into a local principal is a deployment extension and MUST NOT be advertised as base V1 conformance.
-6. If a key claim is configured and present, it parses to exactly one 32-byte Nostr public key. Lowercase hex is the canonical encoding; a bare NIP-19 `npub` using Bech32 (not Bech32m) MAY be accepted as a documented input normalization. That optional decoder accepts only a bare NIP-19 Bech32 — not Bech32m — `npub` that is all lowercase or all uppercase, whose lowercased prefix is exactly `npub`, with a valid checksum and exactly 32 decoded bytes. It rejects mixed case, Bech32m, another prefix, a TLV form, invalid checksum, or another payload length, and converts either permitted case to the same canonical lowercase hex before comparison, so one claim has only one key interpretation.
+1. The input is exactly one bounded compact JWS. Protected-header and claim member names are unambiguous. Unknown critical headers, `none`, symmetric algorithms, algorithm and key-type mismatch, and incompatible JWK `use` or `key_ops` are rejected before signature acceptance.
+2. The signature verifies under exactly one currently accepted asymmetric key and explicitly allowed algorithm. A duplicate or ambiguous `kid` fails. A missing `kid` is accepted only when policy deterministically selects exactly one compatible key.
+3. `iss` exactly equals the configured issuer used to select the policy and key source.
+4. At least one `aud` value exactly equals an accepted audience.
+5. `exp` and `iat` are finite numeric dates. The verifier requires `now < exp`, `iat <= now + skew`, and `now < iat + maximum_assertion_age`, using overflow-safe comparisons. An optional `nbf` requires `nbf <= now + skew`. Equality at an expiry or maximum-age bound is expired.
+6. `sub` is a non-empty exact string and the issuer contract guarantees that it is stable, opaque, non-reassignable, and not intentionally derived from a profile or personally identifying claim.
+7. If a Nostr-key claim is configured and present, it resolves unambiguously to one 32-byte public key. Lowercase hexadecimal is canonical. Any additional accepted encoding must normalize to that value without ambiguity.
 
-Display-name, email, and similar profile claims MAY be extracted as mutable metadata. They MUST NOT participate in any authorization decision.
+The verifier bounds assertion, header, claim, subject, key-identifier, and configured key-set sizes before lookup or observability. Attacker-controlled values, including `kid`, are never emitted unsanitized.
 
-Signing-key retrieval failures MUST fail closed. Verifiers SHOULD cache the key set with a bounded lifetime and SHOULD NOT refetch it in response to an unknown `kid` that was absent from a freshly fetched set, so that forged tokens cannot drive request floods to the identity provider.
+The validated result seals `i`, an optional asserted key `k_a`, the assertion deadline, `policy_id`, JWKS generation `g`, the verification-key identity, the key snapshot's hard-validity deadline, and confidential revalidation material that can recover the exact compact-JWS bytes. Display names, email addresses, and other profile claims do not enter this result.
 
-## Nostr proof
+Verifier-policy identity is independent of key rotation. Adding, overlapping, or removing issuer keys changes `g`, not `policy_id`. Final admission MUST deny if the current verifier policy identity differs from the prepared identity. Evidence prepared under generation `g_old` MUST be revalidated against the current key snapshot before final admission if the generation changed. Revalidation must reproduce the same identity, asserted key, policy identity, and live time bounds. A removed key, rollback to an unaccepted generation, unreadable current generation, or failed revalidation denies admission. A normal overlapping key rotation therefore does not require a new binding or policy lineage.
 
-The key being authorized is always the key returned by Nostr proof validation — a valid NIP-42 AUTH for the current WebSocket connection, or a valid NIP-98 event for the current HTTP request. It is never taken from an assertion claim, an unsigned request field, or client metadata. A bearer assertion alone MUST NOT authenticate a Nostr key.
+Signing-key retrieval fails closed. Refresh work MUST be bounded and coalesced. An unknown `kid` cannot trigger unbounded per-request retrieval and has no stale-key fallback. A previously known key MAY be used after a soft refresh failure only under a documented finite stale-known-key policy and never after its hard maximum age.
 
-## Authorization
+## Nostr proof and server-owned context
 
-Given a validated assertion yielding identity `i`, optional asserted key `k_a`, and expiry `exp`, and a Nostr proof yielding key `k`, the verifier evaluates one atomic decision in the trusted server-resolved domain `D`:
+The authorized key is always returned by Nostr proof validation, never by an assertion claim or unsigned field.
+
+- NIP-42 validation binds the AUTH event to the current challenge, relay URL, connection, and freshness window.
+- NIP-98 validation binds the event to the exact server-resolved absolute request URL, method, payload digest when required, and freshness window.
+
+The service resolves `D`, operation, resource, transport, and authority from trusted server state. All evidence must agree with that same context. Unknown routes, effects, resources, domains, or transport provenance deny before preparation can become authority.
+
+Every protected ingress in a domain MUST use one canonical current domain policy and final-admission authority. A route with no such authority, a competing authority, or an authority at a different policy lineage makes enforcement unavailable and MUST fail closed.
+
+## Read-only preparation and final admission
+
+Authorization uses two phases. Implementations MAY combine the phases inside one transaction, but they MUST preserve the same no-mutation and revalidation properties.
 
 ```text
-Authorize(D, i, k_a?, k):
-  if k_a exists and k_a != k:            DENY (key mismatch)
+PrepareAuthorization(request, assertion?, nostr_proof?, delegation?):
+  (D, R_t, operation, resource) := ResolveTargetContext(request) or DENY
 
-  atomically read:
-    b_i := active binding for i in D, if any
-    b_k := active binding for k in D, if any
-    p   := whether (i, k) is a retired pair in D
-    x   := whether i is disabled in D
-    y   := whether k is revoked in D
-    q   := whether i is pending explicit replacement in D
+  if delegation is present:
+      require assertion and assertion-provenance fields are absent
+      ValidateNostrProof(nostr_proof, D, R_t) -> k or DENY
+      R := SealActor(R_t, k)
+      return PrepareDelegated(D, R, k, delegation)
 
-  if b_i = (i, k) and b_k = (i, k)
-     and not (p or x or y or q):           preserve source; ALLOW (existing binding)
-  if b_i exists or b_k exists:           DENY (binding conflict)
-  if x:                                   DENY (identity disabled)
-  if y:                                   DENY (key revoked)
-  if p:                                   DENY (pair retired)
-  if q:                                   DENY (explicit replacement required)
+  VerifyTransportProvenance(D, R_t, assertion) or DENY
+  ValidateNostrProof(nostr_proof, D, R_t) -> k or DENY
+  R := SealActor(R_t, k)
+  ValidateAssertion(assertion, D) -> (i, k_a?, deadline, policy_id, g)
+  if k_a exists and k_a != k: DENY(key_mismatch)
 
-  # no active binding or applicable lifecycle gate: first enrollment
-  attested-key:  k_a required, else DENY; create (i, k, source=attested-key); ALLOW
-  provisioned:   DENY (binding must be pre-created by an operator)
-  tofu:          create (i, k, source=(k_a exists ? attested-key : tofu)); ALLOW
+  atomically read B(i), B(k), retired(i,k), disabled(i),
+                      revoked(k), pending(i), mode(D), and policy state
+
+  if disabled(i):                 DENY(identity_disabled)
+  if revoked(k):                  DENY(key_revoked)
+  if retired(i,k):                DENY(pair_retired)
+  if pending(i):                  DENY(explicit_replacement_required)
+
+  if B(i) = B(k) = binding(i,k):
+      if binding.binding_not_after exists and
+         now >= binding.binding_not_after: DENY(binding_expired)
+      proposal := existing(binding.version, binding.provenance)
+  else if B(i) exists or B(k) exists:
+      DENY(binding_conflict)
+  else switch mode(D):
+      attested-key:
+          require k_a = k
+          proposal := enroll(i, k, attested-key)
+      provisioned:
+          DENY(binding_required)
+      tofu:
+          proposal := enroll(i, k, k_a = k ? attested-key : tofu)
+
+  EvaluateEveryLocalAdmissionPolicy(D, R, operation, resource, k) or DENY
+  return PreparedAuthorization(all evidence, proposal, witnesses, and bounds)
 ```
 
-The active-binding and lifecycle-gate reads, and any insertion, MUST be one linearizable transition for `(D, i)` and `(D, k)`. They MUST serialize with provisioning and every lifecycle transition affecting those selectors, including pair retirement, identity disablement, key revocation, rotation, recovery, and re-enablement. Under concurrent first use of the same identity or key, at most one binding is created and every other attempt observes it (allow on exact match, deny on conflict). Missing lifecycle state, storage failure, or a race whose committed result cannot be read MUST deny — never fall back to an unchecked allow.
+An absent `binding_not_after` has no expiry. Assertion `exp`, `iat`, and maximum age never populate or extend it. Enrollment mode controls creation only; changing the mode does not rewrite or downgrade an existing eligible binding or its provenance.
 
-### Enrollment modes
+Preparation is read-only, including for Attested and TOFU first use. It creates or changes no binding, lifecycle, enrollment, replay, receipt, audit, observation, publication, last-seen, lease, or application state. A denial has the same no-mutation property.
 
-- **`attested-key`**: the identity provider carries the user's Nostr public key in the configured key claim. First use binds only when the asserted key equals the proven key. This is the strongest mode and SHOULD be used when the identity provider can carry custom claims.
-- **`provisioned`**: bindings are created only through an out-of-band administrative process; requests never create bindings.
-- **`tofu`** (trust on first use): first use of an unbound identity with an unbound key creates the binding. A stolen assertion for a never-enrolled identity can bind an attacker's key in this mode; services offering it MUST document this risk. When an assertion in `tofu` mode carries a valid key claim, the binding SHOULD record the stronger `attested-key` provenance, and a binding's recorded provenance MUST NOT be downgraded by later requests.
+Final admission consumes the prepared value exactly once:
 
-In `provisioned` mode, creation requires a separately authorized `ProvisionBinding` transition. That transition uses the operation- and domain-bound lifecycle authority described in [Revocation and rotation](#revocation-and-rotation) and formalized as `LifecycleAuthorization(D, provision, i, k)` in the model. It MUST verify the configured mode, that no active binding exists for `i` or `k`, that `i` is neither disabled nor pending replacement, that `k` is not revoked, and that the exact pair `(i, k)` is not retired. Its transition shape is `ProvisionBinding(D, i, k): atomically(require LifecycleAuthorization(D, provision, i, k); require provisioned mode and every eligibility condition above; create (i, k, provisioned); append provision history)`, followed by no direct lease. A failed requirement, including an unreadable mode, active-binding, or lifecycle-selector read, rolls back the entire shape. A later direct `Authorize` still requires a valid assertion for `i` and fresh Nostr proof by `k`. Delegated authorization remains subject to the separate active-owner, delegation-proof, and deployment-admission rules below.
+```text
+CommitAdmission(prepared, current_request):
+  require exact D, R, operation, resource, actor, and transport match
+  require every assertion, proof, proxy, delegation, and policy bound is live
+  if prepared is DirectPrepared:
+      require CurrentVerifierPolicyIdentity(D, prepared.direct.i.iss) =
+              prepared.direct.policy_id
+      if CurrentJwksGeneration(prepared.direct.policy_id) !=
+         prepared.direct.g:
+          revalidate the assertion under the current generation
+  else:
+      require prepared is DelegatedPrepared
+      revalidate its delegation, relationship, owner, target, and policy witnesses
 
-### Binding invariant
+  atomically:
+      reread every applicable binding, lifecycle, enrollment-mode, policy, resource,
+             replay, and invalidation witness
+      unreadable state denies; changed state requires a complete recomputation
+      require the current result is equivalent and eligible
+      claim every applicable proxy nonce and proof replay identity
+      create the proposed binding only if enrollment remains eligible
+      append the required receipt and privacy-safe authorization audit evidence
 
-Within a domain, active bindings form a partial bijection: an identity has at most one active key and a key has at most one active identity. An active binding MUST NOT overlap a retired pair, disabled identity, revoked key, or pending-replacement identity. Every state transition in this NIP preserves these invariants.
+  return CommittedAuthorization(exact actor, binding dependencies,
+                                capabilities, dependencies, and deadline)
+```
 
-Pending replacement is identity-scoped and blocks every active binding for that identity until an explicit recovery transition—or re-enablement when the identity is disabled—succeeds. Exact-pair retirement remains pair-scoped: by itself it does not revoke the retired key for a different identity in the same authorization domain.
+No committed authorization can be constructed directly from raw claims, a prepared value, cached policy, or earlier lease. A final-admission failure rolls back every authority mutation. Complete recomputation may accept only a semantically equivalent current result. If another request concurrently creates the identical eligible binding, this request may therefore recompute as `existing`; a conflicting winner denies. Storage failure or an unreadable committed result never falls back to allow.
 
-Base V1 therefore has one active principal key per domain. Multiple devices either share that principal key or use bounded delegation. Supporting multiple simultaneously active principal keys requires a future protocol extension.
+The admitted application operation runs only after committed authorization. If the operation cannot share the authorization transaction, the implementation must use a request-bound idempotent receipt or equivalent staging so a retry cannot create a second effect from the same proof.
 
-Base V1 also treats the verifier's binding and lifecycle state as authoritative. A signed external binding authority is a future extension and requires explicit claim, conflict, rotation, revocation, and migration semantics; a normal assertion under this NIP does not transfer that authority.
+## Enrollment modes
 
-## Session semantics
+- **`attested-key`**: first use requires the assertion's key claim to equal the proven key. The created binding records `attested-key` provenance.
+- **`provisioned`**: ordinary requests never create a binding. A separately authorized `ProvisionBinding` transition creates it without creating a lease; later direct use still requires a current assertion and fresh proof.
+- **`tofu`**: first eligible use may create a binding without a key claim. This accepts the risk that a stolen assertion for a never-enrolled identity can bind an attacker's key. Deployments MUST label and document that risk. When a matching key claim is present, the binding records `attested-key`, not `tofu`.
 
-For HTTP requests, the decision applies to that request only.
+Binding provenance is immutable and cannot be downgraded by later requests.
 
-For a NIP-42 WebSocket connection, the relay MAY cache the decision as a direct lease. Its expiry MUST be no later than the assertion's `exp` and every shorter known binding-expiry, policy, or configured implementation bound. At expiry the relay MUST reject protected operations or close the connection. Renewal requires a new WebSocket connection carrying a fresh assertion on its upgrade request, followed by fresh NIP-42 proof; base V1 defines no in-connection renewal message. When a relay learns that a binding, identity, key, policy decision, or delegation on which a lease depends is no longer valid, it MUST invalidate every matching direct and delegated lease. A relay that detects revocation by polling MUST NOT claim immediate revocation and SHOULD document its maximum detection latency.
+## Lifecycle transitions
 
-When multiple keys authenticate on one connection (NIP-42 permits this), authorization is tracked per key. A lease for one key MUST NOT authorize operations attributed to another.
+Provisioning, retirement, disablement, revocation, rotation, recovery, re-enablement, and administrative-expiry changes are explicit privileged transitions, never side effects of ordinary authorization. Privileged authority is bound to the exact domain, operation, identity, old binding version when present, target key when present, and request. Ordinary assertion and Nostr proof cannot substitute for that authority.
 
-## Revocation and rotation
+Every transition reads and rechecks the active relation and all applicable retired-pair, disabled-identity, revoked-key, and pending-replacement facts in one atomic transition. It appends immutable lifecycle history and triggers dependent lease invalidation after commit. Failure or stale state causes no partial mutation.
 
-Provisioning and lifecycle changes are explicit administrative or policy transitions, never side effects of `Authorize`. Each requires authenticated authority for the named operation in the selected domain. This NIP defines state semantics, not an operator transport, approval policy, retry protocol, or complete audit schema; an implementation MAY wrap the transitions in an idempotent operation-ID interface with actor, reason, correlation, and durable audit evidence.
+- **Provision binding**: allowed only in `provisioned` mode for an eligible identity and key. It creates a fresh binding version with `provisioned` provenance and no lease.
+- **Retire pair**: removes the active binding, records its exact pair as retired, and records pending replacement lineage.
+- **Disable identity**: records the identity as disabled. If an active binding exists, it retires that exact pair and records pending lineage.
+- **Revoke key**: records the key as revoked even if it is not active. If active, it removes the binding, retires the exact pair, and records pending lineage. Repeating the same authorized revocation is idempotent and cannot erase lineage.
+- **Rotate**: replaces one exact active old binding with an eligible new key, retires the old pair, and creates a fresh binding version. Rotation does not globally revoke the old key.
+- **Recover**: consumes one exact pending-replacement lineage, preserves the retired old pair, and creates a fresh binding version for an eligible new key. A disabled identity uses Re-enable identity instead of Recover.
+- **Re-enable identity**: requires the disabled identity and either no prior lineage or one exact pending lineage. It creates an eligible binding, clears the disabled state, and consumes present lineage exactly once.
+- **Set administrative expiry**: requires one exact active binding version and sets, replaces, or clears `binding_not_after` under separate privileged policy. It advances the binding version and cannot change the pair or provenance.
 
-The storage representation is implementation-defined, but each transition's denial selectors, active-binding changes, and lifecycle-state-history append MUST commit atomically. That history preserves state and replacement lineage; it is not by itself the complete operational audit contract. After a successful commit, the implementation MUST trigger invalidation of affected direct and dependent delegated leases within its documented detection bound; cache invalidation need not share the state transaction:
+Every new target key, including a provisioned key, requires fresh target-bound Nostr proof. When the domain requires issuer attestation for creation or replacement, the transition also requires a current assertion for the same identity with a key claim equal to the target key. Supplied stale, claimless, wrong-identity, or mismatched attestation is rejected; it cannot be treated as absent optional evidence.
 
-- **Retire pair**: recheck within the atomic transition that the active pair's identity has no pending-replacement selector; a present or unreadable selector denies without mutation instead of overwriting lineage. Then remove `(i, k)`, retain an exact-pair tombstone, mark `i` pending explicit replacement, and invalidate matching direct and dependent delegated leases after commit.
-- **Disable identity**: record the identity selector even when `i` has never enrolled. If `i` has an active binding, recheck within the atomic transition that its pending-replacement selector is absent; a present or unreadable selector denies and rolls back the entire invocation. Then remove the active pair, add an exact-pair tombstone, and mark `i` pending explicit replacement. If no active binding exists and `i` was already pending replacement, preserve that state. After commit, invalidate direct and dependent delegated leases for `i`.
-- **Revoke key**: record the key selector even when `k` is not active. If `k` has an active binding, recheck within the atomic transition that its identity has no pending-replacement selector; a present or unreadable selector denies without mutation instead of overwriting lineage. Then remove the active pair, retire it, and mark its identity pending explicit replacement. If no active binding exists, preserve every pending-replacement selector unchanged. After commit, invalidate every direct or delegated lease that depends on `k`.
-
-Every privileged lifecycle transition affecting the same domain, identity, or key MUST be linearizable with every other such transition and with `Authorize`. Its preconditions MUST be rechecked within the atomic transition, so concurrent provision, retire, disable, revoke, rotate, recover, or re-enable operations cannot partially commit or overwrite one another.
-
-A subsequent valid assertion — including one whose key claim matches a retired key — cannot clear these selectors or create a replacement binding. This prevents a replayed, still-valid assertion and a routine login with a different key from silently undoing revocation.
-
-Rotation and recovery are distinct privileged transitions. `Rotate` requires an active `(i, k_old)` binding and an absent pending-replacement selector for `i`; `Recover` requires both `Q(i) = k_old` and the exact retired pair `(i, k_old)`, plus no active binding for `i`. `Rotate` reads and rechecks the selector's absence inside the same atomic transition as its mutation; a present or unreadable selector denies without mutation. `Recover` likewise reads and rechecks both pending lineage and the exact retired-pair selector inside the same atomic transition; missing, mismatched, or unreadable state denies without mutation. It conditionally compare-and-clears `Q(i)` from `k_old` to absent inside that atomic transition; if the comparison loses to a concurrent lifecycle change, the entire invocation denies and rolls back with no binding, selector, or history mutation, lease, or invalidation. Both transitions require that `i` is not disabled, no active binding exists for `k_new`, `k_new` is not revoked, the exact pair `(i, k_new)` is not retired, and fresh target-bound Nostr proof by `k_new` is supplied for the privileged request. A retired pair containing `k_new` and a different identity does not make `k_new` ineligible. Any assertion supplied as key-attestation evidence to either transition MUST currently validate to identity `i` with key claim `k_new`; a stale assertion, different identity, absent key claim, or different key is invalid evidence and cannot be treated as if no attestation was supplied. Where the domain requires issuer attestation, valid matching evidence MUST be supplied.
-
-`Rotate` atomically removes the active old pair from `B`, adds the exact `(i, k_old)` pair to retired-pair selector `P`, and creates `(i, k_new)`. `Recover` preserves the already-retired old pair, clears pending replacement, and creates `(i, k_new)`. Each records `attested-key` provenance when matching attestation evidence is present and `provisioned` provenance otherwise, and appends a distinct rotation or recovery history entry. After commit it invalidates direct and dependent delegated leases for the old pair. Neither transition revokes `k_old` across the authorization domain; key revocation remains the separate `RevokeKey` transition. A routine request presenting a new key is either a binding conflict or `explicit replacement required` and MUST be denied without mutation, including no binding, lifecycle, enrollment, publication, or last-seen update; a redacted security audit record is allowed.
-
-Evidence carried by ordinary `Authorize`, including its Nostr proof, cannot satisfy lifecycle authorization or invoke `Rotate`, `Recover`, or `EnableIdentity`. Replacement-key proof is validated only inside the separately authorized lifecycle transition.
-
-Base V1 recovery uses a replacement key that has no active binding, is not revoked in the authorization domain, and has never formed a retired pair with `i`. A retired pair with another identity does not by itself revoke the key across that domain; only the distinct domain-scoped key-revocation selector does. Same-pair reactivation is an extension and MUST provide an equivalently explicit privileged transition while retaining the original lifecycle history; ordinary `Authorize` can never perform it.
-
-Base V1 has no standalone operation that merely clears a disabled-identity selector. Re-enablement requires a privileged `EnableIdentity` transition that selects an eligible replacement or first key, requires fresh target-bound Nostr proof by that key, and atomically creates its binding, clears the disabled selector, conditionally clears a present pending-replacement selector, and appends identity-enablement history. The transition reads `Q(i)` inside that atomic transition and fails closed if it is unreadable: an absent selector remains absent; when `Q(i) = k_old` is present, the transition rechecks the exact retired pair `(i, k_old)` and conditionally compare-and-clears that exact selector to absent. Missing, mismatched, or unreadable retired-pair state denies without mutation instead of clearing lineage. If the conditional comparison loses to a concurrent lifecycle change, the entire invocation denies and rolls back with no binding, selector, or history mutation, lease, or invalidation. Any assertion supplied as key-attestation evidence to the transition MUST currently validate to identity `i` with a key claim equal to the selected key; a stale assertion, different identity, absent key claim, or different key is invalid evidence and cannot be treated as if no attestation was supplied. Where the domain requires issuer attestation, valid matching evidence MUST be supplied. Matching attestation records `attested-key` provenance; otherwise the transition records `provisioned`. After commit, invalidate any direct and dependent delegated leases for a prior retired pair. For a never-enrolled identity there is no prior pair, but the new binding is still created in the same transaction that clears disablement. A prior key remains pair-retired; revoking it across the authorization domain requires the separate `RevokeKey` transition. Ordinary enrollment therefore never observes a re-enabled identity with neither an active binding nor a lifecycle gate.
+An administrative `binding_not_after` is an authorization gate, not an implicit lifecycle transition. At or after the bound, the binding remains durable and occupies both sides of the partial bijection, but it is authorization-ineligible. Time passage alone creates no tombstone, pending lineage, or history. Restoring access requires `SetAdministrativeExpiry` or another applicable privileged lifecycle transition; ordinary authorization cannot renew the bound.
 
 ## Delegation
 
-Delegation is outside the base primitive but composes with it. A service MAY admit a key that presents no assertion when a separately validated delegation proof (for example a NIP-OA `auth` tag) establishes an owner key that holds an active binding in the domain. A cached owner lease MUST NOT substitute for that active binding. This delegation path MUST NOT create or modify any federated identity binding or lifecycle selector for either the owner or delegate key. The delegated decision retains an explicit dependency on the active owner binding, intersects the delegated operations and conditions, and expires no later than a mandatory finite configured implementation limit and every shorter known owner-binding, delegation, or policy bound. A service without that finite maximum MUST NOT issue delegated leases or advertise delegation support. Because the delegate presents no assertion, its lease has no independent assertion-expiry bound; if a deployment additionally requires a current owner assertion or direct lease, that bound is included too. Revoking or retiring the owner binding invalidates dependent delegated leases on the same detection schedule as the owner's own leases. A deployment MAY require a stronger current-provider admission decision for the owner, but that is an additional authorization layer rather than part of this base binding primitive.
+Delegation is a separate evidence path. The delegate presents fresh proof of its own key and no federated assertion. Separately validated delegation evidence seals the owner key, delegate key, relationship identifier and revision, allowed operations and conditions, exact request or target, and mandatory finite expiry.
+
+The service MUST resolve a current authorization-eligible owner binding and exact binding version at preparation and final admission. A cached owner lease is not substitute authority. The delegated operation is the intersection of the sealed delegation and local operation policy. The path creates or changes no owner or delegate binding, lifecycle fact, provenance, or last-seen state.
+
+A delegated lease requires a configured positive finite maximum. Its deadline is no later than every owner-binding, delegation, local-policy, implementation, and optional stronger owner-assertion bound. Missing finite configuration, stale owner state, actor or request mismatch, unsupported capability, unreadable dependency, or expired delegation denies. Owner retirement, disablement, key revocation, binding-version change, or relationship change invalidates dependent leases within the documented detection bound.
+
+## Session semantics
+
+HTTP authorization applies to one exact request. It does not imply a reusable lease.
+
+A WebSocket lease is scoped to one authenticated key, domain, operation set, direct-assertion or delegated-evidence dependencies, current binding and lifecycle versions, policy versions, and invalidation dependencies. A direct lease records its verifier policy identity, JWKS generation, verification-key identity, key-snapshot hard-validity deadline, and confidential revalidation material for the exact assertion. A delegated lease instead records the exact owner binding version and relationship revision.
+
+The deadline is the earliest applicable assertion `exp`, `iat + maximum_assertion_age`, key-snapshot hard-validity deadline, proof or proxy bound, administrative binding expiry, delegation expiry, local-policy limit, and configured finite implementation maximum. Equality is expired.
+
+Assertion expiry ends the lease, not the binding. Renewal requires a new connection carrying a fresh assertion on the upgrade request, followed by fresh NIP-42 proof and a complete new preparation and final admission. If the durable binding remains eligible, expiry of the assertion used for an earlier lease does not prevent the new decision. Exact assertion revalidation material is retained confidentially only through the admission or lease that may need it and is destroyed on expiry, close, or invalidation.
+
+Before each protected use, the service rechecks the binding and lifecycle versions, administrative bound, operation, resource, actor, and lease deadline. A direct lease also requires a live, readable key snapshot within its hard-validity deadline; a changed JWKS generation requires revalidation of the original assertion against the current generation. For a delegated lease, the service rechecks the exact current owner binding and relationship revision. When another dependency changes, the service rejects protected operations or closes the connection within its documented detection bound. A polling implementation cannot claim immediate invalidation. A lease for one key never authorizes an operation attributed to another key on the same connection.
 
 ## Rejection semantics
 
-Machine-readable rejection classes and their transport mapping reuse NIP-01/NIP-42 prefixes on `OK` and `CLOSED` messages:
+Implementations may retain detailed private decision reasons for audit and conformance, including `key_mismatch`, `binding_conflict`, `pair_retired`, `identity_disabled`, `key_revoked`, `explicit_replacement_required`, and `binding_expired`. Public results map them to four stable, privacy-safe classes:
 
-- `auth-required: ` — no assertion was presented, or no applicable Nostr proof has been performed or presented for the protected operation: NIP-42 for WebSocket or NIP-98 for HTTP.
-- `restricted: ` — the assertion or proof was presented but failed validation, mismatched, conflicted with an active binding, or the identity's enrollment/binding state does not permit the operation.
-- Transport mapping (not a new prefix) — a protected operation on an established WebSocket connection by a key without applicable NIP-42 proof uses `auth-required`; an HTTP protected request without applicable NIP-98 proof uses `auth-required` and status `401`.
+| Public code | Nostr prefix | HTTP status | Meaning |
+|---|---|---:|---|
+| `missing_evidence` | `auth-required:` | 401 | Required assertion, proof, or delegation evidence was absent. |
+| `evidence_rejected` | `restricted:` | 403 | Presented evidence or transport provenance was rejected. |
+| `authorization_denied` | `restricted:` | 403 | Current binding, lifecycle, delegation, or local operation policy denied access. |
+| `authorization_unavailable` | `restricted:` | 503 | Required current state could not be verified. |
 
-
-HTTP endpoints respond `401` where `auth-required` applies and `403` where `restricted` applies. Rejection bodies MUST NOT echo assertion contents, claim values, or the conflicting party's identity or key.
+Responses MUST NOT identify another principal or key, distinguish a conflict from a tombstone, expose issuer or claim details, echo bearer material, or reveal private policy state. An unavailable dependency never becomes an allow.
 
 ## Discovery
 
-A relay SHOULD advertise support in its NIP-11 document under `limitation` as `"federated_identity": true`. It MAY additionally include this top-level object:
+A relay SHOULD advertise support in its NIP-11 document under `limitation` as `"federated_identity": true`. It MAY include this top-level object:
 
 ```json
 {
   "federated_identity": {
-    "transports": ["trusted-proxy", "client-attached"],
+    "transports": ["trusted-proxy-hmac-v1"],
     "enrollment": "attested-key",
-    "delegation": true, "delegated_lease_max_seconds": 300
+    "delegation": false
   }
 }
 ```
 
-The value `300` is illustrative; an implementation publishes its actual configured finite maximum.
+`transports` contains only the exact identifiers `client-attached` and `trusted-proxy-hmac-v1` for profiles implemented completely. `enrollment` is exactly one configured mode. `delegation` is true only when owner-current resolution and a positive finite delegated maximum are configured. Unknown fields are ignored.
 
-`transports` contains the supported profile names from this NIP, `enrollment` is exactly one enrollment mode, and `delegation` states whether separately validated delegation may be honored. When `delegation` is `true`, the object MUST also include `delegated_lease_max_seconds` as a positive integer advertising the configured finite upper bound; when `delegation` is `false`, that field SHOULD be omitted. A relay MUST NOT advertise delegation without that finite bound. Unknown fields MUST be ignored. A relay MUST NOT publish issuer-internal detail (tenant URLs, claim names, audiences) that is not already public.
+A service MUST NOT enter enforcement or advertise support until every configured protected operation uses the same canonical final-admission authority, unknown protected routes fail closed, and all applicable conformance traces pass at one reviewed revision. Discovery is selected by the same server-owned domain policy as authorization. It MUST NOT expose private issuer URLs, audiences, claim names, tenant identifiers, HMAC key identifiers, or implementation-only policy detail.
 
 ## Privacy
 
-Federated identities are typically personal data (employee identifiers). NIP-FI itself MUST NOT publish `iss`, `sub`, assertion contents, or display-name claims in Nostr events or tags, and a conforming service MUST NOT expose another user's binding state through rejection messages. Access-controlled binding and lifecycle records are service-internal and MAY retain the identifiers needed to enforce and audit the state machine. Operational logs and metrics MUST NOT record raw bearer assertions or unredacted `iss`, `sub`, display-name, email, or other private assertion claims; redacted or pseudonymous security records are allowed.
+NIP-FI defines no public identity projection. Protocol events, tags, filters, discovery, errors, logs, metrics, and traces MUST NOT contain raw assertions or unredacted `iss`, `sub`, email, display name, or other private claims. Access-controlled binding, lifecycle, receipt, and audit state may retain the minimum identifiers required for enforcement and investigation.
 
-A separate, opt-in relay-signed projection protocol such as NIP-85 MAY publish an approved label. Such a projection MUST NOT contain `iss`, `sub`, bearer material, or other unapproved private claims, and it MUST NOT be accepted as NIP-FI authorization evidence.
+Any separate presentation protocol is non-authoritative and cannot create, renew, prove, or revoke NIP-FI authorization. Implementations MUST bound metric and log cardinality and use redacted or pseudonymous correlation.
 
 ## Security considerations
 
-- **Issuer or proxy compromise** impersonates federated principals, but cannot satisfy Nostr proof for an already-bound uncompromised key, and in `attested-key` mode cannot bind an arbitrary key without also forging the key claim.
-- **Assertion theft** cannot authorize an already-bound identity without control of the bound key. Its remaining power — enrolling a never-bound identity — exists only in `tofu` mode, which is why that mode is risk-labeled.
-- **Header injection**: the trusted-proxy profile is void if clients can reach the verifier directly or the proxy forwards inbound copies of the assertion header. Deployments MUST verify both properties. Verification evidence identifies the enforced origin-isolation control — for example a network ACL, mutually authenticated proxy-to-verifier channel, or local socket boundary — and records negative tests showing that bypass ingress is unreachable and a client-supplied assertion header is stripped or replaced before trusted injection.
-- **Algorithm confusion** is excluded by rejecting symmetric algorithms before key selection.
-- **Availability vs. safety**: issuer, key-set, and storage outages deny. Availability MUST NOT override identity safety.
-- **Cross-issuer collision**: the same exact literal `sub` value under different issuers denotes distinct identities, which MUST never collide or inherit each other's bindings.
+- **Issuer compromise** can impersonate principals but cannot prove an uncompromised already-bound Nostr key. In `attested-key` mode it must also forge the matching key claim to enroll an arbitrary key.
+- **Assertion theft** cannot use an eligible existing binding without the bound key. TOFU intentionally retains first-use theft risk.
+- **Proxy spoofing and replay** are limited by request-bound HMAC provenance, bounded time, one-time nonce consumption, exact assertion and body digests, and exact server-resolved routing values.
+- **JWKS rotation and rollback** do not change stable policy identity. Final generation revalidation prevents a removed key or stale snapshot from authorizing.
+- **Time-of-check/time-of-use races** are limited by read-only preparation and complete witness revalidation in final admission.
+- **Lifecycle replay** cannot erase retired-pair, disabled-identity, revoked-key, or pending-replacement facts. Ordinary assertions never reactivate them.
+- **Cross-domain and cross-request confusion** are prevented by server-owned context and exact evidence binding.
+- **Availability attacks** on issuer, key retrieval, policy, binding, replay, or audit state fail closed. Refresh, replay, and observability work must be bounded.
+- **Delegation confusion** is limited by exact owner and delegate keys, owner binding version, relationship revision, capability intersection, target binding, and finite expiry.
 
-The companion [formal model](NIP-FI-MODEL.md) defines the state machine and safety/liveness properties. The [conformance matrix](NIP-FI-CONFORMANCE.md) supplies stable, reviewable success, denial, concurrency, lifecycle, session, disclosure, and privacy traces.
+## Stable conformance labels
 
-## Implementation relationship
+The companion model and later executable matrix use these stable trace identifiers. A conforming implementation must cover every applicable trace and its boundary and concurrency subcases at one reviewed revision. The model also defines the stable safety labels `FI-INV-01` through `FI-INV-16`.
 
-Buzz PR [#1476](https://github.com/block/buzz/pull/1476), reviewed at revision `1e9822de8dbe0ae91c00c0ce0ed8ff583915692f`, is a disabled partial foundation from which this provider-neutral contract was generalized. Its default identity-claim selection is `sub`, but that revision trims string claims; preserving the exact literal `sub` value, future-`iat` rejection, NIP-11 discovery, and additional lifecycle and lease conformance remain additive implementation work. Its combined replacement helper and domain-scoped old-key revocation also do not implement this draft's distinct rotation, recovery, and pair-retirement semantics. A configured non-`sub` mapping is a deployment extension and cannot claim Base V1 identity conformance. This draft does not require modifying the reviewed revision.
+| ID | Required property |
+|---|---|
+| `FI-TRACE-PROXY-SPOOF` | A valid assertion without valid proxy HMAC provenance, including direct ingress, denies. |
+| `FI-TRACE-PROXY-REPLAY` | Two final admissions using one proxy nonce produce at most one committed authorization; preparation consumes neither. |
+| `FI-TRACE-PROXY-CROSS-REQUEST` | Changing the assertion, method, authority, path/query, or body invalidates provenance and denies. |
+| `FI-TRACE-AUTHORITY-UNIFORM` | Every protected ingress uses the same current domain policy and final-admission authority. |
+| `FI-TRACE-VERIFIER-PARITY` | The same assertion, policy, time, and key snapshot produce the same verifier result on every transport. |
+| `FI-TRACE-DOMAIN-SPOOF` | Client-selected domain or forwarded authority cannot replace server-owned context. |
+| `FI-TRACE-ASSERTION-KEY-MISMATCH` | An asserted key different from the proven key denies before mutation. |
+| `FI-TRACE-BINDING-CONFLICT` | A pair that conflicts with either side of the active relation denies without replacement. |
+| `FI-TRACE-TOMBSTONE-REPLAY` | Fresh evidence for a retired pair, disabled identity, revoked key, or pending replacement denies ordinary authorization. |
+| `FI-TRACE-ASSERTION-REFRESH` | A fresh assertion can authorize the same eligible durable binding after an earlier assertion expires. |
+| `FI-TRACE-ADMIN-EXPIRY` | A fresh assertion after administrative expiry denies; only an explicit privileged transition can restore access. |
+| `FI-TRACE-JWKS-ADD` | A generation change with the old key retained revalidates and may authorize the unchanged binding. |
+| `FI-TRACE-JWKS-REMOVE` | A generation change that removes the signing key denies prepared evidence and leases signed by it. |
+| `FI-TRACE-PREPARED-STALE` | Changed request or decision witnesses deny or require a complete recomputation before admission. |
+| `FI-TRACE-FINAL-DENIAL-NO-MUTATION` | Preparation, denied local policy, and denied final admission create no binding, audit or denial observation, replay claim, receipt, lease, or application mutation. |
+| `FI-TRACE-CONCURRENT-ENROLLMENT` | Identical eligible first uses converge on one binding version; conflicting first uses commit at most one winner. |
+| `FI-TRACE-TOFU-THEFT` | Stolen-assertion first use denies except under explicit risk-labelled TOFU. |
+| `FI-TRACE-DELEGATE-OWNER-ROTATED` | Owner rotation makes an old-owner delegation non-current and denies without inheritance. |
+| `FI-TRACE-DELEGATION-EXPIRED` | Missing or expired finite delegation bounds deny. |
+| `FI-TRACE-DENIAL-ORACLE` | Unknown, conflict, tombstone, and private-policy denials are not publicly distinguishable. |
+| `FI-TRACE-DEPENDENCY-FAIL-CLOSED` | An unreadable current verifier, key, state, replay, policy, receipt, or audit dependency denies. |
+| `FI-TRACE-MULTI-KEY-SESSION` | A lease for one authenticated key does not authorize another key on the same connection. |
+| `FI-TRACE-CROSS-DOMAIN-COLLISION` | Equal subjects across issuers or equal pairs across domains remain distinct. |
+| `FI-TRACE-PRIVACY-NONPUBLIC` | Assertion or private identity material in protocol output, public history, or observability is a conformance failure. |
+
+The companion [formal model](NIP-FI-MODEL.md) gives the state machine, safety and liveness properties, and the complete form of these traces.

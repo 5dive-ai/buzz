@@ -181,9 +181,18 @@ export function useAgentEditMergedSubmit(
             commandUpdate = inst.agentCommandOverride != null ? "" : undefined;
           } else {
             const pinned = (effectiveRuntime?.command ?? s.agentCommand).trim();
+            // Only write a commandUpdate when the command actually changed OR
+            // when a linked agent (personaId != null) is creating a new pin that
+            // matches the current inherited command (no override yet). Unlinked
+            // agents have no inherit/pin distinction — their agentCommandOverride
+            // is always null, so the second clause must not trigger for them or
+            // every unmodified save generates a phantom harness write that
+            // `observedStateMatchesAgentInput` then fails to settle.
             if (
               pinned !== inst.agentCommand ||
-              (inst.agentCommandOverride == null && pinned.length > 0)
+              (inst.personaId != null &&
+                inst.agentCommandOverride == null &&
+                pinned.length > 0)
             ) {
               commandUpdate = pinned;
             }

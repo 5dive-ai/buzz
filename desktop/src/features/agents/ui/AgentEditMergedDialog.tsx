@@ -322,6 +322,14 @@ export function AgentEditMergedDialog({
     const defaultRuntime = getDefaultPersonaRuntime(runtimes);
     if (!defaultRuntime) return;
     setDefinitionRuntimeId(defaultRuntime.id);
+    // In definition-only context, selectedRuntimeId is the same conceptual field
+    // as definitionRuntimeId (there is no separate I-harness pin). Sync it so
+    // that model discovery runs: useAgentEditRuntimeState derives `selectedRuntime`
+    // from `selectedRuntimeId`, and a stale "custom" value leaves discovery unable
+    // to resolve a runtime → model list stays empty.
+    if (!inst) {
+      setSelectedRuntimeId(defaultRuntime.id);
+    }
   }, [open, runtimes.length, showDef]);
 
   // Re-derive runtime id when catalog loads
@@ -545,7 +553,12 @@ export function AgentEditMergedDialog({
 
   const selectSavedHarness = usePendingHarnessSelection(
     runtimes,
-    handleRuntimeDropdownChange,
+    // In definition-only context the harness dropdown drives `definitionRuntimeId`
+    // (via handleDefinitionRuntimeChange), not the I-harness pin. Route to the
+    // correct handler so the saved harness appears in the D-section dropdown.
+    showDef && !showInst
+      ? handleDefinitionRuntimeChange
+      : handleRuntimeDropdownChange,
     open,
   );
 

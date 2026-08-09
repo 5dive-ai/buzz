@@ -78,6 +78,21 @@ async function pickDropdownOption(
   await page.getByRole("menuitemradio", { name: optionName }).click();
 }
 
+/**
+ * Pick an option from a PersonaModelCombobox (popover-based combobox with
+ * <button> items, not a PersonaDropdownField with menuitemradio items).
+ */
+async function pickModelComboboxOption(
+  page: import("@playwright/test").Page,
+  triggerId: string,
+  optionName: string | RegExp,
+) {
+  await page.locator(`#${triggerId}`).click();
+  // Items in PersonaModelCombobox are plain <button> elements inside the popover.
+  // Query at page level because the popover is portaled outside the dialog.
+  await page.getByRole("button", { name: optionName }).click();
+}
+
 test.describe("agent definition dialog", () => {
   test("owner-only-access build shows disabled agent access with an explanation", async ({
     page,
@@ -205,7 +220,7 @@ test.describe("edit agent dialog", () => {
 
     // Pick a provider so model discovery has a scope, then set a custom model.
     await pickDropdownOption(page, "edit-agent-llm-provider", "Anthropic");
-    await pickDropdownOption(page, "edit-agent-model", "Custom model...");
+    await pickModelComboboxOption(page, "edit-agent-model", "Custom model...");
     await page.locator("#edit-agent-custom-model").fill("claude-opus-4-5");
     // Anthropic requires a credential before save unlocks.
     await page.getByLabel("Anthropic API Key").fill("sk-test-edit-agent-e2e");

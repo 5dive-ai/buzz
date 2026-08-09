@@ -216,7 +216,7 @@ test.describe("agent provider dropdown screenshots", () => {
     await installMockBridge(page, {
       globalAgentConfig: {
         provider: "databricks_v2",
-        model: "global-databricks-model",
+        model: "global-openai-model",
         env_vars: {},
       },
       personas: [

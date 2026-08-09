@@ -31,6 +31,7 @@ import {
   sortPersonaRuntimes,
   type PersonaDropdownOption,
   getProviderApiKeyEnvVar,
+  getDefaultLlmModelLabel,
 } from "./agentConfigOptions";
 import {
   MODEL_DISCOVERY_LOADING_VALUE,
@@ -221,7 +222,16 @@ export function useAgentEditRuntimeState({
   ]);
 
   const llmProviderFieldVisible = runtimeSupportsLlmProviderSelection(
-    showInst ? prospectiveRuntimeId : selectedRuntimeId,
+    // In linked context (showDef && showInst), the D-section provider/model
+    // picker is driven by the definition's runtime (definitionRuntimeId), not by
+    // the instance's harness pin (prospectiveRuntimeId). Using prospectiveRuntimeId
+    // here would make the D-section picker visible whenever the instance's
+    // agentCommand matches a provider-supporting runtime, even if the definition
+    // has no runtime configured — a phantom provider field exposure.
+    // Instance-only context (showInst && !showDef) correctly uses prospectiveRuntimeId
+    // because the instance's harness is the only runtime in scope.
+    // D-only context falls through to definitionRuntimeId via selectedRuntimeId (they equal).
+    showInst && !showDef ? prospectiveRuntimeId : definitionRuntimeId,
   );
   const prospectiveRuntime = runtimes.find(
     (r) => r.id === prospectiveRuntimeId,
@@ -460,5 +470,6 @@ function resolveInheritedModelLabel(
   const model = inherited.value;
   if (!model) return "Default model";
   if (inherited.source === "build") return getBakedModelInheritLabel(model);
+  if (inherited.source === "global") return getDefaultLlmModelLabel(model);
   return `Default (${model})`;
 }

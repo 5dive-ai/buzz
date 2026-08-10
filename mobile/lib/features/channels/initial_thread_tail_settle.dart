@@ -15,6 +15,15 @@ class InitialThreadTailSettle {
   /// visible after hydration has settled, or the scheduled scroll finishes.
   bool get isComplete => _isComplete;
 
+  /// Permanently abandons initial settling and invalidates queued callbacks.
+  ///
+  /// This is terminal: later scheduling remains disabled even if the user
+  /// returns to the tail and resumes ordinary follow behavior.
+  void abandon() {
+    _generation++;
+    _isComplete = true;
+  }
+
   /// Schedules a settle after each hydrated thread layout until [isComplete].
   ///
   /// A later schedule replaces an earlier target while replies are still

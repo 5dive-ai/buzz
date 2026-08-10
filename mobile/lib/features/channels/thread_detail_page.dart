@@ -341,6 +341,7 @@ class ThreadDetailPage extends HookConsumerWidget {
                   viewport: listViewport,
                   child: KeyboardDismissOnDrag(
                     onUserScrollStart: () {
+                      initialTailSettle.abandon();
                       userOptedOutOfTailFollow.value = true;
                       followsThreadTail.value = false;
                       pendingTailAlignment.value = null;

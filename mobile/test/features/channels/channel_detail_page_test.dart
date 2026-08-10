@@ -33,6 +33,7 @@ import 'package:buzz/shared/mentions/agent_identity_provider.dart';
 import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/widgets/frosted_app_bar.dart';
+import 'package:buzz/shared/widgets/keyboard_dismiss_on_drag.dart';
 import 'package:buzz/shared/widgets/skeleton.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -4212,6 +4213,173 @@ void main() {
       expect(
         tester.getTopLeft(latestReply).dy,
         greaterThanOrEqualTo(frostedAppBarHeight(tester.element(latestReply))),
+      );
+    });
+
+    testWidgets(
+      'user drag abandons pending hydration settle until returning to tail',
+      (tester) async {
+        tester.view.physicalSize = const Size(400, 800);
+        tester.view.devicePixelRatio = 1;
+        addTearDown(tester.view.reset);
+
+        final rootEvent = _textMsg(
+          id: 'thread-root',
+          pubkey: 'alice',
+          content: 'Thread root',
+          createdAt: 1000,
+        );
+        final replies = [
+          for (var i = 0; i < 35; i++)
+            _textMsg(
+              id: 'reply-$i',
+              pubkey: 'bob',
+              content: 'Reply $i',
+              createdAt: 1100 + i,
+              extraTags: const [
+                ['e', 'thread-root', '', 'reply'],
+              ],
+            ),
+        ];
+        final completer = Completer<List<NostrEvent>>();
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [rootEvent],
+            pendingThreadReplies: {'thread-root': completer.future},
+            users: const {
+              'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+              'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
+            },
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final provisional = formatTimeline([rootEvent, ...replies.take(30)]);
+        Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+          MaterialPageRoute<void>(
+            builder: (_) => ThreadDetailPage(
+              threadHead: provisional.first,
+              allMessages: provisional,
+              channelId: _channelId,
+              currentPubkey: 'self',
+              isMember: true,
+              isArchived: false,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final list = find.byKey(const ValueKey('thread-message-list'));
+        await tester.drag(list, const Offset(0, -100));
+        await tester.pumpAndSettle();
+        final anchor = find.byKey(
+          const ValueKey('thread-message-group-reply-10'),
+        );
+        final anchorTop = tester.getTopLeft(anchor).dy;
+
+        completer.complete(replies);
+        await tester.pumpAndSettle();
+
+        expect(anchor, findsOneWidget);
+        expect(tester.getTopLeft(anchor).dy, closeTo(anchorTop, 0.5));
+        expect(
+          find.byKey(const ValueKey('thread-message-group-reply-34')),
+          findsNothing,
+        );
+
+        for (var i = 0; i < 12; i++) {
+          await tester.drag(list, const Offset(0, -100));
+          await tester.pumpAndSettle();
+        }
+        final latestReply = find.byKey(
+          const ValueKey('thread-message-group-reply-34'),
+        );
+        expect(latestReply, findsOneWidget);
+
+        tester.view.viewInsets = const FakeViewPadding(bottom: 300);
+        await tester.pumpAndSettle();
+
+        expect(
+          tester.getBottomLeft(latestReply).dy,
+          lessThanOrEqualTo(
+            tester
+                .getTopLeft(find.byKey(const ValueKey('composer-surface')))
+                .dy,
+          ),
+        );
+      },
+    );
+
+    testWidgets('user drag invalidates an already queued hydration settle', (
+      tester,
+    ) async {
+      final rootEvent = _textMsg(
+        id: 'thread-root',
+        pubkey: 'alice',
+        content: 'Thread root',
+        createdAt: 1000,
+      );
+      final replies = [
+        for (var i = 0; i < 35; i++)
+          _textMsg(
+            id: 'reply-$i',
+            pubkey: 'bob',
+            content: 'Reply $i',
+            createdAt: 1100 + i,
+            extraTags: const [
+              ['e', 'thread-root', '', 'reply'],
+            ],
+          ),
+      ];
+      final completer = Completer<List<NostrEvent>>();
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [rootEvent],
+          pendingThreadReplies: {'thread-root': completer.future},
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final provisional = formatTimeline([rootEvent, ...replies.take(30)]);
+      Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ThreadDetailPage(
+            threadHead: provisional.first,
+            allMessages: provisional,
+            channelId: _channelId,
+            currentPubkey: 'self',
+            isMember: true,
+            isArchived: false,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final anchor = find.byKey(
+        const ValueKey('thread-message-group-thread-root'),
+      );
+      final anchorTop = tester.getTopLeft(anchor).dy;
+      completer.complete(replies);
+      await tester.pump();
+
+      // Hydration has scheduled the settle's second post-frame callback. A
+      // drag starts before another frame can run it.
+      tester
+          .widget<KeyboardDismissOnDrag>(find.byType(KeyboardDismissOnDrag))
+          .onUserScrollStart!();
+      await tester.pumpAndSettle();
+
+      expect(anchor, findsOneWidget);
+      expect(tester.getTopLeft(anchor).dy, closeTo(anchorTop, 0.5));
+      expect(
+        find.byKey(const ValueKey('thread-message-group-reply-34')),
+        findsNothing,
       );
     });
 

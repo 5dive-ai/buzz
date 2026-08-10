@@ -4,6 +4,26 @@ import { useChannelTemplatesQuery } from "@/features/channel-templates/hooks";
 import { DEFAULT_EPHEMERAL_TTL_SECONDS } from "@/features/channels/lib/ephemeralChannel";
 import type { ChannelTemplate, ChannelVisibility } from "@/shared/api/types";
 
+export type TemplateQueryStatus = "pending" | "success" | "error";
+
+/**
+ * Resolve a section's saved template against the template query.
+ *
+ * `undefined` means the query is still pending, `null` means the saved
+ * template must be cleared, and a template means the default can be applied.
+ */
+export function resolveInitialChannelTemplate(
+  initialTemplateId: string | undefined,
+  templates: ChannelTemplate[],
+  status: TemplateQueryStatus,
+): ChannelTemplate | null | undefined {
+  if (!initialTemplateId || status === "pending") return undefined;
+  if (status === "error") return null;
+  return (
+    templates.find((template) => template.id === initialTemplateId) ?? null
+  );
+}
+
 export type CreateChannelKind = "stream" | "forum";
 
 export type CreateChannelInput = {
@@ -82,6 +102,8 @@ export function useCreateChannelForm({
   const [selectedTemplateId, setSelectedTemplateId] = React.useState<
     string | null
   >(initialTemplateId ?? null);
+  const [sectionDefaultTemplateId, setSectionDefaultTemplateId] =
+    React.useState<string | null>(initialTemplateId ?? null);
   const [typePopoverOpen, setTypePopoverOpen] = React.useState(false);
   const nameInputRef = React.useRef<HTMLInputElement>(null);
   const visibilityTouchedRef = React.useRef(false);
@@ -101,6 +123,7 @@ export function useCreateChannelForm({
     setTtlSeconds(DEFAULT_EPHEMERAL_TTL_SECONDS);
     setErrorMessage(null);
     setSelectedTemplateId(initialTemplateId ?? null);
+    setSectionDefaultTemplateId(initialTemplateId ?? null);
     setTypePopoverOpen(false);
     visibilityTouchedRef.current = false;
     initialTemplateAppliedRef.current = null;
@@ -134,20 +157,42 @@ export function useCreateChannelForm({
   }, []);
 
   React.useEffect(() => {
-    if (
-      !active ||
-      !initialTemplateId ||
-      initialTemplateAppliedRef.current === initialTemplateId
-    ) {
+    if (!active || !initialTemplateId) return;
+
+    const queryStatus: TemplateQueryStatus = templatesQuery.isError
+      ? "error"
+      : templatesQuery.isSuccess
+        ? "success"
+        : "pending";
+    const template = resolveInitialChannelTemplate(
+      initialTemplateId,
+      templates,
+      queryStatus,
+    );
+    if (template === undefined) return;
+    if (template === null) {
+      // Missing templates and terminal query failures both unlock the form.
+      // Keeping the raw section ID selected would promise defaults that cannot
+      // be applied after channel creation.
+      initialTemplateAppliedRef.current = initialTemplateId;
+      setSelectedTemplateId(null);
+      setSectionDefaultTemplateId(null);
+      setDescription("");
+      if (!visibilityTouchedRef.current) setVisibility("open");
+      setErrorMessage(null);
       return;
     }
-    const template = templates.find(
-      (candidate) => candidate.id === initialTemplateId,
-    );
-    if (!template) return;
+    if (initialTemplateAppliedRef.current === initialTemplateId) return;
     initialTemplateAppliedRef.current = initialTemplateId;
     applyTemplate(template);
-  }, [active, applyTemplate, initialTemplateId, templates]);
+  }, [
+    active,
+    applyTemplate,
+    initialTemplateId,
+    templates,
+    templatesQuery.isError,
+    templatesQuery.isSuccess,
+  ]);
 
   const handleTemplateCreated = React.useCallback(
     (template: ChannelTemplate) => {
@@ -246,7 +291,7 @@ export function useCreateChannelForm({
     handleTemplateChange,
     handleTemplateCreated,
     templates,
-    sectionDefaultTemplateId: initialTemplateId ?? null,
+    sectionDefaultTemplateId,
     nameInputRef,
     isCreating,
     canSubmit: name.trim().length > 0 && !isCreating,

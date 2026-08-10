@@ -1,6 +1,7 @@
+use crate::managed_agents::MAX_TEAM_NAME_CHARS;
 use nostr::Tag;
 
-const MAX_TEAM_MENTION_FIELD_CHARS: usize = 200;
+const MAX_TEAM_MENTION_ID_CHARS: usize = 200;
 
 pub(super) fn parse_mention_reference_tag(mention: &[String]) -> Result<Tag, String> {
     match mention.first().map(String::as_str) {
@@ -40,8 +41,8 @@ fn parse_team_mention(mention: &[String]) -> Result<Tag, String> {
     if team_id.is_empty() || display_name.is_empty() {
         return Err("team mention id and display name must not be blank".into());
     }
-    if team_id.chars().count() > MAX_TEAM_MENTION_FIELD_CHARS
-        || display_name.chars().count() > MAX_TEAM_MENTION_FIELD_CHARS
+    if team_id.chars().count() > MAX_TEAM_MENTION_ID_CHARS
+        || display_name.chars().count() > MAX_TEAM_NAME_CHARS
     {
         return Err("team mention id and display name must be at most 200 characters".into());
     }

@@ -496,6 +496,12 @@ export function TemplateFormDialog({
       const input: UpdateChannelTemplateInput = {
         id: template.id,
         name: trimmedName,
+        // The current editor intentionally does not expose channel type or
+        // visibility, so preserve the stored values when updating unrelated
+        // template fields rather than letting the backend's defaults overwrite
+        // them.
+        channelType: template.channelType,
+        visibility: template.visibility,
         description: template.description ?? undefined,
         canvasTemplate: canvasTemplate.trim() || undefined,
         projectFolders,

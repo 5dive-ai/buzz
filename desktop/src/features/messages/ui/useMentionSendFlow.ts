@@ -31,6 +31,7 @@ import type { AcpRuntime, ManagedAgent } from "@/shared/api/types";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import {
   buildMentionTags,
+  exceedsMentionPubkeyLimit,
   getErrorMessage,
   isManagedAgentRunning,
   isProviderBackedAgent,
@@ -683,6 +684,23 @@ export function useMentionSendFlow({
           return;
         }
 
+        const preflightMentionPubkeys = mentions.extractMentionPubkeys(trimmed);
+        const preflightPersonaIds = mentions
+          .extractMentionPersonas(trimmed)
+          .map(({ persona }) => persona.id);
+        if (
+          exceedsMentionPubkeyLimit(
+            preflightMentionPubkeys,
+            preflightPersonaIds,
+          )
+        ) {
+          const message =
+            "Too many mentions. Messages can mention at most 50 people or agents.";
+          setNonMemberPromptError(message);
+          toast.error(message);
+          return;
+        }
+
         let effectiveChannelId = capturedChannelId;
         if (!effectiveChannelId && onPrepareSendChannel) {
           effectiveChannelId = await onPrepareSendChannel();
@@ -798,6 +816,7 @@ export function useMentionSendFlow({
       mentions.isManagedAgentPubkey,
       mentions.getDraftMentionRefs,
       onPrepareSendChannel,
+      mentions.extractMentionPersonas,
     ],
   );
 

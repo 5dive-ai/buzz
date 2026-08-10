@@ -38,8 +38,13 @@ pub struct TemplateAgentRoster {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Workspace settings applied when creating a worktree from a channel template.
+/// `location` is the parent directory for new worktrees; `base_branch` is the
+/// branch fetched from origin and used as each worktree's starting point.
 pub struct TemplateWorktreeConfig {
+    /// Parent directory where new worktrees are created.
     pub location: String,
+    /// Branch used as the base for each new worktree.
     pub base_branch: String,
 }
 

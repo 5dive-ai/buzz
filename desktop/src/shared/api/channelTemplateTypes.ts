@@ -17,7 +17,12 @@ export type TemplateTeamEntry = {
   backend: TemplateBackend | null;
 };
 
-export type TemplateWorktreeConfig = { location: string; baseBranch: string };
+export type TemplateWorktreeConfig = {
+  /** Directory where new worktrees are created. */
+  location: string;
+  /** Branch used as the base for each new worktree. */
+  baseBranch: string;
+};
 export type TemplateAgents = {
   personas: TemplateAgentEntry[];
   teams: TemplateTeamEntry[];

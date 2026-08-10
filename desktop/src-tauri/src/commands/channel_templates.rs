@@ -72,6 +72,11 @@ fn validate_visibility(value: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
+/// Open a native multi-folder picker for channel-template project folders.
+///
+/// Returns an empty list when the user cancels. Returns an error if the dialog
+/// closes unexpectedly or any selected folder cannot be represented as a local
+/// filesystem path.
 pub async fn pick_channel_template_project_folder(app: AppHandle) -> Result<Vec<String>, String> {
     use tauri_plugin_dialog::DialogExt;
 

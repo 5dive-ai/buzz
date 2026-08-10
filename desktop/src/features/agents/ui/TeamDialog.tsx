@@ -144,7 +144,11 @@ export function TeamDialog({
         ...baseInput,
       };
     }
-    return baseInput;
+    return {
+      ...baseInput,
+      description: teamDescription.trim() || undefined,
+      instructions: instructions.trim() || undefined,
+    };
   }
 
   async function handleSubmit() {

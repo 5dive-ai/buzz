@@ -160,10 +160,8 @@ pub(crate) fn build_import_team(
     persona_ids: Vec<String>,
     now: &str,
 ) -> Result<TeamRecord, String> {
-    let name = snapshot.team.name.trim();
-    if name.is_empty() {
-        return Err("Team snapshot name is empty.".to_string());
-    }
+    let name = crate::managed_agents::validate_team_name(&snapshot.team.name)
+        .map_err(|error| format!("Invalid team snapshot: {error}"))?;
 
     Ok(TeamRecord {
         id: Uuid::new_v4().to_string(),

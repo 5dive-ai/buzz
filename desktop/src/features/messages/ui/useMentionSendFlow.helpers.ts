@@ -81,6 +81,21 @@ export function uniqueNormalizedPubkeys(pubkeys: Iterable<string>) {
   return [...new Set([...pubkeys].map(normalizePubkey))].filter(Boolean);
 }
 
+export const MAX_MENTION_PUBKEYS = 50;
+
+export function exceedsMentionPubkeyLimit(
+  resolvedPubkeys: Iterable<string>,
+  unresolvedPersonaIds: Iterable<string>,
+) {
+  const targetPubkeys = new Set(
+    [...resolvedPubkeys].map(normalizePubkey).filter(Boolean),
+  );
+  for (const personaId of unresolvedPersonaIds) {
+    if (personaId.trim()) targetPubkeys.add(`persona:${personaId}`);
+  }
+  return targetPubkeys.size > MAX_MENTION_PUBKEYS;
+}
+
 export function isManagedAgentRunning(agent: ManagedAgent) {
   return agent.status === "running" || agent.status === "deployed";
 }

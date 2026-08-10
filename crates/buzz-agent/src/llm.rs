@@ -227,6 +227,17 @@ impl Llm {
                 .await
             }
         };
+        // Stamp the actually-requested model into the response so the usage
+        // accumulation path can derive pricingIdentity. For OpenAi/Databricks
+        // this is done per-response inside openai_request_for_model (where the
+        // resolved request_model is known after mesh/auto resolution). For the
+        // remaining providers the effective_model IS the request model.
+        let result = result.map(|mut r| {
+            if r.request_model.is_none() {
+                r.request_model = Some(effective_model.to_string());
+            }
+            r
+        });
         // Stamp the effective model into Llm errors so log lines carry
         // `llm: (model-name) 404 Not Found: …` instead of the bare status.
         // The `llm: ` prefix comes from `Display for AgentError::Llm`; the
@@ -618,6 +629,10 @@ impl Llm {
                 self.post_openai(cfg, "/responses", &body, request_model)
                     .await?,
             )
+            .map(|mut r| {
+                r.request_model = Some(request_model.to_string());
+                r
+            })
             .map_err(PostError::from);
         }
         let (body, parse) = build(false, request_model);
@@ -625,7 +640,12 @@ impl Llm {
             .post_openai(cfg, "/chat/completions", &body, request_model)
             .await
         {
-            Ok(value) => parse(value).map_err(PostError::from),
+            Ok(value) => parse(value)
+                .map(|mut r| {
+                    r.request_model = Some(request_model.to_string());
+                    r
+                })
+                .map_err(PostError::from),
             Err(PostError::Agent(error))
                 if cfg.openai_api == OpenAiApi::Auto && self.try_upgrade(&error) =>
             {
@@ -634,6 +654,10 @@ impl Llm {
                     self.post_openai(cfg, "/responses", &body, request_model)
                         .await?,
                 )
+                .map(|mut r| {
+                    r.request_model = Some(request_model.to_string());
+                    r
+                })
                 .map_err(PostError::from)
             }
             Err(error) => Err(error),
@@ -1330,27 +1354,33 @@ fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
         Some("completed") => ProviderStop::EndTurn,
         _ => ProviderStop::Other,
     };
-    let input_tokens = sum_usage(&v, &["input_tokens"]);
-    let output_tokens = sum_usage(&v, &["output_tokens"]);
+    let input_tokens = sum_usage(&v, &["input_tokens"]).and_then(SumUsageResult::into_exact);
+    let output_tokens = sum_usage(&v, &["output_tokens"]).and_then(SumUsageResult::into_exact);
     // The Responses API nests the cache split under `input_tokens_details`.
     let cached_input_tokens = usage_first(
         &v,
         &["cache_read_input_tokens"],
         &[("input_tokens_details", "cached_tokens")],
     );
+    // Responses API does not expose cache-write tokens today; stays None.
+    let cache_write_tokens: Option<u64> = None;
     // Responses API reports a genuine provider total. Read it directly —
     // never derived, so it stays None when the provider omits it.
-    let total_tokens = sum_usage(&v, &["total_tokens"]);
+    let total_tokens = sum_usage(&v, &["total_tokens"]).and_then(SumUsageResult::into_exact);
     Ok(LlmResponse {
         text,
         tool_calls,
         stop,
         input_tokens,
+        input_tokens_overflowed: false, // input_tokens is a single field; cannot overflow
         cached_input_tokens,
+        cache_write_tokens,
         output_tokens,
         total_tokens,
         reasoning,
         reasoning_details: None,
+        // Stamped by the dispatch layer (openai_request_for_model) after parse.
+        request_model: None,
     })
 }
 
@@ -1364,28 +1394,70 @@ fn map_stop(s: Option<&str>) -> ProviderStop {
     }
 }
 
+/// Result of a multi-field token sum — distinguishes a successful total from an
+/// arithmetic overflow so callers can propagate the overflow signal rather than
+/// silently clamping to `u64::MAX`.
+#[derive(Debug, PartialEq)]
+enum SumUsageResult {
+    /// At least one field was present and the total did not overflow.
+    Exact(u64),
+    /// At least one field was present but the cumulative sum overflowed `u64`.
+    Overflow,
+}
+
+impl SumUsageResult {
+    /// Returns `Some(n)` when exact, `None` when overflow or when the caller
+    /// needs to signal an explicit absence.  Single-field callers whose sums
+    /// cannot overflow use this to convert back to `Option<u64>`.
+    fn into_exact(self) -> Option<u64> {
+        match self {
+            SumUsageResult::Exact(n) => Some(n),
+            SumUsageResult::Overflow => None,
+        }
+    }
+}
+
 /// Sum a set of `usage` token fields, returning `None` only when the `usage`
 /// object is absent or carries none of the requested fields. A field that is
 /// present is added; a field that is missing contributes 0. This keeps the
 /// result an inclusive total (so cached tokens are never silently dropped)
 /// while still distinguishing "no usage reported" from "usage was zero".
-fn sum_usage(v: &Value, fields: &[&str]) -> Option<u64> {
+///
+/// Returns [`SumUsageResult::Overflow`] if the cumulative total exceeds `u64::MAX`.
+/// Single-field callers whose sums cannot overflow may call `.into_exact()` to
+/// convert back to `Option<u64>` without loss.
+fn sum_usage(v: &Value, fields: &[&str]) -> Option<SumUsageResult> {
     let usage = v.get("usage")?;
     let mut total: u64 = 0;
     let mut saw_any = false;
+    let mut overflowed = false;
     for f in fields {
         if let Some(n) = usage.get(*f).and_then(Value::as_u64) {
-            total = total.saturating_add(n);
+            match total.checked_add(n) {
+                Some(t) => total = t,
+                None => overflowed = true,
+            }
             saw_any = true;
         }
     }
-    saw_any.then_some(total)
+    if !saw_any {
+        return None;
+    }
+    if overflowed {
+        Some(SumUsageResult::Overflow)
+    } else {
+        Some(SumUsageResult::Exact(total))
+    }
 }
 
 /// Input-token total for Anthropic / Databricks (Anthropic-style) responses.
 /// `input_tokens` alone EXCLUDES cached tokens, so we sum it with the two
 /// cache fields to get the inclusive total the context budget must gate on.
-fn anthropic_input_tokens(v: &Value) -> Option<u64> {
+///
+/// Returns [`SumUsageResult::Overflow`] when the sum of the three fields
+/// exceeds `u64::MAX` — the caller must propagate the overflow signal rather
+/// than clamping.
+fn anthropic_input_tokens(v: &Value) -> Option<SumUsageResult> {
     sum_usage(
         v,
         &[
@@ -1415,7 +1487,7 @@ fn anthropic_input_tokens(v: &Value) -> Option<u64> {
 /// The two never collide here: the router sends `claude*` models to the
 /// Anthropic route, so `parse_openai` only ever sees inclusive `prompt_tokens`.
 fn openai_chat_input_tokens(v: &Value) -> Option<u64> {
-    sum_usage(v, &["prompt_tokens"])
+    sum_usage(v, &["prompt_tokens"]).and_then(SumUsageResult::into_exact)
 }
 
 /// First present value among `usage.<field>` and `usage.<nested>.<leaf>` pairs.
@@ -1576,23 +1648,38 @@ fn parse_anthropic(v: Value) -> Result<LlmResponse, AgentError> {
             }
         }
     }
-    let input_tokens = anthropic_input_tokens(&v);
-    let output_tokens = sum_usage(&v, &["output_tokens"]);
+    // anthropic_input_tokens() returns Option<SumUsageResult> because it sums
+    // three fields that can collectively overflow u64. Propagate the overflow
+    // signal via `input_tokens_overflowed` so the run loop can poison the
+    // turn accumulator rather than treating u64::MAX as an exact reading.
+    let (input_tokens, input_tokens_overflowed) = match anthropic_input_tokens(&v) {
+        Some(SumUsageResult::Exact(n)) => (Some(n), false),
+        Some(SumUsageResult::Overflow) => (None, true),
+        None => (None, false),
+    };
+    let output_tokens = sum_usage(&v, &["output_tokens"]).and_then(SumUsageResult::into_exact);
     // Anthropic reports the cache split flat on `usage`. Note this is already
     // part of `input_tokens` above, which sums it in deliberately.
     let cached_input_tokens = usage_first(&v, &["cache_read_input_tokens"], &[]);
+    // Anthropic reports cache-creation tokens as `cache_creation_input_tokens`;
+    // also a subset of `input_tokens` (already folded in above).
+    let cache_write_tokens = usage_first(&v, &["cache_creation_input_tokens"], &[]);
     Ok(LlmResponse {
         text,
         tool_calls,
         stop,
         input_tokens,
+        input_tokens_overflowed,
         cached_input_tokens,
+        cache_write_tokens,
         output_tokens,
         // Anthropic reports only category counts; NIP-AM forbids deriving a
         // total from them. Always None for this provider.
         total_tokens: None,
         reasoning,
         reasoning_details: None,
+        // Stamped by the dispatch layer (complete) after parse.
+        request_model: None,
     })
 }
 
@@ -1690,21 +1777,29 @@ fn parse_openai(v: Value) -> Result<LlmResponse, AgentError> {
     }
     dedupe_provider_ids(&mut tool_calls);
     let input_tokens = openai_chat_input_tokens(&v);
-    let output_tokens = sum_usage(&v, &["completion_tokens"]);
+    let output_tokens = sum_usage(&v, &["completion_tokens"]).and_then(SumUsageResult::into_exact);
     let cached_input_tokens = openai_chat_cached_tokens(&v);
+    // OpenAI Chat Completions reports cache-write tokens under
+    // `prompt_tokens_details.cache_write_tokens`. A subset of `prompt_tokens`.
+    let cache_write_tokens =
+        usage_first(&v, &[], &[("prompt_tokens_details", "cache_write_tokens")]);
     // OpenAI Chat Completions reports a genuine provider total. Read it
     // directly — never derived, so it stays None when the provider omits it.
-    let total_tokens = sum_usage(&v, &["total_tokens"]);
+    let total_tokens = sum_usage(&v, &["total_tokens"]).and_then(SumUsageResult::into_exact);
     Ok(LlmResponse {
         text,
         tool_calls,
         stop,
         input_tokens,
+        input_tokens_overflowed: false, // prompt_tokens is a single field; cannot overflow
         cached_input_tokens,
+        cache_write_tokens,
         output_tokens,
         total_tokens,
         reasoning,
         reasoning_details: None,
+        // Stamped by the dispatch layer (openai_request_for_model) after parse.
+        request_model: None,
     })
 }
 
@@ -2203,8 +2298,33 @@ where
                 }
             }
         }
-        return serde_json::from_slice(&buf)
-            .map_err(|e| PostError::Agent(AgentError::Llm(format!("json: {e}"))));
+        // A 2xx body that fails to parse (e.g. a provider flushing a
+        // truncated JSON document and closing the stream cleanly) is a
+        // transient upstream fault, not a request problem: retry it like a
+        // 5xx. Safe to re-send — a malformed body produced no parsed
+        // response, so no tool call was ever extracted from it, and the
+        // retried request is the identical completion POST captured in
+        // `body_bytes` at function entry.
+        match serde_json::from_slice(&buf) {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if attempt + 1 < MAX_RETRIES {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_attempts = MAX_RETRIES,
+                        error = %e,
+                        "llm: malformed response body, retrying"
+                    );
+                    backoff_with_jitter(attempt).await;
+                    continue;
+                }
+                return Err(PostError::Agent(terminal_llm_error(
+                    call_start.elapsed(),
+                    attempt + 1,
+                    &format!("json: {e}"),
+                )));
+            }
+        }
     }
     // Unreachable in practice: every iteration either returns or continues.
     // A fallthrough here would mean MAX_RETRIES was 0, which is rejected at
@@ -2610,7 +2730,31 @@ async fn openrouter_post(
                 }
             }
         }
-        return serde_json::from_slice(&buf).map_err(|e| AgentError::Llm(format!("json: {e}")));
+        // Same malformed-body retry as the shared `post()` terminal: a
+        // truncated 2xx JSON body is transient upstream trouble, and
+        // re-sending is provably tool-safe — nothing was parsed, so no tool
+        // call could have been extracted, and the retry re-uses the
+        // identical `body_bytes` completion request.
+        match serde_json::from_slice(&buf) {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if attempt + 1 < MAX_RETRIES {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_attempts = MAX_RETRIES,
+                        error = %e,
+                        "llm: openrouter malformed response body, retrying"
+                    );
+                    backoff_with_jitter(attempt).await;
+                    continue;
+                }
+                return Err(terminal_llm_error(
+                    call_start.elapsed(),
+                    attempt + 1,
+                    &format!("json: {e}"),
+                ));
+            }
+        }
     }
     Err(terminal_llm_error(
         call_start.elapsed(),
@@ -4791,6 +4935,237 @@ mod tests {
         );
     }
 
+    /// Regression (write-compressor, tb21-twins-1): a provider returning
+    /// HTTP 200 with a *truncated* JSON body (cleanly closed, correct
+    /// framing, unparseable content) previously surfaced as a terminal
+    /// `AgentError::Llm("json: EOF while parsing a value ...")` on the very
+    /// first attempt, killing the agent turn. A malformed body is transient
+    /// upstream trouble and must be retried like a 5xx. Re-sending is
+    /// tool-safe: nothing was parsed, so no tool call was extracted from the
+    /// bad body, and the retry replays the identical completion request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_retries_malformed_json_body_and_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/x", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicU32::new(0));
+        let accepts_srv = accepts.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let n = accepts_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                    }
+                }
+                if n == 0 {
+                    // First attempt: 200 OK with a truncated JSON document.
+                    // Content-Length matches the bytes actually sent, so the
+                    // body read completes cleanly — the fault is purely that
+                    // the JSON is cut off mid-value.
+                    let body = "{\"choices\":[{\"mess";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    continue;
+                }
+                // Subsequent attempts: complete valid JSON.
+                let body = "{\"ok\":true}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let out = post(
+            &client,
+            &url,
+            &serde_json::json!({}),
+            false,
+            Duration::from_secs(5),
+            |b| b,
+        )
+        .await
+        .expect("post should succeed after retrying the malformed body");
+        assert_eq!(out, serde_json::json!({ "ok": true }));
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "server must see exactly 2 attempts (malformed body retried once)"
+        );
+    }
+
+    /// A persistently malformed 200 body exhausts MAX_RETRIES and surfaces
+    /// the terminal error with the `json:` detail plus cumulative
+    /// duration/attempt count — never an early first-attempt death.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_exhausts_retries_on_persistent_malformed_json() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/x", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicU32::new(0));
+        let accepts_srv = accepts.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                    }
+                }
+                let body = "{\"choices\":[{\"mess";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = post(
+            &client,
+            &url,
+            &serde_json::json!({}),
+            false,
+            Duration::from_secs(5),
+            |b| b,
+        )
+        .await
+        .unwrap_err();
+        match &err {
+            PostError::Agent(AgentError::Llm(msg)) => {
+                assert!(
+                    msg.contains("json:"),
+                    "expected the json parse detail, got: {msg}"
+                );
+                assert!(
+                    msg.contains("cumulative") && msg.contains("3 attempts"),
+                    "expected cumulative duration + exact attempt count, got: {msg}"
+                );
+            }
+            other => panic!("expected PostError::Agent(AgentError::Llm), got: {other:?}"),
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            MAX_RETRIES,
+            "server must see exactly MAX_RETRIES attempts — malformed bodies must be retried"
+        );
+    }
+
+    /// Same regression coverage for `openrouter_post`, which carries its own
+    /// retry loop: a truncated 200 body on the first attempt is retried and
+    /// the call succeeds on the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openrouter_post_retries_malformed_json_body_and_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/x", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicU32::new(0));
+        let accepts_srv = accepts.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let n = accepts_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                    }
+                }
+                if n == 0 {
+                    let body = "{\"choices\":[{\"mess";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    continue;
+                }
+                let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let out = openrouter_post(&client, &url, &json!({}), "key", Duration::from_secs(5))
+            .await
+            .expect("openrouter_post should succeed after retrying the malformed body");
+        assert!(out.is_object(), "expected a JSON object: {out:?}");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "server must see exactly 2 attempts (malformed body retried once)"
+        );
+    }
+
     /// A body-read timeout on the first attempt triggers a retry under an
     /// escalated budget, and the call succeeds on the second attempt.
     ///
@@ -5842,6 +6217,98 @@ mod tests {
         // is "no usable reading" -> None, not Some(0).
         let v = serde_json::json!({"usage": {"output_tokens": 5}});
         assert_eq!(sum_usage(&v, &["input_tokens", "prompt_tokens"]), None);
+    }
+
+    #[test]
+    fn sum_usage_exact_single_field() {
+        let v = serde_json::json!({"usage": {"input_tokens": 42}});
+        assert_eq!(
+            sum_usage(&v, &["input_tokens"]),
+            Some(SumUsageResult::Exact(42))
+        );
+    }
+
+    #[test]
+    fn sum_usage_exact_two_fields() {
+        let v = serde_json::json!({"usage": {"input_tokens": 100, "cache_read_input_tokens": 50}});
+        assert_eq!(
+            sum_usage(&v, &["input_tokens", "cache_read_input_tokens"]),
+            Some(SumUsageResult::Exact(150))
+        );
+    }
+
+    #[test]
+    fn sum_usage_overflow_two_fields_signals_overflow() {
+        // Reproducer from Thufir's finding: input_tokens = u64::MAX, cache_read = 1.
+        // Must return Overflow, not Exact(u64::MAX).
+        let v = serde_json::json!({
+            "usage": {
+                "input_tokens": u64::MAX,
+                "cache_read_input_tokens": 1_u64,
+                "cache_creation_input_tokens": 0_u64
+            }
+        });
+        assert_eq!(
+            sum_usage(
+                &v,
+                &[
+                    "input_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens"
+                ]
+            ),
+            Some(SumUsageResult::Overflow)
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_input_overflow_sets_flag_and_clears_value() {
+        // The inclusive sum overflows; input_tokens must be None and the flag set.
+        let v = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {
+                "input_tokens": u64::MAX,
+                "cache_read_input_tokens": 1_u64,
+                "cache_creation_input_tokens": 0_u64,
+                "output_tokens": 7
+            }
+        });
+        let r = parse_anthropic(v).unwrap();
+        assert_eq!(r.input_tokens, None, "overflowed value must be discarded");
+        assert!(r.input_tokens_overflowed, "overflow flag must be set");
+        // output_tokens unaffected by input overflow
+        assert_eq!(r.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn parse_anthropic_normal_sum_does_not_set_flag() {
+        // Normal (non-overflow) path: flag stays false.
+        let v = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {
+                "input_tokens": 100_u64,
+                "cache_read_input_tokens": 900_u64,
+                "cache_creation_input_tokens": 50_u64,
+                "output_tokens": 7
+            }
+        });
+        let r = parse_anthropic(v).unwrap();
+        assert_eq!(r.input_tokens, Some(1050));
+        assert!(!r.input_tokens_overflowed);
+    }
+
+    #[test]
+    fn parse_anthropic_absent_usage_does_not_set_flag() {
+        // Absent usage: flag stays false, input_tokens stays None.
+        let v = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "hi"}]
+        });
+        let r = parse_anthropic(v).unwrap();
+        assert_eq!(r.input_tokens, None);
+        assert!(!r.input_tokens_overflowed);
     }
 
     /// A token source whose `bearer()` always hands back the same stale

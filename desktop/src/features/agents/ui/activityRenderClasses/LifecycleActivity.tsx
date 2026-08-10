@@ -40,6 +40,33 @@ function permissionOutcomeTone(outcome: string): "approve" | "deny" | "cancel" {
 }
 
 /**
+ * Exact recognized permission-option kinds the observer feed can act on.
+ * `allow_once` grants once; `reject_once` / `reject_always` deny (persistent
+ * denial only reduces authority, so it stays actionable and fail-safe). Any
+ * kind not in this set — including unrecognized `reject_*` variants — is
+ * treated as unknown and rendered non-actionable.
+ */
+const ACTIONABLE_KINDS = new Set([
+  "allow_once",
+  "reject_once",
+  "reject_always",
+]);
+
+function isActionableKind(kind: string): boolean {
+  return ACTIONABLE_KINDS.has(kind);
+}
+
+/**
+ * Default button label when the harness omits one. `reject_always` must read
+ * "Always deny" so a user never silently chooses persistent denial.
+ */
+function defaultOptionLabel(kind: string): string {
+  if (kind === "reject_always") return "Always deny";
+  if (kind === "reject_once") return "Deny";
+  return "Allow";
+}
+
+/**
  * Allow/Deny buttons for an actionable permission card.
  * Renders the agent's exact options as labeled buttons; a click sends the
  * `permission_decision` control event (fire-and-forget).
@@ -78,11 +105,12 @@ function PermissionDecisionButtons({
   }, [deliveryFailed]);
 
   // Classify each option into an actionable bucket or a non-actionable
-  // display-only slot.  Unknown kinds fail closed: they are not rendered at
-  // all so the user cannot accidentally make an irreversible choice on an
-  // option the UI doesn't understand.
-  const actionableOptions = options.filter(
-    ({ kind }) => kind === "allow_once" || kind.startsWith("reject"),
+  // display-only slot.  Recognition is an EXACT allowlist, never a prefix:
+  // an unknown kind (including an unrecognized `reject_*` such as
+  // `reject_later_v2`) fails closed and is not rendered, so the user cannot
+  // click a trusted-looking button whose semantics this UI doesn't understand.
+  const actionableOptions = options.filter(({ kind }) =>
+    isActionableKind(kind),
   );
   const hasPersistentGrant = options.some(
     ({ kind }) => kind === "allow_always",
@@ -95,8 +123,8 @@ function PermissionDecisionButtons({
   return (
     <div className="mt-1.5 flex flex-wrap gap-1.5">
       {actionableOptions.map(({ optionId, kind, label }) => {
-        const isDeny = kind.startsWith("reject");
-        const displayLabel = label ?? (isDeny ? "Deny" : "Allow");
+        const isDeny = kind === "reject_once" || kind === "reject_always";
+        const displayLabel = label ?? defaultOptionLabel(kind);
         return (
           <button
             key={optionId}

@@ -170,6 +170,67 @@ test("test_unknown_kind_fails_closed_renders_nothing", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Unknown reject_*-prefixed kind — fail closed: exact allowlist, not prefix
+// ---------------------------------------------------------------------------
+
+test("test_unknown_reject_prefixed_kind_fails_closed_renders_nothing", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(LifecycleActivity, {
+      ...BASE_PROPS,
+      item: pendingPermissionItem([
+        { optionId: "opt-reject-future", kind: "reject_later_v2" },
+      ]),
+    }),
+  );
+
+  // A reject-prefixed but unrecognized kind must NOT render a trusted button:
+  // recognition is an exact allowlist, not a prefix match.
+  assert.ok(
+    !html.includes("permission-decision-opt-reject-future"),
+    "unknown reject_*-prefixed kind must not render an actionable button",
+  );
+  assert.ok(
+    !html.includes("<button"),
+    "unknown reject_*-prefixed-only card must not render any button element",
+  );
+  assert.ok(
+    !html.includes("permission-decision-persistent-grant"),
+    "unknown reject_*-prefixed kind must not render the persistent-grant badge",
+  );
+  // The outer permission card shell is still rendered.
+  assert.ok(
+    html.includes("transcript-permission-item"),
+    "unknown reject_*-prefixed kind still renders the permission card shell",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// reject_always with no label — actionable Deny labelled "Always deny"
+// ---------------------------------------------------------------------------
+
+test("test_reject_always_without_label_renders_always_deny_button", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(LifecycleActivity, {
+      ...BASE_PROPS,
+      item: pendingPermissionItem([
+        { optionId: "opt-reject-always", kind: "reject_always" },
+      ]),
+    }),
+  );
+
+  // Persistent denial stays actionable (fail-safe), but the harness omitted a
+  // label — the default must disclose persistence, not read generic "Deny".
+  assert.ok(
+    html.includes("permission-decision-opt-reject-always"),
+    "reject_always should render an actionable button",
+  );
+  assert.ok(
+    html.includes("Always deny"),
+    "reject_always without a label must default to 'Always deny', not 'Deny'",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Mixed options — allow_once + allow_always in same card
 // ---------------------------------------------------------------------------
 

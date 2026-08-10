@@ -14,10 +14,7 @@ import { pendingOverrideIntentStore } from "../pendingOverrideIntents.ts";
 import { forcedUnreadStore } from "../forcedUnreadStore.ts";
 import { createDrainOutcomeHandler } from "../useUnreadChannelsHelpers.ts";
 
-// ── ReadStateManager integration helpers ─────────────────────────────────────
-// Provide browser globals required by ReadStateManager (localStorage,
-// window.setTimeout/clearTimeout). Each test that uses ReadStateManager
-// constructs a fresh in-memory store so tests are isolated.
+// ── Shared test helpers ───────────────────────────────────────────────────────
 
 function makeLocalStorage() {
   const store = new Map();
@@ -25,6 +22,69 @@ function makeLocalStorage() {
     getItem: (key) => store.get(key) ?? null,
     setItem: (key, value) => store.set(key, value),
     removeItem: (key) => store.delete(key),
+  };
+}
+
+function makeFenceHandle({
+  eose = true,
+  lapsesAfterEose = false,
+  lapseBeforeEose = false,
+} = {}) {
+  let lapsed = lapseBeforeEose;
+  let resolveEstablished;
+  const established = new Promise((r) => {
+    resolveEstablished = r;
+  });
+  if (lapseBeforeEose) {
+    resolveEstablished();
+  } else if (eose) {
+    resolveEstablished();
+    if (lapsesAfterEose) lapsed = true;
+  }
+  return {
+    established,
+    get lapsed() {
+      return lapsed;
+    },
+    unsubscribe: async () => {},
+    _lapse() {
+      lapsed = true;
+    },
+  };
+}
+
+function makeFakeRelay(overrides = {}) {
+  return {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
+    subscribeLive: async (_f, _h) => () => {},
+    subscribeToReconnects: () => () => {},
+    getConnectionGeneration: () => 0,
+    ...overrides,
+  };
+}
+
+function makeFakeTimers() {
+  const scheduled = new Map();
+  const origSetTimeout = globalThis.window.setTimeout;
+  globalThis.window.setTimeout = (fn, ms) => {
+    const id = origSetTimeout(fn, ms);
+    scheduled.set(id, { fn, ms });
+    return id;
+  };
+  const origClearTimeout = globalThis.window.clearTimeout;
+  globalThis.window.clearTimeout = (id) => {
+    scheduled.delete(id);
+    origClearTimeout(id);
+  };
+  return {
+    scheduled,
+    origSetTimeout,
+    restore() {
+      globalThis.window.setTimeout = origSetTimeout;
+      globalThis.window.clearTimeout = origClearTimeout;
+    },
   };
 }
 
@@ -45,7 +105,6 @@ function makeLocalStorage() {
       globalThis.window.setTimeout = (fn, ms) => setTimeout(fn, ms);
     }
   }
-  // Ensure bare `localStorage` always proxies to window.localStorage.
   Object.defineProperty(globalThis, "localStorage", {
     get: () => globalThis.window.localStorage,
     configurable: true,
@@ -53,78 +112,21 @@ function makeLocalStorage() {
 }
 
 /**
- * Build a FenceHandle-shaped fake for use in test relay objects.
- *
- * @param {object} opts
- * @param {boolean}  opts.eose      — if true, `established` resolves immediately (EOSE received).
- * @param {boolean}  opts.lapsesAfterEose — if true, `lapsed` becomes true after established resolves.
- * @param {boolean}  opts.lapseBeforeEose — if true, sets lapsed=true and resolves established together.
- * @param {(ev: object) => void} [opts.captureHandler] — called with the onEvent handler so tests can deliver events.
- */
-function makeFenceHandle({
-  eose = true,
-  lapsesAfterEose = false,
-  lapseBeforeEose = false,
-} = {}) {
-  let lapsed = lapseBeforeEose;
-  let resolveEstablished;
-  const established = new Promise((r) => {
-    resolveEstablished = r;
-  });
-
-  if (lapseBeforeEose) {
-    // Lapsed before EOSE: resolve immediately with lapsed=true.
-    resolveEstablished();
-  } else if (eose) {
-    resolveEstablished();
-    if (lapsesAfterEose) lapsed = true;
-  }
-  // If neither, `established` never resolves (hung fence — caller will lapse via reconnect).
-
-  return {
-    established,
-    get lapsed() {
-      return lapsed;
-    },
-    unsubscribe: async () => {},
-    /** For tests that need to trigger a lapse mid-enumeration. */
-    _lapse() {
-      lapsed = true;
-    },
-  };
-}
-
-/**
  * Wire the production `createDrainOutcomeHandler` onto `manager.onDrainOutcome`.
- *
- * Uses the SAME pure handler exported from `useUnreadChannelsHelpers.ts` that
- * `useDrainOutcomeCallback` uses in production — no hand-copied mirror.  This
- * guarantees the test exercises the exact same outcome routing logic.
- *
- * Returns an object with:
- *  - `forcedUnreadMap`   — live reference to the map being mutated
- *  - `pendingSnapshots`  — in-memory snapshot map (same role as the React ref)
- *  - `versionBumps`      — counter incremented on each bumpLatestVersion call
- *
- * Call `teardown()` to clear `manager.onDrainOutcome` when the test is done.
+ * Returns { forcedUnreadMap, pendingSnapshots, versionBumps, teardown }.
  */
 function wireDrainCallback(manager, pubkey) {
   const forcedUnreadMap = forcedUnreadStore.read(pubkey);
   const pendingSnapshots = new Map();
   let versionBumps = 0;
-
-  const bumpLatestVersion = () => {
-    versionBumps++;
-  };
-
-  // Delegate to the production handler — not a hand-copied mirror.
   manager.onDrainOutcome = createDrainOutcomeHandler(
     { current: forcedUnreadMap },
     pendingSnapshots,
     pubkey,
-    bumpLatestVersion,
+    () => {
+      versionBumps++;
+    },
   );
-
   return {
     forcedUnreadMap,
     pendingSnapshots,
@@ -201,7 +203,6 @@ const THREAD_ID = "b".repeat(64);
 
 test("trimContextsToBudget_underBudget_returnsZeroAndLeavesContextsUnchanged", () => {
   const contexts = { [`msg:${MSG_ID}`]: 100 };
-  // A very large budget — nothing should be evicted.
   const { evicted, fitsAfterTrim } = trimContextsToBudget(
     contexts,
     CLIENT_ID,
@@ -213,19 +214,15 @@ test("trimContextsToBudget_underBudget_returnsZeroAndLeavesContextsUnchanged", (
 });
 
 test("trimContextsToBudget_overBudget_evictsMsgEntriesOldestFirst", () => {
-  // Build a contexts map that exceeds a tiny budget.
-  // Three msg entries with timestamps 1 (oldest), 2, 3 (newest).
   const contexts = {
     [`msg:${MSG_ID}`]: 1,
     [`msg:${"c".repeat(64)}`]: 3,
     [`msg:${"d".repeat(64)}`]: 2,
   };
   const encoder = new TextEncoder();
-  // Budget that requires evicting at least one entry.
   const budget =
     encoder.encode(JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts }))
       .length - 10;
-
   const { evicted, fitsAfterTrim } = trimContextsToBudget(
     contexts,
     CLIENT_ID,
@@ -233,61 +230,39 @@ test("trimContextsToBudget_overBudget_evictsMsgEntriesOldestFirst", () => {
   );
   assert.ok(evicted >= 1, `expected at least 1 eviction, got ${evicted}`);
   assert.equal(fitsAfterTrim, true);
-  // The oldest entry (ts=1) must be gone.
-  assert.ok(
-    !(`msg:${MSG_ID}` in contexts),
-    "oldest msg entry should be evicted",
-  );
-  // Result must fit within budget.
+  assert.ok(!(`msg:${MSG_ID}` in contexts));
   const resultSize = encoder.encode(
     JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts }),
   ).length;
-  assert.ok(
-    resultSize <= budget,
-    `result ${resultSize} exceeds budget ${budget}`,
-  );
+  assert.ok(resultSize <= budget);
 });
 
 test("trimContextsToBudget_channelKeysNeverEvicted", () => {
-  // Fill with msg entries plus one channel key; budget forces eviction.
   const contexts = {};
   for (let i = 0; i < 50; i++) {
     contexts[`msg:${i.toString().padStart(64, "0")}`] = i;
   }
   contexts["channel:some-channel-id"] = 999;
-
   const encoder = new TextEncoder();
   const fullSize = encoder.encode(
     JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts }),
   ).length;
   const budget = Math.floor(fullSize / 2);
-
   const { fitsAfterTrim } = trimContextsToBudget(contexts, CLIENT_ID, budget);
-
-  // Channel key must survive regardless of how many msg entries were evicted.
-  assert.ok(
-    "channel:some-channel-id" in contexts,
-    "channel key must not be evicted",
-  );
+  assert.ok("channel:some-channel-id" in contexts);
   assert.equal(fitsAfterTrim, true);
   const resultSize = encoder.encode(
     JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts }),
   ).length;
-  assert.ok(
-    resultSize <= budget,
-    `result ${resultSize} exceeds budget ${budget}`,
-  );
+  assert.ok(resultSize <= budget);
 });
 
 test("trimContextsToBudget_msgEvictedBeforeThread", () => {
-  // One msg entry (older) and one thread entry (newer).
-  // Budget forces exactly one eviction; msg must go first.
   const contexts = {
     [`msg:${MSG_ID}`]: 1,
     [`thread:${THREAD_ID}`]: 2,
   };
   const encoder = new TextEncoder();
-  // Tight budget: remove exactly one entry.
   const oneEntrySize = encoder.encode(
     JSON.stringify({
       v: 1,
@@ -296,7 +271,6 @@ test("trimContextsToBudget_msgEvictedBeforeThread", () => {
     }),
   ).length;
   const budget = oneEntrySize + 5; // fits one entry, not two
-
   const { evicted, fitsAfterTrim } = trimContextsToBudget(
     contexts,
     CLIENT_ID,
@@ -304,15 +278,11 @@ test("trimContextsToBudget_msgEvictedBeforeThread", () => {
   );
   assert.equal(evicted, 1);
   assert.equal(fitsAfterTrim, true);
-  assert.ok(
-    !(`msg:${MSG_ID}` in contexts),
-    "msg entry should be evicted before thread",
-  );
+  assert.ok(!(`msg:${MSG_ID}` in contexts));
   assert.ok(`thread:${THREAD_ID}` in contexts, "thread entry should survive");
 });
 
 test("trimContextsToBudget_emptyContexts_returnsZeroAndFits", () => {
-  // Empty contexts: blob is just the skeleton — fits any reasonable budget.
   const contexts = {};
   const { evicted, fitsAfterTrim } = trimContextsToBudget(
     contexts,
@@ -324,8 +294,6 @@ test("trimContextsToBudget_emptyContexts_returnsZeroAndFits", () => {
 });
 
 test("trimContextsToBudget_channelOnlyBlobExceedsBudget_fitsAfterTrimFalse", () => {
-  // Channel keys cannot be evicted. If the channel-only skeleton exceeds the
-  // budget, fitsAfterTrim must be false so the caller can suppress the publish.
   const contexts = {
     "channel:some-channel-id": 100,
   };
@@ -333,9 +301,7 @@ test("trimContextsToBudget_channelOnlyBlobExceedsBudget_fitsAfterTrimFalse", () 
   const skeletonSize = encoder.encode(
     JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts }),
   ).length;
-  // Budget smaller than the channel-only skeleton — cannot be satisfied.
   const budget = skeletonSize - 1;
-
   const { evicted, fitsAfterTrim } = trimContextsToBudget(
     contexts,
     CLIENT_ID,
@@ -343,7 +309,6 @@ test("trimContextsToBudget_channelOnlyBlobExceedsBudget_fitsAfterTrimFalse", () 
   );
   assert.equal(evicted, 0, "no evictable entries exist");
   assert.equal(fitsAfterTrim, false, "channel-only blob still exceeds budget");
-  // Channel key must still be present.
   assert.ok("channel:some-channel-id" in contexts);
 });
 
@@ -367,7 +332,6 @@ const deterministicSlotId = () =>
   `slot-${(++slotCounter).toString().padStart(4, "0")}`;
 
 test("splitContextsIntoBudgetedSlots_fitsInOneSlot_returnsSingleSlot", () => {
-  // 3 channel keys — easily fits in one slot with a generous budget.
   const channelEntries = [
     [makeChannelKey(1), 100],
     [makeChannelKey(2), 200],
@@ -382,31 +346,25 @@ test("splitContextsIntoBudgetedSlots_fitsInOneSlot_returnsSingleSlot", () => {
     maxBytes: 1_000_000,
     slotIdGenerator: deterministicSlotId,
   });
-
   assert.ok(result !== null, "should succeed");
   assert.equal(result.slots.length, 1, "single slot");
   assert.equal(result.extraSlotIds.length, 0, "no extra slots allocated");
-  // All channel keys present in slot 0.
   for (const [key] of channelEntries) {
     assert.ok(key in result.slots[0], `${key} should be in slot 0`);
   }
 });
 
 test("splitContextsIntoBudgetedSlots_requiresGrowth_allocatesExtraSlot", () => {
-  // Build enough channel keys that a single slot overflows a tight budget
-  // but two slots fit.
   const channelEntries = [];
   for (let i = 0; i < 20; i++) {
     channelEntries.push([makeChannelKey(i), i + 1]);
   }
   const encoder = new TextEncoder();
-  // Budget that fits ~10 channel keys but not 20.
   const tenKeyContexts = Object.fromEntries(channelEntries.slice(0, 10));
   const tenKeySize = encoder.encode(
     JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: tenKeyContexts }),
   ).length;
   const budget = tenKeySize + 50; // fits 10 but not 20
-
   const result = splitContextsIntoBudgetedSlots({
     channelEntries,
     threadMsgEntries: [],
@@ -416,11 +374,9 @@ test("splitContextsIntoBudgetedSlots_requiresGrowth_allocatesExtraSlot", () => {
     maxBytes: budget,
     slotIdGenerator: deterministicSlotId,
   });
-
   assert.ok(result !== null, "should succeed with 2 slots");
   assert.equal(result.slots.length, 2, "two slots");
   assert.equal(result.extraSlotIds.length, 1, "one extra slot allocated");
-  // All 20 keys present across both slots.
   const allKeys = new Set([
     ...Object.keys(result.slots[0]),
     ...Object.keys(result.slots[1]),
@@ -428,7 +384,6 @@ test("splitContextsIntoBudgetedSlots_requiresGrowth_allocatesExtraSlot", () => {
   for (const [key] of channelEntries) {
     assert.ok(allKeys.has(key), `${key} should appear in some slot`);
   }
-  // Each slot fits within budget.
   for (const slotContexts of result.slots) {
     const size = encoder.encode(
       JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: slotContexts }),
@@ -438,8 +393,6 @@ test("splitContextsIntoBudgetedSlots_requiresGrowth_allocatesExtraSlot", () => {
 });
 
 test("splitContextsIntoBudgetedSlots_exceedsMaxSlots_returnsNull", () => {
-  // Build enough channel keys that even maxSlots=2 can't fit them with a
-  // very tight budget (1 byte — nothing can fit).
   const channelEntries = [[makeChannelKey(1), 1]];
   const result = splitContextsIntoBudgetedSlots({
     channelEntries,
@@ -450,18 +403,15 @@ test("splitContextsIntoBudgetedSlots_exceedsMaxSlots_returnsNull", () => {
     maxBytes: 1, // impossibly small
     slotIdGenerator: deterministicSlotId,
   });
-
   assert.equal(result, null, "should return null when max slots exceeded");
 });
 
 test("splitContextsIntoBudgetedSlots_includesThreadMsgInPrimarySlot", () => {
-  // Channel key in slot 0; thread and msg entries should also land in slot 0.
   const channelEntries = [[makeChannelKey(1), 100]];
   const threadMsgEntries = [
     [makeThreadKey(1), 200],
     [makeMsgKey(1), 300],
   ];
-
   const result = splitContextsIntoBudgetedSlots({
     channelEntries,
     threadMsgEntries,
@@ -471,29 +421,19 @@ test("splitContextsIntoBudgetedSlots_includesThreadMsgInPrimarySlot", () => {
     maxBytes: 1_000_000,
     slotIdGenerator: deterministicSlotId,
   });
-
   assert.ok(result !== null, "should succeed");
   assert.equal(result.slots.length, 1);
-  // Channel key in slot 0.
   assert.ok(makeChannelKey(1) in result.slots[0], "channel key in slot 0");
-  // Thread and msg entries in slot 0.
   assert.ok(makeThreadKey(1) in result.slots[0], "thread key in slot 0");
   assert.ok(makeMsgKey(1) in result.slots[0], "msg key in slot 0");
 });
 
 test("splitContextsIntoBudgetedSlots_threadMsgTrimmedWhenPrimarySlotOverBudget", () => {
-  // Channel key fills the primary slot to near-budget. Thread/msg entries
-  // added to slot 0 would overflow — trimContextsToBudget must evict them.
   const channelEntries = [[makeChannelKey(1), 100]];
-  // Compute the size of a blob with just the channel key.
   const channelOnlyContexts = { [makeChannelKey(1)]: 100 };
   const channelOnlySize = blobSize(CLIENT_ID, channelOnlyContexts);
-  // Budget = channel-only size + 5 bytes: fits the channel key but not
-  // an additional thread/msg entry (~70+ bytes each).
   const budget = channelOnlySize + 5;
-
   const threadMsgEntries = [[makeThreadKey(1), 200]];
-
   const result = splitContextsIntoBudgetedSlots({
     channelEntries,
     threadMsgEntries,
@@ -503,16 +443,9 @@ test("splitContextsIntoBudgetedSlots_threadMsgTrimmedWhenPrimarySlotOverBudget",
     maxBytes: budget,
     slotIdGenerator: deterministicSlotId,
   });
-
   assert.ok(result !== null, "should succeed");
-  // Channel key must survive (never evicted by trimContextsToBudget).
   assert.ok(makeChannelKey(1) in result.slots[0], "channel key survives");
-  // Thread entry must be evicted (doesn't fit within budget).
-  assert.ok(
-    !(makeThreadKey(1) in result.slots[0]),
-    "thread key evicted to fit budget",
-  );
-  // Slot 0 must fit within budget.
+  assert.ok(!(makeThreadKey(1) in result.slots[0]));
   const size = blobSize(CLIENT_ID, result.slots[0]);
   assert.ok(size <= budget, `slot 0 size ${size} exceeds budget ${budget}`);
 });
@@ -520,17 +453,8 @@ test("splitContextsIntoBudgetedSlots_threadMsgTrimmedWhenPrimarySlotOverBudget",
 // ── ReadStateManager.publish — no-op suppression in split mode ────────────────
 
 // Verify that publishSplitSlots returns early (no relay writes) when the
-// union of all slot contexts is identical to lastPublishedContexts.
-//
-// Strategy: construct a ReadStateManager with enough channel keys to force
-// split mode, then mock publishOneSlot (private, accessed via bracket notation)
-// to avoid tauri calls while still simulating its effect on lastPublishedContexts.
-// Call publish() twice with the same effectiveState and assert that
-// publishOneSlot is called only on the first publish (no-op on the second).
 test("publishSplitSlots_noopSuppression_skipsWhenUnchanged", async () => {
-  // Isolate localStorage so slot IDs don't leak between tests.
   globalThis.window.localStorage = makeLocalStorage();
-
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
@@ -540,29 +464,14 @@ test("publishSplitSlots_noopSuppression_skipsWhenUnchanged", async () => {
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
   };
-
   const pubkey = "b".repeat(64);
   const mgr = new ReadStateManager(pubkey, fakeRelay);
-
-  // Add enough channel keys to exceed the 32KB single-slot budget.
-  // Each key is ~70 bytes in the blob; 700 keys ≈ 49KB > 32KB.
   const ts = 1_000_000;
   for (let i = 0; i < 700; i++) {
     const channelId = `channel-${i.toString().padStart(64, "0")}`;
     mgr.markContextRead(channelId, ts);
   }
-
-  // Confirm split mode: currentContexts() must return null.
-  assert.equal(
-    mgr.currentContexts(),
-    null,
-    "precondition: 700 channel keys must exceed single-slot budget",
-  );
-
-  // Replace publishOneSlot with a stub that records calls and simulates the
-  // lastPublishedContexts merge (the only side-effect the no-op check depends
-  // on). This avoids tauri (nip44EncryptToSelf / signRelayEvent) while keeping
-  // the suppression logic under test.
+  assert.equal(mgr.currentContexts(), null);
   let publishOneSlotCallCount = 0;
   mgr.publishOneSlot = async (_slotId, contexts) => {
     publishOneSlotCallCount++;
@@ -570,33 +479,18 @@ test("publishSplitSlots_noopSuppression_skipsWhenUnchanged", async () => {
       mgr.lastPublishedContexts[key] = tsVal;
     }
   };
-
-  // Simulate a completed full-state load so the truncation guard does not
-  // block the publish path. The guard is tested separately.
   mgr.isLoadComplete = true;
-
-  // First publish: contexts differ from lastPublishedContexts ({}) → must publish.
   await mgr.publish();
   const callsAfterFirst = publishOneSlotCallCount;
   assert.ok(callsAfterFirst > 0, "first publish must call publishOneSlot");
-
-  // Second publish with identical effectiveState: union equals lastPublishedContexts
-  // → no-op suppression must fire → publishOneSlot must NOT be called again.
   await mgr.publish();
-  assert.equal(
-    publishOneSlotCallCount,
-    callsAfterFirst,
-    "second publish with unchanged state must not call publishOneSlot (no-op suppression)",
-  );
-
+  assert.equal(publishOneSlotCallCount, callsAfterFirst);
   mgr.destroy();
 });
 
 // ── NIP-RS override layer: mandatory acceptance tests ─────────────────────────
 
 // Helper: build a ReadStateManager with mocked relay and localStorage.
-// subscribeFenced returns an immediately-established fence (happy path).
-// subscribeLive is still wired for the live subscription path.
 function makeManager(pubkey = "a".repeat(64)) {
   globalThis.window.localStorage = makeLocalStorage();
   const fakeRelay = {
@@ -613,11 +507,8 @@ function makeManager(pubkey = "a".repeat(64)) {
 
 // ── Test 1: no ov_* key ever reaches a non-primary slot ──────────────────────
 test("splitContextsIntoBudgetedSlots_noOverrideKeyInNonPrimarySlot", () => {
-  // Build channel entries that include ov_* keys for two contexts.
-  // Also include enough plain channel entries to force multi-slot distribution.
   const ctx1 = "a".repeat(64);
   const ctx2 = "b".repeat(64);
-
   const ovEntries = [
     [`ov_s:${ctx1}`, 1],
     [`ov_c:${ctx1}`, 0],
@@ -628,30 +519,21 @@ test("splitContextsIntoBudgetedSlots_noOverrideKeyInNonPrimarySlot", () => {
     [`ov_b:${ctx2}`, 200],
     [ctx2, 200], // frontier for ctx2
   ];
-
-  // Add enough plain channel entries to force at least 2 slots.
-  // We need the round-robin entries (NOT the pinned ov entries) to overflow.
   const plainChannelEntries = [];
   for (let i = 0; i < 30; i++) {
     plainChannelEntries.push([makeChannelKey(i), i + 1]);
   }
   const channelEntries = [...ovEntries, ...plainChannelEntries];
-
   const encoder = new TextEncoder();
-  // Compute the size of a slot containing only the 8 override+frontier entries.
   const ovOnlyContexts = Object.fromEntries(ovEntries);
   const ovOnlySize = encoder.encode(
     JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: ovOnlyContexts }),
   ).length;
-  // Budget: fits the override entries + ~10 plain entries per slot,
-  // but not all 30 plain entries in one slot (forces at least 3 slots).
-  // Add 15 plain entries to the ov-only size to get a safe per-slot budget.
   const fifteenPlain = Object.fromEntries(plainChannelEntries.slice(0, 15));
   const fifteenPlainSize = encoder.encode(
     JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: fifteenPlain }),
   ).length;
   const budget = ovOnlySize + fifteenPlainSize;
-
   const result = splitContextsIntoBudgetedSlots({
     channelEntries,
     threadMsgEntries: [],
@@ -661,22 +543,14 @@ test("splitContextsIntoBudgetedSlots_noOverrideKeyInNonPrimarySlot", () => {
     maxBytes: budget,
     slotIdGenerator: deterministicSlotId,
   });
-
   assert.ok(result !== null, "should succeed");
   assert.ok(result.slots.length >= 2, "should use at least 2 slots");
-
-  // Verify: no ov_* key appears in any non-primary slot.
   for (let slotIdx = 1; slotIdx < result.slots.length; slotIdx++) {
     const slot = result.slots[slotIdx];
     for (const key of Object.keys(slot)) {
-      assert.ok(
-        !key.startsWith("ov_"),
-        `ov_* key "${key}" must not appear in slot ${slotIdx} (non-primary)`,
-      );
+      assert.ok(!key.startsWith("ov_"));
     }
   }
-
-  // Verify: ov_* keys and their frontier siblings ARE in slot 0.
   const slot0 = result.slots[0];
   assert.ok(`ov_s:${ctx1}` in slot0, "ov_s:ctx1 must be in slot 0");
   assert.ok(`ov_c:${ctx1}` in slot0, "ov_c:ctx1 must be in slot 0");
@@ -688,26 +562,18 @@ test("splitContextsIntoBudgetedSlots_noOverrideKeyInNonPrimarySlot", () => {
 
 // ── Test 1b: reserved esc: raw ID — unescape-before-group rule ───────────────
 test("splitContextsIntoBudgetedSlots_escapedFrontierKeyStaysWithItsOverrideGroup", () => {
-  // A context whose raw ID starts with "ov_" must be escaped to "esc:ov_s:evil"
-  // as a frontier wire key.  The ov_* siblings are keyed by the RAW suffix
-  // "ov_s:evil".  The splitter must unescape "esc:ov_s:evil" → "ov_s:evil"
-  // and recognise it as belonging to the same group as ov_s:ov_s:evil etc.
   const rawCtx = "ov_s:evil";
   const wireKey = `esc:${rawCtx}`; // what currentContexts() emits
-
   const channelEntries = [
     [`ov_s:${rawCtx}`, 1], // ov_s:ov_s:evil
     [`ov_c:${rawCtx}`, 0], // ov_c:ov_s:evil
     [`ov_b:${rawCtx}`, 50], // ov_b:ov_s:evil
     [wireKey, 50], // esc:ov_s:evil  (escaped frontier)
   ];
-  // Add plain entries to force multi-slot so the splitter actually partitions.
   const plain = [];
   for (let i = 0; i < 20; i++) plain.push([makeChannelKey(i), i + 1]);
   const allEntries = [...channelEntries, ...plain];
-
   const encoder = new TextEncoder();
-  // Budget: fits the override group + 5 plain entries, not all 20.
   const groupOnly = Object.fromEntries(channelEntries);
   const fivePlain = Object.fromEntries(plain.slice(0, 5));
   const budget =
@@ -717,7 +583,6 @@ test("splitContextsIntoBudgetedSlots_escapedFrontierKeyStaysWithItsOverrideGroup
     encoder.encode(
       JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: fivePlain }),
     ).length;
-
   const result = splitContextsIntoBudgetedSlots({
     channelEntries: allEntries,
     threadMsgEntries: [],
@@ -727,25 +592,16 @@ test("splitContextsIntoBudgetedSlots_escapedFrontierKeyStaysWithItsOverrideGroup
     maxBytes: budget,
     slotIdGenerator: deterministicSlotId,
   });
-
   assert.ok(result !== null, "should succeed");
   assert.ok(result.slots.length >= 2, "should split");
   const slot0 = result.slots[0];
-  // The escaped frontier key and all three ov_* siblings must be in slot 0.
-  assert.ok(
-    wireKey in slot0,
-    `${wireKey} (escaped frontier) must be in slot 0`,
-  );
+  assert.ok(wireKey in slot0);
   assert.ok(`ov_s:${rawCtx}` in slot0, "ov_s: sibling must be in slot 0");
   assert.ok(`ov_c:${rawCtx}` in slot0, "ov_c: sibling must be in slot 0");
   assert.ok(`ov_b:${rawCtx}` in slot0, "ov_b: sibling must be in slot 0");
-  // No ov_* or esc: entry in non-primary slots.
   for (let i = 1; i < result.slots.length; i++) {
     for (const key of Object.keys(result.slots[i])) {
-      assert.ok(
-        !key.startsWith("ov_") && !key.startsWith("esc:"),
-        `reserved key "${key}" must not appear in slot ${i}`,
-      );
+      assert.ok(!key.startsWith("ov_") && !key.startsWith("esc:"));
     }
   }
 });
@@ -769,7 +625,6 @@ function makeFakeEvent(pubkey, createdAt) {
 
 // ── 2a: empty relay + EOSE → complete ────────────────────────────────────────
 test("fetchAndMerge_emptyRelay_setsLoadComplete", async () => {
-  // A relay with no events + EOSE-established fence → empty first band → complete.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "a".repeat(64);
   let subscribeFencedCallCount = 0;
@@ -785,16 +640,8 @@ test("fetchAndMerge_emptyRelay_setsLoadComplete", async () => {
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
-  assert.equal(
-    mgr.isLoadComplete,
-    true,
-    "empty relay with EOSE-established fence must produce complete load",
-  );
-  assert.equal(
-    subscribeFencedCallCount,
-    1,
-    "subscribeFenced must be called exactly once for the fence",
-  );
+  assert.equal(mgr.isLoadComplete, true);
+  assert.equal(subscribeFencedCallCount, 1);
   mgr.destroy();
 });
 
@@ -826,9 +673,6 @@ for (const { name, pubkey, desc } of lapseBeforeEoseCases) {
 
 // ── 2d: reconnect during post-empty barrier → lapse after tentative complete ──
 test("fetchAndMerge_lapseAfterEmptyBand_forcesIncomplete", async () => {
-  // Empty first band → loader sets complete=true tentatively; fence lapses
-  // after EOSE (simulates mid-load reconnect). Final fence.lapsed check must
-  // override and force complete:false.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "a3".repeat(32);
   const fakeRelay = {
@@ -841,19 +685,12 @@ test("fetchAndMerge_lapseAfterEmptyBand_forcesIncomplete", async () => {
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
-  assert.equal(
-    mgr.isLoadComplete,
-    false,
-    "lapse after tentative complete must override and force incomplete",
-  );
+  assert.equal(mgr.isLoadComplete, false);
   mgr.destroy();
 });
 
 // ── 2e: single event completes after pinned-window discharge ──────────────────
 test("fetchAndMerge_singleEvent_completesAfterPinnedWindowDischarge", async () => {
-  // Single event at T=1000: band=1, C=1, L=2 → max(C,L)=2.
-  // Pinned window {since:1000, until:1000} returns 1 event → 1 < 2 → discharged.
-  // Continuation {until:999} returns 0 → complete.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "b".repeat(64);
   const event = makeFakeEvent(pubkey, 1000);
@@ -872,11 +709,7 @@ test("fetchAndMerge_singleEvent_completesAfterPinnedWindowDischarge", async () =
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
-  assert.equal(
-    mgr.isLoadComplete,
-    true,
-    "single-event relay must produce complete load after pinned-window discharge",
-  );
+  assert.equal(mgr.isLoadComplete, true);
   mgr.destroy();
 });
 
@@ -902,31 +735,20 @@ test("fetchAndMerge_pinnedWindowAtCap_setsLoadIncomplete", async () => {
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
-  assert.equal(
-    mgr.isLoadComplete,
-    false,
-    "pinned window returning ≥ max(C,L) must produce incomplete load",
-  );
+  assert.equal(mgr.isLoadComplete, false);
   mgr.destroy();
 });
 
 // ── 2g: epoch-zero termination ───────────────────────────────────────────────
 test("fetchAndMerge_epochZero_completesAfterPinnedWindowDischarged", async () => {
-  // T=0: an event at created_at=0 → T=0. Once the pinned window is discharged,
-  // no event can have created_at < 0, so the load terminates complete directly.
-  // The loader must NOT issue an `until:0` continuation (which is inclusive
-  // and would re-fetch the same epoch-zero event, making completion unprovable).
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "a4".repeat(32);
   const event = makeFakeEvent(pubkey, 0); // created_at=0
   let continuationCalled = false;
   const fakeRelay = {
     fetchEvents: async (filter) => {
-      // Pinned window: {since:0, until:0} → 1 event, 1 < max(1,2)=2 → discharged.
       if (filter.since !== undefined && filter.until !== undefined)
         return [event];
-      // Any `until:0` without `since` would be the old continuation path —
-      // it must NOT be issued; flag it if it is.
       if (filter.until === 0 && filter.since === undefined) {
         continuationCalled = true;
         return [event]; // a conforming relay returns the event (inclusive filter)
@@ -941,16 +763,8 @@ test("fetchAndMerge_epochZero_completesAfterPinnedWindowDischarged", async () =>
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
-  assert.equal(
-    mgr.isLoadComplete,
-    true,
-    "T=0 pinned-window-discharged must produce complete load directly",
-  );
-  assert.equal(
-    continuationCalled,
-    false,
-    "loader must NOT issue until:0 continuation after epoch-zero pinned-window discharge",
-  );
+  assert.equal(mgr.isLoadComplete, true);
+  assert.equal(continuationCalled, false);
   mgr.destroy();
 });
 
@@ -969,11 +783,7 @@ test("fetchAndMerge_fenceFails_setsLoadIncomplete", async () => {
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
-  assert.equal(
-    mgr.isLoadComplete,
-    false,
-    "subscribeFenced failure must produce incomplete load",
-  );
+  assert.equal(mgr.isLoadComplete, false);
   mgr.destroy();
 });
 
@@ -1003,47 +813,22 @@ test("fetchAndMerge_incompleteLoad_blocksGatedOperations", async () => {
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.markContextRead("ch", 1000);
   await mgr.fetchAndMerge();
-
   assert.equal(mgr.isLoadComplete, false, "precondition: load is incomplete");
-
   mgr.fetchOwnBlobBeforePublish = async () => true;
   await mgr.publish();
   assert.equal(publishCalls, 0, "publish must be blocked when load incomplete");
-
   const ur = mgr.markChannelUnread("ch");
-  assert.equal(
-    ur.status,
-    "queued",
-    "markChannelUnread on incomplete load must return queued",
-  );
-
+  assert.equal(ur.status, "queued");
   const rr = mgr.markChannelRead("ch");
-  assert.equal(
-    rr.status,
-    "queued",
-    "markChannelRead on incomplete load must return queued",
-  );
-
+  assert.equal(rr.status, "queued");
   mgr.extraSlotIds = ["fakeextraslot0000000000000000000"];
   await mgr.deleteExtraSlots();
-  assert.equal(
-    publishCalls,
-    0,
-    "deleteExtraSlots must not publish when load incomplete",
-  );
-
+  assert.equal(publishCalls, 0);
   mgr.destroy();
 });
 
 // ── 2i-b: pre-ready read click → zero register/frontier mutation, zero publish ─
 test("preReady_read_witness_b_zeroMutationZeroPublish", async () => {
-  // Witness (b): explicit mark-read during incomplete load causes zero
-  // register mutation, zero frontier advance, and zero publication.
-  //
-  // Verifies:
-  //   - markChannelRead returns "queued" (intent enqueued only, no bump).
-  //   - No publish fires.
-  //   - overrideRegisters is empty (no S/C/B bump).
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "ee".repeat(32);
   let publishCalls = 0;
@@ -1054,7 +839,6 @@ test("preReady_read_witness_b_zeroMutationZeroPublish", async () => {
     },
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
-    // Force incomplete load by making subscribeFenced throw.
     subscribeFenced: async () => {
       throw new Error("fence timeout");
     },
@@ -1062,46 +846,22 @@ test("preReady_read_witness_b_zeroMutationZeroPublish", async () => {
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
-
   assert.equal(mgr.isLoadComplete, false, "precondition: load is incomplete");
-
   const channelId = "witness-b-ch";
   const regBefore = mgr.overrideRegisters.get(channelId);
-
-  // Simulate the read click: markChannelRead (register path) only.
-  // The frontier advance (markContextRead) is guarded at the hook level, not here.
   const result = mgr.markChannelRead(channelId);
-  assert.equal(
-    result.status,
-    "queued",
-    "markChannelRead must return queued pre-ready",
-  );
-
-  // Register is untouched — no S/C/B bump.
+  assert.equal(result.status, "queued");
   const regAfter = mgr.overrideRegisters.get(channelId);
-  assert.equal(
-    regAfter,
-    regBefore,
-    "override register must be unchanged after queued read",
-  );
-  assert.equal(
-    regAfter,
-    undefined,
-    "no register entry must exist for the channel",
-  );
-
-  // No publication fired.
+  assert.equal(regAfter, regBefore);
+  assert.equal(regAfter, undefined);
   mgr.fetchOwnBlobBeforePublish = async () => true;
   await mgr.publish();
   assert.equal(publishCalls, 0, "zero publish allowed before complete load");
-
   mgr.destroy();
 });
 
 // ── 2j: production retry path fires on reconnect ─────────────────────────────
 test("retryLoad_firesOnReconnect_andClearsIncomplete", async () => {
-  // startLiveSubscription wires retryLoad() via subscribeToReconnects.
-  // (1) reconnect listener registered; (2) firing it re-runs fetchAndMerge.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "a5".repeat(32);
   let reconnectCb = null;
@@ -1137,24 +897,12 @@ test("retryLoad_firesOnReconnect_andClearsIncomplete", async () => {
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.initialize();
-  assert.equal(
-    mgr.isLoadComplete,
-    false,
-    "precondition: first load is incomplete",
-  );
-  assert.ok(
-    reconnectCb !== null,
-    "subscribeToReconnects listener must be registered",
-  );
-
+  assert.equal(mgr.isLoadComplete, false);
+  assert.ok(reconnectCb !== null);
   callRound = 999;
   reconnectCb();
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(
-    mgr.isLoadComplete,
-    true,
-    "reconnect-triggered retry must clear incomplete when relay is now empty",
-  );
+  assert.equal(mgr.isLoadComplete, true);
   mgr.destroy();
 });
 
@@ -1190,30 +938,18 @@ test("fetchAndMerge_retryClears_incomplete", async () => {
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
   assert.equal(mgr.isLoadComplete, false, "first load must be incomplete");
-
   callRound = 999;
   await mgr.fetchAndMerge();
-  assert.equal(
-    mgr.isLoadComplete,
-    true,
-    "retry with empty relay must set complete",
-  );
+  assert.equal(mgr.isLoadComplete, true);
   mgr.destroy();
 });
 
 // ── Test 3: live events go through structured ingest ──────────────────────────
 test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
-  // Construct a fake event whose content decrypts to a NIP-RS blob with an
-  // override register.  Use a __TAURI_INTERNALS__ mock so parseReadStateEvent
-  // can decrypt without a real NIP-44 key.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "aa".repeat(32);
   const rawCtx = `live-channel-${"x".repeat(51)}`;
   const channelFrontier = 100;
-  // Build a blob where the register (S=3, C=1, B=50) is ACTIVE:
-  // isOverrideActive = S>0 && F<=B && S>C. B=50, frontier=100 → F>B → INACTIVE.
-  // Corrected: to make this active we need B >= F, e.g. B=100 with F=100 (boundary).
-  // Using B=100 so the register is genuinely active: 3>0, 100<=100, 3>1 → active.
   const blobContexts = {
     [rawCtx]: channelFrontier,
     [`ov_s:${rawCtx}`]: 3,
@@ -1225,8 +961,6 @@ test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
     client_id: "other-device",
     contexts: blobContexts,
   });
-
-  // Install Tauri IPC mock so nip44_decrypt_from_self returns our plaintext.
   globalThis.window.__TAURI_INTERNALS__ = {
     invoke: async (command, args) => {
       if (command === "nip44_decrypt_from_self") {
@@ -1236,7 +970,6 @@ test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
       throw new Error(`Unexpected Tauri command: ${command}`);
     },
   };
-
   let liveHandler = null;
   const fakeRelay = {
     fetchEvents: async () => [],
@@ -1253,8 +986,6 @@ test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
   try {
     const mgr = new ReadStateManager(pubkey, fakeRelay);
     await mgr.initialize();
-
-    // Build fake NIP-RS event.
     const fakeEvent = {
       id: "b".repeat(64),
       pubkey,
@@ -1267,9 +998,6 @@ test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
       content: "FAKE_CIPHER",
       sig: "s".repeat(128),
     };
-
-    // Deliver via the live subscription callback (same path as relay push).
-    // Track decrypt count: each live event must decrypt exactly once.
     let decryptCount = 0;
     const origInvoke = globalThis.window.__TAURI_INTERNALS__.invoke;
     globalThis.window.__TAURI_INTERNALS__.invoke = async (command, args) => {
@@ -1279,33 +1007,17 @@ test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
     assert.ok(liveHandler !== null, "live subscription must be established");
     liveHandler(fakeEvent); // void-wrapped; wait for async completion
     await new Promise((r) => setTimeout(r, 50));
-    assert.equal(
-      decryptCount,
-      1,
-      "live event must decrypt exactly once (no double-parse)",
-    );
-
-    // The override register must now reflect the ingested remote values.
+    assert.equal(decryptCount, 1);
     const reg = mgr.overrideRegisters.get(rawCtx);
     assert.ok(reg, "override register must exist after live delivery");
     assert.equal(reg.s, 3, "S must be 3 from live event");
     assert.equal(reg.c, 1, "C must be 1 from live event");
     assert.equal(reg.b, 100, "B must be 100 from live event");
-
-    // Verify the register is genuinely active: isOverrideActive(S=3,C=1,B=100,F=100).
     const livenessActive = mgr.getOverrideLiveness(rawCtx);
-    assert.ok(
-      livenessActive !== null,
-      "liveness must be available after live delivery",
-    );
-    assert.equal(
-      livenessActive.active,
-      true,
-      "register must be active (B=100 >= F=100, S>C)",
-    );
+    assert.ok(livenessActive !== null);
+    assert.equal(livenessActive.active, true);
 
     // ── existing-key live clear (higher C defeating S) ───────────────────
-    // A follow-up event with S=3, C=4 (C > S → inactive/tombstone).
     const blobClear = {
       [rawCtx]: channelFrontier,
       [`ov_c:${rawCtx}`]: 4, // tombstone floor: max(S=3,C=1)+1=4
@@ -1339,21 +1051,10 @@ test("handleIncomingEvent_liveOverride_updatesRegisterViaIngest", async () => {
     await new Promise((r) => setTimeout(r, 50));
     const regAfterClear = mgr.overrideRegisters.get(rawCtx);
     assert.ok(regAfterClear, "register must still exist after clear event");
-    // tombstone floor: only ov_c:ctx=4 is present → S=0, C=4, B=0 merged via componentwise max
-    // after merge with prior (S=3, C=1, B=100): S=3, C=4, B=100 — override_active = S <= C = inactive
-    assert.equal(
-      regAfterClear.c,
-      4,
-      "C must be 4 (tombstone floor from clear event)",
-    );
+    assert.equal(regAfterClear.c, 4);
     const liveness = mgr.getOverrideLiveness(rawCtx);
     assert.ok(liveness !== null, "liveness must be available");
-    assert.equal(
-      liveness.active,
-      false,
-      "override must be inactive after clear",
-    );
-
+    assert.equal(liveness.active, false);
     mgr.destroy();
   } finally {
     delete globalThis.window.__TAURI_INTERNALS__;
@@ -1367,7 +1068,6 @@ test("publish_fetchOwnBlobFails_doesNotPublish", async () => {
   let publishCalls = 0;
   const fakeRelay = {
     fetchEvents: async (filter) => {
-      // Own-blob fetch (has #d filter) → fail.
       if (filter["#d"]) throw new Error("relay unreachable");
       return [];
     },
@@ -1383,29 +1083,16 @@ test("publish_fetchOwnBlobFails_doesNotPublish", async () => {
   mgr.isLoadComplete = true;
   mgr.markContextRead("ch", 1000);
   await mgr.publish();
-  assert.equal(
-    publishCalls,
-    0,
-    "publish must not call publishEvent when fetchOwnBlobBeforePublish fails",
-  );
+  assert.equal(publishCalls, 0);
   mgr.destroy();
 });
 
 // ── Test 5: durability — register survives restart before debounce ────────────
 test("overrideRegister_survivesRestartBeforeDebounce", () => {
-  // markChannelUnread persists the register via persistLocalState.
-  // A new ReadStateManager constructed from the same localStorage must see it.
   const ls = makeLocalStorage();
   globalThis.window.localStorage = ls;
   const pubkey = "cc".repeat(32);
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-  };
+  const fakeRelay = makeFakeRelay();
   const mgr1 = new ReadStateManager(pubkey, fakeRelay);
   mgr1.isLoadComplete = true;
   mgr1.effectiveState.set("restart-ch", 1000);
@@ -1413,18 +1100,12 @@ test("overrideRegister_survivesRestartBeforeDebounce", () => {
   const result = mgr1.markChannelUnread("restart-ch");
   assert.equal(result.status, "applied", "mark-unread must succeed");
   mgr1.destroy();
-
-  // Construct a new manager on the same localStorage — no relay fetch yet.
   globalThis.window.localStorage = ls;
   const mgr2 = new ReadStateManager(pubkey, fakeRelay);
   mgr2.hydrateFromLocalStorage();
   const liveness = mgr2.getOverrideLiveness("restart-ch");
   assert.ok(liveness !== null, "register must be hydrated after restart");
-  assert.equal(
-    liveness.active,
-    true,
-    "override must still be active after restart",
-  );
+  assert.equal(liveness.active, true);
   mgr2.destroy();
 });
 
@@ -1441,7 +1122,6 @@ test("overrideRegister_tombstoneFloorSurvivesRestartWithFetchFailure", async () 
     subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
     subscribeLive: async (_f, _h) => () => {},
   };
-  // Establish a mark-read tombstone floor: S=1, C=max(S,C)+1=2 (clear-wins → inactive).
   const mgr1 = new ReadStateManager(pubkey, goodRelay);
   mgr1.isLoadComplete = true;
   mgr1.effectiveState.set("tombstone-ch", 500);
@@ -1453,9 +1133,6 @@ test("overrideRegister_tombstoneFloorSurvivesRestartWithFetchFailure", async () 
   assert.equal(tomb.s, 1);
   assert.equal(tomb.c, 2); // max(S=1,C=0)+1 = 2
   mgr1.destroy();
-
-  // New manager: initialize() with a relay that throws on fetchEvents.
-  // Tombstone must still be present even after failed fetch.
   globalThis.window.localStorage = ls;
   const failRelay = {
     fetchEvents: async () => {
@@ -1483,7 +1160,6 @@ test("overrideRegister_tombstoneFloorSurvivesRestartWithFetchFailure", async () 
 // ── Test 7: budget planner ────────────────────────────────────────────────────
 test("markChannelUnread_visibleRefusal_atBudgetExhaustionAndUint32Max", () => {
   const mgr = makeManager();
-  // Simulate completed load so mark operations are not blocked by load_incomplete.
   mgr.isLoadComplete = true;
 
   // ── uint32 max refusal ────────────────────────────────────────────────────
@@ -1496,19 +1172,11 @@ test("markChannelUnread_visibleRefusal_atBudgetExhaustionAndUint32Max", () => {
   });
   mgr.publishableContextIds.add(overflowCtx);
   mgr.effectiveState.set(overflowCtx, 100);
-
   const overflowResult = mgr.markChannelUnread(overflowCtx);
   assert.equal(overflowResult.status, "refused");
-  assert.equal(
-    overflowResult.reason,
-    "uint32_overflow",
-    "markChannelUnread must refuse with uint32_overflow when S is at max",
-  );
+  assert.equal(overflowResult.reason, "uint32_overflow");
 
   // ── multi-slot success: 700 frontier-only channels → split planner must succeed ─
-  // Thufir's deterministic witness: 700 plain frontier channels overflow a single slot
-  // but the splitter can spread them across ≤ 8 slots. A new override group in the
-  // primary must succeed because the pure candidate planner tries the split path.
   const splitMgr = makeManager("f".repeat(64));
   splitMgr.isLoadComplete = true;
   for (let i = 0; i < 700; i++) {
@@ -1518,29 +1186,13 @@ test("markChannelUnread_visibleRefusal_atBudgetExhaustionAndUint32Max", () => {
   }
   const splitCtx = `new-override-ctx-${"n".repeat(48)}`;
   const splitResult = splitMgr.markChannelUnread(splitCtx);
-  assert.equal(
-    splitResult.status,
-    "applied",
-    "700 frontier-only channels must allow a new override via multi-slot split",
-  );
-  assert.ok(
-    splitMgr.overrideRegisters.has(splitCtx),
-    "override register must be committed on split success",
-  );
+  assert.equal(splitResult.status, "applied");
+  assert.ok(splitMgr.overrideRegisters.has(splitCtx));
   splitMgr.destroy();
 
   // ── near-limit refusal: all 8 slots insufficient → budget_exhausted, no mutation ─
-  // Pack so many non-evictable override groups that even 8 slots cannot accommodate
-  // the new entry. Each override group contributes ov_s+ov_c+ov_b+frontier ≈ 4 keys
-  // × ~75 bytes each + JSON overhead.  200 groups × 4 keys ≈ 300 bytes each ≈ 60 KB
-  // per slot if split across 8 → ~7.5 KB per slot, which fits. We need them to NOT fit.
-  // Easiest: fill primary to near-capacity with 250 big-key override groups so even
-  // splitting all 8 slots still cannot carry the new group in primary (which must
-  // hold ALL override groups per spec, so they all go in slot 0).
   const fullMgr = makeManager("aa".repeat(32));
   fullMgr.isLoadComplete = true;
-  // 250 override groups with long context IDs ≈ 250 × (4 keys × ~100 bytes) = 100 KB
-  // → exceeds READ_STATE_MAX_PLAINTEXT_BYTES (32 KB) even in slot 0 alone.
   for (let i = 0; i < 250; i++) {
     const ctx = `ov-ch-${i.toString().padStart(60, "0")}`;
     fullMgr.overrideRegisters.set(ctx, { s: 1, c: 0, b: 0 });
@@ -1549,32 +1201,20 @@ test("markChannelUnread_visibleRefusal_atBudgetExhaustionAndUint32Max", () => {
   }
   const nearCtx = `near-limit-ctx-${"z".repeat(49)}`;
   const nearResult = fullMgr.markChannelUnread(nearCtx);
-  assert.equal(
-    nearResult.status,
-    "refused",
-    "near-limit manager with 250 non-evictable override groups must refuse",
-  );
+  assert.equal(nearResult.status, "refused");
   assert.equal(nearResult.reason, "budget_exhausted");
-  assert.ok(
-    !fullMgr.overrideRegisters.has(nearCtx),
-    "budget_exhausted must not mutate overrideRegisters",
-  );
+  assert.ok(!fullMgr.overrideRegisters.has(nearCtx));
   fullMgr.destroy();
-
-  // Verify the uint32_overflow register was not mutated in the original mgr.
   const reg = mgr.overrideRegisters.get(overflowCtx);
   assert.ok(reg, "overflow channel register must still exist");
   assert.equal(reg.s, UINT32_MAX, "overflow register S must be unchanged");
-
   mgr.destroy();
 });
 
 // ── Test 8: persistence failure — storage_failed + rollback + coherent restart ─
 test("markChannelUnread_storageFailure_returnsStorageFailed", () => {
-  // Use a throwing localStorage to simulate quota failure.
   const throwingLS = makeLocalStorage();
   const originalSetItem = throwingLS.setItem.bind(throwingLS);
-  // Allow initial writes (ClientId, slotId), then fail on override writes.
   let writeCount = 0;
   throwingLS.setItem = (key, value) => {
     writeCount++;
@@ -1582,31 +1222,15 @@ test("markChannelUnread_storageFailure_returnsStorageFailed", () => {
     originalSetItem(key, value);
   };
   globalThis.window.localStorage = throwingLS;
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager("st".repeat(32), fakeRelay);
   mgr.isLoadComplete = true;
   mgr.effectiveState.set("storage-test-ch", 1000);
-
-  // Snapshot pre-mutation state for rollback verification.
   const regBefore = mgr.overrideRegisters.get("storage-test-ch");
   const wasPublishableBefore = mgr.publishableContextIds.has("storage-test-ch");
-
   const result = mgr.markChannelUnread("storage-test-ch");
-  assert.equal(
-    result.status,
-    "refused",
-    "markChannelUnread must fail when localStorage throws",
-  );
+  assert.equal(result.status, "refused");
   assert.equal(result.reason, "storage_failed");
-
-  // Contract 3 rollback: manager state must be unchanged after storage_failed.
   const regAfter = mgr.overrideRegisters.get("storage-test-ch");
   assert.deepEqual(
     regAfter,
@@ -1616,19 +1240,11 @@ test("markChannelUnread_storageFailure_returnsStorageFailed", () => {
   assert.equal(
     mgr.publishableContextIds.has("storage-test-ch"),
     wasPublishableBefore,
-    "publishableContextIds must be rolled back after storage failure",
   );
-
-  // Coherent restart: a new manager on the same (throwing) storage must see no
-  // orphaned register — the failed write must not have partially persisted.
   const mgr2 = new ReadStateManager("st".repeat(32), fakeRelay);
   mgr2.hydrateFromLocalStorage();
   const regOnRestart = mgr2.overrideRegisters.get("storage-test-ch");
-  assert.equal(
-    regOnRestart,
-    undefined,
-    "a failed mark must not persist any register (coherent restart)",
-  );
+  assert.equal(regOnRestart, undefined);
   mgr.destroy();
   mgr2.destroy();
 });
@@ -1637,33 +1253,18 @@ test("markChannelUnread_storageFailure_returnsStorageFailed", () => {
 test("markChannelRead_inactiveExistingRegister_performsCBump", () => {
   const mgr = makeManager();
   mgr.isLoadComplete = true;
-  // Inject an inactive register: S=1, C=2 (clear-wins: C > S → inactive).
   const ctx = "inactive-ch";
   mgr.overrideRegisters.set(ctx, { s: 1, c: 2, b: 0 });
   mgr.publishableContextIds.add(ctx);
   mgr.effectiveState.set(ctx, 100);
-
-  // Verify it is indeed inactive.
   const livenessBefore = mgr.getOverrideLiveness(ctx);
   assert.ok(livenessBefore !== null, "register must exist");
   assert.equal(livenessBefore.active, false, "register must be inactive");
-
-  // markChannelRead must still perform the C-bump (spec NIP-RS.md:537-539).
   const result = mgr.markChannelRead(ctx);
-  assert.equal(
-    result.status,
-    "applied",
-    "markChannelRead must succeed on inactive register",
-  );
-
+  assert.equal(result.status, "applied");
   const reg = mgr.overrideRegisters.get(ctx);
   assert.ok(reg, "register must still exist after markChannelRead");
-  // newC = max(S=1, C=2) + 1 = 3
-  assert.equal(
-    reg.c,
-    3,
-    "C must be bumped to max(S,C)+1=3 even when already inactive",
-  );
+  assert.equal(reg.c, 3);
   assert.equal(reg.s, 1, "S must be unchanged");
   mgr.destroy();
 });
@@ -1696,8 +1297,6 @@ test("deduplicateByCoordinate_newerVersionWins_olderDropped", async () => {
   const deduped = deduplicateByCoordinate([older, newer]);
   assert.equal(deduped.length, 1, "dedup must yield one event");
   assert.equal(deduped[0].content, "newer", "newer created_at must win");
-
-  // Tie-break: same created_at, lower id wins.
   const tie1 = { ...older, created_at: 3_000, id: "c".repeat(64) };
   const tie2 = { ...newer, created_at: 3_000, id: "a".repeat(64) };
   const tieDuped = deduplicateByCoordinate([tie1, tie2]);
@@ -1707,18 +1306,13 @@ test("deduplicateByCoordinate_newerVersionWins_olderDropped", async () => {
 
 // ── Test 11: lapse mid-enumeration → incomplete ───────────────────────────────
 test("fetchAndMerge_lapseMidEnumeration_setsLoadIncomplete", async () => {
-  // Simulate a connection lapse after the first band is fetched but before
-  // the pinned window returns. The fence.lapsed flag is set mid-enumeration.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "ef".repeat(32);
   const event = makeFakeEvent(pubkey, 1000);
-
-  // Build a fence that starts unlapsed but lapses when the pinned window fires.
   const fence = makeFenceHandle({ eose: true });
   const fakeRelay = {
     fetchEvents: async (filter) => {
       if (filter.since !== undefined) {
-        // Pinned window: trigger lapse mid-enumeration.
         fence._lapse();
         return [event];
       }
@@ -1732,24 +1326,14 @@ test("fetchAndMerge_lapseMidEnumeration_setsLoadIncomplete", async () => {
   };
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   await mgr.fetchAndMerge();
-  assert.equal(
-    mgr.isLoadComplete,
-    false,
-    "lapse during enumeration must produce incomplete load",
-  );
+  assert.equal(mgr.isLoadComplete, false);
   mgr.destroy();
 });
 
 // ── Test 12: foreign client_id at initial load triggers slot rotation ─────────
 test("fetchAndMerge_foreignClientId_rotatesSlotAndUpdatesMetadata", async () => {
-  // If a fetched event carries our slot coordinate but a different client_id,
-  // the manager must rotate slotId and record maxFetchedCreatedAt.
-  // Also validates read-before-write path: fetchOwnBlobBeforePublish runs the
-  // same parsed-record metadata path (Contract 2).
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "a6".repeat(32);
-
-  // Install Tauri IPC mock.
   const slotId = "deadbeefdeadbeef0123456789abcdef"; // will be the initial slotId
   const foreignClientId = "other-client-uuid-9999";
   const blob = JSON.stringify({
@@ -1770,8 +1354,6 @@ test("fetchAndMerge_foreignClientId_rotatesSlotAndUpdatesMetadata", async () => 
       throw new Error(`Unexpected: ${command}`);
     },
   };
-
-  // Build a fetched event at our slot coordinate but with foreign client_id.
   const conflictEvent = {
     id: "f0".repeat(32),
     pubkey,
@@ -1784,10 +1366,7 @@ test("fetchAndMerge_foreignClientId_rotatesSlotAndUpdatesMetadata", async () => 
     content: "CONFLICT_CIPHER",
     sig: "s".repeat(128),
   };
-
   const fakeRelay = {
-    // Respect `until` so the loader terminates: once `until` drops below the
-    // event's created_at the relay returns empty, ending the enumeration.
     fetchEvents: async (filter) => {
       if (filter.until !== undefined && conflictEvent.created_at > filter.until)
         return [];
@@ -1799,26 +1378,12 @@ test("fetchAndMerge_foreignClientId_rotatesSlotAndUpdatesMetadata", async () => 
     subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
     subscribeLive: async (_f, _h) => () => {},
   };
-
   try {
     const mgr = new ReadStateManager(pubkey, fakeRelay);
-    // Pre-seed the manager's slotId to match the conflict event's d-tag.
     mgr.slotId = slotId;
     await mgr.fetchAndMerge();
-
-    // Slot rotation: slotId must differ from the conflicting coordinate.
-    assert.notEqual(
-      mgr.slotId,
-      slotId,
-      "slotId must rotate when fetched event carries foreign client_id at our coordinate",
-    );
-
-    // maxFetchedCreatedAt must reflect the fetched event's created_at.
-    assert.equal(
-      mgr.maxFetchedCreatedAt,
-      12345,
-      "maxFetchedCreatedAt must be updated from fetched event created_at",
-    );
+    assert.notEqual(mgr.slotId, slotId);
+    assert.equal(mgr.maxFetchedCreatedAt, 12345);
   } finally {
     delete globalThis.window.__TAURI_INTERNALS__;
   }
@@ -1826,36 +1391,17 @@ test("fetchAndMerge_foreignClientId_rotatesSlotAndUpdatesMetadata", async () => 
 
 // ── Test 13: frontier-only advance schedules canonical convergence ─────────────
 test("ingest_frontierAdvanceFlipsRegister_schedulesCanonicalConvergence", async () => {
-  // A frontier advance that flips an override register from live→tombstone must
-  // set canonicalChanged=true and trigger schedulePublish (debounce timer set).
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "a7".repeat(32);
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-  };
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.isLoadComplete = true;
-
-  // Seed an active register: S=5, C=0, B=10, F=5.
-  // isOverrideActive(S=5,C=0,B=10,F=5) = 5>0 && 5<=10 && 5>0 → active.
   const ctx = "convergence-ch";
   mgr.overrideRegisters.set(ctx, { s: 5, c: 0, b: 10 });
   mgr.effectiveState.set(ctx, 5);
   mgr.publishableContextIds.add(ctx);
-
-  // Verify it's active before the frontier advance.
   const before = mgr.getOverrideLiveness(ctx);
   assert.ok(before?.active, "register must be active before frontier advance");
-
-  // Deliver a frontier advance F=11 (> B=10) → register becomes dead.
-  // Simulate via a live event that carries only the frontier for this ctx.
-  // Build a minimal fake event that encodes just the frontier key.
   const frontierBlob = JSON.stringify({
     v: 1,
     client_id: "peer-device",
@@ -1867,9 +1413,7 @@ test("ingest_frontierAdvanceFlipsRegister_schedulesCanonicalConvergence", async 
       throw new Error(`Unexpected: ${command}`);
     },
   };
-
   try {
-    // Fire the live subscription callback directly.
     const fakeEvent = {
       id: "cc".repeat(32),
       pubkey,
@@ -1882,24 +1426,11 @@ test("ingest_frontierAdvanceFlipsRegister_schedulesCanonicalConvergence", async 
       content: "FRONTIER_CIPHER",
       sig: "s".repeat(128),
     };
-
-    // Access the private handleIncomingEvent via the test helper path.
     await mgr.handleIncomingEvent(fakeEvent);
-
-    // Register must now be inactive.
     const after = mgr.getOverrideLiveness(ctx);
     assert.ok(after !== null, "liveness must still be available");
-    assert.equal(
-      after.active,
-      false,
-      "frontier advance past B must flip register to inactive",
-    );
-
-    // debounceTimer must be set (schedulePublish was called for convergence).
-    assert.ok(
-      mgr.debounceTimer !== null,
-      "frontier-only canonical deactivation must schedule a convergence publish",
-    );
+    assert.equal(after.active, false);
+    assert.ok(mgr.debounceTimer !== null);
   } finally {
     delete globalThis.window.__TAURI_INTERNALS__;
     mgr.destroy();
@@ -1908,7 +1439,6 @@ test("ingest_frontierAdvanceFlipsRegister_schedulesCanonicalConvergence", async 
 
 // ── Test 14: createFencedSubscription — EOSE establishes the fence ────────────
 test("createFencedSubscription_eoseEstablishes_notLapsed", async () => {
-  // Drive the real primitive: EOSE resolves established with lapsed=false.
   const subscriptions = new Map();
   let _capturedSubId = null;
   let capturedFencedSub = null;
@@ -1929,32 +1459,20 @@ test("createFencedSubscription_eoseEstablishes_notLapsed", async () => {
   );
   assert.ok(!handle.lapsed, "fence must not be lapsed before EOSE");
   assert.ok(capturedFencedSub, "fenced sub must be registered");
-
-  // Simulate EOSE arriving.
   capturedFencedSub.resolveEstablished();
   await handle.established;
-
-  assert.equal(
-    handle.lapsed,
-    false,
-    "EOSE must establish fence with lapsed=false",
-  );
+  assert.equal(handle.lapsed, false);
   await handle.unsubscribe();
 });
 
 // ── Test 14b: createFencedSubscription — EOSE during sendReq cancels timer ────
 test("createFencedSubscription_eoseDuringSend_timerCancelledAndStaysUnlapsed", async () => {
-  // Thufir's mandated EOSE-during-send witness: if EOSE is delivered while the
-  // sendReq() promise is still resolving (e.g. synchronous delivery), the
-  // establishment timer must be cancelled immediately and the fence must remain
-  // unlapsed past the original timeout window.
   const subscriptions = new Map();
   const timeoutMs = 12; // short so the test can observe no late lapse
   const deps = {
     connectionGeneration: () => 0,
     subscriptions,
     sendReq: async (subId) => {
-      // Synchronously fire EOSE before sendReq() returns — races the timer.
       const sub = subscriptions.get(subId);
       if (sub && sub.mode === "fenced") {
         sub.resolveEstablished(); // fires EOSE handler: cancels timer, sets alreadyEstablished
@@ -1968,34 +1486,20 @@ test("createFencedSubscription_eoseDuringSend_timerCancelledAndStaysUnlapsed", a
     { kinds: [30078], limit: 500 },
     () => {},
   );
-  // EOSE already fired during sendReq — established resolves with lapsed=false.
   await handle.established;
-  assert.equal(
-    handle.lapsed,
-    false,
-    "EOSE during sendReq must establish fence with lapsed=false",
-  );
-
-  // Wait well past the timeout to confirm the timer does NOT fire and lapse
-  // an already-established fence.
+  assert.equal(handle.lapsed, false);
   await new Promise((r) => setTimeout(r, timeoutMs * 3));
-  assert.equal(
-    handle.lapsed,
-    false,
-    "timer must not lapse an already-established fence after EOSE-during-send",
-  );
+  assert.equal(handle.lapsed, false);
   await handle.unsubscribe();
 });
 
 // ── Test 15: createFencedSubscription — CLOSED lapses before EOSE ────────────
 test("createFencedSubscription_closedBeforeEose_lapses", async () => {
-  // Drive the real primitive: CLOSED sets lapsed=true and resolves established.
   const subscriptions = new Map();
   const deps = {
     connectionGeneration: () => 0,
     subscriptions,
     sendReq: async (subId) => {
-      // Simulate CLOSED immediately after REQ (before EOSE).
       const sub = subscriptions.get(subId);
       if (sub && sub.mode === "fenced") {
         sub.lapsed = true;
@@ -2017,8 +1521,6 @@ test("createFencedSubscription_closedBeforeEose_lapses", async () => {
 
 // ── Test 16: createFencedSubscription — resetConnection lapses all fences ─────
 test("createFencedSubscription_resetConnection_lapses", async () => {
-  // Drive the real primitive: simulated resetConnection sets lapsed on all
-  // pending fenced subscriptions and resolves their established promises.
   const subscriptions = new Map();
   const deps = {
     connectionGeneration: () => 0,
@@ -2033,8 +1535,6 @@ test("createFencedSubscription_resetConnection_lapses", async () => {
     () => {},
   );
   assert.equal(handle.lapsed, false, "fence must not be lapsed before reset");
-
-  // Simulate resetConnection: mark all fenced subs as lapsed.
   for (const [subId, sub] of subscriptions) {
     if (sub.mode === "fenced") {
       sub.lapsed = true;
@@ -2042,19 +1542,12 @@ test("createFencedSubscription_resetConnection_lapses", async () => {
       subscriptions.delete(subId);
     }
   }
-
   await handle.established;
-  assert.equal(
-    handle.lapsed,
-    true,
-    "resetConnection must set lapsed=true on pending fence",
-  );
+  assert.equal(handle.lapsed, true);
 });
 
 // ── Test 17: createFencedSubscription — establishment timeout lapses fence ────
 test("createFencedSubscription_establishmentTimeout_lapses", async () => {
-  // A relay that keeps the socket alive but never sends EOSE must lapse the
-  // fence after the establishment timeout — never hang forever.
   const subscriptions = new Map();
   const deps = {
     connectionGeneration: () => 0,
@@ -2068,31 +1561,14 @@ test("createFencedSubscription_establishmentTimeout_lapses", async () => {
     { kinds: [30078], limit: 500 },
     () => {},
   );
-  assert.equal(
-    handle.lapsed,
-    false,
-    "fence must not be lapsed immediately after REQ",
-  );
-
-  // Wait for the timeout to fire.
+  assert.equal(handle.lapsed, false);
   await handle.established;
-
-  assert.equal(
-    handle.lapsed,
-    true,
-    "establishment timeout must lapse the fence",
-  );
-  assert.equal(
-    subscriptions.size,
-    0,
-    "timed-out fence must be removed from subscriptions map",
-  );
+  assert.equal(handle.lapsed, true);
+  assert.equal(subscriptions.size, 0);
 });
 
 // ── Test 18: createFencedSubscription — timeout does NOT count as establishment
 test("createFencedSubscription_timeout_doesNotCountAsEstablishment", async () => {
-  // Even though established resolves after the timeout, lapsed must be true —
-  // the timeout NEVER counts as EOSE-based establishment.
   const subscriptions = new Map();
   const deps = {
     connectionGeneration: () => 0,
@@ -2107,17 +1583,11 @@ test("createFencedSubscription_timeout_doesNotCountAsEstablishment", async () =>
     () => {},
   );
   await handle.established; // timeout fires here
-  assert.equal(
-    handle.lapsed,
-    true,
-    "establishment timeout must never count as successful establishment",
-  );
+  assert.equal(handle.lapsed, true);
 });
 
 // ── Test 19: establishment timeout → no-EOSE relay produces incomplete load ───
 test("fetchAndMerge_establishmentTimeout_setsLoadIncomplete", async () => {
-  // Thufir's exact witness: a relay that stays alive but never sends EOSE must
-  // cause the load to conclude complete:false, not hang initialize() forever.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "b0".repeat(32);
   const fakeRelay = {
@@ -2125,8 +1595,6 @@ test("fetchAndMerge_establishmentTimeout_setsLoadIncomplete", async () => {
     publishEvent: async () => {},
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
-    // subscribeFenced delegates to the real createFencedSubscription with a
-    // fast establishment timeout so the test runs quickly.
     subscribeFenced: async (filter, onEvent) => {
       const subscriptions = new Map();
       const deps = {
@@ -2145,30 +1613,13 @@ test("fetchAndMerge_establishmentTimeout_setsLoadIncomplete", async () => {
     mgr.fetchAndMerge().then(() => "settled"),
     new Promise((r) => setTimeout(() => r("timeout"), raceMs)),
   ]);
-  assert.equal(
-    result,
-    "settled",
-    `fetchAndMerge must settle within ${raceMs}ms when EOSE never arrives (no-EOSE relay must not hang initialize)`,
-  );
-  assert.equal(
-    mgr.isLoadComplete,
-    false,
-    "no-EOSE relay with establishment timeout must produce incomplete load",
-  );
+  assert.equal(result, "settled");
+  assert.equal(mgr.isLoadComplete, false);
   mgr.destroy();
 });
 
 // ── Test 20: early-write-fails / v2-succeeds → outcome + restart agree ────────
 test("markChannelUnread_earlyWriteFails_v2Succeeds_outcomeAndRestartAgree", () => {
-  // Thufir's mandated witness: the v2 write is the commit point. If the v2
-  // write succeeds, the action succeeds regardless of ancillary write failures.
-  // A reconstructed manager must see the committed action, and the context must
-  // be publishable so it reaches the relay (serialized primary not empty).
-  //
-  // New write order in writeStoredReadState: v2 (ok4) first, then ancillary
-  // writes (ok1/ok2/ok3). Writes during manager construction: ClientId (1),
-  // SlotId (2). First mark write = v2 override write (3) → let it through.
-  // Ancillary writes follow (4+) → throw to prove they don't affect outcome.
   const throwingLS = makeLocalStorage();
   const originalSetItem = throwingLS.setItem.bind(throwingLS);
   let writeCount = 0;
@@ -2179,84 +1630,37 @@ test("markChannelUnread_earlyWriteFails_v2Succeeds_outcomeAndRestartAgree", () =
     originalSetItem(key, value);
   };
   globalThis.window.localStorage = throwingLS;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
+  const fakeRelay = makeFakeRelay();
   const pubkey = "ea".repeat(32);
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.isLoadComplete = true;
   mgr.effectiveState.set("committed-ch", 1000);
-
-  // Enable ancillary-write failure before the mark call.
   blockAncillary = true;
   const result = mgr.markChannelUnread("committed-ch");
   blockAncillary = false;
-
-  // Write #3 (v2) succeeded → action must succeed.
-  assert.equal(
-    result.status,
-    "applied",
-    "markChannelUnread must succeed when v2 write succeeds even if ancillary writes fail",
-  );
-
-  // v2 key must contain the committed register.
+  assert.equal(result.status, "applied");
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const stored = throwingLS.getItem(v2Key);
   assert.ok(stored !== null, "v2 key must be present after committed action");
   const parsed = JSON.parse(stored);
-  // v2 blob format: {r: {<ctx>: {s,c,b,f}}, receipts?: {...}}
-  assert.ok(
-    parsed.r !== undefined && "committed-ch" in parsed.r,
-    "v2 record must contain the committed channel register under .r for coherent restart",
-  );
-
-  // Reconstruct a real manager from the same storage — simulates restart.
-  // The v2 entry is inherently publishable so hydrateFromLocalStorage must
-  // add it to publishableContextIds without the ancillary key.
+  assert.ok(parsed.r !== undefined && "committed-ch" in parsed.r);
   writeCount = 0; // reset counter so reconstruction writes go through
   const mgr2 = new ReadStateManager(pubkey, fakeRelay);
   mgr2.hydrateFromLocalStorage(); // simulate the init-time hydration step
   mgr2.isLoadComplete = true;
-
-  // publishableContextIds must contain the committed context — hydration from
-  // v2 must not require the ancillary publishable key.
-  assert.ok(
-    mgr2.publishableContextIds.has("committed-ch"),
-    "reconstructed manager must mark the v2-committed context as publishable",
-  );
-
-  // currentContexts() must include the register so the committed action is
-  // serialized and can be published to the relay.
+  assert.ok(mgr2.publishableContextIds.has("committed-ch"));
   const contexts2 = mgr2.currentContexts();
-  assert.ok(
-    contexts2 !== null,
-    "reconstructed manager currentContexts must not be null",
-  );
+  assert.ok(contexts2 !== null);
   const hasEntry = Object.keys(contexts2 ?? {}).some(
     (k) => k.startsWith("committed-ch") || k.includes("committed-ch"),
   );
-  assert.ok(
-    hasEntry,
-    "reconstructed manager serialized primary must include the committed register/frontier",
-  );
-
+  assert.ok(hasEntry);
   mgr.destroy();
   mgr2.destroy();
 });
 
 // ── Test 21: v2-write-fails → storage_failed, slot IDs unchanged ─────────────
 test("markChannelUnread_v2WriteFails_slotIdsUnchanged", () => {
-  // When the v2 write (commit point) fails, the action must return storage_failed
-  // AND extra slot IDs must not persist (neither in memory nor in the
-  // extra-slot-ids key).  Uses 700 channel contexts to force split planning
-  // (splitContextsIntoSlots allocates an extra slot), matching Thufir's exact
-  // 700-frontier witness.
   const throwingLS = makeLocalStorage();
   const originalSetItem = throwingLS.setItem.bind(throwingLS);
   let blockV2 = false;
@@ -2267,278 +1671,107 @@ test("markChannelUnread_v2WriteFails_slotIdsUnchanged", () => {
     originalSetItem(key, value);
   };
   globalThis.window.localStorage = throwingLS;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const pubkey = "eb".repeat(32);
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.isLoadComplete = true;
-
-  // Populate 700 publishable channel contexts so the split planner is forced
-  // to allocate an extra slot (exceeds READ_STATE_MAX_PLAINTEXT_BYTES per slot).
   for (let i = 0; i < 700; i++) {
     const ctx = `channel-id-${String(i).padStart(5, "0")}-${"x".repeat(30)}`;
     mgr.effectiveState.set(ctx, 1_700_000_000 + i);
     mgr.publishableContextIds.add(ctx);
   }
-  // Also add the target channel for the mark call.
   mgr.effectiveState.set("slot-test-ch", 1000);
-
   const prevExtraSlotIdsMem = mgr.extraSlotIds.slice();
   const extraSlotKey = `buzz.nip-rs.extra-slot-ids:${pubkey}`;
   const prevExtraSlotIdsStored = throwingLS.getItem(extraSlotKey);
-
-  // Block v2 writes.
   blockV2 = true;
   const result = mgr.markChannelUnread("slot-test-ch");
   blockV2 = false;
-
-  assert.equal(
-    result.status,
-    "refused",
-    "markChannelUnread must fail when v2 write fails",
-  );
+  assert.equal(result.status, "refused");
   assert.equal(result.reason, "storage_failed");
-
-  // Memory slot IDs must be unchanged.
   assert.deepEqual(
     mgr.extraSlotIds,
     prevExtraSlotIdsMem,
     "extraSlotIds in memory must be rolled back on v2 write failure",
   );
-
-  // Persisted slot IDs must be storage-identical to before the action —
-  // including absent-vs-present: if the key was absent before, it must still
-  // be absent (not `[]`).
   const afterExtraSlotIdsStored = throwingLS.getItem(extraSlotKey);
-  assert.equal(
-    afterExtraSlotIdsStored,
-    prevExtraSlotIdsStored,
-    "buzz.nip-rs.extra-slot-ids must be storage-identical after a failed v2 write (absent=absent, not written as [])",
-  );
-
-  // v2 key must not contain the failed register.
+  assert.equal(afterExtraSlotIdsStored, prevExtraSlotIdsStored);
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const v2Stored = throwingLS.getItem(v2Key);
   const v2Parsed = v2Stored ? JSON.parse(v2Stored) : {};
-  assert.equal(
-    "slot-test-ch" in v2Parsed,
-    false,
-    "v2 record must not contain the rolled-back channel register after failed action",
-  );
-
+  assert.equal("slot-test-ch" in v2Parsed, false);
   mgr.destroy();
 });
 
 // ── Test 22b: stale ancillary frontier suppressed by authoritative v2 frontier ─
 test("hydrateFromLocalStorage_staleAncillaryFrontier_v2FrontierWins", () => {
-  // Thufir's exact policy-edge witness: when a v2-success/ancillary-failure
-  // commit leaves the ordinary frontier key stale, hydration must apply
-  // max(existing, e.f) — not skip the update when the key is present.
-  //
-  // Setup:  ordinary frontier key  = 50  (stale)
-  //         v2 override entry       = {s:5, c:0, b:100, f:101}
-  // isOverrideActive(S=5,C=0,B=100, frontier=50)  = 50<=100 → ACTIVE  (wrong)
-  // isOverrideActive(S=5,C=0,B=100, frontier=101) = 101>100 → INACTIVE (correct)
-  // The test asserts the reconstructed manager uses frontier=101 so the
-  // register is inactive and serializes as a tombstone (ov_c: only, no ov_s:).
   const ls = makeLocalStorage();
   globalThis.window.localStorage = ls;
-
   const pubkey = "ec".repeat(32);
   const ctx = "stale-frontier-ch";
-
-  // Seed the stale ancillary frontier (epoch-seconds → ISO timestamp).
   const staleFrontierKey = `buzz.channel-read-state.v2:${pubkey}`;
   ls.setItem(
     staleFrontierKey,
     JSON.stringify({ [ctx]: new Date(50 * 1_000).toISOString() }),
   );
-
-  // Seed the v2 override key with the authoritative frontier f=101.
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   ls.setItem(v2Key, JSON.stringify({ [ctx]: { s: 5, c: 0, b: 100, f: 101 } }));
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // v2 is authoritative: effectiveState must hold 101, not the stale 50.
-  assert.equal(
-    mgr.effectiveState.get(ctx),
-    101,
-    "hydration must apply max(staleAncillary=50, v2.f=101) → 101",
-  );
-
-  // With frontier=101 > B=100, the register is INACTIVE (tombstone).
-  // currentContexts() must serialize only ov_c: for this channel — no ov_s:.
+  assert.equal(mgr.effectiveState.get(ctx), 101);
   mgr.isLoadComplete = true;
   const contexts = mgr.currentContexts();
   assert.ok(contexts !== null, "currentContexts must not be null");
   const ovSKey = `ov_s:${ctx}`;
   const ovCKey = `ov_c:${ctx}`;
-  assert.equal(
-    ovSKey in contexts,
-    false,
-    "inactive override must NOT serialize ov_s: (would mark channel active/unread)",
-  );
-  assert.ok(
-    ovCKey in contexts,
-    "inactive override must serialize ov_c: tombstone floor",
-  );
-
+  assert.equal(ovSKey in contexts, false);
+  assert.ok(ovCKey in contexts);
   mgr.destroy();
 });
 
 // ── Test 23: Amendment A — same-source read→unread reincarnation ──────────────
 test("drain_sameSourceReincarnation_genFenceZeroLocalEffects", async () => {
-  // Amendment A correctness: a same-source read→unread reincarnation witness.
-  //
-  // Scenario:
-  //   (1) Entry {sources:["inbox"]} with register (S=1, C=0) — channel is unread.
-  //   (2) During incomplete load, user marks channel read → read(gen=1) queued.
-  //   (3) User immediately re-marks channel unread → unread(gen=2) replaces gen=1.
-  //   (4) Load completes. Drain captures gen=2 (unread). Gen=1 (read) is gone —
-  //       the idempotent addForcedUnreadSource gave it no new local identity, so
-  //       the stale read-scope from gen=1 can never fire (it was overwritten).
-  //   (5) Assert: gen=2 drain applies S-bump correctly; gen=1's read scope is NOT
-  //       applied (channel remains unread); gen=2 intent is deleted from store.
-  //
-  // The mutation-verify: if a drain somehow applied gen=1's read scope on top of
-  // gen=2's unread, the register would be C-bumped and the channel would be
-  // observable as read. This asserts that never happens.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d1".repeat(32);
   const channelId = `reincarnation-channel-${"a".repeat(40)}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
-  // Precondition: existing unread register (S=1, override active at frontier=50).
   mgr.effectiveState.set(channelId, 50);
   mgr.overrideRegisters.set(channelId, { s: 1, c: 0, b: 50 });
   mgr.publishableContextIds.add(channelId);
-
-  // Load is incomplete — mark ops queue.
-  assert.equal(
-    mgr.isLoadComplete,
-    false,
-    "precondition: load must be incomplete",
-  );
-
-  // Step (2): mark read → queued(gen=1).
+  assert.equal(mgr.isLoadComplete, false);
   const readResult = mgr.markChannelRead(channelId);
-  assert.equal(
-    readResult.status,
-    "queued",
-    "mark-read during incomplete load must queue",
-  );
-
-  // Step (3): immediately re-mark unread → queued(gen=2), gen=1 replaced.
+  assert.equal(readResult.status, "queued");
   const unreadResult = mgr.markChannelUnread(channelId);
-  assert.equal(
-    unreadResult.status,
-    "queued",
-    "mark-unread during incomplete load must queue",
-  );
-
-  // Confirm gen=2 is now current (gen=1 is gone).
+  assert.equal(unreadResult.status, "queued");
   const currentIntent = pendingOverrideIntentStore.get(channelId);
   assert.ok(currentIntent, "intent must exist after re-mark");
-  assert.equal(
-    currentIntent.op,
-    "unread",
-    "current intent must be unread (gen=2)",
-  );
+  assert.equal(currentIntent.op, "unread");
   assert.equal(currentIntent.gen, 2, "current intent must be gen=2");
-
-  // Step (4): complete load then drain.
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Step (5): gen=2 (unread) was applied — register must have S bumped.
   const reg = mgr.overrideRegisters.get(channelId);
   assert.ok(reg, "override register must exist after drain");
   assert.ok(reg.s > 1, "S must be bumped by the unread drain (gen=2 applied)");
-  assert.ok(
-    reg.c === 0,
-    "C must NOT be bumped (gen=1's read scope must not have fired)",
-  );
-
-  // Gen=2 intent must be consumed (compare-and-delete fired).
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "gen=2 intent must be deleted after successful drain",
-  );
-
+  assert.ok(reg.c === 0);
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   mgr.destroy();
 });
 
 // ── Test 24: Amendment B — drain crash window 1 ───────────────────────────────
 test("drain_crashWindow1_restartReplaysOnce_extraBumpOnly", async () => {
-  // Amendment B crash window 1: crash after register replay but before
-  // intent cleanup/deletion (between steps 1 and 2 of the commit order).
-  //
-  // After a crash in this window, the intent survives in localStorage (no
-  // receipt — crash happened BEFORE the register+receipt commit in step 1).
-  // On restart, drain replays the same action once more → one extra monotonic
-  // S/C bump. The bump is harmless (counters only move up; liveness is
-  // threshold-based). The receipt is then written and cleanup + delete runs.
-  //
-  // Mutation-verify: if instead a crash between (1) and (2) left the receipt
-  // persisted alongside the register, the restart hydration rule (Amendment C)
-  // would skip the re-bump. This test exercises the NO-receipt path (crash
-  // before step 1) to confirm restart does replay exactly once.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d2".repeat(32);
   const channelId = `crash-window-1-ch-${"b".repeat(44)}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
+  const fakeRelay = makeFakeRelay();
 
   // ── Session 1: enqueue, then "crash" before drain can commit ──────────────
   const mgr1 = new ReadStateManager(pubkey, fakeRelay);
   mgr1.effectiveState.set(channelId, 100);
   assert.equal(mgr1.isLoadComplete, false, "precondition: load incomplete");
-
   const q1 = mgr1.markChannelUnread(channelId);
-  assert.equal(
-    q1.status,
-    "queued",
-    "mark-unread must queue during incomplete load",
-  );
-
-  // The intent is now persisted (gen=1). Simulate a crash: destroy manager
-  // without draining — intent stays in the v2 blob, no register committed.
+  assert.equal(q1.status, "queued");
   mgr1.destroy();
 
   // ── Session 2: restart. Intent present, no receipt → replay fires once ────
@@ -2546,67 +1779,25 @@ test("drain_crashWindow1_restartReplaysOnce_extraBumpOnly", async () => {
   mgr2.hydrateFromLocalStorage();
   mgr2.effectiveState.set(channelId, 100);
   mgr2.isLoadComplete = true;
-
-  // Confirm intent survived (reloaded from v2 blob by hydrateFromLocalStorage).
   const intentAfterRestart = pendingOverrideIntentStore.get(channelId);
-  assert.ok(
-    intentAfterRestart,
-    "intent must survive restart (no receipt was written)",
-  );
-  assert.equal(
-    intentAfterRestart.op,
-    "unread",
-    "surviving intent must be unread",
-  );
-
-  // No receipt in store (crash before commit) → no alreadyApplied path.
-  assert.equal(
-    mgr2.appliedReceipts.get(channelId),
-    undefined,
-    "no applied receipt after crash-before-commit restart",
-  );
-
-  // Drain on restart: replay fires, S-bumped, receipt written, intent deleted.
+  assert.ok(intentAfterRestart);
+  assert.equal(intentAfterRestart.op, "unread");
+  assert.equal(mgr2.appliedReceipts.get(channelId), undefined);
   await mgr2.drainPendingIntents(mgr2.loadGeneration);
-
   const reg = mgr2.overrideRegisters.get(channelId);
   assert.ok(reg, "register must exist after drain-on-restart");
   assert.ok(reg.s > 0, "S must be bumped (replay fired once)");
-
-  // Intent consumed.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "intent must be deleted after drain-on-restart",
-  );
-
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   mgr2.destroy();
 });
 
 // ── Test 25: Amendment B — drain crash window 2 ───────────────────────────────
 test("drain_crashWindow2_receiptPresent_restartNoRebump", async () => {
-  // Amendment B+C crash window 2: crash after register+receipt commit (step 1)
-  // but before intent deletion (step 3). Receipt is durable; intent survives.
-  //
-  // On restart, hydration loads the applied receipt (intent matches receipt →
-  // not swept). The drain finds a surviving intent whose {intentGen, op} matches
-  // the receipt → alreadyApplied path: cleanup + compare-and-delete WITHOUT
-  // another S/C bump.
-  //
-  // Mutation-verify: if the alreadyApplied path re-bumped the register, the
-  // final S value would be higher than the once-applied value. This asserts the
-  // register is unchanged from the original single commit.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d3".repeat(32);
   const channelId = `crash-window-2-ch-${"c".repeat(44)}`;
-
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-
-  // Craft the crash state directly in localStorage.
-  // Register committed with S=2 (unread applied: max(0,0)+1=1... let's use S=2 for clarity),
-  // receipt {intentGen:1, op:"unread"} present, intent {gen:1, op:"unread"} still alive.
-  // This is the exact state from "crash after register+receipt commit, before intent delete".
   const sSingleCommit = 2;
   ls.setItem(
     v2Key,
@@ -2617,323 +1808,134 @@ test("drain_crashWindow2_receiptPresent_restartNoRebump", async () => {
       ng: 2,
     }),
   );
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
-  // Restart: hydration sees receipt+intent → receipt loaded (matching intent).
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
   mgr.effectiveState.set(channelId, 100);
   mgr.isLoadComplete = true;
-
-  // Receipt must have been loaded (matching intent exists).
   const receipt = mgr.appliedReceipts.get(channelId);
-  assert.ok(
-    receipt,
-    "applied receipt must be loaded on restart (matching intent present)",
-  );
+  assert.ok(receipt);
   assert.equal(receipt.intentGen, 1, "receipt intentGen must be 1");
   assert.equal(receipt.op, "unread", "receipt op must be unread");
-
-  // Intent must still be present.
   const intent = pendingOverrideIntentStore.get(channelId);
   assert.ok(intent, "intent must be present (simulated crash before delete)");
   assert.equal(intent.gen, 1, "intent gen must be 1");
-
-  // Run drain: alreadyApplied path — cleanup + delete, NO re-bump.
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Register S must be unchanged from the single-commit value (no re-bump).
   const regAfterRestart = mgr.overrideRegisters.get(channelId);
   assert.ok(regAfterRestart, "register must still exist after restart drain");
-  assert.equal(
-    regAfterRestart.s,
-    sSingleCommit,
-    "S must NOT be re-bumped (alreadyApplied path skips replay)",
-  );
-
-  // Intent must now be deleted.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "intent must be deleted after alreadyApplied drain",
-  );
-
+  assert.equal(regAfterRestart.s, sSingleCommit);
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   mgr.destroy();
 });
 
-// ── Test 26: Amendment C — crash after applied unread, newer remote read ──────
-test("drain_crashAfterAppliedUnread_newerRemoteRead_noRebump", async () => {
-  // Amendment C crash race 1 — PRODUCTION LOAD PATH:
-  // Unread applied (register+receipt durable), then another device publishes C=6
-  // (read). On restart, the receipt prevents a second S-bump that would reverse
-  // the phone's read. This test uses the real fetchAndMerge() path — the remote
-  // read is delivered as an encrypted relay event, not a direct register write.
-  //
-  // Without Amendment C, restart would replay S=max(S,C)+1 on top of merged C=6,
-  // computing S=7, undoing the phone's read. With Amendment C, the receipt proves
-  // application; only cleanup+delete runs, so C=6 stands.
-  globalThis.window.localStorage = makeLocalStorage();
-  const pubkey = "d4".repeat(32);
-  const channelId = `amend-c-unread-race-${"d".repeat(44)}`;
-
-  // Craft the crash state in localStorage:
-  // - Register committed with S=5 (unread applied, from S=4, C=3).
-  // - Receipt {intentGen:1, op:"unread"} persisted atomically.
-  // - Intent {gen:1, op:"unread"} still alive (crash before cleanup delete).
-  const ls = globalThis.window.localStorage;
-  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-  ls.setItem(
-    v2Key,
-    JSON.stringify({
-      r: { [channelId]: { s: 5, c: 3, b: 100, f: 100 } },
-      receipts: { [channelId]: { intentGen: 1, op: "unread" } },
-      pi: { [channelId]: { gen: 1, op: "unread" } },
+// ── Tests 26/27: Amendment C crash races (mirror pair) ───────────────────────
+// biome-ignore format: compact table rows
+const crashAfterAppliedCases = [
+  {
+    name: "drain_crashAfterAppliedUnread_newerRemoteRead_noRebump",
+    // Unread applied (receipt durable); remote publishes C=6 (read).
+    // Receipt prevents second S-bump that would reverse the phone's read.
+    pubkey: "d4".repeat(32), channelId: `amend-c-unread-race-${"d".repeat(44)}`,
+    initReg: { s: 5, c: 3, b: 100, f: 100 }, receiptOp: "unread",
+    remoteCtx: (ch) => ({ [`ov_s:${ch}`]: 5, [`ov_c:${ch}`]: 6, [`ov_b:${ch}`]: 100, [ch]: 200 }),
+    remoteSlot: "d4".repeat(16), blobId: "d4".repeat(32),
+    assertDrain(reg) { assert.equal(reg.s, 5, "S must NOT be re-bumped"); assert.ok(reg.c >= 6, "C must reflect remote read"); },
+  },
+  {
+    name: "drain_crashAfterAppliedRead_newerRemoteUnread_noRebump",
+    // Read applied (C-bump + receipt durable); remote publishes S=7 (unread).
+    // Receipt prevents second C-bump that would reverse the new unread.
+    pubkey: "d5".repeat(32), channelId: `amend-c-read-race-${"e".repeat(45)}`,
+    initReg: { s: 5, c: 6, b: 100, f: 200 }, receiptOp: "read",
+    remoteCtx: (ch) => ({ [`ov_s:${ch}`]: 7, [`ov_c:${ch}`]: 6, [`ov_b:${ch}`]: 100, [ch]: 100 }),
+    remoteSlot: "d5".repeat(16), blobId: "d5".repeat(32),
+    assertDrain(reg) { assert.equal(reg.c, 6, "C must NOT be re-bumped"); assert.ok(reg.s >= 7, "remote S=7 must be preserved"); },
+  },
+];
+for (const row of crashAfterAppliedCases) {
+  test(row.name, async () => {
+    const { pubkey, channelId } = row;
+    const initBlob = {
+      r: { [channelId]: row.initReg },
+      receipts: { [channelId]: { intentGen: 1, op: row.receiptOp } },
+      pi: { [channelId]: { gen: 1, op: row.receiptOp } },
       ng: 2,
-    }),
-  );
-
-  // Remote device published C=6 (read) and frontier advanced to 200.
-  // Deliver via a real relay event that fetchAndMerge will decrypt and merge.
-  const remoteBlob = JSON.stringify({
-    v: 1,
-    client_id: "remote-device-client",
-    contexts: {
-      [`ov_s:${channelId}`]: 5,
-      [`ov_c:${channelId}`]: 6,
-      [`ov_b:${channelId}`]: 100,
-      [channelId]: 200, // frontier advanced past B=100 → inactive
-    },
+    };
+    const remoteBlob = JSON.stringify({
+      v: 1,
+      client_id: "remote-device-client",
+      contexts: row.remoteCtx(channelId),
+    });
+    const blobEvent = {
+      id: row.blobId,
+      pubkey,
+      created_at: 9999,
+      kind: 30078,
+      tags: [
+        ["d", `read-state:${row.remoteSlot}`],
+        ["t", "read-state"],
+      ],
+      content: "CIPHER",
+      sig: "s".repeat(128),
+    };
+    let fetchCallCount = 0;
+    globalThis.window.__TAURI_INTERNALS__ = {
+      invoke: async (cmd) => {
+        if (cmd === "nip44_decrypt_from_self") return remoteBlob;
+        throw new Error(`Unexpected: ${cmd}`);
+      },
+    };
+    const fakeRelay = {
+      fetchEvents: async () => {
+        fetchCallCount++;
+        return fetchCallCount === 1 ? [blobEvent] : [];
+      },
+      publishEvent: async () => {},
+      subscribeFenced: async (_f, handler) => {
+        if (fetchCallCount === 0) handler(blobEvent);
+        return makeFenceHandle({ eose: true });
+      },
+      subscribeLive: async (_f, _h) => () => {},
+      subscribeToReconnects: () => () => {},
+      getConnectionGeneration: () => 0,
+    };
+    try {
+      globalThis.window.localStorage = makeLocalStorage();
+      const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
+      globalThis.window.localStorage.setItem(v2Key, JSON.stringify(initBlob));
+      const mgr = new ReadStateManager(pubkey, fakeRelay);
+      mgr.hydrateFromLocalStorage();
+      const receipt = mgr.appliedReceipts.get(channelId);
+      assert.ok(receipt, "receipt must be loaded on restart");
+      assert.equal(receipt.intentGen, 1);
+      assert.equal(receipt.op, row.receiptOp);
+      await mgr.fetchAndMerge(mgr.loadGeneration);
+      assert.equal(mgr.isLoadComplete, true, "load must complete");
+      const regAfterLoad = mgr.overrideRegisters.get(channelId);
+      assert.ok(regAfterLoad, "register must exist after fetchAndMerge");
+      await mgr.drainPendingIntents(mgr.loadGeneration);
+      const reg = mgr.overrideRegisters.get(channelId);
+      assert.ok(reg, "register must exist after drain");
+      row.assertDrain(reg);
+      assert.equal(
+        pendingOverrideIntentStore.get(channelId),
+        undefined,
+        "intent must be deleted after alreadyApplied drain",
+      );
+      mgr.destroy();
+    } finally {
+      delete globalThis.window.__TAURI_INTERNALS__;
+    }
   });
-  const remoteSlotId = "d4".repeat(16);
-  const blobEvent = {
-    id: "d4".repeat(32),
-    pubkey,
-    created_at: 9999,
-    kind: 30078,
-    tags: [
-      ["d", `read-state:${remoteSlotId}`],
-      ["t", "read-state"],
-    ],
-    content: "CIPHER",
-    sig: "s".repeat(128),
-  };
-
-  let fetchCallCount = 0;
-  globalThis.window.__TAURI_INTERNALS__ = {
-    invoke: async (command) => {
-      if (command === "nip44_decrypt_from_self") return remoteBlob;
-      throw new Error(`Unexpected: ${command}`);
-    },
-  };
-
-  const fakeRelay = {
-    fetchEvents: async () => {
-      fetchCallCount++;
-      return fetchCallCount === 1 ? [blobEvent] : [];
-    },
-    publishEvent: async () => {},
-    subscribeFenced: async (_filter, handler) => {
-      if (fetchCallCount === 0) handler(blobEvent);
-      return makeFenceHandle({ eose: true });
-    },
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
-  try {
-    // Session 2 (restart): hydrate, then complete load via real fetchAndMerge().
-    const mgr = new ReadStateManager(pubkey, fakeRelay);
-    mgr.hydrateFromLocalStorage();
-
-    // Receipt must be loaded from crash state.
-    const receipt = mgr.appliedReceipts.get(channelId);
-    assert.ok(receipt, "receipt must be loaded on restart");
-    assert.equal(receipt.intentGen, 1);
-    assert.equal(receipt.op, "unread");
-
-    // Complete load via production path — fetchAndMerge merges the remote C=6.
-    await mgr.fetchAndMerge(mgr.loadGeneration);
-    assert.equal(mgr.isLoadComplete, true, "load must complete");
-
-    // The merged register should reflect remote C=6 and frontier 200.
-    const regAfterLoad = mgr.overrideRegisters.get(channelId);
-    assert.ok(regAfterLoad, "register must exist after fetchAndMerge");
-    assert.ok(
-      regAfterLoad.c >= 6,
-      "merged C must be at least 6 (remote C=6 merged)",
-    );
-
-    // Drain via production path — alreadyApplied must fire, no new S-bump.
-    await mgr.drainPendingIntents(mgr.loadGeneration);
-
-    // S must remain 5, NOT 7 (which replay would compute as max(5,6)+1=7).
-    const reg = mgr.overrideRegisters.get(channelId);
-    assert.ok(reg, "register must exist after drain");
-    assert.equal(
-      reg.s,
-      5,
-      "S must NOT be re-bumped (would override phone's C=6)",
-    );
-    assert.ok(reg.c >= 6, "C must reflect remote read (≥6)");
-
-    // Intent consumed — cleanup step ran.
-    assert.equal(
-      pendingOverrideIntentStore.get(channelId),
-      undefined,
-      "intent must be deleted after alreadyApplied drain",
-    );
-
-    mgr.destroy();
-  } finally {
-    delete globalThis.window.__TAURI_INTERNALS__;
-  }
-});
-
-// ── Test 27: Amendment C — crash after applied read, newer remote unread ──────
-test("drain_crashAfterAppliedRead_newerRemoteUnread_noRebump", async () => {
-  // Amendment C crash race 2 — PRODUCTION LOAD PATH (mirror of Test 26):
-  // Read applied (C-bump committed + receipt durable), then another device
-  // publishes S=7 (marks unread). On restart, the receipt prevents a second
-  // C-bump that would reverse the new unread. The remote S=7 is delivered via
-  // a real relay event through fetchAndMerge(), not a direct register write.
-  globalThis.window.localStorage = makeLocalStorage();
-  const pubkey = "d5".repeat(32);
-  const channelId = `amend-c-read-race-${"e".repeat(45)}`;
-
-  const ls = globalThis.window.localStorage;
-  const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-
-  // Crash state: read C-bump committed (S=5, C=6), receipt present, intent alive.
-  ls.setItem(
-    v2Key,
-    JSON.stringify({
-      r: { [channelId]: { s: 5, c: 6, b: 100, f: 200 } },
-      receipts: { [channelId]: { intentGen: 1, op: "read" } },
-      pi: { [channelId]: { gen: 1, op: "read" } },
-      ng: 2,
-    }),
-  );
-
-  // Remote device published S=7 (marked unread after our crash), C stays 6,
-  // frontier remains at 100 (below B=100 is NOT above B, so override is active).
-  const remoteBlob = JSON.stringify({
-    v: 1,
-    client_id: "remote-device-client",
-    contexts: {
-      [`ov_s:${channelId}`]: 7,
-      [`ov_c:${channelId}`]: 6,
-      [`ov_b:${channelId}`]: 100,
-      [channelId]: 100, // frontier at B → still active (s=7 > c=6, f<=b)
-    },
-  });
-  const remoteSlotId = "d5".repeat(16);
-  const blobEvent = {
-    id: "d5".repeat(32),
-    pubkey,
-    created_at: 9999,
-    kind: 30078,
-    tags: [
-      ["d", `read-state:${remoteSlotId}`],
-      ["t", "read-state"],
-    ],
-    content: "CIPHER",
-    sig: "s".repeat(128),
-  };
-
-  let fetchCallCount = 0;
-  globalThis.window.__TAURI_INTERNALS__ = {
-    invoke: async (command) => {
-      if (command === "nip44_decrypt_from_self") return remoteBlob;
-      throw new Error(`Unexpected: ${command}`);
-    },
-  };
-
-  const fakeRelay = {
-    fetchEvents: async () => {
-      fetchCallCount++;
-      return fetchCallCount === 1 ? [blobEvent] : [];
-    },
-    publishEvent: async () => {},
-    subscribeFenced: async (_filter, handler) => {
-      if (fetchCallCount === 0) handler(blobEvent);
-      return makeFenceHandle({ eose: true });
-    },
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
-  try {
-    const mgr = new ReadStateManager(pubkey, fakeRelay);
-    mgr.hydrateFromLocalStorage();
-
-    const receipt = mgr.appliedReceipts.get(channelId);
-    assert.ok(receipt, "receipt must be loaded on restart");
-    assert.equal(receipt.intentGen, 1);
-    assert.equal(receipt.op, "read");
-
-    // Complete load via production path — fetchAndMerge merges remote S=7.
-    await mgr.fetchAndMerge(mgr.loadGeneration);
-    assert.equal(mgr.isLoadComplete, true, "load must complete");
-
-    // Merged register must reflect remote S=7.
-    const regAfterLoad = mgr.overrideRegisters.get(channelId);
-    assert.ok(regAfterLoad, "register must exist after fetchAndMerge");
-    assert.ok(regAfterLoad.s >= 7, "merged S must be at least 7 (remote S=7)");
-
-    // Drain — alreadyApplied path: no new C-bump (would erase remote unread).
-    await mgr.drainPendingIntents(mgr.loadGeneration);
-
-    const reg = mgr.overrideRegisters.get(channelId);
-    assert.ok(reg);
-    assert.equal(
-      reg.c,
-      6,
-      "C must NOT be re-bumped (would erase remote S=7 unread)",
-    );
-    assert.ok(reg.s >= 7, "remote S=7 must be preserved");
-
-    assert.equal(
-      pendingOverrideIntentStore.get(channelId),
-      undefined,
-      "intent must be deleted after alreadyApplied drain",
-    );
-
-    mgr.destroy();
-  } finally {
-    delete globalThis.window.__TAURI_INTERNALS__;
-  }
-});
+}
 
 // ── Test 28: Amendment C — receipt without matching intent is swept silently ──
 test("drain_receiptWithoutMatchingIntent_sweptWithoutRegisterEffect", async () => {
-  // Amendment C receipt lifecycle: a receipt whose {intentGen, op} matches no
-  // surviving intent (superseded generation) must be swept without any register
-  // effect. Sweeping happens at hydrateFromLocalStorage (the orphan-sweep step),
-  // so the receipt is discarded before it can be consulted by the drain.
-  //
-  // This covers: (a) intent deleted by a successful prior drain, receipt cleanup
-  // lagged (e.g., cleanup-commit failed), AND (b) the general "no orphaned
-  // receipt persists across sessions" invariant.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d6".repeat(32);
   const channelId = `receipt-sweep-ch-${"f".repeat(46)}`;
-
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-
-  // Craft state: register committed, receipt present, but NO intent in queue.
-  // This is the state after a successful drain where cleanup-commit failed
-  // (the receipt was left in the blob but the intent was deleted).
   ls.setItem(
     v2Key,
     JSON.stringify({
@@ -2941,76 +1943,29 @@ test("drain_receiptWithoutMatchingIntent_sweptWithoutRegisterEffect", async () =
       receipts: { [channelId]: { intentGen: 1, op: "unread" } },
     }),
   );
-  // No intent key in localStorage (intent was already deleted by the prior drain).
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
   mgr.isLoadComplete = true;
-
-  // Orphan sweep: hydrateFromLocalStorage discards receipts with no matching intent.
-  // The receipt must NOT be in appliedReceipts (it was swept).
   const receipt = mgr.appliedReceipts.get(channelId);
-  assert.equal(
-    receipt,
-    undefined,
-    "orphaned receipt must be swept during hydration (no matching intent)",
-  );
-
-  // No matching intent in the queue.
+  assert.equal(receipt, undefined);
   const intent = pendingOverrideIntentStore.get(channelId);
-  assert.equal(
-    intent,
-    undefined,
-    "no intent must exist (was deleted in prior drain)",
-  );
-
-  // Drain: nothing to drain (no intent), no register effect.
+  assert.equal(intent, undefined);
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Register S must be unchanged (no replay fired).
   const reg = mgr.overrideRegisters.get(channelId);
   assert.ok(reg, "register must still exist");
-  assert.equal(
-    reg.s,
-    3,
-    "S must be unchanged — orphaned receipt must not trigger replay",
-  );
-
-  // The v2 blob must no longer contain the receipt (swept by hydrateFromLocalStorage
-  // via persistLocalState, which persisted this.appliedReceipts without the orphan).
+  assert.equal(reg.s, 3);
   const stored = JSON.parse(ls.getItem(v2Key) ?? "{}");
   const receiptsInBlob = stored.receipts ?? {};
-  assert.equal(
-    Object.keys(receiptsInBlob).length,
-    0,
-    "orphaned receipt must be swept from v2 blob (hydrateFromLocalStorage orphan-sweep)",
-  );
-
+  assert.equal(Object.keys(receiptsInBlob).length, 0);
   mgr.destroy();
 });
 
 // ── Test 29: Amendment C — register+receipt atomicity (no torn state) ─────────
 test("drain_registerReceiptAtomicity_noStateWhereOnePersistsWithoutOther", async () => {
-  // Amendment C atomicity: if the v2 write fails mid-drain (storage failure
-  // during step 1), neither the register nor the receipt must be committed.
-  // The intent must be preserved for the next drain pass.
-  //
-  // Mutation-verify: if register and receipt were written separately (two writes),
-  // a failure after the first would leave them observably out of sync. This
-  // asserts the combined single-write invariant.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "d7".repeat(32);
   const channelId = `atomicity-ch-${"a".repeat(51)}`;
-
   const ls = globalThis.window.localStorage;
   let blockV2Writes = false;
   const originalSetItem = ls.setItem.bind(ls);
@@ -3020,64 +1975,30 @@ test("drain_registerReceiptAtomicity_noStateWhereOnePersistsWithoutOther", async
     }
     originalSetItem(key, value);
   };
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.effectiveState.set(channelId, 100);
   mgr.isLoadComplete = false;
-
-  // Queue the intent.
   const q = mgr.markChannelUnread(channelId);
   assert.equal(q.status, "queued");
-
-  // Block v2 writes before drain fires.
   mgr.isLoadComplete = true;
   blockV2Writes = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
   blockV2Writes = false;
-
-  // v2 write failed: register must NOT be committed.
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const stored = JSON.parse(ls.getItem(v2Key) ?? "null");
-  // The v2 key should be absent or have no register for channelId.
   const registersInBlob = stored?.r ?? {};
-  assert.equal(
-    Object.keys(registersInBlob).length,
-    0,
-    "register must NOT be committed when v2 write fails (atomicity invariant)",
-  );
-
-  // And no receipt must be present (they're in the same write).
+  assert.equal(Object.keys(registersInBlob).length, 0);
   const receiptsInBlob = stored?.receipts ?? {};
-  assert.equal(
-    Object.keys(receiptsInBlob).length,
-    0,
-    "receipt must NOT be committed when v2 write fails (same-blob atomicity)",
-  );
-
-  // Intent must still be alive (not consumed on storage failure).
+  assert.equal(Object.keys(receiptsInBlob).length, 0);
   const intent = pendingOverrideIntentStore.get(channelId);
   assert.ok(intent, "intent must survive when drain's v2 write fails");
   assert.equal(intent.op, "unread");
-
   mgr.destroy();
 });
 
 // ── Test 22: fetchOwnBlobBeforePublish processes foreign client_id ────────────
 test("fetchOwnBlobBeforePublish_foreignClientId_rotatesSlotAndUpdatesMetadata", async () => {
-  // Thufir's mandated witness: fetchOwnBlobBeforePublish must run the same
-  // parsed-record metadata path — a foreign client_id at our coordinate must
-  // trigger slot rotation and maxFetchedCreatedAt update via that path.
-  // This is distinct from the fetchAndMerge path (test 12) — covers
-  // read-before-write semantics.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "b1".repeat(32);
   const slotId = "aabbccddeeff00112233445566778899";
@@ -3093,7 +2014,6 @@ test("fetchOwnBlobBeforePublish_foreignClientId_rotatesSlotAndUpdatesMetadata", 
       throw new Error(`Unexpected: ${command}`);
     },
   };
-
   const blobEvent = {
     id: "f1".repeat(32),
     pubkey,
@@ -3106,7 +2026,6 @@ test("fetchOwnBlobBeforePublish_foreignClientId_rotatesSlotAndUpdatesMetadata", 
     content: "BLOB_CIPHER",
     sig: "s".repeat(128),
   };
-
   const fakeRelay = {
     fetchEvents: async () => [blobEvent],
     publishEvent: async () => {},
@@ -3115,29 +2034,13 @@ test("fetchOwnBlobBeforePublish_foreignClientId_rotatesSlotAndUpdatesMetadata", 
     subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
     subscribeLive: async (_f, _h) => () => {},
   };
-
   try {
     const mgr = new ReadStateManager(pubkey, fakeRelay);
     mgr.slotId = slotId;
     mgr.isLoadComplete = true;
-
-    // Call fetchOwnBlobBeforePublish directly to test the read-before-write path.
     await mgr.fetchOwnBlobBeforePublish();
-
-    // Slot must have rotated because the blob carried a foreign client_id at
-    // our coordinate.
-    assert.notEqual(
-      mgr.slotId,
-      slotId,
-      "fetchOwnBlobBeforePublish must rotate slotId for foreign client_id at our coordinate",
-    );
-
-    // maxFetchedCreatedAt must reflect the blob event's created_at.
-    assert.equal(
-      mgr.maxFetchedCreatedAt,
-      55555,
-      "fetchOwnBlobBeforePublish must update maxFetchedCreatedAt from the fetched event",
-    );
+    assert.notEqual(mgr.slotId, slotId);
+    assert.equal(mgr.maxFetchedCreatedAt, 55555);
   } finally {
     delete globalThis.window.__TAURI_INTERNALS__;
   }
@@ -3145,264 +2048,113 @@ test("fetchOwnBlobBeforePublish_foreignClientId_rotatesSlotAndUpdatesMetadata", 
 
 // ── Test 30: Amendment A structural — gen2 enqueued DURING replay is durably committed ──
 test("drain_gen2EnqueuedDuringReplay_bufferedUntilTransactionCommit", async () => {
-  // Under the deferred-enqueue latch topology, any enqueue() for a channel while
-  // its drain transaction is open is BUFFERED — not applied.  The gen cannot
-  // change inside the transaction window, so gen1 commits cleanly.  On
-  // promoteDeferred() (called before the step-3 cleanup persist), gen2 is
-  // promoted into the live queue and written to the v2 blob atomically with
-  // gen1's cleanup.  scheduleDrain() then fires a fresh pass.
-  //
-  // Assertions (all durable surfaces):
-  //  - gen1 register committed (register in v2 blob)
-  //  - gen2 pi in v2 blob (durable promotion in same commit as cleanup)
-  //  - restart witness: new manager hydrates gen2 from blob
-  //  - fired-second-pass witness: scheduleDrain() leads to gen2 draining
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "30".repeat(32);
   const channelId = `amend-a-biting-ch-${"b".repeat(46)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.effectiveState.set(channelId, 50);
-
-  // Queue gen1 (unread) during incomplete load.
   mgr.isLoadComplete = false;
   const q = mgr.markChannelUnread(channelId);
   assert.equal(q.status, "queued", "gen1 must be queued");
   const gen1 = pendingOverrideIntentStore.get(channelId).gen;
   assert.ok(gen1 >= 1, "gen1 must be a positive generation number");
-
-  // Override tryCandidatePlan to enqueue gen2 DURING replay of gen1.
-  // The transaction latch is active at this point, so the enqueue is buffered.
   const origTry = mgr.tryCandidatePlan.bind(mgr);
   let injected = false;
   mgr.tryCandidatePlan = (id, reg) => {
     const ok = origTry(id, reg);
     if (!injected && id === channelId) {
       injected = true;
-      // Call enqueue() directly (bypassing the isLoadComplete guard in
-      // markChannelUnread) to simulate a concurrent pre-ready enqueue arriving
-      // while the drain transaction is open.  The latch buffers this call.
       pendingOverrideIntentStore.enqueue(channelId, "unread");
     }
     return ok;
   };
-
-  // Complete load and drain gen1.  The buffered gen2 enqueue fires mid-replay
-  // but is deferred — gen1's transaction commits cleanly, gen2 is promoted and
-  // persisted in the same cleanup write, then scheduleDrain() fires a second pass.
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Allow the auto-scheduled drain pass (gen2) to complete.
   await new Promise((r) => setTimeout(r, 10));
-
-  // Amendment A via latch: gen1's transaction committed cleanly.
-  // The register must be present (gen1 applied, not rolled back).
   const reg = mgr.overrideRegisters.get(channelId);
-  assert.ok(
-    reg !== undefined,
-    "gen1's register must be committed — latch prevents gen change, no rollback needed",
-  );
+  assert.ok(reg !== undefined);
   assert.ok(reg.s > 0, "gen1 S-bump must be present");
-
-  // Durable commitment: v2 blob must have gen1 register.
   const rawBlob = globalThis.window.localStorage.getItem(v2Key);
   const blob = rawBlob ? JSON.parse(rawBlob) : {};
   assert.ok(blob.r?.[channelId], "gen1 register must be persisted in v2 blob");
-
-  // Gen2 is promoted and persisted in the cleanup commit OR consumed by the
-  // auto-drain second pass.  Either way: after the second pass completes,
-  // the v2 blob must NOT have a stale gen1 pi entry (it was cleaned up) and
-  // gen2 was either in the blob (before the second pass) or consumed by it.
-  // What we assert: after the drain passes settle, the forced store is
-  // consistent (no stale teardown needed) and the queue is cleared.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "gen2 must be consumed by the auto-scheduled second drain pass",
-  );
-
-  // Clean up.
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   mgr.destroy();
 });
 
 // ── Test 31: unread→read inversion — read gen replaces unread gen ─────────────
 test("drain_unreadToReadInversion_onlyReadApplied", async () => {
-  // Both inversion directions: unread gen1, then read gen2 replaces it.
-  // Drain must apply only gen2 (read = C-bump), not gen1 (unread = S-bump).
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "31".repeat(32);
   const channelId = `inversion-ur-ch-${"c".repeat(48)}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
-  // Pre-seed an existing unread register so C-bump has something to work with.
   mgr.effectiveState.set(channelId, 50);
   mgr.overrideRegisters.set(channelId, { s: 1, c: 0, b: 50 });
   mgr.publishableContextIds.add(channelId);
   mgr.isLoadComplete = false;
-
-  // Step 1: queue unread (gen1).
   const r1 = mgr.markChannelUnread(channelId);
   assert.equal(r1.status, "queued");
   const gen1 = pendingOverrideIntentStore.get(channelId).gen;
-
-  // Step 2: queue read (gen2) — replaces gen1.
   const r2 = mgr.markChannelRead(channelId);
   assert.equal(r2.status, "queued");
   const intent = pendingOverrideIntentStore.get(channelId);
   assert.equal(intent.op, "read", "current intent must be read (gen2)");
   assert.ok(intent.gen > gen1, "gen2 must exceed gen1");
-
-  // Complete load and drain.
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Gen2 (read) must have applied: C bumped, S unchanged at 1.
   const reg = mgr.overrideRegisters.get(channelId);
   assert.ok(reg, "register must exist after read drain");
-  assert.equal(
-    reg.s,
-    1,
-    "S must be unchanged — unread gen1 was replaced, not applied",
-  );
+  assert.equal(reg.s, 1);
   assert.ok(reg.c > 0, "C must be bumped by the read drain (gen2)");
-
-  // Gen2 intent consumed.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "gen2 intent must be deleted after drain",
-  );
-
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   mgr.destroy();
 });
 
 // ── Test 32: read→unread inversion — unread gen replaces read gen ─────────────
 test("drain_readToUnreadInversion_onlySBumpApplied", async () => {
-  // Mirror of Test 31: read gen1 queued, then unread gen2 replaces it.
-  // Drain applies only gen2 (S-bump), not gen1 (C-bump).
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "32".repeat(32);
   const channelId = `inversion-ru-ch-${"d".repeat(48)}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.effectiveState.set(channelId, 50);
   mgr.isLoadComplete = false;
-
-  // Queue read (gen1) — no existing register, will be already_inactive after drain.
   const r1 = mgr.markChannelRead(channelId);
   assert.equal(r1.status, "queued");
-
-  // Queue unread (gen2) — replaces read.
   const r2 = mgr.markChannelUnread(channelId);
   assert.equal(r2.status, "queued");
   const intent = pendingOverrideIntentStore.get(channelId);
   assert.equal(intent.op, "unread", "current intent must be unread (gen2)");
-
-  // Complete load and drain.
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Gen2 (unread) applied: S bumped.
   const reg = mgr.overrideRegisters.get(channelId);
   assert.ok(reg, "register must exist after unread drain");
   assert.ok(reg.s > 0, "S must be bumped by unread drain (gen2)");
-  assert.equal(
-    reg.c,
-    0,
-    "C must be zero — read gen1 was replaced, not applied",
-  );
-
-  // Consumed.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "gen2 intent consumed",
-  );
-
+  assert.equal(reg.c, 0);
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   mgr.destroy();
 });
 
 // ── Test 33: non-reentrant drain transaction — deferred enqueue durably committed ─
 test("drain_compareDeletePreservesNewerIntent", async () => {
-  // Under the deferred-enqueue topology: while gen1's drain transaction is open
-  // for channelId, any enqueue() for that channel is buffered.  The transaction
-  // commits cleanly for gen1.  On promoteDeferred() (called before the step-3
-  // cleanup persist), gen2 is promoted and written to the v2 blob atomically
-  // with gen1's cleanup.  scheduleDrain() then fires a fresh pass for gen2.
-  //
-  // This replaces the old rollback witness.  Assertions (all surfaces):
-  //  - gen1 transaction commits cleanly (no rollback triggered)
-  //  - INTERMEDIATE: v2 blob has gen1's register + gen2's pi entry atomically
-  //    (checked right after the first drain + before the auto-drain)
-  //  - forcedUnreadStore: applied-unread callback ran (snapshot cleared)
-  //  - versionBumps === 0 (applied-unread does not bump)
-  //  - FINAL: gen2 drains in the auto-scheduled pass; queue empty, blob clean
-  //  - restart witness: if we intercept BEFORE the auto-drain, a fresh manager
-  //    hydrates gen2 from the blob
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "33".repeat(32);
   const channelId = `cmp-del-newer-ch-${"e".repeat(47)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const forcedKey = `buzz-forced-unread.v1:${pubkey}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.effectiveState.set(channelId, 50);
   mgr.isLoadComplete = false;
-
-  // Seed forced-unread state: gen1 unread intent has a "manual" source.
   const initialForcedEntry = { markerAtWhenForced: 50, sources: ["manual"] };
   globalThis.window.localStorage.setItem(
     forcedKey,
     JSON.stringify({ [channelId]: initialForcedEntry }),
   );
-
-  // Queue gen1 (unread).
   mgr.markChannelUnread(channelId);
   const gen1 = pendingOverrideIntentStore.get(channelId).gen;
-
-  // Wire the hook-level callback via wireDrainCallback.
-  // Inside the callback for applied-unread, simulate a concurrent pre-ready
-  // enqueue by calling pendingOverrideIntentStore.enqueue() directly.
-  // Under the latch, this enqueue is buffered — it does NOT change gen1's
-  // transaction (gen cannot change while the transaction is open).
   const cb = wireDrainCallback(mgr, pubkey);
   const origCallback = mgr.onDrainOutcome;
   let gen2PromotedAfterCallback = false;
@@ -3415,126 +2167,57 @@ test("drain_compareDeletePreservesNewerIntent", async () => {
       outcome.channelId === channelId
     ) {
       injectedOnce = true;
-      // Simulate a concurrent pre-ready enqueue arriving while the drain
-      // transaction is still open (between onDrainOutcome and cleanup commit).
-      // This must be buffered by the latch, not applied immediately.
       pendingOverrideIntentStore.enqueue(channelId, "unread");
       gen2PromotedAfterCallback = true;
     }
   };
-
-  // Prevent the auto-scheduled gen2 drain from running so we can assert the
-  // intermediate blob state (gen2 pi present).  We do this by capturing the
-  // scheduleDrain call and deferring it.
   let capturedDrainFn = null;
   const origScheduleDrain = mgr.scheduleDrain.bind(mgr);
   mgr.scheduleDrain = () => {
-    // Instead of draining immediately, save the request for manual triggering.
     capturedDrainFn = () => {
       origScheduleDrain();
     };
   };
-
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
 
   // ── Intermediate assertions (before gen2 auto-drain) ──────────────────────
-  assert.ok(
-    gen2PromotedAfterCallback,
-    "gen2 enqueue must have been injected in callback",
-  );
-
-  // Gen1's register must be committed to the v2 blob.
+  assert.ok(gen2PromotedAfterCallback);
   let rawBlob = globalThis.window.localStorage.getItem(v2Key);
   let blob = rawBlob ? JSON.parse(rawBlob) : {};
-  assert.ok(
-    blob.r?.[channelId],
-    "gen1's register must be persisted in v2 blob after successful drain",
-  );
-
-  // Gen2's pi must be in the v2 blob (promoted atomically with gen1's cleanup).
-  assert.ok(
-    blob.pi?.[channelId],
-    "gen2's pi must be in v2 blob — durable promotion in same commit as gen1 cleanup",
-  );
-
-  // Gen1's receipt must be cleaned up.
-  assert.equal(
-    blob.receipts?.[channelId],
-    undefined,
-    "gen1's receipt entry must be cleaned up",
-  );
-
-  // Gen2 gen must be higher than gen1.
+  assert.ok(blob.r?.[channelId]);
+  assert.ok(blob.pi?.[channelId]);
+  assert.equal(blob.receipts?.[channelId], undefined);
   assert.ok(blob.pi[channelId].gen > gen1, "gen2 gen in blob must exceed gen1");
-
-  // Restart witness: a fresh manager must hydrate gen2 from the blob.
   {
     const mgr2 = new ReadStateManager(pubkey, fakeRelay);
     mgr2.hydrateFromLocalStorage();
     const hydratedGen2 = pendingOverrideIntentStore.get(channelId);
-    assert.ok(
-      hydratedGen2,
-      "gen2 must be hydrated from v2 blob in a new session",
-    );
+    assert.ok(hydratedGen2);
     assert.equal(hydratedGen2.op, "unread", "gen2 op must be unread");
-    assert.ok(
-      hydratedGen2.gen > gen1,
-      "gen2 gen must exceed gen1 in hydrated state",
-    );
+    assert.ok(hydratedGen2.gen > gen1);
     mgr2.destroy();
-    // Restore the in-memory store to its pre-hydration2 state for the gen2 drain below.
-    // (hydrateFromLocalStorage restores from blob, so gen2 is still in the store.)
   }
-
-  // versionBumps: applied-unread does not bump version (no forced store write).
-  assert.equal(
-    cb.versionBumps,
-    0,
-    "applied-unread does not bump version (no forced store write needed)",
-  );
+  assert.equal(cb.versionBumps, 0);
 
   // ── Fire the gen2 drain ────────────────────────────────────────────────────
   assert.ok(capturedDrainFn, "scheduleDrain must have been called");
-  // Restore the original scheduleDrain and fire the captured request.
   mgr.scheduleDrain = origScheduleDrain;
   capturedDrainFn();
-  // Wait for the gen2 drain to complete.
   await new Promise((r) => setTimeout(r, 10));
-
-  // After gen2 drains: queue empty, blob has no pi entry.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "gen2 intent must be consumed after the auto-scheduled drain pass",
-  );
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   rawBlob = globalThis.window.localStorage.getItem(v2Key);
   blob = rawBlob ? JSON.parse(rawBlob) : {};
-  assert.equal(
-    blob.pi?.[channelId],
-    undefined,
-    "gen2's pi must be cleaned up after the auto-drain",
-  );
-
-  // Clean up.
+  assert.equal(blob.pi?.[channelId], undefined);
   cb.teardown();
   mgr.destroy();
 });
 
 // ── Test 34: Amendment C via production load — restart + fetchAndMerge ────────
 test("drain_amendmentC_restart_fetchAndMerge_noBumpAfterReceipt", async () => {
-  // Amendment C via the PRODUCTION load path: after a crash-in-cleanup, the
-  // next session hydrates from storage and runs fetchAndMerge() (not a direct
-  // register write). The receipt must prevent a second S-bump.
-  //
-  // Thufir's finding: Tests 26/27 directly set isLoadComplete=true and write
-  // overrideRegisters directly — they bypass the production load path.
-  // This test uses the actual fetchAndMerge() flow via fakeRelay event delivery.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "34".repeat(32);
   const channelId = `amend-c-prod-ch-${"f".repeat(48)}`;
-
-  // Craft crash-state in localStorage: unread applied (S=5), receipt intact.
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   ls.setItem(
@@ -3546,9 +2229,6 @@ test("drain_amendmentC_restart_fetchAndMerge_noBumpAfterReceipt", async () => {
       ng: 2,
     }),
   );
-
-  // A remote device published C=6 (read). Simulate via a fetched event that,
-  // when decrypted, delivers C=6 for the channel via the standard merge path.
   const remoteBlob = JSON.stringify({
     v: 1,
     client_id: "remote-device-client",
@@ -3559,7 +2239,6 @@ test("drain_amendmentC_restart_fetchAndMerge_noBumpAfterReceipt", async () => {
       [channelId]: 200, // frontier advanced past B → override inactive
     },
   });
-  // Slot ID must match /^[0-9a-f]{32}$/ to pass isValidReadStateDTag.
   const remoteSlotId = "0d".repeat(16);
   const blobEvent = {
     id: "ab".repeat(32),
@@ -3573,7 +2252,6 @@ test("drain_amendmentC_restart_fetchAndMerge_noBumpAfterReceipt", async () => {
     content: "CIPHER",
     sig: "s".repeat(128),
   };
-
   let fetchCallCount = 0;
   globalThis.window.__TAURI_INTERNALS__ = {
     invoke: async (command) => {
@@ -3581,7 +2259,6 @@ test("drain_amendmentC_restart_fetchAndMerge_noBumpAfterReceipt", async () => {
       throw new Error(`Unexpected: ${command}`);
     },
   };
-
   const fakeRelay = {
     fetchEvents: async () => {
       fetchCallCount++;
@@ -3591,7 +2268,6 @@ test("drain_amendmentC_restart_fetchAndMerge_noBumpAfterReceipt", async () => {
     subscribeToReconnects: () => () => {},
     getConnectionGeneration: () => 0,
     subscribeFenced: async (_filter, handler) => {
-      // Deliver the event synchronously before EOSE.
       if (fetchCallCount === 0) {
         handler(blobEvent);
       }
@@ -3599,41 +2275,20 @@ test("drain_amendmentC_restart_fetchAndMerge_noBumpAfterReceipt", async () => {
     },
     subscribeLive: async (_f, _h) => () => {},
   };
-
   try {
-    // Session 2: hydrate, then complete load via real fetchAndMerge().
     const mgr = new ReadStateManager(pubkey, fakeRelay);
     mgr.hydrateFromLocalStorage();
-
-    // Receipt must be loaded.
     const receipt = mgr.appliedReceipts.get(channelId);
     assert.ok(receipt, "receipt must be loaded on restart");
     assert.equal(receipt.intentGen, 1);
-
-    // Run fetchAndMerge via the production path.
     await mgr.fetchAndMerge(mgr.loadGeneration);
     assert.equal(mgr.isLoadComplete, true, "load must complete");
-
-    // Drain via production path.
     await mgr.drainPendingIntents(mgr.loadGeneration);
-
-    // The alreadyApplied path must have run: no new S-bump.
-    // C must reflect the merged remote (max(3,6)=6).
     const reg = mgr.overrideRegisters.get(channelId);
     assert.ok(reg, "register must exist");
-    assert.equal(
-      reg.s,
-      5,
-      "S must NOT be re-bumped by drain (receipt prevents it)",
-    );
+    assert.equal(reg.s, 5);
     assert.ok(reg.c >= 6, "C must reflect remote C=6 merge");
-
-    // Intent consumed.
-    assert.equal(
-      pendingOverrideIntentStore.get(channelId),
-      undefined,
-      "intent must be consumed after drain",
-    );
+    assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   } finally {
     delete globalThis.window.__TAURI_INTERNALS__;
   }
@@ -3641,305 +2296,95 @@ test("drain_amendmentC_restart_fetchAndMerge_noBumpAfterReceipt", async () => {
 
 // ── Test 35: atomic deletion — intent + receipt deleted in one persist ─────────
 test("drain_cleanupCommit_intentAndReceiptDeletedAtomically", async () => {
-  // Atomic deletion witness: after successful drain, both the intent AND the
-  // receipt are absent from the v2 blob in a single commit (same persist call).
-  // If they were deleted in separate writes, there would be a window where one
-  // survives without the other.
-  //
-  // Verify: after drain, the v2 blob contains neither pi nor receipts entry.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "35".repeat(32);
   const channelId = `atomic-del-ch-${"g".repeat(50)}`;
-
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.effectiveState.set(channelId, 50);
   mgr.isLoadComplete = false;
-
-  // Queue the intent.
   mgr.markChannelUnread(channelId);
-
-  // Drain: apply the intent (receipt gets co-committed with register).
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // After successful drain, check the persisted v2 blob.
   const rawAfter = ls.getItem(v2Key);
   const blobAfter = rawAfter ? JSON.parse(rawAfter) : {};
-
-  // Both intent (pi) and receipt (receipts) must be absent — single cleanup commit.
   const piEntry = blobAfter?.pi?.[channelId];
-  assert.equal(
-    piEntry,
-    undefined,
-    "intent must be deleted from pi in cleanup commit",
-  );
-
+  assert.equal(piEntry, undefined);
   const receiptEntry = blobAfter?.receipts?.[channelId];
-  assert.equal(
-    receiptEntry,
-    undefined,
-    "receipt must be deleted from receipts in cleanup commit",
-  );
-
-  // The register IS present (drain succeeded, override applied).
+  assert.equal(receiptEntry, undefined);
   const regEntry = blobAfter?.r?.[channelId];
   assert.ok(regEntry, "register must persist after successful drain");
-
   mgr.destroy();
 });
 
-// ── Test 36: controller — automatic retry after incomplete verdict ─────────────
-test("retryLoad_incompleteVerdictSchedulesAutomaticRetry", async () => {
-  // After an incomplete verdict, retryLoad() must schedule a backoff timer that
-  // actually fires a fresh retryLoad() attempt automatically.
-  // Verifies: (1) timer is scheduled, (2) delay > 0 for second attempt,
-  // (3) retryAttempt is incremented, (4) the fired callback starts a new generation
-  // (fresh fetch), (5) destroy cancels the scheduled timer before it fires.
-  globalThis.window.localStorage = makeLocalStorage();
-  const pubkey = "36".repeat(32);
-
-  let fetchCallCount = 0;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-    subscribeFenced: async () => {
-      fetchCallCount++;
-      throw new Error("fence timeout"); // always incomplete
-    },
-    subscribeLive: async (_f, _h) => () => {},
-  };
-
-  const origSetTimeout = globalThis.window.setTimeout;
-  const origClearTimeout = globalThis.window.clearTimeout;
-
-  const scheduledTimers = new Map();
-  let nextFakeId = 10000;
-
-  globalThis.window.setTimeout = (fn, ms) => {
-    if (ms > 0) {
-      const id = nextFakeId++;
-      scheduledTimers.set(id, { fn, ms });
-      return id;
+// ── Tests 36/36b: incomplete verdict schedules automatic retry (mirror pair) ──
+// biome-ignore format: compact table rows
+const incompleteVerdictCases = [
+  { name: "retryLoad_incompleteVerdictSchedulesAutomaticRetry",   pubkey: "36".repeat(32),              trigger: (mgr) => mgr.retryLoad()   },
+  { name: "initialize_incompleteVerdict_schedulesAutomaticRetry", pubkey: "36b".repeat(21).slice(0,64), trigger: (mgr) => mgr.initialize() },
+];
+for (const row of incompleteVerdictCases) {
+  test(row.name, async () => {
+    let fetchCallCount = 0;
+    const timers = makeFakeTimers();
+    try {
+      globalThis.window.localStorage = makeLocalStorage();
+      const fakeRelay = makeFakeRelay({
+        subscribeFenced: async () => {
+          fetchCallCount++;
+          throw new Error("fence timeout");
+        },
+      });
+      const mgr = new ReadStateManager(row.pubkey, fakeRelay);
+      assert.equal(mgr.retryAttempt, 0, "precondition: retryAttempt is 0");
+      await row.trigger(mgr);
+      assert.equal(fetchCallCount, 1, "first fetch must have been called");
+      assert.ok(
+        mgr.retryAttempt > 0,
+        "retryAttempt must be > 0 after first incomplete",
+      );
+      assert.ok(
+        mgr.retryBackoffTimer !== null,
+        "retryBackoffTimer must be set",
+      );
+      assert.ok(timers.scheduled.size > 0, "a timer must be pending");
+      const [timerId, { fn: timerFn, ms }] = [...timers.scheduled.entries()][0];
+      assert.ok(ms > 0, "backoff timer delay must be > 0");
+      timers.scheduled.delete(timerId);
+      const genBeforeFire = mgr.loadGeneration;
+      timerFn();
+      await new Promise((r) => timers.origSetTimeout(r, 50));
+      assert.ok(
+        fetchCallCount >= 2,
+        "automatic retry must trigger a second fetch",
+      );
+      assert.ok(
+        mgr.loadGeneration >= genBeforeFire,
+        "load generation must not regress",
+      );
+      assert.ok(
+        mgr.retryBackoffTimer !== null || timers.scheduled.size > 0,
+        "follow-up timer must be scheduled",
+      );
+      mgr.destroy();
+      assert.equal(
+        mgr.retryBackoffTimer,
+        null,
+        "destroy must clear retryBackoffTimer",
+      );
+      assert.equal(timers.scheduled.size, 0, "no pending timers after destroy");
+    } finally {
+      timers.restore();
     }
-    return origSetTimeout(fn, ms);
-  };
-  globalThis.window.clearTimeout = (id) => {
-    if (scheduledTimers.has(id)) {
-      scheduledTimers.delete(id);
-    } else {
-      origClearTimeout(id);
-    }
-  };
-
-  try {
-    const mgr = new ReadStateManager(pubkey, fakeRelay);
-    assert.equal(mgr.retryAttempt, 0, "precondition: retryAttempt is 0");
-
-    // First retry (immediate — attempt 0 means delayMs=0).
-    await mgr.retryLoad();
-    assert.equal(fetchCallCount, 1, "first fetch must have been called");
-
-    // After first incomplete verdict, retryAttempt must be > 0.
-    assert.ok(
-      mgr.retryAttempt > 0,
-      "retryAttempt must be > 0 after first incomplete",
-    );
-
-    // A backoff timer must have been scheduled (automatic retry loop).
-    assert.ok(
-      mgr.retryBackoffTimer !== null,
-      "retryBackoffTimer must be set — automatic retry was scheduled",
-    );
-    assert.ok(
-      scheduledTimers.size > 0,
-      "a timer must be pending in the fake scheduler",
-    );
-
-    // Timer delay must be > 0 (bounded backoff).
-    const [timerId, { fn: timerFn, ms }] = [...scheduledTimers.entries()][0];
-    assert.ok(ms > 0, "backoff timer delay must be > 0 for attempt >= 1");
-
-    // Fire the timer callback — this simulates the automatic second attempt.
-    // The callback calls retryLoad() with a fresh generation.
-    scheduledTimers.delete(timerId);
-    const genBeforeFire = mgr.loadGeneration;
-    timerFn(); // fires the callback
-    // Wait for the async retryLoad to complete.
-    await new Promise((r) => origSetTimeout(r, 50));
-
-    // A fresh fetch must have been triggered by the automatic retry.
-    assert.ok(
-      fetchCallCount >= 2,
-      "automatic retry must trigger a second fetch; fetchCallCount=" +
-        fetchCallCount,
-    );
-    // A new generation must have been started (or the same if it finished).
-    assert.ok(
-      mgr.loadGeneration >= genBeforeFire,
-      "load generation must not regress",
-    );
-
-    // After the automatic retry (also incomplete), another timer is scheduled.
-    assert.ok(
-      mgr.retryBackoffTimer !== null || scheduledTimers.size > 0,
-      "a follow-up backoff timer must be scheduled after the second incomplete",
-    );
-
-    // Destroy must cancel the pending timer.
-    mgr.destroy();
-    assert.equal(
-      mgr.retryBackoffTimer,
-      null,
-      "destroy must clear retryBackoffTimer",
-    );
-    assert.equal(
-      scheduledTimers.size,
-      0,
-      "fake scheduler must have no pending timers after destroy",
-    );
-  } finally {
-    globalThis.window.setTimeout = origSetTimeout;
-    globalThis.window.clearTimeout = origClearTimeout;
-  }
-});
-
-// ── Test 36b: controller — initialize() incomplete → schedules automatic retry
-test("initialize_incompleteVerdict_schedulesAutomaticRetry", async () => {
-  // initialize() ending with an incomplete verdict must schedule a retryBackoffTimer
-  // so the manager eventually retries even without an external reconnect signal.
-  // Verifies: (1) retryBackoffTimer is set, (2) delay > 0, (3) retryAttempt is 1,
-  // (4) the fired callback starts a fresh fetch (second attempt), (5) destroy cancels.
-  globalThis.window.localStorage = makeLocalStorage();
-  const pubkey = "36b".repeat(21).slice(0, 64);
-
-  let fetchCallCount = 0;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-    subscribeFenced: async () => {
-      fetchCallCount++;
-      throw new Error("fence timeout"); // always incomplete
-    },
-    subscribeLive: async (_f, _h) => () => {},
-  };
-
-  const origSetTimeout = globalThis.window.setTimeout;
-  const origClearTimeout = globalThis.window.clearTimeout;
-
-  const scheduledTimers = new Map();
-  let nextFakeId = 20000;
-
-  globalThis.window.setTimeout = (fn, ms) => {
-    if (ms > 0) {
-      const id = nextFakeId++;
-      scheduledTimers.set(id, { fn, ms });
-      return id;
-    }
-    return origSetTimeout(fn, ms);
-  };
-  globalThis.window.clearTimeout = (id) => {
-    if (scheduledTimers.has(id)) {
-      scheduledTimers.delete(id);
-    } else {
-      origClearTimeout(id);
-    }
-  };
-
-  try {
-    const mgr = new ReadStateManager(pubkey, fakeRelay);
-
-    await mgr.initialize();
-
-    // initialize() must have scheduled a retry timer.
-    assert.ok(
-      mgr.retryBackoffTimer !== null,
-      "retryBackoffTimer must be set after incomplete initialize()",
-    );
-    assert.ok(
-      scheduledTimers.size > 0,
-      "a timer must be pending in the fake scheduler after incomplete initialize()",
-    );
-
-    // retryAttempt must be 1 (initialize = attempt 0 consumed).
-    assert.equal(
-      mgr.retryAttempt,
-      1,
-      "retryAttempt must be 1 after incomplete initialize()",
-    );
-
-    // Timer delay must be > 0.
-    const [timerId, { fn: timerFn, ms }] = [...scheduledTimers.entries()][0];
-    assert.ok(
-      ms > 0,
-      "backoff timer delay must be > 0 after incomplete initialize()",
-    );
-
-    // Fire the timer callback — proves the automatic second attempt runs.
-    scheduledTimers.delete(timerId);
-    const fetchBeforeFire = fetchCallCount;
-    timerFn(); // fires the scheduled retryLoad()
-    // Wait for the async retryLoad() to complete.
-    await new Promise((r) => origSetTimeout(r, 50));
-
-    assert.ok(
-      fetchCallCount > fetchBeforeFire,
-      "automatic retry must trigger another fetch after initialize() timer fires",
-    );
-
-    // destroy() must cancel any remaining pending timer.
-    mgr.destroy();
-    assert.equal(
-      mgr.retryBackoffTimer,
-      null,
-      "destroy must clear retryBackoffTimer",
-    );
-    assert.equal(
-      scheduledTimers.size,
-      0,
-      "fake scheduler must have no pending timers after destroy",
-    );
-  } finally {
-    globalThis.window.setTimeout = origSetTimeout;
-    globalThis.window.clearTimeout = origClearTimeout;
-  }
-});
+  });
+}
 
 // ── Test 37: controller — reconnect coalescing, backoff cancel, fresh gen/fetch ──
 test("retryLoad_reconnectDuringLoadInFlight_coalescesToPendingRetry", async () => {
-  // Scenario: a load is in-flight; a reconnect arrives (sets pendingRetryOnComplete);
-  // the in-flight load completes with an incomplete verdict (backoff timer set);
-  // pendingRetryOnComplete fires an immediate retry that cancels the EXACT first
-  // backoff timer and starts a second fetch; a second reconnect during the
-  // pending-triggered (second) fetch is coalesced unconditionally.
-  //
-  // Assertions (all unconditional — no conditional skips):
-  //  - reconnect during load sets pendingRetryOnComplete, does NOT advance gen
-  //  - after the first load resolves: gen advanced by exactly 1, second fetch fired
-  //  - the EXACT backoff timer from the first incomplete is cancelled (tracked by ID)
-  //  - second reconnect during the second in-flight load always sets pendingRetryOnComplete
-  //  - destroy cancels all residual timers
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "37".repeat(32);
-
-  // Two barriers: first controls the gen-1 fetch; second controls the gen-2 fetch.
   let resolveFirst;
   const firstBarrier = new Promise((r) => {
     resolveFirst = r;
@@ -3948,8 +2393,6 @@ test("retryLoad_reconnectDuringLoadInFlight_coalescesToPendingRetry", async () =
   const secondBarrier = new Promise((r) => {
     resolveSecond = r;
   });
-
-  // Fake timer: intercept ms>0 timers, record exact IDs, track clears.
   const origSetTimeout = globalThis.window.setTimeout;
   const origClearTimeout = globalThis.window.clearTimeout;
   const scheduledTimers = new Map(); // id → { fn, ms } — only ACTIVE (not yet cleared) timers
@@ -3973,7 +2416,6 @@ test("retryLoad_reconnectDuringLoadInFlight_coalescesToPendingRetry", async () =
       origClearTimeout(id);
     }
   };
-
   let fetchCallCount = 0;
   const fakeRelay = {
     fetchEvents: async () => [],
@@ -3990,143 +2432,56 @@ test("retryLoad_reconnectDuringLoadInFlight_coalescesToPendingRetry", async () =
         await secondBarrier;
         throw new Error("fence timeout"); // incomplete
       }
-      // call 3+: immediately incomplete
       throw new Error("fence timeout");
     },
     subscribeLive: async (_f, _h) => () => {},
   };
-
   try {
     const mgr = new ReadStateManager(pubkey, fakeRelay);
 
     // ── Phase 1: start first load, block it at the barrier ────────────────────
     const load1Promise = mgr.retryLoad();
     await new Promise((r) => origSetTimeout(r, 0)); // let async fn reach await
-    assert.equal(
-      mgr.loadInFlight,
-      true,
-      "loadInFlight must be true while first fetch blocks",
-    );
+    assert.equal(mgr.loadInFlight, true);
     const gen1 = mgr.loadGeneration;
 
     // ── Phase 2: first reconnect while load is in-flight ──────────────────────
-    // retryLoad() returns synchronously because loadInFlight is true.
     mgr.retryLoad();
-    assert.equal(
-      mgr.pendingRetryOnComplete,
-      true,
-      "first reconnect during loadInFlight must set pendingRetryOnComplete",
-    );
-    assert.equal(
-      mgr.loadGeneration,
-      gen1,
-      "loadGeneration must NOT advance on coalesced reconnect",
-    );
-
-    // A second simultaneous reconnect also coalesces.
+    assert.equal(mgr.pendingRetryOnComplete, true);
+    assert.equal(mgr.loadGeneration, gen1);
     mgr.retryLoad();
-    assert.equal(
-      mgr.pendingRetryOnComplete,
-      true,
-      "second reconnect during loadInFlight must keep pendingRetryOnComplete set",
-    );
-    assert.equal(
-      mgr.loadGeneration,
-      gen1,
-      "gen must still not advance after second reconnect",
-    );
+    assert.equal(mgr.pendingRetryOnComplete, true);
+    assert.equal(mgr.loadGeneration, gen1);
 
     // ── Phase 3: release gen-1 fetch — incomplete verdict fires ───────────────
     resolveFirst();
     await load1Promise;
-    // The incomplete verdict (line 384-392) sets a backoff timer with ms>0,
-    // but the finally-block detects pendingRetryOnComplete, cancels it, and
-    // calls retryLoad() immediately.  By the time we're here:
-    //  - The backoff timer was created (in allScheduledTimerIds)
-    //  - The backoff timer was cancelled (in clearedTimerIds)
-    //  - The gen-2 fetch is already in-flight (blocked on secondBarrier)
-    assert.ok(
-      allScheduledTimerIds.size >= 1,
-      "at least one backoff timer must have been created for the incomplete verdict",
-    );
+    assert.ok(allScheduledTimerIds.size >= 1);
     const firstBackoffTimerId = [...allScheduledTimerIds][0];
 
     // ── Phase 4: finally-block fires pending retry ─────────────────────────────
-    // The finally-block detects pendingRetryOnComplete, cancels the backoff timer,
-    // and calls retryLoad() immediately (which starts gen-2 fetch).
     await new Promise((r) => origSetTimeout(r, 0));
-
-    // The first backoff timer must have been cancelled with its EXACT ID.
-    assert.ok(
-      clearedTimerIds.has(firstBackoffTimerId),
-      "the first incomplete's backoff timer must be cancelled by the exact timer ID",
-    );
-    assert.equal(
-      scheduledTimers.size,
-      0,
-      "no timers must be pending after the cancel (gen-2 fetch is in-flight, not waiting)",
-    );
-
-    // loadGeneration must have advanced exactly once for the fresh pending retry.
-    assert.equal(
-      mgr.loadGeneration,
-      gen1 + 1,
-      "gen must advance by exactly 1 when pendingRetryOnComplete fires",
-    );
+    assert.ok(clearedTimerIds.has(firstBackoffTimerId));
+    assert.equal(scheduledTimers.size, 0);
+    assert.equal(mgr.loadGeneration, gen1 + 1);
     assert.equal(fetchCallCount, 2, "exactly two fetches must have occurred");
 
     // ── Phase 5: gen-2 fetch is in-flight — multiple reconnects coalesce ─────────
-    // loadInFlight must still be true because secondBarrier has not been released.
-    assert.equal(
-      mgr.loadInFlight,
-      true,
-      "gen-2 load must still be in-flight (secondBarrier not released)",
-    );
-    // First reconnect — unconditional, no `if (loadInFlight)` guard.
+    assert.equal(mgr.loadInFlight, true);
     mgr.retryLoad();
-    assert.equal(
-      mgr.pendingRetryOnComplete,
-      true,
-      "first reconnect during gen-2 load must unconditionally set pendingRetryOnComplete",
-    );
-    // Second reconnect — must also coalesce (not start a third fetch immediately).
+    assert.equal(mgr.pendingRetryOnComplete, true);
     mgr.retryLoad();
-    assert.equal(
-      mgr.pendingRetryOnComplete,
-      true,
-      "second reconnect during gen-2 load must keep pendingRetryOnComplete set",
-    );
-    assert.equal(
-      mgr.loadGeneration,
-      gen1 + 1,
-      "gen must not advance on coalesced reconnects during gen-2 in-flight",
-    );
+    assert.equal(mgr.pendingRetryOnComplete, true);
+    assert.equal(mgr.loadGeneration, gen1 + 1);
 
     // ── Phase 6: release gen-2 fetch — pending retry fires gen-3 load ─────────
-    // The pending retry means the finally-block fires retryLoad() immediately after
-    // gen-2 resolves, starting a gen-3 fetch.  Assert gen-3 fires BEFORE destroy.
     resolveSecond();
     await new Promise((r) => origSetTimeout(r, 0));
-
-    // Gen-3 fetch must be in-flight (started by the pending retry on gen-2 complete).
-    assert.equal(
-      mgr.loadGeneration,
-      gen1 + 2,
-      "gen must advance to gen1+2 when pending retry fires after gen-2 complete",
-    );
+    assert.equal(mgr.loadGeneration, gen1 + 2);
     assert.equal(fetchCallCount, 3, "exactly three fetches must have occurred");
-
     mgr.destroy();
-    assert.equal(
-      mgr.retryBackoffTimer,
-      null,
-      "destroy must clear retryBackoffTimer",
-    );
-    assert.equal(
-      scheduledTimers.size,
-      0,
-      "fake scheduler must have no timers after destroy",
-    );
+    assert.equal(mgr.retryBackoffTimer, null);
+    assert.equal(scheduledTimers.size, 0);
   } finally {
     globalThis.window.setTimeout = origSetTimeout;
     globalThis.window.clearTimeout = origClearTimeout;
@@ -4135,17 +2490,13 @@ test("retryLoad_reconnectDuringLoadInFlight_coalescesToPendingRetry", async () =
 
 // ── Test 38: controller — stale-completion ordering via gen check ──────────────
 test("fetchAndMerge_staleGeneration_doesNotSetLoadComplete", async () => {
-  // If loadGeneration advances while fetchAndMerge is in flight, the stale
-  // generation's complete verdict must NOT mark the manager as load-complete.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "38".repeat(32);
-
   let resolveFirst;
   const firstBarrier = new Promise((r) => {
     resolveFirst = r;
   });
   let callCount = 0;
-
   const fakeRelay = {
     fetchEvents: async () => [],
     publishEvent: async () => {},
@@ -4154,7 +2505,6 @@ test("fetchAndMerge_staleGeneration_doesNotSetLoadComplete", async () => {
     subscribeFenced: async (_f, _h) => {
       callCount++;
       if (callCount === 1) {
-        // First call: wait for barrier before returning EOSE.
         await firstBarrier;
         return makeFenceHandle({ eose: true });
       }
@@ -4162,62 +2512,37 @@ test("fetchAndMerge_staleGeneration_doesNotSetLoadComplete", async () => {
     },
     subscribeLive: async (_f, _h) => () => {},
   };
-
   const mgr = new ReadStateManager(pubkey, fakeRelay);
-
-  // Start gen=1 fetch; it blocks at subscribeFenced.
   const gen1 = mgr.loadGeneration;
   const firstFetch = mgr.fetchAndMerge(gen1);
   await new Promise((r) => setTimeout(r, 0));
-
-  // Advance the generation by starting a new fetch.
   ++mgr.loadGeneration;
   const gen2 = mgr.loadGeneration;
   await mgr.fetchAndMerge(gen2);
   assert.equal(mgr.isLoadComplete, true, "gen2 load must complete");
-
-  // Now release the blocked gen1 fetch.
   resolveFirst();
   await firstFetch;
-
-  // Gen1's verdict should not have mutated isLoadComplete back to stale state.
-  // (Gen2 left it true; gen1 must not interfere.)
-  assert.equal(
-    mgr.isLoadComplete,
-    true,
-    "gen1 stale verdict must not corrupt gen2's complete state",
-  );
-
+  assert.equal(mgr.isLoadComplete, true);
   mgr.destroy();
 });
 
 // ── Test 39: controller — destroy cancels backoff timer ───────────────────────
 test("retryLoad_destroyWhileTimerPending_cancelsTimer", async () => {
-  // destroy() must cancel any pending retryBackoffTimer so no stale retry fires.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "39".repeat(32);
-
   let timerSet = false;
   let pendingTimerResolve = null; // captured so we can drain after destroy
   const origSetTimeout = globalThis.window.setTimeout;
   const origClearTimeout = globalThis.window.clearTimeout;
-
-  // Track active backoff timers by real ID so clearTimeout works correctly.
-  // When ms > 0 we wrap the fn to capture state, but still use the real timer
-  // (with a large delay so it doesn't fire during the test) so origClearTimeout
-  // can cancel it.  After destroy() we must resolve the pending await manually
-  // to let retryLoad's finally-block run and the promise settle.
   const activeTimerIds = new Set();
   globalThis.window.setTimeout = (fn, ms) => {
     if (ms > 0) {
       timerSet = true;
-      // Schedule with origSetTimeout at a safe delay so clearTimeout works.
       const id = origSetTimeout(() => {
         activeTimerIds.delete(id);
         pendingTimerResolve = null;
         fn();
       }, 60_000); // long enough never to fire during test
-      // Capture resolve so we can drain manually after destroy().
       pendingTimerResolve = fn;
       activeTimerIds.add(id);
       return id;
@@ -4228,7 +2553,6 @@ test("retryLoad_destroyWhileTimerPending_cancelsTimer", async () => {
     activeTimerIds.delete(id);
     origClearTimeout(id);
   };
-
   try {
     const fakeRelay = {
       fetchEvents: async () => [],
@@ -4240,41 +2564,15 @@ test("retryLoad_destroyWhileTimerPending_cancelsTimer", async () => {
       },
       subscribeLive: async (_f, _h) => () => {},
     };
-
     const mgr = new ReadStateManager(pubkey, fakeRelay);
-
-    // First retry (immediate, attempt=0 → no timer).
     await mgr.retryLoad();
-    // retryAttempt is now 1; next retry will schedule a timer.
-
-    // Start second retry asynchronously — it will set a timer.
     const retryPromise = mgr.retryLoad();
-    // Give async fn time to reach the timer await.
     await new Promise((r) => origSetTimeout(r, 0));
-
     assert.equal(timerSet, true, "a backoff timer must have been scheduled");
-    assert.ok(
-      mgr.retryBackoffTimer !== null,
-      "retryBackoffTimer must be non-null while waiting",
-    );
-
-    // Destroy must cancel the timer.
+    assert.ok(mgr.retryBackoffTimer !== null);
     mgr.destroy();
-    assert.equal(
-      mgr.retryBackoffTimer,
-      null,
-      "retryBackoffTimer must be null after destroy",
-    );
-    assert.equal(
-      activeTimerIds.size,
-      0,
-      "backoff timer must be cleared by destroy()",
-    );
-
-    // retryLoad is still awaiting its backoff Promise. Fire the pending resolve
-    // manually (the real timer was cleared so it won't auto-fire) so the
-    // finally-block in retryLoad runs and retryPromise settles. Since
-    // mgr.destroyed===true, retryLoad returns immediately after the resolve.
+    assert.equal(mgr.retryBackoffTimer, null);
+    assert.equal(activeTimerIds.size, 0);
     if (pendingTimerResolve) pendingTimerResolve();
     await retryPromise;
   } finally {
@@ -4285,166 +2583,77 @@ test("retryLoad_destroyWhileTimerPending_cancelsTimer", async () => {
 
 // ── Test 40: controller — exactly one drain per complete-load generation ───────
 test("retryLoad_exactlyOneDrainPerCompleteGeneration", async () => {
-  // A single complete-load transition must trigger exactly one drain.
-  // Multiple retryLoad() calls for the same complete generation must not
-  // enqueue a second drain.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "40".repeat(32);
   const channelId = `one-drain-ch-${"h".repeat(51)}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.isLoadComplete = false;
-
-  // Queue an intent that will be consumed by the drain.
   mgr.markChannelUnread(channelId);
-
-  // First retryLoad → complete → drain fires.
   await mgr.retryLoad();
   assert.equal(mgr.isLoadComplete, true, "load must be complete");
-
-  // Record register state after first drain.
   const regAfterFirst = mgr.overrideRegisters.get(channelId);
   const sAfterFirst = regAfterFirst?.s ?? 0;
-
-  // Second retryLoad on an already-complete manager: drainScheduled is false
-  // (already consumed), so a second drain must NOT re-bump the register.
   await mgr.retryLoad();
-
   const regAfterSecond = mgr.overrideRegisters.get(channelId);
-  assert.equal(
-    regAfterSecond?.s ?? 0,
-    sAfterFirst,
-    "S must NOT be re-bumped by a second retryLoad (exactly-one-drain invariant)",
-  );
-
+  assert.equal(regAfterSecond?.s ?? 0, sAfterFirst);
   mgr.destroy();
 });
 
 // ── Test 41: store/UI — identity swap during drain cancels stale gen ──────────
 test("drain_identitySwapDuringDrain_staleGenCancelled", async () => {
-  // If the manager is destroyed and recreated for a new pubkey, the stale
-  // generation's drain must be cancelled. Verify via the pubkey fence inside
-  // drainPendingIntents: pubkeyFence !== ctx.pubkey → break.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkeyA = "41".repeat(32);
   const channelId = `identity-swap-ch-${"i".repeat(47)}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgrA = new ReadStateManager(pubkeyA, fakeRelay);
   mgrA.effectiveState.set(channelId, 50);
   mgrA.isLoadComplete = false;
-
-  // Queue intent for pubkeyA.
   mgrA.markChannelUnread(channelId);
   const intentA = pendingOverrideIntentStore.get(channelId);
   assert.ok(intentA, "intent must exist for pubkeyA");
-
-  // Destroy mgrA before drain (simulates identity swap).
   mgrA.destroy();
-
-  // The drainPendingIntents call with mgrA's context should be cancelled
-  // because mgrA.destroyed === true.
-  // Verify by running the drain and asserting the intent is NOT consumed.
-  // (The drain early-exits on ctx.destroyed.)
   await mgrA.drainPendingIntents(mgrA.loadGeneration);
-
-  // The intent must still be alive — drain was no-op because destroyed.
   const intentAfter = pendingOverrideIntentStore.get(channelId);
   assert.ok(intentAfter, "intent must survive drain when manager is destroyed");
-
-  // Clean up.
   pendingOverrideIntentStore.compareAndDelete(channelId, intentAfter.gen);
 });
 
 // ── Test 42: deferred refusal — queued unread intent refused by drain ─────────
 test("drain_queuedUnread_refused_surfacesOutcome", async () => {
-  // When a queued unread intent is refused by drain (e.g., budget_exhausted),
-  // onDrainOutcome must be called with (channelId, "unread", "refused", reason).
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "42".repeat(32);
   const channelId = `deferred-refusal-ch-${"j".repeat(44)}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.effectiveState.set(channelId, 50);
   mgr.isLoadComplete = false;
-
-  // Queue an unread intent with uint32 overflow condition: S is at max.
   mgr.overrideRegisters.set(channelId, { s: 0xffffffff, c: 0, b: 50 });
   mgr.publishableContextIds.add(channelId);
   const q = mgr.markChannelUnread(channelId);
   assert.equal(q.status, "queued", "must queue pre-ready");
-
-  // Wire outcome callback.
   const outcomes = [];
   mgr.onDrainOutcome = (outcome) => {
     outcomes.push(outcome);
   };
-
-  // Complete load and drain.
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Drain must have surfaced the refusal.
   assert.equal(outcomes.length, 1, "exactly one outcome must be emitted");
   assert.equal(outcomes[0].channelId, channelId);
   assert.equal(outcomes[0].kind, "genuine-refusal");
   assert.equal(outcomes[0].op, "unread");
-  assert.equal(
-    outcomes[0].reason,
-    "uint32_overflow",
-    "refusal reason must be uint32_overflow",
-  );
-
-  // Intent must be cleaned up even after refusal (it's a genuine refusal, not load_incomplete).
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "intent must be deleted after genuine refusal",
-  );
-
+  assert.equal(outcomes[0].reason, "uint32_overflow");
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   mgr.destroy();
 });
 
 // ── Test 43: deferred-refusal-after-restart — intent persisted, hydrated, refused ─
 test("drain_deferredRefusalAfterRestart_intentHydratedAndRefused", async () => {
-  // Intent survives a restart: queued during incomplete load, persisted in the
-  // v2 blob, then loaded by the next session and refused by drain.
-  // Verifies the full round-trip: enqueue → persist → hydrate → drain (refused).
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "43".repeat(32);
   const channelId = `deferred-restart-ch-${"k".repeat(44)}`;
-
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-
-  // Simulate session 1: intent queued and persisted with a uint32-maxed register.
-  // The session closed before the load completed (crash / tab close).
   ls.setItem(
     v2Key,
     JSON.stringify({
@@ -4453,70 +2662,37 @@ test("drain_deferredRefusalAfterRestart_intentHydratedAndRefused", async () => {
       ng: 2,
     }),
   );
-
-  // Session 2: new manager hydrates the persisted intent.
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // Intent must be restored from v2 blob.
   const hydrated = pendingOverrideIntentStore.get(channelId);
   assert.ok(hydrated, "intent must be hydrated from v2 blob on restart");
   assert.equal(hydrated.op, "unread");
   assert.equal(hydrated.gen, 1);
-
-  // Wire outcome callback to capture the refusal.
   const outcomes = [];
   mgr.onDrainOutcome = (outcome) => {
     outcomes.push(outcome);
   };
-
-  // Complete load and drain — the register is still at uint32-max, so S-bump
-  // would overflow → refused (uint32_overflow).
   await mgr.fetchAndMerge(mgr.loadGeneration);
   assert.equal(mgr.isLoadComplete, true, "load must complete");
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Drain must surface the refusal via onDrainOutcome.
   assert.equal(outcomes.length, 1, "exactly one outcome must be emitted");
   assert.equal(outcomes[0].kind, "genuine-refusal");
   assert.equal(outcomes[0].op, "unread");
   assert.equal(outcomes[0].reason, "uint32_overflow");
-
-  // Intent consumed even after refusal (genuine, not load_incomplete).
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "intent must be deleted after genuine refusal on restart",
-  );
-
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   mgr.destroy();
 });
 
 // ── Test 44: storage_failed — enqueue survives; in-memory intent is live ─────
 test("markChannelUnread_storageFailed_intentInMemoryOnly", () => {
-  // When localStorage.setItem throws (quota exceeded) during persistLocalState()
-  // after enqueueing a pre-ready intent, the intent must remain in-memory so the
-  // current session can still drain it — failing-safe rather than silently losing
-  // the user's action.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "44".repeat(32);
   const channelId = `storage-fail-ch-${"l".repeat(50)}`;
-
-  // Replace setItem with a throwing version to simulate quota exhaustion.
   const origSetItem = globalThis.window.localStorage.setItem;
   globalThis.window.localStorage.setItem = () => {
     throw new Error("QuotaExceededError");
   };
-
   try {
     const fakeRelay = {
       fetchEvents: async () => [],
@@ -4526,145 +2702,65 @@ test("markChannelUnread_storageFailed_intentInMemoryOnly", () => {
       subscribeToReconnects: () => () => {},
       getConnectionGeneration: () => 0,
     };
-
     const mgr = new ReadStateManager(pubkey, fakeRelay);
     mgr.isLoadComplete = false;
-
-    // Pre-ready enqueue — should succeed despite storage failure.
     const result = mgr.markChannelUnread(channelId);
-    assert.equal(
-      result.status,
-      "queued",
-      "must return queued on incomplete load",
-    );
-
-    // Intent must be alive in-memory even though persist failed.
+    assert.equal(result.status, "queued");
     const intent = pendingOverrideIntentStore.get(channelId);
     assert.ok(intent, "intent must be in-memory even if persist failed");
     assert.equal(intent.op, "unread");
-
-    // Restore setItem so we can drain.
     globalThis.window.localStorage.setItem = origSetItem;
     mgr.isLoadComplete = true;
-
-    // Drain must pick up the in-memory intent and apply it.
-    // (Register is empty → S-bump succeeds.)
     return mgr.drainPendingIntents(mgr.loadGeneration).then(() => {
       const reg = mgr.overrideRegisters.get(channelId);
       assert.ok(reg, "register must exist after drain");
       assert.ok(reg.s > 0, "S-bump must have been applied by drain");
-
-      // Intent must be consumed.
-      assert.equal(
-        pendingOverrideIntentStore.get(channelId),
-        undefined,
-        "intent must be consumed by drain",
-      );
-
+      assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
       mgr.destroy();
     });
   } finally {
-    // Ensure setItem is restored even on test failure.
     globalThis.window.localStorage.setItem = origSetItem;
   }
 });
 
 // ── Test 45: authoritative queued-read target captured at click time ──────────
 test("markChannelRead_preReady_capturesAuthoritativeMarkAt", async () => {
-  // When load is incomplete, markChannelRead() must persist the caller's markAt
-  // (not ctx.channelFrontier()) as readTarget in the intent.  Drain must then
-  // advance the frontier to markAt (not the stale partial frontier) before C-bump,
-  // and the hook-level callback must clean up the forced-unread source.
-  //
-  // Assertions (all surfaces):
-  //  - readTarget in intent = authoritativeMarkAt (not partialFrontier)
-  //  - after drain: effectiveState[channelId] >= authoritativeMarkAt
-  //  - v2 blob: register persisted with C-bump, intent/receipt cleaned up
-  //  - forcedUnreadStore: "inbox" source removed from channelId
-  //  - versionBumps === 1 (exactly one forced-store cleanup via hook)
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "45".repeat(32);
   const channelId = `mark-at-ch-${"m".repeat(53)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const forcedKey = `buzz-forced-unread.v1:${pubkey}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
-  // Partial frontier (simulates what's visible pre-ready).
   const partialFrontier = 100;
   mgr.effectiveState.set(channelId, partialFrontier);
   mgr.isLoadComplete = false;
-
-  // Simulate a register so the read is not already_inactive.
   mgr.overrideRegisters.set(channelId, { s: 5, c: 0, b: 100 });
   mgr.publishableContextIds.add(channelId);
-
-  // Seed forced-unread store: channel has "inbox" + "manual" sources.
   const forcedEntry = { markerAtWhenForced: 50, sources: ["inbox", "manual"] };
   globalThis.window.localStorage.setItem(
     forcedKey,
     JSON.stringify({ [channelId]: forcedEntry }),
   );
-
-  // Click-time markAt — greater than the partial frontier.
   const authoritativeMarkAt = 999;
   const sourceScope = "inbox";
   const r = mgr.markChannelRead(channelId, sourceScope, authoritativeMarkAt);
   assert.equal(r.status, "queued", "must queue when load incomplete");
-
-  // Intent must carry the authoritative markAt as readTarget.
   const intent = pendingOverrideIntentStore.get(channelId);
   assert.ok(intent, "intent must exist");
-  assert.equal(
-    intent.readTarget,
-    authoritativeMarkAt,
-    "readTarget must equal the authoritative markAt, not the partial frontier",
-  );
-
-  // Wire hook-level callback (mirrors useDrainOutcomeCallback logic).
+  assert.equal(intent.readTarget, authoritativeMarkAt);
   const cb = wireDrainCallback(mgr, pubkey);
-
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Frontier must have advanced to authoritativeMarkAt.
   const frontier = mgr.effectiveState.get(channelId) ?? 0;
-  assert.ok(
-    frontier >= authoritativeMarkAt,
-    `frontier must be advanced to at least authoritativeMarkAt (${authoritativeMarkAt}); got ${frontier}`,
-  );
-
-  // v2 blob: register must be persisted with C-bump.
+  assert.ok(frontier >= authoritativeMarkAt);
   const rawBlob = globalThis.window.localStorage.getItem(v2Key);
   const blob = rawBlob ? JSON.parse(rawBlob) : {};
-  assert.ok(
-    blob.r?.[channelId],
-    "register must be persisted in v2 blob after drain",
-  );
+  assert.ok(blob.r?.[channelId]);
   const reg = blob.r[channelId];
   assert.ok(reg.c > 0, "C must be bumped (applied read)");
-
-  // Intent and receipt must be cleaned up from blob.
-  assert.equal(
-    blob.pi?.[channelId],
-    undefined,
-    "intent must be cleaned up from v2 blob",
-  );
-  assert.equal(
-    blob.receipts?.[channelId],
-    undefined,
-    "receipt must be cleaned up from v2 blob",
-  );
-
-  // forcedUnreadStore: "inbox" source must be removed; "manual" remains.
+  assert.equal(blob.pi?.[channelId], undefined);
+  assert.equal(blob.receipts?.[channelId], undefined);
   const storedForced = forcedUnreadStore.read(pubkey);
   const afterEntry = storedForced[channelId];
   assert.ok(
@@ -4683,49 +2779,21 @@ test("markChannelRead_preReady_capturesAuthoritativeMarkAt", async () => {
     sources.includes("manual"),
     '"manual" source must remain after "inbox"-only cleanup',
   );
-
-  // versionBumps: exactly 1 (hook cleaned up the forced source once).
-  assert.equal(
-    cb.versionBumps,
-    1,
-    "versionBumps must be 1 — exactly one forced-store cleanup for applied-read",
-  );
-
+  assert.equal(cb.versionBumps, 1);
   cb.teardown();
   mgr.destroy();
 });
 
 // ── Test 46: already_inactive — source cleanup runs via hook/store ────────────
 test("drain_alreadyInactive_sourceCleanupCallback", async () => {
-  // When a queued read drains and the register is gone (already_inactive),
-  // the outcome must be silent-inactive and the hook callback must remove the
-  // exact source from the persisted forcedUnreadStore.
-  //
-  // Assertions (all surfaces):
-  //  - outcome is silent-inactive (not genuine-refusal)
-  //  - forcedUnreadStore: "inbox" source is removed from channelId entry
-  //  - the remaining entry still has "manual" source byte-for-byte
-  //  - versionBumps === 1
-  //  - intent consumed from queue
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "46".repeat(32);
   const channelId = `already-inactive-ch-${"n".repeat(44)}`;
   const forcedKey = `buzz-forced-unread.v1:${pubkey}`;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.effectiveState.set(channelId, 100);
   mgr.isLoadComplete = false;
-
-  // Seed forced-unread store: channel has "inbox" + "manual" sources.
   const forcedEntry = {
     markerAtWhenForced: 100,
     sources: ["inbox", "manual"],
@@ -4734,20 +2802,12 @@ test("drain_alreadyInactive_sourceCleanupCallback", async () => {
     forcedKey,
     JSON.stringify({ [channelId]: forcedEntry }),
   );
-
-  // Queue a read with "inbox" sourceScope — no register exists.
   const sourceScope = "inbox";
   const r = mgr.markChannelRead(channelId, sourceScope);
   assert.equal(r.status, "queued");
-
-  // Wire hook-level callback.
   const cb = wireDrainCallback(mgr, pubkey);
-
-  // Complete load without adding a register — already_inactive path.
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // forcedUnreadStore must have lost exactly "inbox" — "manual" remains.
   const storedForced = forcedUnreadStore.read(pubkey);
   const afterEntry = storedForced[channelId];
   assert.ok(
@@ -4766,54 +2826,20 @@ test("drain_alreadyInactive_sourceCleanupCallback", async () => {
     sources.includes("manual"),
     '"manual" source must remain unchanged',
   );
-
-  // versionBumps: exactly 1 (one forced-store write by hook).
-  assert.equal(
-    cb.versionBumps,
-    1,
-    "versionBumps must be 1 for silent-inactive cleanup",
-  );
-
-  // Intent consumed from queue.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "intent must be consumed after already_inactive",
-  );
-
+  assert.equal(cb.versionBumps, 1);
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   cb.teardown();
   mgr.destroy();
 });
 
 // ── Test 47: restart-safe unread rollback — priorForcedEntry restored in forcedUnreadStore
 test("drain_unreadRefusal_restartSafe_priorForcedEntryRestored", async () => {
-  // After a restart, a refused unread intent must restore the prior forced entry
-  // (not delete the whole channel entry) using the priorForcedEntry persisted in
-  // the intent metadata, and write that restoration to forcedUnreadStore.
-  //
-  // Scenario:
-  //  - Session 1: channel had {sources:["inbox"]} entry; "manual" unread attempted
-  //    (S at max → uint32_overflow), intent queued with priorForcedEntry.
-  //    The optimistic unread replaced the entry in forcedUnreadStore.
-  //  - App restarts.
-  //  - Session 2: hydrates intent with priorForcedEntry; drain runs; overflow → refused.
-  //    Hook must restore {sources:["inbox"]} in forcedUnreadStore.
-  //
-  // Assertions (all surfaces):
-  //  - priorForcedEntry hydrates correctly from v2 blob
-  //  - outcome is genuine-refusal with priorForcedEntry
-  //  - forcedUnreadStore[channelId] = priorForcedEntry byte-for-byte after hook runs
-  //  - versionBumps === 1
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "47".repeat(32);
   const channelId = `restart-safe-ch-${"o".repeat(47)}`;
-
   const ls = globalThis.window.localStorage;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const forcedKey = `buzz-forced-unread.v1:${pubkey}`;
-
-  // Simulate session 1: {sources:["inbox"]} entry existed, then manual unread
-  // was attempted (S at max → will overflow), intent queued with priorForcedEntry.
   const priorForcedEntry = { markerAtWhenForced: 50, sources: ["inbox"] };
   ls.setItem(
     v2Key,
@@ -4829,28 +2855,15 @@ test("drain_unreadRefusal_restartSafe_priorForcedEntryRestored", async () => {
       ng: 2,
     }),
   );
-  // The optimistic unread had replaced the forced entry with "manual".
   ls.setItem(
     forcedKey,
     JSON.stringify({
       [channelId]: { markerAtWhenForced: 50, sources: ["manual"] },
     }),
   );
-
-  // Session 2: new manager hydrates.
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // Verify intent restored with priorForcedEntry.
   const hydrated = pendingOverrideIntentStore.get(channelId);
   assert.ok(hydrated, "intent must be hydrated");
   assert.deepEqual(
@@ -4858,50 +2871,29 @@ test("drain_unreadRefusal_restartSafe_priorForcedEntryRestored", async () => {
     priorForcedEntry,
     "priorForcedEntry must survive round-trip through v2 blob",
   );
-
-  // Wire hook-level callback.  No in-memory snapshot exists (new session), so
-  // the callback falls back to outcome.priorForcedEntry for restoration.
   const cb = wireDrainCallback(mgr, pubkey);
-
-  // Complete load — register still at uint32-max → S-bump overflows → refused.
   await mgr.fetchAndMerge(mgr.loadGeneration);
   assert.equal(mgr.isLoadComplete, true);
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // forcedUnreadStore must be restored to the priorForcedEntry byte-for-byte.
   const storedForced = forcedUnreadStore.read(pubkey);
   assert.deepEqual(
     storedForced[channelId],
     priorForcedEntry,
     "forcedUnreadStore must be restored to priorForcedEntry after post-restart refusal",
   );
-
-  // versionBumps: exactly 1 (hook wrote to forced store once).
-  assert.equal(
-    cb.versionBumps,
-    1,
-    "versionBumps must be 1 — exactly one restore write",
-  );
-
+  assert.equal(cb.versionBumps, 1);
   cb.teardown();
   mgr.destroy();
 });
 
 // ── Test 48: legacy null priorForcedEntry — hydrates correctly, drain runs ────
 test("hydrate_legacyNullPriorForcedEntry_intentHydratedAndDrains", async () => {
-  // `null` is a valid legacy v1 ForcedUnreadEntry marker.  It must NOT be treated
-  // as the invalid-value sentinel — an intent whose priorForcedEntry is null must
-  // hydrate successfully and drain normally.  A valid sibling intent in the same
-  // blob must also hydrate (proving the null entry does not corrupt the parse loop).
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "48".repeat(32);
   const channelId1 = `legacy-null-ch-${"p".repeat(49)}`;
   const channelId2 = `sibling-null-ch-${"q".repeat(48)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
-
-  // Plant: ch1 has unread intent with priorForcedEntry=null (legacy null marker).
-  //        ch2 has unread intent with no priorForcedEntry (valid sibling).
   ls.setItem(
     v2Key,
     JSON.stringify({
@@ -4916,87 +2908,32 @@ test("hydrate_legacyNullPriorForcedEntry_intentHydratedAndDrains", async () => {
       ng: 3,
     }),
   );
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // ch1 intent must hydrate with priorForcedEntry=null (not rejected).
   const intent1 = pendingOverrideIntentStore.get(channelId1);
   assert.ok(intent1, "ch1 intent (null prior) must hydrate");
   assert.equal(intent1.gen, 1, "ch1 intent gen must be 1");
-  assert.equal(
-    "priorForcedEntry" in intent1,
-    true,
-    "ch1 intent must carry priorForcedEntry",
-  );
-  assert.equal(
-    intent1.priorForcedEntry,
-    null,
-    "ch1 priorForcedEntry must be null (valid legacy marker)",
-  );
-
-  // ch2 (sibling) intent must hydrate regardless of ch1's null prior.
+  assert.equal("priorForcedEntry" in intent1, true);
+  assert.equal(intent1.priorForcedEntry, null);
   const intent2 = pendingOverrideIntentStore.get(channelId2);
-  assert.ok(
-    intent2,
-    "ch2 sibling intent must hydrate alongside null-prior intent",
-  );
+  assert.ok(intent2);
   assert.equal(intent2.gen, 2, "ch2 intent gen must be 2");
-
-  // Drain: ch1 has s=0xffffffff → overflow.  With the liveness re-evaluation
-  // fix, since the frontier has not advanced past b=50, the override IS still
-  // active (frontier=0 ≤ b=50) → genuine uint32_overflow refusal.
-  // ch2 applies normally (S-bump on existing register).
   mgr.effectiveState.set(channelId1, 0); // frontier below b=50
   mgr.effectiveState.set(channelId2, 10);
   await mgr.fetchAndMerge(mgr.loadGeneration);
   assert.equal(mgr.isLoadComplete, true);
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // ch2 must have drained (S-bump beyond existing s=5).
   const reg2 = mgr.overrideRegisters.get(channelId2);
   assert.ok(reg2, "ch2 register must be present after drain");
-  // ch2 has existing s=5, so new S = max(5,3)+1 = 6.
   assert.equal(reg2.s, 6, "ch2 S must be bumped by drain");
-
-  // ch1 intent consumed (refusal still consumes the intent).
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId1),
-    undefined,
-    "ch1 intent must be consumed after uint32_overflow refusal",
-  );
-
-  // No RangeError was thrown — drain completed without abort.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId2),
-    undefined,
-    "ch2 intent must also be consumed (no drain abort from null prior)",
-  );
-
+  assert.equal(pendingOverrideIntentStore.get(channelId1), undefined);
+  assert.equal(pendingOverrideIntentStore.get(channelId2), undefined);
   mgr.destroy();
 });
 
 // ── Test 49: corrupt v2 blob fields — malformed intents rejected, valid sibling hydrates ──
 test("hydrate_corruptV2BlobIntentFields_rejectedWithoutBlockingValidSibling", async () => {
-  // Corrupt/out-of-range intent fields must be silently rejected.
-  // The following cases are planted in the same blob:
-  //  - ch1: readTarget = 1e300 (out of uint32 range → rejected, prevents RangeError)
-  //  - ch2: priorForcedEntry = { markerAtWhenForced: -1, sources: ["inbox"] }
-  //         (invalid marker → rejected)
-  //  - ch3: priorForcedEntry = { sources: ["unknown-source"] }
-  //         (invalid source member → rejected, no silent partial filtering)
-  //  - ch4: valid unread intent (must hydrate, proving the parse loop continues)
-  //
-  // All assertions run without throwing — no RangeError can abort hydration.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "49".repeat(32);
   const channelId1 = `corrupt-rt-ch-${"r".repeat(50)}`;
@@ -5005,7 +2942,6 @@ test("hydrate_corruptV2BlobIntentFields_rejectedWithoutBlockingValidSibling", as
   const channelId4 = `valid-sibling-${"u".repeat(50)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
-
   ls.setItem(
     v2Key,
     JSON.stringify({
@@ -5029,225 +2965,76 @@ test("hydrate_corruptV2BlobIntentFields_rejectedWithoutBlockingValidSibling", as
       ng: 5,
     }),
   );
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
-
-  // hydrateFromLocalStorage must not throw for any of the corrupt entries.
   assert.doesNotThrow(
     () => mgr.hydrateFromLocalStorage(),
     "hydrateFromLocalStorage must not throw on corrupt intent fields",
   );
-
-  // ch1 (readTarget=1e300): rejected — out of uint32 range.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId1),
-    undefined,
-    "ch1 intent with readTarget=1e300 must be rejected",
-  );
-
-  // ch2 (invalid marker=-1): rejected.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId2),
-    undefined,
-    "ch2 intent with priorForcedEntry markerAtWhenForced=-1 must be rejected",
-  );
-
-  // ch3 (invalid source member): rejected — no silent partial filtering.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId3),
-    undefined,
-    "ch3 intent with invalid source member must be rejected (no partial filtering)",
-  );
-
-  // ch4 (valid): must hydrate.
+  assert.equal(pendingOverrideIntentStore.get(channelId1), undefined);
+  assert.equal(pendingOverrideIntentStore.get(channelId2), undefined);
+  assert.equal(pendingOverrideIntentStore.get(channelId3), undefined);
   const intent4 = pendingOverrideIntentStore.get(channelId4);
-  assert.ok(
-    intent4,
-    "ch4 valid intent must hydrate despite corrupt sibling entries",
-  );
+  assert.ok(intent4);
   assert.equal(intent4.gen, 4, "ch4 intent gen must be 4");
   assert.equal(intent4.op, "unread", "ch4 intent op must be unread");
-
-  // Drain must run without throwing (no RangeError from 1e300 readTarget).
   mgr.effectiveState.set(channelId4, 50);
   await mgr.fetchAndMerge(mgr.loadGeneration);
   assert.equal(mgr.isLoadComplete, true);
-
   let drainThrew = false;
   try {
     await mgr.drainPendingIntents(mgr.loadGeneration);
   } catch {
     drainThrew = true;
   }
-  assert.equal(
-    drainThrew,
-    false,
-    "drain must not throw (no RangeError from corrupt readTarget)",
-  );
-
-  // ch4 intent consumed (S-bumped on existing register s=3).
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId4),
-    undefined,
-    "ch4 intent must be consumed after drain",
-  );
-
+  assert.equal(drainThrew, false);
+  assert.equal(pendingOverrideIntentStore.get(channelId4), undefined);
   mgr.destroy();
 });
 
 // ── Test 50: overflow with frontier-deactivated register → silent success ─────
 test("markChannelReadDirect_uint32overflow_frontierDeactivated_silentSuccess", async () => {
-  // When C-bump is unrepresentable (s=0xffffffff, c=0) but the post-advance
-  // frontier has already deactivated the register (frontier > b=50),
-  // the outcome must be silent-inactive (not uint32_overflow).
-  // Parity with applyOverrideRead() sync path at readStateOverride.ts.
-  //
-  // Setup: {s:0xffffffff, c:0, b:50}, queued readTarget=100.
-  // After frontier advance to 100: frontier(100) > b(50), s(0xffffffff) > c(0)
-  // BUT: isOverrideActive = s > 0 && frontier <= b && s > c
-  //                       = true && 100 <= 50 (FALSE) → inactive.
-  // → silent-inactive outcome, source cleanup runs, forced owner removed.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "50".repeat(32);
   const channelId = `overflow-deact-ch-${"v".repeat(46)}`;
   const forcedKey = `buzz-forced-unread.v1:${pubkey}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
-
   const ls = globalThis.window.localStorage;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.effectiveState.set(channelId, 50); // initial frontier
   mgr.isLoadComplete = false;
-
-  // Seed an existing register: s=0xffffffff, c=0, b=50.
   mgr.overrideRegisters.set(channelId, { s: 0xffffffff, c: 0, b: 50 });
   mgr.publishableContextIds.add(channelId);
-
-  // Seed forced-unread store: channel has "manual" source.
   const forcedEntry = { markerAtWhenForced: 50, sources: ["manual"] };
   ls.setItem(forcedKey, JSON.stringify({ [channelId]: forcedEntry }));
-
-  // Queue a read with readTarget=100 (authoritative mark-at).
   const sourceScope = "manual";
   const r = mgr.markChannelRead(channelId, sourceScope, 100);
   assert.equal(r.status, "queued", "must queue when load incomplete");
-
-  // Wire hook-level callback.
   const cb = wireDrainCallback(mgr, pubkey);
-
-  // Complete load — register still has s=0xffffffff.
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Frontier must have advanced to 100.
   const frontier = mgr.effectiveState.get(channelId) ?? 0;
-  assert.ok(
-    frontier >= 100,
-    `frontier must advance to readTarget (100); got ${frontier}`,
-  );
-
-  // The register must now be inactive (frontier=100 > b=50).
-  // The outcome must have been silent-inactive, NOT uint32_overflow.
-  // Evidence: versionBumps=1 (source cleanup ran) and forcedUnreadStore lost "manual".
+  assert.ok(frontier >= 100);
   const storedForced = forcedUnreadStore.read(pubkey);
-  assert.equal(
-    storedForced[channelId],
-    undefined,
-    "forced entry must be fully removed (silent-inactive source cleanup)",
-  );
-
-  assert.equal(
-    cb.versionBumps,
-    1,
-    "versionBumps must be 1 — silent-inactive triggered source cleanup",
-  );
-
-  // Intent consumed (silent-inactive still consumes the intent).
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "intent must be consumed after silent-inactive outcome",
-  );
-
-  // v2 blob: forced owner must not persist (cleanup write ran).
+  assert.equal(storedForced[channelId], undefined);
+  assert.equal(cb.versionBumps, 1);
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   const rawBlob = ls.getItem(v2Key);
   const blob = rawBlob ? JSON.parse(rawBlob) : {};
-  assert.equal(
-    blob.pi?.[channelId],
-    undefined,
-    "pi entry must be cleaned up from v2 blob",
-  );
-
+  assert.equal(blob.pi?.[channelId], undefined);
   cb.teardown();
   mgr.destroy();
 });
 
 // ── Test 51: abort/retry on step-1 storage failure — gen1 survives, retry drains ──
 test("drain_step1StorageFailure_abortRetry_gen1SurvivesAndRetrains", async () => {
-  // If the step-1 register+receipt persist fails, the drain aborts the transaction:
-  // gen1 stays live, no outcome callback fires (step-1 abort skips steps 2-3 via `continue`),
-  // and scheduleAbortRetry() fires a bounded-backoff timer.  When the timer fires, storage is
-  // healthy: gen1 drains fully; the outcome callback enqueues gen2 (deferred while channel is
-  // locked); promoteDeferred() commits gen1-cleanup + gen2-pi atomically; scheduleDrain() fires
-  // gen2 drain immediately; gen2 applies (frontier=999).
-  //
-  // Failure branches covered:
-  //  - step-1 failure path: abort + bounded retry timer (no immediate spin)
-  //
-  // Assertions (durable surfaces):
-  //  - blob pre-drain: gen1 pi (no register)
-  //  - post-fail: blob unchanged (step-1 abort rolled back register), gen1 live in memory
-  //  - restart witness 1: blob has gen1 pi; fresh mgr hydrates gen1 (gen2 not yet durable)
-  //  - scheduleAbortRetry sets mgr.drainRetryTimer (bounded backoff, NOT immediate pendingFreshDrain)
-  //  - retry fires: gen1 drains + gen2 auto-drains (scheduleDrain path)
-  //  - post-retry: register committed (from gen1), frontier ≥ 999 (gen2 applied), no pending intent
-  //  - restart witness 2: fresh mgr hydrates frontier ≥ 999; no stale gen1 intent
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "51".repeat(32);
   const channelId = `abort-step1-ch-${"w".repeat(49)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
-
-  // Fake timer: intercept ms>0 timers for scheduleAbortRetry control.
-  const origSetTimeout = globalThis.window.setTimeout;
-  const origClearTimeout = globalThis.window.clearTimeout;
-  const scheduledTimers = new Map(); // id → fn
-  let nextFakeId = 51000;
-  globalThis.window.setTimeout = (fn, ms) => {
-    if (ms > 0) {
-      const id = nextFakeId++;
-      scheduledTimers.set(id, fn);
-      return id;
-    }
-    return origSetTimeout(fn, ms);
-  };
-  globalThis.window.clearTimeout = (id) => {
-    if (scheduledTimers.has(id)) {
-      scheduledTimers.delete(id);
-    } else {
-      origClearTimeout(id);
-    }
-  };
-
-  // Block ALL v2 writes until explicitly unblocked (step-1 fail simulation).
+  const timers = makeFakeTimers();
   let blockV2Writes = false;
   const origSetItem = ls.setItem.bind(ls);
   ls.setItem = (key, value) => {
@@ -5256,38 +3043,15 @@ test("drain_step1StorageFailure_abortRetry_gen1SurvivesAndRetrains", async () =>
     }
     origSetItem(key, value);
   };
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   try {
     const mgr = new ReadStateManager(pubkey, fakeRelay);
     mgr.effectiveState.set(channelId, 50);
     mgr.isLoadComplete = false;
-
-    // Queue gen1 (unread) — also persists initial pi (write 0).
     mgr.markChannelUnread(channelId);
     const gen1 = pendingOverrideIntentStore.get(channelId).gen;
-
-    // Confirm v2 blob has gen1 pi from write 0.
     const blobBefore = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-    assert.equal(
-      blobBefore.pi?.[channelId]?.gen,
-      gen1,
-      "blob must carry gen1 pi before drain",
-    );
-
-    // Wire drain callback: enqueue gen2 (read, readTarget=999) from inside the transaction.
-    // Force isLoadComplete=false temporarily so markChannelRead goes through the latch buffer
-    // (deferred enqueue path) — the channel is locked at callback time, so the enqueue is
-    // buffered as deferred rather than applied immediately.  This is the scenario the latch
-    // is designed for: a user action arrives mid-transaction while the drain holds the lock.
+    assert.equal(blobBefore.pi?.[channelId]?.gen, gen1);
     mgr.onDrainOutcome = (outcome) => {
       if (
         outcome.kind === "applied-unread" &&
@@ -5297,198 +3061,67 @@ test("drain_step1StorageFailure_abortRetry_gen1SurvivesAndRetrains", async () =>
         mgr.isLoadComplete = false; // route through deferred latch path
         mgr.markChannelRead(channelId, undefined, 999);
         mgr.isLoadComplete = prev;
-        // The enqueue returned gen:-1 (buffered placeholder); real gen assigned on promote.
       }
     };
-
-    // NOTE: step-1 failure skips the outcome callback entirely (abort + continue before step 2).
-    // The callback only fires during the retry drain (when step-1 succeeds).
-
-    // Drain with step-1 blocked.
     mgr.isLoadComplete = true;
     blockV2Writes = true;
     await mgr.drainPendingIntents(mgr.loadGeneration);
     blockV2Writes = false;
-
-    // After failing drain: register NOT committed (step-1 rolled back), gen1 live.
-    assert.equal(
-      mgr.overrideRegisters.get(channelId),
-      undefined,
-      "register must not be committed after step-1 failure",
-    );
-
-    // v2 blob must still be write-0 state: gen1 pi, no register.
+    assert.equal(mgr.overrideRegisters.get(channelId), undefined);
     const blobAfterFail = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-    assert.equal(
-      blobAfterFail.pi?.[channelId]?.gen,
-      gen1,
-      "blob must still have gen1 pi after step-1 failure",
-    );
-    assert.equal(
-      blobAfterFail.r?.[channelId],
-      undefined,
-      "register must not be in blob after step-1 failure",
-    );
-
-    // Gen1 must be live in the store (abort restored it).
+    assert.equal(blobAfterFail.pi?.[channelId]?.gen, gen1);
+    assert.equal(blobAfterFail.r?.[channelId], undefined);
     const intentAfterFail = pendingOverrideIntentStore.get(channelId);
     assert.ok(intentAfterFail, "gen1 must be live after abort");
-    assert.equal(
-      intentAfterFail.gen,
-      gen1,
-      "live intent must be gen1 after step-1 abort",
-    );
-
-    // scheduleAbortRetry must have set mgr.drainRetryTimer (bounded backoff timer).
-    // Step-1 fail skips schedulePublish (step-1 is the register write — on failure,
-    // the register is rolled back and no publish is scheduled).  Exactly one timer.
-    assert.equal(
-      scheduledTimers.size,
-      1,
-      "exactly one abort retry timer after step-1 failure",
-    );
-    assert.ok(
-      mgr.drainRetryTimer !== null,
-      "mgr.drainRetryTimer must be set by scheduleAbortRetry",
-    );
-    assert.ok(
-      scheduledTimers.has(mgr.drainRetryTimer),
-      "abort retry timer ID must be in scheduledTimers",
-    );
-
-    // Restart witness 1: blob has gen1 pi; hydrating sees gen1 (gen2 not yet durable).
+    assert.equal(intentAfterFail.gen, gen1);
+    assert.equal(timers.scheduled.size, 1);
+    assert.ok(mgr.drainRetryTimer !== null);
+    assert.ok(timers.scheduled.has(mgr.drainRetryTimer));
     {
       const mgr2 = new ReadStateManager(pubkey, fakeRelay);
       mgr2.hydrateFromLocalStorage();
       const hydratedIntent = pendingOverrideIntentStore.get(channelId);
-      assert.ok(
-        hydratedIntent,
-        "gen1 must hydrate from blob (step-1 fail leaves gen1 pi in blob)",
-      );
+      assert.ok(hydratedIntent);
       assert.equal(hydratedIntent.gen, gen1, "hydrated intent must be gen1");
       mgr2.destroy();
     }
-    // Restore for original mgr (hydration above replaced singleton state).
     mgr.hydrateFromLocalStorage();
-
-    // Fire the abort retry timer — storage is healthy now.
-    // Use mgr.drainRetryTimer to get the specific abort retry timer (not publish debounce).
     const drainRetryTimerId = mgr.drainRetryTimer;
-    const retryFn = scheduledTimers.get(drainRetryTimerId);
-    assert.ok(retryFn, "abort retry timer fn must be in scheduledTimers");
-    scheduledTimers.clear(); // clear all before firing
+    const retryFn = timers.scheduled.get(drainRetryTimerId)?.fn;
+    assert.ok(retryFn, "abort retry timer fn must be in timers.scheduled");
+    timers.scheduled.clear(); // clear all before firing
     await retryFn(); // fires the drain retry
-    // The retry drain is async but has no awaits internally — drainPendingIntentsImpl runs
-    // synchronously.  The gen2 auto-drain (via scheduleDrain/pendingFreshDrain) also runs
-    // synchronously within the outer drainPendingIntents wrapper microtask.
-    // One setTimeout(0) macrotask is sufficient to let all microtasks settle.
-    await new Promise((r) => origSetTimeout(r, 0));
-
-    // After retry + auto-drain:
-    //  - gen1 register committed (S-bumped from gen1 unread drain)
-    //  - gen2 (read, readTarget=999) promoted, committed atomically with gen1 cleanup,
-    //    then auto-drained via scheduleDrain → frontier advances to 999
-    //  - no pending intent remains (both gen1 and gen2 consumed)
-    //  - blob: register with C-bumped (from gen2 read drain), no pi, no receipt
+    await new Promise((r) => timers.origSetTimeout(r, 0));
     const regAfterRetry = mgr.overrideRegisters.get(channelId);
     assert.ok(regAfterRetry, "register must be committed after retry");
     assert.ok(regAfterRetry.s > 0, "S must be bumped (gen1 unread applied)");
-
-    // Receipt must be gone (step-3 cleanup succeeded).
     const blobAfterRetry = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-    assert.equal(
-      blobAfterRetry.receipts?.[channelId],
-      undefined,
-      "receipt must be cleaned up after retry",
-    );
-
-    // Frontier must have advanced to 999 (gen2 read applied).
+    assert.equal(blobAfterRetry.receipts?.[channelId], undefined);
     const frontierAfterRetry = mgr.effectiveState.get(channelId) ?? 0;
-    assert.ok(
-      frontierAfterRetry >= 999,
-      `frontier must be ≥ 999 after gen2 drain; got ${frontierAfterRetry}`,
-    );
-
-    // No pending intent (both gen1 and gen2 consumed by drain).
-    assert.equal(
-      pendingOverrideIntentStore.get(channelId),
-      undefined,
-      "no pending intent after gen1+gen2 drain",
-    );
-
-    // Restart witness 2: fresh manager sees frontier ≥ 999 (gen2 durably applied);
-    // no stale gen1 intent.  Restart parity: durable state reflects what memory holds.
+    assert.ok(frontierAfterRetry >= 999);
+    assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
     {
       const mgr3 = new ReadStateManager(pubkey, fakeRelay);
       mgr3.hydrateFromLocalStorage();
-      // No pending intent (both drained).
-      assert.equal(
-        pendingOverrideIntentStore.get(channelId),
-        undefined,
-        "fresh manager: no pending intent after full drain",
-      );
-      // Frontier must be persisted at ≥ 999 (stored in blob.r[channelId].f).
+      assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
       const f3 = mgr3.effectiveState.get(channelId) ?? 0;
-      assert.ok(
-        f3 >= 999,
-        `fresh manager must hydrate frontier ≥ 999; got ${f3}`,
-      );
+      assert.ok(f3 >= 999);
       mgr3.destroy();
     }
-
     mgr.destroy();
   } finally {
-    globalThis.window.setTimeout = origSetTimeout;
-    globalThis.window.clearTimeout = origClearTimeout;
+    timers.restore();
   }
 });
 
 // ── Test 52: abort/retry on step-3 cleanup failure — gen1 stays live, retry cleans up ──
 test("drain_step3CleanupFailure_abortRetry_gen1StaysLiveAndRetrains", async () => {
-  // If the step-3 cleanup write fails (after step-1 register+receipt committed),
-  // abortTransaction restores gen1 as the live intent and re-buffers gen2 (enqueued
-  // from onDrainOutcome during the transaction).  The in-memory receipt is also
-  // restored so the retry drain's alreadyApplied check fires (cleanup-only, no re-bump).
-  // scheduleAbortRetry fires a bounded-backoff timer.  On retry: combined gen1-cleanup
-  // + gen2-pi committed atomically.  Restart must see gen2.
-  //
-  // Assertions (durable surfaces):
-  //  - after failing pass: register in blob (step-1 ok), gen1 pi + receipt still in blob
-  //    (cleanup write failed), gen1 live in memory
-  //  - restart witness: gen1 + receipt in blob; hydration sees gen1 pending
-  //  - timer fires: retry drain runs alreadyApplied (no re-bump), gen1-cleanup + gen2-pi atomic
-  //  - post-retry: pi cleaned, receipt cleaned, queue has gen2, blob has gen2 pi
-  //  - restart witness 2: fresh manager hydrates gen2 from blob
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "52".repeat(32);
   const channelId = `abort-step3-ch-${"x".repeat(49)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
-
-  // Fake timer for scheduleAbortRetry.
-  const origSetTimeout = globalThis.window.setTimeout;
-  const origClearTimeout = globalThis.window.clearTimeout;
-  const scheduledTimers = new Map();
-  let nextFakeId = 52000;
-  globalThis.window.setTimeout = (fn, ms) => {
-    if (ms > 0) {
-      const id = nextFakeId++;
-      scheduledTimers.set(id, fn);
-      return id;
-    }
-    return origSetTimeout(fn, ms);
-  };
-  globalThis.window.clearTimeout = (id) => {
-    if (scheduledTimers.has(id)) {
-      scheduledTimers.delete(id);
-    } else {
-      origClearTimeout(id);
-    }
-  };
-
-  // Write 0: enqueue persist (succeeds)
-  // Write 1: step-1 register+receipt commit (succeeds)
-  // Write 2: step-3 cleanup commit (FAILS once, then succeeds)
+  const timers = makeFakeTimers();
   let v2WriteCount = 0;
   let blockFromWriteIndex = -1;
   const origSetItem = ls.setItem.bind(ls);
@@ -5501,30 +3134,13 @@ test("drain_step3CleanupFailure_abortRetry_gen1StaysLiveAndRetrains", async () =
     }
     origSetItem(key, value);
   };
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   try {
     const mgr = new ReadStateManager(pubkey, fakeRelay);
     mgr.effectiveState.set(channelId, 50);
     mgr.isLoadComplete = false;
-
-    // Queue gen1 (unread) — write 0 (enqueue persist).
     mgr.markChannelUnread(channelId);
     const gen1 = pendingOverrideIntentStore.get(channelId).gen;
-
-    // Wire callback: enqueue gen2 (read, readTarget=999) from inside the transaction.
-    // Force isLoadComplete=false temporarily so markChannelRead goes through the
-    // deferred latch path (enqueue() with locked channel → deferredEnqueues buffer).
-    // Without this toggle, markChannelRead uses the direct path (isLoadComplete=true),
-    // bypasses enqueue(), and applies the register change immediately outside the latch.
     mgr.onDrainOutcome = (outcome) => {
       if (
         outcome.kind === "applied-unread" &&
@@ -5534,55 +3150,25 @@ test("drain_step3CleanupFailure_abortRetry_gen1StaysLiveAndRetrains", async () =
         mgr.isLoadComplete = false; // route through deferred latch path
         mgr.markChannelRead(channelId, undefined, 999);
         mgr.isLoadComplete = prev;
-        // The enqueue returned gen:-1 (buffered placeholder); real gen assigned on promote.
       }
     };
-
-    // Block writes starting at write index 2 (step-3 cleanup).
     blockFromWriteIndex = 2;
     mgr.isLoadComplete = true;
     await mgr.drainPendingIntents(mgr.loadGeneration);
     blockFromWriteIndex = -1;
-
-    // After failing pass: register committed (step-1 ok), gen1 pi + receipt in blob (cleanup failed).
     const reg = mgr.overrideRegisters.get(channelId);
     assert.ok(reg, "register must be committed after step-1 succeeds");
     assert.ok(reg.s > 0, "S must be bumped");
-
     const blobAfterFail = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-    assert.ok(
-      blobAfterFail.r?.[channelId],
-      "register must be in blob after step-1 success",
-    );
-    assert.ok(
-      blobAfterFail.pi?.[channelId],
-      "gen1 pi must still be in blob (cleanup write failed)",
-    );
-    assert.ok(
-      blobAfterFail.receipts?.[channelId],
-      "receipt must still be in blob (cleanup write failed)",
-    );
-
-    // Gen1 must be live in memory (abortTransaction restored it).
+    assert.ok(blobAfterFail.r?.[channelId]);
+    assert.ok(blobAfterFail.pi?.[channelId]);
+    assert.ok(blobAfterFail.receipts?.[channelId]);
     const intentAfterFail = pendingOverrideIntentStore.get(channelId);
     assert.ok(intentAfterFail, "gen1 must be live after step-3 abort");
     assert.equal(intentAfterFail.gen, gen1, "live intent must be gen1");
-
-    // scheduleAbortRetry must have set the drain retry timer.
-    // Note: schedulePublish() also fires after step-1 success, so scheduledTimers
-    // may contain a debounce timer in addition to the abort retry timer.
-    // Use mgr.drainRetryTimer to identify the specific abort retry timer.
     const drainRetryTimerId = mgr.drainRetryTimer;
-    assert.ok(
-      drainRetryTimerId !== null,
-      "scheduleAbortRetry must set mgr.drainRetryTimer",
-    );
-    assert.ok(
-      scheduledTimers.has(drainRetryTimerId),
-      "abort retry timer ID must be in scheduledTimers",
-    );
-
-    // Restart witness 1: gen1 pi + receipt in blob; hydration sees gen1.
+    assert.ok(drainRetryTimerId !== null);
+    assert.ok(timers.scheduled.has(drainRetryTimerId));
     {
       const mgr2 = new ReadStateManager(pubkey, fakeRelay);
       mgr2.hydrateFromLocalStorage();
@@ -5591,93 +3177,39 @@ test("drain_step3CleanupFailure_abortRetry_gen1StaysLiveAndRetrains", async () =
       assert.equal(hydratedIntent.gen, gen1, "hydrated must be gen1");
       mgr2.destroy();
     }
-    // Restore mgr's intent store state (hydration above replaced singleton).
     mgr.hydrateFromLocalStorage();
-
-    // Fire the abort retry timer specifically (not the publish debounce timer).
-    // Storage is healthy (blockFromWriteIndex = -1).
-    const retryFn = scheduledTimers.get(drainRetryTimerId);
+    const retryFn = timers.scheduled.get(drainRetryTimerId)?.fn;
     assert.ok(retryFn, "retry timer fn must still be pending");
-    scheduledTimers.clear(); // clear all (publish debounce + retry) before firing
+    timers.scheduled.clear(); // clear all (publish debounce + retry) before firing
     await retryFn();
-    await new Promise((r) => origSetTimeout(r, 0));
-
-    // After retry: gen1 cleaned up (alreadyApplied path), gen2 promoted+committed atomically,
-    // gen2 auto-drained via scheduleDrain (frontier advances to 999), then gen2 cleaned up.
-    // The blob now has: register (C-bumped from gen2 read drain), no pi, no receipt.
-    // Gen2 pi was in the blob briefly (after atomic gen1-cleanup+gen2-pi commit) but was
-    // consumed synchronously by the gen2 auto-drain within the same microtask chain.
+    await new Promise((r) => timers.origSetTimeout(r, 0));
     const blobAfterRetry = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-    assert.equal(
-      blobAfterRetry.pi?.[channelId],
-      undefined,
-      "pi must be cleaned after retry + gen2 auto-drain",
-    );
-    assert.equal(
-      blobAfterRetry.receipts?.[channelId],
-      undefined,
-      "receipt must be cleaned after retry",
-    );
-
-    // Frontier must have advanced to 999 (gen2 read applied by auto-drain).
+    assert.equal(blobAfterRetry.pi?.[channelId], undefined);
+    assert.equal(blobAfterRetry.receipts?.[channelId], undefined);
     const frontierAfterRetry = mgr.effectiveState.get(channelId) ?? 0;
-    assert.ok(
-      frontierAfterRetry >= 999,
-      `frontier must be ≥ 999 after gen2 auto-drain; got ${frontierAfterRetry}`,
-    );
-
-    // No pending intent (gen1 + gen2 both consumed).
-    assert.equal(
-      pendingOverrideIntentStore.get(channelId),
-      undefined,
-      "no pending intent after gen1+gen2 drain",
-    );
-
-    // Restart witness 2: fresh manager sees frontier ≥ 999 (gen2 durably applied);
-    // no stale gen1 intent.  Restart parity: durable state reflects what memory holds.
+    assert.ok(frontierAfterRetry >= 999);
+    assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
     {
       const mgr3 = new ReadStateManager(pubkey, fakeRelay);
       mgr3.hydrateFromLocalStorage();
-      // No pending intent (both drained).
-      assert.equal(
-        pendingOverrideIntentStore.get(channelId),
-        undefined,
-        "fresh manager: no pending intent after full drain",
-      );
-      // Frontier must be persisted at ≥ 999 (stored in blob.r[channelId].f).
+      assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
       const f3 = mgr3.effectiveState.get(channelId) ?? 0;
-      assert.ok(
-        f3 >= 999,
-        `fresh manager must hydrate frontier ≥ 999; got ${f3}`,
-      );
+      assert.ok(f3 >= 999);
       mgr3.destroy();
     }
-
     mgr.destroy();
   } finally {
-    globalThis.window.setTimeout = origSetTimeout;
-    globalThis.window.clearTimeout = origClearTimeout;
+    timers.restore();
   }
 });
 
 // ── Test 53: ng normalization — gen7 collision cannot discard a fresh action ──
 test("hydrate_ngCollision_normalizedAboveExistingGens_freshActionNotDiscarded", async () => {
-  // Reproduce Thufir's collision witness: blob has pi.gen=7, receipt gen=7, ng=7.
-  // After hydration, a fresh enqueue gets the NEXT gen (≥ 8), so the old receipt
-  // (gen=7) does NOT match the new intent (gen≠7) and drain performs the action.
-  //
-  // Assertions:
-  //  - hydrated nextGen is normalized to max(intent gens, receipt gens) + 1
-  //  - fresh enqueue gets a gen STRICTLY GREATER than 7
-  //  - drain does NOT treat the old receipt as proof already-applied
-  //  - frontier advances to the new readTarget (999)
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "53".repeat(32);
   const channelId = `ng-collision-ch-${"y".repeat(47)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
-
-  // Plant: pi.gen=7, receipt.gen=7, ng=7 — corrupt: ng should be ≥ 8.
   ls.setItem(
     v2Key,
     JSON.stringify({
@@ -5693,91 +3225,38 @@ test("hydrate_ngCollision_normalizedAboveExistingGens_freshActionNotDiscarded", 
       ng: 7,
     }),
   );
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // After hydration, nextGen must be normalized to > 7 (above max intent/receipt gen).
-  // The hydrated intent (gen=7) and receipt (gen=7) must be accepted.
   const hydratedIntent = pendingOverrideIntentStore.get(channelId);
   assert.ok(hydratedIntent, "intent (gen=7) must hydrate");
   assert.equal(hydratedIntent.gen, 7, "hydrated intent gen must be 7");
-
-  // nextGen must have been normalized to ≥ 8.
   const nextGenAfterHydrate = pendingOverrideIntentStore.nextGen;
-  assert.ok(
-    nextGenAfterHydrate >= 8,
-    `nextGen must be normalized to ≥ 8 after hydration; got ${nextGenAfterHydrate}`,
-  );
-
-  // Replace the intent by enqueueing a NEW read with readTarget=999.
-  // Under the correct normalization, this gets a gen > 7.
+  assert.ok(nextGenAfterHydrate >= 8);
   mgr.isLoadComplete = false;
   const r = mgr.markChannelRead(channelId, undefined, 999);
-  assert.equal(
-    r.status,
-    "queued",
-    "new read must be queued while load incomplete",
-  );
+  assert.equal(r.status, "queued");
   const freshIntent = pendingOverrideIntentStore.get(channelId);
   assert.ok(freshIntent, "fresh intent must be in store");
-  assert.ok(
-    freshIntent.gen > 7,
-    `fresh intent gen must be strictly > 7 (got ${freshIntent.gen}) — collision prevented`,
-  );
-  assert.equal(
-    freshIntent.readTarget,
-    999,
-    "fresh intent must carry readTarget=999",
-  );
-
-  // Drain: the old receipt (intentGen=7) must NOT match the fresh intent (gen > 7).
-  // Amendment C: alreadyApplied = receipt.intentGen === capturedGen.
-  // Since fresh gen ≠ 7, drain re-applies the read.
+  assert.ok(freshIntent.gen > 7);
+  assert.equal(freshIntent.readTarget, 999);
   mgr.effectiveState.set(channelId, 100); // frontier
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Frontier must advance to readTarget=999.
   const frontier = mgr.effectiveState.get(channelId) ?? 0;
-  assert.ok(
-    frontier >= 999,
-    `frontier must advance to 999; got ${frontier} — old receipt must not have swallowed the action`,
-  );
-
-  // Intent consumed.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "fresh intent must be consumed",
-  );
-
+  assert.ok(frontier >= 999);
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   mgr.destroy();
 });
 
 // ── Test 54: scalar-number priorForcedEntry — hydrates as valid ForcedUnreadEntry ──
 test("hydrate_scalarNumberPriorForcedEntry_acceptedAsValidLegacyEntry", async () => {
-  // ForcedUnreadEntry includes legacy scalar-number markers (e.g. a unix timestamp).
-  // parseForcedUnreadEntry must accept a valid non-negative number as a valid entry,
-  // not reject it as corrupt.  A valid sibling intent in the same blob also hydrates.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "54".repeat(32);
   const channelId1 = `scalar-num-ch-${"z".repeat(50)}`;
   const channelId2 = `sibling-scalar-${"A".repeat(49)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
-
-  // Plant: ch1 has unread intent with priorForcedEntry=1700000000 (valid scalar number).
-  //        ch2 has unread intent with no priorForcedEntry.
   ls.setItem(
     v2Key,
     JSON.stringify({
@@ -5791,87 +3270,42 @@ test("hydrate_scalarNumberPriorForcedEntry_acceptedAsValidLegacyEntry", async ()
       ng: 3,
     }),
   );
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // ch1 intent must hydrate with priorForcedEntry=1700000000 (valid scalar number).
   const intent1 = pendingOverrideIntentStore.get(channelId1);
   assert.ok(intent1, "ch1 intent (scalar-number prior) must hydrate");
   assert.equal(intent1.gen, 1, "ch1 intent gen must be 1");
-  assert.equal(
-    intent1.priorForcedEntry,
-    1700000000,
-    "ch1 priorForcedEntry must be the scalar number 1700000000",
-  );
-
-  // ch2 (sibling without prior) must also hydrate.
+  assert.equal(intent1.priorForcedEntry, 1700000000);
   const intent2 = pendingOverrideIntentStore.get(channelId2);
   assert.ok(intent2, "ch2 sibling intent must hydrate");
   assert.equal(intent2.gen, 2, "ch2 gen must be 2");
-
-  // Wire the drain callback and drain both intents.
   const cb = wireDrainCallback(mgr, pubkey);
   mgr.effectiveState.set(channelId1, 50);
   mgr.effectiveState.set(channelId2, 30);
   await mgr.fetchAndMerge(mgr.loadGeneration);
   assert.equal(mgr.isLoadComplete, true);
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // ch2 must have drained normally (S-bump).
   const reg2 = mgr.overrideRegisters.get(channelId2);
   assert.ok(reg2, "ch2 register must be present");
-
-  // ch1 had no existing register → uint32_overflow refusal on s=0 → actually
-  // new S = max(0,0)+1 = 1, not overflow.  It should apply cleanly.
   const reg1 = mgr.overrideRegisters.get(channelId1);
   assert.ok(reg1, "ch1 register must be committed");
   assert.equal(reg1.s, 1, "ch1 S must be 1 after unread drain");
-
-  // Drain completed without abort (no RangeError).
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId1),
-    undefined,
-    "ch1 intent must be consumed",
-  );
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId2),
-    undefined,
-    "ch2 intent must be consumed",
-  );
-
+  assert.equal(pendingOverrideIntentStore.get(channelId1), undefined);
+  assert.equal(pendingOverrideIntentStore.get(channelId2), undefined);
   cb.teardown();
   mgr.destroy();
 });
 
 // ── Test 55: backoff escalation — drain-abort retry delays escalate (1s→2s…) ──
 test("scheduleAbortRetry_persistentFailure_escalatesBackoffAndRecoversBoundedly", async () => {
-  // Holds storage failed across ≥2 timer firings. Asserts:
-  //  - no microtask spin: each failure schedules exactly one timer, not a flood
-  //  - escalating delays: first retry = 1 000 ms, second = 2 000 ms
-  //  - attempt counter resets only after a successful commit (not on every pass)
-  //  - once storage is healthy, the next automatic retry completes the drain
-  //
-  // Failure branch: step-1 (register write) — abort + scheduleAbortRetry on every failure
-  // Durable surfaces: blob post-success has register committed; intent consumed; frontier ≥ 50
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "55".repeat(32);
   const channelId = `backoff-escalation-ch-${"e".repeat(45)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
-
   const origSetTimeout = globalThis.window.setTimeout;
   const origClearTimeout = globalThis.window.clearTimeout;
-  // Capture both fn and delay so we can assert escalation.
   const scheduledTimers = new Map(); // id → { fn, delay }
   let nextFakeId = 55000;
   globalThis.window.setTimeout = (fn, ms) => {
@@ -5889,7 +3323,6 @@ test("scheduleAbortRetry_persistentFailure_escalatesBackoffAndRecoversBoundedly"
       origClearTimeout(id);
     }
   };
-
   let blockV2Writes = false;
   const origSetItem = ls.setItem.bind(ls);
   ls.setItem = (key, value) => {
@@ -5898,122 +3331,47 @@ test("scheduleAbortRetry_persistentFailure_escalatesBackoffAndRecoversBoundedly"
     }
     origSetItem(key, value);
   };
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   try {
     const mgr = new ReadStateManager(pubkey, fakeRelay);
     mgr.hydrateFromLocalStorage(); // clear any leftover state from previous tests
     mgr.effectiveState.set(channelId, 25);
     mgr.isLoadComplete = true;
-
     mgr.isLoadComplete = false; // queue via pending intents store
     mgr.markChannelUnread(channelId);
     mgr.isLoadComplete = true;
-
-    // --- First drain: storage blocked → first abort retry scheduled ---
     blockV2Writes = true;
     await mgr.drainPendingIntents(mgr.loadGeneration);
     blockV2Writes = false; // still blocked during drain; unblock after
-
-    // The abort retry timer must be set (scheduleAbortRetry called).
-    // Note: scheduledTimers also contains the publish-debounce timer (5 000 ms).
-    // Use mgr.drainRetryTimer to get the specific abort retry timer ID.
-    assert.ok(
-      mgr.drainRetryTimer !== null,
-      "drainRetryTimer must be set after first failure",
-    );
+    assert.ok(mgr.drainRetryTimer !== null);
     const timerEntry1 = scheduledTimers.get(mgr.drainRetryTimer);
     assert.ok(timerEntry1, "abort retry timer ID must be in scheduledTimers");
     const delay1 = timerEntry1.delay;
-    assert.equal(
-      delay1,
-      1_000,
-      `first retry delay must be 1 000 ms; got ${delay1}`,
-    );
-    // drainRetryAttempt must NOT have been reset (counter preserved across abort).
-    assert.equal(
-      mgr.drainRetryAttempt,
-      1,
-      "attempt counter must be 1 after first abort",
-    );
-
-    // --- Fire first retry: block again → second abort retry scheduled (2 s) ---
+    assert.equal(delay1, 1_000);
+    assert.equal(mgr.drainRetryAttempt, 1);
     const retryTimerId1 = mgr.drainRetryTimer;
     const fn1 = timerEntry1.fn;
     blockV2Writes = true;
     scheduledTimers.delete(retryTimerId1);
     await fn1(); // drainRetryTimer fn fires; starts a drain synchronously
     blockV2Writes = false;
-
-    // After second failure: drainRetryTimer updated, delay escalated to 2 000 ms.
-    assert.ok(
-      mgr.drainRetryTimer !== null,
-      "drainRetryTimer must be set after second failure",
-    );
+    assert.ok(mgr.drainRetryTimer !== null);
     const timerEntry2 = scheduledTimers.get(mgr.drainRetryTimer);
-    assert.ok(
-      timerEntry2,
-      "abort retry timer ID must be in scheduledTimers after second failure",
-    );
+    assert.ok(timerEntry2);
     const delay2 = timerEntry2.delay;
-    assert.equal(
-      delay2,
-      2_000,
-      `second retry delay must be 2 000 ms; got ${delay2}`,
-    );
-    assert.equal(
-      mgr.drainRetryAttempt,
-      2,
-      "attempt counter must be 2 after second abort",
-    );
-
-    // --- Fire second retry with healthy storage → drain succeeds ---
+    assert.equal(delay2, 2_000);
+    assert.equal(mgr.drainRetryAttempt, 2);
     const fn3 = timerEntry2.fn;
     scheduledTimers.delete(mgr.drainRetryTimer);
     await fn3();
     await new Promise((r) => origSetTimeout(r, 0));
-
-    // Drain committed: register in blob, intent consumed.
     const blobOk = JSON.parse(ls.getItem(v2Key) ?? "null") ?? {};
-    assert.ok(
-      blobOk.r?.[channelId],
-      "register must be in blob after successful retry",
-    );
-    assert.equal(
-      pendingOverrideIntentStore.get(channelId),
-      undefined,
-      "intent must be consumed after successful retry",
-    );
-
-    // Attempt counter reset to 0 after successful commit.
-    assert.equal(
-      mgr.drainRetryAttempt,
-      0,
-      "attempt counter must reset to 0 after success",
-    );
-
-    // Frontier advanced (unread drain bumps S, effectiveState updated).
+    assert.ok(blobOk.r?.[channelId]);
+    assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
+    assert.equal(mgr.drainRetryAttempt, 0);
     const frontier = mgr.effectiveState.get(channelId) ?? 0;
-    assert.ok(
-      frontier >= 25,
-      `frontier must be ≥ 25 after drain; got ${frontier}`,
-    );
-
-    // No pending drain retry timer remains (no more retries needed).
-    assert.equal(
-      mgr.drainRetryTimer,
-      null,
-      "drainRetryTimer must be null after successful drain",
-    );
-
+    assert.ok(frontier >= 25);
+    assert.equal(mgr.drainRetryTimer, null);
     mgr.destroy();
   } finally {
     globalThis.window.setTimeout = origSetTimeout;
@@ -6023,17 +3381,6 @@ test("scheduleAbortRetry_persistentFailure_escalatesBackoffAndRecoversBoundedly"
 
 // ── Test 56: stale-receipt collision at MAX_SAFE_INTEGER ceiling ───────────────
 test("hydrate_maxSafeIntegerCeiling_staleReceiptCollision_replacementNotDiscarded", async () => {
-  // Reproduce Thufir's ceiling collision: blob has a valid intent at gen=1 with a
-  // matching receipt (intentGen=1), a second intent at gen=MAX_SAFE_INTEGER, and
-  // ng=MAX_SAFE_INTEGER.  Hydration must normalize nextGen so a replacement enqueue
-  // for ch1 gets a gen that does NOT match the retained receipt (gen=1), and the
-  // fresh readTarget=999 is not discarded.
-  //
-  // With the clamp-down fix: requiredNextGen = MAX_SAFE_INTEGER + 1 — unrepresentable,
-  // so the rebase branch fires.  After rebase: gen1 ch1 → gen1, gen2 ch2 → gen2,
-  // nextGen = 3.  The replacement read for ch1 gets gen=3, which ≠ receipt intentGen=1.
-  //
-  // Durable surface: frontier reaches 999 after drain.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "56".repeat(32);
   const channelId1 = `ceiling-ch1-${"f".repeat(52)}`;
@@ -6041,7 +3388,6 @@ test("hydrate_maxSafeIntegerCeiling_staleReceiptCollision_replacementNotDiscarde
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
   const MAX = Number.MAX_SAFE_INTEGER;
-
   ls.setItem(
     v2Key,
     JSON.stringify({
@@ -6059,88 +3405,36 @@ test("hydrate_maxSafeIntegerCeiling_staleReceiptCollision_replacementNotDiscarde
       ng: MAX,
     }),
   );
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // After rebase: intents rebased to [1, 2], nextGen = 3.
   const intent1 = pendingOverrideIntentStore.get(channelId1);
   assert.ok(intent1, "ch1 intent must hydrate after rebase");
   const intent2 = pendingOverrideIntentStore.get(channelId2);
   assert.ok(intent2, "ch2 intent must hydrate after rebase");
-  // All gens must be safe integers.
-  assert.ok(
-    Number.isSafeInteger(intent1.gen),
-    "ch1 gen must be safe after rebase",
-  );
-  assert.ok(
-    Number.isSafeInteger(intent2.gen),
-    "ch2 gen must be safe after rebase",
-  );
-
-  // nextGen must be safe and above all rebased gens.
+  assert.ok(Number.isSafeInteger(intent1.gen));
+  assert.ok(Number.isSafeInteger(intent2.gen));
   const ng = pendingOverrideIntentStore.nextGen;
   assert.ok(Number.isSafeInteger(ng), "nextGen must be safe after rebase");
-  assert.ok(
-    ng > intent1.gen && ng > intent2.gen,
-    "nextGen must be above all intent gens",
-  );
-
-  // Replace ch1 intent with a fresh read (readTarget=999).
-  // The replacement gets a gen > original receipt intentGen (1) so drain cannot discard it.
+  assert.ok(ng > intent1.gen && ng > intent2.gen);
   mgr.isLoadComplete = false;
   const r = mgr.markChannelRead(channelId1, undefined, 999);
   assert.equal(r.status, "queued", "replacement read must be queued");
   const fresh1 = pendingOverrideIntentStore.get(channelId1);
   assert.ok(fresh1, "fresh intent must be in store");
-  assert.ok(
-    Number.isSafeInteger(fresh1.gen),
-    "fresh intent gen must be safe integer",
-  );
-
-  // Drain: the retained receipt (intentGen=1 pre-rebase → rebased to its new gen value)
-  // must NOT match the replacement gen, so the fresh read is applied.
+  assert.ok(Number.isSafeInteger(fresh1.gen));
   mgr.effectiveState.set(channelId1, 50);
   mgr.effectiveState.set(channelId2, 30);
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
   const frontier1 = mgr.effectiveState.get(channelId1) ?? 0;
-  assert.ok(
-    frontier1 >= 999,
-    `ch1 frontier must reach 999 after drain; got ${frontier1} — stale receipt must not discard replacement`,
-  );
-
-  // ch1 intent consumed.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId1),
-    undefined,
-    "ch1 intent consumed",
-  );
-
+  assert.ok(frontier1 >= 999);
+  assert.equal(pendingOverrideIntentStore.get(channelId1), undefined);
   mgr.destroy();
 });
 
 // ── Test 57: ng=MAX_SAFE_INTEGER multi-enqueue — no unsafe gen minted ────────
 test("enqueue_ngMaxSafeInteger_twoEnqueues_noUnsafeGenMinted_bothSurviveHydration", async () => {
-  // When a blob has ng=MAX_SAFE_INTEGER and low intent gens, the normalization clamp-down
-  // must prevent the first enqueue from minting gen=MAX_SAFE_INTEGER and the second from
-  // throwing (or minting an unsafe gen from _nextGen++).
-  //
-  // After the clamp-down fix: requiredNextGen = max(intent gens, receipt gens) + 1 (small).
-  // nextGen is clamped to that value.  Both enqueues receive distinct safe gens; both
-  // survive a subsequent hydration.
-  //
-  // Durable surface: both intents present in v2 blob after two enqueues; hydrated correctly.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "57".repeat(32);
   const ch1 = `max-enq-ch1-${"h".repeat(52)}`;
@@ -6148,34 +3442,13 @@ test("enqueue_ngMaxSafeInteger_twoEnqueues_noUnsafeGenMinted_bothSurviveHydratio
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
   const MAX = Number.MAX_SAFE_INTEGER;
-
-  // Plant: ng=MAX_SAFE_INTEGER, no existing intents, no receipts.
   ls.setItem(v2Key, JSON.stringify({ ng: MAX }));
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // nextGen must have been clamped down: no existing gens → requiredNextGen = 0+1 = 1.
   const ngAfterHydrate = pendingOverrideIntentStore.nextGen;
-  assert.ok(
-    Number.isSafeInteger(ngAfterHydrate),
-    "nextGen must be safe after hydration",
-  );
-  assert.ok(
-    ngAfterHydrate < MAX,
-    `nextGen must be clamped below MAX_SAFE_INTEGER; got ${ngAfterHydrate}`,
-  );
-
-  // First enqueue — must not throw and must mint a safe gen.
+  assert.ok(Number.isSafeInteger(ngAfterHydrate));
+  assert.ok(ngAfterHydrate < MAX);
   mgr.isLoadComplete = false;
   let r1;
   assert.doesNotThrow(() => {
@@ -6184,12 +3457,7 @@ test("enqueue_ngMaxSafeInteger_twoEnqueues_noUnsafeGenMinted_bothSurviveHydratio
   assert.equal(r1.status, "queued", "first enqueue must be queued");
   const intent1 = pendingOverrideIntentStore.get(ch1);
   assert.ok(intent1, "first intent must be in store");
-  assert.ok(
-    Number.isSafeInteger(intent1.gen),
-    `first intent gen must be safe; got ${intent1.gen}`,
-  );
-
-  // Second enqueue — must not throw, distinct safe gen.
+  assert.ok(Number.isSafeInteger(intent1.gen));
   let r2;
   assert.doesNotThrow(() => {
     r2 = mgr.markChannelUnread(ch2);
@@ -6197,53 +3465,26 @@ test("enqueue_ngMaxSafeInteger_twoEnqueues_noUnsafeGenMinted_bothSurviveHydratio
   assert.equal(r2.status, "queued", "second enqueue must be queued");
   const intent2 = pendingOverrideIntentStore.get(ch2);
   assert.ok(intent2, "second intent must be in store");
-  assert.ok(
-    Number.isSafeInteger(intent2.gen),
-    `second intent gen must be safe; got ${intent2.gen}`,
-  );
-  assert.notEqual(
-    intent1.gen,
-    intent2.gen,
-    "both intents must have distinct gens",
-  );
-
-  // Both intents must survive hydration (durable surface: v2 blob).
+  assert.ok(Number.isSafeInteger(intent2.gen));
+  assert.notEqual(intent1.gen, intent2.gen);
   const blobRaw = ls.getItem(v2Key);
   assert.ok(blobRaw, "v2 blob must be present");
   const blob = JSON.parse(blobRaw);
   assert.ok(blob.pi?.[ch1], "ch1 pi must be in blob");
   assert.ok(blob.pi?.[ch2], "ch2 pi must be in blob");
-
-  // Hydrate a fresh manager; both intents must be present.
   const mgr2 = new ReadStateManager(pubkey, fakeRelay);
   mgr2.hydrateFromLocalStorage();
-  assert.ok(
-    pendingOverrideIntentStore.get(ch1),
-    "ch1 must hydrate in fresh manager",
-  );
-  assert.ok(
-    pendingOverrideIntentStore.get(ch2),
-    "ch2 must hydrate in fresh manager",
-  );
+  assert.ok(pendingOverrideIntentStore.get(ch1));
+  assert.ok(pendingOverrideIntentStore.get(ch2));
   mgr2.destroy();
-
   mgr.destroy();
 });
 
 // ── Test 58: thrown-handler — callback throws, tx aborts, bounded retry, latch cleared ──
 test("drain_onDrainOutcomeThrows_transactionAborts_gen1Restored_boundedRetryScheduled", async () => {
-  // If onDrainOutcome throws, the try/catch in drain wraps it and routes to abortTransaction
-  // + scheduleAbortRetry.  After the abort:
-  //   - gen1 is restored as the live intent (not lost)
-  //   - a bounded retry timer is scheduled (not immediate spin)
-  //   - a subsequent enqueue is NOT swallowed by a stale latch (channel unlocked)
-  //
-  // Failure branch: thrown callback — catch → abortTransaction + scheduleAbortRetry
-  // Durable surface: gen1 live in store after abort; channel unlocked (enqueue succeeds)
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "58".repeat(32);
   const channelId = `thrown-cb-ch-${"j".repeat(51)}`;
-
   const origSetTimeout = globalThis.window.setTimeout;
   const origClearTimeout = globalThis.window.clearTimeout;
   const scheduledTimers = new Map();
@@ -6257,88 +3498,40 @@ test("drain_onDrainOutcomeThrows_transactionAborts_gen1Restored_boundedRetrySche
     return origSetTimeout(fn, ms);
   };
   globalThis.window.clearTimeout = (id) => {
-    if (scheduledTimers.has(id)) {
-      scheduledTimers.delete(id);
-    } else {
-      origClearTimeout(id);
-    }
+    if (scheduledTimers.has(id)) scheduledTimers.delete(id);
+    else origClearTimeout(id);
   };
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   try {
     const mgr = new ReadStateManager(pubkey, fakeRelay);
     mgr.hydrateFromLocalStorage(); // clear any leftover state from previous tests
     mgr.effectiveState.set(channelId, 50);
     mgr.isLoadComplete = false; // Queue via pending intents store
-
     mgr.markChannelUnread(channelId);
     const gen1Intent = pendingOverrideIntentStore.get(channelId);
     assert.ok(gen1Intent, "gen1 must be in store after markChannelUnread");
     const gen1 = gen1Intent.gen;
-
-    // Wire a throwing outcome callback.
     let callbackFired = false;
     mgr.onDrainOutcome = (_outcome) => {
       callbackFired = true;
       throw new Error("simulated callback failure");
     };
-
-    // Run drain; the callback throws on outcome dispatch after step-1 commit.
     mgr.isLoadComplete = true;
     await mgr.drainPendingIntents(mgr.loadGeneration);
-
-    // Callback must have been invoked (drain did reach outcome dispatch).
     assert.ok(callbackFired, "onDrainOutcome must have been invoked");
-
-    // Gen1 must be restored as the live intent (abort undid any in-flight promotion).
     const intentAfterThrow = pendingOverrideIntentStore.get(channelId);
-    assert.ok(
-      intentAfterThrow,
-      "gen1 must be restored after thrown callback abort",
-    );
+    assert.ok(intentAfterThrow);
     assert.equal(intentAfterThrow.gen, gen1, "restored intent must be gen1");
-
-    // Channel must be unlocked (latch cleared by abortTransaction).
-    // Set isLoadComplete=false so markChannelRead goes through the queue path —
-    // a locked channel would return gen:-1 placeholder; an unlocked one gets real gen.
     mgr.isLoadComplete = false;
     const rAfterAbort = mgr.markChannelRead(channelId, undefined, 999);
-    assert.notEqual(
-      rAfterAbort.status,
-      undefined,
-      "enqueue after abort must return a result",
-    );
-    // The store must hold a real gen (> 0), not the deferred placeholder (-1).
+    assert.notEqual(rAfterAbort.status, undefined);
     const intentAfterEnqueue = pendingOverrideIntentStore.get(channelId);
     assert.ok(intentAfterEnqueue, "intent must exist after enqueue");
-    assert.ok(
-      intentAfterEnqueue.gen > 0,
-      "new intent gen must be > 0 (not deferred placeholder — channel must be unlocked)",
-    );
-
-    // A bounded retry timer must be scheduled (scheduleAbortRetry called).
-    // Use mgr.drainRetryTimer to identify the specific abort retry timer
-    // (scheduledTimers also contains the publish-debounce timer at 5 000 ms).
-    assert.ok(
-      mgr.drainRetryTimer !== null,
-      "drainRetryTimer must be set after thrown-callback abort",
-    );
+    assert.ok(intentAfterEnqueue.gen > 0);
+    assert.ok(mgr.drainRetryTimer !== null);
     const retryEntry = scheduledTimers.get(mgr.drainRetryTimer);
     assert.ok(retryEntry, "abort retry timer must be in scheduledTimers");
-    assert.equal(
-      retryEntry.delay,
-      1_000,
-      `first retry delay after throw must be 1 000 ms; got ${retryEntry.delay}`,
-    );
-
+    assert.equal(retryEntry.delay, 1_000);
     mgr.destroy();
   } finally {
     globalThis.window.setTimeout = origSetTimeout;
@@ -6348,120 +3541,44 @@ test("drain_onDrainOutcomeThrows_transactionAborts_gen1Restored_boundedRetrySche
 
 // ── Test 59: identity swap — A deferred mid-tx, B hydrates, B sees no A state ──
 test("identitySwap_aDeferredMidTransaction_bHydrates_bSeesNoAState", async () => {
-  // An A-account drain holds a transaction lock on channelId while a deferred enqueue
-  // is buffered (simulated by beginTransaction + buffering a deferred enqueue manually).
-  // When B calls hydrateFromLocalStorage (identity swap), clearTransactionState() must
-  // purge all A-owned locks, snapshots, deferred payloads, and promoted payloads.
-  // B must see none of A's transaction state.
-  //
-  // Durable surface: pendingOverrideIntentStore has no lock/deferred/promoted for A's
-  // channelId after B hydration; B's own intent (if any) is unaffected.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkeyA = "59aa".repeat(16);
   const pubkeyB = "59bb".repeat(16);
   const channelId = `id-swap-ch-${"k".repeat(53)}`;
   const v2KeyB = `buzz.nip-rs.override-state.v2:${pubkeyB}`;
   const ls = globalThis.window.localStorage;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
-  // A-account: queue an intent and begin a transaction (simulates drain holding lock).
+  const fakeRelay = makeFakeRelay();
   const mgrA = new ReadStateManager(pubkeyA, fakeRelay);
   mgrA.effectiveState.set(channelId, 10);
   mgrA.isLoadComplete = false;
   mgrA.markChannelUnread(channelId);
-
-  // Begin transaction manually (as drain would) and buffer a deferred enqueue for A.
   pendingOverrideIntentStore.beginTransaction(channelId);
-  // Enqueue another action while locked — it becomes a deferred enqueue (gen=-1 placeholder).
   mgrA.markChannelRead(channelId, undefined, 999);
-  // Confirm the enqueue was deferred (placeholder gen=-1 while channel is locked).
-  // markChannelRead returns a MarkResult whose status is "queued" but the stored intent's
-  // underlying gen is -1.  We verify locking indirectly: after B hydration, the channel
-  // must accept a normal enqueue (gen > 0), proving the lock was cleared.
-
-  // B-account hydration: this must call clearTransactionState() and wipe all A state.
-  // Plant a minimal B blob so hydrateFromLocalStorage has something to restore.
   ls.setItem(v2KeyB, JSON.stringify({ ng: 2 }));
   const mgrB = new ReadStateManager(pubkeyB, fakeRelay);
   mgrB.hydrateFromLocalStorage();
-
-  // After B hydration, the channel must be unlocked.
-  // Probe: a fresh enqueue from mgrB must get a real gen (not -1 placeholder).
   mgrB.isLoadComplete = false;
   const rB = mgrB.markChannelUnread(channelId);
   assert.equal(rB.status, "queued", "B enqueue must be queued");
   const intentB = pendingOverrideIntentStore.get(channelId);
   assert.ok(intentB, "B must have its own intent after enqueue");
-  assert.ok(
-    intentB.gen > 0,
-    `B intent gen must be a real allocated gen (not -1 placeholder); got ${intentB.gen} — channel must be unlocked after identity swap`,
-  );
-  assert.ok(
-    Number.isSafeInteger(intentB.gen),
-    "B intent gen must be safe integer",
-  );
-
-  // No A-owned deferred payload should have survived:
-  // if A's deferred read (readTarget=999) had leaked, B's own intent would show
-  // a read op or readTarget=999 from A's payload.  B enqueued an unread, so:
-  assert.equal(
-    intentB.op,
-    "unread",
-    "B intent op must be unread (A deferred read did not leak)",
-  );
-  assert.equal(
-    intentB.readTarget,
-    undefined,
-    "B intent must have no readTarget (A payload did not leak)",
-  );
-
+  assert.ok(intentB.gen > 0);
+  assert.ok(Number.isSafeInteger(intentB.gen));
+  assert.equal(intentB.op, "unread");
+  assert.equal(intentB.readTarget, undefined);
   mgrA.destroy();
   mgrB.destroy();
 });
 
 // ── Test 60: MAX-2 boundary — two enqueues from valid two-below-ceiling hydration ──
 test("hydrate_maxMinusTwoState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe", async () => {
-  // Paul's exact repro: blob with pi.gen = MAX_SAFE_INTEGER-2 and ng = MAX_SAFE_INTEGER-2.
-  // Before the headroom fix, the boundary was requiredNextGen >= MAX_SAFE_INTEGER (one notch):
-  //   requiredNextGen = MAX-1 → safe, < MAX → no rebase; clamp sets nextGen = MAX-1.
-  //   Click 1 mints gen=MAX-1, _nextGen=MAX (safe, persisted).
-  //   Click 2 preflight: next=MAX+1 unsafe → THROWS synchronously up markChannelRead.
-  //
-  // After the headroom fix: rebase triggers when requiredNextGen >= MAX - GEN_REBASE_HEADROOM
-  // (i.e. within 2**32 of MAX_SAFE_INTEGER).  MAX-1 is well within that window, so the
-  // rebase fires on the MAX-2 blob just as it did on the MAX-1 blob.
-  // The single pending intent is rebased to gen=1, nextGen=2.  Both enqueues get safe
-  // distinct gens; neither throws; the persisted ng after each enqueue is safe.
-  //
-  // Failure branch: rebase boundary (maxObservedGen = MAX_SAFE_INTEGER-2, requiredNextGen
-  //   = MAX-1 >= MAX - GEN_REBASE_HEADROOM → rebase rather than clamp).
-  // Durable surface: v2 blob after each enqueue has safe ng; fresh-manager hydration
-  //   succeeds and sees both intents.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "60".repeat(32);
   const channelId = `max-minus-two-ch-${"\u006d".repeat(47)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
   const MAX = Number.MAX_SAFE_INTEGER;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
-  // Plant blob: one intent at gen=MAX_SAFE_INTEGER-2, ng=MAX_SAFE_INTEGER-2.
+  const fakeRelay = makeFakeRelay();
   ls.setItem(
     v2Key,
     JSON.stringify({
@@ -6469,27 +3586,13 @@ test("hydrate_maxMinusTwoState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe",
       ng: MAX - 2,
     }),
   );
-
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // After hydration: rebase must have fired.
-  // maxObservedGen = MAX-2 → requiredNextGen = MAX-1 → >= MAX - 2**32 → rebase.
-  // One intent rebased to gen=1; nextGen=2.
   const ngAfterHydrate = pendingOverrideIntentStore.nextGen;
-  assert.ok(
-    Number.isSafeInteger(ngAfterHydrate),
-    `nextGen must be safe after hydration; got ${ngAfterHydrate}`,
-  );
-  assert.ok(
-    ngAfterHydrate < MAX,
-    `nextGen must be well below MAX_SAFE_INTEGER after rebase; got ${ngAfterHydrate}`,
-  );
+  assert.ok(Number.isSafeInteger(ngAfterHydrate));
+  assert.ok(ngAfterHydrate < MAX);
   assert.equal(ngAfterHydrate, 2, "nextGen must be 2 after rebase of 1 intent");
-
   const ch2 = `max-minus-two-ch2-${"n".repeat(46)}`;
-
-  // First enqueue — must NOT throw, must produce safe gen.
   mgr.isLoadComplete = false;
   let r1;
   assert.doesNotThrow(() => {
@@ -6498,29 +3601,15 @@ test("hydrate_maxMinusTwoState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe",
   assert.equal(r1.status, "queued", "first enqueue must be queued");
   const intent1 = pendingOverrideIntentStore.get(ch2);
   assert.ok(intent1, "first intent must be in store");
-  assert.ok(
-    Number.isSafeInteger(intent1.gen),
-    `first intent gen must be safe; got ${intent1.gen}`,
-  );
+  assert.ok(Number.isSafeInteger(intent1.gen));
   assert.ok(intent1.gen > 0, "first intent gen must be positive");
-
-  // Persisted ng after first enqueue must be safe.
   const blob1Raw = ls.getItem(v2Key);
   assert.ok(blob1Raw, "v2 blob must be present after first enqueue");
   const blob1 = JSON.parse(blob1Raw);
   const ng1 = blob1.ng ?? 1; // ng omitted when === 1 (the `ng > 1` condition)
-  assert.ok(
-    Number.isSafeInteger(ng1),
-    `persisted ng after first enqueue must be safe; got ${ng1}`,
-  );
-  assert.ok(
-    ng1 < MAX,
-    `persisted ng must be below MAX_SAFE_INTEGER; got ${ng1}`,
-  );
-
+  assert.ok(Number.isSafeInteger(ng1));
+  assert.ok(ng1 < MAX);
   const ch3 = `max-minus-two-ch3-${"o".repeat(46)}`;
-
-  // Second enqueue — must NOT throw, must produce distinct safe gen.
   let r2;
   assert.doesNotThrow(() => {
     r2 = mgr.markChannelRead(ch3, undefined, 500);
@@ -6528,112 +3617,38 @@ test("hydrate_maxMinusTwoState_twoEnqueues_safeGensNeitherThrows_ngPersistSafe",
   assert.equal(r2.status, "queued", "second enqueue must be queued");
   const intent2 = pendingOverrideIntentStore.get(ch3);
   assert.ok(intent2, "second intent must be in store");
-  assert.ok(
-    Number.isSafeInteger(intent2.gen),
-    `second intent gen must be safe; got ${intent2.gen}`,
-  );
-  assert.notEqual(
-    intent1.gen,
-    intent2.gen,
-    "both enqueues must have distinct gens",
-  );
-
-  // Persisted ng after second enqueue must be safe.
+  assert.ok(Number.isSafeInteger(intent2.gen));
+  assert.notEqual(intent1.gen, intent2.gen);
   const blob2Raw = ls.getItem(v2Key);
   assert.ok(blob2Raw, "v2 blob must be present after second enqueue");
   const blob2 = JSON.parse(blob2Raw);
   const ng2 = blob2.ng ?? 1;
-  assert.ok(
-    Number.isSafeInteger(ng2),
-    `persisted ng after second enqueue must be safe; got ${ng2}`,
-  );
-  assert.ok(
-    ng2 < MAX,
-    `persisted ng must be below MAX_SAFE_INTEGER; got ${ng2}`,
-  );
-
-  // Both intents survive hydration on a fresh manager.
+  assert.ok(Number.isSafeInteger(ng2));
+  assert.ok(ng2 < MAX);
   const mgr2 = new ReadStateManager(pubkey, fakeRelay);
   mgr2.hydrateFromLocalStorage();
-  assert.ok(
-    pendingOverrideIntentStore.get(ch2),
-    "ch2 intent must survive hydration",
-  );
-  assert.ok(
-    pendingOverrideIntentStore.get(ch3),
-    "ch3 intent must survive hydration",
-  );
+  assert.ok(pendingOverrideIntentStore.get(ch2));
+  assert.ok(pendingOverrideIntentStore.get(ch3));
   mgr2.destroy();
-
   mgr.destroy();
 });
 
 // ── Test 61: promotion allocation failure — no stranded lock, retry scheduled ──
 test("drain_promoteDeferredAllocExhausted_noStrandedLock_retryScheduled_drainScheduledCleared", async () => {
-  // Forces allocateGeneration() to throw during promoteDeferred() inside the drain.
-  // Achieved by: restoreFromStorage with _nextGen=MAX_SAFE_INTEGER (artificially exhausted),
-  // plus a gen1 intent and a deferred gen2 enqueue buffered mid-transaction.
-  // The promoteDeferred() call preflights BEFORE mutating — when it throws:
-  //   • deferredEnqueues still has the gen2 payload (not deleted before throw)
-  //   • abortTransaction() is called: gen1 restored as live intent, channel unlocked
-  //   • scheduleAbortRetry() fires: drainRetryTimer set
-  //   • manager finally clears drainScheduled
-  //
-  // Failure branch: promoteDeferred() allocation exhaustion → catch in step-3.
-  // Durable surface: immediately after failure, lockedChannels is clear, deferredEnqueues
-  //   retains the ORIGINAL gen2 payload, drainScheduled=false, retry timer set.
-  //   Recovery: reset _nextGen directly (no hydration / clearTransactionState), fire retry
-  //   timer, assert the RETAINED original payload drives frontier to 999.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "61".repeat(32);
   const channelId = `promo-alloc-ch-${"p".repeat(50)}`;
   const MAX = Number.MAX_SAFE_INTEGER;
-
-  const origSetTimeout = globalThis.window.setTimeout;
-  const origClearTimeout = globalThis.window.clearTimeout;
-  const scheduledTimers = new Map(); // id → fn
-  let nextFakeId = 61000;
-  globalThis.window.setTimeout = (fn, ms) => {
-    if (ms > 0) {
-      const id = nextFakeId++;
-      scheduledTimers.set(id, fn);
-      return id;
-    }
-    return origSetTimeout(fn, ms);
-  };
-  globalThis.window.clearTimeout = (id) => {
-    if (scheduledTimers.has(id)) {
-      scheduledTimers.delete(id);
-    } else {
-      origClearTimeout(id);
-    }
-  };
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const timers = makeFakeTimers();
+  const fakeRelay = makeFakeRelay();
   try {
     const mgr = new ReadStateManager(pubkey, fakeRelay);
     mgr.effectiveState.set(channelId, 50);
-
-    // Plant a gen1 intent and set ng = MAX_SAFE_INTEGER directly via restoreFromStorage.
-    // This bypasses hydration normalization to simulate an exhausted allocator.
-    // (In production, the rebase boundary prevents _nextGen from ever reaching MAX in-session.)
     const gen1Intent = { gen: 1, op: /** @type {"unread"} */ ("unread") };
     pendingOverrideIntentStore.restoreFromStorage(
       new Map([[channelId, gen1Intent]]),
       MAX,
     );
-
-    // Wire the drain callback: enqueue gen2 (read, readTarget=999) from inside the
-    // outcome callback.  The channel is locked at callback time, so the enqueue is
-    // buffered as deferred.  The promoteDeferred() call will then exhaust the allocator.
     mgr.onDrainOutcome = (outcome) => {
       if (
         outcome.kind === "applied-unread" &&
@@ -6645,152 +3660,69 @@ test("drain_promoteDeferredAllocExhausted_noStrandedLock_retryScheduled_drainSch
         mgr.isLoadComplete = prev;
       }
     };
-
-    // Drain with _nextGen = MAX_SAFE_INTEGER: step1 succeeds (register + receipt written),
-    // step2 callback fires (deferred enqueue buffered), step3 promoteDeferred() throws.
     mgr.isLoadComplete = true;
     await mgr.drainPendingIntents(mgr.loadGeneration);
 
     // ── drainScheduled must be false (manager's try-finally always clears it) ──
-    assert.equal(
-      mgr.drainScheduled,
-      false,
-      "drainScheduled must be false after allocation throw (finally path)",
-    );
+    assert.equal(mgr.drainScheduled, false);
 
     // ── drainRetryTimer must be set (scheduleAbortRetry called from catch) ──
-    assert.ok(
-      mgr.drainRetryTimer !== null,
-      "drainRetryTimer must be set after allocation failure",
-    );
-    assert.ok(
-      scheduledTimers.has(mgr.drainRetryTimer),
-      "abort retry timer ID must be in scheduledTimers",
-    );
+    assert.ok(mgr.drainRetryTimer !== null);
+    assert.ok(timers.scheduled.has(mgr.drainRetryTimer));
 
     // ── Channel is unlocked: direct probe of lockedChannels ──
     assert.equal(
-      // @ts-expect-error — private field, accessible at runtime for verification
       pendingOverrideIntentStore.lockedChannels.has(channelId),
       false,
-      "lockedChannels must NOT contain channelId after abort",
     );
 
     // ── gen1 must be the live intent (abortTransaction restored it) ──
     const intentAfterFail = pendingOverrideIntentStore.get(channelId);
-    assert.ok(
-      intentAfterFail,
-      "gen1 must be live in store after allocation failure",
-    );
-    assert.equal(
-      intentAfterFail.gen,
-      gen1Intent.gen,
-      "live intent gen must be gen1 after abort",
-    );
+    assert.ok(intentAfterFail);
+    assert.equal(intentAfterFail.gen, gen1Intent.gen);
 
     // ── Original deferred gen2 payload must be retained in deferredEnqueues ──
-    // promoteDeferred() preflights before mutating, so deferredEnqueues was NOT
-    // touched before the throw.
     const deferredPayload =
-      // @ts-expect-error — private field, accessible at runtime for verification
       pendingOverrideIntentStore.deferredEnqueues.get(channelId);
-    assert.ok(
-      deferredPayload,
-      "deferredEnqueues must retain the gen2 payload after allocation failure",
-    );
-    assert.equal(
-      deferredPayload.op,
-      "read",
-      "retained deferred op must be 'read'",
-    );
-    assert.equal(
-      deferredPayload.readTarget,
-      999,
-      "retained deferred readTarget must be 999",
-    );
+    assert.ok(deferredPayload);
+    assert.equal(deferredPayload.op, "read");
+    assert.equal(deferredPayload.readTarget, 999);
 
     // ── No promoted payload must exist ──
     assert.equal(
-      // @ts-expect-error — private field, accessible at runtime for verification
       pendingOverrideIntentStore.promotedDeferredPayloads.get(channelId),
       undefined,
-      "promotedDeferredPayloads must be clear after abort",
     );
 
     // ── Recovery: reset _nextGen directly to a safe value WITHOUT hydrating ──
-    // Hydration would call restoreFromStorage → clearTransactionState, which would
-    // clear deferredEnqueues and destroy the retained payload.  Instead, set _nextGen
-    // directly to 2 (safe) so allocateGeneration() can succeed on retry.
-    // @ts-expect-error — private field write, test-only
     pendingOverrideIntentStore._nextGen = 2;
-    // Do NOT reinstall the callback — the original callback is still registered and
-    // will re-enqueue gen2.  But for this recovery witness we want to prove the
-    // RETAINED payload (currently in deferredEnqueues) is what drives frontier 999,
-    // not a newly-created payload.  Disable the callback to isolate the retained payload.
     mgr.onDrainOutcome = null;
-
-    // Fire the retry timer — _nextGen is now 2 (safe), allocation will succeed.
     const retryTimerId = mgr.drainRetryTimer;
-    const retryFn = scheduledTimers.get(retryTimerId);
-    assert.ok(retryFn, "retry timer fn must be in scheduledTimers");
-    scheduledTimers.clear();
+    const retryFn = timers.scheduled.get(retryTimerId)?.fn;
+    assert.ok(retryFn, "retry timer fn must be in timers.scheduled");
+    timers.scheduled.clear();
     await retryFn();
-    await new Promise((r) => origSetTimeout(r, 0));
+    await new Promise((r) => timers.origSetTimeout(r, 0));
 
     // ── After retry: gen1 cleaned up, gen2 (from retained payload) committed ──
-    // The retained deferred read-to-999 payload was promoted in this pass.
     const frontierAfterRetry = mgr.effectiveState.get(channelId) ?? 0;
-    assert.ok(
-      frontierAfterRetry >= 999,
-      `frontier must be ≥ 999 after drain with retained gen2 payload; got ${frontierAfterRetry}`,
-    );
-    assert.equal(
-      pendingOverrideIntentStore.get(channelId),
-      undefined,
-      "no pending intent after successful retry drain",
-    );
-
-    // drainScheduled must be false (no new drain was needed).
-    assert.equal(
-      mgr.drainScheduled,
-      false,
-      "drainScheduled must be false after successful retry",
-    );
-
+    assert.ok(frontierAfterRetry >= 999);
+    assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
+    assert.equal(mgr.drainScheduled, false);
     mgr.destroy();
   } finally {
-    globalThis.window.setTimeout = origSetTimeout;
-    globalThis.window.clearTimeout = origClearTimeout;
+    timers.restore();
   }
 });
 
 // ── Test 62: normal blob — no rebase fires on healthy state ──────────────────
 test("hydrate_normalBlob_noRebase_verbatimNextGen", () => {
-  // Control witness for the GEN_REBASE_HEADROOM trigger.  A blob with gens
-  // well below the ceiling (e.g. gen=1000, ng=1001) must NOT trigger a rebase.
-  // The headroom boundary (requiredNextGen >= MAX_SAFE_INTEGER - 2**32) is
-  // ~4.3e9 away from MAX_SAFE_INTEGER.  At ng=1001 the trigger cannot fire.
-  //
-  // Failure branch: clamp/normalize only — requiredNextGen = 1001, nextGen
-  //   must be exactly 1001 after hydration (verbatim, no rebase).
-  // Durable surface: nextGen equals requiredNextGen exactly; rebase was not
-  //   invoked (intents retain their original gen identities).
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "62".repeat(32);
   const channelId = `normal-blob-ch-${"n".repeat(49)}`;
   const v2Key = `buzz.nip-rs.override-state.v2:${pubkey}`;
   const ls = globalThis.window.localStorage;
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
-  // Plant a normal blob: one intent at gen=1000, ng=1001.
+  const fakeRelay = makeFakeRelay();
   ls.setItem(
     v2Key,
     JSON.stringify({
@@ -6798,54 +3730,18 @@ test("hydrate_normalBlob_noRebase_verbatimNextGen", () => {
       ng: 1001,
     }),
   );
-
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // nextGen must equal requiredNextGen = 1001, verbatim — no rebase.
   const ngAfterHydrate = pendingOverrideIntentStore.nextGen;
-  assert.equal(
-    ngAfterHydrate,
-    1001,
-    `nextGen must be verbatim 1001 for healthy blob; got ${ngAfterHydrate}`,
-  );
-
-  // The single intent must retain its original gen=1000.
+  assert.equal(ngAfterHydrate, 1001);
   const intent = pendingOverrideIntentStore.get(channelId);
   assert.ok(intent, "intent must be present after hydration");
-  assert.equal(
-    intent.gen,
-    1000,
-    `intent gen must remain 1000 (no rebase); got ${intent.gen}`,
-  );
-
+  assert.equal(intent.gen, 1000);
   mgr.destroy();
 });
 
 // ── Test 63: pre-rebase receipt sweep — stale receipt does not manufacture alreadyApplied ──
 test("hydrate_rebase_staleReceiptSweptBeforeCompaction_drainReplaysAction", async () => {
-  // Thufir's exact round-8 repro state: a headroom-triggering unread intent at
-  // gen = MAX_SAFE_INTEGER - 2**32, a same-channel STALE unread receipt at gen = 1,
-  // and a register at s=4, c=2.
-  //
-  // Without the pre-rebase sweep (prior behavior):
-  //   • Rebase assigned new gen=1 to the intent (compact range [1..N]).
-  //   • The stale receipt was left unchanged at intentGen=1.
-  //   • Rebased intent.gen (1) === retained receipt.intentGen (1) → manufactured match.
-  //   • Drain saw alreadyApplied=true, deleted the intent without replaying: s stayed 4.
-  //
-  // With the pre-rebase sweep (this fix):
-  //   • Before computing maxObservedGen: for each receipt, check that same-channel intent
-  //     exists and has IDENTICAL {gen, op}.  The stale receipt has gen=1 but intent.gen=MAX-2**32
-  //     → mismatch → receipt deleted.
-  //   • maxObservedGen = MAX-2**32 (from intent only, no receipts).
-  //   • requiredNextGen = MAX-2**32+1 >= MAX-2**32 → rebase fires.
-  //   • Intent rebased to gen=1, nextGen=2.  No receipt exists for the channel.
-  //   • Drain: alreadyApplied=false → action replayed → s: 4→5.
-  //
-  // Failure branch: pre-rebase receipt sweep (gen/op identity validation before compaction).
-  // Durable surface: after drain, register s=5 (replayed, not skipped);
-  //   persisted blob contains no receipt for the channel; no pending intent.
   globalThis.window.localStorage = makeLocalStorage();
   const pubkey = "63".repeat(32);
   const channelId = `stale-receipt-ch-${"s".repeat(47)}`;
@@ -6853,9 +3749,6 @@ test("hydrate_rebase_staleReceiptSweptBeforeCompaction_drainReplaysAction", asyn
   const ls = globalThis.window.localStorage;
   const MAX = Number.MAX_SAFE_INTEGER;
   const HEADROOM = 2 ** 32;
-
-  // Plant Thufir's exact state: unread intent at gen=MAX-HEADROOM, stale unread receipt
-  // at gen=1 (mismatched — from a prior session's drain), register s=4, c=2.
   ls.setItem(
     v2Key,
     JSON.stringify({
@@ -6871,59 +3764,22 @@ test("hydrate_rebase_staleReceiptSweptBeforeCompaction_drainReplaysAction", asyn
       ng: MAX - HEADROOM,
     }),
   );
-
-  const fakeRelay = {
-    fetchEvents: async () => [],
-    publishEvent: async () => {},
-    subscribeFenced: async (_f, _h) => makeFenceHandle({ eose: true }),
-    subscribeLive: async (_f, _h) => () => {},
-    subscribeToReconnects: () => () => {},
-    getConnectionGeneration: () => 0,
-  };
-
+  const fakeRelay = makeFakeRelay();
   const mgr = new ReadStateManager(pubkey, fakeRelay);
   mgr.hydrateFromLocalStorage();
-
-  // After hydration: stale receipt must have been swept (gen=1 ≠ intent gen=MAX-HEADROOM).
-  // Then rebase fires (requiredNextGen = MAX-HEADROOM+1 >= MAX-HEADROOM), compacts intent to gen=1.
   const intentAfterHydrate = pendingOverrideIntentStore.get(channelId);
   assert.ok(intentAfterHydrate, "intent must survive hydration");
-  assert.ok(
-    Number.isSafeInteger(intentAfterHydrate.gen),
-    `rebased intent gen must be safe; got ${intentAfterHydrate.gen}`,
-  );
+  assert.ok(Number.isSafeInteger(intentAfterHydrate.gen));
   assert.equal(intentAfterHydrate.op, "unread", "intent op must be unread");
-
-  // Drain: alreadyApplied must be false (no receipt retained after sweep).
-  // The unread replay bumps s: 4 → 5.
   mgr.effectiveState.set(channelId, 0);
   mgr.isLoadComplete = true;
   await mgr.drainPendingIntents(mgr.loadGeneration);
-
-  // Register s must have been incremented to 5 (replayed, not alreadyApplied-skipped).
   const reg = mgr.overrideRegisters.get(channelId);
   assert.ok(reg, "register must exist after drain");
-  assert.equal(
-    reg.s,
-    5,
-    `register s must be 5 after unread replay; got ${reg.s} — alreadyApplied must not have fired`,
-  );
-
-  // Intent must be consumed.
-  assert.equal(
-    pendingOverrideIntentStore.get(channelId),
-    undefined,
-    "intent must be consumed after drain",
-  );
-
-  // Persisted blob must not contain a receipt for the channel that was swept.
+  assert.equal(reg.s, 5);
+  assert.equal(pendingOverrideIntentStore.get(channelId), undefined);
   const blobAfterDrain = JSON.parse(ls.getItem(v2Key) ?? "{}");
   const receiptInBlob = blobAfterDrain?.receipts?.[channelId] ?? null;
-  assert.equal(
-    receiptInBlob,
-    null,
-    "persisted blob must not contain a receipt for the channel after drain",
-  );
-
+  assert.equal(receiptInBlob, null);
   mgr.destroy();
 });

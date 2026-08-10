@@ -47,6 +47,12 @@ class KeyboardDismissOnDrag extends HookWidget {
     final userScrollInProgress = useRef(false);
 
     bool handle(ScrollNotification notification) {
+      // This wrapper owns the directly wrapped message list. Notifications from
+      // scrollables inside a message (code blocks, media, reactions, and any
+      // future vertical descendants) bubble through here at a greater depth and
+      // must not affect the primary list's drag lifecycle or dismissal state.
+      if (notification.depth != 0) return false;
+
       if (notification is ScrollStartNotification) {
         userScrollInProgress.value = notification.dragDetails != null;
         if (userScrollInProgress.value) onUserScrollStart?.call();

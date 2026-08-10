@@ -104,6 +104,9 @@ impl AgentDefinition {
             persona_id: None,
             private_key_nsec: String::new(),
             auth_tag: None,
+            auth_tag_ref: None,
+            env_vars_ref: None,
+            provider_config_ref: None,
             relay_url: String::new(),
             avatar_url: self.avatar_url,
             acp_command: DEFAULT_ACP_COMMAND.to_string(),
@@ -217,24 +220,25 @@ pub struct ManagedAgentRecord {
     /// Team this instance was deployed from. Resolves runtime team instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
-    /// nsec private key. Held in memory but persisted to the OS keyring (keyed
-    /// by `pubkey`) rather than serialized to `managed-agents.json`. The
-    /// storage layer blanks this before writing JSON once the key is safely in
-    /// the keyring, and re-hydrates it from the keyring on load.
-    ///
-    /// It is only serialized inline (the `0o600` JSON fallback) when the
-    /// keyring is unreachable — `skip_serializing_if` keeps it out of JSON in
-    /// the normal keyring-backed case. `default` also lets an old build parse a
-    /// store whose inline key was already migrated out and blanked.
+    /// nsec private key. Stored in the OS keyring (keyed by `pubkey`); the
+    /// storage layer blanks this before writing JSON once the key is in the
+    /// keyring and re-hydrates it on load. Serialized inline only when the
+    /// keyring is unreachable (`0o600` JSON fallback).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub private_key_nsec: String,
-    /// NIP-OA auth tag JSON. Computed at agent creation time.
-    ///
-    /// Pre-existing agents created before NIP-OA will have `None` here.
-    /// This is intentional — they continue to work without attestation.
-    /// Re-attestation requires agent recreation (v2 migration scope).
+    /// NIP-OA auth tag JSON. Pre-existing agents (pre-NIP-OA) have `None`
+    /// and continue to work without attestation.
     #[serde(default)]
     pub auth_tag: Option<String>,
+    /// Keyring gen ref for `auth_tag`; absent = intentionally empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_tag_ref: Option<String>,
+    /// Keyring gen ref for `env_vars`; absent = intentionally empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_vars_ref: Option<String>,
+    /// Keyring gen ref for `BackendKind::Provider.config`; `None` for Local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_config_ref: Option<String>,
     pub relay_url: String,
     /// Avatar URL resolved at creation time (user-supplied input, else the
     /// command-based fallback). Persisted so startup reconciliation compares
@@ -700,9 +704,7 @@ pub struct InstallRuntimeResult {
     /// Number of agents whose stop succeeded but respawn failed.
     /// Mirrors `GlobalAgentConfigSaveResult.failed_restart_count`.
     pub failed_restart_count: u32,
-    /// Install log file for this run, when one was written. The UI surfaces it
-    /// on failure so a user can read the full retry history instead of only the
-    /// last step's truncated output. `None` when no log could be opened.
+    /// Install log file for this run. `None` when no log could be opened.
     pub log_path: Option<String>,
 }
 

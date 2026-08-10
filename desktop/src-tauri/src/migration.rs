@@ -191,6 +191,7 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     reconcile_provider_mcp_commands(app);
     reconcile_databricks_v1_to_v2(app);
     materialize_agent_runtimes(app);
+    migrate_inline_secrets_to_keyring(app); // keyring extraction — runs after all raw-JSON migrations
 }
 
 /// Copy one-time app state from the legacy app identifier directory to
@@ -1378,31 +1379,29 @@ mod detach;
 pub use detach::detach_directory_backed_teams;
 mod team_suffix;
 pub use team_suffix::strip_baked_team_instructions;
-
-#[cfg(test)]
-#[path = "migration_test_support.rs"]
-mod test_support;
-
-#[cfg(test)]
-#[path = "migration_tests.rs"]
-mod tests;
+mod migration_secrets;
+use migration_secrets::migrate_inline_secrets_to_keyring;
+#[allow(unused_imports)]
+pub(crate) use migration_secrets::run_secret_gc;
 
 #[cfg(test)]
 #[path = "migration_avatar_tests.rs"]
 mod avatar_tests;
-
 #[cfg(test)]
 #[path = "migration_command_tests.rs"]
 mod command_tests;
-
 #[cfg(test)]
 #[path = "migration_databricks_tests.rs"]
 mod databricks_tests;
-
-#[cfg(test)]
-#[path = "migration_team_dir_tests.rs"]
-mod team_dir_tests;
-
 #[cfg(test)]
 #[path = "migration_sync_guard_tests.rs"]
 mod sync_guard_tests;
+#[cfg(test)]
+#[path = "migration_team_dir_tests.rs"]
+mod team_dir_tests;
+#[cfg(test)]
+#[path = "migration_test_support.rs"]
+mod test_support;
+#[cfg(test)]
+#[path = "migration_tests.rs"]
+mod tests;

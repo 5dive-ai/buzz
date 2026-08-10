@@ -9,6 +9,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::app_state::keyring_service;
 use crate::managed_agents::{
+    secret_seam::{hydrate_all_secrets_for_records, strip_and_persist_all_for_records},
     ManagedAgentRecord, ManagedAgentRuntimeKey, ManagedAgentRuntimeReceipt,
 };
 use crate::secret_store::{KeyringProbe, SecretStore};
@@ -263,6 +264,14 @@ pub fn load_managed_agents(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, S
     let mut records = load_agent_store(app)?;
     records.retain(|record| !record.pubkey.is_empty());
     hydrate_keys(&mut records);
+    // Hydrate env/auth_tag/provider_config from keyring.
+    if let Some(store) = agent_secret_store() {
+        let _ = hydrate_all_secrets_for_records(store, &mut records);
+        // Note: unavailable env/auth/provider_config does NOT block load — only
+        // nsec unavailability (handled in hydrate_keys) causes spawn refusal.
+        // The returned unavailable list is informational here; readiness checks
+        // surface it to the user via the existing refusal path.
+    }
     Ok(records)
 }
 
@@ -272,6 +281,10 @@ pub fn load_managed_agents(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, S
 pub(crate) fn load_agent_definitions(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
     let mut records = load_agent_store(app)?;
     records.retain(|record| record.pubkey.is_empty());
+    // Hydrate definition env_vars from keyring.
+    if let Some(store) = agent_secret_store() {
+        let _ = hydrate_all_secrets_for_records(store, &mut records);
+    }
     Ok(records)
 }
 
@@ -373,10 +386,14 @@ pub fn save_managed_agents(app: &AppHandle, records: &[ManagedAgentRecord]) -> R
             .then_with(|| left.pubkey.cmp(&right.pubkey))
     });
 
-    // Persist each key to the keyring; on success blank the inline copy so it
-    // is skipped from JSON (`skip_serializing_if = "String::is_empty"`). If the
-    // keyring is unreachable, the key stays inline.
+    // Persist each nsec to the keyring; on success blank the inline copy.
     persist_agent_keys(&mut sorted);
+
+    // Persist env/auth_tag/provider_config to the keyring; on success blank
+    // inline values and set *_ref. On failure keep inline and clear *_ref.
+    if let Some(store) = agent_secret_store() {
+        strip_and_persist_all_for_records(store, &mut sorted);
+    }
 
     write_agent_store(app, definitions, sorted)
 }
@@ -391,6 +408,12 @@ pub(crate) fn save_agent_definitions(
     instances.retain(|record| !record.pubkey.is_empty());
     let mut definitions = definitions.to_vec();
     definitions.retain(|record| record.pubkey.is_empty());
+
+    // Persist definition env_vars to the keyring before writing JSON.
+    if let Some(store) = agent_secret_store() {
+        strip_and_persist_all_for_records(store, &mut definitions);
+    }
+
     write_agent_store(app, definitions, instances)
 }
 
@@ -593,6 +616,37 @@ pub fn delete_agent_key(pubkey: &str) {
     if let Err(e) = try_delete_agent_key(pubkey) {
         eprintln!("buzz-desktop: failed to delete agent {pubkey} key from keyring: {e}");
     }
+}
+
+// ── Migration-seam helpers (pub(crate) for use by migration.rs) ───────────
+
+/// Load the raw unified store (instances + definitions) without any keyring
+/// hydration. Used by the boot migration to read inline secrets before
+/// extracting them into the keyring. After extraction, call
+/// [`write_agent_store_raw`] to persist the updated records.
+pub(crate) fn load_agent_store_raw(app: &AppHandle) -> Result<Vec<ManagedAgentRecord>, String> {
+    load_agent_store(app)
+}
+
+/// Write the raw unified store (instances + definitions) without any keyring
+/// strip step. Used by the boot migration after inline secrets have been
+/// extracted into the keyring and the `*_ref` fields set accordingly.
+pub(crate) fn write_agent_store_raw(
+    app: &AppHandle,
+    records: &[ManagedAgentRecord],
+) -> Result<(), String> {
+    let path = managed_agents_store_path(app)?;
+    let payload = serde_json::to_vec_pretty(records)
+        .map_err(|e| format!("failed to serialize agent store: {e}"))?;
+    atomic_write_json_restricted(&path, &payload)
+}
+
+/// Return the shared secret store used for agent secrets, or `None` when the
+/// build has no keyring backend. Exposed as `pub(crate)` so `migration.rs`
+/// can run GC sweeps and the secret-migration function against the same store
+/// instance used by the normal save/load path.
+pub(crate) fn agent_secret_store_pub() -> Option<&'static crate::secret_store::SecretStore> {
+    agent_secret_store()
 }
 
 /// Atomic, symlink-preserving JSON write.

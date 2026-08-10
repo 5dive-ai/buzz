@@ -502,6 +502,9 @@ fn make_agent(name: &str, persona_id: Option<&str>) -> ManagedAgentRecord {
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
         relay_mesh: None,
+        auth_tag_ref: None,
+        env_vars_ref: None,
+        provider_config_ref: None,
     }
 }
 

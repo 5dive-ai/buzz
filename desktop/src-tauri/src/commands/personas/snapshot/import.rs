@@ -654,6 +654,9 @@ pub async fn confirm_agent_snapshot_import(
             relay_mesh: None,
             runtime: snapshot.definition.runtime.clone(),
             name_pool: snapshot.definition.name_pool.clone(),
+            auth_tag_ref: None,
+            env_vars_ref: None,
+            provider_config_ref: None,
         };
 
         records.push(record.clone());
@@ -983,7 +986,6 @@ mod import_avatar_tests {
 
         assert_eq!(result.unwrap_err(), "relay upload failed");
     }
-
     #[tokio::test]
     async fn malformed_inline_avatar_fails_before_upload() {
         let result =

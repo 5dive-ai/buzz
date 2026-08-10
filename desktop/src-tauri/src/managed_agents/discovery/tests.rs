@@ -18,7 +18,6 @@ fn resolves_known_avatar_for_bare_command() {
 
     assert_eq!(avatar_url, GOOSE_AVATAR_URL);
 }
-
 #[test]
 fn resolves_known_avatar_for_command_paths_and_aliases() {
     assert_eq!(
@@ -38,12 +37,10 @@ fn resolves_known_avatar_for_command_paths_and_aliases() {
         Some(CLAUDE_CODE_AVATAR_URL.to_string())
     );
 }
-
 #[test]
 fn returns_none_for_unknown_commands() {
     assert!(managed_agent_avatar_url("custom-agent").is_none());
 }
-
 #[test]
 fn default_agent_command_resolves_bundled_buzz_agent() {
     // The default must be bundled buzz-agent, never bare `goose` on a stock Windows install.
@@ -283,6 +280,9 @@ fn record_with(
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
         relay_mesh: None,
+        auth_tag_ref: None,
+        env_vars_ref: None,
+        provider_config_ref: None,
     }
 }
 

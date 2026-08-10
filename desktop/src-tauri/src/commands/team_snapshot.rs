@@ -611,6 +611,9 @@ pub async fn confirm_team_snapshot_import(
             relay_mesh: None,
             runtime: member.definition.runtime.clone(),
             name_pool: member.definition.name_pool.clone(),
+            auth_tag_ref: None,
+            env_vars_ref: None,
+            provider_config_ref: None,
         };
 
         minted.push(MintedMember {

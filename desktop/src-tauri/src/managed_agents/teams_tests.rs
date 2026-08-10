@@ -216,6 +216,9 @@ fn managed_agent(name: &str) -> ManagedAgentRecord {
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,
+        auth_tag_ref: None,
+        env_vars_ref: None,
+        provider_config_ref: None,
     }
 }
 

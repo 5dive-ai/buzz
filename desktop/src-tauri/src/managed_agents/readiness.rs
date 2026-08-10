@@ -697,7 +697,6 @@ mod tests {
             "requirements should include NormalizedField(provider); got {reqs:?}"
         );
     }
-
     #[test]
     fn buzz_agent_missing_model_returns_not_ready_with_normalized_field() {
         let env = make_env(
@@ -715,7 +714,6 @@ mod tests {
                 field: "model".to_string()
             }));
     }
-
     #[test]
     fn buzz_agent_missing_anthropic_key_returns_not_ready_with_env_key() {
         let env = make_env(
@@ -731,7 +729,6 @@ mod tests {
             key: "ANTHROPIC_API_KEY".to_string()
         }));
     }
-
     #[test]
     fn buzz_agent_missing_openai_key_returns_not_ready() {
         let env = make_env(
@@ -1530,6 +1527,9 @@ mod tests {
             definition_respond_to_allowlist: Vec::new(),
             definition_parallelism: None,
             relay_mesh: None,
+            auth_tag_ref: None,
+            env_vars_ref: None,
+            provider_config_ref: None,
         };
 
         let runtime = known_acp_runtime_exact("buzz-agent");

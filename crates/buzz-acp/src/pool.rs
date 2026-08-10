@@ -2927,6 +2927,23 @@ pub(crate) async fn resolve_edit_routing(
     })
 }
 
+pub(crate) fn format_native_steer_prompt_sync(
+    channel_id: Uuid,
+    event: &nostr::Event,
+    prompt_tag: &str,
+) -> Vec<String> {
+    let (header, closing) = crate::queue::native_steer_framing();
+    let event = crate::queue::BatchEvent {
+        event: event.clone(),
+        prompt_tag: prompt_tag.to_string(),
+        received_at: std::time::Instant::now(),
+    };
+    vec![format!(
+        "{header}\n\n[Buzz event: {prompt_tag}]\n{}\n\n{closing}",
+        crate::queue::format_event_block(channel_id, None, &event, None)
+    )]
+}
+
 /// Resolve an edit-aware native-steer delta through the same routing and
 /// context boundary as ordinary batch dispatch. This keeps successful native
 /// steering from exposing the invisible kind:40003 event as a reply anchor.

@@ -62,6 +62,9 @@ function reportedUsage(
     inputTokens: usageField(overrides.inputTokens ?? null),
     outputTokens: usageField(overrides.outputTokens ?? null),
     totalTokens: usageField(overrides.totalTokens ?? null),
+    cacheReadTokens: usageField(null),
+    cacheWriteTokens: usageField(null),
+    freshInputTokens: usageField(null),
   };
 }
 
@@ -832,6 +835,9 @@ test("Partial badge renders in the row, bar, and ingress when total is an incomp
       inputTokens: usageField("800", true), // incomplete
       outputTokens: usageField("200", false),
       totalTokens: usageField(null),
+      cacheReadTokens: usageField(null),
+      cacheWriteTokens: usageField(null),
+      freshInputTokens: usageField(null),
     },
   };
   await seedSeries(
@@ -845,6 +851,9 @@ test("Partial badge renders in the row, bar, and ingress when total is an incomp
             inputTokens: usageField("800", true), // incomplete
             outputTokens: usageField("200", false),
             totalTokens: usageField(null),
+            cacheReadTokens: usageField(null),
+            cacheWriteTokens: usageField(null),
+            freshInputTokens: usageField(null),
           },
         }),
       ],
@@ -896,6 +905,9 @@ test("focused view renders the unknown-intervals and invalid-reports caveats und
               inputTokens: usageField("400", true), // incomplete → unknown-intervals fires
               outputTokens: usageField("100", false),
               totalTokens: usageField("500"),
+              cacheReadTokens: usageField(null),
+              cacheWriteTokens: usageField(null),
+              freshInputTokens: usageField(null),
             },
           }),
         ],
@@ -941,6 +953,9 @@ test("focused view renders the unknown-intervals and invalid-reports caveats und
               inputTokens: usageField("400", false), // complete → unknown-intervals must NOT fire
               outputTokens: usageField("100", false),
               totalTokens: usageField("500", true), // incomplete total → hasUnknownUsage
+              cacheReadTokens: usageField(null),
+              cacheWriteTokens: usageField(null),
+              freshInputTokens: usageField(null),
             },
           }),
         ],

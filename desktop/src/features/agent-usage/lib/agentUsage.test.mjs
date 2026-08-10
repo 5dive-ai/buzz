@@ -39,6 +39,9 @@ function reportedUsage(overrides = {}) {
     outputTokens: usageField(),
     totalTokens: usageField(),
     estimatedCostUsd: usageField(),
+    cacheReadTokens: usageField(),
+    cacheWriteTokens: usageField(),
+    freshInputTokens: usageField(),
     ...overrides,
   };
 }

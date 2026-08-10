@@ -31,6 +31,9 @@ function reportedUsage(
     inputTokens: usageField(overrides.inputTokens ?? null),
     outputTokens: usageField(overrides.outputTokens ?? null),
     totalTokens: usageField(overrides.totalTokens ?? null),
+    cacheReadTokens: usageField(null),
+    cacheWriteTokens: usageField(null),
+    freshInputTokens: usageField(null),
   };
 }
 
@@ -187,6 +190,9 @@ test.describe("agent usage screenshots", () => {
               inputTokens: usageField(null),
               outputTokens: usageField(null),
               totalTokens: usageField("1500", true),
+              cacheReadTokens: usageField(null),
+              cacheWriteTokens: usageField(null),
+              freshInputTokens: usageField(null),
             },
           }),
         ],

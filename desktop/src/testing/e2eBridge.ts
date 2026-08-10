@@ -167,6 +167,9 @@ type RawReportedUsage = {
   outputTokens: RawUsageField;
   totalTokens: RawUsageField;
   estimatedCostUsd: RawCostField;
+  cacheReadTokens: RawUsageField;
+  cacheWriteTokens: RawUsageField;
+  freshInputTokens: RawUsageField;
 };
 
 type RawAgentUsageSeriesBucket = {

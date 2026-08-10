@@ -141,6 +141,9 @@ export type MockReportedUsage = {
   outputTokens: MockUsageField;
   totalTokens: MockUsageField;
   estimatedCostUsd: MockCostField;
+  cacheReadTokens: MockUsageField;
+  cacheWriteTokens: MockUsageField;
+  freshInputTokens: MockUsageField;
 };
 
 export type MockAgentUsageSeriesBucket = {

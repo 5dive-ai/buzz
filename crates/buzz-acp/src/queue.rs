@@ -4582,7 +4582,7 @@ mod tests {
             "all cap slots are reserved, so a new event must not create another preparation"
         );
         assert_eq!(q.withheld_native_steer[&ch].len(), MAX_PENDING_PER_CHANNEL);
-        assert!(q.queues.get(&ch).is_none());
+        assert!(!q.queues.contains_key(&ch));
     }
 
     #[test]

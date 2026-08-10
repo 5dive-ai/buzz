@@ -14,6 +14,7 @@ import 'package:buzz/features/channels/channel_detail_page.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
 import 'package:buzz/features/channels/channel_messages_provider.dart';
 import 'package:buzz/features/channels/channel_typing_provider.dart';
+import 'package:buzz/features/channels/composer_dock_size_reporter.dart';
 import 'package:buzz/features/channels/date_formatters.dart';
 import 'package:buzz/features/channels/day_divider.dart';
 import 'package:buzz/features/channels/emoji_picker.dart';
@@ -4086,6 +4087,90 @@ void main() {
         lessThanOrEqualTo(tester.getTopLeft(composerSurface).dy),
       );
     });
+
+    for (final replyCount in [0, 1]) {
+      testWidgets(
+        'cached writable $replyCount-reply thread defers dock correction until measured',
+        (tester) async {
+          tester.view.physicalSize = const Size(400, 800);
+          tester.view.devicePixelRatio = 1;
+          addTearDown(tester.view.reset);
+          final rootEvent = _textMsg(
+            id: 'thread-root',
+            pubkey: 'alice',
+            content: 'Short root',
+            createdAt: 1000,
+          );
+          final replies = [
+            if (replyCount == 1)
+              _textMsg(
+                id: 'reply-0',
+                pubkey: 'bob',
+                content: 'Short reply',
+                createdAt: 1100,
+                extraTags: const [
+                  ['e', 'thread-root', '', 'reply'],
+                ],
+              ),
+          ];
+          await tester.pumpWidget(
+            _buildTestable(
+              messages: [rootEvent],
+              threadReplies: {'thread-root': replies},
+              users: const {
+                'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+                'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
+              },
+            ),
+          );
+          await tester.pumpAndSettle();
+          final routeMessages = formatTimeline([rootEvent, ...replies]);
+          Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+            MaterialPageRoute<void>(
+              builder: (_) => ThreadDetailPage(
+                threadHead: routeMessages.first,
+                allMessages: routeMessages,
+                channelId: _channelId,
+                currentPubkey: 'self',
+                isMember: true,
+                isArchived: false,
+              ),
+            ),
+          );
+
+          await tester.pump();
+          expect(tester.takeException(), isNull);
+          final earlyDock = tester.widget<ComposerDockSizeReporter>(
+            find.byType(ComposerDockSizeReporter).last,
+          );
+
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull);
+          earlyDock.onHeightChanged(200);
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull);
+          final composerSurface = find.byKey(
+            const ValueKey('composer-surface'),
+          );
+          final tail = find.byKey(
+            ValueKey(
+              replyCount == 0
+                  ? 'thread-message-group-thread-root'
+                  : 'thread-message-group-reply-0',
+            ),
+          );
+          expect(tail, findsOneWidget);
+          expect(
+            tester.getTopLeft(tail).dy,
+            greaterThanOrEqualTo(frostedAppBarHeight(tester.element(tail))),
+          );
+          expect(
+            tester.getBottomLeft(tail).dy,
+            lessThanOrEqualTo(tester.getTopLeft(composerSurface).dy),
+          );
+        },
+      );
+    }
 
     testWidgets(
       'cached initial thread settles between the app bar and measured composer',

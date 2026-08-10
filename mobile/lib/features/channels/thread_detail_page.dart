@@ -305,7 +305,11 @@ class ThreadDetailPage extends HookConsumerWidget {
           (followsThreadTail.value || threadTailIsVisible());
       if (shouldFollowTail) followsThreadTail.value = true;
       composerDockHeight.value = height;
-      if (heightDelta <= 0 || !shouldFollowTail) {
+      if (heightDelta <= 0 ||
+          !shouldFollowTail ||
+          !viewportHeight.isFinite ||
+          viewportHeight <= 0 ||
+          !initialTailSettle.isComplete) {
         pendingTailAlignment.value = null;
         return;
       }

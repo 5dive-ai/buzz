@@ -56,7 +56,12 @@ fn status_for_with(
     let command = record_agent_command(record, personas);
     let metadata = super::known_acp_runtime(&command);
     let effective = resolve_effective_agent_env(record, personas, metadata, global);
-    let local_setup = matches!(agent_readiness(&effective), AgentReadiness::Ready);
+    // `secrets_unavailable` means at least one keyring ref exists but the
+    // entry is missing/unreadable.  Spawn will refuse via `spawn_key_refusal`,
+    // so `local_setup` must also be false — the agent cannot start even if the
+    // effective env happens to satisfy the runtime's credential check.
+    let local_setup =
+        !record.secrets_unavailable && matches!(agent_readiness(&effective), AgentReadiness::Ready);
     ManagedAgentRuntimeStatus {
         pubkey: key.pubkey.clone(),
         relay_url: key.relay_url.clone(),
@@ -438,7 +443,8 @@ fn unkeyable_failed_status(
         pubkey: record.pubkey.clone(),
         relay_url: requested.clone(),
         requested_relay_url: Some(requested),
-        local_setup: matches!(agent_readiness(&effective), AgentReadiness::Ready),
+        local_setup: !record.secrets_unavailable
+            && matches!(agent_readiness(&effective), AgentReadiness::Ready),
         lifecycle: ManagedAgentRuntimeLifecycle::Failed,
         pid: None,
         error: Some(error),
@@ -712,5 +718,26 @@ mod tests {
             Some("unexpected"),
         );
         assert!(observer_lifecycle_key(&ready_with_error.pubkey, &ready_with_error).is_err());
+    }
+
+    #[test]
+    fn secrets_unavailable_forces_local_setup_false() {
+        // When `secrets_unavailable` is true on a record, `local_setup` must
+        // be false regardless of what `agent_readiness` would return for the
+        // effective env — spawn will refuse, and the UI must reflect that.
+        let mut record = record_with_relay("");
+        record.secrets_unavailable = true;
+
+        let status = unkeyable_failed_status(
+            &record,
+            "wss://relay.example".to_string(),
+            "test error".to_string(),
+            &[],
+            &super::super::GlobalAgentConfig::default(),
+        );
+        assert!(
+            !status.local_setup,
+            "local_setup must be false when secrets_unavailable is true"
+        );
     }
 }

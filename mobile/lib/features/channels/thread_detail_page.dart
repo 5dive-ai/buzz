@@ -330,6 +330,9 @@ class ThreadDetailPage extends HookConsumerWidget {
 
     // Channel names for message content rendering.
     final channelsAsync = ref.watch(channelsProvider);
+    final channel = channelsAsync.value
+        ?.where((candidate) => candidate.id == channelId)
+        .firstOrNull;
     final channelNamesMap = <String, String>{};
     channelsAsync.whenData((channels) {
       for (final ch in channels) {
@@ -539,6 +542,7 @@ class ThreadDetailPage extends HookConsumerWidget {
                             channelId: channelId,
                             content: content,
                             mentionPubkeys: mentionPubkeys,
+                            channel: channel,
                             parentEventId: threadHead.id,
                             rootEventId: effectiveRootId,
                             mediaTags: mediaTags,

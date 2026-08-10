@@ -476,7 +476,14 @@ Future<DateTime?> _showNativeDateTimePicker(
     initialTime: TimeOfDay.fromDateTime(safeInitial),
   );
   if (time == null) return null;
-  return DateTime(date.year, date.month, date.day, time.hour, time.minute);
+  final selected = DateTime(
+    date.year,
+    date.month,
+    date.day,
+    time.hour,
+    time.minute,
+  );
+  return selected.isBefore(minimum) ? minimum : selected;
 }
 
 String _formatUntil(DateTime value) =>

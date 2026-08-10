@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:hooks_riverpod/misc.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -168,6 +169,24 @@ class _TestChannelsNotifier extends ChannelsNotifier {
 
 void main() {
   group('MessageContent', () {
+    testWidgets('forwards text alignment to markdown rendering', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _testable(
+          const MessageContent(
+            content: 'Centered status',
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+
+      expect(
+        tester.widget<GptMarkdown>(find.byType(GptMarkdown)).textAlign,
+        TextAlign.center,
+      );
+    });
+
     testWidgets('opens local file links through an authenticated download', (
       tester,
     ) async {

@@ -338,10 +338,7 @@ class _FloatingTabBar extends StatelessWidget {
           child: ClipRRect(
             borderRadius: BorderRadius.circular(HomePage._tabBarRadius),
             child: BackdropFilter(
-              filter: ImageFilter.blur(
-                sigmaX: mobileTabBackdropBlurSigma,
-                sigmaY: mobileTabBackdropBlurSigma,
-              ),
+              filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
               child: DecoratedBox(
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(HomePage._tabBarRadius),

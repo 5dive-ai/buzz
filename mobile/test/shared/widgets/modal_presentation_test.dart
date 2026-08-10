@@ -30,6 +30,10 @@ void main() {
           ),
           findsOneWidget,
         );
+        final contentClip = tester.widget<ClipRSuperellipse>(
+          find.byKey(const ValueKey('concentric-sheet-content-clip')),
+        );
+        expect(contentClip.borderRadius, BorderRadius.circular(Radii.dialog));
       } finally {
         debugDefaultTargetPlatformOverride = null;
       }
@@ -120,6 +124,11 @@ void main() {
         find.byKey(const ValueKey('buzz-sheet-surface-clip')),
         findsNothing,
       );
+      final contentClip = tester.widget<ClipRSuperellipse>(
+        find.byKey(const ValueKey('concentric-sheet-content-clip')),
+      );
+      expect(contentClip.borderRadius, BorderRadius.circular(Radii.dialog * 2));
+      expect(contentClip.clipBehavior, Clip.antiAlias);
       expect(find.text('Members'), findsOneWidget);
     } finally {
       tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(

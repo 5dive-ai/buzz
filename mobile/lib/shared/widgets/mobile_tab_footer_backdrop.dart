@@ -8,9 +8,6 @@ const mobileTabBarHeight = 56.0;
 /// Gap between the floating mobile tab bar and the bottom safe area.
 const mobileTabBarBottomGap = Grid.twelve;
 
-/// Blur strength used by the floating Home/Activity/Search navigation.
-const mobileTabBackdropBlurSigma = 18.0;
-
 /// Fixed visual height of the shared footer fade behind the floating tab bar.
 double mobileTabFooterBackdropHeight(BuildContext _) => 180;
 

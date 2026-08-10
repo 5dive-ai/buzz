@@ -13,12 +13,14 @@ class BuzzSheetHeader extends StatelessWidget {
     this.title,
     this.titleKey,
     this.leading,
+    this.trailing,
     this.showDragHandle = false,
   });
 
   final String? title;
   final Key? titleKey;
   final Widget? leading;
+  final Widget? trailing;
   final bool showDragHandle;
 
   @override
@@ -57,7 +59,7 @@ class BuzzSheetHeader extends StatelessWidget {
               ),
             Align(
               alignment: Alignment.bottomRight,
-              child: const _SheetCloseButton(),
+              child: trailing ?? const _SheetCloseButton(),
             ),
             if (leading case final leading?)
               Align(alignment: Alignment.bottomLeft, child: leading),

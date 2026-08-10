@@ -304,7 +304,6 @@ class ChannelsPage extends HookConsumerWidget {
       ref.invalidate(communityIconProvider);
       showBuzzModalBottomSheet<void>(
         context: context,
-        title: 'Switch Community',
         showCloseButton: false,
         showDragHandle: false,
         builder: (_) => const _CommunitySwitcherSheet(),

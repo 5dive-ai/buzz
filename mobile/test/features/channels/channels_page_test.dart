@@ -860,18 +860,11 @@ void main() {
     final options = find.byKey(const Key('community-switcher-options'));
     expect(options, findsOneWidget);
     final editButton = find.byKey(const Key('community-switcher-edit'));
-    expect(
-      tester.getRect(options).top - tester.getRect(editButton).bottom,
-      closeTo(16, 0.01),
-    );
-    expect(tester.getSize(editButton), const Size.square(44));
-    expect(
-      tester.getCenter(find.byTooltip('Close sheet')).dx,
-      greaterThan(tester.getCenter(find.text('Switch Community')).dx),
-    );
+    expect(tester.getSize(editButton), const Size(56, 44));
+    expect(find.byTooltip('Close sheet'), findsNothing);
     expect(
       tester.getCenter(editButton).dx,
-      lessThan(tester.getCenter(find.text('Switch Community')).dx),
+      greaterThan(tester.getCenter(find.text('Switch Community')).dx),
     );
     expect(find.text('alpha.example.com'), findsOneWidget);
     expect(find.text('bravo.example.com'), findsOneWidget);
@@ -901,6 +894,10 @@ void main() {
     );
     final inactiveSelection = find.byKey(
       const Key('community-switcher-selection-bravo'),
+    );
+    expect(
+      tester.getCenter(editButton).dx,
+      closeTo(tester.getCenter(activeSelection).dx, 0.01),
     );
     expect(tester.getSize(activeSelection), const Size.square(40));
     expect(

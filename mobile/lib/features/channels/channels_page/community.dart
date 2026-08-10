@@ -15,14 +15,14 @@ class _CommunitySwitcherSheet extends HookConsumerWidget {
         title: 'Switch Community',
         titleKey: const Key('community-switcher-title'),
         showDragHandle: true,
-        leading: SizedBox(
+        trailing: SizedBox(
           key: const Key('community-switcher-edit'),
-          width: 44,
+          width: 56,
           height: 44,
           child: TextButton(
             onPressed: () => isEditing.value = !isEditing.value,
             style: TextButton.styleFrom(
-              minimumSize: const Size.square(44),
+              minimumSize: const Size(56, 44),
               padding: EdgeInsets.zero,
               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
             ),

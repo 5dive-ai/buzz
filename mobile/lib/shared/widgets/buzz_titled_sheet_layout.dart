@@ -11,6 +11,7 @@ class BuzzTitledSheetLayout extends StatelessWidget {
     required this.title,
     required this.child,
     this.leading,
+    this.trailing,
     this.titleKey,
     this.showDragHandle = false,
     this.surfaceColor,
@@ -19,6 +20,7 @@ class BuzzTitledSheetLayout extends StatelessWidget {
   final String title;
   final Widget child;
   final Widget? leading;
+  final Widget? trailing;
   final Key? titleKey;
   final bool showDragHandle;
   final Color? surfaceColor;
@@ -40,6 +42,7 @@ class BuzzTitledSheetLayout extends StatelessWidget {
               title: title,
               titleKey: titleKey,
               leading: leading,
+              trailing: trailing,
               showDragHandle: showDragHandle,
             ),
             Flexible(child: child),

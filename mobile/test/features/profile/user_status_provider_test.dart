@@ -39,6 +39,67 @@ void main() {
       expect(event.tags, contains(equals(['expiration', '1900000000'])));
     },
   );
+
+  testWidgets('clears the current status and shared cache at expiration', (
+    tester,
+  ) async {
+    final keys = nostr.Keys.generate();
+    final relaySession = _RecordingRelaySession();
+    final statusCache = _RecordingUserStatusCache();
+    final container = ProviderContainer(
+      overrides: [
+        relayConfigProvider.overrideWith(
+          () => _FixedRelayConfigNotifier(keys.nsec),
+        ),
+        relaySessionProvider.overrideWith(() => relaySession),
+        userStatusCacheProvider.overrideWith(() => statusCache),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    await container.read(userStatusProvider.future);
+    await container
+        .read(userStatusProvider.notifier)
+        .setStatus('Focusing', '🎯', expiresAt: DateTime.now());
+
+    expect(container.read(userStatusProvider).value, isNotNull);
+    expect(statusCache.updates.last.$2, isNotNull);
+
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(container.read(userStatusProvider).value, isNull);
+    expect(statusCache.updates.last, (keys.public.toLowerCase(), null));
+  });
+
+  testWidgets('clears another user status without a new relay event', (
+    tester,
+  ) async {
+    final container = ProviderContainer(
+      overrides: [
+        relayClientProvider.overrideWithValue(
+          RelayClient(baseUrl: 'https://relay.example'),
+        ),
+        relaySessionProvider.overrideWith(_DisconnectedRelaySession.new),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    final cache = container.read(userStatusCacheProvider.notifier);
+    cache.updateStatus(
+      'alice',
+      UserStatus(
+        text: 'Focusing',
+        emoji: '',
+        updatedAt: 1,
+        expiresAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      ),
+    );
+    expect(container.read(userStatusCacheProvider)['alice'], isNotNull);
+
+    await tester.pump(const Duration(milliseconds: 1));
+
+    expect(container.read(userStatusCacheProvider)['alice'], isNull);
+  });
 }
 
 class _FixedRelayConfigNotifier extends RelayConfigNotifier {
@@ -70,6 +131,24 @@ class _RecordingRelaySession extends RelaySessionNotifier {
   }) async {
     published.add(event);
     return event;
+  }
+}
+
+class _DisconnectedRelaySession extends RelaySessionNotifier {
+  @override
+  SessionState build() =>
+      const SessionState(status: SessionStatus.disconnected);
+}
+
+class _RecordingUserStatusCache extends UserStatusCacheNotifier {
+  final List<(String, UserStatus?)> updates = [];
+
+  @override
+  Map<String, UserStatus?> build() => {};
+
+  @override
+  void updateStatus(String pubkey, UserStatus? status) {
+    updates.add((pubkey, status));
   }
 }
 

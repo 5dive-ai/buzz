@@ -45,7 +45,6 @@ enum _StatusDuration {
 void showSetStatusSheet(BuildContext context, {UserStatus? currentStatus}) {
   showBuzzModalBottomSheet<void>(
     context: context,
-    title: 'Set a status',
     isScrollControlled: true,
     showCloseButton: false,
     showDragHandle: false,

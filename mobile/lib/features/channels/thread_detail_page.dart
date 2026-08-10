@@ -175,8 +175,11 @@ class ThreadDetailPage extends HookConsumerWidget {
     final hasFetchedReplies = fetchedReplies != null;
     final initialTailSettle = useMemoized(InitialThreadTailSettle.new);
     final previousReplyCount = useRef(replies.length);
+    final viewportHeight = MediaQuery.sizeOf(context).height;
+    final topOverlayFraction = frostedAppBarHeight(context) / viewportHeight;
     useEffect(() {
       if (!hasFetchedReplies) return null;
+      if (isMember && !isArchived && composerDockHeight.value <= 0) return null;
       if (!initialTailSettle.isComplete) {
         previousReplyCount.value = replies.length;
         initialTailSettle.schedule(
@@ -186,12 +189,11 @@ class ThreadDetailPage extends HookConsumerWidget {
           targetIndex: initialMessageId == null && replies.isNotEmpty
               ? indexForReply(replies.length - 1)
               : null,
-          hiddenBottomFraction:
-              composerDockHeight.value / MediaQuery.sizeOf(context).height,
+          hiddenTopFraction: topOverlayFraction,
+          hiddenBottomFraction: composerDockHeight.value / viewportHeight,
         );
         return null;
       }
-
       final previous = previousReplyCount.value;
       previousReplyCount.value = replies.length;
       if (replies.length <= previous) return null;
@@ -219,7 +221,7 @@ class ThreadDetailPage extends HookConsumerWidget {
         );
       });
       return null;
-    }, [hasFetchedReplies, replies.length]);
+    }, [hasFetchedReplies, replies.length, composerDockHeight.value]);
     final readState = ref.watch(readStateProvider);
     final visibleReplyReadKey = replies
         .map((reply) => '${reply.id}:${reply.createdAt}')

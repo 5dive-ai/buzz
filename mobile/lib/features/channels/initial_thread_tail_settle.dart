@@ -19,12 +19,13 @@ class InitialThreadTailSettle {
   ///
   /// A later schedule replaces an earlier target while replies are still
   /// arriving. The final target is left in place when already visible; otherwise
-  /// it scrolls above the portion obscured by the composer dock.
+  /// it scrolls into the viewport between the measured top and bottom overlays.
   void schedule({
     required BuildContext context,
     required ItemScrollController controller,
     required ItemPositionsListener positionsListener,
     required int? targetIndex,
+    required double hiddenTopFraction,
     required double hiddenBottomFraction,
   }) {
     if (_isComplete) return;
@@ -49,7 +50,7 @@ class InitialThreadTailSettle {
         final targetIsFullyVisible = positionsListener.itemPositions.value.any(
           (position) =>
               position.index == targetIndex &&
-              position.itemLeadingEdge >= 0 &&
+              position.itemLeadingEdge >= hiddenTopFraction &&
               position.itemTrailingEdge <= 1 - hiddenBottomFraction,
         );
         // Short threads already expose their tail from the top anchor. Moving
@@ -62,7 +63,7 @@ class InitialThreadTailSettle {
         controller
             .scrollTo(
               index: targetIndex,
-              alignment: 0.0,
+              alignment: hiddenTopFraction,
               duration: const Duration(milliseconds: 1),
             )
             .whenComplete(() {

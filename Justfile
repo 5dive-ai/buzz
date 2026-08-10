@@ -306,6 +306,10 @@ test-unit:
         # #[ignore]d, so --lib runs only the infra-free set. Without this gate a
         # stray file in migrations/ or a broken lint ships green.
         cargo nextest run -p buzz-db --lib
+        # Embedded single-node community foundation. This is intentionally
+        # narrower than the PostgreSQL suite: only SQLite community, channel,
+        # membership, and relay-owner durability belongs to PR 1A.
+        cargo nextest run -p buzz-db sqlite::tests
         # Multi-tenant conformance gate (buzz-conformance): the independent
         # replay checker + golden fixtures. No infra — pure in-process trace
         # replay — so it belongs in the unit job. Run all targets (lib + the

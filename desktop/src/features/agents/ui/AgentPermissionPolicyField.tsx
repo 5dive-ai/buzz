@@ -23,7 +23,11 @@ export type AgentPermissionPolicyFieldHandle = {
 type Props = {
   agent: Pick<
     ManagedAgent,
-    "backend" | "backendAgentId" | "permissionPolicy" | "permissionPolicySource"
+    | "backend"
+    | "backendAgentId"
+    | "permissionPolicy"
+    | "permissionPolicySource"
+    | "appliedPermissionPolicy"
   >;
   disabled: boolean;
 };
@@ -47,6 +51,11 @@ export const AgentPermissionPolicyField = React.forwardRef<
   const sourceLabel =
     SOURCE_LABEL[agent.permissionPolicySource] ?? agent.permissionPolicySource;
 
+  const hasDrift =
+    isRemoteDeployed &&
+    agent.appliedPermissionPolicy !== null &&
+    agent.appliedPermissionPolicy !== agent.permissionPolicy;
+
   return (
     <div className="space-y-1.5">
       <div className="flex items-center gap-1.5">
@@ -61,9 +70,23 @@ export const AgentPermissionPolicyField = React.forwardRef<
         </span>
       </div>
       {isRemoteDeployed ? (
-        <p className="text-xs text-muted-foreground">
-          Read-only while deployed. To change, shut down and redeploy the agent.
-        </p>
+        <>
+          <p className="text-xs text-muted-foreground">
+            Read-only while deployed. To change, shut down and redeploy the
+            agent.
+          </p>
+          {hasDrift && (
+            <p className="text-xs text-amber-600 dark:text-amber-400">
+              Applied policy:{" "}
+              <span className="font-medium">
+                {agent.appliedPermissionPolicy}
+              </span>{" "}
+              · Desired:{" "}
+              <span className="font-medium">{agent.permissionPolicy}</span> —
+              redeploy required to apply.
+            </p>
+          )}
+        </>
       ) : (
         <select
           className="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50"

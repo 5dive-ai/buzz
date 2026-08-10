@@ -73,6 +73,7 @@ fn minimal_record() -> ManagedAgentRecord {
         definition_parallelism: Some(4),
         relay_mesh: None,
         permission_policy: None,
+        applied_permission_policy: None,
     }
 }
 

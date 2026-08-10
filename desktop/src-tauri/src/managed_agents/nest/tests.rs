@@ -503,6 +503,7 @@ fn make_agent(name: &str, persona_id: Option<&str>) -> ManagedAgentRecord {
         definition_parallelism: None,
         relay_mesh: None,
         permission_policy: None,
+        applied_permission_policy: None,
     }
 }
 

@@ -344,6 +344,7 @@ pub fn build_managed_agent_summary(
         respond_to_allowlist: record.respond_to_allowlist.clone(),
         permission_policy: effective_permission_policy_summary,
         permission_policy_source: effective_permission_policy_source,
+        applied_permission_policy: record.applied_permission_policy,
     })
 }
 

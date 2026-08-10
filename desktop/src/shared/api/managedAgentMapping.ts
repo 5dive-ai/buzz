@@ -53,6 +53,8 @@ export type RawManagedAgent = {
   // Pre-feature fixtures may omit these; defaults applied in fromRawManagedAgent.
   permission_policy?: PermissionPolicy;
   permission_policy_source?: PermissionPolicySource;
+  /** Policy actually applied at the last remote deploy. `null` / absent for local or never-deployed agents. */
+  applied_permission_policy?: PermissionPolicy | null;
 };
 
 export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
@@ -100,5 +102,6 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     respondToAllowlist: agent.respond_to_allowlist ?? [],
     permissionPolicy: agent.permission_policy ?? "ask",
     permissionPolicySource: agent.permission_policy_source ?? "built_in",
+    appliedPermissionPolicy: agent.applied_permission_policy ?? null,
   };
 }

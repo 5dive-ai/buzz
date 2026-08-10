@@ -408,13 +408,8 @@ pub(super) async fn start_local_agent_with_preflight(
     if record.backend != BackendKind::Local {
         return Err(format!("agent {pubkey} is no longer a local agent"));
     }
-    // Re-snapshot the persona onto the record at every spawn so the agent always
-    // starts with the current persona config (system_prompt, model, provider,
-    // runtime). This clears the "out of date" drift badge without requiring a
-    // delete+recreate. See `apply_persona_snapshot` for the precedence and
-    // env-override self-heal rules.
-    // Load personas once: used for snapshot application below and summary build
-    // at the end — avoids a second disk read for the same file in the same call.
+    // Re-snapshot the persona at every spawn (current persona config wins; clears
+    // drift badge). Load once — also used for summary build at the end.
     let personas = load_personas(app).unwrap_or_default();
     if let Some(persona_id) = record.persona_id.clone() {
         match personas.iter().find(|p| p.id == persona_id) {
@@ -480,12 +475,15 @@ async fn deploy_to_provider(
         .map_or_else(|| resolve_provider_binary(provider_id), Ok)?;
 
     let config_clone = config.clone();
+    let applied_policy: Option<crate::managed_agents::permission_policy::PermissionPolicy> =
+        agent_json["launch"]["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"]
+            .as_str()
+            .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
     let deploy_result =
         tokio::task::spawn_blocking(move || provider_deploy(&bin_path, &agent_json, &config_clone))
             .await
             .map_err(|e| format!("spawn_blocking failed: {e}"))?;
 
-    // Persist result under lock.
     let _store_guard = state
         .managed_agents_store_lock
         .lock()
@@ -502,6 +500,7 @@ async fn deploy_to_provider(
             rec.last_started_at = Some(now_iso());
             rec.updated_at = now_iso();
             rec.last_error = None;
+            rec.applied_permission_policy = applied_policy;
         }
         Err(ref e) => {
             rec.last_error = Some(e.clone());
@@ -913,6 +912,7 @@ pub async fn create_managed_agent(
                 relay_mesh.clone()
             },
             permission_policy: None, // inherits global default or built-in `ask`
+            applied_permission_policy: None, // populated on first successful remote deploy
         };
 
         records.push(record);

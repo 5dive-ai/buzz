@@ -392,6 +392,8 @@ export type ManagedAgent = {
   permissionPolicy: PermissionPolicy;
   /** Where `permissionPolicy` came from: agent, global_default, or built_in. */
   permissionPolicySource: PermissionPolicySource;
+  /** Policy active on the remote worker; non-null only after a successful deploy. Differs from `permissionPolicy` when drift exists. */
+  appliedPermissionPolicy: PermissionPolicy | null;
 };
 
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */

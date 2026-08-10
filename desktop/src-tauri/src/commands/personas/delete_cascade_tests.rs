@@ -67,6 +67,7 @@ fn make_agent(
         catalog_source: None,
         relay_mesh: None,
         permission_policy: None,
+        applied_permission_policy: None,
         auto_restart_on_config_change: false,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],

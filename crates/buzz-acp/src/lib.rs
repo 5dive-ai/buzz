@@ -1256,27 +1256,24 @@ fn handle_set_config_option_control(
     // advertised in session/new (agentConfigCore.ts uses the one from the
     // session cache via deferredUntilNativeOptionsAvailable resolution).
     //
-    // V-2 fix: use pool-level capability cache instead of scanning idle agents.
-    // Checked-out workers leave None slots; the cache is written at return_agent
+    // V-2 fix: use pool-level capability state instead of scanning idle agents.
+    // Checked-out workers leave None slots; the state is written at return_agent
     // once the first worker completes a session and returns to the pool.
     //
-    // Four cases:
-    //  A. effort_capabilities.config_id is Some and matches → full validation path
-    //  B. effort_capabilities.config_id is None AND capabilities not yet discovered
-    //     AND no category trust → unknown configId → synthetic ok (non-effort)
-    //  C. effort_capabilities.config_id is None AND capabilities were discovered →
-    //     all workers are currently busy; trust the incoming configId from the
-    //     Desktop's session cache and store for apply at next checkout/session.
-    //  D. effort_capabilities.config_id is None AND capabilities not yet discovered
-    //     AND category == "thought_level" → pre-first-session window; Desktop
-    //     sends its session-cache configId with category as the trust signal.
-    //     Store the value and ack pending_session — the first session creation
-    //     will apply it and emit the honest final ok/failure.
-    let thought_level_id = pool
-        .effort_capabilities
-        .config_id
-        .as_deref()
-        .map(str::to_string);
+    // Three-state classifier (replaces the former case A/B/C/D four-way):
+    //  Supported(config_id, valid_values):
+    //    incoming configId matches → full I-7 validation path (case A).
+    //    incoming configId doesn't match → synthetic ok (non-effort, case B).
+    //  Unsupported:
+    //    current model confirmed to not have thought_level; reject the pick
+    //    immediately so Desktop surfaces the capability loss rather than
+    //    silently queuing a value that will never apply.
+    //  Unknown:
+    //    no session has returned capabilities yet (pre-first-session window,
+    //    or capabilities reset after a model switch pending the next session/new).
+    //    Trust the Desktop's category field as the trust signal (case D):
+    //    if category == "thought_level", store and ack pending_session —
+    //    the first session creation will apply it and emit the honest result.
 
     // Category from the incoming frame (Desktop sends "thought_level" for all
     // effort picks and clears, including during the pre-discovery window).
@@ -1285,51 +1282,75 @@ fn handle_set_config_option_control(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Determine if this is a thought_level pick:
-    //   Case A: cache has a matching configId.
-    //   Case C: capabilities known from a prior session, all workers busy.
-    //   Case D: pre-first-session, Desktop asserts category = "thought_level".
-    //
-    // For the clear path (empty value), the same cases apply.
-    let cache_matches = thought_level_id.as_deref() == Some(config_id);
-    // Case C: capabilities were discovered before (so configId is known) but
-    // workers are currently checked out and the cache is temporarily None.
-    let all_busy_with_known_caps =
-        pool.capabilities_ever_discovered && thought_level_id.is_none() && config_id != "unknown";
-    // Case D: pre-first-session; Desktop sends category as the trust signal.
-    let pre_discovery_trusted = !pool.capabilities_ever_discovered
-        && frame_category == "thought_level"
-        && config_id != "unknown";
-    let is_thought_level = cache_matches || all_busy_with_known_caps || pre_discovery_trusted;
-
-    let (status, include_category) = if is_thought_level {
-        // I-7: validate the incoming value against adapter-advertised options
-        // from the pool-level capability cache. Works even when all workers
-        // are checked out — the cache was written at the first session creation.
-        // Skip validation when cache is empty (case C — workers busy, no cache
-        // to validate against; trust the Desktop's session-cache configId).
-        let valid_values = &pool.effort_capabilities.valid_values;
-
-        if !valid_values.is_empty()
-            && !value.is_empty()
-            && !valid_values.contains(&value.to_string())
-        {
-            // Value is not in the adapter's advertised option set.
+    // Tri-state dispatch: Supported → validate + store, Unsupported → reject,
+    // Unknown → pre-discovery trust path.
+    use crate::pool::EffortCapabilityState;
+    let (status, include_category) = match &pool.effort_capability_state {
+        EffortCapabilityState::Supported {
+            config_id: known_id,
+            valid_values,
+        } if known_id.as_str() == config_id => {
+            // Case A: configId matches the pool's known supported configId.
+            // I-7: validate value against adapter-advertised options.
+            if !valid_values.is_empty()
+                && !value.is_empty()
+                && !valid_values.contains(&value.to_string())
+            {
+                tracing::warn!(
+                    target: "pool::effort",
+                    "effort value {value:?} not in advertised options {valid_values:?} — rejecting"
+                );
+                let mut ack = serde_json::json!({
+                    "type": "set_config_option",
+                    "configId": config_id,
+                    "status": "invalid_value",
+                    "value": value,
+                });
+                ack["category"] = serde_json::json!("thought_level");
+                if let Some(ref n) = nonce {
+                    ack["nonce"] = serde_json::json!(n);
+                }
+                obs.emit(
+                    "control_result",
+                    None,
+                    &observer::ObserverContext::default(),
+                    ack,
+                );
+                return;
+            }
+            // Value is valid (or no validation possible for clears).
+            if value.is_empty() {
+                pool.pending_effort_nonce = nonce.clone();
+                pool.clear_pool_effort();
+                ("pending_session", true)
+            } else {
+                pool.pending_effort_nonce = nonce.clone();
+                let result = pool.set_pool_effort(config_id, value);
+                match result {
+                    SetPoolEffortResult::Stored { .. } => ("pending_session", true),
+                }
+            }
+        }
+        EffortCapabilityState::Supported { .. } => {
+            // Case B: state is Supported but configId doesn't match the incoming
+            // frame — not an effort option; emit synthetic ok (no-op).
+            ("ok", false)
+        }
+        EffortCapabilityState::Unsupported => {
+            // Current model does not support effort. Reject so Desktop can surface
+            // the capability loss rather than silently queuing a value that will
+            // never apply.
             tracing::warn!(
                 target: "pool::effort",
-                "effort value {value:?} not in advertised options {valid_values:?} — rejecting"
+                "effort pick configId={config_id} rejected — current model is known-unsupported"
             );
             let mut ack = serde_json::json!({
                 "type": "set_config_option",
                 "configId": config_id,
-                "status": "invalid_value",
+                "status": "unsupported_model",
                 "value": value,
             });
             ack["category"] = serde_json::json!("thought_level");
-            // P2-1: echo the nonce on the early-return rejection path, matching
-            // the behaviour of the common ack builder below. Without this the
-            // Desktop's awaitEffortOutcome nonce guard rejects the ack, causing
-            // an 8 s timeout instead of an immediate "invalid_value" outcome.
             if let Some(ref n) = nonce {
                 ack["nonce"] = serde_json::json!(n);
             }
@@ -1341,22 +1362,27 @@ fn handle_set_config_option_control(
             );
             return;
         }
-
-        // Empty value = clear (Auto). Bypass set_pool_effort.
-        if value.is_empty() {
-            pool.pending_effort_nonce = nonce.clone();
-            pool.clear_pool_effort();
-            ("pending_session", true)
-        } else {
-            pool.pending_effort_nonce = nonce.clone();
-            let result = pool.set_pool_effort(config_id, value);
-            match result {
-                SetPoolEffortResult::Stored { .. } => ("pending_session", true),
+        EffortCapabilityState::Unknown => {
+            // Pre-first-session window (or reset after a model switch pending
+            // the next session/new). Trust the Desktop's category field as the
+            // signal: if category == "thought_level", store for apply and ack
+            // pending_session; otherwise synthetic ok (non-effort).
+            if frame_category == "thought_level" && config_id != "unknown" {
+                if value.is_empty() {
+                    pool.pending_effort_nonce = nonce.clone();
+                    pool.clear_pool_effort();
+                    ("pending_session", true)
+                } else {
+                    pool.pending_effort_nonce = nonce.clone();
+                    let result = pool.set_pool_effort(config_id, value);
+                    match result {
+                        SetPoolEffortResult::Stored { .. } => ("pending_session", true),
+                    }
+                }
+            } else {
+                ("ok", false)
             }
         }
-    } else {
-        // Not a thought_level option — synthetic ok (no-op behaviour unchanged).
-        ("ok", false)
     };
 
     // B5: include "category": "thought_level" ONLY on the real-forward branch.
@@ -8046,6 +8072,7 @@ mod observer_payload_trim_tests {
 #[cfg(test)]
 mod control_result_tests {
     use super::*;
+    use crate::pool::{AgentModelCapabilities, EffortCapabilityState};
 
     // ── B5 harness-level tests for handle_set_config_option_control ──────────
     //
@@ -8582,6 +8609,291 @@ mod control_result_tests {
         assert!(
             events[0].payload.get("category").is_none() || events[0].payload["category"].is_null(),
             "synthetic ok ack must not carry category field"
+        );
+    }
+
+    // ── Tri-state switch-path regressions ─────────────────────────────────────
+
+    /// Helper: build a pool with an idle agent, drive capabilities via the real
+    /// `return_agent` path (not the test-only `notify_capabilities_discovered`
+    /// helper), and return the pool ready for further assertions.
+    ///
+    /// `thought_level_id` — Some means the agent supports effort; None means
+    /// the model does not.
+    async fn pool_with_capabilities_via_return(thought_level_id: Option<&str>) -> AgentPool {
+        use crate::acp::AcpClient;
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), "sleep 10".to_string()],
+            &[],
+            false,
+        )
+        .await
+        .expect("failed to spawn test agent for capability helper");
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        // Claim and immediately return with populated capabilities — drives the
+        // `return_agent` capability-refresh path, the PRODUCTION code path.
+        let mut agent = pool.try_claim(None).unwrap();
+        agent.model_capabilities = Some(AgentModelCapabilities {
+            thought_level_config_id: thought_level_id.map(str::to_string),
+            config_options_raw: thought_level_id
+                .map(|id| {
+                    vec![serde_json::json!({
+                        "id": id,
+                        "options": [{"value": "low"}, {"value": "medium"}, {"value": "high"}]
+                    })]
+                })
+                .unwrap_or_default(),
+            available_models_raw: None,
+        });
+        pool.return_agent(agent);
+        pool
+    }
+
+    /// Switch effort-supporting model → non-effort model:
+    /// - `return_agent` must write `Unsupported`
+    /// - a subsequent effort pick must be REJECTED with `"unsupported_model"` status
+    /// - the pick must not update `pool.desired_effort`
+    #[tokio::test]
+    async fn test_tristate_switch_effort_to_no_effort_rejects_pick() {
+        // Start Supported (effort-capable model).
+        let mut pool = pool_with_capabilities_via_return(Some("effort")).await;
+        assert!(
+            matches!(
+                pool.effort_capability_state,
+                EffortCapabilityState::Supported { .. }
+            ),
+            "setup: pool must be Supported"
+        );
+
+        // Simulate a model switch: agent returns with capabilities but no
+        // thought_level — the new model does not support effort.
+        let mut agent = pool.try_claim(None).unwrap();
+        agent.model_capabilities = Some(AgentModelCapabilities {
+            thought_level_config_id: None,
+            config_options_raw: vec![],
+            available_models_raw: None,
+        });
+        pool.return_agent(agent);
+
+        // Pool must now be Unsupported.
+        assert!(
+            matches!(
+                pool.effort_capability_state,
+                EffortCapabilityState::Unsupported
+            ),
+            "after switch to non-effort model: pool must be Unsupported"
+        );
+
+        // A subsequent effort pick must be REJECTED.
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "high",
+            "category": "thought_level",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1, "exactly one ack emitted");
+        assert_eq!(
+            events[0].payload["status"].as_str().unwrap(),
+            "unsupported_model",
+            "effort pick on Unsupported state must emit unsupported_model"
+        );
+        // Pick must not have been stored — desired_effort unchanged.
+        assert!(
+            pool.desired_effort.is_none(),
+            "Unsupported pick must not update pool.desired_effort"
+        );
+    }
+
+    /// Switch no-effort model → effort-supporting model:
+    /// - `return_agent` must write `Supported` with the new option set
+    /// - a subsequent pick with the correct configId must be STORED and acked
+    ///   `pending_session`
+    #[tokio::test]
+    async fn test_tristate_switch_no_effort_to_effort_accepts_pick() {
+        // Start Unsupported (non-effort model).
+        let mut pool = pool_with_capabilities_via_return(None).await;
+        assert!(
+            matches!(
+                pool.effort_capability_state,
+                EffortCapabilityState::Unsupported
+            ),
+            "setup: pool must be Unsupported"
+        );
+
+        // Simulate a model switch: agent returns with thought_level capability.
+        let new_config_id = "effort_v2";
+        let mut agent = pool.try_claim(None).unwrap();
+        agent.model_capabilities = Some(AgentModelCapabilities {
+            thought_level_config_id: Some(new_config_id.to_string()),
+            config_options_raw: vec![serde_json::json!({
+                "id": new_config_id,
+                "options": [{"value": "low"}, {"value": "high"}]
+            })],
+            available_models_raw: None,
+        });
+        pool.return_agent(agent);
+
+        // Pool must now be Supported with the new configId.
+        assert!(
+            matches!(
+                &pool.effort_capability_state,
+                EffortCapabilityState::Supported { config_id, .. } if config_id == new_config_id
+            ),
+            "after switch to effort-capable model: pool must be Supported with new configId"
+        );
+
+        // A pick with the correct configId must be STORED.
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": new_config_id,
+            "value": "high",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1, "exactly one ack emitted");
+        assert_eq!(
+            events[0].payload["status"].as_str().unwrap(),
+            "pending_session",
+            "pick on newly-Supported state must emit pending_session"
+        );
+        assert_eq!(
+            pool.desired_effort
+                .as_ref()
+                .map(|(id, v)| (id.as_str(), v.as_str())),
+            Some((new_config_id, "high")),
+            "pick must be stored in pool.desired_effort"
+        );
+    }
+
+    /// Option-set CHANGE across a switch (both models support effort, different option sets):
+    /// - value valid for the OLD model but absent from the new model's options → `invalid_value`
+    /// - value in the NEW model's option set → `pending_session`
+    #[tokio::test]
+    async fn test_tristate_switch_new_options_validates_against_new_snapshot() {
+        // Start with configId="effort", options=[low, medium, high].
+        let mut pool = pool_with_capabilities_via_return(Some("effort")).await;
+
+        // Simulate a switch to a model with configId="effort", options=[standard, extended] only.
+        let mut agent = pool.try_claim(None).unwrap();
+        agent.model_capabilities = Some(AgentModelCapabilities {
+            thought_level_config_id: Some("effort".to_string()),
+            config_options_raw: vec![serde_json::json!({
+                "id": "effort",
+                "options": [{"value": "standard"}, {"value": "extended"}]
+            })],
+            available_models_raw: None,
+        });
+        pool.return_agent(agent);
+
+        // Verify snapshot updated.
+        let new_valid_values = match &pool.effort_capability_state {
+            EffortCapabilityState::Supported { valid_values, .. } => valid_values.clone(),
+            other => panic!("expected Supported, got {other:?}"),
+        };
+        assert_eq!(
+            new_valid_values,
+            vec!["standard", "extended"],
+            "option set must reflect new model's options"
+        );
+
+        // Old value "high" (valid for old model, absent from new) → invalid_value.
+        let obs = observer::ObserverHandle::in_process();
+        let stale_payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "high",
+        });
+        handle_set_config_option_control(&stale_payload, &mut pool, Some(&obs));
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1, "exactly one ack for stale pick");
+        assert_eq!(
+            events[0].payload["status"].as_str().unwrap(),
+            "invalid_value",
+            "stale value from old model option set must be rejected"
+        );
+
+        // New value "extended" (valid for new model) → pending_session.
+        let obs2 = observer::ObserverHandle::in_process();
+        let valid_payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "extended",
+        });
+        handle_set_config_option_control(&valid_payload, &mut pool, Some(&obs2));
+        let events2 = obs2.snapshot();
+        assert_eq!(events2.len(), 1, "exactly one ack for new-model pick");
+        assert_eq!(
+            events2[0].payload["status"].as_str().unwrap(),
+            "pending_session",
+            "value from new model option set must be accepted"
+        );
+    }
+
+    /// After a model switch, `effort_capability_state` becomes `Unknown` while
+    /// the agent is checked out (capabilities reset). Once the agent returns
+    /// with `model_capabilities = None` (post-switch, pre-next-session/new),
+    /// a pick with category trust must use the Unknown path (pending_session),
+    /// NOT be rejected as Unsupported.
+    #[tokio::test]
+    async fn test_tristate_unknown_after_switch_uses_pre_discovery_trust_path() {
+        // Start Supported.
+        let mut pool = pool_with_capabilities_via_return(Some("effort")).await;
+
+        // Simulate post-switch return with capabilities=None (reset by switch).
+        let mut agent = pool.try_claim(None).unwrap();
+        agent.model_capabilities = None; // reset — capabilities unknown until next session/new
+        pool.return_agent(agent);
+
+        // Pool must be Unknown.
+        assert!(
+            matches!(pool.effort_capability_state, EffortCapabilityState::Unknown),
+            "capabilities=None on return must produce Unknown state"
+        );
+
+        // A pick with category trust must use the pre-discovery path (pending_session).
+        let obs = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "type": "set_config_option",
+            "configId": "effort",
+            "value": "high",
+            "category": "thought_level",
+        });
+        handle_set_config_option_control(&payload, &mut pool, Some(&obs));
+
+        let events = obs.snapshot();
+        assert_eq!(events.len(), 1, "exactly one ack emitted");
+        assert_eq!(
+            events[0].payload["status"].as_str().unwrap(),
+            "pending_session",
+            "Unknown state with category trust must emit pending_session (pre-discovery path)"
+        );
+        assert_eq!(
+            pool.desired_effort.as_ref().map(|(_, v)| v.as_str()),
+            Some("high"),
+            "Unknown path must store pick for apply at next session"
         );
     }
 }

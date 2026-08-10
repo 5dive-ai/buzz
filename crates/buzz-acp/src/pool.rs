@@ -280,21 +280,30 @@ impl OwnedAgent {
     }
 }
 
-/// Pool-level capability snapshot for the `thought_level` config option.
+/// Pool-level effort capability state derived from worker session data.
 ///
-/// Written at `return_agent` when a worker with populated capabilities returns
-/// to the pool. Because checked-out agents carry their own `model_capabilities`,
-/// this cache ensures `handle_set_config_option_control` can identify and
-/// validate effort picks even when all workers are checked out (pool slots
-/// are `None`).
+/// Written at `return_agent` from the returning worker's `model_capabilities`.
+/// Drives the classifier in `handle_set_config_option_control`:
+/// - `Unknown` → no session data yet; trust the Desktop's `category` field
+///   (pre-first-session window, case D).
+/// - `Supported` → current model advertises `thought_level`; validate picks
+///   against the snapshot's option set (case A).
+/// - `Unsupported` → current model confirmed to not advertise `thought_level`;
+///   reject picks immediately without updating the pool.
 #[derive(Debug, Clone, Default)]
-pub struct PoolEffortCapabilities {
-    /// The adapter's `thought_level` configId from `session/new`.
-    /// `None` until the first session has been created.
-    pub config_id: Option<String>,
-    /// Adapter-advertised option values for the `thought_level` config option.
-    /// Empty until the first session returns options.
-    pub valid_values: Vec<String>,
+pub enum EffortCapabilityState {
+    /// No session has returned capabilities yet — pre-first-session window.
+    #[default]
+    Unknown,
+    /// Current model advertises `thought_level`. Contains the configId and
+    /// the adapter-advertised valid option values.
+    Supported {
+        config_id: String,
+        valid_values: Vec<String>,
+    },
+    /// Current model does not advertise `thought_level` (confirmed via a
+    /// session/new response that carries no `thought_level` configOption).
+    Unsupported,
 }
 
 /// Pre-prompt effort application result sent from a worker task to the main loop
@@ -364,23 +373,21 @@ pub struct AgentPool {
     /// pool level — a live pick/clear is always authoritative over startup seeding,
     /// even if the pool value is `None` (i.e. the user explicitly cleared it).
     pub effort_ever_picked: bool,
-    /// Pool-level capability cache for the `thought_level` config option.
+    /// Pool-level effort capability state for the `thought_level` config option.
     ///
-    /// Written at `return_agent` (refreshed from the returned agent's
-    /// capabilities). Allows `handle_set_config_option_control` to identify
-    /// and validate effort picks regardless of idle occupancy.
-    pub effort_capabilities: PoolEffortCapabilities,
-    /// True once any worker has ever had capabilities populated and returned to
-    /// the pool. Used to distinguish "pre-first-return" (capabilities unknown
-    /// — case D trust path applies) from "all workers currently busy"
-    /// (capabilities known but cache temporarily empty — case C trust path)
-    /// in `handle_set_config_option_control`.
-    pub capabilities_ever_discovered: bool,
+    /// Written at `return_agent` from the returning worker's `model_capabilities`,
+    /// refreshing on every return so the state always reflects the current model.
+    /// Drives `handle_set_config_option_control`'s three-way classifier:
+    /// `Supported` → validate and store; `Unsupported` → reject; `Unknown` →
+    /// pre-discovery trust (store for apply at first session).
+    pub effort_capability_state: EffortCapabilityState,
     /// Generation of the last effort pick/clear for which a terminal ack
     /// (ok/failure/cleared) has already been emitted. Used by `return_agent`
     /// to emit exactly one terminal ack per generation when parallelism > 1:
     /// the first worker whose result is processed owns the ack; subsequent
-    /// workers with the same generation are silenced.
+    /// workers with the same generation are silenced. The sole ack authority
+    /// is `resolve_effort_report`; `return_agent` only reads this field for
+    /// the stale-generation force-invalidation (F1) guard.
     ///
     /// `None` means no terminal ack has been emitted yet for any generation.
     pub last_acked_effort_gen: Option<u64>,
@@ -743,8 +750,7 @@ impl AgentPool {
             effort_generation: 0,
             pending_effort_nonce: None,
             effort_ever_picked: false,
-            effort_capabilities: PoolEffortCapabilities::default(),
-            capabilities_ever_discovered: false,
+            effort_capability_state: EffortCapabilityState::Unknown,
             last_acked_effort_gen: None,
         }
     }
@@ -819,9 +825,9 @@ impl AgentPool {
     /// so the next session creation applies the current pool value. This closes
     /// the window where a busy worker's surviving session runs at a stale effort.
     ///
-    /// **Capability refresh:** the pool-level `effort_capabilities` cache is
-    /// updated from the returned agent's capabilities (if populated), ensuring
-    /// the cache is available even when all other workers are checked out.
+    /// **Capability refresh:** the pool-level `effort_capability_state` is
+    /// re-derived from the returned agent's `model_capabilities`, so the state
+    /// always reflects the current model even after live model switches.
     pub fn return_agent(&mut self, mut agent: OwnedAgent) {
         let idx = agent.index;
 
@@ -911,11 +917,18 @@ impl AgentPool {
             agent.state.invalidate_all();
         }
 
-        // Capability refresh: write back the agent's capability snapshot to the
-        // pool-level cache so validation remains available when all workers are
-        // checked out. Always overwrite — returned workers have fresh capabilities.
-        if let Some(ref caps) = agent.model_capabilities {
-            if caps.thought_level_config_id.is_some() {
+        // Capability refresh: derive the pool-level tri-state from the returned
+        // agent's model_capabilities. Refresh on every return so the pool state
+        // always reflects the current model — not just the first model seen.
+        //
+        // `Some(caps)` with a thought_level configId → Supported
+        // `Some(caps)` without a thought_level configId → Unsupported (model
+        //   confirmed to not advertise thought_level; future picks are rejected)
+        // `None` → Unknown (capability not yet resolved; keep the pre-first-
+        //   session trust path active for the next session)
+        match &agent.model_capabilities {
+            Some(caps) if caps.thought_level_config_id.is_some() => {
+                let config_id = caps.thought_level_config_id.clone().unwrap();
                 let valid_values = caps
                     .config_options_raw
                     .iter()
@@ -923,7 +936,7 @@ impl AgentPool {
                         opt.get("id")
                             .or_else(|| opt.get("configId"))
                             .and_then(|v| v.as_str())
-                            == caps.thought_level_config_id.as_deref()
+                            == Some(&config_id)
                     })
                     .and_then(|opt| opt.get("options"))
                     .and_then(|o| o.as_array())
@@ -935,24 +948,20 @@ impl AgentPool {
                             .collect()
                     })
                     .unwrap_or_default();
-                self.effort_capabilities = PoolEffortCapabilities {
-                    config_id: caps.thought_level_config_id.clone(),
+                self.effort_capability_state = EffortCapabilityState::Supported {
+                    config_id,
                     valid_values,
                 };
-                self.capabilities_ever_discovered = true;
-            } else if self.capabilities_ever_discovered {
-                // P3: the returning agent has populated capabilities but no
-                // thought_level configId — the model was swapped to one that
-                // does not support effort. Clear the pool-level cache so
-                // subsequent picks are not validated against stale options.
-                //
-                // capabilities_ever_discovered stays true: we have seen at
-                // least one session. This activates case C in
-                // handle_set_config_option_control, letting picks through
-                // without value-validation while the cache is empty (correct
-                // — the user can still send a pick; the adapter will reject
-                // it if the value is unsupported).
-                self.effort_capabilities = PoolEffortCapabilities::default();
+            }
+            Some(_) => {
+                // Populated capabilities, no thought_level — model is confirmed unsupported.
+                self.effort_capability_state = EffortCapabilityState::Unsupported;
+            }
+            None => {
+                // Capabilities not yet resolved (e.g. reset after a model switch).
+                // Leave the tri-state Unknown so the pre-discovery trust path stays
+                // active; the next session/new will resolve it.
+                self.effort_capability_state = EffortCapabilityState::Unknown;
             }
         }
 
@@ -1318,13 +1327,13 @@ impl AgentPool {
 
     /// Notify the pool that capabilities have been discovered for a worker.
     ///
-    /// **Test-only helper.** In production the pool capability cache is written
+    /// **Test-only helper.** In production the pool capability state is written
     /// by `return_agent` when a worker returns after completing its first session.
-    /// This function lets tests seed the cache directly without going through the
+    /// This function lets tests seed the state directly without going through the
     /// full spawn-session-return cycle.
     #[cfg(test)]
     pub fn notify_capabilities_discovered(&mut self, caps: &AgentModelCapabilities) {
-        if caps.thought_level_config_id.is_some() && self.effort_capabilities.config_id.is_none() {
+        if let Some(ref config_id) = caps.thought_level_config_id {
             let valid_values = caps
                 .config_options_raw
                 .iter()
@@ -1332,7 +1341,7 @@ impl AgentPool {
                     opt.get("id")
                         .or_else(|| opt.get("configId"))
                         .and_then(|v| v.as_str())
-                        == caps.thought_level_config_id.as_deref()
+                        == Some(config_id.as_str())
                 })
                 .and_then(|opt| opt.get("options"))
                 .and_then(|o| o.as_array())
@@ -1342,11 +1351,12 @@ impl AgentPool {
                         .collect()
                 })
                 .unwrap_or_default();
-            self.effort_capabilities = PoolEffortCapabilities {
-                config_id: caps.thought_level_config_id.clone(),
+            self.effort_capability_state = EffortCapabilityState::Supported {
+                config_id: config_id.clone(),
                 valid_values,
             };
-            self.capabilities_ever_discovered = true;
+        } else {
+            self.effort_capability_state = EffortCapabilityState::Unsupported;
         }
     }
 }
@@ -1536,14 +1546,15 @@ async fn create_session_and_apply_model(
         }
     }
 
-    // Populate model capabilities on first session creation.
-    if agent.model_capabilities.is_none() {
-        agent.model_capabilities = Some(AgentModelCapabilities {
-            config_options_raw: extract_agent_config_options(&resp.raw),
-            available_models_raw: extract_model_state(&resp.raw),
-            thought_level_config_id: extract_thought_level_config_id(&resp.raw),
-        });
-    }
+    // Populate model capabilities from every session/new response — not just the
+    // first. This ensures that after a model switch (which resets capabilities to
+    // None to discard the pre-switch snapshot), the next session/new supplies
+    // fresh capability data for the new model.
+    agent.model_capabilities = Some(AgentModelCapabilities {
+        config_options_raw: extract_agent_config_options(&resp.raw),
+        available_models_raw: extract_model_state(&resp.raw),
+        thought_level_config_id: extract_thought_level_config_id(&resp.raw),
+    });
 
     // B5 startup-default: arm desired_effort from startup_effort + capabilities.
     // No-op when desired_effort already set (live pick takes precedence, via the
@@ -1558,6 +1569,14 @@ async fn create_session_and_apply_model(
         match resolve_model_switch_method(&resp.raw, desired) {
             Some(method) => {
                 apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?;
+                // The session/new response captured above reflects the pre-switch
+                // model's configOptions. Reset capabilities to None so:
+                //   1. `return_agent` writes EffortCapabilityState::Unknown, keeping
+                //      the pre-discovery trust path active (not stale-Supported).
+                //   2. The next session/new (after this session is invalidated on
+                //      the next model switch or rotation) re-derives capabilities
+                //      from the then-current model's response.
+                agent.model_capabilities = None;
                 true
             }
             None => {
@@ -1680,10 +1699,23 @@ async fn create_session_and_apply_model(
     // post-switch state. modelOverridden reflects whether the switch actually
     // applied — false on the unsupported arm so the panel doesn't show a
     // stale override badge.
+    //
+    // When a model switch succeeded, the configOptions in resp.raw are pre-switch
+    // data and must not be cached — the next session/new will supply fresh options
+    // for the new model. Emit null for configOptions on the switch path so Desktop
+    // clears its picker state rather than rendering stale capability data.
+    let config_options_for_cache = if switch_succeeded {
+        serde_json::Value::Null
+    } else {
+        resp.raw
+            .get("configOptions")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
     agent.acp.observe(
         "session_config_captured",
         serde_json::json!({
-            "configOptions": resp.raw.get("configOptions").cloned().unwrap_or(serde_json::Value::Null),
+            "configOptions": config_options_for_cache,
             "modes": resp.raw.get("modes").cloned().unwrap_or(serde_json::Value::Null),
             "models": resp.raw.get("models").cloned().unwrap_or(serde_json::Value::Null),
             "modelOverridden": agent.model_overridden && switch_succeeded,
@@ -8235,9 +8267,14 @@ mod effort_tests {
             available_models_raw: None,
         });
 
-        // All slots are None (workers checked out) but capabilities ARE known.
-        assert!(pool.effort_capabilities.config_id.is_some());
-        assert!(pool.capabilities_ever_discovered);
+        // All slots are None (workers checked out) but capabilities ARE known (Supported).
+        assert!(
+            matches!(
+                pool.effort_capability_state,
+                EffortCapabilityState::Supported { .. }
+            ),
+            "V-2 setup: pool must be Supported after notify_capabilities_discovered"
+        );
         assert!(pool.agents_mut().iter().flatten().next().is_none());
 
         // set_pool_effort should store, not return NoCatalog.
@@ -9222,12 +9259,12 @@ mod effort_tests {
         );
     }
 
-    // ── P3: stale capability cache cleared on model swap ─────────────────────
+    // ── P3: capability state updated to Unsupported on model swap ─────────────────
 
     /// P3: when a returning agent has populated capabilities but no
     /// thought_level configId (model swapped to non-effort), the pool-level
-    /// effort_capabilities cache is cleared so stale options are not used for
-    /// validation on the next pick.
+    /// effort_capability_state transitions to `Unsupported` so subsequent picks
+    /// are rejected immediately rather than validated against stale options.
     #[tokio::test]
     async fn test_capability_cache_cleared_when_model_loses_thought_level() {
         let acp = AcpClient::spawn(
@@ -9260,8 +9297,13 @@ mod effort_tests {
             config_options_raw: vec![serde_json::json!({"id": "effort", "options": [{"value": "low"}, {"value": "high"}]})],
             available_models_raw: None,
         });
-        assert!(pool.effort_capabilities.config_id.is_some());
-        assert!(pool.capabilities_ever_discovered);
+        assert!(
+            matches!(
+                pool.effort_capability_state,
+                EffortCapabilityState::Supported { .. }
+            ),
+            "P3 setup: must start Supported"
+        );
 
         // Worker returns after a model swap — no thought_level in new model.
         let mut agent = pool.try_claim(None).unwrap();
@@ -9272,19 +9314,13 @@ mod effort_tests {
         });
         pool.return_agent(agent);
 
-        // P3: cache must be cleared.
+        // P3: state must transition to Unsupported — not Unknown, not stale-Supported.
         assert!(
-            pool.effort_capabilities.config_id.is_none(),
-            "P3: effort_capabilities must be cleared when model loses thought_level"
-        );
-        assert!(
-            pool.effort_capabilities.valid_values.is_empty(),
-            "P3: valid_values must be cleared"
-        );
-        // capabilities_ever_discovered stays true (case C remains active).
-        assert!(
-            pool.capabilities_ever_discovered,
-            "capabilities_ever_discovered must stay true after cache clear"
+            matches!(
+                pool.effort_capability_state,
+                EffortCapabilityState::Unsupported
+            ),
+            "P3: effort_capability_state must be Unsupported when model loses thought_level"
         );
     }
 

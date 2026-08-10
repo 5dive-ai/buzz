@@ -286,7 +286,6 @@ fn record_with(
         secrets_unavailable: false,
     }
 }
-
 #[test]
 fn record_agent_command_own_runtime_wins_over_persona() {
     // A record with its own materialized runtime never consults the

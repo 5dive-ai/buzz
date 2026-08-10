@@ -1356,8 +1356,7 @@ pub async fn delete_managed_agent(
 // Remote agent shutdown is handled entirely by the frontend:
 // 1. Frontend sends "!shutdown" @mention via WebSocket (signed by user's key)
 // 2. Harness sees it, exits gracefully, sets presence to "offline"
-// 3. Desktop's existing presence polling sees "offline" — UI updates automatically
-// No backend Tauri command needed. Presence IS the status.
+// 3. Desktop's existing presence polling sees "offline" — UI updates automatically. No backend command needed; presence IS the status.
 #[path = "agents_deploy.rs"]
 mod deploy;
 pub(super) mod provider_access;

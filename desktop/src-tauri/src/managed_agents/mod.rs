@@ -11,6 +11,10 @@ pub(crate) use agent_env::{
 mod backend;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
+#[cfg(debug_assertions)]
+mod dev_service_migration;
+#[cfg(debug_assertions)]
+pub(crate) use dev_service_migration::migrate_agent_secrets_to_dev_service;
 mod discovery;
 pub(crate) mod effective_config;
 mod env_vars;

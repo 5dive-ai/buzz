@@ -984,7 +984,6 @@ mod import_avatar_tests {
             |_| async { Err("relay upload failed".to_string()) },
         )
         .await;
-
         assert_eq!(result.unwrap_err(), "relay upload failed");
     }
     #[tokio::test]

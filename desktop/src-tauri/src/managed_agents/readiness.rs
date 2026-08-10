@@ -1532,7 +1532,6 @@ mod tests {
             provider_config_ref: None,
             secrets_unavailable: false,
         };
-
         let runtime = known_acp_runtime_exact("buzz-agent");
         let effective = resolve_effective_agent_env(&record, &[], runtime, &Default::default());
 

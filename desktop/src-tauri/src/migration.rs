@@ -191,12 +191,8 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     reconcile_provider_mcp_commands(app);
     reconcile_databricks_v1_to_v2(app);
     materialize_agent_runtimes(app);
-    migrate_inline_secrets_to_keyring(app); // keyring extraction — runs after all raw-JSON migrations
-                                            // Dev-build-only: copy secret-projection keys (env vars, auth tags, provider
-                                            // configs) from the source keyring service into the destination dev service.
-                                            // Runs AFTER migrate_inline_secrets_to_keyring so projection keys are
-                                            // present in the source before we copy them.
-    #[cfg(debug_assertions)]
+    migrate_inline_secrets_to_keyring(app); // keyring extraction — after all raw-JSON migrations
+    #[cfg(debug_assertions)] // dev-build only; runs after extraction so keys exist in the source
     if is_dev {
         crate::managed_agents::migrate_agent_secrets_to_dev_service(app);
     }
@@ -1389,9 +1385,6 @@ mod team_suffix;
 pub use team_suffix::strip_baked_team_instructions;
 mod migration_secrets;
 use migration_secrets::migrate_inline_secrets_to_keyring;
-#[allow(unused_imports)]
-pub(crate) use migration_secrets::run_secret_gc;
-
 #[cfg(test)]
 #[path = "migration_avatar_tests.rs"]
 mod avatar_tests;

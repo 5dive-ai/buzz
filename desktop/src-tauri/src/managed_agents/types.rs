@@ -221,23 +221,18 @@ pub struct ManagedAgentRecord {
     /// Team this instance was deployed from. Resolves runtime team instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
-    /// nsec private key. Stored in the OS keyring (keyed by `pubkey`); the
-    /// storage layer blanks this before writing JSON once the key is in the
-    /// keyring and re-hydrates it on load. Serialized inline only when the
-    /// keyring is unreachable (`0o600` JSON fallback).
+    /// nsec private key. Stored in the OS keyring (keyed by `pubkey`); blanked
+    /// before JSON write, re-hydrated on load. Inline only when keyring is unreachable.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub private_key_nsec: String,
-    /// NIP-OA auth tag JSON. Pre-existing agents (pre-NIP-OA) have `None`
-    /// and continue to work without attestation.
+    /// NIP-OA auth tag JSON. Pre-existing agents (pre-NIP-OA) have `None`.
     #[serde(default)]
     pub auth_tag: Option<String>,
-    /// Keyring gen ref for `auth_tag`; absent = intentionally empty.
+    /// Keyring gen refs; absent = intentionally empty (`provider_config_ref` is `None` for `Local`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_tag_ref: Option<String>,
-    /// Keyring gen ref for `env_vars`; absent = intentionally empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_vars_ref: Option<String>,
-    /// Keyring gen ref for `BackendKind::Provider.config`; `None` for Local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_config_ref: Option<String>,
     pub relay_url: String,
@@ -443,13 +438,8 @@ pub struct ManagedAgentRecord {
     /// deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mesh: Option<RelayMeshConfig>,
-    /// Set by the load path when one or more secret fields (env_vars, auth_tag,
-    /// provider_config) have a keyring `*_ref` that points to an unavailable or
-    /// missing entry.  Never serialized — it is a transient load-time signal
-    /// that the spawn path must consult before starting this agent.
-    ///
-    /// `true` → at least one referenced secret is unreachable; spawn must refuse.
-    /// `false` (default) → all refs resolved successfully (or there are no refs).
+    /// Set by the load path when a secret field's keyring `*_ref` points to an
+    /// unavailable entry. Never serialized; `true` means spawn must refuse.
     #[serde(skip)]
     pub secrets_unavailable: bool,
 }

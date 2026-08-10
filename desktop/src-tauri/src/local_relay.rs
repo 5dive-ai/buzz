@@ -5,6 +5,8 @@
 //! supervises the bundled `buzz-relay` binary.
 
 use std::{
+    fs::OpenOptions,
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -104,13 +106,15 @@ pub(crate) fn start(
 ) -> Result<LocalRelayRuntime, String> {
     let relay_port = requested_port.unwrap_or(free_loopback_port()?);
     let owner_pubkey = keys.public_key().to_hex();
+    let data_dir = local_data_dir(app, &owner_pubkey)?;
+    let relay_keys = load_or_create_relay_keys(&data_dir)?;
     let config = LocalRelayConfig {
         relay_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
         health_port: free_loopback_port()?,
         metrics_port: free_loopback_port()?,
-        data_dir: local_data_dir(app, &owner_pubkey)?,
+        data_dir,
         owner_pubkey,
-        relay_private_key: keys.secret_key().to_secret_hex(),
+        relay_private_key: relay_keys.secret_key().to_secret_hex(),
     };
     let url = config.url();
     let media_dir = config.data_dir.join("media");
@@ -233,6 +237,34 @@ fn local_data_dir(app: &AppHandle, owner_pubkey: &str) -> Result<PathBuf, String
         .map_err(|e| format!("resolve app data directory for local relay: {e}"))
 }
 
+fn load_or_create_relay_keys(data_dir: &Path) -> Result<Keys, String> {
+    let path = data_dir.join("relay-service.key");
+    match std::fs::read_to_string(&path) {
+        Ok(secret) => Keys::parse(secret.trim())
+            .map_err(|error| format!("parse local relay service key: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(data_dir)
+                .map_err(|error| format!("create local relay data dir: {error}"))?;
+            let keys = Keys::generate();
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|error| format!("create local relay service key: {error}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|error| format!("secure local relay service key: {error}"))?;
+            }
+            file.write_all(keys.secret_key().to_secret_hex().as_bytes())
+                .map_err(|error| format!("write local relay service key: {error}"))?;
+            Ok(keys)
+        }
+        Err(error) => Err(format!("read local relay service key: {error}")),
+    }
+}
+
 fn sqlite_url(path: &Path) -> String {
     // sqlx accepts an absolute sqlite URL with three slashes. Path display is
     // intentional: app-data paths come from the OS, not user relay input.
@@ -272,7 +304,8 @@ fn relay_binary() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_local_relay_url, local_relay_url, sqlite_url, LocalRelayConfig, LOCAL_RELAY_SENTINEL,
+        is_local_relay_url, load_or_create_relay_keys, local_relay_url, sqlite_url,
+        LocalRelayConfig, LOCAL_RELAY_SENTINEL,
     };
     use std::{
         collections::HashMap,

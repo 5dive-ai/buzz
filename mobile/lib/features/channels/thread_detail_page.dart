@@ -172,10 +172,6 @@ class ThreadDetailPage extends HookConsumerWidget {
       return null;
     }, [initialMessageId, fetchedReplies, replies.length]);
 
-    // A top-anchored list doesn't stick to the newest item the way the old
-    // reversed one did, so follow the tail explicitly: when a reply arrives
-    // while the last item is on screen, scroll it into view. If the user has
-    // scrolled up to read, leave them where they are.
     final hasFetchedReplies = fetchedReplies != null;
     final initialTailSettle = useMemoized(InitialThreadTailSettle.new);
     final previousReplyCount = useRef(replies.length);
@@ -213,9 +209,6 @@ class ThreadDetailPage extends HookConsumerWidget {
           replies
               .skip(previous)
               .any((reply) => reply.pubkey.toLowerCase() == localPubkey);
-      // A reply the current user just sent must be visible even if they were
-      // reading at the head of a long thread. Remote arrivals still respect
-      // the user's scroll position.
       if (!wasAtTail && !hasNewLocalReply) return null;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!context.mounted || !itemScrollController.isAttached) return;
@@ -370,10 +363,6 @@ class ThreadDetailPage extends HookConsumerWidget {
                     key: const ValueKey('thread-message-list'),
                     itemScrollController: itemScrollController,
                     itemPositionsListener: itemPositionsListener,
-                    // Top-anchored, head first, replies flowing down — matching
-                    // desktop's thread panel. The old reversed list bottom-anchored
-                    // the content, which jammed the head against the composer
-                    // whenever a thread had only a handful of replies.
                     padding: EdgeInsets.only(
                       left: Grid.gutter,
                       right: Grid.gutter,

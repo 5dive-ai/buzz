@@ -195,25 +195,30 @@ export async function runAgentSaveCoordinator(
   }> = [];
   if (!firstError) {
     for (const policy of policySets) {
+      let caughtError: string | null = null;
       try {
         if (policy.type === "autoRestart") {
           await setAutoRestart(policy.pubkey, policy.value);
         } else {
           await setStartOnAppLaunch(policy.pubkey, policy.value);
         }
-        // Settle: verify policy persisted from observed state.
-        const { agent: settled } = await refetchStores();
-        const persisted =
-          settled !== null && observedPolicyMatches(settled, policy);
-        policyResults.push({ policy, written: persisted });
-        if (!persisted) {
-          firstError = `${policy.type === "autoRestart" ? "Auto-restart" : "Start on launch"} policy did not persist.`;
-          break;
-        }
       } catch (err) {
-        policyResults.push({ policy, written: false });
-        firstError =
+        caughtError =
           err instanceof Error ? err.message : "Failed to save agent policy.";
+      }
+      // Settle after the setter — re-fetch regardless of throw, mirroring the
+      // D/I steps above. Observed persistence (not the command result) decides:
+      // both Tauri setters save the record BEFORE building their returned
+      // summary, so a post-save summary error is a thrown-but-persisted write
+      // and must NOT stop the sequence. Only an observed non-persist does.
+      const { agent: settled } = await refetchStores();
+      const persisted =
+        settled !== null && observedPolicyMatches(settled, policy);
+      policyResults.push({ policy, written: persisted });
+      if (!persisted) {
+        firstError =
+          caughtError ??
+          `${policy.type === "autoRestart" ? "Auto-restart" : "Start on launch"} policy did not persist.`;
         break;
       }
     }
@@ -359,24 +364,23 @@ function observedStateMatchesPersonaInput(
     return false;
   if (!namePoolEqual(observed.namePool, submitted.namePool ?? [])) return false;
   if (!envVarsMapEqual(observed.envVars, submitted.envVars ?? {})) return false;
-  // Behavior: compare respondTo/allowlist/parallelism when submitted
+  // Behavior: a submitted group is a full-replacement unit (definition-only
+  // context). The backend replaces respondTo/allowlist/parallelism as a set,
+  // clearing any OMITTED member to null/empty — so settlement must compare
+  // every member, including omitted ones, against the observed cleared value.
+  // Skipping undefined members (the prior `!== undefined` guards) let a clear
+  // the backend failed to apply false-succeed.
   if (submitted.behavior !== undefined) {
     const b = submitted.behavior;
+    if ((observed.respondTo ?? null) !== (b.respondTo ?? null)) return false;
+    // The backend stores the allowlist only in allowlist mode and clears it to
+    // empty otherwise, so an omitted allowlist settles against an empty list.
     if (
-      b.respondTo !== undefined &&
-      (observed.respondTo ?? null) !== (b.respondTo ?? null)
-    )
-      return false;
-    if (
-      b.respondToAllowlist !== undefined &&
       observed.respondToAllowlist.join(",") !==
-        (b.respondToAllowlist ?? []).join(",")
+      (b.respondToAllowlist ?? []).join(",")
     )
       return false;
-    if (
-      b.parallelism !== undefined &&
-      (observed.parallelism ?? null) !== (b.parallelism ?? null)
-    )
+    if ((observed.parallelism ?? null) !== (b.parallelism ?? null))
       return false;
   }
   return true;

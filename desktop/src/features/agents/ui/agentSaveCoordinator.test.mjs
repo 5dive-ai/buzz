@@ -712,3 +712,181 @@ test("test_definition_write_not_persisted_stops_instance_write", async () => {
     "instance write must NOT be attempted when D-write did not persist",
   );
 });
+
+// ── Test family 5: thrown-but-persisted policy settlement (Thufir pass-1 CRITICAL) ──
+//
+// Both Tauri policy setters save the record BEFORE building their returned
+// summary, so a post-save summary error yields a thrown-but-persisted write.
+// Settlement must observe the store — not the command result — exactly as the
+// D/I steps do: a throw whose write landed is success, the sequence continues,
+// and onDone fires.
+
+test("test_auto_restart_throws_but_persisted_advances_and_calls_onDone", async () => {
+  // autoRestart setter throws, but the refetched agent shows the new value.
+  const opts = makeOpts({
+    policySets: [{ type: "autoRestart", pubkey: "pk-abc", value: true }],
+    setAutoRestart: async () => {
+      throw new Error("summary build failed after save");
+    },
+    refetchStores: async () => ({
+      persona: null,
+      agent: makeInstance({ autoRestartOnConfigChange: true }),
+    }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(
+    result,
+    true,
+    "a thrown-but-persisted autoRestart write must be treated as success",
+  );
+  assert.equal(
+    opts._calls.onDone,
+    1,
+    "onDone must be called when the policy persisted despite the throw",
+  );
+});
+
+test("test_start_on_app_launch_throws_but_persisted_advances_and_calls_onDone", async () => {
+  // startOnAppLaunch setter throws, but the refetched agent shows the new value.
+  const opts = makeOpts({
+    policySets: [{ type: "startOnAppLaunch", pubkey: "pk-abc", value: true }],
+    setStartOnAppLaunch: async () => {
+      throw new Error("summary build failed after save");
+    },
+    refetchStores: async () => ({
+      persona: null,
+      agent: makeInstance({ startOnAppLaunch: true }),
+    }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(
+    result,
+    true,
+    "a thrown-but-persisted startOnAppLaunch write must be treated as success",
+  );
+  assert.equal(
+    opts._calls.onDone,
+    1,
+    "onDone must be called when the policy persisted despite the throw",
+  );
+});
+
+test("test_thrown_but_persisted_policy_continues_to_later_policy", async () => {
+  const calls = { setAutoRestart: 0, setStartOnAppLaunch: 0 };
+  // First policy (autoRestart) throws but persists; the coordinator must
+  // observe persistence, advance to the second policy, and (with the second
+  // also persisting) call onDone. The buggy behavior skipped the second policy.
+  const opts = makeOpts({
+    policySets: [
+      { type: "autoRestart", pubkey: "pk-abc", value: true },
+      { type: "startOnAppLaunch", pubkey: "pk-abc", value: true },
+    ],
+    setAutoRestart: async () => {
+      calls.setAutoRestart++;
+      throw new Error("summary build failed after save");
+    },
+    setStartOnAppLaunch: async () => {
+      calls.setStartOnAppLaunch++;
+    },
+    // Both values are observed as persisted throughout — the first setter's
+    // write landed before it threw, the second write is clean.
+    refetchStores: async () => ({
+      persona: null,
+      agent: makeInstance({
+        autoRestartOnConfigChange: true,
+        startOnAppLaunch: true,
+      }),
+    }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(
+    result,
+    true,
+    "a thrown-but-persisted first policy must not block a persisted second policy",
+  );
+  assert.equal(calls.setAutoRestart, 1, "first policy attempted");
+  assert.equal(
+    calls.setStartOnAppLaunch,
+    1,
+    "second policy must be attempted after the first policy persisted despite throwing",
+  );
+  assert.equal(opts._calls.onDone, 1, "onDone must fire on full persistence");
+});
+
+// ── Test family 6: full-replacement behavior-group settlement (Thufir pass-1 IMPORTANT) ──
+//
+// A submitted behavior group is replace-as-a-unit: the backend clears any
+// OMITTED member to null/empty. Settlement must compare every member —
+// including omitted ones — against the observed cleared value, so a clear the
+// backend failed to apply cannot false-succeed.
+
+test("test_parallelism_clear_not_applied_is_flagged_as_not_persisted", async () => {
+  // The user cleared parallelism: the submitted behavior group omits it (the
+  // clear signal). The store still shows the OLD value (4) — the clear did not
+  // apply. Settlement must treat this as not persisted and return false.
+  const opts = makeOpts({
+    ctx: {
+      kind: "definition-only",
+      definition: makeDefinition({ respondTo: "anyone", parallelism: 4 }),
+    },
+    personaInput: makePersonaInput({
+      // Behavior group carries respondTo but omits parallelism → clear it.
+      behavior: { respondTo: "anyone" },
+    }),
+    updatePersona: async () => {},
+    refetchStores: async () => ({
+      // Clear failed: parallelism is still 4 in the observed store.
+      persona: makeDefinition({ respondTo: "anyone", parallelism: 4 }),
+      agent: null,
+    }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(
+    result,
+    false,
+    "an unapplied parallelism clear must be flagged as not persisted",
+  );
+  assert.equal(
+    opts._calls.onDone,
+    0,
+    "onDone must NOT be called when the clear did not apply",
+  );
+});
+
+test("test_parallelism_clear_applied_settles_as_persisted", async () => {
+  // Same clear, but the store now shows parallelism cleared (null). Settlement
+  // must treat the omitted member as matching the observed null and succeed.
+  const opts = makeOpts({
+    ctx: {
+      kind: "definition-only",
+      definition: makeDefinition({ respondTo: "anyone", parallelism: 4 }),
+    },
+    personaInput: makePersonaInput({ behavior: { respondTo: "anyone" } }),
+    updatePersona: async () => {},
+    refetchStores: async () => ({
+      persona: makeDefinition({ respondTo: "anyone", parallelism: null }),
+      agent: null,
+    }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(
+    result,
+    true,
+    "an applied parallelism clear (observed null) must settle as persisted",
+  );
+  assert.equal(
+    opts._calls.onDone,
+    1,
+    "onDone must fire when the clear applied",
+  );
+});

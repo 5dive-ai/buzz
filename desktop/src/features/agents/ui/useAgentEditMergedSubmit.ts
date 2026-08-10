@@ -151,10 +151,21 @@ export function buildNextAgentFormModel(
     namePool,
     instanceName: s.instanceName.trim() || undefined,
     instanceEnvVars: s.showInst ? s.instanceEnvVars : undefined,
+    // Parallelism is D-owned only in definition-only context, where the
+    // backend clears it via an omitted member in the full-replacement behavior
+    // group. Represent a blank field as an explicit clear (null) there so
+    // `emitAgentFormDiff` dirties the D-field and emits the clearing value.
+    // A valid positive value is carried through (the backend rejects
+    // out-of-range and settlement surfaces that error); any other non-blank
+    // value falls back to the seed, a safe no-op that never clears. A blank
+    // field in instance context also keeps the seed — the instance
+    // `parallelism` setter is `Option<u32>` with no clear-to-null wire shape.
     parallelism:
       s.parsedParallelism > 0
         ? s.parsedParallelism
-        : (seed.parallelism ?? null),
+        : s.parallelism.trim() === "" && s.ctx.kind === "definition-only"
+          ? null
+          : (seed.parallelism ?? null),
     // Harness pin (I-fields) — now first-class model fields; emitAgentFormDiff
     // settles inherit-vs-pin and the "" clear sentinel against the instance.
     harnessInherit: s.showInst ? s.inheritHarness : undefined,

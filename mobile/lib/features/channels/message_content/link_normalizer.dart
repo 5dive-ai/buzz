@@ -12,24 +12,42 @@ final _trailingPunctuationPattern = RegExp(r'[.,!?:;]+$');
 /// leaving inline and fenced code untouched.
 String normalizeBareLinks(String content) {
   final buffer = StringBuffer();
-  final parts = content.split('`');
-  for (var i = 0; i < parts.length; i++) {
-    if (i.isOdd) {
-      buffer.write('`${parts[i]}`');
-      continue;
+  final backtickRuns = RegExp(r'`+').allMatches(content);
+  var offset = 0;
+  String? codeDelimiter;
+
+  for (final run in backtickRuns) {
+    if (codeDelimiter == null) {
+      buffer.write(_normalizeLinkSegment(content.substring(offset, run.start)));
+      codeDelimiter = run[0]!;
+    } else {
+      buffer.write(content.substring(offset, run.start));
+      if (run[0] == codeDelimiter) {
+        codeDelimiter = null;
+      }
     }
 
-    var segment = parts[i].replaceAllMapped(
-      _autolinkPattern,
-      (match) => '[${match[1]}](${match[1]})',
-    );
-    segment = segment.replaceAllMapped(
-      _bareLinkPattern,
-      (match) => _normalizeBareLink(segment, match),
-    );
-    buffer.write(segment);
+    buffer.write(run[0]!);
+    offset = run.end;
   }
+
+  final trailing = content.substring(offset);
+  buffer.write(
+    codeDelimiter == null ? _normalizeLinkSegment(trailing) : trailing,
+  );
   return buffer.toString();
+}
+
+String _normalizeLinkSegment(String segment) {
+  var normalized = segment.replaceAllMapped(
+    _autolinkPattern,
+    (match) => '[${match[1]}](${match[1]})',
+  );
+  normalized = normalized.replaceAllMapped(
+    _bareLinkPattern,
+    (match) => _normalizeBareLink(normalized, match),
+  );
+  return normalized;
 }
 
 String _normalizeBareLink(String segment, Match match) {

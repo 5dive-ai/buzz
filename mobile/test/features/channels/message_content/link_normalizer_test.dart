@@ -33,4 +33,15 @@ void main() {
   test('leaves links inside backticks untouched', () {
     expect(normalizeBareLinks('`$url` then $url'), '`$url` then [$url]($url)');
   });
+
+  test('leaves links inside matching multi-backtick code spans untouched', () {
+    expect(
+      normalizeBareLinks('``$url`` then $url'),
+      '``$url`` then [$url]($url)',
+    );
+    expect(
+      normalizeBareLinks('````$url```` then $url'),
+      '````$url```` then [$url]($url)',
+    );
+  });
 }

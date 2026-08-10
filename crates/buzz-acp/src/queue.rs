@@ -5100,6 +5100,37 @@ mod tests {
     }
 
     #[test]
+    fn removed_channel_discards_late_async_edit_steer_preparation() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let event = edit_event(&"ab".repeat(32));
+        let event_id = event.id.to_hex();
+        q.push(QueuedEvent {
+            channel_id: ch,
+            event,
+            received_at: Instant::now(),
+            prompt_tag: "@mention".into(),
+        });
+        q.in_flight_channels.insert(ch);
+        q.in_flight_deadlines
+            .insert(ch, Instant::now() + Duration::from_secs(60));
+
+        assert!(q.mark_native_steer_pending(ch, &event_id));
+        q.drain_channel(ch);
+        let removed_channels = HashSet::from([ch]);
+        assert!(crate::native_steer_preparation_is_stale(
+            &removed_channels,
+            ch
+        ));
+
+        // A late preparation is discarded by the main loop. Its reservation
+        // was already drained, so release cannot resurrect stale work.
+        q.release_native_steer(ch, &event_id);
+        q.mark_complete(ch);
+        assert!(q.flush_next().is_none());
+    }
+
+    #[test]
     fn native_steer_edit_uses_original_thread_anchor() {
         let original_id = "66".repeat(32);
         let root_id = "77".repeat(32);

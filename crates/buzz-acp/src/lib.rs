@@ -1389,6 +1389,13 @@ struct NativeSteerPrepared {
     prompt_blocks: Vec<String>,
 }
 
+/// Async edit enrichment may finish after channel membership was revoked.
+/// Such prepared work is stale: removal drains its queue reservation, and it
+/// must never be forwarded to an otherwise still-live ACP turn.
+fn native_steer_preparation_is_stale(removed_channels: &HashSet<Uuid>, channel_id: Uuid) -> bool {
+    removed_channels.contains(&channel_id)
+}
+
 struct SteerAckEvent {
     channel_id: Uuid,
     event_id: String,
@@ -2792,6 +2799,14 @@ async fn tokio_main() -> Result<()> {
                 event,
                 prompt_blocks,
             })) => {
+                if native_steer_preparation_is_stale(&removed_channels, channel_id) {
+                    tracing::debug!(
+                        %channel_id,
+                        event_id = %event.id.to_hex(),
+                        "discarding native steer prepared after channel removal"
+                    );
+                    continue;
+                }
                 if !try_native_steer(
                     &mut pool,
                     &mut queue,

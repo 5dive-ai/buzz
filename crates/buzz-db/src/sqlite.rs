@@ -305,11 +305,110 @@ pub(crate) async fn add_member(
     role: crate::channel::MemberRole,
     invited_by: Option<&[u8]>,
 ) -> Result<crate::channel::MemberRecord> {
-    get_channel(pool, community, channel_id).await?;
+    if pubkey.len() != 32 {
+        return Err(crate::DbError::InvalidData(format!(
+            "pubkey must be 32 bytes, got {}",
+            pubkey.len()
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+    let channel = sqlx::query(
+        "SELECT * FROM channels WHERE community_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(channel_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(crate::DbError::ChannelNotFound(channel_id))?;
+    let channel = channel_record(channel)?;
+
+    let effective_role = if channel.visibility == "private" {
+        let inviter = invited_by.ok_or_else(|| {
+            crate::DbError::AccessDenied("private channel requires an invite".to_string())
+        })?;
+        let creator_bootstrap = inviter == pubkey && inviter == channel.created_by.as_slice();
+        if !creator_bootstrap {
+            let inviter_role = active_member_role(&mut tx, channel_id, inviter)
+                .await?
+                .ok_or_else(|| {
+                    crate::DbError::AccessDenied("inviter is not an active member".to_string())
+                })?;
+            if role.is_elevated() && !is_elevated_role(&inviter_role) {
+                return Err(crate::DbError::AccessDenied(
+                    "only owners/admins may grant elevated roles".to_string(),
+                ));
+            }
+        }
+        role
+    } else if role.is_elevated() {
+        let granter_role = match invited_by {
+            Some(inviter) => active_member_role(&mut tx, channel_id, inviter).await?,
+            None => None,
+        };
+        if !granter_role.is_some_and(|role| is_elevated_role(&role)) {
+            return Err(crate::DbError::AccessDenied(
+                "only owners/admins may grant elevated roles".to_string(),
+            ));
+        }
+        role
+    } else {
+        role
+    };
+
+    if let Some(current_role) = active_member_role(&mut tx, channel_id, pubkey).await? {
+        if current_role != effective_role.as_str() {
+            let actor_role = match invited_by {
+                Some(inviter) => active_member_role(&mut tx, channel_id, inviter).await?,
+                None => None,
+            };
+            if !actor_role.is_some_and(|role| is_elevated_role(&role)) {
+                return Err(crate::DbError::AccessDenied(
+                    "only owners/admins may change an active member's role".to_string(),
+                ));
+            }
+            if current_role == "owner" && effective_role != crate::channel::MemberRole::Owner {
+                let owner_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM channel_members WHERE channel_id = ?1 AND role = 'owner' AND removed_at IS NULL",
+            )
+            .bind(channel_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+                if owner_count <= 1 {
+                    return Err(crate::DbError::AccessDenied(
+                        "cannot demote the last owner — transfer ownership first".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
     sqlx::query("INSERT INTO channel_members (channel_id, pubkey, role, invited_by) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(channel_id, pubkey) DO UPDATE SET role = excluded.role, invited_by = excluded.invited_by, removed_at = NULL")
-        .bind(channel_id.to_string()).bind(pubkey).bind(role.as_str()).bind(invited_by).execute(pool).await?;
-    member_record(sqlx::query("SELECT channel_id, pubkey, role, joined_at, invited_by, removed_at FROM channel_members WHERE channel_id = ?1 AND pubkey = ?2")
-        .bind(channel_id.to_string()).bind(pubkey).fetch_one(pool).await?)
+        .bind(channel_id.to_string()).bind(pubkey).bind(effective_role.as_str()).bind(invited_by).execute(&mut *tx).await?;
+    let row = sqlx::query("SELECT channel_id, pubkey, role, joined_at, invited_by, removed_at FROM channel_members WHERE channel_id = ?1 AND pubkey = ?2")
+        .bind(channel_id.to_string()).bind(pubkey).fetch_one(&mut *tx).await?;
+    let record = member_record(row)?;
+    tx.commit().await?;
+    Ok(record)
+}
+
+async fn active_member_role(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    channel_id: Uuid,
+    pubkey: &[u8],
+) -> Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT role FROM channel_members WHERE channel_id = ?1 AND pubkey = ?2 AND removed_at IS NULL",
+    )
+    .bind(channel_id.to_string())
+    .bind(pubkey)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+fn is_elevated_role(role: &str) -> bool {
+    matches!(role, "owner" | "admin")
 }
 
 pub(crate) async fn is_member(
@@ -564,6 +663,102 @@ mod tests {
         );
         reopened.close().await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_membership_preserves_public_contract_invariants() {
+        let pool = connect(":memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "local.buzz")
+            .await
+            .unwrap();
+        let owner = Keys::generate().public_key().to_bytes();
+        let member = Keys::generate().public_key().to_bytes();
+        let other = Keys::generate().public_key().to_bytes();
+        let channel_id = Uuid::new_v4();
+        create_channel_with_id(
+            &pool,
+            community.id,
+            channel_id,
+            "private",
+            crate::channel::ChannelType::Stream,
+            crate::channel::ChannelVisibility::Private,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            add_member(
+                &pool,
+                community.id,
+                channel_id,
+                &[0; 31],
+                crate::channel::MemberRole::Member,
+                Some(&owner),
+            )
+            .await,
+            Err(crate::DbError::InvalidData(_))
+        ));
+        assert!(matches!(
+            add_member(
+                &pool,
+                community.id,
+                channel_id,
+                &member,
+                crate::channel::MemberRole::Member,
+                None,
+            )
+            .await,
+            Err(crate::DbError::AccessDenied(_))
+        ));
+        add_member(
+            &pool,
+            community.id,
+            channel_id,
+            &member,
+            crate::channel::MemberRole::Member,
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            add_member(
+                &pool,
+                community.id,
+                channel_id,
+                &other,
+                crate::channel::MemberRole::Admin,
+                Some(&member),
+            )
+            .await,
+            Err(crate::DbError::AccessDenied(_))
+        ));
+        assert!(matches!(
+            add_member(
+                &pool,
+                community.id,
+                channel_id,
+                &member,
+                crate::channel::MemberRole::Guest,
+                Some(&member),
+            )
+            .await,
+            Err(crate::DbError::AccessDenied(_))
+        ));
+        assert!(matches!(
+            add_member(
+                &pool,
+                community.id,
+                channel_id,
+                &owner,
+                crate::channel::MemberRole::Member,
+                Some(&owner),
+            )
+            .await,
+            Err(crate::DbError::AccessDenied(_))
+        ));
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use buzz_db::{Db, DbConfig};
 use buzz_pubsub::{rate_limiter::AdmissionRateLimiter, InProcessNip98ReplayGuard, PubSubManager};
 use buzz_search::SearchService;
 
-use buzz_relay::config::{Config, MAX_DRAIN_JITTER_MS};
+use buzz_relay::config::{Config, RelayProfile, MAX_DRAIN_JITTER_MS};
 use buzz_relay::metrics as relay_metrics;
 use buzz_relay::router::{build_health_router, build_router};
 use buzz_relay::state::{AppBackends, AppState};
@@ -1217,7 +1218,7 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
         ));
     }
 
-    relay_metrics::install(config.metrics_port, usage_metrics_idle_timeout_secs(60));
+    relay_metrics::install_loopback(config.metrics_port, usage_metrics_idle_timeout_secs(60));
     let db_path =
         std::env::var("BUZZ_LOCAL_DB").unwrap_or_else(|_| "buzz-local.sqlite".to_string());
     let media_root =
@@ -1340,6 +1341,24 @@ async fn run_single_node(config: Config, tracer_init: telemetry::TracerInit) -> 
 /// roughly the 5s grace plus the ack wait.
 const GRACEFUL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+fn health_listener_ip(profile: RelayProfile) -> IpAddr {
+    match profile {
+        RelayProfile::SingleNode => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        RelayProfile::Production => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::{health_listener_ip, RelayProfile};
+
+    #[test]
+    fn single_node_health_listener_is_loopback_only() {
+        assert!(health_listener_ip(RelayProfile::SingleNode).is_loopback());
+        assert!(health_listener_ip(RelayProfile::Production).is_unspecified());
+    }
+}
+
 async fn serve(
     router: axum::Router,
     health_router: axum::Router,
@@ -1347,10 +1366,11 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let config = &state.config;
 
-    let health_listener = tokio::net::TcpListener::bind(("0.0.0.0", config.health_port))
+    let health_host = health_listener_ip(config.profile);
+    let health_listener = tokio::net::TcpListener::bind((health_host, config.health_port))
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind health port {}: {e}", config.health_port))?;
-    info!(port = config.health_port, "Health probe listener started");
+    info!(host = %health_host, port = config.health_port, "Health probe listener started");
     tokio::spawn(async move {
         axum::serve(health_listener, health_router).await.ok();
     });

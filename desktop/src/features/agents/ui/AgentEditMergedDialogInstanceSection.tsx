@@ -43,7 +43,6 @@ import { RunOnSummarySection } from "./RunOnSummarySection";
 export type AgentEditMergedISectionProps = {
   inst: ManagedAgent;
   showDef: boolean;
-  defReadOnly: boolean; // kept for API compatibility; I-owned access fields are not gated by D read-only
   isSaving: boolean;
   runtimeCatalogStatus: "loading" | "error" | "ready";
   // Instance name
@@ -134,9 +133,6 @@ export type AgentEditMergedISectionProps = {
 export function AgentEditMergedInstanceSection({
   inst,
   showDef,
-  // defReadOnly intentionally unused: I-owned access fields are not gated by D read-only
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  defReadOnly: _defReadOnly,
   isSaving,
   runtimeCatalogStatus,
   instanceName,

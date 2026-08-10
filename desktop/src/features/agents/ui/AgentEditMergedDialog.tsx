@@ -34,6 +34,7 @@ import {
   hasInstanceContext,
   isDefinitionReadOnly,
   definitionFieldsDirty,
+  fieldEditable,
   editContextDefinition,
   editContextInstance,
   type AgentEditContext,
@@ -729,7 +730,11 @@ export function AgentEditMergedDialog({
             ) : (
               <AgentCreationPreview
                 avatarUrl={previewAvatarUrl}
-                disabled={isSaving || isAvatarUploadPending || defReadOnly}
+                disabled={
+                  isSaving ||
+                  isAvatarUploadPending ||
+                  !fieldEditable("avatarUrl", ctx)
+                }
                 label={previewLabel}
                 onClearAvatar={() => setAvatarUrl("")}
                 onUploadPendingChange={setIsAvatarUploadPending}
@@ -777,7 +782,7 @@ export function AgentEditMergedDialog({
             {/* ── D-section: Identity + Behavior + Runtime ──────────── */}
             {showDef ? (
               <AgentEditMergedDSection
-                defReadOnly={defReadOnly}
+                fieldEditable={(field) => fieldEditable(field, ctx)}
                 isSaving={isSaving}
                 displayName={displayName}
                 onDisplayNameChange={setDisplayName}
@@ -829,7 +834,6 @@ export function AgentEditMergedDialog({
               <AgentEditMergedInstanceSection
                 inst={inst}
                 showDef={showDef}
-                defReadOnly={defReadOnly}
                 isSaving={isSaving}
                 runtimeCatalogStatus={runtimeCatalogStatus}
                 instanceName={instanceName}

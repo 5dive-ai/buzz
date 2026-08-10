@@ -30,14 +30,20 @@ import { PersonaDropdownField } from "./PersonaDropdownField";
 import { PersonaModelCombobox } from "./PersonaModelCombobox";
 import { EnvVarsEditor, type EnvVarsValue } from "./EnvVarsEditor";
 import { OwnerOnlyAccessField } from "./OwnerOnlyAccessField";
+import type { AgentFormModel } from "./agentFormModel";
 
 const advancedFieldsTransition = { duration: 0.18, ease: "easeInOut" } as const;
 
 // ── Props ─────────────────────────────────────────────────────────────────────
 
 export type AgentEditMergedDSectionProps = {
-  /** When true definition fields are team-managed and rendered read-only. */
-  defReadOnly: boolean;
+  /**
+   * Per-field editability, resolved from the ownership map (`fieldEditable`
+   * bound to the edit context). A D-owned field is read-only when the
+   * definition is team-managed; this is the single authority for enabling and
+   * disabling every control below — no section-level `defReadOnly` boolean.
+   */
+  fieldEditable: (field: keyof AgentFormModel) => boolean;
   isSaving: boolean;
   // Identity
   displayName: string;
@@ -94,7 +100,7 @@ export type AgentEditMergedDSectionProps = {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function AgentEditMergedDSection({
-  defReadOnly,
+  fieldEditable,
   isSaving,
   displayName,
   onDisplayNameChange,
@@ -157,7 +163,7 @@ export function AgentEditMergedDSection({
               "h-8 px-0 py-0 leading-6",
               PERSONA_FIELD_CONTROL_CLASS,
             )}
-            disabled={isSaving || defReadOnly}
+            disabled={isSaving || !fieldEditable("displayName")}
             id="edit-agent-display-name"
             onChange={(e) => onDisplayNameChange(e.target.value)}
             placeholder="Agent name"
@@ -180,7 +186,7 @@ export function AgentEditMergedDSection({
               "min-h-40 resize-y px-3 py-3 leading-5",
               PERSONA_FIELD_CONTROL_CLASS,
             )}
-            disabled={isSaving || defReadOnly}
+            disabled={isSaving || !fieldEditable("systemPrompt")}
             id="edit-agent-system-prompt"
             onChange={(e) => onSystemPromptChange(e.target.value)}
             placeholder="Describe what this agent should do."
@@ -191,7 +197,11 @@ export function AgentEditMergedDSection({
 
       {/* Runtime (harness) — D-field, shown for all definition contexts */}
       <AgentHarnessField
-        disabled={isSaving || runtimeCatalogStatus === "loading" || defReadOnly}
+        disabled={
+          isSaving ||
+          runtimeCatalogStatus === "loading" ||
+          !fieldEditable("runtime")
+        }
         onValueChange={onRuntimeChange}
         options={defRuntimeDropdownOptions}
         placeholder={defBlankLabel}
@@ -210,7 +220,7 @@ export function AgentEditMergedDSection({
             <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
           </label>
           <PersonaDropdownField
-            disabled={isSaving || defReadOnly}
+            disabled={isSaving || !fieldEditable("provider")}
             id="edit-agent-llm-provider"
             onValueChange={onProviderChange}
             options={providerDropdownOptions}
@@ -231,7 +241,7 @@ export function AgentEditMergedDSection({
                   "h-8 px-0 py-0 leading-6",
                   PERSONA_FIELD_CONTROL_CLASS,
                 )}
-                disabled={isSaving || defReadOnly}
+                disabled={isSaving || !fieldEditable("provider")}
                 id="edit-agent-custom-provider"
                 onChange={(e) => onProviderTextChange(e.target.value)}
                 placeholder="Custom provider ID"
@@ -252,7 +262,9 @@ export function AgentEditMergedDSection({
           <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
         </label>
         <PersonaModelCombobox
-          disabled={isSaving || modelDiscoveryLoading || defReadOnly}
+          disabled={
+            isSaving || modelDiscoveryLoading || !fieldEditable("model")
+          }
           id="edit-agent-model"
           onValueChange={onModelChange}
           options={modelDropdownOptions}
@@ -273,7 +285,7 @@ export function AgentEditMergedDSection({
                 "h-8 px-0 py-0 leading-6",
                 PERSONA_FIELD_CONTROL_CLASS,
               )}
-              disabled={isSaving || defReadOnly}
+              disabled={isSaving || !fieldEditable("model")}
               id="edit-agent-custom-model"
               onChange={(e) => onModelTextChange(e.target.value)}
               placeholder="Custom model ID"
@@ -294,7 +306,7 @@ export function AgentEditMergedDSection({
           <OwnerOnlyAccessField
             accessLocked={agentAccessOwnerOnly === true}
             allowlist={respondToAllowlist}
-            disabled={isSaving || defReadOnly}
+            disabled={isSaving || !fieldEditable("respondTo")}
             // Definition-only default is owner-only (matches PersonaAdvancedFields
             // and the backend default). Rendering an unset respondTo as "anyone"
             // would show open access where owner-only is in force.
@@ -315,7 +327,7 @@ export function AgentEditMergedDSection({
             <div className="flex min-h-11 items-center rounded-lg border border-input bg-input/30 px-3">
               <input
                 className="h-8 w-full bg-transparent px-0 py-0 text-sm leading-6 outline-none placeholder:text-muted-foreground"
-                disabled={isSaving || defReadOnly}
+                disabled={isSaving || !fieldEditable("parallelism")}
                 id="edit-agent-parallelism"
                 inputMode="numeric"
                 min={1}
@@ -333,7 +345,7 @@ export function AgentEditMergedDSection({
       <div className="space-y-2">
         <Button
           className="flex items-center gap-1 px-0 text-sm text-muted-foreground hover:text-foreground"
-          disabled={isSaving || defReadOnly}
+          disabled={isSaving || !fieldEditable("namePool")}
           onClick={() => setShowAdvanced((v) => !v)}
           type="button"
           variant="ghost"
@@ -365,7 +377,7 @@ export function AgentEditMergedDSection({
                       "min-h-20 resize-y px-3 py-3 leading-5",
                       PERSONA_FIELD_CONTROL_CLASS,
                     )}
-                    disabled={isSaving || defReadOnly}
+                    disabled={isSaving || !fieldEditable("namePool")}
                     id="edit-agent-name-pool"
                     onChange={(e) => onNamePoolTextChange(e.target.value)}
                     placeholder={"Alice\nBob\nCarol"}
@@ -384,7 +396,7 @@ export function AgentEditMergedDSection({
                   <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
                 </p>
                 <EnvVarsEditor
-                  disabled={isSaving || defReadOnly}
+                  disabled={isSaving || !fieldEditable("envVars")}
                   onChange={onEnvVarsChange}
                   value={envVars}
                 />

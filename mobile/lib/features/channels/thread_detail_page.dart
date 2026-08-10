@@ -18,7 +18,6 @@ import 'channel_messages_provider.dart';
 import 'channel_typing_provider.dart';
 import 'channel_typing_indicator.dart';
 import 'thread_replies_provider.dart';
-import 'thread_tail_intent.dart';
 import 'channels_provider.dart';
 import 'compose_bar.dart';
 import 'composer_dock_size_reporter.dart';
@@ -36,6 +35,8 @@ import '../../shared/read_state/read_state_provider.dart';
 import 'send_message_provider.dart';
 import 'small_avatar.dart';
 import 'timeline_message.dart';
+
+part 'thread_detail_helpers.dart';
 
 /// Full-screen thread detail page.
 ///
@@ -110,15 +111,13 @@ class ThreadDetailPage extends HookConsumerWidget {
     final didJumpToInitialMessage = useRef(false);
     final followsThreadTail = useRef(false);
     final userOptedOutOfTailFollow = useRef(false);
-    final tailIntent = useMemoized(ThreadTailIntent.new);
+    final tailIntent = useMemoized(_ThreadTailIntent.new);
     final pendingTailAlignment = useRef<double?>(null);
     const headIndex = 0;
     int indexForReply(int chronologicalIndex) => chronologicalIndex + 1;
 
     bool threadTailIsVisible() {
-      final lastIndex = replies.isEmpty
-          ? headIndex
-          : indexForReply(replies.length - 1);
+      final lastIndex = _threadTailIndex(replies.length);
       return itemPositionsListener.itemPositions.value.any(
         (position) =>
             position.index == lastIndex && position.itemTrailingEdge <= 1.001,
@@ -179,9 +178,11 @@ class ThreadDetailPage extends HookConsumerWidget {
       bool allowIdleDetached = false,
       bool animate = true,
     }) {
-      if (!currentIntentAllowsTailMutation(
-        allowIdleDetached: allowIdleDetached,
-      )) {
+      if (!initialTailSettle.isComplete ||
+          viewportHeight <= 0 ||
+          !currentIntentAllowsTailMutation(
+            allowIdleDetached: allowIdleDetached,
+          )) {
         return;
       }
       if (!allowIdleDetached) followsThreadTail.value = true;
@@ -194,17 +195,19 @@ class ThreadDetailPage extends HookConsumerWidget {
               allowIdleDetached: allowIdleDetached,
             ),
         action: () {
-          final lastIndex = replies.isEmpty
-              ? headIndex
-              : indexForReply(replies.length - 1);
+          final lastIndex = _threadTailIndex(replies.length);
           if (animate) {
             itemScrollController.scrollTo(
               index: lastIndex,
+              alignment: topOverlayFraction,
               duration: const Duration(milliseconds: 220),
               curve: Curves.easeOutCubic,
             );
           } else {
-            itemScrollController.jumpTo(index: lastIndex);
+            itemScrollController.jumpTo(
+              index: lastIndex,
+              alignment: topOverlayFraction,
+            );
           }
         },
       );
@@ -306,9 +309,7 @@ class ThreadDetailPage extends HookConsumerWidget {
         pendingTailAlignment.value = null;
         return;
       }
-      final lastIndex = replies.isEmpty
-          ? headIndex
-          : indexForReply(replies.length - 1);
+      final lastIndex = _threadTailIndex(replies.length);
       final lastPosition = itemPositionsListener.itemPositions.value
           .where((position) => position.index == lastIndex)
           .firstOrNull;
@@ -516,7 +517,7 @@ class ThreadDetailPage extends HookConsumerWidget {
                 ),
               ),
               if (!isMember || isArchived)
-                ThreadTypingIndicator(entries: threadTyping, animated: false),
+                _ThreadTypingIndicator(entries: threadTyping, animated: false),
             ],
           ),
           if (isMember && !isArchived)
@@ -528,7 +529,7 @@ class ThreadDetailPage extends HookConsumerWidget {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    ThreadTypingIndicator(entries: threadTyping),
+                    _ThreadTypingIndicator(entries: threadTyping),
                     ComposeBar(
                       channelId: channelId,
                       hintText: 'Reply in thread\u2026',
@@ -704,15 +705,6 @@ class _NestedThreadSummaryRow extends ConsumerWidget {
       ),
     );
   }
-}
-
-class _ThreadTailMetricsObserver with WidgetsBindingObserver {
-  final VoidCallback onMetricsChanged;
-
-  _ThreadTailMetricsObserver({required this.onMetricsChanged});
-
-  @override
-  void didChangeMetrics() => onMetricsChanged();
 }
 
 class _ThreadMessage extends ConsumerWidget {

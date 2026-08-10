@@ -4787,78 +4787,99 @@ void main() {
       (name: 'archived', isMember: true, isArchived: true),
       (name: 'writable member', isMember: true, isArchived: false),
     ]) {
-      testWidgets(
-        '${layout.name} typing transitions preserve a followed tail',
-        (tester) async {
-          tester.view.physicalSize = const Size(400, 800);
-          tester.view.devicePixelRatio = 1;
-          addTearDown(tester.view.reset);
-          final rootEvent = _textMsg(
-            id: 'thread-root',
-            pubkey: 'alice',
-            content: 'Root',
-            createdAt: 1000,
-          );
-          final replies = [
-            for (var i = 0; i < 30; i++)
-              _textMsg(
-                id: 'reply-$i',
+      for (final tail in <({String name, bool isLong})>[
+        (name: 'short', isLong: false),
+        (name: 'long', isLong: true),
+      ]) {
+        testWidgets(
+          '${layout.name} typing transitions preserve a followed ${tail.name} tail',
+          (tester) async {
+            tester.view.physicalSize = const Size(400, 800);
+            tester.view.devicePixelRatio = 1;
+            addTearDown(tester.view.reset);
+            final rootEvent = _textMsg(
+              id: 'thread-root',
+              pubkey: 'alice',
+              content: 'Root',
+              createdAt: 1000,
+            );
+            final replies = [
+              for (var i = 0; i < 30; i++)
+                _textMsg(
+                  id: 'reply-$i',
+                  pubkey: 'bob',
+                  content: i == 29 && tail.isLong
+                      ? List.filled(8, 'Tall latest reply').join('\n')
+                      : 'Reply $i',
+                  createdAt: 1100 + i,
+                  extraTags: const [
+                    ['e', 'thread-root', '', 'reply'],
+                  ],
+                ),
+            ];
+            final typingNotifier = _FakeTypingNotifier(const []);
+            await tester.pumpWidget(
+              _buildTestable(
+                messages: [rootEvent],
+                typingNotifier: typingNotifier,
+                threadReplies: {'thread-root': replies},
+                disableAnimations: true,
+              ),
+            );
+            await tester.pumpAndSettle();
+            final threadHead = formatTimeline([rootEvent]).single;
+            Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+              MaterialPageRoute<void>(
+                builder: (_) => ThreadDetailPage(
+                  threadHead: threadHead,
+                  allMessages: [threadHead],
+                  channelId: _channelId,
+                  currentPubkey: 'self',
+                  isMember: layout.isMember,
+                  isArchived: layout.isArchived,
+                ),
+              ),
+            );
+            await tester.pumpAndSettle();
+            final latest = find.byKey(
+              const ValueKey('thread-message-group-reply-29'),
+            );
+            final list = find.byKey(const ValueKey('thread-message-list'));
+            final initialHeight = tester.getSize(list).height;
+            void expectTailWithinList() {
+              final latestRect = tester.getRect(latest);
+              final listRect = tester.getRect(list);
+              expect(
+                latestRect.top,
+                greaterThanOrEqualTo(
+                  frostedAppBarHeight(tester.element(latest)),
+                ),
+              );
+              if (tail.isLong) {
+                expect(latestRect.bottom, lessThanOrEqualTo(listRect.bottom));
+              }
+            }
+
+            expectTailWithinList();
+            typingNotifier.setEntries(const [
+              TypingEntry(
                 pubkey: 'bob',
-                content: 'Reply $i',
-                createdAt: 1100 + i,
-                extraTags: const [
-                  ['e', 'thread-root', '', 'reply'],
-                ],
+                threadHeadId: 'thread-root',
+                expiresAtMs: 9999999999999,
               ),
-          ];
-          final typingNotifier = _FakeTypingNotifier(const []);
-          await tester.pumpWidget(
-            _buildTestable(
-              messages: [rootEvent],
-              typingNotifier: typingNotifier,
-              threadReplies: {'thread-root': replies},
-              disableAnimations: true,
-            ),
-          );
-          await tester.pumpAndSettle();
-          final threadHead = formatTimeline([rootEvent]).single;
-          Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
-            MaterialPageRoute<void>(
-              builder: (_) => ThreadDetailPage(
-                threadHead: threadHead,
-                allMessages: [threadHead],
-                channelId: _channelId,
-                currentPubkey: 'self',
-                isMember: layout.isMember,
-                isArchived: layout.isArchived,
-              ),
-            ),
-          );
-          await tester.pumpAndSettle();
-          final latest = find.byKey(
-            const ValueKey('thread-message-group-reply-29'),
-          );
-          final list = find.byKey(const ValueKey('thread-message-list'));
-          final initialHeight = tester.getSize(list).height;
-          expect(latest, findsOneWidget);
-          typingNotifier.setEntries(const [
-            TypingEntry(
-              pubkey: 'bob',
-              threadHeadId: 'thread-root',
-              expiresAtMs: 9999999999999,
-            ),
-          ]);
-          await tester.pumpAndSettle();
-          expect(latest, findsOneWidget);
-          if (!layout.isMember || layout.isArchived) {
-            expect(tester.getSize(list).height, lessThan(initialHeight));
-          }
-          typingNotifier.setEntries(const []);
-          await tester.pumpAndSettle();
-          expect(latest, findsOneWidget);
-          expect(tester.getSize(list).height, closeTo(initialHeight, 0.5));
-        },
-      );
+            ]);
+            await tester.pumpAndSettle();
+            expectTailWithinList();
+            if (!layout.isMember || layout.isArchived) {
+              expect(tester.getSize(list).height, lessThan(initialHeight));
+            }
+            typingNotifier.setEntries(const []);
+            await tester.pumpAndSettle();
+            expectTailWithinList();
+            expect(tester.getSize(list).height, closeTo(initialHeight, 0.5));
+          },
+        );
+      }
 
       testWidgets(
         '${layout.name} typing transitions preserve a detached anchor',

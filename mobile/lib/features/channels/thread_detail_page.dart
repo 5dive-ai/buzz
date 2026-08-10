@@ -361,6 +361,11 @@ class ThreadDetailPage extends HookConsumerWidget {
                     followsThreadTail.value = false;
                     pendingTailAlignment.value = null;
                   },
+                  onUserScrollEnd: () {
+                    if (!threadTailIsVisible()) return;
+                    userOptedOutOfTailFollow.value = false;
+                    followsThreadTail.value = true;
+                  },
                   child: ScrollablePositionedList.builder(
                     key: const ValueKey('thread-message-list'),
                     itemScrollController: itemScrollController,

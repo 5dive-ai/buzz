@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 Widget _testable({
   required FocusNode focusNode,
   VoidCallback? onUserScrollStart,
+  VoidCallback? onUserScrollEnd,
 }) {
   return MaterialApp(
     home: Scaffold(
@@ -16,6 +17,7 @@ Widget _testable({
           Expanded(
             child: KeyboardDismissOnDrag(
               onUserScrollStart: onUserScrollStart,
+              onUserScrollEnd: onUserScrollEnd,
               child: ListView(
                 children: [
                   for (var i = 0; i < 40; i++)
@@ -123,6 +125,23 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(userScrollStarts, 1);
+    });
+
+    testWidgets('reports a user scroll ending', (tester) async {
+      final focusNode = FocusNode();
+      addTearDown(focusNode.dispose);
+      var userScrollEnds = 0;
+      await tester.pumpWidget(
+        _testable(
+          focusNode: focusNode,
+          onUserScrollEnd: () => userScrollEnds += 1,
+        ),
+      );
+
+      await tester.drag(find.text('row 3'), const Offset(0, -100));
+      await tester.pumpAndSettle();
+
+      expect(userScrollEnds, 1);
     });
 
     testWidgets('an upward drag never dismisses, however far it goes', (

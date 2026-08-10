@@ -9,8 +9,17 @@ class InitialThreadTailSettle {
   var _generation = 0;
   var _isComplete = false;
 
+  /// Whether no more settling is needed.
+  ///
+  /// Completion occurs when there is no tail target, the target is already
+  /// visible after hydration has settled, or the scheduled scroll finishes.
   bool get isComplete => _isComplete;
 
+  /// Schedules a settle after each hydrated thread layout until [isComplete].
+  ///
+  /// A later schedule replaces an earlier target while replies are still
+  /// arriving. The final target is left in place when already visible; otherwise
+  /// it scrolls above the portion obscured by the composer dock.
   void schedule({
     required BuildContext context,
     required ItemScrollController controller,

@@ -4253,7 +4253,7 @@ void main() {
     );
 
     testWidgets(
-      'dragging away from the settled tail opts out of keyboard realignment',
+      'dragging away opts out, then returning to the tail resumes keyboard realignment',
       (tester) async {
         tester.view.physicalSize = const Size(400, 800);
         tester.view.devicePixelRatio = 1;
@@ -4343,6 +4343,32 @@ void main() {
               )
               .map((widget) => widget.key),
           isNotEmpty,
+        );
+
+        // Return the viewport to its original geometry while opt-out remains
+        // active. This must not itself pull the list back to the tail.
+        tester.view.viewInsets = FakeViewPadding.zero;
+        await tester.pumpAndSettle();
+
+        // Returning to the tail is a deliberate choice to resume following.
+        // Only the scroll-end callback may clear the opt-out state, so this
+        // reverse drag must complete before geometry changes re-align the tail.
+        for (var i = 0; i < 12; i++) {
+          await tester.drag(list, const Offset(0, -100));
+          await tester.pumpAndSettle();
+        }
+        final latestReply = find.byKey(
+          const ValueKey('thread-message-group-reply-29'),
+        );
+        expect(latestReply, findsOneWidget);
+
+        final composerSurface = find.byKey(const ValueKey('composer-surface'));
+        tester.view.viewInsets = const FakeViewPadding(bottom: 300);
+        await tester.pumpAndSettle();
+
+        expect(
+          tester.getBottomLeft(latestReply).dy,
+          lessThanOrEqualTo(tester.getTopLeft(composerSurface).dy),
         );
       },
     );

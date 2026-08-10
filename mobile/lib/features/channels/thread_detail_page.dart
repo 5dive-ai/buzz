@@ -18,6 +18,7 @@ import 'channel_messages_provider.dart';
 import 'channel_typing_provider.dart';
 import 'channel_typing_indicator.dart';
 import 'thread_replies_provider.dart';
+import 'thread_tail_intent.dart';
 import 'channels_provider.dart';
 import 'compose_bar.dart';
 import 'composer_dock_size_reporter.dart';
@@ -109,8 +110,8 @@ class ThreadDetailPage extends HookConsumerWidget {
     final didJumpToInitialMessage = useRef(false);
     final followsThreadTail = useRef(false);
     final userOptedOutOfTailFollow = useRef(false);
+    final tailIntent = useMemoized(ThreadTailIntent.new);
     final pendingTailAlignment = useRef<double?>(null);
-    final tailRealignmentQueued = useRef(false);
     const headIndex = 0;
     int indexForReply(int chronologicalIndex) => chronologicalIndex + 1;
 
@@ -151,6 +152,7 @@ class ThreadDetailPage extends HookConsumerWidget {
       if (targetIndex == null || didJumpToInitialMessage.value) return null;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!context.mounted || !itemScrollController.isAttached) return;
+        tailIntent.detach();
         followsThreadTail.value = false;
         pendingTailAlignment.value = null;
         itemScrollController.jumpTo(index: targetIndex, alignment: 0.35);
@@ -163,8 +165,51 @@ class ThreadDetailPage extends HookConsumerWidget {
     final initialTailSettle = useMemoized(InitialThreadTailSettle.new);
     final previousReplyCount = useRef(replies.length);
     final viewportHeight = useListenable(listViewport.height).value;
+    final previousViewportHeight = useRef(viewportHeight);
     final topOverlayFraction = frostedAppBarHeight(context) / viewportHeight;
     final settleGeometry = (composerDockHeight.value, viewportHeight);
+    bool currentIntentAllowsTailMutation({bool allowIdleDetached = false}) {
+      if (tailIntent.isDragging) return false;
+      if (allowIdleDetached) return true;
+      return !userOptedOutOfTailFollow.value &&
+          (followsThreadTail.value || threadTailIsVisible());
+    }
+
+    void queueTailRealignment({
+      bool allowIdleDetached = false,
+      bool animate = true,
+    }) {
+      if (!currentIntentAllowsTailMutation(
+        allowIdleDetached: allowIdleDetached,
+      )) {
+        return;
+      }
+      if (!allowIdleDetached) followsThreadTail.value = true;
+      tailIntent.schedule(
+        allowed: true,
+        revalidate: () =>
+            context.mounted &&
+            itemScrollController.isAttached &&
+            currentIntentAllowsTailMutation(
+              allowIdleDetached: allowIdleDetached,
+            ),
+        action: () {
+          final lastIndex = replies.isEmpty
+              ? headIndex
+              : indexForReply(replies.length - 1);
+          if (animate) {
+            itemScrollController.scrollTo(
+              index: lastIndex,
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+            );
+          } else {
+            itemScrollController.jumpTo(index: lastIndex);
+          }
+        },
+      );
+    }
+
     useEffect(() {
       if (!hasFetchedReplies || viewportHeight <= 0) return null;
       if (isMember && !isArchived && composerDockHeight.value <= 0) {
@@ -172,6 +217,7 @@ class ThreadDetailPage extends HookConsumerWidget {
       }
       if (!initialTailSettle.isComplete) {
         previousReplyCount.value = replies.length;
+        previousViewportHeight.value = viewportHeight;
         initialTailSettle.schedule(
           context: context,
           controller: itemScrollController,
@@ -186,9 +232,14 @@ class ThreadDetailPage extends HookConsumerWidget {
       }
       final previous = previousReplyCount.value;
       previousReplyCount.value = replies.length;
-      if (replies.length <= previous) return null;
+      final viewportChanged =
+          (viewportHeight - previousViewportHeight.value).abs() >= 0.5;
+      previousViewportHeight.value = viewportHeight;
+      if (replies.length <= previous) {
+        if (viewportChanged) queueTailRealignment(animate: false);
+        return null;
+      }
       final positions = itemPositionsListener.itemPositions.value;
-      final lastIndex = indexForReply(replies.length - 1);
       final previousLastIndex = previous == 0
           ? headIndex
           : indexForReply(previous - 1);
@@ -201,15 +252,11 @@ class ThreadDetailPage extends HookConsumerWidget {
           replies
               .skip(previous)
               .any((reply) => reply.pubkey.toLowerCase() == localPubkey);
-      if (!wasAtTail && !hasNewLocalReply) return null;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!context.mounted || !itemScrollController.isAttached) return;
-        itemScrollController.scrollTo(
-          index: lastIndex,
-          duration: const Duration(milliseconds: 220),
-          curve: Curves.easeOutCubic,
-        );
-      });
+      if (tailIntent.isDragging) return null;
+      if (!hasNewLocalReply && (userOptedOutOfTailFollow.value || !wasAtTail)) {
+        return null;
+      }
+      queueTailRealignment(allowIdleDetached: hasNewLocalReply);
       return null;
     }, [hasFetchedReplies, replies.length, settleGeometry]);
     final readState = ref.watch(readStateProvider);
@@ -229,7 +276,6 @@ class ThreadDetailPage extends HookConsumerWidget {
       return null;
     }, [threadHead.id, readState.isReady, visibleReplyReadKey]);
 
-    // Thread-scoped typing indicators (exclude self).
     final allTyping = ref.watch(channelTypingProvider(channelId));
     final threadTyping = allTyping
         .where((e) => e.threadHeadId == threadHead.id)
@@ -240,12 +286,9 @@ class ThreadDetailPage extends HookConsumerWidget {
         )
         .toList();
 
-    // Resolve thread head from live data (reactions/edits may have changed).
     final liveHead =
         allMsgs.where((m) => m.id == threadHead.id).firstOrNull ?? threadHead;
 
-    // The root of the entire thread chain. If the current thread head is
-    // itself a root message its rootId is null, so fall back to its own id.
     final effectiveRootId = threadHead.rootId ?? threadHead.id;
 
     void updateComposerDockHeight(double height) {
@@ -275,39 +318,22 @@ class ThreadDetailPage extends HookConsumerWidget {
           (heightDelta / viewportHeight);
       pendingTailAlignment.value = targetAlignment;
 
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!context.mounted || !itemScrollController.isAttached) return;
-        itemScrollController.jumpTo(
+      tailIntent.schedule(
+        allowed: true,
+        revalidate: () =>
+            context.mounted &&
+            itemScrollController.isAttached &&
+            currentIntentAllowsTailMutation(),
+        action: () => itemScrollController.jumpTo(
           index: lastIndex,
           alignment: targetAlignment,
-        );
-      });
+        ),
+      );
     }
 
     void realignThreadTailAfterMetricsChange() {
       listViewport.reportAfterLayout();
-      final shouldFollowTail =
-          !userOptedOutOfTailFollow.value &&
-          (followsThreadTail.value || threadTailIsVisible());
-      if (!shouldFollowTail || tailRealignmentQueued.value) return;
-      followsThreadTail.value = true;
-      tailRealignmentQueued.value = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        tailRealignmentQueued.value = false;
-        if (!context.mounted ||
-            !itemScrollController.isAttached ||
-            !followsThreadTail.value) {
-          return;
-        }
-        final lastIndex = replies.isEmpty
-            ? headIndex
-            : indexForReply(replies.length - 1);
-        itemScrollController.scrollTo(
-          index: lastIndex,
-          duration: const Duration(milliseconds: 220),
-          curve: Curves.easeOutCubic,
-        );
-      });
+      queueTailRealignment();
     }
 
     useEffect(() {
@@ -342,11 +368,13 @@ class ThreadDetailPage extends HookConsumerWidget {
                   child: KeyboardDismissOnDrag(
                     onUserScrollStart: () {
                       initialTailSettle.abandon();
+                      tailIntent.beginDrag();
                       userOptedOutOfTailFollow.value = true;
                       followsThreadTail.value = false;
                       pendingTailAlignment.value = null;
                     },
                     onUserScrollEnd: () {
+                      tailIntent.endDrag();
                       if (!threadTailIsVisible()) return;
                       userOptedOutOfTailFollow.value = false;
                       followsThreadTail.value = true;
@@ -442,7 +470,6 @@ class ThreadDetailPage extends HookConsumerWidget {
                                 reply.pubkey.toLowerCase() ||
                             (reply.createdAt - prevReply.createdAt) > 300;
 
-                        // Check if this reply itself has children (nested thread).
                         final nestedChildren = childrenByParent[reply.id];
                         final nestedSummary =
                             nestedChildren != null && nestedChildren.isNotEmpty
@@ -451,9 +478,6 @@ class ThreadDetailPage extends HookConsumerWidget {
 
                         return Padding(
                           key: ValueKey('thread-message-group-${reply.id}'),
-                          // Tail spacing comes from the list's own bottom padding now
-                          // that the list runs top-down; the reversed list used to
-                          // need it here because item 0 sat against the composer.
                           padding: EdgeInsets.zero,
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -492,16 +516,7 @@ class ThreadDetailPage extends HookConsumerWidget {
                 ),
               ),
               if (!isMember || isArchived)
-                AnimatedSize(
-                  duration: MediaQuery.disableAnimationsOf(context)
-                      ? Duration.zero
-                      : const Duration(milliseconds: 180),
-                  curve: Curves.easeOutCubic,
-                  alignment: Alignment.bottomCenter,
-                  child: threadTyping.isEmpty
-                      ? const SizedBox.shrink()
-                      : ChannelTypingIndicator(entries: threadTyping),
-                ),
+                ThreadTypingIndicator(entries: threadTyping, animated: false),
             ],
           ),
           if (isMember && !isArchived)
@@ -513,16 +528,7 @@ class ThreadDetailPage extends HookConsumerWidget {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    AnimatedSize(
-                      duration: MediaQuery.disableAnimationsOf(context)
-                          ? Duration.zero
-                          : const Duration(milliseconds: 180),
-                      curve: Curves.easeOutCubic,
-                      alignment: Alignment.bottomCenter,
-                      child: threadTyping.isEmpty
-                          ? const SizedBox.shrink()
-                          : ChannelTypingIndicator(entries: threadTyping),
-                    ),
+                    ThreadTypingIndicator(entries: threadTyping),
                     ComposeBar(
                       channelId: channelId,
                       hintText: 'Reply in thread\u2026',

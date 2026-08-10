@@ -177,6 +177,7 @@ Widget _buildTestable({
   ChannelActions Function(Ref ref)? createChannelActions,
   ReadStateNotifier? readStateNotifier,
   _FakeMessagesNotifier? messagesNotifier,
+  _FakeTypingNotifier? typingNotifier,
   String? canvasContent,
   String? initialMessageId,
   String? initialThreadRootId,
@@ -198,7 +199,7 @@ Widget _buildTestable({
       ).overrideWith(() => fakeMessagesNotifier),
       channelTypingProvider(
         _channelId,
-      ).overrideWith(() => _FakeTypingNotifier(typing)),
+      ).overrideWith(() => typingNotifier ?? _FakeTypingNotifier(typing)),
       userCacheProvider.overrideWith(
         () => userCacheNotifier ?? _FakeUserCacheNotifier(users),
       ),
@@ -4636,6 +4637,310 @@ void main() {
     );
 
     testWidgets(
+      'active primary drag rejects queued remote and local reply tail work',
+      (tester) async {
+        final rootEvent = _textMsg(
+          id: 'thread-root',
+          pubkey: 'alice',
+          content: 'Root',
+          createdAt: 1000,
+        );
+        final replies = [
+          for (var i = 0; i < 30; i++)
+            _textMsg(
+              id: 'reply-$i',
+              pubkey: 'bob',
+              content: 'Reply $i',
+              createdAt: 1100 + i,
+              extraTags: const [
+                ['e', 'thread-root', '', 'reply'],
+              ],
+            ),
+        ];
+        final messagesNotifier = _FakeMessagesNotifier([rootEvent]);
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [rootEvent],
+            messagesNotifier: messagesNotifier,
+            threadReplies: {'thread-root': replies},
+          ),
+        );
+        await tester.pumpAndSettle();
+        final threadHead = formatTimeline([rootEvent]).single;
+        Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+          MaterialPageRoute<void>(
+            builder: (_) => ThreadDetailPage(
+              threadHead: threadHead,
+              allMessages: [threadHead],
+              channelId: _channelId,
+              currentPubkey: 'self',
+              isMember: true,
+              isArchived: false,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        final lifecycle = tester.widget<KeyboardDismissOnDrag>(
+          find.byType(KeyboardDismissOnDrag),
+        );
+        lifecycle.onUserScrollStart!();
+        final anchor = find.byKey(
+          const ValueKey('thread-message-group-reply-20'),
+        );
+        final anchorTop = tester.getTopLeft(anchor).dy;
+        final remoteReply = _textMsg(
+          id: 'reply-remote',
+          pubkey: 'bob',
+          content: 'Remote',
+          createdAt: 1200,
+          extraTags: const [
+            ['e', 'thread-root', '', 'reply'],
+          ],
+        );
+        messagesNotifier.setMessages([rootEvent, remoteReply]);
+        await tester.pumpAndSettle();
+        expect(tester.getTopLeft(anchor).dy, closeTo(anchorTop, 0.5));
+        final localReply = _textMsg(
+          id: 'reply-local',
+          pubkey: 'self',
+          content: 'Local',
+          createdAt: 1201,
+          extraTags: const [
+            ['e', 'thread-root', '', 'reply'],
+          ],
+        );
+        messagesNotifier.setMessages([rootEvent, remoteReply, localReply]);
+        await tester.pumpAndSettle();
+        expect(tester.getTopLeft(anchor).dy, closeTo(anchorTop, 0.5));
+        lifecycle.onUserScrollEnd!();
+      },
+    );
+
+    testWidgets('idle detached local reply retains force-visible behavior', (
+      tester,
+    ) async {
+      final rootEvent = _textMsg(
+        id: 'thread-root',
+        pubkey: 'alice',
+        content: 'Root',
+        createdAt: 1000,
+      );
+      final replies = [
+        for (var i = 0; i < 30; i++)
+          _textMsg(
+            id: 'reply-$i',
+            pubkey: 'bob',
+            content: 'Reply $i',
+            createdAt: 1100 + i,
+            extraTags: const [
+              ['e', 'thread-root', '', 'reply'],
+            ],
+          ),
+      ];
+      final messagesNotifier = _FakeMessagesNotifier([rootEvent]);
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [rootEvent],
+          messagesNotifier: messagesNotifier,
+          threadReplies: {'thread-root': replies},
+        ),
+      );
+      await tester.pumpAndSettle();
+      final threadHead = formatTimeline([rootEvent]).single;
+      Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ThreadDetailPage(
+            threadHead: threadHead,
+            allMessages: [threadHead],
+            channelId: _channelId,
+            currentPubkey: 'self',
+            isMember: true,
+            isArchived: false,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final list = find.byKey(const ValueKey('thread-message-list'));
+      for (var i = 0; i < 4; i++) {
+        await tester.drag(list, const Offset(0, 100));
+        await tester.pumpAndSettle();
+      }
+      final localReply = _textMsg(
+        id: 'reply-local',
+        pubkey: 'self',
+        content: 'Local',
+        createdAt: 1200,
+        extraTags: const [
+          ['e', 'thread-root', '', 'reply'],
+        ],
+      );
+      messagesNotifier.setMessages([rootEvent, localReply]);
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('thread-message-group-reply-local')),
+        findsOneWidget,
+      );
+    });
+
+    for (final layout in <({String name, bool isMember, bool isArchived})>[
+      (name: 'non-member', isMember: false, isArchived: false),
+      (name: 'archived', isMember: true, isArchived: true),
+      (name: 'writable member', isMember: true, isArchived: false),
+    ]) {
+      testWidgets(
+        '${layout.name} typing transitions preserve a followed tail',
+        (tester) async {
+          tester.view.physicalSize = const Size(400, 800);
+          tester.view.devicePixelRatio = 1;
+          addTearDown(tester.view.reset);
+          final rootEvent = _textMsg(
+            id: 'thread-root',
+            pubkey: 'alice',
+            content: 'Root',
+            createdAt: 1000,
+          );
+          final replies = [
+            for (var i = 0; i < 30; i++)
+              _textMsg(
+                id: 'reply-$i',
+                pubkey: 'bob',
+                content: 'Reply $i',
+                createdAt: 1100 + i,
+                extraTags: const [
+                  ['e', 'thread-root', '', 'reply'],
+                ],
+              ),
+          ];
+          final typingNotifier = _FakeTypingNotifier(const []);
+          await tester.pumpWidget(
+            _buildTestable(
+              messages: [rootEvent],
+              typingNotifier: typingNotifier,
+              threadReplies: {'thread-root': replies},
+              disableAnimations: true,
+            ),
+          );
+          await tester.pumpAndSettle();
+          final threadHead = formatTimeline([rootEvent]).single;
+          Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+            MaterialPageRoute<void>(
+              builder: (_) => ThreadDetailPage(
+                threadHead: threadHead,
+                allMessages: [threadHead],
+                channelId: _channelId,
+                currentPubkey: 'self',
+                isMember: layout.isMember,
+                isArchived: layout.isArchived,
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          final latest = find.byKey(
+            const ValueKey('thread-message-group-reply-29'),
+          );
+          final list = find.byKey(const ValueKey('thread-message-list'));
+          final initialHeight = tester.getSize(list).height;
+          expect(latest, findsOneWidget);
+          typingNotifier.setEntries(const [
+            TypingEntry(
+              pubkey: 'bob',
+              threadHeadId: 'thread-root',
+              expiresAtMs: 9999999999999,
+            ),
+          ]);
+          await tester.pumpAndSettle();
+          expect(latest, findsOneWidget);
+          if (!layout.isMember || layout.isArchived) {
+            expect(tester.getSize(list).height, lessThan(initialHeight));
+          }
+          typingNotifier.setEntries(const []);
+          await tester.pumpAndSettle();
+          expect(latest, findsOneWidget);
+          expect(tester.getSize(list).height, closeTo(initialHeight, 0.5));
+        },
+      );
+
+      testWidgets(
+        '${layout.name} typing transitions preserve a detached anchor',
+        (tester) async {
+          tester.view.physicalSize = const Size(400, 800);
+          tester.view.devicePixelRatio = 1;
+          addTearDown(tester.view.reset);
+          final rootEvent = _textMsg(
+            id: 'thread-root',
+            pubkey: 'alice',
+            content: 'Root',
+            createdAt: 1000,
+          );
+          final replies = [
+            for (var i = 0; i < 30; i++)
+              _textMsg(
+                id: 'reply-$i',
+                pubkey: 'bob',
+                content: 'Reply $i',
+                createdAt: 1100 + i,
+                extraTags: const [
+                  ['e', 'thread-root', '', 'reply'],
+                ],
+              ),
+          ];
+          final typingNotifier = _FakeTypingNotifier(const []);
+          await tester.pumpWidget(
+            _buildTestable(
+              messages: [rootEvent],
+              typingNotifier: typingNotifier,
+              threadReplies: {'thread-root': replies},
+              disableAnimations: true,
+            ),
+          );
+          await tester.pumpAndSettle();
+          final threadHead = formatTimeline([rootEvent]).single;
+          Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+            MaterialPageRoute<void>(
+              builder: (_) => ThreadDetailPage(
+                threadHead: threadHead,
+                allMessages: [threadHead],
+                channelId: _channelId,
+                currentPubkey: 'self',
+                isMember: layout.isMember,
+                isArchived: layout.isArchived,
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          final list = find.byKey(const ValueKey('thread-message-list'));
+          for (var i = 0; i < 4; i++) {
+            await tester.drag(list, const Offset(0, 100));
+            await tester.pumpAndSettle();
+          }
+          final listRect = tester.getRect(list);
+          final anchor =
+              [
+                for (var i = 0; i < replies.length; i++)
+                  find.byKey(ValueKey('thread-message-group-reply-$i')),
+              ].firstWhere(
+                (candidate) =>
+                    candidate.evaluate().length == 1 &&
+                    listRect.overlaps(tester.getRect(candidate)),
+              );
+          final anchorTop = tester.getTopLeft(anchor).dy;
+          typingNotifier.setEntries(const [
+            TypingEntry(
+              pubkey: 'bob',
+              threadHeadId: 'thread-root',
+              expiresAtMs: 9999999999999,
+            ),
+          ]);
+          await tester.pumpAndSettle();
+          expect(tester.getTopLeft(anchor).dy, closeTo(anchorTop, 0.5));
+          typingNotifier.setEntries(const []);
+          await tester.pumpAndSettle();
+          expect(tester.getTopLeft(anchor).dy, closeTo(anchorTop, 0.5));
+        },
+      );
+    }
+
+    testWidgets(
       'dragging away opts out, then returning to the tail resumes keyboard realignment',
       (tester) async {
         tester.view.physicalSize = const Size(400, 800);
@@ -5136,6 +5441,8 @@ class _FakeTypingNotifier extends ChannelTypingNotifier {
 
   @override
   List<TypingEntry> build() => _entries;
+
+  void setEntries(List<TypingEntry> entries) => state = entries;
 }
 
 class _SynchronousReadStateNotifier extends ReadStateNotifier {

@@ -745,6 +745,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(readded.invited_by, Some(owner.to_vec()));
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE channel_members SET removed_at = unixepoch() WHERE channel_id = ?1 AND pubkey = ?2",
+        )
+            .bind(channel_id.to_string())
+            .bind(&member[..])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let reactivated = add_member(
+            &pool,
+            community.id,
+            channel_id,
+            &member,
+            crate::channel::MemberRole::Member,
+            Some(&admin),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reactivated.invited_by, Some(owner.to_vec()));
+        assert!(reactivated.removed_at.is_none());
         assert!(matches!(
             add_member(
                 &pool,

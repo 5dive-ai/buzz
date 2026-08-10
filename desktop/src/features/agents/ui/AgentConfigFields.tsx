@@ -48,7 +48,7 @@ import {
 } from "@/features/agents/ui/agentConfigControls";
 import { PersonaProviderApiKeyField } from "@/features/agents/ui/PersonaProviderApiKeyField";
 import { usePersonaModelDiscovery } from "@/features/agents/ui/usePersonaModelDiscovery";
-import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
+import { formatDefaultModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import {
   BUZZ_AGENT_THINKING_EFFORT,
   getProviderEffortConfig,
@@ -284,6 +284,9 @@ export function AgentConfigFields({
     () => getGlobalModelFallback(bakedEnv, effectiveProvider, config.env_vars),
     [bakedEnv, config.env_vars, effectiveProvider],
   );
+  const fallbackModelLabel = fallbackModel
+    ? formatDefaultModelLabel(fallbackModel, effectiveProvider || undefined)
+    : undefined;
   const modelField = fieldModel.fields.find(
     (field) => field.kind === "model" && field.render === "control",
   );
@@ -799,11 +802,7 @@ export function AgentConfigFields({
         <div className={showDescriptions ? fieldClassName : undefined}>
           <AgentModelField
             allowDefaultModel={fallbackModel !== null}
-            defaultModelLabel={
-              fallbackModel
-                ? `Default model (${resolveModelLabel(fallbackModel, undefined, effectiveProvider || undefined)})`
-                : undefined
-            }
+            defaultModelLabel={fallbackModelLabel}
             disableSelectDuringDiscovery={disableModelSelectDuringDiscovery}
             disabled={dependentFieldsDisabled}
             discoveredModelOptions={

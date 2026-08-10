@@ -393,7 +393,6 @@ function StandaloneAgentCard({
       modelLabel={resolveAgentCardModelLabel({
         agent,
         personaModel: null,
-        provider: agent.provider,
         defaultModel,
       })}
       onClick={() => {

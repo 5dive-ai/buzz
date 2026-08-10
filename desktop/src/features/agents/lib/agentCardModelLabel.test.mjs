@@ -119,7 +119,6 @@ test("resolveAgentCardModelLabel — openai agent inheriting a Databricks-named 
   const label = resolveAgentCardModelLabel({
     agent: { modelSource: "global", model: null, provider: "openai" },
     personaModel: null,
-    provider: "openai",
     defaultModel: "databricks-gpt-5-5",
   });
   assert.equal(label, "Default model (databricks-gpt-5-5)");
@@ -129,7 +128,6 @@ test("resolveAgentCardModelLabel — anthropic agent inheriting a Databricks-nam
   const label = resolveAgentCardModelLabel({
     agent: { modelSource: "global", model: null, provider: "anthropic" },
     personaModel: null,
-    provider: "anthropic",
     defaultModel: "databricks-gpt-5-5",
   });
   assert.equal(label, "Default model (databricks-gpt-5-5)");
@@ -139,7 +137,6 @@ test("resolveAgentCardModelLabel — databricks_v2 agent inheriting a Databricks
   const label = resolveAgentCardModelLabel({
     agent: { modelSource: "global", model: null, provider: "databricks_v2" },
     personaModel: null,
-    provider: "databricks_v2",
     defaultModel: "databricks-gpt-5-5",
   });
   assert.equal(label, "Default model (GPT-5.5)");

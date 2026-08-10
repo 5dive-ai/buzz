@@ -1,9 +1,10 @@
 //! Best-effort usage-event delivery for relay operators.
 //!
 //! The exporter is deliberately small: it emits one privacy-minimal JSON
-//! object for each newly persisted kind:9 message. Delivery never blocks event
-//! ingestion; a bounded queue drops analytics work when its single worker
-//! cannot keep up.
+//! object for each newly persisted client-submitted stream message (Nostr kind
+//! 9). Relay-authored automation is intentionally excluded. Delivery never
+//! blocks event ingestion; a bounded queue drops analytics work when its single
+//! worker cannot keep up.
 
 use std::time::Duration;
 

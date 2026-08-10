@@ -227,6 +227,17 @@ impl Llm {
                 .await
             }
         };
+        // Stamp the actually-requested model into the response so the usage
+        // accumulation path can derive pricingIdentity. For OpenAi/Databricks
+        // this is done per-response inside openai_request_for_model (where the
+        // resolved request_model is known after mesh/auto resolution). For the
+        // remaining providers the effective_model IS the request model.
+        let result = result.map(|mut r| {
+            if r.request_model.is_none() {
+                r.request_model = Some(effective_model.to_string());
+            }
+            r
+        });
         // Stamp the effective model into Llm errors so log lines carry
         // `llm: (model-name) 404 Not Found: …` instead of the bare status.
         // The `llm: ` prefix comes from `Display for AgentError::Llm`; the
@@ -618,6 +629,10 @@ impl Llm {
                 self.post_openai(cfg, "/responses", &body, request_model)
                     .await?,
             )
+            .map(|mut r| {
+                r.request_model = Some(request_model.to_string());
+                r
+            })
             .map_err(PostError::from);
         }
         let (body, parse) = build(false, request_model);
@@ -625,7 +640,12 @@ impl Llm {
             .post_openai(cfg, "/chat/completions", &body, request_model)
             .await
         {
-            Ok(value) => parse(value).map_err(PostError::from),
+            Ok(value) => parse(value)
+                .map(|mut r| {
+                    r.request_model = Some(request_model.to_string());
+                    r
+                })
+                .map_err(PostError::from),
             Err(PostError::Agent(error))
                 if cfg.openai_api == OpenAiApi::Auto && self.try_upgrade(&error) =>
             {
@@ -634,6 +654,10 @@ impl Llm {
                     self.post_openai(cfg, "/responses", &body, request_model)
                         .await?,
                 )
+                .map(|mut r| {
+                    r.request_model = Some(request_model.to_string());
+                    r
+                })
                 .map_err(PostError::from)
             }
             Err(error) => Err(error),
@@ -1229,6 +1253,11 @@ fn databricks_v2_path(route: DatabricksV2Route) -> &'static str {
 }
 
 fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
+    let max_tokens = v.get("status").and_then(Value::as_str) == Some("incomplete")
+        && v.get("incomplete_details")
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some("max_output_tokens");
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
@@ -1259,7 +1288,7 @@ fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
                     }
                 }
             }
-            Some("function_call") => {
+            Some("function_call") if !max_tokens => {
                 saw_function_call = true;
                 let raw = item
                     .get("arguments")
@@ -1279,6 +1308,9 @@ fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
                     Default::default(),
                 )?);
             }
+            // Incomplete Responses output can carry a partial function call.
+            // It is intentionally discarded by the in-turn recovery path.
+            Some("function_call") => {}
             Some("reasoning") => {
                 // Reasoning summary items from the Responses API. Each item has a
                 // `summary` array of `{"type": "summary_text", "text": "..."}` objects.
@@ -1322,27 +1354,33 @@ fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
         Some("completed") => ProviderStop::EndTurn,
         _ => ProviderStop::Other,
     };
-    let input_tokens = sum_usage(&v, &["input_tokens"]);
-    let output_tokens = sum_usage(&v, &["output_tokens"]);
+    let input_tokens = sum_usage(&v, &["input_tokens"]).and_then(SumUsageResult::into_exact);
+    let output_tokens = sum_usage(&v, &["output_tokens"]).and_then(SumUsageResult::into_exact);
     // The Responses API nests the cache split under `input_tokens_details`.
     let cached_input_tokens = usage_first(
         &v,
         &["cache_read_input_tokens"],
         &[("input_tokens_details", "cached_tokens")],
     );
+    // Responses API does not expose cache-write tokens today; stays None.
+    let cache_write_tokens: Option<u64> = None;
     // Responses API reports a genuine provider total. Read it directly —
     // never derived, so it stays None when the provider omits it.
-    let total_tokens = sum_usage(&v, &["total_tokens"]);
+    let total_tokens = sum_usage(&v, &["total_tokens"]).and_then(SumUsageResult::into_exact);
     Ok(LlmResponse {
         text,
         tool_calls,
         stop,
         input_tokens,
+        input_tokens_overflowed: false, // input_tokens is a single field; cannot overflow
         cached_input_tokens,
+        cache_write_tokens,
         output_tokens,
         total_tokens,
         reasoning,
         reasoning_details: None,
+        // Stamped by the dispatch layer (openai_request_for_model) after parse.
+        request_model: None,
     })
 }
 
@@ -1356,28 +1394,70 @@ fn map_stop(s: Option<&str>) -> ProviderStop {
     }
 }
 
+/// Result of a multi-field token sum — distinguishes a successful total from an
+/// arithmetic overflow so callers can propagate the overflow signal rather than
+/// silently clamping to `u64::MAX`.
+#[derive(Debug, PartialEq)]
+enum SumUsageResult {
+    /// At least one field was present and the total did not overflow.
+    Exact(u64),
+    /// At least one field was present but the cumulative sum overflowed `u64`.
+    Overflow,
+}
+
+impl SumUsageResult {
+    /// Returns `Some(n)` when exact, `None` when overflow or when the caller
+    /// needs to signal an explicit absence.  Single-field callers whose sums
+    /// cannot overflow use this to convert back to `Option<u64>`.
+    fn into_exact(self) -> Option<u64> {
+        match self {
+            SumUsageResult::Exact(n) => Some(n),
+            SumUsageResult::Overflow => None,
+        }
+    }
+}
+
 /// Sum a set of `usage` token fields, returning `None` only when the `usage`
 /// object is absent or carries none of the requested fields. A field that is
 /// present is added; a field that is missing contributes 0. This keeps the
 /// result an inclusive total (so cached tokens are never silently dropped)
 /// while still distinguishing "no usage reported" from "usage was zero".
-fn sum_usage(v: &Value, fields: &[&str]) -> Option<u64> {
+///
+/// Returns [`SumUsageResult::Overflow`] if the cumulative total exceeds `u64::MAX`.
+/// Single-field callers whose sums cannot overflow may call `.into_exact()` to
+/// convert back to `Option<u64>` without loss.
+fn sum_usage(v: &Value, fields: &[&str]) -> Option<SumUsageResult> {
     let usage = v.get("usage")?;
     let mut total: u64 = 0;
     let mut saw_any = false;
+    let mut overflowed = false;
     for f in fields {
         if let Some(n) = usage.get(*f).and_then(Value::as_u64) {
-            total = total.saturating_add(n);
+            match total.checked_add(n) {
+                Some(t) => total = t,
+                None => overflowed = true,
+            }
             saw_any = true;
         }
     }
-    saw_any.then_some(total)
+    if !saw_any {
+        return None;
+    }
+    if overflowed {
+        Some(SumUsageResult::Overflow)
+    } else {
+        Some(SumUsageResult::Exact(total))
+    }
 }
 
 /// Input-token total for Anthropic / Databricks (Anthropic-style) responses.
 /// `input_tokens` alone EXCLUDES cached tokens, so we sum it with the two
 /// cache fields to get the inclusive total the context budget must gate on.
-fn anthropic_input_tokens(v: &Value) -> Option<u64> {
+///
+/// Returns [`SumUsageResult::Overflow`] when the sum of the three fields
+/// exceeds `u64::MAX` — the caller must propagate the overflow signal rather
+/// than clamping.
+fn anthropic_input_tokens(v: &Value) -> Option<SumUsageResult> {
     sum_usage(
         v,
         &[
@@ -1407,7 +1487,7 @@ fn anthropic_input_tokens(v: &Value) -> Option<u64> {
 /// The two never collide here: the router sends `claude*` models to the
 /// Anthropic route, so `parse_openai` only ever sees inclusive `prompt_tokens`.
 fn openai_chat_input_tokens(v: &Value) -> Option<u64> {
-    sum_usage(v, &["prompt_tokens"])
+    sum_usage(v, &["prompt_tokens"]).and_then(SumUsageResult::into_exact)
 }
 
 /// First present value among `usage.<field>` and `usage.<nested>.<leaf>` pairs.
@@ -1551,34 +1631,55 @@ fn parse_anthropic(v: Value) -> Result<LlmResponse, AgentError> {
                         reasoning.push_str(t);
                     }
                 }
-                // Anthropic's replay shape is fully modelled, so nothing to keep.
-                Some("tool_use") => tool_calls.push(make_tool_call(
-                    str_field(b, "id"),
-                    str_field(b, "name"),
-                    b.get("input").cloned().unwrap_or(Value::Null),
-                    Default::default(),
-                )?),
+                // A max-token response may end in the middle of a tool input.
+                // The agent discards all calls from truncated responses, so do
+                // not reject the whole response trying to parse an input that
+                // can never be executed.
+                Some("tool_use") if stop != ProviderStop::MaxTokens => {
+                    tool_calls.push(make_tool_call(
+                        str_field(b, "id"),
+                        str_field(b, "name"),
+                        b.get("input").cloned().unwrap_or(Value::Null),
+                        Default::default(),
+                    )?)
+                }
+                Some("tool_use") => {}
                 _ => {}
             }
         }
     }
-    let input_tokens = anthropic_input_tokens(&v);
-    let output_tokens = sum_usage(&v, &["output_tokens"]);
+    // anthropic_input_tokens() returns Option<SumUsageResult> because it sums
+    // three fields that can collectively overflow u64. Propagate the overflow
+    // signal via `input_tokens_overflowed` so the run loop can poison the
+    // turn accumulator rather than treating u64::MAX as an exact reading.
+    let (input_tokens, input_tokens_overflowed) = match anthropic_input_tokens(&v) {
+        Some(SumUsageResult::Exact(n)) => (Some(n), false),
+        Some(SumUsageResult::Overflow) => (None, true),
+        None => (None, false),
+    };
+    let output_tokens = sum_usage(&v, &["output_tokens"]).and_then(SumUsageResult::into_exact);
     // Anthropic reports the cache split flat on `usage`. Note this is already
     // part of `input_tokens` above, which sums it in deliberately.
     let cached_input_tokens = usage_first(&v, &["cache_read_input_tokens"], &[]);
+    // Anthropic reports cache-creation tokens as `cache_creation_input_tokens`;
+    // also a subset of `input_tokens` (already folded in above).
+    let cache_write_tokens = usage_first(&v, &["cache_creation_input_tokens"], &[]);
     Ok(LlmResponse {
         text,
         tool_calls,
         stop,
         input_tokens,
+        input_tokens_overflowed,
         cached_input_tokens,
+        cache_write_tokens,
         output_tokens,
         // Anthropic reports only category counts; NIP-AM forbids deriving a
         // total from them. Always None for this provider.
         total_tokens: None,
         reasoning,
         reasoning_details: None,
+        // Stamped by the dispatch layer (complete) after parse.
+        request_model: None,
     })
 }
 
@@ -1645,49 +1746,60 @@ fn parse_openai(v: Value) -> Result<LlmResponse, AgentError> {
         }
     };
     let mut tool_calls = Vec::new();
-    if let Some(arr) = msg.get("tool_calls").and_then(Value::as_array) {
-        for tc in arr {
-            let f = tc
-                .get("function")
-                .ok_or_else(|| AgentError::Llm("tool_call missing function".into()))?;
-            let raw = f.get("arguments").and_then(Value::as_str).unwrap_or("{}");
-            let args: Value = serde_json::from_str(raw)
-                .map_err(|e| AgentError::Llm(format!("tool_call.arguments not valid JSON: {e}")))?;
-            // Everything on the wire object we do not model, kept for replay.
-            let extra = tc
-                .as_object()
-                .map(|o| {
-                    o.iter()
-                        .filter(|(k, _)| !matches!(k.as_str(), "id" | "type" | "function"))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            tool_calls.push(make_tool_call(
-                str_field(tc, "id"),
-                str_field(f, "name"),
-                args,
-                extra,
-            )?);
+    if stop != ProviderStop::MaxTokens {
+        if let Some(arr) = msg.get("tool_calls").and_then(Value::as_array) {
+            for tc in arr {
+                let f = tc
+                    .get("function")
+                    .ok_or_else(|| AgentError::Llm("tool_call missing function".into()))?;
+                let raw = f.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                let args: Value = serde_json::from_str(raw).map_err(|e| {
+                    AgentError::Llm(format!("tool_call.arguments not valid JSON: {e}"))
+                })?;
+                // Everything on the wire object we do not model, kept for replay.
+                let extra = tc
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .filter(|(k, _)| !matches!(k.as_str(), "id" | "type" | "function"))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                tool_calls.push(make_tool_call(
+                    str_field(tc, "id"),
+                    str_field(f, "name"),
+                    args,
+                    extra,
+                )?);
+            }
         }
     }
     dedupe_provider_ids(&mut tool_calls);
     let input_tokens = openai_chat_input_tokens(&v);
-    let output_tokens = sum_usage(&v, &["completion_tokens"]);
+    let output_tokens = sum_usage(&v, &["completion_tokens"]).and_then(SumUsageResult::into_exact);
     let cached_input_tokens = openai_chat_cached_tokens(&v);
+    // OpenAI Chat Completions reports cache-write tokens under
+    // `prompt_tokens_details.cache_write_tokens`. A subset of `prompt_tokens`.
+    let cache_write_tokens =
+        usage_first(&v, &[], &[("prompt_tokens_details", "cache_write_tokens")]);
     // OpenAI Chat Completions reports a genuine provider total. Read it
     // directly — never derived, so it stays None when the provider omits it.
-    let total_tokens = sum_usage(&v, &["total_tokens"]);
+    let total_tokens = sum_usage(&v, &["total_tokens"]).and_then(SumUsageResult::into_exact);
     Ok(LlmResponse {
         text,
         tool_calls,
         stop,
         input_tokens,
+        input_tokens_overflowed: false, // prompt_tokens is a single field; cannot overflow
         cached_input_tokens,
+        cache_write_tokens,
         output_tokens,
         total_tokens,
         reasoning,
         reasoning_details: None,
+        // Stamped by the dispatch layer (openai_request_for_model) after parse.
+        request_model: None,
     })
 }
 
@@ -1915,9 +2027,24 @@ fn classify_body_read_error(
     }
 }
 
+/// Provider bodies that mean "this model cannot accept image input", the
+/// signal the agent loop uses to strip rejected images from history and
+/// continue the turn (see `replace_unsupported_images`).
+///
+/// Deliberately tight, same doctrine as [`is_context_length_error`]: each
+/// phrase is a verbatim capability rejection observed live. Misclassifying a
+/// generic 400 as recoverable would mutate history for an error that removing
+/// images cannot fix.
 fn is_unsupported_image_input_error(body: &str) -> bool {
-    body.to_ascii_lowercase()
-        .contains("no endpoints found that support image input")
+    let b = body.to_ascii_lowercase();
+    // OpenRouter 404: no provider endpoint accepts images for this model.
+    b.contains("no endpoints found that support image input")
+        // OpenAI-compatible 400 from text-only single-model deployments,
+        // e.g. Crusoe serverless GLM: `"crusoeai/GLM-5.2-NVFP4 is not a
+        // multimodal model"`. Without this arm the 400 is terminal, the image
+        // stays in history, and every subsequent request in the session fails
+        // identically — the turn wedges until the harness/user gives up.
+        || b.contains("is not a multimodal model")
 }
 
 /// Build the terminal `AgentError::Llm` for a `post()` exit that has given up
@@ -2112,6 +2239,13 @@ where
                     "{status}: {body}"
                 ))));
             }
+            // Image-capability rejection is equally recoverable and equally
+            // deterministic: a text-only deployment 400s the same request
+            // forever. Typed here (not just on the 404 arm) because
+            // OpenAI-compatible providers report it as a 400.
+            if status == 400 && is_unsupported_image_input_error(&body) {
+                return Err(PostError::Agent(AgentError::UnsupportedImageInput(body)));
+            }
             return Err(PostError::Agent(AgentError::Llm(format!(
                 "{status}: {body}"
             ))));
@@ -2164,8 +2298,33 @@ where
                 }
             }
         }
-        return serde_json::from_slice(&buf)
-            .map_err(|e| PostError::Agent(AgentError::Llm(format!("json: {e}"))));
+        // A 2xx body that fails to parse (e.g. a provider flushing a
+        // truncated JSON document and closing the stream cleanly) is a
+        // transient upstream fault, not a request problem: retry it like a
+        // 5xx. Safe to re-send — a malformed body produced no parsed
+        // response, so no tool call was ever extracted from it, and the
+        // retried request is the identical completion POST captured in
+        // `body_bytes` at function entry.
+        match serde_json::from_slice(&buf) {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if attempt + 1 < MAX_RETRIES {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_attempts = MAX_RETRIES,
+                        error = %e,
+                        "llm: malformed response body, retrying"
+                    );
+                    backoff_with_jitter(attempt).await;
+                    continue;
+                }
+                return Err(PostError::Agent(terminal_llm_error(
+                    call_start.elapsed(),
+                    attempt + 1,
+                    &format!("json: {e}"),
+                )));
+            }
+        }
     }
     // Unreachable in practice: every iteration either returns or continues.
     // A fallthrough here would mean MAX_RETRIES was 0, which is rejected at
@@ -2220,22 +2379,56 @@ pub(crate) fn build_token_source(cfg: &Config) -> Result<Arc<dyn TokenSource>, A
     }
 }
 
+/// Completion-token cap that [`Llm::summarize`] actually requests from
+/// `provider`, given the caller's visible-text budget. OpenRouter grants
+/// reasoning a separate, equal budget on top of the text budget (see
+/// [`openrouter_summary_body`]), so its top-level cap is double the caller's
+/// budget; every other provider requests the caller's budget unchanged.
+/// Callers that reserve output headroom in an input budget
+/// (`handoff_prompt_budget_bytes`) must reserve THIS value, not the text
+/// budget — otherwise input plus the actual completion allowance can exceed
+/// the configured context window.
+pub(crate) fn summary_completion_cap(provider: Provider, max_output_tokens: u32) -> u32 {
+    match provider {
+        Provider::OpenRouter => max_output_tokens.saturating_mul(2),
+        Provider::Anthropic | Provider::OpenAi | Provider::Databricks | Provider::DatabricksV2 => {
+            max_output_tokens
+        }
+    }
+}
+
 /// Build the request body for `Llm::summarize` on `Provider::OpenRouter`.
 /// Extracted so tests can assert on the actual wire shape instead of a
-/// hand-rolled literal — summaries never carry `reasoning` (see
-/// `apply_openrouter_mutations`, which the summary path never calls).
-/// It spells the token limit `max_tokens` directly for the same reason: the
-/// mutation that renames it is never applied here.
+/// hand-rolled literal — summaries never carry config-driven reasoning
+/// *effort* (see `apply_openrouter_mutations`, which the summary path never
+/// calls). It spells the token limit `max_tokens` directly for the same
+/// reason: the mutation that renames it is never applied here.
 fn openrouter_summary_body(
     effective_model: &str,
     system_prompt: &str,
     user_prompt: &str,
     max_output_tokens: u32,
 ) -> Value {
+    // Reasoning models spend output tokens thinking before emitting any
+    // visible text, and that spend counts against `max_tokens`. Left
+    // unseparated, a model can burn the entire cap mid-reasoning and return an
+    // empty `content` — observed with deepseek-v4-flash, where 13 consecutive
+    // handoff attempts length-stopped inside the reasoning channel and every
+    // one degraded to lossy history truncation. Give reasoning its own
+    // equal-sized budget on top of the text budget so `max_output_tokens`
+    // remains what the caller means: visible summary text. `exclude` keeps the
+    // reasoning out of the response body; `summarize()` only reads `content`.
+    // Non-reasoning endpoints ignore the `reasoning` object (see
+    // `apply_openrouter_mutations` on why it is never paired with
+    // `provider.require_parameters`).
     json!({
         "model": effective_model,
         "stream": false,
-        "max_tokens": max_output_tokens,
+        "max_tokens": summary_completion_cap(Provider::OpenRouter, max_output_tokens),
+        "reasoning": {
+            "max_tokens": max_output_tokens,
+            "exclude": true,
+        },
         "messages": [
             { "role": "system", "content": system_prompt },
             { "role": "user", "content": user_prompt },
@@ -2484,6 +2677,12 @@ async fn openrouter_post(
             if status == 400 && is_context_length_error(&body) {
                 return Err(AgentError::LlmContextExceeded(format!("{status}: {body}")));
             }
+            // Same 400-shaped image rejection as the shared `post()` terminal:
+            // OpenRouter normally reports this as a 404 (handled above), but a
+            // BYOK/passthrough upstream can surface the provider's own 400.
+            if status == 400 && is_unsupported_image_input_error(&body) {
+                return Err(AgentError::UnsupportedImageInput(body));
+            }
             return Err(AgentError::Llm(format!("{status}: {body}")));
         }
         if let Some(len) = resp.content_length() {
@@ -2531,7 +2730,31 @@ async fn openrouter_post(
                 }
             }
         }
-        return serde_json::from_slice(&buf).map_err(|e| AgentError::Llm(format!("json: {e}")));
+        // Same malformed-body retry as the shared `post()` terminal: a
+        // truncated 2xx JSON body is transient upstream trouble, and
+        // re-sending is provably tool-safe — nothing was parsed, so no tool
+        // call could have been extracted, and the retry re-uses the
+        // identical `body_bytes` completion request.
+        match serde_json::from_slice(&buf) {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if attempt + 1 < MAX_RETRIES {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_attempts = MAX_RETRIES,
+                        error = %e,
+                        "llm: openrouter malformed response body, retrying"
+                    );
+                    backoff_with_jitter(attempt).await;
+                    continue;
+                }
+                return Err(terminal_llm_error(
+                    call_start.elapsed(),
+                    attempt + 1,
+                    &format!("json: {e}"),
+                ));
+            }
+        }
     }
     Err(terminal_llm_error(
         call_start.elapsed(),
@@ -3527,10 +3750,51 @@ mod tests {
         let v = serde_json::json!({
             "status": "incomplete",
             "incomplete_details": {"reason": "max_output_tokens"},
-            "output": [],
+            "output": [{
+                "type": "function_call",
+                "call_id": "partial",
+                "name": "dev__shell",
+                "arguments": "{\"command\":\"unterminated",
+            }],
         });
         let r = parse_responses(v).unwrap();
         assert_eq!(r.stop, ProviderStop::MaxTokens);
+        assert!(r.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn truncated_openai_tool_arguments_are_discarded_not_rejected() {
+        let v = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": "partial text",
+                    "tool_calls": [{
+                        "id": "partial",
+                        "type": "function",
+                        "function": {
+                            "name": "dev__shell",
+                            "arguments": "{\"command\":\"unterminated",
+                        },
+                    }],
+                },
+            }],
+        });
+        let r = parse_openai(v).unwrap();
+        assert_eq!(r.stop, ProviderStop::MaxTokens);
+        assert_eq!(r.text, "partial text");
+        assert!(r.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn truncated_anthropic_tool_use_is_discarded_not_rejected() {
+        let v = serde_json::json!({
+            "stop_reason": "max_tokens",
+            "content": [{"type": "tool_use", "id": "", "name": "", "input": null}],
+        });
+        let r = parse_anthropic(v).unwrap();
+        assert_eq!(r.stop, ProviderStop::MaxTokens);
+        assert!(r.tool_calls.is_empty());
     }
 
     #[test]
@@ -4671,6 +4935,237 @@ mod tests {
         );
     }
 
+    /// Regression (write-compressor, tb21-twins-1): a provider returning
+    /// HTTP 200 with a *truncated* JSON body (cleanly closed, correct
+    /// framing, unparseable content) previously surfaced as a terminal
+    /// `AgentError::Llm("json: EOF while parsing a value ...")` on the very
+    /// first attempt, killing the agent turn. A malformed body is transient
+    /// upstream trouble and must be retried like a 5xx. Re-sending is
+    /// tool-safe: nothing was parsed, so no tool call was extracted from the
+    /// bad body, and the retry replays the identical completion request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_retries_malformed_json_body_and_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/x", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicU32::new(0));
+        let accepts_srv = accepts.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let n = accepts_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                    }
+                }
+                if n == 0 {
+                    // First attempt: 200 OK with a truncated JSON document.
+                    // Content-Length matches the bytes actually sent, so the
+                    // body read completes cleanly — the fault is purely that
+                    // the JSON is cut off mid-value.
+                    let body = "{\"choices\":[{\"mess";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    continue;
+                }
+                // Subsequent attempts: complete valid JSON.
+                let body = "{\"ok\":true}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let out = post(
+            &client,
+            &url,
+            &serde_json::json!({}),
+            false,
+            Duration::from_secs(5),
+            |b| b,
+        )
+        .await
+        .expect("post should succeed after retrying the malformed body");
+        assert_eq!(out, serde_json::json!({ "ok": true }));
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "server must see exactly 2 attempts (malformed body retried once)"
+        );
+    }
+
+    /// A persistently malformed 200 body exhausts MAX_RETRIES and surfaces
+    /// the terminal error with the `json:` detail plus cumulative
+    /// duration/attempt count — never an early first-attempt death.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_exhausts_retries_on_persistent_malformed_json() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/x", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicU32::new(0));
+        let accepts_srv = accepts.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                    }
+                }
+                let body = "{\"choices\":[{\"mess";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = post(
+            &client,
+            &url,
+            &serde_json::json!({}),
+            false,
+            Duration::from_secs(5),
+            |b| b,
+        )
+        .await
+        .unwrap_err();
+        match &err {
+            PostError::Agent(AgentError::Llm(msg)) => {
+                assert!(
+                    msg.contains("json:"),
+                    "expected the json parse detail, got: {msg}"
+                );
+                assert!(
+                    msg.contains("cumulative") && msg.contains("3 attempts"),
+                    "expected cumulative duration + exact attempt count, got: {msg}"
+                );
+            }
+            other => panic!("expected PostError::Agent(AgentError::Llm), got: {other:?}"),
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            MAX_RETRIES,
+            "server must see exactly MAX_RETRIES attempts — malformed bodies must be retried"
+        );
+    }
+
+    /// Same regression coverage for `openrouter_post`, which carries its own
+    /// retry loop: a truncated 200 body on the first attempt is retried and
+    /// the call succeeds on the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openrouter_post_retries_malformed_json_body_and_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/x", listener.local_addr().unwrap());
+        let accepts = Arc::new(AtomicU32::new(0));
+        let accepts_srv = accepts.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let n = accepts_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                    }
+                }
+                if n == 0 {
+                    let body = "{\"choices\":[{\"mess";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                    continue;
+                }
+                let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let out = openrouter_post(&client, &url, &json!({}), "key", Duration::from_secs(5))
+            .await
+            .expect("openrouter_post should succeed after retrying the malformed body");
+        assert!(out.is_object(), "expected a JSON object: {out:?}");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "server must see exactly 2 attempts (malformed body retried once)"
+        );
+    }
+
     /// A body-read timeout on the first attempt triggers a retry under an
     /// escalated budget, and the call succeeds on the second attempt.
     ///
@@ -5724,6 +6219,98 @@ mod tests {
         assert_eq!(sum_usage(&v, &["input_tokens", "prompt_tokens"]), None);
     }
 
+    #[test]
+    fn sum_usage_exact_single_field() {
+        let v = serde_json::json!({"usage": {"input_tokens": 42}});
+        assert_eq!(
+            sum_usage(&v, &["input_tokens"]),
+            Some(SumUsageResult::Exact(42))
+        );
+    }
+
+    #[test]
+    fn sum_usage_exact_two_fields() {
+        let v = serde_json::json!({"usage": {"input_tokens": 100, "cache_read_input_tokens": 50}});
+        assert_eq!(
+            sum_usage(&v, &["input_tokens", "cache_read_input_tokens"]),
+            Some(SumUsageResult::Exact(150))
+        );
+    }
+
+    #[test]
+    fn sum_usage_overflow_two_fields_signals_overflow() {
+        // Reproducer from Thufir's finding: input_tokens = u64::MAX, cache_read = 1.
+        // Must return Overflow, not Exact(u64::MAX).
+        let v = serde_json::json!({
+            "usage": {
+                "input_tokens": u64::MAX,
+                "cache_read_input_tokens": 1_u64,
+                "cache_creation_input_tokens": 0_u64
+            }
+        });
+        assert_eq!(
+            sum_usage(
+                &v,
+                &[
+                    "input_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens"
+                ]
+            ),
+            Some(SumUsageResult::Overflow)
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_input_overflow_sets_flag_and_clears_value() {
+        // The inclusive sum overflows; input_tokens must be None and the flag set.
+        let v = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {
+                "input_tokens": u64::MAX,
+                "cache_read_input_tokens": 1_u64,
+                "cache_creation_input_tokens": 0_u64,
+                "output_tokens": 7
+            }
+        });
+        let r = parse_anthropic(v).unwrap();
+        assert_eq!(r.input_tokens, None, "overflowed value must be discarded");
+        assert!(r.input_tokens_overflowed, "overflow flag must be set");
+        // output_tokens unaffected by input overflow
+        assert_eq!(r.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn parse_anthropic_normal_sum_does_not_set_flag() {
+        // Normal (non-overflow) path: flag stays false.
+        let v = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {
+                "input_tokens": 100_u64,
+                "cache_read_input_tokens": 900_u64,
+                "cache_creation_input_tokens": 50_u64,
+                "output_tokens": 7
+            }
+        });
+        let r = parse_anthropic(v).unwrap();
+        assert_eq!(r.input_tokens, Some(1050));
+        assert!(!r.input_tokens_overflowed);
+    }
+
+    #[test]
+    fn parse_anthropic_absent_usage_does_not_set_flag() {
+        // Absent usage: flag stays false, input_tokens stays None.
+        let v = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "hi"}]
+        });
+        let r = parse_anthropic(v).unwrap();
+        assert_eq!(r.input_tokens, None);
+        assert!(!r.input_tokens_overflowed);
+    }
+
     /// A token source whose `bearer()` always hands back the same stale
     /// token and whose `refresh_now()` mints a distinct fresh one, counting
     /// each refresh. Lets a test assert exactly how many forced refreshes a
@@ -6205,8 +6792,14 @@ mod tests {
         assert!(body.get("max_completion_tokens").is_none());
     }
 
+    /// The summary body reserves `max_output_tokens` for visible text by
+    /// granting reasoning a separate, equal budget on top and excluding it
+    /// from the response. Without the separation, a reasoning model can spend
+    /// the entire cap thinking and length-stop with empty `content`, which
+    /// `summarize()` reports as an empty summary and the handoff degrades to
+    /// lossy truncation.
     #[test]
-    fn openrouter_summary_carries_neither_reasoning_nor_provider() {
+    fn openrouter_summary_budgets_reasoning_separately_and_carries_no_provider() {
         let body = openrouter_summary_body(
             "anthropic/claude-opus-4-7",
             "summarize",
@@ -6216,14 +6809,25 @@ mod tests {
         assert_eq!(body["model"], "anthropic/claude-opus-4-7");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "text to summarize");
-        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(
+            body["max_tokens"], 2048,
+            "total cap must cover the text budget plus the reasoning budget"
+        );
+        assert_eq!(
+            body["reasoning"]["max_tokens"], 1024,
+            "reasoning gets its own budget so it cannot starve the summary text"
+        );
+        assert_eq!(
+            body["reasoning"]["exclude"], true,
+            "reasoning must not be included in the response; summarize() reads only content"
+        );
+        assert!(
+            body["reasoning"].get("effort").is_none(),
+            "budget-based cap only; effort stays unset for the summary call"
+        );
         assert!(
             body.get("max_completion_tokens").is_none(),
             "summary body must use OpenRouter's token-limit spelling"
-        );
-        assert!(
-            body.get("reasoning").is_none(),
-            "summary body must not carry reasoning"
         );
         assert!(
             body.get("provider").is_none(),
@@ -7426,6 +8030,73 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(&err, AgentError::UnsupportedImageInput(s) if s.contains("support image input")),
+            "image rejection must reach the history-recovery path: got {err:?}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a deterministic capability rejection must not be retried"
+        );
+    }
+
+    /// OpenAI-compatible text-only deployments report the image rejection as a
+    /// 400, not OpenRouter's 404 — Crusoe serverless GLM answers
+    /// `"crusoeai/GLM-5.2-NVFP4 is not a multimodal model"` to every request
+    /// whose history contains an image. Before the 400 arm existed, this fell
+    /// through to terminal `AgentError::Llm`: the image stayed in history and
+    /// every later call in the session failed identically (measured live:
+    /// 8 wedged benchmark trials, 40 min of doomed retries each). Asserted
+    /// through `complete()` so the arm's return path into the convergence
+    /// mapper is covered, same doctrine as the context-400 tests above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openai_400_unsupported_image_is_typed_through_complete() {
+        let (base_url, captured) = spawn_sequence_stub(vec![StubHttpResponse {
+            status: 400,
+            body: json!({"error":{"message":"crusoeai/GLM-5.2-NVFP4 is not a multimodal model","type":"invalid_request_error"}}),
+        }])
+        .await;
+        let mut c = cfg(Provider::OpenAi);
+        c.base_url = base_url;
+        let llm = Llm::new(&c).unwrap();
+        let err = complete_model(&llm, &c, "gpt-probe-model")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, AgentError::UnsupportedImageInput(s) if s.contains("not a multimodal model")),
+            "a text-only deployment's 400 must reach the history-recovery path: got {err:?}"
+        );
+        assert_eq!(
+            captured.lock().await.len(),
+            1,
+            "a deterministic capability rejection must not be retried"
+        );
+    }
+
+    /// Same 400-shaped rejection at the OpenRouter terminal, which has its own
+    /// status ladder: a BYOK/passthrough upstream can surface the provider's
+    /// own 400 body instead of OpenRouter's 404 routing error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn openrouter_post_400_unsupported_image_is_typed_and_not_retried() {
+        let (url, _captured, attempts) = spawn_openrouter_stub(vec![CannedResponse::new(
+            400,
+            r#"{"error":{"message":"crusoeai/GLM-5.2-NVFP4 is not a multimodal model"}}"#,
+        )])
+        .await;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let err = openrouter_post(
+            &http,
+            &format!("{url}/x"),
+            &json!({}),
+            "key",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, AgentError::UnsupportedImageInput(s) if s.contains("not a multimodal model")),
             "image rejection must reach the history-recovery path: got {err:?}"
         );
         assert_eq!(

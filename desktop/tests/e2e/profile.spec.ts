@@ -1145,7 +1145,7 @@ test("renders settings in the app shell with a back button", async ({
   await expect(personalGroup).toContainText("Personal");
   await expect(
     page.getByTestId("settings-nav-channel-templates"),
-  ).toContainText("Channel templates");
+  ).toContainText("Templates");
   await expect(page.getByTestId("settings-nav-profile")).toHaveAttribute(
     "aria-pressed",
     "true",

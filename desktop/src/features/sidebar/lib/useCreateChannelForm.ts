@@ -151,7 +151,6 @@ export function useCreateChannelForm({
 
   const handleTemplateCreated = React.useCallback(
     (template: ChannelTemplate) => {
-      if (template.templateType !== "channel") return;
       applyTemplate(template);
     },
     [applyTemplate],

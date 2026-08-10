@@ -832,7 +832,6 @@ export type {
   TemplateAgents,
   TemplateBackend,
   TemplateTeamEntry,
-  TemplateType,
   TemplateWorktreeConfig,
   UpdateChannelTemplateInput,
 } from "./channelTemplateTypes";

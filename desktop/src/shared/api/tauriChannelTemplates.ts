@@ -8,7 +8,6 @@ import type {
 type RawChannelTemplate = {
   id: string;
   name: string;
-  template_type?: "channel" | "section";
   description?: string | null;
   channel_type: string;
   visibility: string;
@@ -51,7 +50,6 @@ function fromRawChannelTemplate(raw: RawChannelTemplate): ChannelTemplate {
   return {
     id: raw.id,
     name: raw.name,
-    templateType: raw.template_type ?? "channel",
     description: raw.description ?? null,
     channelType: raw.channel_type as "stream" | "forum",
     visibility: raw.visibility as "open" | "private",
@@ -97,7 +95,6 @@ export async function createChannelTemplate(
     await invokeTauri<RawChannelTemplate>("create_channel_template", {
       input: {
         name: input.name,
-        templateType: input.templateType,
         description: input.description,
         channelType: input.channelType,
         visibility: input.visibility,
@@ -119,7 +116,6 @@ export async function updateChannelTemplate(
       input: {
         id: input.id,
         name: input.name,
-        templateType: input.templateType,
         description: input.description,
         channelType: input.channelType,
         visibility: input.visibility,

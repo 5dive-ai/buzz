@@ -505,6 +505,7 @@ test("the new team card opens one create and import dialog with add-row agent se
         id: "existing-release-team",
         name: "Existing release team",
         description: "Coordinates releases.",
+        instructions: "Keep every release coordinated.",
         personaIds: ["custom:release-agent"],
       },
     ],
@@ -726,12 +727,57 @@ test("the new team card opens one create and import dialog with add-row agent se
     "Coordinates releases.",
   );
   await expect(dialog.getByLabel("Team Instructions")).toBeVisible();
+  await expect(dialog.getByLabel("Team Instructions")).toHaveValue(
+    "Keep every release coordinated.",
+  );
   await expect(dialog.getByTestId("team-import")).toHaveCount(0);
   await expect(
     dialog
       .getByTestId("team-agent-row-custom:release-agent")
       .getByRole("button", { exact: true, name: "Remove" }),
   ).toBeVisible();
+
+  await dialog.getByRole("button", { name: "Close" }).click();
+  await page
+    .getByRole("button", { name: "Existing release team team actions" })
+    .click();
+  await page.getByRole("menuitem", { exact: true, name: "Duplicate" }).click();
+  await expect(
+    dialog.getByRole("heading", {
+      exact: true,
+      name: "Duplicate Existing release team",
+    }),
+  ).toBeVisible();
+  await expect(dialog.getByLabel("Name")).toHaveValue(
+    "Existing release team copy",
+  );
+  await dialog.getByTestId("team-submit").click();
+
+  const duplicatePayload = await page.evaluate(() =>
+    (
+      (
+        window as Window & {
+          __BUZZ_E2E_COMMAND_LOG__?: Array<{
+            command: string;
+            payload: unknown;
+          }>;
+        }
+      ).__BUZZ_E2E_COMMAND_LOG__ ?? []
+    )
+      .filter((entry) => entry.command === "create_team")
+      .at(-1),
+  );
+  expect(duplicatePayload).toEqual({
+    command: "create_team",
+    payload: {
+      input: {
+        name: "Existing release team copy",
+        description: "Coordinates releases.",
+        instructions: "Keep every release coordinated.",
+        personaIds: ["custom:release-agent"],
+      },
+    },
+  });
 });
 
 test("team cards follow the agents grid alignment at compact widths", async ({

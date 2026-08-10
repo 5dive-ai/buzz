@@ -42,6 +42,7 @@ import {
   useLeaveChannelMutation,
 } from "@/features/channels/hooks";
 import { ChannelDeleteConfirmationDialog } from "@/features/channels/ui/ChannelManagementModerationActions";
+import { TemplateInfoTooltip } from "@/features/sidebar/ui/TemplateInfoTooltip";
 
 export type SectionDialogValue = {
   name: string;
@@ -184,8 +185,9 @@ function SectionNameDialog({
           </div>
           {templates ? (
             <div className="mt-3 flex min-h-11 items-center justify-between gap-4 rounded-xl border border-input bg-background px-3">
-              <span className="text-sm font-medium text-foreground">
+              <span className="inline-flex items-center gap-1 text-sm font-medium text-foreground">
                 Template
+                <TemplateInfoTooltip context="section" />
                 <span className="ml-1 text-xs font-normal text-muted-foreground/50">
                   Optional
                 </span>
@@ -193,7 +195,7 @@ function SectionNameDialog({
               <DropdownMenu modal={false}>
                 <DropdownMenuTrigger asChild>
                   <Button
-                    aria-label={`Section template: ${
+                    aria-label={`Template: ${
                       templates.find(
                         (template) => template.id === selectedTemplateId,
                       )?.name ?? "None"
@@ -239,7 +241,7 @@ function SectionNameDialog({
                         onSelect={() => setIsCreateTemplateOpen(true)}
                       >
                         <Plus className="size-4" />
-                        Create new section template
+                        Create new template
                       </DropdownMenuItem>
                     </>
                   ) : null}
@@ -268,7 +270,6 @@ function SectionNameDialog({
       </DialogContent>
       {allowTemplateCreation ? (
         <TemplateFormDialog
-          fixedTemplateType="section"
           onCreated={(template) => setSelectedTemplateId(template.id)}
           onOpenChange={setIsCreateTemplateOpen}
           open={isCreateTemplateOpen}
@@ -291,9 +292,6 @@ export function CreateSectionDialog({
   onConfirm,
 }: CreateSectionDialogProps) {
   const templatesQuery = useChannelTemplatesQuery();
-  const sectionTemplates = (templatesQuery.data ?? []).filter(
-    (template) => template.templateType === "section",
-  );
 
   return (
     <SectionNameDialog
@@ -302,7 +300,7 @@ export function CreateSectionDialog({
       title="Create section"
       description="Sections let you group related channels in the sidebar."
       initialValue=""
-      templates={sectionTemplates}
+      templates={templatesQuery.data ?? []}
       allowTemplateCreation
       confirmLabel="Create"
       isConfirmDisabled={(trimmed) => trimmed.length === 0}
@@ -329,9 +327,6 @@ export function RenameSectionDialog({
   onConfirm,
 }: RenameSectionDialogProps) {
   const templatesQuery = useChannelTemplatesQuery();
-  const sectionTemplates = (templatesQuery.data ?? []).filter(
-    (template) => template.templateType === "section",
-  );
 
   return (
     <SectionNameDialog
@@ -342,7 +337,7 @@ export function RenameSectionDialog({
       initialValue={sectionName}
       initialIcon={sectionIcon}
       initialTemplateId={sectionTemplateId}
-      templates={sectionTemplates}
+      templates={templatesQuery.data ?? []}
       confirmLabel="Save"
       isConfirmDisabled={(trimmed, icon, templateId) =>
         trimmed.length === 0 ||

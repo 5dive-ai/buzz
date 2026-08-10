@@ -5,7 +5,7 @@ use crate::{
     app_state::AppState,
     templates::{
         load_channel_templates, save_channel_templates, validate_channel_template_deletion,
-        ChannelTemplateRecord, CreateChannelTemplateRequest, TemplateType, TemplateWorktreeConfig,
+        ChannelTemplateRecord, CreateChannelTemplateRequest, TemplateWorktreeConfig,
         UpdateChannelTemplateRequest,
     },
     util::now_iso,
@@ -115,7 +115,6 @@ pub async fn create_channel_template(
 ) -> Result<ChannelTemplateRecord, String> {
     tokio::task::spawn_blocking(move || {
         let name = trim_required(&input.name, "Template name")?;
-        let template_type = input.template_type.unwrap_or(TemplateType::Channel);
         let description = trim_optional(input.description);
         let canvas_template = trim_optional(input.canvas_template);
         let project_folders =
@@ -138,7 +137,6 @@ pub async fn create_channel_template(
         let template = ChannelTemplateRecord {
             id: Uuid::new_v4().to_string(),
             name,
-            template_type,
             description,
             channel_type,
             visibility,
@@ -167,7 +165,6 @@ pub async fn update_channel_template(
 ) -> Result<ChannelTemplateRecord, String> {
     tokio::task::spawn_blocking(move || {
         let name = trim_required(&input.name, "Template name")?;
-        let requested_template_type = input.template_type;
         let description = trim_optional(input.description);
         let canvas_template = trim_optional(input.canvas_template);
         let project_folders =
@@ -189,10 +186,8 @@ pub async fn update_channel_template(
             .iter_mut()
             .find(|record| record.id == input.id)
             .ok_or_else(|| format!("template {} not found", input.id))?;
-        let template_type = requested_template_type.unwrap_or(template.template_type);
 
         template.name = name;
-        template.template_type = template_type;
         template.description = description;
         template.channel_type = channel_type;
         template.visibility = visibility;

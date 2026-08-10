@@ -98,8 +98,18 @@ export function buildTeamMentionCandidates(
   personas: AgentPersona[],
   candidates: readonly MentionCandidate[],
 ): MentionCandidate[] {
-  return teams.flatMap((team) => {
-    if (team.isBuiltin || !team.name.trim()) return [];
+  const individualNames = new Set(
+    candidates.flatMap((candidate) => {
+      if (candidate.kind === "team") return [];
+      const name = candidate.displayName?.trim().toLowerCase();
+      return name ? [name] : [];
+    }),
+  );
+
+  const eligibleTeams = teams.flatMap((team) => {
+    const displayName = team.name.trim();
+    const normalizedName = displayName.toLowerCase();
+    if (team.isBuiltin || !displayName) return [];
 
     const resolution = resolveTeamPersonas(team, personas);
     if (!resolution.isUsable) return [];
@@ -116,17 +126,38 @@ export function buildTeamMentionCandidates(
       mentionNames.add(mentionName);
     }
 
-    return [
-      {
-        kind: "team" as const,
-        teamId: team.id,
-        teamMembers,
-        displayName: team.name.trim(),
-        isMember: false,
-        isAgent: true,
-      },
-    ];
+    return [{ displayName, normalizedName, team, teamMembers }];
   });
+
+  const teamNameCounts = new Map<string, number>();
+  for (const team of eligibleTeams) {
+    teamNameCounts.set(
+      team.normalizedName,
+      (teamNameCounts.get(team.normalizedName) ?? 0) + 1,
+    );
+  }
+
+  return eligibleTeams.flatMap(
+    ({ displayName, normalizedName, team, teamMembers }) => {
+      if (
+        teamNameCounts.get(normalizedName) !== 1 ||
+        individualNames.has(normalizedName)
+      ) {
+        return [];
+      }
+
+      return [
+        {
+          kind: "team" as const,
+          teamId: team.id,
+          teamMembers,
+          displayName,
+          isMember: false,
+          isAgent: true,
+        },
+      ];
+    },
+  );
 }
 
 export function formatTeamMention(

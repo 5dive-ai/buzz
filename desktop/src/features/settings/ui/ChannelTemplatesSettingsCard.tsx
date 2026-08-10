@@ -31,7 +31,6 @@ import {
 import type {
   ChannelTemplate,
   CreateChannelTemplateInput,
-  TemplateType,
   UpdateChannelTemplateInput,
 } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
@@ -67,11 +66,11 @@ import {
   DEFAULT_WORKTREE_BASE_BRANCH,
   DEFAULT_WORKTREE_LOCATION,
 } from "./ChannelTemplateWorkspaceFields";
-import { TemplateStepIndicator, TemplateTypeStep } from "./TemplateTypeStep";
+import { TemplateStepIndicator } from "./TemplateStepIndicator";
 import { ChannelTemplateSavedIdentities } from "./ChannelTemplateSavedIdentities";
 
 const TEMPLATE_FORM_ID = "template-form";
-type TemplateFormPage = "type" | "details" | "agents";
+type TemplateFormPage = "details" | "agents";
 
 export function ChannelTemplatesSettingsCard() {
   const templatesQuery = useChannelTemplatesQuery();
@@ -85,12 +84,6 @@ export function ChannelTemplatesSettingsCard() {
     React.useState<ChannelTemplate | null>(null);
 
   const templates = templatesQuery.data ?? [];
-  const channelTemplates = templates.filter(
-    (template) => template.templateType === "channel",
-  );
-  const sectionTemplates = templates.filter(
-    (template) => template.templateType === "section",
-  );
 
   function handleDuplicate(template: ChannelTemplate) {
     duplicateMutation.mutate(template.id, {
@@ -124,9 +117,7 @@ export function ChannelTemplatesSettingsCard() {
     <section className="min-w-0" data-testid="settings-channel-templates">
       <SettingsSectionHeader
         title="Templates"
-        description={
-          <>Save reusable defaults for new channels and channel sections.</>
-        }
+        description={<>Save reusable configurations for new channels.</>}
         action={
           <Button
             onClick={() => setIsCreateOpen(true)}
@@ -135,7 +126,7 @@ export function ChannelTemplatesSettingsCard() {
             variant="outline"
           >
             <Plus className="mr-1.5 h-4 w-4" />
-            Create
+            New template
           </Button>
         }
       />
@@ -145,26 +136,13 @@ export function ChannelTemplatesSettingsCard() {
           Loading templates...
         </p>
       ) : (
-        <div className="space-y-7">
-          <TemplateList
-            emptyCopy="No channel templates yet."
-            onDelete={setDeleteTarget}
-            onDuplicate={handleDuplicate}
-            onEdit={setEditingTemplate}
-            templates={channelTemplates}
-            title="Channel templates"
-            type="channel"
-          />
-          <TemplateList
-            emptyCopy="No section templates yet."
-            onDelete={setDeleteTarget}
-            onDuplicate={handleDuplicate}
-            onEdit={setEditingTemplate}
-            templates={sectionTemplates}
-            title="Section templates"
-            type="section"
-          />
-        </div>
+        <TemplateList
+          emptyCopy="No templates yet."
+          onDelete={setDeleteTarget}
+          onDuplicate={handleDuplicate}
+          onEdit={setEditingTemplate}
+          templates={templates}
+        />
       )}
 
       <TemplateFormDialog
@@ -213,16 +191,12 @@ export function ChannelTemplatesSettingsCard() {
 }
 
 function TemplateList({
-  title,
-  type,
   templates,
   emptyCopy,
   onEdit,
   onDuplicate,
   onDelete,
 }: {
-  title: string;
-  type: TemplateType;
   templates: ChannelTemplate[];
   emptyCopy: string;
   onEdit: (template: ChannelTemplate) => void;
@@ -230,8 +204,7 @@ function TemplateList({
   onDelete: (template: ChannelTemplate) => void;
 }) {
   return (
-    <div className="space-y-3" data-testid={`${type}-templates-list`}>
-      <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+    <div className="space-y-3" data-testid="templates-list">
       {templates.length === 0 ? (
         <div className="rounded-xl border border-dashed border-border/70 bg-muted/15 px-4 py-6 text-center text-sm text-muted-foreground">
           {emptyCopy}
@@ -396,15 +369,11 @@ export function TemplateFormDialog({
   open,
   onOpenChange,
   onCreated,
-  initialTemplateType = "channel",
-  fixedTemplateType,
 }: {
   template: ChannelTemplate | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated?: (template: ChannelTemplate) => void;
-  initialTemplateType?: TemplateType;
-  fixedTemplateType?: TemplateType;
 }) {
   const isEditing = template !== null;
   const createMutation = useCreateChannelTemplateMutation();
@@ -412,14 +381,9 @@ export function TemplateFormDialog({
   const personasQuery = usePersonasQuery();
   const teamsQuery = useTeamsQuery();
   const shouldReduceMotion = useReducedMotion() ?? false;
-  const dialogContentRef = React.useRef<HTMLDivElement>(null);
 
-  const [page, setPage] = React.useState<TemplateFormPage>(
-    template || fixedTemplateType ? "details" : "type",
-  );
+  const [page, setPage] = React.useState<TemplateFormPage>("details");
   const [pageDirection, setPageDirection] = React.useState<1 | -1>(1);
-  const [templateType, setTemplateType] =
-    React.useState<TemplateType>("channel");
   const [name, setName] = React.useState("");
   const [canvasTemplate, setCanvasTemplate] = React.useState("");
   const [isCanvasOpen, setIsCanvasOpen] = React.useState(false);
@@ -443,7 +407,6 @@ export function TemplateFormDialog({
   >({});
 
   const isPending = createMutation.isPending || updateMutation.isPending;
-  const isTypePage = page === "type";
   const isAgentPage = page === "agents";
   const detailsValid =
     name.trim().length > 0 &&
@@ -452,11 +415,10 @@ export function TemplateFormDialog({
 
   React.useEffect(() => {
     if (!open) return;
-    setPage(template || fixedTemplateType ? "details" : "type");
+    setPage("details");
     setPageDirection(1);
     setIsCanvasOpen(false);
     if (template) {
-      setTemplateType(template.templateType);
       setName(template.name);
       setCanvasTemplate(template.canvasTemplate ?? "");
       setProjectFolders(template.projectFolders);
@@ -478,7 +440,6 @@ export function TemplateFormDialog({
       }
       setTeamRuntimes(tRuntimes);
     } else {
-      setTemplateType(fixedTemplateType ?? initialTemplateType);
       setName("");
       setCanvasTemplate("");
       setProjectFolders([]);
@@ -490,30 +451,20 @@ export function TemplateFormDialog({
       setPersonaRuntimes({});
       setTeamRuntimes({});
     }
-  }, [fixedTemplateType, initialTemplateType, open, template]);
+  }, [open, template]);
 
   function showAgentPage() {
     setPageDirection(1);
     setPage("agents");
   }
 
-  function showTypePage() {
-    if (fixedTemplateType) return;
-    setPageDirection(-1);
-    setPage("type");
-  }
-
   function showDetailsPage() {
-    setPageDirection(page === "type" ? 1 : -1);
+    setPageDirection(-1);
     setPage("details");
   }
 
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
-    if (!isEditing && page === "type") {
-      showDetailsPage();
-      return;
-    }
     if (!isEditing && page === "details") {
       if (detailsValid) showAgentPage();
       return;
@@ -545,7 +496,6 @@ export function TemplateFormDialog({
       const input: UpdateChannelTemplateInput = {
         id: template.id,
         name: trimmedName,
-        templateType: template.templateType,
         description: template.description ?? undefined,
         canvasTemplate: canvasTemplate.trim() || undefined,
         projectFolders,
@@ -572,7 +522,6 @@ export function TemplateFormDialog({
     } else {
       const input: CreateChannelTemplateInput = {
         name: trimmedName,
-        templateType,
         canvasTemplate: canvasTemplate.trim() || undefined,
         projectFolders,
         worktree: worktreeEnabled
@@ -648,29 +597,15 @@ export function TemplateFormDialog({
   const dialogHeight =
     isEditing || isAgentPage || isCanvasOpen || worktreeEnabled
       ? "min(42rem, 85vh)"
-      : isTypePage
-        ? "min(27rem, 85vh)"
-        : "min(31rem, 85vh)";
+      : "min(31rem, 85vh)";
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
       <ChooserDialogContent
-        className={isTypePage ? "max-w-2xl" : "max-w-xl"}
+        className="max-w-xl"
         contentClassName="h-full pt-3"
         data-testid="channel-template-dialog"
-        onOpenAutoFocus={(event) => {
-          if (!isTypePage) return;
-          event.preventDefault();
-          dialogContentRef.current?.focus({ preventScroll: true });
-        }}
-        ref={dialogContentRef}
-        title={
-          isEditing
-            ? `Edit ${template.templateType} template`
-            : isTypePage
-              ? "Create template"
-              : `Create ${templateType} template`
-        }
+        title={isEditing ? "Edit template" : "Create new template"}
         headerSubtitle={
           isEditing
             ? isAgentPage
@@ -690,12 +625,10 @@ export function TemplateFormDialog({
                 <ArrowLeft className="mr-1.5 h-4 w-4" />
                 Back
               </Button>
-            ) : !isEditing &&
-              !isTypePage &&
-              (!fixedTemplateType || isAgentPage) ? (
+            ) : !isEditing && isAgentPage ? (
               <Button
                 disabled={isPending}
-                onClick={isAgentPage ? showDetailsPage : showTypePage}
+                onClick={showDetailsPage}
                 type="button"
                 variant="ghost"
               >
@@ -724,15 +657,6 @@ export function TemplateFormDialog({
                   type="button"
                 >
                   Done
-                </Button>
-              ) : !isEditing && isTypePage ? (
-                <Button
-                  disabled={isPending}
-                  key="show-template-details"
-                  onClick={showDetailsPage}
-                  type="button"
-                >
-                  Next
                 </Button>
               ) : !isEditing && !isAgentPage ? (
                 <Button
@@ -785,9 +709,7 @@ export function TemplateFormDialog({
         >
           {!isEditing ? (
             <div className="mb-5 shrink-0">
-              <TemplateStepIndicator
-                step={isTypePage ? 1 : isAgentPage ? 3 : 2}
-              />
+              <TemplateStepIndicator step={isAgentPage ? 2 : 1} />
             </div>
           ) : null}
           <AnimatePresence initial={false} mode="popLayout">
@@ -816,18 +738,7 @@ export function TemplateFormDialog({
                 ease: [0.23, 1, 0.32, 1],
               }}
             >
-              {isTypePage ? (
-                <div
-                  className="min-h-0 flex-1 overflow-y-auto"
-                  data-testid="template-type-page"
-                >
-                  <TemplateTypeStep
-                    disabled={isPending}
-                    onChange={setTemplateType}
-                    value={templateType}
-                  />
-                </div>
-              ) : !isAgentPage ? (
+              {!isAgentPage ? (
                 <div
                   className="min-h-0 flex-1 overflow-y-auto pr-1"
                   data-testid="channel-template-details-page"

@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 pub struct ChannelTemplateRecord {
     pub id: String,
     pub name: String,
-    #[serde(default)]
-    pub template_type: TemplateType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default = "default_channel_type")]
@@ -27,14 +25,6 @@ pub struct ChannelTemplateRecord {
     pub is_builtin: bool,
     pub created_at: String,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TemplateType {
-    #[default]
-    Channel,
-    Section,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -98,7 +88,6 @@ fn default_visibility() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct CreateChannelTemplateRequest {
     pub name: String,
-    pub template_type: Option<TemplateType>,
     pub description: Option<String>,
     pub channel_type: Option<String>,
     pub visibility: Option<String>,
@@ -116,7 +105,6 @@ pub struct CreateChannelTemplateRequest {
 pub struct UpdateChannelTemplateRequest {
     pub id: String,
     pub name: String,
-    pub template_type: Option<TemplateType>,
     pub description: Option<String>,
     pub channel_type: Option<String>,
     pub visibility: Option<String>,

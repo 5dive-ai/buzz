@@ -212,3 +212,32 @@ test("teams with identity and persona display-name collisions are not suggested"
     [],
   );
 });
+
+test("teams with duplicate names are not suggested", () => {
+  const builder = persona("builder", "Builder");
+
+  assert.deepEqual(
+    buildTeamMentionCandidates(
+      [
+        team("launch-one", ["builder"]),
+        team("launch-two", ["builder"], { name: " launch team " }),
+      ],
+      [builder],
+      [],
+    ),
+    [],
+  );
+});
+
+test("teams sharing a display name with an individual are not suggested", () => {
+  const builder = persona("builder", "Builder");
+
+  assert.deepEqual(
+    buildTeamMentionCandidates(
+      [team("launch", ["builder"])],
+      [builder],
+      [identity("individual", "Launch Team", { pubkey: "1".repeat(64) })],
+    ),
+    [],
+  );
+});

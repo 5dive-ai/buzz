@@ -81,14 +81,12 @@ mod tests {
     use super::sort_channel_templates;
     use crate::templates::{
         validate_channel_template_deletion, ChannelTemplateRecord, TemplateAgentRoster,
-        TemplateType,
     };
 
     fn template(id: &str, name: &str) -> ChannelTemplateRecord {
         ChannelTemplateRecord {
             id: id.to_string(),
             name: name.to_string(),
-            template_type: TemplateType::Channel,
             description: None,
             channel_type: "stream".to_string(),
             visibility: "open".to_string(),
@@ -155,7 +153,6 @@ mod tests {
         let original = ChannelTemplateRecord {
             id: "t1".to_string(),
             name: "Sprint Planning".to_string(),
-            template_type: TemplateType::Section,
             description: Some("Template for sprint channels".to_string()),
             channel_type: "stream".to_string(),
             visibility: "private".to_string(),
@@ -195,7 +192,6 @@ mod tests {
         let parsed: ChannelTemplateRecord = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed.id, original.id);
-        assert_eq!(parsed.template_type, TemplateType::Section);
         assert_eq!(parsed.name, original.name);
         assert_eq!(parsed.description, original.description);
         assert_eq!(parsed.channel_type, original.channel_type);
@@ -226,10 +222,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_template_defaults_to_channel_type() {
+    fn legacy_template_type_is_ignored() {
         let json = serde_json::json!({
             "id": "legacy",
             "name": "Legacy template",
+            "template_type": "section",
             "channel_type": "stream",
             "visibility": "open",
             "agents": {},
@@ -239,7 +236,8 @@ mod tests {
         });
 
         let parsed: ChannelTemplateRecord = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.template_type, TemplateType::Channel);
+        let serialized = serde_json::to_value(parsed).unwrap();
+        assert!(serialized.get("template_type").is_none());
     }
 
     #[test]

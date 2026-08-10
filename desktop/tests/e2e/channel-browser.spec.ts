@@ -42,7 +42,6 @@ test.beforeEach(async ({ page }, testInfo) => {
           {
             id: "engineering-defaults",
             name: "Engineering defaults",
-            templateType: "section" as const,
             description: "Inherited section channel",
             channelType: "stream" as const,
             visibility: "private" as const,
@@ -58,7 +57,6 @@ test.beforeEach(async ({ page }, testInfo) => {
           {
             id: "channel-only",
             name: "Channel only",
-            templateType: "channel" as const,
             description: null,
             channelType: "stream" as const,
             visibility: "open" as const,
@@ -74,7 +72,6 @@ test.beforeEach(async ({ page }, testInfo) => {
           {
             id: "product-defaults",
             name: "Product defaults",
-            templateType: "section" as const,
             description: "Inherited product channel",
             channelType: "stream" as const,
             visibility: "open" as const,
@@ -303,6 +300,19 @@ test("sidebar add-channel button creates without treating the click as a callbac
   await expect(page.getByTestId("stream-list")).toContainText(channelName);
 });
 
+test("Channels actions menu creates a section", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByTestId("section-actions-channels").click();
+  await page.getByRole("menuitem", { name: "Create section" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "Create section" });
+  await dialog.getByPlaceholder("Section name").fill("Planning");
+  await dialog.getByRole("button", { name: "Create", exact: true }).click();
+
+  await expect(page.getByText("Planning", { exact: true })).toBeVisible();
+});
+
 test("custom section add button creates directly into that section", async ({
   page,
 }) => {
@@ -339,9 +349,20 @@ test("new-section flow stores a section template selection", async ({
 
   const dialog = page.getByRole("dialog", { name: "Create section" });
   await dialog.getByPlaceholder("Section name").fill("Engineering");
+  const templateInfo = dialog.getByRole("button", {
+    name: "About section templates",
+  });
+  await expect(templateInfo).toBeVisible();
+  await templateInfo.hover();
+  await expect(page.getByRole("tooltip")).toHaveText(
+    "A template is a reusable channel configuration. New channels in this section automatically use the selected template.",
+  );
   const templateControl = dialog.getByTestId("create-section-template");
   await expect(templateControl).toHaveText("None");
   await templateControl.click();
+  await expect(
+    page.getByRole("menuitemradio", { name: "Channel only" }),
+  ).toBeVisible();
   await page
     .getByRole("menuitemradio", { name: "Engineering defaults" })
     .click();
@@ -379,14 +400,12 @@ test("create-section flow creates and preselects a new section template", async 
   await sectionDialog.getByPlaceholder("Section name").fill("Product");
   const templateControl = sectionDialog.getByTestId("create-section-template");
   await templateControl.click();
-  await page
-    .getByRole("menuitem", { name: "Create new section template" })
-    .click();
+  await page.getByRole("menuitem", { name: "Create new template" }).click();
 
   const templateDialog = page.getByTestId("channel-template-dialog");
   await expect(
     templateDialog.getByRole("heading", {
-      name: "Create section template",
+      name: "Create new template",
       exact: true,
     }),
   ).toBeVisible();
@@ -407,9 +426,16 @@ test("create-section flow creates and preselects a new section template", async 
   );
   expect(createTemplateCall?.payload).toEqual(
     expect.objectContaining({
-      input: expect.objectContaining({ templateType: "section" }),
+      input: expect.objectContaining({ name: "Product launch" }),
     }),
   );
+  expect(
+    (
+      createTemplateCall?.payload as
+        | { input: { templateType?: string } }
+        | undefined
+    )?.input.templateType,
+  ).toBeUndefined();
   await sectionDialog
     .getByRole("button", { name: "Create", exact: true })
     .click();
@@ -465,9 +491,6 @@ test("custom section inherits section template defaults for new channels", async
   ).not.toContainText("Optional");
   await expect(
     page.getByRole("menuitem", { name: "Create new template" }),
-  ).toHaveCount(0);
-  await expect(
-    page.getByRole("menuitem", { name: "Create new section template" }),
   ).toHaveCount(0);
   await expect(page.getByTestId("create-channel-description")).toHaveValue(
     "Inherited section channel",

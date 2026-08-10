@@ -133,6 +133,8 @@ export function TeamDialog({
   function buildSubmitInput(): CreateTeamInput | UpdateTeamInput {
     const baseInput = {
       name,
+      description: teamDescription.trim() || undefined,
+      instructions: instructions.trim() || undefined,
       personaIds: filterAvailablePersonaIds(selectedPersonaIds, personas),
     };
 
@@ -140,8 +142,6 @@ export function TeamDialog({
       return {
         id: initialValues.id,
         ...baseInput,
-        description: teamDescription.trim() || undefined,
-        instructions: instructions.trim() || undefined,
       };
     }
     return baseInput;

@@ -431,12 +431,11 @@ export function AppSidebar({
   }, [streamChannels, starredChannelIds, sortModeFor]);
 
   const handleCreateSectionForChannel = React.useCallback(
-    (channelId: string) => {
+    (channelId: string | null = null) => {
       setCreateSectionState({ open: true, pendingChannelId: channelId });
     },
     [],
   );
-
   const handleCreateSectionConfirm = React.useCallback(
     (value: SectionDialogValue) => {
       const section = createSection(value.name, value.icon, value.templateId);
@@ -756,6 +755,7 @@ export function AppSidebar({
                       onAssignChannel={assignChannel}
                       onUnassignChannel={unassignChannel}
                       onCreateSectionForChannel={handleCreateSectionForChannel}
+                      onCreateSection={handleCreateSectionForChannel}
                       mutedChannelIds={mutedChannelIds}
                       onMuteChannel={onMuteChannel}
                       onUnmuteChannel={onUnmuteChannel}

@@ -18,7 +18,6 @@ export type TemplateTeamEntry = {
 };
 
 export type TemplateWorktreeConfig = { location: string; baseBranch: string };
-export type TemplateType = "channel" | "section";
 export type TemplateAgents = {
   personas: TemplateAgentEntry[];
   teams: TemplateTeamEntry[];
@@ -27,7 +26,6 @@ export type TemplateAgents = {
 export type ChannelTemplate = {
   id: string;
   name: string;
-  templateType: TemplateType;
   description: string | null;
   channelType: "stream" | "forum";
   visibility: "open" | "private";
@@ -44,7 +42,6 @@ export type ChannelTemplate = {
 
 export type CreateChannelTemplateInput = {
   name: string;
-  templateType?: TemplateType;
   description?: string;
   channelType?: string;
   visibility?: string;
@@ -59,7 +56,6 @@ export type CreateChannelTemplateInput = {
 export type UpdateChannelTemplateInput = {
   id: string;
   name: string;
-  templateType?: TemplateType;
   description?: string;
   channelType?: string;
   visibility?: string;

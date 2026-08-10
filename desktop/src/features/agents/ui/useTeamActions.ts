@@ -186,6 +186,8 @@ export function useTeamActions(
       submitLabel: "Create team",
       initialValues: {
         name: `${team.name} copy`,
+        description: team.description ?? undefined,
+        instructions: team.instructions ?? undefined,
         personaIds: [...team.personaIds],
       },
     });

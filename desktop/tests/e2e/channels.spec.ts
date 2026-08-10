@@ -1376,7 +1376,6 @@ test("create channel template selector matches the lifecycle controls", async ({
       {
         id: "project-kickoff",
         name: "Project kickoff",
-        templateType: "channel",
         description: "Coordinate a new project from planning through launch.",
         channelType: "stream",
         visibility: "private",
@@ -1416,7 +1415,6 @@ test("create channel template selector matches the lifecycle controls", async ({
       {
         id: "engineering-section",
         name: "Engineering section",
-        templateType: "section",
         description: null,
         channelType: "stream",
         visibility: "open",
@@ -1455,6 +1453,15 @@ test("create channel template selector matches the lifecycle controls", async ({
   await page.goto("/");
   await openCreateChannelDialog(page);
 
+  const templateInfo = page.getByRole("button", {
+    name: "About channel templates",
+  });
+  await expect(templateInfo).toBeVisible();
+  await templateInfo.hover();
+  await expect(page.getByRole("tooltip")).toHaveText(
+    "A template is a reusable channel configuration. Choose one to apply its settings to this channel.",
+  );
+
   const templateControl = page.getByTestId("create-channel-template");
   await expect(templateControl).toHaveRole("button");
   await expect(templateControl).toHaveText("None");
@@ -1464,7 +1471,7 @@ test("create channel template selector matches the lifecycle controls", async ({
   ).toBeVisible();
   await expect(
     page.getByRole("menuitemradio", { name: "Engineering section" }),
-  ).toHaveCount(0);
+  ).toBeVisible();
   await page.getByRole("menuitemradio", { name: "Project kickoff" }).click();
 
   await expect(templateControl).toHaveText("Project kickoff");
@@ -1521,7 +1528,6 @@ test("channel template settings use structured cards with visible actions", asyn
       {
         id: "project-kickoff",
         name: "Project kickoff",
-        templateType: "channel",
         description: "Legacy description that is no longer presented.",
         channelType: "stream",
         visibility: "private",
@@ -1558,7 +1564,6 @@ test("channel template settings use structured cards with visible actions", asyn
       {
         id: "engineering-section",
         name: "Engineering section",
-        templateType: "section",
         description: null,
         channelType: "stream",
         visibility: "open",
@@ -1600,12 +1605,9 @@ test("channel template settings use structured cards with visible actions", asyn
   await expect(
     page.getByRole("heading", { name: "Templates", exact: true }),
   ).toBeVisible();
-  const channelTemplateList = page.getByTestId("channel-templates-list");
-  const sectionTemplateList = page.getByTestId("section-templates-list");
-  await expect(channelTemplateList).toContainText("Project kickoff");
-  await expect(channelTemplateList).not.toContainText("Engineering section");
-  await expect(sectionTemplateList).toContainText("Engineering section");
-  await expect(sectionTemplateList).not.toContainText("Project kickoff");
+  const templateList = page.getByTestId("templates-list");
+  await expect(templateList).toContainText("Project kickoff");
+  await expect(templateList).toContainText("Engineering section");
 
   const row = page.getByTestId("channel-template-row-project-kickoff");
   await expect(row).toBeVisible();
@@ -1741,7 +1743,7 @@ test("channel template settings use structured cards with visible actions", asyn
   );
 });
 
-test("create channel template uses the grouped agent team and agent picker", async ({
+test("create template uses the grouped agent team and agent picker", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -1807,7 +1809,7 @@ test("create channel template uses the grouped agent team and agent picker", asy
   await openSettings(page, "channel-templates");
   await page
     .getByTestId("settings-channel-templates")
-    .getByRole("button", { name: "Create", exact: true })
+    .getByRole("button", { name: "New template", exact: true })
     .click();
 
   const dialog = page.getByTestId("channel-template-dialog");
@@ -1823,134 +1825,24 @@ test("create channel template uses the grouped agent team and agent picker", asy
   await expect(dialog).toBeVisible();
   await expect(
     dialog.getByRole("heading", {
-      name: "Create template",
+      name: "Create new template",
       exact: true,
     }),
   ).toBeVisible();
   const stepIndicator = dialog.getByTestId("template-step-indicator");
   await expect(stepIndicator).toHaveAttribute("aria-valuenow", "1");
+  await expect(stepIndicator).toHaveAttribute("aria-valuemax", "2");
   await expect(stepIndicator.locator('[data-state="active"]')).toHaveCount(1);
-  await expect(stepIndicator.locator('[data-state="future"]')).toHaveCount(2);
-  await expect(dialog.getByTestId("template-type-page")).toBeVisible();
+  await expect(stepIndicator.locator('[data-state="future"]')).toHaveCount(1);
+  await expect(dialog.getByTestId("template-type-page")).toHaveCount(0);
   await expect(
     dialog.getByRole("button", { name: "Cancel", exact: true }),
   ).toHaveCount(0);
-  const channelType = dialog.getByTestId("template-type-channel");
-  const sectionType = dialog.getByTestId("template-type-section");
-  const channelTypeCard = channelType.locator("..");
-  await expect(channelType).toBeChecked();
-  await expect(sectionType).not.toBeChecked();
-  await expect(dialog).toBeFocused();
-  await expect(channelTypeCard).toHaveCSS("box-shadow", "none");
-  await page.keyboard.press("Tab");
-  await expect(channelType).toBeFocused();
-  await expect(channelTypeCard).not.toHaveCSS("box-shadow", "none");
-  await expect(
-    dialog.getByText("Choose what this template configures.", { exact: true }),
-  ).toHaveCount(0);
-  await waitForAnimations(page);
-  const channelTypeBox = await channelTypeCard.boundingBox();
-  const sectionTypeBox = await sectionType.locator("..").boundingBox();
-  const typeDialogBox = await dialog.boundingBox();
-  expect(channelTypeBox).not.toBeNull();
-  expect(sectionTypeBox).not.toBeNull();
-  expect(typeDialogBox?.width ?? 0).toBeGreaterThanOrEqual(640);
-  expect(channelTypeBox?.height ?? 0).toBeGreaterThanOrEqual(192);
-  expect(channelTypeBox?.y).toBe(sectionTypeBox?.y);
-  expect(channelTypeBox?.x ?? 0).toBeLessThan(sectionTypeBox?.x ?? 0);
-  await expect(
-    dialog.getByText("Set defaults for one new channel.", { exact: true }),
-  ).toHaveClass(/text-muted-foreground/);
-  await expect(dialog.getByTestId("template-type-copy-channel")).toHaveClass(
-    /mt-auto/,
-  );
-  const neutralColors = await dialog.evaluate(() => {
-    const channelInput = document.querySelector(
-      '[data-testid="template-type-channel"]',
-    );
-    const sectionInput = document.querySelector(
-      '[data-testid="template-type-section"]',
-    );
-    const channelIcon = document.querySelector(
-      '[data-testid="template-type-icon-channel"]',
-    );
-    const sectionIcon = document.querySelector(
-      '[data-testid="template-type-icon-section"]',
-    );
-    return {
-      selectedCard: channelInput?.parentElement
-        ? getComputedStyle(channelInput.parentElement).backgroundColor
-        : null,
-      unselectedCard: sectionInput?.parentElement
-        ? getComputedStyle(sectionInput.parentElement).backgroundColor
-        : null,
-      selectedIcon: channelIcon
-        ? getComputedStyle(channelIcon).backgroundColor
-        : null,
-      unselectedIcon: sectionIcon
-        ? getComputedStyle(sectionIcon).backgroundColor
-        : null,
-    };
-  });
-  expect(neutralColors.selectedCard).toBe(neutralColors.unselectedCard);
-  expect(neutralColors.selectedIcon).toBe(neutralColors.unselectedIcon);
-  await expect(sectionType.locator("..")).toHaveClass(/hover:bg-input\/30/);
   await expect(dialog).toHaveCSS("transition-property", "height, max-width");
   await expect(dialog).toHaveCSS("transition-duration", "0.22s");
   expect(await dialog.evaluate((element) => element.style.height)).toBe(
-    "min(27rem, 85vh)",
-  );
-  await sectionType.locator("..").click();
-  await expect(sectionType).toBeChecked();
-  await dialog.getByRole("button", { name: "Next", exact: true }).click();
-  await expect(
-    dialog.getByRole("heading", {
-      name: "Create section template",
-      exact: true,
-    }),
-  ).toBeVisible();
-  await expect(
-    dialog.getByRole("button", { name: "Cancel", exact: true }),
-  ).toHaveCount(0);
-  await dialog.locator("#template-name").fill("Section defaults");
-  await expectFilledTemplateNameForeground();
-  await dialog.locator("#template-name").fill("");
-  await dialog.getByRole("button", { name: "Back", exact: true }).click();
-  await channelType.locator("..").click();
-  await dialog.getByRole("button", { name: "Next", exact: true }).click();
-  await expect(stepIndicator).toHaveAttribute("aria-valuenow", "2");
-  await expect(
-    dialog.getByRole("heading", {
-      name: "Create channel template",
-      exact: true,
-    }),
-  ).toBeVisible();
-  await expect(
-    dialog.getByRole("button", { name: "Cancel", exact: true }),
-  ).toHaveCount(0);
-  expect(await dialog.evaluate((element) => element.style.height)).toBe(
     "min(31rem, 85vh)",
   );
-  await dialog.getByRole("button", { name: "Back", exact: true }).click();
-  await expect(stepIndicator).toHaveAttribute("aria-valuenow", "1");
-  await expect(dialog.getByTestId("template-type-page")).toBeVisible();
-  expect(await dialog.evaluate((element) => element.style.height)).toBe(
-    "min(27rem, 85vh)",
-  );
-  await expect(
-    dialog.getByRole("heading", { name: "Create template", exact: true }),
-  ).toBeVisible();
-  const typePageMetrics = await dialog
-    .getByTestId("template-type-page")
-    .evaluate((element) => ({
-      clientHeight: element.clientHeight,
-      scrollHeight: element.scrollHeight,
-    }));
-  expect(typePageMetrics.scrollHeight).toBeLessThanOrEqual(
-    typePageMetrics.clientHeight + 1,
-  );
-  await dialog.getByRole("button", { name: "Next", exact: true }).click();
-  await expect(stepIndicator).toHaveAttribute("aria-valuenow", "2");
   await expect(
     dialog.getByRole("button", { name: "Cancel", exact: true }),
   ).toHaveCount(0);
@@ -2113,7 +2005,7 @@ test("create channel template uses the grouped agent team and agent picker", asy
   await page.locator("#template-name").fill("Weekly planning");
   await expectFilledTemplateNameForeground();
   await dialog.getByRole("button", { name: "Next", exact: true }).click();
-  await expect(stepIndicator).toHaveAttribute("aria-valuenow", "3");
+  await expect(stepIndicator).toHaveAttribute("aria-valuenow", "2");
   await expect(
     dialog.getByTestId("channel-template-agents-page"),
   ).toBeVisible();
@@ -2203,7 +2095,7 @@ test("create channel template uses the grouped agent team and agent picker", asy
   ).toBeVisible();
 
   await dialog.getByRole("button", { name: "Back", exact: true }).click();
-  await expect(stepIndicator).toHaveAttribute("aria-valuenow", "2");
+  await expect(stepIndicator).toHaveAttribute("aria-valuenow", "1");
   await expect(page.locator("#template-name")).toHaveValue("Weekly planning");
   await expect(firstProjectFolder).toHaveText("/Users/dev/projects/sprout");
   await expect(
@@ -2244,7 +2136,6 @@ test("create channel template uses the grouped agent team and agent picker", asy
   expect(createTemplateCall?.payload).toEqual(
     expect.objectContaining({
       input: expect.objectContaining({
-        templateType: "channel",
         canvasTemplate: "# Weekly planning",
         projectFolders: [
           "/Users/dev/projects/sprout",
@@ -2265,29 +2156,33 @@ test("create channel template uses the grouped agent team and agent picker", asy
       }),
     }),
   );
-  await expect(page.getByTestId("channel-templates-list")).toContainText(
+  expect(
+    (
+      createTemplateCall?.payload as
+        | { input: { templateType?: string } }
+        | undefined
+    )?.input.templateType,
+  ).toBeUndefined();
+  await expect(page.getByTestId("templates-list")).toContainText(
     "Weekly planning",
   );
 });
 
-test("create channel template wizard respects reduced motion", async ({
-  page,
-}) => {
+test("create template wizard respects reduced motion", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
   await openSettings(page, "channel-templates");
   await page
     .getByTestId("settings-channel-templates")
-    .getByRole("button", { name: "Create", exact: true })
+    .getByRole("button", { name: "New template", exact: true })
     .click();
 
   const dialog = page.getByTestId("channel-template-dialog");
   await expect(dialog).toHaveCSS("transition-property", "height, max-width");
   await expect(dialog).toHaveCSS("transition-duration", "0s");
-  await dialog.getByRole("button", { name: "Next", exact: true }).click();
   await expect(
     dialog.getByRole("heading", {
-      name: "Create channel template",
+      name: "Create new template",
       exact: true,
     }),
   ).toBeVisible();

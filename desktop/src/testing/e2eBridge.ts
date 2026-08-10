@@ -142,6 +142,7 @@ type MockTeamSeed = {
   id?: string;
   name: string;
   description?: string | null;
+  instructions?: string | null;
   personaIds: string[];
 };
 
@@ -930,6 +931,7 @@ type RawTeam = {
   id: string;
   name: string;
   description: string | null;
+  instructions: string | null;
   persona_ids: string[];
   is_builtin: boolean;
   source_dir: string | null;
@@ -2413,6 +2415,7 @@ function resetMockTeams(config?: E2eConfig) {
       id: "team-engineering-001",
       name: "Engineering",
       description: "Core engineering personas",
+      instructions: null,
       persona_ids: [],
       is_builtin: false,
       source_dir: null,
@@ -2426,6 +2429,7 @@ function resetMockTeams(config?: E2eConfig) {
       id: "team-research-002",
       name: "Research Agents",
       description: "Directory-backed research team",
+      instructions: null,
       persona_ids: [],
       is_builtin: false,
       source_dir: "/Users/dev/agents/research",
@@ -2439,6 +2443,7 @@ function resetMockTeams(config?: E2eConfig) {
       id: "team-platform-003",
       name: "Platform Tools",
       description: "Symlinked platform team",
+      instructions: null,
       persona_ids: [],
       is_builtin: false,
       source_dir: "/Users/dev/agents/platform",
@@ -2455,6 +2460,7 @@ function resetMockTeams(config?: E2eConfig) {
       id: team.id ?? crypto.randomUUID(),
       name: team.name,
       description: team.description ?? null,
+      instructions: team.instructions ?? null,
       persona_ids: [...team.personaIds],
       is_builtin: false,
       source_dir: null,
@@ -8190,6 +8196,7 @@ async function handleCreateTeam(args: {
   input: {
     name: string;
     description?: string;
+    instructions?: string;
     personaIds: string[];
   };
 }): Promise<RawTeam> {
@@ -8199,6 +8206,7 @@ async function handleCreateTeam(args: {
     id: crypto.randomUUID(),
     name: args.input.name.trim(),
     description: args.input.description?.trim() || null,
+    instructions: args.input.instructions?.trim() || null,
     persona_ids: [...args.input.personaIds],
     is_builtin: false,
     source_dir: null,
@@ -8217,6 +8225,7 @@ async function handleUpdateTeam(args: {
     id: string;
     name: string;
     description?: string;
+    instructions?: string;
     personaIds: string[];
   };
 }): Promise<RawTeam> {
@@ -8228,6 +8237,7 @@ async function handleUpdateTeam(args: {
   ensureMockPersonaIdsAreActive(args.input.personaIds);
   team.name = args.input.name.trim();
   team.description = args.input.description?.trim() || null;
+  team.instructions = args.input.instructions?.trim() || null;
   team.persona_ids = [...args.input.personaIds];
   team.updated_at = new Date().toISOString();
 
@@ -8274,6 +8284,7 @@ async function handleInstallTeamFromDirectory(args: {
     id: crypto.randomUUID(),
     name: "Installed Team",
     description: null,
+    instructions: null,
     persona_ids: [],
     is_builtin: false,
     source_dir: args.path,
@@ -11963,7 +11974,6 @@ export function maybeInstallE2eTauriMocks() {
         return (activeConfig?.mock?.channelTemplates ?? []).map((template) => ({
           id: template.id,
           name: template.name,
-          template_type: template.templateType,
           description: template.description,
           channel_type: template.channelType,
           visibility: template.visibility,
@@ -11980,7 +11990,6 @@ export function maybeInstallE2eTauriMocks() {
         const { input } = payload as {
           input: {
             name: string;
-            templateType?: "channel" | "section";
             description?: string;
             channelType?: "stream" | "forum";
             visibility?: "open" | "private";
@@ -11995,7 +12004,6 @@ export function maybeInstallE2eTauriMocks() {
         const created: ChannelTemplate = {
           id: `template-${Date.now()}`,
           name: input.name,
-          templateType: input.templateType ?? "channel",
           description: input.description ?? null,
           channelType: input.channelType ?? "stream",
           visibility: input.visibility ?? "open",
@@ -12021,7 +12029,6 @@ export function maybeInstallE2eTauriMocks() {
         return {
           id: created.id,
           name: created.name,
-          template_type: created.templateType,
           description: created.description,
           channel_type: created.channelType,
           visibility: created.visibility,

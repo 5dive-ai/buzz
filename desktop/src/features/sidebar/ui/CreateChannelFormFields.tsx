@@ -23,6 +23,7 @@ import {
 import { ChannelPermissionsSettings } from "@/features/channels/ui/ChannelPermissionsSettings";
 import { ChannelTypeSettings } from "@/features/channels/ui/ChannelTypeSettings";
 import type { CreateChannelFormState } from "@/features/sidebar/lib/useCreateChannelForm";
+import { TemplateInfoTooltip } from "@/features/sidebar/ui/TemplateInfoTooltip";
 
 const CREATE_LABEL_OPTIONAL_CLASS =
   "ml-1 text-xs font-normal text-muted-foreground/50";
@@ -45,9 +46,6 @@ export function CreateChannelFormFields({
   const [isCreateTemplateOpen, setIsCreateTemplateOpen] = React.useState(false);
   const selectedTemplate = form.templates.find(
     (template) => template.id === form.selectedTemplateId,
-  );
-  const channelTemplates = form.templates.filter(
-    (template) => template.templateType === "channel",
   );
 
   return (
@@ -140,8 +138,9 @@ export function CreateChannelFormFields({
           )}
           data-testid="create-channel-template-container"
         >
-          <span className="text-sm font-medium text-foreground">
-            Section template
+          <span className="inline-flex items-center gap-1 text-sm font-medium text-foreground">
+            Template
+            <TemplateInfoTooltip context="channel" />
           </span>
           <span
             className="-mr-2.5 flex h-9 min-w-0 max-w-[60%] items-center px-2.5 text-right text-sm font-medium text-foreground"
@@ -161,8 +160,9 @@ export function CreateChannelFormFields({
           )}
           data-testid="create-channel-template-container"
         >
-          <span className="text-sm font-medium text-foreground">
+          <span className="inline-flex items-center gap-1 text-sm font-medium text-foreground">
             Template
+            <TemplateInfoTooltip context="channel" />
             <span className={CREATE_LABEL_OPTIONAL_CLASS}>Optional</span>
           </span>
           <DropdownMenu modal={false}>
@@ -200,7 +200,7 @@ export function CreateChannelFormFields({
                 <DropdownMenuRadioItem value={NO_TEMPLATE_VALUE}>
                   None
                 </DropdownMenuRadioItem>
-                {channelTemplates.map((template) => (
+                {form.templates.map((template) => (
                   <DropdownMenuRadioItem key={template.id} value={template.id}>
                     {template.name}
                   </DropdownMenuRadioItem>
@@ -214,7 +214,6 @@ export function CreateChannelFormFields({
             </DropdownMenuContent>
           </DropdownMenu>
           <TemplateFormDialog
-            fixedTemplateType="channel"
             onCreated={form.handleTemplateCreated}
             onOpenChange={setIsCreateTemplateOpen}
             open={isCreateTemplateOpen}

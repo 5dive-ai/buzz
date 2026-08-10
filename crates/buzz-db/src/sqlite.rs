@@ -1,7 +1,7 @@
-//! SQLite storage for the single-node relay profile.
+//! SQLite storage for the single-node community profile.
 //!
-//! This module deliberately contains a separate, minimal schema rather than
-//! attempting to translate the production PostgreSQL migrations.
+//! This intentionally covers only community bootstrap, channels, memberships,
+//! and relay ownership. Event and user persistence lands with PR 2.
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -28,21 +28,6 @@ CREATE TABLE IF NOT EXISTS relay_members (
     added_by TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    PRIMARY KEY (community_id, pubkey),
-    FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS users (
-    community_id TEXT NOT NULL,
-    pubkey BLOB NOT NULL,
-    display_name TEXT,
-    avatar_url TEXT,
-    about TEXT,
-    nip05_handle TEXT,
-    channel_add_policy TEXT NOT NULL DEFAULT 'anyone',
-    is_agent INTEGER NOT NULL DEFAULT 0,
-    agent_owner_pubkey BLOB,
-    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (community_id, pubkey),
     FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE
 );
@@ -86,52 +71,6 @@ CREATE TABLE IF NOT EXISTS channel_members (
     PRIMARY KEY (channel_id, pubkey),
     FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
 );
-
-CREATE TABLE IF NOT EXISTS moderation_restrictions (
-    community_id TEXT NOT NULL,
-    pubkey TEXT NOT NULL COLLATE NOCASE,
-    restriction_type TEXT NOT NULL,
-    expires_at INTEGER,
-    PRIMARY KEY (community_id, pubkey, restriction_type),
-    FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    community_id TEXT NOT NULL,
-    id BLOB NOT NULL,
-    pubkey BLOB NOT NULL,
-    created_at INTEGER NOT NULL,
-    kind INTEGER NOT NULL,
-    tags_json TEXT NOT NULL,
-    content TEXT NOT NULL,
-    sig BLOB NOT NULL,
-    channel_id TEXT,
-    received_at INTEGER NOT NULL,
-    event_json TEXT NOT NULL,
-    PRIMARY KEY (community_id, id),
-    FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_events_community_created
-    ON events (community_id, created_at DESC, id);
-CREATE INDEX IF NOT EXISTS idx_events_community_kind
-    ON events (community_id, kind, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_events_channel_created
-    ON events (community_id, channel_id, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS reactions (
-    community_id TEXT NOT NULL,
-    event_created_at INTEGER NOT NULL,
-    event_id BLOB NOT NULL,
-    pubkey BLOB NOT NULL,
-    emoji TEXT NOT NULL,
-    reaction_event_id BLOB,
-    removed_at INTEGER,
-    PRIMARY KEY (community_id, event_created_at, event_id, pubkey, emoji),
-    FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_reactions_source_event
-    ON reactions (community_id, reaction_event_id)
-    WHERE reaction_event_id IS NOT NULL;
 "#;
 
 pub(crate) async fn connect(path_or_url: &str) -> Result<SqlitePool> {
@@ -152,77 +91,8 @@ pub(crate) async fn connect(path_or_url: &str) -> Result<SqlitePool> {
 }
 
 pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
-    let had_application_schema = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'channels'",
-    )
-    .fetch_one(pool)
-    .await?
-        != 0;
-
     for statement in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         sqlx::query(statement).execute(pool).await?;
-    }
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS schema_version (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), version INTEGER NOT NULL)",
-    )
-    .execute(pool)
-    .await?;
-    let initial_version = if had_application_schema { 1_i64 } else { 2_i64 };
-    sqlx::query(
-        "INSERT INTO schema_version (singleton, version) VALUES (1, ?1) ON CONFLICT(singleton) DO NOTHING",
-    )
-    .bind(initial_version)
-    .execute(pool)
-    .await?;
-
-    let mut version =
-        sqlx::query_scalar::<_, i64>("SELECT version FROM schema_version WHERE singleton = 1")
-            .fetch_one(pool)
-            .await?;
-    if version < 2 {
-        let mut tx = pool.begin().await?;
-        ensure_column_on(
-            &mut tx,
-            "channels",
-            "participant_hash",
-            "ALTER TABLE channels ADD COLUMN participant_hash BLOB",
-        )
-        .await?;
-        ensure_column_on(
-            &mut tx,
-            "channel_members",
-            "hidden_at",
-            "ALTER TABLE channel_members ADD COLUMN hidden_at INTEGER",
-        )
-        .await?;
-        sqlx::query("UPDATE schema_version SET version = 2 WHERE singleton = 1")
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        version = 2;
-    }
-    if version != 2 {
-        return Err(crate::DbError::InvalidData(format!(
-            "unsupported SQLite schema version {version}"
-        )));
-    }
-    Ok(())
-}
-
-async fn ensure_column_on(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    table: &str,
-    column: &str,
-    alter_sql: &'static str,
-) -> Result<()> {
-    let pragma = format!("PRAGMA table_info({table})");
-    let exists = sqlx::query(sqlx::AssertSqlSafe(pragma))
-        .fetch_all(&mut **tx)
-        .await?
-        .iter()
-        .any(|row| row.get::<String, _>("name") == column);
-    if !exists {
-        sqlx::query(alter_sql).execute(&mut **tx).await?;
     }
     Ok(())
 }
@@ -274,8 +144,8 @@ pub(crate) async fn rebind_single_node_community_host(
 
     // Defect-era databases may contain several loopback communities, one per
     // ephemeral port. Prefer a community owned by this desktop identity, then
-    // the one carrying the most events. This preserves the most useful UUID and
-    // its channels/messages while making the current Host header resolvable.
+    // the oldest community. This keeps ownership stable without depending on
+    // event persistence, which arrives with PR 2.
     let row = sqlx::query(
         r#"SELECT c.id, c.host
            FROM communities c
@@ -283,11 +153,9 @@ pub(crate) async fn rebind_single_node_community_host(
              ON rm.community_id = c.id
             AND lower(rm.pubkey) = lower(?1)
             AND rm.role = 'owner'
-           LEFT JOIN events e ON e.community_id = c.id
            WHERE c.archived_at IS NULL
              AND c.host LIKE '127.0.0.1:%'
-           GROUP BY c.id, c.host, c.created_at
-           ORDER BY (rm.pubkey IS NOT NULL) DESC, count(e.id) DESC, c.created_at ASC, c.id ASC
+           ORDER BY CASE WHEN rm.pubkey IS NULL THEN 0 ELSE 1 END DESC, c.created_at ASC, c.id ASC
            LIMIT 1"#,
     )
     .bind(owner_pubkey)
@@ -369,487 +237,6 @@ pub(crate) async fn ensure_configured_community(
         created: inserted,
     })
 }
-
-pub(crate) async fn insert_event(
-    pool: &SqlitePool,
-    community: CommunityId,
-    event: &nostr::Event,
-    channel_id: Option<Uuid>,
-) -> Result<(buzz_core::StoredEvent, bool)> {
-    let kind = u32::from(event.kind.as_u16());
-    if kind == buzz_core::kind::KIND_AUTH {
-        return Err(crate::DbError::AuthEventRejected);
-    }
-    if buzz_core::kind::is_ephemeral(kind) {
-        return Err(crate::DbError::EphemeralEventRejected(event.kind.as_u16()));
-    }
-    let received_at = chrono::Utc::now();
-    let inserted = sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT DO NOTHING")
-        .bind(community.as_uuid().to_string()).bind(event.id.as_bytes().as_slice()).bind(event.pubkey.to_bytes().as_slice())
-        .bind(event.created_at.as_secs() as i64).bind(event.kind.as_u16() as i32).bind(serde_json::to_string(&event.tags)?)
-        .bind(&event.content).bind(event.sig.serialize().as_slice()).bind(channel_id.map(|id| id.to_string()))
-        .bind(received_at.timestamp()).bind(serde_json::to_string(event)?).execute(pool).await?.rows_affected() == 1;
-    Ok((
-        buzz_core::StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
-        inserted,
-    ))
-}
-
-pub(crate) async fn replace_event(
-    pool: &SqlitePool,
-    community: CommunityId,
-    event: &nostr::Event,
-    channel_id: Option<Uuid>,
-    d_tag: Option<&str>,
-) -> Result<(buzz_core::StoredEvent, bool)> {
-    let mut tx = pool.begin().await?;
-    let rows = sqlx::query("SELECT id, event_json FROM events WHERE community_id = ?1 AND kind = ?2 AND pubkey = ?3 AND channel_id IS ?4")
-        .bind(community.as_uuid().to_string())
-        .bind(event.kind.as_u16() as i32)
-        .bind(event.pubkey.to_bytes().as_slice())
-        .bind(channel_id.map(|id| id.to_string()))
-        .fetch_all(&mut *tx)
-        .await?;
-    let mut replaced_ids = Vec::new();
-    for row in rows {
-        let existing: nostr::Event = serde_json::from_str(row.try_get("event_json")?)?;
-        let existing_d = crate::event::extract_d_tag(&existing).unwrap_or_default();
-        if d_tag.is_some_and(|expected| existing_d != expected) {
-            continue;
-        }
-        if event.created_at < existing.created_at
-            || (event.created_at == existing.created_at && event.id <= existing.id)
-        {
-            return Ok((
-                buzz_core::StoredEvent::with_received_at(
-                    existing,
-                    chrono::Utc::now(),
-                    channel_id,
-                    true,
-                ),
-                false,
-            ));
-        }
-        replaced_ids.push(row.try_get::<Vec<u8>, _>("id")?);
-    }
-    for id in replaced_ids {
-        sqlx::query("DELETE FROM events WHERE community_id = ?1 AND id = ?2")
-            .bind(community.as_uuid().to_string())
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    let received_at = chrono::Utc::now();
-    sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)")
-        .bind(community.as_uuid().to_string()).bind(event.id.as_bytes().as_slice()).bind(event.pubkey.to_bytes().as_slice())
-        .bind(event.created_at.as_secs() as i64).bind(event.kind.as_u16() as i32).bind(serde_json::to_string(&event.tags)?)
-        .bind(&event.content).bind(event.sig.serialize().as_slice()).bind(channel_id.map(|id| id.to_string()))
-        .bind(received_at.timestamp()).bind(serde_json::to_string(event)?).execute(&mut *tx).await?;
-    tx.commit().await?;
-    Ok((
-        buzz_core::StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
-        true,
-    ))
-}
-
-pub(crate) async fn soft_delete_event(
-    pool: &SqlitePool,
-    community: CommunityId,
-    event_id: &[u8],
-) -> Result<bool> {
-    Ok(
-        sqlx::query("DELETE FROM events WHERE community_id = ?1 AND id = ?2")
-            .bind(community.as_uuid().to_string())
-            .bind(event_id)
-            .execute(pool)
-            .await?
-            .rows_affected()
-            != 0,
-    )
-}
-
-pub(crate) async fn get_event_by_id(
-    pool: &SqlitePool,
-    community: CommunityId,
-    id: &[u8],
-) -> Result<Option<buzz_core::StoredEvent>> {
-    let row = sqlx::query("SELECT event_json, received_at, channel_id FROM events WHERE community_id = ?1 AND id = ?2")
-        .bind(community.as_uuid().to_string()).bind(id).fetch_optional(pool).await?;
-    row.map(stored_event).transpose()
-}
-
-pub(crate) async fn query_events(
-    pool: &SqlitePool,
-    q: &crate::EventQuery,
-) -> Result<Vec<buzz_core::StoredEvent>> {
-    if q.before_id.is_some() && q.until.is_none() {
-        return Err(crate::DbError::InvalidData(
-            "before_id requires until to be set".into(),
-        ));
-    }
-    if q.global_only && q.channel_id.is_some() {
-        return Err(crate::DbError::InvalidData(
-            "global_only and channel_id are mutually exclusive".into(),
-        ));
-    }
-    if q.kinds.as_ref().is_some_and(Vec::is_empty)
-        || q.authors.as_ref().is_some_and(Vec::is_empty)
-        || q.ids.as_ref().is_some_and(Vec::is_empty)
-        || q.e_tags.as_ref().is_some_and(Vec::is_empty)
-    {
-        return Ok(vec![]);
-    }
-    let rows = sqlx::query("SELECT event_json, received_at, channel_id FROM events WHERE community_id = ?1 ORDER BY created_at DESC, id ASC")
-        .bind(q.community_id.as_uuid().to_string()).fetch_all(pool).await?;
-    let mut events = Vec::new();
-    for row in rows {
-        let stored = stored_event(row)?;
-        let event = &stored.event;
-        let created = event.created_at.as_secs() as i64;
-        let id = event.id.as_bytes().as_slice();
-        let tags: Vec<Vec<String>> = event
-            .tags
-            .iter()
-            .map(|tag| tag.as_slice().to_vec())
-            .collect();
-        let has_tag = |name: &str, value: &str| {
-            tags.iter().any(|tag| {
-                tag.first().is_some_and(|v| v == name) && tag.get(1).is_some_and(|v| v == value)
-            })
-        };
-        if q.channel_id.is_some_and(|ch| stored.channel_id != Some(ch))
-            || (q.global_only && stored.channel_id.is_some())
-        {
-            continue;
-        }
-        if q.channel_ids
-            .as_ref()
-            .is_some_and(|ids| stored.channel_id.is_some_and(|id| !ids.contains(&id)))
-        {
-            continue;
-        }
-        if q.kinds
-            .as_ref()
-            .is_some_and(|ks| !ks.contains(&(event.kind.as_u16() as i32)))
-        {
-            continue;
-        }
-        if q.pubkey
-            .as_ref()
-            .is_some_and(|pk| pk.as_slice() != event.pubkey.to_bytes().as_slice())
-        {
-            continue;
-        }
-        if q.authors.as_ref().is_some_and(|authors| {
-            !authors
-                .iter()
-                .any(|pk| pk.as_slice() == event.pubkey.to_bytes().as_slice())
-        }) {
-            continue;
-        }
-        if q.ids
-            .as_ref()
-            .is_some_and(|ids| !ids.iter().any(|candidate| candidate.as_slice() == id))
-        {
-            continue;
-        }
-        if q.since.is_some_and(|since| created < since.timestamp())
-            || q.until.is_some_and(|until| created > until.timestamp())
-        {
-            continue;
-        }
-        if q.before_id.as_ref().is_some_and(|before| {
-            q.until.is_some_and(|until| created == until.timestamp()) && id <= before.as_slice()
-        }) {
-            continue;
-        }
-        if q.p_tag_hex
-            .as_ref()
-            .is_some_and(|p| !has_tag("p", &p.to_ascii_lowercase()))
-        {
-            continue;
-        }
-        if q.e_tags
-            .as_ref()
-            .is_some_and(|values| !values.iter().any(|value| has_tag("e", value)))
-        {
-            continue;
-        }
-        let d_tag = tags
-            .iter()
-            .find(|tag| tag.first().is_some_and(|v| v == "d"))
-            .and_then(|tag| tag.get(1));
-        if q.d_tag.as_ref().is_some_and(|d| d_tag != Some(d)) {
-            continue;
-        }
-        if q.d_tags
-            .as_ref()
-            .is_some_and(|ds| !d_tag.is_some_and(|d| ds.contains(d)))
-        {
-            continue;
-        }
-        if q.shared_gated_reader.as_ref().is_some_and(|reader| {
-            buzz_core::kind::SHARED_GATED_KINDS.contains(&(event.kind.as_u16() as u32))
-                && reader.as_slice() != event.pubkey.to_bytes().as_slice()
-                && !has_tag("shared", "true")
-        }) {
-            continue;
-        }
-        events.push(stored);
-    }
-    let offset = q.offset.unwrap_or(0).max(0) as usize;
-    let limit = q
-        .limit
-        .unwrap_or(100)
-        .min(q.max_limit.unwrap_or(crate::DEFAULT_MAX_PAGE_LIMIT))
-        .max(0) as usize;
-    Ok(events.into_iter().skip(offset).take(limit).collect())
-}
-
-pub(crate) async fn query_feed_mentions(
-    pool: &SqlitePool,
-    community: CommunityId,
-    pubkey_bytes: &[u8],
-    accessible_channel_ids: &[Uuid],
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    limit: i64,
-) -> Result<Vec<buzz_core::StoredEvent>> {
-    let mut query = crate::EventQuery::for_community(community);
-    query.kinds = Some(vec![
-        buzz_core::kind::KIND_STREAM_MESSAGE as i32,
-        buzz_core::kind::KIND_STREAM_MESSAGE_V2 as i32,
-        buzz_core::kind::KIND_TEXT_NOTE as i32,
-        buzz_core::kind::KIND_FORUM_POST as i32,
-        buzz_core::kind::KIND_FORUM_COMMENT as i32,
-        buzz_core::kind::KIND_GIT_PULL_REQUEST as i32,
-        buzz_core::kind::KIND_GIT_PR_UPDATE as i32,
-        buzz_core::kind::KIND_GIT_ISSUE as i32,
-        buzz_core::kind::KIND_GIT_STATUS_OPEN as i32,
-        buzz_core::kind::KIND_GIT_STATUS_MERGED as i32,
-        buzz_core::kind::KIND_GIT_STATUS_CLOSED as i32,
-        buzz_core::kind::KIND_GIT_STATUS_DRAFT as i32,
-    ]);
-    query.p_tag_hex = Some(hex::encode(pubkey_bytes));
-    query.channel_ids = Some(accessible_channel_ids.to_vec());
-    query.since = since;
-    query.limit = Some(limit.min(crate::feed::FEED_MAX_LIMIT));
-    query_events(pool, &query).await
-}
-
-pub(crate) async fn query_feed_needs_action(
-    pool: &SqlitePool,
-    community: CommunityId,
-    pubkey_bytes: &[u8],
-    accessible_channel_ids: &[Uuid],
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    limit: i64,
-) -> Result<Vec<buzz_core::StoredEvent>> {
-    let mut query = crate::EventQuery::for_community(community);
-    query.kinds = Some(vec![
-        buzz_core::kind::KIND_WORKFLOW_APPROVAL_REQUESTED as i32,
-        buzz_core::kind::KIND_STREAM_REMINDER as i32,
-    ]);
-    query.p_tag_hex = Some(hex::encode(pubkey_bytes));
-    query.channel_ids = Some(accessible_channel_ids.to_vec());
-    query.since = since;
-    query.limit = Some(limit.min(crate::feed::FEED_MAX_LIMIT));
-    query_events(pool, &query).await
-}
-
-pub(crate) async fn query_feed_activity(
-    pool: &SqlitePool,
-    community: CommunityId,
-    accessible_channel_ids: &[Uuid],
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    limit: i64,
-) -> Result<Vec<buzz_core::StoredEvent>> {
-    let mut query = crate::EventQuery::for_community(community);
-    query.kinds = Some(vec![
-        buzz_core::kind::KIND_STREAM_MESSAGE as i32,
-        buzz_core::kind::KIND_STREAM_MESSAGE_V2 as i32,
-        buzz_core::kind::KIND_FORUM_POST as i32,
-        buzz_core::kind::KIND_JOB_REQUEST as i32,
-        buzz_core::kind::KIND_JOB_PROGRESS as i32,
-        buzz_core::kind::KIND_JOB_RESULT as i32,
-    ]);
-    query.channel_ids = Some(accessible_channel_ids.to_vec());
-    query.since = since;
-    query.limit = Some(limit.min(crate::feed::FEED_MAX_LIMIT));
-    query_events(pool, &query).await
-}
-
-pub(crate) async fn insert_reaction_event(
-    pool: &SqlitePool,
-    community: CommunityId,
-    reaction_event: &nostr::Event,
-    channel_id: Option<Uuid>,
-    target_event_id: &[u8],
-    actor_pubkey: &[u8],
-    emoji: &str,
-) -> Result<crate::event::ReactionEventInsertOutcome> {
-    let mut tx = pool.begin().await?;
-    let target_created_at: Option<i64> = sqlx::query_scalar(
-        "SELECT created_at FROM events WHERE community_id = ?1 AND id = ?2 LIMIT 1",
-    )
-    .bind(community.as_uuid().to_string())
-    .bind(target_event_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some(target_created_at) = target_created_at else {
-        return Ok(crate::event::ReactionEventInsertOutcome::TargetMissing);
-    };
-    let changed = sqlx::query("INSERT INTO reactions (community_id, event_created_at, event_id, pubkey, emoji, reaction_event_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (community_id, event_created_at, event_id, pubkey, emoji) DO UPDATE SET removed_at = NULL, reaction_event_id = excluded.reaction_event_id WHERE reactions.removed_at IS NOT NULL")
-        .bind(community.as_uuid().to_string()).bind(target_created_at).bind(target_event_id)
-        .bind(actor_pubkey).bind(emoji).bind(reaction_event.id.as_bytes().as_slice())
-        .execute(&mut *tx).await?.rows_affected() != 0;
-    if !changed {
-        return Ok(crate::event::ReactionEventInsertOutcome::Duplicate);
-    }
-    let received_at = chrono::Utc::now();
-    let inserted = sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT DO NOTHING")
-        .bind(community.as_uuid().to_string()).bind(reaction_event.id.as_bytes().as_slice()).bind(reaction_event.pubkey.to_bytes().as_slice())
-        .bind(reaction_event.created_at.as_secs() as i64).bind(reaction_event.kind.as_u16() as i32).bind(serde_json::to_string(&reaction_event.tags)?)
-        .bind(&reaction_event.content).bind(reaction_event.sig.serialize().as_slice()).bind(channel_id.map(|id| id.to_string()))
-        .bind(received_at.timestamp()).bind(serde_json::to_string(reaction_event)?).execute(&mut *tx).await?.rows_affected() == 1;
-    tx.commit().await?;
-    Ok(crate::event::ReactionEventInsertOutcome::Inserted {
-        stored_event: Box::new(buzz_core::StoredEvent::with_received_at(
-            reaction_event.clone(),
-            received_at,
-            channel_id,
-            true,
-        )),
-        was_inserted: inserted,
-    })
-}
-
-pub(crate) async fn remove_reaction(
-    pool: &SqlitePool,
-    community: CommunityId,
-    event_id: &[u8],
-    event_created_at: chrono::DateTime<chrono::Utc>,
-    pubkey: &[u8],
-    emoji: &str,
-) -> Result<bool> {
-    Ok(sqlx::query("UPDATE reactions SET removed_at = unixepoch() WHERE community_id = ?1 AND event_created_at = ?2 AND event_id = ?3 AND pubkey = ?4 AND emoji = ?5 AND removed_at IS NULL")
-        .bind(community.as_uuid().to_string()).bind(event_created_at.timestamp()).bind(event_id).bind(pubkey).bind(emoji)
-        .execute(pool).await?.rows_affected() != 0)
-}
-
-pub(crate) async fn remove_reaction_by_source_event_id(
-    pool: &SqlitePool,
-    community: CommunityId,
-    reaction_event_id: &[u8],
-) -> Result<bool> {
-    Ok(sqlx::query("UPDATE reactions SET removed_at = unixepoch() WHERE community_id = ?1 AND reaction_event_id = ?2 AND removed_at IS NULL")
-        .bind(community.as_uuid().to_string()).bind(reaction_event_id)
-        .execute(pool).await?.rows_affected() != 0)
-}
-
-pub(crate) async fn open_dm(
-    pool: &SqlitePool,
-    community: CommunityId,
-    pubkeys: &[&[u8]],
-    created_by: &[u8],
-    command_event: Option<&nostr::Event>,
-) -> Result<Option<(crate::channel::ChannelRecord, bool)>> {
-    let mut participants = pubkeys.to_vec();
-    if !participants.contains(&created_by) {
-        participants.push(created_by);
-    }
-    participants.sort_unstable();
-    participants.dedup();
-    if !(2..=9).contains(&participants.len()) {
-        return Err(crate::DbError::InvalidData(
-            "DM requires 2-9 unique participants".into(),
-        ));
-    }
-    if participants.iter().any(|pubkey| pubkey.len() != 32) {
-        return Err(crate::DbError::InvalidData(
-            "DM participant pubkeys must be 32 bytes".into(),
-        ));
-    }
-    let hash = crate::dm::compute_participant_hash(&participants);
-    let mut tx = pool.begin().await?;
-    if let Some(event) = command_event {
-        let received_at = chrono::Utc::now();
-        let inserted = sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10) ON CONFLICT DO NOTHING")
-            .bind(community.as_uuid().to_string()).bind(event.id.as_bytes().as_slice()).bind(event.pubkey.to_bytes().as_slice())
-            .bind(event.created_at.as_secs() as i64).bind(event.kind.as_u16() as i32).bind(serde_json::to_string(&event.tags)?)
-            .bind(&event.content).bind(event.sig.serialize().as_slice()).bind(received_at.timestamp()).bind(serde_json::to_string(event)?)
-            .execute(&mut *tx).await?.rows_affected() != 0;
-        if !inserted {
-            return Ok(None);
-        }
-    }
-    let select = "SELECT id, name, channel_type, visibility, description, canvas, created_by, created_at, updated_at, archived_at, deleted_at, nip29_group_id, topic_required, max_members, topic, topic_set_by, topic_set_at, purpose, purpose_set_by, purpose_set_at, ttl_seconds, ttl_deadline FROM channels WHERE community_id = ?1 AND participant_hash = ?2 AND channel_type = 'dm' AND deleted_at IS NULL LIMIT 1";
-    if let Some(row) = sqlx::query(select)
-        .bind(community.as_uuid().to_string())
-        .bind(hash.as_slice())
-        .fetch_optional(&mut *tx)
-        .await?
-    {
-        sqlx::query("UPDATE channel_members SET hidden_at = NULL WHERE channel_id = ?1 AND pubkey = ?2 AND removed_at IS NULL")
-            .bind(row.try_get::<String, _>("id")?)
-            .bind(created_by)
-            .execute(&mut *tx)
-            .await?;
-        let record = channel_record(row)?;
-        tx.commit().await?;
-        return Ok(Some((record, false)));
-    }
-
-    let id = Uuid::new_v4();
-    let name = if participants.len() == 2 {
-        "DM".to_owned()
-    } else {
-        format!("Group DM ({})", participants.len())
-    };
-    sqlx::query("INSERT INTO channels (id, community_id, name, channel_type, visibility, participant_hash, created_by) VALUES (?1, ?2, ?3, 'dm', 'private', ?4, ?5)")
-        .bind(id.to_string())
-        .bind(community.as_uuid().to_string())
-        .bind(name)
-        .bind(hash.as_slice())
-        .bind(created_by)
-        .execute(&mut *tx)
-        .await?;
-    for participant in participants {
-        sqlx::query("INSERT INTO channel_members (channel_id, pubkey, role, invited_by) VALUES (?1, ?2, 'member', ?3)")
-            .bind(id.to_string())
-            .bind(participant)
-            .bind(created_by)
-            .execute(&mut *tx)
-            .await?;
-    }
-    let row = sqlx::query(select)
-        .bind(community.as_uuid().to_string())
-        .bind(hash.as_slice())
-        .fetch_one(&mut *tx)
-        .await?;
-    let record = channel_record(row)?;
-    tx.commit().await?;
-    Ok(Some((record, true)))
-}
-
-fn stored_event(row: sqlx::sqlite::SqliteRow) -> Result<buzz_core::StoredEvent> {
-    let json: String = row.try_get("event_json")?;
-    let event: nostr::Event = serde_json::from_str(&json)?;
-    let received: i64 = row.try_get("received_at")?;
-    let channel: Option<String> = row.try_get("channel_id")?;
-    let channel_id = channel
-        .map(|id| {
-            Uuid::parse_str(&id)
-                .map_err(|e| crate::DbError::InvalidData(format!("invalid SQLite channel id: {e}")))
-        })
-        .transpose()?;
-    Ok(buzz_core::StoredEvent::with_received_at(
-        event,
-        timestamp(received)?,
-        channel_id,
-        true,
-    ))
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_channel_with_id(
     pool: &SqlitePool,
@@ -960,38 +347,6 @@ pub(crate) async fn get_accessible_channel_ids(
         .collect()
 }
 
-pub(crate) async fn communities_of_channels(
-    pool: &SqlitePool,
-    channel_ids: &[Uuid],
-) -> Result<std::collections::HashMap<Uuid, CommunityId>> {
-    let mut out = std::collections::HashMap::with_capacity(channel_ids.len());
-    for channel_id in channel_ids {
-        let row = sqlx::query_scalar::<_, String>(
-            "SELECT community_id FROM channels WHERE id = ?1 AND deleted_at IS NULL",
-        )
-        .bind(channel_id.to_string())
-        .fetch_optional(pool)
-        .await?;
-        if let Some(community_id) = row {
-            let community_id = Uuid::parse_str(&community_id).map_err(|e| {
-                crate::DbError::InvalidData(format!("invalid SQLite community id: {e}"))
-            })?;
-            out.insert(*channel_id, CommunityId::from_uuid(community_id));
-        }
-    }
-    Ok(out)
-}
-
-pub(crate) async fn get_member_role(
-    pool: &SqlitePool,
-    community: CommunityId,
-    channel_id: Uuid,
-    pubkey: &[u8],
-) -> Result<Option<String>> {
-    Ok(sqlx::query_scalar("SELECT cm.role FROM channel_members cm JOIN channels c ON c.id = cm.channel_id WHERE c.community_id = ?1 AND c.id = ?2 AND cm.pubkey = ?3 AND cm.removed_at IS NULL AND c.deleted_at IS NULL")
-        .bind(community.as_uuid().to_string()).bind(channel_id.to_string()).bind(pubkey).fetch_optional(pool).await?)
-}
-
 fn timestamp(value: i64) -> Result<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::from_timestamp(value, 0).ok_or(crate::DbError::InvalidTimestamp(value))
 }
@@ -1038,117 +393,6 @@ fn member_record(row: sqlx::sqlite::SqliteRow) -> Result<crate::channel::MemberR
         removed_at: optional_timestamp(row.try_get("removed_at")?)?,
     })
 }
-
-pub(crate) async fn ensure_user(
-    pool: &SqlitePool,
-    community: CommunityId,
-    pubkey: &[u8],
-) -> Result<bool> {
-    Ok(sqlx::query(
-        "INSERT INTO users (community_id, pubkey) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
-    )
-    .bind(community.as_uuid().to_string())
-    .bind(pubkey)
-    .execute(pool)
-    .await?
-    .rows_affected()
-        == 1)
-}
-
-pub(crate) async fn update_user_profile(
-    pool: &SqlitePool,
-    community: CommunityId,
-    pubkey: &[u8],
-    display_name: Option<&str>,
-    avatar_url: Option<&str>,
-    about: Option<&str>,
-    nip05_handle: Option<&str>,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE users SET display_name = COALESCE(?3, display_name), avatar_url = COALESCE(?4, avatar_url), about = COALESCE(?5, about), nip05_handle = COALESCE(?6, nip05_handle) WHERE community_id = ?1 AND pubkey = ?2",
-    )
-    .bind(community.as_uuid().to_string())
-    .bind(pubkey)
-    .bind(display_name)
-    .bind(avatar_url)
-    .bind(about)
-    .bind(nip05_handle)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub(crate) async fn get_user(
-    pool: &SqlitePool,
-    community: CommunityId,
-    pubkey: &[u8],
-) -> Result<Option<crate::user::UserProfile>> {
-    let row = sqlx::query(
-        "SELECT pubkey, display_name, avatar_url, about, nip05_handle FROM users WHERE community_id = ?1 AND pubkey = ?2",
-    )
-    .bind(community.as_uuid().to_string())
-    .bind(pubkey)
-    .fetch_optional(pool)
-    .await?;
-    row.map(|row| {
-        Ok(crate::user::UserProfile {
-            pubkey: row.try_get("pubkey")?,
-            display_name: row.try_get("display_name")?,
-            avatar_url: row.try_get("avatar_url")?,
-            about: row.try_get("about")?,
-            nip05_handle: row.try_get("nip05_handle")?,
-        })
-    })
-    .transpose()
-}
-
-pub(crate) async fn set_agent_owner(
-    pool: &SqlitePool,
-    community: CommunityId,
-    agent_pubkey: &[u8],
-    owner_pubkey: &[u8],
-) -> Result<bool> {
-    Ok(sqlx::query(
-        "UPDATE users SET agent_owner_pubkey = ?3, is_agent = 1 WHERE community_id = ?1 AND pubkey = ?2 AND agent_owner_pubkey IS NULL",
-    )
-    .bind(community.as_uuid().to_string())
-    .bind(agent_pubkey)
-    .bind(owner_pubkey)
-    .execute(pool)
-    .await?
-    .rows_affected() == 1)
-}
-
-pub(crate) async fn get_agent_channel_policy(
-    pool: &SqlitePool,
-    community: CommunityId,
-    pubkey: &[u8],
-) -> Result<Option<(String, Option<Vec<u8>>)>> {
-    Ok(sqlx::query_as(
-        "SELECT channel_add_policy, agent_owner_pubkey FROM users WHERE community_id = ?1 AND pubkey = ?2",
-    )
-    .bind(community.as_uuid().to_string())
-    .bind(pubkey)
-    .fetch_optional(pool)
-    .await?)
-}
-
-pub(crate) async fn is_agent_owner(
-    pool: &SqlitePool,
-    community: CommunityId,
-    target_pubkey: &[u8],
-    actor_pubkey: &[u8],
-) -> Result<bool> {
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM users WHERE community_id = ?1 AND pubkey = ?2 AND agent_owner_pubkey = ?3",
-    )
-    .bind(community.as_uuid().to_string())
-    .bind(target_pubkey)
-    .bind(actor_pubkey)
-    .fetch_one(pool)
-    .await? != 0)
-}
-
 pub(crate) async fn is_relay_member(
     pool: &SqlitePool,
     community: CommunityId,
@@ -1264,63 +508,16 @@ fn community_record(row: sqlx::sqlite::SqliteRow) -> Result<CommunityRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, Keys, Kind};
+    use nostr::Keys;
 
     #[tokio::test]
-    async fn upgrades_phase_1_core_schema_before_dm_use() {
-        let path = std::env::temp_dir().join(format!("buzz-db-upgrade-{}.sqlite", Uuid::new_v4()));
-        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
-            .unwrap()
-            .create_if_missing(true)
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::query("CREATE TABLE communities (id TEXT PRIMARY KEY NOT NULL, host TEXT NOT NULL COLLATE NOCASE UNIQUE, icon TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()), archived_at INTEGER)")
-            .execute(&pool).await.unwrap();
-        sqlx::query("CREATE TABLE channels (id TEXT PRIMARY KEY NOT NULL, community_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT, canvas TEXT, channel_type TEXT NOT NULL, visibility TEXT NOT NULL, created_by BLOB NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()), archived_at INTEGER, deleted_at INTEGER, nip29_group_id TEXT, topic_required INTEGER NOT NULL DEFAULT 0, max_members INTEGER, topic TEXT, topic_set_by BLOB, topic_set_at INTEGER, purpose TEXT, purpose_set_by BLOB, purpose_set_at INTEGER, ttl_seconds INTEGER, ttl_deadline INTEGER)")
-            .execute(&pool).await.unwrap();
-        sqlx::query("CREATE TABLE channel_members (channel_id TEXT NOT NULL, pubkey BLOB NOT NULL, role TEXT NOT NULL, joined_at INTEGER NOT NULL DEFAULT (unixepoch()), invited_by BLOB, removed_at INTEGER, PRIMARY KEY (channel_id, pubkey))")
-            .execute(&pool).await.unwrap();
-        pool.close().await;
-
-        let upgraded = connect(path.to_str().unwrap()).await.unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT version FROM schema_version WHERE singleton = 1")
-                .fetch_one(&upgraded)
-                .await
-                .unwrap(),
-            2
-        );
-        for (table, column) in [
-            ("channels", "participant_hash"),
-            ("channel_members", "hidden_at"),
-        ] {
-            let pragma = format!("PRAGMA table_info({table})");
-            assert!(sqlx::query(sqlx::AssertSqlSafe(pragma))
-                .fetch_all(&upgraded)
-                .await
-                .unwrap()
-                .iter()
-                .any(|row| row.get::<String, _>("name") == column));
-        }
-        upgraded.close().await;
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn core_slice_survives_temporary_file_reopen() {
+    async fn community_slice_survives_temporary_file_reopen() {
         let path = std::env::temp_dir().join(format!("buzz-db-{}.sqlite", Uuid::new_v4()));
         let path_string = path.to_string_lossy().into_owned();
         let owner = Keys::generate();
         let owner_bytes = owner.public_key().to_bytes();
         let owner_hex = owner.public_key().to_hex();
         let channel_id = Uuid::new_v4();
-        let event = EventBuilder::new(Kind::Custom(9), "durable message")
-            .sign_with_keys(&owner)
-            .unwrap();
 
         let pool = connect(&path_string).await.unwrap();
         let ensured = ensure_configured_community(&pool, "Local.Buzz")
@@ -1329,7 +526,6 @@ mod tests {
         bootstrap_owner(&pool, ensured.id, &owner_hex)
             .await
             .unwrap();
-        assert!(ensure_user(&pool, ensured.id, &owner_bytes).await.unwrap());
         let (channel, created) = create_channel_with_id(
             &pool,
             ensured.id,
@@ -1348,12 +544,6 @@ mod tests {
         assert!(is_member(&pool, ensured.id, channel_id, &owner_bytes)
             .await
             .unwrap());
-        assert!(
-            insert_event(&pool, ensured.id, &event, Some(channel_id))
-                .await
-                .unwrap()
-                .1
-        );
         pool.close().await;
 
         let reopened = connect(&path_string).await.unwrap();
@@ -1372,16 +562,32 @@ mod tests {
                 .unwrap(),
             vec![channel_id]
         );
-        let stored = get_event_by_id(&reopened, ensured.id, event.id.as_bytes())
+        reopened.close().await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebind_prefers_owned_then_oldest_community() {
+        let pool = connect(":memory:").await.unwrap();
+        let first = ensure_configured_community(&pool, "127.0.0.1:4000")
+            .await
+            .unwrap();
+        let second = ensure_configured_community(&pool, "127.0.0.1:4001")
+            .await
+            .unwrap();
+        bootstrap_owner(&pool, second.id, "owner").await.unwrap();
+        let rebound = rebind_single_node_community_host(&pool, "127.0.0.1:5000", "owner")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.event.content, "durable message");
-        let mut query = crate::EventQuery::for_community(ensured.id);
-        query.channel_id = Some(channel_id);
-        query.kinds = Some(vec![9]);
-        assert_eq!(query_events(&reopened, &query).await.unwrap().len(), 1);
-        reopened.close().await;
-        std::fs::remove_file(path).unwrap();
+        assert_eq!(rebound.id, second.id);
+        assert_eq!(
+            lookup_community_host(&pool, first.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            "127.0.0.1:4000"
+        );
+        assert_eq!(rebound.host, "127.0.0.1:5000");
     }
 }

@@ -180,7 +180,6 @@ enum DbBackend {
 #[derive(Clone, Debug)]
 pub struct Db {
     backend: DbBackend,
-    // Retained for Postgres test helpers. All production method access goes through `pg_pool`.
     pub(crate) pool: PgPool,
     /// Maximum connections configured for this pool (from [`DbConfig::max_connections`]).
     pub(crate) max_connections: u32,
@@ -649,17 +648,6 @@ pub struct TokenSummary {
 }
 
 impl Db {
-    /// Returns the PostgreSQL pool or a typed error for local SQLite handles.
-    fn pg_pool(&self) -> Result<&PgPool> {
-        match self.backend {
-            DbBackend::Postgres => Ok(&self.pool),
-            DbBackend::SQLite(_) => Err(DbError::UnsupportedBackend(
-                "PostgreSQL operation on SQLite Db",
-            )),
-        }
-    }
-
-    /// Returns the SQLite pool or a typed error for PostgreSQL handles.
     fn sqlite_pool(&self) -> Result<&sqlx::SqlitePool> {
         match &self.backend {
             DbBackend::SQLite(pool) => Ok(pool),
@@ -670,8 +658,6 @@ impl Db {
     }
 
     /// Creates a local single-node database backed by SQLite.
-    ///
-    /// The embedded local schema is applied before this constructor returns.
     pub async fn new_sqlite(database_url: &str) -> Result<Self> {
         let sqlite = sqlite::connect(database_url).await?;
         let pool = PgPoolOptions::new()
@@ -688,7 +674,6 @@ impl Db {
             reader_aurora_identity: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
-
     /// Creates a new `Db` by connecting a Postgres pool with the given config.
     ///
     /// When `config.read_database_url` is set, a second pool with the same
@@ -887,10 +872,10 @@ impl Db {
         if self.read_pool.is_none() {
             return Ok(false);
         }
-        replica_fence::verify_floor_guard_catalog(self.pg_pool()?).await?;
-        replica_fence::verify_floor_guard_behavior(self.pg_pool()?).await?;
+        replica_fence::verify_floor_guard_catalog(&self.pool).await?;
+        replica_fence::verify_floor_guard_behavior(&self.pool).await?;
         tokio::spawn(replica_fence::run_probe(
-            self.pg_pool()?.clone(),
+            self.pool.clone(),
             std::sync::Arc::clone(&self.fence),
         ));
         Ok(true)
@@ -905,8 +890,8 @@ impl Db {
     /// reads must go through [`Db::route_read`]-backed entry points; this
     /// remains only for the fence's own plumbing tests.
     #[cfg(test)]
-    fn read(&self) -> Result<&PgPool> {
-        Ok(self.read_pool.as_ref().unwrap_or(self.pg_pool()?))
+    fn read(&self) -> &PgPool {
+        self.read_pool.as_ref().unwrap_or(&self.pool)
     }
 
     /// Whether a distinct read-replica pool is configured.
@@ -1064,7 +1049,7 @@ impl Db {
     /// Run pending database migrations.
     pub async fn migrate(&self) -> Result<()> {
         match &self.backend {
-            DbBackend::Postgres => migration::run_migrations(self.pg_pool()?).await,
+            DbBackend::Postgres => migration::run_migrations(&self.pool).await,
             DbBackend::SQLite(_) => sqlite::migrate(self.sqlite_pool()?).await,
         }
     }
@@ -1083,19 +1068,9 @@ impl Db {
     /// `idle`  — connections available for immediate reuse
     /// `max`   — pool ceiling set at construction
     pub fn pool_stats(&self) -> DbPoolStats {
-        let Some(pool) = (match &self.backend {
-            DbBackend::Postgres => Some(&self.pool),
-            DbBackend::SQLite(_) => None,
-        }) else {
-            return DbPoolStats {
-                size: 0,
-                idle: 0,
-                max: 0,
-            };
-        };
         DbPoolStats {
-            size: pool.size(),
-            idle: pool.num_idle() as u32,
+            size: self.pool.size(),
+            idle: self.pool.num_idle() as u32,
             max: self.max_connections,
         }
     }
@@ -1126,7 +1101,7 @@ impl Db {
         &self,
         lock_key: i64,
     ) -> Result<Option<UsageMetricsLeader>> {
-        let mut connection = self.pg_pool()?.acquire().await?;
+        let mut connection = self.pool.acquire().await?;
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(lock_key)
             .fetch_one(&mut *connection)
@@ -1154,7 +1129,7 @@ impl Db {
         limit: i64,
     ) -> Result<Vec<admin_moderation::AdminReport>> {
         admin_moderation::list_reports(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             status,
             report_type,
@@ -1172,7 +1147,7 @@ impl Db {
         &self,
         id: Uuid,
     ) -> Result<Option<admin_moderation::AdminReportDetail>> {
-        admin_moderation::get_report(self.pg_pool()?, id).await
+        admin_moderation::get_report(&self.pool, id).await
     }
 
     /// List feedback for the deployment-global read-only admin plane.
@@ -1180,7 +1155,7 @@ impl Db {
         &self,
         limit: i64,
     ) -> Result<Vec<admin_moderation::AdminFeedback>> {
-        admin_moderation::list_feedback(self.pg_pool()?, limit).await
+        admin_moderation::list_feedback(&self.pool, limit).await
     }
 
     /// Fetch one feedback submission for the deployment-global admin plane.
@@ -1188,42 +1163,42 @@ impl Db {
         &self,
         id: Uuid,
     ) -> Result<Option<admin_moderation::AdminFeedback>> {
-        admin_moderation::get_feedback(self.pg_pool()?, id).await
+        admin_moderation::get_feedback(&self.pool, id).await
     }
 
     /// Return total number of communities on this relay.
     pub async fn usage_community_count(&self) -> Result<i64> {
-        usage::community_count(self.pg_pool()?).await
+        usage::community_count(&self.pool).await
     }
 
     /// Return per-community user counts split by human/agent.
     pub async fn usage_user_counts(&self) -> Result<Vec<usage::CommunityUserCounts>> {
-        usage::user_counts(self.pg_pool()?).await
+        usage::user_counts(&self.pool).await
     }
 
     /// Return per-community channel counts by type.
     pub async fn usage_channel_counts(&self) -> Result<Vec<usage::CommunityChannelCount>> {
-        usage::channel_counts(self.pg_pool()?).await
+        usage::channel_counts(&self.pool).await
     }
 
     /// Return per-community kind=9 message counts.
     pub async fn usage_message_counts(&self) -> Result<Vec<usage::CommunityMessageCount>> {
-        usage::message_counts(self.pg_pool()?).await
+        usage::message_counts(&self.pool).await
     }
 
     /// Return per-community relay-member counts by role.
     pub async fn usage_relay_member_counts(&self) -> Result<Vec<usage::CommunityMemberCount>> {
-        usage::relay_member_counts(self.pg_pool()?).await
+        usage::relay_member_counts(&self.pool).await
     }
 
     /// Return per-community workflow counts by status.
     pub async fn usage_workflow_counts(&self) -> Result<Vec<usage::CommunityWorkflowCount>> {
-        usage::workflow_counts(self.pg_pool()?).await
+        usage::workflow_counts(&self.pool).await
     }
 
     /// Return per-community git-repo counts.
     pub async fn usage_git_repo_counts(&self) -> Result<Vec<usage::CommunityGitRepoCount>> {
-        usage::git_repo_counts(self.pg_pool()?).await
+        usage::git_repo_counts(&self.pool).await
     }
 
     /// Return per-community distinct active-user counts for a given SQL interval.
@@ -1233,7 +1208,7 @@ impl Db {
         &self,
         interval_sql: &'static str,
     ) -> Result<Vec<usage::CommunityActiveUsers>> {
-        usage::active_user_counts(self.pg_pool()?, interval_sql).await
+        usage::active_user_counts(&self.pool, interval_sql).await
     }
 
     /// Return per-community active-channel counts for a given SQL interval.
@@ -1241,12 +1216,12 @@ impl Db {
         &self,
         interval_sql: &'static str,
     ) -> Result<Vec<usage::CommunityActiveChannels>> {
-        usage::active_channel_counts(self.pg_pool()?, interval_sql).await
+        usage::active_channel_counts(&self.pool, interval_sql).await
     }
 
     /// Return all community id → host mappings.
     pub async fn usage_community_hosts(&self) -> Result<Vec<usage::CommunityHost>> {
-        usage::community_hosts(self.pg_pool()?).await
+        usage::community_hosts(&self.pool).await
     }
 
     /// Begin a database transaction for atomic multi-statement operations.
@@ -1254,7 +1229,7 @@ impl Db {
     /// Returns a `'static` transaction because `PgPool` is `Arc`-backed internally.
     /// The transaction holds an owned pool handle, not a borrow.
     pub async fn begin_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-        self.pg_pool()?.begin().await.map_err(Into::into)
+        self.pool.begin().await.map_err(Into::into)
     }
 
     /// Returns the community mapped to a normalized request host, if one exists.
@@ -1277,7 +1252,7 @@ impl Db {
             "#,
         )
         .bind(normalized_host)
-        .fetch_optional(self.pg_pool()?)
+        .fetch_optional(&self.pool)
         .await?;
 
         row.map(|row| {
@@ -1301,7 +1276,7 @@ impl Db {
             "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 AND archived_at IS NULL)",
         )
         .bind(community_id.as_uuid())
-        .fetch_one(self.pg_pool()?)
+        .fetch_one(&self.pool)
         .await?;
         Ok(active)
     }
@@ -1313,7 +1288,7 @@ impl Db {
     ) -> Result<Option<CommunityRecord>> {
         let row = sqlx::query("SELECT id, host FROM communities WHERE lower(host) = lower($1)")
             .bind(normalized_host)
-            .fetch_optional(self.pg_pool()?)
+            .fetch_optional(&self.pool)
             .await?;
         row.map(|row| {
             Ok(CommunityRecord {
@@ -1344,7 +1319,7 @@ impl Db {
             "#,
         )
         .bind(owner_pubkey)
-        .fetch_all(self.pg_pool()?)
+        .fetch_all(&self.pool)
         .await?;
 
         rows.into_iter()
@@ -1386,7 +1361,7 @@ impl Db {
             "#,
         )
         .bind(community_id.as_uuid())
-        .fetch_optional(self.pg_pool()?)
+        .fetch_optional(&self.pool)
         .await?;
 
         row.map(|row| {
@@ -1394,6 +1369,22 @@ impl Db {
             Ok(host)
         })
         .transpose()
+    }
+
+    /// Rebinds a stale loopback community to the current single-node authority.
+    pub async fn rebind_single_node_community_host(
+        &self,
+        normalized_host: &str,
+        owner_pubkey: &str,
+    ) -> Result<Option<CommunityRecord>> {
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::rebind_single_node_community_host(pool, normalized_host, owner_pubkey).await
+            }
+            DbBackend::Postgres => Err(DbError::UnsupportedBackend(
+                "single-node community rebind on PostgreSQL Db",
+            )),
+        }
     }
 
     /// Returns the community's workspace icon (NIP-11 `icon`), if set.
@@ -1409,7 +1400,7 @@ impl Db {
             "#,
         )
         .bind(community_id.as_uuid())
-        .fetch_optional(self.pg_pool()?)
+        .fetch_optional(&self.pool)
         .await?;
 
         Ok(row
@@ -1434,30 +1425,9 @@ impl Db {
         )
         .bind(community_id.as_uuid())
         .bind(icon)
-        .execute(self.pg_pool()?)
+        .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    /// Rebind the durable loopback community to this single-node process's
-    /// current ephemeral authority while preserving its stable UUID and data.
-    /// SQLite-only: production deployments never rewrite tenant host mappings.
-    pub async fn rebind_single_node_community_host(
-        &self,
-        normalized_host: &str,
-        owner_pubkey: &str,
-    ) -> Result<Option<CommunityRecord>> {
-        if matches!(&self.backend, DbBackend::SQLite(_)) {
-            return sqlite::rebind_single_node_community_host(
-                self.sqlite_pool()?,
-                normalized_host,
-                owner_pubkey,
-            )
-            .await;
-        }
-        Err(DbError::UnsupportedBackend(
-            "single-node community rebind requires SQLite",
-        ))
     }
 
     /// Ensure a configured community host exists and return its row.
@@ -1481,7 +1451,7 @@ impl Db {
             "#,
         )
         .bind(normalized_host)
-        .fetch_one(self.pg_pool()?)
+        .fetch_one(&self.pool)
         .await?;
 
         let id: Uuid = row.try_get("id")?;
@@ -1506,7 +1476,7 @@ impl Db {
         owner_pubkey: &str,
     ) -> Result<CreateCommunityWithOwnerResult> {
         let owner_pubkey = owner_pubkey.to_ascii_lowercase();
-        let mut tx = self.pg_pool()?.begin().await?;
+        let mut tx = self.pool.begin().await?;
 
         // Serialize on the owner pubkey so concurrent creates to the same
         // owner cannot both pass the ownership count check.
@@ -1605,7 +1575,7 @@ impl Db {
         .bind(normalized_host)
         .bind(owner_pubkey)
         .bind(protected_deployment_host)
-        .fetch_optional(self.pg_pool()?)
+        .fetch_optional(&self.pool)
         .await?;
         row.map(|row| {
             Ok(ArchivedCommunityRecord {
@@ -1635,7 +1605,7 @@ impl Db {
         )
         .bind(normalized_host)
         .bind(owner_pubkey)
-        .fetch_optional(self.pg_pool()?)
+        .fetch_optional(&self.pool)
         .await?;
         row.map(|row| {
             Ok(UnarchivedCommunityRecord {
@@ -1660,7 +1630,7 @@ impl Db {
             "#,
         )
         .bind(channel_id)
-        .fetch_optional(self.pg_pool()?)
+        .fetch_optional(&self.pool)
         .await?;
 
         row.map(|row| {
@@ -1695,30 +1665,25 @@ impl Db {
         if channel_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        match &self.backend {
-            DbBackend::SQLite(pool) => sqlite::communities_of_channels(pool, channel_ids).await,
-            DbBackend::Postgres => {
-                let rows = sqlx::query(
-                    r#"
+        let rows = sqlx::query(
+            r#"
             SELECT id, community_id
             FROM channels
             WHERE id = ANY($1)
               AND deleted_at IS NULL
             "#,
-                )
-                .bind(channel_ids)
-                .fetch_all(self.pg_pool()?)
-                .await?;
+        )
+        .bind(channel_ids)
+        .fetch_all(&self.pool)
+        .await?;
 
-                let mut out = std::collections::HashMap::with_capacity(rows.len());
-                for row in rows {
-                    let ch: Uuid = row.try_get("id")?;
-                    let cm: Uuid = row.try_get("community_id")?;
-                    out.insert(ch, CommunityId::from_uuid(cm));
-                }
-                Ok(out)
-            }
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let ch: Uuid = row.try_get("id")?;
+            let cm: Uuid = row.try_get("community_id")?;
+            out.insert(ch, CommunityId::from_uuid(cm));
         }
+        Ok(out)
     }
 
     /// Inserts an event. Returns `(StoredEvent, was_inserted)` — `false` on duplicate.
@@ -1728,13 +1693,9 @@ impl Db {
         event: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::insert_event(pool, community_id, event, channel_id).await;
-        }
-        let result = event::insert_event(self.pg_pool()?, community_id, event, channel_id).await?;
+        let result = event::insert_event(&self.pool, community_id, event, channel_id).await?;
         if result.1 {
-            if let Err(e) = insert_mentions(self.pg_pool()?, community_id, event, channel_id).await
-            {
+            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
                 tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
             }
         }
@@ -1749,10 +1710,7 @@ impl Db {
     /// [`Db::query_events_routed`] instead — converting a caller is an
     /// explicit, per-callsite decision, never a change to this method.
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<StoredEvent>> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => sqlite::query_events(pool, q).await,
-            DbBackend::Postgres => event::query_events(self.pg_pool()?, q).await,
-        }
+        event::query_events(&self.pool, q).await
     }
 
     /// [`Db::query_events`] with replica routing — the opt-in fast path for
@@ -1776,9 +1734,6 @@ impl Db {
         path: &'static str,
         q: &EventQuery,
     ) -> Result<Vec<StoredEvent>> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::query_events(pool, q).await;
-        }
         let predicate = RoutePredicate::for_query(q, self.replica_read_max_age.is_some());
         match self.route_read(path, predicate).await {
             RouteDecision::Replica(mut tx, _entry, reason) => {
@@ -1792,11 +1747,11 @@ impl Db {
                         // writer rather than surfacing a routed error.
                         tracing::warn!(path, "replica read failed; re-running on writer: {e}");
                         Self::record_route(path, "writer", "replica_error");
-                        event::query_events(self.pg_pool()?, q).await
+                        event::query_events(&self.pool, q).await
                     }
                 }
             }
-            RouteDecision::Writer => event::query_events(self.pg_pool()?, q).await,
+            RouteDecision::Writer => event::query_events(&self.pool, q).await,
         }
     }
 
@@ -1813,9 +1768,6 @@ impl Db {
         path: &'static str,
         q: &EventQuery,
     ) -> Result<Vec<StoredEvent>> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::query_events(pool, q).await;
-        }
         match self.route_read(path, RoutePredicate::Bounded).await {
             RouteDecision::Replica(mut tx, _entry, reason) => {
                 match event::query_events_on(&mut tx, q).await {
@@ -1826,11 +1778,11 @@ impl Db {
                     Err(e) => {
                         tracing::warn!(path, "replica read failed; re-running on writer: {e}");
                         Self::record_route(path, "writer", "replica_error");
-                        event::query_events(self.pg_pool()?, q).await
+                        event::query_events(&self.pool, q).await
                     }
                 }
             }
-            RouteDecision::Writer => event::query_events(self.pg_pool()?, q).await,
+            RouteDecision::Writer => event::query_events(&self.pool, q).await,
         }
     }
 
@@ -1839,7 +1791,7 @@ impl Db {
     /// Always reads from the WRITER pool — see [`Db::query_events`] for the
     /// writer-vs-routed rule.
     pub async fn count_events(&self, q: &EventQuery) -> Result<i64> {
-        event::count_events(self.pg_pool()?, q).await
+        event::count_events(&self.pool, q).await
     }
 
     /// [`Db::count_events`] with replica routing — same contract, rules,
@@ -1863,11 +1815,11 @@ impl Db {
                     Err(e) => {
                         tracing::warn!(path, "replica count failed; re-running on writer: {e}");
                         Self::record_route(path, "writer", "replica_error");
-                        event::count_events(self.pg_pool()?, q).await
+                        event::count_events(&self.pool, q).await
                     }
                 }
             }
-            RouteDecision::Writer => event::count_events(self.pg_pool()?, q).await,
+            RouteDecision::Writer => event::count_events(&self.pool, q).await,
         }
     }
 
@@ -1881,7 +1833,7 @@ impl Db {
         creator_pubkey: &[u8],
     ) -> Result<bool> {
         event::huddle_started_link_exists(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             parent_channel_id,
             ephemeral_channel_id,
@@ -1901,8 +1853,7 @@ impl Db {
         kind: i32,
         pubkey_bytes: &[u8],
     ) -> Result<Option<StoredEvent>> {
-        event::get_latest_global_replaceable(self.pg_pool()?, community_id, kind, pubkey_bytes)
-            .await
+        event::get_latest_global_replaceable(&self.pool, community_id, kind, pubkey_bytes).await
     }
 
     /// Fetches a single non-deleted event by its raw ID bytes.
@@ -1913,12 +1864,7 @@ impl Db {
         community_id: CommunityId,
         id_bytes: &[u8],
     ) -> Result<Option<StoredEvent>> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => sqlite::get_event_by_id(pool, community_id, id_bytes).await,
-            DbBackend::Postgres => {
-                event::get_event_by_id(self.pg_pool()?, community_id, id_bytes).await
-            }
-        }
+        event::get_event_by_id(&self.pool, community_id, id_bytes).await
     }
 
     /// Fetches a single event by its raw ID bytes, **including soft-deleted rows**.
@@ -1927,13 +1873,7 @@ impl Db {
         community_id: CommunityId,
         id_bytes: &[u8],
     ) -> Result<Option<StoredEvent>> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => sqlite::get_event_by_id(pool, community_id, id_bytes).await,
-            DbBackend::Postgres => {
-                event::get_event_by_id_including_deleted(self.pg_pool()?, community_id, id_bytes)
-                    .await
-            }
-        }
+        event::get_event_by_id_including_deleted(&self.pool, community_id, id_bytes).await
     }
 
     /// Soft-deletes an event. Returns `Ok(true)` if deleted, `Ok(false)` if already deleted.
@@ -1942,7 +1882,7 @@ impl Db {
         community_id: CommunityId,
         event_id: &[u8],
     ) -> Result<bool> {
-        event::soft_delete_event(self.pg_pool()?, community_id, event_id).await
+        event::soft_delete_event(&self.pool, community_id, event_id).await
     }
 
     /// Soft-delete the live row for an addressable coordinate `(kind, pubkey, d_tag)`
@@ -1958,7 +1898,7 @@ impl Db {
         deletion_created_at_secs: i64,
     ) -> Result<bool> {
         event::soft_delete_by_coordinate(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             kind,
             pubkey,
@@ -1976,21 +1916,14 @@ impl Db {
         parent_event_id: Option<&[u8]>,
         root_event_id: Option<&[u8]>,
     ) -> Result<bool> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::soft_delete_event(pool, community_id, event_id).await
-            }
-            DbBackend::Postgres => {
-                event::soft_delete_event_and_update_thread(
-                    self.pg_pool()?,
-                    community_id,
-                    event_id,
-                    parent_event_id,
-                    root_event_id,
-                )
-                .await
-            }
-        }
+        event::soft_delete_event_and_update_thread(
+            &self.pool,
+            community_id,
+            event_id,
+            parent_event_id,
+            root_event_id,
+        )
+        .await
     }
 
     /// Returns the most recent `created_at` for a channel.
@@ -1999,7 +1932,7 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<Option<DateTime<Utc>>> {
-        event::get_last_message_at(self.pg_pool()?, community_id, channel_id).await
+        event::get_last_message_at(&self.pool, community_id, channel_id).await
     }
 
     /// Bulk-fetch the most recent `created_at` for a set of channel IDs.
@@ -2008,7 +1941,7 @@ impl Db {
         community_id: CommunityId,
         channel_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, DateTime<Utc>>> {
-        event::get_last_message_at_bulk(self.pg_pool()?, community_id, channel_ids).await
+        event::get_last_message_at_bulk(&self.pool, community_id, channel_ids).await
     }
 
     /// Batch-fetch non-deleted events by their raw IDs.
@@ -2017,7 +1950,7 @@ impl Db {
         community_id: CommunityId,
         ids: &[&[u8]],
     ) -> Result<Vec<StoredEvent>> {
-        event::get_events_by_ids(self.pg_pool()?, community_id, ids).await
+        event::get_events_by_ids(&self.pool, community_id, ids).await
     }
 
     /// [`Db::get_events_by_ids`] with replica routing — same contract and
@@ -2043,13 +1976,11 @@ impl Db {
                     Err(e) => {
                         tracing::warn!(path, "replica read failed; re-running on writer: {e}");
                         Self::record_route(path, "writer", "replica_error");
-                        event::get_events_by_ids(self.pg_pool()?, community_id, ids).await
+                        event::get_events_by_ids(&self.pool, community_id, ids).await
                     }
                 }
             }
-            RouteDecision::Writer => {
-                event::get_events_by_ids(self.pg_pool()?, community_id, ids).await
-            }
+            RouteDecision::Writer => event::get_events_by_ids(&self.pool, community_id, ids).await,
         }
     }
 
@@ -2059,7 +1990,7 @@ impl Db {
         limit: i64,
         lease_until: DateTime<Utc>,
     ) -> Result<Option<push::ClaimedMatchBatch>> {
-        push::claim_due_match_batch(self.pg_pool()?, limit, lease_until).await
+        push::claim_due_match_batch(&self.pool, limit, lease_until).await
     }
 
     /// Load active endpoint-enabled leases eligible for push matching.
@@ -2067,7 +1998,7 @@ impl Db {
         &self,
         community: CommunityId,
     ) -> Result<Vec<push::MatchLease>> {
-        push::active_match_leases(self.pg_pool()?, community).await
+        push::active_match_leases(&self.pool, community).await
     }
 
     /// Complete matcher jobs from one claimed batch while the fence holds.
@@ -2077,7 +2008,7 @@ impl Db {
         claim_id: uuid::Uuid,
         event_ids: &[Vec<u8>],
     ) -> Result<u64> {
-        push::complete_match_batch(self.pg_pool()?, community, claim_id, event_ids).await
+        push::complete_match_batch(&self.pool, community, claim_id, event_ids).await
     }
 
     /// Release fenced matcher claims from one batch for retry.
@@ -2088,12 +2019,12 @@ impl Db {
         event_ids: &[Vec<u8>],
         next: DateTime<Utc>,
     ) -> Result<u64> {
-        push::retry_match_batch(self.pg_pool()?, community, claim_id, event_ids, next).await
+        push::retry_match_batch(&self.pool, community, claim_id, event_ids, next).await
     }
 
     /// Delete exhausted matcher jobs (periodic sweep, off the claim path).
     pub async fn reap_exhausted_push_matches(&self) -> Result<u64> {
-        push::reap_exhausted_matches(self.pg_pool()?).await
+        push::reap_exhausted_matches(&self.pool).await
     }
 
     /// Idempotently enqueue a wake for a matched lease and event.
@@ -2104,7 +2035,7 @@ impl Db {
         installation_id: &str,
         wake: push::NewWake<'_>,
     ) -> Result<push::EnqueueWakeOutcome> {
-        push::enqueue_wake(self.pg_pool()?, community, author, installation_id, wake).await
+        push::enqueue_wake(&self.pool, community, author, installation_id, wake).await
     }
 
     /// Set-wise [`Self::enqueue_push_wake`]: one transaction per batch.
@@ -2113,7 +2044,7 @@ impl Db {
         community: CommunityId,
         requests: &[push::WakeRequest],
     ) -> Result<Vec<push::EnqueueWakeOutcome>> {
-        push::enqueue_wakes(self.pg_pool()?, community, requests).await
+        push::enqueue_wakes(&self.pool, community, requests).await
     }
 
     /// Exclusively claim due wake jobs for one community.
@@ -2123,7 +2054,7 @@ impl Db {
         limit: i64,
         lease_until: DateTime<Utc>,
     ) -> Result<Vec<push::ClaimedWake>> {
-        push::claim_due_wakes(self.pg_pool()?, community, limit, lease_until).await
+        push::claim_due_wakes(&self.pool, community, limit, lease_until).await
     }
 
     /// Revalidate a wake's claim, source event, and current lease before send.
@@ -2133,7 +2064,7 @@ impl Db {
         id: Uuid,
         claim_id: Uuid,
     ) -> Result<push::RevalidateWakeOutcome> {
-        push::revalidate_wake_for_send(self.pg_pool()?, community, id, claim_id).await
+        push::revalidate_wake_for_send(&self.pool, community, id, claim_id).await
     }
 
     /// Mark a fenced wake claim delivered.
@@ -2143,7 +2074,7 @@ impl Db {
         id: Uuid,
         claim_id: Uuid,
     ) -> Result<bool> {
-        push::complete_wake(self.pg_pool()?, community, id, claim_id).await
+        push::complete_wake(&self.pool, community, id, claim_id).await
     }
 
     /// Release a fenced wake claim for retry at the supplied time.
@@ -2154,7 +2085,7 @@ impl Db {
         claim_id: Uuid,
         next: DateTime<Utc>,
     ) -> Result<bool> {
-        push::retry_wake(self.pg_pool()?, community, id, claim_id, next).await
+        push::retry_wake(&self.pool, community, id, claim_id, next).await
     }
 
     /// Mark a fenced wake claim terminally failed.
@@ -2164,7 +2095,7 @@ impl Db {
         id: Uuid,
         claim_id: Uuid,
     ) -> Result<bool> {
-        push::fail_wake(self.pg_pool()?, community, id, claim_id).await
+        push::fail_wake(&self.pool, community, id, claim_id).await
     }
 
     /// Disable an endpoint only if the specified lease generation is current.
@@ -2176,7 +2107,7 @@ impl Db {
         generation: i64,
     ) -> Result<bool> {
         push::disable_endpoint_generation(
-            self.pg_pool()?,
+            &self.pool,
             community,
             author,
             installation_id,
@@ -2197,7 +2128,7 @@ impl Db {
         max_active_leases: i64,
     ) -> Result<push::AcceptLeaseOutcome> {
         push::accept_lease_event(
-            self.pg_pool()?,
+            &self.pool,
             community,
             event,
             installation_id,
@@ -2216,15 +2147,8 @@ impl Db {
         channel_id: Option<Uuid>,
         thread_meta: Option<event::ThreadMetadataParams<'_>>,
     ) -> Result<(StoredEvent, bool)> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            // SQLite Phase 1 persists the canonical event; thread relationships
-            // remain durable in the event's NIP-10 tags until Phase 2 ports the
-            // denormalized thread metadata tables.
-            let _ = thread_meta;
-            return sqlite::insert_event(pool, community_id, event, channel_id).await;
-        }
         let result = event::insert_event_with_thread_metadata(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             event,
             channel_id,
@@ -2232,8 +2156,7 @@ impl Db {
         )
         .await?;
         if result.1 {
-            if let Err(e) = insert_mentions(self.pg_pool()?, community_id, event, channel_id).await
-            {
+            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
                 tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
             }
         }
@@ -2252,21 +2175,8 @@ impl Db {
         actor_pubkey: &[u8],
         emoji: &str,
     ) -> Result<event::ReactionEventInsertOutcome> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            let _ = thread_meta;
-            return sqlite::insert_reaction_event(
-                pool,
-                community_id,
-                event,
-                channel_id,
-                target_event_id,
-                actor_pubkey,
-                emoji,
-            )
-            .await;
-        }
         let outcome = event::insert_reaction_event_with_thread_metadata(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             event,
             channel_id,
@@ -2280,8 +2190,7 @@ impl Db {
             was_inserted: true, ..
         } = &outcome
         {
-            if let Err(e) = insert_mentions(self.pg_pool()?, community_id, event, channel_id).await
-            {
+            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
                 tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
             }
         }
@@ -2301,7 +2210,7 @@ impl Db {
         ttl_seconds: Option<i32>,
     ) -> Result<channel::ChannelRecord> {
         channel::create_channel(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             name,
             channel_type,
@@ -2343,7 +2252,7 @@ impl Db {
             .await;
         }
         channel::create_channel_with_id(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             channel_id,
             name,
@@ -2364,9 +2273,7 @@ impl Db {
     ) -> Result<channel::ChannelRecord> {
         match &self.backend {
             DbBackend::SQLite(pool) => sqlite::get_channel(pool, community_id, channel_id).await,
-            DbBackend::Postgres => {
-                channel::get_channel(self.pg_pool()?, community_id, channel_id).await
-            }
+            DbBackend::Postgres => channel::get_channel(&self.pool, community_id, channel_id).await,
         }
     }
 
@@ -2376,7 +2283,7 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<Option<String>> {
-        channel::get_canvas(self.pg_pool()?, community_id, channel_id).await
+        channel::get_canvas(&self.pool, community_id, channel_id).await
     }
 
     /// Sets or clears the canvas content for a channel.
@@ -2386,7 +2293,7 @@ impl Db {
         channel_id: Uuid,
         canvas: Option<&str>,
     ) -> Result<()> {
-        channel::set_canvas(self.pg_pool()?, community_id, channel_id, canvas).await
+        channel::set_canvas(&self.pool, community_id, channel_id, canvas).await
     }
 
     /// Adds a member to a channel.
@@ -2403,7 +2310,7 @@ impl Db {
                 .await;
         }
         channel::add_member(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             channel_id,
             pubkey,
@@ -2421,14 +2328,7 @@ impl Db {
         pubkey: &[u8],
         actor_pubkey: &[u8],
     ) -> Result<()> {
-        channel::remove_member(
-            self.pg_pool()?,
-            community_id,
-            channel_id,
-            pubkey,
-            actor_pubkey,
-        )
-        .await
+        channel::remove_member(&self.pool, community_id, channel_id, pubkey, actor_pubkey).await
     }
 
     /// Returns `true` if the pubkey is an active member.
@@ -2443,7 +2343,7 @@ impl Db {
                 sqlite::is_member(pool, community_id, channel_id, pubkey).await
             }
             DbBackend::Postgres => {
-                channel::is_member(self.pg_pool()?, community_id, channel_id, pubkey).await
+                channel::is_member(&self.pool, community_id, channel_id, pubkey).await
             }
         }
     }
@@ -2456,7 +2356,7 @@ impl Db {
         channel_ids: &[Uuid],
         pubkeys: &[Vec<u8>],
     ) -> Result<Vec<(Uuid, Vec<u8>)>> {
-        channel::membership_pairs(self.pg_pool()?, community_id, channel_ids, pubkeys).await
+        channel::membership_pairs(&self.pool, community_id, channel_ids, pubkeys).await
     }
 
     /// Returns all active members of a channel.
@@ -2467,9 +2367,7 @@ impl Db {
     ) -> Result<Vec<channel::MemberRecord>> {
         match &self.backend {
             DbBackend::SQLite(pool) => sqlite::get_members(pool, community_id, channel_id).await,
-            DbBackend::Postgres => {
-                channel::get_members(self.pg_pool()?, community_id, channel_id).await
-            }
+            DbBackend::Postgres => channel::get_members(&self.pool, community_id, channel_id).await,
         }
     }
 
@@ -2479,7 +2377,7 @@ impl Db {
         community_id: CommunityId,
         channel_ids: &[Uuid],
     ) -> Result<Vec<channel::MemberRecord>> {
-        channel::get_members_bulk(self.pg_pool()?, community_id, channel_ids).await
+        channel::get_members_bulk(&self.pool, community_id, channel_ids).await
     }
 
     /// Get all channel IDs accessible to a pubkey.
@@ -2493,7 +2391,7 @@ impl Db {
                 sqlite::get_accessible_channel_ids(pool, community_id, pubkey).await
             }
             DbBackend::Postgres => {
-                channel::get_accessible_channel_ids(self.pg_pool()?, community_id, pubkey).await
+                channel::get_accessible_channel_ids(&self.pool, community_id, pubkey).await
             }
         }
     }
@@ -2504,7 +2402,7 @@ impl Db {
         community_id: CommunityId,
         visibility: Option<&str>,
     ) -> Result<Vec<channel::ChannelRecord>> {
-        channel::list_channels(self.pg_pool()?, community_id, visibility).await
+        channel::list_channels(&self.pool, community_id, visibility).await
     }
 
     /// Returns full channel records for all channels a user can access.
@@ -2516,7 +2414,7 @@ impl Db {
         member_only: Option<bool>,
     ) -> Result<Vec<channel::AccessibleChannel>> {
         channel::get_accessible_channels(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             pubkey,
             visibility_filter,
@@ -2530,7 +2428,7 @@ impl Db {
         &self,
         community_id: CommunityId,
     ) -> Result<Vec<channel::BotMemberRecord>> {
-        channel::get_bot_members(self.pg_pool()?, community_id).await
+        channel::get_bot_members(&self.pool, community_id).await
     }
 
     /// Bulk-fetch user records by pubkey.
@@ -2539,7 +2437,7 @@ impl Db {
         community_id: CommunityId,
         pubkeys: &[Vec<u8>],
     ) -> Result<Vec<channel::UserRecord>> {
-        channel::get_users_bulk(self.pg_pool()?, community_id, pubkeys).await
+        channel::get_users_bulk(&self.pool, community_id, pubkeys).await
     }
 
     /// Updates a channel's name and/or description.
@@ -2549,7 +2447,7 @@ impl Db {
         channel_id: Uuid,
         updates: channel::ChannelUpdate,
     ) -> Result<channel::ChannelRecord> {
-        channel::update_channel(self.pg_pool()?, community_id, channel_id, updates).await
+        channel::update_channel(&self.pool, community_id, channel_id, updates).await
     }
 
     /// Sets the topic for a channel.
@@ -2560,7 +2458,7 @@ impl Db {
         topic: &str,
         set_by: &[u8],
     ) -> Result<()> {
-        channel::set_topic(self.pg_pool()?, community_id, channel_id, topic, set_by).await
+        channel::set_topic(&self.pool, community_id, channel_id, topic, set_by).await
     }
 
     /// Sets the purpose for a channel.
@@ -2571,12 +2469,12 @@ impl Db {
         purpose: &str,
         set_by: &[u8],
     ) -> Result<()> {
-        channel::set_purpose(self.pg_pool()?, community_id, channel_id, purpose, set_by).await
+        channel::set_purpose(&self.pool, community_id, channel_id, purpose, set_by).await
     }
 
     /// Archives a channel.
     pub async fn archive_channel(&self, community_id: CommunityId, channel_id: Uuid) -> Result<()> {
-        channel::archive_channel(self.pg_pool()?, community_id, channel_id).await
+        channel::archive_channel(&self.pool, community_id, channel_id).await
     }
 
     /// Unarchives a channel.
@@ -2585,7 +2483,7 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<()> {
-        channel::unarchive_channel(self.pg_pool()?, community_id, channel_id).await
+        channel::unarchive_channel(&self.pool, community_id, channel_id).await
     }
 
     /// Soft-delete a channel.
@@ -2594,7 +2492,7 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<bool> {
-        channel::soft_delete_channel(self.pg_pool()?, community_id, channel_id).await
+        channel::soft_delete_channel(&self.pool, community_id, channel_id).await
     }
 
     /// Returns the count of active members in a channel.
@@ -2603,7 +2501,7 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<i64> {
-        channel::get_member_count(self.pg_pool()?, community_id, channel_id).await
+        channel::get_member_count(&self.pool, community_id, channel_id).await
     }
 
     /// Bulk-fetch member counts for a set of channel IDs.
@@ -2612,7 +2510,7 @@ impl Db {
         community_id: CommunityId,
         channel_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, i64>> {
-        channel::get_member_counts_bulk(self.pg_pool()?, community_id, channel_ids).await
+        channel::get_member_counts_bulk(&self.pool, community_id, channel_ids).await
     }
 
     /// Get the active role of a pubkey in a channel.
@@ -2622,21 +2520,14 @@ impl Db {
         channel_id: Uuid,
         pubkey: &[u8],
     ) -> Result<Option<String>> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::get_member_role(pool, community_id, channel_id, pubkey).await
-            }
-            DbBackend::Postgres => {
-                channel::get_member_role(self.pg_pool()?, community_id, channel_id, pubkey).await
-            }
-        }
+        channel::get_member_role(&self.pool, community_id, channel_id, pubkey).await
     }
 
     /// Archive ephemeral channels whose TTL deadline has passed.
     pub async fn reap_expired_ephemeral_channels(
         &self,
     ) -> Result<Vec<channel::ReapedEphemeralChannel>> {
-        channel::reap_expired_ephemeral_channels(self.pg_pool()?).await
+        channel::reap_expired_ephemeral_channels(&self.pool).await
     }
 
     /// Query due reminders ready for delivery.
@@ -2645,7 +2536,7 @@ impl Db {
         now_secs: i64,
         batch_limit: i64,
     ) -> Result<Vec<event::DueReminder>> {
-        event::query_due_reminders(self.pg_pool()?, now_secs, batch_limit).await
+        event::query_due_reminders(&self.pool, now_secs, batch_limit).await
     }
 
     /// Atomically claim a due reminder for delivery (cross-pod dedup).
@@ -2655,7 +2546,7 @@ impl Db {
         event_id: &[u8],
         event_created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool> {
-        event::claim_due_reminder(self.pg_pool()?, community_id, event_id, event_created_at).await
+        event::claim_due_reminder(&self.pool, community_id, event_id, event_created_at).await
     }
 
     /// Atomically claim a due reminder using a caller-supplied delivery stamp.
@@ -2667,7 +2558,7 @@ impl Db {
         delivery_stamp: i64,
     ) -> Result<bool> {
         event::claim_due_reminder_with_stamp(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             event_id,
             event_created_at,
@@ -2685,7 +2576,7 @@ impl Db {
         delivery_stamp: i64,
     ) -> Result<bool> {
         event::release_due_reminder(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             event_id,
             event_created_at,
@@ -2700,10 +2591,7 @@ impl Db {
     /// already existed. Callers use the `true` return to increment
     /// `buzz_users_created_total`.
     pub async fn ensure_user(&self, community_id: CommunityId, pubkey: &[u8]) -> Result<bool> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => sqlite::ensure_user(pool, community_id, pubkey).await,
-            DbBackend::Postgres => user::ensure_user(self.pg_pool()?, community_id, pubkey).await,
-        }
+        user::ensure_user(&self.pool, community_id, pubkey).await
     }
 
     /// Get a single user record by pubkey.
@@ -2712,10 +2600,7 @@ impl Db {
         community_id: CommunityId,
         pubkey: &[u8],
     ) -> Result<Option<user::UserProfile>> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => sqlite::get_user(pool, community_id, pubkey).await,
-            DbBackend::Postgres => user::get_user(self.pg_pool()?, community_id, pubkey).await,
-        }
+        user::get_user(&self.pool, community_id, pubkey).await
     }
 
     /// Update a user's profile fields.
@@ -2728,32 +2613,16 @@ impl Db {
         about: Option<&str>,
         nip05_handle: Option<&str>,
     ) -> Result<()> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::update_user_profile(
-                    pool,
-                    community_id,
-                    pubkey,
-                    display_name,
-                    avatar_url,
-                    about,
-                    nip05_handle,
-                )
-                .await
-            }
-            DbBackend::Postgres => {
-                user::update_user_profile(
-                    self.pg_pool()?,
-                    community_id,
-                    pubkey,
-                    display_name,
-                    avatar_url,
-                    about,
-                    nip05_handle,
-                )
-                .await
-            }
-        }
+        user::update_user_profile(
+            &self.pool,
+            community_id,
+            pubkey,
+            display_name,
+            avatar_url,
+            about,
+            nip05_handle,
+        )
+        .await
     }
 
     /// Look up a user by NIP-05 handle.
@@ -2763,7 +2632,7 @@ impl Db {
         local_part: &str,
         domain: &str,
     ) -> Result<Option<user::UserProfile>> {
-        user::get_user_by_nip05(self.pg_pool()?, community_id, local_part, domain).await
+        user::get_user_by_nip05(&self.pool, community_id, local_part, domain).await
     }
 
     /// Search users by display name, NIP-05 handle, or pubkey prefix.
@@ -2773,7 +2642,7 @@ impl Db {
         query: &str,
         limit: u32,
     ) -> Result<Vec<user::UserSearchProfile>> {
-        user::search_users(self.pg_pool()?, community_id, query, limit).await
+        user::search_users(&self.pool, community_id, query, limit).await
     }
 
     /// Atomically set agent owner — only if no owner is currently assigned.
@@ -2784,15 +2653,7 @@ impl Db {
         agent_pubkey: &[u8],
         owner_pubkey: &[u8],
     ) -> Result<bool> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::set_agent_owner(pool, community_id, agent_pubkey, owner_pubkey).await
-            }
-            DbBackend::Postgres => {
-                user::set_agent_owner(self.pg_pool()?, community_id, agent_pubkey, owner_pubkey)
-                    .await
-            }
-        }
+        user::set_agent_owner(&self.pool, community_id, agent_pubkey, owner_pubkey).await
     }
 
     /// Get the channel_add_policy and agent_owner_pubkey for a user.
@@ -2801,14 +2662,7 @@ impl Db {
         community_id: CommunityId,
         pubkey: &[u8],
     ) -> Result<Option<(String, Option<Vec<u8>>)>> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::get_agent_channel_policy(pool, community_id, pubkey).await
-            }
-            DbBackend::Postgres => {
-                user::get_agent_channel_policy(self.pg_pool()?, community_id, pubkey).await
-            }
-        }
+        user::get_agent_channel_policy(&self.pool, community_id, pubkey).await
     }
 
     /// Check whether `actor_pubkey` is the agent owner of `target_pubkey`.
@@ -2818,15 +2672,7 @@ impl Db {
         target_pubkey: &[u8],
         actor_pubkey: &[u8],
     ) -> Result<bool> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::is_agent_owner(pool, community_id, target_pubkey, actor_pubkey).await
-            }
-            DbBackend::Postgres => {
-                user::is_agent_owner(self.pg_pool()?, community_id, target_pubkey, actor_pubkey)
-                    .await
-            }
-        }
+        user::is_agent_owner(&self.pool, community_id, target_pubkey, actor_pubkey).await
     }
 
     /// Set the channel_add_policy for a user.
@@ -2836,7 +2682,7 @@ impl Db {
         pubkey: &[u8],
         policy: &str,
     ) -> Result<()> {
-        user::set_channel_add_policy(self.pg_pool()?, community_id, pubkey, policy).await
+        user::set_channel_add_policy(&self.pool, community_id, pubkey, policy).await
     }
 
     /// Find an existing DM by its participant hash.
@@ -2845,7 +2691,7 @@ impl Db {
         community_id: CommunityId,
         participant_hash: &[u8],
     ) -> Result<Option<channel::ChannelRecord>> {
-        dm::find_dm_by_participants(self.pg_pool()?, community_id, participant_hash).await
+        dm::find_dm_by_participants(&self.pool, community_id, participant_hash).await
     }
 
     /// Create or return an existing DM channel.
@@ -2855,7 +2701,7 @@ impl Db {
         participants: &[&[u8]],
         created_by: &[u8],
     ) -> Result<channel::ChannelRecord> {
-        dm::create_dm(self.pg_pool()?, community_id, participants, created_by).await
+        dm::create_dm(&self.pool, community_id, participants, created_by).await
     }
 
     /// List all DMs for a user.
@@ -2866,7 +2712,7 @@ impl Db {
         limit: u32,
         cursor: Option<Uuid>,
     ) -> Result<Vec<dm::DmRecord>> {
-        dm::list_dms_for_user(self.pg_pool()?, community_id, pubkey, limit, cursor).await
+        dm::list_dms_for_user(&self.pool, community_id, pubkey, limit, cursor).await
     }
 
     /// Open or retrieve a DM for the given participants.
@@ -2876,33 +2722,7 @@ impl Db {
         pubkeys: &[&[u8]],
         created_by: &[u8],
     ) -> Result<(channel::ChannelRecord, bool)> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::open_dm(pool, community_id, pubkeys, created_by, None)
-                    .await?
-                    .ok_or_else(|| DbError::InvalidData("unexpected duplicate DM open".into()))
-            }
-            DbBackend::Postgres => {
-                dm::open_dm(self.pg_pool()?, community_id, pubkeys, created_by).await
-            }
-        }
-    }
-
-    /// Atomically persist a SQLite DM-open command and its channel mutation.
-    /// `None` means the command event was already processed.
-    pub async fn open_dm_sqlite_command(
-        &self,
-        community_id: CommunityId,
-        pubkeys: &[&[u8]],
-        created_by: &[u8],
-        event: &nostr::Event,
-    ) -> Result<Option<(channel::ChannelRecord, bool)>> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::open_dm(pool, community_id, pubkeys, created_by, Some(event)).await
-            }
-            DbBackend::Postgres => Ok(None),
-        }
+        dm::open_dm(&self.pool, community_id, pubkeys, created_by).await
     }
 
     /// Hide a DM channel for a specific user.
@@ -2915,7 +2735,7 @@ impl Db {
         channel_id: Uuid,
         pubkey: &[u8],
     ) -> Result<()> {
-        dm::hide_dm(self.pg_pool()?, community_id, channel_id, pubkey).await
+        dm::hide_dm(&self.pool, community_id, channel_id, pubkey).await
     }
 
     /// Unhide a DM channel for a specific user.
@@ -2925,7 +2745,7 @@ impl Db {
         channel_id: Uuid,
         pubkey: &[u8],
     ) -> Result<()> {
-        dm::unhide_dm(self.pg_pool()?, community_id, channel_id, pubkey).await
+        dm::unhide_dm(&self.pool, community_id, channel_id, pubkey).await
     }
 
     /// List the channel IDs of all DMs the given user currently has hidden.
@@ -2934,7 +2754,7 @@ impl Db {
         community_id: CommunityId,
         pubkey: &[u8],
     ) -> Result<Vec<Uuid>> {
-        dm::list_hidden_dms(self.pg_pool()?, community_id, pubkey).await
+        dm::list_hidden_dms(&self.pool, community_id, pubkey).await
     }
 
     /// Insert thread metadata.
@@ -2953,7 +2773,7 @@ impl Db {
         broadcast: bool,
     ) -> Result<()> {
         thread::insert_thread_metadata(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             event_id,
             event_created_at,
@@ -3052,7 +2872,7 @@ impl Db {
             }
         }
         thread::get_thread_replies(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             root_event_id,
             depth_limit,
@@ -3068,7 +2888,7 @@ impl Db {
         community_id: CommunityId,
         event_id: &[u8],
     ) -> Result<Option<thread::ThreadSummary>> {
-        thread::get_thread_summary(self.pg_pool()?, community_id, event_id).await
+        thread::get_thread_summary(&self.pool, community_id, event_id).await
     }
 
     /// One channel window: top-level rows + summaries + server `has_more`.
@@ -3152,7 +2972,7 @@ impl Db {
                             ReadSession {
                                 inner: ReadSessionInner::Replica {
                                     tx,
-                                    writer: self.pg_pool()?.clone(),
+                                    writer: self.pool.clone(),
                                 },
                             },
                         ));
@@ -3176,7 +2996,7 @@ impl Db {
             RouteDecision::Writer => {}
         }
         let window = thread::get_channel_window(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             channel_id,
             limit,
@@ -3187,7 +3007,7 @@ impl Db {
         Ok((
             window,
             ReadSession {
-                inner: ReadSessionInner::Writer(self.pg_pool()?.clone()),
+                inner: ReadSessionInner::Writer(self.pool.clone()),
             },
         ))
     }
@@ -3284,12 +3104,7 @@ impl Db {
         community_id: CommunityId,
         event_id: &[u8],
     ) -> Result<Option<thread::ThreadMetadataRecord>> {
-        if matches!(&self.backend, DbBackend::SQLite(_)) {
-            // SQLite Phase 1 derives ancestry from durable NIP-10 event tags;
-            // denormalized counters and metadata arrive with the Phase 2 port.
-            return Ok(None);
-        }
-        thread::get_thread_metadata_by_event(self.pg_pool()?, community_id, event_id).await
+        thread::get_thread_metadata_by_event(&self.pool, community_id, event_id).await
     }
 
     /// Decrement reply counts.
@@ -3299,13 +3114,8 @@ impl Db {
         parent_event_id: &[u8],
         root_event_id: Option<&[u8]>,
     ) -> Result<()> {
-        thread::decrement_reply_count(
-            self.pg_pool()?,
-            community_id,
-            parent_event_id,
-            root_event_id,
-        )
-        .await
+        thread::decrement_reply_count(&self.pool, community_id, parent_event_id, root_event_id)
+            .await
     }
 
     /// Add (or re-activate) a reaction.
@@ -3319,7 +3129,7 @@ impl Db {
         reaction_event_id: Option<&[u8]>,
     ) -> Result<bool> {
         reaction::add_reaction(
-            self.pg_pool()?,
+            &self.pool,
             community,
             event_id,
             event_created_at,
@@ -3339,19 +3149,8 @@ impl Db {
         pubkey: &[u8],
         emoji: &str,
     ) -> Result<bool> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::remove_reaction(
-                pool,
-                community,
-                event_id,
-                event_created_at,
-                pubkey,
-                emoji,
-            )
-            .await;
-        }
         reaction::remove_reaction(
-            self.pg_pool()?,
+            &self.pool,
             community,
             event_id,
             event_created_at,
@@ -3367,12 +3166,7 @@ impl Db {
         community: CommunityId,
         reaction_event_id: &[u8],
     ) -> Result<bool> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::remove_reaction_by_source_event_id(pool, community, reaction_event_id)
-                .await;
-        }
-        reaction::remove_reaction_by_source_event_id(self.pg_pool()?, community, reaction_event_id)
-            .await
+        reaction::remove_reaction_by_source_event_id(&self.pool, community, reaction_event_id).await
     }
 
     /// Look up the active reaction row for one actor + emoji + target tuple.
@@ -3385,7 +3179,7 @@ impl Db {
         emoji: &str,
     ) -> Result<Option<reaction::ActiveReactionRecord>> {
         reaction::get_active_reaction_record(
-            self.pg_pool()?,
+            &self.pool,
             community,
             event_id,
             event_created_at,
@@ -3406,7 +3200,7 @@ impl Db {
         reaction_event_id: &[u8],
     ) -> Result<bool> {
         reaction::set_reaction_event_id(
-            self.pg_pool()?,
+            &self.pool,
             community,
             event_id,
             event_created_at,
@@ -3427,7 +3221,7 @@ impl Db {
         cursor: Option<&str>,
     ) -> Result<Vec<reaction::ReactionGroup>> {
         reaction::get_reactions(
-            self.pg_pool()?,
+            &self.pool,
             community,
             event_id,
             event_created_at,
@@ -3443,7 +3237,7 @@ impl Db {
         community: CommunityId,
         event_ids: &[(&[u8], DateTime<Utc>)],
     ) -> Result<Vec<reaction::BulkReactionEntry>> {
-        reaction::get_reactions_bulk(self.pg_pool()?, community, event_ids).await
+        reaction::get_reactions_bulk(&self.pool, community, event_ids).await
     }
 
     /// Find events that @mention the given pubkey.
@@ -3456,7 +3250,7 @@ impl Db {
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
         feed::query_mentions(
-            self.pg_pool()?,
+            &self.pool,
             community,
             pubkey_bytes,
             accessible_channel_ids,
@@ -3482,17 +3276,6 @@ impl Db {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::query_feed_mentions(
-                pool,
-                community,
-                pubkey_bytes,
-                accessible_channel_ids,
-                since,
-                limit,
-            )
-            .await;
-        }
         match self.route_read(path, RoutePredicate::Bounded).await {
             RouteDecision::Replica(mut tx, _entry, reason) => {
                 match feed::query_mentions_on(
@@ -3513,7 +3296,7 @@ impl Db {
                         tracing::warn!(path, "replica read failed; re-running on writer: {e}");
                         Self::record_route(path, "writer", "replica_error");
                         feed::query_mentions(
-                            self.pg_pool()?,
+                            &self.pool,
                             community,
                             pubkey_bytes,
                             accessible_channel_ids,
@@ -3526,7 +3309,7 @@ impl Db {
             }
             RouteDecision::Writer => {
                 feed::query_mentions(
-                    self.pg_pool()?,
+                    &self.pool,
                     community,
                     pubkey_bytes,
                     accessible_channel_ids,
@@ -3548,7 +3331,7 @@ impl Db {
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
         feed::query_needs_action(
-            self.pg_pool()?,
+            &self.pool,
             community,
             pubkey_bytes,
             accessible_channel_ids,
@@ -3570,17 +3353,6 @@ impl Db {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::query_feed_needs_action(
-                pool,
-                community,
-                pubkey_bytes,
-                accessible_channel_ids,
-                since,
-                limit,
-            )
-            .await;
-        }
         match self.route_read(path, RoutePredicate::Bounded).await {
             RouteDecision::Replica(mut tx, _entry, reason) => {
                 match feed::query_needs_action_on(
@@ -3601,7 +3373,7 @@ impl Db {
                         tracing::warn!(path, "replica read failed; re-running on writer: {e}");
                         Self::record_route(path, "writer", "replica_error");
                         feed::query_needs_action(
-                            self.pg_pool()?,
+                            &self.pool,
                             community,
                             pubkey_bytes,
                             accessible_channel_ids,
@@ -3614,7 +3386,7 @@ impl Db {
             }
             RouteDecision::Writer => {
                 feed::query_needs_action(
-                    self.pg_pool()?,
+                    &self.pool,
                     community,
                     pubkey_bytes,
                     accessible_channel_ids,
@@ -3634,14 +3406,7 @@ impl Db {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        feed::query_activity(
-            self.pg_pool()?,
-            community,
-            accessible_channel_ids,
-            since,
-            limit,
-        )
-        .await
+        feed::query_activity(&self.pool, community, accessible_channel_ids, since, limit).await
     }
 
     /// [`Db::query_feed_activity`] with replica routing — BOUNDED arm only;
@@ -3655,16 +3420,6 @@ impl Db {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::query_feed_activity(
-                pool,
-                community,
-                accessible_channel_ids,
-                since,
-                limit,
-            )
-            .await;
-        }
         match self.route_read(path, RoutePredicate::Bounded).await {
             RouteDecision::Replica(mut tx, _entry, reason) => {
                 match feed::query_activity_on(
@@ -3684,7 +3439,7 @@ impl Db {
                         tracing::warn!(path, "replica read failed; re-running on writer: {e}");
                         Self::record_route(path, "writer", "replica_error");
                         feed::query_activity(
-                            self.pg_pool()?,
+                            &self.pool,
                             community,
                             accessible_channel_ids,
                             since,
@@ -3695,14 +3450,8 @@ impl Db {
                 }
             }
             RouteDecision::Writer => {
-                feed::query_activity(
-                    self.pg_pool()?,
-                    community,
-                    accessible_channel_ids,
-                    since,
-                    limit,
-                )
-                .await
+                feed::query_activity(&self.pool, community, accessible_channel_ids, since, limit)
+                    .await
             }
         }
     }
@@ -3720,7 +3469,7 @@ impl Db {
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<Uuid> {
         api_token::create_api_token(
-            self.pg_pool()?,
+            &self.pool,
             *community_id.as_uuid(),
             token_hash,
             owner_pubkey,
@@ -3745,7 +3494,7 @@ impl Db {
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<Option<Uuid>> {
         api_token::create_api_token_if_under_limit(
-            self.pg_pool()?,
+            &self.pool,
             *community_id.as_uuid(),
             token_hash,
             owner_pubkey,
@@ -3778,7 +3527,7 @@ impl Db {
         )
         .bind(community_id.as_uuid())
         .bind(hash)
-        .fetch_optional(self.pg_pool()?)
+        .fetch_optional(&self.pool)
         .await?;
 
         match row {
@@ -3794,7 +3543,7 @@ impl Db {
         hash: &[u8],
     ) -> Result<Option<ApiTokenRecord>> {
         api_token::get_api_token_by_hash_including_revoked(
-            self.pg_pool()?,
+            &self.pool,
             *community_id.as_uuid(),
             hash,
         )
@@ -3808,7 +3557,7 @@ impl Db {
         )
         .bind(community_id.as_uuid())
         .bind(hash)
-        .execute(self.pg_pool()?)
+        .execute(&self.pool)
         .await?;
         Ok(())
     }
@@ -3834,7 +3583,7 @@ impl Db {
             "#,
         )
         .bind(community_id.as_uuid())
-        .fetch_all(self.pg_pool()?)
+        .fetch_all(&self.pool)
         .await?;
 
         let mut out = Vec::with_capacity(rows.len());
@@ -3862,7 +3611,7 @@ impl Db {
         community_id: CommunityId,
         pubkey: &[u8],
     ) -> Result<Vec<ApiTokenRecord>> {
-        api_token::list_tokens_by_owner(self.pg_pool()?, *community_id.as_uuid(), pubkey).await
+        api_token::list_tokens_by_owner(&self.pool, *community_id.as_uuid(), pubkey).await
     }
 
     /// Revoke a single token by ID, scoped to (community, owner).
@@ -3874,7 +3623,7 @@ impl Db {
         revoked_by: &[u8],
     ) -> Result<bool> {
         api_token::revoke_token(
-            self.pg_pool()?,
+            &self.pool,
             *community_id.as_uuid(),
             id,
             owner_pubkey,
@@ -3891,7 +3640,7 @@ impl Db {
         revoked_by: &[u8],
     ) -> Result<u64> {
         api_token::revoke_all_tokens(
-            self.pg_pool()?,
+            &self.pool,
             *community_id.as_uuid(),
             owner_pubkey,
             revoked_by,
@@ -3910,7 +3659,7 @@ impl Db {
         definition_hash: &[u8],
     ) -> Result<Uuid> {
         workflow::create_workflow(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             channel_id,
             owner_pubkey,
@@ -3934,7 +3683,7 @@ impl Db {
         definition_hash: &[u8],
     ) -> Result<()> {
         workflow::upsert_workflow(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             id,
             channel_id,
@@ -3952,7 +3701,7 @@ impl Db {
         community_id: CommunityId,
         id: Uuid,
     ) -> Result<workflow::WorkflowRecord> {
-        workflow::get_workflow(self.pg_pool()?, community_id, id).await
+        workflow::get_workflow(&self.pool, community_id, id).await
     }
 
     /// List workflows for a channel.
@@ -3963,8 +3712,7 @@ impl Db {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<workflow::WorkflowRecord>> {
-        workflow::list_channel_workflows(self.pg_pool()?, community_id, channel_id, limit, offset)
-            .await
+        workflow::list_channel_workflows(&self.pool, community_id, channel_id, limit, offset).await
     }
 
     /// List active, enabled workflows for a channel.
@@ -3973,12 +3721,12 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<Vec<workflow::WorkflowRecord>> {
-        workflow::list_enabled_channel_workflows(self.pg_pool()?, community_id, channel_id).await
+        workflow::list_enabled_channel_workflows(&self.pool, community_id, channel_id).await
     }
 
     /// List all active, enabled schedule-triggered workflows.
     pub async fn list_all_enabled_workflows(&self) -> Result<Vec<workflow::WorkflowRecord>> {
-        workflow::list_all_enabled_workflows(self.pg_pool()?).await
+        workflow::list_all_enabled_workflows(&self.pool).await
     }
 
     /// Claim a scheduled workflow fire for an authoritative schedule instant.
@@ -3996,7 +3744,7 @@ impl Db {
         scheduled_for: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<workflow::ScheduledWorkflowFireClaim>> {
         workflow::claim_scheduled_workflow_fire(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             workflow_id,
             scheduled_for,
@@ -4010,7 +3758,7 @@ impl Db {
         community_id: CommunityId,
         workflow_id: Uuid,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        workflow::latest_scheduled_workflow_fire(self.pg_pool()?, community_id, workflow_id).await
+        workflow::latest_scheduled_workflow_fire(&self.pool, community_id, workflow_id).await
     }
 
     /// Attach the workflow run id created from a won scheduled-fire claim.
@@ -4022,7 +3770,7 @@ impl Db {
         workflow_run_id: Uuid,
     ) -> Result<bool> {
         workflow::attach_scheduled_workflow_run(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             workflow_id,
             scheduled_for,
@@ -4036,7 +3784,7 @@ impl Db {
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        workflow::prune_scheduled_workflow_fires_before(self.pg_pool()?, older_than).await
+        workflow::prune_scheduled_workflow_fires_before(&self.pool, older_than).await
     }
 
     /// Update a workflow's name, definition, and hash.
@@ -4049,7 +3797,7 @@ impl Db {
         definition_hash: &[u8],
     ) -> Result<()> {
         workflow::update_workflow(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             id,
             name,
@@ -4066,7 +3814,7 @@ impl Db {
         id: Uuid,
         status: workflow::WorkflowStatus,
     ) -> Result<()> {
-        workflow::update_workflow_status(self.pg_pool()?, community_id, id, status).await
+        workflow::update_workflow_status(&self.pool, community_id, id, status).await
     }
 
     /// Enable or disable a workflow.
@@ -4076,7 +3824,7 @@ impl Db {
         id: Uuid,
         enabled: bool,
     ) -> Result<()> {
-        workflow::set_workflow_enabled(self.pg_pool()?, community_id, id, enabled).await
+        workflow::set_workflow_enabled(&self.pool, community_id, id, enabled).await
     }
 
     /// Disable all of an owner's workflows in a channel (SEC-006, on
@@ -4088,7 +3836,7 @@ impl Db {
         owner_pubkey: &[u8],
     ) -> Result<u64> {
         workflow::disable_workflows_for_owner_in_channel(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             channel_id,
             owner_pubkey,
@@ -4098,7 +3846,7 @@ impl Db {
 
     /// Delete a workflow and all its runs/approvals.
     pub async fn delete_workflow(&self, community_id: CommunityId, id: Uuid) -> Result<()> {
-        workflow::delete_workflow(self.pg_pool()?, community_id, id).await
+        workflow::delete_workflow(&self.pool, community_id, id).await
     }
 
     /// Delete a workflow only when it belongs to the provided owner.
@@ -4109,7 +3857,7 @@ impl Db {
         id: Uuid,
         owner_pubkey: &[u8],
     ) -> Result<Option<Uuid>> {
-        workflow::delete_workflow_for_owner(self.pg_pool()?, community_id, id, owner_pubkey).await
+        workflow::delete_workflow_for_owner(&self.pool, community_id, id, owner_pubkey).await
     }
 
     /// Find a workflow by owner pubkey and name within a community. Used for
@@ -4120,7 +3868,7 @@ impl Db {
         owner_pubkey: &[u8],
         name: &str,
     ) -> Result<Option<workflow::WorkflowRecord>> {
-        workflow::find_by_owner_and_name(self.pg_pool()?, community_id, owner_pubkey, name).await
+        workflow::find_by_owner_and_name(&self.pool, community_id, owner_pubkey, name).await
     }
 
     /// Create a new workflow run.
@@ -4132,7 +3880,7 @@ impl Db {
         trigger_context: Option<&serde_json::Value>,
     ) -> Result<Uuid> {
         workflow::create_workflow_run(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             workflow_id,
             trigger_event_id,
@@ -4147,7 +3895,7 @@ impl Db {
         community_id: CommunityId,
         id: Uuid,
     ) -> Result<workflow::WorkflowRunRecord> {
-        workflow::get_workflow_run(self.pg_pool()?, community_id, id).await
+        workflow::get_workflow_run(&self.pool, community_id, id).await
     }
 
     /// List runs for a workflow.
@@ -4157,7 +3905,7 @@ impl Db {
         workflow_id: Uuid,
         limit: i64,
     ) -> Result<Vec<workflow::WorkflowRunRecord>> {
-        workflow::list_workflow_runs(self.pg_pool()?, community_id, workflow_id, limit).await
+        workflow::list_workflow_runs(&self.pool, community_id, workflow_id, limit).await
     }
 
     /// Update a workflow run's status.
@@ -4171,7 +3919,7 @@ impl Db {
         error: Option<&str>,
     ) -> Result<()> {
         workflow::update_workflow_run(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             id,
             status,
@@ -4184,7 +3932,7 @@ impl Db {
 
     /// Create an approval request.
     pub async fn create_approval(&self, params: workflow::CreateApprovalParams<'_>) -> Result<()> {
-        workflow::create_approval(self.pg_pool()?, params).await
+        workflow::create_approval(&self.pool, params).await
     }
 
     /// Fetch an approval by raw token.
@@ -4193,7 +3941,7 @@ impl Db {
         community_id: CommunityId,
         token: &str,
     ) -> Result<workflow::ApprovalRecord> {
-        workflow::get_approval(self.pg_pool()?, community_id, token).await
+        workflow::get_approval(&self.pool, community_id, token).await
     }
 
     /// Fetch an approval by its already-hashed token (no re-hashing).
@@ -4202,7 +3950,7 @@ impl Db {
         community_id: CommunityId,
         token_hash: &[u8],
     ) -> Result<workflow::ApprovalRecord> {
-        workflow::get_approval_by_stored_hash(self.pg_pool()?, community_id, token_hash).await
+        workflow::get_approval_by_stored_hash(&self.pool, community_id, token_hash).await
     }
 
     /// Fetch all approvals for a workflow run.
@@ -4212,7 +3960,7 @@ impl Db {
         workflow_id: uuid::Uuid,
         run_id: uuid::Uuid,
     ) -> Result<Vec<workflow::ApprovalRecord>> {
-        workflow::get_run_approvals(self.pg_pool()?, community_id, workflow_id, run_id).await
+        workflow::get_run_approvals(&self.pool, community_id, workflow_id, run_id).await
     }
 
     /// Update an approval's status.
@@ -4225,7 +3973,7 @@ impl Db {
         note: Option<&str>,
     ) -> Result<bool> {
         workflow::update_approval(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             token,
             status,
@@ -4245,7 +3993,7 @@ impl Db {
         note: Option<&str>,
     ) -> Result<bool> {
         workflow::update_approval_by_stored_hash(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             token_hash,
             status,
@@ -4257,7 +4005,7 @@ impl Db {
 
     /// Ensures monthly partitions exist for the next N months.
     pub async fn ensure_future_partitions(&self, months_ahead: u32) -> Result<()> {
-        partition::ensure_future_partitions(self.pg_pool()?, months_ahead).await
+        partition::ensure_future_partitions(&self.pool, months_ahead).await
     }
 
     /// Backfill `d_tag` for existing NIP-33 events (kind 30000–39999) that have `d_tag IS NULL`.
@@ -4274,7 +4022,7 @@ impl Db {
              ) \
              WHERE kind BETWEEN 30000 AND 39999 AND d_tag IS NULL",
         )
-        .execute(self.pg_pool()?)
+        .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
     }
@@ -4286,7 +4034,7 @@ impl Db {
         )
         .bind(community.as_uuid())
         .bind(pubkey)
-        .fetch_one(self.pg_pool()?)
+        .fetch_one(&self.pool)
         .await?;
         let cnt: i64 = row.try_get("cnt")?;
         Ok(cnt > 0)
@@ -4297,7 +4045,7 @@ impl Db {
         let row =
             sqlx::query("SELECT COUNT(*) as cnt FROM pubkey_allowlist WHERE community_id = $1")
                 .bind(community.as_uuid())
-                .fetch_one(self.pg_pool()?)
+                .fetch_one(&self.pool)
                 .await?;
         let cnt: i64 = row.try_get("cnt")?;
         Ok(cnt > 0)
@@ -4319,7 +4067,7 @@ impl Db {
         .bind(pubkey)
         .bind(added_by)
         .bind(note)
-        .execute(self.pg_pool()?)
+        .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -4334,7 +4082,7 @@ impl Db {
             sqlx::query("DELETE FROM pubkey_allowlist WHERE community_id = $1 AND pubkey = $2")
                 .bind(community.as_uuid())
                 .bind(pubkey)
-                .execute(self.pg_pool()?)
+                .execute(&self.pool)
                 .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -4345,7 +4093,7 @@ impl Db {
             "SELECT pubkey, added_by, added_at, note FROM pubkey_allowlist WHERE community_id = $1 ORDER BY added_at DESC",
         )
         .bind(community.as_uuid())
-        .fetch_all(self.pg_pool()?)
+        .fetch_all(&self.pool)
         .await?;
 
         let mut out = Vec::with_capacity(rows.len());
@@ -4369,32 +4117,26 @@ impl Db {
     /// [`Db::query_events_routed_bounded`]. Not precedent for routing other
     /// permission reads.
     pub async fn is_relay_member(&self, community: CommunityId, pubkey: &str) -> Result<bool> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => sqlite::is_relay_member(pool, community, pubkey).await,
-            DbBackend::Postgres => {
-                let path = "relay_membership";
-                match self.route_read(path, RoutePredicate::Bounded).await {
-                    RouteDecision::Replica(mut tx, _entry, reason) => {
-                        match relay_members::is_relay_member_on(&mut tx, community, pubkey).await {
-                            Ok(is_member) => {
-                                Self::record_route(path, "replica", reason);
-                                Ok(is_member)
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    path,
-                                    "replica read failed; re-running on writer: {e}"
-                                );
-                                Self::record_route(path, "writer", "replica_error");
-                                relay_members::is_relay_member(self.pg_pool()?, community, pubkey)
-                                    .await
-                            }
-                        }
+        if let DbBackend::SQLite(pool) = &self.backend {
+            return sqlite::is_relay_member(pool, community, pubkey).await;
+        }
+        let path = "relay_membership";
+        match self.route_read(path, RoutePredicate::Bounded).await {
+            RouteDecision::Replica(mut tx, _entry, reason) => {
+                match relay_members::is_relay_member_on(&mut tx, community, pubkey).await {
+                    Ok(is_member) => {
+                        Self::record_route(path, "replica", reason);
+                        Ok(is_member)
                     }
-                    RouteDecision::Writer => {
-                        relay_members::is_relay_member(self.pg_pool()?, community, pubkey).await
+                    Err(e) => {
+                        tracing::warn!(path, "replica read failed; re-running on writer: {e}");
+                        Self::record_route(path, "writer", "replica_error");
+                        relay_members::is_relay_member(&self.pool, community, pubkey).await
                     }
                 }
+            }
+            RouteDecision::Writer => {
+                relay_members::is_relay_member(&self.pool, community, pubkey).await
             }
         }
     }
@@ -4405,12 +4147,10 @@ impl Db {
         community: CommunityId,
         pubkey: &str,
     ) -> Result<Option<relay_members::RelayMember>> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => sqlite::get_relay_member(pool, community, pubkey).await,
-            DbBackend::Postgres => {
-                relay_members::get_relay_member(self.pg_pool()?, community, pubkey).await
-            }
+        if let DbBackend::SQLite(pool) = &self.backend {
+            return sqlite::get_relay_member(pool, community, pubkey).await;
         }
+        relay_members::get_relay_member(&self.pool, community, pubkey).await
     }
 
     /// Returns all relay members of `community` ordered by `created_at` ascending.
@@ -4418,12 +4158,10 @@ impl Db {
         &self,
         community: CommunityId,
     ) -> Result<Vec<relay_members::RelayMember>> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => sqlite::list_relay_members(pool, community).await,
-            DbBackend::Postgres => {
-                relay_members::list_relay_members(self.pg_pool()?, community).await
-            }
+        if let DbBackend::SQLite(pool) = &self.backend {
+            return sqlite::list_relay_members(pool, community).await;
         }
+        relay_members::list_relay_members(&self.pool, community).await
     }
 
     /// Adds a new relay member to `community`.
@@ -4437,15 +4175,10 @@ impl Db {
         role: &str,
         added_by: Option<&str>,
     ) -> Result<bool> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::add_relay_member(pool, community, pubkey, role, added_by).await
-            }
-            DbBackend::Postgres => {
-                relay_members::add_relay_member(self.pg_pool()?, community, pubkey, role, added_by)
-                    .await
-            }
+        if let DbBackend::SQLite(pool) = &self.backend {
+            return sqlite::add_relay_member(pool, community, pubkey, role, added_by).await;
         }
+        relay_members::add_relay_member(&self.pool, community, pubkey, role, added_by).await
     }
 
     /// Claims relay membership via an invite and atomically persists the
@@ -4457,14 +4190,8 @@ impl Db {
         role: &str,
         policy_version: Option<&str>,
     ) -> Result<bool> {
-        relay_members::claim_relay_membership(
-            self.pg_pool()?,
-            community,
-            pubkey,
-            role,
-            policy_version,
-        )
-        .await
+        relay_members::claim_relay_membership(&self.pool, community, pubkey, role, policy_version)
+            .await
     }
 
     /// Returns whether a member has persisted acceptance evidence for a policy version.
@@ -4474,13 +4201,8 @@ impl Db {
         pubkey: &str,
         policy_version: &str,
     ) -> Result<bool> {
-        relay_members::has_join_policy_acceptance(
-            self.pg_pool()?,
-            community,
-            pubkey,
-            policy_version,
-        )
-        .await
+        relay_members::has_join_policy_acceptance(&self.pool, community, pubkey, policy_version)
+            .await
     }
 
     /// Removes a relay member from `community` atomically, refusing to delete the owner.
@@ -4489,7 +4211,7 @@ impl Db {
         community: CommunityId,
         pubkey: &str,
     ) -> Result<relay_members::RemoveResult> {
-        relay_members::remove_relay_member(self.pg_pool()?, community, pubkey).await
+        relay_members::remove_relay_member(&self.pool, community, pubkey).await
     }
 
     /// Removes a relay member from `community` only if their current role matches `expected_role`.
@@ -4502,13 +4224,8 @@ impl Db {
         pubkey: &str,
         expected_role: &str,
     ) -> Result<relay_members::RemoveResult> {
-        relay_members::remove_relay_member_if_role(
-            self.pg_pool()?,
-            community,
-            pubkey,
-            expected_role,
-        )
-        .await
+        relay_members::remove_relay_member_if_role(&self.pool, community, pubkey, expected_role)
+            .await
     }
 
     /// Updates the role of an existing relay member in `community`. Returns `true` if updated.
@@ -4518,17 +4235,15 @@ impl Db {
         pubkey: &str,
         new_role: &str,
     ) -> Result<bool> {
-        relay_members::update_relay_member_role(self.pg_pool()?, community, pubkey, new_role).await
+        relay_members::update_relay_member_role(&self.pool, community, pubkey, new_role).await
     }
 
     /// Ensures the owner pubkey exists with role `"owner"` in `community`. Called at startup.
     pub async fn bootstrap_owner(&self, community: CommunityId, owner_pubkey: &str) -> Result<()> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => sqlite::bootstrap_owner(pool, community, owner_pubkey).await,
-            DbBackend::Postgres => {
-                relay_members::bootstrap_owner(self.pg_pool()?, community, owner_pubkey).await
-            }
+        if let DbBackend::SQLite(pool) = &self.backend {
+            return sqlite::bootstrap_owner(pool, community, owner_pubkey).await;
         }
+        relay_members::bootstrap_owner(&self.pool, community, owner_pubkey).await
     }
 
     /// Returns `true` if any member of `community` holds the `admin` or
@@ -4548,7 +4263,7 @@ impl Db {
         expected_owner_pubkey: &str,
     ) -> Result<relay_members::TransferResult> {
         relay_members::transfer_ownership(
-            self.pg_pool()?,
+            &self.pool,
             community,
             new_owner_pubkey,
             expected_owner_pubkey,
@@ -4561,7 +4276,7 @@ impl Db {
     /// Idempotent — uses `ON CONFLICT DO NOTHING`. Returns the number of rows
     /// inserted, or 0 if the `pubkey_allowlist` table doesn't exist.
     pub async fn backfill_from_allowlist(&self, community: CommunityId) -> Result<u64> {
-        relay_members::backfill_from_allowlist(self.pg_pool()?, community).await
+        relay_members::backfill_from_allowlist(&self.pool, community).await
     }
 
     /// Mints a v2 use-limited relay invite. The plaintext code is returned
@@ -4576,8 +4291,7 @@ impl Db {
         ttl_secs: u64,
         max_uses: Option<i32>,
     ) -> Result<relay_invite::MintedInvite> {
-        relay_invite::mint_relay_invite(self.pg_pool()?, community, created_by, ttl_secs, max_uses)
-            .await
+        relay_invite::mint_relay_invite(&self.pool, community, created_by, ttl_secs, max_uses).await
     }
 
     /// Delete one bounded batch of invites expired before `cutoff`.
@@ -4585,7 +4299,7 @@ impl Db {
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        relay_invite::reap_expired_relay_invites(self.pg_pool()?, cutoff).await
+        relay_invite::reap_expired_relay_invites(&self.pool, cutoff).await
     }
 
     /// Atomically claims a v2 relay invite. The full redemption (membership
@@ -4601,7 +4315,7 @@ impl Db {
         policy_version: Option<&str>,
     ) -> Result<relay_invite::ClaimOutcome> {
         relay_invite::claim_relay_invite(
-            self.pg_pool()?,
+            &self.pool,
             community,
             token_hash,
             claimer_pubkey,
@@ -4616,7 +4330,7 @@ impl Db {
         community: CommunityId,
         feedback: product_feedback::NewProductFeedback<'_>,
     ) -> Result<Uuid> {
-        product_feedback::insert(self.pg_pool()?, community, feedback).await
+        product_feedback::insert(&self.pool, community, feedback).await
     }
 
     /// List product feedback across the deployment, newest first.
@@ -4624,7 +4338,7 @@ impl Db {
         &self,
         limit: i64,
     ) -> Result<Vec<product_feedback::ProductFeedbackRecord>> {
-        product_feedback::list(self.pg_pool()?, limit).await
+        product_feedback::list(&self.pool, limit).await
     }
 
     /// Insert a tenant-scoped NIP-56 report row, idempotent by report event id.
@@ -4633,7 +4347,7 @@ impl Db {
         community: CommunityId,
         report: moderation::NewReport<'_>,
     ) -> Result<Uuid> {
-        moderation::insert_report(self.pg_pool()?, community, report).await
+        moderation::insert_report(&self.pool, community, report).await
     }
 
     /// List moderation reports for a community, newest first.
@@ -4643,7 +4357,7 @@ impl Db {
         status: Option<&str>,
         limit: i64,
     ) -> Result<Vec<moderation::ReportRecord>> {
-        moderation::list_reports(self.pg_pool()?, community, status, limit).await
+        moderation::list_reports(&self.pool, community, status, limit).await
     }
 
     /// Fetch one moderation report by row id.
@@ -4652,7 +4366,7 @@ impl Db {
         community: CommunityId,
         report_id: Uuid,
     ) -> Result<Option<moderation::ReportRecord>> {
-        moderation::get_report(self.pg_pool()?, community, report_id).await
+        moderation::get_report(&self.pool, community, report_id).await
     }
 
     /// Fetch one moderation report by signed NIP-56 report event id.
@@ -4661,7 +4375,7 @@ impl Db {
         community: CommunityId,
         report_event_id: &[u8],
     ) -> Result<Option<moderation::ReportRecord>> {
-        moderation::get_report_by_event(self.pg_pool()?, community, report_event_id).await
+        moderation::get_report_by_event(&self.pool, community, report_event_id).await
     }
 
     /// Resolve, dismiss, or escalate an open moderation report.
@@ -4674,7 +4388,7 @@ impl Db {
         action_id: Option<Uuid>,
     ) -> Result<bool> {
         moderation::resolve_report(
-            self.pg_pool()?,
+            &self.pool,
             community,
             report_id,
             status,
@@ -4693,15 +4407,7 @@ impl Db {
         reason: Option<&str>,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        moderation::ban_member(
-            self.pg_pool()?,
-            community,
-            pubkey,
-            actor,
-            reason,
-            expires_at,
-        )
-        .await
+        moderation::ban_member(&self.pool, community, pubkey, actor, reason, expires_at).await
     }
 
     /// Lift a community ban for a member pubkey.
@@ -4711,7 +4417,7 @@ impl Db {
         pubkey: &[u8],
         actor: &[u8],
     ) -> Result<bool> {
-        moderation::unban_member(self.pg_pool()?, community, pubkey, actor).await
+        moderation::unban_member(&self.pool, community, pubkey, actor).await
     }
 
     /// Upsert a community timeout/write-block for a member pubkey.
@@ -4723,15 +4429,7 @@ impl Db {
         muted_until: DateTime<Utc>,
         reason: Option<&str>,
     ) -> Result<()> {
-        moderation::timeout_member(
-            self.pg_pool()?,
-            community,
-            pubkey,
-            actor,
-            muted_until,
-            reason,
-        )
-        .await
+        moderation::timeout_member(&self.pool, community, pubkey, actor, muted_until, reason).await
     }
 
     /// Clear a community timeout/write-block for a member pubkey.
@@ -4741,7 +4439,7 @@ impl Db {
         pubkey: &[u8],
         actor: &[u8],
     ) -> Result<bool> {
-        moderation::untimeout_member(self.pg_pool()?, community, pubkey, actor).await
+        moderation::untimeout_member(&self.pool, community, pubkey, actor).await
     }
 
     /// Fetch the active ban/timeout restriction state for enforcement hot paths.
@@ -4750,12 +4448,7 @@ impl Db {
         community: CommunityId,
         pubkey: &[u8],
     ) -> Result<moderation::RestrictionState> {
-        match &self.backend {
-            DbBackend::SQLite(_) => Ok(moderation::RestrictionState::default()),
-            DbBackend::Postgres => {
-                moderation::restriction_state(self.pg_pool()?, community, pubkey).await
-            }
-        }
+        moderation::restriction_state(&self.pool, community, pubkey).await
     }
 
     /// Fetch the full ban/timeout row for a member pubkey.
@@ -4764,7 +4457,7 @@ impl Db {
         community: CommunityId,
         pubkey: &[u8],
     ) -> Result<Option<moderation::BanRecord>> {
-        moderation::get_ban(self.pg_pool()?, community, pubkey).await
+        moderation::get_ban(&self.pool, community, pubkey).await
     }
 
     /// List currently restricted members in a community.
@@ -4772,7 +4465,7 @@ impl Db {
         &self,
         community: CommunityId,
     ) -> Result<Vec<moderation::BanRecord>> {
-        moderation::list_restricted(self.pg_pool()?, community).await
+        moderation::list_restricted(&self.pool, community).await
     }
 
     /// Insert a moderation audit action row.
@@ -4781,7 +4474,7 @@ impl Db {
         community: CommunityId,
         action: moderation::NewAction<'_>,
     ) -> Result<Uuid> {
-        moderation::insert_action(self.pg_pool()?, community, action).await
+        moderation::insert_action(&self.pool, community, action).await
     }
 
     /// List moderation audit action rows, newest first.
@@ -4790,7 +4483,7 @@ impl Db {
         community: CommunityId,
         limit: i64,
     ) -> Result<Vec<moderation::ActionRecord>> {
-        moderation::list_actions(self.pg_pool()?, community, limit).await
+        moderation::list_actions(&self.pool, community, limit).await
     }
 
     /// Return the current owner of git repo name `repo_id` in `community`, or
@@ -4800,7 +4493,7 @@ impl Db {
         community: CommunityId,
         repo_id: &str,
     ) -> Result<Option<String>> {
-        git_repo::repo_name_owner(self.pg_pool()?, community, repo_id).await
+        git_repo::repo_name_owner(&self.pool, community, repo_id).await
     }
 
     /// Reserve a git repo name for `owner_pubkey` in `community` (NIP-34).
@@ -4813,7 +4506,7 @@ impl Db {
         repo_id: &str,
         owner_pubkey: &str,
     ) -> Result<git_repo::ReserveOutcome> {
-        git_repo::reserve_repo_name(self.pg_pool()?, community, repo_id, owner_pubkey).await
+        git_repo::reserve_repo_name(&self.pool, community, repo_id, owner_pubkey).await
     }
 
     /// Count git repos reserved by `owner_pubkey` in `community` (quota check).
@@ -4822,7 +4515,7 @@ impl Db {
         community: CommunityId,
         owner_pubkey: &str,
     ) -> Result<i64> {
-        git_repo::count_repos_for_owner(self.pg_pool()?, community, owner_pubkey).await
+        git_repo::count_repos_for_owner(&self.pool, community, owner_pubkey).await
     }
 
     /// Release a git repo name reservation held by `owner_pubkey` (rollback).
@@ -4834,12 +4527,12 @@ impl Db {
         repo_id: &str,
         owner_pubkey: &str,
     ) -> Result<u64> {
-        git_repo::release_repo_name(self.pg_pool()?, community, repo_id, owner_pubkey).await
+        git_repo::release_repo_name(&self.pool, community, repo_id, owner_pubkey).await
     }
 
     /// Returns `true` if `pubkey` (64-char hex) is archived in `community_id`.
     pub async fn is_archived(&self, community_id: CommunityId, pubkey: &str) -> Result<bool> {
-        archived_identities::is_archived(self.pg_pool()?, community_id, pubkey).await
+        archived_identities::is_archived(&self.pool, community_id, pubkey).await
     }
 
     /// Archives an identity in `community_id`. Returns `true` if inserted, `false` if already archived.
@@ -4855,7 +4548,7 @@ impl Db {
         request_event_id: &str,
     ) -> Result<bool> {
         archived_identities::archive(
-            self.pg_pool()?,
+            &self.pool,
             community_id,
             pubkey,
             consent_path,
@@ -4869,7 +4562,7 @@ impl Db {
 
     /// Unarchives an identity from `community_id`. Returns `true` if deleted, `false` if absent.
     pub async fn unarchive(&self, community_id: CommunityId, pubkey: &str) -> Result<bool> {
-        archived_identities::unarchive(self.pg_pool()?, community_id, pubkey).await
+        archived_identities::unarchive(&self.pool, community_id, pubkey).await
     }
 
     /// Returns all identities archived in `community_id`, ordered by archive time ascending.
@@ -4877,7 +4570,7 @@ impl Db {
         &self,
         community_id: CommunityId,
     ) -> Result<Vec<archived_identities::ArchivedIdentity>> {
-        archived_identities::list_archived(self.pg_pool()?, community_id).await
+        archived_identities::list_archived(&self.pool, community_id).await
     }
 
     /// Soft-delete NIP-29 discovery events for a channel created by a specific relay pubkey.
@@ -4894,7 +4587,7 @@ impl Db {
         .bind(community_id.as_uuid())
         .bind(channel_id)
         .bind(relay_pubkey)
-        .execute(self.pg_pool()?)
+        .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
     }
@@ -4912,9 +4605,6 @@ impl Db {
         event: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::replace_event(pool, community_id, event, channel_id, None).await;
-        }
         let kind_i32 = buzz_core::kind::event_kind_i32(event);
         let pubkey_bytes = event.pubkey.to_bytes();
         let created_at_secs = event.created_at.as_secs() as i64;
@@ -4929,7 +4619,7 @@ impl Db {
             channel_id.as_ref().map(|id| id.as_bytes().as_slice()),
         );
 
-        let mut tx = self.pg_pool()?.begin().await?;
+        let mut tx = self.pool.begin().await?;
 
         // Serialize all writers for the same (kind, pubkey, channel_id) tuple.
         // Advisory lock is transaction-scoped — released on commit/rollback.
@@ -5025,9 +4715,7 @@ impl Db {
 
         // Mentions are a denormalized index — safe outside the transaction.
         // insert_event() normally handles this, but we inlined the INSERT above.
-        if let Err(e) =
-            crate::insert_mentions(self.pg_pool()?, community_id, event, channel_id).await
-        {
+        if let Err(e) = crate::insert_mentions(&self.pool, community_id, event, channel_id).await {
             tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
         }
 
@@ -5106,7 +4794,7 @@ impl Db {
         let lock_key =
             event_replacement_lock_key(community_id, kind_i32, pubkey_bytes.as_slice(), None);
 
-        let mut tx = self.pg_pool()?.begin().await?;
+        let mut tx = self.pool.begin().await?;
 
         // Acquire the per-community snapshot lock BEFORE reading members.
         // This serializes the entire read-build-write cycle: a concurrent
@@ -5201,7 +4889,7 @@ impl Db {
 
         tx.commit().await?;
 
-        if let Err(e) = crate::insert_mentions(self.pg_pool()?, community_id, &event, None).await {
+        if let Err(e) = crate::insert_mentions(&self.pool, community_id, &event, None).await {
             tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
         }
 
@@ -5240,9 +4928,6 @@ impl Db {
         d_tag: &str,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::replace_event(pool, community_id, event, channel_id, Some(d_tag)).await;
-        }
         let kind_i32 = buzz_core::kind::event_kind_i32(event);
         let pubkey_bytes = event.pubkey.to_bytes();
         let created_at_secs = event.created_at.as_secs() as i64;
@@ -5256,7 +4941,7 @@ impl Db {
             Some(d_tag.as_bytes()),
         );
 
-        let mut tx = self.pg_pool()?.begin().await?;
+        let mut tx = self.pool.begin().await?;
 
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(lock_key)
@@ -5441,9 +5126,7 @@ impl Db {
         tx.commit().await?;
 
         // Mentions are a denormalized index — safe outside the transaction.
-        if let Err(e) =
-            crate::insert_mentions(self.pg_pool()?, community_id, event, channel_id).await
-        {
+        if let Err(e) = crate::insert_mentions(&self.pool, community_id, event, channel_id).await {
             tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
         }
 
@@ -7059,7 +6742,7 @@ mod tests {
         let db = Db::from_pool(pool);
         assert!(!db.has_read_pool());
         assert!(
-            std::ptr::eq(db.read().expect("Postgres test DB"), &db.pool),
+            std::ptr::eq(db.read(), &db.pool),
             "read() must be the writer pool when no replica is configured"
         );
         assert!(db.read_pool_stats().is_none());

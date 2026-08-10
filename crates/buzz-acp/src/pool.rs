@@ -6238,6 +6238,11 @@ done"#
             model_capabilities: None,
             desired_model: None,
             model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -6248,6 +6253,7 @@ done"#
         ctx.base_prompt = Some("standing-once");
         let ctx = Arc::new(ctx);
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let (effort_report_tx, _effort_report_rx) = mpsc::unbounded_channel();
 
         for turn in 1..=3 {
             run_prompt_task(
@@ -6256,6 +6262,7 @@ done"#
                 Some(format!("heartbeat-{turn}")),
                 Arc::clone(&ctx),
                 result_tx.clone(),
+                effort_report_tx.clone(),
                 None,
                 format!("turn-{turn}"),
             )
@@ -6332,6 +6339,11 @@ done"#
             model_capabilities: None,
             desired_model: None,
             model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -6349,6 +6361,7 @@ done"#
         ctx.base_prompt = Some("standing-once");
         let ctx = Arc::new(ctx);
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let (effort_report_tx, _effort_report_rx) = mpsc::unbounded_channel();
 
         for turn in 1..=3 {
             let event = EventBuilder::new(Kind::Custom(9), format!("channel-{turn}"))
@@ -6371,6 +6384,7 @@ done"#
                 None,
                 Arc::clone(&ctx),
                 result_tx.clone(),
+                effort_report_tx.clone(),
                 None,
                 format!("turn-{turn}"),
             )
@@ -6504,6 +6518,11 @@ done"#
             model_capabilities: None,
             desired_model: None,
             model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -6537,6 +6556,7 @@ done"#
         );
         let ctx = Arc::new(ctx);
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let (effort_report_tx, _effort_report_rx) = mpsc::unbounded_channel();
 
         for (turn_id, batch) in [("merged-turn", merged_batch), ("next-turn", next_batch)] {
             run_prompt_task(
@@ -6545,6 +6565,7 @@ done"#
                 None,
                 Arc::clone(&ctx),
                 result_tx.clone(),
+                effort_report_tx.clone(),
                 None,
                 turn_id.into(),
             )
@@ -6653,6 +6674,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             model_capabilities: None,
             desired_model: None,
             model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -6697,12 +6723,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             },
         );
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let (effort_report_tx, _effort_report_rx) = mpsc::unbounded_channel();
         run_prompt_task(
             agent,
             Some(batch),
             None,
             Arc::new(ctx),
             result_tx,
+            effort_report_tx,
             None,
             "next-turn".into(),
         )

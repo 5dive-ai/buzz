@@ -136,6 +136,20 @@ export type AgentFormModel = {
   /** Rows 9–10: I-owned when instance present; D-owned (definition default) in definition-only context. */
   parallelism: number | null;
 
+  // Instance harness pin (I-fields) — undefined when no instance context.
+  /** True when the harness is inherited from the definition/default (not pinned). */
+  harnessInherit: boolean | undefined;
+  /**
+   * Resolved effective harness command to pin. The dialog resolves this from
+   * the selected runtime's command (or the manual entry) before it reaches the
+   * model; ignored when harnessInherit is true.
+   */
+  harnessCommand: string | undefined;
+  /** Resolved harness args; ignored when harnessInherit is true. */
+  harnessArgs: string[] | undefined;
+  /** ACP command override. */
+  acpCommand: string | undefined;
+
   // Device policy (L-fields)
   autoRestartOnConfigChange: boolean | undefined;
   startOnAppLaunch: boolean | undefined;
@@ -148,13 +162,15 @@ export type AgentFormModel = {
  * (respondTo, parallelism) have context-dependent ownership per rows 9–10:
  * they are I-owned when an instance is in context, and D-owned only in
  * definition-only (zero-instance) context. `fieldOwner()` resolves this
- * context dependence and is consulted by `emitAgentFormDiff` for all emit
- * routing decisions.
+ * context dependence.
  *
- * Editability (which controls are enabled/disabled) is handled separately by
- * context-specific predicates in the dialog (`isDefinitionReadOnly`,
- * `dFieldsDirty`). Those predicates operate at the section level rather than
- * per-field, which is sufficient for the current two-section (D/I) layout.
+ * The ownership map is the single authority for BOTH routing and editability:
+ *   - `emitAgentFormDiff` consults `fieldOwner` to route every field's change.
+ *   - `fieldEditable` derives per-field enabled/disabled from `fieldOwner` +
+ *     `isDefinitionReadOnly` (a D-owned field is read-only when the definition
+ *     is team-managed; I- and L-owned fields stay editable regardless).
+ *   - `definitionFieldsDirty` iterates the map to derive the catalog-publish
+ *     dirty signal from D-owned field changes — no parallel dirty boolean.
  */
 export const FIELD_OWNERS: Record<keyof AgentFormModel, FieldOwner> = {
   // Identity
@@ -173,6 +189,11 @@ export const FIELD_OWNERS: Record<keyof AgentFormModel, FieldOwner> = {
   instanceEnvVars: "instance",
   namePool: "definition",
   instanceName: "instance",
+  // Instance harness pin — I-owned
+  harnessInherit: "instance",
+  harnessCommand: "instance",
+  harnessArgs: "instance",
+  acpCommand: "instance",
   // Device policy
   autoRestartOnConfigChange: "local-policy",
   startOnAppLaunch: "local-policy",
@@ -193,9 +214,9 @@ export const FIELD_OWNERS: Record<keyof AgentFormModel, FieldOwner> = {
  *    context (no definition) they fall back to I-owned.
  *
  * `emitAgentFormDiff` consults this function for every emit routing decision.
- * Dialog editability (enabled/disabled controls) is handled by section-level
- * predicates (`isDefinitionReadOnly`, `dFieldsDirty`) and does not call this
- * function — see FIELD_OWNERS JSDoc for the Artifact 4 editability disposition.
+ * Dialog editability (enabled/disabled controls) is derived from the same
+ * function via `fieldEditable`, and the catalog-publish dirty signal via
+ * `definitionFieldsDirty` — the ownership map is the single authority for both.
  */
 export function fieldOwner(
   field: keyof AgentFormModel,
@@ -228,6 +249,68 @@ export function fieldOwner(
   }
 
   return base;
+}
+
+/**
+ * Whether a field's control should be editable in the given context.
+ *
+ * Derived from `fieldOwner`: a D-owned field is read-only when the definition
+ * is team-managed (`isDefinitionReadOnly`); I- and L-owned fields are always
+ * editable — team management of the definition never disables instance-owned
+ * controls (row 9 contract: team-linked live access stays I-editable).
+ */
+export function fieldEditable(
+  field: keyof AgentFormModel,
+  ctx: AgentEditContext,
+): boolean {
+  return !(
+    fieldOwner(field, ctx) === "definition" && isDefinitionReadOnly(ctx)
+  );
+}
+
+/**
+ * Whether any D-owned field differs between saved and next.
+ *
+ * Drives the catalog-publish affordance (shown once the user dirties a D-field
+ * on a shared definition). Iterates the ownership map so the dirty signal comes
+ * from the same authority that routes emits — no parallel dirty boolean.
+ */
+export function definitionFieldsDirty(
+  saved: AgentFormModel,
+  next: AgentFormModel,
+  ctx: AgentEditContext,
+): boolean {
+  return (Object.keys(FIELD_OWNERS) as Array<keyof AgentFormModel>).some(
+    (field) =>
+      fieldOwner(field, ctx) === "definition" &&
+      !fieldValueEqual(field, saved[field], next[field]),
+  );
+}
+
+/** Canonical per-field equality used by `definitionFieldsDirty`. */
+function fieldValueEqual(
+  field: keyof AgentFormModel,
+  a: AgentFormModel[keyof AgentFormModel],
+  b: AgentFormModel[keyof AgentFormModel],
+): boolean {
+  if (field === "namePool") {
+    return namePoolEqual((a as string[]) ?? [], (b as string[]) ?? []);
+  }
+  if (field === "envVars" || field === "instanceEnvVars") {
+    return envVarsMapEqual(
+      (a as Record<string, string>) ?? {},
+      (b as Record<string, string>) ?? {},
+    );
+  }
+  if (field === "respondToAllowlist" || field === "harnessArgs") {
+    return (
+      ((a as string[]) ?? []).join(",") === ((b as string[]) ?? []).join(",")
+    );
+  }
+  if (typeof a === "string" && typeof b === "string") {
+    return a.trim() === b.trim();
+  }
+  return (a ?? null) === (b ?? null);
 }
 
 /** Which coordinator outputs changed vs. last saved state. */
@@ -312,6 +395,16 @@ export function seedAgentFormModel(ctx: AgentEditContext): AgentFormModel {
   const autoRestartOnConfigChange = inst?.autoRestartOnConfigChange;
   const startOnAppLaunch = inst?.startOnAppLaunch;
 
+  // Harness pin (I-fields). Inherit when the instance is linked and carries no
+  // command override; otherwise the stored command is a pin.
+  const harnessInherit =
+    inst != null
+      ? inst.personaId != null && inst.agentCommandOverride == null
+      : undefined;
+  const harnessCommand = inst?.agentCommand;
+  const harnessArgs = inst?.agentArgs;
+  const acpCommand = inst?.acpCommand;
+
   return {
     displayName,
     avatarUrl,
@@ -326,6 +419,10 @@ export function seedAgentFormModel(ctx: AgentEditContext): AgentFormModel {
     instanceName,
     instanceEnvVars,
     parallelism,
+    harnessInherit,
+    harnessCommand,
+    harnessArgs,
+    acpCommand,
     autoRestartOnConfigChange,
     startOnAppLaunch,
   };
@@ -468,6 +565,41 @@ export function emitAgentFormDiff(
       isI("parallelism") &&
       (next.parallelism ?? null) !== (inst.parallelism ?? null);
 
+    // Harness pin (I-fields). The dialog resolves next.harnessCommand to the
+    // effective command (selected-runtime command or manual entry) before it
+    // reaches the model; here we settle inherit-vs-pin against the instance.
+    let harnessCommandUpdate: string | undefined;
+    if (isI("harnessCommand")) {
+      if (next.harnessInherit) {
+        // Inherit: clear an existing pin ("" sentinel), else no-op. An unlinked
+        // agent has no override, so this stays undefined for it.
+        harnessCommandUpdate =
+          inst.agentCommandOverride != null ? "" : undefined;
+      } else {
+        const pinned = (next.harnessCommand ?? "").trim();
+        // Emit when the command changed, OR when a linked agent is minting a
+        // first pin over the inherited command (override still null). Unlinked
+        // agents always have a null override, so the second clause must not fire
+        // for them — otherwise every unmodified save writes a phantom pin.
+        if (
+          pinned !== (inst.agentCommand ?? "") ||
+          (inst.personaId != null &&
+            inst.agentCommandOverride == null &&
+            pinned.length > 0)
+        ) {
+          harnessCommandUpdate = pinned;
+        }
+      }
+    }
+    const argsChanged =
+      isI("harnessArgs") &&
+      !next.harnessInherit &&
+      (next.harnessArgs ?? []).join(",") !== (inst.agentArgs ?? []).join(",");
+    const acpChanged =
+      isI("acpCommand") &&
+      next.acpCommand !== undefined &&
+      next.acpCommand.trim() !== (inst.acpCommand ?? "");
+
     const iChanged =
       nameChanged ||
       systemPromptChanged ||
@@ -476,7 +608,10 @@ export function emitAgentFormDiff(
       instanceEnvChanged ||
       respondToChanged ||
       allowlistChanged ||
-      parallelismChanged;
+      parallelismChanged ||
+      harnessCommandUpdate !== undefined ||
+      argsChanged ||
+      acpChanged;
 
     if (iChanged) {
       agentInput = { pubkey: inst.pubkey };
@@ -492,6 +627,14 @@ export function emitAgentFormDiff(
         agentInput.respondToAllowlist = next.respondToAllowlist;
       if (parallelismChanged && next.parallelism != null)
         agentInput.parallelism = next.parallelism;
+      if (harnessCommandUpdate !== undefined) {
+        agentInput.agentCommand = harnessCommandUpdate;
+        // harnessOverride marks a real pin; the "" inherit-clear leaves it unset.
+        agentInput.harnessOverride =
+          harnessCommandUpdate.length > 0 ? !next.harnessInherit : undefined;
+      }
+      if (argsChanged) agentInput.agentArgs = next.harnessArgs ?? [];
+      if (acpChanged) agentInput.acpCommand = next.acpCommand?.trim();
     }
   }
 

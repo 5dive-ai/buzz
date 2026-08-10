@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   createInputFromRequest,
   requestTargetsEditablePersona,
+  reviewOverridesForUpdate,
   type AgentManagementRequest,
 } from "./agentManagement";
 import { subscribeAgentManagementRequests } from "./observerRelayStore";
@@ -267,26 +268,7 @@ export function useAgentManagement() {
     /** Returns agent-requested field changes for R6 review mode pre-fill (overrides for the merged dialog). */
     get reviewOverrides() {
       if (request?.action !== "update" || !currentPersona) return undefined;
-      const changes = request.request;
-      const overrides: Partial<{
-        displayName: string;
-        systemPrompt: string;
-        runtime: string | undefined;
-        provider: string | undefined;
-        model: string | undefined;
-        respondTo: string | undefined;
-      }> = {};
-      if (changes.displayName != null)
-        overrides.displayName = changes.displayName;
-      if (changes.systemPrompt != null)
-        overrides.systemPrompt = changes.systemPrompt;
-      if (changes.runtime != null) overrides.runtime = changes.runtime;
-      if (changes.provider != null)
-        overrides.provider = changes.provider ?? undefined;
-      if (changes.model != null) overrides.model = changes.model ?? undefined;
-      // IMPORTANT-4: carry agent-requested respondTo into definition-only review mode.
-      if (changes.respondTo != null) overrides.respondTo = changes.respondTo;
-      return Object.keys(overrides).length > 0 ? overrides : undefined;
+      return reviewOverridesForUpdate(request.request);
     },
   };
 }

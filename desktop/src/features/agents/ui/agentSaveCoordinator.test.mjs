@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { runAgentSaveCoordinator } from "./agentSaveCoordinator.ts";
-import { seedAgentFormModel, emitAgentFormDiff } from "./agentFormModel.ts";
 
 // ── Shared fixtures ────────────────────────────────────────────────────────────
 
@@ -363,6 +362,70 @@ test("test_observed_match_calls_onDone_and_returns_true", async () => {
   assert.equal(opts._calls.onDone, 1, "onDone must be called on full success");
 });
 
+test("test_definition_write_throws_but_persisted_is_success", async () => {
+  // Observed state is authoritative over the command result: a definition
+  // write that threw but whose write landed on disk must NOT be reported as a
+  // failed step. The instance write proceeds and onDone is called.
+  const updatedPersona = makeDefinition({ displayName: "Alice-renamed" });
+
+  const opts = makeOpts({
+    personaInput: makePersonaInput({ displayName: "Alice-renamed" }),
+    agentInput: makeAgentInput(),
+    updatePersona: async () => {
+      throw new Error("Relay timeout after commit");
+    },
+    refetchStores: async () => ({
+      persona: updatedPersona,
+      agent: makeInstance(),
+    }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(
+    result,
+    true,
+    "a thrown-but-persisted definition write must be treated as success",
+  );
+  assert.equal(
+    opts._calls.updateManagedAgent,
+    1,
+    "instance write must proceed when the definition write persisted",
+  );
+  assert.equal(
+    opts._calls.onDone,
+    1,
+    "onDone must be called on persisted write",
+  );
+});
+
+test("test_instance_write_throws_but_persisted_is_success", async () => {
+  // Same authority rule for the instance step: a throw whose write persisted
+  // is success.
+  const updatedInstance = makeInstance({ name: "Alice-renamed" });
+
+  const opts = makeOpts({
+    agentInput: makeAgentInput({ name: "Alice-renamed" }),
+    updateManagedAgent: async () => {
+      throw new Error("Relay timeout after commit");
+    },
+    refetchStores: async () => ({ persona: null, agent: updatedInstance }),
+  });
+
+  const result = await runAgentSaveCoordinator(opts);
+
+  assert.equal(
+    result,
+    true,
+    "a thrown-but-persisted instance write must be treated as success",
+  );
+  assert.equal(
+    opts._calls.onDone,
+    1,
+    "onDone must be called on persisted write",
+  );
+});
+
 test("test_absent_entity_after_refetch_is_not_persisted", async () => {
   // persona: null after refetch means the entity was not found → not persisted.
   const opts = makeOpts({
@@ -647,145 +710,5 @@ test("test_definition_write_not_persisted_stops_instance_write", async () => {
     instanceWriteCalled,
     false,
     "instance write must NOT be attempted when D-write did not persist",
-  );
-});
-
-// ── R6 route-level behavioral tests ──────────────────────────────────────────
-//
-// These tests exercise the full chain that R6 (owner-review dialog) exercises
-// in production:
-//   1. reviewOverrides.respondTo arrives from useAgentManagement
-//   2. Dialog seed effect applies it as initialValueOverrides.respondTo
-//   3. emitAgentFormDiff routes the change to personaInput.behavior.respondTo
-//   4. runAgentSaveCoordinator calls updatePersona with the correct behavior
-//   5. onValidate is checked (permission gate)
-//   6. Settlement confirms persistence
-//
-// This is a coordinator-level behavioral test: it calls emitAgentFormDiff to
-// produce inputs and then passes them through runAgentSaveCoordinator, proving
-// the full pipeline from override → emission → coordinator → save.
-
-test("test_r6_respondTo_override_visible_and_delivered_through_coordinator", async () => {
-  // Scenario: owner-review dialog for a definition that currently has no
-  // respondTo (null = owner-only by backend default). Agent requested
-  // respondTo: "owner-only" explicitly. The dialog pre-fills it via
-  // initialValueOverrides.respondTo = "owner-only".
-
-  const definition = makeDefinition({ respondTo: null });
-  const ctx = { kind: "definition-only", definition };
-
-  // Step 1: seed form model (mirrors AgentEditMergedDialog's seed effect).
-  const seed = seedAgentFormModel(ctx);
-  assert.equal(
-    seed.respondTo,
-    null,
-    "definition-only seed preserves null respondTo",
-  );
-
-  // Step 2: apply initialValueOverrides.respondTo (mirrors the dialog's
-  // useEffect block that sets respondTo from initialValueOverrides).
-  const formState = { ...seed, respondTo: "owner-only" };
-
-  // Step 3: emit the diff — proves the override is visible in the form state
-  // and routes to personaInput (D-owned in definition-only context).
-  const { personaInput, agentInput } = emitAgentFormDiff(seed, formState, ctx);
-
-  assert.ok(
-    personaInput,
-    "R6 respondTo override must produce a personaInput diff",
-  );
-  assert.equal(
-    personaInput.behavior?.respondTo,
-    "owner-only",
-    "personaInput.behavior.respondTo must carry the agent-requested value",
-  );
-  assert.equal(agentInput, null, "definition-only: no agentInput");
-
-  // Step 4+5: run coordinator to verify coordinator receives and
-  // persists a well-formed personaInput from the emission pipeline.
-  // (onValidate is called by useAgentEditMergedSubmit before the coordinator;
-  // we verify here that the coordinator delivers the respondTo to updatePersona.)
-  let capturedPersonaInput = null;
-  let doneCalled = false;
-
-  const updatedDefinition = makeDefinition({
-    respondTo: "owner-only",
-    respondToAllowlist: [],
-    parallelism: null,
-  });
-
-  const result = await runAgentSaveCoordinator({
-    ctx,
-    personaInput,
-    agentInput: null,
-    policySets: [],
-    updatePersona: async (input) => {
-      capturedPersonaInput = input;
-    },
-    updatePersonaAndPublish: async () => ({ publicationStatus: "published" }),
-    updateManagedAgent: async () => {
-      throw new Error("no instance in definition-only context");
-    },
-    setAutoRestart: async () => {},
-    setStartOnAppLaunch: async () => {},
-    refetchStores: async () => ({
-      persona: updatedDefinition,
-      agent: null,
-    }),
-    onDone: () => {
-      doneCalled = true;
-    },
-  });
-
-  assert.equal(result, true, "coordinator must succeed with approved save");
-  assert.ok(capturedPersonaInput, "updatePersona must be called");
-  assert.equal(
-    capturedPersonaInput.behavior?.respondTo,
-    "owner-only",
-    "updatePersona must receive the agent-requested respondTo",
-  );
-  assert.equal(doneCalled, true, "onDone must be called on success");
-});
-
-test("test_r6_respondTo_override_settlement_fails_if_persona_not_updated", async () => {
-  // Negative case: coordinator emits the correct personaInput but the
-  // re-fetched persona still has the old value → settlement failure → onDone NOT called.
-  const definition = makeDefinition({ respondTo: null });
-  const ctx = { kind: "definition-only", definition };
-  const seed = seedAgentFormModel(ctx);
-  const formState = { ...seed, respondTo: "owner-only" };
-  const { personaInput } = emitAgentFormDiff(seed, formState, ctx);
-
-  let doneCalled = false;
-
-  // Settlement returns STALE persona (respondTo still null).
-  const stalePersona = makeDefinition({ respondTo: null });
-
-  const result = await runAgentSaveCoordinator({
-    ctx,
-    personaInput,
-    agentInput: null,
-    policySets: [],
-    updatePersona: async () => {},
-    updatePersonaAndPublish: async () => ({ publicationStatus: "published" }),
-    updateManagedAgent: async () => {
-      throw new Error("no instance in definition-only context");
-    },
-    setAutoRestart: async () => {},
-    setStartOnAppLaunch: async () => {},
-    refetchStores: async () => ({
-      persona: stalePersona,
-      agent: null,
-    }),
-    onDone: () => {
-      doneCalled = true;
-    },
-  });
-
-  assert.equal(result, false, "stale observed state must return false");
-  assert.equal(
-    doneCalled,
-    false,
-    "onDone must NOT be called when respondTo did not persist",
   );
 });

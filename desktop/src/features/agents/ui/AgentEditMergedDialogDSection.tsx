@@ -295,7 +295,10 @@ export function AgentEditMergedDSection({
             accessLocked={agentAccessOwnerOnly === true}
             allowlist={respondToAllowlist}
             disabled={isSaving || defReadOnly}
-            mode={(respondTo ?? "anyone") as RespondToMode}
+            // Definition-only default is owner-only (matches PersonaAdvancedFields
+            // and the backend default). Rendering an unset respondTo as "anyone"
+            // would show open access where owner-only is in force.
+            mode={(respondTo ?? "owner-only") as RespondToMode}
             onAllowlistChange={onAllowlistChange}
             onModeChange={onRespondToChange}
           />

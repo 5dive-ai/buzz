@@ -139,6 +139,7 @@ export async function runAgentSaveCoordinator(
 
   // Step 1: Definition write — settle immediately, stop if not persisted.
   if (personaInput) {
+    let caughtError: string | null = null;
     try {
       if (publishCatalogUpdates) {
         const result = await updatePersonaAndPublish(personaInput);
@@ -147,38 +148,42 @@ export async function runAgentSaveCoordinator(
         await updatePersona(personaInput);
       }
     } catch (err) {
-      firstError =
+      caughtError =
         err instanceof Error ? err.message : "Failed to save agent profile.";
     }
-    // Settle after definition write — re-fetch regardless of throw so that
-    // observed persistence (not the command result) decides whether it failed.
+    // Settle after definition write — re-fetch regardless of throw. Observed
+    // persistence (not the command result) decides whether the step failed: a
+    // throw whose write is on disk is NOT a failed step, and a silent no-op
+    // that did not persist IS. Only a genuine non-persisted write stops advance.
     const { persona: settled } = await refetchStores();
-    if (
-      !firstError &&
-      (settled === null ||
-        !observedStateMatchesPersonaInput(settled, personaInput))
-    ) {
-      firstError = "Agent profile did not persist — reopen to retry.";
+    const persisted =
+      settled !== null &&
+      observedStateMatchesPersonaInput(settled, personaInput);
+    if (!persisted) {
+      firstError =
+        caughtError ?? "Agent profile did not persist — reopen to retry.";
     }
   }
 
   // Step 2: Instance write — only if definition step passed.
   if (agentInput && !firstError) {
+    let caughtError: string | null = null;
     try {
       const result = await updateManagedAgent(agentInput);
       latestAgent = result.agent;
       profileSyncError = result.profileSyncError;
     } catch (err) {
-      firstError =
+      caughtError =
         err instanceof Error ? err.message : "Failed to save agent settings.";
     }
-    // Settle after instance write — re-fetch regardless of throw.
+    // Settle after instance write — re-fetch regardless of throw; observed
+    // persistence decides (a throw whose write persisted is not a failure).
     const { agent: settled } = await refetchStores();
-    if (
-      !firstError &&
-      (settled === null || !observedStateMatchesAgentInput(settled, agentInput))
-    ) {
-      firstError = "Agent settings did not persist — reopen to retry.";
+    const persisted =
+      settled !== null && observedStateMatchesAgentInput(settled, agentInput);
+    if (!persisted) {
+      firstError =
+        caughtError ?? "Agent settings did not persist — reopen to retry.";
     }
   }
 

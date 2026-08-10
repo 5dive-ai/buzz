@@ -29,6 +29,7 @@ import {
   seedAgentFormModel,
   emitAgentFormDiff,
   type AgentEditContext,
+  type AgentFormModel,
 } from "./agentFormModel";
 import { runAgentSaveCoordinator } from "./agentSaveCoordinator";
 import { parsePersonaNamePoolText } from "./personaDialogState";
@@ -93,6 +94,80 @@ export type AgentEditSubmitHookReturn = {
   resetSaveError: () => void;
 };
 
+/**
+ * Build the canonical "next" AgentFormModel from live dialog state.
+ *
+ * Single source of truth for what the user is submitting: consumed by the
+ * submit hook to emit the diff AND by the dialog to derive the D-field dirty
+ * signal (`definitionFieldsDirty`). Keeping one builder means the dirty
+ * affordance and the actual write can never disagree.
+ */
+export function buildNextAgentFormModel(
+  seed: AgentFormModel,
+  s: AgentEditSubmitState,
+): AgentFormModel {
+  const namePool = parsePersonaNamePoolText(s.namePoolText);
+  const normalizedModel = (s.model || null) as string | null;
+  const normalizedProvider = s.showInst
+    ? (s.inheritedSubmissionProvider ?? null)
+    : s.provider.trim() || null;
+
+  // Resolve the effective harness command from the selected runtime (or the
+  // manual entry) so the model — not a post-emit merge — carries it.
+  const effectiveRuntime = s.runtimes.find(
+    (r) => r.id === (s.selectedRuntimeId || "custom"),
+  );
+  const resolvedHarnessCommand = (
+    effectiveRuntime?.command ?? s.agentCommand
+  ).trim();
+  const resolvedHarnessArgs = s.agentArgs
+    .split(",")
+    .map((a) => a.trim())
+    .filter(Boolean);
+
+  return {
+    ...seed,
+    displayName: s.displayName.trim(),
+    avatarUrl: s.avatarUrl.trim(),
+    systemPrompt: s.systemPrompt.trim(),
+    respondTo: s.respondTo as typeof seed.respondTo,
+    respondToAllowlist: s.respondToAllowlist,
+    // D-field: use definitionRuntimeId (independent of I-harness pin).
+    // If the runtime was auto-seeded (not a user choice), use the seed's
+    // original runtime so a no-op save doesn't persist the app default
+    // as a new definition runtime.
+    runtime:
+      s.autoSeededDefinitionRuntimeRef.current !== null &&
+      s.autoSeededDefinitionRuntimeRef.current === s.definitionRuntimeId
+        ? (seed.runtime ?? undefined) // preserve original (undefined = no runtime)
+        : s.definitionRuntimeId === "custom"
+          ? undefined
+          : s.definitionRuntimeId,
+    model: normalizedModel,
+    provider: normalizedProvider,
+    // D-field env: use the definition env from the form state (not the
+    // live linkedPersonaEnvVars, which would bypass user edits).
+    envVars: s.envVars,
+    namePool,
+    instanceName: s.instanceName.trim() || undefined,
+    instanceEnvVars: s.showInst ? s.instanceEnvVars : undefined,
+    parallelism:
+      s.parsedParallelism > 0
+        ? s.parsedParallelism
+        : (seed.parallelism ?? null),
+    // Harness pin (I-fields) — now first-class model fields; emitAgentFormDiff
+    // settles inherit-vs-pin and the "" clear sentinel against the instance.
+    harnessInherit: s.showInst ? s.inheritHarness : undefined,
+    harnessCommand: s.showInst ? resolvedHarnessCommand : undefined,
+    harnessArgs: s.showInst ? resolvedHarnessArgs : undefined,
+    acpCommand: s.showInst ? s.acpCommand.trim() : undefined,
+    autoRestartOnConfigChange: s.showInst
+      ? s.autoRestartOnConfigChange
+      : undefined,
+    startOnAppLaunch: s.showInst ? s.startOnAppLaunch : seed.startOnAppLaunch,
+  };
+}
+
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useAgentEditMergedSubmit(
@@ -128,104 +203,13 @@ export function useAgentEditMergedSubmit(
 
       try {
         const seed = seedAgentFormModel(s.ctx);
-        const namePool = parsePersonaNamePoolText(s.namePoolText);
-        const normalizedModel = (s.model || null) as string | null;
-        const normalizedProvider = s.showInst
-          ? (s.inheritedSubmissionProvider ?? null)
-          : s.provider.trim() || null;
+        const next = buildNextAgentFormModel(seed, s);
 
-        const next = {
-          ...seed,
-          displayName: s.displayName.trim(),
-          avatarUrl: s.avatarUrl.trim(),
-          systemPrompt: s.systemPrompt.trim(),
-          respondTo: s.respondTo as typeof seed.respondTo,
-          respondToAllowlist: s.respondToAllowlist,
-          // D-field: use definitionRuntimeId (independent of I-harness pin).
-          // If the runtime was auto-seeded (not a user choice), use the seed's
-          // original runtime so a no-op save doesn't persist the app default
-          // as a new definition runtime.
-          runtime:
-            s.autoSeededDefinitionRuntimeRef.current !== null &&
-            s.autoSeededDefinitionRuntimeRef.current === s.definitionRuntimeId
-              ? (seed.runtime ?? undefined) // preserve original (undefined = no runtime)
-              : s.definitionRuntimeId === "custom"
-                ? undefined
-                : s.definitionRuntimeId,
-          model: normalizedModel,
-          provider: normalizedProvider,
-          // D-field env: use the definition env from the form state (not the
-          // live linkedPersonaEnvVars, which would bypass user edits).
-          envVars: s.envVars,
-          namePool,
-          instanceName: s.instanceName.trim() || undefined,
-          instanceEnvVars: s.showInst ? s.instanceEnvVars : undefined,
-          parallelism:
-            s.parsedParallelism > 0
-              ? s.parsedParallelism
-              : (seed.parallelism ?? null),
-          autoRestartOnConfigChange: s.showInst
-            ? s.autoRestartOnConfigChange
-            : undefined,
-          startOnAppLaunch: s.showInst
-            ? s.startOnAppLaunch
-            : seed.startOnAppLaunch,
-        };
-
-        const {
-          personaInput,
-          agentInput: base,
-          policySets,
-        } = emitAgentFormDiff(seed, next, s.ctx);
-
-        // Merge harness-pin fields (I-fields not tracked in AgentFormModel).
-        let agentInput = base;
-        if (s.showInst && inst) {
-          const resolvedArgs = s.agentArgs
-            .split(",")
-            .map((a) => a.trim())
-            .filter(Boolean);
-          const effectiveRuntime = s.runtimes.find(
-            (r) => r.id === (s.selectedRuntimeId || "custom"),
-          );
-          let commandUpdate: string | undefined;
-          if (s.inheritHarness) {
-            commandUpdate = inst.agentCommandOverride != null ? "" : undefined;
-          } else {
-            const pinned = (effectiveRuntime?.command ?? s.agentCommand).trim();
-            // Only write a commandUpdate when the command actually changed OR
-            // when a linked agent (personaId != null) is creating a new pin that
-            // matches the current inherited command (no override yet). Unlinked
-            // agents have no inherit/pin distinction — their agentCommandOverride
-            // is always null, so the second clause must not trigger for them or
-            // every unmodified save generates a phantom harness write that
-            // `observedStateMatchesAgentInput` then fails to settle.
-            if (
-              pinned !== inst.agentCommand ||
-              (inst.personaId != null &&
-                inst.agentCommandOverride == null &&
-                pinned.length > 0)
-            ) {
-              commandUpdate = pinned;
-            }
-          }
-          const argsChanged =
-            !s.inheritHarness &&
-            resolvedArgs.join(",") !== inst.agentArgs.join(",");
-          if (commandUpdate !== undefined || argsChanged) {
-            agentInput = agentInput ?? { pubkey: inst.pubkey };
-            if (commandUpdate !== undefined) {
-              agentInput.agentCommand = commandUpdate;
-              agentInput.harnessOverride =
-                commandUpdate.length > 0 ? !s.inheritHarness : undefined;
-            }
-            if (argsChanged) agentInput.agentArgs = resolvedArgs;
-          }
-          if (s.acpCommand.trim() !== inst.acpCommand) {
-            agentInput = agentInput ?? { pubkey: inst.pubkey };
-            agentInput.acpCommand = s.acpCommand.trim();
-          }
-        }
+        const { personaInput, agentInput, policySets } = emitAgentFormDiff(
+          seed,
+          next,
+          s.ctx,
+        );
 
         const refetchStores = async () => {
           // Use refetchQueries (not invalidateQueries) so the await resolves only

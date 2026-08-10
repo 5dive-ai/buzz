@@ -33,11 +33,16 @@ import {
   hasDefinitionContext,
   hasInstanceContext,
   isDefinitionReadOnly,
+  definitionFieldsDirty,
   editContextDefinition,
   editContextInstance,
   type AgentEditContext,
 } from "./agentFormModel";
-import { useAgentEditMergedSubmit } from "./useAgentEditMergedSubmit";
+import {
+  useAgentEditMergedSubmit,
+  buildNextAgentFormModel,
+  type AgentEditSubmitState,
+} from "./useAgentEditMergedSubmit";
 import { AgentEditMergedDSection } from "./AgentEditMergedDialogDSection";
 import { AgentEditMergedInstanceSection } from "./AgentEditMergedDialogInstanceSection";
 import {
@@ -49,6 +54,10 @@ import { AgentCreationPreview } from "./AgentCreationPreview";
 import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOwnerOnly";
 import { isEditAgentProviderSaveValid } from "./personaRuntimeModel";
+import {
+  agentAiConfigurationModeSatisfied,
+  initialAgentAiConfigurationMode,
+} from "./agentAiConfigurationPolicy";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { formatPersonaNamePoolText } from "./personaDialogState";
 import { useAgentEditRuntimeState } from "./useAgentEditRuntimeState";
@@ -254,9 +263,6 @@ export function AgentEditMergedDialog({
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
   const aiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const [isAddHarnessOpen, setIsAddHarnessOpen] = React.useState(false);
-  // Track whether any D-field has been dirtied so the catalog publish affordance
-  // activates only after the user makes a change (matching AgentDefinitionDialog).
-  const [dFieldsDirty, setDFieldsDirty] = React.useState(false);
 
   // ── Seed form on open ─────────────────────────────────────────────────────
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional — only re-seed on open/entity-switch
@@ -342,7 +348,6 @@ export function AgentEditMergedDialog({
           (initialValueOverrides.respondTo as RespondToMode | null) ?? null,
         );
     }
-    setDFieldsDirty(false);
   }, [open, inst?.pubkey, def?.id]);
 
   // Auto-seed D-section runtime when the definition has no runtime configured
@@ -450,26 +455,35 @@ export function AgentEditMergedDialog({
     [provider],
   );
 
-  const providerValid = isEditAgentProviderSaveValid({
-    llmProviderFieldVisible,
-    currentProvider: provider,
-    originalProvider: showInst
-      ? (inst?.provider ?? null)
-      : (def?.provider ?? null),
-    globalProvider: inheritedProviderDefault.value,
-    originalRuntimeSupportsProvider: showInst
-      ? originalRuntimeSupportsProvider
-      : llmProviderFieldVisible, // for D-only: picker is visible → was already editable
-  });
+  // Provider Save-gate.
+  //
+  // Definition-present context (D-section picker): use the AgentDefinitionDialog
+  // gate — when the provider picker is visible and the pair is customized
+  // (provider or model set), both provider AND model must be non-empty. The
+  // global fallback does NOT satisfy the definition gate (that is the
+  // instance-dialog rule), so a runtime-less definition with a saved model and
+  // an empty provider keeps Save blocked (test-11 regression pin from 87dc4dccba).
+  //
+  // Instance-only context: keep isEditAgentProviderSaveValid — the instance
+  // record inherits the global provider, so the global fallback is valid there.
+  const providerValid = showDef
+    ? agentAiConfigurationModeSatisfied(
+        initialAgentAiConfigurationMode({ provider, model }),
+        { provider, model },
+        llmProviderFieldVisible,
+      )
+    : isEditAgentProviderSaveValid({
+        llmProviderFieldVisible,
+        currentProvider: provider,
+        originalProvider: inst?.provider ?? null,
+        globalProvider: inheritedProviderDefault.value,
+        originalRuntimeSupportsProvider,
+      });
 
   const parsedParallelism = parseInt(parallelism, 10);
 
   // ── Submit hook (must come before canSubmit so isSaving is available) ─────
-  const {
-    isSaving,
-    saveError,
-    handleSubmit: _handleSubmit,
-  } = useAgentEditMergedSubmit({
+  const submitState = {
     ctx,
     displayName,
     avatarUrl,
@@ -497,15 +511,29 @@ export function AgentEditMergedDialog({
     defReadOnly,
     inheritedSubmissionProvider: inheritedSubmission.provider ?? null,
     runtimes,
-    updatePersona: (p) => updatePersonaMutation.mutateAsync(p),
-    updatePersonaAndPublish: (p) =>
-      updatePersonaAndPublishMutation.mutateAsync(p),
-    updateManagedAgent: (input) => updateMutation.mutateAsync(input),
-    startMutate: (pubkey, cbs) => startMutation.mutate(pubkey, cbs),
+    updatePersona: (
+      p: Parameters<typeof updatePersonaMutation.mutateAsync>[0],
+    ) => updatePersonaMutation.mutateAsync(p),
+    updatePersonaAndPublish: (
+      p: Parameters<typeof updatePersonaAndPublishMutation.mutateAsync>[0],
+    ) => updatePersonaAndPublishMutation.mutateAsync(p),
+    updateManagedAgent: (
+      input: Parameters<typeof updateMutation.mutateAsync>[0],
+    ) => updateMutation.mutateAsync(input),
+    startMutate: (
+      pubkey: string,
+      cbs: { onSuccess: () => void; onError: (err: unknown) => void },
+    ) => startMutation.mutate(pubkey, cbs),
     onValidate,
     onOpenChange,
     onUpdated,
-  });
+  } satisfies AgentEditSubmitState;
+
+  const {
+    isSaving,
+    saveError,
+    handleSubmit: _handleSubmit,
+  } = useAgentEditMergedSubmit(submitState);
 
   const canSubmit =
     !isSaving &&
@@ -605,20 +633,26 @@ export function AgentEditMergedDialog({
       : "Edit agent";
 
   // Catalog publish affordance: only shown when the definition is shared
-  // and the user has made at least one D-field change.
+  // and the user has dirtied at least one D-owned field. Derived from the
+  // canonical model diff (definitionFieldsDirty over fieldOwner) rather than a
+  // parallel dirty boolean — the same authority that routes emits.
+  const dFieldsDirty =
+    showDef &&
+    !defReadOnly &&
+    (() => {
+      const seed = seedAgentFormModel(ctx);
+      return definitionFieldsDirty(
+        seed,
+        buildNextAgentFormModel(seed, submitState),
+        ctx,
+      );
+    })();
+
   const publishesCatalogUpdates = !!(
     def?.shared &&
     !defReadOnly &&
     dFieldsDirty
   );
-
-  // Helper: wrap a D-section setter to also mark D-fields dirty.
-  function dChange<T>(setter: (v: T) => void): (v: T) => void {
-    return (v: T) => {
-      setter(v);
-      setDFieldsDirty(true);
-    };
-  }
 
   return (
     <Dialog
@@ -746,59 +780,47 @@ export function AgentEditMergedDialog({
                 defReadOnly={defReadOnly}
                 isSaving={isSaving}
                 displayName={displayName}
-                onDisplayNameChange={dChange(setDisplayName)}
+                onDisplayNameChange={setDisplayName}
                 systemPrompt={systemPrompt}
-                onSystemPromptChange={dChange(setSystemPrompt)}
+                onSystemPromptChange={setSystemPrompt}
                 namePoolText={namePoolText}
-                onNamePoolTextChange={dChange(setNamePoolText)}
+                onNamePoolTextChange={setNamePoolText}
                 envVars={envVars}
-                onEnvVarsChange={dChange(setEnvVars)}
+                onEnvVarsChange={setEnvVars}
                 runtimeCatalogStatus={runtimeCatalogStatus}
                 runtimeDropdownValue={defRuntimeDropdownValue}
                 defRuntimeDropdownOptions={defRuntimeDropdownOptions}
                 defBlankLabel={defBlankLabel}
                 onRuntimeChange={(v) => {
-                  setDFieldsDirty(true);
+                  // An explicit selection is a user choice, not an auto-seed —
+                  // clear the ref so submit persists it even when the chosen
+                  // runtime equals the previously auto-seeded default.
+                  autoSeededDefinitionRuntimeRef.current = null;
                   handleDefinitionRuntimeChange(v);
                 }}
                 llmProviderFieldVisible={llmProviderFieldVisible}
                 providerSelectValue={providerSelectValue}
                 providerDropdownOptions={providerDropdownOptions}
-                onProviderChange={(v) => {
-                  setDFieldsDirty(true);
-                  handleProviderDropdownChange(v);
-                }}
+                onProviderChange={handleProviderDropdownChange}
                 isCustomProviderEditing={isCustomProviderEditing}
                 provider={provider}
-                onProviderTextChange={dChange(setDProvider)}
+                onProviderTextChange={setDProvider}
                 modelSelectValue={modelSelectValue}
                 modelDropdownOptions={modelDropdownOptions}
-                onModelChange={(v) => {
-                  setDFieldsDirty(true);
-                  handleModelDropdownChange(v);
-                }}
+                onModelChange={handleModelDropdownChange}
                 modelDiscoveryLoading={modelDiscoveryLoading}
                 showCustomModelInput={showCustomModelInput}
                 model={model}
-                onModelTextChange={dChange(setDModel)}
+                onModelTextChange={setDModel}
                 modelStatusMessage={modelStatusMessage}
                 showInstancePresent={showInst}
                 respondTo={respondTo}
                 respondToAllowlist={respondToAllowlist}
-                onRespondToChange={(v) => {
-                  setRespondTo(v);
-                  setDFieldsDirty(true);
-                }}
-                onAllowlistChange={(v) => {
-                  setRespondToAllowlist(v);
-                  setDFieldsDirty(true);
-                }}
+                onRespondToChange={setRespondTo}
+                onAllowlistChange={setRespondToAllowlist}
                 agentAccessOwnerOnly={agentAccessOwnerOnly}
                 parallelism={parallelism}
-                onParallelismChange={(v) => {
-                  setParallelism(v);
-                  setDFieldsDirty(true);
-                }}
+                onParallelismChange={setParallelism}
               />
             ) : null}
 

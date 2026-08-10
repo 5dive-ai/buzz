@@ -530,6 +530,10 @@ test.describe("merged dialog — team-linked and D+I wiring", () => {
 
     // I-fields (instance name, respond-to) remain editable.
     await expect(page.locator("#edit-agent-name")).not.toBeDisabled();
+    // The access control is the regression pin for the defReadOnly fix: it is an
+    // I-owned field, so it must stay enabled even though the definition is
+    // team-managed and its D-fields are read-only.
+    await expect(page.locator("#agent-respond-to")).not.toBeDisabled();
   });
 
   test("linked agent: edit D-field and I-field, one Save persists both layers", async ({

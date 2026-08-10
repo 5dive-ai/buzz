@@ -251,14 +251,12 @@ export function useAgentEditRuntimeState({
     // contract introduced in commit 87dc4dccba — restoring the capability that was
     // accidentally dropped when test-11 was rewritten.
     if (showDef && activeRuntimeId === "custom") {
-      const defRuntime = (
-        activeRuntimeId === "custom" ? "" : activeRuntimeId
-      ).trim();
-      const isRuntimeless = defRuntime.length === 0;
+      // The outer guard already means this is a runtime-less definition, so
+      // expose the picker as soon as there is a saved model or provider to edit.
       const hasSavedModelOrProvider =
         (linkedPersona?.model ?? def?.model ?? "").trim().length > 0 ||
         (linkedPersona?.provider ?? def?.provider ?? "").trim().length > 0;
-      if (isRuntimeless && hasSavedModelOrProvider) return true;
+      if (hasSavedModelOrProvider) return true;
     }
 
     return false;

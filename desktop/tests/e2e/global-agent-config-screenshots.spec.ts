@@ -882,21 +882,24 @@ test.describe("global agent config screenshots", () => {
     });
   });
 
-  // Shot 11: the merged surface's equivalent of the "provider gate" regression pin.
-  // A runtime-less definition-with-instance that has a saved model (but no provider)
-  // exposes the provider picker (blankRuntimeModelProviderEditable — restoring the
-  // contract from AgentDefinitionDialog commit 87dc4dccba). The global provider
-  // "anthropic" satisfies the provider gate, so Save is enabled with the picker visible.
-  test("11-edit-runtime-less-provider-visible-save-enabled", async ({
+  // Shot 11: the merged surface's equivalent of the "provider gate" regression pin
+  // (wesbillman's blocking review point, originally on AgentDefinitionDialog via
+  // 87dc4dccba). A runtime-less definition-with-instance that has a saved model but
+  // NO provider still EXPOSES the provider picker (blankRuntimeModelProviderEditable),
+  // so the empty provider must keep Save DISABLED. The definition-context gate keys
+  // off the visible picker (agentAiConfigurationModeSatisfied), NOT the global
+  // fallback — a runtime-less legacy definition must require an explicit provider.
+  test("11-edit-runtime-less-provider-required-save-blocked", async ({
     page,
   }) => {
     const PERSONA_ID = "persona-runtime-less-edit-e2e";
     await installMockBridge(page, {
       // No runtime is available, so getDefaultPersonaRuntime returns null and
       // the dialog does NOT auto-seed a runtime on open — the runtime-less
-      // definition stays runtime-less.
+      // definition stays runtime-less, which is the only state where
+      // blankRuntimeModelProviderEditable exposes the provider picker.
       acpRuntimesCatalog: CATALOG_NONE_AVAILABLE,
-      // Global defaults satisfy localMode.
+      // Global defaults satisfy localMode, so any block is the pair gate alone.
       globalAgentConfig: {
         provider: "anthropic",
         model: "claude-opus-4-5",
@@ -916,7 +919,8 @@ test.describe("global agent config screenshots", () => {
           id: PERSONA_ID,
           displayName: "Legacy Editor",
           systemPrompt: "You are the runtime-less edit-mode e2e persona.",
-          // Runtime-less definition with a saved model and NO provider.
+          // Runtime-less definition with a saved model and NO provider — the
+          // picker is editable-without-runtime, so the provider stays required.
           runtime: null,
           model: "claude-opus-4-5",
           provider: null,
@@ -946,14 +950,12 @@ test.describe("global agent config screenshots", () => {
       /Save changes/,
     );
 
-    // blankRuntimeModelProviderEditable: runtime-less definition with a saved model
-    // exposes the provider picker so the user can edit the existing model/provider values.
-    // The global provider "anthropic" satisfies isEditAgentProviderSaveValid, so Save
-    // is not blocked even though the form provider field is empty.
+    // The provider picker IS visible (runtime-less editable definition) …
     await expect(page.locator("#edit-agent-llm-provider")).toBeVisible({
       timeout: 10_000,
     });
-    await expect(page.getByTestId("edit-agent-dialog-submit")).toBeEnabled({
+    // … so the empty provider must keep Save DISABLED.
+    await expect(page.getByTestId("edit-agent-dialog-submit")).toBeDisabled({
       timeout: 10_000,
     });
 
@@ -961,7 +963,7 @@ test.describe("global agent config screenshots", () => {
 
     const dialog = page.getByRole("dialog");
     await dialog.screenshot({
-      path: `${SHOTS}/11-edit-runtime-less-provider-visible-save-enabled.png`,
+      path: `${SHOTS}/11-edit-runtime-less-provider-required-save-blocked.png`,
     });
   });
 

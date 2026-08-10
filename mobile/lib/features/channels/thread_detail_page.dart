@@ -25,6 +25,7 @@ import 'date_formatters.dart';
 import 'day_divider.dart';
 import '../profile/user_profile_sheet.dart';
 import 'initial_thread_tail_settle.dart';
+import 'laid_out_viewport.dart';
 import 'message_actions.dart';
 import 'message_long_press_region.dart';
 import 'message_content.dart';
@@ -63,20 +64,12 @@ class ThreadDetailPage extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final composerDockHeight = useState(0.0);
     final sendMessage = ref.read(sendMessageProvider);
-    // Relay thread queries are keyed by the outermost root, even when this
-    // page displays a nested branch. Query that root, then select this head's
-    // direct children from the returned subtree below.
     final queryRootId = threadHead.rootId ?? threadHead.id;
     final repliesState = ref.watch(
       threadRepliesWithLocalProvider(
         ThreadRepliesArgs(channelId: channelId, rootId: queryRootId),
       ),
     );
-    // The thread query is one-shot and asks only for content kinds, so a
-    // reaction, edit, or deletion that lands while the thread is open never
-    // reaches it — a new pill (and its burst) only showed up after leaving and
-    // re-entering, which refetched. The channel socket already receives those
-    // events, so union the two sources and format once.
     final liveChannelEvents =
         ref.watch(channelMessagesProvider(channelId)).value ??
         const <NostrEvent>[];
@@ -95,18 +88,12 @@ class ThreadDetailPage extends HookConsumerWidget {
     final allMsgs = fetchedReplies == null
         ? allMessages
         : [
-            // Only fall back to the pushed-route snapshot when neither source
-            // carries the head, and no live deletion has suppressed it. That
-            // keeps a temporarily unavailable head visible without restoring
-            // a head that was deleted while this page was open.
             if (!liveDeletionHidesHead &&
                 !fetchedReplies.any((message) => message.id == threadHead.id))
               threadHead,
             ...fetchedReplies,
           ];
 
-    // Index all messages by parentId so we can find direct children of any
-    // message and compute thread summaries for nested threads.
     final childrenByParent = <String, List<TimelineMessage>>{};
     for (final msg in allMsgs) {
       final pid = msg.parentId;
@@ -117,6 +104,8 @@ class ThreadDetailPage extends HookConsumerWidget {
     final replies = childrenByParent[threadHead.id] ?? const [];
     final itemScrollController = useMemoized(ItemScrollController.new);
     final itemPositionsListener = useMemoized(ItemPositionsListener.create);
+    final listViewport = useMemoized(LaidOutViewport.new);
+    useEffect(() => listViewport.dispose, [listViewport]);
     final didJumpToInitialMessage = useRef(false);
     final followsThreadTail = useRef(false);
     final userOptedOutOfTailFollow = useRef(false);
@@ -150,8 +139,6 @@ class ThreadDetailPage extends HookConsumerWidget {
 
     useEffect(() {
       final messageId = initialMessageId;
-      // Wait for the authoritative thread query before consuming the one-shot
-      // jump; the fallback main-timeline list can contain only the linked reply.
       if (messageId == null || fetchedReplies == null) return null;
       final chronologicalIndex = replies.indexWhere(
         (reply) => reply.id == messageId,
@@ -175,11 +162,14 @@ class ThreadDetailPage extends HookConsumerWidget {
     final hasFetchedReplies = fetchedReplies != null;
     final initialTailSettle = useMemoized(InitialThreadTailSettle.new);
     final previousReplyCount = useRef(replies.length);
-    final viewportHeight = MediaQuery.sizeOf(context).height;
+    final viewportHeight = useListenable(listViewport.height).value;
     final topOverlayFraction = frostedAppBarHeight(context) / viewportHeight;
+    final settleGeometry = (composerDockHeight.value, viewportHeight);
     useEffect(() {
-      if (!hasFetchedReplies) return null;
-      if (isMember && !isArchived && composerDockHeight.value <= 0) return null;
+      if (!hasFetchedReplies || viewportHeight <= 0) return null;
+      if (isMember && !isArchived && composerDockHeight.value <= 0) {
+        return null;
+      }
       if (!initialTailSettle.isComplete) {
         previousReplyCount.value = replies.length;
         initialTailSettle.schedule(
@@ -221,7 +211,7 @@ class ThreadDetailPage extends HookConsumerWidget {
         );
       });
       return null;
-    }, [hasFetchedReplies, replies.length, composerDockHeight.value]);
+    }, [hasFetchedReplies, replies.length, settleGeometry]);
     final readState = ref.watch(readStateProvider);
     final visibleReplyReadKey = replies
         .map((reply) => '${reply.id}:${reply.createdAt}')
@@ -259,6 +249,7 @@ class ThreadDetailPage extends HookConsumerWidget {
     final effectiveRootId = threadHead.rootId ?? threadHead.id;
 
     void updateComposerDockHeight(double height) {
+      listViewport.reportAfterLayout();
       final previousHeight = composerDockHeight.value;
       final heightDelta = height - previousHeight;
       if (heightDelta.abs() < 0.5) return;
@@ -281,7 +272,7 @@ class ThreadDetailPage extends HookConsumerWidget {
       if (lastPosition == null) return;
       final targetAlignment =
           (pendingTailAlignment.value ?? lastPosition.itemLeadingEdge) -
-          (heightDelta / MediaQuery.sizeOf(context).height);
+          (heightDelta / viewportHeight);
       pendingTailAlignment.value = targetAlignment;
 
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -293,11 +284,8 @@ class ThreadDetailPage extends HookConsumerWidget {
       });
     }
 
-    // Composer size changes and keyboard metrics changes are independent:
-    // the dock grows first, then the Scaffold's viewport shrinks once the
-    // keyboard appears. Re-align after that latter layout pass too, but only
-    // while the user was already following the thread tail.
     void realignThreadTailAfterMetricsChange() {
+      listViewport.reportAfterLayout();
       final shouldFollowTail =
           !userOptedOutOfTailFollow.value &&
           (followsThreadTail.value || threadTailIsVisible());
@@ -330,7 +318,6 @@ class ThreadDetailPage extends HookConsumerWidget {
       return () => WidgetsBinding.instance.removeObserver(observer);
     }, [itemScrollController, replies.length]);
 
-    // Channel names for message content rendering.
     final channelsAsync = ref.watch(channelsProvider);
     final channelNamesMap = <String, String>{};
     channelsAsync.whenData((channels) {
@@ -350,150 +337,156 @@ class ThreadDetailPage extends HookConsumerWidget {
           Column(
             children: [
               Expanded(
-                child: KeyboardDismissOnDrag(
-                  onUserScrollStart: () {
-                    userOptedOutOfTailFollow.value = true;
-                    followsThreadTail.value = false;
-                    pendingTailAlignment.value = null;
-                  },
-                  onUserScrollEnd: () {
-                    if (!threadTailIsVisible()) return;
-                    userOptedOutOfTailFollow.value = false;
-                    followsThreadTail.value = true;
-                  },
-                  child: ScrollablePositionedList.builder(
-                    key: const ValueKey('thread-message-list'),
-                    itemScrollController: itemScrollController,
-                    itemPositionsListener: itemPositionsListener,
-                    padding: EdgeInsets.only(
-                      left: Grid.gutter,
-                      right: Grid.gutter,
-                      top: frostedAppBarHeight(context),
-                      bottom: Grid.xs + composerDockHeight.value,
-                    ),
-                    itemCount: replies.length + 1, // +1 for thread head
-                    itemBuilder: (context, index) {
-                      if (index == headIndex) {
-                        if (liveDeletionHidesHead) {
-                          return const Padding(
-                            key: ValueKey('thread-message-deleted'),
-                            padding: EdgeInsets.only(bottom: Grid.xs),
-                            child: Text('This message was deleted'),
+                child: LaidOutViewportReporter(
+                  viewport: listViewport,
+                  child: KeyboardDismissOnDrag(
+                    onUserScrollStart: () {
+                      userOptedOutOfTailFollow.value = true;
+                      followsThreadTail.value = false;
+                      pendingTailAlignment.value = null;
+                    },
+                    onUserScrollEnd: () {
+                      if (!threadTailIsVisible()) return;
+                      userOptedOutOfTailFollow.value = false;
+                      followsThreadTail.value = true;
+                    },
+                    child: ScrollablePositionedList.builder(
+                      key: const ValueKey('thread-message-list'),
+                      itemScrollController: itemScrollController,
+                      itemPositionsListener: itemPositionsListener,
+                      padding: EdgeInsets.only(
+                        left: Grid.gutter,
+                        right: Grid.gutter,
+                        top: frostedAppBarHeight(context),
+                        bottom: Grid.xs + composerDockHeight.value,
+                      ),
+                      itemCount: replies.length + 1, // +1 for thread head
+                      itemBuilder: (context, index) {
+                        if (index == headIndex) {
+                          if (liveDeletionHidesHead) {
+                            return const Padding(
+                              key: ValueKey('thread-message-deleted'),
+                              padding: EdgeInsets.only(bottom: Grid.xs),
+                              child: Text('This message was deleted'),
+                            );
+                          }
+                          return Padding(
+                            key: ValueKey(
+                              'thread-message-group-${liveHead.id}',
+                            ),
+                            padding: const EdgeInsets.only(bottom: Grid.xs),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                DayDivider(
+                                  label: formatDayHeading(liveHead.createdAt),
+                                ),
+                                _ThreadMessage(
+                                  message: liveHead,
+                                  channelNames: channelNamesMap,
+                                  channelId: channelId,
+                                  currentPubkey: currentPubkey,
+                                  showAuthor: true,
+                                  isHighlighted:
+                                      liveHead.id == initialMessageId,
+                                  allMessages: allMsgs,
+                                  isMember: isMember,
+                                  isArchived: isArchived,
+                                  isThreadHead: true,
+                                ),
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: Grid.xxs,
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Text(
+                                        '${replies.length} ${replies.length == 1 ? 'reply' : 'replies'}',
+                                        style: context.textTheme.labelMedium
+                                            ?.copyWith(
+                                              color: context
+                                                  .colors
+                                                  .onSurfaceVariant,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                      ),
+                                      const SizedBox(width: Grid.xxs),
+                                      Expanded(
+                                        child: Divider(
+                                          color: context.colors.outlineVariant,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
                           );
                         }
+
+                        final chronIdx = index - 1;
+                        final reply = replies[chronIdx];
+                        final prevReply = chronIdx > 0
+                            ? replies[chronIdx - 1]
+                            : null;
+                        final previousMessage = prevReply ?? liveHead;
+                        final showDayDivider = !isSameDay(
+                          previousMessage.createdAt,
+                          reply.createdAt,
+                        );
+                        final showAuthor =
+                            prevReply == null ||
+                            showDayDivider ||
+                            prevReply.pubkey.toLowerCase() !=
+                                reply.pubkey.toLowerCase() ||
+                            (reply.createdAt - prevReply.createdAt) > 300;
+
+                        // Check if this reply itself has children (nested thread).
+                        final nestedChildren = childrenByParent[reply.id];
+                        final nestedSummary =
+                            nestedChildren != null && nestedChildren.isNotEmpty
+                            ? _buildNestedSummary(reply.id, nestedChildren)
+                            : null;
+
                         return Padding(
-                          key: ValueKey('thread-message-group-${liveHead.id}'),
-                          padding: const EdgeInsets.only(bottom: Grid.xs),
+                          key: ValueKey('thread-message-group-${reply.id}'),
+                          // Tail spacing comes from the list's own bottom padding now
+                          // that the list runs top-down; the reversed list used to
+                          // need it here because item 0 sat against the composer.
+                          padding: EdgeInsets.zero,
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              DayDivider(
-                                label: formatDayHeading(liveHead.createdAt),
-                              ),
+                              if (showDayDivider)
+                                DayDivider(
+                                  label: formatDayHeading(reply.createdAt),
+                                ),
                               _ThreadMessage(
-                                message: liveHead,
+                                message: reply,
                                 channelNames: channelNamesMap,
                                 channelId: channelId,
                                 currentPubkey: currentPubkey,
-                                showAuthor: true,
-                                isHighlighted: liveHead.id == initialMessageId,
+                                showAuthor: showAuthor,
+                                isHighlighted: reply.id == initialMessageId,
                                 allMessages: allMsgs,
                                 isMember: isMember,
                                 isArchived: isArchived,
-                                isThreadHead: true,
                               ),
-                              Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  vertical: Grid.xxs,
+                              if (nestedSummary != null)
+                                _NestedThreadSummaryRow(
+                                  summary: nestedSummary,
+                                  replyMessage: reply,
+                                  allMessages: allMsgs,
+                                  channelId: channelId,
+                                  currentPubkey: currentPubkey,
+                                  isMember: isMember,
+                                  isArchived: isArchived,
                                 ),
-                                child: Row(
-                                  children: [
-                                    Text(
-                                      '${replies.length} ${replies.length == 1 ? 'reply' : 'replies'}',
-                                      style: context.textTheme.labelMedium
-                                          ?.copyWith(
-                                            color:
-                                                context.colors.onSurfaceVariant,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                    ),
-                                    const SizedBox(width: Grid.xxs),
-                                    Expanded(
-                                      child: Divider(
-                                        color: context.colors.outlineVariant,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
                             ],
                           ),
                         );
-                      }
-
-                      // Chronological list: index 1 = oldest reply.
-                      final chronIdx = index - 1;
-                      final reply = replies[chronIdx];
-                      final prevReply = chronIdx > 0
-                          ? replies[chronIdx - 1]
-                          : null;
-                      final previousMessage = prevReply ?? liveHead;
-                      final showDayDivider = !isSameDay(
-                        previousMessage.createdAt,
-                        reply.createdAt,
-                      );
-                      final showAuthor =
-                          prevReply == null ||
-                          showDayDivider ||
-                          prevReply.pubkey.toLowerCase() !=
-                              reply.pubkey.toLowerCase() ||
-                          (reply.createdAt - prevReply.createdAt) > 300;
-
-                      // Check if this reply itself has children (nested thread).
-                      final nestedChildren = childrenByParent[reply.id];
-                      final nestedSummary =
-                          nestedChildren != null && nestedChildren.isNotEmpty
-                          ? _buildNestedSummary(reply.id, nestedChildren)
-                          : null;
-
-                      return Padding(
-                        key: ValueKey('thread-message-group-${reply.id}'),
-                        // Tail spacing comes from the list's own bottom padding now
-                        // that the list runs top-down; the reversed list used to
-                        // need it here because item 0 sat against the composer.
-                        padding: EdgeInsets.zero,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            if (showDayDivider)
-                              DayDivider(
-                                label: formatDayHeading(reply.createdAt),
-                              ),
-                            _ThreadMessage(
-                              message: reply,
-                              channelNames: channelNamesMap,
-                              channelId: channelId,
-                              currentPubkey: currentPubkey,
-                              showAuthor: showAuthor,
-                              isHighlighted: reply.id == initialMessageId,
-                              allMessages: allMsgs,
-                              isMember: isMember,
-                              isArchived: isArchived,
-                            ),
-                            if (nestedSummary != null)
-                              _NestedThreadSummaryRow(
-                                summary: nestedSummary,
-                                replyMessage: reply,
-                                allMessages: allMsgs,
-                                channelId: channelId,
-                                currentPubkey: currentPubkey,
-                                isMember: isMember,
-                                isArchived: isArchived,
-                              ),
-                          ],
-                        ),
-                      );
-                    },
+                      },
+                    ),
                   ),
                 ),
               ),

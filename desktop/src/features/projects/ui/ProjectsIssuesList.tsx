@@ -6,6 +6,7 @@ import type {
   ProjectIssueListItem,
   Repository,
 } from "@/features/projects/hooks";
+import { issueShareLink } from "@/features/projects/lib/projectShareLinks";
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import type { ProjectWorkItemSection } from "@/features/projects/projectWorkItems";
 import {
@@ -16,6 +17,7 @@ import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { DropdownMenuItem } from "@/shared/ui/dropdown-menu";
+import { CopyShareLinkMenuItem } from "./CopyShareLinkMenuItem";
 import { ProjectAuthorIdentity } from "./ProjectAuthorIdentity";
 import { ProjectEventTypeIcon } from "./ProjectEventTypeIcon";
 import { ProjectListRowMenu } from "./ProjectListRowMenu";
@@ -233,6 +235,10 @@ function IssueListRow({
               <Eye className="h-4 w-4" />
               {nextStepLabel(issue.status)}
             </DropdownMenuItem>
+            <CopyShareLinkMenuItem
+              link={issueShareLink(issue)}
+              testId={`projects-issue-copy-link-${issue.id}`}
+            />
           </ProjectListRowMenu>
         </div>
       </div>

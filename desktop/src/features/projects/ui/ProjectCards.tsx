@@ -24,6 +24,7 @@ import {
   relativeTime,
 } from "@/features/projects/lib/projectsViewHelpers";
 import type { ProjectRepoUnavailableReason } from "@/features/projects/lib/projectRepoAvailability";
+import { projectShareLink } from "@/features/projects/lib/projectShareLinks";
 import { projectTerminalLabel } from "@/features/projects/ui/useOpenProjectTerminal";
 import {
   PROJECT_LIST_ROW_CLASS,
@@ -50,6 +51,7 @@ import { Card } from "@/shared/ui/card";
 import { DropdownMenuItem } from "@/shared/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
+import { CopyShareLinkMenuItem } from "./CopyShareLinkMenuItem";
 import { ProjectListRowMenu } from "./ProjectListRowMenu";
 
 function ProjectUpdatedLabel({
@@ -395,6 +397,10 @@ function ProjectActionsMenu({
   return (
     <AlertDialog onOpenChange={setConfirmOpen} open={confirmOpen}>
       <ProjectListRowMenu label={`More options for ${project.name}`}>
+        <CopyShareLinkMenuItem
+          link={projectShareLink(project)}
+          testId={`project-copy-link-${project.dtag}`}
+        />
         <DropdownMenuItem
           onSelect={(event) => {
             event.preventDefault();

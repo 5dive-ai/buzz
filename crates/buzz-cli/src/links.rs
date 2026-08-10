@@ -9,9 +9,32 @@
 //! Callers are expected to validate inputs first (`validate_hex64`,
 //! `validate_repo_id`); the identifier charsets need no URL encoding.
 
+/// Whether a d-tag can be expressed in a `buzz://` link.
+///
+/// Project slugs accept up to 1024 bytes of arbitrary UTF-8, but the link
+/// format is restricted to `[a-zA-Z0-9._-]{1,64}` (no leading dot, no `..`)
+/// so links need no escaping and stay safe to paste. Callers must check
+/// before building a link and omit the field when it returns false, rather
+/// than emitting a link no client can parse. Mirrors `isValidDtag` in
+/// `desktop/src/shared/lib/entityLink.ts`.
+pub fn is_linkable_dtag(dtag: &str) -> bool {
+    !dtag.is_empty()
+        && dtag.len() <= 64
+        && !dtag.starts_with('.')
+        && !dtag.contains("..")
+        && dtag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
 /// Build a `buzz://repo` link for a repository announcement (kind 30617).
 pub fn repo_link(owner: &str, repo_id: &str) -> String {
     format!("buzz://repo?owner={owner}&d={repo_id}")
+}
+
+/// Build a `buzz://project` link for a project announcement (kind 30621).
+pub fn project_link(owner: &str, project_id: &str) -> String {
+    format!("buzz://project?owner={owner}&d={project_id}")
 }
 
 /// Build a `buzz://pr` link for a pull request event (kind 1618).
@@ -47,5 +70,26 @@ mod tests {
             repo_link(OWNER, "buzz-world"),
             format!("buzz://repo?owner={OWNER}&d=buzz-world")
         );
+        assert_eq!(
+            project_link(OWNER, "buzz-world"),
+            format!("buzz://project?owner={OWNER}&d=buzz-world")
+        );
+    }
+
+    #[test]
+    fn linkable_dtag_matches_the_desktop_charset() {
+        for ok in ["buzz-world", "a", "a.b_c-d", &"a".repeat(64)] {
+            assert!(is_linkable_dtag(ok), "{ok:?} should be linkable");
+        }
+        for bad in [
+            "",
+            ".hidden",
+            "a..b",
+            "has space",
+            "sl/ash",
+            &"a".repeat(65),
+        ] {
+            assert!(!is_linkable_dtag(bad), "{bad:?} should not be linkable");
+        }
     }
 }

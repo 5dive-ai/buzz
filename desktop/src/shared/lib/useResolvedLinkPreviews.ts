@@ -5,9 +5,11 @@ import { relayClient } from "@/shared/api/relayClient";
 import {
   KIND_GIT_ISSUE,
   KIND_GIT_PULL_REQUEST,
+  KIND_PROJECT_ANNOUNCEMENT,
+  KIND_REPO_ANNOUNCEMENT,
 } from "@/shared/constants/kinds";
 
-import { parseEntityLink } from "./entityLink";
+import { isEntityLink, parseEntityLink } from "./entityLink";
 import {
   buzzEntityFallbackTitle,
   type SupportedLinkPreview,
@@ -200,17 +202,70 @@ function fetchLinkPreviewMetadata(
 const metadataLoader = createMetadataLoader({
   fetcher: fetchLinkPreviewMetadata,
 });
+function buzzEntityMetadata(
+  title: string | null | undefined,
+  description?: string | null,
+): LinkPreviewMetadata | null {
+  return title
+    ? {
+        title,
+        siteName: "Buzz",
+        description: description || null,
+        imageDataUrl: null,
+        imageDomain: null,
+      }
+    : null;
+}
+
+/**
+ * Resolve the display name of an addressable coordinate (`kind:owner:d`) from
+ * its announcement event. Returns null when the relay has no such event, which
+ * drops the card rather than advertising a coordinate nobody can open.
+ */
+async function loadCoordinateMetadata(
+  kind: number,
+  owner: string,
+  dtag: string,
+): Promise<LinkPreviewMetadata | null> {
+  const events = await relayClient.fetchEvents({
+    kinds: [kind],
+    authors: [owner],
+    "#d": [dtag],
+    limit: 1,
+  });
+  const event = events[0];
+  if (!event) return null;
+
+  const tag = (name: string) =>
+    event.tags.find((entry) => entry[0] === name)?.[1] || null;
+  return buzzEntityMetadata(tag("name") ?? dtag, tag("description"));
+}
+
 const entityTitleLoader = createMetadataLoader({
   fetcher: async (href) => {
     const parsed = parseEntityLink(href);
-    if (!parsed.ok || parsed.value.type === "repo") return null;
+    if (!parsed.ok) return null;
 
-    const { id, owner, dtag } = parsed.value;
+    const link = parsed.value;
+    if (link.type === "repo") {
+      return loadCoordinateMetadata(
+        KIND_REPO_ANNOUNCEMENT,
+        link.owner,
+        link.dtag,
+      );
+    }
+    if (link.type === "project") {
+      return loadCoordinateMetadata(
+        KIND_PROJECT_ANNOUNCEMENT,
+        link.owner,
+        link.dtag,
+      );
+    }
+
+    const { id, owner, dtag } = link;
     const expectedCoordinate = `30617:${owner}:${dtag}`;
     const events = await relayClient.fetchEvents({
-      kinds: [
-        parsed.value.type === "pr" ? KIND_GIT_PULL_REQUEST : KIND_GIT_ISSUE,
-      ],
+      kinds: [link.type === "pr" ? KIND_GIT_PULL_REQUEST : KIND_GIT_ISSUE],
       ids: [id],
       limit: 1,
     });
@@ -224,16 +279,7 @@ const entityTitleLoader = createMetadataLoader({
     }
 
     const subject = event.tags.find((tag) => tag[0] === "subject")?.[1];
-    const title = subject || event.content.split("\n")[0] || null;
-    return title
-      ? {
-          title,
-          siteName: "Buzz",
-          description: null,
-          imageDataUrl: null,
-          imageDomain: null,
-        }
-      : null;
+    return buzzEntityMetadata(subject || event.content.split("\n")[0]);
   },
 });
 
@@ -260,9 +306,7 @@ type ResolvedMetadataByHref = Record<
 
 /** Only auto-generated titles may be replaced; explicit markdown labels win. */
 export function shouldResolveTitle(preview: SupportedLinkPreview): boolean {
-  if (preview.kind !== "buzz-pull-request" && preview.kind !== "buzz-issue") {
-    return true;
-  }
+  if (!isEntityLink(preview.href)) return true;
   const parsed = parseEntityLink(preview.href);
   return parsed.ok && preview.title === buzzEntityFallbackTitle(parsed.value);
 }

@@ -4,11 +4,13 @@
  *
  * Formats:
  *   buzz://repo?owner=<owner-pubkey>&d=<repo-dtag>
+ *   buzz://project?owner=<owner-pubkey>&d=<project-dtag>
  *   buzz://pr?id=<event-id>&owner=<owner-pubkey>&d=<repo-dtag>
  *   buzz://issue?id=<event-id>&owner=<owner-pubkey>&d=<repo-dtag>
  *
  * `owner` + `d` identify the NIP-34 repository coordinate
- * (`30617:<owner>:<d>`); `id` is the kind 1618 / 1621 event id. The CLI
+ * (`30617:<owner>:<d>`) or the NIP-MP project coordinate
+ * (`30621:<owner>:<d>`); `id` is the kind 1618 / 1621 event id. The CLI
  * builder in `crates/buzz-cli/src/links.rs` emits the same format — the two
  * must stay compatible (see the golden-format tests on both sides).
  */
@@ -18,7 +20,8 @@ const ENTITY_LINK_SCHEME = "buzz:";
 export type ParsedEntityLink =
   | { type: "pr"; id: string; owner: string; dtag: string }
   | { type: "issue"; id: string; owner: string; dtag: string }
-  | { type: "repo"; owner: string; dtag: string };
+  | { type: "repo"; owner: string; dtag: string }
+  | { type: "project"; owner: string; dtag: string };
 
 export type EntityLinkParseResult =
   | { ok: true; value: ParsedEntityLink }
@@ -36,8 +39,18 @@ function checkCoordinate(owner: string, dtag: string): void {
     throw new Error("entityLink: owner must be a 64-char hex pubkey");
   }
   if (!isValidDtag(dtag)) {
-    throw new Error("entityLink: invalid repository d-tag");
+    throw new Error("entityLink: invalid addressable d-tag");
   }
+}
+
+/**
+ * True when a coordinate can be expressed as an entity link. Addressable
+ * d-tags accept a wider charset than the link format does, so callers that
+ * build links from read models must check first and hide the share
+ * affordance rather than surface a builder throw.
+ */
+export function isLinkableCoordinate(owner: string, dtag: string): boolean {
+  return HEX64_RE.test(owner) && isValidDtag(dtag);
 }
 
 function checkEventId(id: string): void {
@@ -50,6 +63,15 @@ function checkEventId(id: string): void {
 export function buildRepoLink(input: { owner: string; dtag: string }): string {
   checkCoordinate(input.owner, input.dtag);
   return `buzz://repo?owner=${input.owner.toLowerCase()}&d=${input.dtag}`;
+}
+
+/** Build a `buzz://project` link for a project announcement (kind 30621). */
+export function buildProjectLink(input: {
+  owner: string;
+  dtag: string;
+}): string {
+  checkCoordinate(input.owner, input.dtag);
+  return `buzz://project?owner=${input.owner.toLowerCase()}&d=${input.dtag}`;
 }
 
 /** Build a `buzz://pr` link for a pull request event (kind 1618). */
@@ -84,7 +106,8 @@ export function isEntityLink(href: string | undefined | null): boolean {
   return (
     href.startsWith("buzz://pr?") ||
     href.startsWith("buzz://issue?") ||
-    href.startsWith("buzz://repo?")
+    href.startsWith("buzz://repo?") ||
+    href.startsWith("buzz://project?")
   );
 }
 
@@ -116,9 +139,15 @@ export function parseEntityLink(url: string): EntityLinkParseResult {
   }
 
   const host = parsed.hostname;
-  if (host !== "pr" && host !== "issue" && host !== "repo") {
+  if (
+    host !== "pr" &&
+    host !== "issue" &&
+    host !== "repo" &&
+    host !== "project"
+  ) {
     return { ok: false, reason: "wrong-host" };
   }
+  const isCoordinateHost = host === "repo" || host === "project";
 
   // Require empty/root path — path segments are reserved for future versioning.
   if (parsed.pathname !== "" && parsed.pathname !== "/") {
@@ -131,9 +160,11 @@ export function parseEntityLink(url: string): EntityLinkParseResult {
   }
 
   // Validate known params and reject unknown ones, and enforce single-instance.
-  const KNOWN_REPO_PARAMS = new Set(["owner", "d"]);
+  const KNOWN_COORDINATE_PARAMS = new Set(["owner", "d"]);
   const KNOWN_EVENT_PARAMS = new Set(["id", "owner", "d"]);
-  const knownParams = host === "repo" ? KNOWN_REPO_PARAMS : KNOWN_EVENT_PARAMS;
+  const knownParams = isCoordinateHost
+    ? KNOWN_COORDINATE_PARAMS
+    : KNOWN_EVENT_PARAMS;
 
   for (const key of parsed.searchParams.keys()) {
     if (!knownParams.has(key)) {
@@ -156,10 +187,10 @@ export function parseEntityLink(url: string): EntityLinkParseResult {
     return { ok: false, reason: "invalid-dtag" };
   }
 
-  if (host === "repo") {
+  if (host === "repo" || host === "project") {
     return {
       ok: true,
-      value: { type: "repo", owner: owner.toLowerCase(), dtag },
+      value: { type: host, owner: owner.toLowerCase(), dtag },
     };
   }
 
@@ -180,15 +211,19 @@ export function parseEntityLink(url: string): EntityLinkParseResult {
 }
 
 /**
- * Canonical NIP-34 repository coordinate (`30617:<owner>:<dtag>`) used as the
- * route id for `/projects/$projectId`. Duncan's #4671 branch resolves 30617
- * coordinates regardless of which explicit project contains the repository, so
- * entity links remain stable when a repo's container project changes.
+ * Canonical addressable coordinate used as the route id for
+ * `/projects/$projectId`: `30621:<owner>:<dtag>` for project links, and
+ * `30617:<owner>:<dtag>` for repository-scoped links (repo, PR, issue).
+ *
+ * `projectMatchesRouteId` resolves a 30617 coordinate regardless of which
+ * explicit project contains the repository, so entity links remain stable
+ * when a repo's container project changes.
  *
  * Do NOT use the legacy `<owner>:<dtag>` form — it only matched implicit
  * project cards and breaks for repos claimed by an explicit project with a
  * different d-tag.
  */
 export function entityLinkProjectRouteId(link: ParsedEntityLink): string {
-  return `30617:${link.owner}:${link.dtag}`;
+  const kind = link.type === "project" ? 30621 : 30617;
+  return `${kind}:${link.owner}:${link.dtag}`;
 }

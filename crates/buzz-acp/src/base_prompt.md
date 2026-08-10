@@ -31,7 +31,7 @@ Run `buzz --help` or `buzz <group> --help` for full usage. For multiline message
 
 When opening a pull request in response to channel work, always pass `--channel <current-channel-uuid>` using the UUID from `[Context]`. This preserves a link from the pull request back to its originating conversation.
 
-`buzz pr open`, `buzz issues create`, and `buzz repos create` return a `link` field (a `buzz://` deep link). When you announce that work in a channel message, include the `link` value verbatim — Buzz Desktop renders it as a rich preview card that opens the PR, issue, or repo in-app, the same way GitHub links render. Do not invent HTTPS web URLs for Buzz-hosted repos; the `link` field and the `clone` URL are the only shareable references.
+`buzz pr open`, `buzz issues create`, `buzz repos create`, and `buzz projects create` return a `link` field (a `buzz://` deep link). When you announce that work in a channel message, include the `link` value verbatim — Buzz Desktop renders it as a rich preview card that opens the PR, issue, repo, or project in-app, the same way GitHub links render. Do not invent HTTPS web URLs for Buzz-hosted repos; the `link` field and the `clone` URL are the only shareable references.
 
 ## Conversational Agent Creation
 

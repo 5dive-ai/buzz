@@ -26,6 +26,7 @@ import {
   useCreateProjectPullRequestCommentMutation,
 } from "@/features/projects/hooks";
 import { projectPullRequestCommentTimelineKind } from "@/features/projects/projectPullRequests.mjs";
+import { pullRequestShareLink } from "@/features/projects/lib/projectShareLinks";
 import {
   formatExactTimestamp,
   relativeTime,
@@ -51,6 +52,7 @@ import {
 import { ProjectRichContent } from "./ProjectRichContent";
 import { PullRequestReviewersRow } from "./PullRequestReviewersRow";
 import { PullRequestReviewCard } from "./PullRequestReviewCard";
+import { ShareLinkButton } from "./ShareLinkButton";
 
 function profileForPubkey(pubkey: string, profiles?: UserProfileLookup) {
   return profiles?.[normalizePubkey(pubkey)] ?? null;
@@ -333,12 +335,19 @@ export function PullRequestDetailHeader({
 
   return (
     <header className="min-w-0 space-y-1 p-4 pb-4">
-      <h3 className="line-clamp-2 min-w-0 text-xl font-semibold text-foreground">
-        {pullRequest.title}{" "}
-        <span className="font-normal text-muted-foreground">
-          #{pullRequest.id.slice(0, 8)}
-        </span>
-      </h3>
+      <div className="flex min-w-0 items-start gap-2">
+        <h3 className="line-clamp-2 min-w-0 flex-1 text-xl font-semibold text-foreground">
+          {pullRequest.title}{" "}
+          <span className="font-normal text-muted-foreground">
+            #{pullRequest.id.slice(0, 8)}
+          </span>
+        </h3>
+        <ShareLinkButton
+          label="Copy pull request link"
+          link={pullRequestShareLink(pullRequest)}
+          testId="project-pull-request-copy-link"
+        />
+      </div>
       <p className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
         <GitPullRequest className="h-3.5 w-3.5" />
         <span className="flex min-w-0 items-center gap-1">

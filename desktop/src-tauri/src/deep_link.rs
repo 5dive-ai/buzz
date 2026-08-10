@@ -163,6 +163,71 @@ fn parse_join_deep_link(url: &Url) -> Option<serde_json::Value> {
     }))
 }
 
+/// Hosts of the `buzz://` git-entity links built by
+/// `desktop/src/shared/lib/entityLink.ts` and `crates/buzz-cli/src/links.rs`.
+const ENTITY_LINK_HOSTS: [&str; 4] = ["repo", "project", "pr", "issue"];
+
+fn is_hex64(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Mirrors `isValidDtag` in `entityLink.ts` — the link format addresses a
+/// narrower d-tag charset than Nostr allows.
+fn is_linkable_dtag(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !value.starts_with('.')
+        && !value.contains("..")
+}
+
+/// Validate a `buzz://repo|project|pr|issue?…` link and return it verbatim
+/// for the frontend, which re-parses it with `parseEntityLink` before
+/// navigating. Validating here too keeps a malformed link from raising and
+/// focusing the window for a navigation that would then be declined.
+///
+/// The canonical-form rules match `parseEntityLink`: no path segments, no
+/// fragment, and no parameters beyond `owner`/`d` (plus `id` for event
+/// links), so a future extension of the format is declined by old builds
+/// rather than silently misread.
+fn parse_entity_deep_link(url: &Url) -> Option<()> {
+    let host = url.host_str()?;
+    if !ENTITY_LINK_HOSTS.contains(&host) {
+        return None;
+    }
+    if !matches!(url.path(), "" | "/") || url.fragment().is_some() {
+        return None;
+    }
+
+    let needs_event_id = host == "pr" || host == "issue";
+    let (mut owner, mut dtag, mut id) = (None, None, None);
+    for (key, value) in url.query_pairs() {
+        let slot = match key.as_ref() {
+            "owner" => &mut owner,
+            "d" => &mut dtag,
+            "id" if needs_event_id => &mut id,
+            _ => return None,
+        };
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(value.into_owned());
+    }
+
+    if !owner.is_some_and(|owner| is_hex64(&owner)) {
+        return None;
+    }
+    if !dtag.is_some_and(|dtag| is_linkable_dtag(&dtag)) {
+        return None;
+    }
+    if needs_event_id && !id.is_some_and(|id| is_hex64(&id)) {
+        return None;
+    }
+    Some(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AddCommunityDeepLinkPayload {
@@ -295,6 +360,7 @@ fn parse_nostr_bind_deep_link(url: &Url) -> Result<NostrBindDeepLinkPayload, Str
 ///
 /// Currently supports:
 /// - `buzz://connect?relay=<ws(s)://...>` — emits `deep-link-connect` to the frontend
+/// - `buzz://repo|project|pr|issue?…` — emits `deep-link-entity` to the frontend
 pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
     let url = match Url::parse(url_str) {
         Ok(u) => u,
@@ -366,6 +432,19 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
             activate_main_window(app);
             let _ = app.emit("deep-link-message", payload);
         }
+        Some("repo" | "project" | "pr" | "issue") => {
+            // `buzz://repo|project?owner=<pubkey>&d=<dtag>` and
+            // `buzz://pr|issue?id=<eventId>&owner=<pubkey>&d=<dtag>` — the
+            // share links copied from the Projects UI. The frontend owns
+            // routing (`useEntityDeepLinks`), so the validated URL is
+            // forwarded unchanged.
+            if parse_entity_deep_link(&url).is_none() {
+                eprintln!("buzz-desktop: malformed entity deep link: {url_str}");
+                return;
+            }
+            activate_main_window(app);
+            let _ = app.emit("deep-link-entity", url_str.to_owned());
+        }
         Some("nostr-bind") => match parse_nostr_bind_deep_link(&url) {
             Ok(payload) => {
                 activate_main_window(app);
@@ -389,9 +468,55 @@ mod tests {
     use url::Url;
 
     use super::{
-        parse_add_community_deep_link, parse_join_deep_link, parse_message_deep_link,
-        parse_nostr_bind_deep_link, PendingCommunityDeepLink, PendingCommunityDeepLinks,
+        parse_add_community_deep_link, parse_entity_deep_link, parse_join_deep_link,
+        parse_message_deep_link, parse_nostr_bind_deep_link, PendingCommunityDeepLink,
+        PendingCommunityDeepLinks,
     };
+
+    const OWNER: &str = "71d67180ba17e749ee825fc8819c9c6ee7003617e1c126504f9b658070ab9224";
+    const EVENT_ID: &str = "c3b589fa5713ba25bad6dc095e2de00a4ac8f50050fdea00fc6444e603be1dd1";
+
+    #[test]
+    fn parse_entity_deep_link_accepts_every_share_link_shape() {
+        for raw in [
+            format!("buzz://repo?owner={OWNER}&d=buzz-world"),
+            format!("buzz://project?owner={OWNER}&d=buzz-world"),
+            format!("buzz://pr?id={EVENT_ID}&owner={OWNER}&d=buzz-world"),
+            format!("buzz://issue?id={EVENT_ID}&owner={OWNER}&d=buzz-world"),
+        ] {
+            assert!(
+                parse_entity_deep_link(&Url::parse(&raw).unwrap()).is_some(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_entity_deep_link_rejects_malformed_and_non_canonical_links() {
+        for raw in [
+            // Missing or malformed identifiers.
+            format!("buzz://repo?owner={OWNER}"),
+            "buzz://repo?owner=nope&d=buzz-world".to_owned(),
+            format!("buzz://repo?owner={OWNER}&d=.hidden"),
+            format!("buzz://repo?owner={OWNER}&d=has%20space"),
+            format!("buzz://pr?owner={OWNER}&d=buzz-world"),
+            format!("buzz://pr?id=short&owner={OWNER}&d=buzz-world"),
+            // Coordinate links take no event id.
+            format!("buzz://repo?id={EVENT_ID}&owner={OWNER}&d=buzz-world"),
+            // Non-canonical: unknown param, duplicate param, path, fragment.
+            format!("buzz://repo?owner={OWNER}&d=buzz-world&relay=wss%3A%2F%2Fx.example"),
+            format!("buzz://repo?owner={OWNER}&owner={OWNER}&d=buzz-world"),
+            format!("buzz://repo/extra?owner={OWNER}&d=buzz-world"),
+            format!("buzz://repo?owner={OWNER}&d=buzz-world#top"),
+            // Not an entity host.
+            format!("buzz://message?owner={OWNER}&d=buzz-world"),
+        ] {
+            assert!(
+                parse_entity_deep_link(&Url::parse(&raw).unwrap()).is_none(),
+                "{raw}"
+            );
+        }
+    }
 
     fn pending(id: &str, relay_url: &str, code: Option<&str>) -> PendingCommunityDeepLink {
         PendingCommunityDeepLink {

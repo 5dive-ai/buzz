@@ -3,10 +3,12 @@ import test from "node:test";
 
 import {
   buildIssueLink,
+  buildProjectLink,
   buildPullRequestLink,
   buildRepoLink,
   entityLinkProjectRouteId,
   isEntityLink,
+  isLinkableCoordinate,
   parseEntityLink,
 } from "./entityLink.ts";
 
@@ -29,6 +31,10 @@ test("builders emit the canonical cross-language link format", () => {
   assert.equal(
     buildRepoLink({ owner: OWNER, dtag: "buzz-world" }),
     `buzz://repo?owner=${OWNER}&d=buzz-world`,
+  );
+  assert.equal(
+    buildProjectLink({ owner: OWNER, dtag: "buzz-world" }),
+    `buzz://project?owner=${OWNER}&d=buzz-world`,
   );
 });
 
@@ -58,6 +64,12 @@ test("parseEntityLink round-trips built links", () => {
   assert.deepEqual(parseEntityLink(repoLink), {
     ok: true,
     value: { type: "repo", owner: OWNER, dtag: "buzz-world" },
+  });
+
+  const projectLink = buildProjectLink({ owner: OWNER, dtag: "buzz-world" });
+  assert.deepEqual(parseEntityLink(projectLink), {
+    ok: true,
+    value: { type: "project", owner: OWNER, dtag: "buzz-world" },
   });
 });
 
@@ -91,6 +103,7 @@ test("isEntityLink matches entity hosts and excludes message links", () => {
   assert.equal(isEntityLink(`buzz://pr?id=${EVENT_ID}`), true);
   assert.equal(isEntityLink(`buzz://issue?id=${EVENT_ID}`), true);
   assert.equal(isEntityLink(`buzz://repo?owner=${OWNER}`), true);
+  assert.equal(isEntityLink(`buzz://project?owner=${OWNER}`), true);
   assert.equal(isEntityLink("buzz://message?channel=x&id=y"), false);
   assert.equal(isEntityLink("https://github.com/block/buzz"), false);
   assert.equal(isEntityLink(null), false);
@@ -105,6 +118,27 @@ test("entityLinkProjectRouteId emits the canonical 30617 coordinate route id", (
     entityLinkProjectRouteId(parsed.value),
     `30617:${OWNER}:buzz-world`,
   );
+});
+
+test("entityLinkProjectRouteId routes project links to the 30621 coordinate", () => {
+  const parsed = parseEntityLink(
+    buildProjectLink({ owner: OWNER, dtag: "buzz-world" }),
+  );
+  assert.ok(parsed.ok);
+  assert.equal(
+    entityLinkProjectRouteId(parsed.value),
+    `30621:${OWNER}:buzz-world`,
+  );
+});
+
+test("isLinkableCoordinate gates coordinates the link format cannot express", () => {
+  assert.equal(isLinkableCoordinate(OWNER, "buzz-world"), true);
+  assert.equal(isLinkableCoordinate(OWNER, "a".repeat(64)), true);
+  // Addressable d-tags allow far more than the link charset does.
+  assert.equal(isLinkableCoordinate(OWNER, "a".repeat(65)), false);
+  assert.equal(isLinkableCoordinate(OWNER, "has space"), false);
+  assert.equal(isLinkableCoordinate(OWNER, ".hidden"), false);
+  assert.equal(isLinkableCoordinate("not-a-pubkey", "buzz-world"), false);
 });
 
 test("parseEntityLink rejects noncanonical extras", () => {

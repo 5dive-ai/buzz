@@ -165,6 +165,19 @@ export function listenForMessageDeepLinks(
   });
 }
 
+/**
+ * Register a listener for `deep-link-entity` events — the `buzz://` share
+ * links for projects, repositories, issues, and pull requests. The payload is
+ * the raw URL; callers parse it with `parseEntityLink` before navigating.
+ */
+export function listenForEntityDeepLinks(
+  onOpen: (href: string) => void,
+): Promise<UnlistenFn> {
+  return listen<string>("deep-link-entity", (event) => {
+    onOpen(event.payload);
+  });
+}
+
 export function listenForNostrBindDeepLinks(
   onOpen: (payload: NostrBindDeepLinkPayload) => void,
 ): Promise<UnlistenFn> {

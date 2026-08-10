@@ -13,6 +13,7 @@ import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
+import { issueShareLink } from "@/features/projects/lib/projectShareLinks";
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import type { ChannelMember } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
@@ -27,6 +28,7 @@ import { ProjectOriginReference } from "./ProjectOriginReference";
 import { OverviewRailSection } from "./ProjectOverviewPanel";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
+import { ShareLinkButton } from "./ShareLinkButton";
 
 export function issueStatusClassName(status: ProjectIssue["status"]) {
   if (status === "Done") return "text-purple-400";
@@ -194,21 +196,28 @@ export function ProjectIssueDetail({
     >
       <div className="min-w-0 divide-y divide-border/50">
         <header className="space-y-3 p-4">
-          <div className="min-w-0">
-            <p className="flex flex-wrap items-center gap-1.5 text-xs font-medium text-muted-foreground">
-              <CircleDot className="h-3.5 w-3.5" />
-              Issue from {authorLabel}
-              <ProjectOriginReference
-                agentName={issue.originAgentName}
-                channelId={issue.channelId}
-              />
-            </p>
-            <h3 className="mt-1 line-clamp-2 text-base font-semibold text-foreground">
-              {issue.title}{" "}
-              <span className="font-normal text-muted-foreground">
-                #{issue.id.slice(0, 8)}
-              </span>
-            </h3>
+          <div className="flex min-w-0 items-start gap-2">
+            <div className="min-w-0 flex-1">
+              <p className="flex flex-wrap items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                <CircleDot className="h-3.5 w-3.5" />
+                Issue from {authorLabel}
+                <ProjectOriginReference
+                  agentName={issue.originAgentName}
+                  channelId={issue.channelId}
+                />
+              </p>
+              <h3 className="mt-1 line-clamp-2 text-base font-semibold text-foreground">
+                {issue.title}{" "}
+                <span className="font-normal text-muted-foreground">
+                  #{issue.id.slice(0, 8)}
+                </span>
+              </h3>
+            </div>
+            <ShareLinkButton
+              label="Copy issue link"
+              link={issueShareLink(issue)}
+              testId="project-issue-copy-link"
+            />
           </div>
           {issue.content ? (
             <ProjectRichContent content={issue.content} tags={issue.tags} />

@@ -388,7 +388,12 @@ export function emitAgentFormDiff(
       (isD("respondToAllowlist") &&
         next.respondTo === "allowlist" &&
         next.respondToAllowlist.join(",") !==
-          (saved.respondToAllowlist ?? []).join(","));
+          (saved.respondToAllowlist ?? []).join(",")) ||
+      // D-parallelism: included in dChanged so the owner-only build-lock gate
+      // can suppress it, and so that a parallelism-only change in definition-only
+      // context actually emits a personaInput (Thufir pass-3 CRITICAL-1).
+      (isD("parallelism") &&
+        (next.parallelism ?? null) !== (saved.parallelism ?? null));
 
     if (dChanged) {
       personaInput = {
@@ -404,11 +409,14 @@ export function emitAgentFormDiff(
         // Include behavior block only when respondTo/parallelism are D-owned
         // (definition-only context per rows 9–10).
         behavior:
-          isD("respondTo") && next.respondTo != null
+          isD("respondTo") || isD("parallelism")
             ? {
-                respondTo: next.respondTo,
+                respondTo:
+                  isD("respondTo") && next.respondTo != null
+                    ? next.respondTo
+                    : undefined,
                 respondToAllowlist:
-                  next.respondTo === "allowlist"
+                  isD("respondTo") && next.respondTo === "allowlist"
                     ? next.respondToAllowlist
                     : undefined,
                 parallelism: isD("parallelism")

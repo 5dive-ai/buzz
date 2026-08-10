@@ -20,6 +20,7 @@ import {
   useUpdateManagedAgentMutation,
   useUpdatePersonaMutation,
 } from "@/features/agents/hooks";
+import { useTeamsQuery } from "@/features/agents/teamHooks";
 import { useUpdatePersonaAndPublishMutation } from "@/features/agents/lib/usePersonaCatalogRelay";
 import type { ManagedAgent, RespondToMode } from "@/shared/api/types";
 import type { EditAgentFocusTarget } from "@/features/agents/openEditAgentEvent";
@@ -40,21 +41,10 @@ import { useAgentEditMergedSubmit } from "./useAgentEditMergedSubmit";
 import { AgentEditMergedDSection } from "./AgentEditMergedDialogDSection";
 import { AgentEditMergedInstanceSection } from "./AgentEditMergedDialogInstanceSection";
 import {
-  runtimeDropdownAction,
-  usePendingHarnessSelection,
-} from "./addCustomHarness";
-import {
-  AUTO_PROVIDER_DROPDOWN_VALUE,
   getDefaultPersonaRuntime,
   isMissingRequiredDropdownField,
-  runtimeSupportsLlmProviderSelection,
 } from "./agentConfigOptions";
-import {
-  selectionOnModelDropdownChange,
-  selectionOnProviderDropdownChange,
-  selectionOnRuntimeChange,
-  type RuntimeModelProviderSelection,
-} from "./runtimeModelProviderSelection";
+import { useAgentEditRuntimeHandlers } from "./useAgentEditRuntimeHandlers";
 import { AgentCreationPreview } from "./AgentCreationPreview";
 import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
 import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOwnerOnly";
@@ -156,10 +146,18 @@ export function AgentEditMergedDialog({
 
   const { data: bakedEnvKeys } = useBakedBuildEnvKeysQuery({ enabled: open });
   const { data: agentAccessOwnerOnly } = useAgentAccessOwnerOnlyQuery({
-    enabled: open && showInst,
+    // Query in both instance and definition-only contexts: rows 9–10 say
+    // access/parallelism are D-owned in definition-only (shown on the form).
+    enabled: open && (showInst || ctx.kind === "definition-only"),
   });
 
   const personasQuery = usePersonasQuery();
+  const teamsQuery = useTeamsQuery();
+  const sourceTeamName = React.useMemo(() => {
+    if (!def?.sourceTeam) return null;
+    const team = teamsQuery.data?.find((t) => t.id === def.sourceTeam);
+    return team?.name ?? def.sourceTeam;
+  }, [def?.sourceTeam, teamsQuery.data]);
   const linkedPersona = React.useMemo(
     () =>
       inst?.personaId
@@ -177,20 +175,43 @@ export function AgentEditMergedDialog({
   // Definition runtime (D-field) — separate from instance harness pin (I-field)
   const [definitionRuntimeId, setDefinitionRuntimeId] =
     React.useState("custom");
+  // Track whether the D-runtime was auto-seeded (not a deliberate user choice).
+  // Prevents a no-op save from persisting the app default as the definition runtime.
+  const autoSeededDefinitionRuntimeRef = React.useRef<string | null>(null);
   // I-fields — harness pin state (I-section only, independent of D-runtime)
   const [selectedRuntimeId, setSelectedRuntimeId] = React.useState("custom");
-  // LLM model/provider (shared between D and I sections; which store they target is context-dependent)
-  const [model, setModel] = React.useState("");
-  const [provider, setProvider] = React.useState("");
-  const [isCustomModelEditing, setIsCustomModelEditing] = React.useState(false);
-  const [isCustomProviderEditing, setIsCustomProviderEditing] =
+  // D-section LLM model/provider — for the definition (D-owned)
+  const [dModel, setDModel] = React.useState("");
+  const [dProvider, setDProvider] = React.useState("");
+  const [dIsCustomModelEditing, setDIsCustomModelEditing] =
+    React.useState(false);
+  const [dIsCustomProviderEditing, setDIsCustomProviderEditing] =
+    React.useState(false);
+  // I-section LLM model/provider — for unlinked agents (I-owned, shown only when !showDef)
+  const [iModel, setIModel] = React.useState("");
+  const [iProvider, setIProvider] = React.useState("");
+  const [iIsCustomModelEditing, setIIsCustomModelEditing] =
+    React.useState(false);
+  const [iIsCustomProviderEditing, setIIsCustomProviderEditing] =
     React.useState(false);
   const runtimeTouched = React.useRef(false);
 
+  // Convenience: the active model/provider — D-state when a definition is present,
+  // I-state when instance-only (no definition). Used for the D-section and for
+  // useAgentEditRuntimeState, which is always driven by the relevant layer.
+  const model = showDef ? dModel : iModel;
+  const provider = showDef ? dProvider : iProvider;
+  const isCustomModelEditing = showDef
+    ? dIsCustomModelEditing
+    : iIsCustomModelEditing;
+  const isCustomProviderEditing = showDef
+    ? dIsCustomProviderEditing
+    : iIsCustomProviderEditing;
+
   // I-fields
   const [instanceName, setInstanceName] = React.useState("");
-  const [respondTo, setRespondTo] = React.useState<RespondToMode>(
-    inst?.respondTo ?? "anyone",
+  const [respondTo, setRespondTo] = React.useState<RespondToMode | null>(
+    inst?.respondTo ?? null,
   );
   const [respondToAllowlist, setRespondToAllowlist] = React.useState<string[]>(
     inst?.respondToAllowlist ?? [],
@@ -247,13 +268,23 @@ export function AgentEditMergedDialog({
     setAvatarUrl(seed.avatarUrl);
     setSystemPrompt(seed.systemPrompt);
     setNamePoolText(formatPersonaNamePoolText(seed.namePool ?? []));
-    setModel(seed.model ?? "");
-    setProvider(seed.provider ?? "");
-    setIsCustomModelEditing(false);
-    setIsCustomProviderEditing(false);
-    setRespondTo((seed.respondTo ?? "anyone") as RespondToMode);
+    // D-section model/provider — seed from definition (or instance for I-only)
+    setDModel(seed.model ?? "");
+    setDProvider(seed.provider ?? "");
+    setDIsCustomModelEditing(false);
+    setDIsCustomProviderEditing(false);
+    // I-section model/provider — only relevant for instance-only context
+    setIModel(seed.model ?? "");
+    setIProvider(seed.provider ?? "");
+    setIIsCustomModelEditing(false);
+    setIIsCustomProviderEditing(false);
+    // Rows 9–10: seed respondTo/allowlist/parallelism from the canonical seed.
+    // Preserve null from the seed — do NOT coerce null→"anyone" here; the
+    // seed already handles the instance-vs-definition context. Coercing here
+    // would cause phantom D-writes when an unset definition behavior opens.
+    setRespondTo((seed.respondTo as RespondToMode | null) ?? null);
     setRespondToAllowlist(seed.respondToAllowlist);
-    setParallelism(String(seed.parallelism ?? 1));
+    setParallelism(seed.parallelism != null ? String(seed.parallelism) : "");
     setEnvVars(seed.envVars);
     setInstanceEnvVars(seed.instanceEnvVars ?? {});
     setInstanceName(seed.instanceName ?? "");
@@ -262,6 +293,7 @@ export function AgentEditMergedDialog({
     setShowAdvancedFields(false);
     setIsAvatarUploadPending(false);
     runtimeTouched.current = false;
+    autoSeededDefinitionRuntimeRef.current = null;
 
     // Seed definition runtime (D-field) from definition record.
     const defRuntimeId = def?.runtime?.trim() ?? "";
@@ -292,16 +324,22 @@ export function AgentEditMergedDialog({
         setDisplayName(initialValueOverrides.displayName);
       if (initialValueOverrides.systemPrompt !== undefined)
         setSystemPrompt(initialValueOverrides.systemPrompt);
-      if (initialValueOverrides.model !== undefined)
-        setModel(initialValueOverrides.model ?? "");
-      if (initialValueOverrides.provider !== undefined)
-        setProvider(initialValueOverrides.provider ?? "");
+      if (initialValueOverrides.model !== undefined) {
+        setDModel(initialValueOverrides.model ?? "");
+        setIModel(initialValueOverrides.model ?? "");
+      }
+      if (initialValueOverrides.provider !== undefined) {
+        setDProvider(initialValueOverrides.provider ?? "");
+        setIProvider(initialValueOverrides.provider ?? "");
+      }
       if (initialValueOverrides.runtime !== undefined)
         setDefinitionRuntimeId(initialValueOverrides.runtime ?? "custom");
-      // R6: carry agent-requested respondTo into definition-only form (IMPORTANT-4)
+      // R6: carry agent-requested respondTo into definition-only form.
+      // This makes the requested change VISIBLE in the review dialog —
+      // the owner sees the requested value and can accept (Save) or change it.
       if (initialValueOverrides.respondTo !== undefined)
         setRespondTo(
-          (initialValueOverrides.respondTo ?? "anyone") as RespondToMode,
+          (initialValueOverrides.respondTo as RespondToMode | null) ?? null,
         );
     }
     setDFieldsDirty(false);
@@ -322,6 +360,10 @@ export function AgentEditMergedDialog({
     const defaultRuntime = getDefaultPersonaRuntime(runtimes);
     if (!defaultRuntime) return;
     setDefinitionRuntimeId(defaultRuntime.id);
+    // Record that this runtime was auto-seeded, not chosen by the user.
+    // useAgentEditMergedSubmit uses this to prevent persisting the auto-seed
+    // as a definition runtime change when no other D-fields were modified.
+    autoSeededDefinitionRuntimeRef.current = defaultRuntime.id;
     // In definition-only context, selectedRuntimeId is the same conceptual field
     // as definitionRuntimeId (there is no separate I-harness pin). Sync it so
     // that model discovery runs: useAgentEditRuntimeState derives `selectedRuntime`
@@ -390,11 +432,12 @@ export function AgentEditMergedDialog({
     instanceEnvVars,
     inheritHarness,
     inst,
+    def,
     linkedPersona,
     bakedEnvKeys,
     originalAgentCommand,
-    setModel,
-    setIsCustomModelEditing,
+    setModel: setDModel,
+    setIsCustomModelEditing: setDIsCustomModelEditing,
   });
 
   // ── Submit validity ────────────────────────────────────────────────────────
@@ -432,8 +475,8 @@ export function AgentEditMergedDialog({
     avatarUrl,
     systemPrompt,
     namePoolText,
-    model,
-    provider,
+    model: showDef ? dModel : iModel,
+    provider: showDef ? dProvider : iProvider,
     respondTo,
     respondToAllowlist,
     parallelism,
@@ -444,6 +487,7 @@ export function AgentEditMergedDialog({
     autoRestartOnConfigChange,
     startOnAppLaunch: showInst ? startOnAppLaunch : undefined,
     definitionRuntimeId,
+    autoSeededDefinitionRuntimeRef,
     selectedRuntimeId,
     inheritHarness,
     agentCommand,
@@ -476,121 +520,49 @@ export function AgentEditMergedDialog({
           agentCommand.trim().length > 0)
       : true);
 
-  // ── selection helpers ──────────────────────────────────────────────────────
-  const selection: RuntimeModelProviderSelection = {
-    provider,
-    model,
-    isCustomProviderEditing,
-    isCustomModelEditing,
-    envVars: showInst ? instanceEnvVars : envVars,
-  };
-
-  function applySelection(next: RuntimeModelProviderSelection) {
-    setProvider(next.provider);
-    setModel(next.model);
-    setIsCustomProviderEditing(next.isCustomProviderEditing);
-    setIsCustomModelEditing(next.isCustomModelEditing);
-    if (showInst) {
-      setInstanceEnvVars(next.envVars);
-    } else {
-      setEnvVars(next.envVars);
-    }
-  }
-
-  // D-section runtime change (definition runtime, D-field)
-  function handleDefinitionRuntimeChange(nextValue: string) {
-    const action = runtimeDropdownAction(nextValue);
-    if (action.kind === "add-custom-harness") {
-      setIsAddHarnessOpen(true);
-      return;
-    }
-    const nextRuntimeId = action.runtimeId;
-    const previousRuntimeId = definitionRuntimeId;
-    setDefinitionRuntimeId(nextRuntimeId || "custom");
-    applySelection(
-      selectionOnRuntimeChange(selection, {
-        previousRuntime: previousRuntimeId,
-        nextRuntime: nextRuntimeId,
-        nextRuntimeCanChooseProvider:
-          runtimeSupportsLlmProviderSelection(nextRuntimeId),
-        lockedRuntimeReset: "full",
-      }),
-    );
-  }
-
-  // I-section runtime change (instance harness pin, I-field)
-  function handleRuntimeDropdownChange(nextValue: string) {
-    const action = runtimeDropdownAction(nextValue);
-    if (action.kind === "add-custom-harness") {
-      setIsAddHarnessOpen(true);
-      return;
-    }
-    const nextRuntimeId = action.runtimeId;
-    const previousRuntimeId = selectedRuntimeId;
-
-    runtimeTouched.current = true;
-    const nextRuntime = runtimes.find((r) => r.id === nextRuntimeId);
-    const resolvedRuntimeId = nextRuntimeId || "custom";
-    setSelectedRuntimeId(resolvedRuntimeId);
-    if (resolvedRuntimeId === "custom" || nextRuntime?.command) {
-      setInheritHarness(false);
-    }
-    if (nextRuntime?.command) {
-      setAgentCommand(nextRuntime.command);
-      setAgentArgs(nextRuntime.defaultArgs.join(","));
-    }
-
-    applySelection(
-      selectionOnRuntimeChange(selection, {
-        previousRuntime: previousRuntimeId,
-        nextRuntime: nextRuntimeId,
-        nextRuntimeCanChooseProvider:
-          runtimeSupportsLlmProviderSelection(nextRuntimeId),
-        lockedRuntimeReset: "full",
-      }),
-    );
-  }
-
-  const selectSavedHarness = usePendingHarnessSelection(
+  // ── Runtime/model/provider handlers (extracted to useAgentEditRuntimeHandlers) ──
+  const {
+    handleDefinitionRuntimeChange,
+    handleRuntimeDropdownChange,
+    handleProviderDropdownChange,
+    handleModelDropdownChange,
+    selectSavedHarness,
+  } = useAgentEditRuntimeHandlers({
+    showDef,
+    showInst,
+    dProvider,
+    dModel,
+    dIsCustomProviderEditing,
+    dIsCustomModelEditing,
+    setDProvider,
+    setDModel,
+    setDIsCustomProviderEditing,
+    setDIsCustomModelEditing,
+    envVars,
+    setEnvVars,
+    definitionRuntimeId,
+    setDefinitionRuntimeId,
+    iProvider,
+    iModel,
+    iIsCustomProviderEditing,
+    iIsCustomModelEditing,
+    setIProvider,
+    setIModel,
+    setIIsCustomProviderEditing,
+    setIIsCustomModelEditing,
+    instanceEnvVars,
+    setInstanceEnvVars,
+    selectedRuntimeId,
+    setSelectedRuntimeId,
+    setInheritHarness,
+    setAgentCommand,
+    setAgentArgs,
+    runtimeTouched,
+    setIsAddHarnessOpen,
     runtimes,
-    // In definition-only context the harness dropdown drives `definitionRuntimeId`
-    // (via handleDefinitionRuntimeChange), not the I-harness pin. Route to the
-    // correct handler so the saved harness appears in the D-section dropdown.
-    showDef && !showInst
-      ? handleDefinitionRuntimeChange
-      : handleRuntimeDropdownChange,
+    selectedRuntime,
     open,
-  );
-
-  function handleProviderDropdownChange(nextValue: string) {
-    const nextProvider =
-      nextValue === AUTO_PROVIDER_DROPDOWN_VALUE ? "" : nextValue;
-    if (nextProvider === "relay-mesh" && selectedRuntimeId !== "buzz-agent") {
-      handleRuntimeDropdownChange("buzz-agent");
-    }
-    const nextSelection = selectionOnProviderDropdownChange(selection, {
-      runtime:
-        nextProvider === "relay-mesh"
-          ? "buzz-agent"
-          : (selectedRuntime?.id ?? selectedRuntimeId),
-      nextValue,
-      clearModelWhenApiKeyMissing: !showInst,
-    });
-    applySelection({
-      ...nextSelection,
-      model: nextProvider === "relay-mesh" ? "auto" : nextSelection.model,
-    });
-  }
-
-  function handleModelDropdownChange(nextValue: string) {
-    applySelection(
-      selectionOnModelDropdownChange(selection, {
-        nextValue,
-        clearKnownModelOnCustomEntry: !showInst,
-        isModelCustom: false,
-      }),
-    );
-  }
+  });
 
   // ── Focus target (R2) ──────────────────────────────────────────────────────
   const normalizedFieldFocusFiredRef = React.useRef(false);
@@ -740,8 +712,8 @@ export function AgentEditMergedDialog({
                 className="text-sm text-muted-foreground"
                 data-testid="team-managed-notice"
               >
-                Managed by team{def?.sourceTeam ? ` ${def.sourceTeam}` : ""}.
-                Its configuration cannot be edited here.
+                Managed by team{sourceTeamName ? ` ${sourceTeamName}` : ""}. Its
+                configuration cannot be edited here.
               </p>
             ) : null}
 
@@ -755,8 +727,10 @@ export function AgentEditMergedDialog({
               </p>
             ) : null}
 
-            {/* Identity-archived flair (14b) — fields remain editable; Save does not unarchive */}
-            {isIdentityArchived && showDef ? (
+            {/* Identity-archived flair (14b) — per agent pubkey, shown for any
+                archived agent regardless of definition linkage. Fields remain
+                editable; Save does not unarchive. */}
+            {isIdentityArchived ? (
               <p
                 className="text-sm font-medium text-amber-600 dark:text-amber-400"
                 data-testid="identity-archived-flair"
@@ -796,7 +770,7 @@ export function AgentEditMergedDialog({
                 }}
                 isCustomProviderEditing={isCustomProviderEditing}
                 provider={provider}
-                onProviderTextChange={dChange(setProvider)}
+                onProviderTextChange={dChange(setDProvider)}
                 modelSelectValue={modelSelectValue}
                 modelDropdownOptions={modelDropdownOptions}
                 onModelChange={(v) => {
@@ -806,8 +780,25 @@ export function AgentEditMergedDialog({
                 modelDiscoveryLoading={modelDiscoveryLoading}
                 showCustomModelInput={showCustomModelInput}
                 model={model}
-                onModelTextChange={dChange(setModel)}
+                onModelTextChange={dChange(setDModel)}
                 modelStatusMessage={modelStatusMessage}
+                showInstancePresent={showInst}
+                respondTo={respondTo}
+                respondToAllowlist={respondToAllowlist}
+                onRespondToChange={(v) => {
+                  setRespondTo(v);
+                  setDFieldsDirty(true);
+                }}
+                onAllowlistChange={(v) => {
+                  setRespondToAllowlist(v);
+                  setDFieldsDirty(true);
+                }}
+                agentAccessOwnerOnly={agentAccessOwnerOnly}
+                parallelism={parallelism}
+                onParallelismChange={(v) => {
+                  setParallelism(v);
+                  setDFieldsDirty(true);
+                }}
               />
             ) : null}
 
@@ -821,7 +812,7 @@ export function AgentEditMergedDialog({
                 runtimeCatalogStatus={runtimeCatalogStatus}
                 instanceName={instanceName}
                 onInstanceNameChange={setInstanceName}
-                respondTo={respondTo}
+                respondTo={respondTo ?? "anyone"}
                 respondToAllowlist={respondToAllowlist}
                 onRespondToChange={setRespondTo}
                 onAllowlistChange={setRespondToAllowlist}
@@ -840,7 +831,7 @@ export function AgentEditMergedDialog({
                 onProviderChange={handleProviderDropdownChange}
                 isCustomProviderEditing={isCustomProviderEditing}
                 provider={provider}
-                onProviderTextChange={setProvider}
+                onProviderTextChange={setIProvider}
                 providerRequired={providerRequired}
                 topLevelSecretEnvVar={topLevelSecretEnvVar}
                 apiKeyValue={apiKeyValue}
@@ -857,7 +848,7 @@ export function AgentEditMergedDialog({
                 modelDiscoveryLoading={modelDiscoveryLoading}
                 showCustomModelInput={showCustomModelInput}
                 model={model}
-                onModelTextChange={setModel}
+                onModelTextChange={setIModel}
                 modelStatusMessage={modelStatusMessage}
                 modelRequired={modelRequired}
                 inheritedSubmission={inheritedSubmission}

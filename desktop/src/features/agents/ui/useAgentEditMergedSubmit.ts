@@ -43,7 +43,7 @@ export type AgentEditSubmitState = {
   namePoolText: string;
   model: string;
   provider: string;
-  respondTo: string;
+  respondTo: string | null;
   respondToAllowlist: string[];
   parallelism: string;
   parsedParallelism: number;
@@ -54,6 +54,12 @@ export type AgentEditSubmitState = {
   startOnAppLaunch: boolean | undefined;
   /** D-field: definition runtime id (independent of I-harness pin). */
   definitionRuntimeId: string;
+  /**
+   * Ref tracking the auto-seeded definition runtime ID. When non-null, the
+   * auto-seed was not a user choice — skip persisting runtime as a D-change
+   * if no other D-field was actually modified.
+   */
+  autoSeededDefinitionRuntimeRef: React.RefObject<string | null>;
   /** I-field: harness pin runtime id (instance only). */
   selectedRuntimeId: string;
   inheritHarness: boolean;
@@ -135,11 +141,17 @@ export function useAgentEditMergedSubmit(
           systemPrompt: s.systemPrompt.trim(),
           respondTo: s.respondTo as typeof seed.respondTo,
           respondToAllowlist: s.respondToAllowlist,
-          // D-field: use definitionRuntimeId (independent of I-harness pin)
+          // D-field: use definitionRuntimeId (independent of I-harness pin).
+          // If the runtime was auto-seeded (not a user choice), use the seed's
+          // original runtime so a no-op save doesn't persist the app default
+          // as a new definition runtime.
           runtime:
-            s.definitionRuntimeId === "custom"
-              ? undefined
-              : s.definitionRuntimeId,
+            s.autoSeededDefinitionRuntimeRef.current !== null &&
+            s.autoSeededDefinitionRuntimeRef.current === s.definitionRuntimeId
+              ? (seed.runtime ?? undefined) // preserve original (undefined = no runtime)
+              : s.definitionRuntimeId === "custom"
+                ? undefined
+                : s.definitionRuntimeId,
           model: normalizedModel,
           provider: normalizedProvider,
           // D-field env: use the definition env from the form state (not the

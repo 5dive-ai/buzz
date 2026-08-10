@@ -65,6 +65,7 @@ export type AgentEditRuntimeStateInputs = {
   instanceEnvVars: Record<string, string>;
   inheritHarness: boolean;
   inst: ManagedAgent | null;
+  def: AgentPersona | null;
   linkedPersona: AgentPersona | null;
   bakedEnvKeys: string[] | undefined;
   originalAgentCommand: string;
@@ -113,6 +114,12 @@ export type AgentEditRuntimeStateResult = {
   advancedRequiredEnvKeys: readonly string[];
   /** True while model discovery is in progress (drives model dropdown disabled state). */
   modelDiscoveryLoading: boolean;
+  /**
+   * True when the definition has no runtime but has a saved model/provider,
+   * making the provider/model picker editable without a runtime selection.
+   * Matches AgentDefinitionDialog's blankRuntimeModelProviderEditable contract.
+   */
+  blankRuntimeModelProviderEditable: boolean;
 };
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
@@ -133,6 +140,7 @@ export function useAgentEditRuntimeState({
   instanceEnvVars,
   inheritHarness,
   inst,
+  def,
   linkedPersona,
   bakedEnvKeys,
   originalAgentCommand,
@@ -221,7 +229,7 @@ export function useAgentEditRuntimeState({
     inst,
   ]);
 
-  const llmProviderFieldVisible = runtimeSupportsLlmProviderSelection(
+  const llmProviderFieldVisible = React.useMemo(() => {
     // In linked context (showDef && showInst), the D-section provider/model
     // picker is driven by the definition's runtime (definitionRuntimeId), not by
     // the instance's harness pin (prospectiveRuntimeId). Using prospectiveRuntimeId
@@ -231,8 +239,37 @@ export function useAgentEditRuntimeState({
     // Instance-only context (showInst && !showDef) correctly uses prospectiveRuntimeId
     // because the instance's harness is the only runtime in scope.
     // D-only context falls through to definitionRuntimeId via selectedRuntimeId (they equal).
-    showInst && !showDef ? prospectiveRuntimeId : definitionRuntimeId,
-  );
+    const activeRuntimeId =
+      showInst && !showDef ? prospectiveRuntimeId : definitionRuntimeId;
+
+    if (runtimeSupportsLlmProviderSelection(activeRuntimeId)) return true;
+
+    // blankRuntimeModelProviderEditable: for an edit context (not create), when the
+    // definition has no runtime configured but already has a saved model or provider,
+    // expose the provider/model picker so the user can edit the existing values.
+    // This matches AgentDefinitionDialog's `initialModelProviderEditableWithoutRuntime`
+    // contract introduced in commit 87dc4dccba — restoring the capability that was
+    // accidentally dropped when test-11 was rewritten.
+    if (showDef && activeRuntimeId === "custom") {
+      const defRuntime = (
+        activeRuntimeId === "custom" ? "" : activeRuntimeId
+      ).trim();
+      const isRuntimeless = defRuntime.length === 0;
+      const hasSavedModelOrProvider =
+        (linkedPersona?.model ?? def?.model ?? "").trim().length > 0 ||
+        (linkedPersona?.provider ?? def?.provider ?? "").trim().length > 0;
+      if (isRuntimeless && hasSavedModelOrProvider) return true;
+    }
+
+    return false;
+  }, [
+    showInst,
+    showDef,
+    prospectiveRuntimeId,
+    definitionRuntimeId,
+    linkedPersona,
+    def,
+  ]);
   const prospectiveRuntime = runtimes.find(
     (r) => r.id === prospectiveRuntimeId,
   );
@@ -461,6 +498,11 @@ export function useAgentEditRuntimeState({
     topLevelSecretEnvVar,
     advancedRequiredEnvKeys,
     modelDiscoveryLoading,
+    blankRuntimeModelProviderEditable:
+      showDef &&
+      definitionRuntimeId === "custom" &&
+      ((linkedPersona?.model ?? def?.model ?? "").trim().length > 0 ||
+        (linkedPersona?.provider ?? def?.provider ?? "").trim().length > 0),
   };
 }
 

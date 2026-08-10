@@ -150,15 +150,15 @@ export async function runAgentSaveCoordinator(
       firstError =
         err instanceof Error ? err.message : "Failed to save agent profile.";
     }
-    // Settle after definition write — verify the write persisted before advancing.
-    if (!firstError) {
-      const { persona: settled } = await refetchStores();
-      if (
-        settled === null ||
-        !observedStateMatchesPersonaInput(settled, personaInput)
-      ) {
-        firstError = "Agent profile did not persist — reopen to retry.";
-      }
+    // Settle after definition write — re-fetch regardless of throw so that
+    // observed persistence (not the command result) decides whether it failed.
+    const { persona: settled } = await refetchStores();
+    if (
+      !firstError &&
+      (settled === null ||
+        !observedStateMatchesPersonaInput(settled, personaInput))
+    ) {
+      firstError = "Agent profile did not persist — reopen to retry.";
     }
   }
 
@@ -172,15 +172,13 @@ export async function runAgentSaveCoordinator(
       firstError =
         err instanceof Error ? err.message : "Failed to save agent settings.";
     }
-    // Settle after instance write.
-    if (!firstError) {
-      const { agent: settled } = await refetchStores();
-      if (
-        settled === null ||
-        !observedStateMatchesAgentInput(settled, agentInput)
-      ) {
-        firstError = "Agent settings did not persist — reopen to retry.";
-      }
+    // Settle after instance write — re-fetch regardless of throw.
+    const { agent: settled } = await refetchStores();
+    if (
+      !firstError &&
+      (settled === null || !observedStateMatchesAgentInput(settled, agentInput))
+    ) {
+      firstError = "Agent settings did not persist — reopen to retry.";
     }
   }
 
@@ -345,11 +343,12 @@ function observedStateMatchesPersonaInput(
     (observed.avatarUrl ?? "") !== (submitted.avatarUrl ?? "")
   )
     return false;
-  if (
-    submitted.runtime !== undefined &&
-    (observed.runtime ?? null) !== (submitted.runtime ?? null)
-  )
-    return false;
+  // Runtime: UpdatePersonaRequest is a full write — omitted/undefined runtime
+  // means "clear this field to null". Compare against observed null when
+  // submitted.runtime is undefined (clear semantics). If submitted.runtime is
+  // a non-empty string, compare against that value.
+  const submittedRuntime = submitted.runtime ?? null;
+  if ((observed.runtime ?? null) !== submittedRuntime) return false;
   if ((observed.model ?? null) !== (submitted.model ?? null)) return false;
   if ((observed.provider ?? null) !== (submitted.provider ?? null))
     return false;
@@ -433,11 +432,17 @@ function observedStateMatchesAgentInput(
     return false;
   }
   // Harness-pin fields (Artifact 3 / Thufir pass-2 CRITICAL-3)
-  if (
-    submitted.agentCommand !== undefined &&
-    (submitted.agentCommand ?? "") !== (observed.agentCommand ?? "")
-  ) {
-    return false;
+  if (submitted.agentCommand !== undefined) {
+    if (submitted.agentCommand === "") {
+      // "" is the sentinel for "inherit/unpin" — the backend clears
+      // agentCommandOverride. Settle against agentCommandOverride === null,
+      // NOT against agentCommand (which carries the resolved effective command).
+      if ((observed.agentCommandOverride ?? null) !== null) return false;
+    } else {
+      // Explicit pin — compare the stored command.
+      if ((submitted.agentCommand ?? "") !== (observed.agentCommand ?? ""))
+        return false;
+    }
   }
   if (submitted.harnessOverride !== undefined) {
     // harnessOverride=true means agentCommand is a pin (agentCommandOverride non-null).

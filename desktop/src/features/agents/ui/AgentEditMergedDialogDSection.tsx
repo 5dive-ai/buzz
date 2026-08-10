@@ -4,6 +4,9 @@
  * Renders agent name, system prompt, name pool, D-env vars, and (for all definition
  * contexts) runtime, LLM provider, and model. Team-managed fields render read-only.
  *
+ * When showInstancePresent is false (definition-only context), also renders the
+ * D-owned access/allowlist and parallelism controls (rows 9–10, Artifact 4).
+ *
  * Extracted from AgentEditMergedDialog to satisfy the desktop file-size gate.
  */
 
@@ -14,6 +17,7 @@ import { cn } from "@/shared/lib/cn";
 import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
 import { Button } from "@/shared/ui/button";
+import type { RespondToMode } from "@/shared/api/types";
 
 import {
   PERSONA_FIELD_CONTROL_CLASS,
@@ -25,6 +29,7 @@ import { AgentHarnessField } from "./AgentHarnessField";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import { PersonaModelCombobox } from "./PersonaModelCombobox";
 import { EnvVarsEditor, type EnvVarsValue } from "./EnvVarsEditor";
+import { OwnerOnlyAccessField } from "./OwnerOnlyAccessField";
 
 const advancedFieldsTransition = { duration: 0.18, ease: "easeInOut" } as const;
 
@@ -69,6 +74,21 @@ export type AgentEditMergedDSectionProps = {
   model: string;
   onModelTextChange: (value: string) => void;
   modelStatusMessage: string | null;
+  /**
+   * When false (definition-only context, no instance), renders the D-owned
+   * access/allowlist and parallelism controls (rows 9–10, Artifact 4).
+   * When true (instance is present), access/parallelism are I-owned and
+   * rendered in AgentEditMergedDialogInstanceSection.
+   */
+  showInstancePresent: boolean;
+  // D-owned access/parallelism (shown when !showInstancePresent)
+  respondTo: RespondToMode | null;
+  respondToAllowlist: string[];
+  onRespondToChange: (value: RespondToMode) => void;
+  onAllowlistChange: (value: string[]) => void;
+  agentAccessOwnerOnly: boolean | undefined;
+  parallelism: string;
+  onParallelismChange: (value: string) => void;
 };
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -104,6 +124,14 @@ export function AgentEditMergedDSection({
   model,
   onModelTextChange,
   modelStatusMessage,
+  showInstancePresent,
+  respondTo,
+  respondToAllowlist,
+  onRespondToChange,
+  onAllowlistChange,
+  agentAccessOwnerOnly,
+  parallelism,
+  onParallelismChange,
 }: AgentEditMergedDSectionProps) {
   const [showAdvanced, setShowAdvanced] = React.useState(false);
 
@@ -257,6 +285,46 @@ export function AgentEditMergedDSection({
           <p className="text-xs text-muted-foreground">{modelStatusMessage}</p>
         ) : null}
       </div>
+
+      {/* D-owned access/parallelism (rows 9–10, Artifact 4) — rendered only in
+          definition-only context (no instance). When an instance is present,
+          access/parallelism are I-owned and rendered in the I-section. */}
+      {!showInstancePresent ? (
+        <>
+          <OwnerOnlyAccessField
+            accessLocked={agentAccessOwnerOnly === true}
+            allowlist={respondToAllowlist}
+            disabled={isSaving || defReadOnly}
+            mode={(respondTo ?? "anyone") as RespondToMode}
+            onAllowlistChange={onAllowlistChange}
+            onModeChange={onRespondToChange}
+          />
+          <div className="space-y-1.5">
+            <label
+              className="text-sm font-medium text-foreground"
+              htmlFor="edit-agent-parallelism"
+            >
+              Parallelism
+              <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+                Optional
+              </span>
+            </label>
+            <div className="flex min-h-11 items-center rounded-lg border border-input bg-input/30 px-3">
+              <input
+                className="h-8 w-full bg-transparent px-0 py-0 text-sm leading-6 outline-none placeholder:text-muted-foreground"
+                disabled={isSaving || defReadOnly}
+                id="edit-agent-parallelism"
+                inputMode="numeric"
+                min={1}
+                onChange={(e) => onParallelismChange(e.target.value)}
+                placeholder="Default (1)"
+                type="number"
+                value={parallelism}
+              />
+            </div>
+          </div>
+        </>
+      ) : null}
 
       {/* Advanced section toggle (name pool + D-env vars) */}
       <div className="space-y-2">

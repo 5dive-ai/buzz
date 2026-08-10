@@ -168,6 +168,53 @@ test.describe("edit agent dialog", () => {
     await expect(page.getByTestId("agent-respond-to")).toBeVisible();
   });
 
+  test("definition-only context renders access control and parallelism (rows 9–10 D-owned)", async ({
+    page,
+  }) => {
+    // Rows 9–10: in definition-only context (zero-instance definition), access/parallelism
+    // are D-owned and must be rendered. This test proves Artifact 4 access-field
+    // completeness for the definition-only route (R5 — definition-only edit from library).
+    const DEFONLY_PERSONA_ID = "persona-defonly-access-e2e";
+    await installMockBridge(page, {
+      bakedBuildEnv: BAKED_DEFAULTS,
+      personas: [
+        {
+          id: DEFONLY_PERSONA_ID,
+          displayName: "Definition Only Agent",
+          systemPrompt: "No instances here.",
+          respondTo: "owner-only",
+        },
+      ],
+    });
+
+    await page.goto("/");
+    await page.getByTestId("open-agents-view").click();
+
+    // Navigate to the definition-edit route via the definitions library button.
+    const defButton = page.getByRole("button", {
+      name: "Definition Only Agent agent profile",
+    });
+    await expect(defButton).toBeVisible({ timeout: 10_000 });
+    await defButton.click();
+    await expect(page.getByTestId("user-profile-panel")).toBeVisible({
+      timeout: 10_000,
+    });
+    await page.getByTestId("user-profile-edit-agent").click();
+
+    await expect(page.getByTestId("edit-agent-dialog")).toBeVisible({
+      timeout: 10_000,
+    });
+
+    // Rows 9–10 Artifact 4: access control IS visible in definition-only context.
+    await expect(page.getByTestId("agent-respond-to")).toBeVisible({
+      timeout: 10_000,
+    });
+    // D-owned parallelism field rendered.
+    await expect(page.locator("#edit-agent-parallelism")).toBeVisible({
+      timeout: 10_000,
+    });
+  });
+
   test("edits the agent name and persists it across a dialog reopen", async ({
     page,
   }) => {

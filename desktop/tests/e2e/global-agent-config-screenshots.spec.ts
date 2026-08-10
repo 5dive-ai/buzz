@@ -883,12 +883,11 @@ test.describe("global agent config screenshots", () => {
   });
 
   // Shot 11: the merged surface's equivalent of the "provider gate" regression pin.
-  // In the merged surface, a runtime-less definition-with-instance does NOT expose
-  // the provider picker (llmProviderFieldVisible=false when no runtime supports LLM
-  // selection). This pins the correct observable behavior: provider picker hidden
-  // and save enabled. Compared to AgentDefinitionDialog's blankRuntimeModelProviderEditable
-  // — that dialog's own gate behavior is pinned separately in its own e2e path.
-  test("11-edit-runtime-less-provider-hidden-save-enabled", async ({
+  // A runtime-less definition-with-instance that has a saved model (but no provider)
+  // exposes the provider picker (blankRuntimeModelProviderEditable — restoring the
+  // contract from AgentDefinitionDialog commit 87dc4dccba). The global provider
+  // "anthropic" satisfies the provider gate, so Save is enabled with the picker visible.
+  test("11-edit-runtime-less-provider-visible-save-enabled", async ({
     page,
   }) => {
     const PERSONA_ID = "persona-runtime-less-edit-e2e";
@@ -947,9 +946,13 @@ test.describe("global agent config screenshots", () => {
       /Save changes/,
     );
 
-    // In the merged surface, runtime-less definition-with-instance: no runtime
-    // supports LLM selection → provider picker NOT shown → save is NOT blocked.
-    await expect(page.locator("#edit-agent-llm-provider")).not.toBeVisible();
+    // blankRuntimeModelProviderEditable: runtime-less definition with a saved model
+    // exposes the provider picker so the user can edit the existing model/provider values.
+    // The global provider "anthropic" satisfies isEditAgentProviderSaveValid, so Save
+    // is not blocked even though the form provider field is empty.
+    await expect(page.locator("#edit-agent-llm-provider")).toBeVisible({
+      timeout: 10_000,
+    });
     await expect(page.getByTestId("edit-agent-dialog-submit")).toBeEnabled({
       timeout: 10_000,
     });
@@ -958,7 +961,7 @@ test.describe("global agent config screenshots", () => {
 
     const dialog = page.getByRole("dialog");
     await dialog.screenshot({
-      path: `${SHOTS}/11-edit-runtime-less-provider-hidden-save-enabled.png`,
+      path: `${SHOTS}/11-edit-runtime-less-provider-visible-save-enabled.png`,
     });
   });
 

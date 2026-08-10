@@ -43,7 +43,7 @@ import { RunOnSummarySection } from "./RunOnSummarySection";
 export type AgentEditMergedISectionProps = {
   inst: ManagedAgent;
   showDef: boolean;
-  defReadOnly: boolean;
+  defReadOnly: boolean; // kept for API compatibility; I-owned access fields are not gated by D read-only
   isSaving: boolean;
   runtimeCatalogStatus: "loading" | "error" | "ready";
   // Instance name
@@ -134,7 +134,9 @@ export type AgentEditMergedISectionProps = {
 export function AgentEditMergedInstanceSection({
   inst,
   showDef,
-  defReadOnly,
+  // defReadOnly intentionally unused: I-owned access fields are not gated by D read-only
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  defReadOnly: _defReadOnly,
   isSaving,
   runtimeCatalogStatus,
   instanceName,
@@ -243,11 +245,11 @@ export function AgentEditMergedInstanceSection({
         </div>
       </div>
 
-      {/* Respond-to (D-field when linked; I-field when unlinked) */}
+      {/* Respond-to / access (I-owned field — editable even when definition is team-managed) */}
       <OwnerOnlyAccessField
         accessLocked={agentAccessOwnerOnly === true}
         allowlist={respondToAllowlist}
-        disabled={isSaving || (showDef && defReadOnly)}
+        disabled={isSaving}
         mode={respondTo}
         onAllowlistChange={onAllowlistChange}
         onModeChange={onRespondToChange}

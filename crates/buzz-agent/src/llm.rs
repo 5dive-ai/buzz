@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -42,6 +42,24 @@ enum MeshCatalogObservation {
     Available,
     Unavailable,
     Unknown,
+}
+
+fn output_cap_key(cfg: &Config, model: &str) -> String {
+    format!(
+        "{:?}|{}|{model}",
+        cfg.provider,
+        cfg.base_url.trim_end_matches('/')
+    )
+}
+
+fn advertised_output_cap(catalog: &Value, model: &str) -> Option<u32> {
+    let entries = catalog.get("data")?.as_array()?;
+    let raw = entries
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(model))?
+        .pointer("/top_provider/max_completion_tokens")?
+        .as_u64()?;
+    u32::try_from(raw).ok().filter(|cap| *cap > 0)
 }
 
 fn mesh_catalog_supports_collective(catalog: &Value) -> Option<bool> {
@@ -96,6 +114,10 @@ pub struct Llm {
     /// Mixture-of-Agents model. A TTL, confirmation count, and failure cooldown
     /// let long-running agents adapt without bouncing as peers briefly flap.
     mesh_auto_state: Mutex<MeshAutoState>,
+    /// Per-model output ceilings learned from provider catalog metadata. The
+    /// key includes the base URL so a deployment-specific cap is never reused
+    /// for another endpoint exposing the same model name.
+    output_token_caps: Mutex<HashMap<String, Option<u32>>>,
     /// Bearer-token source for OpenAI-family requests. Static for OpenAI
     /// (the `OPENAI_COMPAT_API_KEY` env var) and Databricks-with-token
     /// (the `DATABRICKS_TOKEN` env var); a refreshable PKCE engine for
@@ -126,6 +148,7 @@ impl Llm {
             http,
             auto_upgraded: AtomicBool::new(false),
             mesh_auto_state: Mutex::new(MeshAutoState::default()),
+            output_token_caps: Mutex::new(HashMap::new()),
             auth,
         })
     }
@@ -138,6 +161,13 @@ impl Llm {
         tools: &[ToolDef],
         effective_model: &str,
     ) -> Result<LlmResponse, AgentError> {
+        // `BUZZ_AGENT_MAX_OUTPUT_TOKENS` is the operator's desired ceiling. A
+        // provider catalog may advertise a smaller deployment/model ceiling;
+        // apply that before building any provider body. The original Config is
+        // immutable and shared, so keep the negotiated value request-local.
+        let mut effective_cfg = cfg.clone();
+        effective_cfg.max_output_tokens = self.effective_output_cap(cfg, effective_model).await;
+        let cfg = &effective_cfg;
         let effort = cfg.thinking_effort;
         let call_start = std::time::Instant::now();
         let result = match cfg.provider {
@@ -392,6 +422,59 @@ impl Llm {
             );
         }
         result
+    }
+
+    async fn effective_output_cap(&self, cfg: &Config, effective_model: &str) -> u32 {
+        let desired = cfg.max_output_tokens;
+        let key = output_cap_key(cfg, effective_model);
+        if let Some(cached) = self.output_token_caps.lock().await.get(&key).copied() {
+            return cached.map_or(desired, |cap| desired.min(cap));
+        }
+
+        let cap = self.fetch_advertised_output_cap(cfg, effective_model).await;
+        self.output_token_caps.lock().await.insert(key, cap);
+        let Some(cap) = cap else {
+            return desired;
+        };
+        if cap < desired {
+            tracing::info!(
+                model = effective_model,
+                desired_max_output_tokens = desired,
+                advertised_max_output_tokens = cap,
+                "llm: clamped output tokens to provider-advertised model limit"
+            );
+        }
+        desired.min(cap)
+    }
+
+    /// Read an explicit output-token capability from a model catalog. Today the
+    /// public OpenRouter catalog is the only supported shape: it distinguishes
+    /// `top_provider.max_completion_tokens` from `context_length`, so no model-
+    /// name table or prose parsing is needed. A missing/null/zero/out-of-range
+    /// field means unknown and leaves the operator ceiling unchanged.
+    async fn fetch_advertised_output_cap(
+        &self,
+        cfg: &Config,
+        effective_model: &str,
+    ) -> Option<u32> {
+        if cfg.provider != Provider::OpenRouter
+            || cfg.base_url.trim_end_matches('/') != "https://openrouter.ai/api/v1"
+        {
+            return None;
+        }
+        let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+        let response = self
+            .http
+            .get(url)
+            .timeout(MESH_AUTO_CATALOG_TIMEOUT)
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let catalog = response.json::<Value>().await.ok()?;
+        advertised_output_cap(&catalog, effective_model)
     }
 
     async fn post_anthropic(&self, cfg: &Config, body: &Value) -> Result<Value, AgentError> {
@@ -2782,12 +2865,68 @@ mod tests {
     use tokio::sync::Mutex;
     use tracing_subscriber::layer::SubscriberExt;
 
+    #[test]
+    fn advertised_output_cap_uses_exact_model_and_output_field() {
+        let catalog = json!({"data": [
+            {"id": "model-a", "context_length": 1_000_000,
+             "top_provider": {"context_length": 900_000, "max_completion_tokens": 32_768}},
+            {"id": "model-b", "top_provider": {"max_completion_tokens": 128_000}},
+        ]});
+        assert_eq!(advertised_output_cap(&catalog, "model-a"), Some(32_768));
+        assert_eq!(advertised_output_cap(&catalog, "model-b"), Some(128_000));
+        assert_eq!(advertised_output_cap(&catalog, "missing"), None);
+    }
+
+    #[test]
+    fn advertised_output_cap_rejects_context_only_null_zero_and_overflow() {
+        for entry in [
+            json!({"id":"m","context_length":32_768,"top_provider":{"context_length":16_384}}),
+            json!({"id":"m","top_provider":{"max_completion_tokens":null}}),
+            json!({"id":"m","top_provider":{"max_completion_tokens":0}}),
+            json!({"id":"m","top_provider":{"max_completion_tokens":u64::from(u32::MAX)+1}}),
+        ] {
+            assert_eq!(advertised_output_cap(&json!({"data":[entry]}), "m"), None);
+        }
+        assert_eq!(advertised_output_cap(&json!({"not_data":[]}), "m"), None);
+    }
+
+    #[tokio::test]
+    async fn effective_output_cap_clamps_to_cached_cap_and_falls_back_when_unknown() {
+        let llm = llm_with(Arc::new(CountingAuth {
+            refreshes: std::sync::atomic::AtomicU32::new(0),
+        }));
+        let mut c = cfg(Provider::OpenRouter);
+        c.max_output_tokens = 65_536;
+
+        let capped_key = output_cap_key(&c, "capped");
+        let larger_key = output_cap_key(&c, "larger");
+        let unknown_key = output_cap_key(&c, "unknown");
+        let mut cache = llm.output_token_caps.lock().await;
+        cache.insert(capped_key, Some(32_768));
+        cache.insert(larger_key, Some(128_000));
+        cache.insert(unknown_key, None);
+        drop(cache);
+        assert_eq!(
+            llm.output_token_caps
+                .lock()
+                .await
+                .get(&output_cap_key(&c, "capped"))
+                .copied(),
+            Some(Some(32_768))
+        );
+
+        assert_eq!(llm.effective_output_cap(&c, "capped").await, 32_768);
+        assert_eq!(llm.effective_output_cap(&c, "larger").await, 65_536);
+        assert_eq!(llm.effective_output_cap(&c, "unknown").await, 65_536);
+    }
+
     fn cfg(provider: Provider) -> Config {
         Config {
             provider,
             system_prompt: "system".into(),
             max_rounds: 10,
             max_output_tokens: 1024,
+            max_token_recoveries: 5,
             llm_timeout: Duration::from_secs(10),
             tool_timeout: Duration::from_secs(10),
             mcp_init_timeout: Duration::from_secs(10),
@@ -6211,6 +6350,7 @@ mod tests {
                 .unwrap(),
             auto_upgraded: std::sync::atomic::AtomicBool::new(false),
             mesh_auto_state: Mutex::new(MeshAutoState::default()),
+            output_token_caps: Mutex::new(HashMap::new()),
             auth,
         }
     }

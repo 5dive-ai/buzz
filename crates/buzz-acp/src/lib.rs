@@ -1410,6 +1410,44 @@ fn native_steer_preparation_is_stale(
             != prepared_generation
 }
 
+/// Reserve an edit before its asynchronous enrichment starts, returning the
+/// membership generation that completion must still match.
+fn reserve_native_edit_preparation(
+    queue: &mut EventQueue,
+    membership_generations: &HashMap<Uuid, u64>,
+    channel_id: Uuid,
+    event_id: &str,
+) -> Option<u64> {
+    queue
+        .mark_native_steer_pending(channel_id, event_id)
+        .then(|| {
+            membership_generations
+                .get(&channel_id)
+                .copied()
+                .unwrap_or(0)
+        })
+}
+
+/// Apply the queue and membership state transition for a channel removal.
+/// The generation deliberately advances even if a later add restores access.
+fn remove_channel_for_membership_change(
+    queue: &mut EventQueue,
+    removed_channels: &mut HashSet<Uuid>,
+    membership_generations: &mut HashMap<Uuid, u64>,
+    channel_id: Uuid,
+) -> Vec<String> {
+    let drained_ids = queue.drain_channel(channel_id);
+    removed_channels.insert(channel_id);
+    let generation = membership_generations.entry(channel_id).or_default();
+    *generation = generation.wrapping_add(1);
+    drained_ids
+}
+
+/// Restore current membership without validating work prepared before removal.
+fn readd_channel_after_membership_change(removed_channels: &mut HashSet<Uuid>, channel_id: Uuid) {
+    removed_channels.remove(&channel_id);
+}
+
 struct SteerAckEvent {
     channel_id: Uuid,
     event_id: String,
@@ -2299,7 +2337,7 @@ async fn tokio_main() -> Result<()> {
                                 if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION {
                                     // Clear removal tracking so sessions are not
                                     // stripped for a legitimately re-added channel.
-                                    removed_channels.remove(&ch);
+                                    readd_channel_after_membership_change(&mut removed_channels, ch);
 
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
@@ -2323,7 +2361,12 @@ async fn tokio_main() -> Result<()> {
                                     // removed channel. Events already in-flight will
                                     // complete normally (the relay may reject actions if
                                     // the agent lost access).
-                                    let drained_ids = queue.drain_channel(ch);
+                                    let drained_ids = remove_channel_for_membership_change(
+                                        &mut queue,
+                                        &mut removed_channels,
+                                        &mut membership_generations,
+                                        ch,
+                                    );
                                     let invalidated = if pool_ready {
                                         pool.invalidate_channel_sessions(ch)
                                     } else {
@@ -2331,9 +2374,6 @@ async fn tokio_main() -> Result<()> {
                                     };
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
-                                    removed_channels.insert(ch);
-                                    let generation = membership_generations.entry(ch).or_default();
-                                    *generation = generation.wrapping_add(1);
                                     typing_channels.remove(&ch);
                                     // Best-effort: clean up 👀 on drained events.
                                     // Note: the relay revokes membership before
@@ -2581,18 +2621,16 @@ async fn tokio_main() -> Result<()> {
                                     {
                                         if queue::edit_target_id(&event_for_steer).is_some() {
                                             let event_id = event_for_steer.id.to_hex();
-                                            let reserved = queue.mark_native_steer_pending(
-                                                buzz_event.channel_id,
+                                            let channel_id = buzz_event.channel_id;
+                                            let membership_generation = reserve_native_edit_preparation(
+                                                &mut queue,
+                                                &membership_generations,
+                                                channel_id,
                                                 &event_id,
-                                            );
-                                            debug_assert!(reserved, "accepted edit must still be queued");
+                                            )
+                                            .expect("accepted edit must still be queued");
                                             let tx = native_steer_tx.clone();
                                             let ctx = Arc::clone(&ctx);
-                                            let channel_id = buzz_event.channel_id;
-                                            let membership_generation = membership_generations
-                                                .get(&channel_id)
-                                                .copied()
-                                                .unwrap_or(0);
                                             tokio::spawn(async move {
                                                 let prompt_blocks = pool::format_native_steer_prompt(
                                                     channel_id,
@@ -8235,5 +8273,65 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+#[cfg(test)]
+mod native_edit_membership_lifecycle_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    fn edit_event(target: &str) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(40003), "edited mention")
+            .tags([nostr::Tag::parse(["e", target]).expect("target tag")])
+            .sign_with_keys(&Keys::generate())
+            .expect("signed edit")
+    }
+
+    #[test]
+    fn late_prepared_edit_is_discarded_across_remove_then_readd() {
+        let channel_id = Uuid::new_v4();
+        let event = edit_event(&"ab".repeat(32));
+        let event_id = event.id.to_hex();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "@mention".into(),
+        }));
+
+        // This is the production reservation/capture boundary used before the
+        // detached REST preparation task is spawned.
+        let mut generations = HashMap::new();
+        let prepared_generation =
+            reserve_native_edit_preparation(&mut queue, &generations, channel_id, &event_id)
+                .expect("accepted edit is reserved before preparation");
+
+        // These are the production removal and re-add transitions. Removal
+        // drains the reservation and advances generation; re-add restores
+        // access without revalidating old prepared work.
+        let mut removed_channels = HashSet::new();
+        assert!(remove_channel_for_membership_change(
+            &mut queue,
+            &mut removed_channels,
+            &mut generations,
+            channel_id,
+        )
+        .is_empty());
+        readd_channel_after_membership_change(&mut removed_channels, channel_id);
+
+        // This is the completion-arm guard. A false result would enter
+        // try_native_steer or its release/fallback path; stale completion must
+        // instead be discarded, leaving neither queued nor withheld work to
+        // steer, release, or resurrect.
+        assert!(native_steer_preparation_is_stale(
+            &removed_channels,
+            &generations,
+            channel_id,
+            prepared_generation,
+        ));
+        queue.release_native_steer(channel_id, &event_id);
+        assert!(queue.flush_next().is_none());
     }
 }

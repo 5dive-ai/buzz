@@ -45,6 +45,38 @@ type MetadataLoadResult = MetadataCacheEntry & {
 const DEFAULT_TRANSIENT_RETRY_MS = 30_000;
 const NULL_METADATA_RETRY_MS = 5 * 60_000;
 const MAX_CONCURRENT_METADATA_FETCHES = 2;
+/** Backoff before the single inline retry that a transient blip earns before
+ * it falls into the longer {@link DEFAULT_TRANSIENT_RETRY_MS} self-heal wait. */
+const INLINE_RETRY_BACKOFF_MS = 750;
+/** Prefix the native fetcher uses to mark a 429. A rate limit must NOT get the
+ * fast inline retry (we would just be throttled again); it waits instead. Kept
+ * in sync with RATE_LIMITED_ERROR_PREFIX in link_preview.rs. */
+const RATE_LIMITED_ERROR_PREFIX = "link preview rate limited";
+
+type TransientFailure = {
+  /** A 429 rate limit: skip the inline retry and wait it out. */
+  rateLimited: boolean;
+  /** Server-supplied Retry-After, in ms, when present on a rate limit. */
+  retryAfterMs?: number;
+};
+
+/** Classify a rejected native fetch. Any rejection is transient (a genuine
+ * "no metadata" result resolves, it does not reject); we only distinguish a
+ * rate limit — which must not be retried immediately — from an ordinary blip. */
+function classifyTransientFailure(reason: unknown): TransientFailure {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  if (!message.startsWith(RATE_LIMITED_ERROR_PREFIX)) {
+    return { rateLimited: false };
+  }
+  const match = /retry-after (\d+)/.exec(message);
+  const retryAfterSeconds = match ? Number.parseInt(match[1], 10) : NaN;
+  return {
+    rateLimited: true,
+    retryAfterMs: Number.isFinite(retryAfterSeconds)
+      ? retryAfterSeconds * 1_000
+      : undefined,
+  };
+}
 
 /**
  * React may flush an interaction-triggered effect before the browser paints.
@@ -84,11 +116,13 @@ function metadataExpiry(
   metadata: LinkPreviewMetadata | null,
   now: number,
   transient = false,
+  transientRetryMs = DEFAULT_TRANSIENT_RETRY_MS,
 ): number | null {
   // A transient failure (timeout/429/5xx/network) must not stick for the full
   // miss TTL: one unlucky fetch would otherwise blank the card for 5 minutes
-  // even though the link is perfectly valid. Retry it soon instead.
-  if (transient) return now + DEFAULT_TRANSIENT_RETRY_MS;
+  // even though the link is perfectly valid. Retry it soon instead — after the
+  // server's Retry-After when it gave us one, otherwise the default window.
+  if (transient) return now + transientRetryMs;
   if (metadata === null) return now + NULL_METADATA_RETRY_MS;
   if (metadata.imageFetchState !== "transient_failure") return null;
   const retryAfterMs =
@@ -128,10 +162,13 @@ function createTaskScheduler(concurrency: number) {
 
 function createMetadataLoader({
   concurrency = MAX_CONCURRENT_METADATA_FETCHES,
+  delay = (ms: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, ms)),
   fetcher,
   now = Date.now,
 }: {
   concurrency?: number;
+  delay?: (ms: number) => Promise<void>;
   fetcher: (href: string) => Promise<LinkPreviewMetadata | null>;
   now?: () => number;
 }) {
@@ -165,16 +202,57 @@ function createMetadataLoader({
     }
 
     const requestGeneration = generation;
-    const promise = schedule(() => fetcher(href))
-      .then(
-        (metadata) => ({ metadata, transient: false }),
-        // A rejected fetch is a transient failure (timeout, network error, or a
-        // retryable status surfaced as an error), not a genuine "no metadata".
-        () => ({ metadata: null, transient: true }),
-      )
-      .then(({ metadata, transient }) => {
+    // One coalesced attempt sequence. A transient blip earns a single inline
+    // retry after a short backoff before we give up and fall into the longer
+    // self-heal wait; a rate limit (429) skips that retry — an immediate retry
+    // would just be throttled again — and waits out its Retry-After instead.
+    const attempt = (): Promise<{
+      metadata: LinkPreviewMetadata | null;
+      transient: boolean;
+      transientRetryMs: number;
+    }> =>
+      fetcher(href).then(
+        (metadata) => ({
+          metadata,
+          transient: false,
+          transientRetryMs: DEFAULT_TRANSIENT_RETRY_MS,
+        }),
+        (reason) => {
+          const failure = classifyTransientFailure(reason);
+          if (failure.rateLimited) {
+            return {
+              metadata: null,
+              transient: true,
+              transientRetryMs:
+                failure.retryAfterMs ?? DEFAULT_TRANSIENT_RETRY_MS,
+            };
+          }
+          return delay(INLINE_RETRY_BACKOFF_MS)
+            .then(() => fetcher(href))
+            .then(
+              (metadata) => ({
+                metadata,
+                transient: false,
+                transientRetryMs: DEFAULT_TRANSIENT_RETRY_MS,
+              }),
+              () => ({
+                metadata: null,
+                transient: true,
+                transientRetryMs: DEFAULT_TRANSIENT_RETRY_MS,
+              }),
+            );
+        },
+      );
+
+    const promise = schedule(attempt).then(
+      ({ metadata, transient, transientRetryMs }) => {
         const entry = {
-          expiresAt: metadataExpiry(metadata, now(), transient),
+          expiresAt: metadataExpiry(
+            metadata,
+            now(),
+            transient,
+            transientRetryMs,
+          ),
           metadata,
           transient,
         };
@@ -182,7 +260,8 @@ function createMetadataLoader({
           cache.set(key, entry);
         }
         return { key, ...entry };
-      });
+      },
+    );
     cache.set(key, promise);
     return promise;
   };

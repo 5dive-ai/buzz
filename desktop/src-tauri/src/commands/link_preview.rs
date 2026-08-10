@@ -14,7 +14,10 @@ use url::Url;
 #[path = "link_preview_rate_limit.rs"]
 mod rate_limit;
 
-use rate_limit::{image_host_cooldown_remaining, retry_after_duration, set_image_host_cooldown};
+use rate_limit::{
+    image_host_cooldown_remaining, is_transient_status, rate_limited_response_error,
+    retry_after_duration, set_image_host_cooldown,
+};
 
 const MAX_PREVIEW_FETCH_BYTES: usize = 256 * 1024;
 const MAX_IMAGE_FETCH_BYTES: usize = 2 * 1024 * 1024;
@@ -93,6 +96,9 @@ async fn fetch_link_preview_metadata_inner(
             // retries soon instead of caching an empty card for the full miss
             // TTL. Any other non-success (e.g. 404) is a genuine hard miss.
             let status = response.status();
+            if let Some(error) = rate_limited_response_error(&response) {
+                return Err(error);
+            }
             if is_transient_status(status) {
                 return Err(format!("link preview request failed: HTTP {status}"));
             }
@@ -224,16 +230,6 @@ async fn send_pinned_request(url: &Url, accept: &str) -> Result<reqwest::Respons
         .await
         .map_err(|_| "link preview request timed out".to_string())?
         .map_err(|error| format!("link preview request failed: {error}"))
-}
-
-/// A retryable HTTP status: rate limit, request timeout, too early, or any
-/// server error. These are transient and should be retried soon rather than
-/// cached as a genuine "no metadata" miss.
-fn is_transient_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || status == reqwest::StatusCode::REQUEST_TIMEOUT
-        || status == reqwest::StatusCode::TOO_EARLY
-        || status.is_server_error()
 }
 
 fn is_html_response(response: &reqwest::Response) -> bool {

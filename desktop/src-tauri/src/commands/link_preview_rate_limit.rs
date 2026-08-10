@@ -22,6 +22,43 @@ pub(super) fn retry_after_duration(response: &reqwest::Response) -> Option<Durat
         .map(|duration| duration.min(MAX_IMAGE_RETRY_AFTER))
 }
 
+/// Marker prefix the caller matches to distinguish a rate limit (429) from an
+/// ordinary transient blip. When the server supplied a Retry-After, its whole
+/// seconds are appended so the caller can wait exactly that long instead of
+/// blindly retrying or falling back to the default transient window.
+pub(super) const RATE_LIMITED_ERROR_PREFIX: &str = "link preview rate limited";
+
+pub(super) fn rate_limited_error(retry_after: Option<Duration>) -> String {
+    match retry_after {
+        Some(retry_after) => {
+            format!(
+                "{RATE_LIMITED_ERROR_PREFIX}: retry-after {}",
+                retry_after.as_secs()
+            )
+        }
+        None => RATE_LIMITED_ERROR_PREFIX.to_string(),
+    }
+}
+
+/// A 429 is a genuine rate limit: an immediate retry would just be throttled
+/// again, so surface it distinctly (carrying any Retry-After) rather than as an
+/// ordinary transient blip. Returns `None` for every other status so the caller
+/// keeps its usual transient/hard-miss handling.
+pub(super) fn rate_limited_response_error(response: &reqwest::Response) -> Option<String> {
+    (response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS)
+        .then(|| rate_limited_error(retry_after_duration(response)))
+}
+
+/// A retryable HTTP status: rate limit, request timeout, too early, or any
+/// server error. These are transient and should be retried soon rather than
+/// cached as a genuine "no metadata" miss.
+pub(super) fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_EARLY
+        || status.is_server_error()
+}
+
 pub(super) fn image_host_cooldown_remaining(url: &Url) -> Option<Duration> {
     let host = url.host_str()?;
     let cooldowns = IMAGE_HOST_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -58,5 +95,32 @@ pub(super) fn set_image_host_cooldown(url: &Url, retry_after: Duration) {
             }
         }
         cooldowns.insert(host.to_string(), expires_at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rate_limited_error, RATE_LIMITED_ERROR_PREFIX};
+    use std::time::Duration;
+
+    #[test]
+    fn rate_limited_error_carries_retry_after_seconds() {
+        // A rate limit surfaces a distinct marker so the caller skips the fast
+        // inline retry; when the server gave a Retry-After we append its whole
+        // seconds so the caller can wait exactly that long.
+        assert_eq!(
+            rate_limited_error(Some(Duration::from_secs(45))),
+            format!("{RATE_LIMITED_ERROR_PREFIX}: retry-after 45"),
+        );
+        // Sub-second remainders truncate to whole seconds.
+        assert_eq!(
+            rate_limited_error(Some(Duration::from_millis(1_500))),
+            format!("{RATE_LIMITED_ERROR_PREFIX}: retry-after 1"),
+        );
+        // No Retry-After: bare marker, caller falls back to its default window.
+        assert_eq!(
+            rate_limited_error(None),
+            RATE_LIMITED_ERROR_PREFIX.to_string(),
+        );
     }
 }

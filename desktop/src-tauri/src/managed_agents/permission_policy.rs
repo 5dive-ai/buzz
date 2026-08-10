@@ -180,37 +180,27 @@ mod tests {
         assert_eq!(source, PermissionPolicySource::Agent);
     }
 
-    /// Wes's regression: deploy under Allow, then flip global default to Reject.
-    /// The summary's *desired* policy changes (global Reject wins) but the
-    /// *applied* policy on the record must stay Allow — the worker is still
-    /// running the policy it was launched with. The UI detects drift by
-    /// comparing these two values and prompts a redeploy.
+    /// Desired-vs-applied drift at the resolver level (Wes's regression, resolver
+    /// half): after a post-deploy global flip to Reject, the recomputed *desired*
+    /// policy is Reject while the persisted *applied* receipt stays Allow, so the
+    /// two diverge and the UI can flag drift. The production stamp/receipt half —
+    /// that `applied` is written from the byte-identical sent value and survives a
+    /// failed redeploy — is pinned by the discriminating transition tests in
+    /// `commands/agents_deploy.rs`.
     #[test]
     fn test_applied_policy_survives_global_flip_deploy_allow_global_flips_to_reject() {
         let mut record = empty_record();
-        // Simulate: agent was deployed with no per-agent override, global=Allow
-        // at deploy time → applied_permission_policy stamped as Allow.
         record.permission_policy = None;
         record.applied_permission_policy = Some(PermissionPolicy::Allow);
 
-        // Global is now flipped to Reject (post-deploy mutation).
         let global_after_flip = GlobalAgentConfig {
             permission_policy: Some(PermissionPolicy::Reject),
             ..Default::default()
         };
 
-        // Desired policy reflects the new global.
         let (desired, source) = resolve_effective_permission_policy(&record, &global_after_flip);
         assert_eq!(desired, PermissionPolicy::Reject);
         assert_eq!(source, PermissionPolicySource::GlobalDefault);
-
-        // Applied policy is unchanged — still what the worker was launched with.
-        assert_eq!(
-            record.applied_permission_policy,
-            Some(PermissionPolicy::Allow)
-        );
-
-        // Drift is detectable: applied ≠ desired.
         assert_ne!(record.applied_permission_policy, Some(desired));
     }
 }

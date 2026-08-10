@@ -240,6 +240,50 @@ pub(super) fn deploy_payload_json(
     })
 }
 
+use crate::managed_agents::permission_policy::PermissionPolicy;
+
+/// Extract the applied permission policy from a deploy payload — the byte-identical
+/// value `build_deploy_payload` wrote into `launch.policy_env`, not a recompute.
+///
+/// The key is unconditionally present in every payload `build_deploy_payload`
+/// produces (it falls back to `desktop_default`), so a missing or unparseable
+/// value is a broken invariant on the JSON boundary, not a legacy shape. Callers
+/// must fail the deploy rather than stamping a silent `None` that would suppress
+/// the drift row and defeat the field's purpose.
+pub(super) fn extract_applied_permission_policy(
+    agent_json: &serde_json::Value,
+) -> Result<PermissionPolicy, String> {
+    let raw = agent_json["launch"]["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"]
+        .as_str()
+        .ok_or("deploy payload is missing launch.policy_env.BUZZ_ACP_PERMISSION_POLICY")?;
+    serde_json::from_value(serde_json::Value::String(raw.to_string()))
+        .map_err(|_| format!("deploy payload has unrecognized permission policy {raw:?}"))
+}
+
+/// Record the outcome of a successful provider deploy. Stamps the confirmed
+/// receipt: `applied_permission_policy` is the exact value that was sent, so a
+/// later global-default flip is detectable as drift against the live worker.
+pub(super) fn record_deploy_success(
+    record: &mut ManagedAgentRecord,
+    backend_agent_id: String,
+    applied_policy: PermissionPolicy,
+) {
+    record.backend_agent_id = Some(backend_agent_id);
+    record.last_started_at = Some(crate::util::now_iso());
+    record.updated_at = crate::util::now_iso();
+    record.last_error = None;
+    record.applied_permission_policy = Some(applied_policy);
+}
+
+/// Record a failed provider deploy. The previous `applied_permission_policy` is
+/// intentionally retained: it is the last confirmed deployment receipt, the old
+/// worker may still be running that policy, and `last_error` records the failed
+/// new attempt. Clearing it would destroy known truth.
+pub(super) fn record_deploy_failure(record: &mut ManagedAgentRecord, error: &str) {
+    record.last_error = Some(error.to_string());
+    record.updated_at = crate::util::now_iso();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +620,99 @@ mod tests {
             launch["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"], "allow",
             "global allow policy must be injected when record has no per-agent policy"
         );
+    }
+
+    // ── Deploy-receipt invariant + applied-policy state transitions ──────────
+
+    /// A payload built by `build_launch_block` always carries the policy key, and
+    /// `extract_applied_permission_policy` reads back the byte-identical value —
+    /// not a recompute. This is the receipt the deploy path stamps.
+    #[test]
+    fn extract_applied_policy_reads_the_exact_sent_value() {
+        let record = record();
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "goose".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        let launch = build_launch_block(
+            &record,
+            &descriptor,
+            &[],
+            None,
+            None,
+            "owner-hex",
+            Some(PermissionPolicy::Allow),
+        );
+        let payload = serde_json::json!({ "launch": launch });
+        assert_eq!(
+            extract_applied_permission_policy(&payload),
+            Ok(PermissionPolicy::Allow),
+            "extract must return the exact policy the payload carries"
+        );
+    }
+
+    /// A payload missing the policy key is a broken invariant: extraction errors
+    /// so the deploy fails before the provider is invoked, never stamping None.
+    #[test]
+    fn extract_applied_policy_missing_key_errors() {
+        let payload = serde_json::json!({ "launch": { "policy_env": {} } });
+        assert!(
+            extract_applied_permission_policy(&payload).is_err(),
+            "missing policy key must error, not silently stamp None"
+        );
+    }
+
+    /// A payload whose policy value is not a recognized enum variant errors —
+    /// the deploy fails before the provider is invoked.
+    #[test]
+    fn extract_applied_policy_unparseable_value_errors() {
+        let payload = serde_json::json!({
+            "launch": { "policy_env": { "BUZZ_ACP_PERMISSION_POLICY": "bogus" } }
+        });
+        assert!(
+            extract_applied_permission_policy(&payload).is_err(),
+            "unrecognized policy value must error, not silently stamp None"
+        );
+    }
+
+    /// Successful deploy stamps the exact sent value as the confirmed receipt and
+    /// clears any prior error.
+    #[test]
+    fn record_deploy_success_stamps_exact_sent_value() {
+        let mut rec = record();
+        rec.last_error = Some("stale error".into());
+        record_deploy_success(&mut rec, "backend-1".into(), PermissionPolicy::Allow);
+        assert_eq!(rec.backend_agent_id.as_deref(), Some("backend-1"));
+        assert_eq!(rec.applied_permission_policy, Some(PermissionPolicy::Allow));
+        assert_eq!(rec.last_error, None);
+    }
+
+    /// Successful redeploy overwrites the applied receipt with the new sent value.
+    #[test]
+    fn record_deploy_success_redeploy_updates_applied_value() {
+        let mut rec = record();
+        record_deploy_success(&mut rec, "backend-1".into(), PermissionPolicy::Allow);
+        record_deploy_success(&mut rec, "backend-1".into(), PermissionPolicy::Reject);
+        assert_eq!(
+            rec.applied_permission_policy,
+            Some(PermissionPolicy::Reject),
+            "redeploy must update the applied receipt to the new sent value"
+        );
+    }
+
+    /// Failed redeploy retains the last confirmed applied policy — the old worker
+    /// may still be running it — while recording the new error.
+    #[test]
+    fn record_deploy_failure_retains_last_confirmed_applied_value() {
+        let mut rec = record();
+        record_deploy_success(&mut rec, "backend-1".into(), PermissionPolicy::Allow);
+        record_deploy_failure(&mut rec, "provider unreachable");
+        assert_eq!(
+            rec.applied_permission_policy,
+            Some(PermissionPolicy::Allow),
+            "failed redeploy must retain the last confirmed applied policy"
+        );
+        assert_eq!(rec.last_error.as_deref(), Some("provider unreachable"));
     }
 }

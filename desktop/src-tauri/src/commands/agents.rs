@@ -475,10 +475,11 @@ async fn deploy_to_provider(
         .map_or_else(|| resolve_provider_binary(provider_id), Ok)?;
 
     let config_clone = config.clone();
-    let applied_policy: Option<crate::managed_agents::permission_policy::PermissionPolicy> =
-        agent_json["launch"]["policy_env"]["BUZZ_ACP_PERMISSION_POLICY"]
-            .as_str()
-            .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
+    // Enforce the deploy-receipt invariant BEFORE invoking the provider: the
+    // applied policy is the byte-identical value build_deploy_payload wrote, and
+    // a missing/unparseable one is a broken JSON-boundary invariant that must fail
+    // the deploy rather than silently stamp None and suppress the drift row.
+    let applied_policy = extract_applied_permission_policy(&agent_json)?;
     let deploy_result =
         tokio::task::spawn_blocking(move || provider_deploy(&bin_path, &agent_json, &config_clone))
             .await
@@ -496,15 +497,10 @@ async fn deploy_to_provider(
 
     match deploy_result {
         Ok(backend_agent_id) => {
-            rec.backend_agent_id = Some(backend_agent_id);
-            rec.last_started_at = Some(now_iso());
-            rec.updated_at = now_iso();
-            rec.last_error = None;
-            rec.applied_permission_policy = applied_policy;
+            record_deploy_success(rec, backend_agent_id, applied_policy);
         }
         Err(ref e) => {
-            rec.last_error = Some(e.clone());
-            rec.updated_at = now_iso();
+            record_deploy_failure(rec, e);
             save_managed_agents(app, &records)?;
             return Err(e.clone());
         }
@@ -1363,6 +1359,7 @@ use deploy::build_deploy_payload;
 use deploy::{deploy_payload_json, DeployProjections};
 #[cfg(test)]
 use deploy::{ensure_remote_provider_supported, resolve_deploy_model_provider};
+use deploy::{extract_applied_permission_policy, record_deploy_failure, record_deploy_success};
 
 #[path = "agents_profile.rs"]
 mod profile;

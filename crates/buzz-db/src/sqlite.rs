@@ -383,7 +383,7 @@ pub(crate) async fn add_member(
         }
     }
 
-    sqlx::query("INSERT INTO channel_members (channel_id, pubkey, role, invited_by) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(channel_id, pubkey) DO UPDATE SET role = excluded.role, invited_by = excluded.invited_by, removed_at = NULL")
+    sqlx::query("INSERT INTO channel_members (channel_id, pubkey, role, invited_by) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(channel_id, pubkey) DO UPDATE SET role = excluded.role, removed_at = NULL")
         .bind(channel_id.to_string()).bind(pubkey).bind(effective_role.as_str()).bind(invited_by).execute(&mut *tx).await?;
     let row = sqlx::query("SELECT channel_id, pubkey, role, joined_at, invited_by, removed_at FROM channel_members WHERE channel_id = ?1 AND pubkey = ?2")
         .bind(channel_id.to_string()).bind(pubkey).fetch_one(&mut *tx).await?;
@@ -673,6 +673,7 @@ mod tests {
             .unwrap();
         let owner = Keys::generate().public_key().to_bytes();
         let member = Keys::generate().public_key().to_bytes();
+        let admin = Keys::generate().public_key().to_bytes();
         let other = Keys::generate().public_key().to_bytes();
         let channel_id = Uuid::new_v4();
         create_channel_with_id(
@@ -723,6 +724,27 @@ mod tests {
         )
         .await
         .unwrap();
+        add_member(
+            &pool,
+            community.id,
+            channel_id,
+            &admin,
+            crate::channel::MemberRole::Admin,
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+        let readded = add_member(
+            &pool,
+            community.id,
+            channel_id,
+            &member,
+            crate::channel::MemberRole::Member,
+            Some(&admin),
+        )
+        .await
+        .unwrap();
+        assert_eq!(readded.invited_by, Some(owner.to_vec()));
         assert!(matches!(
             add_member(
                 &pool,

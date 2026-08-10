@@ -67,16 +67,28 @@ function makeFakeRelay(overrides = {}) {
 
 function makeFakeTimers() {
   const scheduled = new Map();
+  let nextSyntheticId = 1_000_000;
   const origSetTimeout = globalThis.window.setTimeout;
-  globalThis.window.setTimeout = (fn, ms) => {
-    const id = origSetTimeout(fn, ms);
-    scheduled.set(id, { fn, ms });
-    return id;
-  };
   const origClearTimeout = globalThis.window.clearTimeout;
+  globalThis.window.setTimeout = (fn, ms) => {
+    if (ms > 0) {
+      // Positive-delay timers are purely synthetic: store the callback in the
+      // map and return a synthetic ID without touching the native scheduler.
+      // Tests fire them explicitly via the returned fn; the process never lingers.
+      const id = nextSyntheticId++;
+      scheduled.set(id, { fn, ms });
+      return id;
+    }
+    // Zero-delay work delegates to the native scheduler so async continuations
+    // and micro-queues flush correctly.
+    return origSetTimeout(fn, ms);
+  };
   globalThis.window.clearTimeout = (id) => {
-    scheduled.delete(id);
-    origClearTimeout(id);
+    if (scheduled.has(id)) {
+      scheduled.delete(id);
+    } else {
+      origClearTimeout(id);
+    }
   };
   return {
     scheduled,
@@ -2322,8 +2334,12 @@ test("drain_cleanupCommit_intentAndReceiptDeletedAtomically", async () => {
 // ── Tests 36/36b: incomplete verdict schedules automatic retry (mirror pair) ──
 // biome-ignore format: compact table rows
 const incompleteVerdictCases = [
-  { name: "retryLoad_incompleteVerdictSchedulesAutomaticRetry",   pubkey: "36".repeat(32),              trigger: (mgr) => mgr.retryLoad()   },
-  { name: "initialize_incompleteVerdict_schedulesAutomaticRetry", pubkey: "36b".repeat(21).slice(0,64), trigger: (mgr) => mgr.initialize() },
+  // retryLoad(): attempt-0 is the call itself (immediate, no delay), so after
+  // the first incomplete verdict retryAttempt is 1. The baseline used `> 0`.
+  { name: "retryLoad_incompleteVerdictSchedulesAutomaticRetry",   pubkey: "36".repeat(32),              trigger: (mgr) => mgr.retryLoad(),   expectedAttempt: 1 },
+  // initialize(): attempt-0 is also consumed by the call, same invariant.
+  // The baseline required the exact value 1; that tighter assertion is restored here.
+  { name: "initialize_incompleteVerdict_schedulesAutomaticRetry", pubkey: "36b".repeat(21).slice(0,64), trigger: (mgr) => mgr.initialize(),  expectedAttempt: 1 },
 ];
 for (const row of incompleteVerdictCases) {
   test(row.name, async () => {
@@ -2341,9 +2357,10 @@ for (const row of incompleteVerdictCases) {
       assert.equal(mgr.retryAttempt, 0, "precondition: retryAttempt is 0");
       await row.trigger(mgr);
       assert.equal(fetchCallCount, 1, "first fetch must have been called");
-      assert.ok(
-        mgr.retryAttempt > 0,
-        "retryAttempt must be > 0 after first incomplete",
+      assert.equal(
+        mgr.retryAttempt,
+        row.expectedAttempt,
+        `retryAttempt must be ${row.expectedAttempt} after first incomplete`,
       );
       assert.ok(
         mgr.retryBackoffTimer !== null,

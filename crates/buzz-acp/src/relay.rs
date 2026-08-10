@@ -623,11 +623,6 @@ impl HarnessRelay {
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .map_err(|e| RelayError::Http(format!("failed to build HTTP client: {e}")))?;
-        // NIP-11 is the authority binding between this configured endpoint and
-        // its relay signing key. Missing, malformed, or unreachable info fails
-        // closed for workflow delegation without preventing ordinary ACP use.
-        let relay_self = fetch_relay_self(&http, relay_url).await;
-
         // Perform the initial connection and auth handshake, retrying
         // transient failures (dropped handshake, timeout) with bounded
         // jittered backoff. A terminal error (bad URL, bad auth tag,
@@ -635,6 +630,18 @@ impl HarnessRelay {
         // `is_terminal_connect_error`.
         let (ws, handshake_buffer) =
             retry_initial_connect(|| do_connect(relay_url, keys, auth_tag.as_ref())).await?;
+
+        // NIP-11 is the authority binding between this configured endpoint and
+        // its relay signing key. Fetch it after the successful connection so a
+        // transient startup outage cannot permanently disable workflow handling.
+        // Missing, malformed, or unreachable info still fails closed for workflow
+        // delegation without preventing ordinary ACP use.
+        let relay_self = fetch_relay_self(&http, relay_url).await;
+        if relay_self.is_none() {
+            warn!(
+                "could not fetch relay NIP-11 identity after connecting; workflow delegation is disabled until restart"
+            );
+        }
 
         let (event_tx, event_rx) = mpsc::channel::<Option<BuzzEvent>>(event_channel_capacity());
         let (observer_control_tx, observer_control_rx) =
@@ -3505,24 +3512,55 @@ struct RelayInformationDocument {
 }
 
 async fn fetch_relay_self(http: &reqwest::Client, relay_url: &str) -> Option<String> {
-    let response = http
-        .get(relay_ws_to_http(relay_url))
-        .header("Accept", "application/nostr+json")
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
+    // Keep NIP-11 retrieval bounded. The initial connection already proved the
+    // endpoint reachable; these retries cover a short-lived HTTP-side outage.
+    for (attempt, delay) in std::iter::once(None)
+        .chain(
+            STARTUP_CONNECT_BACKOFFS
+                .iter()
+                .take(2)
+                .map(|delay| Some(*delay)),
+        )
+        .enumerate()
+    {
+        if let Some(delay) = delay {
+            tokio::time::sleep(jittered_duration(delay)).await;
+        }
+
+        let Some(response) = http
+            .get(relay_ws_to_http(relay_url))
+            .header("Accept", "application/nostr+json")
+            .send()
+            .await
+            .ok()
+        else {
+            warn!("NIP-11 relay identity fetch attempt {attempt} failed");
+            continue;
+        };
+        if !response.status().is_success() {
+            warn!(
+                "NIP-11 relay identity fetch attempt {attempt} returned HTTP {}",
+                response.status()
+            );
+            continue;
+        }
+        let Some(value) = response
+            .json::<RelayInformationDocument>()
+            .await
+            .ok()
+            .and_then(|document| document.relay_self)
+            .map(|value| value.to_ascii_lowercase())
+        else {
+            warn!("NIP-11 relay identity fetch attempt {attempt} returned invalid metadata");
+            continue;
+        };
+        if let Ok(key) = nostr::PublicKey::from_hex(&value) {
+            return Some(key.to_hex());
+        }
+        warn!("NIP-11 relay identity fetch attempt {attempt} returned an invalid public key");
     }
-    let value = response
-        .json::<RelayInformationDocument>()
-        .await
-        .ok()?
-        .relay_self?
-        .to_ascii_lowercase();
-    nostr::PublicKey::from_hex(&value)
-        .ok()
-        .map(|key| key.to_hex())
+
+    None
 }
 
 pub(crate) fn relay_ws_to_http(url: &str) -> String {

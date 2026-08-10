@@ -68,10 +68,7 @@ pub async fn get_channel_workflows(
 
 const WORKFLOW_OVERVIEW_PAGE_SIZE: usize = 500;
 
-fn advance_workflow_cursor(filter: &mut Value, page: &[nostr::Event]) {
-    let last = page
-        .last()
-        .expect("a full workflow overview page always has a last event");
+fn advance_workflow_cursor(filter: &mut Value, last: &nostr::Event) {
     filter["until"] = serde_json::json!(last.created_at.as_secs());
     filter["before_id"] = serde_json::json!(last.id.to_hex());
 }
@@ -95,7 +92,12 @@ pub async fn get_member_channel_workflows(
         let page = query_relay(&state, &[filter.clone()]).await?;
         let done = page.len() < WORKFLOW_OVERVIEW_PAGE_SIZE;
         if !done {
-            advance_workflow_cursor(&mut filter, &page);
+            // A full page is necessarily non-empty, but keep the boundary
+            // explicit rather than assuming it in the cursor helper.
+            let Some(last) = page.last() else {
+                return Ok(workflows);
+            };
+            advance_workflow_cursor(&mut filter, last);
         }
         workflows.extend(page.iter().map(workflow_from_event));
         if done {

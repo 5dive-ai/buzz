@@ -118,9 +118,15 @@ class ThreadDetailPage extends HookConsumerWidget {
 
     bool threadTailIsVisible() {
       final lastIndex = _threadTailIndex(replies.length);
+      final trailingBoundary = _threadTailTrailingBoundary(
+        hasComposerDock: isMember && !isArchived,
+        viewportHeight: listViewport.height.value,
+        dockHeight: composerDockHeight.value,
+      );
       return itemPositionsListener.itemPositions.value.any(
         (position) =>
-            position.index == lastIndex && position.itemTrailingEdge <= 1.001,
+            position.index == lastIndex &&
+            position.itemTrailingEdge <= trailingBoundary,
       );
     }
 
@@ -380,9 +386,19 @@ class ThreadDetailPage extends HookConsumerWidget {
                     },
                     onUserScrollEnd: () {
                       tailIntent.endDrag();
-                      if (!threadTailIsVisible()) return;
-                      userOptedOutOfTailFollow.value = false;
-                      followsThreadTail.value = true;
+                      tailIntent.schedule(
+                        allowed: userOptedOutOfTailFollow.value,
+                        revalidate: () =>
+                            context.mounted &&
+                            itemScrollController.isAttached &&
+                            !tailIntent.isDragging &&
+                            userOptedOutOfTailFollow.value,
+                        action: () => _resumeThreadTailFollow(
+                          isVisible: threadTailIsVisible,
+                          userOptedOut: userOptedOutOfTailFollow,
+                          followsTail: followsThreadTail,
+                        ),
+                      );
                     },
                     child: ScrollablePositionedList.builder(
                       key: const ValueKey('thread-message-list'),
@@ -561,42 +577,6 @@ class ThreadDetailPage extends HookConsumerWidget {
       ),
     );
   }
-}
-
-bool _isDeletedBy(Iterable<NostrEvent> events, String messageId) {
-  for (final event in events) {
-    if (event.kind != EventKind.deletion &&
-        event.kind != EventKind.nip29DeleteEvent) {
-      continue;
-    }
-    if (event.tags.any(
-      (tag) => tag.length >= 2 && tag[0] == 'e' && tag[1] == messageId,
-    )) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/// Build a lightweight summary for a nested thread (reply that has its own
-/// replies). Same logic as the top-level [ThreadSummary] but kept local to
-/// avoid coupling.
-ThreadSummary _buildNestedSummary(
-  String messageId,
-  List<TimelineMessage> children,
-) {
-  final seen = <String>{};
-  final participants = <String>[];
-  for (var i = children.length - 1; i >= 0 && participants.length < 3; i--) {
-    final pk = children[i].pubkey.toLowerCase();
-    if (seen.add(pk)) participants.add(pk);
-  }
-  return ThreadSummary(
-    threadHeadId: messageId,
-    replyCount: children.length,
-    participantPubkeys: participants.reversed.toList(),
-    lastReplyAt: children.last.createdAt,
-  );
 }
 
 /// Tappable summary row shown below a reply that itself has replies.

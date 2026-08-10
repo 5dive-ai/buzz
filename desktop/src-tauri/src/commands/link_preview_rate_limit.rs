@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use reqwest::header::RETRY_AFTER;
@@ -17,9 +17,25 @@ pub(super) fn retry_after_duration(response: &reqwest::Response) -> Option<Durat
         .headers()
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
+        .and_then(parse_retry_after)
         .map(|duration| duration.min(MAX_IMAGE_RETRY_AFTER))
+}
+
+/// Parse a `Retry-After` header value. RFC 9110 §10.2.3 permits either a
+/// non-negative delta-seconds count or an HTTP-date; a server may send either,
+/// so we accept both. An HTTP-date is converted to a delay from now, floored at
+/// zero (a date already in the past means "retry immediately").
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    Some(
+        retry_at
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 /// Marker prefix the caller matches to distinguish a rate limit (429) from an
@@ -27,6 +43,20 @@ pub(super) fn retry_after_duration(response: &reqwest::Response) -> Option<Durat
 /// seconds are appended so the caller can wait exactly that long instead of
 /// blindly retrying or falling back to the default transient window.
 pub(super) const RATE_LIMITED_ERROR_PREFIX: &str = "link preview rate limited";
+
+/// Marker prefix for a permanent validation/policy rejection (non-HTTPS or
+/// credentialed URL, non-default port, a host that resolves to a private or
+/// reserved address, or an unparseable URL/redirect target). These are NOT
+/// transient: an inline retry or periodic self-heal poll would only repeat the
+/// same rejected work, so the caller must cache them as a hard miss. Kept in
+/// sync with PERMANENTLY_REJECTED_ERROR_PREFIX in useResolvedLinkPreviews.ts.
+pub(super) const PERMANENTLY_REJECTED_ERROR_PREFIX: &str = "link preview rejected";
+
+/// Tag a permanent rejection with [`PERMANENTLY_REJECTED_ERROR_PREFIX`] so the
+/// caller can distinguish it from a transient failure and skip all retries.
+pub(super) fn permanently_rejected_error(reason: &str) -> String {
+    format!("{PERMANENTLY_REJECTED_ERROR_PREFIX}: {reason}")
+}
 
 pub(super) fn rate_limited_error(retry_after: Option<Duration>) -> String {
     match retry_after {
@@ -100,8 +130,59 @@ pub(super) fn set_image_host_cooldown(url: &Url, retry_after: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{rate_limited_error, RATE_LIMITED_ERROR_PREFIX};
-    use std::time::Duration;
+    use super::{
+        parse_retry_after, permanently_rejected_error, rate_limited_error,
+        PERMANENTLY_REJECTED_ERROR_PREFIX, RATE_LIMITED_ERROR_PREFIX,
+    };
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn parse_retry_after_reads_delta_seconds() {
+        // The common form: a non-negative integer count of seconds.
+        assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_retry_after("  30 "), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parse_retry_after_reads_http_date() {
+        // RFC 9110 also permits an HTTP-date; a future date parses to the delay
+        // from now. Allow slack for the second that elapses during the test.
+        let value = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(300));
+        let parsed = parse_retry_after(&value).expect("http-date should parse");
+        assert!(
+            parsed <= Duration::from_secs(300) && parsed >= Duration::from_secs(295),
+            "expected ~300s, got {parsed:?}",
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_floors_past_http_date_at_zero() {
+        // A date already in the past means "retry immediately" — never a
+        // negative or wildly large duration from an underflow.
+        let value = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(300));
+        assert_eq!(parse_retry_after(&value), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_garbage() {
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after(""), None);
+        // A negative value is neither valid delta-seconds nor an HTTP-date.
+        assert_eq!(parse_retry_after("-5"), None);
+    }
+
+    #[test]
+    fn permanently_rejected_error_carries_marker() {
+        // A permanent validation/policy rejection surfaces a distinct marker so
+        // the caller skips every retry and caches it as a hard miss.
+        assert_eq!(
+            permanently_rejected_error("host resolved to a private or reserved address"),
+            format!(
+                "{PERMANENTLY_REJECTED_ERROR_PREFIX}: host resolved to a private or reserved address"
+            ),
+        );
+    }
 
     #[test]
     fn rate_limited_error_carries_retry_after_seconds() {

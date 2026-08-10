@@ -285,6 +285,110 @@ test("a genuine no-metadata miss stays cached for the full miss TTL", async () =
   assert.equal(calls, 2);
 });
 
+test("a Retry-After: 0 floors the transient window instead of looping", async () => {
+  // Regression: a 429 with `Retry-After: 0` used to yield expiresAt === now, so
+  // the expiry timer would delete and refetch immediately, spinning a tight
+  // loop while the 429 persisted. The transient window must be floored at a
+  // positive minimum so the refetch is deferred, not fired on the same tick.
+  let now = 1_000;
+  let calls = 0;
+  const loader = __linkPreviewMetadataTest.createMetadataLoader({
+    delay: () => Promise.resolve(),
+    fetcher: async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error("link preview rate limited: retry-after 0");
+      }
+      return metadata();
+    },
+    now: () => now,
+  });
+
+  assert.equal((await loader.load(preview.href)).metadata, null);
+  assert.equal(calls, 1);
+
+  // On the same tick the entry is still cached — no immediate refetch loop.
+  assert.equal((await loader.load(preview.href)).metadata, null);
+  assert.equal(calls, 1);
+
+  // Past the positive floor the entry expires and the refetch succeeds.
+  now += 1_000;
+  assert.deepEqual((await loader.load(preview.href)).metadata, metadata());
+  assert.equal(calls, 2);
+});
+
+test("a 429 on the inline retry keeps its own Retry-After", async () => {
+  // Regression: a transient blip earns one inline retry; if that retry itself
+  // comes back 429 with a Retry-After, the loader must re-classify it and honor
+  // that cooldown — not collapse the second rejection to the default 30s window.
+  let now = 1_000;
+  let calls = 0;
+  const loader = __linkPreviewMetadataTest.createMetadataLoader({
+    delay: () => Promise.resolve(),
+    fetcher: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("temporary failure");
+      if (calls === 2) {
+        throw new Error("link preview rate limited: retry-after 600");
+      }
+      return metadata();
+    },
+    now: () => now,
+  });
+
+  // Initial blip + one inline retry that comes back 429: two fetches, cached.
+  assert.equal((await loader.load(preview.href)).metadata, null);
+  assert.equal(calls, 2);
+
+  // The default transient window has elapsed, but the retry's Retry-After was
+  // 600s — the entry is still cached, no refetch yet.
+  now += 30_000;
+  assert.equal((await loader.load(preview.href)).metadata, null);
+  assert.equal(calls, 2);
+
+  // Past the honored 600s cooldown the entry expires and the refetch succeeds.
+  now += 570_000;
+  assert.deepEqual((await loader.load(preview.href)).metadata, metadata());
+  assert.equal(calls, 3);
+});
+
+test("a permanent rejection skips the inline retry and holds the full miss TTL", async () => {
+  // Regression: a permanent validation/policy rejection (SSRF private-host,
+  // non-HTTPS/credentialed URL, bad port, unparseable URL/redirect) used to be
+  // treated as transient — inline-retried and then self-heal polled every 30s,
+  // turning an attacker-controlled URL into recurring DNS/IPC work. It must get
+  // NO inline retry and cache as a hard miss for the full miss TTL.
+  let now = 1_000;
+  let calls = 0;
+  const loader = __linkPreviewMetadataTest.createMetadataLoader({
+    delay: () => Promise.resolve(),
+    fetcher: async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error(
+          "link preview rejected: link preview host resolved to a private or reserved address",
+        );
+      }
+      return metadata();
+    },
+    now: () => now,
+  });
+
+  assert.equal((await loader.load(preview.href)).metadata, null);
+  // No inline retry on a permanent rejection: exactly one fetch.
+  assert.equal(calls, 1);
+
+  // Well past the transient window it is still cached — no 30s self-heal poll.
+  now += 60_000;
+  assert.equal((await loader.load(preview.href)).metadata, null);
+  assert.equal(calls, 1);
+
+  // Only after the full miss TTL does it expire and refetch.
+  now += 5 * 60_000;
+  assert.deepEqual((await loader.load(preview.href)).metadata, metadata());
+  assert.equal(calls, 2);
+});
+
 test("metadata loader coalesces fragment variants and bounds concurrency", async () => {
   let active = 0;
   let maxActive = 0;

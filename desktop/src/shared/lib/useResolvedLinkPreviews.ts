@@ -33,9 +33,6 @@ export type LinkPreviewMetadata = {
 type MetadataCacheEntry = {
   expiresAt: number | null;
   metadata: LinkPreviewMetadata | null;
-  /** A transient fetch failure (timeout/429/5xx/network) rather than a genuine
-   * "no metadata" result; retried soon instead of cached for the full miss TTL. */
-  transient?: boolean;
 };
 
 type MetadataLoadResult = MetadataCacheEntry & {
@@ -44,6 +41,10 @@ type MetadataLoadResult = MetadataCacheEntry & {
 
 const DEFAULT_TRANSIENT_RETRY_MS = 30_000;
 const NULL_METADATA_RETRY_MS = 5 * 60_000;
+/** Floor for any transient retry delay so a `Retry-After: 0` (or a stale
+ * HTTP-date already in the past) cannot collapse `expiresAt` onto `now` and
+ * spin the expiry timer into a tight refetch loop while the failure persists. */
+const MIN_TRANSIENT_RETRY_MS = 1_000;
 const MAX_CONCURRENT_METADATA_FETCHES = 2;
 /** Backoff before the single inline retry that a transient blip earns before
  * it falls into the longer {@link DEFAULT_TRANSIENT_RETRY_MS} self-heal wait. */
@@ -52,26 +53,37 @@ const INLINE_RETRY_BACKOFF_MS = 750;
  * fast inline retry (we would just be throttled again); it waits instead. Kept
  * in sync with RATE_LIMITED_ERROR_PREFIX in link_preview.rs. */
 const RATE_LIMITED_ERROR_PREFIX = "link preview rate limited";
+/** Prefix the native fetcher uses to mark a permanent validation/policy
+ * rejection (non-HTTPS/credentialed URL, non-default port, private/reserved
+ * host, unparseable URL or redirect). These must NOT retry or self-heal poll —
+ * the work would only be rejected again — so they cache as a hard miss. Kept in
+ * sync with PERMANENTLY_REJECTED_ERROR_PREFIX in link_preview.rs. */
+const PERMANENTLY_REJECTED_ERROR_PREFIX = "link preview rejected";
 
-type TransientFailure = {
-  /** A 429 rate limit: skip the inline retry and wait it out. */
-  rateLimited: boolean;
-  /** Server-supplied Retry-After, in ms, when present on a rate limit. */
-  retryAfterMs?: number;
-};
+type FetchFailure =
+  /** A permanent validation/policy rejection: cache as a hard miss, no retry. */
+  | { kind: "rejected" }
+  /** A 429 rate limit: skip the inline retry and wait out its Retry-After. */
+  | { kind: "rate_limited"; retryAfterMs?: number }
+  /** An ordinary transient blip (timeout/5xx/network): earns one inline retry. */
+  | { kind: "transient" };
 
-/** Classify a rejected native fetch. Any rejection is transient (a genuine
- * "no metadata" result resolves, it does not reject); we only distinguish a
- * rate limit — which must not be retried immediately — from an ordinary blip. */
-function classifyTransientFailure(reason: unknown): TransientFailure {
+/** Classify a rejected native fetch. A genuine "no metadata" result resolves
+ * (it does not reject), so every rejection is a failure of one of three kinds:
+ * a permanent validation/policy rejection (never retry), a 429 rate limit (wait
+ * out its Retry-After, no inline retry), or an ordinary transient blip. */
+function classifyFetchFailure(reason: unknown): FetchFailure {
   const message = reason instanceof Error ? reason.message : String(reason);
+  if (message.startsWith(PERMANENTLY_REJECTED_ERROR_PREFIX)) {
+    return { kind: "rejected" };
+  }
   if (!message.startsWith(RATE_LIMITED_ERROR_PREFIX)) {
-    return { rateLimited: false };
+    return { kind: "transient" };
   }
   const match = /retry-after (\d+)/.exec(message);
   const retryAfterSeconds = match ? Number.parseInt(match[1], 10) : NaN;
   return {
-    rateLimited: true,
+    kind: "rate_limited",
     retryAfterMs: Number.isFinite(retryAfterSeconds)
       ? retryAfterSeconds * 1_000
       : undefined,
@@ -112,23 +124,41 @@ function metadataCacheKey(href: string): string {
   }
 }
 
+/** Outcome of a coalesced fetch attempt sequence: a successful (or genuinely
+ * empty) result, an ordinary transient failure that self-heals soon, or a
+ * permanent rejection cached as a hard miss. */
+type AttemptOutcome = "ok" | "transient" | "rejected";
+
+type AttemptResult = {
+  metadata: LinkPreviewMetadata | null;
+  outcome: AttemptOutcome;
+  /** Delay before the self-heal retry when {@link outcome} is "transient". */
+  transientRetryMs: number;
+};
+
 function metadataExpiry(
   metadata: LinkPreviewMetadata | null,
   now: number,
-  transient = false,
+  outcome: AttemptOutcome = "ok",
   transientRetryMs = DEFAULT_TRANSIENT_RETRY_MS,
 ): number | null {
   // A transient failure (timeout/429/5xx/network) must not stick for the full
   // miss TTL: one unlucky fetch would otherwise blank the card for 5 minutes
   // even though the link is perfectly valid. Retry it soon instead — after the
-  // server's Retry-After when it gave us one, otherwise the default window.
-  if (transient) return now + transientRetryMs;
-  if (metadata === null) return now + NULL_METADATA_RETRY_MS;
+  // server's Retry-After when it gave us one, otherwise the default window —
+  // but never sooner than MIN_TRANSIENT_RETRY_MS so a `Retry-After: 0` cannot
+  // spin the expiry timer into a tight refetch loop.
+  if (outcome === "transient") {
+    return now + Math.max(MIN_TRANSIENT_RETRY_MS, transientRetryMs);
+  }
+  // A permanent rejection (SSRF/policy) is a hard miss: retrying only repeats
+  // the same rejected work, so hold it for the full miss TTL like a null result.
+  if (outcome === "rejected" || metadata === null) return now + NULL_METADATA_RETRY_MS;
   if (metadata.imageFetchState !== "transient_failure") return null;
   const retryAfterMs =
     typeof metadata.imageRetryAfterMs === "number" &&
     Number.isFinite(metadata.imageRetryAfterMs)
-      ? Math.max(1_000, metadata.imageRetryAfterMs)
+      ? Math.max(MIN_TRANSIENT_RETRY_MS, metadata.imageRetryAfterMs)
       : DEFAULT_TRANSIENT_RETRY_MS;
   return now + retryAfterMs;
 }
@@ -205,56 +235,53 @@ function createMetadataLoader({
     // One coalesced attempt sequence. A transient blip earns a single inline
     // retry after a short backoff before we give up and fall into the longer
     // self-heal wait; a rate limit (429) skips that retry — an immediate retry
-    // would just be throttled again — and waits out its Retry-After instead.
-    const attempt = (): Promise<{
-      metadata: LinkPreviewMetadata | null;
-      transient: boolean;
-      transientRetryMs: number;
-    }> =>
-      fetcher(href).then(
-        (metadata) => ({
-          metadata,
-          transient: false,
-          transientRetryMs: DEFAULT_TRANSIENT_RETRY_MS,
-        }),
-        (reason) => {
-          const failure = classifyTransientFailure(reason);
-          if (failure.rateLimited) {
-            return {
-              metadata: null,
-              transient: true,
-              transientRetryMs:
-                failure.retryAfterMs ?? DEFAULT_TRANSIENT_RETRY_MS,
-            };
-          }
-          return delay(INLINE_RETRY_BACKOFF_MS)
-            .then(() => fetcher(href))
-            .then(
-              (metadata) => ({
-                metadata,
-                transient: false,
-                transientRetryMs: DEFAULT_TRANSIENT_RETRY_MS,
-              }),
-              () => ({
-                metadata: null,
-                transient: true,
-                transientRetryMs: DEFAULT_TRANSIENT_RETRY_MS,
-              }),
-            );
-        },
-      );
+    // would just be throttled again — and waits out its Retry-After instead; a
+    // permanent rejection (SSRF/policy) skips every retry and caches as a hard
+    // miss. Each network fetch is scheduled separately and the backoff sleeps
+    // OUTSIDE the scheduler, so a failing URL never holds a concurrency slot
+    // through its wait to starve healthy previews.
+    const succeeded = (metadata: LinkPreviewMetadata | null): AttemptResult => ({
+      metadata,
+      outcome: "ok",
+      transientRetryMs: DEFAULT_TRANSIENT_RETRY_MS,
+    });
+    const failed = (failure: FetchFailure): AttemptResult => ({
+      metadata: null,
+      outcome: failure.kind === "rejected" ? "rejected" : "transient",
+      transientRetryMs:
+        failure.kind === "rate_limited"
+          ? (failure.retryAfterMs ?? DEFAULT_TRANSIENT_RETRY_MS)
+          : DEFAULT_TRANSIENT_RETRY_MS,
+    });
+    const scheduledFetch = (): Promise<LinkPreviewMetadata | null> =>
+      schedule(() => fetcher(href));
 
-    const promise = schedule(attempt).then(
-      ({ metadata, transient, transientRetryMs }) => {
+    const attempt = (): Promise<AttemptResult> =>
+      scheduledFetch().then(succeeded, (reason) => {
+        const failure = classifyFetchFailure(reason);
+        // Only an ordinary transient blip earns the inline retry; a rejection
+        // is permanent and a rate limit must wait, so both resolve immediately.
+        if (failure.kind !== "transient") return failed(failure);
+        return delay(INLINE_RETRY_BACKOFF_MS).then(() =>
+          // Re-classify the retry's own failure so a 429 (or a rejection) on the
+          // second attempt keeps its Retry-After / hard-miss semantics instead
+          // of collapsing to the generic transient window.
+          scheduledFetch().then(succeeded, (retryReason) =>
+            failed(classifyFetchFailure(retryReason)),
+          ),
+        );
+      });
+
+    const promise = attempt().then(
+      ({ metadata, outcome, transientRetryMs }) => {
         const entry = {
           expiresAt: metadataExpiry(
             metadata,
             now(),
-            transient,
+            outcome,
             transientRetryMs,
           ),
           metadata,
-          transient,
         };
         if (requestGeneration === generation) {
           cache.set(key, entry);

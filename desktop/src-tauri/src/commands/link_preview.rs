@@ -15,8 +15,8 @@ use url::Url;
 mod rate_limit;
 
 use rate_limit::{
-    image_host_cooldown_remaining, is_transient_status, rate_limited_response_error,
-    retry_after_duration, set_image_host_cooldown,
+    image_host_cooldown_remaining, is_transient_status, permanently_rejected_error,
+    rate_limited_response_error, retry_after_duration, set_image_host_cooldown,
 };
 
 const MAX_PREVIEW_FETCH_BYTES: usize = 256 * 1024;
@@ -67,7 +67,8 @@ pub async fn fetch_link_preview_metadata(
 async fn fetch_link_preview_metadata_inner(
     href: String,
 ) -> Result<Option<LinkPreviewMetadata>, String> {
-    let mut url = Url::parse(href.trim()).map_err(|error| format!("invalid URL: {error}"))?;
+    let mut url = Url::parse(href.trim())
+        .map_err(|error| permanently_rejected_error(&format!("invalid URL: {error}")))?;
     validate_public_https_url(&url).await?;
 
     for redirect_count in 0..=MAX_REDIRECTS {
@@ -80,12 +81,12 @@ async fn fetch_link_preview_metadata_inner(
             let Some(location) = response.headers().get(LOCATION) else {
                 return Ok(None);
             };
-            let location = location
-                .to_str()
-                .map_err(|_| "link preview redirect has an invalid location".to_string())?;
-            url = url
-                .join(location)
-                .map_err(|error| format!("invalid link preview redirect: {error}"))?;
+            let location = location.to_str().map_err(|_| {
+                permanently_rejected_error("link preview redirect has an invalid location")
+            })?;
+            url = url.join(location).map_err(|error| {
+                permanently_rejected_error(&format!("invalid link preview redirect: {error}"))
+            })?;
             validate_public_https_url(&url).await?;
             continue;
         }
@@ -175,15 +176,19 @@ fn apply_image_result(
 
 async fn validate_public_https_url(url: &Url) -> Result<(), String> {
     if url.scheme() != "https" || url.username() != "" || url.password().is_some() {
-        return Err("link previews require an HTTPS URL without credentials".to_string());
+        return Err(permanently_rejected_error(
+            "link previews require an HTTPS URL without credentials",
+        ));
     }
     if url.port().is_some_and(|port| port != 443) {
-        return Err("link previews require the default HTTPS port".to_string());
+        return Err(permanently_rejected_error(
+            "link previews require the default HTTPS port",
+        ));
     }
 
     let host = url
         .host_str()
-        .ok_or_else(|| "link preview URL has no host".to_string())?;
+        .ok_or_else(|| permanently_rejected_error("link preview URL has no host"))?;
     resolve_public_addresses(host).await.map(|_| ())
 }
 
@@ -199,7 +204,9 @@ async fn resolve_public_addresses(host: &str) -> Result<Vec<IpAddr>, String> {
         return Err("link preview DNS resolution returned no addresses".to_string());
     }
     if addresses.iter().any(buzz_core_pkg::network::is_private_ip) {
-        return Err("link preview host resolved to a private or reserved address".to_string());
+        return Err(permanently_rejected_error(
+            "link preview host resolved to a private or reserved address",
+        ));
     }
 
     Ok(addresses)

@@ -5118,9 +5118,12 @@ mod tests {
         assert!(q.mark_native_steer_pending(ch, &event_id));
         q.drain_channel(ch);
         let removed_channels = HashSet::from([ch]);
+        let membership_generations = HashMap::new();
         assert!(crate::native_steer_preparation_is_stale(
             &removed_channels,
-            ch
+            &membership_generations,
+            ch,
+            0,
         ));
 
         // A late preparation is discarded by the main loop. Its reservation
@@ -5128,6 +5131,27 @@ mod tests {
         q.release_native_steer(ch, &event_id);
         q.mark_complete(ch);
         assert!(q.flush_next().is_none());
+    }
+
+    #[test]
+    fn removed_then_readded_channel_discards_late_async_edit_preparation() {
+        let ch = Uuid::new_v4();
+        // Preparation was reserved during the original membership period.
+        let prepared_generation = 0;
+        let mut membership_generations = HashMap::from([(ch, prepared_generation)]);
+        let mut removed_channels = HashSet::from([ch]);
+
+        // Re-add makes the channel usable again but must not validate work
+        // which was prepared before the intervening removal.
+        removed_channels.remove(&ch);
+        *membership_generations.get_mut(&ch).unwrap() += 1;
+
+        assert!(crate::native_steer_preparation_is_stale(
+            &removed_channels,
+            &membership_generations,
+            ch,
+            prepared_generation,
+        ));
     }
 
     #[test]

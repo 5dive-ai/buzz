@@ -1729,6 +1729,21 @@ pub(crate) fn native_steer_framing() -> (&'static str, &'static str) {
     (framing.new_header_single, framing.closing_note)
 }
 
+/// Format the delta delivered through native steering.
+///
+/// Routing and context use the same formatter as ordinary dispatch, while the
+/// native framing remains a concise "weave this into the live turn" envelope.
+pub(crate) fn format_native_steer_prompt(
+    batch: &FlushBatch,
+    args: &FormatPromptArgs<'_>,
+) -> Vec<String> {
+    let (header, closing) = native_steer_framing();
+    let mut sections = format_prompt(batch, args);
+    sections.insert(0, header.to_string());
+    sections.push(closing.to_string());
+    sections
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5052,6 +5067,46 @@ mod tests {
         let edit = edit_event(&original_id);
         let edit_id = edit.id.to_hex();
         let prompt = format_prompt(&one_event_batch(edit), &FormatPromptArgs::default()).join("\n");
+        assert!(prompt.contains(&format!("--reply-to {original_id}")));
+        assert!(!prompt.contains(&format!("--reply-to {edit_id}")));
+    }
+
+    #[test]
+    fn native_steer_edit_uses_original_thread_anchor() {
+        let original_id = "66".repeat(32);
+        let root_id = "77".repeat(32);
+        let batch = one_event_batch(edit_event(&original_id));
+        let edit_id = batch.events[0].event.id.to_hex();
+        let prompt = format_native_steer_prompt(
+            &batch,
+            &FormatPromptArgs {
+                resolved_edit: Some(&ResolvedEdit {
+                    target_event_id: original_id,
+                    target_thread_tags: ThreadTags {
+                        root_event_id: Some(root_id.clone()),
+                        parent_event_id: Some("88".repeat(32)),
+                        mentioned_pubkeys: vec![],
+                    },
+                }),
+                ..Default::default()
+            },
+        )
+        .join("\n");
+
+        assert!(prompt.contains(&format!("--reply-to {root_id}")));
+        assert!(!prompt.contains(&format!("--reply-to {edit_id}")));
+        let (header, closing) = native_steer_framing();
+        assert!(prompt.contains(header));
+        assert!(prompt.contains(closing));
+    }
+
+    #[test]
+    fn native_steer_edit_fetch_failure_anchors_target_never_auxiliary_event() {
+        let original_id = "99".repeat(32);
+        let batch = one_event_batch(edit_event(&original_id));
+        let edit_id = batch.events[0].event.id.to_hex();
+        let prompt = format_native_steer_prompt(&batch, &FormatPromptArgs::default()).join("\n");
+
         assert!(prompt.contains(&format!("--reply-to {original_id}")));
         assert!(!prompt.contains(&format!("--reply-to {edit_id}")));
     }

@@ -2888,7 +2888,7 @@ fn conversation_context_delta(
 
 /// Resolve a kind:40003 edit through its original event for reply routing.
 /// Failure deliberately falls back to the edit target id in `format_prompt`.
-async fn resolve_edit_routing(
+pub(crate) async fn resolve_edit_routing(
     event: &nostr::Event,
     rest: &RestClient,
 ) -> Option<crate::queue::ResolvedEdit> {
@@ -2925,6 +2925,73 @@ async fn resolve_edit_routing(
         target_event_id,
         target_thread_tags: crate::queue::parse_thread_tags(&original),
     })
+}
+
+/// Resolve an edit-aware native-steer delta through the same routing and
+/// context boundary as ordinary batch dispatch. This keeps successful native
+/// steering from exposing the invisible kind:40003 event as a reply anchor.
+pub(crate) async fn format_native_steer_prompt(
+    channel_id: Uuid,
+    event: nostr::Event,
+    prompt_tag: String,
+    ctx: &PromptContext,
+) -> Vec<String> {
+    let batch = FlushBatch {
+        channel_id,
+        events: vec![crate::queue::BatchEvent {
+            event,
+            prompt_tag,
+            received_at: std::time::Instant::now(),
+        }],
+        cancelled_events: Vec::new(),
+        cancel_reason: None,
+    };
+    if crate::queue::edit_target_id(&batch.events[0].event).is_none() {
+        let (header, closing) = crate::queue::native_steer_framing();
+        let event = &batch.events[0];
+        return vec![format!(
+            "{header}\n\n[Buzz event: {}]\n{}\n\n{closing}",
+            event.prompt_tag,
+            crate::queue::format_event_block(channel_id, None, event, None)
+        )];
+    }
+    let channel_info = ctx.channel_info.resolve(channel_id).await;
+    let resolved_edit = resolve_edit_routing(&batch.events[0].event, &ctx.rest_client).await;
+    let conversation_context = if ctx.context_message_limit > 0 {
+        match resolved_edit
+            .as_ref()
+            .and_then(|edit| edit.target_thread_tags.root_event_id.as_deref())
+        {
+            Some(root_id) => {
+                fetch_thread_context(
+                    channel_id,
+                    root_id,
+                    ctx.context_message_limit,
+                    ctx.agent_keys.public_key(),
+                    &ctx.rest_client,
+                )
+                .await
+            }
+            None => fetch_conversation_context(&batch, &channel_info, ctx).await,
+        }
+    } else {
+        None
+    };
+    let profile_lookup =
+        fetch_prompt_profile_lookup(&batch, conversation_context.as_ref(), &ctx.rest_client).await;
+
+    crate::queue::format_native_steer_prompt(
+        &batch,
+        &crate::queue::FormatPromptArgs {
+            channel_info: channel_info.as_ref(),
+            conversation_context: conversation_context.as_ref(),
+            profile_lookup: profile_lookup.as_ref(),
+            resolved_edit: resolved_edit.as_ref(),
+            has_system_prompt_support: true,
+            standing_context_sent: true,
+            ..Default::default()
+        },
+    )
 }
 
 /// Fetch conversation context (thread or DM) for a batch before prompting.

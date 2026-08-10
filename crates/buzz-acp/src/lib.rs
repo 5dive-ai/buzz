@@ -2544,8 +2544,10 @@ async fn tokio_main() -> Result<()> {
                                             buzz_event.channel_id,
                                             event_for_steer,
                                             prompt_tag_for_steer,
+                                            &ctx,
                                             &steer_ack_tx,
-                                        );
+                                        )
+                                        .await;
                                     if !native_attempted {
                                         signal_in_flight_task(
                                             &mut pool,
@@ -3158,40 +3160,21 @@ fn signal_in_flight_task(
 ///
 /// The withheld event is NOT released here on `false` because no withhold
 /// was established: `mark_native_steer_pending` only runs on `Ok(())`.
-fn try_native_steer(
+async fn try_native_steer(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     channel_id: uuid::Uuid,
     event: nostr::Event,
     prompt_tag: String,
+    ctx: &PromptContext,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
-    // Build the steer body: framing strings come from
-    // `queue::native_steer_framing()` (Eva's drift-proof requirement —
-    // native and cancel+merge fallback share these so the agent gets the
-    // same orientation regardless of transport). The single event block
-    // is rendered by `queue::format_event_block`, the same function
-    // `queue::format_prompt` uses internally for `[Buzz event: …]`
-    // sections, so the rendering also cannot drift.
-    //
-    // Passing `None` for `channel_info` / `profile_lookup` is intentional:
-    // native steer is a *delta* into a live turn — the agent already saw
-    // channel context and the actor's profile in the original prompt,
-    // duplicating it here would defeat the point of non-cancelling
-    // steering (which is to inject only what's new).
-    let (header, closing) = queue::native_steer_framing();
     let event_id_hex = event.id.to_hex();
-    let be = queue::BatchEvent {
-        event,
-        prompt_tag: prompt_tag.clone(),
-        received_at: std::time::Instant::now(),
-    };
-    let event_block = queue::format_event_block(channel_id, None, &be, None);
-    let body = format!("{header}\n\n[Buzz event: {prompt_tag}]\n{event_block}\n\n{closing}");
+    let prompt_blocks = pool::format_native_steer_prompt(channel_id, event, prompt_tag, ctx).await;
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
     let request = pool::SteerRequest {
-        prompt_blocks: vec![body],
+        prompt_blocks,
         ack_tx,
     };
 

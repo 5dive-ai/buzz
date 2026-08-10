@@ -419,9 +419,23 @@ pub fn spawn_agent_child(
     // frozen record snapshot. Mirrors the model resolution below.
     let personas = super::load_personas(app).unwrap_or_default();
     let teams = super::load_teams(app).unwrap_or_default();
-    // Load global config once; used for runtime_metadata_env_vars (model/provider fallback)
-    // and for the env-var merge at spawn time.
-    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    // Fail-closed on unavailable definition secrets: mirrors `spawn_key_refusal`
+    // and the global-config gate below — refuse rather than launch empty.
+    if let Some(pid) = record.persona_id.as_deref() {
+        if personas
+            .iter()
+            .find(|p| p.id == pid)
+            .map(|d| d.secrets_unavailable)
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "agent {} cannot start: definition ({pid}) secrets unavailable from keyring",
+                record.pubkey
+            ));
+        }
+    }
+    // Load global config; fail closed if a ref cannot be resolved.
+    let global = crate::managed_agents::load_global_agent_config(app)?;
 
     // Resolve model/provider/prompt ONCE, here, at the shared spawn boundary —
     // the single source both the env writes below and the spawn-config snapshot
@@ -979,5 +993,7 @@ pub fn start_managed_agent_process(
 #[cfg(test)]
 mod test_fixtures;
 
+#[cfg(test)]
+mod definition_tier_tests;
 #[cfg(test)]
 mod tests;

@@ -75,6 +75,7 @@ fn team_export_round_trip_preserves_team_and_excludes_member_memory() {
             parallelism: None,
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
+            secrets_unavailable: false,
         },
         AgentDefinition {
             id: "bob".to_string(),
@@ -97,6 +98,7 @@ fn team_export_round_trip_preserves_team_and_excludes_member_memory() {
             parallelism: None,
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
+            secrets_unavailable: false,
         },
     ];
     let team = TeamRecord {
@@ -160,6 +162,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
         parallelism: None,
         created_at: "now".to_string(),
         updated_at: "now".to_string(),
+        secrets_unavailable: false,
     }];
     let team = TeamRecord {
         id: "t1".to_string(),

@@ -28,6 +28,7 @@ fn definition(
         parallelism: None,
         created_at: "".to_string(),
         updated_at: "".to_string(),
+        secrets_unavailable: false,
     }
 }
 

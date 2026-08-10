@@ -240,6 +240,99 @@ fn test_collect_live_refs_none_on_malformed_json() {
     assert!(result.is_none());
 }
 
+// ── F5b: collect_live_refs validates, not just collects ──────────────────
+//
+// Any ambiguity in the JSON makes the whole sweep a no-op (returns None) —
+// a partial deletion decision could orphan a live secret.
+
+#[test]
+fn test_collect_live_refs_none_on_empty_coordinate() {
+    // An empty ref string is a malformed coordinate — it cannot match any
+    // blob generation, so the sweep must not run.
+    let agents = r#"[{"pubkey":"abc","name":"t","env_vars_ref":"","created_at":"2026","updated_at":"2026"}]"#;
+    assert!(collect_live_refs(agents, "{}").is_none());
+}
+
+#[test]
+fn test_collect_live_refs_none_on_embedded_colon_coordinate() {
+    // A gen id is the last `:`-segment of a blob key. An embedded `:` in the
+    // ref would make it un-matchable, so the coordinate is malformed.
+    let agents = r#"[{"pubkey":"abc","name":"t","env_vars_ref":"gen:evil","created_at":"2026","updated_at":"2026"}]"#;
+    assert!(collect_live_refs(agents, "{}").is_none());
+}
+
+#[test]
+fn test_collect_live_refs_none_on_duplicate_gen_id() {
+    // Two coordinates referencing the same gen id — impossible for fresh
+    // UUIDs, so the JSON is corrupt and the sweep must not run.
+    let agents = r#"[
+        {"pubkey":"a","name":"t","env_vars_ref":"gen1","created_at":"2026","updated_at":"2026"},
+        {"pubkey":"b","name":"t","env_vars_ref":"gen1","created_at":"2026","updated_at":"2026"}
+    ]"#;
+    assert!(collect_live_refs(agents, "{}").is_none());
+}
+
+#[test]
+fn test_collect_live_refs_none_on_duplicate_across_field_and_global() {
+    // Same gen id in an agent env ref and the global env ref.
+    let agents = r#"[{"pubkey":"a","name":"t","env_vars_ref":"gen1","created_at":"2026","updated_at":"2026"}]"#;
+    let global = r#"{"env_vars_ref":"gen1"}"#;
+    assert!(collect_live_refs(agents, global).is_none());
+}
+
+#[test]
+fn test_collect_live_refs_none_on_inline_plus_ref_conflict_env() {
+    // A record carrying BOTH non-empty inline env_vars AND an env_vars_ref is
+    // ambiguous: inline is authoritative on load, so the ref is being ignored.
+    // The GC must not reason about which gen is live.
+    let agents = r#"[{"pubkey":"a","name":"t","env_vars":{"K":"v"},"env_vars_ref":"gen1","created_at":"2026","updated_at":"2026"}]"#;
+    assert!(collect_live_refs(agents, "{}").is_none());
+}
+
+#[test]
+fn test_collect_live_refs_none_on_inline_plus_ref_conflict_auth_tag() {
+    let agents = r#"[{"pubkey":"a","name":"t","auth_tag":"live-tag","auth_tag_ref":"gen1","created_at":"2026","updated_at":"2026"}]"#;
+    assert!(collect_live_refs(agents, "{}").is_none());
+}
+
+#[test]
+fn test_collect_live_refs_none_on_inline_plus_ref_conflict_provider_config() {
+    let agents = r#"[{"pubkey":"a","name":"t","backend":{"type":"provider","id":"anthropic","config":{"k":"v"}},"provider_config_ref":"gen1","created_at":"2026","updated_at":"2026"}]"#;
+    assert!(collect_live_refs(agents, "{}").is_none());
+}
+
+#[test]
+fn test_collect_live_refs_none_on_global_inline_plus_ref_conflict() {
+    let global = r#"{"env_vars":{"K":"v"},"env_vars_ref":"gen1"}"#;
+    assert!(collect_live_refs("[]", global).is_none());
+}
+
+#[test]
+fn test_collect_live_refs_allows_empty_inline_with_ref() {
+    // Empty inline (env_vars: {}) alongside a ref is the HEALTHY stripped
+    // state — not a conflict. The ref must be collected.
+    let agents = r#"[{"pubkey":"a","name":"t","env_vars":{},"env_vars_ref":"gen1","created_at":"2026","updated_at":"2026"}]"#;
+    let refs = collect_live_refs(agents, "{}").expect("empty inline + ref is healthy");
+    assert!(refs.contains("gen1"));
+}
+
+#[test]
+fn test_collect_live_refs_allows_null_provider_config_with_ref() {
+    // Stripped provider config is JSON null alongside a ref — healthy state.
+    let agents = r#"[{"pubkey":"a","name":"t","backend":{"type":"provider","id":"anthropic","config":null},"provider_config_ref":"gen1","created_at":"2026","updated_at":"2026"}]"#;
+    let refs = collect_live_refs(agents, "{}").expect("null config + ref is healthy");
+    assert!(refs.contains("gen1"));
+}
+
+#[test]
+fn test_collect_live_refs_collects_all_three_instance_fields() {
+    let agents = r#"[{"pubkey":"a","name":"t","env_vars_ref":"g_env","auth_tag_ref":"g_auth","backend":{"type":"provider","id":"anthropic","config":null},"provider_config_ref":"g_pc","created_at":"2026","updated_at":"2026"}]"#;
+    let refs = collect_live_refs(agents, "{}").unwrap();
+    assert!(refs.contains("g_env"));
+    assert!(refs.contains("g_auth"));
+    assert!(refs.contains("g_pc"));
+}
+
 #[test]
 fn test_gc_interleaving_save_cancels_candidacy() {
     // Simulate: GC marks gen1 as candidate, then a save confirms it into JSON.
@@ -283,6 +376,108 @@ fn test_gc_no_op_on_unreachable_keyring() {
     let result = store.load_all();
     assert!(result.is_err());
     // Confirms GC would abort before any writes.
+}
+
+// ── F5a: synchronized interleaving — GC vs an in-flight save ─────────────
+//
+// The dangerous ordering the store lock exists to prevent:
+//   1. A save writes a NEW generation to the blob and read-back verifies it.
+//   2. The save has NOT yet committed the JSON pointing at the new gen.
+//   3. GC runs its full two-cycle sweep against the CURRENT (old) JSON.
+//   4. The save commits its JSON.
+//
+// If GC could observe the pre-commit JSON AND delete on the same cycle, the
+// new gen (unreferenced in old JSON) would be destroyed. Two properties make
+// this safe and are exercised here with the REAL GC functions over tempfile
+// JSON: (a) delete-before-mark means a gen written this boot is only a
+// deletion candidate after a full mark cycle, never on the boot it appears;
+// (b) once the JSON commits, the ref is live and the gen is protected.
+
+fn write_json_stores(
+    agents: &str,
+    global: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agents_path = dir.path().join("managed-agents.json");
+    let global_path = dir.path().join("global-agent-config.json");
+    std::fs::write(&agents_path, agents).expect("write agents");
+    std::fs::write(&global_path, global).expect("write global");
+    (dir, agents_path, global_path)
+}
+
+#[test]
+fn test_gc_delete_before_mark_spares_gen_written_this_boot() {
+    // A generation written + verified this boot, whose JSON commit has NOT
+    // landed (JSON still references the OLD gen), must survive a full GC pass.
+    // gen_new has no candidate marker yet, so delete phase skips it; the mark
+    // phase marks it — but deletion only happens on a LATER boot's delete
+    // phase, giving the pending save a full cycle to commit.
+    let store = FakeProjectionStore::reachable()
+        .with_entry("global:env:gen_old", "old-secret")
+        .with_entry("global:env:gen_new", "new-secret"); // in-flight, not yet in JSON
+
+    // JSON still references the OLD generation (commit pending).
+    let (_dir, agents_path, global_path) =
+        write_json_stores(&make_agents_json(None), &make_global_json(Some("gen_old")));
+
+    // Full two-cycle pass in the boot order: delete, then mark.
+    delete_gc_candidates(&store, &agents_path, &global_path);
+    mark_gc_candidates(&store, &agents_path, &global_path);
+
+    // gen_new must NOT have been deleted this boot.
+    assert!(
+        store.get("global:env:gen_new").is_some(),
+        "in-flight generation must survive the GC pass before its JSON commit"
+    );
+}
+
+#[test]
+fn test_gc_spares_gen_once_json_commit_lands() {
+    // Continuation: the save now commits its JSON (references gen_new). Even
+    // though gen_new was marked as a candidate on the prior boot, the delete
+    // phase re-reads JSON, sees gen_new is live, and spares it — while the
+    // now-unreferenced gen_old is reclaimed.
+    let store = FakeProjectionStore::reachable()
+        .with_entry("global:env:gen_old", "old-secret")
+        .with_entry("global:env:gen_new", "new-secret")
+        .with_entry("global:env:gen_new_candidate", "1") // marked last boot
+        .with_entry("global:env:gen_old_candidate", "1"); // also marked last boot
+
+    // JSON now references gen_new (the save committed).
+    let (_dir, agents_path, global_path) =
+        write_json_stores(&make_agents_json(None), &make_global_json(Some("gen_new")));
+
+    delete_gc_candidates(&store, &agents_path, &global_path);
+
+    assert!(
+        store.get("global:env:gen_new").is_some(),
+        "committed generation must be spared even though it was a candidate"
+    );
+    // gen_old is now unreferenced and was a candidate → reclaimed.
+    assert!(
+        store.get("global:env:gen_old").is_none(),
+        "the retired generation must be reclaimed once it is unreferenced"
+    );
+}
+
+#[test]
+fn test_gc_reclaims_stably_unreferenced_candidate() {
+    // The delete phase reclaims a candidate whose generation is unreferenced
+    // in JSON and stays unreferenced across the snapshot + final re-check.
+    // This is the positive case that bounds the mid-sweep abort guard: with
+    // stable JSON there is no false abort, so retirement actually happens.
+    let store = FakeProjectionStore::reachable()
+        .with_entry("global:env:gen_stale", "secret")
+        .with_entry("global:env:gen_stale_candidate", "1");
+    let (_dir, agents_path, global_path) =
+        write_json_stores(&make_agents_json(None), &make_global_json(None));
+
+    delete_gc_candidates(&store, &agents_path, &global_path);
+
+    assert!(
+        store.get("global:env:gen_stale").is_none(),
+        "a stably-unreferenced candidate must be reclaimed"
+    );
 }
 
 #[test]

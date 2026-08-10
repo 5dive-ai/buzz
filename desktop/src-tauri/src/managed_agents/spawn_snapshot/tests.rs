@@ -99,6 +99,7 @@ fn persona(id: &str, runtime: Option<&str>, prompt: &str) -> AgentDefinition {
         parallelism: None,
         created_at: "now".into(),
         updated_at: "now".into(),
+        secrets_unavailable: false,
     }
 }
 

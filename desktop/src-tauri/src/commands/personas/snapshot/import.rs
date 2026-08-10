@@ -584,6 +584,7 @@ pub async fn confirm_agent_snapshot_import(
             parallelism: minted_parallelism,
             created_at: now.clone(),
             updated_at: now.clone(),
+            secrets_unavailable: false,
         };
 
         personas.push(persona.clone());
@@ -592,8 +593,7 @@ pub async fn confirm_agent_snapshot_import(
         // Enqueue the kind:30175 persona event via the retention path.
         super::super::pending::retain_persona_pending(&app, &state, &persona);
 
-        // Build the managed agent record — no machine-local commands, no
-        // secrets, no lineage from the snapshot.
+        // Build the managed agent record — no machine-local commands, no secrets, no lineage.
         let record = ManagedAgentRecord {
             pubkey: pubkey.clone(),
             name: display_name.clone(),

@@ -72,6 +72,20 @@ pub async fn set_global_agent_config(
     // lock in Phase 2 after sync_managed_agent_processes.
     let app_for_write = app.clone();
     let phase1 = tokio::task::spawn_blocking(move || {
+        use tauri::Manager;
+        // Serialize the whole read-modify-write (validate → snapshot old →
+        // save → re-read → candidate scan) against boot-time GC and the card
+        // mint save path, which take the same lock. Without it, GC could read
+        // the JSON between this save's keyring write and its atomic JSON commit
+        // and delete the just-written generation. `save_global_agent_config`
+        // itself must NOT take the lock (card mint and the boot migration hold
+        // it around their own save call — a second acquire would deadlock).
+        let state = app_for_write.state::<AppState>();
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         validate_global_config(&config)?;
 
         let old_global = load_global_agent_config(&app_for_write).unwrap_or_default();

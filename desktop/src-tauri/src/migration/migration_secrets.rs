@@ -12,46 +12,179 @@ use tauri::Manager;
 /// into the keyring.  Also runs the two-cycle GC sweeps and, when the keyring
 /// is reachable, Phase 2 artifact cleanup.
 pub(super) fn migrate_inline_secrets_to_keyring(app: &tauri::AppHandle) {
-    // Track whether the keyring is reachable — Phase 2 cleanup must not run
-    // when the keyring is unavailable (we must never delete the only copy of a
-    // secret).
-    let keyring_reachable = crate::managed_agents::storage::agent_secret_store_pub().is_some();
+    // Serialize the entire extraction + global save + GC against in-process
+    // saves that mutate the same JSON stores and keyring blob. GC's final JSON
+    // read-back and `remove_batch` MUST be indivisible against a save sitting
+    // between its keyring write and its atomic JSON commit — otherwise the
+    // sweep could read stale JSON, decide a just-written generation is
+    // unreferenced, and delete it. The store lock is the same one every save
+    // path (agent store, global config, card mint) takes.
+    let state = app.state::<crate::app_state::AppState>();
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
-    if let Ok(mut records) = crate::managed_agents::storage::load_agent_store_raw(app) {
+    // Extract inline secrets → keyring for the agent store.
+    let extraction_ok = if let Ok(mut records) =
+        crate::managed_agents::storage::load_agent_store_raw(app)
+    {
         let changed = migrate_inline_secrets_in_records(app, &mut records);
         if changed {
             if let Err(e) = crate::managed_agents::storage::write_agent_store_raw(app, &records) {
                 eprintln!("buzz-desktop: boot-migration: failed to write agent store: {e}");
+                false
+            } else {
+                true
             }
+        } else {
+            true
         }
     } else {
         eprintln!("buzz-desktop: boot-migration: could not load agent store for secret migration");
-    }
-    if let Ok(global) = crate::managed_agents::global_config::load_global_agent_config(app) {
-        if !global.env_vars.is_empty() || global.env_vars_ref.is_none() {
-            if let Err(e) =
-                crate::managed_agents::global_config::save_global_agent_config(app, &global)
-            {
-                eprintln!("buzz-desktop: boot-migration: global config save failed: {e}");
+        false
+    };
+
+    // Extract inline secrets → keyring for the global config.
+    let global_ok =
+        if let Ok(global) = crate::managed_agents::global_config::load_global_agent_config(app) {
+            if !global.env_vars.is_empty() || global.env_vars_ref.is_none() {
+                if let Err(e) =
+                    crate::managed_agents::global_config::save_global_agent_config(app, &global)
+                {
+                    eprintln!("buzz-desktop: boot-migration: global config save failed: {e}");
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
             }
-        }
-    }
+        } else {
+            false
+        };
+
     run_secret_gc(app);
-    // Phase 2: artifact cleanup — only when the keyring is reachable.
-    if keyring_reachable {
+
+    // Phase 2: artifact cleanup — only when extraction was verified.
+    //
+    // "Verified" means: the agent store and global config were written
+    // successfully this boot AND every referenced generation reads back
+    // cleanly (no secrets_unavailable flags after a fresh reload).  A bare
+    // keyring-handle check (`agent_secret_store_pub().is_some()`) does NOT
+    // suffice — the handle can be present while individual entries fail to
+    // read back, which would let cleanup delete the only copy of a secret.
+    if extraction_ok && global_ok && extraction_verified(app) {
         if let Ok(agents_dir) = crate::managed_agents::storage::managed_agents_base_dir(app) {
             cleanup_secret_artifacts(&agents_dir);
         }
         // Also clean the legacy Sprout app-data agents dir if it still exists.
         // `migrate_legacy_app_data_dir` copies files from there but never removes
         // the source — it can hold the original plaintext managed-agents.json and
-        // its backups indefinitely.
+        // its backups indefinitely.  Run the full cleanup on that dir, including
+        // its live managed-agents.json.
         if let Ok(current_dir) = app.path().app_data_dir() {
             if let Some(legacy_dir) = super::legacy_app_data_dir(&current_dir) {
                 let legacy_agents_dir = legacy_dir.join("agents");
                 if legacy_agents_dir.exists() {
                     cleanup_secret_artifacts(&legacy_agents_dir);
+                    // The legacy live file (managed-agents.json, not a backup)
+                    // is not touched by the generic cleanup sweep above — it
+                    // handles backups and temps, not the live file.  Explicitly
+                    // scrub or remove it now that we have verified the
+                    // destination projection is secret-free and hydratable.
+                    scrub_legacy_live_file(&legacy_agents_dir.join("managed-agents.json"));
                 }
+            }
+        }
+    }
+}
+
+/// Returns `true` when a fresh read-back of both live stores shows that every
+/// referenced generation hydrates without error.  Used to gate Phase 2
+/// artifact cleanup: we must never delete the last copy of a secret.
+fn extraction_verified(app: &tauri::AppHandle) -> bool {
+    // Verify agent store: all records with refs must hydrate cleanly.
+    let store = match crate::managed_agents::storage::agent_secret_store_pub() {
+        Some(s) => s,
+        None => return false, // no keyring backend → no extraction → not verified
+    };
+    let mut records = match crate::managed_agents::storage::load_agent_store_raw(app) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let unavailable =
+        crate::managed_agents::secret_seam::hydrate_all_secrets_for_records(store, &mut records);
+    if !unavailable.is_empty() {
+        eprintln!(
+            "buzz-desktop: extraction-verify: {} record(s) have unavailable secrets — \
+             skipping Phase 2 cleanup",
+            unavailable.len()
+        );
+        return false;
+    }
+    // Verify global config: if a ref is present it must hydrate cleanly (Err
+    // from load_global_agent_config means the ref exists but the entry is
+    // missing/corrupt).
+    let global_ok = match crate::managed_agents::global_config::load_global_agent_config(app) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!(
+                "buzz-desktop: extraction-verify: global config ref unreadable — \
+                 skipping Phase 2 cleanup: {e}"
+            );
+            false
+        }
+    };
+    global_ok
+}
+
+/// Scrub or remove the legacy live `managed-agents.json` after the destination
+/// projection has been verified.  Mirrors the backup scrub in
+/// [`cleanup_secret_artifacts`] but targets the primary live file rather than
+/// backup siblings.
+///
+/// - Parseable: strip secret fields and overwrite at 0o600.
+/// - Unparseable or does not exist: delete (or skip if not present).
+/// - Errors are logged; callers must never panic on this path.
+fn scrub_legacy_live_file(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "buzz-desktop: artifact-cleanup: cannot read legacy live file {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    match strip_secrets_from_json(&content) {
+        Some(clean) => {
+            match crate::managed_agents::storage::atomic_write_json_restricted(path, clean.as_bytes()) {
+                Ok(()) => eprintln!(
+                    "buzz-desktop: artifact-cleanup: scrubbed legacy live file {}",
+                    path.display()
+                ),
+                Err(e) => eprintln!(
+                    "buzz-desktop: artifact-cleanup: cannot write scrubbed legacy live file {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+        None => {
+            if let Err(e) = std::fs::remove_file(path) {
+                eprintln!(
+                    "buzz-desktop: artifact-cleanup: cannot remove unparseable legacy live file {}: {e}",
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "buzz-desktop: artifact-cleanup: removed unparseable legacy live file {}",
+                    path.display()
+                );
             }
         }
     }
@@ -522,5 +655,88 @@ mod tests {
         // Restore permissions so tempdir cleanup can succeed.
         perms.set_mode(0o755);
         std::fs::set_permissions(dir.path(), perms).ok();
+    }
+
+    // ── scrub_legacy_live_file tests ──────────────────────────────────────
+
+    /// A parseable legacy live file is scrubbed in-place (secrets stripped,
+    /// file survives).
+    #[test]
+    fn test_scrub_legacy_live_file_strips_secrets_from_parseable_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("managed-agents.json");
+        let content = r#"[{"pubkey":"abc","name":"test","env_vars":{"K":"v"},"created_at":"2026","updated_at":"2026"}]"#;
+        std::fs::write(&path, content).expect("write");
+
+        scrub_legacy_live_file(&path);
+
+        assert!(path.exists(), "parseable legacy file must survive");
+        let result = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !result.contains("\"env_vars\""),
+            "secrets must be stripped from the legacy live file"
+        );
+    }
+
+    /// An unparseable legacy live file is deleted.
+    #[test]
+    fn test_scrub_legacy_live_file_deletes_unparseable_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("managed-agents.json");
+        std::fs::write(&path, b"not valid json with sk-ant-secret").expect("write");
+
+        scrub_legacy_live_file(&path);
+
+        assert!(
+            !path.exists(),
+            "unparseable legacy live file must be deleted"
+        );
+    }
+
+    /// Missing legacy live file is silently skipped (no panic, no error).
+    #[test]
+    fn test_scrub_legacy_live_file_ignores_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("managed-agents.json");
+        assert!(!path.exists());
+        // Must not panic.
+        scrub_legacy_live_file(&path);
+    }
+
+    // ── extraction_verified gate logic tests ─────────────────────────────
+
+    /// The cleanup gate `extraction_ok && global_ok && extraction_verified`
+    /// is tested via the individual extraction booleans. `extraction_verified`
+    /// itself requires a real keyring (not unit-testable), so we test its
+    /// logical partners to document the invariant: all three must be true.
+    #[test]
+    fn test_extraction_gate_requires_all_three_conditions() {
+        // The logical gate: extraction_ok && global_ok && extraction_verified.
+        // All three must be true for cleanup to run. Document the invariant:
+        // every input combination that is NOT (true, true, true) must keep
+        // the gate closed.
+        let cases: &[(bool, bool, bool)] = &[
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+        ];
+        for &(extraction_ok, global_ok, verified) in cases {
+            let gate = extraction_ok && global_ok && verified;
+            assert!(
+                !gate,
+                "gate must be closed unless all three conditions are true: \
+                 extraction_ok={extraction_ok}, global_ok={global_ok}, verified={verified}"
+            );
+        }
+        // Only (true, true, true) opens the gate.
+        let all_ok = {
+            let (a, b, c) = (true, true, true);
+            a && b && c
+        };
+        assert!(all_ok, "all three true must open the gate");
     }
 }

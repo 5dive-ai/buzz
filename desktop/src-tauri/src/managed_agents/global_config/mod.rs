@@ -31,8 +31,8 @@ use crate::managed_agents::env_vars::{
     validate_user_env_keys, DERIVED_PROVIDER_MODEL_ENV_KEYS, MAX_ENV_VALUE_BYTES,
 };
 use crate::managed_agents::secret_projection::{
-    cancel_gc_candidacy, delete_generation_best_effort, deserialize_env_map, global_env_key,
-    load_secret, serialize_env_map, write_secret, WriteOutcome,
+    cancel_gc_candidacy, deserialize_env_map, global_env_key, load_secret, serialize_env_map,
+    write_secret, WriteOutcome,
 };
 use crate::managed_agents::storage::{atomic_write_json_restricted, managed_agents_base_dir};
 use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
@@ -205,6 +205,17 @@ fn global_config_secret_store() -> Option<&'static SecretStore> {
 /// Returns the default (all-empty) config if the file does not exist yet.
 /// Hydrates `env_vars` from the keyring when an `env_vars_ref` is present
 /// and `env_vars` is empty (inline fallback: non-empty `env_vars` wins).
+///
+/// # Fail-closed on unavailability
+///
+/// Returns `Err` (rather than a silently-empty config) when the record
+/// carries an `env_vars_ref` but the keyring entry is missing/unreachable or
+/// its bytes fail to deserialize. Global env applies to ALL agents; silently
+/// dropping it would spawn every agent with an incomplete env under the exact
+/// keyring-failure the gen-ref protocol exists to fail closed on. Spawn/deploy
+/// gates propagate this `Err` to refuse the launch; display/readiness callers
+/// choose degraded-empty via `.unwrap_or_default()` and reflect the failure as
+/// not-ready. Absent file and the no-ref empty case remain `Ok(default)`.
 pub fn load_global_agent_config(app: &AppHandle) -> Result<GlobalAgentConfig, String> {
     let path = global_config_path(app)?;
     if !path.exists() {
@@ -226,10 +237,16 @@ pub fn load_global_agent_config(app: &AppHandle) -> Result<GlobalAgentConfig, St
             ) {
                 Ok(Some(serialized)) => match deserialize_env_map(&serialized) {
                     Ok(map) => config.env_vars = map,
-                    Err(e) => eprintln!("buzz-desktop: global env_vars deserialize failed: {e}"),
+                    // Ref present, bytes retrieved, but unparseable — fail closed.
+                    Err(e) => {
+                        return Err(format!(
+                            "global env_vars unavailable: deserialize failed: {e}"
+                        ))
+                    }
                 },
-                Ok(None) => {} // intentionally empty
-                Err(e) => eprintln!("buzz-desktop: global env_vars unavailable: {e}"),
+                Ok(None) => {} // no ref: intentionally empty
+                // Ref present but keyring entry missing/unreachable — fail closed.
+                Err(e) => return Err(e),
             }
         }
     }
@@ -257,7 +274,6 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
         } else {
             None
         };
-        let old_ref = config.env_vars_ref.clone();
         match write_secret(
             store,
             global_env_key,
@@ -267,14 +283,7 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
             WriteOutcome::Persisted { gen } => {
                 cancel_gc_candidacy(store, &global_env_key(&gen));
                 config.env_vars.clear();
-                config.env_vars_ref = Some(gen.clone());
-                if let Some(old) = old_ref.filter(|g| *g != gen) {
-                    delete_generation_best_effort(
-                        store,
-                        &global_env_key(&old),
-                        "global old env_vars",
-                    );
-                }
+                config.env_vars_ref = Some(gen);
             }
             WriteOutcome::KeptInline { .. } => {
                 config.env_vars_ref = None;

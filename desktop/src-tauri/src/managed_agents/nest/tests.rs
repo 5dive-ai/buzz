@@ -444,6 +444,7 @@ fn make_persona(id: &str, display_name: &str) -> AgentDefinition {
         parallelism: None,
         created_at: String::new(),
         updated_at: String::new(),
+        secrets_unavailable: false,
     }
 }
 

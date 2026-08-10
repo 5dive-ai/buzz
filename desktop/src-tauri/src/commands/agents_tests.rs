@@ -91,6 +91,7 @@ fn persona_record(id: &str, model: Option<&str>, provider: Option<&str>) -> Agen
         parallelism: None,
         created_at: "".to_string(),
         updated_at: "".to_string(),
+        secrets_unavailable: false,
     }
 }
 

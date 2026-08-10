@@ -37,8 +37,6 @@ const DEV_SECRETS_MIGRATION_MARKER: &str = "_dev_secrets_migration_v2";
 /// already present in the destination.
 #[cfg(debug_assertions)]
 pub fn migrate_agent_secrets_to_dev_service(app: &tauri::AppHandle) {
-    use crate::managed_agents::secret_projection::is_projection_key;
-
     if !cfg!(feature = "system-keyring") {
         return;
     }
@@ -94,9 +92,92 @@ pub fn migrate_agent_secrets_to_dev_service(app: &tauri::AppHandle) {
     // references it (global-agent-config.json is not a shared file).
     let global_refs = collect_global_env_refs(app);
 
+    let DevMigrationPlan {
+        to_write,
+        conflict_keys,
+        write_marker,
+    } = plan_dev_secrets_migration(&src_map, &dest_map, &global_refs);
+
+    for key in &conflict_keys {
+        eprintln!(
+            "buzz-desktop: keyring-dev-secrets-migration: \
+             conflict on key {key} between {src_service} and {dest_service}; \
+             refusing to overwrite (manual resolution required)"
+        );
+    }
+    let conflict_count = conflict_keys.len();
+
+    // Nothing to persist (no copyable keys and, being unclean, no marker):
+    // skip the write entirely so an unclean boot with zero copyable keys does
+    // not touch the destination keyring.
+    if to_write.is_empty() {
+        if conflict_count > 0 {
+            eprintln!(
+                "buzz-desktop: keyring-dev-secrets-migration: \
+                 {conflict_count} conflict(s), nothing copyable; will retry next boot"
+            );
+        }
+        return;
+    }
+
+    if let Err(e) = dest_store.store_all(&to_write) {
+        eprintln!(
+            "buzz-desktop: keyring-dev-secrets-migration: \
+             cannot write to dest keyring ({dest_service}): {e}"
+        );
+        return;
+    }
+
+    // Subtract the marker (if any) from the copied count.
+    let copied = to_write.len() - usize::from(write_marker);
+    if copied > 0 {
+        eprintln!(
+            "buzz-desktop: keyring-dev-secrets-migration: \
+             copied {copied} projection key(s) from {src_service} → {dest_service}"
+        );
+    }
+    if conflict_count > 0 {
+        eprintln!(
+            "buzz-desktop: keyring-dev-secrets-migration: \
+             {conflict_count} key(s) had conflicts and were NOT copied; \
+             marker withheld — migration will retry on the next boot"
+        );
+    }
+}
+
+/// Output of [`plan_dev_secrets_migration`]: the batch to write to the
+/// destination keyring, the number of unresolved conflicts, and whether the
+/// completion marker is included in the batch.
+#[cfg(debug_assertions)]
+struct DevMigrationPlan {
+    to_write: std::collections::HashMap<String, String>,
+    conflict_keys: Vec<String>,
+    write_marker: bool,
+}
+
+/// Pure decision core of [`migrate_agent_secrets_to_dev_service`]: decide which
+/// projection keys to copy and whether to write the completion marker.
+///
+/// A projection key present in both stores with DIFFERENT values is a conflict:
+/// it is NOT copied and counts toward `conflict_count`. The marker is included
+/// only when `conflict_count == 0` — an unclean run must be retried on the next
+/// boot after the user resolves the conflict, so the non-conflicting keys are
+/// still written (partial progress persists) but the marker is withheld.
+///
+/// `global:env:*` keys are copied only when the gen id is in `global_refs`
+/// (the destination JSON references it) — `global-agent-config.json` is not a
+/// shared file, so an unreferenced global gen must not leak across services.
+#[cfg(debug_assertions)]
+fn plan_dev_secrets_migration(
+    src_map: &std::collections::HashMap<String, String>,
+    dest_map: &std::collections::HashMap<String, String>,
+    global_refs: &std::collections::HashSet<String>,
+) -> DevMigrationPlan {
+    use crate::managed_agents::secret_projection::is_projection_key;
+
     let mut to_write: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut conflict_count = 0usize;
-    for (key, src_val) in &src_map {
+    let mut conflict_keys: Vec<String> = Vec::new();
+    for (key, src_val) in src_map {
         if !is_projection_key(key) {
             continue; // skip non-projection keys (nsec, identity markers, etc.)
         }
@@ -116,40 +197,20 @@ pub fn migrate_agent_secrets_to_dev_service(app: &tauri::AppHandle) {
             }
             Some(_dest_val) => {
                 // Conflict: src and dest have different values.  Fail closed.
-                eprintln!(
-                    "buzz-desktop: keyring-dev-secrets-migration: \
-                     conflict on key {key} between {src_service} and {dest_service}; \
-                     refusing to overwrite (manual resolution required)"
-                );
-                conflict_count += 1;
+                conflict_keys.push(key.clone());
             }
         }
     }
 
-    // Always write the marker (even if there was nothing to copy) so future
-    // boots skip the source-keyring read entirely.
-    to_write.insert(DEV_SECRETS_MIGRATION_MARKER.to_string(), "done".to_string());
-
-    if let Err(e) = dest_store.store_all(&to_write) {
-        eprintln!(
-            "buzz-desktop: keyring-dev-secrets-migration: \
-             cannot write to dest keyring ({dest_service}): {e}"
-        );
-        return;
+    let write_marker = conflict_keys.is_empty();
+    if write_marker {
+        to_write.insert(DEV_SECRETS_MIGRATION_MARKER.to_string(), "done".to_string());
     }
 
-    let copied = to_write.len().saturating_sub(1); // exclude the marker itself
-    if copied > 0 {
-        eprintln!(
-            "buzz-desktop: keyring-dev-secrets-migration: \
-             copied {copied} projection key(s) from {src_service} → {dest_service}"
-        );
-    }
-    if conflict_count > 0 {
-        eprintln!(
-            "buzz-desktop: keyring-dev-secrets-migration: \
-             {conflict_count} key(s) had conflicts and were NOT copied"
-        );
+    DevMigrationPlan {
+        to_write,
+        conflict_keys,
+        write_marker,
     }
 }
 
@@ -176,4 +237,134 @@ fn collect_global_env_refs(app: &tauri::AppHandle) -> std::collections::HashSet<
         refs.insert(r.to_string());
     }
     refs
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use crate::managed_agents::secret_projection::{agent_env_key, global_env_key};
+    use std::collections::{HashMap, HashSet};
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_clean_migration_includes_marker_and_copies() {
+        // One projection key present only in src, no conflicts → copy it AND
+        // write the marker (migration is complete).
+        let key = agent_env_key("abc", "gen1");
+        let src = map(&[(&key, "val")]);
+        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &HashSet::new());
+
+        assert!(plan.conflict_keys.is_empty());
+        assert!(plan.write_marker, "clean migration must write the marker");
+        assert_eq!(plan.to_write.get(&key).map(String::as_str), Some("val"));
+        assert!(plan.to_write.contains_key(DEV_SECRETS_MIGRATION_MARKER));
+    }
+
+    #[test]
+    fn test_conflict_withholds_marker_but_copies_non_conflicting() {
+        // Two keys: one conflicts (differs in dest), one is new. The migration
+        // must copy the new key (partial progress) but WITHHOLD the marker so
+        // the conflict is retried after manual resolution.
+        let conflict = agent_env_key("abc", "gen1");
+        let fresh = agent_env_key("def", "gen2");
+        let src = map(&[(&conflict, "src-val"), (&fresh, "fresh-val")]);
+        let dest = map(&[(&conflict, "dest-val")]);
+
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new());
+
+        assert_eq!(plan.conflict_keys, vec![conflict.clone()]);
+        assert!(
+            !plan.write_marker,
+            "a conflicted migration must NOT write the marker — it must retry"
+        );
+        assert!(
+            !plan.to_write.contains_key(DEV_SECRETS_MIGRATION_MARKER),
+            "marker must be absent from the write batch on conflict"
+        );
+        assert_eq!(
+            plan.to_write.get(&fresh).map(String::as_str),
+            Some("fresh-val"),
+            "non-conflicting key must still be copied for partial progress"
+        );
+        assert!(
+            !plan.to_write.contains_key(&conflict),
+            "conflicting key must NOT be overwritten"
+        );
+    }
+
+    #[test]
+    fn test_identical_key_is_idempotent_and_clean() {
+        // A key already identical in dest is not re-copied, and (no conflict)
+        // the marker is written.
+        let key = agent_env_key("abc", "gen1");
+        let src = map(&[(&key, "same")]);
+        let dest = map(&[(&key, "same")]);
+
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new());
+
+        assert!(plan.conflict_keys.is_empty());
+        assert!(plan.write_marker);
+        assert!(
+            !plan.to_write.contains_key(&key),
+            "identical key must not be re-written"
+        );
+        // Only the marker is in the batch.
+        assert_eq!(plan.to_write.len(), 1);
+    }
+
+    #[test]
+    fn test_empty_source_writes_only_marker() {
+        // Nothing to copy, no conflict → clean: the batch is just the marker.
+        let plan = plan_dev_secrets_migration(&HashMap::new(), &HashMap::new(), &HashSet::new());
+        assert!(plan.write_marker);
+        assert_eq!(plan.to_write.len(), 1);
+        assert!(plan.to_write.contains_key(DEV_SECRETS_MIGRATION_MARKER));
+    }
+
+    #[test]
+    fn test_unreferenced_global_env_is_skipped() {
+        // A global:env gen not referenced by the destination JSON must not be
+        // copied across services (global-agent-config.json is not shared).
+        let key = global_env_key("gen-unref");
+        let src = map(&[(&key, "val")]);
+        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &HashSet::new());
+
+        assert!(
+            !plan.to_write.contains_key(&key),
+            "unreferenced global:env gen must be skipped"
+        );
+        // Clean (no conflict), so only the marker is present.
+        assert!(plan.write_marker);
+        assert_eq!(plan.to_write.len(), 1);
+    }
+
+    #[test]
+    fn test_referenced_global_env_is_copied() {
+        // The same global:env gen IS copied when the destination JSON
+        // references it.
+        let key = global_env_key("gen-ref");
+        let src = map(&[(&key, "val")]);
+        let refs: HashSet<String> = ["gen-ref".to_string()].into_iter().collect();
+        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &refs);
+
+        assert_eq!(plan.to_write.get(&key).map(String::as_str), Some("val"));
+    }
+
+    #[test]
+    fn test_non_projection_key_is_ignored() {
+        // A non-projection key (e.g. an nsec or identity marker) present only
+        // in src must never be copied by this migration.
+        let src = map(&[("some-agent-nsec-key", "secret")]);
+        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &HashSet::new());
+
+        assert!(!plan.to_write.contains_key("some-agent-nsec-key"));
+        assert!(plan.write_marker); // no projection conflict
+        assert_eq!(plan.to_write.len(), 1); // marker only
+    }
 }

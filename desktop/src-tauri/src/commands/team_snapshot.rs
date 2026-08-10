@@ -139,6 +139,7 @@ fn definition_from_snapshot(
         parallelism: behavior.parallelism,
         created_at: now.to_string(),
         updated_at: now.to_string(),
+        secrets_unavailable: false,
     })
 }
 

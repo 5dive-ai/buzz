@@ -27,7 +27,9 @@
 //!    is new.
 //! 3. Atomically commit JSON carrying the new `*_ref` (the JSON write is THE
 //!    commit point).
-//! 4. Best-effort delete the old generation from the blob.
+//! 4. The old generation is NOT deleted here. Eager deletion before the JSON
+//!    commit could orphan a committed secret on write failure; retirement is
+//!    left entirely to the two-cycle GC below.
 //!
 //! ## GC (two-cycle)
 //!
@@ -239,29 +241,38 @@ pub fn load_secret<S: ProjectionStore>(
 }
 
 // ── Delete helpers ─────────────────────────────────────────────────────────
-
-/// Best-effort delete a generation from the keyring blob.
-/// Failure is logged but NOT propagated — a stale generation is GC'd on next boot.
-pub fn delete_generation_best_effort<S: ProjectionStore>(store: &S, key: &str, context: &str) {
-    // Also delete any candidate marker for this generation.
-    let candidate_key = format!("{key}{GC_CANDIDATE_SUFFIX}");
-    let keys: Vec<&str> = vec![key, &candidate_key];
-    if let Err(e) = store.remove_batch(&keys) {
-        eprintln!(
-            "buzz-desktop: best-effort delete of old generation {context} failed: {e} \
-             (GC will clean it up on next boot)"
-        );
-    }
-}
+//
+// Old generations are NEVER deleted eagerly on save: deleting a prior
+// generation before the atomic JSON commit could orphan a secret if the write
+// fails, leaving disk referencing a generation that no longer exists. All
+// retirement of unreferenced generations happens through the two-cycle GC
+// below (`mark_gc_candidates` + `delete_gc_candidates`).
 
 // ── GC snapshot ───────────────────────────────────────────────────────────
 
-/// Collect all live generation refs from both raw JSON stores.
+/// Collect all live generation refs from both raw JSON stores, validating as
+/// it goes.
 ///
-/// Returns `None` when either store is missing, unreadable, or changes between
-/// collection and the caller's subsequent blob mutation — GC must be a no-op
-/// in that case. The returned set contains ALL ref values (gen IDs) referenced
-/// by any live JSON record.
+/// Returns `None` — which makes the GC sweep a **no-op** for this cycle — when
+/// either store is missing/unreadable OR the JSON is in an ambiguous state the
+/// GC must not make a deletion decision against:
+///
+/// - **Malformed coordinate:** a `*_ref` that is empty or contains a `:`
+///   (the gen id is the last `:`-segment of a blob key, so an embedded `:`
+///   would make the reference un-matchable against the blob and could leave a
+///   still-referenced generation unprotected).
+/// - **Duplicate coordinate:** the same gen id referenced by two different
+///   coordinates. Generation ids are fresh UUIDs, so a collision means the JSON
+///   is corrupt; protecting only one of the two would let the sweep delete a
+///   live secret.
+/// - **Inline + ref conflict:** a record (or global) that carries BOTH a
+///   non-empty inline value AND a `*_ref` for the same field. Inline is
+///   authoritative on load, so the ref is being ignored — but the state is
+///   ambiguous enough that the GC must not reason about which generation is
+///   live. Skipping the whole sweep is the fail-safe choice.
+///
+/// The returned set contains ALL validated ref gen ids referenced by any live
+/// JSON record.
 pub fn collect_live_refs(
     agents_json: &str,
     global_json: &str,
@@ -271,24 +282,118 @@ pub fn collect_live_refs(
     // Parse agents store (array of records).
     let agents: Vec<JsonValue> = serde_json::from_str(agents_json).ok()?;
     for record in &agents {
-        collect_refs_from_record(record, &mut refs);
+        collect_refs_from_record(record, &mut refs)?;
     }
 
-    // Parse global config.
+    // Parse global config. Global carries a single `env_vars` / `env_vars_ref`
+    // pair with the same inline-precedence contract as a record field.
     let global: JsonValue = serde_json::from_str(global_json).ok()?;
-    if let Some(r) = global.get("env_vars_ref").and_then(JsonValue::as_str) {
-        refs.insert(r.to_string());
-    }
+    collect_ref_field(
+        &global,
+        "env_vars",
+        "env_vars_ref",
+        /* inline_non_empty */ object_field_non_empty(&global, "env_vars"),
+        &mut refs,
+    )?;
 
     Some(refs)
 }
 
-fn collect_refs_from_record(record: &JsonValue, refs: &mut std::collections::HashSet<String>) {
-    for field in &["env_vars_ref", "auth_tag_ref", "provider_config_ref"] {
-        if let Some(r) = record.get(field).and_then(JsonValue::as_str) {
-            refs.insert(r.to_string());
+/// Validate and collect the three secret refs of one agent/definition record.
+/// Returns `None` on any malformed/duplicate coordinate or inline+ref conflict.
+fn collect_refs_from_record(
+    record: &JsonValue,
+    refs: &mut std::collections::HashSet<String>,
+) -> Option<()> {
+    // env_vars: object, non-empty inline.
+    collect_ref_field(
+        record,
+        "env_vars",
+        "env_vars_ref",
+        object_field_non_empty(record, "env_vars"),
+        refs,
+    )?;
+    // auth_tag: string, non-empty inline.
+    collect_ref_field(
+        record,
+        "auth_tag",
+        "auth_tag_ref",
+        string_field_non_empty(record, "auth_tag"),
+        refs,
+    )?;
+    // provider config: BackendKind::Provider.config, non-null inline.
+    collect_ref_field(
+        record,
+        "backend", // inline lives under backend.config; presence computed below
+        "provider_config_ref",
+        provider_config_inline_present(record),
+        refs,
+    )?;
+    Some(())
+}
+
+/// Validate a single `(inline, ref)` field pair and insert the ref into `refs`.
+///
+/// `_inline_field` is unused for the object lookup (the caller pre-computes
+/// `inline_non_empty`); it is retained only to document which field the ref
+/// pairs with. Returns `None` on an inline+ref conflict, a malformed ref, or a
+/// duplicate ref gen id.
+fn collect_ref_field(
+    record: &JsonValue,
+    _inline_field: &str,
+    ref_field: &str,
+    inline_non_empty: bool,
+    refs: &mut std::collections::HashSet<String>,
+) -> Option<()> {
+    let ref_val = record.get(ref_field).and_then(JsonValue::as_str);
+    match ref_val {
+        Some(r) => {
+            // Inline present alongside a ref → ambiguous; no-op the sweep.
+            if inline_non_empty {
+                return None;
+            }
+            // Malformed coordinate: empty, or an embedded `:` that would break
+            // last-segment gen extraction against the blob.
+            if r.is_empty() || r.contains(':') {
+                return None;
+            }
+            // Duplicate coordinate: a gen id must reference exactly one thing.
+            if !refs.insert(r.to_string()) {
+                return None;
+            }
+            Some(())
         }
+        None => Some(()),
     }
+}
+
+/// True when `record[field]` is a JSON object with at least one entry.
+fn object_field_non_empty(record: &JsonValue, field: &str) -> bool {
+    record
+        .get(field)
+        .and_then(JsonValue::as_object)
+        .is_some_and(|m| !m.is_empty())
+}
+
+/// True when `record[field]` is a non-empty JSON string.
+fn string_field_non_empty(record: &JsonValue, field: &str) -> bool {
+    record
+        .get(field)
+        .and_then(JsonValue::as_str)
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// True when the record's backend is a provider whose `config` is present and
+/// not JSON `null` — i.e. an inline provider-config value that has not been
+/// stripped into the keyring.
+fn provider_config_inline_present(record: &JsonValue) -> bool {
+    let Some(backend) = record.get("backend").and_then(JsonValue::as_object) else {
+        return false;
+    };
+    if backend.get("type").and_then(JsonValue::as_str) != Some("provider") {
+        return false;
+    }
+    matches!(backend.get("config"), Some(c) if !c.is_null())
 }
 
 // ── Two-cycle GC ──────────────────────────────────────────────────────────

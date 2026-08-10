@@ -30,6 +30,7 @@ fn local_in_app() -> AgentDefinition {
         parallelism: None,
         created_at: "2025-01-01T00:00:00Z".to_string(),
         updated_at: "2025-01-01T00:00:00Z".to_string(),
+        secrets_unavailable: false,
     }
 }
 
@@ -57,6 +58,7 @@ fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
         parallelism: None,
         created_at: "2025-06-01T00:00:00Z".to_string(),
         updated_at: "2025-06-01T00:00:00Z".to_string(),
+        secrets_unavailable: false,
     }
 }
 

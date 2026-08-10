@@ -12,7 +12,7 @@ pub enum BackendKind {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentDefinition {
     pub id: String,
     pub display_name: String,
@@ -90,13 +90,13 @@ pub struct AgentDefinition {
     pub parallelism: Option<u32>,
     pub created_at: String,
     pub updated_at: String,
+    /// Runtime-only unavailability flag. Never serialized; reconstructed on boot.
+    #[serde(skip)]
+    pub secrets_unavailable: bool,
 }
 
 impl AgentDefinition {
-    /// Project this persona onto a key-less unified [`ManagedAgentRecord`]
-    /// (Phase 1A store fold). Identity fields stay empty — keys are minted on
-    /// first start. `AgentDefinition.id` becomes `slug`, preserving the 30175
-    /// event coordinate (`d_tag = slug`) across the fold.
+    /// Project this persona onto a unified [`ManagedAgentRecord`] (Phase 1A fold).
     pub fn into_agent_record(self) -> ManagedAgentRecord {
         ManagedAgentRecord {
             pubkey: String::new(),
@@ -163,9 +163,8 @@ impl AgentDefinition {
 
 impl ManagedAgentRecord {
     /// Present a key-less definition record back in the legacy
-    /// [`AgentDefinition`] shape — the compatibility view the persona command
-    /// surface serves until Phase 1B unifies the UI. Inverse of
-    /// [`AgentDefinition::into_agent_record`] for the fields personas carry.
+    /// [`AgentDefinition`] shape (compatibility view for the persona command
+    /// surface). Inverse of [`AgentDefinition::into_agent_record`].
     pub fn to_definition_view(&self) -> Option<AgentDefinition> {
         let slug = self.slug.clone()?;
         Some(AgentDefinition {
@@ -193,6 +192,7 @@ impl ManagedAgentRecord {
             parallelism: self.definition_parallelism,
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
+            secrets_unavailable: self.secrets_unavailable,
         })
     }
 }

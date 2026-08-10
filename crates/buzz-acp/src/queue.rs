@@ -96,6 +96,7 @@ pub struct FlushBatch {
 /// ```text
 /// State:
 ///   queues:               Map<channel_id, VecDeque<QueuedEvent>>  (capped at MAX_PENDING_PER_CHANNEL)
+///   withheld_native_steer: Map<channel_id, Vec<QueuedEvent>>       (native reservations)
 ///   in_flight_channels:   HashSet<Uuid>
 ///   in_flight_deadlines:  Map<channel_id, Instant>                (auto-expire after in_flight_deadline)
 ///   retry_after:          Map<channel_id, Instant>
@@ -106,8 +107,8 @@ pub struct FlushBatch {
 ///   push(event):
 ///     if dedup_mode == Drop AND in_flight_channels.contains(event.channel_id):
 ///       debug log + discard
-///     else if queues[channel].len() >= MAX_PENDING_PER_CHANNEL:
-///       drop oldest (pop_front), warn, push_back new event
+///     else if queued + withheld events for channel reach MAX_PENDING_PER_CHANNEL:
+///       drop oldest queued event, or reject the new event if all slots are withheld
 ///     else:
 ///       queues[event.channel_id].push_back(event)
 ///
@@ -237,17 +238,39 @@ impl EventQueue {
             );
             return false;
         }
-        let queue = self.queues.entry(event.channel_id).or_default();
-        // Enforce per-channel depth cap: drop oldest to make room.
-        if queue.len() >= MAX_PENDING_PER_CHANNEL {
-            queue.pop_front();
-            tracing::warn!(
-                channel_id = %event.channel_id,
-                limit = MAX_PENDING_PER_CHANNEL,
-                "queue depth cap reached — dropped oldest event"
-            );
+        let channel_id = event.channel_id;
+        let withheld = self
+            .withheld_native_steer
+            .get(&channel_id)
+            .map_or(0, Vec::len);
+        let queued = self.queues.get(&channel_id).map_or(0, VecDeque::len);
+        // A native-steer reservation owns its event until its asynchronous
+        // attempt resolves, so it counts toward the per-channel cap too.
+        // Never evict a withheld reservation: its completion may still steer.
+        // If every slot is reserved, reject the new event rather than creating
+        // an unbounded preparation task or violating exact-once delivery.
+        if queued + withheld >= MAX_PENDING_PER_CHANNEL {
+            if self
+                .queues
+                .get_mut(&channel_id)
+                .and_then(VecDeque::pop_front)
+                .is_some()
+            {
+                tracing::warn!(
+                    %channel_id,
+                    limit = MAX_PENDING_PER_CHANNEL,
+                    "queue depth cap reached — dropped oldest queued event"
+                );
+            } else {
+                tracing::warn!(
+                    %channel_id,
+                    limit = MAX_PENDING_PER_CHANNEL,
+                    "queue depth cap reached by native steer reservations — dropped new event"
+                );
+                return false;
+            }
         }
-        queue.push_back(event);
+        self.queues.entry(channel_id).or_default().push_back(event);
         true
     }
 
@@ -4542,6 +4565,26 @@ mod tests {
     /// steer must be invisible to both `flush_next` and `has_flushable_work`.
     /// The withhold is the whole point of the side table — it must close the
     /// `mark_complete` → ack race window.
+    #[test]
+    fn test_native_steer_reservations_count_toward_channel_cap() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+
+        for i in 0..MAX_PENDING_PER_CHANNEL {
+            let qe = make_queued(ch, &format!("reserved-{i}"));
+            let event_id = qe.event.id.to_hex();
+            assert!(q.push(qe));
+            assert!(q.mark_native_steer_pending(ch, &event_id));
+        }
+        assert_eq!(q.withheld_native_steer[&ch].len(), MAX_PENDING_PER_CHANNEL);
+        assert!(
+            !q.push(make_queued(ch, "over-cap")),
+            "all cap slots are reserved, so a new event must not create another preparation"
+        );
+        assert_eq!(q.withheld_native_steer[&ch].len(), MAX_PENDING_PER_CHANNEL);
+        assert!(q.queues.get(&ch).is_none());
+    }
+
     #[test]
     fn test_native_steer_withhold_only_channel_not_flushable() {
         let mut q = EventQueue::new(DedupMode::Queue);

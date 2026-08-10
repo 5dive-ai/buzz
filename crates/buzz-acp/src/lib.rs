@@ -2622,31 +2622,41 @@ async fn tokio_main() -> Result<()> {
                                         if queue::edit_target_id(&event_for_steer).is_some() {
                                             let event_id = event_for_steer.id.to_hex();
                                             let channel_id = buzz_event.channel_id;
-                                            let membership_generation = reserve_native_edit_preparation(
+                                            match reserve_native_edit_preparation(
                                                 &mut queue,
                                                 &membership_generations,
                                                 channel_id,
                                                 &event_id,
-                                            )
-                                            .expect("accepted edit must still be queued");
-                                            let tx = native_steer_tx.clone();
-                                            let ctx = Arc::clone(&ctx);
-                                            tokio::spawn(async move {
-                                                let prompt_blocks = pool::format_native_steer_prompt(
-                                                    channel_id,
-                                                    event_for_steer.clone(),
-                                                    prompt_tag_for_steer,
-                                                    &ctx,
-                                                )
-                                                .await;
-                                                let _ = tx.send(NativeSteerPrepared {
-                                                    channel_id,
-                                                    membership_generation,
-                                                    event: event_for_steer,
-                                                    prompt_blocks,
-                                                });
-                                            });
-                                            true
+                                            ) {
+                                                Some(membership_generation) => {
+                                                    let tx = native_steer_tx.clone();
+                                                    let ctx = Arc::clone(&ctx);
+                                                    tokio::spawn(async move {
+                                                        let prompt_blocks = pool::format_native_steer_prompt(
+                                                            channel_id,
+                                                            event_for_steer.clone(),
+                                                            prompt_tag_for_steer,
+                                                            &ctx,
+                                                        )
+                                                        .await;
+                                                        let _ = tx.send(NativeSteerPrepared {
+                                                            channel_id,
+                                                            membership_generation,
+                                                            event: event_for_steer,
+                                                            prompt_blocks,
+                                                        });
+                                                    });
+                                                    true
+                                                }
+                                                None => {
+                                                    tracing::warn!(
+                                                        %channel_id,
+                                                        %event_id,
+                                                        "native edit steer preparation could not reserve queued event; falling back to cancel+merge"
+                                                    );
+                                                    false
+                                                }
+                                            }
                                         } else {
                                             let prompt_blocks =
                                                 pool::format_native_steer_prompt_sync(
@@ -2883,8 +2893,15 @@ async fn tokio_main() -> Result<()> {
                     prompt_blocks,
                     &steer_ack_tx,
                 ) {
-                    queue.release_native_steer(channel_id, &event.id.to_hex());
-                    signal_in_flight_task(&mut pool, channel_id, ControlSignal::Steer);
+                    release_prepared_native_steer_fallback(
+                        &mut pool,
+                        &mut queue,
+                        channel_id,
+                        &event.id.to_hex(),
+                        &ctx,
+                        &mut last_activity,
+                        &mut typing_channels,
+                    );
                 }
             }
             Some(PoolEvent::SteerAck(SteerAckEvent {
@@ -3357,6 +3374,26 @@ fn try_native_steer(
             );
             false
         }
+    }
+}
+
+/// Recover a prepared edit whose native steer could not be accepted. The edit
+/// was withheld before asynchronous preparation, so release it, request the
+/// universal cancel+merge fallback, and immediately try dispatch in case the
+/// original turn already ended.
+fn release_prepared_native_steer_fallback(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    channel_id: Uuid,
+    event_id: &str,
+    ctx: &Arc<PromptContext>,
+    last_activity: &mut tokio::time::Instant,
+    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+) {
+    queue.release_native_steer(channel_id, event_id);
+    signal_in_flight_task(pool, channel_id, ControlSignal::Steer);
+    for (channel_id, thread_tags) in dispatch_pending(pool, queue, ctx, last_activity) {
+        typing_channels.insert(channel_id, thread_tags);
     }
 }
 
@@ -8286,6 +8323,114 @@ mod native_edit_membership_lifecycle_tests {
             .tags([nostr::Tag::parse(["e", target]).expect("target tag")])
             .sign_with_keys(&Keys::generate())
             .expect("signed edit")
+    }
+
+    async fn dummy_agent(index: usize) -> OwnedAgent {
+        OwnedAgent {
+            index,
+            acp: AcpClient::spawn("cat", &[], &[], false)
+                .await
+                .expect("spawn inert agent"),
+            state: Default::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            protocol_version: 1,
+            goose_system_prompt_supported: None,
+        }
+    }
+
+    fn prompt_context() -> Arc<PromptContext> {
+        let keys = Keys::generate();
+        let rest_client = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:0".into(),
+            keys: keys.clone(),
+            auth_tag_json: None,
+        };
+        Arc::new(PromptContext {
+            mcp_servers: vec![],
+            initial_message: None,
+            idle_timeout: Duration::from_secs(60),
+            max_turn_duration: Duration::from_secs(120),
+            turn_liveness_interval: Duration::ZERO,
+            dedup_mode: DedupMode::Queue,
+            system_prompt: None,
+            session_title: None,
+            team_instructions: None,
+            heartbeat_prompt: None,
+            base_prompt: None,
+            cwd: ".".into(),
+            channel_info: pool::ChannelInfoResolver::new(HashMap::new(), rest_client.clone()),
+            rest_client,
+            context_message_limit: 0,
+            max_turns_per_session: 0,
+            permission_mode: config::PermissionMode::Default,
+            agent_keys: keys,
+            agent_owner_pubkey: None,
+            memory_enabled: false,
+            harness_name: "goose".into(),
+            relay_url: "ws://127.0.0.1:0".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn prepared_native_steer_rejection_releases_and_dispatches_immediately() {
+        let channel_id = Uuid::new_v4();
+        let event = edit_event(&"ab".repeat(32));
+        let event_id = event.id.to_hex();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "@mention".into(),
+        }));
+        assert!(queue.mark_native_steer_pending(channel_id, &event_id));
+
+        // The original turn completed while edit enrichment ran. The native
+        // transport rejection must synchronously release and re-dispatch the
+        // edit; no maintenance tick may be needed to observe the work.
+        let mut pool = AgentPool::from_slots(vec![Some(dummy_agent(0).await)]);
+        let mut last_activity = tokio::time::Instant::now();
+        let mut typing_channels = HashMap::new();
+        release_prepared_native_steer_fallback(
+            &mut pool,
+            &mut queue,
+            channel_id,
+            &event_id,
+            &prompt_context(),
+            &mut last_activity,
+            &mut typing_channels,
+        );
+
+        assert!(typing_channels.contains_key(&channel_id));
+        assert_eq!(
+            pool.task_map().len(),
+            1,
+            "released edit dispatched exactly once"
+        );
+        assert!(
+            queue.flush_next().is_none(),
+            "dispatch consumed the released edit"
+        );
+    }
+
+    #[test]
+    fn unreservable_edit_leaves_universal_fallback_work_queued() {
+        let channel_id = Uuid::new_v4();
+        let event = edit_event(&"ab".repeat(32));
+        let event_id = event.id.to_hex();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let generations = HashMap::new();
+
+        assert_eq!(
+            reserve_native_edit_preparation(&mut queue, &generations, channel_id, &event_id),
+            None,
+            "a missing queue entry must not panic or claim a native attempt"
+        );
+        assert!(queue.flush_next().is_none());
     }
 
     #[test]

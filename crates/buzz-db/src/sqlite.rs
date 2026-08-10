@@ -265,6 +265,85 @@ pub(crate) async fn is_community_active(
     Ok(count != 0)
 }
 
+pub(crate) async fn rebind_single_node_community_host(
+    pool: &SqlitePool,
+    normalized_host: &str,
+    owner_pubkey: &str,
+) -> Result<Option<CommunityRecord>> {
+    let mut tx = pool.begin().await?;
+
+    // Defect-era databases may contain several loopback communities, one per
+    // ephemeral port. Prefer a community owned by this desktop identity, then
+    // the one carrying the most events. This preserves the most useful UUID and
+    // its channels/messages while making the current Host header resolvable.
+    let row = sqlx::query(
+        r#"SELECT c.id, c.host
+           FROM communities c
+           LEFT JOIN relay_members rm
+             ON rm.community_id = c.id
+            AND lower(rm.pubkey) = lower(?1)
+            AND rm.role = 'owner'
+           LEFT JOIN events e ON e.community_id = c.id
+           WHERE c.archived_at IS NULL
+             AND c.host LIKE '127.0.0.1:%'
+           GROUP BY c.id, c.host, c.created_at
+           ORDER BY (rm.pubkey IS NOT NULL) DESC, count(e.id) DESC, c.created_at ASC, c.id ASC
+           LIMIT 1"#,
+    )
+    .bind(owner_pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let record = community_record(row)?;
+    if record.host.eq_ignore_ascii_case(normalized_host) {
+        tx.commit().await?;
+        return Ok(Some(record));
+    }
+
+    // The OS may reuse a port that belongs to another stale defect-era row.
+    // Swap that collision to the selected row's old authority transactionally,
+    // using a temporary unique host to satisfy the case-insensitive constraint.
+    if let Some(collision_id) = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM communities WHERE host = ?1 COLLATE NOCASE AND id <> ?2",
+    )
+    .bind(normalized_host)
+    .bind(record.id.as_uuid().to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let temporary_host = format!("rebind-{}.invalid", Uuid::new_v4());
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(&collision_id)
+            .bind(&temporary_host)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(record.id.as_uuid().to_string())
+            .bind(normalized_host)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(collision_id)
+            .bind(&record.host)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(record.id.as_uuid().to_string())
+            .bind(normalized_host)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(Some(CommunityRecord {
+        id: record.id,
+        host: normalized_host.to_string(),
+    }))
+}
+
 pub(crate) async fn ensure_configured_community(
     pool: &SqlitePool,
     normalized_host: &str,

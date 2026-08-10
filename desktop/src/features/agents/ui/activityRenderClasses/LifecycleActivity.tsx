@@ -77,13 +77,24 @@ function PermissionDecisionButtons({
     }
   }, [deliveryFailed]);
 
-  if (options.length === 0) {
+  // Classify each option into an actionable bucket or a non-actionable
+  // display-only slot.  Unknown kinds fail closed: they are not rendered at
+  // all so the user cannot accidentally make an irreversible choice on an
+  // option the UI doesn't understand.
+  const actionableOptions = options.filter(
+    ({ kind }) => kind === "allow_once" || kind.startsWith("reject"),
+  );
+  const hasPersistentGrant = options.some(
+    ({ kind }) => kind === "allow_always",
+  );
+
+  if (actionableOptions.length === 0 && !hasPersistentGrant) {
     return null;
   }
 
   return (
     <div className="mt-1.5 flex flex-wrap gap-1.5">
-      {options.map(({ optionId, kind, label }) => {
+      {actionableOptions.map(({ optionId, kind, label }) => {
         const isDeny = kind.startsWith("reject");
         const displayLabel = label ?? (isDeny ? "Deny" : "Allow");
         return (
@@ -115,6 +126,17 @@ function PermissionDecisionButtons({
           </button>
         );
       })}
+      {/* allow_always: non-actionable badge — the thread card is the correct
+          surface for persistent grants (D5 disclosure). The observer feed
+          shows it as an informational note only. */}
+      {hasPersistentGrant ? (
+        <span
+          className="rounded px-2 py-0.5 text-xs font-medium border border-amber-500/30 text-amber-600 dark:text-amber-400 opacity-70 cursor-default"
+          data-testid="permission-decision-persistent-grant"
+        >
+          Permanent grant — use request card
+        </span>
+      ) : null}
     </div>
   );
 }

@@ -7,35 +7,107 @@ final _bareLinkPattern = RegExp(
   r'(?<![(\]=])(?:https?://|buzz://(?:message\?|join\?|channel/))[^\s)>\]]+',
 );
 final _trailingPunctuationPattern = RegExp(r'[.,!?:;]+$');
+final _backtickRunPattern = RegExp(r'`+');
 
-/// Converts supported autolinks and bare links into Markdown links while
-/// leaving inline and fenced code untouched.
+/// Converts supported Buzz and HTTP(S) autolinks and bare links into Markdown
+/// links while leaving inline and fenced code untouched. Punctuation peeling
+/// is limited to Buzz URLs so existing HTTP(S) destinations stay unchanged.
 String normalizeBareLinks(String content) {
   final buffer = StringBuffer();
-  final backtickRuns = RegExp(r'`+').allMatches(content);
   var offset = 0;
-  String? codeDelimiter;
+  var proseStart = 0;
+  var codeStart = 0;
+  var inlineDelimiterLength = 0;
+  var fenceDelimiterLength = 0;
 
-  for (final run in backtickRuns) {
-    if (codeDelimiter == null) {
-      buffer.write(_normalizeLinkSegment(content.substring(offset, run.start)));
-      codeDelimiter = run[0]!;
-    } else {
-      buffer.write(content.substring(offset, run.start));
-      if (run[0] == codeDelimiter) {
-        codeDelimiter = null;
-      }
+  while (offset < content.length) {
+    final run = _backtickRunPattern.matchAsPrefix(content, offset);
+    if (run == null) {
+      offset++;
+      continue;
     }
 
-    buffer.write(run[0]!);
+    final runLength = run.end - run.start;
+    if (fenceDelimiterLength > 0) {
+      if (_isClosingFence(content, run.start, run.end, fenceDelimiterLength)) {
+        buffer.write(content.substring(codeStart, run.end));
+        fenceDelimiterLength = 0;
+        proseStart = run.end;
+      }
+    } else if (inlineDelimiterLength > 0) {
+      if (runLength == inlineDelimiterLength) {
+        buffer.write(content.substring(codeStart, run.end));
+        inlineDelimiterLength = 0;
+        proseStart = run.end;
+      }
+    } else if (_hasInlineCloserOnLine(content, run.end, runLength) ||
+        (!_isOpeningFence(content, run.start, runLength) &&
+            _hasInlineCloser(content, run.end, runLength))) {
+      buffer.write(
+        _normalizeLinkSegment(content.substring(proseStart, run.start)),
+      );
+      codeStart = run.start;
+      inlineDelimiterLength = runLength;
+    } else if (_isOpeningFence(content, run.start, runLength)) {
+      buffer.write(
+        _normalizeLinkSegment(content.substring(proseStart, run.start)),
+      );
+      codeStart = run.start;
+      fenceDelimiterLength = runLength;
+    }
+
     offset = run.end;
   }
 
-  final trailing = content.substring(offset);
-  buffer.write(
-    codeDelimiter == null ? _normalizeLinkSegment(trailing) : trailing,
-  );
+  if (inlineDelimiterLength > 0 || fenceDelimiterLength > 0) {
+    buffer.write(content.substring(codeStart));
+  } else {
+    buffer.write(_normalizeLinkSegment(content.substring(proseStart)));
+  }
   return buffer.toString();
+}
+
+bool _isOpeningFence(String content, int runStart, int runLength) {
+  if (runLength < 3) return false;
+  final lineStart = runStart == 0
+      ? 0
+      : content.lastIndexOf('\n', runStart - 1) + 1;
+  final indentation = content.substring(lineStart, runStart);
+  return indentation.length <= 3 && indentation.trim().isEmpty;
+}
+
+bool _isClosingFence(
+  String content,
+  int runStart,
+  int runEnd,
+  int openerLength,
+) {
+  if (runEnd - runStart < openerLength) return false;
+  final lineStart = runStart == 0
+      ? 0
+      : content.lastIndexOf('\n', runStart - 1) + 1;
+  final indentation = content.substring(lineStart, runStart);
+  if (indentation.length > 3 || indentation.trim().isNotEmpty) return false;
+  final newline = content.indexOf('\n', runEnd);
+  final lineEnd = newline < 0 ? content.length : newline;
+  return content.substring(runEnd, lineEnd).trim().isEmpty;
+}
+
+bool _hasInlineCloserOnLine(String content, int start, int delimiterLength) {
+  final newline = content.indexOf('\n', start);
+  final lineEnd = newline < 0 ? content.length : newline;
+  for (final run in _backtickRunPattern.allMatches(content, start)) {
+    if (run.start >= lineEnd) return false;
+    if (run.end - run.start == delimiterLength) return true;
+  }
+  return false;
+}
+
+bool _hasInlineCloser(String content, int start, int delimiterLength) {
+  for (final run in _backtickRunPattern.allMatches(content, start)) {
+    if (run.end - run.start == delimiterLength) return true;
+  }
+  return false;
 }
 
 String _normalizeLinkSegment(String segment) {
@@ -54,12 +126,15 @@ String _normalizeBareLink(String segment, Match match) {
   final matched = match[0]!;
   var url = matched;
   var trailing = '';
+  final isBuzzUrl = matched.startsWith('buzz://');
   final start = match.start;
 
-  final outsidePunctuation = _trailingPunctuationPattern.firstMatch(url);
-  if (outsidePunctuation != null) {
-    url = url.substring(0, outsidePunctuation.start);
-    trailing = outsidePunctuation[0]!;
+  if (isBuzzUrl) {
+    final outsidePunctuation = _trailingPunctuationPattern.firstMatch(url);
+    if (outsidePunctuation != null) {
+      url = url.substring(0, outsidePunctuation.start);
+      trailing = outsidePunctuation[0]!;
+    }
   }
 
   var strippedDelimiter = true;
@@ -79,10 +154,12 @@ String _normalizeBareLink(String segment, Match match) {
     }
   }
 
-  final punctuation = _trailingPunctuationPattern.firstMatch(url);
-  if (punctuation != null) {
-    url = url.substring(0, punctuation.start);
-    trailing = '${punctuation[0]}$trailing';
+  if (isBuzzUrl) {
+    final punctuation = _trailingPunctuationPattern.firstMatch(url);
+    if (punctuation != null) {
+      url = url.substring(0, punctuation.start);
+      trailing = '${punctuation[0]}$trailing';
+    }
   }
 
   // Preserve a URL already used as its own Markdown label. This covers both

@@ -30,18 +30,60 @@ void main() {
     );
   });
 
-  test('leaves links inside backticks untouched', () {
-    expect(normalizeBareLinks('`$url` then $url'), '`$url` then [$url]($url)');
+  group('code boundaries', () {
+    final cases = <({String name, String input, String expected})>[
+      (
+        name: 'single-backtick inline span',
+        input: '`$url` then $url',
+        expected: '`$url` then [$url]($url)',
+      ),
+      (
+        name: 'matching multi-backtick inline span',
+        input: '``$url`` then $url',
+        expected: '``$url`` then [$url]($url)',
+      ),
+      (
+        name: 'literal shorter backtick run in inline span',
+        input: '``inside ` $url`` then $url',
+        expected: '``inside ` $url`` then [$url]($url)',
+      ),
+      (
+        name: 'inline closer must have equal length',
+        input: '``$url``` still code`` then $url',
+        expected: '``$url``` still code`` then [$url]($url)',
+      ),
+      (
+        name: 'fence accepts a longer line-start closer',
+        input: '```\n$url\n````\n$url',
+        expected: '```\n$url\n````\n[$url]($url)',
+      ),
+      (
+        name: 'fence ignores an inline-looking backtick run',
+        input: '```\n$url ``` still code\n```\n$url',
+        expected: '```\n$url ``` still code\n```\n[$url]($url)',
+      ),
+      (
+        name: 'unclosed backticks remain prose',
+        input: '$url then `$url',
+        expected: '[$url]($url) then `[$url]($url)',
+      ),
+    ];
+
+    for (final testCase in cases) {
+      test(testCase.name, () {
+        expect(normalizeBareLinks(testCase.input), testCase.expected);
+      });
+    }
   });
 
-  test('leaves links inside matching multi-backtick code spans untouched', () {
-    expect(
-      normalizeBareLinks('``$url`` then $url'),
-      '``$url`` then [$url]($url)',
-    );
-    expect(
-      normalizeBareLinks('````$url```` then $url'),
-      '````$url```` then [$url]($url)',
-    );
-  });
+  test(
+    'preserves HTTP(S) destinations while retaining bare-link rendering',
+    () {
+      const httpUrl = 'https://example.com/search?q=why?';
+      expect(
+        normalizeBareLinks('See $httpUrl and <$httpUrl>'),
+        'See [$httpUrl]($httpUrl) and [$httpUrl]($httpUrl)',
+      );
+    },
+  );
 }

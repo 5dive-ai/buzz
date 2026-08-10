@@ -21,8 +21,8 @@ const MAX_IMAGE_FETCH_BYTES: usize = 2 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 4096;
 const MAX_IMAGE_PIXELS: u64 = 16_000_000;
 const MAX_SANITIZED_DIMENSION: u32 = 1200;
-const PREVIEW_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
-const PREVIEW_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+const PREVIEW_FETCH_TIMEOUT: Duration = Duration::from_secs(6);
+const PREVIEW_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REDIRECTS: usize = 3;
 const MAX_METADATA_CHARS: usize = 180;
 const MAX_METADATA_DESCRIPTION_CHARS: usize = 280;
@@ -87,7 +87,18 @@ async fn fetch_link_preview_metadata_inner(
             continue;
         }
 
-        if !response.status().is_success() || !is_html_response(&response) {
+        if !response.status().is_success() {
+            // A retryable status (rate limit, request timeout, too early, or a
+            // server error) is transient: surface it as an error so the caller
+            // retries soon instead of caching an empty card for the full miss
+            // TTL. Any other non-success (e.g. 404) is a genuine hard miss.
+            let status = response.status();
+            if is_transient_status(status) {
+                return Err(format!("link preview request failed: HTTP {status}"));
+            }
+            return Ok(None);
+        }
+        if !is_html_response(&response) {
             return Ok(None);
         }
         let body = read_bytes_prefix(response, MAX_PREVIEW_FETCH_BYTES).await?;
@@ -213,6 +224,16 @@ async fn send_pinned_request(url: &Url, accept: &str) -> Result<reqwest::Respons
         .await
         .map_err(|_| "link preview request timed out".to_string())?
         .map_err(|error| format!("link preview request failed: {error}"))
+}
+
+/// A retryable HTTP status: rate limit, request timeout, too early, or any
+/// server error. These are transient and should be retried soon rather than
+/// cached as a genuine "no metadata" miss.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_EARLY
+        || status.is_server_error()
 }
 
 fn is_html_response(response: &reqwest::Response) -> bool {
@@ -350,11 +371,7 @@ async fn fetch_sanitized_image(
         }
         if !response.status().is_success() {
             let status = response.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status == reqwest::StatusCode::REQUEST_TIMEOUT
-                || status == reqwest::StatusCode::TOO_EARLY
-                || status.is_server_error()
-            {
+            if is_transient_status(status) {
                 let retry_after = retry_after_duration(&response);
                 if let Some(retry_after) = retry_after {
                     set_image_host_cooldown(&url, retry_after);
@@ -651,9 +668,9 @@ mod tests {
     use super::rate_limit::MAX_IMAGE_RETRY_AFTER;
     use super::{
         apply_image_result, declares_animation, extract_favicon_url, extract_image_url,
-        extract_link_preview_metadata, is_html_response, read_bytes_prefix, retry_after_duration,
-        sanitize_image, ImageFetchError, LinkPreviewImageFetchState, LinkPreviewMetadata,
-        MAX_METADATA_DESCRIPTION_CHARS,
+        extract_link_preview_metadata, is_html_response, is_transient_status, read_bytes_prefix,
+        retry_after_duration, sanitize_image, ImageFetchError, LinkPreviewImageFetchState,
+        LinkPreviewMetadata, MAX_METADATA_DESCRIPTION_CHARS,
     };
     use axum::{body::Body, http::Response, routing::get, Router};
     use base64::Engine as _;
@@ -956,5 +973,25 @@ mod tests {
     fn metadata_requires_a_non_empty_title() {
         assert_eq!(extract_link_preview_metadata("<title>   </title>"), None);
         assert_eq!(extract_link_preview_metadata("<html></html>"), None);
+    }
+
+    #[test]
+    fn transient_statuses_are_distinguished_from_hard_misses() {
+        use reqwest::StatusCode;
+        // Retryable: surfaced as an error so the caller retries soon instead of
+        // caching an empty card for the full miss TTL.
+        assert!(is_transient_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_transient_status(StatusCode::TOO_EARLY));
+        assert!(is_transient_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_transient_status(StatusCode::BAD_GATEWAY));
+        assert!(is_transient_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_transient_status(StatusCode::GATEWAY_TIMEOUT));
+        // Genuine hard misses: cached for the full miss TTL, not retried early.
+        assert!(!is_transient_status(StatusCode::NOT_FOUND));
+        assert!(!is_transient_status(StatusCode::FORBIDDEN));
+        assert!(!is_transient_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_transient_status(StatusCode::GONE));
+        assert!(!is_transient_status(StatusCode::OK));
     }
 }

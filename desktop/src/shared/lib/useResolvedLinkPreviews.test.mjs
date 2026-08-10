@@ -133,7 +133,7 @@ test("metadata loader retries transient images after the server cooldown", async
   assert.equal(calls, 2);
 });
 
-test("metadata loader retries rejected requests after the negative-cache TTL", async () => {
+test("metadata loader retries a rejected request after the short transient TTL", async () => {
   let now = 1_000;
   let calls = 0;
   const loader = __linkPreviewMetadataTest.createMetadataLoader({
@@ -149,8 +149,58 @@ test("metadata loader retries rejected requests after the negative-cache TTL", a
   assert.equal((await loader.load(preview.href)).metadata, null);
   assert.equal(calls, 1);
 
-  now += 5 * 60_000;
+  now += 30_000;
   assert.deepEqual((await loader.load(preview.href)).metadata, metadata());
+  assert.equal(calls, 2);
+});
+
+test("a rejected fetch does not poison the cache for the full miss TTL", async () => {
+  // Regression: a single transient failure (timeout/429/5xx/network) used to be
+  // cached like a genuine "no metadata" miss, blanking a perfectly valid link
+  // for 5 minutes. It must clear well before the miss TTL so the card recovers.
+  let now = 1_000;
+  let calls = 0;
+  const loader = __linkPreviewMetadataTest.createMetadataLoader({
+    fetcher: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("temporary failure");
+      return metadata();
+    },
+    now: () => now,
+  });
+
+  assert.equal((await loader.load(preview.href)).metadata, null);
+  assert.equal(calls, 1);
+
+  // Well before NULL_METADATA_RETRY_MS (5 min) the transient entry has expired
+  // and the retry succeeds — a hard miss would still be cached here.
+  now += 60_000;
+  assert.deepEqual((await loader.load(preview.href)).metadata, metadata());
+  assert.equal(calls, 2);
+});
+
+test("a genuine no-metadata miss stays cached for the full miss TTL", async () => {
+  let now = 1_000;
+  let calls = 0;
+  const loader = __linkPreviewMetadataTest.createMetadataLoader({
+    fetcher: async () => {
+      calls += 1;
+      return null;
+    },
+    now: () => now,
+  });
+
+  assert.equal((await loader.load(preview.href)).metadata, null);
+  assert.equal(calls, 1);
+
+  // A resolved null (200 + HTML + no metadata) is a hard miss: it must not be
+  // refetched inside the transient window.
+  now += 60_000;
+  assert.equal((await loader.load(preview.href)).metadata, null);
+  assert.equal(calls, 1);
+
+  now += 5 * 60_000;
+  assert.equal((await loader.load(preview.href)).metadata, null);
   assert.equal(calls, 2);
 });
 

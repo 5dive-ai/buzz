@@ -33,6 +33,9 @@ export type LinkPreviewMetadata = {
 type MetadataCacheEntry = {
   expiresAt: number | null;
   metadata: LinkPreviewMetadata | null;
+  /** A transient fetch failure (timeout/429/5xx/network) rather than a genuine
+   * "no metadata" result; retried soon instead of cached for the full miss TTL. */
+  transient?: boolean;
 };
 
 type MetadataLoadResult = MetadataCacheEntry & {
@@ -80,7 +83,12 @@ function metadataCacheKey(href: string): string {
 function metadataExpiry(
   metadata: LinkPreviewMetadata | null,
   now: number,
+  transient = false,
 ): number | null {
+  // A transient failure (timeout/429/5xx/network) must not stick for the full
+  // miss TTL: one unlucky fetch would otherwise blank the card for 5 minutes
+  // even though the link is perfectly valid. Retry it soon instead.
+  if (transient) return now + DEFAULT_TRANSIENT_RETRY_MS;
   if (metadata === null) return now + NULL_METADATA_RETRY_MS;
   if (metadata.imageFetchState !== "transient_failure") return null;
   const retryAfterMs =
@@ -158,11 +166,17 @@ function createMetadataLoader({
 
     const requestGeneration = generation;
     const promise = schedule(() => fetcher(href))
-      .catch(() => null)
-      .then((metadata) => {
+      .then(
+        (metadata) => ({ metadata, transient: false }),
+        // A rejected fetch is a transient failure (timeout, network error, or a
+        // retryable status surfaced as an error), not a genuine "no metadata".
+        () => ({ metadata: null, transient: true }),
+      )
+      .then(({ metadata, transient }) => {
         const entry = {
-          expiresAt: metadataExpiry(metadata, now()),
+          expiresAt: metadataExpiry(metadata, now(), transient),
           metadata,
+          transient,
         };
         if (requestGeneration === generation) {
           cache.set(key, entry);

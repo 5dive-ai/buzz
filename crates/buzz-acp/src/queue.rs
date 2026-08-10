@@ -5072,6 +5072,34 @@ mod tests {
     }
 
     #[test]
+    fn async_edit_steer_reservation_prevents_normal_redispatch() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let event = edit_event(&"aa".repeat(32));
+        let event_id = event.id.to_hex();
+        q.push(QueuedEvent {
+            channel_id: ch,
+            event,
+            received_at: Instant::now(),
+            prompt_tag: "@mention".into(),
+        });
+        q.in_flight_channels.insert(ch);
+        q.in_flight_deadlines
+            .insert(ch, Instant::now() + Duration::from_secs(60));
+
+        assert!(q.mark_native_steer_pending(ch, &event_id));
+        q.mark_complete(ch);
+        assert!(
+            q.flush_next().is_none(),
+            "reserved edit must not redispatch"
+        );
+
+        q.release_native_steer(ch, &event_id);
+        let batch = q.flush_next().expect("failed preparation restores edit");
+        assert_eq!(batch.events[0].event.id.to_hex(), event_id);
+    }
+
+    #[test]
     fn native_steer_edit_uses_original_thread_anchor() {
         let original_id = "66".repeat(32);
         let root_id = "77".repeat(32);

@@ -117,7 +117,7 @@ pub struct Llm {
     /// Per-model output ceilings learned from provider catalog metadata. The
     /// key includes the base URL so a deployment-specific cap is never reused
     /// for another endpoint exposing the same model name.
-    output_token_caps: Mutex<HashMap<String, Option<u32>>>,
+    output_token_caps: Mutex<HashMap<String, u32>>,
     /// Bearer-token source for OpenAI-family requests. Static for OpenAI
     /// (the `OPENAI_COMPAT_API_KEY` env var) and Databricks-with-token
     /// (the `DATABRICKS_TOKEN` env var); a refreshable PKCE engine for
@@ -428,14 +428,16 @@ impl Llm {
         let desired = cfg.max_output_tokens;
         let key = output_cap_key(cfg, effective_model);
         if let Some(cached) = self.output_token_caps.lock().await.get(&key).copied() {
-            return cached.map_or(desired, |cap| desired.min(cap));
+            return desired.min(cached);
         }
 
-        let cap = self.fetch_advertised_output_cap(cfg, effective_model).await;
-        self.output_token_caps.lock().await.insert(key, cap);
-        let Some(cap) = cap else {
+        let Some(cap) = self.fetch_advertised_output_cap(cfg, effective_model).await else {
+            // Unknown metadata may be caused by a transient transport, HTTP,
+            // or parsing failure. Do not make that failure sticky for the
+            // process lifetime; a later request can retry discovery.
             return desired;
         };
+        self.output_token_caps.lock().await.insert(key, cap);
         if cap < desired {
             tracing::info!(
                 model = effective_model,
@@ -2891,7 +2893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn effective_output_cap_clamps_to_cached_cap_and_falls_back_when_unknown() {
+    async fn effective_output_cap_clamps_to_cached_cap_and_leaves_unknown_retryable() {
         let llm = llm_with(Arc::new(CountingAuth {
             refreshes: std::sync::atomic::AtomicU32::new(0),
         }));
@@ -2902,9 +2904,8 @@ mod tests {
         let larger_key = output_cap_key(&c, "larger");
         let unknown_key = output_cap_key(&c, "unknown");
         let mut cache = llm.output_token_caps.lock().await;
-        cache.insert(capped_key, Some(32_768));
-        cache.insert(larger_key, Some(128_000));
-        cache.insert(unknown_key, None);
+        cache.insert(capped_key, 32_768);
+        cache.insert(larger_key, 128_000);
         drop(cache);
         assert_eq!(
             llm.output_token_caps
@@ -2912,12 +2913,19 @@ mod tests {
                 .await
                 .get(&output_cap_key(&c, "capped"))
                 .copied(),
-            Some(Some(32_768))
+            Some(32_768)
         );
 
         assert_eq!(llm.effective_output_cap(&c, "capped").await, 32_768);
         assert_eq!(llm.effective_output_cap(&c, "larger").await, 65_536);
         assert_eq!(llm.effective_output_cap(&c, "unknown").await, 65_536);
+        assert!(
+            !llm.output_token_caps
+                .lock()
+                .await
+                .contains_key(&unknown_key),
+            "an unknown or failed lookup must remain retryable"
+        );
     }
 
     fn cfg(provider: Provider) -> Config {

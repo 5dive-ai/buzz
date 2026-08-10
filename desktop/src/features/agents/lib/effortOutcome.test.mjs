@@ -98,6 +98,20 @@ test("awaitEffortOutcome resolves 'invalid_value' on validation rejection", asyn
   assert.equal(await h.outcome, "invalid_value");
 });
 
+test("awaitEffortOutcome resolves 'unsupported_model' immediately without timing out", async () => {
+  // The harness rejects the pick because the current model advertises no
+  // thought_level option. This is terminal — it must settle now, NOT fall
+  // through to the timeout and resolve pending_session.
+  const h = harness();
+  h.push(frame("unsupported_model"));
+  assert.equal(await h.outcome, "unsupported_model");
+  assert.equal(
+    h.cancelTimeoutCalls,
+    1,
+    "terminal unsupported_model must cancel the pending-session timeout",
+  );
+});
+
 // ── clear path (I-1) ──────────────────────────────────────────────────────────
 
 test("awaitEffortOutcome resolves 'cleared' when Auto (empty value) is selected", async () => {

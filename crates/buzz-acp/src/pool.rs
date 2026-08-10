@@ -1340,6 +1340,11 @@ impl AgentPool {
         agent.desired_model = Some(model_id.to_string());
         agent.model_overridden = true;
         agent.state.invalidate_channel(&channel_id);
+        // The target model's effort capabilities are not yet known — they arrive
+        // on the next session/new + switch. Drop to Unknown now so a concurrent
+        // effort pick can't validate against the outgoing model's Supported
+        // snapshot (it takes the pre-discovery trust path instead).
+        self.effort_capability_state = EffortCapabilityState::Unknown;
         IdleSwitchResult::Switched
     }
 
@@ -1622,37 +1627,52 @@ async fn create_session_and_apply_model(
     }
 
     // Populate model capabilities from every session/new response — not just the
-    // first. This ensures that after a model switch (which resets capabilities to
-    // None to discard the pre-switch snapshot), the next session/new supplies
-    // fresh capability data for the new model.
+    // first. This is the PRE-switch snapshot (the process/default model's
+    // options); the model-switch block below replaces it with the target model's
+    // authoritative snapshot when a switch is applied.
     agent.model_capabilities = Some(AgentModelCapabilities {
         config_options_raw: extract_agent_config_options(&resp.raw),
         available_models_raw: extract_model_state(&resp.raw),
         thought_level_config_id: extract_thought_level_config_id(&resp.raw),
     });
 
-    // B5 startup-default: arm desired_effort from startup_effort + capabilities.
-    // No-op when desired_effort already set (live pick takes precedence, via the
-    // pool-level value copied at checkout) or when the adapter does not advertise
-    // thought_level for this model.
-    agent.resolve_startup_effort();
-
     // Apply desired_model if set, matching against the fresh session/new response.
-    // Track whether the switch succeeded so session_config_captured reflects
-    // the post-switch state (not the pre-switch desired state).
-    let switch_succeeded = if let Some(ref desired) = agent.desired_model {
+    // `post_switch_options` carries the configOptions to cache for Desktop:
+    //   Some(value) → a switch was applied; `value` is the target model's
+    //                 authoritative configOptions (or Null when the adapter
+    //                 returned none and capabilities dropped to Unknown).
+    //   None        → no switch happened; the caller caches the session/new
+    //                 options unchanged.
+    let post_switch_options: Option<serde_json::Value> = if let Some(ref desired) =
+        agent.desired_model
+    {
         match resolve_model_switch_method(&resp.raw, desired) {
             Some(method) => {
-                apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?;
-                // The session/new response captured above reflects the pre-switch
-                // model's configOptions. Reset capabilities to None so:
-                //   1. `return_agent` writes EffortCapabilityState::Unknown, keeping
-                //      the pre-discovery trust path active (not stale-Supported).
-                //   2. The next session/new (after this session is invalidated on
-                //      the next model switch or rotation) re-derives capabilities
-                //      from the then-current model's response.
-                agent.model_capabilities = None;
-                true
+                let switch_result =
+                    apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?;
+                // The adapter rebuilds `session.configOptions` for the target
+                // model and echoes them in the switch response. Consume that
+                // snapshot so model_capabilities, startup-effort resolution, and
+                // the Desktop cache all converge on the model the session is
+                // actually running — not the pre-switch default.
+                let switch_options = switch_result.get("configOptions").cloned();
+                if switch_options.as_ref().is_some_and(|v| !v.is_null()) {
+                    agent.model_capabilities = Some(AgentModelCapabilities {
+                        config_options_raw: extract_agent_config_options(&switch_result),
+                        available_models_raw: extract_model_state(&switch_result),
+                        thought_level_config_id: extract_thought_level_config_id(&switch_result),
+                    });
+                    Some(switch_options.unwrap())
+                } else {
+                    // No authoritative post-switch options (older adapter, or an
+                    // application-level switch failure that returned Null). The
+                    // pre-switch snapshot cannot be trusted for the target model,
+                    // so drop to Unknown: `return_agent` writes
+                    // EffortCapabilityState::Unknown (pre-discovery trust path)
+                    // and the next session/new re-derives capabilities.
+                    agent.model_capabilities = None;
+                    Some(serde_json::Value::Null)
+                }
             }
             None => {
                 tracing::warn!(
@@ -1671,12 +1691,20 @@ async fn create_session_and_apply_model(
                         "modelId": desired,
                     }),
                 );
-                false
+                None
             }
         }
     } else {
-        false
+        None
     };
+    let switch_succeeded = post_switch_options.is_some();
+
+    // B5 startup-default: arm desired_effort from startup_effort + capabilities.
+    // Resolved AFTER the model switch so it targets the post-switch model's
+    // thought_level configId (or no-ops when the target model lacks effort).
+    // No-op when desired_effort is already set (live pick takes precedence, via
+    // the pool-level value copied at checkout).
+    agent.resolve_startup_effort();
 
     // B5: Apply desired_effort if set, or report a pending clear.
     //
@@ -1775,17 +1803,16 @@ async fn create_session_and_apply_model(
     // applied — false on the unsupported arm so the panel doesn't show a
     // stale override badge.
     //
-    // When a model switch succeeded, the configOptions in resp.raw are pre-switch
-    // data and must not be cached — the next session/new will supply fresh options
-    // for the new model. Emit null for configOptions on the switch path so Desktop
-    // clears its picker state rather than rendering stale capability data.
-    let config_options_for_cache = if switch_succeeded {
-        serde_json::Value::Null
-    } else {
-        resp.raw
+    // On the switch path, cache the adapter's authoritative post-switch
+    // configOptions (the target model's option set), or Null when the adapter
+    // returned none. Off the switch path, cache the session/new options as-is.
+    let config_options_for_cache = match post_switch_options {
+        Some(options) => options,
+        None => resp
+            .raw
             .get("configOptions")
             .cloned()
-            .unwrap_or(serde_json::Value::Null)
+            .unwrap_or(serde_json::Value::Null),
     };
     agent.acp.observe(
         "session_config_captured",
@@ -1852,7 +1879,7 @@ async fn apply_model_switch(
     session_id: &str,
     desired: &str,
     method: &ModelSwitchMethod,
-) -> Result<(), AcpError> {
+) -> Result<serde_json::Value, AcpError> {
     let method_label = match method {
         ModelSwitchMethod::ConfigOption { config_id, .. } => {
             format!("configOption (configId={config_id})")
@@ -1877,11 +1904,15 @@ async fn apply_model_switch(
     .await;
 
     match result {
-        Ok(Ok(_)) => {
+        // Return the RPC result so the caller can consume the post-switch
+        // capability snapshot the adapter echoes (claude-agent-acp rebuilds
+        // `session.configOptions` on a model change and returns them here).
+        Ok(Ok(value)) => {
             tracing::info!(
                 target: "pool::model",
                 "applied model {desired} via {method_label} on session {session_id}"
             );
+            Ok(value)
         }
         // Transport-class errors may have corrupted the stdio stream — propagate
         // so the caller can respawn the agent instead of reusing a poisoned one.
@@ -1894,14 +1925,17 @@ async fn apply_model_switch(
                 target: "pool::model",
                 "fatal error setting model {desired} via {method_label}: {e}"
             );
-            return Err(e);
+            Err(e)
         }
-        // Application-level errors (Json, etc.) — agent is fine, just uses default model.
+        // Application-level errors (Json, etc.) — agent is fine, just uses default
+        // model. Report `Null` so the caller keeps the pre-switch capability
+        // snapshot rather than blanking it (the switch did not take effect).
         Ok(Err(e)) => {
             tracing::warn!(
                 target: "pool::model",
                 "failed to set model {desired} via {method_label}: {e} — proceeding with agent default"
             );
+            Ok(serde_json::Value::Null)
         }
         Err(_) => {
             // Outer timeout fired — the inner send_request may have left the
@@ -1910,10 +1944,9 @@ async fn apply_model_switch(
                 target: "pool::model",
                 "model set via {method_label} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
             );
-            return Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT));
+            Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
         }
     }
-    Ok(())
 }
 
 /// Set the session permission mode via `session/set_config_option`.
@@ -8675,6 +8708,216 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             "one fetch_channel_info sequence (initial attempt + single retry)"
         );
         server.abort();
+    }
+
+    // ── Model-switch capability-refresh lifecycle (Thufir pass-1 IMPORTANT) ────
+    //
+    // These exercise the FULL production path — `session/new` →
+    // `apply_model_switch` → `return_agent` — with a scripted ACP process that
+    // returns pre-switch options from `session/new` and different/absent options
+    // from the switch RPC. No manual capability injection: the assertions prove
+    // that `create_session_and_apply_model` consumes the adapter's post-switch
+    // snapshot rather than discarding it.
+
+    /// Spawn a scripted ACP that answers `session/new` (request id 0) with
+    /// `pre_switch_config_options`, the following model-switch RPC (id 1) with
+    /// `post_switch_result`, and any subsequent request (e.g. the startup-effort
+    /// `set_config_option`, id 2) with a generic `ok` echoing the request id, so
+    /// the effort application never blocks on a missing reply.
+    async fn spawn_switch_lifecycle_acp(
+        pre_switch_config_options: &str,
+        post_switch_result: &str,
+    ) -> crate::acp::AcpClient {
+        use crate::acp::AcpClient;
+        // Extract the JSON-RPC id from each request line and reply with a
+        // matching id. The first two replies carry scripted results; anything
+        // after gets `{"ok":true}` so tail requests (effort) resolve promptly.
+        let script = format!(
+            r#"
+            read -r -t 5 _new
+            printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"ses_switch","configOptions":{pre_switch_config_options}}}}}'
+            read -r -t 5 _switch
+            printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{post_switch_result}}}'
+            id=2
+            while read -r -t 5 _line; do
+                printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true}}}}'
+                id=$((id+1))
+            done
+            "#
+        );
+        AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("failed to spawn switch-lifecycle ACP")
+    }
+
+    /// Build an OwnedAgent for the switch-lifecycle tests with `desired_model`
+    /// set (so `create_session_and_apply_model` performs the switch).
+    fn switch_lifecycle_agent(acp: crate::acp::AcpClient, desired_model: &str) -> OwnedAgent {
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: Some(desired_model.to_string()),
+            model_overridden: true,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
+            agent_name: "switch-lifecycle-test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    /// After a successful switch to a model whose option set DIFFERS from the
+    /// pre-switch model, the pool converges on the TARGET model's snapshot:
+    /// `effort_capability_state` reflects the post-switch valid_values, and the
+    /// emitted `session_config_captured` carries the post-switch configOptions —
+    /// not `null`, not the pre-switch set.
+    #[tokio::test]
+    async fn test_switch_refreshes_capabilities_from_post_switch_snapshot() {
+        // Pre-switch model: effort supports low/medium/high, and "model-b" is a
+        // switchable model option.
+        let pre = r#"[{"id":"model","category":"model","options":[{"value":"model-a"},{"value":"model-b"}]},{"id":"effort","category":"thought_level","options":[{"value":"low"},{"value":"medium"},{"value":"high"}]}]"#;
+        // Post-switch model: effort supports ONLY "extended" — a different set.
+        let post = r#"{"configOptions":[{"id":"effort","category":"thought_level","options":[{"value":"extended"}]}]}"#;
+        let acp = spawn_switch_lifecycle_acp(pre, post).await;
+        let mut agent = switch_lifecycle_agent(acp, "model-b");
+
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let ctx = make_prompt_context_no_owner();
+        let (effort_tx, _effort_rx) = mpsc::unbounded_channel();
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None, &effort_tx)
+            .await
+            .expect("session creation + switch must succeed");
+
+        // Agent's live capabilities reflect the POST-switch model.
+        let caps = agent
+            .model_capabilities
+            .as_ref()
+            .expect("capabilities populated from post-switch snapshot");
+        assert_eq!(
+            caps.thought_level_config_id.as_deref(),
+            Some("effort"),
+            "post-switch model still advertises thought_level"
+        );
+
+        // session_config_captured carries the post-switch options (not null).
+        let captured = obs
+            .snapshot()
+            .into_iter()
+            .find(|e| e.kind == "session_config_captured")
+            .expect("session_config_captured emitted");
+        let opts = &captured.payload["configOptions"];
+        assert!(
+            opts.is_array(),
+            "post-switch configOptions must be cached, got {opts}"
+        );
+        let extended_present = opts
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["category"] == "thought_level")
+            .flat_map(|o| o["options"].as_array().cloned().unwrap_or_default())
+            .any(|v| v["value"] == "extended");
+        assert!(
+            extended_present,
+            "cached options must be the post-switch set (contains 'extended'), got {opts}"
+        );
+
+        // return_agent derives the pool tri-state from the post-switch snapshot.
+        let mut pool = AgentPool::from_slots(vec![None]);
+        pool.return_agent(agent);
+        match &pool.effort_capability_state {
+            EffortCapabilityState::Supported {
+                config_id,
+                valid_values,
+            } => {
+                assert_eq!(config_id, "effort");
+                assert_eq!(
+                    valid_values,
+                    &vec!["extended".to_string()],
+                    "pool must validate against the post-switch option set"
+                );
+            }
+            other => panic!("expected Supported(post-switch), got {other:?}"),
+        }
+    }
+
+    /// After a successful switch to a model that advertises NO configOptions,
+    /// the pool drops to `Unknown` (pre-discovery trust path) and the emitted
+    /// cache is `null` — NOT stale pre-switch data. This proves the "adapter
+    /// returns no authoritative options → fallback to Unknown" branch.
+    #[tokio::test]
+    async fn test_switch_to_optionless_model_falls_back_to_unknown() {
+        let pre = r#"[{"id":"model","category":"model","options":[{"value":"model-a"},{"value":"model-b"}]},{"id":"effort","category":"thought_level","options":[{"value":"low"},{"value":"high"}]}]"#;
+        // Post-switch RPC returns no configOptions at all.
+        let post = r#"{"ok":true}"#;
+        let acp = spawn_switch_lifecycle_acp(pre, post).await;
+        let mut agent = switch_lifecycle_agent(acp, "model-b");
+
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let ctx = make_prompt_context_no_owner();
+        let (effort_tx, _effort_rx) = mpsc::unbounded_channel();
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None, &effort_tx)
+            .await
+            .expect("session creation + switch must succeed");
+
+        assert!(
+            agent.model_capabilities.is_none(),
+            "no authoritative post-switch options → capabilities dropped to None"
+        );
+
+        let captured = obs
+            .snapshot()
+            .into_iter()
+            .find(|e| e.kind == "session_config_captured")
+            .expect("session_config_captured emitted");
+        assert!(
+            captured.payload["configOptions"].is_null(),
+            "optionless switch must cache null, not stale pre-switch data"
+        );
+
+        let mut pool = AgentPool::from_slots(vec![None]);
+        pool.return_agent(agent);
+        assert!(
+            matches!(pool.effort_capability_state, EffortCapabilityState::Unknown),
+            "optionless post-switch return must produce Unknown (pre-discovery trust path)"
+        );
+    }
+
+    /// Startup effort resolves against the POST-switch model. When the pre-switch
+    /// model lacks thought_level but the target model supports it, the switch
+    /// must arm startup effort from the target's configId (proving
+    /// `resolve_startup_effort` runs after the switch, not before).
+    #[tokio::test]
+    async fn test_startup_effort_resolves_against_post_switch_model() {
+        // Pre-switch model has NO thought_level — only the model catalog.
+        let pre = r#"[{"id":"model","category":"model","options":[{"value":"model-a"},{"value":"model-b"}]}]"#;
+        // Post-switch model DOES support effort.
+        let post = r#"{"configOptions":[{"id":"effort","category":"thought_level","options":[{"value":"low"},{"value":"high"}]}]}"#;
+        let acp = spawn_switch_lifecycle_acp(pre, post).await;
+        let mut agent = switch_lifecycle_agent(acp, "model-b");
+        // Startup effort requested from the record; no live pick.
+        agent.startup_effort = Some("high".to_string());
+
+        let ctx = make_prompt_context_no_owner();
+        let (effort_tx, _effort_rx) = mpsc::unbounded_channel();
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None, &effort_tx)
+            .await
+            .expect("session creation + switch must succeed");
+
+        assert_eq!(
+            agent.desired_effort,
+            Some(("effort".to_string(), "high".to_string())),
+            "startup effort must arm from the post-switch model's thought_level configId"
+        );
     }
 }
 

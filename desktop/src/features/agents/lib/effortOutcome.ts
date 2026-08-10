@@ -18,8 +18,14 @@ import type { ControlResultFrame } from "@/shared/api/types";
  *      `cleared` (session ran without effort override; Desktop persists null).
  *
  * The function resolves with the first *terminal* status received:
- *   - `"ok"` / `"failure"` / `"invalid_value"` / `"cleared"` — terminal.
+ *   - `"ok"` / `"failure"` / `"invalid_value"` / `"cleared"` /
+ *     `"unsupported_model"` — terminal.
  *   - `"pending_session"` — non-terminal; awaiting final result from the harness.
+ *
+ * `"unsupported_model"` is the harness rejecting the pick because the current
+ * model does not advertise a `thought_level` option — a capability error, not a
+ * deferral. It settles immediately so the UI never shows "Applies at next
+ * session" for a setting that can never apply.
  *
  * Correlation: when `nonce` is provided, only acks carrying the same nonce are
  * considered. This prevents a stale ack from a superseded pick from settling
@@ -52,13 +58,19 @@ export async function awaitEffortOutcome({
   /** Schedule the no-reply fallback; returns a cancel function. */
   scheduleTimeout: (onTimeout: () => void) => () => void;
 }): Promise<
-  "ok" | "failure" | "invalid_value" | "cleared" | "pending_session"
+  | "ok"
+  | "failure"
+  | "invalid_value"
+  | "cleared"
+  | "unsupported_model"
+  | "pending_session"
 > {
   type Outcome =
     | "ok"
     | "failure"
     | "invalid_value"
     | "cleared"
+    | "unsupported_model"
     | "pending_session";
 
   const settled = new Promise<Outcome>((resolve) => {
@@ -91,7 +103,8 @@ export async function awaitEffortOutcome({
         s === "ok" ||
         s === "failure" ||
         s === "invalid_value" ||
-        s === "cleared"
+        s === "cleared" ||
+        s === "unsupported_model"
       ) {
         finish(s);
         return;

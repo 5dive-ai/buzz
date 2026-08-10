@@ -364,9 +364,10 @@ function AdvancedRow({
 // the adapter via `session/set_config_option`.
 //
 // The picker subscribes to `control_result` BEFORE sending and awaits the
-// correlated final result (ok / failure / invalid_value / cleared / timeout
-// resolved as pending_session). Persistence is handled by the observer store
-// on the `ok` and `cleared` acks — the picker only drives UI state.
+// correlated final result (ok / failure / invalid_value / cleared /
+// unsupported_model / timeout resolved as pending_session). Persistence is
+// handled by the observer store on the `ok` and `cleared` acks — the picker
+// only drives UI state.
 //
 // I-7: option values come from the adapter-advertised `effortOptions` rather
 // than a hardcoded list, so model-specific option sets are reflected correctly.
@@ -430,6 +431,11 @@ function EffortPicker({
         setStatusMsg(null);
       } else if (outcome === "pending_session") {
         setStatusMsg({ kind: "info", text: "Applies at next session" });
+      } else if (outcome === "unsupported_model") {
+        setStatusMsg({
+          kind: "error",
+          text: "This model doesn't support thinking effort",
+        });
       } else if (outcome === "failure") {
         setStatusMsg({ kind: "error", text: "Adapter rejected — try again" });
       } else if (outcome === "invalid_value") {

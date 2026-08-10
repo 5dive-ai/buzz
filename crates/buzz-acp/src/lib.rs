@@ -1189,6 +1189,12 @@ fn handle_switch_model_control(
             channel_id,
             ControlSignal::SwitchModel(model_id.to_string()),
         ) {
+            // The switch will land on the requeued session. The target model's
+            // effort capabilities are unknown until that session/new + switch, so
+            // drop the pool to Unknown now: a concurrent effort pick then takes
+            // the pre-discovery trust path instead of validating against the
+            // outgoing model's Supported snapshot.
+            pool.effort_capability_state = crate::pool::EffortCapabilityState::Unknown;
             "sent"
         } else {
             "turn_ending"

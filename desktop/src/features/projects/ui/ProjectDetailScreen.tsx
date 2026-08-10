@@ -843,6 +843,36 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           <ProjectDetailChrome
+            actions={
+              <>
+                <ProjectRepositoryManagement
+                  identityPubkey={identityQuery.data?.pubkey}
+                  onChange={handleRepositoryChange}
+                  project={project}
+                  projects={projectsQuery.data ?? []}
+                  repository={repository}
+                />
+                {repoRemote.webUrl &&
+                (repoRemote.host.kind !== "external" ||
+                  repoSource === "local") ? (
+                  <Button
+                    asChild
+                    aria-label="Open project web page"
+                    className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
+                    size="icon"
+                    variant="ghost"
+                  >
+                    <a
+                      href={repoRemote.webUrl}
+                      rel="noopener noreferrer"
+                      target="_blank"
+                    >
+                      <ExternalLink className="h-4 w-4" />
+                    </a>
+                  </Button>
+                ) : null}
+              </>
+            }
             activeTabCrumb={activeTabCrumb}
             activeWorkItemCrumb={activeWorkItemCrumb}
             chromeRef={projectDetailHeaderChromeRef}
@@ -858,49 +888,6 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto px-4 pb-4">
             <div className="w-full space-y-3 pt-[calc(var(--buzz-channel-content-top-padding,5.75rem)_+_1px)]">
-              <section className="space-y-3">
-                <div className="flex min-w-0 items-start justify-between gap-3">
-                  <div className="min-w-0 flex-1 space-y-0.5">
-                    <div className="flex min-w-0 items-center gap-1.5">
-                      <h2 className="truncate text-xl font-semibold tracking-tight">
-                        {project.name}
-                      </h2>
-                      {repoRemote.webUrl &&
-                      (repoRemote.host.kind !== "external" ||
-                        repoSource === "local") ? (
-                        <Button
-                          asChild
-                          aria-label="Open project web page"
-                          className="h-6 w-6 shrink-0 text-muted-foreground hover:text-foreground"
-                          size="icon-xs"
-                          variant="ghost"
-                        >
-                          <a
-                            href={repoRemote.webUrl}
-                            rel="noopener noreferrer"
-                            target="_blank"
-                          >
-                            <ExternalLink className="h-3.5 w-3.5" />
-                          </a>
-                        </Button>
-                      ) : null}
-                    </div>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <span className="hidden text-xs font-medium text-muted-foreground sm:inline">
-                      Repository
-                    </span>
-                    <ProjectRepositoryManagement
-                      identityPubkey={identityQuery.data?.pubkey}
-                      onChange={handleRepositoryChange}
-                      project={project}
-                      projects={projectsQuery.data ?? []}
-                      repository={repository}
-                    />
-                  </div>
-                </div>
-              </section>
-
               <WorkspaceTabs
                 key={`${project.id}:${repository.id}:${tabsResetKey}`}
                 commitDiff={commitDiffQuery.data}

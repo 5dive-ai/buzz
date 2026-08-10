@@ -15,6 +15,7 @@ export type ProjectDetailWorkItemCrumb = {
 };
 
 export function ProjectDetailChrome({
+  actions,
   activeTabCrumb,
   activeWorkItemCrumb,
   chromeRef,
@@ -23,6 +24,8 @@ export function ProjectDetailChrome({
   onGoProjects,
   project,
 }: {
+  /** Repository-scoped controls, rendered left of the project-wide ones. */
+  actions?: React.ReactNode;
   activeTabCrumb: string | null;
   activeWorkItemCrumb: ProjectDetailWorkItemCrumb | null;
   chromeRef: React.Ref<HTMLDivElement>;
@@ -109,6 +112,7 @@ export function ProjectDetailChrome({
           )}
         </nav>
         <div className="flex shrink-0 items-center gap-1.5">
+          {actions}
           <ShareLinkButton
             label="Copy project link"
             link={projectShareLink(project)}

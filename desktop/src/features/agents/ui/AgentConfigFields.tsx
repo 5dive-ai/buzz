@@ -801,7 +801,7 @@ export function AgentConfigFields({
             allowDefaultModel={fallbackModel !== null}
             defaultModelLabel={
               fallbackModel
-                ? `Default model (${resolveModelLabel(fallbackModel)})`
+                ? `Default model (${resolveModelLabel(fallbackModel, undefined, effectiveProvider || undefined)})`
                 : undefined
             }
             disableSelectDuringDiscovery={disableModelSelectDuringDiscovery}

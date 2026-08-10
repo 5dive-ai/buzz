@@ -86,10 +86,11 @@ test("formatAgentModelLabel — null or empty returns Auto", () => {
   assert.equal(formatAgentModelLabel("   "), "Auto");
 });
 
-test("resolveAgentCardModelLabel — known Databricks defaultModel renders curated name in default label", () => {
+test("resolveAgentCardModelLabel — known Databricks defaultModel with databricks_v2 provider renders curated name in default label", () => {
   const label = resolveAgentCardModelLabel({
     agent: undefined,
     personaModel: null,
+    provider: "databricks_v2",
     defaultModel: "databricks-gpt-5-5",
   });
   assert.equal(label, "Default model (GPT-5.5)");
@@ -111,4 +112,45 @@ test("resolveAgentCardModelLabel — known Databricks agent model renders curate
     defaultModel: "something-else",
   });
   assert.equal(label, "GPT OSS 120B");
+});
+
+// P2 regression: provider-scoped default label — Databricks ID under openai/anthropic must render raw
+test("resolveAgentCardModelLabel — openai agent inheriting a Databricks-named default renders raw ID", () => {
+  const label = resolveAgentCardModelLabel({
+    agent: { modelSource: "global", model: null, provider: "openai" },
+    personaModel: null,
+    provider: "openai",
+    defaultModel: "databricks-gpt-5-5",
+  });
+  assert.equal(label, "Default model (databricks-gpt-5-5)");
+});
+
+test("resolveAgentCardModelLabel — anthropic agent inheriting a Databricks-named default renders raw ID", () => {
+  const label = resolveAgentCardModelLabel({
+    agent: { modelSource: "global", model: null, provider: "anthropic" },
+    personaModel: null,
+    provider: "anthropic",
+    defaultModel: "databricks-gpt-5-5",
+  });
+  assert.equal(label, "Default model (databricks-gpt-5-5)");
+});
+
+test("resolveAgentCardModelLabel — databricks_v2 agent inheriting a Databricks-named default renders curated name", () => {
+  const label = resolveAgentCardModelLabel({
+    agent: { modelSource: "global", model: null, provider: "databricks_v2" },
+    personaModel: null,
+    provider: "databricks_v2",
+    defaultModel: "databricks-gpt-5-5",
+  });
+  assert.equal(label, "Default model (GPT-5.5)");
+});
+
+test("resolveAgentCardModelLabel — unspawned openai persona with Databricks-named default renders raw ID", () => {
+  const label = resolveAgentCardModelLabel({
+    agent: undefined,
+    personaModel: null,
+    provider: "openai",
+    defaultModel: "databricks-gpt-5-5",
+  });
+  assert.equal(label, "Default model (databricks-gpt-5-5)");
 });

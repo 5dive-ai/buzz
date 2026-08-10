@@ -32,20 +32,23 @@ export function resolveAgentCardModelLabel(input: {
     const isInherited =
       !input.agent.modelSource || input.agent.modelSource === "global";
     if (isInherited) {
-      return formatDefaultModelLabel(input.defaultModel);
+      return formatDefaultModelLabel(input.defaultModel, input.agent.provider);
     }
     return input.agent.model?.trim()
       ? formatAgentModelLabel(input.agent.model, input.agent.provider)
-      : formatDefaultModelLabel(input.defaultModel);
+      : formatDefaultModelLabel(input.defaultModel, input.agent.provider);
   }
   return input.personaModel?.trim()
     ? formatAgentModelLabel(input.personaModel, input.provider)
-    : formatDefaultModelLabel(input.defaultModel);
+    : formatDefaultModelLabel(input.defaultModel, input.provider);
 }
 
-export function formatDefaultModelLabel(defaultModel: string) {
+export function formatDefaultModelLabel(
+  defaultModel: string,
+  provider?: string | null | undefined,
+) {
   const model = defaultModel.trim();
   return model
-    ? `Default model (${resolveModelLabel(model)})`
+    ? `Default model (${resolveModelLabel(model, undefined, provider)})`
     : "Default model";
 }

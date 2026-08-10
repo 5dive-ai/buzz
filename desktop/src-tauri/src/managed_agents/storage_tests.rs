@@ -252,6 +252,29 @@ fn spawn_allowed_when_private_key_present() {
 }
 
 #[test]
+fn spawn_refused_when_secrets_unavailable() {
+    // A record whose keyring ref exists but the entry is unavailable must be
+    // refused at spawn time — same semantics as a missing private key.
+    let mut record = record_with_key("nsec1realkey");
+    record.secrets_unavailable = true;
+    assert!(
+        super::spawn_key_refusal(&record).is_some(),
+        "an agent with unavailable secrets must be refused at spawn"
+    );
+}
+
+#[test]
+fn spawn_allowed_when_key_present_and_no_unavailable_secrets() {
+    // A fully hydrated record must not be blocked.
+    let mut record = record_with_key("nsec1realkey");
+    record.secrets_unavailable = false;
+    assert!(
+        super::spawn_key_refusal(&record).is_none(),
+        "an agent with key and reachable secrets must be allowed"
+    );
+}
+
+#[test]
 fn persist_agent_keys_issues_zero_writes_when_inline_keys_already_cleared() {
     // This is the dominant prompt-storm scenario: after the first successful
     // persist all inline copies are cleared, so subsequent saves (e.g. a
@@ -829,4 +852,124 @@ fn install_log_filename_accepts_ordinary_runtime_ids() {
             format!("install-{id}.log")
         );
     }
+}
+
+/// Regression test: after secret extraction, the serialized store must not
+/// contain any secret-shaped values.  This is the grep-empty criterion from
+/// the v5 spec acceptance criteria, exercised at the type level.
+///
+/// The test constructs records with inline secrets, runs the strip path via
+/// the secret seam, and verifies the resulting JSON is free of the known
+/// secret values.
+#[test]
+fn serialized_store_is_empty_of_secret_values_after_strip() {
+    use crate::managed_agents::secret_seam::strip_and_persist_agent_secrets_with;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    // ── FakeProjectionStore (minimal, for this test) ──────────────────
+    struct FakePS {
+        data: RefCell<HashMap<String, String>>,
+    }
+    impl crate::managed_agents::secret_projection::ProjectionStore for FakePS {
+        fn write_and_verify(&self, key: &str, value: &str) -> Result<(), String> {
+            self.data
+                .borrow_mut()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+        fn load_key(&self, key: &str) -> Result<Option<String>, String> {
+            Ok(self.data.borrow().get(key).cloned())
+        }
+        fn load_all(&self) -> Result<Option<HashMap<String, String>>, String> {
+            Ok(Some(self.data.borrow().clone()))
+        }
+        fn store_batch(&self, entries: &HashMap<String, String>) -> Result<(), String> {
+            for (k, v) in entries {
+                self.data.borrow_mut().insert(k.clone(), v.clone());
+            }
+            Ok(())
+        }
+        fn remove_batch(&self, keys: &[&str]) -> Result<(), String> {
+            let mut d = self.data.borrow_mut();
+            for k in keys {
+                d.remove(*k);
+            }
+            Ok(())
+        }
+    }
+
+    let store = FakePS {
+        data: RefCell::new(HashMap::new()),
+    };
+
+    let secret_env_value = "sk-ant-api03-very-secret-key";
+    let secret_auth_tag = "auth-tag-secret";
+
+    // Build a record via JSON deserialization (avoids Default dependency).
+    let mut record: ManagedAgentRecord = serde_json::from_str(&format!(
+        r#"{{
+            "pubkey": "testpubkey123",
+            "name": "test-agent",
+            "env_vars": {{"ANTHROPIC_API_KEY": "{secret_env_value}"}},
+            "auth_tag": "{secret_auth_tag}",
+            "backend": {{"type": "provider", "id": "anthropic", "config": {{"api_key": "provider-secret"}}}},
+            "relay_url": "wss://localhost:3000",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "created_at": "2026-01-01",
+            "updated_at": "2026-01-01"
+        }}"#
+    ))
+    .expect("sample record with inline secrets");
+
+    // Strip: moves secrets from inline fields into the fake keyring.
+    strip_and_persist_agent_secrets_with(&store, &mut record);
+
+    // After strip: inline fields must be empty/null.
+    assert!(
+        record.env_vars.is_empty(),
+        "env_vars must be cleared after strip"
+    );
+    assert!(
+        record.auth_tag.is_none(),
+        "auth_tag must be cleared after strip"
+    );
+    if let crate::managed_agents::types::BackendKind::Provider { config, .. } = &record.backend {
+        assert!(
+            config.is_null(),
+            "provider config must be cleared after strip"
+        );
+    }
+
+    // Serialize to JSON and verify no secret bytes appear.
+    let json = serde_json::to_string(&record).expect("serialize");
+    assert!(
+        !json.contains(secret_env_value),
+        "serialized JSON must not contain env_vars secret"
+    );
+    assert!(
+        !json.contains(secret_auth_tag),
+        "serialized JSON must not contain auth_tag secret"
+    );
+    assert!(
+        !json.contains("provider-secret"),
+        "serialized JSON must not contain provider config secret"
+    );
+    // Refs must be present (the keyring round-trip worked).
+    assert!(
+        record.env_vars_ref.is_some(),
+        "env_vars_ref must be set after successful strip"
+    );
+    assert!(
+        record.auth_tag_ref.is_some(),
+        "auth_tag_ref must be set after successful strip"
+    );
+    assert!(
+        record.provider_config_ref.is_some(),
+        "provider_config_ref must be set after successful strip"
+    );
 }

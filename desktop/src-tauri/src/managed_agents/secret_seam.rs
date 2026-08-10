@@ -264,6 +264,7 @@ pub(crate) fn hydrate_all_secrets_for_records<S: ProjectionStore>(
                 eprintln!("buzz-desktop: {e}");
             }
             if !errors.is_empty() {
+                record.secrets_unavailable = true;
                 unavailable.push(record.pubkey.clone());
             }
         }

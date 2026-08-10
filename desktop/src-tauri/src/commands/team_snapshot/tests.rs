@@ -234,6 +234,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
         auth_tag_ref: None,
         env_vars_ref: None,
         provider_config_ref: None,
+        secrets_unavailable: false,
     };
 
     let mut memory_map = std::collections::HashMap::new();

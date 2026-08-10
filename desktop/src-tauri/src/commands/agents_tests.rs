@@ -65,6 +65,7 @@ fn bare_agent_record(
         auth_tag_ref: None,
         env_vars_ref: None,
         provider_config_ref: None,
+        secrets_unavailable: false,
     }
 }
 fn persona_record(id: &str, model: Option<&str>, provider: Option<&str>) -> AgentDefinition {

@@ -916,6 +916,7 @@ pub async fn create_managed_agent(
             auth_tag_ref: None,
             env_vars_ref: None,
             provider_config_ref: None,
+            secrets_unavailable: false,
         };
 
         records.push(record);

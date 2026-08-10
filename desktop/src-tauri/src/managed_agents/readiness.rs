@@ -1530,6 +1530,7 @@ mod tests {
             auth_tag_ref: None,
             env_vars_ref: None,
             provider_config_ref: None,
+            secrets_unavailable: false,
         };
 
         let runtime = known_acp_runtime_exact("buzz-agent");

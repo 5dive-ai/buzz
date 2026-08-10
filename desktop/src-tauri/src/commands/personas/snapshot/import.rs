@@ -657,6 +657,7 @@ pub async fn confirm_agent_snapshot_import(
             auth_tag_ref: None,
             env_vars_ref: None,
             provider_config_ref: None,
+            secrets_unavailable: false,
         };
 
         records.push(record.clone());

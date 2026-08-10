@@ -614,6 +614,7 @@ pub async fn confirm_team_snapshot_import(
             auth_tag_ref: None,
             env_vars_ref: None,
             provider_config_ref: None,
+            secrets_unavailable: false,
         };
 
         minted.push(MintedMember {

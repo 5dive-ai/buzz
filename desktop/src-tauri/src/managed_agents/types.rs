@@ -156,6 +156,7 @@ impl AgentDefinition {
             definition_respond_to_allowlist: self.respond_to_allowlist,
             definition_parallelism: self.parallelism,
             relay_mesh: None,
+            secrets_unavailable: false,
         }
     }
 }
@@ -442,6 +443,15 @@ pub struct ManagedAgentRecord {
     /// deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mesh: Option<RelayMeshConfig>,
+    /// Set by the load path when one or more secret fields (env_vars, auth_tag,
+    /// provider_config) have a keyring `*_ref` that points to an unavailable or
+    /// missing entry.  Never serialized — it is a transient load-time signal
+    /// that the spawn path must consult before starting this agent.
+    ///
+    /// `true` → at least one referenced secret is unreachable; spawn must refuse.
+    /// `false` (default) → all refs resolved successfully (or there are no refs).
+    #[serde(skip)]
+    pub secrets_unavailable: bool,
 }
 
 /// Typed relay-mesh configuration carried on a [`ManagedAgentRecord`].

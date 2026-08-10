@@ -73,6 +73,7 @@ fn record() -> ManagedAgentRecord {
         auth_tag_ref: None,
         env_vars_ref: None,
         provider_config_ref: None,
+        secrets_unavailable: false,
     }
 }
 

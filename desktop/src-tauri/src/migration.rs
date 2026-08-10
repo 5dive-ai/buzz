@@ -192,6 +192,14 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     reconcile_databricks_v1_to_v2(app);
     materialize_agent_runtimes(app);
     migrate_inline_secrets_to_keyring(app); // keyring extraction — runs after all raw-JSON migrations
+                                            // Dev-build-only: copy secret-projection keys (env vars, auth tags, provider
+                                            // configs) from the source keyring service into the destination dev service.
+                                            // Runs AFTER migrate_inline_secrets_to_keyring so projection keys are
+                                            // present in the source before we copy them.
+    #[cfg(debug_assertions)]
+    if is_dev {
+        crate::managed_agents::migrate_agent_secrets_to_dev_service(app);
+    }
 }
 
 /// Copy one-time app state from the legacy app identifier directory to

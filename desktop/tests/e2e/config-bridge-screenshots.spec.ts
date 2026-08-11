@@ -176,7 +176,9 @@ test.describe("config bridge screenshots", () => {
   test("01 — folded config panel", async ({ page }) => {
     await installMockBridge(page, { managedAgents: MANAGED_AGENTS });
 
-    const panel = await openAgentProfileFromChannel(page, "Goose Agent");
+    const panel = await openAgentProfileFromChannel(page, "Goose Agent", {
+      tab: "Runtime",
+    });
 
     // The folded config panel: provenance sentences inline under each value.
     await expect(panel.getByText("Set in Buzz").first()).toBeVisible();
@@ -191,6 +193,7 @@ test.describe("config bridge screenshots", () => {
     const panel = await openAgentProfileFromChannel(
       page,
       "Runtime Override Agent",
+      { tab: "Runtime" },
     );
 
     // A runtimeOverride model shows the live model, the persona baseline as a
@@ -209,7 +212,13 @@ test.describe("config bridge screenshots", () => {
   test("03 — provenance sentences", async ({ page }) => {
     await installMockBridge(page, { managedAgents: MANAGED_AGENTS });
 
-    const panel = await openAgentProfileFromChannel(page, "Multi-Origin Agent");
+    const panel = await openAgentProfileFromChannel(
+      page,
+      "Multi-Origin Agent",
+      {
+        tab: "Runtime",
+      },
+    );
 
     // Multiple distinct provenance origins visible at once.
     await expect(panel.getByText("Set in Buzz").first()).toBeVisible();
@@ -230,7 +239,9 @@ test.describe("config bridge screenshots", () => {
   test("04 — pre-spawn state", async ({ page }) => {
     await installMockBridge(page, { managedAgents: MANAGED_AGENTS });
 
-    const panel = await openAgentProfileFromChannel(page, "Pre-Spawn Agent");
+    const panel = await openAgentProfileFromChannel(page, "Pre-Spawn Agent", {
+      tab: "Runtime",
+    });
 
     // ACP-only fields show "Available after agent starts" before spawn.
     await expect(
@@ -320,8 +331,8 @@ test.describe("config bridge screenshots", () => {
     const panel = page.getByTestId("user-profile-panel");
     await expect(panel).toBeVisible({ timeout: 10_000 });
 
-    // Editable configuration lives inside the Info tab.
-    await panel.getByRole("tab", { name: "Info" }).click();
+    // Editable configuration lives inside the Runtime tab.
+    await panel.getByRole("tab", { name: "Runtime" }).click();
 
     // Wait for the config section to render and scroll it into view so
     // it is fully visible before capture.

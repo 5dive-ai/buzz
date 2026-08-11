@@ -525,9 +525,7 @@ export function ProfileSummaryView({
                 activityAgent={activityAgent}
                 agentInfoFields={agentInfoFields}
                 archiveActions={archiveActions}
-                canArchiveAgent={
-                  isBot && (isOwner === true || archiveActions.canArchive)
-                }
+                canArchiveAgent={isBot && archiveActions.canArchive}
                 canDeleteAgent={canDeleteAgent}
                 callerChannelId={callerChannelId}
                 channelIdToName={channelIdToName}

@@ -15,13 +15,13 @@ export function ChannelMemberAvatarStack({
   currentPubkey?: string;
   members: ChannelMember[];
 }) {
-  const memberPubkeys = React.useMemo(
-    () => members.map((member) => member.pubkey),
+  const visibleMembers = members.slice(0, MAX_VISIBLE_AVATARS);
+  const visiblePubkeys = React.useMemo(
+    () => members.slice(0, MAX_VISIBLE_AVATARS).map((member) => member.pubkey),
     [members],
   );
-  const profilesQuery = useUsersBatchQuery(memberPubkeys);
+  const profilesQuery = useUsersBatchQuery(visiblePubkeys);
   const profiles = profilesQuery.data?.profiles;
-  const visibleMembers = members.slice(0, MAX_VISIBLE_AVATARS);
   const overflowCount = members.length - visibleMembers.length;
   const stackItemCount = visibleMembers.length + (overflowCount > 0 ? 1 : 0);
 

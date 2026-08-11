@@ -197,6 +197,20 @@ class AgentClass(StrictModel):
     # Defaults to True: production parity is the honest default for a study
     # about Buzz, since it is what a real Buzz agent receives.
     include_platform_prompt: bool = True
+    # Enable buzz-agent's MCP lifecycle hooks (docs/MCP_DRIVEN_HOOKS.md) for this
+    # agent: sets MCP_HOOK_SERVERS=* on its stack, so buzz-dev-mcp's `_Stop` hook
+    # can object to end_turn while todo items remain open. Off by default —
+    # production desktop agents run without hooks unless the operator opts in,
+    # and parity with the shipped default is the baseline condition. Opt-in
+    # because it changes end-turn behaviour and therefore the condition; False
+    # is omitted from canonical bytes below so existing manifests keep their
+    # condition identity, same contract as ``timing_signal``.
+    stop_hooks: bool = False
+    # Enable buzz-agent's in-process reply guard (BUZZ_AGENT_REQUIRE_REPLY=1):
+    # the agent is reminded, up to its rejection budget, when a turn is about to
+    # end without any recognized attempt to post to Buzz. Same opt-in and
+    # hash-preservation contract as ``stop_hooks``.
+    require_reply: bool = False
     # Optional now that every field inside it is: a roster entry that says nothing
     # about generation inherits buzz-agent's defaults wholesale. An empty block and
     # an absent one are the same condition, and both hash the same way.
@@ -307,6 +321,14 @@ class ExperimentManifest(StrictModel):
         # also drop the other optional fields that currently serialise as null
         # and would shift far more hashes than it preserved.
         for entry in data.get("roster", []):
+            # Same identity-preservation contract as `timing_signal` above:
+            # these opt-ins postdate most manifests, and a False (the default)
+            # sends a byte-identical container environment, so it must hash
+            # like the field never existed.
+            if not entry.get("stop_hooks"):
+                entry.pop("stop_hooks", None)
+            if not entry.get("require_reply"):
+                entry.pop("require_reply", None)
             generation = entry.get("generation")
             if not isinstance(generation, dict):
                 continue

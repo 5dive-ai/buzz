@@ -808,6 +808,7 @@ class BuzzContainerRuntime:
             "BUZZ_ACP_NO_MEMORY": "true",
             "BUZZ_ACP_SYSTEM_PROMPT_FILE": remote_prompt,
             **self._platform_prompt_env(agent_class),
+            **self._hooks_env(agent_class),
             "BUZZ_AGENT_PROVIDER": endpoint.provider,
             "BUZZ_AGENT_MODEL": credential.llm_endpoint,
             "BUZZ_AGENT_THINKING_EFFORT": (
@@ -871,6 +872,32 @@ class BuzzContainerRuntime:
         if agent_class.include_platform_prompt:
             return {}
         return {"BUZZ_ACP_NO_BASE_PROMPT": "1"}
+
+    @staticmethod
+    def _hooks_env(agent_class: AgentClass) -> dict[str, str]:
+        """End-turn guard opt-ins, omitted entirely when the manifest is silent.
+
+        Same contract as ``_platform_prompt_env``: a variable present in the
+        trial bundle means the experiment chose it, and the default path leaves
+        buzz-agent's own behaviour (hooks off, no reply guard) untouched.
+
+        ``stop_hooks`` allowlists every MCP server for lifecycle hooks. In this
+        stack that is exactly one server — buzz-dev-mcp — whose `_Stop` hook
+        objects to end_turn while todo items remain open, and whose
+        `_PostCompact` hook re-injects the todo list after a handoff. Both
+        inherit buzz-agent's own advisory bounds (2.5s timeout, 3
+        rejections/prompt), so a wedged hook cannot trap a trial.
+
+        ``require_reply`` arms the in-process reply guard at the same gate: a
+        turn about to end without any recognized publish attempt gets a bounded
+        reminder instead of a silent stop.
+        """
+        env: dict[str, str] = {}
+        if agent_class.stop_hooks:
+            env["MCP_HOOK_SERVERS"] = "*"
+        if agent_class.require_reply:
+            env["BUZZ_AGENT_REQUIRE_REPLY"] = "1"
+        return env
 
     @staticmethod
     def _window_env(generation: GenerationConfig) -> dict[str, str]:

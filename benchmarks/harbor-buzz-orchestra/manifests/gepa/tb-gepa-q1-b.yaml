@@ -1,0 +1,40 @@
+# GEPA per-problem probe Q1 (qemu-startup silent-stall family), arm B.
+# Base: tb-gepa-twins-v2 (KEEP verdict, full-89 59/89 vs v0 49/89).
+# Single variable vs base: stop_hooks: true on Mia — buzz-dev-mcp _Stop hook objects to end_turn while todos are open.
+# Failure targeted: Mia end_turn'd ~37s in, trial idled 15.4min to the 900s wall
+# (v2 full job lb-...T174224Z, qemu-startup__XNCjABQ). 6 fail tasks share the shape.
+schema_version: "1"
+condition: tb-gepa-q1-b
+timing_signal: true
+roster:
+  - id: mia
+    kind: orchestrator
+    role: conn
+    stop_hooks: true
+    count: 1
+    endpoint: deepseek-ai/Deepseek-V4-Flash
+    model_revision: deepseek/deepseek-v4-flash-20260731
+    prompt:
+      path: personas/bench/gepa/mia-v2.md
+      sha256: cce6b223a0ac651ff762c4f50037b14f41d304571353a1e0797e30fffcb4b94d
+    generation:
+      thinking_effort: high
+  - id: mie
+    kind: worker
+    role: twin
+    count: 1
+    endpoint: deepseek-ai/Deepseek-V4-Flash
+    model_revision: deepseek/deepseek-v4-flash-20260731
+    prompt:
+      path: personas/bench/gepa/mie-v0.md
+      sha256: a4924e4c4507ac466a7500bb34a04a782618df41dba850b6f0f729787c48439b
+    generation:
+      thinking_effort: high
+prices:
+  deepseek-ai/Deepseek-V4-Flash:
+    input_per_million_usd: 0.14
+    cached_input_per_million_usd: 0.14
+    output_per_million_usd: 0.28
+    cache_read_rate: 0.0
+trial_budget:
+  timeout_seconds: 36000

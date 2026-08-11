@@ -60,6 +60,36 @@ def test_timing_signal_is_opt_in_and_part_of_the_condition_hash(manifest_data):
     assert enabled.sha256 != baseline.sha256
 
 
+def test_end_turn_guards_are_opt_in_and_part_of_the_condition_hash(manifest_data):
+    """Same identity contract as ``timing_signal``, but per roster entry.
+
+    A manifest written before these fields existed and the same manifest with
+    them explicitly False send byte-identical container environments, so they
+    must share a hash; opting in changes end-turn behaviour and must not.
+    """
+    baseline = ExperimentManifest.load(copy.deepcopy(manifest_data))
+    assert b"stop_hooks" not in baseline.canonical_bytes()
+    assert b"require_reply" not in baseline.canonical_bytes()
+
+    explicit_off = copy.deepcopy(manifest_data)
+    explicit_off["roster"][0]["stop_hooks"] = False
+    explicit_off["roster"][0]["require_reply"] = False
+    assert ExperimentManifest.load(explicit_off).sha256 == baseline.sha256
+
+    hooked = copy.deepcopy(manifest_data)
+    hooked["roster"][0]["stop_hooks"] = True
+    hooked_manifest = ExperimentManifest.load(hooked)
+    assert b'"stop_hooks":true' in hooked_manifest.canonical_bytes()
+    assert hooked_manifest.sha256 != baseline.sha256
+
+    guarded = copy.deepcopy(manifest_data)
+    guarded["roster"][0]["require_reply"] = True
+    guarded_manifest = ExperimentManifest.load(guarded)
+    assert b'"require_reply":true' in guarded_manifest.canonical_bytes()
+    assert guarded_manifest.sha256 != baseline.sha256
+    assert guarded_manifest.sha256 != hooked_manifest.sha256
+
+
 MANIFEST_DIR = pathlib.Path(__file__).resolve().parents[1] / "manifests"
 SHIPPED = sorted(MANIFEST_DIR.glob("*.yaml"))
 

@@ -26,7 +26,11 @@ from harbor_buzz_orchestra.provisioning import AgentCredential, TrialHandle
 
 
 def write_manifest(
-    tmp_path: Path, *, include_platform_prompt: bool = True
+    tmp_path: Path,
+    *,
+    include_platform_prompt: bool = True,
+    stop_hooks: bool = False,
+    require_reply: bool = False,
 ) -> ExperimentManifest:
     prompt = tmp_path / "prompt.md"
     prompt.write_text("prompt", encoding="utf-8")
@@ -36,6 +40,8 @@ def write_manifest(
         "model_revision": "r1",
         "prompt": {"path": "prompt.md", "sha256": digest},
         "include_platform_prompt": include_platform_prompt,
+        "stop_hooks": stop_hooks,
+        "require_reply": require_reply,
         "generation": {"max_output_tokens": 100, "context_window_tokens": 1000},
     }
     return ExperimentManifest.load(
@@ -471,6 +477,41 @@ async def test_one_turn_may_last_as_long_as_the_trial_budget(tmp_path):
     )
     assert "BUZZ_ACP_MAX_TURN_DURATION" not in unset
     assert "BUZZ_ACP_IDLE_TIMEOUT" not in unset
+
+
+async def test_end_turn_guards_are_opt_in_per_agent_class(tmp_path):
+    """Silent manifests send neither variable; opted-in ones send exactly theirs.
+
+    The default condition is Buzz as shipped — hooks off, no reply guard — so
+    the variables must be absent, not set-to-off: a variable's presence in a
+    trial bundle means the experiment chose it.
+    """
+    orch = credential("orch-1", "orchestrator", "orch-model")
+
+    def env_for(manifest):
+        return runtime(tmp_path)._agent_env(
+            trial=trial_handle((orch,)),
+            credential=orch,
+            agent_class=manifest.roster[0],
+            endpoint=EndpointLaunchConfig("anthropic", "ANTHROPIC_API_KEY"),
+            remote_prompt="/opt/buzz/prompts/orch-1.system-prompt.md",
+        )
+
+    silent = env_for(write_manifest(tmp_path))
+    assert "MCP_HOOK_SERVERS" not in silent
+    assert "BUZZ_AGENT_REQUIRE_REPLY" not in silent
+
+    hooked = env_for(write_manifest(tmp_path, stop_hooks=True))
+    assert hooked["MCP_HOOK_SERVERS"] == "*"
+    assert "BUZZ_AGENT_REQUIRE_REPLY" not in hooked
+
+    guarded = env_for(write_manifest(tmp_path, require_reply=True))
+    assert guarded["BUZZ_AGENT_REQUIRE_REPLY"] == "1"
+    assert "MCP_HOOK_SERVERS" not in guarded
+
+    both = env_for(write_manifest(tmp_path, stop_hooks=True, require_reply=True))
+    assert both["MCP_HOOK_SERVERS"] == "*"
+    assert both["BUZZ_AGENT_REQUIRE_REPLY"] == "1"
 
 
 async def test_launch_enables_the_usage_log_target(tmp_path):

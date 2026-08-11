@@ -656,16 +656,13 @@ impl RestoreStore for S3RestoreStore {
         if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_RECORD_BYTES {
             return Err(());
         }
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         match expected_etag {
             Some(etag) => {
-                headers.insert(axum::http::header::IF_MATCH, etag.parse().map_err(|_| ())?);
+                headers.insert(http::header::IF_MATCH, etag.parse().map_err(|_| ())?);
             }
             None => {
-                headers.insert(
-                    axum::http::header::IF_NONE_MATCH,
-                    "*".parse().map_err(|_| ())?,
-                );
+                headers.insert(http::header::IF_NONE_MATCH, "*".parse().map_err(|_| ())?);
             }
         }
         match self

@@ -1054,7 +1054,6 @@ name = "buzz-db"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
  "buzz-auth",
  "buzz-core",
  "buzz-datastore-tracing",
@@ -1062,6 +1061,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "hex",
+ "http",
  "metrics",
  "metrics-util",
  "nostr 0.44.7",

@@ -28,6 +28,7 @@ pub mod hints;
 pub mod hooks;
 pub mod loop_drive;
 pub mod mesh;
+pub mod ops;
 pub mod prompt;
 pub mod session_store;
 pub mod steer;

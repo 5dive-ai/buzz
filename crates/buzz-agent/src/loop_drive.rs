@@ -52,6 +52,8 @@ use goose_provider_types::conversation::message::{Message, MessageContent, ToolR
 use goose_provider_types::conversation::Conversation;
 
 use crate::types::{AgentError, StopReason};
+use goose::agents::state_machine::Emitter;
+
 use crate::wire::WireSender;
 
 /// Appended to every failed tool result so the model diagnoses the failure
@@ -124,19 +126,35 @@ pub async fn run_turn(
     }
 
     let max_rounds = ctx.max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
-    let mut rounds = 0u32;
     let mut stop_blocks = 0u32;
     let mut reflections = 0usize;
+
+    // First decision expressed as a goose `Operation` rather than inline
+    // control flow. The others follow one at a time; see
+    // `PLANS/BUZZ_OPERATIONS_MIGRATION.md` for the order and why.
+    let outcome = crate::ops::Outcome::new();
+    let machine = crate::ops::round_gate(max_rounds, outcome.clone(), ctx.cancel.clone());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+    // Operations may emit; nothing in this step does, but a dropped receiver
+    // would silently swallow events from the ones that follow.
+    tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+    let emitter = Emitter::new(event_tx, ctx.cancel.clone());
 
     loop {
         if ctx.cancel.is_cancelled() {
             return (Ok(StopReason::Cancelled), tokens);
         }
-        if rounds >= max_rounds {
-            tracing::warn!(rounds, "max rounds reached; ending turn");
-            return (Ok(StopReason::MaxTurnRequests), tokens);
+
+        // Ask the machine before doing any work. `step` returns the first
+        // operation that applies, or `None` when the loop below should run.
+        match gate(&machine, &sessions, ctx.session_id, &emitter).await {
+            Err(e) => return (Err(e), tokens),
+            Ok(true) => {
+                let reason = outcome.take().unwrap_or(StopReason::EndTurn);
+                return (Ok(reason), tokens);
+            }
+            Ok(false) => {}
         }
-        rounds += 1;
 
         // Steers land here, at the round boundary — never mid-inference,
         // where they would race a partially streamed response.
@@ -180,6 +198,31 @@ pub async fn run_turn(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Run the operation gate for one round.
+///
+/// Returns `true` when an operation ended the turn. The session is reloaded
+/// each time because operations read the conversation, and the previous round
+/// appended to it.
+async fn gate(
+    machine: &goose::agents::state_machine::StateMachine<'_>,
+    sessions: &SessionManager,
+    session_id: &str,
+    emitter: &Emitter,
+) -> Result<bool, AgentError> {
+    let session = load_session(sessions, session_id).await?;
+    match machine.step(&session, emitter).await {
+        Ok(Some(result)) => Ok(result.yield_to_client),
+        Ok(None) => Ok(false),
+        // A failing gate must not take the turn down with it: the operations
+        // here are guards, and a guard that errors should let the round
+        // proceed rather than strand the user's prompt unanswered.
+        Err(e) => {
+            tracing::warn!(error = %e, "operation gate failed; continuing");
+            Ok(false)
         }
     }
 }

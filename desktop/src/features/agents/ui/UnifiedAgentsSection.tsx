@@ -366,7 +366,11 @@ function AgentPersonaCard({
         )
       }
       avatarUrl={avatarUrl}
-      dataTestId={`persona-agent-row-${persona.id}`}
+      dataTestId={
+        agent
+          ? `managed-agent-${agent.pubkey}`
+          : `persona-agent-row-${persona.id}`
+      }
       identityLabel={agent ? truncatePubkey(agent.pubkey) : null}
       label={title}
       modelLabel={modelLabel}

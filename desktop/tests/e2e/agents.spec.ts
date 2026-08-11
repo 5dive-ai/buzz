@@ -233,10 +233,16 @@ test("Agents view keeps every managed instance that shares a persona visible", a
   await gotoApp(page);
   await page.getByTestId("open-agents-view").click();
 
-  const cards = page.getByTestId(`persona-agent-row-${personaId}`);
+  const cards = page.locator(
+    `[data-testid="managed-agent-${firstPubkey}"], [data-testid="managed-agent-${secondPubkey}"]`,
+  );
   await expect(cards).toHaveCount(2);
-  await expect(cards.nth(0)).toContainText("aaaaaaaa…aaaa");
-  await expect(cards.nth(1)).toContainText("bbbbbbbb…bbbb");
+  await expect(page.getByTestId(`managed-agent-${firstPubkey}`)).toContainText(
+    "aaaaaaaa…aaaa",
+  );
+  await expect(page.getByTestId(`managed-agent-${secondPubkey}`)).toContainText(
+    "bbbbbbbb…bbbb",
+  );
   await expect(page.getByLabel("Open actions for Fizz")).toHaveCount(1);
 });
 
@@ -2505,7 +2511,7 @@ test("start pill morphs into the running dot without remounting the avatar", asy
   await gotoApp(page);
   await page.getByTestId("open-agents-view").click();
 
-  const card = page.getByTestId(`persona-agent-row-${personaId}`);
+  const card = page.getByTestId(`managed-agent-${pubkey}`);
   const startButton = page.getByTestId(`agent-runtime-start-${pubkey}`);
   const badge = startButton.locator("xpath=../..");
   const initialAvatar = await card
@@ -2571,7 +2577,7 @@ test("start pill morphs into the running dot without remounting the avatar", asy
   ).toBe(true);
 });
 
-test("duplicate instances move from the agents gallery into the agent profile", async ({
+test("duplicate instances stay visible in the gallery and agent profile", async ({
   page,
 }) => {
   const personaId = "custom:duplicate-auditor";
@@ -2606,9 +2612,9 @@ test("duplicate instances move from the agents gallery into the agent profile", 
   await expect(page.getByText("Additional running agents")).toHaveCount(0);
   await expect(
     page.getByTestId(`managed-agent-${additionalPubkey}`),
-  ).toHaveCount(0);
+  ).toBeVisible();
 
-  await page.getByTestId(`persona-agent-row-${personaId}`).click();
+  await page.getByTestId(`managed-agent-${primaryPubkey}`).click();
   await page.getByTestId("user-profile-instances").click();
   await page.getByTestId(`user-profile-instance-${additionalPubkey}`).click();
 

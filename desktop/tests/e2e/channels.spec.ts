@@ -2956,8 +2956,11 @@ async function seedHomeInboxMention(
   page: import("@playwright/test").Page,
   itemId: string,
   tags?: string[][],
+  { navigate = true }: { navigate?: boolean } = {},
 ) {
-  await page.goto("/");
+  if (navigate) {
+    await page.goto("/");
+  }
   await expect(page.getByTestId("home-inbox-list")).toBeVisible();
   await page.waitForFunction(
     () =>
@@ -3784,6 +3787,58 @@ test("home inbox manage affordance opens management without leaving home", async
   }
   expect(narrowSheetBox.width).toBeGreaterThanOrEqual(narrowHomeBox.width - 1);
   await expect(page).not.toHaveURL(/#\/channels\//);
+});
+
+test("home channel settings keeps agent lifecycle actions scoped to the active community", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const agentPubkey = await addGenericAgent(
+    page,
+    "general",
+    `home-sidebar-agent-${Date.now()}`,
+  );
+  const baselineCommands = await readCommandLog(page);
+  const baselineRuntimeStopCount = commandCount(
+    baselineCommands,
+    "stop_managed_agent_runtime",
+  );
+  const baselineLegacyStopCount = commandCount(
+    baselineCommands,
+    "stop_managed_agent",
+  );
+
+  await page.getByRole("button", { exact: true, name: "Inbox" }).click();
+  await seedHomeInboxMention(
+    page,
+    "mock-feed-home-agent-lifecycle",
+    undefined,
+    { navigate: false },
+  );
+  await page
+    .getByTestId("home-inbox-detail")
+    .getByTestId("channel-management-trigger")
+    .click();
+  await page.getByTestId("channel-management-member-count").click();
+  await expect(page.getByTestId("members-sidebar")).toBeVisible();
+
+  const agentStatus = page.getByTestId(
+    `sidebar-managed-agent-status-${agentPubkey}`,
+  );
+  const agentAction = page.getByTestId(`sidebar-agent-action-${agentPubkey}`);
+  await expect(agentStatus).toContainText("Here");
+  await openMemberMenu(page, agentPubkey);
+  await expect(agentAction).toContainText("Stop");
+  await agentAction.click();
+  await expect(agentStatus).toContainText("Unavailable");
+
+  const commands = await readCommandLog(page);
+  expect(commandCount(commands, "stop_managed_agent_runtime")).toBe(
+    baselineRuntimeStopCount + 1,
+  );
+  expect(commandCount(commands, "stop_managed_agent")).toBe(
+    baselineLegacyStopCount,
+  );
 });
 
 test("members sidebar virtualizes large channel rosters", async ({ page }) => {

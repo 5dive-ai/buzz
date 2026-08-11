@@ -1,5 +1,6 @@
 import * as React from "react";
 
+import { useCommunities } from "@/features/communities/useCommunities";
 import type { Channel } from "@/shared/api/types";
 
 const MembersSidebar = React.lazy(async () => {
@@ -16,6 +17,8 @@ export function HomeMembersSidebarOverlay({
   currentPubkey?: string;
   onClose: () => void;
 }) {
+  const { activeCommunity } = useCommunities();
+
   if (!channel) return null;
 
   return (
@@ -27,6 +30,7 @@ export function HomeMembersSidebarOverlay({
           if (!nextOpen) onClose();
         }}
         open={true}
+        relayUrl={activeCommunity?.relayUrl}
       />
     </React.Suspense>
   );

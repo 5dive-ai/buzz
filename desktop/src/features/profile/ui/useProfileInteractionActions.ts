@@ -25,6 +25,12 @@ import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 
 export type ProfileInteractionAction = "huddle" | "message" | "wave";
 
+type ProfileInteractionAvailability = {
+  huddle: boolean;
+  message: boolean;
+  wave: boolean;
+};
+
 function findCachedOneToOneDm(
   channels: Channel[] | undefined,
   targetPubkey: string,
@@ -63,17 +69,21 @@ function findCachedOneToOneDm(
 }
 
 export function useProfileInteractionActions({
+  availability,
   effectivePubkey,
   enabled,
   isBot,
   isSelf,
+  onBeforeAction,
   onClose,
   viewerIsOwner,
 }: {
+  availability?: ProfileInteractionAvailability;
   effectivePubkey: string | null;
   enabled: boolean;
   isBot: boolean;
   isSelf: boolean;
+  onBeforeAction?: () => void;
   onClose: () => void;
   viewerIsOwner: boolean | undefined;
 }) {
@@ -83,10 +93,18 @@ export function useProfileInteractionActions({
   const queryClient = useQueryClient();
   const { goChannel } = useAppNavigation();
   const openDmMutation = useOpenDmMutation();
+  const openDm = openDmMutation.mutateAsync;
   const channelsQuery = useChannelsQuery();
   const identityQuery = useIdentityQuery();
-  const selfProfileQuery = useProfileQuery(enabled && !isSelf);
   const { isStarting: isStartingHuddle, startHuddle } = useHuddle();
+
+  const canInteract = enabled && !isSelf && effectivePubkey !== null;
+  const canWave = canInteract && (availability?.wave ?? !isBot);
+  const canMessage =
+    canInteract &&
+    (availability?.message ?? (!isBot || viewerIsOwner === true));
+  const canHuddle = canInteract && (availability?.huddle ?? canMessage);
+  const selfProfileQuery = useProfileQuery(enabled && canWave);
 
   React.useEffect(() => {
     isMountedRef.current = true;
@@ -94,11 +112,6 @@ export function useProfileInteractionActions({
       isMountedRef.current = false;
     };
   }, []);
-
-  const canInteract = enabled && !isSelf && effectivePubkey !== null;
-  const canWave = canInteract && !isBot;
-  const canMessage = canInteract && (!isBot || viewerIsOwner === true);
-  const canHuddle = canMessage;
 
   const runAction = React.useCallback(
     async (
@@ -109,6 +122,7 @@ export function useProfileInteractionActions({
         return;
       }
 
+      onBeforeAction?.();
       setPendingAction(action);
       try {
         await operation(effectivePubkey);
@@ -130,7 +144,7 @@ export function useProfileInteractionActions({
         }
       }
     },
-    [effectivePubkey, pendingAction],
+    [effectivePubkey, onBeforeAction, pendingAction],
   );
 
   const handleMessage = React.useCallback(() => {
@@ -139,13 +153,13 @@ export function useProfileInteractionActions({
     }
 
     void runAction("message", async (targetPubkey) => {
-      const dm = await openDmMutation.mutateAsync({ pubkeys: [targetPubkey] });
+      const dm = await openDm({ pubkeys: [targetPubkey] });
       await goChannel(dm.id);
       if (isMountedRef.current) {
         onClose();
       }
     });
-  }, [canMessage, goChannel, onClose, openDmMutation, runAction]);
+  }, [canMessage, goChannel, onClose, openDm, runAction]);
 
   const handleHuddle = React.useCallback(() => {
     if (!canHuddle || isStartingHuddle) {
@@ -153,7 +167,7 @@ export function useProfileInteractionActions({
     }
 
     void runAction("huddle", async (targetPubkey) => {
-      const dm = await openDmMutation.mutateAsync({ pubkeys: [targetPubkey] });
+      const dm = await openDm({ pubkeys: [targetPubkey] });
       await goChannel(dm.id);
       await startHuddle(dm.id, isBot ? [targetPubkey] : []);
       await queryClient.invalidateQueries({ queryKey: channelsQueryKey });
@@ -167,7 +181,7 @@ export function useProfileInteractionActions({
     isBot,
     isStartingHuddle,
     onClose,
-    openDmMutation,
+    openDm,
     queryClient,
     runAction,
     startHuddle,
@@ -189,7 +203,7 @@ export function useProfileInteractionActions({
           channelsQuery.data,
           targetPubkey,
           identity.pubkey,
-        ) ?? (await openDmMutation.mutateAsync({ pubkeys: [targetPubkey] }));
+        ) ?? (await openDm({ pubkeys: [targetPubkey] }));
       const senderName =
         selfProfileQuery.data?.displayName?.trim() ||
         identity.displayName.trim() ||
@@ -251,7 +265,7 @@ export function useProfileInteractionActions({
     goChannel,
     identityQuery.data,
     onClose,
-    openDmMutation,
+    openDm,
     queryClient,
     runAction,
     selfProfileQuery.data?.displayName,
@@ -264,6 +278,7 @@ export function useProfileInteractionActions({
     handleHuddle,
     handleMessage,
     handleWave,
+    isOpeningDm: openDmMutation.isPending,
     isStartingHuddle,
     pendingAction,
   };

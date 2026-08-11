@@ -6,7 +6,9 @@ import {
   getAgentTranscript,
   getArchivedChannelEvents,
   ingestArchivedObserverEvents,
+  pinArchiveChannel,
   subscribeAgentObserverStore,
+  unpinArchiveChannel,
 } from "@/features/agents/observerRelayStore";
 import {
   listSaveSubscriptions,
@@ -81,6 +83,18 @@ export function useArchivedChannelEvents(
   agentPubkey: string | null | undefined,
   channelId: string | null | undefined,
 ): ObserverEvent[] {
+  // Pin this channel's archive against LRU eviction while the panel is mounted,
+  // so the history the user is looking at is never dropped out from under the
+  // view. Refcounted in the store, so co-mounted consumers of the same channel
+  // (this read hook plus the loader below, plus a second panel) compose. The
+  // pin is keyed on channel only — agent identity does not affect eviction,
+  // which is a per-channel operation.
+  React.useEffect(() => {
+    if (!channelId) return;
+    pinArchiveChannel(channelId);
+    return () => unpinArchiveChannel(channelId);
+  }, [channelId]);
+
   const getSnapshot = React.useCallback(
     () => getArchivedChannelEvents(agentPubkey, channelId),
     [agentPubkey, channelId],
@@ -132,6 +146,19 @@ export function useLoadArchivedObserverEvents(
     pagingStateRef.current = createArchivePagingState();
   }
   const ps = pagingStateRef.current;
+
+  // Fence for in-flight fetches that resolve after unmount. Set true by the
+  // cleanup effect below; checked before every store write so a page still
+  // decrypting when the panel closes cannot repopulate a channel whose pin has
+  // just been released — which would otherwise defeat the archive bound by
+  // resurrecting a dead channel as most-recently-used.
+  const disposedRef = React.useRef(false);
+  React.useEffect(() => {
+    disposedRef.current = false;
+    return () => {
+      disposedRef.current = true;
+    };
+  }, []);
 
   // React state mirrors the fields callers observe so re-renders fire on change.
   const [hasSubscription, setHasSubscription] = React.useState<boolean | null>(
@@ -335,6 +362,15 @@ export function useLoadArchivedObserverEvents(
           createdAt: oldestEvent.created_at,
           id: oldestEvent.id,
         };
+        // Fence post-unmount ingest: if the panel unmounted while this page
+        // was in flight, its pin has been released and the channel may already
+        // be evicted. Writing now would resurrect a dead channel as
+        // most-recently-used, silently defeating the archive bound. Skip the
+        // store write; the cursor advance above is harmless (the ref is
+        // discarded on unmount).
+        if (disposedRef.current) {
+          return;
+        }
         await ingestArchivedObserverEvents(events);
       }
 

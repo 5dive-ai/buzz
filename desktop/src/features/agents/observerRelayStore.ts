@@ -25,9 +25,18 @@ import {
   createEmptyTranscriptState,
   processTranscriptEvent,
 } from "./ui/agentSessionTranscript";
+import { selectArchiveEvictionKeys } from "./lib/observerArchiveEviction";
 
 const MAX_OBSERVER_EVENTS = 3000;
 const MAX_PENDING_UNKNOWN_AGENT_FRAMES = 100;
+
+// Maximum number of distinct channels whose archive scroll-back is retained in
+// RAM. The archive window grows only by explicit paged loads from SQLite, so
+// without a bound a session that visits many channels accumulates their full
+// history for the lifetime of the app. Eviction drops the least-recently-loaded
+// unpinned channels whole; a revisit re-hydrates from SQLite (cache miss, not
+// data loss). Channels with a mounted panel are pinned and never evicted.
+const MAX_RETAINED_ARCHIVE_CHANNELS = 8;
 
 export type ObserverSnapshot = {
   connectionState: ConnectionState;
@@ -57,6 +66,53 @@ const snapshotByAgent = new Map<string, ObserverSnapshot>();
 // or vice versa. UI consumers merge the raw events from both sources, then derive
 // TranscriptState once over the combined window.
 const archiveEventsByChannel = new Map<string, ObserverEvent[]>();
+
+// LRU bookkeeping for `archiveEventsByChannel`. `archiveChannelId` maps a
+// composite key back to its channelId (the eviction unit) so the pure policy
+// can group agent entries by channel. `archiveAccessSeq` records the value of
+// `archiveAccessCounter` at each key's most recent read or write, giving a
+// total order for least-recently-used selection.
+const archiveChannelId = new Map<string, string>();
+const archiveAccessSeq = new Map<string, number>();
+let archiveAccessCounter = 0;
+
+// Channels whose archive must never be evicted because a panel is mounted on
+// them. Refcounted so co-mounted panels (e.g. the channel screen and the
+// profile panel viewing the same channel) compose: the channel stays pinned
+// until the last panel unmounts. A channel with a positive count is pinned.
+const pinnedArchiveChannelCounts = new Map<string, number>();
+
+/**
+ * Pin a channel's archive against eviction while a panel is mounted on it.
+ * Refcounted so multiple mounted consumers of the same channel compose; the
+ * channel is protected until every consumer calls `unpinArchiveChannel`.
+ * No-op for a null/empty channelId (panels open before a channel resolves).
+ */
+export function pinArchiveChannel(channelId: string | null | undefined): void {
+  if (!channelId) return;
+  pinnedArchiveChannelCounts.set(
+    channelId,
+    (pinnedArchiveChannelCounts.get(channelId) ?? 0) + 1,
+  );
+}
+
+/**
+ * Release one pin acquired via `pinArchiveChannel`. When the refcount reaches
+ * zero the channel becomes eligible for LRU eviction again. No-op for a
+ * null/empty channelId or a channel with no outstanding pins.
+ */
+export function unpinArchiveChannel(
+  channelId: string | null | undefined,
+): void {
+  if (!channelId) return;
+  const current = pinnedArchiveChannelCounts.get(channelId);
+  if (current === undefined) return;
+  if (current <= 1) {
+    pinnedArchiveChannelCounts.delete(channelId);
+  } else {
+    pinnedArchiveChannelCounts.set(channelId, current - 1);
+  }
+}
 
 // Per-agent, per-channel latest-live-session-id.
 // Key: `${normalizePubkey(agentPubkey)}:${channelId}`.
@@ -279,7 +335,40 @@ function appendArchivedChannelEvent(
   // order for consumers that call buildTranscriptState over the window.
   const sorted = [...current, event].sort(compareObserverEvents);
   archiveEventsByChannel.set(key, sorted);
+  // Record LRU bookkeeping: which channel this key belongs to (the eviction
+  // unit) and its most-recent access, so the policy can pick the least-recently
+  // loaded unpinned channels when the retained-channel cap is exceeded.
+  archiveChannelId.set(key, channelId);
+  archiveAccessSeq.set(key, ++archiveAccessCounter);
   return true;
+}
+
+/**
+ * Evict the least-recently-loaded unpinned channels from the archive window
+ * when the number of distinct retained channels exceeds
+ * `MAX_RETAINED_ARCHIVE_CHANNELS`. Pinned channels (a panel is mounted on them)
+ * are never evicted. Eviction removes every (agent, channel) entry for the
+ * dropped channels and their LRU bookkeeping; a later revisit re-hydrates the
+ * channel from SQLite through the normal paging path. Returns true if any key
+ * was evicted so the caller can decide whether a notify is warranted.
+ */
+function evictArchiveChannelsIfNeeded(): boolean {
+  const entries = Array.from(archiveEventsByChannel.keys(), (key) => ({
+    key,
+    channelId: archiveChannelId.get(key) ?? "",
+    accessSeq: archiveAccessSeq.get(key) ?? 0,
+  }));
+  const evictKeys = selectArchiveEvictionKeys(
+    entries,
+    new Set(pinnedArchiveChannelCounts.keys()),
+    MAX_RETAINED_ARCHIVE_CHANNELS,
+  );
+  for (const key of evictKeys) {
+    archiveEventsByChannel.delete(key);
+    archiveChannelId.delete(key);
+    archiveAccessSeq.delete(key);
+  }
+  return evictKeys.length > 0;
 }
 
 /**
@@ -730,7 +819,14 @@ export async function ingestArchivedObserverEvents(
   // Batch-notify once for the whole page of archive events. appendAgentEvent
   // already notifies individually for live/no-channelId events above, so we
   // only need one extra notify here for the archive path.
-  if (archiveChanged) {
+  //
+  // Enforce the retained-channel bound after the page lands: the channel just
+  // ingested has the highest access seq, so it is safe from its own eviction;
+  // only older unpinned channels are dropped. Fold the eviction result into the
+  // notify decision so a page that only triggers eviction still refreshes any
+  // panel reading an evicted channel.
+  const evicted = evictArchiveChannelsIfNeeded();
+  if (archiveChanged || evicted) {
     notifyListeners();
   }
 }
@@ -777,6 +873,10 @@ export function resetAgentObserverStore() {
   transcriptByAgent.clear();
   snapshotByAgent.clear();
   archiveEventsByChannel.clear();
+  archiveChannelId.clear();
+  archiveAccessSeq.clear();
+  archiveAccessCounter = 0;
+  pinnedArchiveChannelCounts.clear();
   knownAgentPubkeys.clear();
   knownAgentsBySubscription.clear();
   pendingUnknownAgentFrames.length = 0;

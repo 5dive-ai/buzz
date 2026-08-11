@@ -26,6 +26,20 @@
   - `Host`/`Origin` matching is retained in all modes as defense-in-depth.
   - **Migration from the previous `BUZZ_ADMIN_INSECURE_NO_AUTH=true`:** replace
     with `BUZZ_ADMIN_AUTH=disabled`. The behavior is identical.
+- The relay NIP-11 relay-information document now advertises the admin API
+  origin in an optional `admin_api` field (`scheme://host[:port]`) whenever the
+  admin surface is configured (`BUZZ_ADMIN_HOST` set). The scheme follows the
+  same loopback rule as NIP-98 `u`-tag verification (`http` for
+  `localhost`/`127.x`/`::1`, else `https`). Clients can auto-discover the admin
+  console instead of requiring manual URL entry; the field is omitted entirely
+  when no admin surface is configured.
+- `RELAY_OPERATOR_API_ORIGIN` is no longer required at boot when
+  `RELAY_OPERATOR_PUBKEYS` is set. The allowlist is shared by the NIP-98 admin
+  console (which needs no origin) and the community-provisioning endpoints
+  (which do). Setting the pubkeys for the admin console no longer forces an
+  origin; the relay logs a `WARN` naming the affected feature, and the
+  community-provisioning endpoints (`POST /operator/communities`) fail closed
+  at request time until `RELAY_OPERATOR_API_ORIGIN` is set.
 
 ## v0.5.9
 

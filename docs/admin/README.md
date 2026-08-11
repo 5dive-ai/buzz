@@ -90,6 +90,27 @@ RELAY_OPERATOR_PUBKEYS=<64-char hex pubkey>[,<64-char hex pubkey>...]
 - `BUZZ_ADMIN_TOKEN` set alongside `nip98` is a startup error (ambiguous intent).
 - A malformed `RELAY_OWNER_PUBKEY` alongside `nip98` is a startup error (see
   owner fallback below).
+- `RELAY_OPERATOR_API_ORIGIN` is **not** required to run the admin console.
+  That origin is only used by the community-provisioning endpoints
+  (`POST /operator/communities`), which share the `RELAY_OPERATOR_PUBKEYS`
+  allowlist. When the pubkeys are set but the origin is not, the relay boots
+  with a `WARN` and provisioning requests fail closed at request time until the
+  origin is set — the admin console is unaffected.
+
+#### Auto-discovery via NIP-11
+
+When `BUZZ_ADMIN_HOST` is set, the relay advertises the admin API origin in its
+NIP-11 relay-information document under an optional `admin_api` field:
+
+```json
+{ "admin_api": "https://admin.example.com" }
+```
+
+The value is the canonical origin `scheme://host[:port]` (no path), with the
+scheme derived by the same loopback rule as `u`-tag verification (`http` for
+`localhost`/`127.x`/`::1`, else `https`). The field is omitted entirely when no
+admin surface is configured. Clients (such as the desktop console) read this to
+auto-discover the admin endpoint instead of requiring manual URL entry.
 
 Each request requires:
 

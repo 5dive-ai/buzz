@@ -279,9 +279,14 @@ pub struct Config {
     /// Canonical HTTP origin of the deployment-global operator API.
     ///
     /// Every operator NIP-98 `u` tag is verified against this origin, independent
-    /// of the inbound HTTP `Host` header and tenant registry. Required when
-    /// `RELAY_OPERATOR_PUBKEYS` is non-empty. Set via `RELAY_OPERATOR_API_ORIGIN`
-    /// as an `http://` or `https://` origin with no path, query, or fragment.
+    /// of the inbound HTTP `Host` header and tenant registry. Required only to
+    /// *use* the community-provisioning endpoints: when it is unset, those
+    /// endpoints fail closed at request time (see
+    /// `api::operator::authorize_operator_request`). It is NOT required at boot
+    /// even when `RELAY_OPERATOR_PUBKEYS` is set, because that allowlist is
+    /// shared with the NIP-98 admin console, which needs no origin. Set via
+    /// `RELAY_OPERATOR_API_ORIGIN` as an `http://` or `https://` origin with no
+    /// path, query, or fragment.
     pub relay_operator_api_origin: Option<String>,
 
     /// Deployment-level relay operator pubkeys allowed to use the
@@ -780,10 +785,21 @@ impl Config {
             Err(_) => Vec::new(),
         };
         if !relay_operator_pubkeys.is_empty() && relay_operator_api_origin.is_none() {
-            return Err(ConfigError::InvalidValue(
-                "RELAY_OPERATOR_API_ORIGIN is required when RELAY_OPERATOR_PUBKEYS is configured"
-                    .to_string(),
-            ));
+            // Do NOT fail closed at boot: RELAY_OPERATOR_PUBKEYS is the shared
+            // allowlist for BOTH the community-provisioning endpoints and the
+            // NIP-98 admin console. Only provisioning needs the canonical
+            // origin, so requiring it at boot would force admin-console
+            // operators to configure a provisioning surface they never use.
+            // The provisioning endpoints stay fail-closed at request time
+            // (see `api::operator::authorize_operator_request`, which rejects
+            // when the origin is unconfigured); this warning names that so an
+            // operator who *did* want provisioning knows why it 500s.
+            warn!(
+                "RELAY_OPERATOR_PUBKEYS is set but RELAY_OPERATOR_API_ORIGIN is not — \
+                 the community-provisioning endpoints (POST /operator/communities) will \
+                 reject every request until RELAY_OPERATOR_API_ORIGIN is set. The NIP-98 \
+                 admin console does not require it and is unaffected."
+            );
         }
 
         let auth = buzz_auth::AuthConfig {
@@ -2004,7 +2020,11 @@ mod tests {
     }
 
     #[test]
-    fn relay_operator_pubkeys_require_api_origin() {
+    fn relay_operator_pubkeys_without_api_origin_boots_and_warns() {
+        // Regression: RELAY_OPERATOR_PUBKEYS is the shared allowlist for both
+        // community provisioning and the NIP-98 admin console. Configuring the
+        // admin console (pubkeys) must NOT force the provisioning origin — boot
+        // succeeds; provisioning stays fail-closed at request time.
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var(
             "RELAY_OPERATOR_PUBKEYS",
@@ -2014,10 +2034,15 @@ mod tests {
         let result = Config::from_env();
         std::env::remove_var("RELAY_OPERATOR_PUBKEYS");
 
-        assert!(matches!(
-            result,
-            Err(ConfigError::InvalidValue(ref msg)) if msg.contains("RELAY_OPERATOR_API_ORIGIN is required")
-        ));
+        let config = result.expect("pubkeys-set/origin-unset must boot, not fail closed");
+        assert_eq!(
+            config.relay_operator_pubkeys,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()]
+        );
+        assert!(
+            config.relay_operator_api_origin.is_none(),
+            "origin stays unset — only the provisioning path requires it, at request time"
+        );
     }
 
     #[test]

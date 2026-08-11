@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
     let channel_id = std::env::args()
         .nth(3)
         .unwrap_or_else(|| "00000000-0000-0000-0000-000000000042".into());
+    let channel_name = format!("local-mode-{channel_id}");
     let filter =
         || Filter::new().custom_tag(SingleLetterTag::lowercase(Alphabet::H), channel_id.clone());
     if std::env::args().nth(2).as_deref() == Some("history-only") {
@@ -43,6 +44,21 @@ async fn main() -> anyhow::Result<()> {
         println!("PASS sqlite_restart_history");
         return Ok(());
     }
+    let channel_event = EventBuilder::new(Kind::Custom(9007), "")
+        .tags(vec![
+            Tag::parse(["h", &channel_id])?,
+            Tag::parse(["name", &channel_name])?,
+            Tag::parse(["channel_type", "stream"])?,
+            Tag::parse(["visibility", "open"])?,
+        ])
+        .sign_with_keys(&keys)?;
+    let mut publisher = BuzzTestClient::connect(&url, &keys).await?;
+    let channel_ok = publisher.send_event(channel_event).await?;
+    anyhow::ensure!(
+        channel_ok.accepted,
+        "channel creation rejected: {}",
+        channel_ok.message
+    );
     let mut subscriber = BuzzTestClient::connect(&url, &keys).await?;
     subscriber.subscribe("live", vec![filter()]).await?;
     loop {
@@ -53,7 +69,6 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
     }
-    let mut publisher = BuzzTestClient::connect(&url, &keys).await?;
     let ok = publisher
         .send_text_message(&keys, &channel_id, "phase0 live", 9)
         .await?;

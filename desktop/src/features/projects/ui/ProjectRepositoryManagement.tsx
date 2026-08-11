@@ -118,7 +118,7 @@ export function ProjectRepositoryManagement({
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
-              className="h-8 shrink-0 gap-1.5"
+              className="h-7 shrink-0 gap-1.5 rounded-md"
               disabled={repairMutation.isPending}
               size="sm"
               type="button"

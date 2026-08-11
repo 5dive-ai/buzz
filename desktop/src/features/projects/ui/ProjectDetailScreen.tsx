@@ -843,36 +843,6 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           <ProjectDetailChrome
-            actions={
-              <>
-                <ProjectRepositoryManagement
-                  identityPubkey={identityQuery.data?.pubkey}
-                  onChange={handleRepositoryChange}
-                  project={project}
-                  projects={projectsQuery.data ?? []}
-                  repository={repository}
-                />
-                {repoRemote.webUrl &&
-                (repoRemote.host.kind !== "external" ||
-                  repoSource === "local") ? (
-                  <Button
-                    asChild
-                    aria-label="Open project web page"
-                    className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
-                    size="icon"
-                    variant="ghost"
-                  >
-                    <a
-                      href={repoRemote.webUrl}
-                      rel="noopener noreferrer"
-                      target="_blank"
-                    >
-                      <ExternalLink className="h-4 w-4" />
-                    </a>
-                  </Button>
-                ) : null}
-              </>
-            }
             activeTabCrumb={activeTabCrumb}
             activeWorkItemCrumb={activeWorkItemCrumb}
             chromeRef={projectDetailHeaderChromeRef}
@@ -932,6 +902,36 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 onSelectedTabChange={setActiveTab}
                 profiles={profiles}
                 project={repository}
+                repositoryControls={
+                  <>
+                    <ProjectRepositoryManagement
+                      identityPubkey={identityQuery.data?.pubkey}
+                      onChange={handleRepositoryChange}
+                      project={project}
+                      projects={projectsQuery.data ?? []}
+                      repository={repository}
+                    />
+                    {repoRemote.webUrl &&
+                    (repoRemote.host.kind !== "external" ||
+                      repoSource === "local") ? (
+                      <Button
+                        asChild
+                        aria-label="Open project web page"
+                        className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
+                        size="icon"
+                        variant="ghost"
+                      >
+                        <a
+                          href={repoRemote.webUrl}
+                          rel="noopener noreferrer"
+                          target="_blank"
+                        >
+                          <ExternalLink className="h-4 w-4" />
+                        </a>
+                      </Button>
+                    ) : null}
+                  </>
+                }
                 projectId={project.id}
                 repoDiff={displayedRepoDiff}
                 repoDiffError={displayedRepoDiffError}

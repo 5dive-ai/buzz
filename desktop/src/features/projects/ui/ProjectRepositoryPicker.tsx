@@ -1,13 +1,14 @@
 import {
   Check,
   ChevronDown,
+  FolderGit2,
   FolderPlus,
-  GitBranch,
   Link,
   Plus,
 } from "lucide-react";
 
 import type { Project, Repository } from "@/features/projects/hooks";
+import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import {
   DropdownMenu,
@@ -16,6 +17,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
+import { PROJECT_PICKER_TRIGGER_CLASS } from "./projectPanelStyles";
 
 export function ProjectRepositoryPicker({
   onAttach,
@@ -32,7 +34,7 @@ export function ProjectRepositoryPicker({
 }) {
   const repositoryLabel = (
     <>
-      <GitBranch className="h-3.5 w-3.5" />
+      <FolderGit2 className="h-4 w-4 shrink-0 text-muted-foreground" />
       <span className="truncate">{repository.name}</span>
     </>
   );
@@ -42,7 +44,10 @@ export function ProjectRepositoryPicker({
     <div className="flex items-center gap-1.5">
       {project.repositoryAddresses.length === 1 ? (
         <div
-          className="flex h-8 max-w-64 shrink-0 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-sm font-medium"
+          className={cn(
+            "flex max-w-64 items-center rounded-md border border-input bg-background",
+            PROJECT_PICKER_TRIGGER_CLASS,
+          )}
           data-testid="project-repository-picker"
         >
           {repositoryLabel}
@@ -52,13 +57,13 @@ export function ProjectRepositoryPicker({
           <DropdownMenuTrigger asChild>
             <Button
               aria-label="Select repository"
-              className="h-8 max-w-64 shrink-0 gap-1.5"
+              className={cn("max-w-64", PROJECT_PICKER_TRIGGER_CLASS)}
               data-testid="project-repository-picker"
               size="sm"
               variant="outline"
             >
               {repositoryLabel}
-              <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-56">
@@ -98,7 +103,7 @@ export function ProjectRepositoryPicker({
           <DropdownMenuTrigger asChild>
             <Button
               aria-label="Add repository"
-              className="h-8 w-8 shrink-0"
+              className="h-7 w-7 shrink-0 rounded-md"
               data-testid="add-project-repository"
               size="icon"
               type="button"

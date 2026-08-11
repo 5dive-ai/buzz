@@ -421,7 +421,9 @@ final channelDetailsProvider = FutureProvider.family<ChannelDetails, String>((
 final channelMembersProvider = FutureProvider.autoDispose
     .family<List<ChannelMember>, String>((ref, channelId) async {
       ref.watch(channelMembershipUpdateProvider(channelId));
-      final session = ref.watch(relaySessionProvider.notifier);
+      final sessionState = ref.watch(relaySessionProvider);
+      if (sessionState.status != SessionStatus.connected) return const [];
+      final session = ref.read(relaySessionProvider.notifier);
       final events = await session.fetchHistory(
         NostrFilters.channelMembers(channelId),
       );

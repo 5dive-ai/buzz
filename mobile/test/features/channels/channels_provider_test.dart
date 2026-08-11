@@ -54,6 +54,25 @@ void main() {
     },
   );
 
+  test('retains channel-list member snapshots for immediate reuse', () async {
+    final joinedAt = DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true);
+    final session = _FakeRelaySession(
+      memberships: [_membership(_channelA, myPk, additionalPubkey: 'alice')],
+      metadata: [_meta(id: _channelA, name: 'general')],
+    );
+    final container = _buildContainer(session: session);
+    addTearDown(container.dispose);
+
+    await container.read(channelsProvider.future);
+    final members = container
+        .read(channelsProvider.notifier)
+        .cachedMembersForChannel(_channelA);
+
+    expect(members, hasLength(2));
+    expect(members.map((member) => member.pubkey), [myPk, 'alice']);
+    expect(members.every((member) => member.joinedAt == joinedAt), isTrue);
+  });
+
   test(
     'refreshing an unchanged channel set issues zero new live REQs',
     () async {
@@ -529,7 +548,11 @@ const _channelB = '22222222-2222-4222-8222-222222222222';
 const _channelD = '44444444-4444-4444-8444-444444444444';
 
 /// Build a kind:39002 membership event tagged with the channel id and member.
-NostrEvent _membership(String channelId, String pubkey) => NostrEvent(
+NostrEvent _membership(
+  String channelId,
+  String pubkey, {
+  String? additionalPubkey,
+}) => NostrEvent(
   id: 'mem-$channelId',
   pubkey: 'creator',
   createdAt: 1,
@@ -537,6 +560,7 @@ NostrEvent _membership(String channelId, String pubkey) => NostrEvent(
   tags: [
     ['d', channelId],
     ['p', pubkey],
+    if (additionalPubkey != null) ['p', additionalPubkey],
   ],
   content: '',
   sig: 'sig',

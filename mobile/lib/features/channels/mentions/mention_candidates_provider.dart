@@ -73,15 +73,23 @@ final mentionCandidatesProvider = Provider.family
       ref,
       args,
     ) {
+      final channelsAsync = ref.watch(channelsProvider);
+      final loadedMembers = ref
+          .watch(channelMembersProvider(args.channelId))
+          .asData
+          ?.value;
       final members =
-          ref.watch(channelMembersProvider(args.channelId)).asData?.value ??
-          const <ChannelMember>[];
+          loadedMembers ??
+          (channelsAsync.asData == null
+              ? const <ChannelMember>[]
+              : ref
+                    .read(channelsProvider.notifier)
+                    .cachedMembersForChannel(args.channelId));
       final relayAgents =
           ref.watch(agentDirectoryProvider).asData?.value ??
           const <AgentDirectoryEntry>[];
       final owners = ref.watch(agentOwnersProvider).asData?.value ?? const {};
-      final channels =
-          ref.watch(channelsProvider).asData?.value ?? const <Channel>[];
+      final channels = channelsAsync.asData?.value ?? const <Channel>[];
       final userCache = ref.watch(userCacheProvider);
       final currentPubkey = ref.watch(currentPubkeyProvider);
       final searchResults =

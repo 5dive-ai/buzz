@@ -24,9 +24,6 @@ pub struct CommonArgs {
         default_value_t = 25
     )]
     pub requests_per_second: u32,
-    /// Resume after this sidecar key. The final log line prints the next value.
-    #[arg(long, env = "BUZZ_MEDIA_MIGRATION_START_AFTER")]
-    pub start_after: Option<String>,
     #[arg(long, env = "BUZZ_MEDIA_MIGRATION_PAGE_SIZE", default_value_t = 100)]
     pub page_size: usize,
 }

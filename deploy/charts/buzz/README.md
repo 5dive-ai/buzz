@@ -299,8 +299,10 @@ are in [`deploy/kubernetes/examples/`](../../kubernetes/examples/). The tools:
 - list canonical `_meta/<community>/<sha>.json` sidecars in bounded pages;
 - default to 25 total S3 requests/second, configurable with
   `BUZZ_MEDIA_MIGRATION_REQUESTS_PER_SECOND`;
-- print the last completed sidecar as `checkpoint`; restart with
-  `BUZZ_MEDIA_MIGRATION_START_AFTER=<checkpoint>` if a Job fails;
+- print the last completed sidecar as `checkpoint`; the backfill job can be
+  restarted with `BUZZ_MEDIA_MIGRATION_START_AFTER=<checkpoint>` if it fails;
+  the destructive cleanup job always scans from the beginning so shared legacy
+  keys are verified for every community before deletion;
 - are idempotent: backfill skips an existing destination, and deletion skips an
   absent legacy source;
 - fail closed on malformed metadata or a missing source/destination.

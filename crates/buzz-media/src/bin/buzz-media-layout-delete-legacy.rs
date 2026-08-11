@@ -1,6 +1,6 @@
 //! Delete verified legacy media payloads after migration reconciliation.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, env};
 
 use anyhow::{Context, Result};
 use buzz_media::migration::{objects_for_sidecar, parse_sidecar_key, RequestPacer};
@@ -17,6 +17,9 @@ const CONFIRMATION: &str = "delete-verified-legacy-media";
 struct Args {
     #[command(flatten)]
     common: CommonArgs,
+    /// Rejected for destructive cleanup because partial scans can strand shared legacy CAS keys.
+    #[arg(long, env = "BUZZ_MEDIA_MIGRATION_START_AFTER")]
+    start_after: Option<String>,
     /// Preview is the safe default. Set false only after reconciliation.
     #[arg(long, env = "BUZZ_MEDIA_MIGRATION_DRY_RUN", default_value_t = true, action = clap::ArgAction::Set)]
     dry_run: bool,
@@ -35,19 +38,13 @@ async fn verify_selected_destinations(
     pacer: &mut RequestPacer,
 ) -> Result<(u64, BTreeSet<String>, Option<String>)> {
     let mut continuation = None;
-    let mut start_after = common.start_after.clone();
     let mut verified = 0_u64;
     let mut verified_legacy_keys = BTreeSet::new();
-    let mut checkpoint = start_after.clone();
+    let mut checkpoint = None;
     loop {
         pacer.wait().await;
         let page = storage
-            .list_prefix_page(
-                "_meta/",
-                continuation.take(),
-                start_after.take(),
-                common.page_size,
-            )
+            .list_prefix_page("_meta/", continuation.take(), None, common.page_size)
             .await
             .context("list media sidecars")?;
         for (sidecar_key, _) in page.objects {
@@ -109,10 +106,28 @@ async fn delete_verified_legacy_objects(
     Ok((changed, skipped))
 }
 
+fn ensure_no_start_after(start_after: Option<&str>, env_start_after_is_set: bool) -> Result<()> {
+    if start_after.is_some() {
+        anyhow::bail!(
+            "--start-after/BUZZ_MEDIA_MIGRATION_START_AFTER is unsafe for legacy deletion; rerun from the beginning instead"
+        );
+    }
+    if env_start_after_is_set {
+        anyhow::bail!(
+            "BUZZ_MEDIA_MIGRATION_START_AFTER is unsafe for legacy deletion; rerun from the beginning instead"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
     let args = Args::parse();
+    ensure_no_start_after(
+        args.start_after.as_deref(),
+        env::var_os("BUZZ_MEDIA_MIGRATION_START_AFTER").is_some(),
+    )?;
     if !args.dry_run && args.confirm.as_deref() != Some(CONFIRMATION) {
         anyhow::bail!("destructive mode requires --confirm={CONFIRMATION}");
     }
@@ -126,4 +141,30 @@ async fn main() -> Result<()> {
             .await?;
     tracing::info!(deleted, skipped, dry_run = args.dry_run, checkpoint = ?verified_checkpoint, "legacy deletion complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_no_start_after;
+
+    #[test]
+    fn rejects_start_after_flag() {
+        let error = ensure_no_start_after(Some("_meta/community/sha.json"), false)
+            .expect_err("start-after must be unsafe for legacy deletion");
+
+        assert!(error.to_string().contains("unsafe for legacy deletion"));
+    }
+
+    #[test]
+    fn rejects_start_after_env() {
+        let error = ensure_no_start_after(None, true)
+            .expect_err("start-after env must be unsafe for legacy deletion");
+
+        assert!(error.to_string().contains("unsafe for legacy deletion"));
+    }
+
+    #[test]
+    fn allows_full_bucket_scan() {
+        ensure_no_start_after(None, false).expect("full scan must be allowed");
+    }
 }

@@ -12,6 +12,9 @@ use media_layout_common::{verify_destination, CommonArgs};
 struct Args {
     #[command(flatten)]
     common: CommonArgs,
+    /// Resume after this sidecar key. The final log line prints the next value.
+    #[arg(long, env = "BUZZ_MEDIA_MIGRATION_START_AFTER")]
+    start_after: Option<String>,
     /// Report actions without copying objects.
     #[arg(long, env = "BUZZ_MEDIA_MIGRATION_DRY_RUN", default_value_t = false)]
     dry_run: bool,
@@ -24,7 +27,7 @@ async fn main() -> Result<()> {
     let storage = args.common.storage()?;
     let mut pacer = RequestPacer::new(args.common.requests_per_second);
     let mut continuation = None;
-    let mut start_after = args.common.start_after.clone();
+    let mut start_after = args.start_after.clone();
     let mut processed = 0_u64;
     let mut copied = 0_u64;
     let mut skipped = 0_u64;

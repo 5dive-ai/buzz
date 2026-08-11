@@ -937,6 +937,9 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
 }) => {
   await installMockBridge(page, {
     agentMemory: createMockAgentMemoryListing(),
+    // The viewer is the agent's verified NIP-OA owner, so archiveActions
+    // grants the Archive row (canArchive gate; the relay re-verifies on submit).
+    oaOwnerIsMe: true,
   });
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.goto("/");

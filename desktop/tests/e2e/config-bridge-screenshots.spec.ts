@@ -97,11 +97,15 @@ async function activatePersonas(page: import("@playwright/test").Page) {
 
 /**
  * Open the #agents channel and click an agent's avatar in the message list
- * to open the profile side panel, then navigate to the Runtime tab.
+ * to open the profile side panel, then navigate to the requested tab.
  */
 async function openAgentProfileFromChannel(
   page: import("@playwright/test").Page,
   agentName: string,
+  {
+    anchorText = "Model",
+    tab = "Info",
+  }: { anchorText?: string; tab?: "Info" | "Runtime" } = {},
 ) {
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await waitForInvokeBridge(page);
@@ -121,13 +125,10 @@ async function openAgentProfileFromChannel(
   const panel = page.getByTestId("user-profile-panel");
   await expect(panel).toBeVisible({ timeout: 10_000 });
 
-  // Click the Runtime tab to reveal the Configuration section.
-  await panel.getByRole("tab", { name: "Runtime" }).click();
+  await panel.getByRole("tab", { name: tab }).click();
 
-  // Wait for the first normalized config field ("Model") to appear.
-  const configAnchor = panel.getByText("Model").first();
+  const configAnchor = panel.getByText(anchorText, { exact: true }).first();
   await expect(configAnchor).toBeVisible({ timeout: 10_000 });
-
   // Scroll the panel's internal scroll container to the bottom so the
   // config section content is fully visible.
   await configAnchor.scrollIntoViewIfNeeded();
@@ -212,7 +213,7 @@ test.describe("config bridge screenshots", () => {
 
     // Multiple distinct provenance origins visible at once.
     await expect(panel.getByText("Set in Buzz").first()).toBeVisible();
-    await expect(panel.getByText("Inherited from template")).toBeVisible();
+    await expect(panel.getByText("Inherited from template")).toHaveCount(0);
     await expect(
       panel.getByText("From environment variable (GOOSE_MODE)"),
     ).toBeVisible();
@@ -243,7 +244,10 @@ test.describe("config bridge screenshots", () => {
   test("05 — advanced flat list", async ({ page }) => {
     await installMockBridge(page, { managedAgents: MANAGED_AGENTS });
 
-    const panel = await openAgentProfileFromChannel(page, "Goose Agent");
+    const panel = await openAgentProfileFromChannel(page, "Goose Agent", {
+      anchorText: "MCP servers",
+      tab: "Runtime",
+    });
 
     // Advanced runtime fields render directly in the profile panel's flat list,
     // grouped under their own "Advanced" header.
@@ -251,7 +255,7 @@ test.describe("config bridge screenshots", () => {
     await expect(panel.getByText("Advanced", { exact: true })).toHaveCount(1);
     // MCP servers render once each under their group label.
     await expect(panel.getByText("developer", { exact: true })).toHaveCount(1);
-    await expect(panel.getByText("MCP Servers", { exact: true })).toHaveCount(
+    await expect(panel.getByText("MCP servers", { exact: true })).toHaveCount(
       1,
     );
     await settleAnimations(panel);
@@ -271,12 +275,15 @@ test.describe("config bridge screenshots", () => {
       ],
     });
 
-    const panel = await openAgentProfileFromChannel(page, "Buzz Agent");
+    const panel = await openAgentProfileFromChannel(page, "Buzz Agent", {
+      anchorText: "MCP servers",
+      tab: "Runtime",
+    });
 
     await expect(
-      panel.getByText("No custom servers configured", { exact: true }),
+      panel.getByText("No custom servers configured.", { exact: true }),
     ).toBeVisible();
-    await expect(panel.getByText("MCP Servers", { exact: true })).toHaveCount(
+    await expect(panel.getByText("MCP servers", { exact: true })).toHaveCount(
       1,
     );
   });
@@ -313,8 +320,8 @@ test.describe("config bridge screenshots", () => {
     const panel = page.getByTestId("user-profile-panel");
     await expect(panel).toBeVisible({ timeout: 10_000 });
 
-    // The Configuration section lives inside the Runtime tab — click it first.
-    await panel.getByRole("tab", { name: "Runtime" }).click();
+    // Editable configuration lives inside the Info tab.
+    await panel.getByRole("tab", { name: "Info" }).click();
 
     // Wait for the config section to render and scroll it into view so
     // it is fully visible before capture.

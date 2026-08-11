@@ -983,6 +983,7 @@ export function AppShell() {
                   onSelectChannel={(channelId) => {
                     void goChannel(channelId);
                   }}
+                  relayUrl={communitiesHook.activeCommunity?.relayUrl}
                 />
                 <SendFeedbackController
                   onOpenChange={setIsSendFeedbackOpen}

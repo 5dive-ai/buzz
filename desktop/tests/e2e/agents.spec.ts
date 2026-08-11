@@ -211,6 +211,35 @@ async function countCommandInvocations(
   );
 }
 
+test("Agents view keeps every managed instance that shares a persona visible", async ({
+  page,
+}) => {
+  const personaId = "custom:multi-fizz";
+  const firstPubkey = "a".repeat(64);
+  const secondPubkey = "b".repeat(64);
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: personaId,
+        displayName: "Fizz",
+        systemPrompt: "Move fast.",
+      },
+    ],
+    managedAgents: [
+      { pubkey: firstPubkey, name: "Fizz", personaId },
+      { pubkey: secondPubkey, name: "Fizz", personaId },
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+
+  const cards = page.getByTestId(`persona-agent-row-${personaId}`);
+  await expect(cards).toHaveCount(2);
+  await expect(cards.nth(0)).toContainText("aaaaaaaa…aaaa");
+  await expect(cards.nth(1)).toContainText("bbbbbbbb…bbbb");
+  await expect(page.getByLabel("Open actions for Fizz")).toHaveCount(1);
+});
+
 test("catalog hides built-ins and shows the shared-agent empty state", async ({
   page,
 }) => {

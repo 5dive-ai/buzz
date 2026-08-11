@@ -34,11 +34,13 @@ export function buildUnifiedGroups(
   return { groups, ungrouped, unknown };
 }
 
-export function pickProfileAgent(agents: ManagedAgent[]) {
+export function profileAgentsForGroup(agents: ManagedAgent[]) {
   return [...agents].sort((left, right) => {
     const activeDiff =
       Number(isManagedAgentActive(right)) - Number(isManagedAgentActive(left));
     if (activeDiff !== 0) return activeDiff;
-    return left.name.localeCompare(right.name);
-  })[0];
+    const nameDiff = left.name.localeCompare(right.name);
+    if (nameDiff !== 0) return nameDiff;
+    return left.pubkey.localeCompare(right.pubkey);
+  });
 }

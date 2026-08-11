@@ -35,9 +35,11 @@
 //!   artifacts but before the sidecar serve gate. Record existence therefore
 //!   implies the scan inputs are readable, while record failure cannot leave
 //!   unscanned media publicly servable.
-//! - `ext`, `mime_type`, and `size` are always present so the consumer can
-//!   derive the blob key (`{sha256}.{ext}`) and scan eligibility without
-//!   extra round-trips.
+//! - `ext`, `mime_type`, and `size` are always present for backward-compatible
+//!   consumers; new consumers should prefer `blob_key` (the exact payload key)
+//!   and only derive `{sha256}.{ext}` for old records that omit it.
+//! - `blob_key` uses the active migration layout, so it may be flat legacy or
+//!   hash-sharded global CAS (`media/<hh>/<hh>/<sha256>.<ext>`).
 //! - `uploader_name`, `ip`, and `port` are omitted (never `null`) when
 //!   unknown or when collection is disabled.
 //! - Consumers must tolerate unknown fields; `version` bumps only on
@@ -290,12 +292,13 @@ mod tests {
 
     #[test]
     fn record_serializes_full_shape() {
+        let blob_key = format!("media/bb/bb/{}.png", "b".repeat(64));
         let record = UploadRecord {
             version: UPLOAD_RECORD_VERSION,
             event_id: "01J9W3TEST".into(),
             sha256: "b".repeat(64),
             ext: "png".into(),
-            blob_key: Some(format!("{}.png", "b".repeat(64))),
+            blob_key: Some(blob_key.clone()),
             mime_type: "image/png".into(),
             size: 12345,
             uploaded_at: 1_783_358_352,
@@ -311,7 +314,7 @@ mod tests {
         assert_eq!(json["version"], 1);
         assert_eq!(json["ext"], "png");
         assert_eq!(json["mime_type"], "image/png");
-        assert_eq!(json["blob_key"], format!("{}.png", "b".repeat(64)));
+        assert_eq!(json["blob_key"], blob_key);
         assert_eq!(json["size"], 12345);
         assert_eq!(json["ip"], "203.0.113.7");
         assert_eq!(json["port"], 51234);

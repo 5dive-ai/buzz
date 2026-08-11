@@ -38,18 +38,18 @@ pub fn parse_sidecar_key(key: &str) -> Option<(CommunityId, &str)> {
 
 /// Derive payload and optional thumbnail pairs represented by a sidecar.
 pub fn objects_for_sidecar(
-    community: CommunityId,
+    _community: CommunityId,
     sha: &str,
     meta: &BlobMeta,
 ) -> Result<Vec<MigrationObject>, crate::MediaKeyError> {
     let mut objects = vec![MigrationObject {
         legacy: legacy_blob_key(sha, &meta.ext)?,
-        sharded: sharded_blob_key(community, sha, &meta.ext)?,
+        sharded: sharded_blob_key(sha, &meta.ext)?,
     }];
     if !meta.thumb_url.is_empty() {
         objects.push(MigrationObject {
             legacy: legacy_thumb_key(sha)?,
-            sharded: sharded_thumb_key(community, sha)?,
+            sharded: sharded_thumb_key(sha)?,
         });
     }
     Ok(objects)
@@ -108,6 +108,8 @@ mod tests {
         meta.thumb_url = "https://media.example/thumb".into();
         let objects = objects_for_sidecar(community, SHA, &meta).unwrap();
         assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].sharded, format!("media/ab/cd/{SHA}.jpg"));
+        assert_eq!(objects[1].sharded, format!("media/ab/cd/{SHA}.thumb.jpg"));
         assert!(objects[1].legacy.ends_with(".thumb.jpg"));
     }
 }

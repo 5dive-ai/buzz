@@ -1,10 +1,12 @@
 //! Deterministic object-key derivation for media payloads.
 //!
 //! Public Blossom URLs stay flat (`/media/<sha>.<ext>`), while S3 payloads use
-//! hash-leading shards so aggregate request traffic is distributed before the
-//! community segment. Legacy keys remain read candidates during migration.
+//! hash-leading global CAS shards. Legacy keys remain read candidates during
+//! migration.
 
-use buzz_core::tenant::{CommunityId, TenantContext};
+#[cfg(test)]
+use buzz_core::tenant::CommunityId;
+use buzz_core::tenant::TenantContext;
 
 /// Invalid data supplied to media object-key construction.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -23,7 +25,7 @@ pub enum MediaKeyError {
 /// Ordered object keys for compatibility reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaReadCandidates {
-    /// Hash-sharded, community-scoped key tried first.
+    /// Hash-sharded global CAS key tried first.
     pub sharded: String,
     /// Flat pre-migration key tried only when `sharded` is not found.
     pub legacy: String,
@@ -60,15 +62,11 @@ pub fn legacy_blob_key(sha256: &str, ext: &str) -> Result<String, MediaKeyError>
     Ok(format!("{sha256}.{ext}"))
 }
 
-/// Hash-leading blob key: `media/<2>/<2>/<community>/<sha256>.<ext>`.
-pub fn sharded_blob_key(
-    community: CommunityId,
-    sha256: &str,
-    ext: &str,
-) -> Result<String, MediaKeyError> {
+/// Hash-leading global CAS blob key: `media/<2>/<2>/<sha256>.<ext>`.
+pub fn sharded_blob_key(sha256: &str, ext: &str) -> Result<String, MediaKeyError> {
     let filename = legacy_blob_key(sha256, ext)?;
     Ok(format!(
-        "media/{}/{}/{community}/{filename}",
+        "media/{}/{}/{filename}",
         &sha256[..2],
         &sha256[2..4]
     ))
@@ -80,11 +78,11 @@ pub fn legacy_thumb_key(sha256: &str) -> Result<String, MediaKeyError> {
     Ok(format!("{sha256}.thumb.jpg"))
 }
 
-/// Hash-leading thumbnail key: `media/<2>/<2>/<community>/<sha256>.thumb.jpg`.
-pub fn sharded_thumb_key(community: CommunityId, sha256: &str) -> Result<String, MediaKeyError> {
+/// Hash-leading global CAS thumbnail key: `media/<2>/<2>/<sha256>.thumb.jpg`.
+pub fn sharded_thumb_key(sha256: &str) -> Result<String, MediaKeyError> {
     let filename = legacy_thumb_key(sha256)?;
     Ok(format!(
-        "media/{}/{}/{community}/{filename}",
+        "media/{}/{}/{filename}",
         &sha256[..2],
         &sha256[2..4]
     ))
@@ -92,15 +90,16 @@ pub fn sharded_thumb_key(community: CommunityId, sha256: &str) -> Result<String,
 
 /// Build new-first, legacy-fallback candidates from a validated public payload name.
 ///
-/// The community always comes from the server-resolved tenant context; callers
-/// cannot supply it through a URL, sidecar, or upload record.
+/// The tenant context is intentionally unused by global CAS key construction;
+/// callers still pass it so authorization call sites keep tenant resolution at
+/// the boundary before payload reads.
 pub fn read_candidates(
-    ctx: &TenantContext,
+    _ctx: &TenantContext,
     payload_name: &str,
 ) -> Result<MediaReadCandidates, MediaKeyError> {
     if let Some(sha256) = payload_name.strip_suffix(".thumb.jpg") {
         return Ok(MediaReadCandidates {
-            sharded: sharded_thumb_key(ctx.community(), sha256)?,
+            sharded: sharded_thumb_key(sha256)?,
             legacy: legacy_thumb_key(sha256)?,
         });
     }
@@ -112,7 +111,7 @@ pub fn read_candidates(
         return Err(MediaKeyError::InvalidPayloadName);
     }
     Ok(MediaReadCandidates {
-        sharded: sharded_blob_key(ctx.community(), sha256, ext)?,
+        sharded: sharded_blob_key(sha256, ext)?,
         legacy: legacy_blob_key(sha256, ext)?,
     })
 }
@@ -129,40 +128,36 @@ mod tests {
     }
 
     #[test]
-    fn derives_hash_leading_community_scoped_blob_and_thumb_keys() {
-        let ctx = tenant(1);
-        let community = ctx.community();
-
+    fn derives_hash_leading_global_cas_blob_and_thumb_keys() {
         assert_eq!(
-            sharded_blob_key(community, SHA, "jpg").unwrap(),
-            format!("media/ab/cd/{community}/{SHA}.jpg")
+            sharded_blob_key(SHA, "jpg").unwrap(),
+            format!("media/ab/cd/{SHA}.jpg")
         );
         assert_eq!(
-            sharded_thumb_key(community, SHA).unwrap(),
-            format!("media/ab/cd/{community}/{SHA}.thumb.jpg")
+            sharded_thumb_key(SHA).unwrap(),
+            format!("media/ab/cd/{SHA}.thumb.jpg")
         );
-        assert_ne!(
-            sharded_blob_key(community, SHA, "jpg").unwrap(),
-            sharded_blob_key(tenant(2).community(), SHA, "jpg").unwrap()
+        assert_eq!(
+            sharded_blob_key(SHA, "jpg").unwrap(),
+            sharded_blob_key(SHA, "jpg").unwrap()
         );
     }
 
     #[test]
     fn orders_sharded_before_legacy_for_blobs_and_thumbnails() {
         let ctx = tenant(1);
-        let community = ctx.community();
 
         assert_eq!(
             read_candidates(&ctx, &format!("{SHA}.png")).unwrap(),
             MediaReadCandidates {
-                sharded: format!("media/ab/cd/{community}/{SHA}.png"),
+                sharded: format!("media/ab/cd/{SHA}.png"),
                 legacy: format!("{SHA}.png"),
             }
         );
         assert_eq!(
             read_candidates(&ctx, &format!("{SHA}.thumb.jpg")).unwrap(),
             MediaReadCandidates {
-                sharded: format!("media/ab/cd/{community}/{SHA}.thumb.jpg"),
+                sharded: format!("media/ab/cd/{SHA}.thumb.jpg"),
                 legacy: format!("{SHA}.thumb.jpg"),
             }
         );

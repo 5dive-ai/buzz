@@ -13,8 +13,8 @@
 //!
 //! | Class | Shape |
 //! |---|---|
-//! | thumb | `{sha256}.thumb.jpg` or `media/{hh}/{hh}/{community-uuid}/{sha256}.thumb.jpg` |
-//! | blob | `{sha256}.{ext}` or `media/{hh}/{hh}/{community-uuid}/{sha256}.{ext}` (ext: 1-8 mixed-case alphanumeric) |
+//! | thumb | `{sha256}.thumb.jpg` or `media/{hh}/{hh}/{sha256}.thumb.jpg` |
+//! | blob | `{sha256}.{ext}` or `media/{hh}/{hh}/{sha256}.{ext}` (ext: 1-8 mixed-case alphanumeric) |
 //! | sidecar | `_meta/{community-uuid}/{sha256}.json` |
 //! | auxiliary | `_uploads/{community-uuid}/{sha256}/{ulid}.json` |
 //! | unknown | everything else |
@@ -33,16 +33,9 @@ use crate::error::MediaError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyClass {
     /// Legacy or sharded thumbnail, attributed to the blob's sha.
-    Thumb {
-        community: Option<Uuid>,
-        sha256: String,
-    },
-    /// Legacy or sharded blob; sharded keys carry direct community attribution.
-    Blob {
-        community: Option<Uuid>,
-        sha256: String,
-        ext: String,
-    },
+    Thumb { sha256: String },
+    /// Legacy or sharded blob; sidecar bindings provide community attribution.
+    Blob { sha256: String, ext: String },
     /// `_meta/{community}/{sha256}.json` — the (community, sha) binding.
     Sidecar { community: Uuid, sha256: String },
     /// `_uploads/{community}/{sha256}/{event_id}.json` — fleet physical only.
@@ -59,34 +52,20 @@ pub enum KeyClass {
 /// shape of the blob pattern's segment count), then blob, sidecar,
 /// auxiliary, and finally unknown. See module docs for the exact shapes.
 pub fn classify_key(key: &str) -> KeyClass {
-    if let Some((community, filename)) = parse_sharded_prefix(key) {
-        if let Some(parsed_sha) = parse_thumb_key(filename) {
-            return KeyClass::Thumb {
-                community: Some(community),
-                sha256: parsed_sha,
-            };
+    if let Some(filename) = parse_sharded_prefix(key) {
+        if let Some(sha256) = parse_thumb_key(filename) {
+            return KeyClass::Thumb { sha256 };
         }
-        if let Some((parsed_sha, ext)) = parse_blob_key(filename) {
-            return KeyClass::Blob {
-                community: Some(community),
-                sha256: parsed_sha,
-                ext,
-            };
+        if let Some((sha256, ext)) = parse_blob_key(filename) {
+            return KeyClass::Blob { sha256, ext };
         }
         return KeyClass::Unknown;
     }
     if let Some(sha256) = parse_thumb_key(key) {
-        return KeyClass::Thumb {
-            community: None,
-            sha256,
-        };
+        return KeyClass::Thumb { sha256 };
     }
     if let Some((sha256, ext)) = parse_blob_key(key) {
-        return KeyClass::Blob {
-            community: None,
-            sha256,
-            ext,
-        };
+        return KeyClass::Blob { sha256, ext };
     }
     if let Some((community, sha256)) = parse_sidecar_key(key) {
         return KeyClass::Sidecar { community, sha256 };
@@ -155,16 +134,15 @@ fn parse_canonical_uuid(s: &str) -> Option<Uuid> {
     Uuid::parse_str(s).ok()
 }
 
-/// `media/{sha[0:2]}/{sha[2:4]}/{community}/{filename}`. The filename's digest
-/// must agree with both shard segments; malformed migration keys stay unknown.
-fn parse_sharded_prefix(key: &str) -> Option<(Uuid, &str)> {
+/// `media/{sha[0:2]}/{sha[2:4]}/{filename}`. The filename's digest must
+/// agree with both shard segments; malformed migration keys stay unknown.
+fn parse_sharded_prefix(key: &str) -> Option<&str> {
     let mut segments = key.split('/');
     if segments.next()? != "media" {
         return None;
     }
     let shard_1 = segments.next()?;
     let shard_2 = segments.next()?;
-    let community = parse_canonical_uuid(segments.next()?)?;
     let filename = segments.next()?;
     if segments.next().is_some() || shard_1.len() != 2 || shard_2.len() != 2 {
         return None;
@@ -173,7 +151,7 @@ fn parse_sharded_prefix(key: &str) -> Option<(Uuid, &str)> {
     if !is_sha256(sha256) || shard_1 != &sha256[..2] || shard_2 != &sha256[2..4] {
         return None;
     }
-    Some((community, filename))
+    Some(filename)
 }
 
 /// `{sha256}.thumb.jpg`
@@ -286,31 +264,24 @@ pub struct BucketSnapshot {
 #[derive(Debug, Default)]
 struct LayoutCopies {
     legacy: Option<u64>,
-    sharded: HashMap<Uuid, u64>,
+    sharded: Option<u64>,
 }
 
 impl LayoutCopies {
-    fn insert(&mut self, community: Option<Uuid>, size: u64) {
-        match community {
-            Some(community) => {
-                self.sharded.insert(community, size);
-            }
-            None => {
-                self.legacy = Some(size);
-            }
-        }
+    fn insert_legacy(&mut self, size: u64) {
+        self.legacy = Some(size);
+    }
+
+    fn insert_sharded(&mut self, size: u64) {
+        self.sharded = Some(size);
     }
 
     fn physical_bytes(&self) -> u64 {
-        self.legacy.unwrap_or(0) + self.sharded.values().sum::<u64>()
+        self.legacy.unwrap_or(0) + self.sharded.unwrap_or(0)
     }
 
-    fn logical_bytes(&self, community: Uuid) -> u64 {
-        self.sharded
-            .get(&community)
-            .copied()
-            .or(self.legacy)
-            .unwrap_or(0)
+    fn logical_bytes(&self) -> u64 {
+        self.sharded.or(self.legacy).unwrap_or(0)
     }
 }
 
@@ -336,21 +307,21 @@ impl BucketAggregate {
         self.physical_objects += 1;
         self.physical_bytes += size;
         match classify_key(key) {
-            KeyClass::Thumb { community, sha256 } => {
-                self.thumb_copies
-                    .entry(sha256)
-                    .or_default()
-                    .insert(community, size);
+            KeyClass::Thumb { sha256 } => {
+                let copies = self.thumb_copies.entry(sha256).or_default();
+                if key.starts_with("media/") {
+                    copies.insert_sharded(size);
+                } else {
+                    copies.insert_legacy(size);
+                }
             }
-            KeyClass::Blob {
-                community,
-                sha256,
-                ext,
-            } => {
-                self.blob_variants
-                    .entry((sha256, ext))
-                    .or_default()
-                    .insert(community, size);
+            KeyClass::Blob { sha256, ext } => {
+                let copies = self.blob_variants.entry((sha256, ext)).or_default();
+                if key.starts_with("media/") {
+                    copies.insert_sharded(size);
+                } else {
+                    copies.insert_legacy(size);
+                }
             }
             KeyClass::Sidecar { community, sha256 } => {
                 self.sidecar_bindings.insert((community, sha256), size);
@@ -380,7 +351,7 @@ impl BucketAggregate {
         let mut duplicate_layout_variants = 0u64;
         let mut duplicate_layout_bytes = 0u64;
         for copies in self.blob_variants.values() {
-            if copies.legacy.is_some() && !copies.sharded.is_empty() {
+            if copies.legacy.is_some() && copies.sharded.is_some() {
                 duplicate_layout_variants += 1;
                 duplicate_layout_bytes += copies.physical_bytes();
             }
@@ -414,17 +385,12 @@ impl BucketAggregate {
         for (community, sha256) in self.sidecar_bindings.keys() {
             let blob_bytes: u64 = variants_by_sha
                 .get(sha256.as_str())
-                .map(|variants| {
-                    variants
-                        .iter()
-                        .map(|copies| copies.logical_bytes(*community))
-                        .sum()
-                })
+                .map(|variants| variants.iter().map(|copies| copies.logical_bytes()).sum())
                 .unwrap_or(0);
             let thumb_bytes = self
                 .thumb_copies
                 .get(sha256)
-                .map(|copies| copies.logical_bytes(*community))
+                .map(|copies| copies.logical_bytes())
                 .unwrap_or(0);
             let entry = per_community.entry(*community).or_default();
             entry.bytes += blob_bytes + thumb_bytes;
@@ -546,10 +512,7 @@ mod tests {
         let s = sha(0xaa);
         assert_eq!(
             classify_key(&format!("{s}.thumb.jpg")),
-            KeyClass::Thumb {
-                community: None,
-                sha256: s,
-            }
+            KeyClass::Thumb { sha256: s }
         );
     }
 
@@ -559,7 +522,6 @@ mod tests {
         assert_eq!(
             classify_key(&format!("{s}.png")),
             KeyClass::Blob {
-                community: None,
                 sha256: s,
                 ext: "png".to_string()
             }
@@ -574,7 +536,6 @@ mod tests {
         assert_eq!(
             classify_key(&format!("{s}.Z")),
             KeyClass::Blob {
-                community: None,
                 sha256: s,
                 ext: "Z".to_string()
             }
@@ -582,38 +543,32 @@ mod tests {
     }
 
     #[test]
-    fn classifies_sharded_blob_and_thumb_keys_with_community() {
+    fn classifies_global_sharded_blob_and_thumb_keys() {
         let s = sha(0xab);
-        let c = community(10);
         assert_eq!(
-            classify_key(&format!("media/ab/ab/{c}/{s}.png")),
+            classify_key(&format!("media/ab/ab/{s}.png")),
             KeyClass::Blob {
-                community: Some(c),
                 sha256: s.clone(),
                 ext: "png".to_string(),
             }
         );
         assert_eq!(
-            classify_key(&format!("media/ab/ab/{c}/{s}.thumb.jpg")),
-            KeyClass::Thumb {
-                community: Some(c),
-                sha256: s,
-            }
+            classify_key(&format!("media/ab/ab/{s}.thumb.jpg")),
+            KeyClass::Thumb { sha256: s }
         );
     }
 
     #[test]
     fn malformed_sharded_keys_are_unknown() {
         let s = sha(0xab);
-        let c = community(11);
         for key in [
-            format!("media/ff/ab/{c}/{s}.png"),
-            format!("media/ab/ff/{c}/{s}.png"),
-            format!("media/a/ab/{c}/{s}.png"),
-            format!("media/ab/ab/not-a-uuid/{s}.png"),
-            format!("media/ab/ab/{c}/{s}.png/extra"),
-            format!("media/ab/ab/{c}/{}.png", s.to_uppercase()),
-            format!("media/ab/ab/{c}/{s}.tar.gz"),
+            format!("media/ff/ab/{s}.png"),
+            format!("media/ab/ff/{s}.png"),
+            format!("media/a/ab/{s}.png"),
+            format!("media/ab/ab/{s}.png/extra"),
+            format!("media/ab/ab/{}.png", s.to_uppercase()),
+            format!("media/ab/ab/{s}.tar.gz"),
+            format!("media/ab/ab/not-a-sha.png"),
         ] {
             assert_eq!(classify_key(&key), KeyClass::Unknown, "key: {key}");
         }
@@ -725,9 +680,9 @@ mod tests {
         let c = community(12);
         let mut agg = BucketAggregate::default();
         agg.fold(&format!("{s}.jpg"), 100);
-        agg.fold(&format!("media/ab/ab/{c}/{s}.jpg"), 100);
+        agg.fold(&format!("media/ab/ab/{s}.jpg"), 100);
         agg.fold(&format!("{s}.thumb.jpg"), 20);
-        agg.fold(&format!("media/ab/ab/{c}/{s}.thumb.jpg"), 20);
+        agg.fold(&format!("media/ab/ab/{s}.thumb.jpg"), 20);
         agg.fold(&format!("_meta/{c}/{s}.json"), 10);
 
         let snap = agg.finish();
@@ -743,18 +698,19 @@ mod tests {
     }
 
     #[test]
-    fn sharded_copy_is_attributed_only_to_its_community() {
+    fn global_sharded_copy_bills_every_bound_sidecar_community() {
         let s = sha(0xcd);
-        let sharded_community = community(13);
-        let other_community = community(14);
+        let first_community = community(13);
+        let second_community = community(14);
         let mut agg = BucketAggregate::default();
-        agg.fold(&format!("media/cd/cd/{sharded_community}/{s}.jpg"), 200);
-        agg.fold(&format!("_meta/{sharded_community}/{s}.json"), 10);
-        agg.fold(&format!("_meta/{other_community}/{s}.json"), 10);
+        agg.fold(&format!("media/cd/cd/{s}.jpg"), 200);
+        agg.fold(&format!("_meta/{first_community}/{s}.json"), 10);
+        agg.fold(&format!("_meta/{second_community}/{s}.json"), 10);
 
         let snap = agg.finish();
-        assert_eq!(snap.per_community[&sharded_community].bytes, 200);
-        assert_eq!(snap.per_community[&other_community].bytes, 0);
+        assert_eq!(snap.per_community[&first_community].bytes, 200);
+        assert_eq!(snap.per_community[&second_community].bytes, 200);
+        assert_eq!(snap.logical_bytes, 400);
     }
 
     #[test]

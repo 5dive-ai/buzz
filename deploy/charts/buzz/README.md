@@ -317,8 +317,12 @@ For an **existing deployment**:
 3. Run the backfill Job. Re-run from any logged checkpoint as needed, then run
    it again to a clean `copied=0` result. Reconcile storage sweep unknown keys,
    duplicate gauges, migration failures, and legacy fallback traffic.
-4. Select `sharded-only` only after every supported rollback version understands
-   sharded keys and reconciliation finds no missing sharded destination.
+4. Select `sharded-only` only after every supported rollback version and
+   external consumer understands sharded keys, and reconciliation finds no
+   missing sharded destination. In particular, buzz-moderation must prefer the
+   upload-record `blob_key` field (falling back to flat `{sha}.{ext}` for old
+   records) before `sharded-only` or legacy cleanup; otherwise new scans and
+   pending report/evidence workflows can continue to look for flat objects.
 5. Run the deletion Job with its default `dry-run=true`, review the output, and
    retain a recovery window/S3 versions. Only then set `dry-run=false` and
    `BUZZ_MEDIA_DELETE_CONFIRM=delete-verified-legacy-media`. The tool checks the

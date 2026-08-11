@@ -167,7 +167,7 @@ impl MediaStorage {
     /// copy second. Callers publish sidecars only after this returns success.
     pub async fn put_payload(
         &self,
-        ctx: &TenantContext,
+        _ctx: &TenantContext,
         sha256: &str,
         ext: &str,
         bytes: &[u8],
@@ -175,7 +175,7 @@ impl MediaStorage {
     ) -> Result<String, MediaError> {
         let legacy = crate::keys::legacy_blob_key(sha256, ext)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        let sharded = crate::keys::sharded_blob_key(ctx.community(), sha256, ext)
+        let sharded = crate::keys::sharded_blob_key(sha256, ext)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
         if self.migration_phase.writes_sharded() {
             self.put(&sharded, bytes, content_type).await?;
@@ -193,7 +193,7 @@ impl MediaStorage {
     /// Stream a media payload from disk according to the configured layout.
     pub async fn put_payload_file(
         &self,
-        ctx: &TenantContext,
+        _ctx: &TenantContext,
         sha256: &str,
         ext: &str,
         path: &Path,
@@ -201,7 +201,7 @@ impl MediaStorage {
     ) -> Result<String, MediaError> {
         let legacy = crate::keys::legacy_blob_key(sha256, ext)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        let sharded = crate::keys::sharded_blob_key(ctx.community(), sha256, ext)
+        let sharded = crate::keys::sharded_blob_key(sha256, ext)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
         if self.migration_phase.writes_sharded() {
             self.put_file(&sharded, path, content_type).await?;
@@ -219,13 +219,13 @@ impl MediaStorage {
     /// Store a thumbnail according to the configured migration layout.
     pub async fn put_thumbnail(
         &self,
-        ctx: &TenantContext,
+        _ctx: &TenantContext,
         sha256: &str,
         bytes: &[u8],
     ) -> Result<String, MediaError> {
         let legacy = crate::keys::legacy_thumb_key(sha256)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
-        let sharded = crate::keys::sharded_thumb_key(ctx.community(), sha256)
+        let sharded = crate::keys::sharded_thumb_key(sha256)
             .map_err(|e| MediaError::StorageError(e.to_string()))?;
         if self.migration_phase.writes_sharded() {
             self.put(&sharded, bytes, "image/jpeg").await?;

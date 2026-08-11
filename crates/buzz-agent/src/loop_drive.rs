@@ -14,7 +14,7 @@
 //! | tool execution | `Agent::dispatch_tool_call` |
 //! | system prompt | `Agent::build_turn_system_prompt` → `PromptManager` |
 //! | compaction | `goose::context_mgmt::{check_if_compaction_needed, compact_messages}` |
-//! | conversation store | `SessionManager` (sqlite), read/written by us |
+//! | conversation store | buzz's own [`crate::turn_state::TurnState`], in memory |
 //!
 //! Everything that decides *turn shape* stays here: round structure, the
 //! `_Stop` veto, `[Reflect]` on tool failure, `[PostCompact]` re-injection,
@@ -47,7 +47,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use goose::agents::Agent;
-use goose::session::session_manager::{Session, SessionManager};
+use goose::session::session_manager::Session;
 use goose_provider_types::conversation::message::{Message, MessageContent, ToolRequest};
 use goose_provider_types::conversation::Conversation;
 
@@ -105,25 +105,48 @@ pub struct TurnContext<'a> {
     /// Messages injected mid-turn by `session/steer`. Drained at the round
     /// boundary; a pending steer also blocks the end of the turn.
     pub steers: &'a crate::steer::SteerQueue,
+    /// The session's working directory, for tool dispatch and hint tracking.
+    pub working_dir: std::path::PathBuf,
+    /// Conversation carried over from earlier turns in this session.
+    ///
+    /// buzz-agent holds this across turns itself now that the turn's
+    /// conversation is in memory rather than in goose's database.
+    pub history: &'a [Message],
 }
 
 /// Drive one `session/prompt` turn to completion.
 ///
-/// Returns the ACP stop reason plus the turn's token counts. The caller emits
-/// `usage_update` *before* the `session/prompt` response — that ordering is
-/// load-bearing for kind-44200 metrics.
+/// Returns the ACP stop reason, the turn's token counts, and the conversation
+/// as it stands at the end of the turn — the caller keeps that for the next
+/// prompt, since no database does it for us. The caller emits `usage_update`
+/// *before* the `session/prompt` response: that ordering is load-bearing for
+/// kind-44200 metrics.
 pub async fn run_turn(
     ctx: TurnContext<'_>,
     prompt: Message,
-) -> (Result<StopReason, AgentError>, super::agent::TurnTokens) {
+) -> (
+    Result<StopReason, AgentError>,
+    super::agent::TurnTokens,
+    Vec<Message>,
+) {
     let mut tokens = super::agent::TurnTokens::default();
-    let sessions = crate::session_store::session_manager();
 
-    // The user's prompt is persisted before the first inference so a resumed
-    // or inspected session sees the same history the model saw.
-    if let Err(e) = sessions.add_message(ctx.session_id, &prompt).await {
-        return (Err(AgentError::Llm(format!("persist prompt: {e}"))), tokens);
+    // The turn's conversation lives here, not in a database. See
+    // `crate::turn_state` for why goose never needed one.
+    let model_config = ctx
+        .agent
+        .model_config_for_session(ctx.session_id)
+        .await
+        .ok();
+    let mut state = crate::turn_state::TurnState::new(
+        ctx.session_id.to_string(),
+        ctx.working_dir.clone(),
+        model_config,
+    );
+    for message in ctx.history.iter().cloned() {
+        state.push(message);
     }
+    state.push(prompt);
 
     let max_rounds = ctx.max_rounds.unwrap_or(DEFAULT_MAX_ROUNDS);
     let mut stop_blocks = 0u32;
@@ -142,16 +165,20 @@ pub async fn run_turn(
 
     loop {
         if ctx.cancel.is_cancelled() {
-            return (Ok(StopReason::Cancelled), tokens);
+            return (
+                Ok(StopReason::Cancelled),
+                tokens,
+                state.conversation().messages().to_vec(),
+            );
         }
 
         // Ask the machine before doing any work. `step` returns the first
         // operation that applies, or `None` when the loop below should run.
-        match gate(&machine, &sessions, ctx.session_id, &emitter).await {
-            Err(e) => return (Err(e), tokens),
+        match gate(&machine, state.session(), &emitter).await {
+            Err(e) => return (Err(e), tokens, state.conversation().messages().to_vec()),
             Ok(true) => {
                 let reason = outcome.take().unwrap_or(StopReason::EndTurn);
-                return (Ok(reason), tokens);
+                return (Ok(reason), tokens, state.conversation().messages().to_vec());
             }
             Ok(false) => {}
         }
@@ -159,20 +186,20 @@ pub async fn run_turn(
         // Steers land here, at the round boundary — never mid-inference,
         // where they would race a partially streamed response.
         for message in ctx.steers.drain().await {
-            if let Err(e) = sessions.add_message(ctx.session_id, &message).await {
-                return (Err(AgentError::Llm(format!("persist steer: {e}"))), tokens);
-            }
+            state.push(message);
         }
 
         // Compaction at the round boundary, never mid-stream.
-        if let Err(e) = maybe_compact(&ctx, &sessions).await {
+        if let Err(e) = maybe_compact(&ctx, &mut state).await {
             tracing::warn!(error = %e, "compaction failed; continuing uncompacted");
         }
 
-        match round(&ctx, &sessions, &mut tokens, &mut reflections).await {
-            Err(e) => return (Err(e), tokens),
+        match round(&ctx, &mut state, &mut tokens, &mut reflections).await {
+            Err(e) => return (Err(e), tokens, state.conversation().messages().to_vec()),
             Ok(Round::Continued) => continue,
-            Ok(Round::Stopped(reason)) => return (Ok(reason), tokens),
+            Ok(Round::Stopped(reason)) => {
+                return (Ok(reason), tokens, state.conversation().messages().to_vec())
+            }
             Ok(Round::WantsToEnd) => {
                 // A steer that arrived while the model was finishing must be
                 // answered, not dropped — so it also blocks the end of turn.
@@ -181,20 +208,23 @@ pub async fn run_turn(
                 }
 
                 // The turn wants to end. `_Stop` gets a veto.
-                match stop_veto(&ctx, &sessions, &mut stop_blocks).await {
+                match stop_veto(&ctx, state.session(), &mut stop_blocks).await {
                     Some(objection) => {
-                        let message = Message::user()
-                            .with_text(format!("[Stop] {objection}"))
-                            .with_visibility(false, true);
-                        if let Err(e) = sessions.add_message(ctx.session_id, &message).await {
-                            return (Err(AgentError::Llm(format!("persist stop: {e}"))), tokens);
-                        }
+                        state.push(
+                            Message::user()
+                                .with_text(format!("[Stop] {objection}"))
+                                .with_visibility(false, true),
+                        );
                         continue;
                     }
                     None => {
                         // A steer arriving after this point belongs to no run.
                         ctx.steers.clear().await;
-                        return (Ok(StopReason::EndTurn), tokens);
+                        return (
+                            Ok(StopReason::EndTurn),
+                            tokens,
+                            state.conversation().messages().to_vec(),
+                        );
                     }
                 }
             }
@@ -204,17 +234,13 @@ pub async fn run_turn(
 
 /// Run the operation gate for one round.
 ///
-/// Returns `true` when an operation ended the turn. The session is reloaded
-/// each time because operations read the conversation, and the previous round
-/// appended to it.
+/// Returns `true` when an operation ended the turn.
 async fn gate(
     machine: &goose::agents::state_machine::StateMachine<'_>,
-    sessions: &SessionManager,
-    session_id: &str,
+    session: &Session,
     emitter: &Emitter,
 ) -> Result<bool, AgentError> {
-    let session = load_session(sessions, session_id).await?;
-    match machine.step(&session, emitter).await {
+    match machine.step(session, emitter).await {
         Ok(Some(result)) => Ok(result.yield_to_client),
         Ok(None) => Ok(false),
         // A failing gate must not take the turn down with it: the operations
@@ -230,23 +256,25 @@ async fn gate(
 /// One inference plus, if the model asked for them, one batch of tool calls.
 async fn round(
     ctx: &TurnContext<'_>,
-    sessions: &SessionManager,
+    state: &mut crate::turn_state::TurnState,
     tokens: &mut super::agent::TurnTokens,
     reflections: &mut usize,
 ) -> Result<Round, AgentError> {
-    let session = load_session(sessions, ctx.session_id).await?;
-    let conversation = session.conversation.clone().unwrap_or_default();
+    let conversation = state.conversation();
 
-    let assistant = match infer(ctx, &session, &conversation, tokens).await? {
+    let assistant = match infer(ctx, state.session(), &conversation, tokens).await? {
         Some(message) => message,
         // A provider that returns nothing is not a turn we can continue.
         None => return Ok(Round::Stopped(StopReason::EndTurn)),
     };
 
-    sessions
-        .add_message(ctx.session_id, &assistant)
-        .await
-        .map_err(|e| AgentError::Llm(format!("persist assistant: {e}")))?;
+    state.push(assistant.clone());
+    // Keep the running total current: goose's compaction check prefers it
+    // over re-estimating the conversation.
+    // i32 because that is the width goose's `Usage` uses; a total beyond
+    // i32::MAX means something has gone very wrong upstream, and saturating is
+    // better than wrapping into a negative that reads as "no usage".
+    state.set_total_tokens(tokens.total.map(|t| i32::try_from(t).unwrap_or(i32::MAX)));
 
     let requests: Vec<ToolRequest> = assistant
         .content
@@ -269,7 +297,7 @@ async fn round(
             crate::agent::emit_tool_call_update(ctx.wire_tx, ctx.session_id, &request.id, true)
                 .await;
         }
-        persist_tool_results(ctx, sessions, results).await?;
+        push_tool_results(state, results);
         return Ok(Round::Stopped(StopReason::Cancelled));
     }
 
@@ -278,21 +306,21 @@ async fn round(
     for request in &requests {
         if let Ok(call) = &request.tool_call {
             ctx.prompt
-                .record_tool_arguments(&call.arguments, &session.working_dir)
+                .record_tool_arguments(&call.arguments, &state.session().working_dir)
                 .await;
         }
     }
 
     let results = crate::tools::execute(
         ctx.agent,
-        &session,
+        state.session(),
         ctx.wire_tx,
         ctx.cancel,
         &requests,
         reflections,
     )
     .await;
-    persist_tool_results(ctx, sessions, results).await?;
+    push_tool_results(state, results);
 
     Ok(Round::Continued)
 }
@@ -413,43 +441,39 @@ fn accumulate_usage(
     }
 }
 
-/// Persist tool results as a single user message, matching the shape every
+/// Append tool results as a single user message, matching the shape every
 /// provider wire format expects (one result per outstanding request).
-async fn persist_tool_results(
-    ctx: &TurnContext<'_>,
-    sessions: &SessionManager,
+fn push_tool_results(
+    state: &mut crate::turn_state::TurnState,
     results: Vec<(
         String,
         goose_provider_types::conversation::message::ToolResult<rmcp::model::CallToolResult>,
     )>,
-) -> Result<(), AgentError> {
+) {
     if results.is_empty() {
-        return Ok(());
+        return;
     }
     let mut message = Message::user();
     for (id, result) in results {
         message = message.with_tool_response(id, result);
     }
-    sessions
-        .add_message(ctx.session_id, &message)
-        .await
-        .map_err(|e| AgentError::Llm(format!("persist tool results: {e}")))
+    state.push(message);
 }
 
 /// Compact history when it is close to the context limit, then re-inject the
 /// state `_PostCompact` reports so a todo list survives the truncation.
-async fn maybe_compact(ctx: &TurnContext<'_>, sessions: &SessionManager) -> anyhow::Result<()> {
-    let session = sessions.get_session(ctx.session_id, true).await?;
-    let Some(conversation) = session.conversation.clone() else {
-        return Ok(());
-    };
+async fn maybe_compact(
+    ctx: &TurnContext<'_>,
+    state: &mut crate::turn_state::TurnState,
+) -> anyhow::Result<()> {
+    let conversation = state.conversation();
     let provider = ctx.agent.provider().await?;
 
     if !goose::context_mgmt::check_if_compaction_needed(
         provider.as_ref(),
         &conversation,
         None,
-        &session,
+        state.session(),
     )
     .await?
     {
@@ -466,20 +490,23 @@ async fn maybe_compact(ctx: &TurnContext<'_>, sessions: &SessionManager) -> anyh
     )
     .await?;
 
-    sessions
-        .replace_conversation(ctx.session_id, &result.conversation)
-        .await?;
+    state.replace(result.conversation);
+    // Compaction resets the context: the old running total describes a
+    // conversation that no longer exists, so drop it and let goose re-estimate
+    // from the compacted messages.
+    state.set_total_tokens(None);
     tracing::info!(target: "buzz_agent::compaction", "history compacted");
 
     // `_PostCompact` state is what buzz-agent's handoff existed to preserve.
     if let Some(extension) = ctx.hook_extension {
-        let session = sessions.get_session(ctx.session_id, true).await?;
-        if let Some(state) = crate::hooks::post_compact_state(ctx.agent, &session, extension).await
+        if let Some(reported) =
+            crate::hooks::post_compact_state(ctx.agent, state.session(), extension).await
         {
-            let message = Message::user()
-                .with_text(format!("[PostCompact] {state}"))
-                .with_visibility(false, true);
-            sessions.add_message(ctx.session_id, &message).await?;
+            state.push(
+                Message::user()
+                    .with_text(format!("[PostCompact] {reported}"))
+                    .with_visibility(false, true),
+            );
         }
     }
 
@@ -489,7 +516,7 @@ async fn maybe_compact(ctx: &TurnContext<'_>, sessions: &SessionManager) -> anyh
 /// Ask `_Stop` whether the turn may end. `Some(objection)` means keep working.
 async fn stop_veto(
     ctx: &TurnContext<'_>,
-    sessions: &SessionManager,
+    session: &Session,
     stop_blocks: &mut u32,
 ) -> Option<String> {
     if ctx.cancel.is_cancelled() {
@@ -502,19 +529,11 @@ async fn stop_veto(
         return None;
     }
 
-    let session = sessions.get_session(ctx.session_id, false).await.ok()?;
-    let objection = crate::hooks::stop_objection(ctx.agent, &session, extension).await?;
+    let objection = crate::hooks::stop_objection(ctx.agent, session, extension).await?;
 
     *stop_blocks += 1;
     tracing::info!(blocks = *stop_blocks, "_Stop hook vetoed end of turn");
     Some(objection)
-}
-
-async fn load_session(sessions: &SessionManager, id: &str) -> Result<Session, AgentError> {
-    sessions
-        .get_session(id, true)
-        .await
-        .map_err(|e| AgentError::Llm(format!("load session: {e}")))
 }
 
 /// Preserve buzz-agent's error taxonomy so the harness's JSON-RPC code mapping

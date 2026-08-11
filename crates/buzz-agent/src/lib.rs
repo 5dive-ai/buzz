@@ -33,6 +33,7 @@ pub mod prompt;
 pub mod session_store;
 pub mod steer;
 pub mod tools;
+pub mod turn_state;
 pub mod types;
 pub mod wire;
 
@@ -64,8 +65,19 @@ use wire::{
 /// One live ACP session, wrapping a Goose `Agent`.
 struct Session {
     agent: Arc<Agent>,
-    /// Goose's own session id (the SQLite-backed conversation).
+    /// Session id, shared with goose so tool dispatch and provider request
+    /// attribution agree on a name. No database sits behind it: the
+    /// conversation lives in `history` and in the turn's own
+    /// [`crate::turn_state::TurnState`].
     goose_session_id: String,
+    /// The conversation so far, across turns.
+    ///
+    /// buzz-agent owns this because a Buzz agent's durable record is the
+    /// relay, not a local store. Held here so a second `session/prompt` sees
+    /// what the first one said.
+    history: Vec<goose_provider_types::conversation::message::Message>,
+    /// Working directory for the session, as given at `session/new`.
+    working_dir: std::path::PathBuf,
     busy: bool,
     /// Set for the duration of a turn; advertised to steer-capable clients.
     active_run_id: Option<String>,
@@ -136,6 +148,15 @@ async fn build_agent(
         GoosePlatform::GooseCli,
     ));
 
+    // A session id, not a database row. `Agent::update_provider` and
+    // `model_config_for_session` want an id to key on, but the conversation
+    // itself never goes to goose's store -- see `crate::turn_state`.
+    //
+    // The row still gets created because `update_provider` persists the
+    // provider/model config against it, and that is the one write we cannot
+    // decline without losing the model config goose reads back for the
+    // context limit. Nothing else is written: a full conversation adds zero
+    // message rows.
     let session = session_manager
         .create_session(
             std::path::PathBuf::from(cwd),
@@ -530,6 +551,8 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             Session {
                 agent,
                 goose_session_id,
+                history: Vec::new(),
+                working_dir: std::path::PathBuf::from(&p.cwd),
                 busy: false,
                 active_run_id: None,
                 cancel: None,
@@ -634,7 +657,16 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
     let cancel = CancellationToken::new();
 
     // Single-flight per session, and capture the agent handle.
-    let (agent, goose_session_id, pending_model, hook_extension, prompt, steers) = {
+    let (
+        agent,
+        goose_session_id,
+        pending_model,
+        hook_extension,
+        prompt,
+        steers,
+        history,
+        working_dir,
+    ) = {
         let mut sessions = app.sessions.lock().await;
         let Some(s) = sessions.get_mut(&p.session_id) else {
             return wire::send(
@@ -666,6 +698,8 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             s.hook_extension.clone(),
             s.prompt.clone(),
             s.steers.clone(),
+            s.history.clone(),
+            s.working_dir.clone(),
         )
     };
 
@@ -696,7 +730,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
     )
     .await;
 
-    let (result, tokens) = loop_drive::run_turn(
+    let (result, tokens, conversation) = loop_drive::run_turn(
         loop_drive::TurnContext {
             agent: &agent,
             session_id: &goose_session_id,
@@ -706,6 +740,8 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             max_rounds: app.cfg.max_rounds,
             prompt: &prompt,
             steers: &steers,
+            working_dir,
+            history: &history,
         },
         goose_provider_types::conversation::message::Message::user()
             .with_text(agent::prompt_to_text(&p.prompt)),
@@ -716,6 +752,10 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
     let accumulated = {
         let mut sessions = app.sessions.lock().await;
         sessions.get_mut(&p.session_id).map(|s| {
+            // Carry the turn's conversation forward. Without this the next
+            // prompt starts from an empty history and the agent forgets what
+            // it just said.
+            s.history = conversation;
             s.busy = false;
             s.active_run_id = None;
             s.cancel = None;

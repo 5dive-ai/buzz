@@ -31,6 +31,9 @@ path = "tests/bin/fake_mcp.rs"
 buzz-model-catalog = { path = "../buzz-model-catalog" }
 goose = { git = "https://github.com/aaif-goose/goose", rev = "bf332b983756eaf80353e82e4bb052d589629bf4", default-features = false, features = ["rustls-tls"] }
 goose-provider-types = { git = "https://github.com/aaif-goose/goose", rev = "bf332b983756eaf80353e82e4bb052d589629bf4" }
+# ModelConfig: goose re-exports it from goose-providers; goose::model_config
+# keeps its own copy private.
+goose-providers = { git = "https://github.com/aaif-goose/goose", rev = "bf332b983756eaf80353e82e4bb052d589629bf4" }
 # Resolution guard: goose pins icu_locale "=2.1.1" (needs icu_collections
 # ~2.1.1) while url 2.5.x -> idna -> idna_adapter 1.2.2 pulls icu_normalizer
 # 2.2.0 (needs icu_collections ~2.2.0). Only one 2.x icu_collections can be

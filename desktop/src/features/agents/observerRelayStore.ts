@@ -30,6 +30,17 @@ import { selectArchiveEvictionKeys } from "./lib/observerArchiveEviction";
 const MAX_OBSERVER_EVENTS = 3000;
 const MAX_PENDING_UNKNOWN_AGENT_FRAMES = 100;
 
+// Live-event window retained in RAM for an agent that has NO mounted session
+// viewer. The full MAX_OBSERVER_EVENTS window is kept only while a viewer is
+// pinned (see pinObserverAgent); an unpinned agent keeps just the newest tail.
+// A long-lived session observes many agents over time and each unpinned agent
+// would otherwise hold its full window forever — the accumulator this bounds.
+// The tail must stay large enough that the non-viewer consumers keep working:
+// preventSleep reads only the newest event, the active-turns bridge processes
+// each event once as it arrives (turn state then lives in its own store), and
+// the profile activity feed derives a channel set that degrades to the tail.
+const UNPINNED_AGENT_EVENT_TAIL = 100;
+
 // Maximum number of distinct channels whose archive scroll-back is retained in
 // RAM. The archive window grows only by explicit paged loads from SQLite, so
 // without a bound a session that visits many channels accumulates their full
@@ -112,6 +123,78 @@ export function unpinArchiveChannel(
   } else {
     pinnedArchiveChannelCounts.set(channelId, current - 1);
   }
+}
+
+// Agents whose full live-event window must be retained because a session viewer
+// is mounted on them (the two session panels and the activity bar). Refcounted
+// so co-mounted viewers of the same agent compose; the agent keeps its full
+// window until the last viewer unmounts. Keyed by normalized pubkey. An agent
+// with a positive count is pinned; an unpinned agent's window is bounded to
+// UNPINNED_AGENT_EVENT_TAIL. Consumers that read the window WITHOUT displaying
+// the transcript (preventSleep, the active-turns bridge, the profile activity
+// feed) intentionally do NOT pin — they tolerate the tail by design.
+const viewerPinnedAgentCounts = new Map<string, number>();
+
+/**
+ * Pin an agent's full live-event window against tail-bounding while a session
+ * viewer is mounted on it. Refcounted so multiple mounted viewers of the same
+ * agent compose. No-op for a null/empty pubkey (viewers mount before an agent
+ * resolves). Pinning does not itself grow the window — it lifts the cap so
+ * subsequent events accumulate up to MAX_OBSERVER_EVENTS.
+ */
+export function pinObserverAgent(agentPubkey: string | null | undefined): void {
+  if (!agentPubkey) return;
+  const key = normalizePubkey(agentPubkey);
+  viewerPinnedAgentCounts.set(key, (viewerPinnedAgentCounts.get(key) ?? 0) + 1);
+}
+
+/**
+ * Release one pin acquired via `pinObserverAgent`. When the refcount reaches
+ * zero the agent's window is immediately bounded back to
+ * UNPINNED_AGENT_EVENT_TAIL (see `truncateUnpinnedAgentWindow`) so closing a
+ * viewer reclaims the deep scroll-back it accumulated. No-op for a null/empty
+ * pubkey or an agent with no outstanding pins.
+ */
+export function unpinObserverAgent(
+  agentPubkey: string | null | undefined,
+): void {
+  if (!agentPubkey) return;
+  const key = normalizePubkey(agentPubkey);
+  const current = viewerPinnedAgentCounts.get(key);
+  if (current === undefined) return;
+  if (current <= 1) {
+    viewerPinnedAgentCounts.delete(key);
+    truncateUnpinnedAgentWindow(key);
+  } else {
+    viewerPinnedAgentCounts.set(key, current - 1);
+  }
+}
+
+/** Retention cap for one agent: full window while a viewer is pinned, else the newest-N tail. */
+function agentEventCap(key: string): number {
+  return viewerPinnedAgentCounts.has(key)
+    ? MAX_OBSERVER_EVENTS
+    : UNPINNED_AGENT_EVENT_TAIL;
+}
+
+/**
+ * Bound a now-unpinned agent's event window to UNPINNED_AGENT_EVENT_TAIL,
+ * dropping the deep scroll-back its viewer accumulated. Atomic with the derived
+ * state: the event array, its transcript, and the memoized snapshot are all
+ * rebuilt from the same truncated window before listeners are notified, so no
+ * consumer can observe a transcript that references dropped events. No-op when
+ * the window already fits, so unpinning an agent that never grew is free.
+ */
+function truncateUnpinnedAgentWindow(key: string): void {
+  const current = eventsByAgent.get(key);
+  if (!current || current.length <= UNPINNED_AGENT_EVENT_TAIL) {
+    return;
+  }
+  const trimmed = current.slice(current.length - UNPINNED_AGENT_EVENT_TAIL);
+  eventsByAgent.set(key, trimmed);
+  transcriptByAgent.set(key, buildTranscriptState(trimmed));
+  invalidateSnapshot(key);
+  notifyListeners();
 }
 
 // Per-agent, per-channel latest-live-session-id.
@@ -262,10 +345,9 @@ function appendAgentEvent(agentPubkey: string, event: ObserverEvent) {
   }
 
   const sorted = [...current, event].sort(compareObserverEvents);
-  const trimmed = sorted.length > MAX_OBSERVER_EVENTS;
-  const final = trimmed
-    ? sorted.slice(sorted.length - MAX_OBSERVER_EVENTS)
-    : sorted;
+  const cap = agentEventCap(key);
+  const trimmed = sorted.length > cap;
+  const final = trimmed ? sorted.slice(sorted.length - cap) : sorted;
   eventsByAgent.set(key, final);
 
   // Determine whether the new event landed at the end of the sorted array.
@@ -877,6 +959,7 @@ export function resetAgentObserverStore() {
   archiveAccessSeq.clear();
   archiveAccessCounter = 0;
   pinnedArchiveChannelCounts.clear();
+  viewerPinnedAgentCounts.clear();
   knownAgentPubkeys.clear();
   knownAgentsBySubscription.clear();
   pendingUnknownAgentFrames.length = 0;

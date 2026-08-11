@@ -7,8 +7,10 @@ import {
   getArchivedChannelEvents,
   ingestArchivedObserverEvents,
   pinArchiveChannel,
+  pinObserverAgent,
   subscribeAgentObserverStore,
   unpinArchiveChannel,
+  unpinObserverAgent,
 } from "@/features/agents/observerRelayStore";
 import {
   listSaveSubscriptions,
@@ -33,10 +35,27 @@ export type { ArchivePagingState } from "./archivePagingState";
 const subscribeToStore = (onStoreChange: () => void) =>
   subscribeAgentObserverStore(onStoreChange);
 
+/**
+ * Pin an agent's full live-event window while a session viewer is mounted, so
+ * the deep scroll-back it displays is not tail-bounded out from under it.
+ * Refcounted in the store, so the two session panels and the activity bar
+ * compose when viewing the same agent. Keyed on pubkey only; `enabled` gates
+ * the relay subscription, not the display, so an idle-agent viewer still pins.
+ */
+function useObserverAgentPin(agentPubkey: string | null | undefined): void {
+  React.useEffect(() => {
+    if (!agentPubkey) return;
+    pinObserverAgent(agentPubkey);
+    return () => unpinObserverAgent(agentPubkey);
+  }, [agentPubkey]);
+}
+
 export function useObserverEvents(
   enabled: boolean,
   agentPubkey?: string | null,
 ) {
+  useObserverAgentPin(agentPubkey);
+
   const getSnapshot = React.useCallback(
     () => getAgentObserverSnapshot(agentPubkey, enabled),
     [agentPubkey, enabled],
@@ -57,6 +76,8 @@ export function useAgentTranscript(
   enabled: boolean,
   agentPubkey?: string | null,
 ): TranscriptItem[] {
+  useObserverAgentPin(agentPubkey);
+
   const getSnapshot = React.useCallback(
     () => getAgentTranscript(agentPubkey, enabled),
     [agentPubkey, enabled],

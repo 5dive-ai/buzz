@@ -130,7 +130,7 @@ export function ChannelManagementSheet({
 
   const { canDeleteChannel, canManageChannel } =
     useChannelModerationCapabilities(membersQuery.data, currentPubkey, open);
-  const canEditChannel = canDeleteChannel && detail?.channelType !== "dm";
+  const canEditChannel = canManageChannel && detail?.channelType !== "dm";
   const canEditNarrative =
     canManageChannel && selfMember !== null && detail?.channelType !== "dm";
   const isArchived =

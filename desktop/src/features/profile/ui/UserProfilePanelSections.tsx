@@ -239,6 +239,8 @@ export function ProfileSummaryView({
     isOwner === true &&
     isBot &&
     (managedAgent !== undefined ||
+      runtimeConfigurationFields.length > 0 ||
+      runtimeSettingsFields.length > 0 ||
       instances.length > 0 ||
       diagnosticsFields.length > 0 ||
       canOpenAgentLogs ||

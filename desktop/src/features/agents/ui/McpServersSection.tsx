@@ -9,6 +9,16 @@ type McpServersSectionProps = {
   buzzAgentSlot?: React.ReactNode;
 };
 
+export function shouldRenderMcpServers(
+  runtimeId: string | null,
+  extensions: ExtensionEntry[],
+): boolean {
+  // buzz-agent always surfaces its built-in MCP servers even with no
+  // user-configured extensions; every other runtime shows the section only
+  // once it has extensions parsed from its config file.
+  return runtimeId === "buzz-agent" || extensions.length > 0;
+}
+
 export function McpServersSection({
   buzzAgentSlot,
   extensions,
@@ -17,7 +27,7 @@ export function McpServersSection({
 }: McpServersSectionProps) {
   const isBuzzAgent = runtimeId === "buzz-agent";
 
-  if (!isBuzzAgent && extensions.length === 0) {
+  if (!shouldRenderMcpServers(runtimeId, extensions)) {
     return null;
   }
 

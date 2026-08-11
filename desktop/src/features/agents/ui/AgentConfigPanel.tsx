@@ -21,7 +21,7 @@ import {
   HoverCopyIndicator,
   useCopyFeedback,
 } from "@/shared/ui/HoverCopyIndicator";
-import { McpServersSection } from "./McpServersSection";
+import { McpServersSection, shouldRenderMcpServers } from "./McpServersSection";
 import type {
   ConfigField,
   ConfigOrigin,
@@ -497,7 +497,7 @@ export function AgentConfigSurfaceRows({
     }
     return true;
   }) as [keyof NormalizedConfig, NormalizedField][];
-  const showMcpServers = runtimeId === "buzz-agent" || extensions.length > 0;
+  const showMcpServers = shouldRenderMcpServers(runtimeId, extensions);
   const showModelSection = sections.includes("model");
   const showMcpSection = sections.includes("mcp");
   const showAdvancedSection = sections.includes("advanced");

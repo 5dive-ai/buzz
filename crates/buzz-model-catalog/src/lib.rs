@@ -22,6 +22,33 @@ pub use catalog::{discover_databricks_models, ModelEntry, DATABRICKS_V2_KNOWN_MO
 pub use config::{Config, Provider};
 pub use types::AgentError;
 
+/// PKCE configuration for Databricks OAuth against `host`.
+///
+/// Shared so the desktop model picker and `buzz-agent auth databricks` cache
+/// tokens in the same place.
+pub fn databricks_pkce_config(host: &str) -> auth::PkceOAuthConfig {
+    auth::PkceOAuthConfig {
+        discovery_url: format!(
+            "{}/oidc/.well-known/oauth-authorization-server",
+            host.trim_end_matches('/')
+        ),
+        client_id: "databricks-cli".into(),
+        scopes: vec!["all-apis".into(), "offline_access".into()],
+        cache_namespace: "databricks".into(),
+        cache_dir_override: None,
+    }
+}
+
+/// Run the interactive Databricks OAuth PKCE login and cache the token.
+///
+/// Needs a browser on the machine. The desktop model picker calls this when
+/// discovery fails with an auth error.
+pub async fn authenticate_databricks(host: &str) -> Result<(), AgentError> {
+    auth::PkceOAuthTokenSource::new(databricks_pkce_config(host))?
+        .interactive_login()
+        .await
+}
+
 /// Environment keys the Windows Git Bash resolver may inspect.
 ///
 /// The MCP child is spawned with an otherwise-cleared environment, so every

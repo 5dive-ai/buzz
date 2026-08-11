@@ -1055,23 +1055,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// The cached token is what lets both the agent loop and the desktop model
 /// picker work without a static `DATABRICKS_TOKEN`.
 async fn auth_subcommand(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use buzz_model_catalog::auth::{PkceOAuthConfig, PkceOAuthTokenSource};
-
     match args.first().map(String::as_str) {
         Some("databricks" | "databricks_v2" | "databricks-v2") => {
             let host = std::env::var("DATABRICKS_HOST")
                 .map_err(|_| "auth databricks: DATABRICKS_HOST required")?;
-            let pkce = PkceOAuthConfig {
-                discovery_url: format!(
-                    "{}/oidc/.well-known/oauth-authorization-server",
-                    host.trim_end_matches('/')
-                ),
-                client_id: "databricks-cli".into(),
-                scopes: vec!["all-apis".into(), "offline_access".into()],
-                cache_namespace: "databricks".into(),
-                cache_dir_override: None,
-            };
-            PkceOAuthTokenSource::new(pkce)?.interactive_login().await?;
+            buzz_model_catalog::authenticate_databricks(&host).await?;
             eprintln!("Authenticated. Token cached under ~/.config/buzz-agent/oauth/databricks/.");
             Ok(())
         }

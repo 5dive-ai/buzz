@@ -106,7 +106,7 @@ impl Default for CorporateIdentityConfig {
         Self {
             require: false,
             jwt_header: DEFAULT_CORPORATE_IDENTITY_JWT_HEADER.to_string(),
-            allow_delegation: true,
+            allow_delegation: false,
             auth_precedence: CorporateIdentityAuthPrecedence::Direct,
             jwks_uri: String::new(),
             issuer: String::new(),
@@ -1313,8 +1313,8 @@ mod tests {
             DEFAULT_CORPORATE_IDENTITY_JWT_HEADER
         );
         assert!(
-            config.corporate_identity.allow_delegation,
-            "corporate identity delegation should default to true for agents"
+            !config.corporate_identity.allow_delegation,
+            "corporate identity delegation should default to false"
         );
         assert_eq!(
             config.corporate_identity.auth_precedence,

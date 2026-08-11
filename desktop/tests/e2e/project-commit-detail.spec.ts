@@ -73,10 +73,19 @@ test("top-level project lists align dates and overflow actions", async ({
   ).toBeVisible();
   await expect(page.getByRole("menuitem", { name: "Local" })).toBeVisible();
   await page.keyboard.press("Escape");
-  const projectPositions = await trailingPositions(
-    page.locator('[data-testid^="project-row-"]').first(),
-    { summaryTestId: "projects-row-summary" },
-  );
+  const projectRow = page.locator('[data-testid^="project-row-"]').first();
+  const projectPositions = await trailingPositions(projectRow, {
+    summaryTestId: "projects-row-summary",
+  });
+  // Project rows show the activity bar alone — counts stay in its tooltips.
+  await expect(
+    projectRow
+      .getByTestId("projects-row-summary")
+      .getByTestId("project-activity-bar"),
+  ).toBeVisible();
+  await expect(
+    projectRow.getByTestId("projects-row-summary"),
+  ).not.toContainText("commits");
 
   await page.getByTestId("projects-section-repositories").click();
   await page.getByRole("button", { name: "Filter repositories" }).click();
@@ -100,11 +109,9 @@ test("top-level project lists align dates and overflow actions", async ({
     dateTestId: "repositories-row-date",
     summaryTestId: "repositories-row-summary",
   });
-  expect(
-    Math.abs(
-      (repositoryPositions.summaryX ?? 0) - (projectPositions.summaryX ?? 0),
-    ),
-  ).toBeLessThanOrEqual(ALIGNMENT_TOLERANCE_PX);
+  // No summaryX comparison: repository rows carry text stats next to the bar
+  // while project rows show the bar alone, so the columns differ in width by
+  // design. The right-anchored date and menu still align across the lists.
   expect(
     Math.abs(repositoryPositions.rowHeight - projectPositions.rowHeight),
   ).toBeLessThanOrEqual(ALIGNMENT_TOLERANCE_PX);

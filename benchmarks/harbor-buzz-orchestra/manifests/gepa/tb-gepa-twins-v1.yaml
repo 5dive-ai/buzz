@@ -1,0 +1,45 @@
+# GEPA lineage v1 — verifier-first score contract.
+# Based on: tb-gepa-twins-v0 (mia-v0 bdda429b / mie-v0 a4924e4c).
+# Change (ONE, Mia only): new paragraph after the todo-discipline block —
+#   "The task's own checker outranks its prose": derive the score surface
+#   (files/behavior/thresholds the checker actually tests) before
+#   implementing, build the smallest artifact that satisfies it, treat
+#   installs/builds as last resorts tied to a named checked criterion.
+# Targeting (Perci's verifier-gap mining, msg 90ddc576): rstan-to-pystan,
+#   make-doom-for-mips, make-mips-interpreter, gpt2-codegolf, gcode-to-text,
+#   pytorch-model-cli, largest-eigenval, train-fasttext, adaptive-rejection-
+#   sampler — the prose/verifier-gap timeout family.
+# Mie unchanged (mie-v0). Provider/config identical to v0.
+schema_version: "1"
+condition: tb-gepa-twins-v1
+roster:
+  - id: mia
+    kind: orchestrator
+    role: conn
+    count: 1
+    endpoint: deepseek-ai/Deepseek-V4-Flash
+    model_revision: deepseek/deepseek-v4-flash-20260731
+    prompt:
+      path: personas/bench/gepa/mia-v1.md
+      sha256: 5132351efd82fcc79cedf8734955ead6385c1b58d4f5d9376e39e92e8f74aba7
+    generation:
+      thinking_effort: high
+  - id: mie
+    kind: worker
+    role: twin
+    count: 1
+    endpoint: deepseek-ai/Deepseek-V4-Flash
+    model_revision: deepseek/deepseek-v4-flash-20260731
+    prompt:
+      path: personas/bench/gepa/mie-v0.md
+      sha256: a4924e4c4507ac466a7500bb34a04a782618df41dba850b6f0f729787c48439b
+    generation:
+      thinking_effort: high
+prices:
+  deepseek-ai/Deepseek-V4-Flash:
+    input_per_million_usd: 0.14
+    cached_input_per_million_usd: 0.14
+    output_per_million_usd: 0.28
+    cache_read_rate: 0.0
+trial_budget:
+  timeout_seconds: 36000

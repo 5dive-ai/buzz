@@ -219,9 +219,8 @@ fn local_data_dir(app: &AppHandle, owner_pubkey: &str) -> Result<PathBuf, String
 }
 
 fn sqlite_url(path: &Path) -> String {
-    // sqlx accepts an absolute sqlite URL with three slashes. Path display is
-    // intentional: app-data paths come from the OS, not user relay input.
-    format!("sqlite://{}", path.display())
+    // SQLite URLs use forward slashes so this contract is canonical across platforms.
+    format!("sqlite://{}", path.display().to_string().replace('\\', "/"))
 }
 
 /// Load the relay's service identity from its identity-scoped nest, or create
@@ -417,6 +416,14 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_url_normalizes_windows_separators() {
+        assert_eq!(
+            sqlite_url(Path::new(r"C:\tmp\buzz.sqlite3")),
+            "sqlite://C:/tmp/buzz.sqlite3"
+        );
+    }
+
+    #[test]
     fn local_relay_sentinel_is_the_only_managed_workspace_address() {
         assert_eq!(local_relay_url(4317), "ws://127.0.0.1:4317");
         assert!(is_local_relay_url(LOCAL_RELAY_SENTINEL));
@@ -491,7 +498,12 @@ mod tests {
         );
         assert_eq!(
             env.get("BUZZ_LOCAL_MEDIA_DIR"),
-            Some(&"/tmp/buzz/local-relay/media".to_string())
+            Some(
+                &PathBuf::from("/tmp/buzz/local-relay")
+                    .join("media")
+                    .display()
+                    .to_string()
+            )
         );
         assert_eq!(
             env.get("BUZZ_REQUIRE_RELAY_MEMBERSHIP"),

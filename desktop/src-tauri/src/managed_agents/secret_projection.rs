@@ -75,6 +75,20 @@ const NS_GLOBAL_ENV: &str = "global:env:";
 const NS_AGENT_ENV: &str = "agent:";
 const NS_DEFINITION_ENV: &str = "definition:";
 
+// ── Dev-migration conflict marker ──────────────────────────────────────────
+//
+// The dev secrets migration copies projection generations from the source
+// keyring service into the dev service. A coordinate present in BOTH with
+// DIFFERENT values is a conflict it refuses to resolve. Withholding the
+// completion marker only schedules a retry — it does NOT stop the destination's
+// (possibly wrong) value from being hydrated and consumed during the retry
+// window. To make a conflicted coordinate genuinely unavailable, the migration
+// writes a `conflict:<coordinate>` marker; `load_secret` fails closed whenever
+// a coordinate carries one, so hydration sets `secrets_unavailable` and every
+// downstream gate (spawn, deploy, readiness, the effective-secret gate) refuses
+// until a later migration clears the marker.
+const NS_CONFLICT: &str = "conflict:";
+
 // ── Per-namespace sub-part constants ──────────────────────────────────────
 const PART_ENV: &str = ":env:";
 const PART_AUTH_TAG: &str = ":auth_tag:";
@@ -211,6 +225,11 @@ pub fn write_secret<S: ProjectionStore>(
 
 // ── Load-with-availability ─────────────────────────────────────────────────
 
+/// The conflict-marker key for a projection coordinate: `conflict:<coord>`.
+pub fn conflict_marker_key(coord: &str) -> String {
+    format!("{NS_CONFLICT}{coord}")
+}
+
 /// Load a secret from the keyring given its `ref_gen` from JSON.
 ///
 /// Returns:
@@ -218,6 +237,16 @@ pub fn write_secret<S: ProjectionStore>(
 /// - `Ok(None)` — no `ref_gen` in the record (field intentionally empty).
 /// - `Err(msg)` — `ref_gen` is present but the entry is unavailable → fail
 ///   closed. The caller must refuse agent start/save.
+///
+/// # Conflict marker (fail closed)
+///
+/// When the coordinate carries a `conflict:<coord>` marker (written by the dev
+/// secrets migration for a coordinate whose source and destination values
+/// disagree), the value is treated as UNAVAILABLE regardless of what the blob
+/// currently holds. The destination value cannot be trusted while unresolved,
+/// so hydration must set `secrets_unavailable` and every downstream consumer
+/// must refuse — this is the fail-closed replacement for the marker-withhold +
+/// retry behavior that used to leave the conflicted value hydratable.
 pub fn load_secret<S: ProjectionStore>(
     store: &S,
     ref_gen: Option<&str>,
@@ -228,6 +257,18 @@ pub fn load_secret<S: ProjectionStore>(
         return Ok(None); // intentionally empty
     };
     let key = coord_key_fn(gen);
+    // Fail closed on an unresolved dev-migration conflict for this coordinate.
+    // No marker (`Ok(None)`), or a marker store-read error (`Err(_)`), falls
+    // through to the normal load below: a marker-read error must not mask a
+    // genuinely available secret, and the normal load fails closed on its own
+    // errors.
+    if let Ok(Some(_)) = store.load_key(&conflict_marker_key(&key)) {
+        return Err(format!(
+            "secret unavailable: {context} ref {gen} has an unresolved \
+             dev-migration conflict at {key}; refusing to hydrate a \
+             potentially-wrong value until the conflict is resolved"
+        ));
+    }
     match store.load_key(&key) {
         Ok(Some(v)) => Ok(Some(v)),
         Ok(None) => Err(format!(
@@ -250,6 +291,33 @@ pub fn load_secret<S: ProjectionStore>(
 
 // ── GC snapshot ───────────────────────────────────────────────────────────
 
+/// The live-reference snapshot collected from both JSON stores by
+/// [`collect_live_refs`].
+#[derive(Debug, Default)]
+pub struct LiveRefs {
+    /// All validated ref gen ids referenced by any live JSON record. Used by
+    /// the sweeps to decide whether a blob key's generation is still
+    /// referenced (and therefore must not be marked/deleted).
+    pub gen_ids: std::collections::HashSet<String>,
+    /// The full expected blob coordinate for every live ref
+    /// (e.g. `agent:<pubkey>:env:<gen>`, `global:env:<gen>`). Every one of
+    /// these MUST be present in the blob before GC may delete anything: a
+    /// dangling live ref (its coordinate missing/unreadable) means the store
+    /// is in a degraded state where an older unreferenced generation could be
+    /// the only recoverable payload for that field, so BOTH sweeps no-op until
+    /// the reference resolves.
+    pub coords: std::collections::HashSet<String>,
+}
+
+/// Returns `true` when every live-ref coordinate is present as a key in the
+/// loaded blob. A single missing coordinate means a committed reference is
+/// dangling (its keyring entry was deleted or is unreadable), so GC must not
+/// delete anything this cycle — an older, unreferenced generation could be the
+/// only recoverable payload for that field.
+fn all_live_coords_present(live: &LiveRefs, blob: &HashMap<String, String>) -> bool {
+    live.coords.iter().all(|coord| blob.contains_key(coord))
+}
+
 /// Collect all live generation refs from both raw JSON stores, validating as
 /// it goes.
 ///
@@ -270,19 +338,21 @@ pub fn load_secret<S: ProjectionStore>(
 ///   authoritative on load, so the ref is being ignored — but the state is
 ///   ambiguous enough that the GC must not reason about which generation is
 ///   live. Skipping the whole sweep is the fail-safe choice.
+/// - **Unidentifiable record:** a record carrying a `*_ref` whose owning
+///   coordinate cannot be reconstructed (an instance with no pubkey, or a
+///   definition with no slug). The full coordinate is required for the
+///   blob-existence check, so an unbuildable one no-ops the sweep.
 ///
-/// The returned set contains ALL validated ref gen ids referenced by any live
-/// JSON record.
-pub fn collect_live_refs(
-    agents_json: &str,
-    global_json: &str,
-) -> Option<std::collections::HashSet<String>> {
-    let mut refs = std::collections::HashSet::new();
+/// The returned [`LiveRefs`] carries every validated gen id AND the full
+/// coordinate each ref points at. The sweeps additionally require every
+/// coordinate to exist in the loaded blob before deleting anything.
+pub fn collect_live_refs(agents_json: &str, global_json: &str) -> Option<LiveRefs> {
+    let mut live = LiveRefs::default();
 
     // Parse agents store (array of records).
     let agents: Vec<JsonValue> = serde_json::from_str(agents_json).ok()?;
     for record in &agents {
-        collect_refs_from_record(record, &mut refs)?;
+        collect_refs_from_record(record, &mut live)?;
     }
 
     // Parse global config. Global carries a single `env_vars` / `env_vars_ref`
@@ -290,60 +360,73 @@ pub fn collect_live_refs(
     let global: JsonValue = serde_json::from_str(global_json).ok()?;
     collect_ref_field(
         &global,
-        "env_vars",
         "env_vars_ref",
         /* inline_non_empty */ object_field_non_empty(&global, "env_vars"),
-        &mut refs,
+        &mut live,
+        |gen| Some(global_env_key(gen)),
     )?;
 
-    Some(refs)
+    Some(live)
 }
 
 /// Validate and collect the three secret refs of one agent/definition record.
-/// Returns `None` on any malformed/duplicate coordinate or inline+ref conflict.
-fn collect_refs_from_record(
-    record: &JsonValue,
-    refs: &mut std::collections::HashSet<String>,
-) -> Option<()> {
-    // env_vars: object, non-empty inline.
+/// Returns `None` on any malformed/duplicate coordinate, inline+ref conflict,
+/// or a ref on a record whose owning coordinate cannot be reconstructed.
+fn collect_refs_from_record(record: &JsonValue, live: &mut LiveRefs) -> Option<()> {
+    let pubkey = record
+        .get("pubkey")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let slug = record.get("slug").and_then(JsonValue::as_str);
+    let is_definition = pubkey.is_empty();
+
+    // env_vars: object, non-empty inline. Instance → agent:<pubkey>:env:<gen>;
+    // definition (no pubkey) → definition:<slug>:env:<gen>.
     collect_ref_field(
         record,
-        "env_vars",
         "env_vars_ref",
         object_field_non_empty(record, "env_vars"),
-        refs,
+        live,
+        |gen| {
+            if is_definition {
+                slug.map(|s| definition_env_key(s, gen))
+            } else {
+                Some(agent_env_key(pubkey, gen))
+            }
+        },
     )?;
-    // auth_tag: string, non-empty inline.
+    // auth_tag: string, non-empty inline. Instance-only coordinate.
     collect_ref_field(
         record,
-        "auth_tag",
         "auth_tag_ref",
         string_field_non_empty(record, "auth_tag"),
-        refs,
+        live,
+        |gen| (!is_definition).then(|| agent_auth_tag_key(pubkey, gen)),
     )?;
     // provider config: BackendKind::Provider.config, non-null inline.
+    // Instance-only coordinate.
     collect_ref_field(
         record,
-        "backend", // inline lives under backend.config; presence computed below
         "provider_config_ref",
         provider_config_inline_present(record),
-        refs,
+        live,
+        |gen| (!is_definition).then(|| agent_provider_config_key(pubkey, gen)),
     )?;
     Some(())
 }
 
-/// Validate a single `(inline, ref)` field pair and insert the ref into `refs`.
+/// Validate a single `(inline, ref)` field pair and record both the ref gen id
+/// and its full blob coordinate into `live`.
 ///
-/// `_inline_field` is unused for the object lookup (the caller pre-computes
-/// `inline_non_empty`); it is retained only to document which field the ref
-/// pairs with. Returns `None` on an inline+ref conflict, a malformed ref, or a
-/// duplicate ref gen id.
+/// Returns `None` on an inline+ref conflict, a malformed ref, a duplicate ref
+/// gen id, or a ref whose `coord_fn` cannot reconstruct the owning coordinate
+/// (unidentifiable record) — every one no-ops the sweep as the fail-safe.
 fn collect_ref_field(
     record: &JsonValue,
-    _inline_field: &str,
     ref_field: &str,
     inline_non_empty: bool,
-    refs: &mut std::collections::HashSet<String>,
+    live: &mut LiveRefs,
+    coord_fn: impl FnOnce(&str) -> Option<String>,
 ) -> Option<()> {
     let ref_val = record.get(ref_field).and_then(JsonValue::as_str);
     match ref_val {
@@ -357,10 +440,15 @@ fn collect_ref_field(
             if r.is_empty() || r.contains(':') {
                 return None;
             }
+            // The full coordinate must be reconstructible — an instance ref
+            // with no pubkey, or a definition env ref with no slug, is
+            // un-checkable against the blob, so no-op the sweep.
+            let coord = coord_fn(r)?;
             // Duplicate coordinate: a gen id must reference exactly one thing.
-            if !refs.insert(r.to_string()) {
+            if !live.gen_ids.insert(r.to_string()) {
                 return None;
             }
+            live.coords.insert(coord);
             Some(())
         }
         None => Some(()),
@@ -445,6 +533,18 @@ pub fn mark_gc_candidates<S: ProjectionStore>(
         }
     };
 
+    // Fail-safe: every live ref's full coordinate MUST exist in the blob. A
+    // dangling live ref means the store is degraded — an older unreferenced
+    // generation could be the only recoverable payload for that field — so no
+    // marking happens this cycle until the reference resolves.
+    if !all_live_coords_present(&live_refs, &blob) {
+        eprintln!(
+            "buzz-desktop: GC sweep 1: a live ref's blob entry is missing — \
+             store is degraded, skipping to protect recoverable generations"
+        );
+        return;
+    }
+
     // Find projection generation keys that are:
     // 1. In our namespaces (not candidate markers themselves).
     // 2. Not referenced by any live JSON record.
@@ -462,7 +562,7 @@ pub fn mark_gc_candidates<S: ProjectionStore>(
             Some(g) if !g.is_empty() => g,
             _ => continue,
         };
-        if live_refs.contains(gen) {
+        if live_refs.gen_ids.contains(gen) {
             continue; // referenced by a live record — do NOT mark
         }
         // Unreferenced generation — mark it as a candidate.
@@ -532,6 +632,17 @@ pub fn delete_gc_candidates<S: ProjectionStore>(
         }
     };
 
+    // Same fail-safe as sweep 1: a dangling live ref blocks ALL deletion this
+    // cycle so an unreferenced generation that may be the last recoverable
+    // payload survives until the reference resolves.
+    if !all_live_coords_present(&live_refs, &blob) {
+        eprintln!(
+            "buzz-desktop: GC sweep 2: a live ref's blob entry is missing — \
+             store is degraded, skipping to protect recoverable generations"
+        );
+        return;
+    }
+
     // Find candidate markers whose base generation is still unreferenced.
     let mut to_delete: Vec<String> = Vec::new();
     for key in blob.keys() {
@@ -546,7 +657,7 @@ pub fn delete_gc_candidates<S: ProjectionStore>(
             Some(g) if !g.is_empty() => g,
             _ => continue,
         };
-        if live_refs.contains(gen) {
+        if live_refs.gen_ids.contains(gen) {
             // A save committed between sweep 1 and 2 — keep it.
             continue;
         }

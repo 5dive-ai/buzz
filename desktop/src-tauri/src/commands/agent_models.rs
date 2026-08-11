@@ -69,7 +69,13 @@ pub async fn get_agent_models(
         // so model discovery runs against the persona's current harness, not the
         // frozen record snapshot. An explicit per-agent override wins.
         let personas = load_personas(&app).unwrap_or_default();
-        let global = load_global_agent_config(&app).unwrap_or_default();
+        // Fail closed on unavailable effective secrets BEFORE any credentialed
+        // provider request or model subprocess (mirrors the spawn/deploy gates).
+        let global = crate::managed_agents::effective_config::require_effective_secrets_available(
+            record,
+            &personas,
+            load_global_agent_config(&app),
+        )?;
 
         // Single pure helper — descriptor + authoritative model/provider
         // resolver, packaged so the linked-agent regression test binds the
@@ -367,81 +373,11 @@ fn openai_compatible_models_url_for_discovery(env: &BTreeMap<String, String>) ->
     format!("{}/models", base_url.trim_end_matches('/'))
 }
 
-fn is_agent_text_model_id(id: &str) -> bool {
-    let lower = id.to_ascii_lowercase();
-    if [
-        "audio",
-        "dall-e",
-        "embedding",
-        "image",
-        "moderation",
-        "realtime",
-        "speech",
-        "transcribe",
-        "tts",
-        "whisper",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-    {
-        return false;
-    }
-
-    lower.starts_with("gpt-") || lower.starts_with('o') || lower.starts_with("chatgpt-")
-}
-
-fn openai_dated_snapshot_alias(id: &str) -> Option<String> {
-    let (base, date) = id.rsplit_once('-')?;
-    if date.len() != 2 || !date.chars().all(|character| character.is_ascii_digit()) {
-        return None;
-    }
-    let (base, month) = base.rsplit_once('-')?;
-    if month.len() != 2 || !month.chars().all(|character| character.is_ascii_digit()) {
-        return None;
-    }
-    let (base, year) = base.rsplit_once('-')?;
-    if year.len() != 4 || !year.chars().all(|character| character.is_ascii_digit()) {
-        return None;
-    }
-
-    Some(base.to_string())
-}
-
-fn openai_model_display_name(id: &str) -> String {
-    let canonical = openai_dated_snapshot_alias(id).unwrap_or_else(|| id.to_string());
-    if let Some(rest) = canonical.strip_prefix("chatgpt-") {
-        return format!("ChatGPT {}", title_case_model_suffix(rest));
-    }
-    if let Some(rest) = canonical.strip_prefix("gpt-") {
-        return format!("GPT-{}", title_case_model_suffix(rest));
-    }
-
-    canonical
-}
-
-fn title_case_model_suffix(value: &str) -> String {
-    value
-        .split('-')
-        .enumerate()
-        .map(|(index, part)| {
-            let part = if part.eq_ignore_ascii_case("pro") {
-                "Pro".to_string()
-            } else if part.eq_ignore_ascii_case("mini") {
-                "mini".to_string()
-            } else if part.eq_ignore_ascii_case("nano") {
-                "nano".to_string()
-            } else {
-                part.to_string()
-            };
-
-            if index == 0 {
-                part
-            } else {
-                format!(" {part}")
-            }
-        })
-        .collect::<String>()
-}
+/// OpenAI model-id → display-name helpers, split to a sibling to keep this
+/// file under the desktop file-size ratchet.
+#[path = "agent_models_naming.rs"]
+mod naming;
+use naming::{is_agent_text_model_id, openai_dated_snapshot_alias, openai_model_display_name};
 
 fn normalize_openai_compatible_models(
     response: OpenAiModelListResponse,
@@ -853,6 +789,20 @@ pub async fn update_managed_agent(
         }
 
         record.updated_at = now_iso();
+
+        // A rename re-publishes a signed kind:0 profile. Refuse when the
+        // agent's effective secrets are unavailable: a failed `auth_tag_ref`
+        // leaves `secrets_unavailable` set and `auth_tag` empty, so signing
+        // would publish WITHOUT the NIP-OA tag. Gate before the save so a
+        // refused rename changes neither disk nor relay.
+        if name_changed {
+            let personas = load_personas(&app).unwrap_or_default();
+            crate::managed_agents::effective_config::require_effective_secrets_available(
+                record,
+                &personas,
+                load_global_agent_config(&app),
+            )?;
+        }
 
         save_managed_agents(&app, &records)?;
 

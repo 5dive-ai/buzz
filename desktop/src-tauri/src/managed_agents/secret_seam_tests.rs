@@ -447,3 +447,114 @@ fn test_definition_failed_hydrate_then_save_preserves_ref() {
     );
     assert!(store.contains(&definition_env_key(slug, "gen_live")));
 }
+
+// ── F4: dev-migration conflict makes a coordinate unavailable through the ──
+//       hydration boundary and refuses spawn (not just a withheld marker) ───
+//
+// The pass-1 fix only withheld the completion marker; the conflicted value
+// stayed hydratable and could spawn during the retry window. These tests prove
+// the conflict marker now propagates a real refusal: hydrate → secrets_
+// unavailable → spawn_key_refusal.
+
+#[test]
+fn test_instance_env_conflict_marker_sets_secrets_unavailable_and_refuses_spawn() {
+    use crate::managed_agents::secret_projection::conflict_marker_key;
+    use crate::managed_agents::storage::spawn_key_refusal;
+
+    let pubkey = "abc";
+    let coord = agent_env_key(pubkey, "gen_live");
+    // The generation IS present in the blob (destination has a value), but a
+    // conflict marker for its coordinate means that value cannot be trusted.
+    let store = FakeProjectionStore::new()
+        .with_entry(&coord, r#"{"ANTHROPIC_API_KEY":"dest-value"}"#)
+        .with_entry(&conflict_marker_key(&coord), "1");
+
+    let mut records = vec![{
+        let mut r = instance_record(pubkey);
+        r.env_vars_ref = Some("gen_live".to_string());
+        r
+    }];
+
+    let unavailable = hydrate_all_secrets_for_records(&store, &mut records);
+    assert_eq!(
+        unavailable,
+        vec![pubkey.to_string()],
+        "a conflicted coordinate must surface the instance as unavailable"
+    );
+    assert!(
+        records[0].secrets_unavailable,
+        "conflict marker must set secrets_unavailable through hydration"
+    );
+    assert!(
+        records[0].env_vars.is_empty(),
+        "the conflicted (untrusted) value must NOT be hydrated into the record"
+    );
+    // The launch boundary refuses — the conflicted value can never spawn.
+    assert!(
+        spawn_key_refusal(&records[0]).is_some(),
+        "spawn must refuse an instance with an unresolved conflict"
+    );
+}
+
+#[test]
+fn test_definition_env_conflict_marker_sets_secrets_unavailable() {
+    use crate::managed_agents::secret_projection::conflict_marker_key;
+
+    let slug = "my-def";
+    let coord = definition_env_key(slug, "gen_live");
+    let store = FakeProjectionStore::new()
+        .with_entry(&coord, r#"{"K":"dest"}"#)
+        .with_entry(&conflict_marker_key(&coord), "1");
+
+    let mut records = vec![{
+        let mut d = definition_record(slug);
+        d.env_vars_ref = Some("gen_live".to_string());
+        d
+    }];
+
+    let _ = hydrate_all_secrets_for_records(&store, &mut records);
+    assert!(
+        records[0].secrets_unavailable,
+        "a conflicted definition coordinate must set secrets_unavailable — the \
+         linked-instance spawn/deploy gate then refuses"
+    );
+    assert!(records[0].env_vars.is_empty());
+}
+
+#[test]
+fn test_cleared_conflict_marker_restores_availability_and_allows_spawn() {
+    use crate::managed_agents::storage::spawn_key_refusal;
+
+    // Once the migration clears the conflict marker (conflict resolved), the
+    // same coordinate hydrates normally and spawn is no longer refused for it.
+    let pubkey = "abc";
+    let coord = agent_env_key(pubkey, "gen_live");
+    let store =
+        FakeProjectionStore::new().with_entry(&coord, r#"{"ANTHROPIC_API_KEY":"agreed-value"}"#);
+    // No conflict marker present.
+
+    let mut records = vec![{
+        let mut r = instance_record(pubkey);
+        r.env_vars_ref = Some("gen_live".to_string());
+        r
+    }];
+
+    let unavailable = hydrate_all_secrets_for_records(&store, &mut records);
+    assert!(
+        unavailable.is_empty(),
+        "with the conflict cleared, the coordinate hydrates cleanly"
+    );
+    assert!(!records[0].secrets_unavailable);
+    assert_eq!(
+        records[0]
+            .env_vars
+            .get("ANTHROPIC_API_KEY")
+            .map(String::as_str),
+        Some("agreed-value"),
+        "the resolved value must hydrate once the conflict is cleared"
+    );
+    assert!(
+        spawn_key_refusal(&records[0]).is_none(),
+        "spawn must be allowed once the conflict is resolved"
+    );
+}

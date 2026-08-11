@@ -29,16 +29,35 @@ pub(super) fn migrate_inline_secrets_to_keyring(app: &tauri::AppHandle) {
     let extraction_ok = if let Ok(mut records) =
         crate::managed_agents::storage::load_agent_store_raw(app)
     {
-        let changed = migrate_inline_secrets_in_records(app, &mut records);
-        if changed {
-            if let Err(e) = crate::managed_agents::storage::write_agent_store_raw(app, &records) {
-                eprintln!("buzz-desktop: boot-migration: failed to write agent store: {e}");
-                false
-            } else {
-                true
+        // Cross-process transaction lock: held across BOTH the generation
+        // writes (inside `migrate_inline_secrets_in_records`) and the JSON
+        // commit below, so a second Desktop process's GC cannot delete a
+        // just-written generation in the window before its ref lands in JSON.
+        // The in-process `managed_agents_store_lock` above only serializes THIS
+        // process; the file lock closes the cross-process interleave.
+        match crate::managed_agents::storage::acquire_secret_txn_lock() {
+            Ok(_txn) => {
+                let changed = migrate_inline_secrets_in_records(app, &mut records);
+                if changed {
+                    if let Err(e) =
+                        crate::managed_agents::storage::write_agent_store_raw(app, &records)
+                    {
+                        eprintln!("buzz-desktop: boot-migration: failed to write agent store: {e}");
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
             }
-        } else {
-            true
+            Err(e) => {
+                eprintln!(
+                    "buzz-desktop: boot-migration: could not acquire secret transaction lock \
+                     ({e}); skipping agent-store extraction this boot"
+                );
+                false
+            }
         }
     } else {
         eprintln!("buzz-desktop: boot-migration: could not load agent store for secret migration");
@@ -201,6 +220,21 @@ pub(crate) fn run_secret_gc(app: &tauri::AppHandle) {
         Err(_) => return,
     };
     if let Some(store) = crate::managed_agents::storage::agent_secret_store_pub() {
+        // Cross-process transaction lock: hold across BOTH sweeps' live-ref
+        // read → blob mutation so a second Desktop process's in-flight save
+        // cannot commit a JSON ref between this GC's read and its delete. The
+        // guard releases when this function returns. Leaf-level: GC is never
+        // called while another secret transaction lock is held (boot migration
+        // releases its extraction and global-save spans before calling here).
+        let _txn = match crate::managed_agents::storage::acquire_secret_txn_lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!(
+                    "buzz-desktop: secret GC: could not acquire transaction lock ({e}), skipping"
+                );
+                return;
+            }
+        };
         // Two-cycle GC: DELETE candidates from the PREVIOUS boot first, THEN
         // mark new candidates for this boot.  This ordering is the safety
         // invariant: a generation written and verified in boot N is only ever

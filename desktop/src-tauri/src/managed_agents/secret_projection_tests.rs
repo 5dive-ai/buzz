@@ -1,6 +1,5 @@
 use super::*;
 use std::cell::RefCell;
-use std::collections::HashSet;
 
 // ── FakeProjectionStore ──────────────────────────────────────────────
 
@@ -222,8 +221,8 @@ fn test_collect_live_refs_extracts_refs() {
     let agents = make_agents_json(Some("gen1"));
     let global = make_global_json(Some("gen2"));
     let refs = collect_live_refs(&agents, &global).unwrap();
-    assert!(refs.contains("gen1"));
-    assert!(refs.contains("gen2"));
+    assert!(refs.gen_ids.contains("gen1"));
+    assert!(refs.gen_ids.contains("gen2"));
 }
 
 #[test]
@@ -231,7 +230,7 @@ fn test_collect_live_refs_empty_when_no_refs() {
     let agents = make_agents_json(None);
     let global = make_global_json(None);
     let refs = collect_live_refs(&agents, &global).unwrap();
-    assert!(refs.is_empty());
+    assert!(refs.gen_ids.is_empty());
 }
 
 #[test]
@@ -313,7 +312,7 @@ fn test_collect_live_refs_allows_empty_inline_with_ref() {
     // state — not a conflict. The ref must be collected.
     let agents = r#"[{"pubkey":"a","name":"t","env_vars":{},"env_vars_ref":"gen1","created_at":"2026","updated_at":"2026"}]"#;
     let refs = collect_live_refs(agents, "{}").expect("empty inline + ref is healthy");
-    assert!(refs.contains("gen1"));
+    assert!(refs.gen_ids.contains("gen1"));
 }
 
 #[test]
@@ -321,16 +320,16 @@ fn test_collect_live_refs_allows_null_provider_config_with_ref() {
     // Stripped provider config is JSON null alongside a ref — healthy state.
     let agents = r#"[{"pubkey":"a","name":"t","backend":{"type":"provider","id":"anthropic","config":null},"provider_config_ref":"gen1","created_at":"2026","updated_at":"2026"}]"#;
     let refs = collect_live_refs(agents, "{}").expect("null config + ref is healthy");
-    assert!(refs.contains("gen1"));
+    assert!(refs.gen_ids.contains("gen1"));
 }
 
 #[test]
 fn test_collect_live_refs_collects_all_three_instance_fields() {
     let agents = r#"[{"pubkey":"a","name":"t","env_vars_ref":"g_env","auth_tag_ref":"g_auth","backend":{"type":"provider","id":"anthropic","config":null},"provider_config_ref":"g_pc","created_at":"2026","updated_at":"2026"}]"#;
     let refs = collect_live_refs(agents, "{}").unwrap();
-    assert!(refs.contains("g_env"));
-    assert!(refs.contains("g_auth"));
-    assert!(refs.contains("g_pc"));
+    assert!(refs.gen_ids.contains("g_env"));
+    assert!(refs.gen_ids.contains("g_auth"));
+    assert!(refs.gen_ids.contains("g_pc"));
 }
 
 #[test]
@@ -346,8 +345,8 @@ fn test_gc_interleaving_save_cancels_candidacy() {
     let agents_content = make_agents_json(None);
     let global_content = make_global_json(Some("gen1"));
 
-    let live_refs: HashSet<String> = collect_live_refs(&agents_content, &global_content).unwrap();
-    assert!(live_refs.contains("gen1"), "gen1 must be live");
+    let live_refs = collect_live_refs(&agents_content, &global_content).unwrap();
+    assert!(live_refs.gen_ids.contains("gen1"), "gen1 must be live");
 
     // Verify that delete_gc_candidates would skip gen1 because it's live.
     // Since we can't call delete_gc_candidates directly (it reads files),
@@ -361,7 +360,7 @@ fn test_gc_interleaving_save_cancels_candidacy() {
 
     // Simulate what delete_gc_candidates does: skip live refs.
     let gen = "gen1";
-    let would_delete = !live_refs.contains(gen);
+    let would_delete = !live_refs.gen_ids.contains(gen);
     assert!(
         !would_delete,
         "gen1 must NOT be deleted — it's now referenced"
@@ -480,6 +479,92 @@ fn test_gc_reclaims_stably_unreferenced_candidate() {
     );
 }
 
+// ── F5b: GC validates live refs against the blob, not just syntax ─────────
+//
+// A live ref whose full coordinate is MISSING from the blob (dangling) means
+// the store is degraded: an older, unreferenced generation for the SAME field
+// could be the only recoverable payload. Both sweeps must no-op until the
+// reference resolves — deleting the unreferenced candidate would destroy the
+// last copy.
+
+#[test]
+fn test_gc_delete_no_op_when_a_live_ref_coordinate_is_missing() {
+    // JSON references live gen_g (dangling: NOT present in the blob).
+    // Candidate gen_h is unreferenced and marked from a prior boot.
+    // Without the coordinate check, delete would reclaim gen_h; with it, the
+    // dangling live ref freezes ALL deletion so gen_h (a possible last copy)
+    // survives.
+    let store = FakeProjectionStore::reachable()
+        .with_entry("global:env:gen_h", "recoverable-secret")
+        .with_entry("global:env:gen_h_candidate", "1"); // marked last boot
+                                                        // Note: global:env:gen_g is deliberately ABSENT from the blob.
+
+    let agents = make_agents_json(None);
+    let global = make_global_json(Some("gen_g")); // JSON references the dangling gen
+
+    // Sanity: gen_g's coordinate is a live ref but its blob entry is missing.
+    let live_refs = collect_live_refs(&agents, &global).unwrap();
+    assert!(live_refs.gen_ids.contains("gen_g"));
+    assert!(live_refs.coords.contains("global:env:gen_g"));
+
+    let (_dir, agents_path, global_path) = write_json_stores(&agents, &global);
+    delete_gc_candidates(&store, &agents_path, &global_path);
+
+    assert!(
+        store.get("global:env:gen_h").is_some(),
+        "gen_h must survive: a dangling live ref freezes deletion so the last \
+         recoverable payload is not destroyed"
+    );
+}
+
+#[test]
+fn test_gc_mark_no_op_when_a_live_ref_coordinate_is_missing() {
+    // Same degraded state as above, at the MARK phase: an unreferenced gen_h
+    // must NOT be newly marked as a candidate while a live ref is dangling —
+    // marking is the first step toward deletion, so it is frozen too.
+    let store =
+        FakeProjectionStore::reachable().with_entry("global:env:gen_h", "recoverable-secret");
+    // global:env:gen_g (the live ref's coordinate) is ABSENT.
+
+    let agents = make_agents_json(None);
+    let global = make_global_json(Some("gen_g"));
+    let (_dir, agents_path, global_path) = write_json_stores(&agents, &global);
+
+    mark_gc_candidates(&store, &agents_path, &global_path);
+
+    assert!(
+        store.get("global:env:gen_h_candidate").is_none(),
+        "gen_h must not be marked while a live ref is dangling"
+    );
+}
+
+#[test]
+fn test_gc_delete_proceeds_once_all_live_coordinates_present() {
+    // Positive bound: with every live ref's coordinate present in the blob,
+    // the degraded-state guard does not fire and an unreferenced candidate is
+    // reclaimed as normal. This proves the new check gates on the missing
+    // coordinate specifically, not on the mere presence of any live ref.
+    let store = FakeProjectionStore::reachable()
+        .with_entry("global:env:gen_g", "live-secret") // live ref coordinate present
+        .with_entry("global:env:gen_h", "stale-secret")
+        .with_entry("global:env:gen_h_candidate", "1");
+
+    let agents = make_agents_json(None);
+    let global = make_global_json(Some("gen_g"));
+    let (_dir, agents_path, global_path) = write_json_stores(&agents, &global);
+
+    delete_gc_candidates(&store, &agents_path, &global_path);
+
+    assert!(
+        store.get("global:env:gen_g").is_some(),
+        "the live generation must be spared"
+    );
+    assert!(
+        store.get("global:env:gen_h").is_none(),
+        "the unreferenced candidate must be reclaimed once no live ref dangles"
+    );
+}
+
 #[test]
 fn test_cancel_gc_candidacy_removes_marker() {
     let store = FakeProjectionStore::reachable()
@@ -595,9 +680,9 @@ fn test_gc_delete_first_order_preserves_in_flight_gen() {
     let global = make_global_json(Some("gen0")); // JSON still has old ref
 
     let live_refs = collect_live_refs(&agents, &global).unwrap();
-    assert!(live_refs.contains("gen0"), "gen0 is still in JSON");
+    assert!(live_refs.gen_ids.contains("gen0"), "gen0 is still in JSON");
     assert!(
-        !live_refs.contains("gen1"),
+        !live_refs.gen_ids.contains("gen1"),
         "gen1 not yet committed to JSON"
     );
 
@@ -618,7 +703,7 @@ fn test_gc_delete_first_order_preserves_in_flight_gen() {
 
     // Verify delete_gc_candidates would skip gen0 because it IS referenced.
     let gen = "gen0";
-    let would_delete = !live_refs.contains(gen);
+    let would_delete = !live_refs.gen_ids.contains(gen);
     assert!(
         !would_delete,
         "gen0 must NOT be deleted — it's still referenced in JSON"
@@ -655,12 +740,15 @@ fn test_cancel_before_mark_ordering_protects_in_flight_gen() {
     let global = make_global_json(Some("gen2")); // JSON now has gen2 ref
 
     let live_refs = collect_live_refs(&agents, &global).unwrap();
-    assert!(live_refs.contains("gen2"), "gen2 is now referenced in JSON");
+    assert!(
+        live_refs.gen_ids.contains("gen2"),
+        "gen2 is now referenced in JSON"
+    );
 
     // delete_gc_candidates (next boot): gen2 is a candidate BUT is now
     // referenced → skip.  gen2 must NOT be deleted.
     let gen = "gen2";
-    let would_delete = !live_refs.contains(gen);
+    let would_delete = !live_refs.gen_ids.contains(gen);
     assert!(
         !would_delete,
         "gen2 must NOT be deleted — it's now referenced in JSON"
@@ -668,7 +756,7 @@ fn test_cancel_before_mark_ordering_protects_in_flight_gen() {
 
     // gen1 is now unreferenced → it should become a candidate on next mark.
     assert!(
-        !live_refs.contains("gen1"),
+        !live_refs.gen_ids.contains("gen1"),
         "gen1 is no longer referenced (gen2 replaced it)"
     );
 }

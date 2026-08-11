@@ -96,20 +96,40 @@ pub fn migrate_agent_secrets_to_dev_service(app: &tauri::AppHandle) {
         to_write,
         conflict_keys,
         write_marker,
+        conflict_markers_to_clear,
     } = plan_dev_secrets_migration(&src_map, &dest_map, &global_refs);
 
     for key in &conflict_keys {
         eprintln!(
             "buzz-desktop: keyring-dev-secrets-migration: \
              conflict on key {key} between {src_service} and {dest_service}; \
-             refusing to overwrite (manual resolution required)"
+             refusing to overwrite and marking it unavailable until resolved \
+             (manual resolution required)"
         );
     }
     let conflict_count = conflict_keys.len();
 
-    // Nothing to persist (no copyable keys and, being unclean, no marker):
-    // skip the write entirely so an unclean boot with zero copyable keys does
-    // not touch the destination keyring.
+    // Clear resolved conflict markers first (store_all only inserts, so a
+    // stale marker would otherwise linger and keep a now-healthy coordinate
+    // unavailable forever). Best-effort: a failed clear just retries next boot.
+    if !conflict_markers_to_clear.is_empty() {
+        let keys: Vec<&str> = conflict_markers_to_clear
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for key in &keys {
+            if let Err(e) = dest_store.delete(key) {
+                eprintln!(
+                    "buzz-desktop: keyring-dev-secrets-migration: \
+                     could not clear resolved conflict marker {key}: {e}"
+                );
+            }
+        }
+    }
+
+    // Nothing to persist (no copyable keys, no conflict markers, and — being
+    // unclean — no completion marker): skip the write entirely so an unclean
+    // boot with zero copyable keys does not touch the destination keyring.
     if to_write.is_empty() {
         if conflict_count > 0 {
             eprintln!(
@@ -128,8 +148,10 @@ pub fn migrate_agent_secrets_to_dev_service(app: &tauri::AppHandle) {
         return;
     }
 
-    // Subtract the marker (if any) from the copied count.
-    let copied = to_write.len() - usize::from(write_marker);
+    // Subtract the completion marker and any conflict markers from the copied
+    // count so only real projection copies are reported.
+    let conflict_marker_count = conflict_keys.len();
+    let copied = to_write.len() - usize::from(write_marker) - conflict_marker_count;
     if copied > 0 {
         eprintln!(
             "buzz-desktop: keyring-dev-secrets-migration: \
@@ -146,23 +168,37 @@ pub fn migrate_agent_secrets_to_dev_service(app: &tauri::AppHandle) {
 }
 
 /// Output of [`plan_dev_secrets_migration`]: the batch to write to the
-/// destination keyring, the number of unresolved conflicts, and whether the
-/// completion marker is included in the batch.
+/// destination keyring, the conflicting coordinates, whether the completion
+/// marker is included, and the conflict markers to write/clear so a conflicted
+/// coordinate is made unavailable (and cleared once it resolves).
 #[cfg(debug_assertions)]
 struct DevMigrationPlan {
     to_write: std::collections::HashMap<String, String>,
     conflict_keys: Vec<String>,
     write_marker: bool,
+    /// `conflict:<coord>` marker keys to REMOVE this run: coordinates that
+    /// previously carried a conflict marker but no longer conflict (source and
+    /// destination now agree, or one side dropped the coordinate). Clearing the
+    /// marker lets the coordinate hydrate normally again.
+    conflict_markers_to_clear: Vec<String>,
 }
 
 /// Pure decision core of [`migrate_agent_secrets_to_dev_service`]: decide which
-/// projection keys to copy and whether to write the completion marker.
+/// projection keys to copy, whether to write the completion marker, and which
+/// conflict markers to write or clear.
 ///
 /// A projection key present in both stores with DIFFERENT values is a conflict:
-/// it is NOT copied and counts toward `conflict_count`. The marker is included
-/// only when `conflict_count == 0` — an unclean run must be retried on the next
-/// boot after the user resolves the conflict, so the non-conflicting keys are
-/// still written (partial progress persists) but the marker is withheld.
+/// it is NOT copied and counts toward `conflict_count`. A `conflict:<coord>`
+/// marker is written into the batch so `load_secret` fails closed for that
+/// coordinate — the conflicted value must not be hydrated or consumed while
+/// unresolved. The marker is included only when `conflict_count == 0` — an
+/// unclean run must be retried on the next boot after the user resolves the
+/// conflict, so the non-conflicting keys are still written (partial progress
+/// persists) but the marker is withheld.
+///
+/// A coordinate that previously carried a conflict marker and no longer
+/// conflicts is added to `conflict_markers_to_clear` so the availability block
+/// is lifted once the conflict resolves.
 ///
 /// `global:env:*` keys are copied only when the gen id is in `global_refs`
 /// (the destination JSON references it) — `global-agent-config.json` is not a
@@ -173,7 +209,7 @@ fn plan_dev_secrets_migration(
     dest_map: &std::collections::HashMap<String, String>,
     global_refs: &std::collections::HashSet<String>,
 ) -> DevMigrationPlan {
-    use crate::managed_agents::secret_projection::is_projection_key;
+    use crate::managed_agents::secret_projection::{conflict_marker_key, is_projection_key};
 
     let mut to_write: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut conflict_keys: Vec<String> = Vec::new();
@@ -196,11 +232,29 @@ fn plan_dev_secrets_migration(
                 // Already identical — idempotent, no action needed.
             }
             Some(_dest_val) => {
-                // Conflict: src and dest have different values.  Fail closed.
+                // Conflict: src and dest have different values.  Fail closed:
+                // withhold the copy AND write a conflict marker so the
+                // coordinate cannot be hydrated until the conflict resolves.
                 conflict_keys.push(key.clone());
+                to_write.insert(conflict_marker_key(key), "1".to_string());
             }
         }
     }
+
+    // Clear conflict markers for coordinates that no longer conflict. A marker
+    // present in dest whose underlying coordinate is NOT in this run's
+    // conflict set has resolved (values now agree, or the coordinate is gone),
+    // so lift the availability block.
+    let still_conflicting: std::collections::HashSet<&String> = conflict_keys.iter().collect();
+    let conflict_markers_to_clear: Vec<String> = dest_map
+        .keys()
+        .filter(|k| k.starts_with(NS_CONFLICT_PREFIX))
+        .filter(|marker| {
+            let coord = marker.trim_start_matches(NS_CONFLICT_PREFIX);
+            !still_conflicting.contains(&coord.to_string())
+        })
+        .cloned()
+        .collect();
 
     let write_marker = conflict_keys.is_empty();
     if write_marker {
@@ -211,8 +265,14 @@ fn plan_dev_secrets_migration(
         to_write,
         conflict_keys,
         write_marker,
+        conflict_markers_to_clear,
     }
 }
+
+/// The `conflict:` namespace prefix, mirrored from `secret_projection` so the
+/// planner can recognize existing conflict markers in the destination blob.
+#[cfg(debug_assertions)]
+const NS_CONFLICT_PREFIX: &str = "conflict:";
 
 /// Collect the set of generation IDs referenced by `global-agent-config.json`
 /// for the purposes of the dev secrets migration (to decide whether to copy
@@ -366,5 +426,76 @@ mod tests {
         assert!(!plan.to_write.contains_key("some-agent-nsec-key"));
         assert!(plan.write_marker); // no projection conflict
         assert_eq!(plan.to_write.len(), 1); // marker only
+    }
+
+    #[test]
+    fn test_conflict_writes_conflict_marker_into_batch() {
+        // A conflicting coordinate must add a `conflict:<coord>` marker to the
+        // write batch so `load_secret` fails closed for it — the F4 fix that
+        // makes the conflicted value unavailable, not merely un-marked.
+        use crate::managed_agents::secret_projection::conflict_marker_key;
+        let conflict = agent_env_key("abc", "gen1");
+        let src = map(&[(&conflict, "src-val")]);
+        let dest = map(&[(&conflict, "dest-val")]);
+
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new());
+
+        assert_eq!(plan.conflict_keys, vec![conflict.clone()]);
+        assert!(
+            plan.to_write.contains_key(&conflict_marker_key(&conflict)),
+            "a conflict must write its conflict marker into the batch"
+        );
+        assert!(
+            !plan.to_write.contains_key(&conflict),
+            "the conflicted value itself must NOT be copied"
+        );
+        assert!(!plan.write_marker, "completion marker withheld on conflict");
+    }
+
+    #[test]
+    fn test_resolved_conflict_marker_is_cleared() {
+        // A conflict marker present in dest whose coordinate no longer
+        // conflicts (values now agree) must be scheduled for clearing so the
+        // availability block is lifted.
+        use crate::managed_agents::secret_projection::conflict_marker_key;
+        let coord = agent_env_key("abc", "gen1");
+        let marker = conflict_marker_key(&coord);
+        // src and dest now AGREE on the coordinate — the conflict is resolved.
+        let src = map(&[(&coord, "agreed")]);
+        let dest = map(&[(&coord, "agreed"), (&marker, "1")]);
+
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new());
+
+        assert!(
+            plan.conflict_keys.is_empty(),
+            "coordinate no longer conflicts"
+        );
+        assert!(
+            plan.conflict_markers_to_clear.contains(&marker),
+            "a resolved conflict's stale marker must be cleared"
+        );
+    }
+
+    #[test]
+    fn test_persisting_conflict_marker_is_not_cleared() {
+        // A conflict that STILL conflicts must keep its marker (not clear it),
+        // so the coordinate stays unavailable across the retry.
+        use crate::managed_agents::secret_projection::conflict_marker_key;
+        let coord = agent_env_key("abc", "gen1");
+        let marker = conflict_marker_key(&coord);
+        let src = map(&[(&coord, "src-val")]);
+        let dest = map(&[(&coord, "dest-val"), (&marker, "1")]);
+
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new());
+
+        assert_eq!(plan.conflict_keys, vec![coord.clone()]);
+        assert!(
+            !plan.conflict_markers_to_clear.contains(&marker),
+            "a still-conflicting coordinate's marker must NOT be cleared"
+        );
+        assert!(
+            plan.to_write.contains_key(&marker),
+            "the (re)written marker keeps the coordinate unavailable"
+        );
     }
 }

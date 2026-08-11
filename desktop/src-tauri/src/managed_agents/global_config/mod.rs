@@ -269,6 +269,13 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
 
     // Persist env_vars to keyring (generation-reference protocol).
     if let Some(store) = global_config_secret_store() {
+        // Cross-process transaction lock: hold across the generation write and
+        // the atomic JSON commit below so a second Desktop process's GC cannot
+        // delete the just-written generation before its ref lands in JSON. The
+        // lock releases when `_txn` drops at end of function. Callers never hold
+        // it already (boot migration releases its agent-store span before
+        // calling here), so this does not nest.
+        let _txn = store.transaction_lock()?;
         let inline_env = if !config.env_vars.is_empty() {
             serialize_env_map(&config.env_vars).ok()
         } else {
@@ -292,6 +299,11 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
                 config.env_vars_ref = None;
             }
         }
+
+        let path = global_config_path(app)?;
+        let payload = serde_json::to_vec_pretty(&config)
+            .map_err(|e| format!("failed to serialize global agent config: {e}"))?;
+        return atomic_write_json_restricted(&path, &payload);
     }
 
     let path = global_config_path(app)?;

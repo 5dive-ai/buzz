@@ -403,6 +403,11 @@ pub fn save_managed_agents(app: &AppHandle, records: &[ManagedAgentRecord]) -> R
     // Persist each nsec to the keyring; on success blank the inline copy.
     persist_agent_keys(&mut sorted);
 
+    // Cross-process transaction lock across the generation writes
+    // (`strip_and_persist_all_for_records`) and the JSON commit
+    // (`write_agent_store`) — see `acquire_secret_txn_lock`. Leaf-level.
+    let _txn = acquire_secret_txn_lock()?;
+
     // Persist env/auth_tag/provider_config to the keyring; on success blank
     // inline values and set *_ref. On failure keep inline and clear *_ref.
     if let Some(store) = agent_secret_store() {
@@ -422,6 +427,10 @@ pub(crate) fn save_agent_definitions(
     instances.retain(|record| !record.pubkey.is_empty());
     let mut definitions = definitions.to_vec();
     definitions.retain(|record| record.pubkey.is_empty());
+
+    // Cross-process txn lock across gen-writes + JSON commit (see
+    // `save_managed_agents`). Leaf-level, never nested.
+    let _txn = acquire_secret_txn_lock()?;
 
     // Persist definition env_vars to the keyring before writing JSON.
     if let Some(store) = agent_secret_store() {
@@ -661,6 +670,19 @@ pub(crate) fn write_agent_store_raw(
 /// instance used by the normal save/load path.
 pub(crate) fn agent_secret_store_pub() -> Option<&'static crate::secret_store::SecretStore> {
     agent_secret_store()
+}
+
+/// Acquire the cross-process secret transaction lock for the agent secret
+/// store, or `Ok(None)` when the build has no keyring backend. A save
+/// (gen-write → JSON commit) and GC (live-ref read → blob remove) hold it for
+/// their full span so two Desktop processes cannot interleave. Never nested;
+/// the per-op `mutate_blob` lock is a different file taken after this one.
+pub(crate) fn acquire_secret_txn_lock(
+) -> Result<Option<crate::secret_store::SecretTxnGuard>, String> {
+    match agent_secret_store() {
+        Some(store) => store.transaction_lock().map(Some),
+        None => Ok(None),
+    }
 }
 
 /// Atomic, symlink-preserving JSON write.

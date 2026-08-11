@@ -88,7 +88,21 @@ pub async fn set_global_agent_config(
 
         validate_global_config(&config)?;
 
-        let old_global = load_global_agent_config(&app_for_write).unwrap_or_default();
+        // Fail closed when the CURRENTLY committed global config cannot load:
+        // its `env_vars_ref` points at a keyring entry that is missing or
+        // unreadable this boot. `unwrap_or_default()` here would silently
+        // replace a dangling-but-live committed ref with the caller's config,
+        // orphaning the generation the ref still points at. No destructive
+        // "replace despite unavailability" action is modeled, so refusing is
+        // the only correct arm — retry once the keyring is reachable.
+        let old_global = load_global_agent_config(&app_for_write).map_err(|e| {
+            format!(
+                "cannot save global agent config: the current global config has \
+                 secrets that could not be loaded from the keyring ({e}). \
+                 Refusing to overwrite it while its secrets are unavailable; \
+                 retry once the keyring is reachable."
+            )
+        })?;
 
         save_global_agent_config(&app_for_write, &config)?;
 

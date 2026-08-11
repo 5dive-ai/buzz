@@ -125,6 +125,30 @@ fn inherited_runtime_provider_and_model_are_materialized_for_export() {
     assert_eq!(record.model.as_deref(), Some("databricks-gpt-5-6-sol"));
 }
 
+/// Documents WHY `materialize_snapshot_bytes` must fail closed on a global
+/// loader `Err` instead of `unwrap_or_default()`: with an all-empty
+/// `default()` global (the value `unwrap_or_default()` would substitute for an
+/// unreadable committed ref), an inheriting record materializes EMPTY
+/// runtime/provider/model — silently dropping the inherited config and
+/// breaking the "verbatim portable copy" contract. The command's `?` on the
+/// mapped loader error is what prevents this degraded snapshot from ever being
+/// built.
+#[test]
+fn empty_default_global_would_drop_inherited_config_hence_export_must_refuse() {
+    let mut record = make_definition("wren");
+    // record inherits everything (no explicit runtime/provider/model).
+    let degraded_global = crate::managed_agents::GlobalAgentConfig::default();
+
+    materialize_portable_runtime_defaults(&mut record, &degraded_global);
+
+    assert!(
+        record.runtime.is_none() && record.provider.is_none() && record.model.is_none(),
+        "an all-empty default global materializes empty inherited config — the \
+         exact silent degradation `materialize_snapshot_bytes` now refuses by \
+         propagating the loader Err instead of unwrap_or_default()"
+    );
+}
+
 #[test]
 fn explicit_runtime_provider_and_model_win_over_global_defaults() {
     let mut record = make_definition("wren");

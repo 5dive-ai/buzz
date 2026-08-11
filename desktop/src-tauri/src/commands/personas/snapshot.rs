@@ -254,7 +254,22 @@ pub(crate) async fn materialize_snapshot_bytes(
         // provider, and model configuration, not a pointer to the sender's
         // machine-wide defaults. This does not translate or substitute values
         // for a different recipient setup.
-        let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
+        //
+        // Fail closed when the global config cannot load: its `env_vars_ref`
+        // points at a keyring entry that is missing/unreadable this boot.
+        // `unwrap_or_default()` would coerce that `Err` into an all-empty
+        // config and then materialize empty runtime/provider/model defaults for
+        // an agent that inherits them — silently shipping a snapshot that is
+        // NOT the documented verbatim copy and imports with different behavior.
+        // Refuse export/send instead; retry once the keyring is reachable.
+        let global = crate::managed_agents::load_global_agent_config(&app).map_err(|e| {
+            format!(
+                "cannot export this agent snapshot: the global agent config has \
+                 secrets that could not be loaded from the keyring ({e}), so the \
+                 snapshot's inherited runtime/provider/model defaults cannot be \
+                 resolved faithfully. Retry once the keyring is reachable."
+            )
+        })?;
         materialize_portable_runtime_defaults(&mut def_record, &global);
 
         let memory_pubkey = if memory_level != MemoryLevel::None {

@@ -26,7 +26,11 @@ pub mod builtin_client;
 pub mod config;
 pub mod hints;
 pub mod hooks;
+pub mod loop_drive;
 pub mod mesh;
+pub mod prompt;
+pub mod steer;
+pub mod tools;
 pub mod types;
 pub mod wire;
 
@@ -75,6 +79,12 @@ struct Session {
     /// Name of the MCP extension carrying `_Stop`/`_PostCompact`, if any.
     /// See [`crate::hooks`] for why we dispatch these ourselves.
     hook_extension: Option<String>,
+    /// This session's system prompt. Owned here rather than inside goose's
+    /// `Agent`, because buzz-agent builds the prompt itself each round.
+    prompt: crate::prompt::SessionPrompt,
+    /// Mid-turn steer queue. goose's own is `pub(crate)` to `Agent::reply`,
+    /// which buzz-agent no longer calls. See [`crate::steer`].
+    steers: crate::steer::SteerQueue,
     accumulated_input_tokens: u64,
     accumulated_output_tokens: u64,
     /// Subset of `accumulated_input_tokens`, published as
@@ -102,7 +112,15 @@ async fn build_agent(
     cwd: &str,
     system_prompt: Option<&str>,
     mcp_servers: &[McpServerStdio],
-) -> Result<(Arc<Agent>, String, Option<String>), AgentError> {
+) -> Result<
+    (
+        Arc<Agent>,
+        String,
+        Option<String>,
+        crate::prompt::SessionPrompt,
+    ),
+    AgentError,
+> {
     let session_manager = Arc::new(SessionManager::instance());
     let permission_manager = PermissionManager::instance();
 
@@ -155,9 +173,13 @@ async fn build_agent(
     // goose/crates/goose/src), and both PRs that would have wired it —
     // buzz#1290 and goose#9971 — are closed unmerged. Driving the library
     // directly is what makes Fizz (and `[Base]`) actually arrive.
+    // buzz-agent owns the loop, so it owns the prompt: goose's own
+    // `PromptManager` is only reachable from `Agent::reply`, which we no longer
+    // call. See `crate::prompt`.
+    let prompt = crate::prompt::SessionPrompt::new(cfg.goose_mode);
     if let Some(sp) = system_prompt.or(cfg.system_prompt.as_deref()) {
         if !sp.trim().is_empty() {
-            agent.override_system_prompt(sp.to_string()).await;
+            prompt.set_override(sp.to_string()).await;
         }
     }
 
@@ -193,9 +215,7 @@ async fn build_agent(
     // (`prompt_manager.rs:170-198`), so this survives `override_system_prompt`.
     let (hints, skills) = crate::hints::build_hints_section(std::path::Path::new(cwd));
     if !hints.trim().is_empty() {
-        agent
-            .extend_system_prompt("buzz_hints".to_string(), hints)
-            .await;
+        prompt.add_extra("buzz_hints", hints).await;
     }
 
     // `load_skill` runs in-process, registered the way Maple does it: a
@@ -242,13 +262,13 @@ async fn build_agent(
     }
 
     if let Some(ext) = &hook_extension {
-        agent
-            .extend_system_prompt("buzz_hook_tools".to_string(), hook_tool_guidance())
+        prompt
+            .add_extra("buzz_hook_tools", hook_tool_guidance())
             .await;
         tracing::info!(extension = %ext, "lifecycle hooks available");
     }
 
-    Ok((agent, session.id, hook_extension))
+    Ok((agent, session.id, hook_extension, prompt))
 }
 
 /// Keep the model's hands off the lifecycle hooks.
@@ -461,7 +481,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         .await;
     }
 
-    let (agent, goose_session_id, hook_extension) =
+    let (agent, goose_session_id, hook_extension, prompt) =
         match build_agent(&app.cfg, &p.cwd, p.system_prompt.as_deref(), &p.mcp_servers).await {
             Ok(v) => v,
             Err(e) => {
@@ -503,6 +523,8 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
                 model_override: None,
                 pending_model: None,
                 hook_extension,
+                prompt,
+                steers: crate::steer::SteerQueue::new(),
                 accumulated_input_tokens: 0,
                 accumulated_output_tokens: 0,
                 accumulated_cached_input_tokens: 0,
@@ -599,7 +621,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
     let cancel = CancellationToken::new();
 
     // Single-flight per session, and capture the agent handle.
-    let (agent, goose_session_id, pending_model, hook_extension) = {
+    let (agent, goose_session_id, pending_model, hook_extension, prompt, steers) = {
         let mut sessions = app.sessions.lock().await;
         let Some(s) = sessions.get_mut(&p.session_id) else {
             return wire::send(
@@ -629,6 +651,8 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             s.goose_session_id.clone(),
             s.pending_model.take(),
             s.hook_extension.clone(),
+            s.prompt.clone(),
+            s.steers.clone(),
         )
     };
 
@@ -659,14 +683,19 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
     )
     .await;
 
-    let (result, tokens) = agent::run_turn(
-        agent,
-        &goose_session_id,
-        p.prompt,
-        app.cfg.max_rounds,
-        wire_tx,
-        cancel,
-        hook_extension.as_deref(),
+    let (result, tokens) = loop_drive::run_turn(
+        loop_drive::TurnContext {
+            agent: &agent,
+            session_id: &goose_session_id,
+            wire_tx,
+            cancel: &cancel,
+            hook_extension: hook_extension.as_deref(),
+            max_rounds: app.cfg.max_rounds,
+            prompt: &prompt,
+            steers: &steers,
+        },
+        goose_provider_types::conversation::message::Message::user()
+            .with_text(agent::prompt_to_text(&p.prompt)),
     )
     .await;
 
@@ -835,7 +864,7 @@ async fn steer(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
         .await;
     }
 
-    let (agent, goose_session_id) = {
+    let steers = {
         let sessions = app.sessions.lock().await;
         let Some(s) = sessions.get(&p.session_id) else {
             return wire::send(
@@ -861,15 +890,12 @@ async fn steer(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
             )
             .await;
         }
-        (s.agent.clone(), s.goose_session_id.clone())
+        s.steers.clone()
     };
 
     let message_id = format!("steer_{}", uuid_like());
-    agent
-        .steer(
-            &goose_session_id,
-            goose_provider_types::conversation::message::Message::user().with_text(text),
-        )
+    steers
+        .push(goose_provider_types::conversation::message::Message::user().with_text(text))
         .await;
 
     wire::send(

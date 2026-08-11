@@ -325,14 +325,15 @@ struct OidcEndpoints {
 /// actual credential rejection from a transient fault.
 ///
 /// - [`Refreshed`](Self::Refreshed): a fresh token — success.
-/// - [`Rejected`](Self::Rejected): the token endpoint rejected the *grant*
-///   (dead/rotated refresh token). This is the only outcome that becomes
-///   [`AuthError::RefreshRejected`] for `Headless` or drives a browser
-///   fallback for interactive intents.
-/// - [`Network`](Self::Network): transport error, timeout, 5xx, or an
-///   undecodable/malformed response — infrastructural, never a credential
-///   decision, so it surfaces as [`AuthError::NetworkUnavailable`] and never
-///   pops a browser.
+/// - [`Rejected`](Self::Rejected): the token endpoint returned an
+///   `invalid_grant` error (dead/rotated refresh token). This is the only
+///   outcome that becomes [`AuthError::RefreshRejected`] for `Headless` or
+///   drives a browser fallback for interactive intents.
+/// - [`Network`](Self::Network): transport error, timeout, 5xx, any 4xx that
+///   is not `invalid_grant` (e.g. `invalid_request`, `invalid_client`, 429),
+///   an unparseable error body, or an undecodable/malformed success body —
+///   infrastructural or misconfiguration, never a credential decision, so it
+///   surfaces as [`AuthError::NetworkUnavailable`] and never pops a browser.
 enum RefreshOutcome {
     Refreshed(CachedToken),
     Rejected,
@@ -511,14 +512,25 @@ impl PkceOAuthTokenSource {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            // A 4xx is the token endpoint rejecting the grant (dead/rotated
-            // refresh token). A 5xx is a provider-side fault — transient, not a
-            // credential decision — so it stays in the infrastructural bucket.
-            if status.is_client_error() {
+            // Per RFC 6749 §5.2 only `error == "invalid_grant"` means the
+            // refresh token itself is dead (expired/revoked) — the one failure
+            // a browser sign-in can repair. Every other 4xx (`invalid_request`,
+            // `invalid_client`, `unsupported_grant_type`, `invalid_scope`, 408,
+            // 429, …), an unparseable error body, and all 5xx are
+            // infrastructural or misconfiguration: a browser can't fix them, so
+            // they stay in the non-credential bucket and surface as
+            // `NetworkUnavailable` without ever popping a browser.
+            if status.is_client_error()
+                && serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
+                    .as_deref()
+                    == Some("invalid_grant")
+            {
                 tracing::warn!(status = %status, body = %body, "oauth refresh grant rejected");
                 return RefreshOutcome::Rejected;
             }
-            tracing::warn!(status = %status, body = %body, "oauth refresh server error");
+            tracing::warn!(status = %status, body = %body, "oauth refresh not repairable by browser");
             return RefreshOutcome::Network;
         }
         let v: Value = match resp.json().await {

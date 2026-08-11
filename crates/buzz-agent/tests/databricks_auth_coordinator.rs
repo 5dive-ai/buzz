@@ -1,17 +1,23 @@
 //! Concurrency-matrix tests for the Databricks auth coordinator.
 //!
-//! The coordinator single-flights OAuth acquisition per cache key using an OS
-//! advisory lock, so one browser dance is shared and failures are coalesced
+//! The coordinator single-flights OAuth acquisition per cache key. Within one
+//! process, same-key callers coalesce on an in-memory `INFLIGHT` registry
+//! *before* the file lock; across processes, they serialize on an OS advisory
+//! lock and share success through the on-disk cache, with failures coalesced
 //! through a durable cooldown sidecar. These tests drive the public API
 //! (`acquire_with_intent`, `interactive_login`) with an injected
 //! [`BrowserOpener`] that scripts the localhost callback instead of popping a
 //! real window — the browser step becomes deterministic and countable.
 //!
-//! Two `PkceOAuthTokenSource` instances sharing one cache path model two
-//! processes: `File::try_lock` is per open-file-description, so distinct
-//! handles contend whether or not they live in the same process. The
-//! lock-primitive, crash-release, and lock-timeout edges live in the in-crate
-//! `auth::tests` module where the private helpers are reachable.
+//! Two `PkceOAuthTokenSource` instances in ONE process do not model two
+//! processes: the `INFLIGHT` registry intercepts them before the file lock, so
+//! same-process tests exercise the in-memory single-flight, not the
+//! cross-process protocol. The genuinely cross-process claims — lock
+//! contention, crash release, cooldown sharing across a process boundary, and
+//! one-grant/one-cache under a real race — are proved with the `lock-holder`
+//! and `auth-worker` helper binaries, each a real second process on the same
+//! lock file and cache. The lock-primitive and lock-timeout edges live in the
+//! in-crate `auth::tests` module where the private helpers are reachable.
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
@@ -141,6 +147,11 @@ enum RefreshMode {
     /// `500` — a provider-side fault, transient rather than a credential
     /// decision.
     ServerError,
+    /// A 4xx with the given OAuth `error` code in the body. Lets a test assert
+    /// the coordinator treats `invalid_grant` (any 4xx) as a dead grant, but
+    /// every other error code — and any non-`invalid_grant` status like `429`
+    /// — as infrastructural rather than a credential rejection.
+    ClientError(axum::http::StatusCode, &'static str),
     /// Sleep `d` before answering, so the caller's per-request HTTP timeout
     /// elapses first (a transport timeout, not a verdict from the provider).
     Hang(Duration),
@@ -211,6 +222,9 @@ async fn spawn_stub_with(mode: RefreshMode) -> Stub {
                                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                                 Json(json!({ "error": "temporarily_unavailable" })),
                             ),
+                            RefreshMode::ClientError(status, error) => {
+                                (status, Json(json!({ "error": error })))
+                            }
                             RefreshMode::Succeed | RefreshMode::Hang(_) => (
                                 axum::http::StatusCode::OK,
                                 Json(json!({
@@ -301,7 +315,11 @@ async fn test_same_key_concurrent_callers_share_one_browser_attempt() {
     let cache = TempDir::new().unwrap();
     let opener = ScriptedOpener::new(Script::Approve);
 
-    // Two independent sources on the SAME cache key = two processes racing.
+    // Two independent sources on the same key in ONE process. The in-memory
+    // INFLIGHT registry coalesces them before the file lock, so this proves the
+    // in-process single-flight — one leader runs the browser flow, the other
+    // joins its published result. The genuine cross-process race is
+    // `test_crossprocess_two_coordinators_race_to_one_grant_and_cache`.
     let a = PkceOAuthTokenSource::new_with(
         config(&stub, "/disco/a", cache.path()),
         Arc::new(opener.clone()),
@@ -371,42 +389,45 @@ async fn test_denied_then_auto_reads_cooldown_without_second_launch() {
 }
 
 #[tokio::test]
-async fn test_userinitiated_denial_is_visible_to_crossprocess_auto() {
+async fn test_denial_sidecar_is_read_by_later_auto_in_same_process() {
     let stub = spawn_stub(false).await;
     let cache = TempDir::new().unwrap();
     let opener = ScriptedOpener::new(Script::Deny);
 
-    // Process A: an explicit UserInitiated attempt is denied.
-    let proc_a = PkceOAuthTokenSource::new_with(
+    // An explicit UserInitiated attempt is denied and records the durable
+    // cooldown sidecar.
+    let denier = PkceOAuthTokenSource::new_with(
         config(&stub, "/disco/a", cache.path()),
         Arc::new(opener.clone()),
     )
     .unwrap();
-    let denied = proc_a
+    let denied = denier
         .acquire_with_intent(AuthIntent::UserInitiated, None)
         .await;
     assert_eq!(denied, Err(AuthError::Denied));
     assert_eq!(opener.call_count(), 1);
 
-    // Process B: a passive Auto caller (distinct instance = distinct process)
-    // reads the durable sidecar A wrote and does not launch a second browser.
-    // This is the cross-policy edge: the sidecar is written for ANY failed
-    // interactive attempt, only the reader policy differs.
-    let proc_b = PkceOAuthTokenSource::new_with(
+    // A later passive Auto caller reads the sidecar and does not launch a
+    // second browser. This is the cross-policy read edge — the sidecar is
+    // written for ANY failed interactive attempt, only the reader policy
+    // differs. It is a SEQUENTIAL, same-process read; the genuinely
+    // cross-process, already-waiting variant is
+    // `test_crossprocess_userinitiated_denial_shared_with_waiting_auto`.
+    let later = PkceOAuthTokenSource::new_with(
         config(&stub, "/disco/a", cache.path()),
         Arc::new(opener.clone()),
     )
     .unwrap();
-    let auto = proc_b.acquire_with_intent(AuthIntent::Auto, None).await;
+    let auto = later.acquire_with_intent(AuthIntent::Auto, None).await;
     assert_eq!(
         auto,
         Err(AuthError::Denied),
-        "cross-process Auto reads the UserInitiated failure sidecar"
+        "a later Auto reads the UserInitiated failure sidecar"
     );
     assert_eq!(
         opener.call_count(),
         1,
-        "no second browser across the policy/process boundary"
+        "no second browser once the denial sidecar is recorded"
     );
 }
 
@@ -842,7 +863,131 @@ async fn test_refresh_server_error_is_network_unavailable_not_rejected() {
     assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
 }
 
-// ---- in-process joiner shares the leader's FAILURE result ----------------
+// ---- 4xx classification: only `invalid_grant` is a dead refresh token -----
+//
+// RFC 6749 §5.2 uses 400/401 token responses for several `error` codes, but
+// only `invalid_grant` means the refresh token is dead. Every other 4xx —
+// `invalid_request`, `invalid_client`, `unsupported_grant_type`,
+// `invalid_scope`, `408`, `429` — is a request/config/transient fault a
+// browser cannot repair, so it must stay infrastructural (`NetworkUnavailable`)
+// and never pop a browser. The classifier keys on the OAuth error body, not
+// the bare status class.
+
+#[tokio::test]
+async fn test_refresh_400_invalid_grant_is_dead_grant_not_network() {
+    // A 400 (not just 401) carrying `invalid_grant` is still a dead refresh
+    // token, so a Headless caller must classify it terminally as
+    // RefreshRejected — proving the decision is the body error, not the status.
+    let stub = spawn_stub_with(RefreshMode::ClientError(
+        axum::http::StatusCode::BAD_REQUEST,
+        "invalid_grant",
+    ))
+    .await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "stale",
+            "refresh_token": "dead-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+    let result = src.acquire_with_intent(AuthIntent::Headless, None).await;
+    assert_eq!(
+        result,
+        Err(AuthError::RefreshRejected),
+        "a 400 invalid_grant is a dead refresh token, not infrastructural"
+    );
+    assert_eq!(opener.call_count(), 0, "Headless never opens a browser");
+    assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_refresh_400_invalid_request_is_network_unavailable_not_rejected() {
+    // A 400 `invalid_request` is a malformed/misconfigured request, not a dead
+    // credential. An interactive intent that COULD open a browser must NOT: a
+    // browser cannot repair it, so it surfaces as NetworkUnavailable.
+    let stub = spawn_stub_with(RefreshMode::ClientError(
+        axum::http::StatusCode::BAD_REQUEST,
+        "invalid_request",
+    ))
+    .await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "stale",
+            "refresh_token": "misconfigured-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+    let result = src
+        .acquire_with_intent(AuthIntent::UserInitiated, None)
+        .await;
+    assert_eq!(
+        result,
+        Err(AuthError::NetworkUnavailable),
+        "a non-invalid_grant 4xx is infrastructural, not a credential rejection"
+    );
+    assert_eq!(
+        opener.call_count(),
+        0,
+        "a browser cannot repair invalid_request, so none is opened"
+    );
+    assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_refresh_429_is_network_unavailable_not_rejected() {
+    // A 429 rate limit is a transient 4xx: retry later, don't sign in again.
+    // An interactive intent must not pop a browser off it.
+    let stub = spawn_stub_with(RefreshMode::ClientError(
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        "slow_down",
+    ))
+    .await;
+    let cache = TempDir::new().unwrap();
+    let opener = ScriptedOpener::new(Script::Approve);
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    seed_cache(
+        &cfg,
+        cache.path(),
+        json!({
+            "access_token": "stale",
+            "refresh_token": "rate-limited-refresh",
+            "expires_at": 1u64,
+        }),
+    );
+
+    let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+    let result = src
+        .acquire_with_intent(AuthIntent::UserInitiated, None)
+        .await;
+    assert_eq!(
+        result,
+        Err(AuthError::NetworkUnavailable),
+        "a 429 rate limit is transient, not a credential rejection"
+    );
+    assert_eq!(
+        opener.call_count(),
+        0,
+        "a rate limit must not trigger an interactive browser fallback"
+    );
+    assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
+}
 
 #[tokio::test]
 async fn test_two_concurrent_userinitiated_denials_share_one_browser() {
@@ -964,5 +1109,228 @@ async fn test_crossprocess_lock_holder_blocks_then_crash_release_lets_successor_
         opener.call_count(),
         0,
         "Headless successor recovers via refresh without a browser"
+    );
+}
+
+// ---- genuine cross-process coordinator races -----------------------------
+//
+// The `auth-worker` helper is a real second process running the PUBLIC
+// coordinator API against the shared cache. Unlike two in-process handles
+// (which the `INFLIGHT` registry coalesces before the file lock), these
+// workers contend on the OS advisory lock and share success through the
+// on-disk cache exactly as two Buzz processes on one machine would.
+
+/// A spawned `auth-worker`: its child handle plus the file it writes its JSON
+/// outcome to.
+struct Worker {
+    child: tokio::process::Child,
+    result_path: std::path::PathBuf,
+}
+
+#[derive(Deserialize)]
+struct WorkerOutcome {
+    result: String,
+    bearer: Option<String>,
+    launches: u64,
+}
+
+impl Worker {
+    /// Block until the worker exits, then parse its outcome file.
+    async fn join(mut self) -> WorkerOutcome {
+        let status = self.child.wait().await.expect("auth-worker joins");
+        assert!(
+            status.success(),
+            "auth-worker exited with failure: {status}"
+        );
+        let body = std::fs::read(&self.result_path).expect("auth-worker wrote its outcome");
+        serde_json::from_slice(&body).expect("auth-worker outcome parses")
+    }
+}
+
+/// Spawn an `auth-worker` child against `cfg`'s shared cache. `extra` sets the
+/// optional barrier-marker env vars ((name, path) pairs) a scenario needs to
+/// order events across processes.
+fn spawn_worker(
+    cfg: &PkceOAuthConfig,
+    cache_dir: &std::path::Path,
+    intent: &str,
+    script: &str,
+    tag: &str,
+    extra: &[(&str, &std::path::Path)],
+) -> Worker {
+    let result_path = cache_dir.join(format!("{tag}.result.json"));
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_auth-worker"));
+    cmd.env("AUTH_WORKER_DISCOVERY_URL", &cfg.discovery_url)
+        .env("AUTH_WORKER_CACHE_DIR", cache_dir)
+        .env("AUTH_WORKER_NAMESPACE", &cfg.cache_namespace)
+        .env("AUTH_WORKER_CLIENT_ID", &cfg.client_id)
+        .env("AUTH_WORKER_SCOPES", cfg.scopes.join(","))
+        .env("AUTH_WORKER_INTENT", intent)
+        .env("AUTH_WORKER_SCRIPT", script)
+        .env("AUTH_WORKER_RESULT", &result_path)
+        .kill_on_drop(true);
+    for (key, path) in extra {
+        cmd.env(key, path);
+    }
+    let child = cmd.spawn().expect("spawn the auth-worker helper process");
+    Worker { child, result_path }
+}
+
+async fn wait_for_marker(path: &std::path::Path, what: &str) {
+    for _ in 0..1000 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what} ({})", path.display());
+}
+
+#[tokio::test]
+async fn test_crossprocess_userinitiated_denial_shared_with_waiting_auto() {
+    // Two real processes on one key. The child runs a UserInitiated flow that
+    // is denied; while it holds the lock and its browser is open, the parent's
+    // Auto coordinator is already WAITING on the cross-process lock. The child
+    // must be released only once the parent is queued, so the denial the child
+    // records is what the waiting Auto observes — one launch total, durable
+    // Denied for both, across a genuine process boundary.
+    let stub = spawn_stub(false).await;
+    let cache = TempDir::new().unwrap();
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    let launched = cache.path().join("child.launched");
+    let proceed = cache.path().join("child.proceed");
+    let child = spawn_worker(
+        &cfg,
+        cache.path(),
+        "userinitiated",
+        "deny",
+        "denier",
+        &[
+            ("AUTH_WORKER_LAUNCHED_MARKER", launched.as_path()),
+            ("AUTH_WORKER_PROCEED_MARKER", proceed.as_path()),
+        ],
+    );
+
+    // Wait until the child holds the lock and has opened its (scripted)
+    // browser; its callback is withheld until we create `proceed`.
+    wait_for_marker(&launched, "child browser launch").await;
+
+    // The parent's Auto coordinator now contends for the same lock. It cannot
+    // proceed while the child holds it, so it is a genuine cross-process
+    // waiter.
+    let parent = PkceOAuthTokenSource::new_with(
+        config(&stub, "/disco/a", cache.path()),
+        Arc::new(ScriptedOpener::new(Script::Approve)),
+    )
+    .unwrap();
+    let auto =
+        tokio::spawn(async move { parent.acquire_with_intent(AuthIntent::Auto, None).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !auto.is_finished(),
+        "parent Auto must block while the child process holds the lock"
+    );
+
+    // Release the child's callback: it finishes the denial and writes the
+    // cooldown sidecar, then drops the lock.
+    std::fs::write(&proceed, b"go").unwrap();
+
+    let child_outcome = child.join().await;
+    assert_eq!(
+        child_outcome.result, "denied",
+        "child UserInitiated is denied"
+    );
+    assert_eq!(child_outcome.launches, 1, "child opens exactly one browser");
+
+    let auto_result = auto.await.expect("parent Auto task joins");
+    assert_eq!(
+        auto_result,
+        Err(AuthError::Denied),
+        "the already-waiting Auto reads the child's durable denial"
+    );
+    assert_eq!(
+        stub.code_grants.load(Ordering::SeqCst),
+        0,
+        "a denied flow never reaches the code exchange"
+    );
+}
+
+#[tokio::test]
+async fn test_crossprocess_two_coordinators_race_to_one_grant_and_cache() {
+    // Two real coordinator processes race on one key from a cold cache. They
+    // are released together (via a shared start marker) so both contend for the
+    // lock. Exactly one wins the browser flow and performs the single code
+    // grant; the other serializes behind the lock and adopts the winner's token
+    // from the shared cache. Both must observe the same bearer, and the private
+    // cache must hold exactly one parseable token artifact.
+    let stub = spawn_stub(false).await;
+    let cache = TempDir::new().unwrap();
+    let cfg = config(&stub, "/disco/a", cache.path());
+
+    let ready_a = cache.path().join("a.ready");
+    let ready_b = cache.path().join("b.ready");
+    let start = cache.path().join("start");
+
+    let worker_a = spawn_worker(
+        &cfg,
+        cache.path(),
+        "userinitiated",
+        "approve",
+        "a",
+        &[
+            ("AUTH_WORKER_READY_MARKER", ready_a.as_path()),
+            ("AUTH_WORKER_START_MARKER", start.as_path()),
+        ],
+    );
+    let worker_b = spawn_worker(
+        &cfg,
+        cache.path(),
+        "userinitiated",
+        "approve",
+        "b",
+        &[
+            ("AUTH_WORKER_READY_MARKER", ready_b.as_path()),
+            ("AUTH_WORKER_START_MARKER", start.as_path()),
+        ],
+    );
+
+    // Both processes are built and about to acquire; release them together.
+    wait_for_marker(&ready_a, "worker A ready").await;
+    wait_for_marker(&ready_b, "worker B ready").await;
+    std::fs::write(&start, b"go").unwrap();
+
+    let (out_a, out_b) = tokio::join!(worker_a.join(), worker_b.join());
+    assert_eq!(out_a.result, "ok", "worker A authenticates");
+    assert_eq!(out_b.result, "ok", "worker B authenticates");
+    let bearer_a = out_a.bearer.expect("worker A returns a bearer");
+    let bearer_b = out_b.bearer.expect("worker B returns a bearer");
+    assert_eq!(
+        bearer_a, bearer_b,
+        "both processes observe the same bearer from the shared cache"
+    );
+
+    // Exactly one browser launch and one code exchange across both processes.
+    assert_eq!(
+        out_a.launches + out_b.launches,
+        1,
+        "exactly one browser launch across the two coordinator processes"
+    );
+    assert_eq!(
+        stub.code_grants.load(Ordering::SeqCst),
+        1,
+        "exactly one authorization-code exchange across both processes"
+    );
+
+    // The private cache holds exactly one parseable token artifact carrying the
+    // shared bearer.
+    let cache_path = cache_file_path(&cfg, cache.path());
+    let raw = std::fs::read(&cache_path).expect("cache file exists");
+    let cached: serde_json::Value =
+        serde_json::from_slice(&raw).expect("cache holds one parseable token artifact");
+    assert_eq!(
+        cached.get("access_token").and_then(|v| v.as_str()),
+        Some(bearer_a.as_str()),
+        "the cached token is the shared bearer"
     );
 }

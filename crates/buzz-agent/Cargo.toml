@@ -32,6 +32,16 @@ path = "tests/bin/fake_mcp.rs"
 name = "lock-holder"
 path = "tests/bin/lock_holder.rs"
 
+# Test-only auth worker: a real second process that runs the PUBLIC auth
+# coordinator API (`acquire_with_intent`) with a scripted browser opener and a
+# shared temp cache, so the auth tests can prove the cross-process single-flight
+# contract end-to-end — durable cooldown sharing and one-grant/one-cache races
+# across a genuine process boundary, not two in-process handles. Only used by
+# the databricks auth integration tests.
+[[bin]]
+name = "auth-worker"
+path = "tests/bin/auth_worker.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "process", "time", "net"] }
 serde = { workspace = true }

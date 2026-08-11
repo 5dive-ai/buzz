@@ -164,6 +164,108 @@ async fn spawn_capturing_fake_llm_with_statuses(
     (url, captures)
 }
 
+/// A capturing fake LLM whose FIRST provider response is withheld until
+/// `gate` fires. Later responses are served immediately. Used to make
+/// round-boundary races deterministic: hold round 1 open until a client action
+/// (e.g. a steer) is confirmed, so the second round observes it. Request bodies
+/// are recorded into `captures` exactly as `spawn_capturing_fake_llm` does.
+async fn spawn_gated_capturing_fake_llm(
+    responses: Vec<CannedResponse>,
+    captures: Arc<Mutex<Vec<Value>>>,
+    gate: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+    let captures_clone = captures.clone();
+    tokio::spawn(async move {
+        let mut request_num = 0usize;
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let queue = queue.clone();
+            let captures = captures_clone.clone();
+            let gate = gate.clone();
+            request_num += 1;
+            let req_num = request_num;
+            tokio::spawn(async move {
+                // Read headers.
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                    if buf.len() > 2_000_000 {
+                        return;
+                    }
+                }
+                let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let header_str = String::from_utf8_lossy(&buf[..header_end]);
+                let content_length: usize = header_str
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_lowercase();
+                        if lower.starts_with("content-length:") {
+                            lower
+                                .trim_start_matches("content-length:")
+                                .trim()
+                                .parse()
+                                .ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let mut body_buf = buf[header_end..].to_vec();
+                while body_buf.len() < content_length {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => body_buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                if let Ok(parsed) =
+                    serde_json::from_slice::<Value>(&body_buf[..content_length.min(body_buf.len())])
+                {
+                    captures.lock().await.push(parsed);
+                }
+
+                // Hold the first request's response until the gate opens.
+                if req_num == 1 {
+                    let rx = gate.lock().await.take();
+                    if let Some(rx) = rx {
+                        let _ = rx.await;
+                    }
+                }
+
+                let response = queue.lock().await.pop_front().unwrap_or(CannedResponse {
+                    status: 500,
+                    body: json!({ "error": "no canned response" }),
+                });
+                let body_s = serde_json::to_string(&response.body).unwrap();
+                let reason = if response.status == 200 {
+                    "OK"
+                } else {
+                    "Error"
+                };
+                let resp = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.status,
+                    reason,
+                    body_s.len(),
+                    body_s,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (url, captures)
+}
+
 struct Harness {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
@@ -776,14 +878,37 @@ async fn recv_active_run_id(h: &mut Harness) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_folds_into_active_turn_without_cancelling() {
+    use tokio::sync::oneshot;
+
     // A two-round turn (tool call → text). A steer sent once the run is live
     // must (a) be accepted with the matching runId, (b) NOT cancel the turn —
     // it still ends with end_turn — and (c) reach the provider as a user turn.
-    let (url, captures) = spawn_capturing_fake_llm(vec![
-        openai_tool_call("call_steer", "fake__noop", json!({})),
-        openai_text("acknowledged the steer"),
-    ])
-    .await;
+    //
+    // The steer is drained only at a round boundary (before the next provider
+    // request), so it must be enqueued before round 2 begins. Without
+    // synchronization a fast worker can complete round 1, drain an empty steer
+    // queue at the round-2 boundary, and dispatch round 2 before the steer is
+    // even sent — the steer then lands after the turn ends and never reaches
+    // the provider. To make this deterministic, the FIRST provider response is
+    // gated: it is withheld until the steer has been sent AND observed
+    // accepted, so round 1 cannot complete (and round 2 cannot start its drain)
+    // until the steer is already queued.
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+
+    let responses = vec![
+        CannedResponse {
+            status: 200,
+            body: openai_tool_call("call_steer", "fake__noop", json!({})),
+        },
+        CannedResponse {
+            status: 200,
+            body: openai_text("acknowledged the steer"),
+        },
+    ];
+    let captures: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let (url, _) = spawn_gated_capturing_fake_llm(responses, captures.clone(), gate_rx).await;
+
     let mut h = Harness::spawn(&url).await;
     let sid = init_session(&mut h).await;
 
@@ -797,7 +922,8 @@ async fn steer_folds_into_active_turn_without_cancelling() {
         )
         .await;
 
-    // Learn the run id, then steer into it before the turn finishes.
+    // Learn the run id (advertised before the gated round-1 request), then steer
+    // into the live turn while round 1 is still held.
     let run_id = recv_active_run_id(&mut h).await;
     let steer_text = "STEER-CANARY: also consider the edge case";
     let s_id = h
@@ -811,9 +937,12 @@ async fn steer_folds_into_active_turn_without_cancelling() {
         )
         .await;
 
-    // Steer is accepted and echoes the run id it landed in.
+    // Steer is accepted and echoes the run id it landed in. Only after this
+    // confirmation do we release the gate, so the steer is guaranteed queued
+    // before round 2's boundary drains it.
     let mut steer_ok = false;
     let mut end_turn = false;
+    let mut gate = Some(gate_tx);
     for _ in 0..40 {
         let v = h.recv().await;
         if v["id"] == json!(s_id) {
@@ -829,6 +958,11 @@ async fn steer_folds_into_active_turn_without_cancelling() {
                 "steer reply carries a messageId"
             );
             steer_ok = true;
+            // Steer accepted — release round 1 so the turn proceeds to round 2,
+            // whose boundary now drains the queued steer.
+            if let Some(tx) = gate.take() {
+                let _ = tx.send(());
+            }
         } else if v["id"] == json!(p_id) {
             // The turn was NOT cancelled — it completed normally.
             assert_eq!(v["result"]["stopReason"], "end_turn");

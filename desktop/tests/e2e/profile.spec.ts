@@ -1112,28 +1112,19 @@ test("renders agent profile ingress subviews from the Playwright mock bridge", a
   });
   await expect(primaryActions).not.toHaveAttribute("aria-hidden", "true");
   await expect(primaryActions).toHaveCSS("opacity", "0.75");
-  await expect(primaryActions).toHaveCSS(
-    "transform",
-    "matrix(0.825, 0, 0, 0.825, 0, 0)",
-  );
+  await expect(primaryActions).toHaveCSS("transform", "none");
   await profileScrollBody.evaluate((element) => {
     element.scrollTop = 48;
   });
   await expect(primaryActions).not.toHaveAttribute("aria-hidden", "true");
   await expect(primaryActions).toHaveCSS("opacity", "0.5");
-  await expect(primaryActions).toHaveCSS(
-    "transform",
-    "matrix(0.65, 0, 0, 0.65, 0, 0)",
-  );
+  await expect(primaryActions).toHaveCSS("transform", "none");
   await profileScrollBody.evaluate((element) => {
     element.scrollTop = 96;
   });
   await expect(primaryActions).toHaveAttribute("aria-hidden", "true");
   await expect(primaryActions).toHaveCSS("opacity", "0");
-  await expect(primaryActions).toHaveCSS(
-    "transform",
-    "matrix(0.65, 0, 0, 0.65, 0, 0)",
-  );
+  await expect(primaryActions).toHaveCSS("transform", "none");
   await profileScrollBody.evaluate((element) => {
     element.scrollTop = 0;
   });

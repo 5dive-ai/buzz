@@ -123,9 +123,7 @@ const PROFILE_HERO_SPACING = {
   "0": 0,
   "6": 24,
 } as const;
-const PROFILE_ACTIONS_FADE_DISTANCE_PX = 96;
-const PROFILE_ACTIONS_SCALE_DISTANCE_PX = 48;
-const PROFILE_ACTIONS_MIN_SCALE = 0.65;
+const PROFILE_ACTIONS_SCROLL_DISTANCE_PX = 96;
 
 const PROFILE_HERO_PRESENCE_BADGE = {
   cutout: { cx: 68, cy: 68, r: 15 },
@@ -335,8 +333,6 @@ export function ProfileSummaryView({
     ) {
       if (primaryActionsElement) {
         primaryActionsElement.style.opacity = "";
-        primaryActionsElement.style.scale = "";
-        primaryActionsElement.style.transform = "";
       }
       setPrimaryActionsConcealed(false);
       onStickyChromeChange({ active: false, height: 0 });
@@ -352,19 +348,13 @@ export function ProfileSummaryView({
 
       if (primaryActionsElement) {
         const actionsProgress = Math.min(
-          Math.max(scrollBody.scrollTop / PROFILE_ACTIONS_FADE_DISTANCE_PX, 0),
+          Math.max(
+            scrollBody.scrollTop / PROFILE_ACTIONS_SCROLL_DISTANCE_PX,
+            0,
+          ),
           1,
         );
-        const actionsScaleProgress = Math.min(
-          Math.max(scrollBody.scrollTop / PROFILE_ACTIONS_SCALE_DISTANCE_PX, 0),
-          1,
-        );
-        const actionsScale =
-          1 - actionsScaleProgress * (1 - PROFILE_ACTIONS_MIN_SCALE);
         primaryActionsElement.style.opacity = String(1 - actionsProgress);
-        primaryActionsElement.style.scale = "";
-        primaryActionsElement.style.transform =
-          actionsProgress === 0 ? "" : `scale(${actionsScale})`;
         setPrimaryActionsConcealed(actionsProgress >= 1);
       }
       onStickyChromeChange({
@@ -398,8 +388,6 @@ export function ProfileSummaryView({
       window.removeEventListener("resize", scheduleStickyChromeUpdate);
       if (primaryActionsElement) {
         primaryActionsElement.style.opacity = "";
-        primaryActionsElement.style.scale = "";
-        primaryActionsElement.style.transform = "";
       }
       setPrimaryActionsConcealed(false);
       onStickyChromeChange({ active: false, height: 0 });
@@ -414,7 +402,7 @@ export function ProfileSummaryView({
 
   const primaryActionsMotionClassName = isBot
     ? cn(
-        "origin-top will-change-[opacity,transform]",
+        "will-change-[opacity]",
         primaryActionsConcealed && "pointer-events-none",
       )
     : undefined;

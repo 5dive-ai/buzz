@@ -1183,6 +1183,16 @@ mod tests {
         .expect("read applied migrations")
     }
 
+    /// Read the head version from `MIGRATOR` rather than hardcoding it —
+    /// otherwise every new migration file breaks these assertions.
+    fn latest_migration_version() -> i64 {
+        MIGRATOR
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .expect("migrations exist")
+    }
+
     /// The migration connection must have both limits lifted, and it must not
     /// come back to the pool afterwards — a session with no statement timeout
     /// serving traffic is the failure this exemption trades against.
@@ -1311,7 +1321,10 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
+        assert_eq!(
+            applied_versions(&pool).await.last().copied(),
+            Some(latest_migration_version())
+        );
     }
 
     /// A pool whose connections carry `timeout` for both runtime limits.
@@ -1424,7 +1437,10 @@ mod tests {
         run_migrations(&capped)
             .await
             .expect("migrations must not inherit the runtime caps during the legacy preflight");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(26));
+        assert_eq!(
+            applied_versions(&pool).await.last().copied(),
+            Some(latest_migration_version())
+        );
 
         // And the caps are still in force for traffic afterwards.
         let mut runtime = capped.acquire().await.expect("acquire after migration");

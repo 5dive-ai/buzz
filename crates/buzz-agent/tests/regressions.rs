@@ -2591,16 +2591,15 @@ async fn repeated_max_tokens_is_bounded() {
     h.shutdown().await;
 }
 
-/// The configured value is the exact number of retries: N recoveries produce
-/// N+1 truncating requests, then surface `max_tokens` without another call.
+/// The default value is the exact number of retries: three recoveries produce
+/// four truncating requests, then surface `max_tokens` without another call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn max_tokens_recovery_budget_is_exact() {
+async fn default_max_tokens_recovery_budget_is_exact() {
     let responses = (0..5)
         .map(|_| openai_max_tokens("truncated", json!([])))
         .collect();
     let llm = spawn_capturing_llm(responses).await;
-    let mut h =
-        Harness::spawn_with_env(&llm.url, &[("BUZZ_AGENT_MAX_TOKEN_RECOVERIES", "3")]).await;
+    let mut h = Harness::spawn(&llm.url).await;
     let sid = init_session(&mut h, json!([])).await;
     let prompt_id = h
         .send(

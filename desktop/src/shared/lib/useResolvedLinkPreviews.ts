@@ -2,9 +2,20 @@ import * as React from "react";
 
 import { invokeTauri } from "@/shared/api/tauri";
 import { relayClient } from "@/shared/api/relayClient";
+import type { RelayEvent } from "@/shared/api/types";
+import {
+  eventToExplicitProject,
+  eventToRepository,
+} from "@/features/projects/projectModels";
+import { eventToProjectIssue } from "@/features/projects/projectIssues.mjs";
+import { eventToProjectPullRequest } from "@/features/projects/projectPullRequests.mjs";
 import {
   KIND_GIT_ISSUE,
   KIND_GIT_PULL_REQUEST,
+  KIND_GIT_STATUS_CLOSED,
+  KIND_GIT_STATUS_DRAFT,
+  KIND_GIT_STATUS_MERGED,
+  KIND_GIT_STATUS_OPEN,
   KIND_PROJECT_ANNOUNCEMENT,
   KIND_REPO_ANNOUNCEMENT,
 } from "@/shared/constants/kinds";
@@ -202,91 +213,147 @@ function fetchLinkPreviewMetadata(
 const metadataLoader = createMetadataLoader({
   fetcher: fetchLinkPreviewMetadata,
 });
-function buzzEntityMetadata(
-  title: string | null | undefined,
-  description?: string | null,
-): LinkPreviewMetadata | null {
-  return title
-    ? {
-        title,
-        siteName: "Buzz",
-        description: description || null,
-        imageDataUrl: null,
-        imageDomain: null,
-      }
-    : null;
+const ENTITY_STATUS_KINDS = [
+  KIND_GIT_STATUS_OPEN,
+  KIND_GIT_STATUS_MERGED,
+  KIND_GIT_STATUS_CLOSED,
+  KIND_GIT_STATUS_DRAFT,
+];
+
+type EntityEventFetcher = (
+  filter: Parameters<typeof relayClient.fetchEvents>[0],
+) => Promise<RelayEvent[]>;
+
+function compactMetadata(
+  parts: Array<string | null | undefined>,
+): string | null {
+  const values = parts.filter((part): part is string => Boolean(part));
+  return values.length > 0 ? values.join(" · ") : null;
 }
 
-/**
- * Resolve the display name of an addressable coordinate (`kind:owner:d`) from
- * its announcement event. Returns null when the relay has no such event, which
- * drops the card rather than advertising a coordinate nobody can open.
- */
-async function loadCoordinateMetadata(
-  kind: number,
-  owner: string,
-  dtag: string,
+/** Resolve builder-focused metadata only from the active relay. */
+export async function fetchBuzzEntityMetadata(
+  href: string,
+  fetchEvents: EntityEventFetcher = (filter) => relayClient.fetchEvents(filter),
 ): Promise<LinkPreviewMetadata | null> {
-  const events = await relayClient.fetchEvents({
-    kinds: [kind],
+  const parsed = parseEntityLink(href);
+  if (!parsed.ok) return null;
+
+  const { owner, dtag } = parsed.value;
+  if (parsed.value.type === "project") {
+    const projectAddress = `${KIND_PROJECT_ANNOUNCEMENT}:${owner}:${dtag}`;
+    const projectEvents = await fetchEvents({
+      kinds: [KIND_PROJECT_ANNOUNCEMENT],
+      authors: [owner],
+      "#d": [dtag],
+      limit: 1,
+    });
+    // Repository maps are only needed to resolve a project's repository read
+    // models, which the card does not show — empty maps still validate the
+    // announcement envelope and resolve name/description.
+    const project = projectEvents
+      .map((event) => eventToExplicitProject(event, new Map(), new Map()))
+      .find((candidate) => candidate?.projectAddress === projectAddress);
+    if (!project) return null;
+
+    const repositoryCount = project.repositoryAddresses.length;
+    return {
+      siteName: project.name,
+      faviconDataUrl: null,
+      imageDataUrl: null,
+      imageDomain: null,
+      title: project.description || project.name,
+      description: compactMetadata([
+        repositoryCount > 0
+          ? `${repositoryCount} ${repositoryCount === 1 ? "repository" : "repositories"}`
+          : null,
+      ]),
+    };
+  }
+
+  const repoAddress = `${KIND_REPO_ANNOUNCEMENT}:${owner}:${dtag}`;
+  const repoEvents = await fetchEvents({
+    kinds: [KIND_REPO_ANNOUNCEMENT],
     authors: [owner],
     "#d": [dtag],
     limit: 1,
   });
-  const event = events[0];
-  if (!event) return null;
+  const repository = repoEvents
+    .map((event) => eventToRepository(event))
+    .find((candidate) => candidate?.repoAddress === repoAddress);
+  if (!repository) return null;
 
-  const tag = (name: string) =>
-    event.tags.find((entry) => entry[0] === name)?.[1] || null;
-  return buzzEntityMetadata(tag("name") ?? dtag, tag("description"));
+  const base = {
+    siteName: repository.name,
+    faviconDataUrl: null,
+    imageDataUrl: null,
+    imageDomain: null,
+  };
+  if (parsed.value.type === "repo") {
+    return {
+      ...base,
+      title: repository.description || repository.name,
+      description: compactMetadata([
+        repository.status,
+        `default: ${repository.defaultBranch}`,
+      ]),
+    };
+  }
+
+  const { id, type } = parsed.value;
+  const rootEvents = await fetchEvents({
+    kinds: [type === "pr" ? KIND_GIT_PULL_REQUEST : KIND_GIT_ISSUE],
+    ids: [id],
+    limit: 1,
+  });
+  const root = rootEvents.find((event) => {
+    const repositoryTags = event.tags.filter((tag) => tag[0] === "a");
+    return (
+      event.id === id &&
+      repositoryTags.length === 1 &&
+      repositoryTags[0][1] === repoAddress
+    );
+  });
+  if (!root) return null;
+
+  const trustedAuthors = [...new Set([root.pubkey.toLowerCase(), owner])];
+  const statusEvents = await fetchEvents({
+    kinds: ENTITY_STATUS_KINDS,
+    authors: trustedAuthors,
+    "#e": [id],
+    limit: 20,
+  });
+  if (type === "issue") {
+    const issue = eventToProjectIssue(root, statusEvents);
+    return {
+      ...base,
+      title: issue.title,
+      description: compactMetadata([issue.status, ...issue.labels.slice(0, 2)]),
+    };
+  }
+
+  const pullRequest = eventToProjectPullRequest(root, [], [], statusEvents);
+  const source = pullRequest.branchName;
+  const target = pullRequest.targetBranch ?? repository.defaultBranch;
+  return {
+    ...base,
+    title: pullRequest.title,
+    description: compactMetadata([
+      pullRequest.status,
+      source ? `${source} → ${target}` : null,
+      pullRequest.commit?.slice(0, 7),
+    ]),
+  };
 }
 
-const entityTitleLoader = createMetadataLoader({
-  fetcher: async (href) => {
-    const parsed = parseEntityLink(href);
-    if (!parsed.ok) return null;
-
-    const link = parsed.value;
-    if (link.type === "repo") {
-      return loadCoordinateMetadata(
-        KIND_REPO_ANNOUNCEMENT,
-        link.owner,
-        link.dtag,
-      );
-    }
-    if (link.type === "project") {
-      return loadCoordinateMetadata(
-        KIND_PROJECT_ANNOUNCEMENT,
-        link.owner,
-        link.dtag,
-      );
-    }
-
-    const { id, owner, dtag } = link;
-    const expectedCoordinate = `30617:${owner}:${dtag}`;
-    const events = await relayClient.fetchEvents({
-      kinds: [link.type === "pr" ? KIND_GIT_PULL_REQUEST : KIND_GIT_ISSUE],
-      ids: [id],
-      limit: 1,
-    });
-    const event = events[0];
-    if (
-      !event?.tags.some(
-        (tag) => tag[0] === "a" && tag[1] === expectedCoordinate,
-      )
-    ) {
-      return null;
-    }
-
-    const subject = event.tags.find((tag) => tag[0] === "subject")?.[1];
-    return buzzEntityMetadata(subject || event.content.split("\n")[0]);
-  },
+const entityMetadataLoader = createMetadataLoader({
+  fetcher: fetchBuzzEntityMetadata,
 });
 
 /** Clear ephemeral metadata when the active relay/community changes. */
 export function resetLinkPreviewMetadataCache(): void {
   metadataLoader.reset();
-  entityTitleLoader.reset();
+  entityMetadataLoader.reset();
 }
 
 export type LinkPreviewImageState = "pending" | "image" | "fallback" | "none";
@@ -316,7 +383,10 @@ export function resolveLinkPreview(
   metadata: LinkPreviewMetadata | null | undefined,
 ): ResolvedLinkPreview {
   if (metadata === undefined) {
-    return { ...preview, imageState: "pending" };
+    return {
+      ...preview,
+      imageState: isBuzzEntityPreview(preview) ? "none" : "pending",
+    };
   }
   if (metadata === null) {
     return { ...preview, imageState: "none" };
@@ -337,13 +407,46 @@ export function resolveLinkPreview(
     description: metadata.description,
     faviconDataUrl: metadata.faviconDataUrl,
     provider:
-      preview.kind === "generic-link" && metadata.siteName
+      (preview.kind === "generic-link" || isBuzzEntityPreview(preview)) &&
+      metadata.siteName
         ? metadata.siteName
         : preview.provider,
     imageDataUrl: hasImage ? metadata.imageDataUrl : null,
     imageDomain: hasImage ? metadata.imageDomain : null,
     imageState,
   };
+}
+
+export function isBuzzEntityPreview(preview: SupportedLinkPreview): boolean {
+  return (
+    preview.kind === "buzz-pull-request" ||
+    preview.kind === "buzz-issue" ||
+    preview.kind === "buzz-repository" ||
+    preview.kind === "buzz-project"
+  );
+}
+
+/**
+ * Recipient-side `buzz://` entity cards must render even when the relay
+ * lookup yields no metadata: `useResolvedLinkPreviews` drops null-metadata
+ * previews (correct for external links — no metadata means no card), but
+ * entity links always carry a usable fallback title (the repo d-tag, or
+ * `<dtag> #<id8>` for PRs/issues — see `buzzEntityFallbackTitle`). Re-adds
+ * recognized entity previews on their fallback title; non-entity previews
+ * keep the hook's drop behavior.
+ */
+export function withEntityFallbacks(
+  previews: SupportedLinkPreview[],
+  resolved: ResolvedLinkPreview[],
+): ResolvedLinkPreview[] {
+  const byHref = new Map(resolved.map((preview) => [preview.href, preview]));
+  return previews.flatMap((preview) => {
+    const match = byHref.get(preview.href);
+    if (match) return [match];
+    return isBuzzEntityPreview(preview)
+      ? [{ ...preview, imageState: "none" as const }]
+      : [];
+  });
 }
 
 export function useResolvedLinkPreviews(
@@ -383,7 +486,7 @@ export function useResolvedLinkPreviews(
     const cancelScheduledLoads: Array<() => void> = [];
     for (const preview of previews) {
       const loader = preview.href.startsWith("buzz://")
-        ? entityTitleLoader
+        ? entityMetadataLoader
         : metadataLoader;
       const cached = loader.peek(preview.href);
       if (cached !== undefined) {

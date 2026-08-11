@@ -967,6 +967,22 @@ impl AgentPool {
         //   confirmed to not advertise thought_level; future picks are rejected)
         // `None` → Unknown (capability not yet resolved; keep the pre-first-
         //   session trust path active for the next session)
+        //
+        // Multi-worker coarseness (BUZZ_ACP_AGENTS 1..=32, config.rs): the pool
+        // holds ONE tri-state for a pool whose workers may be on heterogeneous
+        // models. Every return unconditionally re-derives that single state from
+        // the returning worker — so with parallel workers, an unrelated worker
+        // returning during a busy-switch window can overwrite the `Unknown` this
+        // fix installs with its own (old-model) `Supported` snapshot. This is not
+        // introduced here — `return_agent` has always re-derived pool state from
+        // every returning agent — and it is bounded: an effort pick validated
+        // against a stale set is applied at next session creation via
+        // `session_set_config_option`, where an invalid value on the new model
+        // draws the adapter rejection → failure ack → no-persist/rollback path
+        // ratified in the F1/F2 effort machinery. It is the same singleton-over-
+        // heterogeneous-pool coarseness as the already-accepted "pool effort
+        // converges via startup resolution at next spawn" MINOR, so a switch
+        // epoch/generation is deliberately NOT added.
         match &agent.model_capabilities {
             Some(caps) if caps.thought_level_config_id.is_some() => {
                 let config_id = caps.thought_level_config_id.clone().unwrap();
@@ -8973,21 +8989,200 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         );
     }
 
-    /// Finding A regression: when a busy worker accepts `ControlSignal::SwitchModel`,
-    /// it clears its own `model_capabilities` before returning. `return_agent`
-    /// then derives `Unknown` from `None` — not `Supported` from the stale
-    /// outgoing-model snapshot. A concurrent effort pick in the window between
-    /// the worker's return and the requeued session's switch response therefore
-    /// takes the pre-discovery trust path instead of validating against the
-    /// wrong model's config set.
+    /// Finding A regression (production path): a busy worker whose in-flight
+    /// prompt is cancelled by `ControlSignal::SwitchModel` must clear its own
+    /// `model_capabilities` so that `return_agent` derives `Unknown` (pre-
+    /// discovery trust path) rather than restoring the OUTGOING model's stale
+    /// `Supported` snapshot. Restoring `Supported` would reopen the concurrent-
+    /// pick window: an effort pick arriving after the worker returns but before
+    /// the requeued session's switch response would validate against the wrong
+    /// model's config set.
     ///
-    /// This test exercises the unit invariant directly: the cleared-capabilities
-    /// path feeds `return_agent` the same state that the production SwitchModel
-    /// handler produces.
+    /// This drives the REAL production handler — `run_prompt_task`'s `select!`
+    /// cancel arm at the `ControlSignal::SwitchModel` branch — with a scripted
+    /// ACP that holds the prompt open until `session/cancel` arrives. The worker
+    /// starts carrying a `Supported` snapshot for the outgoing model (the state
+    /// a worker holds mid-turn after its `session/new`); the clearing is done by
+    /// production code, not injected by the test. Mutation guard: deleting the
+    /// `agent.model_capabilities = None;` line in that branch makes this fail
+    /// (the returned worker keeps `Some(Supported)` → `return_agent` restores
+    /// `Supported`).
     #[tokio::test]
     async fn test_busy_switch_clears_capabilities_so_return_preserves_unknown() {
-        // Start with a Supported pool — worker carries the outgoing model's snapshot.
-        let mut pool = AgentPool::from_slots(vec![None]); // slot empty = worker checked out
+        use crate::queue::BatchEvent;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Scripted ACP for a PRE-SEEDED session: the first (and only) wire
+        // request is `session/prompt` (id 0, since no `session/new` consumed an
+        // id). The prompt line is read and ignored (no reply), so the harness's
+        // prompt future stays pending and the biased `select!` can poll the
+        // already-armed control oneshot — the genuine busy in-flight window.
+        // Only once production issues `session/cancel` do we reply `cancelled`
+        // to the still-open prompt (id 0), draining the cancel cleanly.
+        let script = r#"
+            while IFS= read -r line; do
+                case "$line" in
+                    *session/cancel*)
+                        printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"cancelled"}}'
+                        ;;
+                esac
+            done
+        "#;
+        let acp = crate::acp::AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("failed to spawn busy-switch ACP");
+
+        let channel_id = Uuid::new_v4();
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            // The worker already discovered the OUTGOING model's Supported
+            // snapshot at its session/new — this is legitimate pre-transition
+            // state, not the post-transition state under test.
+            model_capabilities: Some(AgentModelCapabilities {
+                thought_level_config_id: Some("effort".to_string()),
+                config_options_raw: vec![serde_json::json!({
+                    "id": "effort",
+                    "category": "thought_level",
+                    "options": [{"value": "low"}, {"value": "high"}]
+                })],
+                available_models_raw: None,
+            }),
+            desired_model: None,
+            model_overridden: false,
+            desired_effort: None,
+            startup_effort: None,
+            desired_effort_gen: None,
+            pending_effort_nonce: None,
+            last_effort_result: None,
+            agent_name: "busy-switch-test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        // Pre-seed the channel session so run_prompt_task skips session/new and
+        // issues the prompt directly on the existing (outgoing-model) session.
+        agent.state.sessions.insert(channel_id, "ses_busy".into());
+        agent
+            .state
+            .deliveries
+            .insert(channel_id, ChannelDeliveryState::default());
+
+        // A single-event channel batch; context_message_limit stays 0 so no
+        // conversation context is fetched.
+        let event = EventBuilder::new(Kind::Custom(9), "please switch")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        // The batch author's kind:0 profile is looked up before the prompt is
+        // written. Point the REST client at a fast local stub that returns an
+        // empty event array so that fetch (and any best-effort profile retry)
+        // resolves in microseconds instead of retrying twice against a dead
+        // base_url (~6.5s per fetch). channel_info is seeded from cache below,
+        // so `resolve` never touches REST.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind context stub");
+        let stub_url = format!("http://{}", listener.local_addr().unwrap());
+        let stub = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0; 16 * 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = "[]";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.dedup_mode = DedupMode::Queue; // busy switch requeues the batch
+        ctx.rest_client.base_url = stub_url.clone();
+        // Seed channel_info so `resolve` hits the cache and skips REST entirely.
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                ChannelInfo {
+                    name: "test-dm".into(),
+                    channel_type: "dm".into(),
+                },
+            )]),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url: stub_url,
+                keys: ctx.agent_keys.clone(),
+                auth_tag_json: None,
+            },
+        );
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let (effort_report_tx, _effort_report_rx) = mpsc::unbounded_channel();
+
+        // Deliver the SwitchModel signal over the control oneshot. The biased
+        // select! polls the prompt arm first (writing the prompt, arming
+        // last_prompt_id), then the ready control arm wins — the exact busy
+        // in-flight cancel the fix must handle.
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(ControlSignal::SwitchModel("model-b".to_string()))
+            .expect("control receiver live");
+
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            ctx,
+            result_tx,
+            effort_report_tx,
+            Some(control_rx),
+            "busy-switch-turn".into(),
+        )
+        .await;
+
+        let result = result_rx.recv().await.expect("PromptResult must be sent");
+        assert!(
+            matches!(result.outcome, PromptOutcome::Cancelled),
+            "busy switch must cancel the in-flight turn"
+        );
+        let mut returned = result.agent;
+
+        // The production SwitchModel handler must have landed the switch AND
+        // cleared the outgoing model's capabilities.
+        assert_eq!(
+            returned.desired_model.as_deref(),
+            Some("model-b"),
+            "SwitchModel handler must set desired_model for the requeued session"
+        );
+        assert!(
+            returned.model_overridden,
+            "SwitchModel handler must mark the override"
+        );
+        assert!(
+            returned.model_capabilities.is_none(),
+            "SwitchModel handler must clear the outgoing model's capabilities so \
+             return_agent cannot restore stale Supported"
+        );
+
+        returned.acp.shutdown().await;
+        stub.abort();
+
+        // Pool starts Supported (handle_switch_model_control set it Unknown, but
+        // the returning worker must not undo that). return_agent derives from
+        // the returned worker's None → Unknown.
+        let mut pool = AgentPool::from_slots(vec![None]);
         pool.notify_capabilities_discovered(&AgentModelCapabilities {
             thought_level_config_id: Some("effort".to_string()),
             config_options_raw: vec![serde_json::json!({
@@ -9005,37 +9200,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             "setup: pool must start Supported"
         );
 
-        // handle_switch_model_control (busy path) sets pool to Unknown synchronously…
-        pool.effort_capability_state = EffortCapabilityState::Unknown;
-
-        // …and the production SwitchModel handler on the worker clears its own
-        // model_capabilities. Build a worker whose capabilities were cleared by
-        // that handler (model_capabilities: None), matching the post-signal state.
-        // ACP is a sleeping process — no methods are called on it; it exists only
-        // to satisfy the struct field.
-        let acp =
-            crate::acp::AcpClient::spawn("bash", &["-c".into(), "sleep 600".into()], &[], false)
-                .await
-                .expect("failed to spawn inert ACP for Finding A test");
-        let worker = OwnedAgent {
-            index: 0,
-            acp,
-            state: SessionState::default(),
-            // Cleared by the SwitchModel handler in the production run loop.
-            model_capabilities: None,
-            desired_model: Some("model-new".to_string()),
-            model_overridden: true,
-            desired_effort: None,
-            startup_effort: None,
-            desired_effort_gen: None,
-            pending_effort_nonce: None,
-            last_effort_result: None,
-            agent_name: "busy-switch-test".into(),
-            goose_system_prompt_supported: None,
-            protocol_version: 2,
-        };
-
-        pool.return_agent(worker);
+        pool.return_agent(returned);
 
         assert!(
             matches!(pool.effort_capability_state, EffortCapabilityState::Unknown),
@@ -9121,9 +9286,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             "failure control_result must carry the rejected modelId"
         );
 
-        // Pool must be Unknown after return (rejection cleared no capabilities, but
-        // the returned agent still has pre-switch caps → Supported; verify the correct
-        // pool derivation).
+        // A rejection preserves the pre-switch capabilities, so the returned
+        // agent still carries them → `return_agent` derives `Supported` from that
+        // intact snapshot (the session never left the default model).
         let mut pool = AgentPool::from_slots(vec![None]);
         pool.return_agent(agent);
         assert!(

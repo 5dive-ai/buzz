@@ -88,17 +88,48 @@ pub(crate) fn is_admin_host(state: &AppState, headers: &HeaderMap) -> bool {
         .is_some_and(|host| host == config.host)
 }
 
-/// Derive the canonical URL for a NIP-98 `u`-tag check.
+/// Scheme for an admin authority: `http://` for loopback hosts (localhost,
+/// `::1`, 127.x), else `https://` — matching local dev via the Justfile.
 ///
-/// Scheme: `https://` unless the host is a loopback address (localhost or
-/// 127.x.x.x), in which case `http://` is used — matching local dev via
-/// the Justfile.
-fn canonical_url(host: &str, path: &str) -> String {
-    let host_part = host.split(':').next().unwrap_or(host);
+/// Shared by [`canonical_url`] (NIP-98 `u`-tag verification) and
+/// [`admin_api_origin`] (NIP-11 advertisement) so the origin the relay
+/// advertises and the origin it verifies against can never use different
+/// schemes.
+fn scheme_for_host(host: &str) -> &'static str {
+    // Strip any `:port` to get the bare host. IPv6 literals carry their own
+    // colons, so a plain `split(':')` would mangle them: bracketed authorities
+    // (`[::1]:3000`) take the text inside the brackets, and an unbracketed
+    // multi-colon host is a bare IPv6 literal with no port.
+    let host_part = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else if host.matches(':').count() > 1 {
+        host
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
     let is_loopback =
         host_part == "localhost" || host_part == "::1" || host_part.starts_with("127.");
-    let scheme = if is_loopback { "http" } else { "https" };
-    format!("{scheme}://{host}{path}")
+    if is_loopback {
+        "http"
+    } else {
+        "https"
+    }
+}
+
+/// Derive the canonical URL for a NIP-98 `u`-tag check.
+fn canonical_url(host: &str, path: &str) -> String {
+    format!("{}://{host}{path}", scheme_for_host(host))
+}
+
+/// Canonical admin API origin (`scheme://host[:port]`, no path) advertised in
+/// the NIP-11 document so desktop can auto-discover the admin surface instead
+/// of requiring manual URL entry.
+///
+/// Scheme follows the same loopback rule as [`canonical_url`], so a client that
+/// discovers this origin signs NIP-98 `u` tags against the exact scheme the
+/// relay verifies.
+pub(crate) fn admin_api_origin(host: &str) -> String {
+    format!("{}://{host}", scheme_for_host(host))
 }
 
 /// Whether a request method typically carries a body.
@@ -415,7 +446,8 @@ fn origin_matches_host(origin: &str, host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_credential, canonical_url, method_has_body, nostr_credential, origin_matches_host,
+        admin_api_origin, bearer_credential, canonical_url, method_has_body, nostr_credential,
+        origin_matches_host,
     };
 
     #[test]
@@ -483,6 +515,51 @@ mod tests {
             "http://127.0.0.1:3000/path"
         );
         assert_eq!(canonical_url("127.0.0.1", "/path"), "http://127.0.0.1/path");
+    }
+
+    #[test]
+    fn admin_api_origin_uses_https_for_non_loopback_hosts() {
+        assert_eq!(
+            admin_api_origin("admin.example.com"),
+            "https://admin.example.com"
+        );
+        assert_eq!(
+            admin_api_origin("admin.example.com:8443"),
+            "https://admin.example.com:8443"
+        );
+    }
+
+    #[test]
+    fn admin_api_origin_uses_http_for_loopback_hosts() {
+        assert_eq!(admin_api_origin("localhost:3000"), "http://localhost:3000");
+        assert_eq!(admin_api_origin("127.0.0.1:3000"), "http://127.0.0.1:3000");
+        assert_eq!(admin_api_origin("::1"), "http://::1");
+        // Bracketed IPv6 authority with a port (the RFC 3986 Host-header form).
+        assert_eq!(admin_api_origin("[::1]:3000"), "http://[::1]:3000");
+    }
+
+    /// The advertised origin and the verified `u`-tag URL must agree on scheme
+    /// for every host, or a discovered origin would sign against a scheme the
+    /// relay rejects.
+    #[test]
+    fn admin_api_origin_scheme_matches_canonical_url_scheme() {
+        for host in [
+            "admin.example.com",
+            "admin.example.com:8443",
+            "localhost:3000",
+            "127.0.0.1:3000",
+            "::1",
+            "[::1]:3000",
+        ] {
+            let advertised = admin_api_origin(host);
+            let verified = canonical_url(host, "/api/admin/v1/reports");
+            let advertised_scheme = advertised.split("://").next().expect("scheme");
+            let verified_scheme = verified.split("://").next().expect("scheme");
+            assert_eq!(
+                advertised_scheme, verified_scheme,
+                "advertised and verified schemes must match for host {host}"
+            );
+        }
     }
 
     #[test]

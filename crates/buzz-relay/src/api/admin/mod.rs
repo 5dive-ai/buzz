@@ -28,6 +28,11 @@ pub(crate) fn is_admin_host(state: &crate::state::AppState, headers: &HeaderMap)
     auth::is_admin_host(state, headers)
 }
 
+/// Canonical admin API origin advertised in the NIP-11 document (see
+/// [`auth::admin_api_origin`]). Re-exported so the NIP-11 builder can derive
+/// the advertised origin without reaching into the private `auth` module.
+pub(crate) use auth::admin_api_origin;
+
 /// Build the deployment-admin routes.
 ///
 /// Read routes are available in all auth modes.

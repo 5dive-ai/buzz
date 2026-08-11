@@ -115,7 +115,7 @@ pub async fn run_turn(
     prompt: Message,
 ) -> (Result<StopReason, AgentError>, super::agent::TurnTokens) {
     let mut tokens = super::agent::TurnTokens::default();
-    let sessions = SessionManager::instance();
+    let sessions = crate::session_store::session_manager();
 
     // The user's prompt is persisted before the first inference so a resumed
     // or inspected session sees the same history the model saw.

@@ -29,6 +29,7 @@ pub mod hooks;
 pub mod loop_drive;
 pub mod mesh;
 pub mod prompt;
+pub mod session_store;
 pub mod steer;
 pub mod tools;
 pub mod types;
@@ -49,7 +50,7 @@ use tokio_util::sync::CancellationToken;
 
 use goose::agents::{Agent, AgentConfig, ExtensionConfig, GoosePlatform};
 use goose::config::PermissionManager;
-use goose::session::session_manager::{SessionManager, SessionType};
+use goose::session::session_manager::SessionType;
 
 use config::{Config, MAX_PROMPT_BYTES, MAX_SYSTEM_PROMPT_BYTES, PROTOCOL_VERSION};
 use types::McpServerStdio;
@@ -121,7 +122,7 @@ async fn build_agent(
     ),
     AgentError,
 > {
-    let session_manager = Arc::new(SessionManager::instance());
+    let session_manager = crate::session_store::session_manager();
     let permission_manager = PermissionManager::instance();
 
     let agent = Agent::with_config(AgentConfig::new(

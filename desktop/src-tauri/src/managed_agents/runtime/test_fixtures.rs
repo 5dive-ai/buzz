@@ -85,6 +85,8 @@ pub(super) fn fixture(
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        library_ref: None,
+        library_applied_revision: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,

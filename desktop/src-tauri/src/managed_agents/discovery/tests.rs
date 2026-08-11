@@ -222,8 +222,7 @@ fn effective_agent_command_explicit_override_wins() {
     );
 }
 
-/// Minimal record for `record_agent_command` tests. Only the resolution
-/// inputs (runtime / persona_id / agent_command_override) vary.
+/// Minimal record for `record_agent_command` tests; only runtime/persona_id/agent_command_override vary.
 fn record_with(
     runtime: Option<&str>,
     persona_id: Option<&str>,
@@ -279,6 +278,8 @@ fn record_with(
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        library_ref: None,
+        library_applied_revision: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
@@ -288,8 +289,7 @@ fn record_with(
 
 #[test]
 fn record_agent_command_own_runtime_wins_over_persona() {
-    // A record with its own materialized runtime never consults the
-    // persona list — the unified-model resolution.
+    // A record with its own materialized runtime never consults the persona list.
     let personas = vec![persona_with_runtime("p1", Some("goose"))];
     let record = record_with(Some("claude"), Some("p1"), None);
     assert_eq!(record_agent_command(&record, &personas), "claude-agent-acp");

@@ -3,10 +3,10 @@ use tauri::AppHandle;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        current_instance_id, delete_agent_key, load_managed_agents, load_personas, load_teams,
-        save_managed_agents, save_personas, stop_managed_agent_process,
+        current_instance_id, delete_agent_key, load_managed_agents, load_persona_views,
+        load_personas, load_teams, save_managed_agents, save_personas, stop_managed_agent_process,
         sync_managed_agent_processes, try_regenerate_nest, validate_persona_activation_change,
-        validate_persona_deletion, AgentDefinition, ManagedAgentRecord,
+        validate_persona_deletion, AgentDefinition, ManagedAgentRecord, PersonaView,
     },
     util::now_iso,
 };
@@ -41,7 +41,7 @@ mod inbound;
 pub use inbound::reconcile_inbound_persona_event;
 
 #[tauri::command]
-pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, String> {
+pub async fn list_personas(app: AppHandle) -> Result<Vec<PersonaView>, String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -49,9 +49,23 @@ pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, Strin
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        let mut personas = load_personas(&app)?;
-        pending::project_active_persona_sharing(&app, &state, &mut personas);
-        Ok(personas)
+        let views = load_persona_views(&app)?;
+        // Share state is a command-layer projection over the definition view;
+        // project it onto the definitions, then re-pair with each view's
+        // library metadata. Order is the deterministic `load_personas` sort and
+        // is preserved through both halves.
+        let mut definitions: Vec<AgentDefinition> =
+            views.iter().map(|view| view.definition.clone()).collect();
+        pending::project_active_persona_sharing(&app, &state, &mut definitions);
+        Ok(definitions
+            .into_iter()
+            .zip(views)
+            .map(|(definition, view)| PersonaView {
+                definition,
+                library_ref: view.library_ref,
+                library_applied_revision: view.library_applied_revision,
+            })
+            .collect())
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?

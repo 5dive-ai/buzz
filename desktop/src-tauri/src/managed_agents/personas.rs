@@ -1,6 +1,29 @@
 use std::fs;
 
-use crate::{managed_agents::AgentDefinition, util::now_iso};
+use crate::{
+    managed_agents::{AgentDefinition, ManagedAgentRecord},
+    util::now_iso,
+};
+use serde::Serialize;
+
+/// Read-only persona view for the list/get command boundary (§2.7, resolves
+/// P4-C1). `definition` is the unchanged mutation-input shape; it flattens onto
+/// the wire so the frontend keeps consuming a flat `RawPersona` with two new
+/// optional fields rather than a nested shape.
+///
+/// The metadata fields are OUTPUT-ONLY: no command input, client payload, or
+/// inbound event may author them, and they are never round-tripped into a save
+/// — §3's library operations are their only writers. They surface the shared
+/// indicator without changing the persona mutation contract.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PersonaView {
+    #[serde(flatten)]
+    pub definition: AgentDefinition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library_applied_revision: Option<u64>,
+}
 
 struct BuiltInPersona {
     id: &'static str,
@@ -385,19 +408,79 @@ pub(crate) fn load_personas_from_path(
         .map_err(|error| format!("failed to parse persona store: {error}"))
 }
 
+/// Read personas with their cross-workspace library metadata (§2.7 read-side
+/// exposure, resolves P4-C1). The list/get command boundary calls this instead
+/// of [`load_personas`]; the ~78 non-command readers keep the flat
+/// `Vec<AgentDefinition>` loader unchanged.
+///
+/// The definition projection is IDENTICAL to [`load_personas`] (same built-in
+/// merge and write-back); each merged definition is then paired with its raw
+/// record's `library_ref`/`library_applied_revision` by slug. Built-in
+/// personas added by the merge have no raw record and so carry no metadata —
+/// exactly right, they are never library projections.
+pub(crate) fn load_persona_views<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<Vec<PersonaView>, String> {
+    let definitions = load_personas(app)?;
+    let raw = crate::managed_agents::storage::load_agent_definitions(app)?;
+    Ok(pair_persona_views(definitions, &raw))
+}
+
+/// Scoped variant of [`load_persona_views`]. Part of the scoped `_at()` API:
+/// exercised by tests now, consumed by §3 activation reconcile once the library
+/// read side lands.
+#[allow(dead_code)]
+pub(crate) fn load_persona_views_at(
+    definitions_dir: &std::path::Path,
+) -> Result<Vec<PersonaView>, String> {
+    let definitions = load_personas_at(definitions_dir)?;
+    let raw = crate::managed_agents::storage::load_agent_definitions_at(definitions_dir)?;
+    Ok(pair_persona_views(definitions, &raw))
+}
+
+/// Pair each merged definition with the library metadata of the raw record that
+/// shares its slug. Pure and total: a definition with no matching raw record
+/// (a built-in the merge just added) yields `None`/`None`, and library metadata
+/// is read from the raw record ONLY — never from the definition view, which
+/// cannot carry it.
+fn pair_persona_views(
+    definitions: Vec<AgentDefinition>,
+    raw: &[ManagedAgentRecord],
+) -> Vec<PersonaView> {
+    let metadata: std::collections::HashMap<&str, (&Option<String>, &Option<u64>)> = raw
+        .iter()
+        .filter_map(|record| {
+            record.slug.as_deref().map(|slug| {
+                (
+                    slug,
+                    (&record.library_ref, &record.library_applied_revision),
+                )
+            })
+        })
+        .collect();
+
+    definitions
+        .into_iter()
+        .map(|definition| {
+            let (library_ref, library_applied_revision) = metadata
+                .get(definition.id.as_str())
+                .map(|(r, rev)| ((*r).clone(), **rev))
+                .unwrap_or((None, None));
+            PersonaView {
+                definition,
+                library_ref,
+                library_applied_revision,
+            }
+        })
+        .collect()
+}
+
 pub fn save_personas<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     records: &[AgentDefinition],
 ) -> Result<(), String> {
-    let mut sorted = records.to_vec();
-    sort_personas(&mut sorted);
-
-    // Post-fold: persona saves write key-less definition records into the
-    // unified agent store (instances preserved by `save_agent_definitions`).
-    let definitions: Vec<_> = sorted
-        .into_iter()
-        .map(|persona| persona.into_agent_record())
-        .collect();
+    let existing = crate::managed_agents::storage::load_agent_definitions(app)?;
+    let definitions = merge_preserving_definitions(existing, records);
     crate::managed_agents::storage::save_agent_definitions(app, &definitions)
 }
 
@@ -408,14 +491,54 @@ pub(crate) fn save_personas_at(
     definitions_dir: &std::path::Path,
     records: &[AgentDefinition],
 ) -> Result<(), String> {
-    let mut sorted = records.to_vec();
-    sort_personas(&mut sorted);
-
-    let definitions: Vec<_> = sorted
-        .into_iter()
-        .map(|persona| persona.into_agent_record())
-        .collect();
+    let existing = crate::managed_agents::storage::load_agent_definitions_at(definitions_dir)?;
+    let definitions = merge_preserving_definitions(existing, records);
     crate::managed_agents::storage::save_agent_definitions_at(definitions_dir, &definitions)
+}
+
+/// Build the definition half of a persona save so that every field living only
+/// on [`ManagedAgentRecord`] — `library_ref`, `library_applied_revision`,
+/// `last_completed_deploy_attempt_id`, and any future non-view slot — survives
+/// an ordinary save (§2.7, resolves P3-C1).
+///
+/// At head, `save_personas` reconstructed every record wholesale through
+/// [`AgentDefinition::into_agent_record`], so one unrelated local edit erased
+/// the projection metadata on every OTHER definition — silently detaching every
+/// shared agent. Here each view is instead applied onto the canonical raw
+/// record of the same slug via [`ManagedAgentRecord::apply_definition_view`],
+/// which writes ONLY the view-carried slots and leaves the rest intact. A
+/// genuinely new persona (no matching raw record) is projected fresh through
+/// `into_agent_record` — it has no metadata to lose.
+///
+/// This makes every writer that funnels through `save_personas[_at]` (create,
+/// update, activation toggle, delete, inbound upsert/tombstone, snapshot/team
+/// import, team deletion) merge-preserving *by construction*.
+///
+/// A raw record absent from `views` is a deletion, dropped from the result —
+/// the head-identical plain path. Library-aware deletion routing (§3.4's
+/// `ExcludePending` state machine) and the library-authoritative inbound branch
+/// (§2.7 P4-C2) layer on at §3, where `apply_shared_definition` exists; at
+/// Phase 0 no production path authors `library_ref`, so the plain path is the
+/// only reachable one and matches head exactly.
+fn merge_preserving_definitions(
+    existing: Vec<crate::managed_agents::ManagedAgentRecord>,
+    views: &[AgentDefinition],
+) -> Vec<crate::managed_agents::ManagedAgentRecord> {
+    let mut by_slug: std::collections::HashMap<String, _> = existing
+        .into_iter()
+        .filter_map(|record| record.slug.clone().map(|slug| (slug, record)))
+        .collect();
+
+    views
+        .iter()
+        .map(|view| match by_slug.remove(&view.id) {
+            Some(mut record) => {
+                record.apply_definition_view(view);
+                record
+            }
+            None => view.clone().into_agent_record(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -410,3 +410,188 @@ fn fizz_builtin_resolves_to_buzz_agent() {
         "Fizz must resolve to buzz-agent specifically"
     );
 }
+
+// ── §2.7 merge-preserving persona save (P3-C1 / P4-C1 acceptance) ─────────────
+
+use super::{
+    load_persona_views_at, load_personas_at, merge_preserving_definitions, save_personas_at,
+};
+use crate::managed_agents::storage::{load_agent_definitions_at, save_agent_definitions_at};
+use crate::managed_agents::ManagedAgentRecord;
+
+/// A keyless definition projected from a shared library entry: it carries
+/// `library_ref`/`library_applied_revision`, which live ONLY on
+/// `ManagedAgentRecord` and are exactly what head's wholesale save erased.
+fn projected_record(slug: &str, revision: u64) -> ManagedAgentRecord {
+    let mut record = custom_persona(slug, "Shared Agent").into_agent_record();
+    record.library_ref = Some(format!("lib-{slug}"));
+    record.library_applied_revision = Some(revision);
+    record
+}
+
+/// Assert the projected record survives a save with its library metadata and
+/// index invariant intact. `label` names the writer shape for failure output.
+fn assert_projection_survived(saved: &[ManagedAgentRecord], label: &str) {
+    let projected = saved
+        .iter()
+        .find(|record| record.slug.as_deref() == Some("shared"))
+        .unwrap_or_else(|| panic!("{label}: projected record must survive the save"));
+    assert_eq!(
+        projected.library_ref.as_deref(),
+        Some("lib-shared"),
+        "{label}: library_ref must survive an unrelated writer",
+    );
+    assert_eq!(
+        projected.library_applied_revision,
+        Some(3),
+        "{label}: library_applied_revision must survive an unrelated writer",
+    );
+    assert_eq!(
+        saved
+            .iter()
+            .filter(|record| record.library_ref.as_deref() == Some("lib-shared"))
+            .count(),
+        1,
+        "{label}: exactly one keyless record may link the library entry",
+    );
+}
+
+/// P3-C1 acceptance: every persona writer funnels through `save_personas[_at]`,
+/// so a save that touches ONLY an unrelated persona must leave a projected
+/// record's library metadata untouched. At head, `into_agent_record`
+/// reconstructed the whole vector and erased it. Each closure models one
+/// writer's vector transformation (create, update, activation toggle, delete,
+/// inbound upsert, inbound tombstone, team import, team delete) applied to the
+/// unrelated persona — never the projected one.
+#[test]
+fn merge_preserving_save_keeps_library_metadata_across_every_writer_shape() {
+    let seed = || {
+        vec![
+            projected_record("shared", 3),
+            custom_persona("custom:plain", "Plain").into_agent_record(),
+        ]
+    };
+
+    type Shape = (
+        &'static str,
+        fn(Vec<AgentDefinition>) -> Vec<AgentDefinition>,
+    );
+    let shapes: Vec<Shape> = vec![
+        ("create", |mut views| {
+            views.push(custom_persona("custom:new", "New"));
+            views
+        }),
+        ("update", |mut views| {
+            for view in &mut views {
+                if view.id == "custom:plain" {
+                    view.display_name = "Renamed".to_string();
+                }
+            }
+            views
+        }),
+        ("activation_toggle", |mut views| {
+            for view in &mut views {
+                if view.id == "custom:plain" {
+                    view.is_active = !view.is_active;
+                }
+            }
+            views
+        }),
+        ("delete_unrelated", |views| {
+            views
+                .into_iter()
+                .filter(|v| v.id != "custom:plain")
+                .collect()
+        }),
+        ("inbound_upsert_unrelated", |mut views| {
+            views.push(custom_persona("custom:inbound", "Inbound"));
+            views
+        }),
+        ("inbound_tombstone_unrelated", |views| {
+            views
+                .into_iter()
+                .filter(|v| v.id != "custom:plain")
+                .collect()
+        }),
+        ("team_import", |mut views| {
+            let mut member = custom_persona("team:member", "Team Member");
+            member.source_team = Some("team-1".to_string());
+            views.push(member);
+            views
+        }),
+        ("team_delete", |views| {
+            views
+                .into_iter()
+                .filter(|v| !v.id.starts_with("team:"))
+                .collect()
+        }),
+    ];
+
+    for (label, transform) in shapes {
+        let existing = seed();
+        // A writer always passes the definition VIEW of the current store —
+        // library metadata is stripped because `AgentDefinition` cannot carry
+        // it. The seam must re-merge it from the canonical raw record.
+        let views: Vec<AgentDefinition> = existing
+            .iter()
+            .filter_map(|record| record.to_definition_view())
+            .collect();
+        let saved = merge_preserving_definitions(existing, &transform(views));
+        assert_projection_survived(&saved, label);
+    }
+}
+
+/// The same guarantee through the on-disk `_at` seam — proving the storage
+/// layer and the built-in-merge write-back preserve the metadata too — plus the
+/// §2.7 read-side exposure (P4-C1): `load_persona_views_at` surfaces the
+/// metadata for a projected record and reports none for a plain one.
+#[test]
+fn save_personas_at_preserves_library_metadata_on_disk() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let definitions_dir = dir.path();
+
+    save_agent_definitions_at(
+        definitions_dir,
+        &[
+            projected_record("shared", 3),
+            custom_persona("custom:plain", "Plain").into_agent_record(),
+        ],
+    )
+    .expect("seed raw store");
+
+    // A full writer cycle: load the views (metadata stripped), edit the
+    // unrelated persona, save back through the merge-preserving seam. The load
+    // also merges built-ins and writes them back — another writer exercised.
+    let mut views = load_personas_at(definitions_dir).expect("load personas");
+    for view in &mut views {
+        if view.id == "custom:plain" {
+            view.display_name = "Renamed".to_string();
+        }
+    }
+    save_personas_at(definitions_dir, &views).expect("save personas");
+
+    let raw = load_agent_definitions_at(definitions_dir).expect("reload raw store");
+    let projected = raw
+        .iter()
+        .find(|record| record.slug.as_deref() == Some("shared"))
+        .expect("projected record survives on disk");
+    assert_eq!(projected.library_ref.as_deref(), Some("lib-shared"));
+    assert_eq!(projected.library_applied_revision, Some(3));
+
+    let persona_views = load_persona_views_at(definitions_dir).expect("load persona views");
+    let shared_view = persona_views
+        .iter()
+        .find(|view| view.definition.id == "shared")
+        .expect("shared view present");
+    assert_eq!(shared_view.library_ref.as_deref(), Some("lib-shared"));
+    assert_eq!(shared_view.library_applied_revision, Some(3));
+
+    let plain_view = persona_views
+        .iter()
+        .find(|view| view.definition.id == "custom:plain")
+        .expect("plain view present");
+    assert!(
+        plain_view.library_ref.is_none() && plain_view.library_applied_revision.is_none(),
+        "a plain persona must surface no library metadata",
+    );
+}

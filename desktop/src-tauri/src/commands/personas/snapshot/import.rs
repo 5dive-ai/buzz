@@ -645,6 +645,8 @@ where
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            library_ref: None,
+            library_applied_revision: None,
             definition_respond_to: respond_to_wire.clone(),
             definition_respond_to_allowlist: minted.respond_to_allowlist.clone(),
             definition_parallelism: minted_parallelism,

@@ -59,6 +59,8 @@ fn bare_agent_record(
         catalog_source: None,
         relay_mesh: None,
         auto_restart_on_config_change: false,
+        library_ref: None,
+        library_applied_revision: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,

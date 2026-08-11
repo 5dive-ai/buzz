@@ -25,7 +25,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use goose::agents::mcp_client::McpClientTrait;
 use goose::agents::{ExtensionConfig, ToolCallContext};
-use rmcp::model::{CallToolResult, Content, InitializeResult, JsonObject, ListToolsResult, Tool};
+use rmcp::model::{
+    CallToolResult, ContentBlock, InitializeResult, JsonObject, ListToolsResult, Tool,
+};
 use rmcp::service::ServiceError as Error;
 use tokio_util::sync::CancellationToken;
 
@@ -79,6 +81,7 @@ impl McpClientTrait for BuiltinClient {
             tools: vec![Self::load_skill_tool()],
             next_cursor: None,
             meta: None,
+            ..Default::default()
         })
     }
 
@@ -90,7 +93,7 @@ impl McpClientTrait for BuiltinClient {
         _cancel_token: CancellationToken,
     ) -> Result<CallToolResult, Error> {
         if name != crate::builtin::LOAD_SKILL_TOOL {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "unknown tool: {name}"
             ))]));
         }
@@ -100,10 +103,10 @@ impl McpClientTrait for BuiltinClient {
             .unwrap_or(serde_json::Value::Null);
         let result = crate::builtin::call_load_skill(&args, &self.skills).await;
 
-        let content: Vec<Content> = result
+        let content: Vec<ContentBlock> = result
             .content
             .iter()
-            .map(|c| Content::text(c.as_text_lossy()))
+            .map(|c| ContentBlock::text(c.as_text_lossy()))
             .collect();
 
         Ok(if result.is_error {

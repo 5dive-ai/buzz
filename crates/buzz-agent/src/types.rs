@@ -163,3 +163,105 @@ pub fn truncate_at_boundary(s: &str, max: usize) -> &str {
     }
     &s[..cut]
 }
+
+/// Publisher-side billing identity for a turn.
+///
+/// Mirrors `buzz_core::agent_turn_metric::PricingIdentity` but is local to
+/// `buzz-agent` (which does not depend on `buzz-core`). The two structs have
+/// the same camelCase wire representation and are deserialized identically by
+/// `buzz-acp`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingIdentity {
+    /// Registered billing-namespace identifier (bare lowercase hostname).
+    pub authority: String,
+    /// Actually-requested billable model identifier.
+    pub model: String,
+    /// Cache-write class when applicable; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_class: Option<String>,
+}
+
+/// Tri-state accumulator for provider-reported total tokens within one ACP turn.
+///
+/// - `Unseen`: no usage-bearing response observed yet (initial state for each turn).
+/// - `Exact(n)`: every response so far reported a total; `n` is their sum.
+/// - `Unknown`: at least one response lacked a total — permanently poisoned for
+///   this turn. The session-cumulative also transitions to Unknown when any turn
+///   lands Unknown, and stays there until a new session resets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnTotalState {
+    #[default]
+    Unseen,
+    Exact(u64),
+    Unknown,
+}
+
+impl TurnTotalState {
+    /// Add two exact token counts with overflow protection.
+    ///
+    /// Returns `Exact(acc + n)` on success or `Unknown` on overflow.
+    /// This is the single implementation of the checked-add / overflow-poisons
+    /// contract; both `fold()` and `merge_session()` call this helper so a
+    /// change to overflow semantics needs to be made in exactly one place.
+    fn checked_exact_sum(acc: u64, n: u64) -> TurnTotalState {
+        match acc.checked_add(n) {
+            Some(sum) => TurnTotalState::Exact(sum),
+            None => TurnTotalState::Unknown,
+        }
+    }
+
+    /// Fold one provider-reported total into the current state.
+    ///
+    /// `total`: `Some(n)` when the provider included a genuine total on this
+    /// response; `None` when it was absent (e.g. Anthropic, or an OpenAI
+    /// response that omits usage). Absence of a total on any usage-bearing
+    /// response poisons the whole turn.
+    ///
+    /// Overflow is handled by `checked_exact_sum`: a saturated value would
+    /// not be a genuine provider-reported total, so overflow → `Unknown`.
+    pub fn fold(self, total: Option<u64>) -> TurnTotalState {
+        match (self, total) {
+            // Already poisoned — stays Unknown regardless.
+            (TurnTotalState::Unknown, _) => TurnTotalState::Unknown,
+            // No total from this response — poison the accumulator.
+            (_, None) => TurnTotalState::Unknown,
+            // First response with a total.
+            (TurnTotalState::Unseen, Some(n)) => TurnTotalState::Exact(n),
+            // Subsequent response — delegate to the shared checked-sum helper.
+            (TurnTotalState::Exact(acc), Some(n)) => Self::checked_exact_sum(acc, n),
+        }
+    }
+
+    /// Merge a completed turn's total state into the session-cumulative state.
+    ///
+    /// This is the turn→session boundary accumulation:
+    /// - An `Unseen` turn (no usage-bearing responses) leaves the cumulative unchanged.
+    /// - Any `Unknown` side poisons the session permanently.
+    /// - Two `Exact` values are summed via `checked_exact_sum`; overflow → `Unknown`.
+    ///
+    /// The checked-add logic lives in `checked_exact_sum`; both this function and
+    /// `fold()` call that helper so overflow semantics are defined once.
+    pub fn merge_session(self, turn: TurnTotalState) -> TurnTotalState {
+        match (self, turn) {
+            // Either side poisoned → session is poisoned.
+            (TurnTotalState::Unknown, _) | (_, TurnTotalState::Unknown) => TurnTotalState::Unknown,
+            // Turn had no usage-bearing responses → no change to cumulative.
+            (acc, TurnTotalState::Unseen) => acc,
+            // First exact turn — adopt its value.
+            (TurnTotalState::Unseen, TurnTotalState::Exact(n)) => TurnTotalState::Exact(n),
+            // Add to running exact sum — delegate to the shared checked-sum helper.
+            (TurnTotalState::Exact(acc), TurnTotalState::Exact(n)) => {
+                Self::checked_exact_sum(acc, n)
+            }
+        }
+    }
+
+    /// Consume the exact value if present; `None` for `Unseen` or `Unknown`.
+    pub fn exact_value(self) -> Option<u64> {
+        match self {
+            TurnTotalState::Exact(n) => Some(n),
+            _ => None,
+        }
+    }
+}

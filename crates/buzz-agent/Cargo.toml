@@ -29,8 +29,8 @@ path = "tests/bin/fake_mcp.rs"
 # agent loop itself is goose's; this is the interactive PKCE login that seeds
 # the token cache that goose (and the desktop model picker) then read.
 buzz-model-catalog = { path = "../buzz-model-catalog" }
-goose = { git = "https://github.com/aaif-goose/goose", rev = "305849b71709b95b86ed9f11bd3bc939899c0aab", default-features = false, features = ["rustls-tls"] }
-goose-provider-types = { git = "https://github.com/aaif-goose/goose", rev = "305849b71709b95b86ed9f11bd3bc939899c0aab" }
+goose = { git = "https://github.com/aaif-goose/goose", rev = "bf332b983756eaf80353e82e4bb052d589629bf4", default-features = false, features = ["rustls-tls"] }
+goose-provider-types = { git = "https://github.com/aaif-goose/goose", rev = "bf332b983756eaf80353e82e4bb052d589629bf4" }
 # Resolution guard: goose pins icu_locale "=2.1.1" (needs icu_collections
 # ~2.1.1) while url 2.5.x -> idna -> idna_adapter 1.2.2 pulls icu_normalizer
 # 2.2.0 (needs icu_collections ~2.2.0). Only one 2.x icu_collections can be
@@ -46,7 +46,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls", "form"] }
-rmcp = { version = "1", default-features = false, features = ["client", "transport-child-process"] }
+rmcp = { version = "3", default-features = false, features = ["client", "transport-child-process"] }
 arc-swap = "1"
 getrandom = "0.4"
 tracing = { workspace = true }

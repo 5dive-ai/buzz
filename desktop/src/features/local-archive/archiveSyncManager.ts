@@ -1,6 +1,7 @@
 import { relayClient as defaultRelayClient } from "@/shared/api/relayClient";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import type { RelayEvent } from "@/shared/api/types";
+import { KIND_AGENT_TURN_METRIC } from "@/shared/constants/kinds";
 import {
   archiveEvents as defaultArchiveEvents,
   listSaveSubscriptions as defaultListSaveSubscriptions,
@@ -15,6 +16,8 @@ import {
 
 const FLUSH_BATCH_SIZE = 25;
 const FLUSH_IDLE_MS = 2_000;
+const DISABLE_AGENT_METRIC_ARCHIVE =
+  import.meta.env?.VITE_BUZZ_DISABLE_AGENT_METRIC_ARCHIVE === "1";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -34,6 +37,7 @@ export interface ArchiveSyncDeps {
     }>,
   ) => Promise<ArchiveBatchResult>;
   onSubscriptionChange: (listener: () => void) => () => void;
+  disableAgentMetricArchive?: boolean;
   flushBatchSize?: number;
   flushIdleMs?: number;
 }
@@ -81,8 +85,12 @@ function scopeKey(scopeType: ScopeType, scopeValue: string): string {
  */
 export class ArchiveSyncManager {
   private readonly deps: Required<
-    Omit<ArchiveSyncDeps, "flushBatchSize" | "flushIdleMs">
+    Omit<
+      ArchiveSyncDeps,
+      "disableAgentMetricArchive" | "flushBatchSize" | "flushIdleMs"
+    >
   >;
+  private readonly disableAgentMetricArchive: boolean;
   private readonly flushBatchSize: number;
   private readonly flushIdleMs: number;
 
@@ -112,6 +120,8 @@ export class ArchiveSyncManager {
       onSubscriptionChange:
         deps?.onSubscriptionChange ?? defaultOnSubscriptionChange,
     };
+    this.disableAgentMetricArchive =
+      deps?.disableAgentMetricArchive ?? DISABLE_AGENT_METRIC_ARCHIVE;
     this.flushBatchSize = deps?.flushBatchSize ?? FLUSH_BATCH_SIZE;
     this.flushIdleMs = deps?.flushIdleMs ?? FLUSH_IDLE_MS;
   }
@@ -201,6 +211,15 @@ export class ArchiveSyncManager {
     }
 
     if (this.destroyed) return;
+
+    if (this.disableAgentMetricArchive) {
+      subs = subs.flatMap((sub) => {
+        const kinds = sub.kinds.filter(
+          (kind) => kind !== KIND_AGENT_TURN_METRIC,
+        );
+        return kinds.length > 0 ? [{ ...sub, kinds }] : [];
+      });
+    }
 
     // Full keys (scope+kinds) for the current subscription list.
     const wanted = new Set(

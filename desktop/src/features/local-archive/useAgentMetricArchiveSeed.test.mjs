@@ -10,11 +10,16 @@ import test from "node:test";
 
 // ── Fake deps factory ────────────────────────────────────────────────────────
 
-function makeDeps({ hasExplicitChoice = false, mergeShouldFail = false } = {}) {
+function makeDeps({
+  hasExplicitChoice = false,
+  mergeShouldFail = false,
+  disableAgentMetricArchive = false,
+} = {}) {
   const calls = { mergeSaveSubscriptionKinds: [], setExplicitChoice: [] };
 
   return {
     calls,
+    disableAgentMetricArchive,
     mergeSaveSubscriptionKinds: async (kind) => {
       if (mergeShouldFail) throw new Error("merge failed");
       calls.mergeSaveSubscriptionKinds.push({ kind });
@@ -31,7 +36,7 @@ function makeDeps({ hasExplicitChoice = false, mergeShouldFail = false } = {}) {
 const KIND_AGENT_TURN_METRIC = 44200;
 
 async function runSeed(pubkey, deps) {
-  if (!pubkey) return;
+  if (!pubkey || deps.disableAgentMetricArchive) return;
   if (deps.hasExplicitChoice(pubkey)) return;
 
   try {
@@ -69,6 +74,14 @@ test("test_default_enabled_persists_explicit_choice_after_seed", async () => {
   );
   assert.equal(deps.calls.setExplicitChoice[0].pubkey, "pubkey123");
   assert.equal(deps.calls.setExplicitChoice[0].enabled, true);
+});
+
+test("test_kill_switch_does_not_seed_or_persist_choice", async () => {
+  const deps = makeDeps({ disableAgentMetricArchive: true });
+  await runSeed("pubkey123", deps);
+
+  assert.equal(deps.calls.mergeSaveSubscriptionKinds.length, 0);
+  assert.equal(deps.calls.setExplicitChoice.length, 0);
 });
 
 test("test_explicit_choice_set_does_not_reseed", async () => {

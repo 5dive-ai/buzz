@@ -30,12 +30,15 @@ export interface AgentMetricArchiveSeedDeps {
   mergeSaveSubscriptionKinds: (kind: number) => Promise<void>;
   hasExplicitChoice: (pubkey: string) => boolean;
   setExplicitChoice: (pubkey: string, enabled: boolean) => void;
+  disableAgentMetricArchive: boolean;
 }
 
 const defaultDeps: AgentMetricArchiveSeedDeps = {
   mergeSaveSubscriptionKinds,
   hasExplicitChoice: hasExplicitAgentMetricArchiveChoice,
   setExplicitChoice: setExplicitAgentMetricArchiveChoice,
+  disableAgentMetricArchive:
+    import.meta.env?.VITE_BUZZ_DISABLE_AGENT_METRIC_ARCHIVE === "1",
 };
 
 /**
@@ -51,7 +54,7 @@ export function useAgentMetricArchiveSeed(
   deps: AgentMetricArchiveSeedDeps = defaultDeps,
 ): void {
   React.useEffect(() => {
-    if (!pubkey) return;
+    if (!pubkey || deps.disableAgentMetricArchive) return;
 
     // Already made an explicit choice for this identity — never re-seed.
     if (deps.hasExplicitChoice(pubkey)) return;

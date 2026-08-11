@@ -425,6 +425,43 @@ test("manager_builds_correct_filter_for_owner_p", async () => {
   mgr.destroy();
 });
 
+test("manager_metric_kill_switch_filters_only_kind_44200", async () => {
+  const relay = makeFakeRelayClient();
+  const archive = makeFakeArchive();
+  archive.setSubs([
+    {
+      scopeType: "owner_p",
+      scopeValue: "mixed",
+      kinds: [24200, 44200, 9],
+      identityPubkey: "pk",
+      relayUrl: "wss://r",
+      createdAt: 0,
+    },
+    {
+      scopeType: "owner_p",
+      scopeValue: "metric-only",
+      kinds: [44200],
+      identityPubkey: "pk",
+      relayUrl: "wss://r",
+      createdAt: 0,
+    },
+  ]);
+
+  const mgr = makeManager(relay, archive, {
+    disableAgentMetricArchive: true,
+  });
+  await mgr.start();
+  await tick();
+
+  const activeFilters = [...relay.subs.values()]
+    .filter((entry) => !entry.unsubbed)
+    .map((entry) => entry.filter);
+  assert.deepEqual(activeFilters, [
+    { kinds: [24200, 9], limit: 0, "#p": ["mixed"] },
+  ]);
+  mgr.destroy();
+});
+
 test("manager_forwards_events_to_archive_events_on_flush", async () => {
   const relay = makeFakeRelayClient();
   const archive = makeFakeArchive();

@@ -317,8 +317,9 @@ SELECT pg_temp.ensure_exact_check_constraint(
     $expression$owner_pubkey IS NULL AND delegated_relationship_id IS NULL AND delegated_relationship_revision IS NULL AND delegation_conditions_fingerprint IS NULL OR owner_pubkey IS NOT NULL AND delegated_relationship_id IS NOT NULL AND delegated_relationship_revision IS NOT NULL AND delegation_conditions_fingerprint IS NOT NULL$expression$
 );
 
--- These two disjunctive checks predate NIP-FI but are omitted by the same
--- pgschema dump path, so M0 closes them through the shared exact verifier.
+-- These two disjunctive checks predate the protected authorization schema but
+-- are omitted by the pgschema dump path, so this attachment step restores
+-- their exact definitions after declarative schema application.
 SELECT pg_temp.ensure_exact_check_constraint(
     'moderation_reports',
     'moderation_reports_check',

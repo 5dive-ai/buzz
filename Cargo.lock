@@ -440,7 +440,8 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 [[package]]
 name = "aws-creds"
 version = "0.39.1"
-source = "git+https://github.com/durch/rust-s3?rev=811c4245eb9cc7527ab374288174f59041aca454#811c4245eb9cc7527ab374288174f59041aca454"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca3b85155d265df828f84e53886ed9e427aed979dd8a39f5b8b2162c77e142d7"
 dependencies = [
  "attohttpc",
  "home",

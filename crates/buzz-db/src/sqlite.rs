@@ -804,7 +804,7 @@ pub(crate) async fn create_channel_with_id(
     let inserted = sqlx::query(
         "INSERT INTO channels (id, community_id, name, channel_type, visibility, description, created_by, ttl_seconds, ttl_deadline) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CASE WHEN ?8 IS NULL THEN NULL ELSE unixepoch() + ?8 END) ON CONFLICT DO NOTHING",
     )
-    .bind(channel_id.to_string()).bind(community.as_uuid().to_string()).bind(&name)
+    .bind(channel_id.to_string()).bind(community.as_uuid().to_string()).bind(name)
     .bind(channel_type.as_str()).bind(visibility.as_str()).bind(description).bind(created_by)
     .bind(ttl_seconds).execute(&mut *tx).await?.rows_affected() == 1;
     if inserted {

@@ -27,7 +27,6 @@ import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
 import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { AttachmentGroup } from "@/shared/ui/attachment";
 import { ConfigNudgeCard } from "@/shared/ui/config-nudge-attachment";
-import { LinkPreviewList } from "@/shared/ui/link-preview-list";
 import { useSmoothCorners } from "@/shared/ui/smoothCorners";
 import {
   computeConfigNudge,
@@ -45,8 +44,6 @@ import {
   classifyChildren,
   hasBlockMedia,
   isImageOnlyParagraph,
-  shallowArrayEqual,
-  shallowRecordEqual,
 } from "./markdownUtils";
 import {
   CODE_BLOCK_CLASS,
@@ -111,6 +108,8 @@ import {
 } from "./markdown/imageLightbox";
 import { MarkdownTable } from "./markdown/MarkdownTable";
 import { ProgressiveImage } from "./markdown/ProgressiveImage";
+import { GeneratedPreviewCoordinator } from "./markdown/GeneratedPreviewCoordinator";
+import { markdownPropsEqual } from "./markdown/markdownPropsEqual";
 import { MessageLinkPill } from "./markdown/MessageLinkPill";
 import { renderCachedMarkdown } from "./markdown/nodeCache";
 import { useMessageLinkPreviews } from "./markdown/useMessageLinkPreviews";
@@ -1794,13 +1793,6 @@ function MarkdownInner({
   const onOpenEntityLink = useOpenEntityLink();
   const onOpenMessageLink = React.useCallback(
     (link: ParsedMessageLink) => {
-      // Always route through `goChannel` with `messageId` set: the channel
-      // route already handles scroll-into-view + highlight via
-      // `useAnchoredScroll` + `getEventById` backfill, and works for
-      // both stream-message replies and forum threads. Detecting "the thread
-      // root is a forum post" up front would require an event lookup we don't
-      // currently have synchronously; the brief explicitly allows skipping
-      // that detection and falling through.
       void goChannel(link.channelId, {
         messageId: link.messageId,
         threadRootId: link.threadRootId,
@@ -1809,7 +1801,10 @@ function MarkdownInner({
     [goChannel],
   );
   const relayOrigin = useRelayOrigin();
-  const resolvedLinkPreviews = useMessageLinkPreviews({
+  const {
+    candidates: generatedPreviewCandidates,
+    previews: resolvedLinkPreviews,
+  } = useMessageLinkPreviews({
     content,
     interactive,
     linkPreviewTags,
@@ -1922,10 +1917,13 @@ function MarkdownInner({
               <ConfigNudgeCard nudge={configNudge} />
             </AttachmentGroup>
           ) : null}
-          <LinkPreviewList
+          <GeneratedPreviewCoordinator
+            candidates={generatedPreviewCandidates}
+            channels={channels}
             ImageLightbox={LinkPreviewImageLightbox}
             key={messageId}
             onOpenByHref={entityCardOpenHandlers}
+            onOpenMessageLink={onOpenMessageLink}
             onRemoveForEveryone={onRemoveLinkPreviewsForEveryone}
             previews={resolvedLinkPreviews}
           />
@@ -1935,26 +1933,6 @@ function MarkdownInner({
   );
 }
 
-export const Markdown = React.memo(
-  MarkdownInner,
-  (prev, next) =>
-    prev.content === next.content &&
-    prev.className === next.className &&
-    prev.customEmoji === next.customEmoji &&
-    prev.interactive === next.interactive &&
-    prev.mediaInset === next.mediaInset &&
-    shallowRecordEqual(
-      prev.agentMentionPubkeysByName,
-      next.agentMentionPubkeysByName,
-    ) &&
-    shallowRecordEqual(prev.mentionPubkeysByName, next.mentionPubkeysByName) &&
-    shallowArrayEqual(prev.mentionNames, next.mentionNames) &&
-    shallowArrayEqual(prev.channelNames, next.channelNames) &&
-    prev.imetaByUrl === next.imetaByUrl &&
-    prev.configNudgeAuthorPubkey === next.configNudgeAuthorPubkey &&
-    prev.searchQuery === next.searchQuery &&
-    prev.snapshotSharedBy === next.snapshotSharedBy &&
-    prev.videoReviewContext === next.videoReviewContext,
-);
+export const Markdown = React.memo(MarkdownInner, markdownPropsEqual);
 Markdown.displayName = "Markdown";
 export { SyntaxHighlightedCode } from "./markdown/CodeBlock";

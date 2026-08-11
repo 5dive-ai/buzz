@@ -1,7 +1,8 @@
 import * as React from "react";
 
 import {
-  extractSupportedLinkPreviews,
+  extractGeneratedPreviewCandidates,
+  type GeneratedPreviewCandidate,
   type SupportedLinkPreview,
 } from "@/shared/lib/linkPreview";
 import { parseLinkPreviewSnapshots } from "@/shared/lib/linkPreviewSnapshot";
@@ -61,13 +62,25 @@ export function useMessageLinkPreviews({
   linkPreviewTags?: readonly (readonly string[])[];
   linkPreviewsSuppressed: boolean;
   relayOrigin: string | null;
-}): ResolvedLinkPreview[] {
+}): {
+  candidates: GeneratedPreviewCandidate[];
+  previews: ResolvedLinkPreview[];
+} {
+  const candidates = React.useMemo(
+    () =>
+      interactive && !linkPreviewsSuppressed
+        ? extractGeneratedPreviewCandidates(content, relayOrigin)
+        : [],
+    [content, interactive, linkPreviewsSuppressed, relayOrigin],
+  );
   const linkPreviewCandidates = React.useMemo(
     () =>
       interactive && !linkPreviewsSuppressed
-        ? extractSupportedLinkPreviews(content, relayOrigin)
+        ? candidates.flatMap((candidate) =>
+            candidate.kind === "link" ? [candidate.preview] : [],
+          )
         : [],
-    [content, interactive, linkPreviewsSuppressed, relayOrigin],
+    [candidates, interactive, linkPreviewsSuppressed],
   );
   const entityLinkPreviews = React.useMemo(
     () => linkPreviewCandidates.filter(isBuzzEntityPreview),
@@ -80,7 +93,7 @@ export function useMessageLinkPreviews({
       withEntityFallbacks(entityLinkPreviews, relayResolvedEntityLinkPreviews),
     [entityLinkPreviews, relayResolvedEntityLinkPreviews],
   );
-  return React.useMemo(() => {
+  const previews = React.useMemo(() => {
     const snapshots =
       interactive && !linkPreviewsSuppressed
         ? parseLinkPreviewSnapshots(linkPreviewTags, content, relayOrigin)
@@ -99,4 +112,5 @@ export function useMessageLinkPreviews({
     relayOrigin,
     resolvedEntityLinkPreviews,
   ]);
+  return { candidates, previews };
 }

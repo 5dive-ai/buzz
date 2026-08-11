@@ -534,3 +534,48 @@ test("extractSupportedLinkPreviews finds generic links and preserves exclusions"
     ],
   );
 });
+
+test("extractGeneratedPreviewCandidates shares exclusions and source order with message links", async () => {
+  const { extractGeneratedPreviewCandidates } = await import(
+    "./linkPreview.ts"
+  );
+  const message = "buzz://message?channel=channel-1&id=event-1";
+  const candidates = extractGeneratedPreviewCandidates(
+    [
+      `\`${message}\``,
+      `    ${message}`,
+      `![hidden](${message})`,
+      `||${message}||`,
+      `[labeled](${message})`,
+      `https://example.com/first`,
+      `${message}.`,
+    ].join("\n"),
+  );
+  assert.deepEqual(
+    candidates.map((candidate) =>
+      candidate.kind === "message"
+        ? [candidate.kind, candidate.href]
+        : [candidate.kind, candidate.preview.href],
+    ),
+    [
+      ["link", "https://example.com/first"],
+      ["message", message],
+    ],
+  );
+});
+
+test("extractGeneratedPreviewCandidates applies one attempt budget across candidate kinds", async () => {
+  const { extractGeneratedPreviewCandidates, MAX_GENERATED_PREVIEW_ATTEMPTS } =
+    await import("./linkPreview.ts");
+  const content = Array.from(
+    { length: MAX_GENERATED_PREVIEW_ATTEMPTS + 3 },
+    (_, index) =>
+      index % 2 === 0
+        ? `buzz://message?channel=channel-${index}&id=event-${index}`
+        : `https://example.com/${index}`,
+  ).join(" ");
+  assert.equal(
+    extractGeneratedPreviewCandidates(content).length,
+    MAX_GENERATED_PREVIEW_ATTEMPTS,
+  );
+});

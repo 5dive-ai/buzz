@@ -357,9 +357,10 @@ test("message links to visible root messages open the thread panel", async ({
     .filter({ hasText: "Root link repro" })
     .last();
   await expect(linkMessage).toBeVisible();
-  await linkMessage
-    .getByRole("button", { name: "Open message in general" })
-    .click();
+  const embed = linkMessage.locator('[data-message-embed="resolved"]');
+  await expect(embed).toContainText("Welcome to #general");
+  await expect(embed).toContainText("#general");
+  await embed.getByRole("button", { name: /Open message by/ }).click();
 
   const threadPanel = page.getByTestId("message-thread-panel");
   await expect(threadPanel).toBeVisible();
@@ -424,4 +425,110 @@ test("message deep links survive reload", async ({ page }) => {
   await expect(page.getByTestId("message-timeline")).toContainText(
     "Engineering shipped the desktop build.",
   );
+});
+
+test("unreadable message links stay redacted without fetching their event", async ({
+  page,
+}) => {
+  const channelId = "1be1dcdb-4c31-5a8c-81de-ac102552ca10";
+  const messageId = "unreadable-message-target";
+  const link = `buzz://message?channel=${channelId}&id=${messageId}`;
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page.evaluate(
+    ({ channelId, messageId }) => {
+      const viewer = "deadbeef".repeat(8);
+      window.__BUZZ_E2E_MUTATE_CHANNEL__?.({
+        channelId,
+        removeMemberPubkey: viewer,
+      });
+      window.__BUZZ_E2E_DEFER_GET_EVENT__ = messageId;
+      window.__BUZZ_E2E_GET_EVENT_CALL_COUNT__ = 0;
+    },
+    { channelId, messageId },
+  );
+  await page.evaluate(() => window.__BUZZ_E2E_INVALIDATE_CHANNELS__?.());
+  await page.getByTestId("message-input").fill(`Private link ${link}`);
+  await page.getByTestId("send-message").click();
+
+  const row = page
+    .getByTestId("message-row")
+    .filter({ hasText: "Private link" })
+    .last();
+  await expect(row.locator("[data-message-link]")).toHaveText(
+    "Private message or channel",
+  );
+  await expect(row.locator("[data-message-embed]")).toHaveCount(0);
+  await expect
+    .poll(() => page.evaluate(() => window.__BUZZ_E2E_GET_EVENT_CALL_COUNT__))
+    .toBe(0);
+});
+
+test("invalid message-link targets keep their pills but render no cards", async ({
+  page,
+}) => {
+  const generalId = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
+  const wrongKindId =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const wrongChannelId =
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page.evaluate(
+    ({ wrongKindId, wrongChannelId }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "general",
+        content: "not a message event",
+        id: wrongKindId,
+        kind: 7,
+      });
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "announcements",
+        content: "belongs to another channel",
+        id: wrongChannelId,
+      });
+    },
+    { wrongKindId, wrongChannelId },
+  );
+  const links = [
+    `buzz://message?channel=${generalId}&id=${wrongKindId}`,
+    `buzz://message?channel=${generalId}&id=${wrongChannelId}`,
+  ];
+  await page
+    .getByTestId("message-input")
+    .fill(`Invalid links ${links.join(" ")}`);
+  await page.getByTestId("send-message").click();
+
+  const row = page
+    .getByTestId("message-row")
+    .filter({ hasText: "Invalid links" })
+    .last();
+  await expect(row.locator("[data-message-link]")).toHaveCount(2);
+  await expect(row.locator("[data-message-embed]")).toHaveCount(0);
+});
+
+test("removing generated message previews preserves the message-link pill", async ({
+  page,
+}) => {
+  const link =
+    "buzz://message?channel=9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50&id=mock-general-welcome";
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await page.getByTestId("message-input").fill(`Removable embed ${link}`);
+  await page.getByTestId("send-message").click();
+
+  const row = page
+    .getByTestId("message-row")
+    .filter({ hasText: "Removable embed" })
+    .last();
+  await expect(row.locator('[data-message-embed="resolved"]')).toBeVisible();
+  await row.getByRole("button", { name: "Link display settings" }).click();
+  await page.getByRole("menuitem", { name: "Remove preview" }).click();
+  await page.getByRole("button", { name: "Remove preview" }).click();
+
+  await expect(row.locator("[data-message-embed]")).toHaveCount(0);
+  await expect(row.locator("[data-message-link]")).toBeVisible();
 });

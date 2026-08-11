@@ -1,4 +1,9 @@
 import {
+  parseMessageLink,
+  type ParsedMessageLink,
+} from "@/features/messages/lib/messageLink";
+
+import {
   buildIssueLink,
   buildPullRequestLink,
   buildRepoLink,
@@ -46,10 +51,11 @@ export type SupportedLinkPreview = {
 // their distinctive path shape (`/git/<64-hex-pubkey>/<repo>`) rather than by
 // hostname, and require an explicit scheme. Generic previews remain HTTPS-only.
 const SUPPORTED_URL_RE =
-  /(^|[\s([{<>"'])(https:\/\/[^\s<>"'\]]+|https?:\/\/[^\s<>"'\]]+\/git\/[a-f0-9]{64}\/[^\s<>"'\]]+|buzz:\/\/(?:pr|issue|repo)\?[^\s<>"'\]]+|(?:(?:www\.)?github\.com|(?:www\.)?linear\.app|drive\.google\.com|docs\.google\.com)\/[^\s<>"'\]]+)/gi;
+  /(^|[\s([{<>"'])(buzz:\/\/message\?[^\s<>"'\]]+|https:\/\/[^\s<>"'\]]+|https?:\/\/[^\s<>"'\]]+\/git\/[a-f0-9]{64}\/[^\s<>"'\]]+|buzz:\/\/(?:pr|issue|repo)\?[^\s<>"'\]]+|(?:(?:www\.)?github\.com|(?:www\.)?linear\.app|drive\.google\.com|docs\.google\.com)\/[^\s<>"'\]]+)/gi;
 const MARKDOWN_SUPPORTED_LINK_RE =
-  /!?\[([^\]\n]+)\]\((https:\/\/[^)\s<>"']+|https?:\/\/[^)\s<>"']+\/git\/[a-f0-9]{64}\/[^)\s<>"']+|buzz:\/\/(?:pr|issue|repo)\?[^)\s<>"']+|(?:(?:www\.)?github\.com|(?:www\.)?linear\.app|drive\.google\.com|docs\.google\.com)\/[^)\s<>"']+)\)/gi;
-const MAX_PREVIEWS = 8;
+  /!?\[([^\]\n]+)\]\((buzz:\/\/message\?[^)\s<>"']+|https:\/\/[^)\s<>"']+|https?:\/\/[^)\s<>"']+\/git\/[a-f0-9]{64}\/[^)\s<>"']+|buzz:\/\/(?:pr|issue|repo)\?[^)\s<>"']+|(?:(?:www\.)?github\.com|(?:www\.)?linear\.app|drive\.google\.com|docs\.google\.com)\/[^)\s<>"']+)\)/gi;
+export const MAX_VISIBLE_GENERATED_PREVIEWS = 8;
+export const MAX_GENERATED_PREVIEW_ATTEMPTS = 12;
 
 type HiddenRange = {
   start: number;
@@ -612,19 +618,40 @@ type LinkPreviewCandidate = {
   order: number;
 };
 
-/** Extract supported link previews from message text, preserving first-seen order. */
-export function extractSupportedLinkPreviews(
+export type MessagePreviewCandidate = ParsedMessageLink & {
+  href: string;
+  index: number;
+  kind: "message";
+};
+
+export type LinkPreviewCandidateResult = {
+  index: number;
+  kind: "link";
+  preview: SupportedLinkPreview;
+};
+
+export type GeneratedPreviewCandidate =
+  | LinkPreviewCandidateResult
+  | MessagePreviewCandidate;
+
+/** Extract generated-preview candidates through one hidden-range and policy scanner. */
+export function extractGeneratedPreviewCandidates(
   content: string,
   activeRelayOrigin?: string | null,
-): SupportedLinkPreview[] {
-  const previews: SupportedLinkPreview[] = [];
+): GeneratedPreviewCandidate[] {
+  const results: GeneratedPreviewCandidate[] = [];
   const seen = new Set<string>();
   const searchable = stripHiddenLinkPreviewContent(content);
   const candidates: LinkPreviewCandidate[] = [];
+  const markdownLinkRanges: HiddenRange[] = [];
   let order = 0;
 
   for (const match of searchable.matchAll(MARKDOWN_SUPPORTED_LINK_RE)) {
     if (match[0]?.startsWith("!")) continue;
+    markdownLinkRanges.push({
+      start: match.index ?? 0,
+      end: (match.index ?? 0) + match[0].length,
+    });
     candidates.push({
       href: match[2],
       index: match.index ?? 0,
@@ -633,37 +660,72 @@ export function extractSupportedLinkPreviews(
     });
     order += 1;
   }
-
   for (const match of searchable.matchAll(SUPPORTED_URL_RE)) {
     const prefix = match[1] ?? "";
     const href = match[2];
     if (!href) continue;
-    candidates.push({
-      href,
-      index: (match.index ?? 0) + prefix.length,
-      order,
-    });
+    const index = (match.index ?? 0) + prefix.length;
+    if (isIndexInRanges(index, markdownLinkRanges)) continue;
+    candidates.push({ href, index, order });
     order += 1;
   }
-
   candidates.sort((a, b) => a.index - b.index || a.order - b.order);
 
   const relayOrigin = activeRelayOrigin ?? null;
   for (const candidate of candidates) {
-    const preview = parseSupportedLinkPreview(candidate.href, relayOrigin);
-    if (!preview || seen.has(preview.href)) continue;
-
-    seen.add(preview.href);
-    previews.push(
-      withTitle(
-        preview,
-        candidate.label
-          ? titleFromMarkdownLabel(candidate.label, preview, relayOrigin)
-          : null,
-      ),
-    );
-    if (previews.length >= MAX_PREVIEWS) break;
+    const normalizedHref = trimUrlCandidate(candidate.href);
+    const message = parseMessageLink(normalizedHref);
+    if (message.ok) {
+      // Authored labels stay labels. React Markdown serializes a bare custom
+      // scheme as `[url](url)`, so only an exact message-link label is an
+      // eligible autolink; mark other labels seen before the bare scanner pass.
+      if (candidate.label) {
+        const label = parseMessageLink(candidate.label.trim());
+        if (
+          !label.ok ||
+          trimUrlCandidate(candidate.label.trim()) !== normalizedHref
+        ) {
+          continue;
+        }
+      }
+      if (seen.has(normalizedHref)) continue;
+      seen.add(normalizedHref);
+      results.push({
+        ...message.value,
+        href: normalizedHref,
+        index: candidate.index,
+        kind: "message",
+      });
+    } else {
+      const preview = parseSupportedLinkPreview(candidate.href, relayOrigin);
+      if (!preview || seen.has(preview.href)) continue;
+      seen.add(preview.href);
+      results.push({
+        index: candidate.index,
+        kind: "link",
+        preview: withTitle(
+          preview,
+          candidate.label
+            ? titleFromMarkdownLabel(candidate.label, preview, relayOrigin)
+            : null,
+        ),
+      });
+    }
+    if (results.length >= MAX_GENERATED_PREVIEW_ATTEMPTS) break;
   }
+  return results;
+}
 
-  return previews;
+/** Extract supported link previews from message text, preserving first-seen order. */
+export function extractSupportedLinkPreviews(
+  content: string,
+  activeRelayOrigin?: string | null,
+): SupportedLinkPreview[] {
+  return extractGeneratedPreviewCandidates(content, activeRelayOrigin)
+    .filter(
+      (candidate): candidate is LinkPreviewCandidateResult =>
+        candidate.kind === "link",
+    )
+    .map((candidate) => candidate.preview)
+    .slice(0, MAX_VISIBLE_GENERATED_PREVIEWS);
 }

@@ -113,6 +113,24 @@ test("awaitLiveSwitchOutcome rejects on unsupported immediately and unsubscribes
   assert.equal(h.unsubscribeCalls, 1, "no double-unsubscribe on a late frame");
 });
 
+test("awaitLiveSwitchOutcome settles failed immediately on an adapter-refused frame without waiting for other channels or the timeout", async () => {
+  const h = harness(3);
+  // channelCount 3, so a success-path impl would need three acks. A single
+  // `failure` frame must fail-fast to "failed" (not "unsupported", not "ok")
+  // before the other two channels reply — proving it never traverses the
+  // success-count path.
+  h.push(frame("failure"));
+  assert.equal(await h.outcome, "failed");
+  // The timeout was cancelled (no 8s wait) and the listener detached exactly
+  // once — the frame settled synchronously, not via the fallback.
+  assert.equal(h.cancelTimeoutCalls, 1, "timeout cancelled, not awaited");
+  assert.equal(h.unsubscribeCalls, 1);
+
+  // A later frame must not re-resolve or re-unsubscribe.
+  h.push(frame("switched"));
+  assert.equal(h.unsubscribeCalls, 1, "no double-unsubscribe on a late frame");
+});
+
 test("awaitLiveSwitchOutcome ignores frames for a different model or control type", async () => {
   const h = harness(1);
   h.push(frame("sent", { modelId: "some-other-model" }));

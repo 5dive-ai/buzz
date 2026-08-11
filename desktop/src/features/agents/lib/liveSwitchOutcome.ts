@@ -4,12 +4,18 @@ import type { ControlResultFrame } from "@/shared/api/types";
  * Resolve the outcome of a live `switch_model` across one or more channels.
  *
  * A live switch fires a `switch_model` frame per active channel and learns each
- * channel's result asynchronously over the observer relay. The fail-fast rule:
- * any single `unsupported_model` result rejects the whole pick immediately;
- * every other status must arrive from every channel before resolving success.
- * If the harness never replies, the fallback timeout resolves `"ok"` — the
- * override still rides the requeued/next session, we just can't confirm it
- * synchronously.
+ * channel's result asynchronously over the observer relay. Two statuses
+ * fail-fast — any single frame rejects the whole pick immediately, without
+ * waiting for the other channels or the timeout:
+ *   - `unsupported_model` → the target model isn't available for this agent.
+ *   - `failure`           → the adapter refused the switch (the session stays
+ *                           on its current model).
+ * The causes differ, so they resolve to distinct outcomes (`"unsupported"` vs
+ * `"failed"`) the caller can message separately. Every other status
+ * (`sent` / `switched` / `turn_ending`) must arrive from every channel before
+ * resolving success. If the harness never replies, the fallback timeout
+ * resolves `"ok"` — the override still rides the requeued/next session, we just
+ * can't confirm it synchronously.
  *
  * The counting lives here, isolated from React and the relay so it can be unit
  * tested with synthetic frames and a fake clock. The caller injects the
@@ -32,12 +38,12 @@ export async function awaitLiveSwitchOutcome({
   sendSwitches: () => Promise<void>;
   /** Schedule the no-reply fallback; returns a cancel function. */
   scheduleTimeout: (onTimeout: () => void) => () => void;
-}): Promise<"ok" | "unsupported"> {
-  const settled = new Promise<"ok" | "unsupported">((resolve) => {
+}): Promise<"ok" | "unsupported" | "failed"> {
+  const settled = new Promise<"ok" | "unsupported" | "failed">((resolve) => {
     let unsubscribe = () => {};
     let cancelTimeout = () => {};
     let remaining = channelCount;
-    const finish = (outcome: "ok" | "unsupported") => {
+    const finish = (outcome: "ok" | "unsupported" | "failed") => {
       cancelTimeout();
       unsubscribe();
       resolve(outcome);
@@ -48,8 +54,14 @@ export async function awaitLiveSwitchOutcome({
         return;
       }
       if (frame.status === "unsupported_model") {
-        // Any single failure rejects the whole pick immediately.
+        // Model unavailable — reject the whole pick immediately.
         finish("unsupported");
+        return;
+      }
+      if (frame.status === "failure") {
+        // Adapter refused the switch — reject immediately. The session stays
+        // on its current model; distinct outcome so the caller can say why.
+        finish("failed");
         return;
       }
       // sent / switched / turn_ending — count as success for this channel.

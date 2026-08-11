@@ -906,8 +906,18 @@ async fn steer(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
     };
 
     let message_id = format!("steer_{}", uuid_like());
+    // `with_steer()` marks the message so downstream consumers can tell a
+    // steer apart from an ordinary user turn -- goose's own steer path sets
+    // it (`agent.rs:540`), and its ACP surface republishes it as
+    // `_meta.goose.steer`. buzz-acp does not read it today, but an unmarked
+    // steer is indistinguishable from the user having simply sent another
+    // message, which is exactly the distinction the flag exists to keep.
     steers
-        .push(goose_provider_types::conversation::message::Message::user().with_text(text))
+        .push(
+            goose_provider_types::conversation::message::Message::user()
+                .with_text(text)
+                .with_steer(),
+        )
         .await;
 
     wire::send(

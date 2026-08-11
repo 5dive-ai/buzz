@@ -480,7 +480,7 @@ pub fn save_personas<R: tauri::Runtime>(
     records: &[AgentDefinition],
 ) -> Result<(), String> {
     let existing = crate::managed_agents::storage::load_agent_definitions(app)?;
-    let definitions = merge_preserving_definitions(existing, records);
+    let definitions = merge_preserving_definitions(existing, records)?;
     crate::managed_agents::storage::save_agent_definitions(app, &definitions)
 }
 
@@ -492,8 +492,58 @@ pub(crate) fn save_personas_at(
     records: &[AgentDefinition],
 ) -> Result<(), String> {
     let existing = crate::managed_agents::storage::load_agent_definitions_at(definitions_dir)?;
-    let definitions = merge_preserving_definitions(existing, records);
+    let definitions = merge_preserving_definitions(existing, records)?;
     crate::managed_agents::storage::save_agent_definitions_at(definitions_dir, &definitions)
+}
+
+/// The canonical raw-record-by-slug lookup (§2.7, §8 Phase 0). One place
+/// resolves a slug to its authoritative on-disk record so the library-aware
+/// routing decision below is identical for delete, inbound upsert/tombstone,
+/// and snapshot/team import. Consumed by §3's removal and inbound branches once
+/// the projection state machine lands; used by [`MutationRoute::for_slug`] now.
+#[allow(dead_code)]
+pub(crate) fn raw_record_by_slug<'a>(
+    records: &'a [ManagedAgentRecord],
+    slug: &str,
+) -> Option<&'a ManagedAgentRecord> {
+    records
+        .iter()
+        .find(|record| record.slug.as_deref() == Some(slug))
+}
+
+/// Where a persona mutation on a slug must be routed (§2.7). A keyless record
+/// carrying `library_ref` is a library projection: deleting it or overwriting
+/// its authoritative shared slots is a library operation that must go through
+/// the §3.4 workspace-remove state machine (`ExcludePending` intent first) or
+/// the §3 library-authoritative inbound branch — NEVER the plain local writer.
+/// A record with no `library_ref` (and a brand-new persona) takes the
+/// head-identical plain path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationRoute {
+    /// Plain keyless record (or a new persona): the head-identical local path.
+    Plain,
+    /// Library-projected record: routing is a §3 deliverable. Until it lands,
+    /// the projected path fails closed so no plain writer can silently drop or
+    /// overwrite a shared definition.
+    LibraryProjected,
+}
+
+impl MutationRoute {
+    /// Classify a mutation by its currently-stored record. `None` (no existing
+    /// record — a create) is always [`Plain`](Self::Plain).
+    fn for_record(record: Option<&ManagedAgentRecord>) -> Self {
+        match record {
+            Some(record) if record.library_ref.is_some() => Self::LibraryProjected,
+            _ => Self::Plain,
+        }
+    }
+
+    /// The route for a mutation targeting `slug` against the raw store — the
+    /// decision delete/inbound/import consult before taking the plain path.
+    #[allow(dead_code)]
+    pub(crate) fn for_slug(records: &[ManagedAgentRecord], slug: &str) -> Self {
+        Self::for_record(raw_record_by_slug(records, slug))
+    }
 }
 
 /// Build the definition half of a persona save so that every field living only
@@ -514,31 +564,69 @@ pub(crate) fn save_personas_at(
 /// update, activation toggle, delete, inbound upsert/tombstone, snapshot/team
 /// import, team deletion) merge-preserving *by construction*.
 ///
-/// A raw record absent from `views` is a deletion, dropped from the result —
-/// the head-identical plain path. Library-aware deletion routing (§3.4's
-/// `ExcludePending` state machine) and the library-authoritative inbound branch
-/// (§2.7 P4-C2) layer on at §3, where `apply_shared_definition` exists; at
-/// Phase 0 no production path authors `library_ref`, so the plain path is the
-/// only reachable one and matches head exactly.
+/// **Library-aware routing (§2.7, resolves P4-C1/P4-C2).** A [`LibraryProjected`]
+/// record must not be mutated by this plain path:
+/// - a projected record absent from `views` is a deletion that must advance the
+///   §3.4 `ExcludePending` state machine, not silently drop the row;
+/// - a `views` entry that would change a projected record's shared slots is a
+///   shared-definition edit (ruling 3a) or a library-linked inbound upsert
+///   (P4-C2) that must route through the library, not overwrite the local cache
+///   with no revision.
+///
+/// Both fail closed until §3 wires the state machine. A view that leaves a
+/// projected record unchanged (an unrelated writer re-passing the projected
+/// view, stripped of its metadata) is not a mutation and rides through intact —
+/// the reason `library_ref` survives every writer above. No production path
+/// authors `library_ref` at Phase 0, so the projected branch is an unreachable
+/// guard rail until §3 populates it.
+///
+/// [`LibraryProjected`]: MutationRoute::LibraryProjected
 fn merge_preserving_definitions(
     existing: Vec<crate::managed_agents::ManagedAgentRecord>,
     views: &[AgentDefinition],
-) -> Vec<crate::managed_agents::ManagedAgentRecord> {
-    let mut by_slug: std::collections::HashMap<String, _> = existing
+) -> Result<Vec<crate::managed_agents::ManagedAgentRecord>, String> {
+    let mut by_slug: std::collections::HashMap<String, ManagedAgentRecord> = existing
         .into_iter()
         .filter_map(|record| record.slug.clone().map(|slug| (slug, record)))
         .collect();
 
-    views
-        .iter()
-        .map(|view| match by_slug.remove(&view.id) {
+    let mut merged = Vec::with_capacity(views.len());
+    for view in views {
+        match by_slug.remove(&view.id) {
             Some(mut record) => {
-                record.apply_definition_view(view);
-                record
+                if MutationRoute::for_record(Some(&record)) == MutationRoute::LibraryProjected {
+                    let mut candidate = record.clone();
+                    candidate.apply_definition_view(view);
+                    if candidate != record {
+                        return Err(format!(
+                            "persona '{}' is a library projection: shared-content edits must \
+                             route through the library, not a plain persona save (§2.7)",
+                            view.id
+                        ));
+                    }
+                } else {
+                    record.apply_definition_view(view);
+                }
+                merged.push(record);
             }
-            None => view.clone().into_agent_record(),
-        })
-        .collect()
+            None => merged.push(view.clone().into_agent_record()),
+        }
+    }
+
+    // Every record left in `by_slug` is absent from `views` — a deletion. A
+    // plain record drops exactly as at head; a projected record must fail closed
+    // (§3.4 removal routing not yet wired).
+    for leftover in by_slug.values() {
+        if MutationRoute::for_record(Some(leftover)) == MutationRoute::LibraryProjected {
+            return Err(format!(
+                "persona '{}' is a library projection: removal must route through the §3.4 \
+                 ExcludePending state machine, not a plain persona save (§2.7)",
+                leftover.slug.as_deref().unwrap_or("<unknown>")
+            ));
+        }
+    }
+
+    Ok(merged)
 }
 
 #[cfg(test)]

@@ -13,10 +13,12 @@
 //!   degrade loudly (they cannot journal a fresh key); no other scope and no
 //!   library operation is affected.
 //! - `deploy-intents.json` unreadable OR semantically invalid (unknown version,
-//!   syntax failure, or a duplicate `agent_pubkey` row — the at-most-one mutex
-//!   is VALIDATED on read and group-rejected, never first-wins) → the scope's
+//!   syntax failure, a duplicate `agent_pubkey` row — the at-most-one mutex is
+//!   VALIDATED on read and group-rejected, never first-wins — or a row whose
+//!   `provider_config` fails `validate_provider_config`) → the scope's
 //!   destructive removal and new-deploy paths FAIL CLOSED, because an unreadable
-//!   journal may hide an intent equivalent to a live remote deployment.
+//!   journal may hide an intent equivalent to a live remote deployment, and an
+//!   unvalidated row must never be exposed as authoritative routing.
 //!
 //! Unlike `library.json`, a corrupt journal is NOT copied to `.invalid`: both
 //! failure modes above refuse to write, so the corrupt file is never
@@ -249,15 +251,40 @@ pub(crate) fn load_deploy_intents(definitions_dir: &Path) -> DeployIntentsLoad {
             "deploy-intents.json has duplicate rows for {pubkey}: the at-most-one mutex is violated"
         ));
     }
+    if let Err(reason) = validate_intent_routing(&journal.intents) {
+        return DeployIntentsLoad::Unreadable(reason);
+    }
     DeployIntentsLoad::Loaded(journal)
 }
 
-/// Persist `deploy-intents.json`: atomic temp-file + rename + `0o600`.
+/// Persist `deploy-intents.json`: atomic temp-file + rename + `0o600`. Rejects
+/// any row whose `provider_config` fails `validate_provider_config`, so a
+/// crate-internal caller can never persist an invalid row that a later read
+/// would refuse (§2.1 row contract; the read-side check would otherwise fail a
+/// scope's destructive paths closed against state this process itself wrote).
 pub(crate) fn save_deploy_intents(
     definitions_dir: &Path,
     journal: &DeployIntentsJournal,
 ) -> Result<(), String> {
+    validate_intent_routing(&journal.intents)?;
     save_journal(&deploy_intents_path(definitions_dir), journal)
+}
+
+/// Validate every row's `provider_config` (§2.1: "validated by
+/// `validate_provider_config`, never secret"). A malformed or secret-bearing
+/// hand-edited row must never be exposed as authoritative routing.
+fn validate_intent_routing(intents: &[DeployIntent]) -> Result<(), String> {
+    for intent in intents {
+        crate::managed_agents::backend::validate_provider_config(&intent.provider_config).map_err(
+            |reason| {
+                format!(
+                    "deploy-intents.json row for {} has invalid provider_config: {reason}",
+                    intent.agent_pubkey
+                )
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// The first `agent_pubkey` that appears in more than one row, if any.

@@ -155,14 +155,53 @@ pub(crate) struct LibraryEntry {
     /// Archive obligations deferred by a protected removal (§3.6 step 3).
     /// PERMANENT journaled retirement markers in v1 (P17-C1): no v1 path
     /// discharges them; their presence keeps `key_archive_protected(pubkey)`
-    /// true. SET semantics on `(library_id, scope_id, agent_pubkey)` — every
-    /// append is an upsert (P15-MINOR); reads treat legacy duplicate rows as
-    /// one obligation.
+    /// true. SET semantics on `(library_id, scope_id, agent_pubkey)`
+    /// (`library_id` is fixed per entry). Insert ONLY through
+    /// [`upsert_deferred_archive`](LibraryEntry::upsert_deferred_archive) — every
+    /// append is an upsert (P15-MINOR) — and read through
+    /// [`deferred_archive_obligations`](LibraryEntry::deferred_archive_obligations),
+    /// which collapses legacy duplicate rows to one obligation.
     #[serde(default)]
     pub deferred_archives: Vec<DeferredArchive>,
     /// Authoritative per-scope membership — sole source for delete-confirm
     /// enumeration, tombstone completion, and key lifetime.
     pub projections: BTreeMap<String, ProjectionEntry>,
+}
+
+impl LibraryEntry {
+    /// Upsert a deferred-archive obligation (§2.3, P15-MINOR). SET semantics on
+    /// `(scope_id, agent_pubkey)` — `library_id` is fixed per entry — so §3.6's
+    /// crash-then-re-consent retry can re-run the obligation write idempotently:
+    /// a marker already present is a no-op, never a duplicate row. This is the
+    /// ONLY insertion path; callers never push onto `deferred_archives`
+    /// directly. Returns `true` iff a new marker was added.
+    pub fn upsert_deferred_archive(&mut self, scope_id: String, agent_pubkey: String) -> bool {
+        if self
+            .deferred_archives
+            .iter()
+            .any(|d| d.scope_id == scope_id && d.agent_pubkey == agent_pubkey)
+        {
+            return false;
+        }
+        self.deferred_archives.push(DeferredArchive {
+            scope_id,
+            agent_pubkey,
+        });
+        true
+    }
+
+    /// The deferred-archive obligations as a SET (§2.3): a legacy `Vec` with
+    /// duplicate rows is collapsed to one obligation per `(scope_id,
+    /// agent_pubkey)`. Phase-3 callers read obligations through this view, never
+    /// the raw field, so multiplicity in old on-disk data never becomes
+    /// multiplicity in behavior.
+    pub fn deferred_archive_obligations(&self) -> Vec<&DeferredArchive> {
+        let mut seen = std::collections::HashSet::new();
+        self.deferred_archives
+            .iter()
+            .filter(|d| seen.insert((d.scope_id.as_str(), d.agent_pubkey.as_str())))
+            .collect()
+    }
 }
 
 /// `(origin scope_id, origin slug)` — the share idempotency key (§2.3).
@@ -455,15 +494,19 @@ fn validate_entry_bindings(entry: &LibraryEntry) -> Result<(), String> {
 
 /// Build the document-wide identity index over the individually valid entries
 /// and return the indices of every collider (§2.1 rule; P6-I3). Collisions on
-/// (a) `library_id`, (b) live (non-`deleted`) [`OriginKey`], or (c) a
-/// non-terminal `(scope_id, local_slug)` projection claim group-quarantine ALL
-/// participants — picking a winner would silently rewrite a scope.
+/// (a) `library_id`, (b) live (non-`deleted`) [`OriginKey`], (c) a non-terminal
+/// `(scope_id, local_slug)` projection claim, or (d) one `agent_pubkey` bound
+/// under two DIFFERENT owners anywhere in the document group-quarantine ALL
+/// participants — picking a winner would silently rewrite a scope or alias one
+/// global keyring identity across owner authorities.
 fn identity_collisions<'a>(
     entries: impl Iterator<Item = &'a LibraryEntry>,
 ) -> std::collections::HashSet<usize> {
     let mut by_library_id: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut by_origin: HashMap<&OriginKey, Vec<usize>> = HashMap::new();
     let mut by_scope_slug: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    // agent_pubkey → every (entry index, owner) it is bound under document-wide.
+    let mut by_bound_agent: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
 
     for (index, entry) in entries.enumerate() {
         by_library_id
@@ -481,6 +524,12 @@ fn identity_collisions<'a>(
                     .push(index);
             }
         }
+        for (owner_hex, binding) in &entry.identity_bindings {
+            by_bound_agent
+                .entry(binding.agent_pubkey.as_str())
+                .or_default()
+                .push((index, owner_hex.as_str()));
+        }
     }
 
     let mut colliders = std::collections::HashSet::new();
@@ -491,6 +540,19 @@ fn identity_collisions<'a>(
     {
         if group.len() > 1 {
             colliders.extend(group.iter().copied());
+        }
+    }
+    // (d) Cross-owner identity aliasing (§2.5, spec lines 1765-1766): the
+    // keyring is process-global by pubkey, so one `agent_pubkey` bound under two
+    // different owners aliases a single agent identity across owner authorities.
+    // Group-quarantine every entry that binds a colliding pubkey; same-owner
+    // reuse across entries is explicitly permitted and never collides. (A single
+    // entry binding one pubkey under two owners is already rejected in pass 1.)
+    for occurrences in by_bound_agent.values() {
+        let distinct_owners: std::collections::HashSet<&str> =
+            occurrences.iter().map(|(_, owner)| *owner).collect();
+        if distinct_owners.len() > 1 {
+            colliders.extend(occurrences.iter().map(|(index, _)| *index));
         }
     }
     colliders

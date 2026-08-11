@@ -583,6 +583,71 @@ fn empty_prompt_folds_to_none() {
     assert_eq!(persona.into_agent_record().system_prompt, None);
 }
 
+/// P13-I3 / invariant 4: a legacy head-serialized record (no `library_ref`,
+/// no `library_applied_revision`, no `last_completed_deploy_attempt_id`) reads
+/// with all three `None` and re-serializes WITHOUT resurrecting the keys —
+/// `skip_serializing_if` keeps it byte-identical to head, so a device that
+/// never touched the library is untouched by the fold.
+#[test]
+fn legacy_record_without_deploy_provenance_round_trips_byte_identically() {
+    let legacy = r#"{
+        "pubkey": "abcd1234",
+        "name": "test-agent",
+        "private_key_nsec": "nsec1fake",
+        "relay_url": "wss://localhost:3000",
+        "acp_command": "buzz-acp",
+        "agent_command": "goose",
+        "agent_args": [],
+        "mcp_command": "",
+        "turn_timeout_seconds": 320,
+        "system_prompt": null,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "last_started_at": null,
+        "last_stopped_at": null,
+        "last_exit_code": null,
+        "last_error": null
+    }"#;
+    let record: ManagedAgentRecord =
+        serde_json::from_str(legacy).expect("legacy record deserializes");
+    assert_eq!(record.library_ref, None);
+    assert_eq!(record.library_applied_revision, None);
+    assert_eq!(record.last_completed_deploy_attempt_id, None);
+
+    let reserialized = serde_json::to_value(&record).expect("serialize");
+    let object = reserialized.as_object().expect("record is an object");
+    assert!(!object.contains_key("library_ref"));
+    assert!(!object.contains_key("library_applied_revision"));
+    assert!(!object.contains_key("last_completed_deploy_attempt_id"));
+}
+
+/// P14-I2: the deploy-attempt stamp is not projection metadata, so a fresh
+/// projection carries it as `None`, and an ordinary persona save — which
+/// applies a definition VIEW onto a canonical record — must never shed a
+/// non-`None` stamp (the view cannot carry it, so `apply_definition_view` must
+/// leave it untouched).
+#[test]
+fn deploy_attempt_stamp_survives_into_record_and_apply_view() {
+    // Fresh projection: no stamp.
+    let mut record = sample_persona().into_agent_record();
+    assert_eq!(record.last_completed_deploy_attempt_id, None);
+
+    // Seed a landed deploy stamp, then apply an unrelated definition edit.
+    record.last_completed_deploy_attempt_id = Some("attempt-42".to_string());
+    record.backend_agent_id = Some("backend-7".to_string());
+    let mut edited = sample_persona();
+    edited.display_name = "Renamed".to_string();
+    record.apply_definition_view(&edited);
+
+    assert_eq!(record.display_name.as_deref(), Some("Renamed"));
+    assert_eq!(
+        record.last_completed_deploy_attempt_id.as_deref(),
+        Some("attempt-42"),
+        "apply_definition_view must never shed the deploy-attempt stamp",
+    );
+    assert_eq!(record.backend_agent_id.as_deref(), Some("backend-7"));
+}
+
 // ── Mint-time behavioral defaults (B5 quad activation) ──────────────────────
 
 use super::resolve_mint_behavioral_defaults;

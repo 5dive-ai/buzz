@@ -309,6 +309,80 @@ fn test_one_agent_bound_under_two_owners_quarantines() {
 }
 
 #[test]
+fn test_agent_bound_under_two_owners_across_entries_group_quarantines() {
+    let dir = tempdir().unwrap();
+    let owner_a = Keys::generate();
+    let owner_b = Keys::generate();
+    let agent = Keys::generate();
+    // Two individually-valid entries with distinct library_ids AND distinct
+    // origins, each binding the SAME agent pubkey but under a DIFFERENT owner.
+    // The keyring is process-global by pubkey, so this aliases one agent
+    // identity across owner authorities — a document-wide collision that the
+    // per-entry `seen_agents` pass cannot see (§2.5, spec lines 1761-1762).
+    let a = value_of(&entry(
+        "lib-cross-a",
+        "scope-a",
+        "aria",
+        Some((&owner_a, &agent)),
+    ));
+    let b = value_of(&entry(
+        "lib-cross-b",
+        "scope-b",
+        "bram",
+        Some((&owner_b, &agent)),
+    ));
+    // A healthy sibling binding a DIFFERENT agent stays fully usable.
+    let sibling_owner = Keys::generate();
+    let sibling_agent = Keys::generate();
+    let sibling = value_of(&entry(
+        "lib-sibling",
+        "scope-s",
+        "sara",
+        Some((&sibling_owner, &sibling_agent)),
+    ));
+    write_doc(dir.path(), &doc(vec![a.clone(), b.clone(), sibling]));
+
+    match load_library(dir.path()) {
+        LibraryLoad::Loaded(loaded) => {
+            assert_eq!(loaded.healthy.len(), 1);
+            assert_eq!(loaded.healthy[0].library_id, "lib-sibling");
+            assert_eq!(loaded.quarantined.len(), 2);
+            assert!(loaded.quarantined.contains(&a));
+            assert!(loaded.quarantined.contains(&b));
+        }
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_same_owner_agent_reuse_across_entries_stays_healthy() {
+    let dir = tempdir().unwrap();
+    let owner = Keys::generate();
+    let agent = Keys::generate();
+    // The SAME owner binding the SAME agent across multiple entries is the
+    // identity auto-carry across a same-owner's workspaces (§2.5) — explicitly
+    // permitted, NOT a cross-owner alias. Neither entry may quarantine.
+    let a = value_of(&entry(
+        "lib-reuse-a",
+        "scope-a",
+        "aria",
+        Some((&owner, &agent)),
+    ));
+    let b = value_of(&entry(
+        "lib-reuse-b",
+        "scope-b",
+        "bram",
+        Some((&owner, &agent)),
+    ));
+    write_doc(dir.path(), &doc(vec![a, b]));
+
+    match load_library(dir.path()) {
+        LibraryLoad::Loaded(loaded) => assert_eq!(loaded.healthy.len(), 2),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_duplicate_library_id_group_quarantines_all_colliders() {
     let dir = tempdir().unwrap();
     let a = value_of(&entry("lib-dup", "scope-1", "one", None));
@@ -525,6 +599,61 @@ fn test_apply_shared_definition_empty_prompt_maps_to_none() {
     assert_eq!(record.system_prompt, None);
 }
 
+// ── §2.3: deferred_archives SET semantics (P15-MINOR) ───────────────────────────
+
+#[test]
+fn test_upsert_deferred_archive_is_idempotent_across_retries() {
+    let mut e = entry("lib-def", "scope-d", "dora", None);
+    // Simulate §3.6's crash-then-re-consent retry: the same obligation write
+    // re-runs three times. SET semantics keep exactly one marker.
+    for _ in 0..3 {
+        e.upsert_deferred_archive("scope-x".to_string(), "agent-pk".to_string());
+    }
+    assert_eq!(e.deferred_archives.len(), 1);
+    assert_eq!(e.deferred_archive_obligations().len(), 1);
+}
+
+#[test]
+fn test_upsert_deferred_archive_reports_new_versus_existing() {
+    let mut e = entry("lib-def", "scope-d", "dora", None);
+    assert!(e.upsert_deferred_archive("scope-x".to_string(), "agent-a".to_string()));
+    // Same coordinate → no-op.
+    assert!(!e.upsert_deferred_archive("scope-x".to_string(), "agent-a".to_string()));
+    // A different scope or agent is a distinct obligation.
+    assert!(e.upsert_deferred_archive("scope-y".to_string(), "agent-a".to_string()));
+    assert!(e.upsert_deferred_archive("scope-x".to_string(), "agent-b".to_string()));
+    assert_eq!(e.deferred_archives.len(), 3);
+}
+
+#[test]
+fn test_legacy_duplicate_deferred_archives_read_as_one_obligation() {
+    // A legacy on-disk entry with duplicate rows (written before the upsert
+    // API existed) must READ as one obligation per (scope_id, agent_pubkey).
+    let mut e = entry("lib-legacy", "scope-l", "leo", None);
+    e.deferred_archives = vec![
+        DeferredArchive {
+            scope_id: "scope-x".to_string(),
+            agent_pubkey: "agent-a".to_string(),
+        },
+        DeferredArchive {
+            scope_id: "scope-x".to_string(),
+            agent_pubkey: "agent-a".to_string(),
+        },
+        DeferredArchive {
+            scope_id: "scope-y".to_string(),
+            agent_pubkey: "agent-a".to_string(),
+        },
+    ];
+    let obligations = e.deferred_archive_obligations();
+    assert_eq!(obligations.len(), 2);
+    assert!(obligations
+        .iter()
+        .any(|d| d.scope_id == "scope-x" && d.agent_pubkey == "agent-a"));
+    assert!(obligations
+        .iter()
+        .any(|d| d.scope_id == "scope-y" && d.agent_pubkey == "agent-a"));
+}
+
 // ── scope-local journals (P9-I1 / P10-C3) ───────────────────────────────────────
 
 #[test]
@@ -599,7 +728,7 @@ fn test_deploy_intents_round_trip_preserves_phase() {
                     },
                 },
                 provider_id: "fly".to_string(),
-                provider_config: json!(null),
+                provider_config: json!({"region": "sjc"}),
                 created_at: "2026-08-11T00:01:00Z".to_string(),
             },
         ],
@@ -648,6 +777,110 @@ fn test_deploy_intents_unknown_field_is_unreadable() {
         load_deploy_intents(dir.path()),
         DeployIntentsLoad::Unreadable(_)
     ));
+}
+
+/// A `Running` deploy row with the given `provider_config`, for routing-
+/// validation fixtures.
+fn intent_with_config(pubkey: &str, provider_config: Value) -> DeployIntent {
+    DeployIntent {
+        agent_pubkey: pubkey.to_string(),
+        phase: DeployIntentPhase::Running {
+            attempt_id: "a".to_string(),
+        },
+        provider_id: "fly".to_string(),
+        provider_config,
+        created_at: "t".to_string(),
+    }
+}
+
+#[test]
+fn test_deploy_intents_non_object_provider_config_is_unreadable() {
+    let dir = tempdir().unwrap();
+    // A hand-edited row whose provider_config is a bare scalar, not an object.
+    // `validate_provider_config` rejects it; the row must not be exposed as
+    // authoritative routing (§2.1 row contract).
+    std::fs::write(
+        deploy_intents_path(dir.path()),
+        serde_json::to_vec(&DeployIntentsJournal {
+            version: SUPPORTED_JOURNAL_VERSION,
+            intents: vec![intent_with_config("pk", json!("us-east"))],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    match load_deploy_intents(dir.path()) {
+        DeployIntentsLoad::Unreadable(reason) => assert!(reason.contains("provider_config")),
+        other => panic!("expected Unreadable, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_deploy_intents_nested_provider_config_is_unreadable() {
+    let dir = tempdir().unwrap();
+    // Nested (non-scalar) values are rejected — routing must be a flat object.
+    std::fs::write(
+        deploy_intents_path(dir.path()),
+        serde_json::to_vec(&DeployIntentsJournal {
+            version: SUPPORTED_JOURNAL_VERSION,
+            intents: vec![intent_with_config("pk", json!({"region": {"nested": 1}}))],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        load_deploy_intents(dir.path()),
+        DeployIntentsLoad::Unreadable(_)
+    ));
+}
+
+#[test]
+fn test_deploy_intents_secret_key_provider_config_is_unreadable() {
+    let dir = tempdir().unwrap();
+    // A secret-like key is rejected — provider_config is never secret (§2.1).
+    std::fs::write(
+        deploy_intents_path(dir.path()),
+        serde_json::to_vec(&DeployIntentsJournal {
+            version: SUPPORTED_JOURNAL_VERSION,
+            intents: vec![intent_with_config("pk", json!({"api_key": "leak"}))],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        load_deploy_intents(dir.path()),
+        DeployIntentsLoad::Unreadable(_)
+    ));
+}
+
+#[test]
+fn test_deploy_intents_valid_scalar_object_provider_config_loads() {
+    let dir = tempdir().unwrap();
+    // A flat object of scalar, non-secret values is the healthy shape.
+    let journal = DeployIntentsJournal {
+        version: SUPPORTED_JOURNAL_VERSION,
+        intents: vec![intent_with_config(
+            "pk",
+            json!({"region": "iad", "size": 2}),
+        )],
+    };
+    save_deploy_intents(dir.path(), &journal).unwrap();
+    match load_deploy_intents(dir.path()) {
+        DeployIntentsLoad::Loaded(j) => assert_eq!(j, journal),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_save_deploy_intents_rejects_invalid_provider_config() {
+    let dir = tempdir().unwrap();
+    // The writer boundary refuses an invalid row, so no crate-internal caller
+    // can persist state a later read would fail closed against.
+    let journal = DeployIntentsJournal {
+        version: SUPPORTED_JOURNAL_VERSION,
+        intents: vec![intent_with_config("pk", json!({"secret": "x"}))],
+    };
+    assert!(save_deploy_intents(dir.path(), &journal).is_err());
+    assert!(!deploy_intents_path(dir.path()).exists());
 }
 
 #[test]

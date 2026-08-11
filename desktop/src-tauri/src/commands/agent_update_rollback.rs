@@ -201,4 +201,43 @@ mod tests {
         assert_eq!(records[0].last_error.as_deref(), Some("harness exited"));
         assert_eq!(records[0].updated_at, "runtime-change");
     }
+
+    /// P14-I2: a provider deploy success lands the inseparable pair
+    /// `{backend_agent_id, last_completed_deploy_attempt_id}` on the live record
+    /// WHILE a rename's profile sync is still awaiting; the profile step then
+    /// fails and rollback runs. `copy_runtime_state` carries the pair as one
+    /// unit, so `same_configuration` still matches (no equality-mismatch
+    /// refusal), the restored record keeps the exact pair (never an
+    /// ID-without-stamp record), and the pre-rename configuration is restored.
+    #[test]
+    fn failed_profile_sync_carries_deploy_provenance_pair_through_rollback() {
+        let previous = record("Old name", "before");
+        let mut attempted = previous.clone();
+        attempted.name = "New name".to_string();
+        attempted.updated_at = "attempt".to_string();
+        let rollback = AgentUpdateRollback::new(previous, &attempted);
+
+        // Concurrent provider success: the live record gains BOTH provenance
+        // fields in the same write, plus normal runtime churn.
+        let mut deployed = attempted;
+        deployed.backend_agent_id = Some("backend-42".to_string());
+        deployed.last_completed_deploy_attempt_id = Some("attempt-42".to_string());
+        deployed.last_started_at = Some("started".to_string());
+        deployed.updated_at = "deploy-landed".to_string();
+        let mut records = vec![deployed];
+
+        restore_agent_update(&mut records, "abcd1234", rollback)
+            .expect("a concurrent deploy success must not block the rename rollback");
+
+        // Configuration rolled back; the provenance PAIR survives intact.
+        assert_eq!(records[0].name, "Old name");
+        assert_eq!(records[0].backend_agent_id.as_deref(), Some("backend-42"));
+        assert_eq!(
+            records[0].last_completed_deploy_attempt_id.as_deref(),
+            Some("attempt-42"),
+            "the deploy-attempt stamp must ride the rollback with its backend id",
+        );
+        assert_eq!(records[0].last_started_at.as_deref(), Some("started"));
+        assert_eq!(records[0].updated_at, "deploy-landed");
+    }
 }

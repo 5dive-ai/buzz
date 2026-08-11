@@ -536,9 +536,85 @@ fn merge_preserving_save_keeps_library_metadata_across_every_writer_shape() {
             .iter()
             .filter_map(|record| record.to_definition_view())
             .collect();
-        let saved = merge_preserving_definitions(existing, &transform(views));
+        let saved = merge_preserving_definitions(existing, &transform(views))
+            .unwrap_or_else(|e| panic!("{label}: unrelated writer must not fail: {e}"));
         assert_projection_survived(&saved, label);
     }
+}
+
+/// §2.7 fail-closed routing (P4-C1/P4-C2): a plain persona save must not be
+/// able to DELETE a library-projected record. Dropping the projected view from
+/// the save vector is a removal that must advance the §3.4 `ExcludePending`
+/// state machine; until that lands the seam rejects it rather than silently
+/// dropping the row.
+#[test]
+fn merge_preserving_save_rejects_deleting_a_projected_record() {
+    let existing = vec![
+        projected_record("shared", 3),
+        custom_persona("custom:plain", "Plain").into_agent_record(),
+    ];
+    // The save vector omits "shared" entirely — a deletion of the projection.
+    let views = vec![custom_persona("custom:plain", "Plain")];
+    let err = merge_preserving_definitions(existing, &views)
+        .expect_err("deleting a projected record must fail closed");
+    assert!(err.contains("shared") && err.contains("removal"), "{err}");
+}
+
+/// §2.7 fail-closed routing (P4-C2): a plain persona save must not overwrite a
+/// projected record's shared content. A view that changes a shared slot is a
+/// library edit / library-linked inbound upsert that must route through the
+/// library with a revision, not become an unjournaled local edit.
+#[test]
+fn merge_preserving_save_rejects_editing_a_projected_records_shared_slot() {
+    let existing = vec![projected_record("shared", 3)];
+    // Re-pass the projected view but mutate a shared slot (display name).
+    let mut view = existing[0].to_definition_view().expect("view");
+    view.display_name = "Hijacked".to_string();
+    let err = merge_preserving_definitions(existing, &[view])
+        .expect_err("editing projected shared content must fail closed");
+    assert!(err.contains("shared") && err.contains("edits"), "{err}");
+}
+
+/// The no-op case that keeps the every-writer guarantee honest: re-passing a
+/// projected record's own view (metadata stripped, no field changed) is NOT a
+/// mutation and must ride through intact — otherwise an unrelated writer that
+/// re-serializes the whole store would trip the fail-closed guard.
+#[test]
+fn merge_preserving_save_passes_unchanged_projected_record_through() {
+    let existing = vec![
+        projected_record("shared", 3),
+        custom_persona("custom:plain", "Plain").into_agent_record(),
+    ];
+    let views: Vec<AgentDefinition> = existing
+        .iter()
+        .filter_map(|record| record.to_definition_view())
+        .collect();
+    let saved =
+        merge_preserving_definitions(existing, &views).expect("unchanged projection must pass");
+    assert_projection_survived(&saved, "noop_reserialize");
+}
+
+/// `MutationRoute::for_slug` classifies a projected slug as `LibraryProjected`,
+/// a plain slug and an unknown slug (a create) as `Plain` — the decision every
+/// §3 delete/inbound/import caller consults before the plain path.
+#[test]
+fn mutation_route_classifies_projected_plain_and_unknown_slugs() {
+    let records = vec![
+        projected_record("shared", 3),
+        custom_persona("custom:plain", "Plain").into_agent_record(),
+    ];
+    assert_eq!(
+        super::MutationRoute::for_slug(&records, "shared"),
+        super::MutationRoute::LibraryProjected,
+    );
+    assert_eq!(
+        super::MutationRoute::for_slug(&records, "custom:plain"),
+        super::MutationRoute::Plain,
+    );
+    assert_eq!(
+        super::MutationRoute::for_slug(&records, "does-not-exist"),
+        super::MutationRoute::Plain,
+    );
 }
 
 /// The same guarantee through the on-disk `_at` seam — proving the storage

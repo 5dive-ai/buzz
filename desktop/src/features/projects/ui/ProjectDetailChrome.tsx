@@ -5,6 +5,7 @@ import type { Project } from "@/features/projects/hooks";
 import { projectShareLink } from "@/features/projects/lib/projectShareLinks";
 import { channelChrome, topChromeInset } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
+import type { EntityLinkTab } from "@/shared/lib/entityLink";
 import { Button } from "@/shared/ui/button";
 import { ShareLinkButton } from "./ShareLinkButton";
 
@@ -23,6 +24,7 @@ export function ProjectDetailChrome({
   onGoProjectHome,
   onGoProjects,
   project,
+  shareTab,
 }: {
   /** Repository-scoped controls, rendered left of the project-wide ones. */
   actions?: React.ReactNode;
@@ -33,6 +35,11 @@ export function ProjectDetailChrome({
   onGoProjectHome: () => void;
   onGoProjects: () => void;
   project: Project;
+  /**
+   * Workspace tab the copied link should open (`undefined` = overview), so
+   * sharing from the PR or issue list lands recipients on that same list.
+   */
+  shareTab?: EntityLinkTab;
 }) {
   return (
     <div
@@ -115,7 +122,7 @@ export function ProjectDetailChrome({
           {actions}
           <ShareLinkButton
             label="Copy project link"
-            link={projectShareLink(project)}
+            link={projectShareLink(project, shareTab)}
             testId="project-detail-copy-link"
           />
           {project.projectChannelId ? (

@@ -8,6 +8,12 @@
 //!
 //! Callers are expected to validate inputs first (`validate_hex64`,
 //! `validate_repo_id`); the identifier charsets need no URL encoding.
+//!
+//! Coordinate links additionally accept an optional `&tab=<tab>` parameter
+//! (`files|commits|issues|prs|contributors`) selecting a workspace tab on
+//! the receiving side. The CLI builders emit the canonical no-tab form
+//! (overview); the parameter exists for the desktop's tab-aware copy-link
+//! button.
 
 /// Whether a d-tag can be expressed in a `buzz://` link.
 ///

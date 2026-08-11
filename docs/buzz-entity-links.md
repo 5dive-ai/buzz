@@ -78,8 +78,8 @@ free.
 Extend the existing `buzz://` scheme, mirroring `buzz://message`:
 
 ```
-buzz://repo?owner=<pubkey-hex>&d=<repo-dtag>
-buzz://project?owner=<pubkey-hex>&d=<project-dtag>
+buzz://repo?owner=<pubkey-hex>&d=<repo-dtag>[&tab=<tab>]
+buzz://project?owner=<pubkey-hex>&d=<project-dtag>[&tab=<tab>]
 buzz://pr?id=<event-id-hex>&owner=<pubkey-hex>&d=<repo-dtag>
 buzz://issue?id=<event-id-hex>&owner=<pubkey-hex>&d=<repo-dtag>
 ```
@@ -89,6 +89,13 @@ buzz://issue?id=<event-id-hex>&owner=<pubkey-hex>&d=<repo-dtag>
 - `d` is the addressable `d`-tag. For `repo`/`project` links the
   (`owner`, `d`) pair is the full `30617:<owner>:<d>` /
   `30621:<owner>:<d>` coordinate.
+- `tab` (coordinate links only, optional) selects a workspace tab instead
+  of the default readme overview: `files`, `commits`, `issues`, `prs`, or
+  `contributors`. The overview has no spelling (canonical links omit the
+  parameter), unknown values are rejected, and event links accept no `tab`.
+  The desktop's copy-link button emits it automatically when a non-overview
+  tab is active, so "link to the PR list" is just the project link copied
+  from the Pull Request tab.
 - For `pr`/`issue` links, `id` identifies the kind `1618` / `1621` event;
   `owner` + `d` are the routing coordinate that lets the client navigate
   (and render a fallback card) without an event lookup. **v1 decision:** the

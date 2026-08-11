@@ -188,10 +188,15 @@ fn is_linkable_dtag(value: &str) -> bool {
 /// navigating. Validating here too keeps a malformed link from raising and
 /// focusing the window for a navigation that would then be declined.
 ///
+/// Workspace tabs addressable by `buzz://repo|project` links — mirrors
+/// `ENTITY_LINK_TABS` in `entityLink.ts`.
+const ENTITY_LINK_TABS: [&str; 5] = ["files", "commits", "issues", "prs", "contributors"];
+
 /// The canonical-form rules match `parseEntityLink`: no path segments, no
 /// fragment, and no parameters beyond `owner`/`d` (plus `id` for event
-/// links), so a future extension of the format is declined by old builds
-/// rather than silently misread.
+/// links and the optional `tab` for coordinate links), so a future
+/// extension of the format is declined by old builds rather than silently
+/// misread.
 fn parse_entity_deep_link(url: &Url) -> Option<()> {
     let host = url.host_str()?;
     if !ENTITY_LINK_HOSTS.contains(&host) {
@@ -202,12 +207,14 @@ fn parse_entity_deep_link(url: &Url) -> Option<()> {
     }
 
     let needs_event_id = host == "pr" || host == "issue";
-    let (mut owner, mut dtag, mut id) = (None, None, None);
+    let allows_tab = host == "repo" || host == "project";
+    let (mut owner, mut dtag, mut id, mut tab) = (None, None, None, None);
     for (key, value) in url.query_pairs() {
         let slot = match key.as_ref() {
             "owner" => &mut owner,
             "d" => &mut dtag,
             "id" if needs_event_id => &mut id,
+            "tab" if allows_tab => &mut tab,
             _ => return None,
         };
         if slot.is_some() {
@@ -224,6 +231,11 @@ fn parse_entity_deep_link(url: &Url) -> Option<()> {
     }
     if needs_event_id && !id.is_some_and(|id| is_hex64(&id)) {
         return None;
+    }
+    if let Some(tab) = tab {
+        if !ENTITY_LINK_TABS.contains(&tab.as_str()) {
+            return None;
+        }
     }
     Some(())
 }
@@ -481,6 +493,8 @@ mod tests {
         for raw in [
             format!("buzz://repo?owner={OWNER}&d=buzz-world"),
             format!("buzz://project?owner={OWNER}&d=buzz-world"),
+            format!("buzz://repo?owner={OWNER}&d=buzz-world&tab=prs"),
+            format!("buzz://project?owner={OWNER}&d=buzz-world&tab=issues"),
             format!("buzz://pr?id={EVENT_ID}&owner={OWNER}&d=buzz-world"),
             format!("buzz://issue?id={EVENT_ID}&owner={OWNER}&d=buzz-world"),
         ] {
@@ -506,6 +520,10 @@ mod tests {
             // Non-canonical: unknown param, duplicate param, path, fragment.
             format!("buzz://repo?owner={OWNER}&d=buzz-world&relay=wss%3A%2F%2Fx.example"),
             format!("buzz://repo?owner={OWNER}&owner={OWNER}&d=buzz-world"),
+            // Unknown tab value, duplicate tab, and tab on an event link.
+            format!("buzz://repo?owner={OWNER}&d=buzz-world&tab=overview"),
+            format!("buzz://repo?owner={OWNER}&d=buzz-world&tab=prs&tab=prs"),
+            format!("buzz://pr?id={EVENT_ID}&owner={OWNER}&d=buzz-world&tab=prs"),
             format!("buzz://repo/extra?owner={OWNER}&d=buzz-world"),
             format!("buzz://repo?owner={OWNER}&d=buzz-world#top"),
             // Not an entity host.

@@ -4019,13 +4019,30 @@ fn default_heartbeat_prompt() -> String {
          1. Run `buzz feed get --types needs_action` to check for pending workflow approvals or\n\
             high-priority requests addressed to you.\n\
          2. Run `buzz feed get --types mentions` to check for unanswered @mentions.\n\
-         3. If you find actionable items, address them using the appropriate CLI commands\n\
-            (e.g., `buzz workflows approve --token <UUID>`, `buzz messages send`,\n\
-            `buzz messages send --reply-to <event-id>`).\n\
-         4. If there are no pending actions or mentions, end your turn immediately.\n\n\
+         3. For each actionable feed mention, call\n\
+            `buzz messages thread --channel <h-tag> --event <event_id>` to get the thread root,\n\
+            then reply with `buzz messages send --channel <h-tag> --reply-to <root>`.\n\
+         4. Address other actionable items using the appropriate CLI commands\n\
+            (e.g., `buzz workflows approve --token <UUID>`, `buzz messages send`).\n\
+         5. If there are no pending actions or mentions, end your turn immediately.\n\n\
          Do not run `buzz channels list` or `buzz messages search` unless you have a specific reason.\n\
          Do not invent work — only act on items surfaced by the feed commands."
     )
+}
+
+#[cfg(test)]
+mod heartbeat_prompt_tests {
+    use super::default_heartbeat_prompt;
+
+    #[test]
+    fn default_heartbeat_prompt_resolves_thread_root_for_feed_mentions() {
+        let prompt = default_heartbeat_prompt();
+
+        assert!(prompt.contains("For each actionable feed mention"));
+        assert!(prompt.contains("buzz messages thread --channel <h-tag> --event <event_id>"));
+        assert!(prompt.contains("to get the thread root"));
+        assert!(prompt.contains("buzz messages send --channel <h-tag> --reply-to <root>"));
+    }
 }
 
 /// Spawn a background respawn task for a crashed agent slot.

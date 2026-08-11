@@ -24,6 +24,7 @@ import type {
   RelayAgent,
 } from "@/shared/api/types";
 import { VerifiedBadge } from "@/shared/ui/VerifiedBadge";
+import { getCurrentVerifiedName } from "@/shared/lib/verifiedIdentity";
 
 const RUNTIME_LABELS: Record<string, string> = {
   goose: "Goose",
@@ -49,7 +50,7 @@ export type ProfileField = {
 
 const AGENT_INFO_LABELS = new Set([
   "Public key",
-  "Corporate identity",
+  "Relay-verified identity",
   "Managed by",
   "NIP-05",
   "Agent type",
@@ -59,7 +60,7 @@ const AGENT_INFO_LABELS = new Set([
 const AGENT_SETTINGS_LABELS = new Set([
   "Runtime",
   "Agent profile",
-  "Respond to",
+  "Who can send instructions",
   "ACP command",
   "MCP command",
   "Start on launch",
@@ -177,16 +178,22 @@ export function buildPublicFields({
     });
   }
 
-  const verifiedName = profile?.verifiedName?.trim();
+  const verifiedName = getCurrentVerifiedName(
+    profile?.verifiedName,
+    profile?.verifiedNameExpiresAt,
+  );
   if (verifiedName) {
     fields.push({
       displayValue: verifiedName,
       icon: BadgeCheck,
-      label: "Corporate identity",
-      testId: "user-profile-corporate-identity",
+      label: "Relay-verified identity",
+      testId: "user-profile-relay-verified-identity",
       trailingNode: (
         <span className="flex shrink-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
-          <VerifiedBadge verifiedName={verifiedName} />
+          <VerifiedBadge
+            verifiedName={verifiedName}
+            verifiedNameExpiresAt={profile?.verifiedNameExpiresAt}
+          />
           Binding active
         </span>
       ),
@@ -265,9 +272,13 @@ export function buildOwnerFields({
   const fields: ProfileField[] = [];
   const respondTo = managedAgent?.respondTo ?? relayAgent?.respondTo ?? null;
   const respondToDisplayValue = respondTo
-    ? respondTo === "owner-only" && ownerDisplayName
+    ? respondTo === "owner-only"
       ? ownerDisplayName
-      : respondTo.replace(/-/g, " ")
+        ? `Only ${ownerDisplayName} (owner)`
+        : "Only the owner"
+      : respondTo === "allowlist"
+        ? "Selected people"
+        : "Anyone"
     : null;
 
   const ownerClickable = Boolean(onOpenProfile && ownerProfilePubkey);
@@ -405,7 +416,7 @@ export function buildOwnerFields({
     fields.push({
       displayValue: respondToDisplayValue,
       icon: Ear,
-      label: "Respond to",
+      label: "Who can send instructions",
       testId: "user-profile-respond-to",
     });
   }
@@ -426,19 +437,19 @@ export function buildOwnerFields({
 function orderProfileFields(fields: ProfileField[]) {
   const visibilityLabel = "Visibility";
   const publicKeyLabel = "Public key";
-  const corporateIdentityLabel = "Corporate identity";
+  const relayVerifiedIdentityLabel = "Relay-verified identity";
   const managedByLabel = "Managed by";
   const statusLabel = "Status";
   return [
     ...fields.filter((field) => field.label === visibilityLabel),
     ...fields.filter((field) => field.label === publicKeyLabel),
-    ...fields.filter((field) => field.label === corporateIdentityLabel),
+    ...fields.filter((field) => field.label === relayVerifiedIdentityLabel),
     ...fields.filter((field) => field.label === managedByLabel),
     ...fields.filter(
       (field) =>
         field.label !== visibilityLabel &&
         field.label !== publicKeyLabel &&
-        field.label !== corporateIdentityLabel &&
+        field.label !== relayVerifiedIdentityLabel &&
         field.label !== managedByLabel &&
         field.copyValue,
     ),
@@ -447,7 +458,7 @@ function orderProfileFields(fields: ProfileField[]) {
       if (
         field.label === visibilityLabel ||
         field.label === publicKeyLabel ||
-        field.label === corporateIdentityLabel ||
+        field.label === relayVerifiedIdentityLabel ||
         field.label === managedByLabel ||
         field.label === statusLabel
       ) {

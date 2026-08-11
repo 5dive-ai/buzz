@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row as _};
 
 use crate::error::Result;
+use crate::identity_binding::{BindIdentityResult, IdentityBindingConflict, IdentityBindingInput};
 use crate::CommunityId;
 
 /// A single relay member record.
@@ -29,11 +30,38 @@ pub struct RelayMember {
 
 /// Returns `true` if `pubkey` (64-char hex) is a member of `community`.
 pub async fn is_relay_member(pool: &PgPool, community: CommunityId, pubkey: &str) -> Result<bool> {
+    let mut conn = pool.acquire().await?;
+    is_relay_member_on(&mut conn, community, pubkey).await
+}
+
+/// [`is_relay_member`] on a specific session — the replica-routing path runs
+/// the lookup on the exact reader connection whose heartbeat observation
+/// proved fence coverage.
+pub(crate) async fn is_relay_member_on(
+    conn: &mut sqlx::PgConnection,
+    community: CommunityId,
+    pubkey: &str,
+) -> Result<bool> {
     let row = sqlx::query("SELECT 1 FROM relay_members WHERE community_id = $1 AND pubkey = $2")
         .bind(community.as_uuid())
         .bind(pubkey)
-        .fetch_optional(pool)
+        .fetch_optional(conn)
         .await?;
+    Ok(row.is_some())
+}
+
+/// Returns `true` if any member of `community` holds the `admin` or `owner`
+/// role. Open relays don't *enforce* the roster, but startup
+/// (`bootstrap_owner`) and operator provisioning still populate it — this is
+/// how the workspace-profile gate detects whether a steward exists.
+pub async fn has_admin_or_owner(pool: &PgPool, community: CommunityId) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT 1 FROM relay_members \
+         WHERE community_id = $1 AND role IN ('admin', 'owner') LIMIT 1",
+    )
+    .bind(community.as_uuid())
+    .fetch_optional(pool)
+    .await?;
     Ok(row.is_some())
 }
 
@@ -126,7 +154,62 @@ pub async fn claim_relay_membership(
     role: &str,
     policy_version: Option<&str>,
 ) -> Result<bool> {
+    match claim_relay_membership_with_identity(pool, community, pubkey, role, policy_version, None)
+        .await?
+    {
+        MembershipClaimOutcome::Joined { inserted, .. } => Ok(inserted),
+        MembershipClaimOutcome::IdentityConflict(_) | MembershipClaimOutcome::IdentityRevoked => {
+            Err(crate::DbError::InvalidData(
+                "unexpected corporate identity result without staged identity".to_string(),
+            ))
+        }
+    }
+}
+
+/// Outcome of an atomic membership and optional identity claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipClaimOutcome {
+    /// Membership and any staged binding committed together.
+    Joined {
+        /// Whether the membership row was newly inserted.
+        inserted: bool,
+        /// Binding committed in the same transaction, when one was staged.
+        identity_binding: Option<BindIdentityResult>,
+    },
+    /// The staged identity conflicts with an active binding.
+    IdentityConflict(IdentityBindingConflict),
+    /// The staged identity is revoked.
+    IdentityRevoked,
+}
+
+/// Claims relay membership and an optional corporate identity in one transaction.
+pub async fn claim_relay_membership_with_identity(
+    pool: &PgPool,
+    community: CommunityId,
+    pubkey: &str,
+    role: &str,
+    policy_version: Option<&str>,
+    identity: Option<&IdentityBindingInput<'_>>,
+) -> Result<MembershipClaimOutcome> {
+    crate::identity_binding::validate_membership_identity_key(pubkey, identity)?;
     let mut tx = pool.begin().await?;
+    let identity_binding = if let Some(identity) = identity {
+        match crate::identity_binding::bind_or_validate_identity_tx(&mut tx, community, identity)
+            .await?
+        {
+            binding @ (BindIdentityResult::Created | BindIdentityResult::Matched) => Some(binding),
+            BindIdentityResult::Conflict(conflict) => {
+                tx.rollback().await?;
+                return Ok(MembershipClaimOutcome::IdentityConflict(conflict));
+            }
+            BindIdentityResult::Revoked => {
+                tx.rollback().await?;
+                return Ok(MembershipClaimOutcome::IdentityRevoked);
+            }
+        }
+    } else {
+        None
+    };
     let inserted = sqlx::query(
         "INSERT INTO relay_members (community_id, pubkey, role, added_by) \
          VALUES ($1, $2, $3, 'invite') \
@@ -153,7 +236,10 @@ pub async fn claim_relay_membership(
     }
 
     tx.commit().await?;
-    Ok(inserted)
+    Ok(MembershipClaimOutcome::Joined {
+        inserted,
+        identity_binding,
+    })
 }
 
 /// Returns whether a member has persisted acceptance evidence for a policy version.
@@ -373,10 +459,36 @@ pub enum TransferResult {
     LimitReached,
 }
 
-/// Maximum number of communities a single pubkey can own. Enforced at the
-/// relay layer — the authoritative layer — so that concurrent transfers or
+/// Default maximum number of communities a single pubkey can own. Enforced at
+/// the relay layer — the authoritative layer — so that concurrent transfers or
 /// transfer-vs-create races cannot both pass a preflight count.
-pub const MAX_COMMUNITIES_PER_OWNER: i64 = 3;
+pub const MAX_COMMUNITIES_PER_OWNER: i64 = 5;
+
+/// Effective per-owner community limit for this deployment.
+///
+/// Reads `BUZZ_MAX_COMMUNITIES_PER_OWNER` once (cached for the process
+/// lifetime); a missing, unparsable, or non-positive value falls back to
+/// [`MAX_COMMUNITIES_PER_OWNER`]. Lets multi-tenant operators raise the cap
+/// without a source change while keeping the stock default for everyone else.
+pub fn max_communities_per_owner() -> i64 {
+    static LIMIT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        effective_owner_limit(
+            std::env::var("BUZZ_MAX_COMMUNITIES_PER_OWNER")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Pure resolution of the owner limit from a raw env value — extracted from
+/// [`max_communities_per_owner`] so the parse/fallback rules are testable
+/// without process-global env state.
+fn effective_owner_limit(raw: Option<&str>) -> i64 {
+    raw.and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(MAX_COMMUNITIES_PER_OWNER)
+}
 
 /// Stable advisory-lock key for serializing ownership-granting operations
 /// (transfer + create) per recipient pubkey. Uses FNV-1a over the hex pubkey
@@ -472,7 +584,7 @@ pub async fn transfer_ownership(
     .fetch_one(&mut *tx)
     .await?;
 
-    if owned_count >= MAX_COMMUNITIES_PER_OWNER {
+    if owned_count >= max_communities_per_owner() {
         tx.rollback().await?;
         return Ok(TransferResult::LimitReached);
     }
@@ -555,6 +667,32 @@ pub async fn backfill_from_allowlist(pool: &PgPool, community: CommunityId) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_limit_defaults_when_unset_or_invalid() {
+        assert_eq!(
+            super::effective_owner_limit(None),
+            super::MAX_COMMUNITIES_PER_OWNER
+        );
+        assert_eq!(
+            super::effective_owner_limit(Some("not-a-number")),
+            super::MAX_COMMUNITIES_PER_OWNER
+        );
+        assert_eq!(
+            super::effective_owner_limit(Some("0")),
+            super::MAX_COMMUNITIES_PER_OWNER
+        );
+        assert_eq!(
+            super::effective_owner_limit(Some("-5")),
+            super::MAX_COMMUNITIES_PER_OWNER
+        );
+    }
+
+    #[test]
+    fn owner_limit_honors_positive_override() {
+        assert_eq!(super::effective_owner_limit(Some("100")), 100);
+        assert_eq!(super::effective_owner_limit(Some(" 12 ")), 12);
+    }
+
     use super::*;
     use uuid::Uuid;
 

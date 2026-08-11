@@ -7,6 +7,8 @@
 
 /// NIP-AM: Agent Turn Metric — payload type and encrypt/decrypt helpers.
 pub mod agent_turn_metric;
+/// Provider-free authorization fences and privacy-safe binding evidence.
+pub mod authorization;
 /// Channel and membership enums shared across crates.
 pub mod channel;
 /// NIP-AE Agent Engrams — slug grammar, conversation key, d-tag derivation,
@@ -20,6 +22,8 @@ pub mod event;
 pub mod filter;
 /// Git permission types — ref patterns, protection rules, policy evaluation.
 pub mod git_perms;
+/// Shared invite-link contract constants.
+pub mod invite;
 /// Buzz kind number registry — custom event type constants.
 pub mod kind;
 /// Network utilities — SSRF-safe IP classification.
@@ -30,6 +34,8 @@ pub mod observer;
 pub mod pairing;
 /// Presence status types shared across crates.
 pub mod presence;
+/// NIP-PMA owner-encrypted private managed-agent wire codec.
+pub mod private_managed_agent;
 /// Canonical relay runtime identities.
 pub mod relay;
 /// Tenant identity — the server-resolved community key carried on scoped paths.
@@ -37,6 +43,10 @@ pub mod tenant;
 /// Schnorr signature and event ID verification.
 pub mod verification;
 
+pub use authorization::{
+    AuthorizationLeaseFence, AuthorizationLeaseFenceError, CanonicalCurrentBindingEvidence,
+    CurrentBindingEvidenceError,
+};
 pub use error::VerificationError;
 pub use event::StoredEvent;
 pub use nostr::{Event, EventId, Filter, Keys, Kind, PublicKey};

@@ -20,6 +20,17 @@ pub const DEFAULT_CORPORATE_IDENTITY_UID_CLAIM: &str = "sub";
 /// Default JWT claim displayed as the verified corporate identity.
 pub const DEFAULT_CORPORATE_IDENTITY_DISPLAY_CLAIM: &str = "email";
 
+/// Which identity source wins when a request carries both a JWT and a
+/// cryptographically verified NIP-OA owner declaration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CorporateIdentityAuthPrecedence {
+    /// Treat the JWT as the signer's identity. This is the provider-neutral default.
+    #[default]
+    Direct,
+    /// Treat the NIP-OA owner binding as the signer's delegated identity.
+    Delegated,
+}
+
 /// Errors that can occur while loading relay configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -67,6 +78,8 @@ pub struct CorporateIdentityConfig {
     /// Allow agents without JWTs to pass the corporate identity gate through
     /// NIP-OA when their owner pubkey already has an active identity binding.
     pub allow_delegation: bool,
+    /// Identity source selected when both a JWT and NIP-OA delegation are present.
+    pub auth_precedence: CorporateIdentityAuthPrecedence,
     /// JWKS URI used to verify JWT signatures.
     pub jwks_uri: String,
     /// Expected JWT issuer.
@@ -76,7 +89,14 @@ pub struct CorporateIdentityConfig {
     /// Claim name used as Buzz's stable corporate uid.
     pub uid_claim: String,
     /// Claim name used for verified display.
+    ///
+    /// This value is stored only in the private relay binding table. It is
+    /// never projected into a public Nostr event unless
+    /// `public_display_claim` is configured separately.
     pub display_claim: String,
+    /// Optional claim name explicitly approved for public NIP-85 projection.
+    /// Unset by default so private corporate attributes stay private.
+    pub public_display_claim: Option<String>,
     /// Optional claim name carrying a hex pubkey or `npub1...`.
     pub npub_claim: Option<String>,
 }
@@ -87,15 +107,21 @@ impl Default for CorporateIdentityConfig {
             require: false,
             jwt_header: DEFAULT_CORPORATE_IDENTITY_JWT_HEADER.to_string(),
             allow_delegation: true,
+            auth_precedence: CorporateIdentityAuthPrecedence::Direct,
             jwks_uri: String::new(),
             issuer: String::new(),
             audience: String::new(),
             uid_claim: DEFAULT_CORPORATE_IDENTITY_UID_CLAIM.to_string(),
             display_claim: DEFAULT_CORPORATE_IDENTITY_DISPLAY_CLAIM.to_string(),
+            public_display_claim: None,
             npub_claim: None,
         }
     }
 }
+
+/// Maximum configured jitter, leaving ten seconds of the hard-drain budget for
+/// WebSocket close-frame delivery after the final delayed cancellation.
+pub const MAX_DRAIN_JITTER_MS: u64 = 20_000;
 
 /// Relay runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -107,6 +133,24 @@ pub struct Config {
     /// Optional read-replica connection URL (e.g. an Aurora `cluster-ro-`
     /// endpoint). Unset means all reads stay on the writer.
     pub read_database_url: Option<String>,
+    /// Replica read budget `B` in milliseconds (`BUZZ_REPLICA_READ_MAX_AGE_MS`).
+    /// `0` (the default) disables bounded-staleness replica routing; see
+    /// [`buzz_db::DbConfig::replica_read_max_age_ms`].
+    pub replica_read_max_age_ms: u64,
+
+    /// Upper bound, in milliseconds, of the per-connection random delay applied
+    /// when sending the `1012 Service Restart` close frame during graceful
+    /// shutdown (`BUZZ_DRAIN_JITTER_MS`). Each live connection is closed after
+    /// an independent delay drawn uniformly from `[1, drain_jitter_ms]` when
+    /// jitter is enabled, which
+    /// spreads client reconnects across the window instead of releasing the
+    /// whole pod's sockets in one instant (the reconnect thundering herd that
+    /// drives DB pool-timeout bursts on rolling deploys).
+    ///
+    /// Default `0` reproduces the previous all-at-once close. Values above
+    /// [`MAX_DRAIN_JITTER_MS`] are capped, leaving headroom under the relay's
+    /// 30-second hard-drain timeout for close-frame delivery.
+    pub drain_jitter_ms: u64,
     /// Redis connection URL used by the pub/sub manager.
     pub redis_url: String,
     /// Maximum connections in the shared Redis pool. Defaults to 16.
@@ -115,6 +159,19 @@ pub struct Config {
     /// pod is only 4 — small enough that rate-limit checks, presence, and
     /// pub/sub publishes queue behind each other under load.
     pub redis_pool_size: usize,
+    /// Maximum connections in the Postgres writer/reader pools. Defaults to 50.
+    ///
+    /// The `buzz-db` default of 20 was sized for a handful of pods against
+    /// `max_connections=100`. Against Aurora (~5,000 connections) that cap
+    /// is the binding constraint: a burst of concurrent handlers exhausts
+    /// the per-pod pool and requests fail on acquire timeout while the
+    /// database sits idle.
+    pub db_pool_size: u32,
+    /// Maximum connections in the Postgres read-replica pool
+    /// (`BUZZ_DB_READ_POOL_SIZE`). Defaults to `db_pool_size`. Sized
+    /// independently so reader capacity can be tuned against the replica's
+    /// headroom without touching the writer pool.
+    pub db_read_pool_size: Option<u32>,
     /// Public WebSocket URL of this relay, advertised in NIP-11.
     pub relay_url: String,
     /// Public WebSocket URL of the dedicated device-pairing relay, when configured.
@@ -245,10 +302,6 @@ pub struct Config {
     pub media_max_concurrent_uploads_per_pubkey: u32,
     /// Maximum media upload starts accepted from one pubkey per minute.
     pub media_uploads_per_minute: u32,
-
-    /// Require Blossom kind:24242 `t=get` auth plus relay membership before
-    /// serving media GET/HEAD. Default off for staged client rollout.
-    pub require_media_get_auth: bool,
 
     /// Whether tamper-evident event/media audit logging is enabled. Defaults to true.
     /// This does not control the separate `moderation_actions` audit trail.
@@ -454,45 +507,70 @@ fn ensure_git_path(
     Ok(git_repo_path)
 }
 
-fn env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "true" | "1" | "yes" | "on"
-            )
-        })
-        .unwrap_or(default)
+fn corporate_env_trimmed(name: &str) -> Result<Option<String>, ConfigError> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidValue(format!(
+            "{name} must be valid UTF-8"
+        ))),
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "{name} must not be empty when set"
+                )));
+            }
+            Ok(Some(value.to_string()))
+        }
+    }
 }
 
-fn env_trimmed(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+fn parse_corporate_bool(name: &str, default: bool) -> Result<bool, ConfigError> {
+    match corporate_env_trimmed(name)? {
+        None => Ok(default),
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" => Ok(true),
+            "false" | "0" | "off" => Ok(false),
+            _ => Err(ConfigError::InvalidValue(format!(
+                "{name} must be true or false"
+            ))),
+        },
+    }
 }
 
 fn load_corporate_identity_config() -> Result<CorporateIdentityConfig, ConfigError> {
     let mut config = CorporateIdentityConfig::default();
-    config.require = env_bool("BUZZ_REQUIRE_CORPORATE_IDENTITY", config.require);
-    config.jwt_header = env_trimmed("BUZZ_CORPORATE_IDENTITY_JWT_HEADER")
+    config.require = parse_corporate_bool("BUZZ_REQUIRE_CORPORATE_IDENTITY", config.require)?;
+    config.jwt_header = corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_JWT_HEADER")?
         .unwrap_or_else(|| config.jwt_header.clone())
         .to_ascii_lowercase();
-    config.allow_delegation = env_bool(
+    config.allow_delegation = parse_corporate_bool(
         "BUZZ_ALLOW_CORPORATE_IDENTITY_DELEGATION",
         config.allow_delegation,
-    );
-    config.jwks_uri =
-        env_trimmed("BUZZ_CORPORATE_IDENTITY_JWKS_URI").unwrap_or_else(|| config.jwks_uri.clone());
-    config.issuer =
-        env_trimmed("BUZZ_CORPORATE_IDENTITY_ISSUER").unwrap_or_else(|| config.issuer.clone());
-    config.audience =
-        env_trimmed("BUZZ_CORPORATE_IDENTITY_AUDIENCE").unwrap_or_else(|| config.audience.clone());
-    config.uid_claim = env_trimmed("BUZZ_CORPORATE_IDENTITY_UID_CLAIM")
+    )?;
+    config.auth_precedence =
+        match corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE")?.as_deref() {
+            None | Some("direct") => CorporateIdentityAuthPrecedence::Direct,
+            Some("delegated") => CorporateIdentityAuthPrecedence::Delegated,
+            Some(value) => {
+                return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE must be direct or delegated, got {value}"
+            )));
+            }
+        };
+    config.jwks_uri = corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_JWKS_URI")?
+        .unwrap_or_else(|| config.jwks_uri.clone());
+    config.issuer = corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_ISSUER")?
+        .unwrap_or_else(|| config.issuer.clone());
+    config.audience = corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_AUDIENCE")?
+        .unwrap_or_else(|| config.audience.clone());
+    config.uid_claim = corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_UID_CLAIM")?
         .unwrap_or_else(|| config.uid_claim.clone());
-    config.display_claim = env_trimmed("BUZZ_CORPORATE_IDENTITY_DISPLAY_CLAIM")
+    config.display_claim = corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_DISPLAY_CLAIM")?
         .unwrap_or_else(|| config.display_claim.clone());
-    config.npub_claim = env_trimmed("BUZZ_CORPORATE_IDENTITY_NPUB_CLAIM");
+    config.public_display_claim =
+        corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_PUBLIC_DISPLAY_CLAIM")?;
+    config.npub_claim = corporate_env_trimmed("BUZZ_CORPORATE_IDENTITY_NPUB_CLAIM")?;
 
     if config.require {
         let mut missing = Vec::new();
@@ -520,9 +598,50 @@ fn load_corporate_identity_config() -> Result<CorporateIdentityConfig, ConfigErr
                 missing.join(", ")
             )));
         }
+
+        let jwks_url = url::Url::parse(&config.jwks_uri).map_err(|error| {
+            ConfigError::InvalidValue(format!(
+                "BUZZ_CORPORATE_IDENTITY_JWKS_URI must be a valid HTTPS URL: {error}"
+            ))
+        })?;
+        if jwks_url.scheme() != "https"
+            || jwks_url.host_str().is_none()
+            || !jwks_url.username().is_empty()
+            || jwks_url.password().is_some()
+        {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_CORPORATE_IDENTITY_JWKS_URI must be an HTTPS URL with a host and no credentials"
+                    .to_string(),
+            ));
+        }
     }
 
     Ok(config)
+}
+
+/// Env vars that once gated authenticated media reads.
+///
+/// `BUZZ_REQUIRE_MEDIA_GET_AUTH` was the real flag; `BUZZ_REQUIRE_MEDIA_READ_AUTH`
+/// was documented in `.env.example` as an accepted alias but was never read by
+/// the relay. Media reads are now unconditionally authenticated, so both are
+/// inert and an operator still setting either — especially to `false` — holds a
+/// belief about their deployment that is no longer true.
+const INERT_MEDIA_READ_AUTH_VARS: [&str; 2] = [
+    "BUZZ_REQUIRE_MEDIA_GET_AUTH",
+    "BUZZ_REQUIRE_MEDIA_READ_AUTH",
+];
+
+/// Which of `names` are present, so startup can warn that they do nothing.
+///
+/// `lookup` is injected rather than calling `std::env::var` directly: process
+/// env is global mutable state, so a test that set real vars would race every
+/// other test in the binary.
+fn inert_env_vars<'a>(names: &[&'a str], lookup: impl Fn(&str) -> Option<String>) -> Vec<&'a str> {
+    names
+        .iter()
+        .copied()
+        .filter(|name| lookup(name).is_some())
+        .collect()
 }
 
 impl Config {
@@ -540,6 +659,46 @@ impl Config {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        // The old seconds-denominated name is a hard startup error, not an
+        // alias: silently honouring it would mean 1000x the intended budget.
+        if std::env::var("BUZZ_REPLICA_HEAD_MAX_AGE_SECS").is_ok() {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_REPLICA_HEAD_MAX_AGE_SECS was renamed to BUZZ_REPLICA_READ_MAX_AGE_MS \
+                 (note: milliseconds, not seconds); refusing to start"
+                    .to_string(),
+            ));
+        }
+
+        // Replica read budget: 0 = off (the rollout default), so this is a
+        // non-negative parse, unlike `positive_u64_from_env`.
+        let replica_read_max_age_ms = match std::env::var("BUZZ_REPLICA_READ_MAX_AGE_MS") {
+            Ok(raw) => raw.trim().parse::<u64>().map_err(|_| {
+                ConfigError::InvalidValue(
+                    "BUZZ_REPLICA_READ_MAX_AGE_MS must be a non-negative integer".to_string(),
+                )
+            })?,
+            Err(_) => 0,
+        };
+
+        // Drain jitter: 0 = off (default). Clamp oversized values so every
+        // delayed close is initiated with ten seconds left in the relay's
+        // hard-drain budget. An empty/whitespace-only value is treated as unset
+        // (jitter off), matching the sibling vars in this file — so setting the
+        // var to "" is a valid kill switch, not a crashloop.
+        let drain_jitter_ms = match std::env::var("BUZZ_DRAIN_JITTER_MS") {
+            Ok(raw) if raw.trim().is_empty() => 0,
+            Ok(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| {
+                    ConfigError::InvalidValue(
+                        "BUZZ_DRAIN_JITTER_MS must be a non-negative integer".to_string(),
+                    )
+                })?
+                .min(MAX_DRAIN_JITTER_MS),
+            Err(_) => 0,
+        };
+
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
@@ -548,6 +707,17 @@ impl Config {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(16);
+
+        let db_pool_size = std::env::var("BUZZ_DB_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(50);
+
+        let db_read_pool_size = std::env::var("BUZZ_DB_READ_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v > 0);
 
         let relay_url =
             std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3000".to_string());
@@ -743,6 +913,16 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(9102);
 
+        let s3_addressing_style = match std::env::var("BUZZ_S3_ADDRESSING_STYLE") {
+            Ok(value) => value.parse().map_err(ConfigError::InvalidValue)?,
+            Err(std::env::VarError::NotPresent) => buzz_media::config::S3AddressingStyle::default(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::InvalidValue(
+                    "BUZZ_S3_ADDRESSING_STYLE must be valid Unicode and one of 'path' or 'virtual'"
+                        .to_string(),
+                ));
+            }
+        };
         let media = buzz_media::MediaConfig {
             s3_endpoint: std::env::var("BUZZ_S3_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:9000".to_string()),
@@ -754,6 +934,7 @@ impl Config {
             s3_region: std::env::var("BUZZ_S3_REGION")
                 .or_else(|_| std::env::var("AWS_REGION"))
                 .unwrap_or_else(|_| "us-east-1".to_string()),
+            s3_addressing_style,
             max_image_bytes: std::env::var("BUZZ_MAX_IMAGE_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -806,14 +987,13 @@ impl Config {
             .filter(|&v| v > 0)
             .unwrap_or(30);
 
-        let require_media_get_auth = std::env::var("BUZZ_REQUIRE_MEDIA_GET_AUTH")
-            .map(|v| {
-                v == "true"
-                    || v == "1"
-                    || v.eq_ignore_ascii_case("yes")
-                    || v.eq_ignore_ascii_case("on")
-            })
-            .unwrap_or(false);
+        for name in inert_env_vars(&INERT_MEDIA_READ_AUTH_VARS, |n| std::env::var(n).ok()) {
+            warn!(
+                "{name} is set but is no longer read — GET/HEAD /media/* always require \
+                 Blossom t=get auth plus relay membership. Remove it; a value of `false` \
+                 does not re-open unauthenticated media reads."
+            );
+        }
 
         let ephemeral_ttl_override = std::env::var("BUZZ_EPHEMERAL_TTL_OVERRIDE")
             .ok()
@@ -1000,8 +1180,12 @@ impl Config {
             bind_addr,
             database_url,
             read_database_url,
+            replica_read_max_age_ms,
+            drain_jitter_ms,
             redis_url,
             redis_pool_size,
+            db_pool_size,
+            db_read_pool_size,
             relay_url,
             pairing_relay_url,
             max_connections,
@@ -1030,7 +1214,6 @@ impl Config {
             media_max_concurrent_uploads,
             media_max_concurrent_uploads_per_pubkey,
             media_uploads_per_minute,
-            require_media_get_auth,
             audit_enabled,
             ephemeral_ttl_override,
             git_repo_path,
@@ -1067,15 +1250,70 @@ mod tests {
             "BUZZ_REQUIRE_CORPORATE_IDENTITY",
             "BUZZ_CORPORATE_IDENTITY_JWT_HEADER",
             "BUZZ_ALLOW_CORPORATE_IDENTITY_DELEGATION",
+            "BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE",
             "BUZZ_CORPORATE_IDENTITY_JWKS_URI",
             "BUZZ_CORPORATE_IDENTITY_ISSUER",
             "BUZZ_CORPORATE_IDENTITY_AUDIENCE",
             "BUZZ_CORPORATE_IDENTITY_UID_CLAIM",
             "BUZZ_CORPORATE_IDENTITY_DISPLAY_CLAIM",
+            "BUZZ_CORPORATE_IDENTITY_PUBLIC_DISPLAY_CLAIM",
             "BUZZ_CORPORATE_IDENTITY_NPUB_CLAIM",
         ] {
             std::env::remove_var(name);
         }
+    }
+
+    /// Look up against a fixed set, standing in for process env.
+    fn env_of<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + use<'a> {
+        move |name| {
+            set.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    /// The case that matters: an operator who pinned the old flag to `false`
+    /// must be told it is inert, not left believing media reads are still open.
+    #[test]
+    fn inert_media_read_auth_vars_are_reported_even_when_false() {
+        let found = inert_env_vars(
+            &INERT_MEDIA_READ_AUTH_VARS,
+            env_of(&[("BUZZ_REQUIRE_MEDIA_GET_AUTH", "false")]),
+        );
+
+        assert_eq!(found, vec!["BUZZ_REQUIRE_MEDIA_GET_AUTH"]);
+    }
+
+    /// `BUZZ_REQUIRE_MEDIA_READ_AUTH` was advertised in `.env.example` as an
+    /// accepted alias but the relay never read it, so operators may hold it
+    /// today. It warns too.
+    #[test]
+    fn inert_media_read_auth_vars_include_the_documented_alias() {
+        let found = inert_env_vars(
+            &INERT_MEDIA_READ_AUTH_VARS,
+            env_of(&[
+                ("BUZZ_REQUIRE_MEDIA_GET_AUTH", "true"),
+                ("BUZZ_REQUIRE_MEDIA_READ_AUTH", "false"),
+            ]),
+        );
+
+        assert_eq!(
+            found,
+            vec![
+                "BUZZ_REQUIRE_MEDIA_GET_AUTH",
+                "BUZZ_REQUIRE_MEDIA_READ_AUTH"
+            ]
+        );
+    }
+
+    #[test]
+    fn inert_media_read_auth_vars_stay_quiet_when_unset() {
+        let found = inert_env_vars(
+            &INERT_MEDIA_READ_AUTH_VARS,
+            env_of(&[("BUZZ_REQUIRE_RELAY_MEMBERSHIP", "true")]),
+        );
+
+        assert!(found.is_empty(), "unrelated vars must not warn: {found:?}");
     }
 
     #[test]
@@ -1087,6 +1325,7 @@ mod tests {
         assert!(!config.database_url.is_empty());
         assert!(!config.redis_url.is_empty());
         assert_eq!(config.redis_pool_size, 16);
+        assert_eq!(config.db_pool_size, 50);
         assert!(config.max_connections > 0);
         assert!(config.send_buffer_size > 0);
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
@@ -1115,9 +1354,10 @@ mod tests {
             !config.serve_git_web_gui,
             "serve_git_web_gui should default to false"
         );
-        assert!(
-            !config.require_media_get_auth,
-            "require_media_get_auth should default to false for staged client rollout"
+        assert_eq!(
+            config.media.s3_addressing_style,
+            buzz_media::config::S3AddressingStyle::Path,
+            "S3 addressing must default to path style for bundled MinIO compatibility"
         );
         assert!(
             config.join_policy.is_none(),
@@ -1138,6 +1378,15 @@ mod tests {
         assert!(
             config.corporate_identity.allow_delegation,
             "corporate identity delegation should default to true for agents"
+        );
+        assert_eq!(
+            config.corporate_identity.auth_precedence,
+            CorporateIdentityAuthPrecedence::Direct,
+            "an accompanying JWT should identify the signer by default"
+        );
+        assert!(
+            config.corporate_identity.public_display_claim.is_none(),
+            "public corporate identity projection must be opt-in"
         );
     }
 
@@ -1170,6 +1419,7 @@ mod tests {
         std::env::set_var("BUZZ_CORPORATE_IDENTITY_UID_CLAIM", "employee_id");
         std::env::set_var("BUZZ_CORPORATE_IDENTITY_DISPLAY_CLAIM", "email");
         std::env::set_var("BUZZ_CORPORATE_IDENTITY_NPUB_CLAIM", "buzz_npub");
+        std::env::set_var("BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE", "delegated");
 
         let config = Config::from_env().expect("corporate identity config");
         clear_corporate_identity_env();
@@ -1180,6 +1430,189 @@ mod tests {
             config.corporate_identity.npub_claim.as_deref(),
             Some("buzz_npub")
         );
+        assert_eq!(
+            config.corporate_identity.auth_precedence,
+            CorporateIdentityAuthPrecedence::Delegated
+        );
+    }
+
+    #[test]
+    fn corporate_identity_rejects_invalid_auth_precedence() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_corporate_identity_env();
+        std::env::set_var("BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE", "automatic");
+
+        let err = Config::from_env().expect_err("invalid precedence must fail closed");
+        clear_corporate_identity_env();
+
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue(ref message)
+                if message.contains("BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE")
+        ));
+    }
+
+    #[test]
+    fn corporate_identity_rejects_malformed_boolean_values() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_corporate_identity_env();
+        std::env::set_var("BUZZ_REQUIRE_CORPORATE_IDENTITY", "tru");
+        let require_error = Config::from_env().expect_err("malformed require flag must fail");
+        clear_corporate_identity_env();
+
+        std::env::set_var("BUZZ_ALLOW_CORPORATE_IDENTITY_DELEGATION", "sometimes");
+        let delegation_error = Config::from_env().expect_err("malformed delegation flag must fail");
+        clear_corporate_identity_env();
+
+        assert!(require_error
+            .to_string()
+            .contains("BUZZ_REQUIRE_CORPORATE_IDENTITY"));
+        assert!(delegation_error
+            .to_string()
+            .contains("BUZZ_ALLOW_CORPORATE_IDENTITY_DELEGATION"));
+    }
+
+    #[test]
+    fn corporate_identity_rejects_present_empty_values() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for name in [
+            "BUZZ_REQUIRE_CORPORATE_IDENTITY",
+            "BUZZ_CORPORATE_IDENTITY_JWT_HEADER",
+            "BUZZ_ALLOW_CORPORATE_IDENTITY_DELEGATION",
+            "BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE",
+            "BUZZ_CORPORATE_IDENTITY_JWKS_URI",
+            "BUZZ_CORPORATE_IDENTITY_ISSUER",
+            "BUZZ_CORPORATE_IDENTITY_AUDIENCE",
+            "BUZZ_CORPORATE_IDENTITY_UID_CLAIM",
+            "BUZZ_CORPORATE_IDENTITY_DISPLAY_CLAIM",
+            "BUZZ_CORPORATE_IDENTITY_PUBLIC_DISPLAY_CLAIM",
+            "BUZZ_CORPORATE_IDENTITY_NPUB_CLAIM",
+        ] {
+            clear_corporate_identity_env();
+            std::env::set_var(name, "  ");
+            let error = Config::from_env().expect_err("present empty setting must fail closed");
+            assert!(error.to_string().contains(name));
+            assert!(error.to_string().contains("must not be empty"));
+        }
+        clear_corporate_identity_env();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corporate_identity_rejects_non_utf8_boolean_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for name in [
+            "BUZZ_REQUIRE_CORPORATE_IDENTITY",
+            "BUZZ_ALLOW_CORPORATE_IDENTITY_DELEGATION",
+        ] {
+            clear_corporate_identity_env();
+            std::env::set_var(name, std::ffi::OsString::from_vec(vec![0xff]));
+            let error = Config::from_env().expect_err("non-UTF-8 boolean must fail closed");
+            assert!(error.to_string().contains(name));
+            assert!(error.to_string().contains("valid UTF-8"));
+        }
+        clear_corporate_identity_env();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corporate_identity_rejects_non_utf8_string_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for name in [
+            "BUZZ_CORPORATE_IDENTITY_JWT_HEADER",
+            "BUZZ_CORPORATE_IDENTITY_AUTH_PRECEDENCE",
+            "BUZZ_CORPORATE_IDENTITY_JWKS_URI",
+            "BUZZ_CORPORATE_IDENTITY_ISSUER",
+            "BUZZ_CORPORATE_IDENTITY_AUDIENCE",
+            "BUZZ_CORPORATE_IDENTITY_UID_CLAIM",
+            "BUZZ_CORPORATE_IDENTITY_DISPLAY_CLAIM",
+            "BUZZ_CORPORATE_IDENTITY_PUBLIC_DISPLAY_CLAIM",
+            "BUZZ_CORPORATE_IDENTITY_NPUB_CLAIM",
+        ] {
+            clear_corporate_identity_env();
+            std::env::set_var(name, std::ffi::OsString::from_vec(vec![0xff]));
+            let error = Config::from_env().expect_err("non-UTF-8 setting must fail closed");
+            assert!(error.to_string().contains(name));
+            assert!(error.to_string().contains("valid UTF-8"));
+        }
+        clear_corporate_identity_env();
+    }
+
+    #[test]
+    fn corporate_identity_requires_https_jwks_uri() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        clear_corporate_identity_env();
+        std::env::set_var("BUZZ_REQUIRE_CORPORATE_IDENTITY", "true");
+        std::env::set_var(
+            "BUZZ_CORPORATE_IDENTITY_JWKS_URI",
+            "http://idp.example/.well-known/jwks.json",
+        );
+        std::env::set_var("BUZZ_CORPORATE_IDENTITY_ISSUER", "https://idp.example");
+        std::env::set_var("BUZZ_CORPORATE_IDENTITY_AUDIENCE", "buzz-relay");
+
+        let error = Config::from_env().expect_err("insecure JWKS URL must fail");
+        clear_corporate_identity_env();
+
+        assert!(error.to_string().contains("JWKS_URI must be an HTTPS URL"));
+    }
+
+    #[test]
+    fn s3_addressing_style_env_accepts_virtual_and_rejects_invalid_values() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_S3_ADDRESSING_STYLE");
+
+        std::env::set_var("BUZZ_S3_ADDRESSING_STYLE", "virtual");
+        let configured = Config::from_env()
+            .expect("virtual style config")
+            .media
+            .s3_addressing_style;
+
+        std::env::set_var("BUZZ_S3_ADDRESSING_STYLE", "auto");
+        let invalid = Config::from_env();
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_S3_ADDRESSING_STYLE", value);
+        } else {
+            std::env::remove_var("BUZZ_S3_ADDRESSING_STYLE");
+        }
+
+        assert_eq!(configured, buzz_media::config::S3AddressingStyle::Virtual);
+        assert!(matches!(
+            invalid,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_S3_ADDRESSING_STYLE must be 'path' or 'virtual'")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn s3_addressing_style_env_rejects_non_unicode_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_S3_ADDRESSING_STYLE");
+        std::env::set_var(
+            "BUZZ_S3_ADDRESSING_STYLE",
+            std::ffi::OsString::from_vec(vec![0xff]),
+        );
+
+        let invalid = Config::from_env();
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_S3_ADDRESSING_STYLE", value);
+        } else {
+            std::env::remove_var("BUZZ_S3_ADDRESSING_STYLE");
+        }
+
+        assert!(matches!(
+            invalid,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("must be valid Unicode")
+        ));
     }
 
     #[test]
@@ -1208,6 +1641,60 @@ mod tests {
     }
 
     #[test]
+    fn db_pool_size_env_override_and_invalid_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_DB_POOL_SIZE");
+
+        std::env::set_var("BUZZ_DB_POOL_SIZE", "80");
+        let overridden = Config::from_env().expect("config").db_pool_size;
+
+        std::env::set_var("BUZZ_DB_POOL_SIZE", "0");
+        let zero = Config::from_env().expect("config").db_pool_size;
+
+        std::env::set_var("BUZZ_DB_POOL_SIZE", "not-a-number");
+        let junk = Config::from_env().expect("config").db_pool_size;
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_DB_POOL_SIZE", value);
+        } else {
+            std::env::remove_var("BUZZ_DB_POOL_SIZE");
+        }
+
+        assert_eq!(overridden, 80);
+        assert_eq!(zero, 50, "zero must fall back to the default");
+        assert_eq!(junk, 50, "unparsable value must fall back to the default");
+    }
+
+    #[test]
+    fn db_read_pool_size_env_override_and_invalid_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_DB_READ_POOL_SIZE");
+
+        std::env::remove_var("BUZZ_DB_READ_POOL_SIZE");
+        let unset = Config::from_env().expect("config").db_read_pool_size;
+
+        std::env::set_var("BUZZ_DB_READ_POOL_SIZE", "40");
+        let overridden = Config::from_env().expect("config").db_read_pool_size;
+
+        std::env::set_var("BUZZ_DB_READ_POOL_SIZE", "0");
+        let zero = Config::from_env().expect("config").db_read_pool_size;
+
+        std::env::set_var("BUZZ_DB_READ_POOL_SIZE", "not-a-number");
+        let junk = Config::from_env().expect("config").db_read_pool_size;
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_DB_READ_POOL_SIZE", value);
+        } else {
+            std::env::remove_var("BUZZ_DB_READ_POOL_SIZE");
+        }
+
+        assert_eq!(unset, None, "unset must inherit the writer pool sizing");
+        assert_eq!(overridden, Some(40));
+        assert_eq!(zero, None, "zero must fall back to inheriting");
+        assert_eq!(junk, None, "unparsable value must fall back to inheriting");
+    }
+
+    #[test]
     fn read_database_url_unset_or_blank_is_none() {
         let _guard = ENV_MUTEX.lock().unwrap();
         let previous = std::env::var_os("READ_DATABASE_URL");
@@ -1233,6 +1720,112 @@ mod tests {
             set.as_deref(),
             Some("postgres://buzz:pw@replica:5432/buzz") // sadscan:disable np.postgres.1
         );
+    }
+
+    #[test]
+    fn replica_read_max_age_defaults_off_and_rejects_junk() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_REPLICA_READ_MAX_AGE_MS");
+        let previous_old = std::env::var_os("BUZZ_REPLICA_HEAD_MAX_AGE_SECS");
+        std::env::remove_var("BUZZ_REPLICA_HEAD_MAX_AGE_SECS");
+
+        std::env::remove_var("BUZZ_REPLICA_READ_MAX_AGE_MS");
+        let unset = Config::from_env().expect("config").replica_read_max_age_ms;
+
+        std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", "1000");
+        let set = Config::from_env().expect("config").replica_read_max_age_ms;
+
+        std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", "0");
+        let zero = Config::from_env().expect("config").replica_read_max_age_ms;
+
+        std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", "soon");
+        let junk = Config::from_env();
+
+        // The retired seconds-denominated name must be a hard startup
+        // error even alongside a valid new-name value: silently ignoring
+        // it (or honouring it) would mean 1000x the intended budget.
+        std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", "1000");
+        std::env::set_var("BUZZ_REPLICA_HEAD_MAX_AGE_SECS", "5");
+        let old_name = Config::from_env();
+
+        std::env::remove_var("BUZZ_REPLICA_HEAD_MAX_AGE_SECS");
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", value);
+        } else {
+            std::env::remove_var("BUZZ_REPLICA_READ_MAX_AGE_MS");
+        }
+        if let Some(value) = previous_old {
+            std::env::set_var("BUZZ_REPLICA_HEAD_MAX_AGE_SECS", value);
+        }
+
+        assert_eq!(unset, 0, "replica read routing must default off");
+        assert_eq!(set, 1000);
+        assert_eq!(zero, 0, "explicit 0 is off");
+        assert!(
+            junk.is_err(),
+            "an unparsable budget must fail loudly, not silently disable"
+        );
+        match old_name {
+            Err(ConfigError::InvalidValue(message)) => assert!(
+                message.contains("BUZZ_REPLICA_READ_MAX_AGE_MS"),
+                "the error must name the replacement env var, got: {message}"
+            ),
+            other => panic!("old env name must hard-fail startup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_jitter_defaults_off_and_rejects_junk() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_DRAIN_JITTER_MS");
+
+        std::env::remove_var("BUZZ_DRAIN_JITTER_MS");
+        let unset = Config::from_env().expect("config").drain_jitter_ms;
+
+        std::env::set_var("BUZZ_DRAIN_JITTER_MS", "20000");
+        let set = Config::from_env().expect("config").drain_jitter_ms;
+
+        std::env::set_var("BUZZ_DRAIN_JITTER_MS", "60000");
+        let capped = Config::from_env().expect("config").drain_jitter_ms;
+
+        std::env::set_var("BUZZ_DRAIN_JITTER_MS", "0");
+        let zero = Config::from_env().expect("config").drain_jitter_ms;
+
+        std::env::set_var("BUZZ_DRAIN_JITTER_MS", "soon");
+        let junk = Config::from_env();
+
+        std::env::set_var("BUZZ_DRAIN_JITTER_MS", "");
+        let empty = Config::from_env()
+            .expect("empty is a valid kill switch")
+            .drain_jitter_ms;
+
+        std::env::set_var("BUZZ_DRAIN_JITTER_MS", "   ");
+        let blank = Config::from_env()
+            .expect("whitespace-only is a valid kill switch")
+            .drain_jitter_ms;
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_DRAIN_JITTER_MS", value);
+        } else {
+            std::env::remove_var("BUZZ_DRAIN_JITTER_MS");
+        }
+
+        assert_eq!(unset, 0, "drain jitter must default off");
+        assert_eq!(set, MAX_DRAIN_JITTER_MS);
+        assert_eq!(
+            capped, MAX_DRAIN_JITTER_MS,
+            "oversized jitter leaves close-frame flush headroom"
+        );
+        assert_eq!(zero, 0, "explicit 0 is off");
+        assert!(
+            junk.is_err(),
+            "an unparsable jitter must fail loudly, not silently disable"
+        );
+        assert_eq!(
+            empty, 0,
+            "an empty value is treated as unset — a kill switch, not a crashloop"
+        );
+        assert_eq!(blank, 0, "a whitespace-only value is treated as unset");
     }
 
     #[test]

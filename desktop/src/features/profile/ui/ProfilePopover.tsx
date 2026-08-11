@@ -24,6 +24,7 @@ interface ProfilePopoverProps {
   onOpenChange: (open: boolean) => void;
   displayName: string;
   verifiedName?: string | null;
+  verifiedNameExpiresAt?: number | null;
   avatarUrl: string | null;
   avatarDataUrl?: string | null;
   currentStatus: PresenceStatus;
@@ -40,9 +41,8 @@ interface ProfilePopoverProps {
   // Used when auxiliary triggers (avatar, status text) live alongside the
   // primary PopoverTrigger and toggle the popover via controlled `open`.
   triggerContainerRef?: React.RefObject<HTMLElement | null>;
-  // Optional slot rendered between the identity block and the menu items.
-  // Used by the sidebar to surface the community/relay selector inside the
-  // profile menu instead of on the sidebar card.
+  // Optional slot rendered before the profile actions. Used by the sidebar to
+  // surface active-community actions inside the profile menu.
   communitySwitcherSlot?: React.ReactNode;
 }
 
@@ -56,6 +56,7 @@ export function ProfilePopover({
   onOpenChange,
   displayName,
   verifiedName,
+  verifiedNameExpiresAt,
   avatarUrl,
   avatarDataUrl,
   currentStatus,
@@ -148,7 +149,10 @@ export function ProfilePopover({
                     {displayName}
                   </p>
                   {verifiedName ? (
-                    <VerifiedBadge verifiedName={verifiedName} />
+                    <VerifiedBadge
+                      verifiedName={verifiedName}
+                      verifiedNameExpiresAt={verifiedNameExpiresAt}
+                    />
                   ) : null}
                 </div>
                 {/* ── Presence chip (opens status chooser) ─────────── */}
@@ -238,7 +242,34 @@ export function ProfilePopover({
               </button>
             </div>
 
-            <hr className="my-1 h-px border-0 bg-border" />
+            <hr className="my-1 h-px border-0 bg-border/60" />
+
+            {communitySwitcherSlot ? (
+              <>
+                {/* ── Community actions ──────────────────────────── */}
+                <div className="py-1" data-testid="profile-popover-community">
+                  {communitySwitcherSlot}
+                </div>
+                <hr className="my-1 h-px border-0 bg-border/60" />
+              </>
+            ) : null}
+
+            {onSendFeedback ? (
+              <button
+                className={MENU_ITEM_CLASS}
+                data-testid="profile-popover-send-feedback"
+                onClick={() => {
+                  closePopover();
+                  window.requestAnimationFrame(() => {
+                    onSendFeedback();
+                  });
+                }}
+                role="menuitem"
+                type="button"
+              >
+                <span className="flex-1">Send feedback</span>
+              </button>
+            ) : null}
 
             {/* ── Settings ───────────────────────────────────────── */}
             <button
@@ -258,33 +289,6 @@ export function ProfilePopover({
                 {settingsShortcutLabel}
               </kbd>
             </button>
-
-            {onSendFeedback ? (
-              <button
-                className={MENU_ITEM_CLASS}
-                data-testid="profile-popover-send-feedback"
-                onClick={() => {
-                  closePopover();
-                  window.requestAnimationFrame(() => {
-                    onSendFeedback();
-                  });
-                }}
-                role="menuitem"
-                type="button"
-              >
-                <span className="flex-1">Send feedback</span>
-              </button>
-            ) : null}
-
-            {communitySwitcherSlot ? (
-              <>
-                <hr className="my-1 h-px border-0 bg-border" />
-                {/* ── Community / relay selector ─────────────────── */}
-                <div data-testid="profile-popover-community">
-                  {communitySwitcherSlot}
-                </div>
-              </>
-            ) : null}
           </div>
         </PopoverContent>
       </Popover>

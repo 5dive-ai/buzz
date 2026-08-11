@@ -1,10 +1,12 @@
-//! Corporate identity binding persistence.
+//! Fail-closed compatibility adapter for the direct-final identity foundation.
 //!
-//! Bindings map a corporate IdP uid to the currently authorized Nostr pubkey
-//! inside one Buzz community. The active uniqueness indexes deliberately model
-//! one active pubkey per uid and one active uid per pubkey. Rotation/revocation
-//! flows clear that active state in a follow-up lifecycle layer rather than
-//! silently rewriting it during authentication.
+//! The former auth-time enrollment/lifecycle implementation wrote the legacy
+//! `uid`, `pubkey`, `display_name`, `source`, and `revoked_at` schema. Migration
+//! 0029 deliberately replaces that authority with immutable, receipt-backed
+//! binding generations. Until root callers are moved to the NIP-FI resolver
+//! and lifecycle transaction, every legacy mutation entry point fails closed.
+
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -12,63 +14,105 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use crate::error::{DbError, Result};
 use buzz_core::CommunityId;
 
-/// Binding source when the IdP JWT carries the pubkey claim.
+/// Legacy source label retained only for source-compatible root callers.
 pub const SOURCE_JWT_NPUB: &str = "jwt_npub";
-/// Binding source when the relay falls back to the stored uid/pubkey binding.
+/// Legacy source label retained only for source-compatible root callers.
 pub const SOURCE_DB_BINDING: &str = "db_binding";
 
-/// Active corporate identity binding row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+const LEGACY_MUTATION_DISABLED: &str =
+    "legacy identity mutation authority is disabled; use the NIP-FI lifecycle transaction";
+
+/// Read-only compatibility projection of an active immutable binding.
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdentityBinding {
-    /// Corporate IdP subject or configured stable uid claim.
+    /// Validated identity-provider issuer.
+    pub issuer: String,
+    /// Opaque issuer-qualified subject (legacy field name).
     pub uid: String,
-    /// Bound Nostr pubkey bytes.
+    /// Bound Nostr event-author key bytes.
     pub pubkey: Vec<u8>,
-    /// Human-readable display claim captured from the latest accepted JWT.
+    /// Direct-final storage never persists display claims.
     pub display_name: Option<String>,
-    /// Source that established or last strengthened the active binding.
+    /// Closed provenance label, never a provider/runtime authority.
     pub source: String,
-    /// When the binding was first created.
+    /// Immutable generation creation time.
     pub created_at: DateTime<Utc>,
-    /// When the binding row was last updated.
+    /// Compatibility timestamp equal to `created_at`.
     pub updated_at: DateTime<Utc>,
-    /// When the binding was last seen during authentication.
+    /// Compatibility timestamp equal to `created_at`.
     pub last_seen_at: DateTime<Utc>,
 }
 
+impl fmt::Debug for IdentityBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("IdentityBinding([REDACTED])")
+    }
+}
+
 /// Existing active binding that conflicts with a requested binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdentityBindingConflict {
-    /// Existing active uid.
+    /// Existing active issuer.
+    pub issuer: String,
+    /// Existing active opaque subject.
     pub uid: String,
-    /// Existing active pubkey bytes.
+    /// Existing active event-author key.
     pub pubkey: Vec<u8>,
-    /// Existing active binding source.
+    /// Existing closed provenance label.
     pub source: String,
 }
 
-/// Outcome of creating or validating a corporate identity binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BindIdentityResult {
-    /// A new active binding was created.
-    Created,
-    /// The requested binding matched an existing active binding.
-    Matched,
-    /// Another active binding already owns the uid or pubkey.
-    Conflict(IdentityBindingConflict),
+impl fmt::Debug for IdentityBindingConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("IdentityBindingConflict([REDACTED])")
+    }
 }
 
-fn validate_inputs(uid: &str, pubkey: &[u8], source: &str) -> Result<()> {
-    if uid.trim().is_empty() {
+/// Legacy mutation result retained for root source compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindIdentityResult {
+    /// Unreachable through the disabled compatibility mutation path.
+    Created,
+    /// Unreachable through the disabled compatibility mutation path.
+    Matched,
+    /// A conflicting immutable binding was observed.
+    Conflict(IdentityBindingConflict),
+    /// The operation was rejected by lifecycle state.
+    Revoked,
+}
+
+/// Legacy staged identity input retained only until root integration changes.
+#[derive(Clone, Copy)]
+pub struct IdentityBindingInput<'a> {
+    /// Canonically verified issuer.
+    pub issuer: &'a str,
+    /// Canonically verified opaque subject.
+    pub uid: &'a str,
+    /// Authenticated event-author key.
+    pub pubkey: &'a [u8],
+    /// Ephemeral display claim; never persisted by the direct-final schema.
+    pub display_name: Option<&'a str>,
+    /// Legacy source label; never used as authority.
+    pub source: &'a str,
+}
+
+impl fmt::Debug for IdentityBindingInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("IdentityBindingInput([REDACTED])")
+    }
+}
+
+fn validate_inputs(issuer: &str, subject: &str, pubkey: &[u8], source: &str) -> Result<()> {
+    if issuer.trim().is_empty() || subject.trim().is_empty() {
         return Err(DbError::InvalidData(
-            "identity binding uid must not be empty".to_string(),
+            "identity binding issuer and subject must not be empty".to_owned(),
         ));
     }
     validate_pubkey(pubkey)?;
     if !matches!(source, SOURCE_JWT_NPUB | SOURCE_DB_BINDING) {
-        return Err(DbError::InvalidData(format!(
-            "invalid identity binding source: {source}"
-        )));
+        return Err(DbError::InvalidData(
+            "invalid legacy identity binding source".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -76,172 +120,60 @@ fn validate_inputs(uid: &str, pubkey: &[u8], source: &str) -> Result<()> {
 fn validate_pubkey(pubkey: &[u8]) -> Result<()> {
     if pubkey.len() != 32 {
         return Err(DbError::InvalidData(
-            "identity binding pubkey must be 32 bytes".to_string(),
+            "identity binding pubkey must be 32 bytes".to_owned(),
         ));
     }
     Ok(())
 }
 
-fn row_to_binding(row: sqlx::postgres::PgRow) -> Result<IdentityBinding> {
-    Ok(IdentityBinding {
-        uid: row.try_get("uid")?,
-        pubkey: row.try_get("pubkey")?,
-        display_name: row.try_get("display_name")?,
-        source: row.try_get("source")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-        last_seen_at: row.try_get("last_seen_at")?,
-    })
-}
-
-async fn active_by_uid_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
-    uid: &str,
-) -> Result<Option<IdentityBinding>> {
-    let row = sqlx::query(
-        r#"
-        SELECT uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
-        FROM identity_bindings
-        WHERE community_id = $1 AND uid = $2 AND revoked_at IS NULL
-        FOR UPDATE
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(uid)
-    .fetch_optional(&mut **tx)
-    .await?;
-    row.map(row_to_binding).transpose()
-}
-
-async fn active_by_pubkey_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
-    pubkey: &[u8],
-) -> Result<Option<IdentityBinding>> {
-    let row = sqlx::query(
-        r#"
-        SELECT uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
-        FROM identity_bindings
-        WHERE community_id = $1 AND pubkey = $2 AND revoked_at IS NULL
-        FOR UPDATE
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(pubkey)
-    .fetch_optional(&mut **tx)
-    .await?;
-    row.map(row_to_binding).transpose()
-}
-
-fn conflict_from(binding: IdentityBinding) -> IdentityBindingConflict {
-    IdentityBindingConflict {
-        uid: binding.uid,
-        pubkey: binding.pubkey,
-        source: binding.source,
-    }
-}
-
-async fn lock_identity_keys_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
-    uid: &str,
-    pubkey: &[u8],
+pub(crate) fn validate_membership_identity_key(
+    member_pubkey_hex: &str,
+    identity: Option<&IdentityBindingInput<'_>>,
 ) -> Result<()> {
-    let mut keys = [
-        format!("{}:uid:{uid}", community_id.as_uuid()),
-        format!("{}:pubkey:{}", community_id.as_uuid(), hex::encode(pubkey)),
-    ];
-    keys.sort();
-    for key in keys {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('identity_bindings'), hashtext($1))")
-            .bind(key)
-            .execute(&mut **tx)
-            .await?;
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    let member_pubkey = hex::decode(member_pubkey_hex)
+        .map_err(|_| DbError::InvalidData("membership pubkey must be 32-byte hex".to_owned()))?;
+    if member_pubkey.len() != 32 || member_pubkey.as_slice() != identity.pubkey {
+        return Err(DbError::InvalidData(
+            "membership pubkey does not match staged identity key".to_owned(),
+        ));
     }
     Ok(())
 }
 
-/// Create or validate an active corporate identity binding.
-///
-/// This is a fail-closed auth-time operation:
-/// - same uid + same pubkey updates display/last_seen and succeeds;
-/// - same uid + different pubkey conflicts;
-/// - same pubkey + different uid conflicts;
-/// - no active row creates a new binding.
+/// Legacy auth-time enrollment is disconnected from the direct-final schema.
+#[allow(clippy::too_many_arguments)]
 pub async fn bind_or_validate_identity(
-    pool: &PgPool,
-    community_id: CommunityId,
-    uid: &str,
+    _pool: &PgPool,
+    _community_id: CommunityId,
+    issuer: &str,
+    subject: &str,
     pubkey: &[u8],
-    display_name: Option<&str>,
+    _display_name: Option<&str>,
     source: &str,
 ) -> Result<BindIdentityResult> {
-    validate_inputs(uid, pubkey, source)?;
-
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET LOCAL lock_timeout = '3s'")
-        .execute(&mut *tx)
-        .await?;
-    lock_identity_keys_tx(&mut tx, community_id, uid, pubkey).await?;
-
-    let active_uid = active_by_uid_tx(&mut tx, community_id, uid).await?;
-    if let Some(binding) = active_uid {
-        if binding.pubkey != pubkey {
-            tx.rollback().await?;
-            return Ok(BindIdentityResult::Conflict(conflict_from(binding)));
-        }
-
-        sqlx::query(
-            r#"
-            UPDATE identity_bindings
-            SET display_name = $4,
-                source = CASE
-                    WHEN source = 'jwt_npub' AND $5 = 'db_binding' THEN source
-                    ELSE $5
-                END,
-                updated_at = NOW(),
-                last_seen_at = NOW()
-            WHERE community_id = $1 AND uid = $2 AND pubkey = $3 AND revoked_at IS NULL
-            "#,
-        )
-        .bind(community_id.as_uuid())
-        .bind(uid)
-        .bind(pubkey)
-        .bind(display_name)
-        .bind(source)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        return Ok(BindIdentityResult::Matched);
-    }
-
-    let active_pubkey = active_by_pubkey_tx(&mut tx, community_id, pubkey).await?;
-    if let Some(binding) = active_pubkey {
-        if binding.uid != uid {
-            tx.rollback().await?;
-            return Ok(BindIdentityResult::Conflict(conflict_from(binding)));
-        }
-    }
-
-    sqlx::query(
-        r#"
-        INSERT INTO identity_bindings (community_id, uid, pubkey, display_name, source)
-        VALUES ($1, $2, $3, $4, $5)
-        "#,
-    )
-    .bind(community_id.as_uuid())
-    .bind(uid)
-    .bind(pubkey)
-    .bind(display_name)
-    .bind(source)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(BindIdentityResult::Created)
+    validate_inputs(issuer, subject, pubkey, source)?;
+    Err(DbError::AccessDenied(LEGACY_MUTATION_DISABLED.to_owned()))
 }
 
-/// Return the active binding for `pubkey`, if one exists.
+/// Caller-owned legacy admission transactions also fail before any SQL write.
+pub(crate) async fn bind_or_validate_identity_tx(
+    _tx: &mut Transaction<'_, Postgres>,
+    _community_id: CommunityId,
+    identity: &IdentityBindingInput<'_>,
+) -> Result<BindIdentityResult> {
+    validate_inputs(
+        identity.issuer,
+        identity.uid,
+        identity.pubkey,
+        identity.source,
+    )?;
+    Err(DbError::AccessDenied(LEGACY_MUTATION_DISABLED.to_owned()))
+}
+
+/// Read the exact active direct-final binding for an event-author key.
 pub async fn get_active_identity_binding_by_pubkey(
     pool: &PgPool,
     community_id: CommunityId,
@@ -250,208 +182,109 @@ pub async fn get_active_identity_binding_by_pubkey(
     validate_pubkey(pubkey)?;
     let row = sqlx::query(
         r#"
-        SELECT uid, pubkey, display_name, source, created_at, updated_at, last_seen_at
+        SELECT issuer, subject, event_author_pubkey, binding_provenance, created_at
         FROM identity_bindings
-        WHERE community_id = $1 AND pubkey = $2 AND revoked_at IS NULL
+        WHERE community_id = $1
+          AND event_author_pubkey = $2
+          AND binding_state = 1
+          AND (expires_at IS NULL OR transaction_timestamp() < expires_at)
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(pubkey)
     .fetch_optional(pool)
     .await?;
-    row.map(row_to_binding).transpose()
+    row.map(|row| {
+        let provenance: i16 = row.try_get("binding_provenance")?;
+        let created_at: DateTime<Utc> = row.try_get("created_at")?;
+        let source = match provenance {
+            1 => "attested",
+            2 => "provisioned",
+            3 => "risk_labelled_tofu",
+            _ => {
+                return Err(DbError::InvalidData(
+                    "invalid identity binding provenance".to_owned(),
+                ));
+            }
+        };
+        Ok(IdentityBinding {
+            issuer: row.try_get("issuer")?,
+            uid: row.try_get("subject")?,
+            pubkey: row.try_get("event_author_pubkey")?,
+            display_name: None,
+            source: source.to_owned(),
+            created_at,
+            updated_at: created_at,
+            last_seen_at: created_at,
+        })
+    })
+    .transpose()
+}
+
+/// Legacy principal revocation is replaced by receipt-backed lifecycle state.
+pub async fn revoke_identity_principal(
+    _pool: &PgPool,
+    _community_id: CommunityId,
+    _issuer: &str,
+    _subject: &str,
+    _revoked_by: Option<&[u8]>,
+    _reason: &str,
+) -> Result<bool> {
+    Err(DbError::AccessDenied(LEGACY_MUTATION_DISABLED.to_owned()))
+}
+
+/// Legacy key revocation is replaced by receipt-backed lifecycle state.
+pub async fn revoke_identity_key(
+    _pool: &PgPool,
+    _community_id: CommunityId,
+    pubkey: &[u8],
+    _revoked_by: Option<&[u8]>,
+    _reason: &str,
+) -> Result<bool> {
+    validate_pubkey(pubkey)?;
+    Err(DbError::AccessDenied(LEGACY_MUTATION_DISABLED.to_owned()))
+}
+
+/// Legacy rotation is replaced by the direct-final lifecycle transaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn rotate_identity_binding(
+    _pool: &PgPool,
+    _community_id: CommunityId,
+    issuer: &str,
+    subject: &str,
+    old_pubkey: &[u8],
+    new_pubkey: &[u8],
+    _display_name: Option<&str>,
+    source: &str,
+    _rotated_by: Option<&[u8]>,
+    _reason: &str,
+) -> Result<()> {
+    validate_inputs(issuer, subject, old_pubkey, source)?;
+    validate_pubkey(new_pubkey)?;
+    Err(DbError::AccessDenied(LEGACY_MUTATION_DISABLED.to_owned()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::Keys;
-    use uuid::Uuid;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
-
-    async fn setup_pool() -> PgPool {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
-        let pool = PgPool::connect(&database_url)
-            .await
-            .expect("connect to test DB");
-        crate::migration::run_migrations(&pool)
-            .await
-            .expect("run migrations");
-        pool
+    #[test]
+    fn compatibility_debug_is_redacted() {
+        let input = IdentityBindingInput {
+            issuer: "secret-issuer",
+            uid: "secret-subject",
+            pubkey: &[7; 32],
+            display_name: Some("secret-name"),
+            source: SOURCE_JWT_NPUB,
+        };
+        assert_eq!(format!("{input:?}"), "IdentityBindingInput([REDACTED])");
     }
 
-    async fn make_community(pool: &PgPool) -> CommunityId {
-        let id = Uuid::new_v4();
-        let host = format!("identity-binding-test-{}.example", id.simple());
-        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
-            .bind(id)
-            .bind(host)
-            .execute(pool)
-            .await
-            .expect("insert test community");
-        CommunityId::from_uuid(id)
-    }
-
-    fn random_pubkey() -> Vec<u8> {
-        Keys::generate().public_key().to_bytes().to_vec()
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn bind_identity_creates_then_matches_idempotently() {
-        let pool = setup_pool().await;
-        let community = make_community(&pool).await;
-        let pubkey = random_pubkey();
-
-        let created = bind_or_validate_identity(
-            &pool,
-            community,
-            "user-1",
-            &pubkey,
-            Some("first@example.com"),
-            SOURCE_DB_BINDING,
-        )
-        .await
-        .expect("create binding");
-        assert_eq!(created, BindIdentityResult::Created);
-
-        let matched = bind_or_validate_identity(
-            &pool,
-            community,
-            "user-1",
-            &pubkey,
-            Some("second@example.com"),
-            SOURCE_JWT_NPUB,
-        )
-        .await
-        .expect("match existing binding");
-        assert_eq!(matched, BindIdentityResult::Matched);
-
-        let binding = get_active_identity_binding_by_pubkey(&pool, community, &pubkey)
-            .await
-            .expect("lookup binding")
-            .expect("binding exists");
-        assert_eq!(binding.uid, "user-1");
-        assert_eq!(binding.display_name.as_deref(), Some("second@example.com"));
-        assert_eq!(binding.source, SOURCE_JWT_NPUB);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn bind_identity_rejects_uid_conflict() {
-        let pool = setup_pool().await;
-        let community = make_community(&pool).await;
-        let original_pubkey = random_pubkey();
-        let conflicting_pubkey = random_pubkey();
-
-        bind_or_validate_identity(
-            &pool,
-            community,
-            "user-1",
-            &original_pubkey,
-            Some("user@example.com"),
-            SOURCE_DB_BINDING,
-        )
-        .await
-        .expect("create binding");
-
-        let result = bind_or_validate_identity(
-            &pool,
-            community,
-            "user-1",
-            &conflicting_pubkey,
-            Some("user@example.com"),
-            SOURCE_DB_BINDING,
-        )
-        .await
-        .expect("uid conflict is a binding result");
-
-        assert_eq!(
-            result,
-            BindIdentityResult::Conflict(IdentityBindingConflict {
-                uid: "user-1".to_string(),
-                pubkey: original_pubkey,
-                source: SOURCE_DB_BINDING.to_string(),
-            })
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn bind_identity_rejects_pubkey_conflict() {
-        let pool = setup_pool().await;
-        let community = make_community(&pool).await;
-        let pubkey = random_pubkey();
-
-        bind_or_validate_identity(
-            &pool,
-            community,
-            "user-1",
-            &pubkey,
-            Some("user@example.com"),
-            SOURCE_DB_BINDING,
-        )
-        .await
-        .expect("create binding");
-
-        let result = bind_or_validate_identity(
-            &pool,
-            community,
-            "user-2",
-            &pubkey,
-            Some("other@example.com"),
-            SOURCE_JWT_NPUB,
-        )
-        .await
-        .expect("pubkey conflict is a binding result");
-
-        assert_eq!(
-            result,
-            BindIdentityResult::Conflict(IdentityBindingConflict {
-                uid: "user-1".to_string(),
-                pubkey,
-                source: SOURCE_DB_BINDING.to_string(),
-            })
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn bind_identity_does_not_downgrade_jwt_npub_source() {
-        let pool = setup_pool().await;
-        let community = make_community(&pool).await;
-        let pubkey = random_pubkey();
-
-        bind_or_validate_identity(
-            &pool,
-            community,
-            "user-1",
-            &pubkey,
-            Some("user@example.com"),
-            SOURCE_JWT_NPUB,
-        )
-        .await
-        .expect("create strong binding");
-
-        let matched = bind_or_validate_identity(
-            &pool,
-            community,
-            "user-1",
-            &pubkey,
-            Some("user@example.com"),
-            SOURCE_DB_BINDING,
-        )
-        .await
-        .expect("match existing binding");
-        assert_eq!(matched, BindIdentityResult::Matched);
-
-        let binding = get_active_identity_binding_by_pubkey(&pool, community, &pubkey)
-            .await
-            .expect("lookup binding")
-            .expect("binding exists");
-        assert_eq!(binding.source, SOURCE_JWT_NPUB);
+    #[test]
+    fn malformed_compatibility_inputs_fail_before_io() {
+        assert!(validate_inputs("", "subject", &[7; 32], SOURCE_JWT_NPUB).is_err());
+        assert!(validate_inputs("issuer", "", &[7; 32], SOURCE_JWT_NPUB).is_err());
+        assert!(validate_inputs("issuer", "subject", &[7; 31], SOURCE_JWT_NPUB).is_err());
+        assert!(validate_inputs("issuer", "subject", &[7; 32], "provider").is_err());
     }
 }

@@ -3,6 +3,7 @@ import * as React from "react";
 import { FeatureGate } from "@/shared/features";
 import { SidebarDndContext } from "@/features/sidebar/ui/SidebarDnd";
 
+import type { LeaveCommunityResult } from "@/features/communities/leaveCommunity";
 import type { Community } from "@/features/communities/types";
 import { AddCommunityDialog } from "@/features/communities/ui/AddCommunityDialog";
 import type { AddCommunityPrefillRequest } from "@/features/communities/addCommunityPrefill";
@@ -22,15 +23,9 @@ import {
 import { useChannelSortPreference } from "@/features/sidebar/lib/useChannelSortPreference";
 import { useSidebarScrollLock } from "@/features/sidebar/lib/useSidebarScrollLock";
 import { isSidebarBackgroundTarget } from "@/features/sidebar/lib/sidebarBackgroundTarget";
-import { useUnreadOverflow } from "@/features/sidebar/lib/useUnreadOverflow";
-import {
-  CreateSectionDialog,
-  DeleteSectionAlertDialog,
-  RenameSectionDialog,
-  useDeleteChannelDialog,
-  useLeaveChannelDialog,
-  type SectionDialogValue,
-} from "@/features/sidebar/ui/ChannelSectionDialogs";
+import { useSidebarActivityOverflow } from "@/features/sidebar/lib/useSidebarActivityOverflow";
+// biome-ignore format: keep compact to stay within file size limit
+import { CreateSectionDialog, DeleteSectionAlertDialog, RenameSectionDialog, useDeleteChannelDialog, useLeaveChannelDialog, type SectionDialogValue } from "@/features/sidebar/ui/ChannelSectionDialogs";
 import {
   AppSidebarPinnedHeader,
   AppSidebarPrimaryMenu,
@@ -45,6 +40,11 @@ import {
 } from "@/features/sidebar/ui/CustomChannelSection";
 import { CreateChannelDialog } from "@/features/sidebar/ui/CreateChannelDialog";
 import { SidebarProfileCard } from "@/features/sidebar/ui/SidebarProfileCard";
+import { HuddleProfileControl } from "@/features/huddle";
+import type {
+  CollapsibleSidebarGroup,
+  CreateChannelKind,
+} from "@/features/sidebar/ui/AppSidebar.types";
 import { SidebarRelayConnectionCard } from "@/features/sidebar/ui/SidebarRelayConnectionCard";
 import type { useSidebarRelayConnectionCard } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
 import { formatVerifiedUserLabel } from "@/features/profile/lib/identity";
@@ -56,6 +56,7 @@ import { useDeferredModalOpen } from "@/shared/ui/deferredModalOpen";
 import { SidebarUpdateCard } from "@/features/settings/SidebarUpdateCard";
 import { useUpdaterContext } from "@/features/settings/hooks/UpdaterProvider";
 import { shouldShowSidebarUpdateCard } from "@/features/settings/sidebarUpdateCardVisibility";
+import type { SettingsSection } from "@/features/settings/ui/SettingsPanels";
 import type {
   Channel,
   ChannelVisibility,
@@ -73,14 +74,6 @@ import {
   SidebarRail,
   useSidebar,
 } from "@/shared/ui/sidebar";
-
-type CollapsibleSidebarGroup =
-  | "starred"
-  | "channels"
-  | "forums"
-  | "directMessages";
-
-type CreateChannelKind = "stream" | "forum";
 
 type AppSidebarProps = {
   addCommunityPrefill?: AddCommunityPrefillRequest | null;
@@ -108,6 +101,7 @@ type AppSidebarProps = {
     | "projects";
   unreadChannelCounts: ReadonlyMap<string, number>;
   unreadChannelIds: ReadonlySet<string>;
+  previewActivityChannelIds: ReadonlySet<string>;
   communities: Community[];
   onAddCommunity: (community: Community) => void;
   onAddCommunityOpenChange?: (open: boolean) => void;
@@ -140,7 +134,7 @@ type AppSidebarProps = {
     id: string,
     updates: Partial<Pick<Community, "name" | "relayUrl" | "token">>,
   ) => void;
-  onRemoveCommunity: (id: string) => void;
+  onRemoveCommunity: (id: string) => Promise<LeaveCommunityResult | undefined>;
   onCreateAgent: () => void;
   onSelectAgents: () => void;
   onSelectProjects: () => void;
@@ -156,7 +150,7 @@ type AppSidebarProps = {
    */
   searchChannels: Channel[];
   searchFocusRequest: number;
-  onSelectSettings: (section?: "profile" | "appearance") => void;
+  onSelectSettings: (section?: SettingsSection) => void;
   onSetPresenceStatus?: (status: "online" | "away" | "offline") => void;
   onSetUserStatus: (text: string, emoji: string) => void;
   onClearUserStatus: () => void;
@@ -166,6 +160,8 @@ type AppSidebarProps = {
   onNewMessage: () => void;
   onBackgroundClick?: () => void;
   isCreateChannelOpen?: boolean;
+  isHuddleCompanionOpen?: boolean;
+  onHuddleEnded?: (ephemeralChannelId: string | null) => void;
   onCreateChannelOpenChange?: (open: boolean) => void;
   mutedChannelIds?: ReadonlySet<string>;
   onMuteChannel?: (channelId: string) => void;
@@ -195,6 +191,7 @@ export function AppSidebar({
   selectedView,
   unreadChannelCounts,
   unreadChannelIds,
+  previewActivityChannelIds,
   communities,
   onAddCommunity,
   onAddCommunityOpenChange,
@@ -229,6 +226,8 @@ export function AppSidebar({
   isPresencePending,
   onNewMessage,
   isCreateChannelOpen: isCreateChannelOpenProp,
+  isHuddleCompanionOpen = false,
+  onHuddleEnded,
   onCreateChannelOpenChange,
   mutedChannelIds,
   onMuteChannel,
@@ -249,6 +248,8 @@ export function AppSidebar({
   const [dmActionsMenuOpen, setDmActionsMenuOpen] = React.useState(false);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   useSidebarScrollLock(scrollRef);
+  // biome-ignore format: keep compact to stay within file size limit
+  const { scrollToNextAbove, scrollToNextBelow, unreadAboveCount, unreadBelowCount, unreadAboveLabel, unreadBelowLabel } = useSidebarActivityOverflow({ activeWorkingByChannelId, previewActivityChannelIds, scrollRef, unreadChannelIds });
 
   React.useEffect(() => {
     const scrollElement = scrollRef.current;
@@ -476,6 +477,7 @@ export function AppSidebar({
   const resolvedProfileDisplayName = formatVerifiedUserLabel(
     profile?.displayName,
     profile?.verifiedName,
+    profile?.verifiedNameExpiresAt,
   );
   const { dmChannelLabels, dmParticipantsByChannelId, dmPresenceByChannelId } =
     useDmSidebarMetadata({
@@ -506,13 +508,6 @@ export function AppSidebar({
     resolvedProfileDisplayName ||
     fallbackDisplayName?.trim() ||
     "Current identity";
-  const {
-    scrollToNextAbove,
-    scrollToNextBelow,
-    unreadAboveCount,
-    unreadBelowCount,
-  } = useUnreadOverflow({ scrollRef, unreadChannelIds });
-
   const isCreatingAny =
     createDialogKind === "stream"
       ? isCreatingChannel
@@ -555,7 +550,7 @@ export function AppSidebar({
 
   return (
     <Sidebar
-      className="!border-r-0"
+      className="!z-[100] !border-r-0"
       collapsible="offcanvas"
       data-testid="app-sidebar"
       onClick={(event) => {
@@ -566,7 +561,9 @@ export function AppSidebar({
       variant="sidebar"
     >
       <div
-        className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
+        className={`relative flex min-h-0 flex-1 flex-col overflow-hidden ${
+          communities.length > 1 ? "md:-ml-[11px] md:w-[calc(100%+11px)]" : ""
+        }`}
         data-sidebar-background
         data-testid="app-sidebar-scroll-anchor"
       >
@@ -592,6 +589,7 @@ export function AppSidebar({
           {unreadAboveCount > 0 ? (
             <MoreUnreadButton
               count={unreadAboveCount}
+              label={unreadAboveLabel}
               onClick={scrollToNextAbove}
               position="top"
               testId="sidebar-more-unread-above"
@@ -863,6 +861,7 @@ export function AppSidebar({
             <MoreUnreadButton
               bottomClassName="bottom-full"
               count={unreadBelowCount}
+              label={unreadBelowLabel}
               onClick={scrollToNextBelow}
               position="bottom"
               testId="sidebar-more-unread-below"
@@ -890,6 +889,11 @@ export function AppSidebar({
                 />
               </div>
             ) : null}
+            <HuddleProfileControl
+              channels={channels}
+              onHuddleEnded={onHuddleEnded}
+              visible={isHuddleCompanionOpen}
+            />
             <SidebarMenu>
               <SidebarMenuItem>
                 <SidebarProfileCard

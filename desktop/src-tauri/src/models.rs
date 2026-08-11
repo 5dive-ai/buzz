@@ -6,6 +6,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub struct IdentityInfo {
     pub pubkey: String,
     pub display_name: String,
+    /// Durable location of the active identity key.
+    pub storage: String,
     /// True when the app booted with an ephemeral key because the OS keyring
     /// was empty despite a prior successful migration (key was externally
     /// deleted). The frontend routes to the nsec re-import step when true.
@@ -30,6 +32,9 @@ pub struct ProfileInfo {
     pub display_name: Option<String>,
     #[serde(default)]
     pub verified_name: Option<String>,
+    /// Unix timestamp (seconds) after which `verified_name` must not be shown.
+    #[serde(default)]
+    pub verified_name_expires_at: Option<u64>,
     pub avatar_url: Option<String>,
     pub about: Option<String>,
     pub nip05_handle: Option<String>,
@@ -46,6 +51,9 @@ pub struct UserProfileSummaryInfo {
     pub display_name: Option<String>,
     #[serde(default)]
     pub verified_name: Option<String>,
+    /// Unix timestamp (seconds) after which `verified_name` must not be shown.
+    #[serde(default)]
+    pub verified_name_expires_at: Option<u64>,
     /// Kind-0 `name` field, carried separately from `display_name` so clients
     /// can match @mention text against either alias (agents and the CLI
     /// resolve mentions server-side against `display_name` *or* `name`).
@@ -70,6 +78,9 @@ pub struct UserSearchResultInfo {
     pub display_name: Option<String>,
     #[serde(default)]
     pub verified_name: Option<String>,
+    /// Unix timestamp (seconds) after which `verified_name` must not be shown.
+    #[serde(default)]
+    pub verified_name_expires_at: Option<u64>,
     pub avatar_url: Option<String>,
     pub nip05_handle: Option<String>,
     pub owner_pubkey: Option<String>,

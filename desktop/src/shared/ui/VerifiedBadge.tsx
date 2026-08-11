@@ -1,13 +1,31 @@
+import { useVerifiedIdentityExpiryRevision } from "@/shared/hooks/useVerifiedIdentityExpiry";
+import { getCurrentVerifiedName } from "@/shared/lib/verifiedIdentity";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 
-export function VerifiedBadge({ verifiedName }: { verifiedName: string }) {
+export function VerifiedBadge({
+  verifiedName,
+  verifiedNameExpiresAt,
+}: {
+  verifiedName: string;
+  verifiedNameExpiresAt: number | null | undefined;
+}) {
+  useVerifiedIdentityExpiryRevision([verifiedNameExpiresAt]);
+  const currentVerifiedName = getCurrentVerifiedName(
+    verifiedName,
+    verifiedNameExpiresAt,
+  );
+  if (!currentVerifiedName) {
+    return null;
+  }
+
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <span
-          aria-label={`Verified corporate identity: ${verifiedName}`}
+          aria-label={`Relay-verified identity: ${currentVerifiedName}`}
           className="inline-flex shrink-0 items-center"
-          data-testid="verified-corporate-identity"
+          data-testid="relay-verified-identity"
+          role="img"
         >
           <svg
             aria-hidden="true"
@@ -30,7 +48,7 @@ export function VerifiedBadge({ verifiedName }: { verifiedName: string }) {
         </span>
       </TooltipTrigger>
       <TooltipContent side="top">
-        <p className="text-xs">Verified as {verifiedName}</p>
+        <p className="text-xs">Verified as {currentVerifiedName}</p>
       </TooltipContent>
     </Tooltip>
   );

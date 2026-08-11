@@ -1,12 +1,15 @@
 //! axum routers — app (WebSocket + REST), health (K8s probes), metrics (Prometheus).
 
+mod route_policy;
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{
-    extract::{ConnectInfo, FromRequest, State, WebSocketUpgrade},
-    http::{HeaderMap, StatusCode},
-    middleware,
+    body::Body,
+    extract::{ConnectInfo, FromRequest, MatchedPath, State, WebSocketUpgrade},
+    http::{HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Json},
     routing::{get, post, put},
     Router,
@@ -16,7 +19,7 @@ use tower::ServiceExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeDir;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{HttpMakeClassifier, TraceLayer};
 
 use crate::api;
 use crate::audio;
@@ -186,9 +189,84 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     }
 
     merged
+        // Every registered route must be present in the centralized policy
+        // inventory. When the gate is enabled, an unclassified route fails
+        // before its handler can perform reads or writes.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_corporate_identity_route_inventory,
+        ))
         .layer(middleware::from_fn(track_metrics))
-        .layer(TraceLayer::new_for_http())
+        .layer(http_trace_layer())
         .layer(build_cors_layer(&state.config.cors_origins))
+}
+
+async fn enforce_corporate_identity_route_inventory(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    enforce_route_inventory_for_requirement(state.config.corporate_identity.require, request, next)
+        .await
+}
+
+async fn enforce_route_inventory_for_requirement(
+    corporate_identity_required: bool,
+    request: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    if !corporate_identity_required {
+        return next.run(request).await;
+    }
+    let matched_path = request.extensions().get::<MatchedPath>();
+    let policy = matched_path
+        .and_then(|path| route_policy::classify_matched_route(request.method(), path.as_str()));
+    if policy.is_some() {
+        return next.run(request).await;
+    }
+    if matched_path.is_some_and(|path| route_policy::is_known_matched_path(path.as_str())) {
+        // Axum's method fallback also runs route layers. Return its semantic
+        // equivalent directly, while still preventing an accidentally added
+        // unclassified method handler from executing.
+        let allow = matched_path
+            .and_then(|path| route_policy::allowed_methods(path.as_str()))
+            .unwrap_or_default();
+        return axum::response::Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(axum::http::header::ALLOW, allow)
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::METHOD_NOT_ALLOWED.into_response());
+    }
+    tracing::error!(
+        method = %request.method(),
+        matched_path = matched_path.map(|path| path.as_str()).unwrap_or("<missing>"),
+        "rejecting route missing corporate identity policy classification"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "route unavailable: identity policy is not configured",
+    )
+        .into_response()
+}
+
+fn http_trace_layer() -> TraceLayer<HttpMakeClassifier, fn(&Request<Body>) -> tracing::Span> {
+    TraceLayer::new_for_http().make_span_with(make_http_span as fn(&Request<Body>) -> tracing::Span)
+}
+
+fn make_http_span(request: &Request<Body>) -> tracing::Span {
+    let corporate_identity_policy = request
+        .extensions()
+        .get::<MatchedPath>()
+        .and_then(|path| route_policy::classify_matched_route(request.method(), path.as_str()))
+        .map(route_policy::CorporateIdentityRoutePolicy::trace_label)
+        .unwrap_or("unclassified");
+    tracing::info_span!(
+        target: "buzz_relay",
+        "http.request",
+        otel.kind = "server",
+        http.request.method = %request.method(),
+        buzz.corporate_identity.route_policy = corporate_identity_policy,
+    )
 }
 
 fn is_admin_spa_path(path: &str) -> bool {
@@ -439,13 +517,64 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
 
 #[cfg(test)]
 mod tests {
-    use axum::{routing::get, Router};
+    use axum::{
+        routing::{get, post},
+        Router,
+    };
     use futures_util::SinkExt;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use tower::ServiceBuilder;
+    use tracing::Instrument as _;
+    use tracing_subscriber::prelude::*;
 
     use super::*;
+
+    async fn require_route_inventory(
+        request: Request<Body>,
+        next: Next,
+    ) -> axum::response::Response {
+        enforce_route_inventory_for_requirement(true, request, next).await
+    }
+
+    #[tokio::test]
+    async fn route_inventory_preserves_405_and_rejects_new_unclassified_handlers() {
+        let app = Router::new()
+            .route("/events", post(|| async { StatusCode::OK }))
+            .route("/new-unclassified-route", get(|| async { StatusCode::OK }))
+            .route_layer(middleware::from_fn(require_route_inventory));
+
+        let allowed = app
+            .clone()
+            .oneshot(Request::post("/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let unsupported = app
+            .clone()
+            .oneshot(Request::delete("/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unsupported.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            unsupported.headers().get(axum::http::header::ALLOW),
+            Some(&axum::http::HeaderValue::from_static("POST"))
+        );
+
+        let unclassified = app
+            .oneshot(
+                Request::get("/new-unclassified-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unclassified.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     #[test]
     fn invite_landing_path_requires_exactly_one_nonempty_code_segment() {
@@ -475,6 +604,60 @@ mod tests {
         assert!(should_serve_spa("/", true));
         assert!(should_serve_spa("/repos/example", true));
         assert!(!should_serve_spa("/arbitrary", true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_and_datastore_spans_are_exported_in_the_same_trace() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("test"))
+                .with_filter(crate::telemetry::otel_env_filter(None)),
+        );
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let service = ServiceBuilder::new()
+            .layer(http_trace_layer())
+            .service(tower::service_fn(
+                |_: axum::http::Request<axum::body::Body>| async {
+                    async {}
+                        .instrument(tracing::info_span!(
+                            target: "buzz_datastore",
+                            "SELECT",
+                            otel.kind = "client",
+                            db.system.name = "postgresql",
+                        ))
+                        .await;
+                    Ok::<_, std::convert::Infallible>(axum::response::Response::new(
+                        axum::body::Body::empty(),
+                    ))
+                },
+            ));
+
+        service
+            .oneshot(
+                axum::http::Request::get("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let http = spans
+            .iter()
+            .find(|span| span.name == "http.request")
+            .unwrap();
+        let datastore = spans.iter().find(|span| span.name == "SELECT").unwrap();
+
+        assert_eq!(
+            datastore.span_context.trace_id(),
+            http.span_context.trace_id()
+        );
+        assert_eq!(datastore.parent_span_id, http.span_context.span_id());
     }
 
     async fn handler_receives_message_with_limit(limit: usize, size: usize) -> bool {

@@ -19,6 +19,7 @@ pub fn user_search_result_from_event(ev: &Event) -> UserSearchResultInfo {
             .or_else(|| v.get("name").and_then(Value::as_str))
             .map(str::to_string),
         verified_name: None,
+        verified_name_expires_at: None,
         avatar_url: v.get("picture").and_then(Value::as_str).map(str::to_string),
         nip05_handle: v.get("nip05").and_then(Value::as_str).map(str::to_string),
         is_agent: owner_pubkey.is_some(),

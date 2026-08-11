@@ -1069,6 +1069,19 @@ impl Config {
                     ));
                 }
 
+                // IPv6 authorities must be bracketed (RFC 3986). An unbracketed
+                // literal such as `::1` cannot form a valid URI authority — the
+                // advertised NIP-11 origin and the NIP-98 `u`-tag verifier would
+                // emit `http://::1`, which no URL parser accepts, and no real
+                // client sends an unbracketed IPv6 `Host` header. Reject it here
+                // so every accepted host yields usable discovery and signing URLs.
+                if !host.starts_with('[') && host.matches(':').count() > 1 {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "BUZZ_ADMIN_HOST={host} looks like a bare IPv6 literal; \
+                         wrap IPv6 addresses in brackets, e.g. [::1] or [::1]:3000"
+                    )));
+                }
+
                 // Parse BUZZ_ADMIN_AUTH. Accepted values: "token" (default when
                 // unset), "disabled", "nip98". Any other non-empty value is a
                 // startup error (typo-proofing).
@@ -1411,6 +1424,40 @@ mod tests {
                     t.matches(&expected) && !t.matches(&[0u8; 32])
                 })
             );
+        }
+    }
+
+    #[test]
+    fn admin_host_bare_ipv6_literal_fails_closed() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for host in ["::1", "::1:3000", "fe80::1", "2001:db8::1"] {
+            let result = config_with_admin_env(&[
+                ("BUZZ_ADMIN_HOST", Some(host)),
+                ("BUZZ_ADMIN_TOKEN", Some(VALID_ADMIN_TOKEN)),
+            ]);
+            assert!(
+                matches!(
+                    result,
+                    Err(ConfigError::InvalidValue(ref message))
+                        if message.contains("BUZZ_ADMIN_HOST") && message.contains("bracket")
+                ),
+                "bare IPv6 host {host:?} must be rejected: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_host_bracketed_ipv6_literal_is_accepted() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for host in ["[::1]", "[::1]:3000", "[2001:db8::1]:8443"] {
+            let admin = config_with_admin_env(&[
+                ("BUZZ_ADMIN_HOST", Some(host)),
+                ("BUZZ_ADMIN_TOKEN", Some(VALID_ADMIN_TOKEN)),
+            ])
+            .unwrap_or_else(|e| panic!("bracketed IPv6 host {host:?} must be accepted: {e:?}"))
+            .admin
+            .expect("admin surface is configured");
+            assert_eq!(admin.host, host);
         }
     }
 

@@ -108,9 +108,11 @@ NIP-11 relay-information document under an optional `admin_api` field:
 
 The value is the canonical origin `scheme://host[:port]` (no path), with the
 scheme derived by the same loopback rule as `u`-tag verification (`http` for
-`localhost`/`127.x`/`::1`, else `https`). The field is omitted entirely when no
+`localhost`/`127.x`/`[::1]`, else `https`). The field is omitted entirely when no
 admin surface is configured. Clients (such as the desktop console) read this to
-auto-discover the admin endpoint instead of requiring manual URL entry.
+auto-discover the admin endpoint instead of requiring manual URL entry. IPv6
+admin hosts must be bracketed (`[::1]`, `[::1]:3000`); an unbracketed literal is
+a startup error.
 
 Each request requires:
 

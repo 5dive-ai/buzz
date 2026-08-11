@@ -89,21 +89,19 @@ pub(crate) fn is_admin_host(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 /// Scheme for an admin authority: `http://` for loopback hosts (localhost,
-/// `::1`, 127.x), else `https://` — matching local dev via the Justfile.
+/// `[::1]`, 127.x), else `https://` — matching local dev via the Justfile.
 ///
 /// Shared by [`canonical_url`] (NIP-98 `u`-tag verification) and
 /// [`admin_api_origin`] (NIP-11 advertisement) so the origin the relay
 /// advertises and the origin it verifies against can never use different
 /// schemes.
 fn scheme_for_host(host: &str) -> &'static str {
-    // Strip any `:port` to get the bare host. IPv6 literals carry their own
-    // colons, so a plain `split(':')` would mangle them: bracketed authorities
-    // (`[::1]:3000`) take the text inside the brackets, and an unbracketed
-    // multi-colon host is a bare IPv6 literal with no port.
+    // Strip any `:port` to get the bare host. A bracketed IPv6 authority
+    // (`[::1]:3000`) carries its colons inside the brackets, so take the text
+    // between them; bare (unbracketed) IPv6 literals are rejected at config
+    // parse, so `split(':')` on every other accepted form only strips a port.
     let host_part = if let Some(rest) = host.strip_prefix('[') {
         rest.split(']').next().unwrap_or(rest)
-    } else if host.matches(':').count() > 1 {
-        host
     } else {
         host.split(':').next().unwrap_or(host)
     };
@@ -533,9 +531,36 @@ mod tests {
     fn admin_api_origin_uses_http_for_loopback_hosts() {
         assert_eq!(admin_api_origin("localhost:3000"), "http://localhost:3000");
         assert_eq!(admin_api_origin("127.0.0.1:3000"), "http://127.0.0.1:3000");
-        assert_eq!(admin_api_origin("::1"), "http://::1");
-        // Bracketed IPv6 authority with a port (the RFC 3986 Host-header form).
+        // Bracketed IPv6 authority (the RFC 3986 form; bare `::1` is rejected
+        // at config parse). Loopback `[::1]` resolves to `http`.
+        assert_eq!(admin_api_origin("[::1]"), "http://[::1]");
         assert_eq!(admin_api_origin("[::1]:3000"), "http://[::1]:3000");
+    }
+
+    /// The advertised origin and the verified `u`-tag URL must parse as valid
+    /// URLs for every accepted host — the round-1 defect advertised
+    /// `http://::1`, which no URL parser accepts. Bare IPv6 is rejected at
+    /// config parse, so every host reaching these helpers is bracketed or a
+    /// name/IPv4 authority.
+    #[test]
+    fn admin_api_origin_and_canonical_url_parse_as_valid_urls() {
+        for host in [
+            "admin.example.com",
+            "admin.example.com:8443",
+            "localhost",
+            "localhost:3000",
+            "127.0.0.1",
+            "127.0.0.1:3000",
+            "[::1]",
+            "[::1]:3000",
+        ] {
+            let advertised = admin_api_origin(host);
+            url::Url::parse(&advertised)
+                .unwrap_or_else(|e| panic!("advertised origin {advertised:?} must parse: {e}"));
+            let verified = canonical_url(host, "/api/admin/v1/reports");
+            url::Url::parse(&verified)
+                .unwrap_or_else(|e| panic!("canonical url {verified:?} must parse: {e}"));
+        }
     }
 
     /// The advertised origin and the verified `u`-tag URL must agree on scheme
@@ -548,7 +573,6 @@ mod tests {
             "admin.example.com:8443",
             "localhost:3000",
             "127.0.0.1:3000",
-            "::1",
             "[::1]:3000",
         ] {
             let advertised = admin_api_origin(host);

@@ -30,9 +30,11 @@
   origin in an optional `admin_api` field (`scheme://host[:port]`) whenever the
   admin surface is configured (`BUZZ_ADMIN_HOST` set). The scheme follows the
   same loopback rule as NIP-98 `u`-tag verification (`http` for
-  `localhost`/`127.x`/`::1`, else `https`). Clients can auto-discover the admin
+  `localhost`/`127.x`/`[::1]`, else `https`). Clients can auto-discover the admin
   console instead of requiring manual URL entry; the field is omitted entirely
-  when no admin surface is configured.
+  when no admin surface is configured. IPv6 admin hosts must be bracketed
+  (`[::1]`, `[::1]:3000`); an unbracketed literal is a startup error because it
+  cannot form a valid URI authority.
 - `RELAY_OPERATOR_API_ORIGIN` is no longer required at boot when
   `RELAY_OPERATOR_PUBKEYS` is set. The allowlist is shared by the NIP-98 admin
   console (which needs no origin) and the community-provisioning endpoints

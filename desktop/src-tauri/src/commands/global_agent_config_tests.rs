@@ -631,6 +631,7 @@ async fn test_record_mesh_change_after_preflight_aborts_before_stop() {
         catalog_source: None,
         library_ref: None,
         library_applied_revision: None,
+        last_completed_deploy_attempt_id: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Default::default(),
         definition_parallelism: None,

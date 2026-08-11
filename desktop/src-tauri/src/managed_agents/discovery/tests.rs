@@ -280,6 +280,7 @@ fn record_with(
         catalog_source: None,
         library_ref: None,
         library_applied_revision: None,
+        last_completed_deploy_attempt_id: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
@@ -303,8 +304,7 @@ fn record_agent_command_override_beats_runtime() {
 
 #[test]
 fn record_agent_command_legacy_persona_fallback() {
-    // Pre-migration record: persona_id set, no runtime — resolves through
-    // the legacy persona path unchanged.
+    // Pre-migration record: persona_id set, no runtime — legacy path unchanged.
     let personas = vec![persona_with_runtime("p1", Some("goose"))];
     let record = record_with(None, Some("p1"), None);
     assert_eq!(record_agent_command(&record, &personas), "goose");

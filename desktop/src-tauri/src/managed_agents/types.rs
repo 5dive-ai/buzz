@@ -324,6 +324,20 @@ pub struct ManagedAgentRecord {
     /// through a persona save.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library_applied_revision: Option<u64>,
+    /// Deploy-attempt provenance, not projection metadata (§2.6). Stamps the
+    /// `attempt_id` of the last provider deploy that durably landed a
+    /// `backend_agent_id` — written ONLY alongside `backend_agent_id` in the
+    /// same success write (§3.3 step 2, P12-I1). A failed or ambiguous attempt
+    /// never touches it, so an older stamp survives across failures and a
+    /// `Running` deploy-intent row whose `attempt_id` mismatches this stamp
+    /// still routes to replay. A legacy record reads as unstamped (`None`),
+    /// which recovery already treats as "no residue proof → replay". Forms one
+    /// inseparable deploy-provenance pair with `backend_agent_id` in every
+    /// copy/rollback/normalization helper (`copy_runtime_state`, P14-I2).
+    /// `#[serde(default, skip_serializing_if)]` keeps records without it
+    /// byte-identical to head (invariant 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_completed_deploy_attempt_id: Option<String>,
     /// NIP-AP definition-level behavioral defaults, absorbed from
     /// `AgentDefinition` in WIRE shape (kebab-case string / optional u32),
     /// distinct from the instance-side `respond_to`/`respond_to_allowlist`/

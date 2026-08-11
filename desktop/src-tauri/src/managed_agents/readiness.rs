@@ -1526,6 +1526,7 @@ mod tests {
             catalog_source: None,
             library_ref: None,
             library_applied_revision: None,
+            last_completed_deploy_attempt_id: None,
             definition_respond_to: None,
             definition_respond_to_allowlist: Vec::new(),
             definition_parallelism: None,
@@ -1550,8 +1551,7 @@ mod tests {
 
     #[test]
     fn buzz_agent_databricks_v2_with_databricks_model_but_no_buzz_agent_model_is_ready() {
-        // The baked buzz-releases env sets DATABRICKS_MODEL but not BUZZ_AGENT_MODEL.
-        // An agent with only DATABRICKS_MODEL must pass the readiness gate.
+        // Baked buzz-releases env has DATABRICKS_MODEL but no BUZZ_AGENT_MODEL; an agent with only DATABRICKS_MODEL must pass the gate.
         let env = make_env(
             "buzz-agent",
             env_with(&[

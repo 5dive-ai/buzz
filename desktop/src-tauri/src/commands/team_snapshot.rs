@@ -639,6 +639,7 @@ where
             catalog_source: None,
             library_ref: None,
             library_applied_revision: None,
+            last_completed_deploy_attempt_id: None,
             definition_respond_to: respond_to_wire.clone(),
             definition_respond_to_allowlist: definition.respond_to_allowlist.clone(),
             definition_parallelism: minted_parallelism,

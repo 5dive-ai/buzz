@@ -771,9 +771,8 @@ pub async fn create_managed_agent(
             agent_command_override,
             agent_args,
             mcp_command,
-            // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness;
-            // store the schema default only. Use idle_timeout_seconds or
-            // max_turn_duration_seconds for actual turn-length control.
+            // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness; store
+            // the schema default. Use idle/max_turn_duration_seconds for turn length.
             turn_timeout_seconds: DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
             // 0 or None → harness uses its own default (320s idle, 3600s max), and the CLI also clamps 0 → minimum.
             idle_timeout_seconds: input.idle_timeout_seconds.filter(|s| *s > 0),
@@ -825,6 +824,7 @@ pub async fn create_managed_agent(
             catalog_source: None,
             library_ref: None,
             library_applied_revision: None,
+            last_completed_deploy_attempt_id: None,
             definition_respond_to: None,
             definition_respond_to_allowlist: Vec::new(),
             definition_parallelism: None,

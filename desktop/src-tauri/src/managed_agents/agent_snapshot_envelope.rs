@@ -414,6 +414,7 @@ mod tests {
             catalog_source: None,
             library_ref: None,
             library_applied_revision: None,
+            last_completed_deploy_attempt_id: None,
             definition_respond_to: None,
             definition_respond_to_allowlist: Vec::new(),
             definition_parallelism: None,

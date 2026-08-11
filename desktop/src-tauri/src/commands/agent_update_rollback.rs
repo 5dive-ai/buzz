@@ -26,6 +26,13 @@ fn copy_runtime_state(from: &ManagedAgentRecord, to: &mut ManagedAgentRecord) {
     to.runtime_pid = from.runtime_pid;
     to.backend = from.backend.clone();
     to.backend_agent_id.clone_from(&from.backend_agent_id);
+    // `backend_agent_id` and `last_completed_deploy_attempt_id` are one
+    // inseparable deploy-provenance pair (§2.6, P14-I2): a stamp missing here
+    // would let a rename rollback manufacture a record whose backend id and
+    // attempt stamp disagree, or make `same_configuration` reject the rollback
+    // as an unrelated change. Copy both, never one without the other.
+    to.last_completed_deploy_attempt_id
+        .clone_from(&from.last_completed_deploy_attempt_id);
     to.provider_binary_path
         .clone_from(&from.provider_binary_path);
     to.last_started_at.clone_from(&from.last_started_at);

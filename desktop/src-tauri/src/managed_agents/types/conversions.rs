@@ -72,6 +72,7 @@ impl AgentDefinition {
             // a freshly projected definition carries none.
             library_ref: None,
             library_applied_revision: None,
+            last_completed_deploy_attempt_id: None,
             definition_respond_to: self.respond_to,
             definition_respond_to_allowlist: self.respond_to_allowlist,
             definition_parallelism: self.parallelism,

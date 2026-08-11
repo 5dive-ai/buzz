@@ -568,7 +568,7 @@ mod tests {
             format!("media/ab/ab/{s}.png/extra"),
             format!("media/ab/ab/{}.png", s.to_uppercase()),
             format!("media/ab/ab/{s}.tar.gz"),
-            format!("media/ab/ab/not-a-sha.png"),
+            "media/ab/ab/not-a-sha.png".to_string(),
         ] {
             assert_eq!(classify_key(&key), KeyClass::Unknown, "key: {key}");
         }

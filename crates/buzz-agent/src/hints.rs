@@ -1,9 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::types::truncate_at_boundary;
-
-const MAX_HINTS_BYTES: usize = 128 * 1024;
 pub const MAX_SKILL_BODY_BYTES: usize = 32 * 1024;
 const SKILL_DIRS: &[&str] = &[".agents/skills", ".goose/skills", ".claude/skills"];
 
@@ -24,65 +21,6 @@ pub struct SkillEntry {
 }
 
 /// Handles both normal repos (`.git/` dir) and worktrees (`.git` file).
-fn find_git_root(start: &Path) -> Option<PathBuf> {
-    let mut current = start.to_path_buf();
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
-        }
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => return None,
-        }
-    }
-}
-
-fn load_hint_files_impl(cwd: &Path, home: Option<&Path>) -> String {
-    let mut chain = match find_git_root(cwd) {
-        Some(root) => {
-            let mut c: Vec<PathBuf> = cwd
-                .ancestors()
-                .take_while(|a| a.starts_with(&root))
-                .map(|a| a.to_path_buf())
-                .collect();
-            // ancestors() yields cwd first, root last — reverse for root→cwd.
-            c.reverse();
-            c
-        }
-        None => vec![cwd.to_path_buf()],
-    };
-
-    // Prepend ~/AGENTS.md as global layer, unless ~ is already in the chain.
-    if let Some(home) = home {
-        if !chain.iter().any(|d| d == home) {
-            chain.insert(0, home.to_path_buf());
-        }
-    }
-
-    let mut result = String::new();
-    for dir in &chain {
-        let path = dir.join("AGENTS.md");
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if !result.is_empty() {
-            result.push_str("\n\n");
-        }
-        let remaining = MAX_HINTS_BYTES.saturating_sub(result.len());
-        if remaining == 0 {
-            break;
-        }
-        if content.len() <= remaining {
-            result.push_str(&content);
-        } else {
-            let truncated = truncate_at_boundary(&content, remaining);
-            result.push_str(truncated);
-            break;
-        }
-    }
-    result
-}
-
 fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
     // Must start with `---`
     let rest = content.strip_prefix("---\n")?;
@@ -216,43 +154,39 @@ fn discover_skills_impl(cwd: &Path, home: Option<&Path>) -> Vec<SkillEntry> {
     skills
 }
 
-pub fn build_hints_section(cwd: &Path) -> (String, Vec<SkillEntry>) {
-    build_hints_section_impl(cwd, home_dir().as_deref())
+/// Discover the skills available from `cwd`.
+///
+/// Hint *files* are goose's job (`PromptManager::build_system_prompt` walks
+/// them from the git root). This is only the skill index, which stays ours
+/// because `load_skill` is served by [`crate::builtin_client`] and needs the
+/// same [`SkillEntry`] list the tool dispatches against.
+pub fn discover_skills(cwd: &Path) -> Vec<SkillEntry> {
+    discover_skills_impl(cwd, home_dir().as_deref())
 }
 
-fn build_hints_section_impl(cwd: &Path, home: Option<&Path>) -> (String, Vec<SkillEntry>) {
-    let hints_text = load_hint_files_impl(cwd, home);
-    let skills = discover_skills_impl(cwd, home);
-
-    if hints_text.is_empty() && skills.is_empty() {
-        return (String::new(), skills);
+/// Render the skill index for the system prompt.
+///
+/// Returns an empty string for an empty slate so the caller can skip the
+/// extra entirely rather than adding an empty section.
+pub fn skill_index(skills: &[SkillEntry]) -> String {
+    if skills.is_empty() {
+        return String::new();
     }
 
-    let mut out = String::from("# Additional Instructions\n");
-
-    if !hints_text.is_empty() {
-        out.push_str("\n## Project Hints\n");
-        out.push_str(&hints_text);
-        out.push('\n');
+    let mut out = String::from("# Available Skills\n");
+    for skill in skills {
+        out.push_str(&format!("- {}: {}\n", skill.name, skill.description));
     }
-
-    if !skills.is_empty() {
-        out.push_str("\n## Available Skills\n");
-        for skill in &skills {
-            out.push_str(&format!("- {}: {}\n", skill.name, skill.description));
-        }
-        // Goose namespaces platform-extension tools as `{extension}__{tool}`
-        // (`extension_manager.rs:1415`), so name the tool the way the model
-        // actually sees it -- otherwise the prompt advertises a tool that does
-        // not exist in its tool list.
-        out.push_str(&format!(
-            "\nUse the `{}__{}` tool to read the full content of a skill before using it.\n",
-            crate::builtin_client::BUILTIN_EXTENSION_NAME,
-            crate::builtin::LOAD_SKILL_TOOL,
-        ));
-    }
-
-    (out, skills)
+    // Goose namespaces platform-extension tools as `{extension}__{tool}`
+    // (`extension_manager.rs:1415`), so name the tool the way the model
+    // actually sees it -- otherwise the prompt advertises a tool that does
+    // not exist in its tool list.
+    out.push_str(&format!(
+        "\nUse the `{}__{}` tool to read the full content of a skill before using it.\n",
+        crate::builtin_client::BUILTIN_EXTENSION_NAME,
+        crate::builtin::LOAD_SKILL_TOOL,
+    ));
+    out
 }
 
 /// Strip the YAML frontmatter block from a skill file's content and return
@@ -272,84 +206,6 @@ pub(crate) fn strip_frontmatter(content: &str) -> &str {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    #[test]
-    fn find_git_root_normal_repo() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir(root.join(".git")).unwrap();
-        assert_eq!(find_git_root(root), Some(root.to_path_buf()));
-    }
-
-    #[test]
-    fn find_git_root_worktree() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        // .git as a file (worktree)
-        std::fs::write(root.join(".git"), "gitdir: ../main/.git/worktrees/wt").unwrap();
-        assert_eq!(find_git_root(root), Some(root.to_path_buf()));
-    }
-
-    #[test]
-    fn find_git_root_none() {
-        let tmp = TempDir::new().unwrap();
-        // No .git anywhere under tmp
-        let result = find_git_root(tmp.path());
-        // In a CI environment the test itself may live inside a real git repo,
-        // so only assert None when tmp is truly isolated (not a subpath of a git repo).
-        // We verify by checking that any found root is NOT inside tmp.
-        if let Some(found) = result {
-            assert!(!found.starts_with(tmp.path()));
-        }
-    }
-
-    #[test]
-    fn find_git_root_from_subdirectory() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir(root.join(".git")).unwrap();
-        let deep = root.join("sub").join("deep");
-        std::fs::create_dir_all(&deep).unwrap();
-        assert_eq!(find_git_root(&deep), Some(root.to_path_buf()));
-    }
-
-    #[test]
-    fn load_hint_files_single_at_cwd() {
-        let tmp = TempDir::new().unwrap();
-        let cwd = tmp.path();
-        // No .git → no git root discovery; only cwd is checked.
-        std::fs::write(cwd.join("AGENTS.md"), "cwd hints").unwrap();
-        let result = load_hint_files_impl(cwd, None);
-        assert_eq!(result, "cwd hints");
-    }
-
-    #[test]
-    fn load_hint_files_git_root_and_cwd() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir(root.join(".git")).unwrap();
-        std::fs::write(root.join("AGENTS.md"), "root hints").unwrap();
-        let sub = root.join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::write(sub.join("AGENTS.md"), "sub hints").unwrap();
-        let result = load_hint_files_impl(&sub, None);
-        // Root hints must come first.
-        assert!(
-            result.starts_with("root hints"),
-            "expected root hints first, got: {result:?}"
-        );
-        assert!(result.contains("sub hints"), "missing sub hints");
-        let root_pos = result.find("root hints").unwrap();
-        let sub_pos = result.find("sub hints").unwrap();
-        assert!(root_pos < sub_pos, "root hints should precede sub hints");
-    }
-
-    #[test]
-    fn load_hint_files_missing_files() {
-        let tmp = TempDir::new().unwrap();
-        let result = load_hint_files_impl(tmp.path(), None);
-        assert_eq!(result, "");
-    }
 
     #[test]
     fn discover_skills_finds_across_dirs() {
@@ -437,129 +293,6 @@ mod tests {
 
         let skills = discover_skills_impl(cwd, None);
         assert!(skills.is_empty(), "entry without name should be skipped");
-    }
-
-    #[test]
-    fn build_hints_section_empty() {
-        let tmp = TempDir::new().unwrap();
-        let (result, skills) = build_hints_section_impl(tmp.path(), None);
-        assert_eq!(result, "");
-        assert!(skills.is_empty());
-    }
-
-    #[test]
-    fn build_hints_section_combined() {
-        let tmp = TempDir::new().unwrap();
-        let cwd = tmp.path();
-
-        std::fs::write(cwd.join("AGENTS.md"), "Project-level hints.").unwrap();
-
-        let skill_dir = cwd.join(".agents/skills/buzz-cli");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: buzz-cli\ndescription: CLI reference for Buzz managed agents\n---\nUse `buzz` to manage agents.\n",
-        )
-        .unwrap();
-
-        let (result, skills) = build_hints_section_impl(cwd, None);
-
-        assert!(
-            result.contains("# Additional Instructions"),
-            "missing header"
-        );
-        assert!(result.contains("## Project Hints"), "missing Project Hints");
-        assert!(
-            result.contains("Project-level hints."),
-            "missing hints content"
-        );
-        assert!(
-            result.contains("## Available Skills"),
-            "missing Available Skills"
-        );
-        assert!(
-            result.contains("buzz-cli: CLI reference for Buzz managed agents"),
-            "missing skill bullet"
-        );
-        // Body must NOT be inlined — lazy loading only.
-        assert!(
-            !result.contains("Use `buzz` to manage agents."),
-            "skill body must not be inlined in system prompt"
-        );
-        // The load_skill instruction must be present.
-        assert!(
-            result.contains("load_skill"),
-            "missing load_skill instruction"
-        );
-        // The old ### heading format must not appear.
-        assert!(
-            !result.contains("### buzz-cli"),
-            "skill body heading must not be inlined"
-        );
-        // The returned skills list should contain the discovered skill.
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "buzz-cli");
-    }
-
-    #[test]
-    fn load_hint_files_global_loaded_first() {
-        let home = TempDir::new().unwrap();
-        let cwd = TempDir::new().unwrap();
-        std::fs::write(home.path().join("AGENTS.md"), "global hints").unwrap();
-        std::fs::write(cwd.path().join("AGENTS.md"), "local hints").unwrap();
-        let result = load_hint_files_impl(cwd.path(), Some(home.path()));
-        let global_pos = result.find("global hints").unwrap();
-        let local_pos = result.find("local hints").unwrap();
-        assert!(
-            global_pos < local_pos,
-            "global hints should precede local hints"
-        );
-    }
-
-    #[test]
-    fn load_hint_files_home_missing_agents_md() {
-        let home = TempDir::new().unwrap();
-        let cwd = TempDir::new().unwrap();
-        std::fs::write(cwd.path().join("AGENTS.md"), "local only").unwrap();
-        let result = load_hint_files_impl(cwd.path(), Some(home.path()));
-        assert_eq!(result, "local only");
-    }
-
-    #[test]
-    fn load_hint_files_no_home_dir() {
-        let cwd = TempDir::new().unwrap();
-        std::fs::write(cwd.path().join("AGENTS.md"), "local only").unwrap();
-        let result = load_hint_files_impl(cwd.path(), None);
-        assert_eq!(result, "local only");
-    }
-
-    #[test]
-    fn load_hint_files_dedup_when_home_in_chain() {
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path();
-        std::fs::write(home.join("AGENTS.md"), "single load").unwrap();
-        let result = load_hint_files_impl(home, Some(home));
-        assert_eq!(
-            result.matches("single load").count(),
-            1,
-            "AGENTS.md should be loaded exactly once when CWD is home"
-        );
-    }
-
-    #[test]
-    fn load_hint_files_dedup_when_home_is_git_root() {
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path();
-        std::fs::create_dir(home.join(".git")).unwrap();
-        std::fs::write(home.join("AGENTS.md"), "root+home hints").unwrap();
-        let sub = home.join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let result = load_hint_files_impl(&sub, Some(home));
-        assert_eq!(
-            result.matches("root+home hints").count(),
-            1,
-            "AGENTS.md should be loaded once when home is git root"
-        );
     }
 
     #[test]
@@ -728,5 +461,47 @@ mod tests {
             "unexpected path: {:?}",
             skills[0].supporting_files[0]
         );
+    }
+
+    /// The bug this module's shrink was for: buzz-agent used to add its own
+    /// hint-file scan as a prompt extra, while goose's `build_system_prompt`
+    /// was already loading the same files. Every hint landed in the system
+    /// prompt twice. Nothing here may reintroduce hint *file* loading -- that
+    /// is goose's job now.
+    ///
+    /// The banned names are assembled at runtime so this guard does not trip
+    /// over its own source text.
+    #[test]
+    fn this_module_does_not_load_hint_files() {
+        let source = include_str!("hints.rs");
+        for banned in [format!("AGENTS{}md", "."), format!(".goose{}", "hints")] {
+            assert!(
+                !source.contains(&banned),
+                "hints.rs references {banned}: hint-file loading belongs to \
+                 goose's PromptManager, or hints render twice in the prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn the_skill_index_is_empty_for_an_empty_slate() {
+        // An empty section would still be added as a prompt extra, spending
+        // tokens on a header with nothing under it.
+        assert!(skill_index(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_skill_index_names_the_tool_as_the_model_sees_it() {
+        let skills = vec![SkillEntry {
+            name: "widget".to_string(),
+            description: "makes widgets".to_string(),
+            path: PathBuf::from("/tmp/widget/SKILL.md"),
+            supporting_files: Vec::new(),
+        }];
+        let index = skill_index(&skills);
+        assert!(index.contains("- widget: makes widgets"));
+        // Namespaced, because goose advertises platform tools as
+        // `{extension}__{tool}`; the bare name is not in the model's tool list.
+        assert!(index.contains("buzz__load_skill"));
     }
 }

@@ -211,12 +211,23 @@ async fn build_agent(
         }
     }
 
-    // AGENTS.md hints + the skill index. `system_prompt_extras` are appended
-    // whether the base prompt came from the override or goose's template
-    // (`prompt_manager.rs:170-198`), so this survives `override_system_prompt`.
-    let (hints, skills) = crate::hints::build_hints_section(std::path::Path::new(cwd));
-    if !hints.trim().is_empty() {
-        prompt.add_extra("buzz_hints", hints).await;
+    // AGENTS.md hints are goose's job, not ours.
+    //
+    // `PromptManager::build_system_prompt` already calls `.with_hints()`
+    // (`prompt_manager.rs:255`), which runs the same git-root-anchored walk
+    // buzz-agent used to run itself. Adding our own copy as a prompt extra put
+    // every AGENTS.md into the system prompt *twice* -- verified against a
+    // scratch repo before this change, once under our `## Project Hints` and
+    // again under goose's `### Project Hints`.
+    //
+    // goose's loader is also a superset: `.goosehints` as well as `AGENTS.md`,
+    // the filename list configurable via `CONTEXT_FILE_NAMES`, gitignore-aware
+    // filtering, and `@file` reference expansion bounded at the git root.
+    let skills = crate::hints::discover_skills(std::path::Path::new(cwd));
+    if !skills.is_empty() {
+        prompt
+            .add_extra("buzz_skills", crate::hints::skill_index(&skills))
+            .await;
     }
 
     // `load_skill` runs in-process, registered the way Maple does it: a

@@ -1,7 +1,10 @@
 import { relayClient as defaultRelayClient } from "@/shared/api/relayClient";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import type { RelayEvent } from "@/shared/api/types";
-import { KIND_AGENT_TURN_METRIC } from "@/shared/constants/kinds";
+import {
+  KIND_AGENT_OBSERVER_FRAME,
+  KIND_AGENT_TURN_METRIC,
+} from "@/shared/constants/kinds";
 import {
   archiveEvents as defaultArchiveEvents,
   listSaveSubscriptions as defaultListSaveSubscriptions,
@@ -18,6 +21,11 @@ const FLUSH_BATCH_SIZE = 25;
 const FLUSH_IDLE_MS = 2_000;
 const DISABLE_AGENT_METRIC_ARCHIVE =
   import.meta.env?.VITE_BUZZ_DISABLE_AGENT_METRIC_ARCHIVE === "1";
+const ENABLE_ARCHIVE_PERF_DIAGNOSTICS =
+  import.meta.env?.VITE_BUZZ_ARCHIVE_PERF_DIAGNOSTICS === "1";
+const PERF_REPORT_INTERVAL_MS = 10_000;
+const EVENT_LOOP_PROBE_INTERVAL_MS = 250;
+const EVENT_LOOP_STALL_THRESHOLD_MS = 50;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -38,6 +46,9 @@ export interface ArchiveSyncDeps {
   ) => Promise<ArchiveBatchResult>;
   onSubscriptionChange: (listener: () => void) => () => void;
   disableAgentMetricArchive?: boolean;
+  enableArchivePerfDiagnostics?: boolean;
+  perfNow?: () => number;
+  perfLog?: (message: string) => void;
   flushBatchSize?: number;
   flushIdleMs?: number;
 }
@@ -87,10 +98,18 @@ export class ArchiveSyncManager {
   private readonly deps: Required<
     Omit<
       ArchiveSyncDeps,
-      "disableAgentMetricArchive" | "flushBatchSize" | "flushIdleMs"
+      | "disableAgentMetricArchive"
+      | "enableArchivePerfDiagnostics"
+      | "perfNow"
+      | "perfLog"
+      | "flushBatchSize"
+      | "flushIdleMs"
     >
   >;
   private readonly disableAgentMetricArchive: boolean;
+  private readonly enableArchivePerfDiagnostics: boolean;
+  private readonly perfNow: () => number;
+  private readonly perfLog: (message: string) => void;
   private readonly flushBatchSize: number;
   private readonly flushIdleMs: number;
 
@@ -108,6 +127,22 @@ export class ArchiveSyncManager {
     matchedScope: { scopeType: ScopeType; scopeValue: string };
   }> = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private perfReportTimer: ReturnType<typeof setInterval> | null = null;
+  private eventLoopProbeTimer: ReturnType<typeof setInterval> | null = null;
+  private perfWindowStartedAt = 0;
+  private nextEventLoopProbeAt = 0;
+  private perfCounters = {
+    observerEvents: 0,
+    observerBytes: 0,
+    metricEvents: 0,
+    metricBytes: 0,
+    archiveBatches: 0,
+    archiveEvents: 0,
+    archiveBytes: 0,
+    stalls: 0,
+    stallMs: 0,
+    maxStallMs: 0,
+  };
   private destroyed = false;
   private offSubscriptionChange: (() => void) | null = null;
 
@@ -122,11 +157,16 @@ export class ArchiveSyncManager {
     };
     this.disableAgentMetricArchive =
       deps?.disableAgentMetricArchive ?? DISABLE_AGENT_METRIC_ARCHIVE;
+    this.enableArchivePerfDiagnostics =
+      deps?.enableArchivePerfDiagnostics ?? ENABLE_ARCHIVE_PERF_DIAGNOSTICS;
+    this.perfNow = deps?.perfNow ?? (() => performance.now());
+    this.perfLog = deps?.perfLog ?? ((message) => console.info(message));
     this.flushBatchSize = deps?.flushBatchSize ?? FLUSH_BATCH_SIZE;
     this.flushIdleMs = deps?.flushIdleMs ?? FLUSH_IDLE_MS;
   }
 
   async start(): Promise<void> {
+    this.startPerfDiagnostics();
     // Register the change listener before the initial load so that any
     // subscription change arriving while the first pass is running sets
     // reloadPending and gets picked up by the coalescing loop.
@@ -138,6 +178,14 @@ export class ArchiveSyncManager {
 
   destroy(): void {
     this.destroyed = true;
+    if (this.perfReportTimer !== null) {
+      clearInterval(this.perfReportTimer);
+      this.perfReportTimer = null;
+    }
+    if (this.eventLoopProbeTimer !== null) {
+      clearInterval(this.eventLoopProbeTimer);
+      this.eventLoopProbeTimer = null;
+    }
     if (this.flushTimer !== null) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
@@ -279,14 +327,77 @@ export class ArchiveSyncManager {
     }
   }
 
+  private startPerfDiagnostics(): void {
+    if (!this.enableArchivePerfDiagnostics || this.perfReportTimer !== null) {
+      return;
+    }
+
+    this.perfWindowStartedAt = this.perfNow();
+    this.nextEventLoopProbeAt =
+      this.perfWindowStartedAt + EVENT_LOOP_PROBE_INTERVAL_MS;
+    this.perfLog(
+      `[archive-perf] started metricArchiveDisabled=${this.disableAgentMetricArchive}`,
+    );
+
+    this.eventLoopProbeTimer = setInterval(() => {
+      const now = this.perfNow();
+      const delayMs = Math.max(0, now - this.nextEventLoopProbeAt);
+      this.nextEventLoopProbeAt = now + EVENT_LOOP_PROBE_INTERVAL_MS;
+      if (delayMs >= EVENT_LOOP_STALL_THRESHOLD_MS) {
+        this.perfCounters.stalls++;
+        this.perfCounters.stallMs += delayMs;
+        this.perfCounters.maxStallMs = Math.max(
+          this.perfCounters.maxStallMs,
+          delayMs,
+        );
+      }
+    }, EVENT_LOOP_PROBE_INTERVAL_MS);
+
+    this.perfReportTimer = setInterval(() => {
+      this.reportPerfWindow();
+    }, PERF_REPORT_INTERVAL_MS);
+  }
+
+  private reportPerfWindow(): void {
+    const now = this.perfNow();
+    const durationMs = Math.round(now - this.perfWindowStartedAt);
+    const counters = this.perfCounters;
+    this.perfLog(
+      `[archive-perf] windowMs=${durationMs} metricArchiveDisabled=${this.disableAgentMetricArchive} observerEvents=${counters.observerEvents} observerBytes=${counters.observerBytes} metricEvents=${counters.metricEvents} metricBytes=${counters.metricBytes} archiveBatches=${counters.archiveBatches} archiveEvents=${counters.archiveEvents} archiveBytes=${counters.archiveBytes} stalls=${counters.stalls} stallMs=${Math.round(counters.stallMs)} maxStallMs=${Math.round(counters.maxStallMs)}`,
+    );
+    this.perfWindowStartedAt = now;
+    this.perfCounters = {
+      observerEvents: 0,
+      observerBytes: 0,
+      metricEvents: 0,
+      metricBytes: 0,
+      archiveBatches: 0,
+      archiveEvents: 0,
+      archiveBytes: 0,
+      stalls: 0,
+      stallMs: 0,
+      maxStallMs: 0,
+    };
+  }
+
   private enqueue(
     event: RelayEvent,
     scopeType: ScopeType,
     scopeValue: string,
   ): void {
     if (this.destroyed) return;
+    const rawEventJson = JSON.stringify(event);
+    if (this.enableArchivePerfDiagnostics) {
+      if (event.kind === KIND_AGENT_OBSERVER_FRAME) {
+        this.perfCounters.observerEvents++;
+        this.perfCounters.observerBytes += rawEventJson.length;
+      } else if (event.kind === KIND_AGENT_TURN_METRIC) {
+        this.perfCounters.metricEvents++;
+        this.perfCounters.metricBytes += rawEventJson.length;
+      }
+    }
     this.buffer.push({
-      rawEventJson: JSON.stringify(event),
+      rawEventJson,
       matchedScope: { scopeType, scopeValue },
     });
     if (this.buffer.length >= this.flushBatchSize) {
@@ -328,6 +439,14 @@ export class ArchiveSyncManager {
     }>,
     errLabel: string,
   ): void {
+    if (this.enableArchivePerfDiagnostics) {
+      this.perfCounters.archiveBatches++;
+      this.perfCounters.archiveEvents += batch.length;
+      this.perfCounters.archiveBytes += batch.reduce(
+        (total, candidate) => total + candidate.rawEventJson.length,
+        0,
+      );
+    }
     void this.deps
       .archiveEvents(batch)
       .then((result) => {

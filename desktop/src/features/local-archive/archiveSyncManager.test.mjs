@@ -1023,6 +1023,103 @@ test("manager_notifies_agent_metrics_changed_on_destroy_flush", async () => {
   off();
 });
 
+test("manager_reports_and_resets_archive_perf_diagnostics", async () => {
+  const relay = makeFakeRelayClient();
+  const archive = makeFakeArchive();
+  archive.setSubs([
+    {
+      scopeType: "owner_p",
+      scopeValue: "agent-pk",
+      kinds: [24200, 44200],
+      identityPubkey: "pk",
+      relayUrl: "wss://r",
+      createdAt: 0,
+    },
+  ]);
+  const logs = [];
+  const nowValues = [1_000, 11_000, 21_000];
+  const mgr = makeManager(relay, archive, {
+    enableArchivePerfDiagnostics: true,
+    flushBatchSize: 2,
+    perfNow: () => nowValues.shift(),
+    perfLog: (message) => logs.push(message),
+  });
+  await mgr.start();
+
+  const filter = JSON.parse([...relay.subs.keys()][0]);
+  const observerEvent = {
+    id: "observer-1",
+    kind: 24200,
+    pubkey: "agent-pk",
+    created_at: 1,
+    content: "frame",
+    tags: [],
+  };
+  const metricEvent = {
+    id: "metric-1",
+    kind: 44200,
+    pubkey: "agent-pk",
+    created_at: 2,
+    content: "metric",
+    tags: [],
+  };
+  relay.push(filter, observerEvent);
+  relay.push(filter, metricEvent);
+
+  // biome-ignore lint/complexity/useLiteralKeys: deterministic private diagnostic seam
+  mgr["reportPerfWindow"]();
+  const report = logs.at(-1);
+  assert.match(report, /windowMs=10000/);
+  assert.match(report, /observerEvents=1/);
+  assert.match(
+    report,
+    new RegExp(`observerBytes=${JSON.stringify(observerEvent).length}`),
+  );
+  assert.match(report, /metricEvents=1/);
+  assert.match(
+    report,
+    new RegExp(`metricBytes=${JSON.stringify(metricEvent).length}`),
+  );
+  assert.match(report, /archiveBatches=1 archiveEvents=2/);
+
+  // biome-ignore lint/complexity/useLiteralKeys: deterministic private diagnostic seam
+  mgr["reportPerfWindow"]();
+  assert.match(
+    logs.at(-1),
+    /observerEvents=0 observerBytes=0 metricEvents=0 metricBytes=0 archiveBatches=0 archiveEvents=0 archiveBytes=0/,
+  );
+  mgr.destroy();
+});
+
+test("manager_clears_archive_perf_diagnostic_timers_on_destroy", async () => {
+  const relay = makeFakeRelayClient();
+  const archive = makeFakeArchive();
+  const mgr = makeManager(relay, archive, {
+    enableArchivePerfDiagnostics: true,
+    perfNow: () => 0,
+    perfLog: () => {},
+  });
+  await mgr.start();
+
+  assert.notEqual(
+    // biome-ignore lint/complexity/useLiteralKeys: intentional lifecycle assertion
+    mgr["perfReportTimer"],
+    null,
+  );
+  assert.notEqual(
+    // biome-ignore lint/complexity/useLiteralKeys: intentional lifecycle assertion
+    mgr["eventLoopProbeTimer"],
+    null,
+  );
+
+  mgr.destroy();
+
+  // biome-ignore lint/complexity/useLiteralKeys: intentional lifecycle assertion
+  assert.equal(mgr["perfReportTimer"], null);
+  // biome-ignore lint/complexity/useLiteralKeys: intentional lifecycle assertion
+  assert.equal(mgr["eventLoopProbeTimer"], null);
+});
+
 test("manager_flushes_buffer_on_destroy", async () => {
   const relay = makeFakeRelayClient();
   const archive = makeFakeArchive();

@@ -1082,6 +1082,22 @@ impl Config {
                     )));
                 }
 
+                // Catch-all authority gate: every accepted host is interpolated
+                // verbatim into the NIP-11 advertisement and NIP-98 `u`-tag URLs,
+                // so it must form a parseable authority. The bracket guard above
+                // names the honest bare-IPv6 shape; this rejects any remaining
+                // malformed authority (e.g. the unclosed-bracket typos `[::1`
+                // and `[::1:3000`) that would otherwise produce an unparseable
+                // `http://{host}`. This is a validity gate only — the host is
+                // still stored verbatim, not normalized.
+                if url::Url::parse(&format!("http://{host}")).is_err() {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "BUZZ_ADMIN_HOST={host} is not a valid URL authority; \
+                         it must be a host with an optional port, e.g. \
+                         relay.example.com:8443 or [::1]:3000"
+                    )));
+                }
+
                 // Parse BUZZ_ADMIN_AUTH. Accepted values: "token" (default when
                 // unset), "disabled", "nip98". Any other non-empty value is a
                 // startup error (typo-proofing).
@@ -1442,6 +1458,29 @@ mod tests {
                         if message.contains("BUZZ_ADMIN_HOST") && message.contains("bracket")
                 ),
                 "bare IPv6 host {host:?} must be rejected: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_host_malformed_authority_fails_closed() {
+        // Shapes that slip the bare-IPv6 bracket guard (they start with `[`)
+        // but still cannot form a valid URL authority — the unclosed-bracket
+        // typos. Without the catch-all parse gate these would produce an
+        // unparseable `http://[::1` advertisement and NIP-98 `u`-tag URL.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for host in ["[::1", "[::1:3000", "[not-closed"] {
+            let result = config_with_admin_env(&[
+                ("BUZZ_ADMIN_HOST", Some(host)),
+                ("BUZZ_ADMIN_TOKEN", Some(VALID_ADMIN_TOKEN)),
+            ]);
+            assert!(
+                matches!(
+                    result,
+                    Err(ConfigError::InvalidValue(ref message))
+                        if message.contains("BUZZ_ADMIN_HOST") && message.contains("valid URL authority")
+                ),
+                "malformed authority {host:?} must be rejected: {result:?}"
             );
         }
     }

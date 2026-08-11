@@ -52,6 +52,12 @@ See:
 
 The chart fails at `helm install` / `helm template` time with a clear message if any of these are missing or malformed (see `templates/_validate.tpl`).
 
+When `externalPostgresql.url` is used, the database must permit the `pgcrypto`
+extension (schema bootstrap runs `CREATE EXTENSION IF NOT EXISTS pgcrypto`).
+Most managed PostgreSQL offerings allow it, but the role applying migrations
+needs the privilege to create it, or an administrator can pre-create the
+extension.
+
 ## HA (production)
 
 `replicaCount > 1` hard-requires Redis:
@@ -80,16 +86,21 @@ Save these. Losing any of them is data loss. See NOTES.txt printed by `helm inst
 
 ## NIP-FI readiness
 
-This chart does not expose a NIP-FI runtime adapter, policy schema, trusted-edge
-topology, secret keys, or conformance runner. Do not advertise or enforce
-NIP-FI from this chart, and do not use an ingress identity header or
-provider-specific sidecar as a fallback authority.
+This chart does not provision a NIP-FI trusted-edge topology, issuer
+integration, secret keys, or conformance runner. The relay's identity
+configuration document (`BUZZ_NIP_FI_V1_CONFIG_JSON`, see the
+[identity configuration contract](../../../docs/CORPORATE_IDENTITY.md)) can be
+supplied like any other relay environment variable — keep the whole document
+in `secrets.existingSecret` rather than values, because its
+`transport.active_secrets_base64url` entries are live secret material. Do not
+advertise or enforce NIP-FI from this chart, and do not use an ingress
+identity header or provider-specific sidecar as a fallback authority.
 
-A later chart release must pin an implementation with an exact adapter and
-configuration version, keep policy separate from secret values, isolate
-verifier ingress for `trusted-proxy-hmac-v1`, include every fail-closed
-dependency in readiness, and link an immutable exact-head behavioral report.
-A rendered chart and healthy pod do not prove those behaviors. See the
+An activating deployment must pin an exact image, keep policy separate from
+secret values, isolate verifier ingress for `trusted-proxy-hmac-v1`, include
+every fail-closed dependency in readiness, and link an immutable exact-head
+behavioral report. A rendered chart and healthy pod do not prove those
+behaviors. See the
 [provider-neutral deployment guide](../../../docs/NIP_FI_DEPLOYMENT.md) and
 [runtime operations guide](../../../docs/NIP_FI_RUNTIME_OPERATIONS.md).
 

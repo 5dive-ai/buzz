@@ -2,9 +2,9 @@
 
 This guide covers lifecycle, recovery, restore, and rollback for a conforming Buzz NIP-FI implementation. The normative [specification](nips/NIP-FI.md) and [formal model](nips/NIP-FI-MODEL.md) control when this guide differs.
 
-## Current status
+## Runtime configuration
 
-This documentation revision supplies no runtime adapter or operator command. Command names and request schemas must come from the later exact-head implementation stack. The [recovery-plan example](examples/nip-fi-recovery-plan.json.example) is a review template, not a runtime request.
+The runtime's sole identity-configuration input is `BUZZ_NIP_FI_V1_CONFIG_JSON`: absent is Off, `{"deny_protected":true}` denies every protected route, and the complete document enables Enforce. Field bounds and the removed legacy identity-provider variables — which fail startup when set — are documented in the [identity configuration contract](CORPORATE_IDENTITY.md). Operator lifecycle command names and request schemas come from the implementation's own operator tooling; the [recovery-plan example](examples/nip-fi-recovery-plan.json.example) is a review template, not a runtime request.
 
 Do not simulate an operator transition with direct database edits. Every authority change uses a separately authorized, audited transition with fresh target-key proof when a new key is introduced.
 

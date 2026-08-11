@@ -36,6 +36,18 @@ keypair.
   `buzz-admin migrate` before starting the relay when bootstrapping a fresh
   database. Auto-migration requires an image that includes embedded SQLx
   migrations.
+- PostgreSQL must allow the `pgcrypto` extension — schema bootstrap and
+  migrations run `CREATE EXTENSION IF NOT EXISTS pgcrypto` (used for
+  `gen_random_uuid()` and digest hashing). On managed PostgreSQL, ensure the
+  extension is permitted for the migration role or pre-create it as an
+  administrator.
+- Relay-verified identity (optional, off by default) is configured with
+  `BUZZ_NIP_FI_V1_CONFIG_JSON` (see the
+  [identity configuration contract](../../docs/CORPORATE_IDENTITY.md)). Its
+  `audit` bounds are a one-way lifetime budget per community domain — size
+  `max_events_per_domain` from expected identities × lifecycle operations with
+  generous headroom and monitor consumption, because exhaustion fails closed
+  and denies authorization-affecting operations rather than dropping evidence.
 - The stack uses Postgres, Redis, MinIO, and a git data volume because
   those are real Buzz dependencies today. Minimal mode can simplify this later.
 
@@ -43,16 +55,19 @@ Run `./run.sh backup-hint` for the backup checklist.
 
 ## NIP-FI readiness
 
-This Compose bundle does not wire a NIP-FI runtime adapter, policy schema,
-trusted edge, or conformance runner. Do not advertise or enforce NIP-FI from
-this bundle, and do not add a provider-specific sidecar or unsigned corporate
-identity header as a substitute.
+This Compose bundle does not provision a NIP-FI trusted edge, issuer
+integration, or conformance runner. The relay's identity configuration
+document (`BUZZ_NIP_FI_V1_CONFIG_JSON`, see the
+[identity configuration contract](../../docs/CORPORATE_IDENTITY.md)) passes
+through like any other relay environment variable, but do not advertise or
+enforce NIP-FI from this bundle, and do not add a provider-specific sidecar
+or unsigned corporate identity header as a substitute.
 
-A later implementation release must pin an exact image, document its supported
-configuration and adapter version, isolate verifier ingress when
-`trusted-proxy-hmac-v1` is enabled, deliver HMAC keys through a secret store,
-and pass the complete exact-head behavioral matrix before activation. A valid
-Compose render or healthy relay does not close those gates. See the
+An activating deployment must pin an exact image, isolate verifier ingress
+when `trusted-proxy-hmac-v1` is enabled, deliver HMAC secrets through a
+secret store rather than `.env`, and pass the complete exact-head behavioral
+matrix before activation. A valid Compose render or healthy relay does not
+close those gates. See the
 [provider-neutral deployment guide](../../docs/NIP_FI_DEPLOYMENT.md) and
 [runtime operations guide](../../docs/NIP_FI_RUNTIME_OPERATIONS.md).
 

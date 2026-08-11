@@ -1,12 +1,14 @@
 # NIP-FI stock deployment
 
-This guide describes a provider-neutral stock deployment for the normative [NIP-FI contract](nips/NIP-FI.md). It does not define runtime configuration keys or activate support.
+This guide describes a provider-neutral stock deployment for the normative [NIP-FI contract](nips/NIP-FI.md). It does not by itself activate support.
 
-## Current status
+## Runtime configuration
 
-This documentation revision ships no NIP-FI runtime adapter, configuration schema, image capability, or conformance report. The current Compose and Helm bundles must not advertise or enforce NIP-FI. A later implementation release must document its exact adapter and configuration surface and pass the [behavioral evidence matrix](nips/NIP-FI-CONFORMANCE.md) at the deployed revision before activation.
+The relay accepts exactly one identity-configuration input: the `BUZZ_NIP_FI_V1_CONFIG_JSON` environment variable. Absent means Off, `{"deny_protected":true}` denies every protected route before its handler runs, and only the complete document enables Enforce mode. The document contract, field bounds, and startup rejection rules — including the removed legacy identity-provider variables, which fail startup when set — are documented in the [identity configuration contract](CORPORATE_IDENTITY.md).
 
-The files under [`docs/examples`](examples/) are review templates. They are not accepted runtime schemas and contain no deployable secrets.
+Configuring Enforce is not conformance. A deployment must not advertise or enforce NIP-FI until it passes the [behavioral evidence matrix](nips/NIP-FI-CONFORMANCE.md) at the deployed revision.
+
+The files under [`docs/examples`](examples/) are review templates. They are not accepted runtime schemas — the only runtime input is the environment variable above — and they contain no deployable secrets.
 
 ## Stock topology
 
@@ -41,7 +43,7 @@ A source scan, config parse, rendered manifest, healthy process, or documentatio
 
 Use one reviewed policy object per server-selected domain. The review-only [stock domain example](examples/nip-fi-stock-domain.json.example) records the required decisions without claiming a runtime schema.
 
-At minimum, the later runtime schema must represent:
+The runtime document and its fixed verifier semantics together represent:
 
 - exact domain identity and trusted listener or route mapping;
 - accepted issuer and audience values;
@@ -101,7 +103,7 @@ List every protected ingress and its current authorization path. Include WebSock
 
 ### 2. Install without discovery
 
-Deploy the exact implementation artifact with NIP-FI discovery and enforcement off. Load reviewed policy and secret references. Validate issuer connectivity, JWKS authenticity, state migrations, backup, observability redaction, and route inventory without creating production bindings.
+Deploy the exact implementation artifact with NIP-FI discovery and enforcement off — leave `BUZZ_NIP_FI_V1_CONFIG_JSON` unset, or set `{"deny_protected":true}` where protected routes must already deny. Load reviewed policy and secret references. Validate issuer connectivity, JWKS authenticity, state migrations, backup, observability redaction, and route inventory without creating production bindings.
 
 ### 3. Run isolated behavior
 

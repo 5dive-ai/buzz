@@ -14,6 +14,7 @@ import {
   selectLatestMessageKey,
   selectTimelineBodySurface,
   selectTimelineIntroSurface,
+  selectTimelineRenderSource,
 } from "./timelineSnapshot.ts";
 
 // Local-midnight unix-second timestamps so isSameDay (local time) is stable
@@ -420,15 +421,14 @@ test("timeline-body-surface: loading and deferred-pending both paint the single 
   );
 });
 
-test("timeline-body-surface: first deferred message preserves a persistent channel intro", () => {
+test("timeline-body-surface: known live rows suppress empty/intro until deferred rows commit", () => {
   assert.equal(
     selectTimelineBodySurface({
       deferredCount: 0,
-      hasPersistentIntro: true,
       isLoading: false,
       liveCount: 1,
     }),
-    "empty",
+    "skeleton",
   );
 });
 
@@ -471,6 +471,50 @@ test("deferred-snapshot: fresh when channel ids match", () => {
       liveSnapshot: { channelId: "chan-a" },
     }),
     false,
+  );
+});
+
+test("timeline-render-source: cached revisit paints live rows while old channel is deferred", () => {
+  assert.equal(
+    selectTimelineRenderSource({
+      deferredChannelId: "chan-b",
+      liveChannelId: "chan-a",
+      preferLiveSnapshot: true,
+    }),
+    "live",
+  );
+});
+
+test("timeline-render-source: settled empty revisit proves emptiness without waiting", () => {
+  assert.equal(
+    selectTimelineRenderSource({
+      deferredChannelId: "chan-b",
+      liveChannelId: "chan-a",
+      preferLiveSnapshot: true,
+    }),
+    "live",
+  );
+});
+
+test("timeline-render-source: cold switch never paints the old channel", () => {
+  assert.equal(
+    selectTimelineRenderSource({
+      deferredChannelId: "chan-a",
+      liveChannelId: "chan-b",
+      preferLiveSnapshot: false,
+    }),
+    null,
+  );
+});
+
+test("timeline-render-source: same-channel deferred rows remain the normal path", () => {
+  assert.equal(
+    selectTimelineRenderSource({
+      deferredChannelId: "chan-a",
+      liveChannelId: "chan-a",
+      preferLiveSnapshot: true,
+    }),
+    "deferred",
   );
 });
 

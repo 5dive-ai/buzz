@@ -613,9 +613,10 @@ export function ChannelScreen({
       setThreadReplyTargetId,
       setThreadScrollTargetId,
     });
-  const settledChannelIdRef = React.useRef<string | null>(null);
+  const settledChannelIdsRef = React.useRef<ReadonlySet<string>>(new Set());
   const hasSettledThisChannel =
-    activeChannelId !== null && settledChannelIdRef.current === activeChannelId;
+    activeChannelId !== null &&
+    settledChannelIdsRef.current.has(activeChannelId);
   const timelineLoadingNow =
     activeChannel !== null &&
     activeChannel.channelType !== "forum" &&
@@ -628,18 +629,18 @@ export function ChannelScreen({
       },
       hasSettledThisChannel,
     );
-  const { settledChannelId, isLoading: isTimelineLoading } =
-    resolveTimelineLoadingLatch(
-      settledChannelIdRef.current,
-      activeChannelId,
-      timelineLoadingNow,
-    );
-  settledChannelIdRef.current = settledChannelId;
+  const loadingLatch = resolveTimelineLoadingLatch(
+    settledChannelIdsRef.current,
+    activeChannelId,
+    timelineLoadingNow,
+    messagesQuery.data !== undefined,
+  );
+  settledChannelIdsRef.current = loadingLatch.settledChannelIds;
   const { welcomeKickoffStage, welcomeKickoffSettingUp } =
     useWelcomeKickoffStagePresence(
       activeChannel,
       timelineMessages,
-      isTimelineLoading,
+      loadingLatch.isLoading,
     );
   const resetComposerTargets = React.useCallback(
     (_channelId: string | null) => {
@@ -676,7 +677,7 @@ export function ChannelScreen({
     clearOptimisticThreadOverride,
     editTargetId,
     editTargetMessage,
-    isTimelineLoading,
+    isTimelineLoading: loadingLatch.isLoading,
     openThreadHeadId,
     openThreadHeadMessage,
     setEditTargetId,
@@ -896,7 +897,7 @@ export function ChannelScreen({
                   isFollowingThread={isNotifiedForEffectiveThread}
                   isSending={sendMessageMutation.isPending}
                   isSinglePanelView={isSinglePanelView}
-                  isTimelineLoading={isTimelineLoading}
+                  isTimelineLoading={loadingLatch.isLoading}
                   messages={timelineMessages}
                   threadSummaries={threadSummaries}
                   onCancelEdit={handleCancelEdit}

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { selectTimelineLoadingState } from "./timelineLoadingState.ts";
+import {
+  resolveTimelineLoadingLatch,
+  selectTimelineLoadingState,
+} from "./timelineLoadingState.ts";
 
 const settled = {
   isPending: false,
@@ -120,41 +123,62 @@ test("settled channel with rows mid-refetch is not loading", () => {
   );
 });
 
-import { resolveTimelineLoadingLatch } from "./timelineLoadingState.ts";
-
 test("latch: loading on first entry to a channel", () => {
-  const r = resolveTimelineLoadingLatch(null, "chan-a", true);
+  const r = resolveTimelineLoadingLatch(new Set(), "chan-a", true, false);
   assert.equal(r.isLoading, true);
-  assert.equal(r.settledChannelId, null);
+  assert.deepEqual([...r.settledChannelIds], []);
 });
 
 test("latch: settles when loadingNow turns false, recording the channel", () => {
-  const r = resolveTimelineLoadingLatch(null, "chan-a", false);
+  const r = resolveTimelineLoadingLatch(new Set(), "chan-a", false, true);
   assert.equal(r.isLoading, false);
-  assert.equal(r.settledChannelId, "chan-a");
+  assert.deepEqual([...r.settledChannelIds], ["chan-a"]);
 });
 
 test("latch: background refetch blip stays loaded once settled", () => {
-  // settled for chan-a, then loadingNow blips true (isFetching) — must NOT
-  // re-show the skeleton (the bounce Wes reported).
-  const r = resolveTimelineLoadingLatch("chan-a", "chan-a", true);
+  const r = resolveTimelineLoadingLatch(
+    new Set(["chan-a"]),
+    "chan-a",
+    true,
+    true,
+  );
   assert.equal(r.isLoading, false);
-  assert.equal(r.settledChannelId, "chan-a");
 });
 
-test("latch: switching channels resets and loads the new one", () => {
-  const r = resolveTimelineLoadingLatch("chan-a", "chan-b", true);
+test("latch: remembers both channels across an A-B-A revisit", () => {
+  const settledChannels = new Set(["chan-a", "chan-b"]);
+
+  assert.equal(
+    resolveTimelineLoadingLatch(settledChannels, "chan-a", true, true)
+      .isLoading,
+    false,
+  );
+  assert.equal(
+    resolveTimelineLoadingLatch(settledChannels, "chan-b", true, true)
+      .isLoading,
+    false,
+  );
+});
+
+test("latch: a settled channel goes cold after its query cache is collected", () => {
+  const r = resolveTimelineLoadingLatch(
+    new Set(["chan-a"]),
+    "chan-a",
+    true,
+    false,
+  );
   assert.equal(r.isLoading, true);
-  assert.equal(r.settledChannelId, "chan-a"); // not yet settled for b
 });
 
 test("latch: no active channel passes loadingNow through untouched", () => {
   assert.equal(
-    resolveTimelineLoadingLatch("chan-a", null, true).isLoading,
+    resolveTimelineLoadingLatch(new Set(["chan-a"]), null, true, false)
+      .isLoading,
     true,
   );
   assert.equal(
-    resolveTimelineLoadingLatch("chan-a", null, false).isLoading,
+    resolveTimelineLoadingLatch(new Set(["chan-a"]), null, false, false)
+      .isLoading,
     false,
   );
 });

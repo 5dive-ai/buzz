@@ -41,26 +41,27 @@ export function selectTimelineLoadingState(
 }
 
 /**
- * Monotonic loading latch keyed by channel. Once a channel has settled (loaded),
- * `loadingNow` blipping true again (a background refetch) must not re-show the
- * skeleton — that re-flip is the visible skeleton bounce on entry. A different
- * channel id resets the latch so the new channel loads fresh.
+ * Per-channel loading latch. Once a channel has settled, a background refetch
+ * must not re-show its skeleton, even after visiting another channel. The
+ * `hasCachedData` guard makes an entry forgettable in practice: if React Query
+ * has garbage-collected that channel, a later cold load still shows loading.
  */
 export function resolveTimelineLoadingLatch(
-  settledChannelId: string | null,
+  settledChannelIds: ReadonlySet<string>,
   activeChannelId: string | null,
   loadingNow: boolean,
-): { settledChannelId: string | null; isLoading: boolean } {
+  hasCachedData: boolean,
+): { settledChannelIds: ReadonlySet<string>; isLoading: boolean } {
   if (activeChannelId === null) {
-    return { settledChannelId, isLoading: loadingNow };
+    return { settledChannelIds, isLoading: loadingNow };
   }
-  if (settledChannelId === activeChannelId) {
-    // Already settled for this channel — stay loaded through refetch blips.
-    return { settledChannelId, isLoading: false };
+  if (settledChannelIds.has(activeChannelId) && hasCachedData) {
+    return { settledChannelIds, isLoading: false };
   }
   if (!loadingNow) {
-    // First settle for this channel; latch it.
-    return { settledChannelId: activeChannelId, isLoading: false };
+    const nextSettledChannelIds = new Set(settledChannelIds);
+    nextSettledChannelIds.add(activeChannelId);
+    return { settledChannelIds: nextSettledChannelIds, isLoading: false };
   }
-  return { settledChannelId, isLoading: true };
+  return { settledChannelIds, isLoading: true };
 }

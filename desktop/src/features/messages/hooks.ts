@@ -223,6 +223,7 @@ export function useChannelWindowQuery(channel: Channel | null) {
       queryClient.getQueryData<ChannelWindowStore>(queryKey) ??
       emptyChannelWindowStore(),
     staleTime: Number.POSITIVE_INFINITY,
+    gcTime: 60 * 60 * 1_000,
   });
 }
 

@@ -183,14 +183,37 @@ export function selectDeferredListRenderState(
 
 export type TimelineBodySurface = "skeleton" | "empty" | "list";
 
+export type TimelineRenderSource = "deferred" | "live" | null;
+
+/**
+ * Choose only a snapshot that belongs to the active channel. A previously
+ * settled revisit may paint its live React-Query cache immediately; a cold
+ * switch must wait for the deferred snapshot rather than leaking old rows.
+ */
+export function selectTimelineRenderSource({
+  deferredChannelId,
+  liveChannelId,
+  preferLiveSnapshot,
+}: {
+  deferredChannelId: string | null;
+  liveChannelId: string | null;
+  preferLiveSnapshot: boolean;
+}): TimelineRenderSource {
+  if (deferredChannelId === liveChannelId) {
+    return "deferred";
+  }
+  if (preferLiveSnapshot) {
+    return "live";
+  }
+  return null;
+}
+
 export function selectTimelineBodySurface({
   deferredCount,
-  hasPersistentIntro = false,
   isLoading,
   liveCount,
 }: {
   deferredCount: number;
-  hasPersistentIntro?: boolean;
   isLoading: boolean;
   liveCount: number;
 }): TimelineBodySurface {
@@ -200,10 +223,10 @@ export function selectTimelineBodySurface({
 
   const renderState = selectDeferredListRenderState(deferredCount, liveCount);
   if (renderState === "pending") {
-    // A channel/DM intro is already meaningful stable content. Preserve it
-    // while React's deferred snapshot catches up to the first live message;
-    // replacing it with a skeleton makes an append look like a page reload.
-    return hasPersistentIntro ? "empty" : "skeleton";
+    // Live rows are authoritative proof that the channel is not empty. Keep the
+    // single loading surface until those same-channel rows commit; never flash
+    // an empty/intro surface over known content.
+    return "skeleton";
   }
   return renderState;
 }

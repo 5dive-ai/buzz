@@ -1,10 +1,10 @@
 import * as React from "react";
 
 import {
-  isDeferredTimelineSnapshotStale,
   isRenderedTimelineBehindHistoryPrepend,
   selectTimelineBodySurface,
   selectTimelineIntroSurface,
+  selectTimelineRenderSource,
 } from "@/features/messages/lib/timelineSnapshot";
 import { preloadTimelineImages } from "@/features/messages/lib/timelineImagePreload";
 import type { TimelineMessage } from "@/features/messages/types";
@@ -253,7 +253,18 @@ const MessageTimelineBase = React.forwardRef<
     liveSnapshot,
     EMPTY_TIMELINE_SNAPSHOT,
   );
-  const deferredMessages = deferredSnapshot.messages;
+  const renderSource = selectTimelineRenderSource({
+    deferredChannelId: deferredSnapshot.channelId,
+    liveChannelId: liveSnapshot.channelId,
+    preferLiveSnapshot: !isLoading,
+  });
+  const renderedSnapshot =
+    renderSource === "live"
+      ? liveSnapshot
+      : renderSource === "deferred"
+        ? deferredSnapshot
+        : EMPTY_TIMELINE_SNAPSHOT;
+  const deferredMessages = renderedSnapshot.messages;
   const imagePreloadStateRef = React.useRef({
     activeImages: new Set<HTMLImageElement>(),
     requestedUrls: new Set<string>(),
@@ -261,11 +272,8 @@ const MessageTimelineBase = React.forwardRef<
   React.useEffect(() => {
     preloadTimelineImages(messages, imagePreloadStateRef.current);
   }, [messages]);
-  const isDeferredSnapshotStale = isDeferredTimelineSnapshotStale({
-    deferredSnapshot,
-    liveSnapshot,
-  });
-  const isRenderPending = deferredSnapshot !== liveSnapshot;
+  const isDeferredSnapshotStale = renderSource === null;
+  const isRenderPending = renderedSnapshot !== liveSnapshot;
   const scrollRestorationId = targetMessageId
     ? `message-timeline:${channelId ?? "none"}:target:${targetMessageId}`
     : `message-timeline:${channelId ?? "none"}`;
@@ -287,10 +295,6 @@ const MessageTimelineBase = React.forwardRef<
 
   const timelineBodySurface = selectTimelineBodySurface({
     deferredCount: deferredMessages.length,
-    hasPersistentIntro:
-      channelIntro !== null ||
-      directMessageIntro !== null ||
-      pinnedIntro != null,
     isLoading: isLoading || isDeferredSnapshotStale,
     liveCount: messages.length,
   });
@@ -331,7 +335,7 @@ const MessageTimelineBase = React.forwardRef<
   } = useSettleGatedPrependMessages({
     channelId,
     messages: bufferedTimeline.messages,
-    meta: deferredSnapshot.historyExhausted,
+    meta: renderedSnapshot.historyExhausted,
     scrollElementRef: activeScrollContainerRef,
   });
 

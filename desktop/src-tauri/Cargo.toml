@@ -7,7 +7,7 @@ members = ["crates/buzz-terminal"]
 
 [package]
 name = "buzz-desktop"
-version = "0.5.8"
+version = "0.5.9"
 description = "Buzz desktop app"
 authors = ["you"]
 edition = "2021"
@@ -98,6 +98,7 @@ nostr = { version = "0.44", features = ["nip44", "nip49"] }
 # transitive dependency; pinned here for direct use).
 getrandom = "0.2"
 zeroize = "1"
+percent-encoding = "2"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 url = "2"

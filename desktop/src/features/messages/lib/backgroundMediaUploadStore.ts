@@ -336,6 +336,29 @@ export function takeQueuedAttachmentsForDraft(
   return attachments;
 }
 
+/**
+ * True while any local attachment is queued for a deferred upload. These are
+ * `File` objects retained only in memory (they cannot be serialized into a
+ * persisted draft), so a renderer reload destroys them — the idle backstop
+ * reads this to withhold the reload until the queue drains.
+ */
+export function hasQueuedDraftAttachments(): boolean {
+  for (const attachments of queuedAttachmentsByDraftKey.values()) {
+    if (attachments.length > 0) return true;
+  }
+  return false;
+}
+
+/**
+ * True while any background media upload is in flight, including the
+ * `isCompleting` settling window between the last byte and `onComplete`
+ * resolving. Mirrors the `isUploading` snapshot without a React subscription so
+ * the idle backstop can read it at check time.
+ */
+export function isBackgroundMediaUploadInFlight(): boolean {
+  return snapshot.isUploading;
+}
+
 function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);

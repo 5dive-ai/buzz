@@ -110,8 +110,10 @@ export function ModelPicker({
   // Send a live `switch_model` frame to each channel the agent is working in
   // and wait for the harness to acknowledge. A single `unsupported_model`
   // (model unavailable) or `failure` (adapter refused) result rejects the whole
-  // pick immediately; all other statuses must arrive from every channel before
-  // resolving success.
+  // pick immediately. The busy-path `sent` ack is provisional (the adapter
+  // isn't consulted until the requeued session), so a later terminal frame can
+  // still reject; the remaining success statuses must arrive from every channel,
+  // else the timeout fallback confirms.
   const sendLiveSwitch = React.useCallback(
     (modelId: string) => {
       const channelIds = activeTurns.map((turn) => turn.channelId);
@@ -127,8 +129,8 @@ export function ModelPicker({
             ),
           );
         },
-        // No reply in time: treat as sent. The override still rides the
-        // requeued/next session; we just can't confirm synchronously.
+        // No terminal frame in time: treat as success. The override still
+        // rides the requeued/next session; we just can't confirm synchronously.
         scheduleTimeout: (onTimeout) => {
           const timeout = window.setTimeout(onTimeout, 8_000);
           return () => window.clearTimeout(timeout);

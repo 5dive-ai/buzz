@@ -92,12 +92,18 @@ pub fn migrate_agent_secrets_to_dev_service(app: &tauri::AppHandle) {
     // references it (global-agent-config.json is not a shared file).
     let global_refs = collect_global_env_refs(app);
 
+    // Full blob coordinates referenced by canonical JSON. Used to prove a
+    // conflict marker is safe to clear when its coordinate is no longer live.
+    // `None` when either store is unreadable/malformed — in that case liveness
+    // is unknown and only value-convergence can clear a marker (fail closed).
+    let live_coords = collect_live_projection_coords(app);
+
     let DevMigrationPlan {
         to_write,
         conflict_keys,
         write_marker,
         conflict_markers_to_clear,
-    } = plan_dev_secrets_migration(&src_map, &dest_map, &global_refs);
+    } = plan_dev_secrets_migration(&src_map, &dest_map, &global_refs, live_coords.as_ref());
 
     for key in &conflict_keys {
         eprintln!(
@@ -208,6 +214,7 @@ fn plan_dev_secrets_migration(
     src_map: &std::collections::HashMap<String, String>,
     dest_map: &std::collections::HashMap<String, String>,
     global_refs: &std::collections::HashSet<String>,
+    live_coords: Option<&std::collections::HashSet<String>>,
 ) -> DevMigrationPlan {
     use crate::managed_agents::secret_projection::{conflict_marker_key, is_projection_key};
 
@@ -241,17 +248,38 @@ fn plan_dev_secrets_migration(
         }
     }
 
-    // Clear conflict markers for coordinates that no longer conflict. A marker
-    // present in dest whose underlying coordinate is NOT in this run's
-    // conflict set has resolved (values now agree, or the coordinate is gone),
-    // so lift the availability block.
-    let still_conflicting: std::collections::HashSet<&String> = conflict_keys.iter().collect();
+    // Clear a conflict marker ONLY when the conflict is provably resolved.
+    // Two proofs qualify:
+    //   1. Source and destination both hold the coordinate AND agree — the
+    //      values converged, so the destination value can be trusted again.
+    //   2. The coordinate is proven no longer live in canonical JSON — no
+    //      record references it, so nothing will ever hydrate it and the
+    //      two-cycle GC retires the orphaned generation.
+    // Every other state RETAINS the marker and keeps the coordinate
+    // unavailable (fail closed). In particular, source-absent while the
+    // destination still holds the (conflicting) value and canonical JSON still
+    // references the coordinate is NOT a resolution — a disappearing source is
+    // not evidence that the destination value won. When liveness cannot be
+    // proven (`live_coords` is `None` because a store was unreadable), only
+    // proof #1 can clear a marker.
+    let still_conflicting: std::collections::HashSet<&str> =
+        conflict_keys.iter().map(String::as_str).collect();
     let conflict_markers_to_clear: Vec<String> = dest_map
         .keys()
         .filter(|k| k.starts_with(NS_CONFLICT_PREFIX))
         .filter(|marker| {
             let coord = marker.trim_start_matches(NS_CONFLICT_PREFIX);
-            !still_conflicting.contains(&coord.to_string())
+            // A coordinate re-flagged as conflicting this run is also being
+            // (re)written as a marker above — never clear it in the same pass.
+            if still_conflicting.contains(coord) {
+                return false;
+            }
+            let converged = matches!(
+                (src_map.get(coord), dest_map.get(coord)),
+                (Some(s), Some(d)) if s == d
+            );
+            let not_live = live_coords.is_some_and(|live| !live.contains(coord));
+            converged || not_live
         })
         .cloned()
         .collect();
@@ -299,6 +327,49 @@ fn collect_global_env_refs(app: &tauri::AppHandle) -> std::collections::HashSet<
     refs
 }
 
+/// Collect the full blob coordinates referenced by the canonical JSON stores
+/// (`managed-agents.json` + `global-agent-config.json`), reusing the same
+/// [`collect_live_refs`] the GC uses so the liveness notion is identical.
+///
+/// Returns `None` when either store is unreadable or the JSON is in a state
+/// `collect_live_refs` refuses to reason about (malformed, duplicate, or
+/// inline+ref ambiguity). A `None` result must be treated as "liveness
+/// unknown" — the marker-cleanup caller then declines to clear a marker on
+/// liveness grounds and keeps the coordinate unavailable (fail closed).
+#[cfg(debug_assertions)]
+fn collect_live_projection_coords(
+    app: &tauri::AppHandle,
+) -> Option<std::collections::HashSet<String>> {
+    use crate::managed_agents::secret_projection::collect_live_refs;
+
+    let agents_path = crate::managed_agents::storage::managed_agents_store_path(app).ok()?;
+    let global_path = app
+        .path()
+        .app_data_dir()
+        .ok()?
+        .join("agents/global-agent-config.json");
+
+    // An absent file is a *known* empty liveness set, so default it to the
+    // store's empty JSON shape (`[]` for the agents array, `{}` for the global
+    // object). Only an unreadable *existing* file is genuinely unknown → `None`.
+    let agents_json = read_json_or_default(&agents_path, "[]")?;
+    let global_json = read_json_or_default(&global_path, "{}")?;
+
+    collect_live_refs(&agents_json, &global_json).map(|live| live.coords)
+}
+
+/// Read a JSON store to a string, substituting `default_empty` for an absent
+/// file. Returns `None` only when an existing file cannot be read — a genuine
+/// "unknown" state the caller must fail closed on.
+#[cfg(debug_assertions)]
+fn read_json_or_default(path: &std::path::Path, default_empty: &str) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(default_empty.to_string()),
+        Err(_) => None,
+    }
+}
+
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
@@ -318,7 +389,7 @@ mod tests {
         // write the marker (migration is complete).
         let key = agent_env_key("abc", "gen1");
         let src = map(&[(&key, "val")]);
-        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &HashSet::new());
+        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &HashSet::new(), None);
 
         assert!(plan.conflict_keys.is_empty());
         assert!(plan.write_marker, "clean migration must write the marker");
@@ -336,7 +407,7 @@ mod tests {
         let src = map(&[(&conflict, "src-val"), (&fresh, "fresh-val")]);
         let dest = map(&[(&conflict, "dest-val")]);
 
-        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new());
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new(), None);
 
         assert_eq!(plan.conflict_keys, vec![conflict.clone()]);
         assert!(
@@ -366,7 +437,7 @@ mod tests {
         let src = map(&[(&key, "same")]);
         let dest = map(&[(&key, "same")]);
 
-        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new());
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new(), None);
 
         assert!(plan.conflict_keys.is_empty());
         assert!(plan.write_marker);
@@ -381,7 +452,8 @@ mod tests {
     #[test]
     fn test_empty_source_writes_only_marker() {
         // Nothing to copy, no conflict → clean: the batch is just the marker.
-        let plan = plan_dev_secrets_migration(&HashMap::new(), &HashMap::new(), &HashSet::new());
+        let plan =
+            plan_dev_secrets_migration(&HashMap::new(), &HashMap::new(), &HashSet::new(), None);
         assert!(plan.write_marker);
         assert_eq!(plan.to_write.len(), 1);
         assert!(plan.to_write.contains_key(DEV_SECRETS_MIGRATION_MARKER));
@@ -393,7 +465,7 @@ mod tests {
         // copied across services (global-agent-config.json is not shared).
         let key = global_env_key("gen-unref");
         let src = map(&[(&key, "val")]);
-        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &HashSet::new());
+        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &HashSet::new(), None);
 
         assert!(
             !plan.to_write.contains_key(&key),
@@ -411,7 +483,7 @@ mod tests {
         let key = global_env_key("gen-ref");
         let src = map(&[(&key, "val")]);
         let refs: HashSet<String> = ["gen-ref".to_string()].into_iter().collect();
-        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &refs);
+        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &refs, None);
 
         assert_eq!(plan.to_write.get(&key).map(String::as_str), Some("val"));
     }
@@ -421,7 +493,7 @@ mod tests {
         // A non-projection key (e.g. an nsec or identity marker) present only
         // in src must never be copied by this migration.
         let src = map(&[("some-agent-nsec-key", "secret")]);
-        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &HashSet::new());
+        let plan = plan_dev_secrets_migration(&src, &HashMap::new(), &HashSet::new(), None);
 
         assert!(!plan.to_write.contains_key("some-agent-nsec-key"));
         assert!(plan.write_marker); // no projection conflict
@@ -438,7 +510,7 @@ mod tests {
         let src = map(&[(&conflict, "src-val")]);
         let dest = map(&[(&conflict, "dest-val")]);
 
-        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new());
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new(), None);
 
         assert_eq!(plan.conflict_keys, vec![conflict.clone()]);
         assert!(
@@ -464,7 +536,7 @@ mod tests {
         let src = map(&[(&coord, "agreed")]);
         let dest = map(&[(&coord, "agreed"), (&marker, "1")]);
 
-        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new());
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new(), None);
 
         assert!(
             plan.conflict_keys.is_empty(),
@@ -486,7 +558,7 @@ mod tests {
         let src = map(&[(&coord, "src-val")]);
         let dest = map(&[(&coord, "dest-val"), (&marker, "1")]);
 
-        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new());
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new(), None);
 
         assert_eq!(plan.conflict_keys, vec![coord.clone()]);
         assert!(
@@ -496,6 +568,190 @@ mod tests {
         assert!(
             plan.to_write.contains_key(&marker),
             "the (re)written marker keeps the coordinate unavailable"
+        );
+    }
+
+    #[test]
+    fn test_marker_retained_when_source_gone_but_dest_coord_still_live() {
+        // F4: a disappearing SOURCE coordinate is not evidence the destination
+        // won the conflict. If dest still holds the (conflicting) value AND
+        // canonical JSON still references the coordinate, the marker must be
+        // RETAINED so `load_secret` keeps failing closed. This is the fail-open
+        // arm Thufir flagged: the old code cleared any marker whose coordinate
+        // left the conflict set (source disappearance counted as resolution).
+        use crate::managed_agents::secret_projection::conflict_marker_key;
+        let coord = agent_env_key("abc", "gen1");
+        let marker = conflict_marker_key(&coord);
+        // Source no longer holds the coordinate; dest still holds the old value
+        // plus the marker.
+        let src = map(&[]);
+        let dest = map(&[(&coord, "dest-val"), (&marker, "1")]);
+        // Canonical JSON STILL references the coordinate's generation → live.
+        let live: HashSet<String> = [coord.clone()].into_iter().collect();
+
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new(), Some(&live));
+
+        assert!(
+            plan.conflict_keys.is_empty(),
+            "source is gone, so this run detects no fresh conflict"
+        );
+        assert!(
+            !plan.conflict_markers_to_clear.contains(&marker),
+            "marker must be RETAINED: source disappearance is not resolution while \
+             the destination coordinate is still live"
+        );
+    }
+
+    #[test]
+    fn test_marker_cleared_when_coord_no_longer_live() {
+        // F4 positive bound: once the coordinate is proven no longer referenced
+        // by canonical JSON, nothing can hydrate it, so the stale marker is
+        // safe to clear (the two-cycle GC retires the orphaned generation).
+        use crate::managed_agents::secret_projection::conflict_marker_key;
+        let coord = agent_env_key("abc", "gen1");
+        let marker = conflict_marker_key(&coord);
+        let src = map(&[]);
+        let dest = map(&[(&coord, "dest-val"), (&marker, "1")]);
+        // Canonical JSON references NO coordinates → coord is not live.
+        let live: HashSet<String> = HashSet::new();
+
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new(), Some(&live));
+
+        assert!(
+            plan.conflict_markers_to_clear.contains(&marker),
+            "a marker whose coordinate is proven no longer live must be cleared"
+        );
+    }
+
+    #[test]
+    fn test_marker_retained_when_liveness_unknown_and_values_disagree() {
+        // F4: when liveness cannot be proven (`live_coords` is None because a
+        // store was unreadable) and the values still disagree, only value
+        // convergence (proof #1) may clear a marker — so it is RETAINED.
+        use crate::managed_agents::secret_projection::conflict_marker_key;
+        let coord = agent_env_key("abc", "gen1");
+        let marker = conflict_marker_key(&coord);
+        let src = map(&[(&coord, "src-val")]);
+        let dest = map(&[(&coord, "dest-val"), (&marker, "1")]);
+
+        // liveness unknown → None. src/dest disagree AND this coord conflicts
+        // again this run, so it is re-marked and never cleared.
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new(), None);
+
+        assert!(
+            !plan.conflict_markers_to_clear.contains(&marker),
+            "with liveness unknown and values disagreeing, the marker must be retained"
+        );
+    }
+
+    // ── F4 end-to-end: a PLANNER-PRODUCED marker drives hydration refusal ────
+    //
+    // The other F4 tests hand-seed `conflict:<coord>` and prove `load_secret`
+    // fails closed on it. This one closes the loop from the ORIGIN: run the
+    // real planner on a conflicting src/dest, apply its `to_write` batch
+    // verbatim (marker included) into a store, then hydrate a record pointing
+    // at the conflicted generation. It proves the whole chain —
+    // planner → keyring batch → hydration → spawn refusal — with no
+    // hand-placed marker anywhere in the test.
+    #[test]
+    fn test_planner_conflict_marker_drives_hydration_refusal() {
+        use crate::managed_agents::secret_projection::ProjectionStore;
+        use crate::managed_agents::secret_seam::hydrate_all_secrets_for_records;
+        use crate::managed_agents::storage::spawn_key_refusal;
+        use crate::managed_agents::ManagedAgentRecord;
+        use std::cell::RefCell;
+
+        // Minimal in-memory store; hydration only reads via `load_key`.
+        struct FakeStore(RefCell<HashMap<String, String>>);
+        impl ProjectionStore for FakeStore {
+            fn write_and_verify(&self, key: &str, value: &str) -> Result<(), String> {
+                self.0.borrow_mut().insert(key.into(), value.into());
+                Ok(())
+            }
+            fn load_key(&self, key: &str) -> Result<Option<String>, String> {
+                Ok(self.0.borrow().get(key).cloned())
+            }
+            fn load_all(&self) -> Result<Option<HashMap<String, String>>, String> {
+                Ok(Some(self.0.borrow().clone()))
+            }
+            fn store_batch(&self, entries: &HashMap<String, String>) -> Result<(), String> {
+                for (k, v) in entries {
+                    self.0.borrow_mut().insert(k.clone(), v.clone());
+                }
+                Ok(())
+            }
+            fn remove_batch(&self, keys: &[&str]) -> Result<(), String> {
+                for k in keys {
+                    self.0.borrow_mut().remove(*k);
+                }
+                Ok(())
+            }
+        }
+
+        let pubkey = "abc";
+        let coord = agent_env_key(pubkey, "gen_live");
+        // Source and destination disagree on the same coordinate → conflict.
+        let src = map(&[(&coord, r#"{"ANTHROPIC_API_KEY":"src-value"}"#)]);
+        let dest = map(&[(&coord, r#"{"ANTHROPIC_API_KEY":"dest-value"}"#)]);
+
+        // Run the REAL planner. It flags the conflict, withholds the completion
+        // marker, and emits the `conflict:<coord>` marker in its write batch.
+        let plan = plan_dev_secrets_migration(&src, &dest, &HashSet::new(), None);
+        assert_eq!(plan.conflict_keys, vec![coord.clone()]);
+        assert!(
+            !plan.write_marker,
+            "a conflict withholds the completion marker"
+        );
+
+        // Apply the planner's batch verbatim (the conflict marker rides along),
+        // plus the destination value the migration left untouched — the exact
+        // post-migration keyring state for an unresolved conflict.
+        let store = FakeStore(RefCell::new(HashMap::new()));
+        store.store_batch(&plan.to_write).unwrap();
+        store
+            .write_and_verify(&coord, r#"{"ANTHROPIC_API_KEY":"dest-value"}"#)
+            .unwrap();
+
+        // Hydrate a record that references the conflicted generation.
+        let mut records = vec![{
+            let mut r: ManagedAgentRecord = serde_json::from_str(&format!(
+                r#"{{
+                    "pubkey": "{pubkey}",
+                    "name": "test-agent",
+                    "private_key_nsec": "nsec1realkey",
+                    "relay_url": "wss://localhost:3000",
+                    "acp_command": "buzz-acp",
+                    "agent_command": "goose",
+                    "agent_args": [],
+                    "mcp_command": "",
+                    "turn_timeout_seconds": 320,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                }}"#
+            ))
+            .expect("instance record");
+            r.env_vars_ref = Some("gen_live".to_string());
+            r
+        }];
+
+        let unavailable = hydrate_all_secrets_for_records(&store, &mut records);
+
+        assert_eq!(
+            unavailable,
+            vec![pubkey.to_string()],
+            "the planner's marker must surface the instance as unavailable"
+        );
+        assert!(
+            records[0].secrets_unavailable,
+            "a planner-produced conflict marker must set secrets_unavailable"
+        );
+        assert!(
+            records[0].env_vars.is_empty(),
+            "the untrusted destination value must NOT hydrate"
+        );
+        assert!(
+            spawn_key_refusal(&records[0]).is_some(),
+            "spawn must refuse the instance while the planner's conflict stands"
         );
     }
 }

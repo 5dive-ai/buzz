@@ -198,8 +198,9 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                         // `auth_tag` empty, so signing would strip the NIP-OA
                         // tag. Skip only this instance — one stale record must
                         // not block the rest of the persona rename. The local
-                        // record edits above still persist so a later reachable
-                        // boot reconciles the profile.
+                        // record edits above still persist, so this instance's
+                        // profile converges on its next successful start/reconcile
+                        // (once its secrets hydrate), not merely on a reachable boot.
                         let secrets_ok =
                             crate::managed_agents::effective_config::require_effective_secrets_available(
                                 record,

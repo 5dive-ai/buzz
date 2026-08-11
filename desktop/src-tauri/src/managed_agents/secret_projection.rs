@@ -258,16 +258,32 @@ pub fn load_secret<S: ProjectionStore>(
     };
     let key = coord_key_fn(gen);
     // Fail closed on an unresolved dev-migration conflict for this coordinate.
-    // No marker (`Ok(None)`), or a marker store-read error (`Err(_)`), falls
-    // through to the normal load below: a marker-read error must not mask a
-    // genuinely available secret, and the normal load fails closed on its own
-    // errors.
-    if let Ok(Some(_)) = store.load_key(&conflict_marker_key(&key)) {
-        return Err(format!(
-            "secret unavailable: {context} ref {gen} has an unresolved \
-             dev-migration conflict at {key}; refusing to hydrate a \
-             potentially-wrong value until the conflict is resolved"
-        ));
+    // Only a definitive `Ok(None)` (marker absent) proceeds to the value read.
+    //
+    // A marker-read `Err(_)` MUST also fail closed: `SecretStore::load_blob`
+    // caches a successful read but never caches an error, so a transient
+    // marker-read failure could be followed immediately by a *successful*
+    // value read that hydrates a known-conflicted credential. Falling through
+    // on `Err` would therefore re-open exactly the window the marker exists to
+    // close, so a marker read we cannot complete is treated as "conflict
+    // status unknown" → unavailable.
+    match store.load_key(&conflict_marker_key(&key)) {
+        Ok(Some(_)) => {
+            return Err(format!(
+                "secret unavailable: {context} ref {gen} has an unresolved \
+                 dev-migration conflict at {key}; refusing to hydrate a \
+                 potentially-wrong value until the conflict is resolved"
+            ))
+        }
+        Err(e) => {
+            return Err(format!(
+                "secret unavailable: {context} ref {gen} conflict-marker read \
+                 at {key} failed ({e}); refusing to hydrate until the marker \
+                 can be checked (a later cached-success value read must not \
+                 bypass an unresolved conflict)"
+            ))
+        }
+        Ok(None) => {} // no marker — proceed to the normal load
     }
     match store.load_key(&key) {
         Ok(Some(v)) => Ok(Some(v)),

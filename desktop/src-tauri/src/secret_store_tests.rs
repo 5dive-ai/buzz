@@ -186,53 +186,90 @@ fn test_blob_lock_acquire_and_release() {
     );
 }
 
-// ── F5a: cross-process transaction lock ───────────────────────────────
+// ── F5a: cross-process transaction lock (directory-inode based) ───────
 
 #[test]
-fn test_txn_lockfile_path_is_distinct_from_op_lockfile() {
-    // The transaction lock and the per-operation `mutate_blob` lock MUST be
-    // separate files. A save/GC transaction holds the txn lock while its
-    // inner `mutate_blob` calls take the op lock; if they were the same
-    // file, the second flock in the same process would self-deadlock.
-    let op = blob_lockfile_path("buzz-desktop");
-    let txn = blob_txn_lockfile_path("buzz-desktop");
-    assert_ne!(op, txn, "txn and op lockfiles must be distinct paths");
-    assert!(
-        txn.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.contains("txn")),
-        "txn lockfile {txn:?} must be identifiable as the transaction lock"
+fn test_store_txn_lock_dir_resolves_symlinked_file_to_canonical_parent() {
+    // Two dev worktrees each symlink `managed-agents.json` to one canonical
+    // file (the parent dir is NOT symlinked — see `SHARED_AGENT_FILES`). The
+    // transaction lock must key by the RESOLVED canonical directory so both
+    // worktrees contend on the same inode; keying by the worktree's own path
+    // would give them different locks over the same store.
+    let root = std::env::temp_dir().join(format!("buzz-txn-key-{}", std::process::id()));
+    let canonical = root.join("canonical/agents");
+    std::fs::create_dir_all(&canonical).expect("create canonical agents dir");
+    let real_file = canonical.join("managed-agents.json");
+    std::fs::write(&real_file, b"[]").expect("write canonical store");
+
+    let mut resolved = Vec::new();
+    for wt in ["wtA", "wtB"] {
+        let wt_dir = root.join(wt).join("agents");
+        std::fs::create_dir_all(&wt_dir).expect("create worktree agents dir");
+        let link = wt_dir.join("managed-agents.json");
+        let _ = std::fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_file, &link).expect("symlink store file");
+        resolved.push(store_txn_lock_dir(&link));
+    }
+
+    #[cfg(unix)]
+    {
+        let want = std::fs::canonicalize(&canonical).expect("canonicalize canonical dir");
+        assert_eq!(
+            resolved[0], want,
+            "worktree A must resolve to canonical dir"
+        );
+        assert_eq!(
+            resolved[1], want,
+            "worktree B must resolve to canonical dir"
+        );
+        assert_eq!(
+            resolved[0], resolved[1],
+            "both worktrees must key the transaction lock by ONE canonical dir inode"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_store_txn_lock_dir_falls_back_to_parent_when_file_absent() {
+    // First boot: the store file does not exist yet. The lock dir must still
+    // resolve to the file's parent so the very first save serializes (there is
+    // no committed record to lose in that window, but the API must not panic
+    // or hand back a nonsense path).
+    let dir = std::env::temp_dir().join(format!("buzz-txn-absent-{}/agents", std::process::id()));
+    let absent = dir.join("managed-agents.json");
+    assert_eq!(
+        store_txn_lock_dir(&absent),
+        dir,
+        "an absent store file must key by its parent directory"
     );
 }
 
-/// Two INDEPENDENT participants (distinct `BlobLockGuard`s on the same
-/// service — the analog of two Desktop processes contending on the same
-/// on-disk lockfile) must mutually exclude: while one holds the
+/// Two INDEPENDENT participants (distinct guards on the same resolved store
+/// directory — the analog of two Desktop processes contending on one shared
+/// canonical `agents/` dir) must mutually exclude: while one holds the
 /// transaction lock, a non-blocking acquire by the other must fail.
 ///
-/// Uses the real `flock`/named-mutex path over a unique temp service so it
-/// needs no OS keychain and does not touch the shared store.
-#[cfg(unix)]
+/// Uses the real `flock` path over a unique temp directory so it needs no OS
+/// keychain and does not touch the shared store.
+#[cfg(all(unix, feature = "system-keyring"))]
 #[test]
 fn test_txn_lock_excludes_a_second_participant() {
     use std::os::unix::io::AsRawFd;
 
-    let path = blob_txn_lockfile_path("buzz-test-txn-exclusion");
-    let _ = std::fs::remove_file(&path);
+    let dir = std::env::temp_dir().join(format!("buzz-txn-excl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create store dir");
+    std::fs::write(dir.join("managed-agents.json"), b"[]").expect("seed store file");
 
-    // Participant A takes the transaction lock and holds it.
-    let guard_a = BlobLockGuard::acquire(&path).expect("participant A acquires txn lock");
+    // Participant A takes the transaction lock on the directory inode.
+    let guard_a = transaction_lock_at(&dir).expect("participant A acquires txn lock");
 
     // Participant B is an independent open file description on the SAME
-    // lockfile (what a second process would have). A non-blocking exclusive
+    // directory (what a second process would have). A non-blocking exclusive
     // flock must fail with EWOULDBLOCK while A holds the lock.
-    let file_b = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .expect("participant B opens lockfile");
-    let rc = unsafe { libc::flock(file_b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let dir_b = std::fs::File::open(&dir).expect("participant B opens dir");
+    let rc = unsafe { libc::flock(dir_b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(
         rc, -1,
         "a second participant must NOT acquire the txn lock while A holds it"
@@ -245,10 +282,56 @@ fn test_txn_lock_excludes_a_second_participant() {
 
     // After A releases, B's non-blocking acquire succeeds.
     drop(guard_a);
-    let rc2 = unsafe { libc::flock(file_b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let rc2 = unsafe { libc::flock(dir_b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(rc2, 0, "second participant must acquire once A releases");
-    let _ = unsafe { libc::flock(file_b.as_raw_fd(), libc::LOCK_UN) };
-    let _ = std::fs::remove_file(&path);
+    let _ = unsafe { libc::flock(dir_b.as_raw_fd(), libc::LOCK_UN) };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Finding 3 adversarial regression: the lock must survive a tmp-cleaner-style
+/// unlink+recreate of a FILE inside the store directory. The old `/tmp`
+/// lockfile split here — A held an flock on an inode, the pathname was
+/// unlinked and recreated, and B locked a fresh inode with both "holding" the
+/// lock. Because the transaction lock is on the DIRECTORY inode (not a file
+/// inside it), churning files within cannot swap the locked inode: B must
+/// still be excluded while A holds.
+#[cfg(all(unix, feature = "system-keyring"))]
+#[test]
+fn test_txn_lock_survives_unlink_recreate_of_file_inside() {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = std::env::temp_dir().join(format!("buzz-txn-unlink-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create store dir");
+    let store_file = dir.join("managed-agents.json");
+    std::fs::write(&store_file, b"[]").expect("seed store file");
+
+    // A holds the directory-inode transaction lock.
+    let guard_a = transaction_lock_at(&dir).expect("participant A acquires txn lock");
+
+    // A tmp-cleaner unlinks and recreates the store file (fresh file inode).
+    // The DIRECTORY inode is unchanged — it is non-empty and cannot be rmdir'd.
+    std::fs::remove_file(&store_file).expect("unlink store file");
+    std::fs::write(&store_file, b"[]").expect("recreate store file");
+
+    // B (independent fd on the same directory) must STILL be excluded — the
+    // exact failure the /tmp-lockfile design could not prevent.
+    let dir_b = std::fs::File::open(&dir).expect("participant B opens dir");
+    let rc = unsafe { libc::flock(dir_b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(
+        rc, -1,
+        "B must NOT acquire after an unlink/recreate of a file inside the locked dir"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EWOULDBLOCK),
+        "exclusion must hold across the file churn"
+    );
+
+    drop(guard_a);
+    let rc2 = unsafe { libc::flock(dir_b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc2, 0, "B acquires once A releases");
+    let _ = unsafe { libc::flock(dir_b.as_raw_fd(), libc::LOCK_UN) };
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[ignore = "requires real OS keychain (run locally)"]

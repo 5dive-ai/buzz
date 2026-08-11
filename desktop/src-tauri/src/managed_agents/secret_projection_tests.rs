@@ -196,6 +196,67 @@ fn test_load_secret_err_when_keyring_unreachable() {
     assert!(result.is_err());
 }
 
+/// A [`ProjectionStore`] whose conflict-marker read fails transiently while
+/// the value read succeeds — the exact production shape Thufir flagged: the
+/// real `SecretStore::load_blob` caches a successful read but never caches an
+/// error, so a first (marker) read can error and an immediately-following
+/// (value) read can succeed against a warm cache. The value is present and
+/// KNOWN-conflicted; `load_secret` must fail closed on the marker-read `Err`
+/// rather than fall through and hydrate it.
+struct MarkerReadErrStore {
+    value_key: String,
+    value: String,
+}
+
+impl ProjectionStore for MarkerReadErrStore {
+    fn write_and_verify(&self, _key: &str, _value: &str) -> Result<(), String> {
+        unreachable!("load_secret never writes")
+    }
+    fn load_key(&self, key: &str) -> Result<Option<String>, String> {
+        if key.starts_with("conflict:") {
+            // Transient backend failure on the marker read only.
+            return Err("transient marker read failure".to_string());
+        }
+        if key == self.value_key {
+            // The value read succeeds — a known-conflicted credential.
+            return Ok(Some(self.value.clone()));
+        }
+        Ok(None)
+    }
+    fn load_all(&self) -> Result<Option<HashMap<String, String>>, String> {
+        unreachable!("load_secret never calls load_all")
+    }
+    fn store_batch(&self, _entries: &HashMap<String, String>) -> Result<(), String> {
+        unreachable!("load_secret never writes")
+    }
+    fn remove_batch(&self, _keys: &[&str]) -> Result<(), String> {
+        unreachable!("load_secret never deletes")
+    }
+}
+
+#[test]
+fn test_load_secret_fails_closed_when_marker_read_errors() {
+    // F4: a transient conflict-marker read `Err` must be treated as "conflict
+    // status unknown" → unavailable, even though the value read would succeed.
+    // Falling through would hydrate a known-conflicted value the moment the
+    // marker check flaked.
+    let value_key = global_env_key("gen1");
+    let store = MarkerReadErrStore {
+        value_key,
+        value: "sk-known-conflicted".to_string(),
+    };
+    let result = load_secret(&store, Some("gen1"), global_env_key, "global:env");
+    assert!(
+        result.is_err(),
+        "a marker-read Err must fail closed, not fall through to the value read"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("conflict-marker read") && msg.contains("failed"),
+        "error must name the marker-read failure as the refusal cause, got: {msg}"
+    );
+}
+
 // ── Two-cycle GC tests ────────────────────────────────────────────────
 
 fn make_agents_json(env_ref: Option<&str>) -> String {

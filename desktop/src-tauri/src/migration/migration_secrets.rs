@@ -35,7 +35,7 @@ pub(super) fn migrate_inline_secrets_to_keyring(app: &tauri::AppHandle) {
         // just-written generation in the window before its ref lands in JSON.
         // The in-process `managed_agents_store_lock` above only serializes THIS
         // process; the file lock closes the cross-process interleave.
-        match crate::managed_agents::storage::acquire_secret_txn_lock() {
+        match crate::managed_agents::storage::acquire_secret_txn_lock(app) {
             Ok(_txn) => {
                 let changed = migrate_inline_secrets_in_records(app, &mut records);
                 if changed {
@@ -226,7 +226,7 @@ pub(crate) fn run_secret_gc(app: &tauri::AppHandle) {
         // guard releases when this function returns. Leaf-level: GC is never
         // called while another secret transaction lock is held (boot migration
         // releases its extraction and global-save spans before calling here).
-        let _txn = match crate::managed_agents::storage::acquire_secret_txn_lock() {
+        let _txn = match crate::managed_agents::storage::acquire_secret_txn_lock(app) {
             Ok(guard) => guard,
             Err(e) => {
                 eprintln!(

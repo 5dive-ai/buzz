@@ -388,10 +388,13 @@ fn hydrate_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRecord]) 
 /// before the wholesale rewrite so a definition is never dropped by an
 /// instance-side save (and vice versa via [`save_agent_definitions`]).
 pub fn save_managed_agents(app: &AppHandle, records: &[ManagedAgentRecord]) -> Result<(), String> {
+    // Lock FIRST — the definition half re-read below must be under the lock
+    // (Race 1); see `acquire_secret_txn_lock` for span + residual.
+    let _txn = acquire_secret_txn_lock(app)?;
     let definitions = load_agent_definitions(app).unwrap_or_default();
     let mut sorted = records.to_vec();
     // A caller-supplied key-less record would collide with the definition
-    // half re-read below; instances always carry a pubkey.
+    // half re-read above; instances always carry a pubkey.
     sorted.retain(|record| !record.pubkey.is_empty());
     sorted.sort_by(|left, right| {
         left.name
@@ -402,11 +405,6 @@ pub fn save_managed_agents(app: &AppHandle, records: &[ManagedAgentRecord]) -> R
 
     // Persist each nsec to the keyring; on success blank the inline copy.
     persist_agent_keys(&mut sorted);
-
-    // Cross-process transaction lock across the generation writes
-    // (`strip_and_persist_all_for_records`) and the JSON commit
-    // (`write_agent_store`) — see `acquire_secret_txn_lock`. Leaf-level.
-    let _txn = acquire_secret_txn_lock()?;
 
     // Persist env/auth_tag/provider_config to the keyring; on success blank
     // inline values and set *_ref. On failure keep inline and clear *_ref.
@@ -423,14 +421,13 @@ pub(crate) fn save_agent_definitions(
     app: &AppHandle,
     definitions: &[ManagedAgentRecord],
 ) -> Result<(), String> {
+    // Lock FIRST — the instance half re-read below must be under the lock
+    // (Race 1); mirror of `save_managed_agents`. Leaf-level.
+    let _txn = acquire_secret_txn_lock(app)?;
     let mut instances = load_agent_store(app)?;
     instances.retain(|record| !record.pubkey.is_empty());
     let mut definitions = definitions.to_vec();
     definitions.retain(|record| record.pubkey.is_empty());
-
-    // Cross-process txn lock across gen-writes + JSON commit (see
-    // `save_managed_agents`). Leaf-level, never nested.
-    let _txn = acquire_secret_txn_lock()?;
 
     // Persist definition env_vars to the keyring before writing JSON.
     if let Some(store) = agent_secret_store() {
@@ -672,17 +669,20 @@ pub(crate) fn agent_secret_store_pub() -> Option<&'static crate::secret_store::S
     agent_secret_store()
 }
 
-/// Acquire the cross-process secret transaction lock for the agent secret
-/// store, or `Ok(None)` when the build has no keyring backend. A save
-/// (gen-write → JSON commit) and GC (live-ref read → blob remove) hold it for
-/// their full span so two Desktop processes cannot interleave. Never nested;
-/// the per-op `mutate_blob` lock is a different file taken after this one.
+/// Acquire the cross-process secret transaction lock for the agent store, or
+/// `Ok(None)` on a keyless build. A save and GC hold it for their full span so
+/// two Desktop processes cannot interleave. Keyed by the resolved store dir
+/// ([`crate::secret_store::store_txn_lock_dir`]). Residual (deferred, PR body):
+/// the lock makes each `save_*` atomic cross-process but cannot make a caller's
+/// pre-lock snapshot transactional — caller races stay last-writer-wins (pre-existing).
 pub(crate) fn acquire_secret_txn_lock(
+    app: &AppHandle,
 ) -> Result<Option<crate::secret_store::SecretTxnGuard>, String> {
-    match agent_secret_store() {
-        Some(store) => store.transaction_lock().map(Some),
-        None => Ok(None),
+    if agent_secret_store().is_none() {
+        return Ok(None);
     }
+    let dir = crate::secret_store::store_txn_lock_dir(&managed_agents_store_path(app)?);
+    crate::secret_store::transaction_lock_at(&dir).map(Some)
 }
 
 /// Atomic, symlink-preserving JSON write.

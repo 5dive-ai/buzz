@@ -274,8 +274,12 @@ pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> 
         // delete the just-written generation before its ref lands in JSON. The
         // lock releases when `_txn` drops at end of function. Callers never hold
         // it already (boot migration releases its agent-store span before
-        // calling here), so this does not nest.
-        let _txn = store.transaction_lock()?;
+        // calling here), so this does not nest. Keyed by the SAME canonical
+        // store directory as the agent-store saves and GC (via
+        // `acquire_secret_txn_lock`) so every mutator of the shared keyring
+        // blob serializes on one inode — global-agent-config.json is not itself
+        // shared, but it writes the same blob the agent store does.
+        let _txn = crate::managed_agents::storage::acquire_secret_txn_lock(app)?;
         let inline_env = if !config.env_vars.is_empty() {
             serialize_env_map(&config.env_vars).ok()
         } else {

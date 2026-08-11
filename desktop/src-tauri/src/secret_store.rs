@@ -86,31 +86,45 @@ fn blob_lockfile_path(service: &str) -> PathBuf {
     }
 }
 
-/// Return the path of the *transaction* advisory lockfile for `service`.
+/// Resolve the directory whose inode is the cross-process *transaction* lock
+/// target for the store physically held by `store_file`
+/// (`managed-agents.json`).
 ///
-/// Distinct from [`blob_lockfile_path`] (the per-operation `mutate_blob`
-/// lock): a save's generation-write → JSON-commit and GC's live-ref read →
-/// blob-remove each hold THIS lock end-to-end, so two Desktop processes
-/// sharing the store cannot interleave a GC delete against an in-flight
-/// generation. Using a separate file keeps the coarse transaction lock and
-/// the fine per-operation lock orthogonal: a `mutate_blob` inside a
-/// transaction takes the op-lock on a *different* file, so there is no
-/// same-process self-deadlock (the two locks are always acquired in the same
-/// order — transaction first, operation second — so no cycle is possible).
+/// The transaction lock is deliberately NOT keyed like the per-operation blob
+/// lock. That lock is a service-keyed lockfile under `/tmp`; this one is the
+/// store's own **directory inode**. Two properties fall out of that choice,
+/// and both are load-bearing:
 ///
-/// On Windows the same name feeds a distinct named kernel mutex (the `.txn`
-/// file stem yields a different mutex name than the per-op lock).
-fn blob_txn_lockfile_path(service: &str) -> PathBuf {
-    #[cfg(unix)]
-    {
-        // SAFETY: getuid() is always safe on Unix — it never fails.
-        let uid = unsafe { libc::getuid() };
-        PathBuf::from(format!("/tmp/buzz-keychain-{uid}-{service}.txn.lock"))
+/// - **Stable shared identity, independent of keyring service.**
+///   `managed-agents.json` is symlinked *per file* across dev worktrees while
+///   its parent directory is not (see `migration::SHARED_AGENT_FILES`), so
+///   resolving the file through its symlink and taking the real parent yields
+///   the one canonical directory every process sharing the store contends on —
+///   even when `keyring_service()` hands those processes different scoped
+///   services. Keying by service would let two processes share one JSON inode
+///   while taking different locks; keying by the resolved directory cannot.
+///
+/// - **Immunity to the unlink/recreate split.** A `/tmp` lockfile can be
+///   unlinked by a temp cleaner while a process holds its `flock`; a second
+///   process then recreates the pathname, locks a fresh inode, and both
+///   "hold" the lock. A directory that holds the store files is non-empty and
+///   lives in the owner's app-data tree: no tmp-cleaner unlinks it and
+///   `rmdir` refuses a non-empty directory, so the inode a held lock refers to
+///   cannot be swapped out underneath a second participant.
+///
+/// Falls back to the file's own parent when the file does not exist yet (first
+/// boot, before anything is written or shared) — there is no committed record
+/// to lose in that window.
+pub fn store_txn_lock_dir(store_file: &std::path::Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(store_file) {
+        if let Some(parent) = real.parent() {
+            return parent.to_path_buf();
+        }
     }
-    #[cfg(not(unix))]
-    {
-        std::env::temp_dir().join(format!("buzz-keychain-{service}.txn.lock"))
-    }
+    store_file
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| store_file.to_path_buf())
 }
 
 /// Acquire an exclusive advisory file lock for the blob identified by `service`.
@@ -271,42 +285,143 @@ impl SecretStore {
         static INSTANCE: OnceLock<SecretStore> = OnceLock::new();
         INSTANCE.get_or_init(|| SecretStore::keyring(service))
     }
+}
 
-    /// Acquire the cross-process transaction lock for this store's service and
-    /// hold it for the returned guard's lifetime.
-    ///
-    /// This is the coarse lock every multi-step secret transaction must hold
-    /// so two Desktop processes sharing the store cannot interleave: a save
-    /// holds it from generation-write through the atomic JSON commit; GC holds
-    /// it from the live-ref read through the blob `remove_batch`. Without it,
-    /// process B's GC could delete a generation that process A wrote but has
-    /// not yet committed to JSON, leaving A's committed ref dangling.
-    ///
-    /// The guard is `#[must_use]` — dropping it early releases the lock. On a
-    /// build without the keyring feature this is a no-op guard.
-    #[must_use = "the transaction lock is released when the guard is dropped"]
-    pub fn transaction_lock(&self) -> Result<SecretTxnGuard, String> {
-        #[cfg(feature = "system-keyring")]
-        {
-            let path = blob_txn_lockfile_path(&self.service);
-            Ok(SecretTxnGuard {
-                _inner: BlobLockGuard::acquire(&path)?,
-            })
+/// Acquire the cross-process secret **transaction** lock on the store
+/// directory identified by `store_dir` (the resolved canonical directory from
+/// [`store_txn_lock_dir`]) and hold it for the returned guard's lifetime.
+///
+/// This is the coarse lock every multi-step secret transaction must hold so
+/// two Desktop processes sharing the store cannot interleave: a save holds it
+/// from the other-half read through generation writes to the atomic JSON
+/// commit; GC holds it from the live-ref read through the blob `remove_batch`.
+/// Without it, process B's GC could delete a generation that process A wrote
+/// but has not yet committed to JSON, leaving A's committed ref dangling; or A
+/// could commit a stale pre-lock snapshot over B's committed record.
+///
+/// The lock target is the store **directory inode**, not a `/tmp` lockfile and
+/// not the keyring service — see [`store_txn_lock_dir`] for why (stable shared
+/// identity across worktrees + immunity to the unlink/recreate split).
+///
+/// Orthogonal to the per-operation `mutate_blob` lock, which flocks a separate
+/// `/tmp` lockfile ([`blob_lockfile_path`]): a `mutate_blob` inside a
+/// transaction takes a lock on a *different* object, so the two never
+/// self-deadlock. Transaction callers must not nest this lock within
+/// themselves (a second acquire in the same process blocks on its own held
+/// exclusive lock); the save/GC/global-config entry points are all leaf-level.
+///
+/// The guard is `#[must_use]` — dropping it early releases the lock. On a
+/// build without the keyring feature this is a no-op guard.
+#[cfg(feature = "system-keyring")]
+#[must_use = "the transaction lock is released when the guard is dropped"]
+pub fn transaction_lock_at(store_dir: &std::path::Path) -> Result<SecretTxnGuard, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // Open the directory read-only (never create/truncate — the store dir
+        // already exists, created by `managed_agents_base_dir`). `flock` on the
+        // directory inode blocks until the lock is acquired; no file inside can
+        // split it because a non-empty directory cannot be `rmdir`'d and its
+        // inode is fixed for the directory's lifetime.
+        let dir = std::fs::File::open(store_dir)
+            .map_err(|e| format!("txn lock open dir {}: {e}", store_dir.display()))?;
+        let ret = unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(format!("txn lock flock {}: {err}", store_dir.display()));
         }
-        #[cfg(not(feature = "system-keyring"))]
-        {
-            Ok(SecretTxnGuard {})
+        Ok(SecretTxnGuard { _dir: dir })
+    }
+    #[cfg(windows)]
+    {
+        // Windows cannot `flock` a directory handle the same way, so use a
+        // named kernel mutex whose name is a deterministic hash of the
+        // resolved directory path — the same stable-identity property as the
+        // Unix directory inode, and cross-build stable so a signed build and a
+        // dev build sharing the store contend on one mutex.
+        let name_str = format!("Local\\BuzzSecretTxn-{:016x}", fnv1a64(store_dir));
+        let name_wide: Vec<u16> = name_str
+            .encode_utf16()
+            .chain(std::iter::once(0u16))
+            .collect();
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject, INFINITE};
+        let handle = unsafe {
+            CreateMutexW(
+                std::ptr::null::<SECURITY_ATTRIBUTES>(),
+                0,
+                name_wide.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            let err = std::io::Error::last_os_error();
+            return Err(format!("txn lock CreateMutexW: {err}"));
         }
+        let wait_result = unsafe { WaitForSingleObject(handle, INFINITE) };
+        if wait_result != WAIT_OBJECT_0
+            && wait_result != windows_sys::Win32::Foundation::WAIT_ABANDONED
+        {
+            let err = std::io::Error::last_os_error();
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            return Err(format!(
+                "txn lock WaitForSingleObject: {wait_result} / {err}"
+            ));
+        }
+        Ok(SecretTxnGuard {
+            mutex_handle: handle,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = store_dir;
+        Err("txn lock: unsupported platform".to_string())
     }
 }
 
+/// No-op transaction lock when the keyring feature is disabled: there are no
+/// generation writes to serialize, so the guard holds nothing.
+#[cfg(not(feature = "system-keyring"))]
+#[must_use = "the transaction lock is released when the guard is dropped"]
+pub fn transaction_lock_at(_store_dir: &std::path::Path) -> Result<SecretTxnGuard, String> {
+    Ok(SecretTxnGuard {})
+}
+
+/// Deterministic 64-bit FNV-1a over a path's bytes, used only to name the
+/// Windows transaction mutex. Stable across builds (no random seed), so two
+/// Desktop builds sharing a store derive the same mutex name.
+#[cfg(all(feature = "system-keyring", windows))]
+fn fnv1a64(path: &std::path::Path) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// RAII guard for the cross-process secret transaction lock. Held for the full
-/// duration of a save (generation-write → JSON commit) or a GC pass (live-ref
-/// read → blob remove). See [`SecretStore::transaction_lock`].
+/// duration of a save (other-half read → generation writes → JSON commit) or a
+/// GC pass (live-ref read → blob remove). See [`transaction_lock_at`].
 #[must_use = "the transaction lock is released when the guard is dropped"]
 pub struct SecretTxnGuard {
-    #[cfg(feature = "system-keyring")]
-    _inner: BlobLockGuard,
+    /// The open directory fd. Never read — held purely for RAII: closing it
+    /// releases the `flock(LOCK_EX)` on the directory inode.
+    #[cfg(all(feature = "system-keyring", unix))]
+    #[allow(dead_code)]
+    _dir: std::fs::File,
+    #[cfg(all(feature = "system-keyring", windows))]
+    mutex_handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(all(feature = "system-keyring", windows))]
+impl Drop for SecretTxnGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.mutex_handle);
+            windows_sys::Win32::Foundation::CloseHandle(self.mutex_handle);
+        }
+    }
 }
 
 /// Whether a keyring error string indicates the backend itself is unavailable

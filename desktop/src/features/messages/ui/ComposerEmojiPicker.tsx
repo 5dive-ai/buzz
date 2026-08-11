@@ -3,7 +3,7 @@ import * as React from "react";
 
 import { EmojiPicker } from "@/features/custom-emoji/ui/EmojiPicker";
 import {
-  downloadKlipyGif,
+  klipyGifAttachment,
   type KlipyGif,
   trackKlipyGifShare,
 } from "@/features/gifs/api";
@@ -16,10 +16,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 
 type ComposerEmojiPickerProps = {
   disabled?: boolean;
-  gifUploadController: Pick<
-    MediaUploadController,
-    "setUploadState" | "uploadFile"
-  >;
+  gifMediaController: Pick<MediaUploadController, "setPendingImeta">;
   /** Called when the popover closes without an emoji selection (Escape,
    *  click-outside). Use this to restore focus to the editor. */
   onClose?: () => void;
@@ -31,7 +28,7 @@ type ComposerEmojiPickerProps = {
 
 export const ComposerEmojiPicker = React.memo(function ComposerEmojiPicker({
   disabled = false,
-  gifUploadController,
+  gifMediaController,
   onClose,
   onEmojiSelect,
   onOpenChange,
@@ -41,22 +38,14 @@ export const ComposerEmojiPicker = React.memo(function ComposerEmojiPicker({
   const handleGifSelect = React.useCallback(
     (gif: KlipyGif) => {
       onOpenChange(false);
-      void downloadKlipyGif(gif)
-        .then(gifUploadController.uploadFile)
-        .catch((error: unknown) => {
-          gifUploadController.setUploadState({
-            status: "error",
-            message: String(error),
-          });
-        });
+      gifMediaController.setPendingImeta((current) => [
+        ...current,
+        klipyGifAttachment(gif),
+      ]);
       // Provider analytics must never block the user's attachment flow.
       void trackKlipyGifShare(gif.slug).catch(() => undefined);
     },
-    [
-      gifUploadController.setUploadState,
-      gifUploadController.uploadFile,
-      onOpenChange,
-    ],
+    [gifMediaController.setPendingImeta, onOpenChange],
   );
 
   return (

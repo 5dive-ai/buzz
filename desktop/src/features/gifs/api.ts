@@ -1,3 +1,5 @@
+import type { BlobDescriptor } from "@/shared/api/tauri";
+
 const KLIPY_API_ROOT = "https://api.klipy.com/api/v1";
 const KLIPY_CUSTOMER_ID_STORAGE_KEY = "buzz:klipy-customer-id:v1";
 
@@ -169,16 +171,21 @@ export function klipyGifFilename(gif: KlipyGif): string {
   return `${safeSlug || "klipy-gif"}.gif`;
 }
 
-export async function downloadKlipyGif(gif: KlipyGif): Promise<File> {
-  const response = await fetch(gif.original.url);
-  if (!response.ok) {
-    throw new Error(`Could not download GIF (${response.status})`);
-  }
-
-  const blob = await response.blob();
-  return new File([blob], klipyGifFilename(gif), {
-    type: blob.type || "image/gif",
-  });
+/**
+ * Represent a selected KLIPY GIF as externally hosted media. The empty hash
+ * intentionally distinguishes it from bytes uploaded to Buzz media storage;
+ * NIP-92 permits URL-only media metadata.
+ */
+export function klipyGifAttachment(gif: KlipyGif): BlobDescriptor {
+  return {
+    dim: `${gif.original.width}x${gif.original.height}`,
+    filename: klipyGifFilename(gif),
+    sha256: "",
+    size: gif.original.size,
+    type: "image/gif",
+    uploaded: 0,
+    url: gif.original.url,
+  };
 }
 
 /** Record the provider's share event after the user chooses a GIF. */

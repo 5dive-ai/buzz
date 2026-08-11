@@ -23,7 +23,7 @@ export const MessageComposerToolbar = React.memo(
     editor,
     extraActions,
     formattingDisabled,
-    gifUploadController,
+    gifMediaController,
     isEmojiPickerOpen,
     isFormattingOpen,
     isSending,
@@ -41,10 +41,7 @@ export const MessageComposerToolbar = React.memo(
     editor: Editor | null;
     extraActions?: React.ReactNode;
     formattingDisabled: boolean;
-    gifUploadController: Pick<
-      MediaUploadController,
-      "setUploadState" | "uploadFile"
-    >;
+    gifMediaController: Pick<MediaUploadController, "setPendingImeta">;
     isEmojiPickerOpen: boolean;
     isFormattingOpen: boolean;
     isSending: boolean;
@@ -200,7 +197,7 @@ export const MessageComposerToolbar = React.memo(
                 </Tooltip>
                 <ComposerEmojiPicker
                   disabled={composerDisabled}
-                  gifUploadController={gifUploadController}
+                  gifMediaController={gifMediaController}
                   onClose={() => editor?.commands.focus()}
                   onEmojiSelect={onEmojiSelect}
                   onOpenChange={onEmojiPickerOpenChange}

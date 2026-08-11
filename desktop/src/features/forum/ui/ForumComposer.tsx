@@ -562,7 +562,7 @@ export function ForumComposer({
                 ) : undefined
               }
               formattingDisabled={disabled ?? false}
-              gifUploadController={media}
+              gifMediaController={media}
               isEmojiPickerOpen={isEmojiPickerOpen}
               isFormattingOpen={isFormattingOpen}
               isSending={isSending ?? false}

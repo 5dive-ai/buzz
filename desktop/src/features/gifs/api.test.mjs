@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { klipyGifFilename, normalizeKlipyGifs } from "./api.ts";
+import {
+  klipyGifAttachment,
+  klipyGifFilename,
+  normalizeKlipyGifs,
+} from "./api.ts";
 
 const GIF_ASSET = {
   url: "https://static.klipy.com/example.gif",
@@ -46,13 +50,35 @@ test("normalizeKlipyGifs omits ads and malformed file records", () => {
 });
 
 test("klipyGifFilename sanitizes provider slugs", () => {
-  const filename = klipyGifFilename({
+  const gif = {
     id: 1,
     original: GIF_ASSET,
     preview: GIF_ASSET,
     slug: "  That's a wrap!  ",
     title: "That's a wrap",
-  });
+  };
+
+  const filename = klipyGifFilename(gif);
 
   assert.equal(filename, "that-s-a-wrap.gif");
+});
+
+test("klipyGifAttachment references KLIPY media without an uploaded copy", () => {
+  const attachment = klipyGifAttachment({
+    id: 1,
+    original: GIF_ASSET,
+    preview: GIF_ASSET,
+    slug: "ship-it",
+    title: "Ship it",
+  });
+
+  assert.deepEqual(attachment, {
+    dim: "640x360",
+    filename: "ship-it.gif",
+    sha256: "",
+    size: 42,
+    type: "image/gif",
+    uploaded: 0,
+    url: GIF_ASSET.url,
+  });
 });

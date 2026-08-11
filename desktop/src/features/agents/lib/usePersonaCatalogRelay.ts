@@ -7,7 +7,10 @@ import {
 } from "@/features/agents/lib/personaCatalogRelay";
 import { invalidatePersonaEditCaches } from "@/features/agents/lib/personaEditCaches";
 import { relayClient } from "@/shared/api/relayClient";
-import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
+import {
+  refetchOnFocusWhenOld,
+  useFocusedRefetchInterval,
+} from "@/shared/lib/useDocumentVisible";
 import {
   setPersonaShared,
   updatePersonaAndPublish,
@@ -27,7 +30,7 @@ export function usePersonaCatalogQuery(communityId: string | null) {
     queryFn: fetchPersonaCatalogPublications,
     staleTime: 30_000,
     refetchInterval,
-    refetchOnWindowFocus: true,
+    refetchOnWindowFocus: refetchOnFocusWhenOld,
   });
 }
 

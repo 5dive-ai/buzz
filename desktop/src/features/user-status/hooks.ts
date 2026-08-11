@@ -8,7 +8,10 @@ import type {
   UserStatusLookup,
 } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
-import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
+import {
+  refetchOnFocusWhenOld,
+  useFocusedRefetchInterval,
+} from "@/shared/lib/useDocumentVisible";
 import { KIND_USER_STATUS } from "@/shared/constants/kinds";
 
 function normalizePubkeys(pubkeys: string[]) {
@@ -78,7 +81,7 @@ export function useUserStatusQuery(pubkeys: string[]) {
     },
     staleTime: 60_000,
     refetchInterval,
-    refetchOnWindowFocus: true,
+    refetchOnWindowFocus: refetchOnFocusWhenOld,
   });
 }
 

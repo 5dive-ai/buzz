@@ -10,7 +10,10 @@ import {
   setCustomEmoji,
 } from "@/shared/api/customEmoji";
 import { relayClient } from "@/shared/api/relayClient";
-import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
+import {
+  refetchOnFocusWhenOld,
+  useFocusedRefetchInterval,
+} from "@/shared/lib/useDocumentVisible";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 
 /**
@@ -38,7 +41,7 @@ export function useCustomEmojiQuery() {
     // but poll every 2 minutes as a backstop for any missed live event.
     staleTime: 60_000,
     refetchInterval,
-    refetchOnWindowFocus: true,
+    refetchOnWindowFocus: refetchOnFocusWhenOld,
   });
 }
 

@@ -19,6 +19,7 @@ import {
 import { updateCachedChannelMemberDisplayName } from "@/features/channels/channelMemberProfileCache";
 import { evictUsersBatchEntries } from "@/features/profile/hooks";
 import {
+  refetchOnFocusWhenOld,
   useAppFocused,
   useFocusedRefetchInterval,
 } from "@/shared/lib/useDocumentVisible";
@@ -340,7 +341,7 @@ export function useRelayAgentsQuery(options?: { enabled?: boolean }) {
     // reconcile (kinds PERSONA/TEAM/MANAGED_AGENT), never for kind:10100. So we
     // keep polling but at a relaxed cadence and pause it while backgrounded.
     refetchInterval,
-    refetchOnWindowFocus: true,
+    refetchOnWindowFocus: refetchOnFocusWhenOld,
     enabled: options?.enabled,
   });
 }
@@ -364,7 +365,7 @@ export function useManagedAgentsQuery(options?: { enabled?: boolean }) {
         ? 5_000
         : false;
     },
-    refetchOnWindowFocus: true,
+    refetchOnWindowFocus: refetchOnFocusWhenOld,
   });
 }
 

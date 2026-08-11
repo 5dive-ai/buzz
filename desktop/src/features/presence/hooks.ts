@@ -7,7 +7,10 @@ import { useRelayConnection } from "@/shared/api/useRelayConnection";
 import { getOsIdleSeconds } from "@/shared/api/osIdle";
 import { getPresence } from "@/shared/api/tauri";
 import { normalizePubkey } from "@/shared/lib/pubkey";
-import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
+import {
+  refetchOnFocusWhenOld,
+  useFocusedRefetchInterval,
+} from "@/shared/lib/useDocumentVisible";
 import {
   mergePresenceUpdate,
   parseLivePresenceEvent,
@@ -95,7 +98,7 @@ export function usePresenceQuery(
     // (crashed clients). WS events handle the fast path. Pause on degraded
     // connections — HTTP presence calls fail anyway and consume relay quota.
     refetchInterval,
-    refetchOnWindowFocus: true,
+    refetchOnWindowFocus: refetchOnFocusWhenOld,
   });
 }
 

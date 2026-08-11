@@ -1,5 +1,23 @@
 import * as React from "react";
 
+export const FOCUS_RETURN_STALE_TIME_MS = 5 * 60_000;
+
+export function shouldRefetchOnFocus(
+  state: { dataUpdatedAt: number; status: string },
+  now = Date.now(),
+): boolean | "always" {
+  if (state.status !== "success" || state.dataUpdatedAt <= 0) return "always";
+  const ageMs = now - state.dataUpdatedAt;
+  if (ageMs < 0) return "always";
+  return ageMs >= FOCUS_RETURN_STALE_TIME_MS;
+}
+
+export function refetchOnFocusWhenOld(query: {
+  state: { dataUpdatedAt: number; status: string };
+}): boolean | "always" {
+  return shouldRefetchOnFocus(query.state);
+}
+
 export function isDocumentVisible(): boolean {
   if (typeof document === "undefined") return true;
   return document.visibilityState === "visible";

@@ -179,4 +179,4 @@ strip = true
 # portion of durch/rust-s3#449 (including refresh and loopback protections).
 # Revert to crates.io once that support is released upstream.
 [patch.crates-io]
-aws-creds = { git = "https://github.com/LockedThread/rust-s3", rev = "811c4245eb9cc7527ab374288174f59041aca454" }
+aws-creds = { git = "https://github.com/durch/rust-s3", rev = "811c4245eb9cc7527ab374288174f59041aca454" }

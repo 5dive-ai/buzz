@@ -1,4 +1,5 @@
 import { Images, Smile, SmilePlus } from "lucide-react";
+import { motion, useReducedMotion } from "motion/react";
 import * as React from "react";
 
 import { EmojiPicker } from "@/features/custom-emoji/ui/EmojiPicker";
@@ -26,6 +27,11 @@ type ComposerEmojiPickerProps = {
   open: boolean;
 };
 
+type ComposerPickerTab = "emoji" | "gifs";
+
+const PICKER_TAB_ORDER: ComposerPickerTab[] = ["emoji", "gifs"];
+const ACTIVE_TAB_OUTER_CORNER_RADIUS = "calc(var(--radius-2xl) - 0.375rem)";
+
 export const ComposerEmojiPicker = React.memo(function ComposerEmojiPicker({
   disabled = false,
   gifMediaController,
@@ -35,6 +41,13 @@ export const ComposerEmojiPicker = React.memo(function ComposerEmojiPicker({
   onTriggerMouseDown,
   open,
 }: ComposerEmojiPickerProps) {
+  const [pickerTab, setPickerTab] = React.useState<ComposerPickerTab>("emoji");
+  const shouldReduceMotion = useReducedMotion();
+
+  React.useEffect(() => {
+    if (!open) setPickerTab("emoji");
+  }, [open]);
+
   const handleGifSelect = React.useCallback(
     (gif: KlipyGif) => {
       onOpenChange(false);
@@ -88,15 +101,49 @@ export const ComposerEmojiPicker = React.memo(function ComposerEmojiPicker({
         sideOffset={10}
       >
         <Tabs
-          className="w-[352px] overflow-hidden rounded-2xl bg-popover"
-          defaultValue="emoji"
+          className="w-[352px] overflow-hidden rounded-2xl bg-muted"
+          onValueChange={(value) => setPickerTab(value as ComposerPickerTab)}
+          value={pickerTab}
         >
-          <TabsList className="h-11 w-full rounded-none border-b border-border/60 bg-popover p-1.5">
-            <TabsTrigger className="h-8 flex-1 gap-1.5" value="emoji">
+          <TabsList className="relative isolate grid h-11 w-full grid-cols-2 overflow-hidden rounded-none border-b border-border/60 bg-muted p-1.5 text-muted-foreground">
+            <motion.div
+              animate={{
+                transform: `translateX(${PICKER_TAB_ORDER.indexOf(pickerTab) * 100}%)`,
+              }}
+              aria-hidden="true"
+              className="absolute bottom-1.5 left-1.5 top-1.5 z-0 rounded-md bg-background shadow"
+              initial={false}
+              style={{
+                borderTopLeftRadius:
+                  pickerTab === "emoji"
+                    ? ACTIVE_TAB_OUTER_CORNER_RADIUS
+                    : undefined,
+                borderTopRightRadius:
+                  pickerTab === "gifs"
+                    ? ACTIVE_TAB_OUTER_CORNER_RADIUS
+                    : undefined,
+                width: "calc((100% - 12px) / 2)",
+              }}
+              transition={
+                shouldReduceMotion
+                  ? { duration: 0 }
+                  : {
+                      duration: 0.18,
+                      ease: [0.77, 0, 0.175, 1],
+                    }
+              }
+            />
+            <TabsTrigger
+              className="relative z-10 h-8 gap-1.5 bg-transparent shadow-none transition-colors data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+              value="emoji"
+            >
               <Smile aria-hidden className="h-4 w-4" />
               Emoji
             </TabsTrigger>
-            <TabsTrigger className="h-8 flex-1 gap-1.5" value="gifs">
+            <TabsTrigger
+              className="relative z-10 h-8 gap-1.5 bg-transparent shadow-none transition-colors data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+              value="gifs"
+            >
               <Images aria-hidden className="h-4 w-4" />
               GIFs
             </TabsTrigger>

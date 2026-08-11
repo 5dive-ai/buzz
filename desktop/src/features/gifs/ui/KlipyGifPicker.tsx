@@ -50,8 +50,8 @@ export const KlipyGifPicker = React.memo(function KlipyGifPicker({
   });
 
   return (
-    <div className="flex h-[435px] w-[352px] flex-col bg-popover text-popover-foreground">
-      <div className="border-b border-border/60 p-2.5">
+    <div className="flex h-[435px] w-[352px] flex-col bg-muted text-foreground">
+      <div className="p-2.5">
         <div className="relative">
           <Search
             aria-hidden
@@ -60,7 +60,7 @@ export const KlipyGifPicker = React.memo(function KlipyGifPicker({
           <Input
             aria-label="Search KLIPY"
             autoFocus
-            className="h-9 pl-8 pr-8"
+            className="h-9 bg-background/75 pl-8 pr-8 hover:bg-background/85 focus-visible:bg-background focus-visible:ring-ring/40"
             disabled={!configured}
             onChange={(event) => setSearch(event.target.value)}
             placeholder="Search KLIPY"

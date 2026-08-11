@@ -112,6 +112,10 @@ pub struct TurnContext<'a> {
     /// buzz-agent holds this across turns itself now that the turn's
     /// conversation is in memory rather than in goose's database.
     pub history: &'a [Message],
+    /// Provider and model config for this turn. Read from here rather than
+    /// from goose's `Agent`, which resolves the config out of its session
+    /// store; see [`crate::model`].
+    pub model: &'a crate::model::SessionModel,
 }
 
 /// Drive one `session/prompt` turn to completion.
@@ -333,16 +337,8 @@ async fn infer(
     conversation: &Conversation,
     tokens: &mut super::agent::TurnTokens,
 ) -> Result<Option<Message>, AgentError> {
-    let provider = ctx
-        .agent
-        .provider()
-        .await
-        .map_err(|e| AgentError::Llm(e.to_string()))?;
-    let model_config = ctx
-        .agent
-        .model_config_for_session(ctx.session_id)
-        .await
-        .map_err(|e| AgentError::LlmModelNotFound(e.to_string()))?;
+    let provider = ctx.model.provider().await;
+    let model_config = ctx.model.config().await;
 
     let system_prompt = ctx.prompt.build(&session.working_dir).await;
     let tools = ctx.agent.list_tools(ctx.session_id, None).await;
@@ -467,7 +463,7 @@ async fn maybe_compact(
     state: &mut crate::turn_state::TurnState,
 ) -> anyhow::Result<()> {
     let conversation = state.conversation();
-    let provider = ctx.agent.provider().await?;
+    let provider = ctx.model.provider().await;
 
     if !goose::context_mgmt::check_if_compaction_needed(
         provider.as_ref(),
@@ -480,7 +476,7 @@ async fn maybe_compact(
         return Ok(());
     }
 
-    let model_config = ctx.agent.model_config_for_session(ctx.session_id).await?;
+    let model_config = ctx.model.config().await;
     let result = goose::context_mgmt::compact_messages(
         provider.as_ref(),
         &model_config,

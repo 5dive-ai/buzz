@@ -28,6 +28,7 @@ pub mod hints;
 pub mod hooks;
 pub mod loop_drive;
 pub mod mesh;
+pub mod model;
 pub mod ops;
 pub mod prompt;
 pub mod session_store;
@@ -78,6 +79,9 @@ struct Session {
     history: Vec<goose_provider_types::conversation::message::Message>,
     /// Working directory for the session, as given at `session/new`.
     working_dir: std::path::PathBuf,
+    /// Provider + model config in force. Held by buzz rather than pushed into
+    /// goose's `Agent`, because `update_provider` writes to the session store.
+    model: crate::model::SessionModel,
     busy: bool,
     /// Set for the duration of a turn; advertised to steer-capable clients.
     active_run_id: Option<String>,
@@ -130,6 +134,7 @@ async fn build_agent(
     (
         Arc<Agent>,
         String,
+        crate::model::SessionModel,
         Option<String>,
         crate::prompt::SessionPrompt,
     ),
@@ -148,15 +153,20 @@ async fn build_agent(
         GoosePlatform::GooseCli,
     ));
 
-    // A session id, not a database row. `Agent::update_provider` and
-    // `model_config_for_session` want an id to key on, but the conversation
-    // itself never goes to goose's store -- see `crate::turn_state`.
+    // One session row, and it is genuinely required -- I tried removing it.
     //
-    // The row still gets created because `update_provider` persists the
-    // provider/model config against it, and that is the one write we cannot
-    // decline without losing the model config goose reads back for the
-    // context limit. Nothing else is written: a full conversation adds zero
-    // message rows.
+    // `Agent::add_extension_inner` (goose agent.rs:1465) resolves the
+    // extension's working directory by loading the session from the store, and
+    // fails setup outright if the row is absent: "Failed to get session ...
+    // Session not found". Every MCP server buzz mounts goes through that path,
+    // so without the row an agent has no tools at all.
+    //
+    // Nothing else needs it. The conversation stays in memory
+    // (`crate::turn_state`) and the provider config stays on buzz's own handle
+    // (`crate::model`), so a conversation of any length adds zero further
+    // rows. Removing this last one means an upstream change: goose would have
+    // to take the working directory as an argument rather than reading it back
+    // out of the session.
     let session = session_manager
         .create_session(
             std::path::PathBuf::from(cwd),
@@ -166,11 +176,8 @@ async fn build_agent(
         )
         .await
         .map_err(|e| AgentError::Llm(format!("session create: {e}")))?;
+    let session_id = session.id;
 
-    // Provider. `Agent::with_config` starts with no provider set, so this is
-    // mandatory before the first `reply()` — otherwise the turn fails with
-    // "Provider not set".
-    //
     // Provider/model names come from the `GOOSE_*` variables `Config::from_env`
     // projected out of the `BUZZ_AGENT_*` ones; goose's registry owns base-url
     // and credential resolution from there.
@@ -186,10 +193,10 @@ async fn build_agent(
         goose::model_config::model_config_from_user_config(&provider_name, &model_name)
             .map_err(|e| AgentError::LlmModelNotFound(e.to_string()))?;
 
-    agent
-        .update_provider(provider, model_config, &session.id)
-        .await
-        .map_err(|e| map_provider_error(&e.to_string()))?;
+    // Held here rather than pushed into the `Agent` with `update_provider`:
+    // that call writes the provider config to goose's sqlite session row, and
+    // buzz reads the provider and config back through `SessionModel` anyway.
+    let model = crate::model::SessionModel::new(provider, model_config);
 
     // Persona. This is the seam that does NOT work over plain ACP: goose's own
     // ACP server never reads `systemPrompt` (rg finds zero hits in
@@ -226,7 +233,7 @@ async fn build_agent(
             available_tools: Vec::new(),
         };
 
-        if let Err(e) = agent.add_extension(ext, &session.id).await {
+        if let Err(e) = agent.add_extension(ext, &session_id).await {
             // Match buzz-agent: a failed MCP server is a hard session error,
             // not a silently tool-less agent.
             return Err(AgentError::Mcp(format!("{}: {e}", server.name)));
@@ -285,7 +292,7 @@ async fn build_agent(
     // also make them undispatchable — which would break the veto. They stay
     // visible; `hook_tool_guidance()` tells the model to leave them alone.
     let mut hook_extension = None;
-    for tool in agent.list_tools(&session.id, None).await {
+    for tool in agent.list_tools(&session_id, None).await {
         if tool.name.ends_with("___Stop") {
             hook_extension = tool
                 .name
@@ -302,7 +309,7 @@ async fn build_agent(
         tracing::info!(extension = %ext, "lifecycle hooks available");
     }
 
-    Ok((agent, session.id, hook_extension, prompt))
+    Ok((agent, session_id, model, hook_extension, prompt))
 }
 
 /// Keep the model's hands off the lifecycle hooks.
@@ -515,7 +522,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
         .await;
     }
 
-    let (agent, goose_session_id, hook_extension, prompt) =
+    let (agent, goose_session_id, model, hook_extension, prompt) =
         match build_agent(&app.cfg, &p.cwd, p.system_prompt.as_deref(), &p.mcp_servers).await {
             Ok(v) => v,
             Err(e) => {
@@ -526,7 +533,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
     let sid = format!("ses_{}", goose_session_id);
 
     // Keep a handle for catalog discovery below; the Session takes ownership.
-    let session_agent = agent.clone();
+    let session_model = model.clone();
     let current_model = app
         .cfg
         .model
@@ -553,6 +560,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
                 goose_session_id,
                 history: Vec::new(),
                 working_dir: std::path::PathBuf::from(&p.cwd),
+                model,
                 busy: false,
                 active_run_id: None,
                 cancel: None,
@@ -581,7 +589,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
     // cannot call it. The underlying data is public, though:
     // `Provider::fetch_supported_models` (goose-provider-types/base.rs:425).
     let mut result = json!({ "sessionId": sid });
-    if let Some(models) = discover_models(&session_agent, &current_model).await {
+    if let Some(models) = discover_models(&session_model, &current_model).await {
         result["models"] = models;
     }
 
@@ -598,8 +606,8 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
 /// `fetch_supported_models` defaults to an empty list). A missing catalog is
 /// degraded UX, never a session failure — buzz-agent's Databricks discovery
 /// made the same choice (`catalog.rs:52-80`).
-async fn discover_models(agent: &Arc<Agent>, current_model: &str) -> Option<Value> {
-    let provider = agent.provider().await.ok()?;
+async fn discover_models(model: &crate::model::SessionModel, current_model: &str) -> Option<Value> {
+    let provider = model.provider().await;
     let ids = provider.fetch_supported_models().await.ok()?;
 
     let mut available: Vec<Value> = ids
@@ -666,6 +674,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
         steers,
         history,
         working_dir,
+        model,
     ) = {
         let mut sessions = app.sessions.lock().await;
         let Some(s) = sessions.get_mut(&p.session_id) else {
@@ -700,12 +709,13 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             s.steers.clone(),
             s.history.clone(),
             s.working_dir.clone(),
+            s.model.clone(),
         )
     };
 
     // Apply a pending `session/set_model` before the turn starts.
     if let Some(model_id) = pending_model {
-        if let Err(e) = apply_model(&agent, &goose_session_id, &model_id).await {
+        if let Err(e) = apply_model(&model, &model_id).await {
             {
                 let mut sessions = app.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(&p.session_id) {
@@ -742,6 +752,7 @@ async fn session_prompt(app: &Arc<App>, id: Value, params: Value, wire_tx: &Wire
             steers: &steers,
             working_dir,
             history: &history,
+            model: &model,
         },
         goose_provider_types::conversation::message::Message::user()
             .with_text(agent::prompt_to_text(&p.prompt)),
@@ -1040,19 +1051,14 @@ fn env_first(keys: &[&str]) -> Option<String> {
         .find(|v| !v.trim().is_empty())
 }
 
-async fn apply_model(
-    agent: &Arc<Agent>,
-    session_id: &str,
-    model_id: &str,
-) -> Result<(), AgentError> {
+async fn apply_model(model: &crate::model::SessionModel, model_id: &str) -> Result<(), AgentError> {
     let provider_name = std::env::var("GOOSE_PROVIDER").unwrap_or_else(|_| "openai".to_string());
     let provider = build_provider(&provider_name).await?;
     let model_config = goose::model_config::model_config_from_user_config(&provider_name, model_id)
         .map_err(|e| AgentError::LlmModelNotFound(e.to_string()))?;
-    agent
-        .update_provider(provider, model_config, session_id)
-        .await
-        .map_err(|e| map_provider_error(&e.to_string()))?;
+    // Swapped on buzz's own handle. `Agent::update_provider` would do the same
+    // thing plus a write to goose's session row; see [`crate::model`].
+    model.set(provider, model_config).await;
     Ok(())
 }
 

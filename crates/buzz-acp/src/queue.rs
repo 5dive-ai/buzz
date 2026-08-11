@@ -718,6 +718,13 @@ impl EventQueue {
         true
     }
 
+    /// Return whether this channel has any native-steer reservation in flight.
+    pub fn has_native_steer_reservations(&self, channel_id: Uuid) -> bool {
+        self.withheld_native_steer
+            .get(&channel_id)
+            .is_some_and(|entries| !entries.is_empty())
+    }
+
     /// Return whether this exact event still owns a native-steer reservation.
     ///
     /// Async edit preparation uses this at completion time: deadline recovery,
@@ -4688,6 +4695,8 @@ mod tests {
         q.in_flight_deadlines.insert(ch, Instant::now());
         q.in_flight_batch_sizes.insert(ch, 1);
         assert!(q.mark_native_steer_pending(ch, &event_id));
+        assert!(q.has_native_steer_reservations(ch));
+        assert!(q.has_native_steer_reservation(ch, &event_id));
 
         // Force the in-flight deadline to be in the past, simulating the
         // steer ack never arriving and the read loop hanging long enough
@@ -4705,6 +4714,8 @@ mod tests {
 
         // The withheld event has been moved back to `queues[ch]`.
         assert!(q.withheld_native_steer.is_empty());
+        assert!(!q.has_native_steer_reservations(ch));
+        assert!(!q.has_native_steer_reservation(ch, &event_id));
         assert_eq!(pending_count(&q), 1);
 
         // Normal dispatch delivers it.

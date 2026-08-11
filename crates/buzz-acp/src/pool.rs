@@ -698,6 +698,21 @@ impl AgentPool {
         &mut self.task_map
     }
 
+    /// Return whether the current channel task can accept a native steer now.
+    ///
+    /// This is a main-loop preflight for edit enrichment: avoid withholding an
+    /// edit and performing REST work when the task has no steer transport or
+    /// its capacity-one request slot is already occupied. Availability can
+    /// still change while enrichment runs, so callers must retain the normal
+    /// send-time fallback.
+    pub fn native_steer_available(&self, channel_id: Uuid) -> bool {
+        self.task_map
+            .values()
+            .find(|meta| meta.channel_id == Some(channel_id))
+            .and_then(|meta| meta.steer_tx.as_ref())
+            .is_some_and(|tx| !tx.is_closed() && tx.capacity() > 0)
+    }
+
     /// Try to send a goose-native steer request to the in-flight task for
     /// `channel_id`.
     ///

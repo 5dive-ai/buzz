@@ -2622,7 +2622,19 @@ async fn tokio_main() -> Result<()> {
                                     // agent.
                                     let native_attempted = if matches!(signal, ControlSignal::Steer)
                                     {
-                                        if queue::edit_target_id(&event_for_steer).is_some() {
+                                        let is_edit =
+                                            queue::edit_target_id(&event_for_steer).is_some();
+                                        if queue.has_native_steer_reservations(
+                                            buzz_event.channel_id,
+                                        ) {
+                                            tracing::debug!(
+                                                channel_id = %buzz_event.channel_id,
+                                                "native steer preparation already pending; preserving channel order via cancel+merge"
+                                            );
+                                            false
+                                        } else if is_edit
+                                            && pool.native_steer_available(buzz_event.channel_id)
+                                        {
                                             let event_id = event_for_steer.id.to_hex();
                                             let channel_id = buzz_event.channel_id;
                                             match reserve_native_edit_preparation(
@@ -2660,6 +2672,12 @@ async fn tokio_main() -> Result<()> {
                                                     false
                                                 }
                                             }
+                                        } else if is_edit {
+                                            tracing::debug!(
+                                                channel_id = %buzz_event.channel_id,
+                                                "native edit steer unavailable before preparation; falling back to cancel+merge"
+                                            );
+                                            false
                                         } else {
                                             let prompt_blocks =
                                                 pool::format_native_steer_prompt_sync(

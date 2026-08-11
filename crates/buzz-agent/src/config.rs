@@ -199,10 +199,6 @@ impl Config {
         if let Some(ctx) = env_str("BUZZ_AGENT_MAX_CONTEXT_TOKENS") {
             set_if_absent("GOOSE_CONTEXT_LIMIT", &ctx);
         }
-
-        // `BUZZ_AGENT_PREFER_MESH_FOR_AUTO` is consumed in `build_provider`
-        // (lib.rs), not here: it selects a provider *wrapper* rather than an
-        // env var goose reads. See `mesh.rs`.
     }
 }
 

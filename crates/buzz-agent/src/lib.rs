@@ -27,7 +27,6 @@ pub mod config;
 pub mod hints;
 pub mod hooks;
 pub mod loop_drive;
-pub mod mesh;
 pub mod model;
 pub mod ops;
 pub mod prompt;
@@ -1004,51 +1003,17 @@ async fn cancel_session(app: &Arc<App>, params: Value) {
 /// registry) and installs it with the new `ModelConfig`. `SharedProvider` is an
 /// `Arc<Mutex<Option<..>>>` precisely so this is hot-swappable
 /// (goose `agents/types.rs:11-12`).
-/// Construct the goose provider, wrapping it in Buzz's relay-mesh `auto`
-/// policy when the desktop asked for it.
+/// Construct the goose provider.
 ///
-/// `BUZZ_AGENT_PREFER_MESH_FOR_AUTO=1` is set on every relay-mesh agent
-/// (`desktop/src-tauri/src/managed_agents/relay_mesh.rs:41-44`). It means "when
-/// the configured model is `auto`, dynamically use mesh-llm's virtual
-/// Mixture-of-Agents model whenever the live catalog can support it". Goose
-/// resolves a model once per session and has no hook for that, so
-/// [`mesh::MeshAutoProvider`] re-resolves per request instead — see that module
-/// for why this is only possible with goose-as-a-library.
+/// Relay-mesh `auto` is resolved by the desktop before spawn
+/// (`managed_agents/relay_mesh.rs:relay_mesh_wire_model`), so buzz-agent sends
+/// whatever model it was given and does not know meshes exist (#5289).
 async fn build_provider(
     provider_name: &str,
 ) -> Result<Arc<dyn goose::providers::base::Provider>, AgentError> {
-    let provider = goose::providers::create(provider_name, Vec::new())
+    goose::providers::create(provider_name, Vec::new())
         .await
-        .map_err(|e| map_provider_error(&e.to_string()))?;
-
-    let prefer_mesh = std::env::var("BUZZ_AGENT_PREFER_MESH_FOR_AUTO")
-        .is_ok_and(|v| !v.trim().is_empty() && v != "0");
-    if !prefer_mesh {
-        return Ok(provider);
-    }
-
-    // The policy needs to poll the router's own `/models`, so it needs the
-    // base URL and key. Without them there is nothing to probe, and silently
-    // pinning `auto` would look like MoA is broken.
-    let Some(base_url) = env_first(&["OPENAI_BASE_URL", "OPENAI_COMPAT_BASE_URL"]) else {
-        tracing::warn!(
-            "BUZZ_AGENT_PREFER_MESH_FOR_AUTO is set but no OpenAI base URL is \
-             configured; relay-mesh auto policy disabled"
-        );
-        return Ok(provider);
-    };
-    let api_key = env_first(&["OPENAI_API_KEY", "OPENAI_COMPAT_API_KEY"]).unwrap_or_default();
-
-    tracing::info!(%base_url, "relay-mesh auto policy enabled");
-    Ok(Arc::new(mesh::MeshAutoProvider::new(
-        provider, base_url, api_key,
-    )))
-}
-
-fn env_first(keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .filter_map(|k| std::env::var(k).ok())
-        .find(|v| !v.trim().is_empty())
+        .map_err(|e| map_provider_error(&e.to_string()))
 }
 
 async fn apply_model(model: &crate::model::SessionModel, model_id: &str) -> Result<(), AgentError> {

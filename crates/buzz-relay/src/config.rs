@@ -342,7 +342,12 @@ fn pg_timeout_or_default(raw: Option<&str>, default: &str) -> String {
     let unit = unit.trim().to_ascii_lowercase();
 
     match pg_timeout_millis(magnitude, &unit) {
-        Some(millis) if millis <= buzz_db::PG_TIMEOUT_MAX_MILLIS => candidate.to_string(),
+        // Return the spelling we validated. PostgreSQL's timeout units are
+        // case-sensitive, so returning `candidate` here would let `45S` pass
+        // validation and then fail every pool's `after_connect`.
+        Some(millis) if millis <= buzz_db::PG_TIMEOUT_MAX_MILLIS => {
+            format!("{magnitude}{unit}")
+        }
         Some(millis) => {
             tracing::warn!(
                 value = candidate,
@@ -1126,6 +1131,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Connection;
 
     // Mutex to serialize tests that mutate environment variables.
     // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
@@ -1344,10 +1350,17 @@ mod tests {
 
     #[test]
     fn pg_timeout_accepts_postgres_spellings_and_refuses_the_rest() {
-        for accepted in ["30s", "500ms", "0", "45S", "2min", " 10s "] {
+        for (accepted, canonical) in [
+            ("30s", "30s"),
+            ("500ms", "500ms"),
+            ("0", "0"),
+            ("45S", "45s"),
+            ("2MIN", "2min"),
+            (" 10 H ", "10h"),
+        ] {
             assert_eq!(
                 pg_timeout_or_default(Some(accepted), "30s"),
-                accepted.trim(),
+                canonical,
                 "{accepted} is a valid Postgres timeout"
             );
         }
@@ -1363,6 +1376,41 @@ mod tests {
         }
 
         assert_eq!(pg_timeout_or_default(None, "5s"), "5s");
+    }
+
+    /// Every supported unit spelling emitted by the parser must be usable by
+    /// PostgreSQL. A parser-only assertion missed that PostgreSQL rejects
+    /// uppercase units even though validation lowercases them.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn pg_timeout_canonical_spellings_are_accepted_by_postgres() {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| {
+                "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string() // sadscan:disable np.postgres.1
+            });
+        let mut connection = sqlx::PgConnection::connect(&database_url)
+            .await
+            .expect("connect test Postgres");
+
+        for (raw, canonical) in [
+            ("500US", "500us"),
+            ("500MS", "500ms"),
+            ("2S", "2s"),
+            ("2MIN", "2min"),
+            ("2H", "2h"),
+            ("2D", "2d"),
+            ("0", "0"),
+            (" 10 S ", "10s"),
+        ] {
+            let parsed = pg_timeout_or_default(Some(raw), "30s");
+            assert_eq!(parsed, canonical);
+            buzz_db::apply_runtime_connection_timeouts(&mut connection, &parsed, &parsed)
+                .await
+                .unwrap_or_else(|error| panic!("{raw:?} normalized to {parsed:?}: {error}"));
+        }
+
+        connection.close().await.expect("close test Postgres");
     }
 
     #[test]
@@ -1431,6 +1479,12 @@ mod tests {
         let overridden = Config::from_env().expect("config");
         assert_eq!(overridden.db_statement_timeout, "90s");
         assert_eq!(overridden.db_lock_timeout, "250ms");
+
+        std::env::set_var("BUZZ_DB_STATEMENT_TIMEOUT", "45S");
+        std::env::set_var("BUZZ_DB_LOCK_TIMEOUT", " 2 MIN ");
+        let canonicalized = Config::from_env().expect("config");
+        assert_eq!(canonicalized.db_statement_timeout, "45s");
+        assert_eq!(canonicalized.db_lock_timeout, "2min");
 
         std::env::set_var("BUZZ_DB_STATEMENT_TIMEOUT", "half a minute");
         let junk = Config::from_env().expect("config");

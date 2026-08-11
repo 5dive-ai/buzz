@@ -53,9 +53,9 @@ import { hasLinkPreviewSuppression } from "@/features/messages/lib/formatTimelin
 import { toast } from "sonner";
 import { MessageAgentOwner } from "./MessageAgentOwner";
 import { MessageAuthorText, MessageHeaderRow } from "./MessageHeader";
+import { MessageStatusMetadata } from "./MessageStatusMetadata";
 import { MessageTimestamp } from "./MessageTimestamp";
 import { WaveMessageAttachment } from "./WaveMessageAttachment";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 
 const DiffMessage = React.lazy(() => import("./DiffMessage"));
 const DiffMessageExpanded = React.lazy(() => import("./DiffMessageExpanded"));
@@ -585,24 +585,10 @@ export const MessageRow = React.memo(
 
     const statusMetadataNode =
       message.pending || message.edited ? (
-        <>
-          {message.pending ? (
-            <p
-              className="font-normal text-muted-foreground/70"
-              data-testid="message-send-status"
-            >
-              Sending…
-            </p>
-          ) : null}
-          {message.edited ? (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <p className="text-muted-foreground/70">(edited)</p>
-              </TooltipTrigger>
-              <TooltipContent>This message has been edited</TooltipContent>
-            </Tooltip>
-          ) : null}
-        </>
+        <MessageStatusMetadata
+          edited={message.edited}
+          pending={message.pending}
+        />
       ) : null;
 
     const inlineMetadataNode = (

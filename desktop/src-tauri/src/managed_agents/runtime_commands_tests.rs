@@ -385,7 +385,10 @@ fn test_workspace_apply_result_applied_but_blocked_sets_fields() {
         Some("provider deploy rejected"),
         "blocked must carry the failure reason"
     );
-    assert!(r.degraded.is_empty(), "degraded must be empty when none passed");
+    assert!(
+        r.degraded.is_empty(),
+        "degraded must be empty when none passed"
+    );
 }
 
 #[test]
@@ -397,7 +400,11 @@ fn test_workspace_apply_result_applied_but_blocked_preserves_degraded_entries() 
     );
     assert!(r.applied, "applied_but_blocked must report applied: true");
     assert!(r.blocked.is_some(), "blocked must be set");
-    assert_eq!(r.degraded.len(), 1, "pre-failure degraded entries must be preserved");
+    assert_eq!(
+        r.degraded.len(),
+        1,
+        "pre-failure degraded entries must be preserved"
+    );
     assert!(r.degraded[0].contains("nest"));
 }
 
@@ -410,8 +417,8 @@ fn test_workspace_apply_result_three_state_distinction() {
     assert!(clean.degraded.is_empty());
 
     // State 2: applied with degradation — applied true, blocked None, degraded non-empty.
-    let degraded = super::super::scope::WorkspaceApplyResult::success()
-        .with_degradation("event sync skipped");
+    let degraded =
+        super::super::scope::WorkspaceApplyResult::success().with_degradation("event sync skipped");
     assert!(degraded.applied);
     assert!(degraded.blocked.is_none());
     assert!(!degraded.degraded.is_empty());

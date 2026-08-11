@@ -350,8 +350,6 @@ async def test_install_stack_requires_the_ca_bundle_on_disk(tmp_path):
 
 
 async def test_forwarder_bridges_the_canonical_relay_address(tmp_path):
-    from harbor_buzz_orchestra.container_runtime import FORWARDER
-
     forwarder = tmp_path / "relay-forwarder"
     forwarder.write_text("ELF")
     rt = runtime(
@@ -1461,8 +1459,6 @@ class _BindsAfter(Environment):
         self._log = ""
 
     async def exec(self, command, env=None, **kwargs):
-        from harbor_buzz_orchestra.container_runtime import FORWARDER
-
         self.commands.append((command, env))
         if command.startswith(": >"):
             self._log = ""
@@ -1504,8 +1500,6 @@ async def test_forwarder_gives_up_after_the_attempt_budget(tmp_path, monkeypatch
 
 async def test_forwarder_does_not_retry_other_failures(tmp_path, monkeypatch):
     """Only EADDRINUSE is transient; a silent forwarder is a real fault."""
-    from harbor_buzz_orchestra.container_runtime import FORWARDER
-
     rt = _forwarder_runtime(tmp_path)
     monkeypatch.setattr(type(rt), "readiness_timeout_seconds", 0.0, raising=False)
     rt.readiness_timeout_seconds = 0.0
@@ -1545,8 +1539,6 @@ async def test_forwarder_from_an_earlier_phase_is_adopted(tmp_path):
     without SO_REUSEADDR, so its accepted sockets hold the port in TIME_WAIT
     for 60s after it exits.
     """
-    from harbor_buzz_orchestra.container_runtime import FORWARDER
-
     rt = _forwarder_runtime(tmp_path)
     environment = _HasLiveForwarder(pid=4242)
 

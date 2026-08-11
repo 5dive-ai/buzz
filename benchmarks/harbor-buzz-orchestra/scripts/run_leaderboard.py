@@ -233,6 +233,9 @@ def build_command(
         "buzz_agent_binary": agent_binaries["buzz-agent"],
         "buzz_dev_mcp_binary": agent_binaries["buzz-dev-mcp"],
         "buzz_cli_binary": binaries["buzz"],
+        "timeout_multiplier": (
+            args.timeout_multiplier if args.timeout_multiplier is not None else 1.0
+        ),
         "run_id": args.job_name,
     }
     if args.relay_gateway:

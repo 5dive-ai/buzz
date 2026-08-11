@@ -49,6 +49,17 @@ def test_pinned_effort_is_part_of_the_condition_hash(manifest_data):
     assert pinned_manifest.sha256 != baseline.sha256
 
 
+def test_timing_signal_is_opt_in_and_part_of_the_condition_hash(manifest_data):
+    baseline = ExperimentManifest.load(copy.deepcopy(manifest_data))
+    explicit_off = ExperimentManifest.load({**manifest_data, "timing_signal": False})
+    enabled = ExperimentManifest.load({**manifest_data, "timing_signal": True})
+
+    assert b"timing_signal" not in baseline.canonical_bytes()
+    assert explicit_off.sha256 == baseline.sha256
+    assert b'"timing_signal":true' in enabled.canonical_bytes()
+    assert enabled.sha256 != baseline.sha256
+
+
 MANIFEST_DIR = pathlib.Path(__file__).resolve().parents[1] / "manifests"
 SHIPPED = sorted(MANIFEST_DIR.glob("*.yaml"))
 

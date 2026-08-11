@@ -107,6 +107,7 @@ def test_command_uses_standard_settings_only(args, binaries, agent_binaries):
     assert any(k.startswith("buzz_acp_binary=") for k in kwargs)
     assert any(k.startswith("buzz_agent_binary=") for k in kwargs)
     assert any(k.startswith("buzz_dev_mcp_binary=") for k in kwargs)
+    assert "timeout_multiplier=1.0" in kwargs
 
 
 def test_agent_binaries_must_exist(tmp_path):

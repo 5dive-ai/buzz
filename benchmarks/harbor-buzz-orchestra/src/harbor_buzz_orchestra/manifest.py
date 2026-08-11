@@ -254,6 +254,10 @@ class ExperimentManifest(StrictModel):
     roster: tuple[AgentClass, ...] = Field(min_length=1)
     prices: dict[str, Price]
     trial_budget: TrialBudget
+    # Opt-in because the line changes the task prompt and therefore the condition.
+    # False is omitted from canonical bytes below so manifests written before this
+    # field existed retain their condition identity.
+    timing_signal: bool = False
     # Absent and empty are the same condition and hash identically, matching
     # how ``generation`` behaves on AgentClass.
     environment: EnvironmentOverrides = Field(default_factory=EnvironmentOverrides)
@@ -285,6 +289,8 @@ class ExperimentManifest(StrictModel):
     def canonical_bytes(self) -> bytes:
         """Return stable UTF-8 JSON independent of YAML formatting and key order."""
         data = self.model_dump(mode="json", exclude_none=False)
+        if not self.timing_signal:
+            data.pop("timing_signal", None)
         # An unpinned `thinking_effort` is dropped rather than serialised as
         # null, so that opening the effort axis did not re-identify every
         # condition that does not use it.

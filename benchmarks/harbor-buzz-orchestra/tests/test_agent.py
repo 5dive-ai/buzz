@@ -103,6 +103,46 @@ async def test_agent_lifecycle_and_context(tmp_path, manifest_data):
     assert context.metadata["trial_id"] == str(context_id)
 
 
+async def test_timing_signal_uses_task_agent_timeout(tmp_path, manifest_data):
+    task_dir = tmp_path / "task"
+    environment_dir = task_dir / "environment"
+    environment_dir.mkdir(parents=True)
+    (task_dir / "task.toml").write_text("[agent]\ntimeout_sec = 900.0\n")
+    environment = SimpleNamespace(
+        context_id=uuid4(),
+        environment_name="hello-world",
+        environment_dir=environment_dir,
+    )
+    manifest_data["timing_signal"] = True
+    agent = BuzzOrchestraAgent(
+        logs_dir=tmp_path,
+        manifest=manifest_data,
+        provisioner=Provisioner(),
+        runtime=Runtime(),
+        timeout_multiplier=3.0,
+    )
+    await agent.run("solve it", environment, AgentContext())
+
+    assert agent.runtime.called["instruction"] == (
+        "solve it\n\n[Trial timing: 2700s total.]"
+    )
+
+
+async def test_timing_signal_off_preserves_instruction(tmp_path, manifest_data):
+    provisioner, runtime = Provisioner(), Runtime()
+    environment = SimpleNamespace(context_id=uuid4(), environment_name="hello-world")
+    agent = BuzzOrchestraAgent(
+        logs_dir=tmp_path,
+        manifest=manifest_data,
+        provisioner=provisioner,
+        runtime=runtime,
+    )
+
+    await agent.run("solve it", environment, AgentContext())
+
+    assert runtime.called["instruction"] == "solve it"
+
+
 async def test_teardown_runs_when_runtime_fails(tmp_path, manifest_data):
     provisioner, runtime, context_id = (
         Provisioner(),

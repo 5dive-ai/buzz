@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tomllib
 from typing import Any
 
 from harbor.agents.base import BaseAgent
@@ -39,6 +40,7 @@ class BuzzOrchestraAgent(BaseAgent):
         buzz_cli_binary: str = "buzz",
         relay_gateway: str = "",
         forwarder_binary: str = "relay-forwarder",
+        timeout_multiplier: float = 1.0,
         run_id: str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -59,6 +61,9 @@ class BuzzOrchestraAgent(BaseAgent):
             forwarder_binary,
         )
         self.run_id = run_id
+        self.timeout_multiplier = float(timeout_multiplier)
+        if self.timeout_multiplier <= 0:
+            raise ValueError("timeout_multiplier must be positive")
 
     @staticmethod
     def name() -> str:
@@ -149,6 +154,31 @@ class BuzzOrchestraAgent(BaseAgent):
         if self.provisioner is not None:
             self.provisioner.healthcheck()
 
+    def _instruction_with_timing(
+        self, instruction: str, environment: BaseEnvironment
+    ) -> str:
+        if not self.manifest.timing_signal:
+            return instruction
+        task_config = Path(environment.environment_dir).parent / "task.toml"
+        try:
+            timeout = float(
+                tomllib.loads(task_config.read_text(encoding="utf-8"))["agent"][
+                    "timeout_sec"
+                ]
+            )
+        except (
+            OSError,
+            tomllib.TOMLDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise RuntimeError(
+                f"cannot resolve task agent timeout from {task_config}"
+            ) from error
+        total_seconds = round(timeout * self.timeout_multiplier)
+        return instruction + f"\n\n[Trial timing: {total_seconds}s total.]"
+
     async def run(
         self,
         instruction: str,
@@ -178,7 +208,7 @@ class BuzzOrchestraAgent(BaseAgent):
             raise RuntimeError("provisioner returned a handle for a different manifest")
         try:
             result = await self.runtime.run(
-                instruction=instruction,
+                instruction=self._instruction_with_timing(instruction, environment),
                 environment=environment,
                 manifest=self.manifest,
                 trial=handle,

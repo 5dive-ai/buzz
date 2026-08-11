@@ -2627,9 +2627,13 @@ async fn tokio_main() -> Result<()> {
                                         if queue.has_native_steer_reservations(
                                             buzz_event.channel_id,
                                         ) {
+                                            let released = queue.release_native_steers(
+                                                buzz_event.channel_id,
+                                            );
                                             tracing::debug!(
                                                 channel_id = %buzz_event.channel_id,
-                                                "native steer preparation already pending; preserving channel order via cancel+merge"
+                                                released,
+                                                "native steer preparation already pending; releasing reservations for ordered cancel+merge"
                                             );
                                             false
                                         } else if is_edit

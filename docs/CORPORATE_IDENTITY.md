@@ -6,6 +6,26 @@ Historical corporate identity approaches based on provider-specific middleware, 
 
 This documentation revision does not include a NIP-FI runtime adapter, activate identity enforcement, or establish conformance. Do not deploy a legacy identity sidecar or trust an identity header as a temporary substitute. A later exact-head implementation and deployment must pass the [behavioral evidence matrix](nips/NIP-FI-CONFORMANCE.md) before discovery or enforcement is enabled.
 
+### Delegation availability
+
+Corporate-identity delegation is currently unsupported. The public production
+path does not implement complete delegated issuance, owner-bound resolution,
+expiry, invalidation, reconnect, or protected-transport behavior. Operators
+must keep delegation disabled, and discovery must report it as false or omit
+it. A legacy or downstream configuration flag does not add the missing
+authority and must not be used to advertise support.
+
+This documentation-only revision does not change runtime code or configuration
+defaults. Operators must verify the effective setting in their deployment;
+public wording alone is not activation or conformance evidence. See the
+[integration guide's availability boundary](NIP_FI_INTEGRATION.md#delegation-availability)
+for the implementation and evidence requirements.
+
+Direct NIP-FI authorization and future delegation are separate capabilities.
+Delegation can be advertised only after a reviewed delegated-owner
+implementation passes the complete applicable cross-transport lifecycle and
+session evidence.
+
 ## Supported boundary
 
 NIP-FI combines a valid issuer assertion with independent fresh Nostr key proof, current durable binding and lifecycle state, server-owned request context, and final application admission. For the trusted-proxy profile, the stock Buzz contract requires cryptographic HMAC provenance bound to the complete canonical request. Header presence and network location alone are insufficient.

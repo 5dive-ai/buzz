@@ -8,6 +8,28 @@ This documentation revision does not add a runtime adapter, activate enforcement
 
 Source review, type presence, configuration parsing, route registration, and prose checks are useful review inputs. None proves runtime behavior.
 
+### Delegation availability
+
+NIP-FI delegation is an optional protocol capability, not an implied Buzz
+feature. The current public production path has no reviewed delegated-owner
+implementation and MUST NOT advertise delegation. Discovery reports
+`"delegation": false` or omits the field, and operators keep delegation
+disabled. A downstream or legacy configuration switch cannot create the
+missing issuance, owner-resolution, expiry, invalidation, reconnect, and
+protected-transport behavior.
+
+This documentation-only revision does not change runtime code or configuration
+defaults. Operators must verify the effective setting in their deployment;
+public wording alone is not evidence that the runtime or its defaults satisfy
+this boundary.
+
+The specification, model, sealed types, and conformance vectors may describe
+future delegation work without claiming that a route is live. Support can be
+advertised only after one reviewed implementation supplies the separate
+delegated-owner capability and passes every applicable delegation and session
+trace across every advertised transport. Until then, any partially wired
+delegation-shaped request must fail closed.
+
 ## Integration boundary
 
 NIP-FI is an additional admission authority above NIP-42 or NIP-98 proof of key control. It does not replace Nostr signatures or application authorization. A protected operation proceeds only when all applicable gates agree:
@@ -129,6 +151,10 @@ See [runtime operations](NIP_FI_RUNTIME_OPERATIONS.md) for preconditions, postco
 ## Sessions and delegation
 
 HTTP authorization applies to one request. A WebSocket lease is per key, domain, capability, resource, and exact dependency set. Its deadline is the earliest applicable assertion, key-snapshot, proxy, proof, binding, delegation, policy, and implementation bound.
+
+This section defines the contract for future delegation support; the current
+[delegation availability](#delegation-availability) statement remains
+controlling for Buzz deployments.
 
 Direct lease reuse rechecks current binding and lifecycle versions, the key-snapshot hard deadline, and JWKS generation. Delegated lease reuse rechecks the current exact owner binding and relationship revision. A lease for one key never covers another key on the connection.
 

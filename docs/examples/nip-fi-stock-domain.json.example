@@ -1,6 +1,7 @@
 {
   "schema": "nip-fi-stock-domain-review-v1",
   "document_role": "review-template-not-runtime-schema",
+  "numeric_values_role": "illustrative-review-values-not-production-defaults",
   "domain": {
     "id": "community.example.test",
     "authority": "community.example.test:443",

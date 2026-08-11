@@ -61,6 +61,50 @@ Hermit pins Rust, `just`, Node, pnpm, and other tools to the versions in
 upfront. If you don't use Hermit, ensure your toolchain meets the minimum
 versions in the table above.
 
+#### Native AWS-LC build requirements
+
+The locked non-FIPS dependency graph includes `aws-lc-rs` and `aws-lc-sys`.
+`aws-lc-sys` compiles bundled AWS-LC sources during a clean build, so Rust
+alone is not sufficient. Contributors need a working platform C/C++ compiler,
+linker, and SDK headers:
+
+- macOS: Xcode Command Line Tools (`xcode-select --install`);
+- Debian/Ubuntu: `build-essential` (also included in the desktop package list
+  below); and
+- Windows: Visual Studio Build Tools with the **Desktop development with C++**
+  workload and a Windows SDK. Windows x86 and x86-64 source builds also need
+  NASM unless the resolved crate features explicitly enable and permit the
+  crate-provided prebuilt objects.
+
+For the versions in `Cargo.lock` (`aws-lc-rs` 1.17.0 and `aws-lc-sys`
+0.41.0), the default non-FIPS build does not require CMake, Go, or bindgen.
+The presence of the `cmake` helper crate in the lockfile or a Hermit-pinned
+`cmake` executable does not by itself make CMake an AWS-LC prerequisite. If an
+upgrade, target, or feature change selects a different builder, update this
+section from the newly locked crate's build requirements in the same change.
+
+On macOS or Linux, verify a fresh-clone bootstrap before a long test run:
+
+```bash
+. ./bin/activate-hermit
+cc --version
+c++ --version
+cargo check --locked --workspace --all-targets
+```
+
+On Windows, use a Developer Command Prompt after making the repository's
+pinned toolchain available on `PATH`:
+
+```text
+cl
+nasm -v
+cargo check --locked --workspace --all-targets
+```
+
+If `aws-lc-sys` fails before Rust compilation starts, verify the native tools
+first. Do not switch cryptographic backends, disable locked features, or add
+unreviewed prebuilt objects to work around a missing contributor toolchain.
+
 ### First-Time Setup
 
 ```bash

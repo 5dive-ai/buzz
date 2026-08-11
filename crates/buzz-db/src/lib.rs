@@ -1396,6 +1396,22 @@ impl Db {
         .transpose()
     }
 
+    /// Rebinds a stale loopback community to the current single-node authority.
+    pub async fn rebind_single_node_community_host(
+        &self,
+        normalized_host: &str,
+        owner_pubkey: &str,
+    ) -> Result<Option<CommunityRecord>> {
+        match &self.backend {
+            DbBackend::SQLite(pool) => {
+                sqlite::rebind_single_node_community_host(pool, normalized_host, owner_pubkey).await
+            }
+            DbBackend::Postgres => Err(DbError::UnsupportedBackend(
+                "single-node community rebind on PostgreSQL Db",
+            )),
+        }
+    }
+
     /// Returns the community's workspace icon (NIP-11 `icon`), if set.
     ///
     /// Set by relay admins/owners via the kind:9033 command; the value is
@@ -2231,19 +2247,6 @@ impl Db {
         actor_pubkey: &[u8],
         emoji: &str,
     ) -> Result<event::ReactionEventInsertOutcome> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            let _ = thread_meta;
-            return sqlite::insert_reaction_event(
-                pool,
-                community_id,
-                event,
-                channel_id,
-                target_event_id,
-                actor_pubkey,
-                emoji,
-            )
-            .await;
-        }
         let outcome = event::insert_reaction_event_with_thread_metadata(
             self.pg_pool()?,
             community_id,
@@ -2855,33 +2858,7 @@ impl Db {
         pubkeys: &[&[u8]],
         created_by: &[u8],
     ) -> Result<(channel::ChannelRecord, bool)> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::open_dm(pool, community_id, pubkeys, created_by, None)
-                    .await?
-                    .ok_or_else(|| DbError::InvalidData("unexpected duplicate DM open".into()))
-            }
-            DbBackend::Postgres => {
-                dm::open_dm(self.pg_pool()?, community_id, pubkeys, created_by).await
-            }
-        }
-    }
-
-    /// Atomically persist a SQLite DM-open command and its channel mutation.
-    /// `None` means the command event was already processed.
-    pub async fn open_dm_sqlite_command(
-        &self,
-        community_id: CommunityId,
-        pubkeys: &[&[u8]],
-        created_by: &[u8],
-        event: &nostr::Event,
-    ) -> Result<Option<(channel::ChannelRecord, bool)>> {
-        match &self.backend {
-            DbBackend::SQLite(pool) => {
-                sqlite::open_dm(pool, community_id, pubkeys, created_by, Some(event)).await
-            }
-            DbBackend::Postgres => Ok(None),
-        }
+        dm::open_dm(self.pg_pool()?, community_id, pubkeys, created_by).await
     }
 
     /// Hide a DM channel for a specific user.
@@ -3318,17 +3295,6 @@ impl Db {
         pubkey: &[u8],
         emoji: &str,
     ) -> Result<bool> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::remove_reaction(
-                pool,
-                community,
-                event_id,
-                event_created_at,
-                pubkey,
-                emoji,
-            )
-            .await;
-        }
         reaction::remove_reaction(
             self.pg_pool()?,
             community,
@@ -3346,10 +3312,6 @@ impl Db {
         community: CommunityId,
         reaction_event_id: &[u8],
     ) -> Result<bool> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::remove_reaction_by_source_event_id(pool, community, reaction_event_id)
-                .await;
-        }
         reaction::remove_reaction_by_source_event_id(self.pg_pool()?, community, reaction_event_id)
             .await
     }
@@ -3461,17 +3423,6 @@ impl Db {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::query_feed_mentions(
-                pool,
-                community,
-                pubkey_bytes,
-                accessible_channel_ids,
-                since,
-                limit,
-            )
-            .await;
-        }
         match self.route_read(path, RoutePredicate::Bounded).await {
             RouteDecision::Replica(mut tx, _entry, reason) => {
                 match feed::query_mentions_on(
@@ -3549,17 +3500,6 @@ impl Db {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::query_feed_needs_action(
-                pool,
-                community,
-                pubkey_bytes,
-                accessible_channel_ids,
-                since,
-                limit,
-            )
-            .await;
-        }
         match self.route_read(path, RoutePredicate::Bounded).await {
             RouteDecision::Replica(mut tx, _entry, reason) => {
                 match feed::query_needs_action_on(
@@ -3634,16 +3574,6 @@ impl Db {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<StoredEvent>> {
-        if let DbBackend::SQLite(pool) = &self.backend {
-            return sqlite::query_feed_activity(
-                pool,
-                community,
-                accessible_channel_ids,
-                since,
-                limit,
-            )
-            .await;
-        }
         match self.route_read(path, RoutePredicate::Bounded).await {
             RouteDecision::Replica(mut tx, _entry, reason) => {
                 match feed::query_activity_on(

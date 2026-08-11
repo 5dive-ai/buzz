@@ -118,20 +118,6 @@ CREATE INDEX IF NOT EXISTS idx_events_community_kind
 CREATE INDEX IF NOT EXISTS idx_events_channel_created
     ON events (community_id, channel_id, created_at DESC);
 
-CREATE TABLE IF NOT EXISTS reactions (
-    community_id TEXT NOT NULL,
-    event_created_at INTEGER NOT NULL,
-    event_id BLOB NOT NULL,
-    pubkey BLOB NOT NULL,
-    emoji TEXT NOT NULL,
-    reaction_event_id BLOB,
-    removed_at INTEGER,
-    PRIMARY KEY (community_id, event_created_at, event_id, pubkey, emoji),
-    FOREIGN KEY (community_id) REFERENCES communities(id) ON DELETE CASCADE
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_reactions_source_event
-    ON reactions (community_id, reaction_event_id)
-    WHERE reaction_event_id IS NOT NULL;
 "#;
 
 pub(crate) async fn connect(path_or_url: &str) -> Result<SqlitePool> {
@@ -263,6 +249,83 @@ pub(crate) async fn is_community_active(
     .fetch_one(pool)
     .await?;
     Ok(count != 0)
+}
+
+pub(crate) async fn rebind_single_node_community_host(
+    pool: &SqlitePool,
+    normalized_host: &str,
+    owner_pubkey: &str,
+) -> Result<Option<CommunityRecord>> {
+    let mut tx = pool.begin().await?;
+
+    // Defect-era databases may contain several loopback communities, one per
+    // ephemeral port. Prefer a community owned by this desktop identity, then
+    // the oldest community. This keeps ownership stable without depending on
+    // event persistence, which arrives with PR 2.
+    let row = sqlx::query(
+        r#"SELECT c.id, c.host
+           FROM communities c
+           LEFT JOIN relay_members rm
+             ON rm.community_id = c.id
+            AND lower(rm.pubkey) = lower(?1)
+            AND rm.role = 'owner'
+           WHERE c.archived_at IS NULL
+             AND c.host LIKE '127.0.0.1:%'
+           ORDER BY CASE WHEN rm.pubkey IS NULL THEN 0 ELSE 1 END DESC, c.created_at ASC, c.id ASC
+           LIMIT 1"#,
+    )
+    .bind(owner_pubkey)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let record = community_record(row)?;
+    if record.host.eq_ignore_ascii_case(normalized_host) {
+        tx.commit().await?;
+        return Ok(Some(record));
+    }
+
+    // The OS may reuse a port that belongs to another stale defect-era row.
+    // Swap that collision to the selected row's old authority transactionally,
+    // using a temporary unique host to satisfy the case-insensitive constraint.
+    if let Some(collision_id) = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM communities WHERE host = ?1 COLLATE NOCASE AND id <> ?2",
+    )
+    .bind(normalized_host)
+    .bind(record.id.as_uuid().to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let temporary_host = format!("rebind-{}.invalid", Uuid::new_v4());
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(&collision_id)
+            .bind(&temporary_host)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(record.id.as_uuid().to_string())
+            .bind(normalized_host)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(collision_id)
+            .bind(&record.host)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query("UPDATE communities SET host = ?2 WHERE id = ?1")
+            .bind(record.id.as_uuid().to_string())
+            .bind(normalized_host)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(Some(CommunityRecord {
+        id: record.id,
+        host: normalized_host.to_string(),
+    }))
 }
 
 pub(crate) async fn ensure_configured_community(
@@ -527,231 +590,6 @@ pub(crate) async fn query_events(
     Ok(events.into_iter().skip(offset).take(limit).collect())
 }
 
-pub(crate) async fn query_feed_mentions(
-    pool: &SqlitePool,
-    community: CommunityId,
-    pubkey_bytes: &[u8],
-    accessible_channel_ids: &[Uuid],
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    limit: i64,
-) -> Result<Vec<buzz_core::StoredEvent>> {
-    let mut query = crate::EventQuery::for_community(community);
-    query.kinds = Some(vec![
-        buzz_core::kind::KIND_STREAM_MESSAGE as i32,
-        buzz_core::kind::KIND_STREAM_MESSAGE_V2 as i32,
-        buzz_core::kind::KIND_TEXT_NOTE as i32,
-        buzz_core::kind::KIND_FORUM_POST as i32,
-        buzz_core::kind::KIND_FORUM_COMMENT as i32,
-        buzz_core::kind::KIND_GIT_PULL_REQUEST as i32,
-        buzz_core::kind::KIND_GIT_PR_UPDATE as i32,
-        buzz_core::kind::KIND_GIT_ISSUE as i32,
-        buzz_core::kind::KIND_GIT_STATUS_OPEN as i32,
-        buzz_core::kind::KIND_GIT_STATUS_MERGED as i32,
-        buzz_core::kind::KIND_GIT_STATUS_CLOSED as i32,
-        buzz_core::kind::KIND_GIT_STATUS_DRAFT as i32,
-    ]);
-    query.p_tag_hex = Some(hex::encode(pubkey_bytes));
-    query.channel_ids = Some(accessible_channel_ids.to_vec());
-    query.since = since;
-    query.limit = Some(limit.min(crate::feed::FEED_MAX_LIMIT));
-    query_events(pool, &query).await
-}
-
-pub(crate) async fn query_feed_needs_action(
-    pool: &SqlitePool,
-    community: CommunityId,
-    pubkey_bytes: &[u8],
-    accessible_channel_ids: &[Uuid],
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    limit: i64,
-) -> Result<Vec<buzz_core::StoredEvent>> {
-    let mut query = crate::EventQuery::for_community(community);
-    query.kinds = Some(vec![
-        buzz_core::kind::KIND_WORKFLOW_APPROVAL_REQUESTED as i32,
-        buzz_core::kind::KIND_STREAM_REMINDER as i32,
-    ]);
-    query.p_tag_hex = Some(hex::encode(pubkey_bytes));
-    query.channel_ids = Some(accessible_channel_ids.to_vec());
-    query.since = since;
-    query.limit = Some(limit.min(crate::feed::FEED_MAX_LIMIT));
-    query_events(pool, &query).await
-}
-
-pub(crate) async fn query_feed_activity(
-    pool: &SqlitePool,
-    community: CommunityId,
-    accessible_channel_ids: &[Uuid],
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    limit: i64,
-) -> Result<Vec<buzz_core::StoredEvent>> {
-    let mut query = crate::EventQuery::for_community(community);
-    query.kinds = Some(vec![
-        buzz_core::kind::KIND_STREAM_MESSAGE as i32,
-        buzz_core::kind::KIND_STREAM_MESSAGE_V2 as i32,
-        buzz_core::kind::KIND_FORUM_POST as i32,
-        buzz_core::kind::KIND_JOB_REQUEST as i32,
-        buzz_core::kind::KIND_JOB_PROGRESS as i32,
-        buzz_core::kind::KIND_JOB_RESULT as i32,
-    ]);
-    query.channel_ids = Some(accessible_channel_ids.to_vec());
-    query.since = since;
-    query.limit = Some(limit.min(crate::feed::FEED_MAX_LIMIT));
-    query_events(pool, &query).await
-}
-
-pub(crate) async fn insert_reaction_event(
-    pool: &SqlitePool,
-    community: CommunityId,
-    reaction_event: &nostr::Event,
-    channel_id: Option<Uuid>,
-    target_event_id: &[u8],
-    actor_pubkey: &[u8],
-    emoji: &str,
-) -> Result<crate::event::ReactionEventInsertOutcome> {
-    let mut tx = pool.begin().await?;
-    let target_created_at: Option<i64> = sqlx::query_scalar(
-        "SELECT created_at FROM events WHERE community_id = ?1 AND id = ?2 LIMIT 1",
-    )
-    .bind(community.as_uuid().to_string())
-    .bind(target_event_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some(target_created_at) = target_created_at else {
-        return Ok(crate::event::ReactionEventInsertOutcome::TargetMissing);
-    };
-    let changed = sqlx::query("INSERT INTO reactions (community_id, event_created_at, event_id, pubkey, emoji, reaction_event_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (community_id, event_created_at, event_id, pubkey, emoji) DO UPDATE SET removed_at = NULL, reaction_event_id = excluded.reaction_event_id WHERE reactions.removed_at IS NOT NULL")
-        .bind(community.as_uuid().to_string()).bind(target_created_at).bind(target_event_id)
-        .bind(actor_pubkey).bind(emoji).bind(reaction_event.id.as_bytes().as_slice())
-        .execute(&mut *tx).await?.rows_affected() != 0;
-    if !changed {
-        return Ok(crate::event::ReactionEventInsertOutcome::Duplicate);
-    }
-    let received_at = chrono::Utc::now();
-    let inserted = sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT DO NOTHING")
-        .bind(community.as_uuid().to_string()).bind(reaction_event.id.as_bytes().as_slice()).bind(reaction_event.pubkey.to_bytes().as_slice())
-        .bind(reaction_event.created_at.as_secs() as i64).bind(reaction_event.kind.as_u16() as i32).bind(serde_json::to_string(&reaction_event.tags)?)
-        .bind(&reaction_event.content).bind(reaction_event.sig.serialize().as_slice()).bind(channel_id.map(|id| id.to_string()))
-        .bind(received_at.timestamp()).bind(serde_json::to_string(reaction_event)?).execute(&mut *tx).await?.rows_affected() == 1;
-    tx.commit().await?;
-    Ok(crate::event::ReactionEventInsertOutcome::Inserted {
-        stored_event: Box::new(buzz_core::StoredEvent::with_received_at(
-            reaction_event.clone(),
-            received_at,
-            channel_id,
-            true,
-        )),
-        was_inserted: inserted,
-    })
-}
-
-pub(crate) async fn remove_reaction(
-    pool: &SqlitePool,
-    community: CommunityId,
-    event_id: &[u8],
-    event_created_at: chrono::DateTime<chrono::Utc>,
-    pubkey: &[u8],
-    emoji: &str,
-) -> Result<bool> {
-    Ok(sqlx::query("UPDATE reactions SET removed_at = unixepoch() WHERE community_id = ?1 AND event_created_at = ?2 AND event_id = ?3 AND pubkey = ?4 AND emoji = ?5 AND removed_at IS NULL")
-        .bind(community.as_uuid().to_string()).bind(event_created_at.timestamp()).bind(event_id).bind(pubkey).bind(emoji)
-        .execute(pool).await?.rows_affected() != 0)
-}
-
-pub(crate) async fn remove_reaction_by_source_event_id(
-    pool: &SqlitePool,
-    community: CommunityId,
-    reaction_event_id: &[u8],
-) -> Result<bool> {
-    Ok(sqlx::query("UPDATE reactions SET removed_at = unixepoch() WHERE community_id = ?1 AND reaction_event_id = ?2 AND removed_at IS NULL")
-        .bind(community.as_uuid().to_string()).bind(reaction_event_id)
-        .execute(pool).await?.rows_affected() != 0)
-}
-
-pub(crate) async fn open_dm(
-    pool: &SqlitePool,
-    community: CommunityId,
-    pubkeys: &[&[u8]],
-    created_by: &[u8],
-    command_event: Option<&nostr::Event>,
-) -> Result<Option<(crate::channel::ChannelRecord, bool)>> {
-    let mut participants = pubkeys.to_vec();
-    if !participants.contains(&created_by) {
-        participants.push(created_by);
-    }
-    participants.sort_unstable();
-    participants.dedup();
-    if !(2..=9).contains(&participants.len()) {
-        return Err(crate::DbError::InvalidData(
-            "DM requires 2-9 unique participants".into(),
-        ));
-    }
-    if participants.iter().any(|pubkey| pubkey.len() != 32) {
-        return Err(crate::DbError::InvalidData(
-            "DM participant pubkeys must be 32 bytes".into(),
-        ));
-    }
-    let hash = crate::dm::compute_participant_hash(&participants);
-    let mut tx = pool.begin().await?;
-    if let Some(event) = command_event {
-        let received_at = chrono::Utc::now();
-        let inserted = sqlx::query("INSERT INTO events (community_id, id, pubkey, created_at, kind, tags_json, content, sig, channel_id, received_at, event_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10) ON CONFLICT DO NOTHING")
-            .bind(community.as_uuid().to_string()).bind(event.id.as_bytes().as_slice()).bind(event.pubkey.to_bytes().as_slice())
-            .bind(event.created_at.as_secs() as i64).bind(event.kind.as_u16() as i32).bind(serde_json::to_string(&event.tags)?)
-            .bind(&event.content).bind(event.sig.serialize().as_slice()).bind(received_at.timestamp()).bind(serde_json::to_string(event)?)
-            .execute(&mut *tx).await?.rows_affected() != 0;
-        if !inserted {
-            return Ok(None);
-        }
-    }
-    let select = "SELECT id, name, channel_type, visibility, description, canvas, created_by, created_at, updated_at, archived_at, deleted_at, nip29_group_id, topic_required, max_members, topic, topic_set_by, topic_set_at, purpose, purpose_set_by, purpose_set_at, ttl_seconds, ttl_deadline FROM channels WHERE community_id = ?1 AND participant_hash = ?2 AND channel_type = 'dm' AND deleted_at IS NULL LIMIT 1";
-    if let Some(row) = sqlx::query(select)
-        .bind(community.as_uuid().to_string())
-        .bind(hash.as_slice())
-        .fetch_optional(&mut *tx)
-        .await?
-    {
-        sqlx::query("UPDATE channel_members SET hidden_at = NULL WHERE channel_id = ?1 AND pubkey = ?2 AND removed_at IS NULL")
-            .bind(row.try_get::<String, _>("id")?)
-            .bind(created_by)
-            .execute(&mut *tx)
-            .await?;
-        let record = channel_record(row)?;
-        tx.commit().await?;
-        return Ok(Some((record, false)));
-    }
-
-    let id = Uuid::new_v4();
-    let name = if participants.len() == 2 {
-        "DM".to_owned()
-    } else {
-        format!("Group DM ({})", participants.len())
-    };
-    sqlx::query("INSERT INTO channels (id, community_id, name, channel_type, visibility, participant_hash, created_by) VALUES (?1, ?2, ?3, 'dm', 'private', ?4, ?5)")
-        .bind(id.to_string())
-        .bind(community.as_uuid().to_string())
-        .bind(name)
-        .bind(hash.as_slice())
-        .bind(created_by)
-        .execute(&mut *tx)
-        .await?;
-    for participant in participants {
-        sqlx::query("INSERT INTO channel_members (channel_id, pubkey, role, invited_by) VALUES (?1, ?2, 'member', ?3)")
-            .bind(id.to_string())
-            .bind(participant)
-            .bind(created_by)
-            .execute(&mut *tx)
-            .await?;
-    }
-    let row = sqlx::query(select)
-        .bind(community.as_uuid().to_string())
-        .bind(hash.as_slice())
-        .fetch_one(&mut *tx)
-        .await?;
-    let record = channel_record(row)?;
-    tx.commit().await?;
-    Ok(Some((record, true)))
-}
-
 fn stored_event(row: sqlx::sqlite::SqliteRow) -> Result<buzz_core::StoredEvent> {
     let json: String = row.try_get("event_json")?;
     let event: nostr::Event = serde_json::from_str(&json)?;
@@ -839,11 +677,110 @@ pub(crate) async fn add_member(
     role: crate::channel::MemberRole,
     invited_by: Option<&[u8]>,
 ) -> Result<crate::channel::MemberRecord> {
-    get_channel(pool, community, channel_id).await?;
-    sqlx::query("INSERT INTO channel_members (channel_id, pubkey, role, invited_by) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(channel_id, pubkey) DO UPDATE SET role = excluded.role, invited_by = excluded.invited_by, removed_at = NULL")
-        .bind(channel_id.to_string()).bind(pubkey).bind(role.as_str()).bind(invited_by).execute(pool).await?;
-    member_record(sqlx::query("SELECT channel_id, pubkey, role, joined_at, invited_by, removed_at FROM channel_members WHERE channel_id = ?1 AND pubkey = ?2")
-        .bind(channel_id.to_string()).bind(pubkey).fetch_one(pool).await?)
+    if pubkey.len() != 32 {
+        return Err(crate::DbError::InvalidData(format!(
+            "pubkey must be 32 bytes, got {}",
+            pubkey.len()
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+    let channel = sqlx::query(
+        "SELECT * FROM channels WHERE community_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+    )
+    .bind(community.as_uuid().to_string())
+    .bind(channel_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(crate::DbError::ChannelNotFound(channel_id))?;
+    let channel = channel_record(channel)?;
+
+    let effective_role = if channel.visibility == "private" {
+        let inviter = invited_by.ok_or_else(|| {
+            crate::DbError::AccessDenied("private channel requires an invite".to_string())
+        })?;
+        let creator_bootstrap = inviter == pubkey && inviter == channel.created_by.as_slice();
+        if !creator_bootstrap {
+            let inviter_role = active_member_role(&mut tx, channel_id, inviter)
+                .await?
+                .ok_or_else(|| {
+                    crate::DbError::AccessDenied("inviter is not an active member".to_string())
+                })?;
+            if role.is_elevated() && !is_elevated_role(&inviter_role) {
+                return Err(crate::DbError::AccessDenied(
+                    "only owners/admins may grant elevated roles".to_string(),
+                ));
+            }
+        }
+        role
+    } else if role.is_elevated() {
+        let granter_role = match invited_by {
+            Some(inviter) => active_member_role(&mut tx, channel_id, inviter).await?,
+            None => None,
+        };
+        if !granter_role.is_some_and(|role| is_elevated_role(&role)) {
+            return Err(crate::DbError::AccessDenied(
+                "only owners/admins may grant elevated roles".to_string(),
+            ));
+        }
+        role
+    } else {
+        role
+    };
+
+    if let Some(current_role) = active_member_role(&mut tx, channel_id, pubkey).await? {
+        if current_role != effective_role.as_str() {
+            let actor_role = match invited_by {
+                Some(inviter) => active_member_role(&mut tx, channel_id, inviter).await?,
+                None => None,
+            };
+            if !actor_role.is_some_and(|role| is_elevated_role(&role)) {
+                return Err(crate::DbError::AccessDenied(
+                    "only owners/admins may change an active member's role".to_string(),
+                ));
+            }
+            if current_role == "owner" && effective_role != crate::channel::MemberRole::Owner {
+                let owner_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM channel_members WHERE channel_id = ?1 AND role = 'owner' AND removed_at IS NULL",
+            )
+            .bind(channel_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+                if owner_count <= 1 {
+                    return Err(crate::DbError::AccessDenied(
+                        "cannot demote the last owner — transfer ownership first".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    sqlx::query("INSERT INTO channel_members (channel_id, pubkey, role, invited_by) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(channel_id, pubkey) DO UPDATE SET role = excluded.role, removed_at = NULL")
+        .bind(channel_id.to_string()).bind(pubkey).bind(effective_role.as_str()).bind(invited_by).execute(&mut *tx).await?;
+    let row = sqlx::query("SELECT channel_id, pubkey, role, joined_at, invited_by, removed_at FROM channel_members WHERE channel_id = ?1 AND pubkey = ?2")
+        .bind(channel_id.to_string()).bind(pubkey).fetch_one(&mut *tx).await?;
+    let record = member_record(row)?;
+    tx.commit().await?;
+    Ok(record)
+}
+
+async fn active_member_role(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    channel_id: Uuid,
+    pubkey: &[u8],
+) -> Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT role FROM channel_members WHERE channel_id = ?1 AND pubkey = ?2 AND removed_at IS NULL",
+    )
+    .bind(channel_id.to_string())
+    .bind(pubkey)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+fn is_elevated_role(role: &str) -> bool {
+    matches!(role, "owner" | "admin")
 }
 
 pub(crate) async fn is_member(
@@ -1186,6 +1123,169 @@ fn community_record(row: sqlx::sqlite::SqliteRow) -> Result<CommunityRecord> {
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind};
+
+    #[tokio::test]
+    async fn rebind_prefers_owned_then_oldest_community() {
+        let pool = connect(":memory:").await.unwrap();
+        let first = ensure_configured_community(&pool, "127.0.0.1:4000")
+            .await
+            .unwrap();
+        let second = ensure_configured_community(&pool, "127.0.0.1:4001")
+            .await
+            .unwrap();
+        bootstrap_owner(&pool, second.id, "owner").await.unwrap();
+        let rebound = rebind_single_node_community_host(&pool, "127.0.0.1:5000", "owner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebound.id, second.id);
+        assert_eq!(
+            lookup_community_host(&pool, first.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            "127.0.0.1:4000"
+        );
+        assert_eq!(rebound.host, "127.0.0.1:5000");
+    }
+
+    #[tokio::test]
+    async fn sqlite_membership_preserves_public_contract_invariants() {
+        let pool = connect(":memory:").await.unwrap();
+        let community = ensure_configured_community(&pool, "local.buzz")
+            .await
+            .unwrap();
+        let owner = Keys::generate().public_key().to_bytes();
+        let member = Keys::generate().public_key().to_bytes();
+        let admin = Keys::generate().public_key().to_bytes();
+        let other = Keys::generate().public_key().to_bytes();
+        let channel_id = Uuid::new_v4();
+        create_channel_with_id(
+            &pool,
+            community.id,
+            channel_id,
+            "private",
+            crate::channel::ChannelType::Stream,
+            crate::channel::ChannelVisibility::Private,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            add_member(
+                &pool,
+                community.id,
+                channel_id,
+                &[0; 31],
+                crate::channel::MemberRole::Member,
+                Some(&owner),
+            )
+            .await,
+            Err(crate::DbError::InvalidData(_))
+        ));
+        assert!(matches!(
+            add_member(
+                &pool,
+                community.id,
+                channel_id,
+                &member,
+                crate::channel::MemberRole::Member,
+                None,
+            )
+            .await,
+            Err(crate::DbError::AccessDenied(_))
+        ));
+        add_member(
+            &pool,
+            community.id,
+            channel_id,
+            &member,
+            crate::channel::MemberRole::Member,
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+        add_member(
+            &pool,
+            community.id,
+            channel_id,
+            &admin,
+            crate::channel::MemberRole::Admin,
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+        let readded = add_member(
+            &pool,
+            community.id,
+            channel_id,
+            &member,
+            crate::channel::MemberRole::Member,
+            Some(&admin),
+        )
+        .await
+        .unwrap();
+        assert_eq!(readded.invited_by, Some(owner.to_vec()));
+        sqlx::query::<sqlx::Sqlite>(
+            "UPDATE channel_members SET removed_at = unixepoch() WHERE channel_id = ?1 AND pubkey = ?2",
+        )
+            .bind(channel_id.to_string())
+            .bind(&member[..])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let reactivated = add_member(
+            &pool,
+            community.id,
+            channel_id,
+            &member,
+            crate::channel::MemberRole::Member,
+            Some(&admin),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reactivated.invited_by, Some(owner.to_vec()));
+        assert!(reactivated.removed_at.is_none());
+        assert!(matches!(
+            add_member(
+                &pool,
+                community.id,
+                channel_id,
+                &other,
+                crate::channel::MemberRole::Admin,
+                Some(&member),
+            )
+            .await,
+            Err(crate::DbError::AccessDenied(_))
+        ));
+        assert!(matches!(
+            add_member(
+                &pool,
+                community.id,
+                channel_id,
+                &member,
+                crate::channel::MemberRole::Guest,
+                Some(&member),
+            )
+            .await,
+            Err(crate::DbError::AccessDenied(_))
+        ));
+        assert!(matches!(
+            add_member(
+                &pool,
+                community.id,
+                channel_id,
+                &owner,
+                crate::channel::MemberRole::Member,
+                Some(&owner),
+            )
+            .await,
+            Err(crate::DbError::AccessDenied(_))
+        ));
+    }
 
     #[tokio::test]
     async fn upgrades_phase_1_core_schema_before_dm_use() {

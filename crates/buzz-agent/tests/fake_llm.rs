@@ -77,19 +77,35 @@ async fn spawn_capturing_fake_llm(responses: Vec<Value>) -> (String, Arc<Mutex<V
 async fn spawn_capturing_fake_llm_with_statuses(
     responses: Vec<CannedResponse>,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let captures: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_capturing_fake_llm_core(responses, captures.clone(), None).await;
+    (url, captures)
+}
+
+/// Shared connection loop for the capturing fake LLM: reads each request,
+/// records its JSON body into `captures`, and replies with the next canned
+/// response. When `gate` is `Some`, the FIRST request's response is withheld
+/// until the gate fires; when `None`, every response is served immediately.
+async fn spawn_capturing_fake_llm_core(
+    responses: Vec<CannedResponse>,
+    captures: Arc<Mutex<Vec<Value>>>,
+    gate: Option<Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
-    let captures: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-    let captures_clone = captures.clone();
     tokio::spawn(async move {
+        let mut request_num = 0usize;
         loop {
             let (mut sock, _) = match listener.accept().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
             let queue = queue.clone();
-            let captures = captures_clone.clone();
+            let captures = captures.clone();
+            let gate = gate.clone();
+            request_num += 1;
+            let req_num = request_num;
             tokio::spawn(async move {
                 // Read headers.
                 let mut buf = Vec::new();
@@ -138,6 +154,15 @@ async fn spawn_capturing_fake_llm_with_statuses(
                     captures.lock().await.push(parsed);
                 }
 
+                // Hold the first request's response until the gate opens.
+                if req_num == 1 {
+                    if let Some(gate) = &gate {
+                        if let Some(rx) = gate.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                    }
+                }
+
                 // Send canned response.
                 let response = queue.lock().await.pop_front().unwrap_or(CannedResponse {
                     status: 500,
@@ -161,7 +186,7 @@ async fn spawn_capturing_fake_llm_with_statuses(
             });
         }
     });
-    (url, captures)
+    url
 }
 
 /// A capturing fake LLM whose FIRST provider response is withheld until
@@ -174,95 +199,7 @@ async fn spawn_gated_capturing_fake_llm(
     captures: Arc<Mutex<Vec<Value>>>,
     gate: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
-    let captures_clone = captures.clone();
-    tokio::spawn(async move {
-        let mut request_num = 0usize;
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            let queue = queue.clone();
-            let captures = captures_clone.clone();
-            let gate = gate.clone();
-            request_num += 1;
-            let req_num = request_num;
-            tokio::spawn(async move {
-                // Read headers.
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 4096];
-                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match sock.read(&mut tmp).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                    }
-                    if buf.len() > 2_000_000 {
-                        return;
-                    }
-                }
-                let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-                let header_str = String::from_utf8_lossy(&buf[..header_end]);
-                let content_length: usize = header_str
-                    .lines()
-                    .find_map(|line| {
-                        let lower = line.to_lowercase();
-                        if lower.starts_with("content-length:") {
-                            lower
-                                .trim_start_matches("content-length:")
-                                .trim()
-                                .parse()
-                                .ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                let mut body_buf = buf[header_end..].to_vec();
-                while body_buf.len() < content_length {
-                    match sock.read(&mut tmp).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => body_buf.extend_from_slice(&tmp[..n]),
-                    }
-                }
-                if let Ok(parsed) =
-                    serde_json::from_slice::<Value>(&body_buf[..content_length.min(body_buf.len())])
-                {
-                    captures.lock().await.push(parsed);
-                }
-
-                // Hold the first request's response until the gate opens.
-                if req_num == 1 {
-                    let rx = gate.lock().await.take();
-                    if let Some(rx) = rx {
-                        let _ = rx.await;
-                    }
-                }
-
-                let response = queue.lock().await.pop_front().unwrap_or(CannedResponse {
-                    status: 500,
-                    body: json!({ "error": "no canned response" }),
-                });
-                let body_s = serde_json::to_string(&response.body).unwrap();
-                let reason = if response.status == 200 {
-                    "OK"
-                } else {
-                    "Error"
-                };
-                let resp = format!(
-                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response.status,
-                    reason,
-                    body_s.len(),
-                    body_s,
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            });
-        }
-    });
+    let url = spawn_capturing_fake_llm_core(responses, captures.clone(), Some(gate)).await;
     (url, captures)
 }
 

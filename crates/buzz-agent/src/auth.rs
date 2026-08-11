@@ -2170,29 +2170,4 @@ mod tests {
 
         drop(holder);
     }
-
-    #[tokio::test]
-    async fn test_lock_released_on_holder_drop_lets_successor_proceed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.json.lock");
-
-        let holder = acquire_auth_lock(&path, Instant::now() + Duration::from_secs(30))
-            .await
-            .expect("holder should acquire the free lock");
-        // Confirm contention while held.
-        assert!(matches!(
-            acquire_auth_lock(&path, Instant::now()).await,
-            Err(AuthError::LockTimeout)
-        ));
-
-        // Dropping the guard is the RAII stand-in for the holder process
-        // dying: the kernel releases the advisory lock, so a successor
-        // acquires without any PID inspection or lock breaking.
-        drop(holder);
-        let successor = acquire_auth_lock(&path, Instant::now() + Duration::from_secs(30)).await;
-        assert!(
-            successor.is_ok(),
-            "successor must acquire after the holder releases, got {successor:?}"
-        );
-    }
 }

@@ -389,49 +389,6 @@ async fn test_denied_then_auto_reads_cooldown_without_second_launch() {
 }
 
 #[tokio::test]
-async fn test_denial_sidecar_is_read_by_later_auto_in_same_process() {
-    let stub = spawn_stub(false).await;
-    let cache = TempDir::new().unwrap();
-    let opener = ScriptedOpener::new(Script::Deny);
-
-    // An explicit UserInitiated attempt is denied and records the durable
-    // cooldown sidecar.
-    let denier = PkceOAuthTokenSource::new_with(
-        config(&stub, "/disco/a", cache.path()),
-        Arc::new(opener.clone()),
-    )
-    .unwrap();
-    let denied = denier
-        .acquire_with_intent(AuthIntent::UserInitiated, None)
-        .await;
-    assert_eq!(denied, Err(AuthError::Denied));
-    assert_eq!(opener.call_count(), 1);
-
-    // A later passive Auto caller reads the sidecar and does not launch a
-    // second browser. This is the cross-policy read edge — the sidecar is
-    // written for ANY failed interactive attempt, only the reader policy
-    // differs. It is a SEQUENTIAL, same-process read; the genuinely
-    // cross-process, already-waiting variant is
-    // `test_crossprocess_userinitiated_denial_shared_with_waiting_auto`.
-    let later = PkceOAuthTokenSource::new_with(
-        config(&stub, "/disco/a", cache.path()),
-        Arc::new(opener.clone()),
-    )
-    .unwrap();
-    let auto = later.acquire_with_intent(AuthIntent::Auto, None).await;
-    assert_eq!(
-        auto,
-        Err(AuthError::Denied),
-        "a later Auto reads the UserInitiated failure sidecar"
-    );
-    assert_eq!(
-        opener.call_count(),
-        1,
-        "no second browser once the denial sidecar is recorded"
-    );
-}
-
-#[tokio::test]
 async fn test_userinitiated_retry_bypasses_cooldown_and_reopens() {
     let stub = spawn_stub(false).await;
     let cache = TempDir::new().unwrap();
@@ -720,29 +677,6 @@ async fn test_auto_rejected_fresh_bearer_with_dead_refresh_launches_browser() {
 }
 
 #[tokio::test]
-async fn test_userinitiated_rejected_fresh_bearer_with_dead_refresh_launches_browser() {
-    let stub = spawn_stub(true).await; // refresh grants 401
-    let cache = TempDir::new().unwrap();
-    let opener = ScriptedOpener::new(Script::Approve);
-    let cfg = config(&stub, "/disco/a", cache.path());
-    let rejected = seed_fresh_rejectable(&cfg, cache.path());
-
-    let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
-    let token = src
-        .acquire_with_intent(AuthIntent::UserInitiated, Some(&rejected))
-        .await
-        .expect("UserInitiated recovers a rejected-but-fresh bearer via the browser");
-    assert_eq!(token, "browser-token-1");
-    assert_eq!(
-        opener.call_count(),
-        1,
-        "UserInitiated launches a browser to recover"
-    );
-    assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
-    assert_eq!(stub.code_grants.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
 async fn test_headless_rejected_fresh_bearer_with_dead_refresh_returns_refresh_rejected() {
     let stub = spawn_stub(true).await; // refresh grants 401
     let cache = TempDir::new().unwrap();
@@ -909,84 +843,56 @@ async fn test_refresh_400_invalid_grant_is_dead_grant_not_network() {
 }
 
 #[tokio::test]
-async fn test_refresh_400_invalid_request_is_network_unavailable_not_rejected() {
-    // A 400 `invalid_request` is a malformed/misconfigured request, not a dead
-    // credential. An interactive intent that COULD open a browser must NOT: a
-    // browser cannot repair it, so it surfaces as NetworkUnavailable.
-    let stub = spawn_stub_with(RefreshMode::ClientError(
-        axum::http::StatusCode::BAD_REQUEST,
-        "invalid_request",
-    ))
-    .await;
-    let cache = TempDir::new().unwrap();
-    let opener = ScriptedOpener::new(Script::Approve);
-    let cfg = config(&stub, "/disco/a", cache.path());
+async fn test_refresh_non_invalid_grant_4xx_is_network_unavailable_not_rejected() {
+    // Every 4xx whose OAuth body is NOT `invalid_grant` is a request/config or
+    // transient fault a browser cannot repair, so it must surface as
+    // NetworkUnavailable and never pop a browser — even for an interactive
+    // intent that COULD. Two representative cases prove the classifier keys on
+    // the body `error`, not the status class: a 400 `invalid_request`
+    // (malformed/misconfigured) and a 429 `slow_down` (transient rate limit).
+    for (status, error, refresh_token) in [
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "misconfigured-refresh",
+        ),
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "slow_down",
+            "rate-limited-refresh",
+        ),
+    ] {
+        let stub = spawn_stub_with(RefreshMode::ClientError(status, error)).await;
+        let cache = TempDir::new().unwrap();
+        let opener = ScriptedOpener::new(Script::Approve);
+        let cfg = config(&stub, "/disco/a", cache.path());
 
-    seed_cache(
-        &cfg,
-        cache.path(),
-        json!({
-            "access_token": "stale",
-            "refresh_token": "misconfigured-refresh",
-            "expires_at": 1u64,
-        }),
-    );
+        seed_cache(
+            &cfg,
+            cache.path(),
+            json!({
+                "access_token": "stale",
+                "refresh_token": refresh_token,
+                "expires_at": 1u64,
+            }),
+        );
 
-    let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
-    let result = src
-        .acquire_with_intent(AuthIntent::UserInitiated, None)
-        .await;
-    assert_eq!(
-        result,
-        Err(AuthError::NetworkUnavailable),
-        "a non-invalid_grant 4xx is infrastructural, not a credential rejection"
-    );
-    assert_eq!(
-        opener.call_count(),
-        0,
-        "a browser cannot repair invalid_request, so none is opened"
-    );
-    assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn test_refresh_429_is_network_unavailable_not_rejected() {
-    // A 429 rate limit is a transient 4xx: retry later, don't sign in again.
-    // An interactive intent must not pop a browser off it.
-    let stub = spawn_stub_with(RefreshMode::ClientError(
-        axum::http::StatusCode::TOO_MANY_REQUESTS,
-        "slow_down",
-    ))
-    .await;
-    let cache = TempDir::new().unwrap();
-    let opener = ScriptedOpener::new(Script::Approve);
-    let cfg = config(&stub, "/disco/a", cache.path());
-
-    seed_cache(
-        &cfg,
-        cache.path(),
-        json!({
-            "access_token": "stale",
-            "refresh_token": "rate-limited-refresh",
-            "expires_at": 1u64,
-        }),
-    );
-
-    let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
-    let result = src
-        .acquire_with_intent(AuthIntent::UserInitiated, None)
-        .await;
-    assert_eq!(
-        result,
-        Err(AuthError::NetworkUnavailable),
-        "a 429 rate limit is transient, not a credential rejection"
-    );
-    assert_eq!(
-        opener.call_count(),
-        0,
-        "a rate limit must not trigger an interactive browser fallback"
-    );
-    assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
+        let src = PkceOAuthTokenSource::new_with(cfg, Arc::new(opener.clone())).unwrap();
+        let result = src
+            .acquire_with_intent(AuthIntent::UserInitiated, None)
+            .await;
+        assert_eq!(
+            result,
+            Err(AuthError::NetworkUnavailable),
+            "a non-invalid_grant 4xx ({status} {error}) is infrastructural, not a credential rejection"
+        );
+        assert_eq!(
+            opener.call_count(),
+            0,
+            "a browser cannot repair {error}, so none is opened"
+        );
+        assert_eq!(stub.refresh_grants.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]

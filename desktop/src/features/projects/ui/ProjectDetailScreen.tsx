@@ -1,4 +1,4 @@
-import { ArrowLeft, ExternalLink, FolderGit2 } from "lucide-react";
+import { ArrowLeft, FolderGit2 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 
@@ -60,8 +60,13 @@ import {
   resolveProjectDefaultBranch,
 } from "@/features/projects/lib/projectBranches";
 import { normalizeRepositoryUrl } from "@/features/projects/lib/projectsViewHelpers";
+import {
+  shareTabForWorkspaceTab,
+  workspaceTabForShareTab,
+} from "@/features/projects/lib/projectShareLinks";
 import { selectProjectRepository } from "@/features/projects/projectModels";
 import { KIND_REPO_ANNOUNCEMENT } from "@/shared/constants/kinds";
+import type { EntityLinkTab } from "@/shared/lib/entityLink";
 import { useProjectRepoPresentation } from "@/features/projects/useProjectRepoHost";
 import { WorkspaceTabs } from "./ProjectWorkspaceTabs";
 import type { RepoSourceHeaderControls } from "./ProjectRepositorySource";
@@ -73,7 +78,7 @@ import {
 import type { CreateIssueDialogInput } from "./CreateIssueDialog";
 import { ProjectBranchActionDialogs } from "./ProjectBranchActionDialogs";
 import { ProjectDetailChrome } from "./ProjectDetailChrome";
-import { ProjectRepositoryManagement } from "./ProjectRepositoryManagement";
+import { ProjectDetailChromeActions } from "./ProjectDetailChromeActions";
 import { UnavailableProjectRepositories } from "./UnavailableProjectRepositories";
 import {
   PROJECT_TAB_CRUMB_LABELS,
@@ -88,6 +93,8 @@ type ProjectDetailScreenProps = {
   pullRequestId?: string;
   issueId?: string;
   repositoryId?: string;
+  /** Workspace tab requested by a share link (link vocabulary). */
+  tab?: EntityLinkTab;
 };
 
 const PROJECT_DETAIL_PANEL_SEARCH_KEYS = [
@@ -103,7 +110,8 @@ const PROJECT_REPOSITORY_SEARCH_KEYS = [
 ] as const;
 
 export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
-  const { commitHash, projectId, pullRequestId, issueId, repositoryId } = props;
+  const { commitHash, projectId, pullRequestId, issueId, repositoryId, tab } =
+    props;
   const { goChannel, goProject, goProjects } = useAppNavigation();
   const { activeCommunity } = useCommunities();
   const mainInsetRef = useMainInsetRef();
@@ -179,6 +187,13 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   // Bumped when breadcrumb navigation should land on the project Overview
   // tab; remounts WorkspaceTabs, which owns the selected-tab state.
   const [tabsResetKey, setTabsResetKey] = React.useState(0);
+  // Tab requested by a share link (`?tab=`), mirrored into local state like
+  // the work-item ids above so breadcrumb/repository resets can drop it —
+  // WorkspaceTabs remounts must not re-apply a stale link tab.
+  const [requestedTab, setRequestedTab] = React.useState<
+    EntityLinkTab | undefined
+  >(tab);
+  React.useEffect(() => setRequestedTab(tab), [tab]);
   // Mirror of the WorkspaceTabs selection so the breadcrumb can name the
   // active sub-tab. The Overview (readme) tab is "home" and gets no crumb.
   const [activeTab, setActiveTab] = React.useState("overview");
@@ -814,6 +829,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     setSelectedPullRequestId(null);
     setSelectedIssueId(null);
     setSelectedCommitHash(null);
+    setRequestedTab(undefined);
     // Remount the workspace tabs so the project page opens on Overview
     // instead of whatever tab the work item left behind.
     setTabsResetKey((key) => key + 1);
@@ -828,6 +844,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     setSelectedPullRequestId(null);
     setSelectedIssueId(null);
     setSelectedCommitHash(null);
+    setRequestedTab(undefined);
     setRepoSource("remote");
     setTabsResetKey((key) => key + 1);
   };
@@ -854,12 +871,22 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
               void goProjects();
             }}
             project={project}
+            shareTab={
+              activeWorkItemCrumb
+                ? undefined
+                : shareTabForWorkspaceTab(activeTab)
+            }
           />
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto px-4 pb-4">
             <div className="w-full space-y-3 pt-[calc(var(--buzz-channel-content-top-padding,5.75rem)_+_1px)]">
               <WorkspaceTabs
                 key={`${project.id}:${repository.id}:${tabsResetKey}`}
+                initialTab={
+                  requestedTab
+                    ? workspaceTabForShareTab(requestedTab)
+                    : undefined
+                }
                 commitDiff={commitDiffQuery.data}
                 commitDiffError={commitDiffQuery.error}
                 commitDiffLoading={commitDiffQuery.isLoading}
@@ -903,34 +930,20 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 profiles={profiles}
                 project={repository}
                 repositoryControls={
-                  <>
-                    <ProjectRepositoryManagement
-                      identityPubkey={identityQuery.data?.pubkey}
-                      onChange={handleRepositoryChange}
-                      project={project}
-                      projects={projectsQuery.data ?? []}
-                      repository={repository}
-                    />
-                    {repoRemote.webUrl &&
-                    (repoRemote.host.kind !== "external" ||
-                      repoSource === "local") ? (
-                      <Button
-                        asChild
-                        aria-label="Open project web page"
-                        className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
-                        size="icon"
-                        variant="ghost"
-                      >
-                        <a
-                          href={repoRemote.webUrl}
-                          rel="noopener noreferrer"
-                          target="_blank"
-                        >
-                          <ExternalLink className="h-4 w-4" />
-                        </a>
-                      </Button>
-                    ) : null}
-                  </>
+                  <ProjectDetailChromeActions
+                    identityPubkey={identityQuery.data?.pubkey}
+                    onRepositoryChange={handleRepositoryChange}
+                    project={project}
+                    projects={projectsQuery.data ?? []}
+                    repository={repository}
+                    webUrl={
+                      repoRemote.webUrl &&
+                      (repoRemote.host.kind !== "external" ||
+                        repoSource === "local")
+                        ? repoRemote.webUrl
+                        : null
+                    }
+                  />
                 }
                 projectId={project.id}
                 repoDiff={displayedRepoDiff}

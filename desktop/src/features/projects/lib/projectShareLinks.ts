@@ -18,6 +18,7 @@ import {
   buildProjectLink,
   buildPullRequestLink,
   buildRepoLink,
+  type EntityLinkTab,
   isLinkableCoordinate,
 } from "@/shared/lib/entityLink";
 
@@ -62,21 +63,50 @@ function repositoryCoordinate(
 }
 
 /**
+ * Map a workspace tab id (`WorkspaceTabs` vocabulary) onto the link format's
+ * tab value. The overview tab is the link's default and PR-detail sub-tabs
+ * have their own `buzz://pr` links, so both map to `undefined` (no tab).
+ */
+export function shareTabForWorkspaceTab(
+  workspaceTab: string,
+): EntityLinkTab | undefined {
+  switch (workspaceTab) {
+    case "files":
+    case "issues":
+    case "prs":
+    case "contributors":
+      return workspaceTab;
+    case "activity":
+      return "commits";
+    default:
+      return undefined;
+  }
+}
+
+/** Inverse of `shareTabForWorkspaceTab`, for the receiving side. */
+export function workspaceTabForShareTab(tab: EntityLinkTab): string {
+  return tab === "commits" ? "activity" : tab;
+}
+
+/**
  * Link to a project. Legacy (implicit) projects are backed by a repository
  * announcement rather than a kind:30621 event, so they share as `buzz://repo`
  * — which resolves to the same project route on the receiving side.
  */
-export function projectShareLink(project: Project): string | null {
+export function projectShareLink(
+  project: Project,
+  tab?: EntityLinkTab,
+): string | null {
   const coordinate = parseAddressableCoordinate(project.projectAddress);
   if (!coordinate || !isLinkableCoordinate(coordinate.owner, coordinate.dtag)) {
     return null;
   }
 
   if (coordinate.kind === KIND_PROJECT_ANNOUNCEMENT) {
-    return buildProjectLink(coordinate);
+    return buildProjectLink({ ...coordinate, tab });
   }
   return coordinate.kind === KIND_REPO_ANNOUNCEMENT
-    ? buildRepoLink(coordinate)
+    ? buildRepoLink({ ...coordinate, tab })
     : null;
 }
 

@@ -135,6 +135,7 @@ export function WorkspaceTabs({
   createIssueAction,
   createPullRequestAction,
   updatePullRequestAction,
+  initialTab,
   localSnapshot,
   localSnapshotError,
   localSnapshotLoading,
@@ -174,6 +175,8 @@ export function WorkspaceTabs({
   createIssueAction: CreateIssueAction;
   createPullRequestAction?: CreatePullRequestAction;
   updatePullRequestAction?: UpdatePullRequestAction;
+  /** Tab to open on mount (workspace vocabulary), e.g. from a share link. */
+  initialTab?: string;
   localSnapshot: ProjectLocalRepoSnapshot | null | undefined;
   localSnapshotError: unknown;
   localSnapshotLoading: boolean;
@@ -264,7 +267,14 @@ export function WorkspaceTabs({
     [pullRequests, selectedCommitHash],
   );
   const isPullRequestSelected = Boolean(selectedPullRequest);
-  const [selectedTab, setSelectedTab] = React.useState("overview");
+  const [selectedTab, setSelectedTab] = React.useState(
+    initialTab ?? "overview",
+  );
+  // Follow later share-link navigations to the same project (the search
+  // param changes without a remount).
+  React.useEffect(() => {
+    if (initialTab) setSelectedTab(initialTab);
+  }, [initialTab]);
   const [pullRequestCommentTarget, setPullRequestCommentTarget] =
     React.useState<{
       anchor: ProjectPullRequestCommentAnchor;

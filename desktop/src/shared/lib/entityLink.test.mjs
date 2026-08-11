@@ -131,6 +131,49 @@ test("entityLinkProjectRouteId routes project links to the 30621 coordinate", ()
   );
 });
 
+test("coordinate links carry an optional workspace tab", () => {
+  const link = buildProjectLink({
+    owner: OWNER,
+    dtag: "buzz-world",
+    tab: "prs",
+  });
+  assert.equal(link, `buzz://project?owner=${OWNER}&d=buzz-world&tab=prs`);
+  assert.deepEqual(parseEntityLink(link), {
+    ok: true,
+    value: { type: "project", owner: OWNER, dtag: "buzz-world", tab: "prs" },
+  });
+
+  const repoLink = buildRepoLink({
+    owner: OWNER,
+    dtag: "buzz-world",
+    tab: "issues",
+  });
+  assert.deepEqual(parseEntityLink(repoLink), {
+    ok: true,
+    value: { type: "repo", owner: OWNER, dtag: "buzz-world", tab: "issues" },
+  });
+
+  // The default overview has no tab spelling; unknown values are rejected
+  // rather than silently dropped, and event links accept no tab at all.
+  assert.throws(() =>
+    buildRepoLink({ owner: OWNER, dtag: "buzz-world", tab: "overview" }),
+  );
+  assert.deepEqual(
+    parseEntityLink(`buzz://repo?owner=${OWNER}&d=buzz-world&tab=overview`),
+    { ok: false, reason: "invalid-tab" },
+  );
+  assert.deepEqual(
+    parseEntityLink(`buzz://repo?owner=${OWNER}&d=buzz-world&tab=`),
+    { ok: false, reason: "invalid-tab" },
+  );
+  assert.deepEqual(
+    parseEntityLink(
+      `buzz://pr?id=${EVENT_ID}&owner=${OWNER}&d=buzz-world&tab=prs`,
+    ),
+    { ok: false, reason: "unknown-param" },
+  );
+});
+
 test("isLinkableCoordinate gates coordinates the link format cannot express", () => {
   assert.equal(isLinkableCoordinate(OWNER, "buzz-world"), true);
   assert.equal(isLinkableCoordinate(OWNER, "a".repeat(64)), true);

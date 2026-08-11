@@ -7,6 +7,8 @@ import {
   projectShareLink,
   pullRequestShareLink,
   repositoryShareLink,
+  shareTabForWorkspaceTab,
+  workspaceTabForShareTab,
 } from "./projectShareLinks.ts";
 
 const OWNER = "a".repeat(64);
@@ -47,6 +49,32 @@ test("projectShareLink links explicit projects by their 30621 coordinate", () =>
     projectShareLink({ projectAddress: PROJECT_ADDRESS }),
     `buzz://project?owner=${OWNER}&d=pollinator`,
   );
+});
+
+test("projectShareLink carries the active workspace tab for both link kinds", () => {
+  assert.equal(
+    projectShareLink({ projectAddress: PROJECT_ADDRESS }, "prs"),
+    `buzz://project?owner=${OWNER}&d=pollinator&tab=prs`,
+  );
+  // Legacy projects share as buzz://repo and keep the tab too.
+  assert.equal(
+    projectShareLink({ projectAddress: REPO_ADDRESS }, "issues"),
+    `buzz://repo?owner=${OWNER}&d=flappy-bee&tab=issues`,
+  );
+});
+
+test("workspace tab ids map onto link tabs and back", () => {
+  assert.equal(shareTabForWorkspaceTab("prs"), "prs");
+  assert.equal(shareTabForWorkspaceTab("issues"), "issues");
+  assert.equal(shareTabForWorkspaceTab("files"), "files");
+  assert.equal(shareTabForWorkspaceTab("contributors"), "contributors");
+  // "activity" is the workspace's name for the commit list.
+  assert.equal(shareTabForWorkspaceTab("activity"), "commits");
+  assert.equal(workspaceTabForShareTab("commits"), "activity");
+  assert.equal(workspaceTabForShareTab("prs"), "prs");
+  // Overview and PR-detail sub-tabs have no link spelling.
+  assert.equal(shareTabForWorkspaceTab("overview"), undefined);
+  assert.equal(shareTabForWorkspaceTab("pr-conversation"), undefined);
 });
 
 test("projectShareLink links legacy projects as their backing repository", () => {

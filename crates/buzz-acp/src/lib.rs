@@ -1392,14 +1392,16 @@ struct NativeSteerPrepared {
     prompt_blocks: Vec<String>,
 }
 
-/// Async edit enrichment may finish after channel membership changed. Such
-/// prepared work is stale: removal drains its queue reservation, and it must
-/// never be forwarded into either the removed membership period or a later
-/// re-added period.
+/// Async edit enrichment may finish after channel membership changed or after
+/// its queue reservation was recovered/consumed. Such prepared work is stale:
+/// it must never be forwarded into a removed/later membership period or into a
+/// replacement turn that already received the recovered edit.
 fn native_steer_preparation_is_stale(
+    queue: &EventQueue,
     removed_channels: &HashSet<Uuid>,
     membership_generations: &HashMap<Uuid, u64>,
     channel_id: Uuid,
+    event_id: &str,
     prepared_generation: u64,
 ) -> bool {
     removed_channels.contains(&channel_id)
@@ -1408,6 +1410,7 @@ fn native_steer_preparation_is_stale(
             .copied()
             .unwrap_or(0)
             != prepared_generation
+        || !queue.has_native_steer_reservation(channel_id, event_id)
 }
 
 /// Reserve an edit before its asynchronous enrichment starts, returning the
@@ -2872,16 +2875,19 @@ async fn tokio_main() -> Result<()> {
                 event,
                 prompt_blocks,
             })) => {
+                let event_id = event.id.to_hex();
                 if native_steer_preparation_is_stale(
+                    &queue,
                     &removed_channels,
                     &membership_generations,
                     channel_id,
+                    &event_id,
                     membership_generation,
                 ) {
                     tracing::debug!(
                         %channel_id,
-                        event_id = %event.id.to_hex(),
-                        "discarding native steer prepared after channel removal"
+                        %event_id,
+                        "discarding native steer prepared after its reservation became stale"
                     );
                     continue;
                 }
@@ -8471,9 +8477,11 @@ mod native_edit_membership_lifecycle_tests {
         // instead be discarded, leaving neither queued nor withheld work to
         // steer, release, or resurrect.
         assert!(native_steer_preparation_is_stale(
+            &queue,
             &removed_channels,
             &generations,
             channel_id,
+            &event_id,
             prepared_generation,
         ));
         queue.release_native_steer(channel_id, &event_id);

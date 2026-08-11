@@ -718,6 +718,17 @@ impl EventQueue {
         true
     }
 
+    /// Return whether this exact event still owns a native-steer reservation.
+    ///
+    /// Async edit preparation uses this at completion time: deadline recovery,
+    /// membership removal, or any other reservation settlement removes the
+    /// entry, so a late preparation cannot steer a replacement turn.
+    pub fn has_native_steer_reservation(&self, channel_id: Uuid, event_id: &str) -> bool {
+        self.withheld_native_steer
+            .get(&channel_id)
+            .is_some_and(|entries| entries.iter().any(|qe| qe.event.id.to_hex() == event_id))
+    }
+
     /// Release a single withheld event back to the front of
     /// `queues[channel_id]`, preserving its original `received_at`.
     ///
@@ -4705,6 +4716,37 @@ mod tests {
         assert_eq!(batch.events[0].event.id.to_hex(), event_id);
     }
 
+    #[test]
+    fn recovered_reservation_invalidates_late_native_steer_preparation() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let qe = make_queued(ch, "prepared edit");
+        let event_id = qe.event.id.to_hex();
+        q.push(qe);
+        q.in_flight_channels.insert(ch);
+        q.in_flight_deadlines
+            .insert(ch, Instant::now() - Duration::from_secs(1));
+        q.in_flight_batch_sizes.insert(ch, 1);
+        assert!(q.mark_native_steer_pending(ch, &event_id));
+
+        // Deadline recovery releases the reservation and normal dispatch takes
+        // the edit into a replacement turn.
+        let replacement = q.flush_next().expect("recovered edit should dispatch");
+        assert_eq!(replacement.events.len(), 1);
+        assert_eq!(replacement.events[0].event.id.to_hex(), event_id);
+
+        // The detached enrichment completion from the expired turn must not be
+        // allowed to steer that replacement turn with the same edit again.
+        assert!(crate::native_steer_preparation_is_stale(
+            &q,
+            &HashSet::new(),
+            &HashMap::new(),
+            ch,
+            &event_id,
+            0,
+        ));
+    }
+
     /// Bulk-release on expiry must preserve original FIFO. The
     /// implementation iterates the side-table entries in reverse and
     /// `push_front`s each — composing to original-FIFO at the queue front.
@@ -5163,9 +5205,11 @@ mod tests {
         let removed_channels = HashSet::from([ch]);
         let membership_generations = HashMap::new();
         assert!(crate::native_steer_preparation_is_stale(
+            &q,
             &removed_channels,
             &membership_generations,
             ch,
+            &event_id,
             0,
         ));
 
@@ -5179,6 +5223,8 @@ mod tests {
     #[test]
     fn removed_then_readded_channel_discards_late_async_edit_preparation() {
         let ch = Uuid::new_v4();
+        let event_id = "ab".repeat(32);
+        let q = EventQueue::new(DedupMode::Queue);
         // Preparation was reserved during the original membership period.
         let prepared_generation = 0;
         let mut membership_generations = HashMap::from([(ch, prepared_generation)]);
@@ -5190,9 +5236,11 @@ mod tests {
         *membership_generations.get_mut(&ch).unwrap() += 1;
 
         assert!(crate::native_steer_preparation_is_stale(
+            &q,
             &removed_channels,
             &membership_generations,
             ch,
+            &event_id,
             prepared_generation,
         ));
     }

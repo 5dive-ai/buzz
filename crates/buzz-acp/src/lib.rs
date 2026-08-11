@@ -2627,15 +2627,24 @@ async fn tokio_main() -> Result<()> {
                                         if queue.has_native_steer_reservations(
                                             buzz_event.channel_id,
                                         ) {
-                                            let released = queue.release_native_steers(
+                                            let released = queue.release_native_steer_preparations(
+                                                buzz_event.channel_id,
+                                            );
+                                            let sent_steer_pending = queue.has_sent_native_steer(
                                                 buzz_event.channel_id,
                                             );
                                             tracing::debug!(
                                                 channel_id = %buzz_event.channel_id,
                                                 released,
-                                                "native steer preparation already pending; releasing reservations for ordered cancel+merge"
+                                                sent_steer_pending,
+                                                "native steer reservation already pending; released preparations and retained sent steers"
                                             );
-                                            false
+                                            // A sent steer must settle before later work can
+                                            // cancel or replace its turn. Treat it as an
+                                            // accepted native attempt so the later event stays
+                                            // queued; the ack arm will settle the reservation
+                                            // and drive fallback/dispatch as needed.
+                                            sent_steer_pending
                                         } else if is_edit
                                             && pool.native_steer_available(buzz_event.channel_id)
                                         {
@@ -3375,6 +3384,7 @@ fn try_native_steer(
             // Ordinary events are withheld after send. Edit preparation reserves
             // its event before leaving the main loop, so this is idempotent.
             let withheld = queue.mark_native_steer_pending(channel_id, &event_id_hex);
+            queue.mark_native_steer_sent(channel_id, &event_id_hex);
             if !withheld {
                 tracing::debug!(
                     channel = %channel_id,

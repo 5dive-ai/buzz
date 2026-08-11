@@ -1084,16 +1084,31 @@ impl Config {
 
                 // Catch-all authority gate: every accepted host is interpolated
                 // verbatim into the NIP-11 advertisement and NIP-98 `u`-tag URLs,
-                // so it must form a parseable authority. The bracket guard above
-                // names the honest bare-IPv6 shape; this rejects any remaining
-                // malformed authority (e.g. the unclosed-bracket typos `[::1`
-                // and `[::1:3000`) that would otherwise produce an unparseable
-                // `http://{host}`. This is a validity gate only — the host is
-                // still stored verbatim, not normalized.
-                if url::Url::parse(&format!("http://{host}")).is_err() {
+                // so it must be exactly an authority — a host with an optional
+                // port and nothing else. Parsing `http://{host}` and requiring
+                // the sentinel to carry only a host rejects any shape that smuggles
+                // a path, query, fragment, or credentials into the value (the
+                // bracket guard above already names the honest bare-IPv6 shape).
+                // Structural check, not parse-only: `admin.example.com?x=1` parses
+                // as a valid URL but lands `?x=1` in the query, which would corrupt
+                // both the advertised origin and the canonical `u`-tag URL. Mirrors
+                // `parse_operator_api_origin`. Validity gate only — the host is
+                // still stored verbatim, not normalized (the `url` crate normalizes
+                // an empty path to `/`, so a bare authority satisfies `path == "/"`).
+                let is_bare_authority =
+                    url::Url::parse(&format!("http://{host}")).is_ok_and(|url| {
+                        url.host().is_some()
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                            && url.path() == "/"
+                            && url.query().is_none()
+                            && url.fragment().is_none()
+                    });
+                if !is_bare_authority {
                     return Err(ConfigError::InvalidValue(format!(
                         "BUZZ_ADMIN_HOST={host} is not a valid URL authority; \
-                         it must be a host with an optional port, e.g. \
+                         it must be a host with an optional port and nothing else \
+                         (no path, query, fragment, or credentials), e.g. \
                          relay.example.com:8443 or [::1]:3000"
                     )));
                 }
@@ -1464,12 +1479,23 @@ mod tests {
 
     #[test]
     fn admin_host_malformed_authority_fails_closed() {
-        // Shapes that slip the bare-IPv6 bracket guard (they start with `[`)
-        // but still cannot form a valid URL authority — the unclosed-bracket
-        // typos. Without the catch-all parse gate these would produce an
-        // unparseable `http://[::1` advertisement and NIP-98 `u`-tag URL.
+        // Shapes that slip the earlier guards but are not a bare authority, so
+        // they would corrupt the NIP-11 advertisement and NIP-98 `u`-tag URL:
+        //   - unclosed-bracket typos start with `[` (pass the bracket guard)
+        //     but are not parseable authorities;
+        //   - query/fragment suffixes parse as a valid URL, but the `?x=1` /
+        //     `#frag` lands in the query/fragment rather than the host, so a
+        //     parse-only gate would miss them — the structural check catches them.
         let _guard = ENV_MUTEX.lock().unwrap();
-        for host in ["[::1", "[::1:3000", "[not-closed"] {
+        for host in [
+            "[::1",
+            "[::1:3000",
+            "[not-closed",
+            "admin.example.com?x=1",
+            "admin.example.com#frag",
+            "[::1]?x=1",
+            "[::1]#frag",
+        ] {
             let result = config_with_admin_env(&[
                 ("BUZZ_ADMIN_HOST", Some(host)),
                 ("BUZZ_ADMIN_TOKEN", Some(VALID_ADMIN_TOKEN)),

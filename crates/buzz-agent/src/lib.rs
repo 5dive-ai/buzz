@@ -21,16 +21,14 @@
 //! * `keepalive` — see `agent.rs`.
 
 pub mod agent;
-pub mod builtin;
-pub mod builtin_client;
 pub mod config;
-pub mod hints;
 pub mod hooks;
 pub mod loop_drive;
 pub mod model;
 pub mod ops;
 pub mod prompt;
 pub mod session_store;
+pub mod skills;
 pub mod steer;
 pub mod tools;
 pub mod turn_state;
@@ -251,31 +249,39 @@ async fn build_agent(
     // goose's loader is also a superset: `.goosehints` as well as `AGENTS.md`,
     // the filename list configurable via `CONTEXT_FILE_NAMES`, gitignore-aware
     // filtering, and `@file` reference expansion bounded at the git root.
-    let skills = crate::hints::discover_skills(std::path::Path::new(cwd));
+    // Skills are goose's too, for the same reason as hints.
+    //
+    // buzz-agent grew its own discovery, index and `load_skill` tool
+    // (`hints.rs` + `builtin.rs` + `builtin_client.rs`, ~1.2k lines) before
+    // goose had one. goose has since shipped `goose::skills` and registers a
+    // `SkillsClient` as a platform extension, so ours was a strictly smaller
+    // duplicate: same three project directories, but goose also reads the
+    // global ones, plugin-installed skills and its own builtins, and supports
+    // `args` templating we never had.
+    //
+    // Registered by *name* rather than by handing over a client: `skills` is
+    // in goose's `PLATFORM_EXTENSIONS` table, so `add_extension` runs its
+    // factory. It is declared `unprefixed_tools: true` there, which is why the
+    // tool the model sees is plain `load_skill` and not `skills__load_skill`.
+    let skills = goose::skills::discover_skills(Some(std::path::Path::new(cwd)));
     if !skills.is_empty() {
-        prompt
-            .add_extra("buzz_skills", crate::hints::skill_index(&skills))
-            .await;
-    }
-
-    // `load_skill` runs in-process, registered the way Maple does it: a
-    // platform extension backed by an `McpClientTrait`, NOT
-    // `ExtensionConfig::Frontend`. Goose advertises frontend tools but refuses
-    // to dispatch them -- it blocks on an uncorrelated result channel until the
-    // embedder calls `handle_tool_result`, with no timeout and no cancellation,
-    // so one missed result wedges the session. A platform client goes through
-    // goose's ordinary tool path instead. See `crate::builtin_client`.
-    if !skills.is_empty() {
-        agent
-            .extension_manager
-            .add_client(
-                crate::builtin_client::BUILTIN_EXTENSION_NAME.to_string(),
-                crate::builtin_client::builtin_extension_config(),
-                std::sync::Arc::new(crate::builtin_client::BuiltinClient::new(skills)),
-                None,
-                None,
-            )
-            .await;
+        let ext = ExtensionConfig::Platform {
+            name: goose::skills::EXTENSION_NAME.to_string(),
+            description: "Skills".to_string(),
+            display_name: Some("Skills".to_string()),
+            bundled: Some(true),
+            available_tools: Vec::new(),
+        };
+        if let Err(e) = agent.add_extension(ext, &session_id).await {
+            // Unlike an MCP server, a missing skills extension is not fatal:
+            // the agent still has every other tool. Losing it silently would
+            // be worse than losing it loudly, hence the warning.
+            tracing::warn!(error = %e, "skills extension unavailable");
+        } else {
+            prompt
+                .add_extra("skills", crate::skills::skill_index(&skills))
+                .await;
+        }
     }
 
     let agent = Arc::new(agent);

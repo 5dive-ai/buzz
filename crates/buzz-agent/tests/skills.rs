@@ -1,10 +1,11 @@
 //! Proves `load_skill` and `AGENTS.md` hints survive the goose swap.
 //!
-//! Both were briefly lost in the port. `load_skill` is registered as a goose
-//! *platform* extension backed by an `McpClientTrait` (the shape Maple uses),
-//! so goose dispatches it on its ordinary tool path. Goose namespaces such
-//! tools as `{extension}__{tool}`, which the system prompt has to match — a
-//! prompt naming a tool that is not in the tool list is a silent failure.
+//! Both were briefly lost in the port. Skills are now goose's `skills`
+//! platform extension rather than a buzz reimplementation, and goose declares
+//! it `unprefixed_tools: true`, so the model sees plain `load_skill` — not
+//! `skills__load_skill`. buzz only renders the index, and an index naming a
+//! tool that is not in the tool list is a silent failure, so this pins both
+//! halves against each other.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -100,7 +101,7 @@ fn spawn_provider() -> (String, mpsc::Receiver<(String, Vec<String>)>) {
                     "id":"c","object":"chat.completion.chunk","created":1,"model":"fake-model",
                     "choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{
                         "index":0,"id":"call_1","type":"function",
-                        "function":{"name":"buzz__load_skill","arguments":"{\"name\":\"widget-maker\"}"}
+                        "function":{"name":"load_skill","arguments":"{\"name\":\"widget-maker\"}"}
                     }]},"finish_reason":null}]
                 });
                 let d = json!({
@@ -198,7 +199,8 @@ fn workspace() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tmp");
     let root = dir.path();
     std::fs::write(root.join("AGENTS.md"), "Always ship the sprocket first.").unwrap();
-    // hints.rs walks up to the git root; give it one so the walk terminates here.
+    // goose's hint loader walks up to the git root; give it one so the walk
+    // terminates inside the temp workspace rather than in the real repo.
     std::fs::create_dir_all(root.join(".git")).unwrap();
     let skill = root.join(".agents/skills/widget-maker");
     std::fs::create_dir_all(&skill).unwrap();
@@ -264,7 +266,7 @@ fn agents_md_and_skill_index_reach_the_model_and_load_skill_resolves() {
         "skill BODY was inlined — the point of load_skill is that it is not:\n{first}"
     );
     assert!(
-        tool_lists[0].iter().any(|t| t == "buzz__load_skill"),
+        tool_lists[0].iter().any(|t| t == "load_skill"),
         "load_skill not advertised: {:?}",
         tool_lists[0]
     );

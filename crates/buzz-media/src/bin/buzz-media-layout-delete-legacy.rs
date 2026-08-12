@@ -8,7 +8,29 @@ use buzz_media::MediaStorage;
 use clap::Parser;
 
 mod media_layout_common;
-use media_layout_common::{verify_destination, CommonArgs};
+use media_layout_common::{verify_destination, CommonArgs, DestinationVerification};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupVerification {
+    SkipAbsentSource,
+    VerifyLegacyKey,
+}
+
+fn decide_cleanup_verification(
+    verification: DestinationVerification,
+    sharded_key: &str,
+    checkpoint: &str,
+) -> Result<CleanupVerification> {
+    match verification {
+        DestinationVerification::LegacySourceAbsent => Ok(CleanupVerification::SkipAbsentSource),
+        DestinationVerification::Verified => Ok(CleanupVerification::VerifyLegacyKey),
+        DestinationVerification::DestinationMissing | DestinationVerification::ByteMismatch => {
+            anyhow::bail!(
+                "refusing deletion: sharded destination bytes do not match legacy source: {sharded_key} (checkpoint: {checkpoint})"
+            )
+        }
+    }
+}
 
 const CONFIRMATION: &str = "delete-verified-legacy-media";
 
@@ -59,14 +81,16 @@ async fn verify_selected_destinations(
                 .context("read media sidecar")?;
             let meta = serde_json::from_slice(&bytes).context("parse media sidecar")?;
             for object in objects_for_sidecar(community, sha, &meta)? {
-                if !verify_destination(storage, pacer, &object).await? {
-                    anyhow::bail!(
-                        "refusing deletion: sharded destination bytes do not match legacy source: {} (checkpoint: {sidecar_key})",
-                        object.sharded
-                    );
+                let verification = verify_destination(storage, pacer, &object).await?;
+                match decide_cleanup_verification(verification, &object.sharded, &sidecar_key)? {
+                    CleanupVerification::SkipAbsentSource => {
+                        tracing::info!(source = %object.legacy, destination = %object.sharded, "legacy source absent; skipping deletion candidate");
+                    }
+                    CleanupVerification::VerifyLegacyKey => {
+                        verified += 1;
+                        verified_legacy_keys.insert(object.legacy);
+                    }
                 }
-                verified += 1;
-                verified_legacy_keys.insert(object.legacy);
             }
             checkpoint = Some(sidecar_key);
         }
@@ -145,7 +169,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_no_start_after;
+    use super::{decide_cleanup_verification, ensure_no_start_after, CleanupVerification};
+    use crate::media_layout_common::DestinationVerification;
 
     #[test]
     fn rejects_start_after_flag() {
@@ -166,5 +191,58 @@ mod tests {
     #[test]
     fn allows_full_bucket_scan() {
         ensure_no_start_after(None, false).expect("full scan must be allowed");
+    }
+    #[test]
+    fn cleanup_skips_absent_legacy_source() {
+        let decision = decide_cleanup_verification(
+            DestinationVerification::LegacySourceAbsent,
+            "media/aa/bb/hash.png",
+            "_meta/community/hash.json",
+        )
+        .expect("absent legacy source should be skipped");
+
+        assert_eq!(decision, CleanupVerification::SkipAbsentSource);
+    }
+
+    #[test]
+    fn cleanup_verifies_matching_destination_for_deletion() {
+        let decision = decide_cleanup_verification(
+            DestinationVerification::Verified,
+            "media/aa/bb/hash.png",
+            "_meta/community/hash.json",
+        )
+        .expect("verified destination should enter deletion set");
+
+        assert_eq!(decision, CleanupVerification::VerifyLegacyKey);
+    }
+
+    #[test]
+    fn cleanup_fails_closed_when_destination_is_missing() {
+        let error = decide_cleanup_verification(
+            DestinationVerification::DestinationMissing,
+            "media/aa/bb/hash.png",
+            "_meta/community/hash.json",
+        )
+        .expect_err("missing sharded destination must block cleanup");
+
+        assert!(
+            error.to_string().contains("refusing deletion"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn cleanup_fails_closed_on_byte_mismatch() {
+        let error = decide_cleanup_verification(
+            DestinationVerification::ByteMismatch,
+            "media/aa/bb/hash.png",
+            "_meta/community/hash.json",
+        )
+        .expect_err("byte mismatch must block cleanup");
+
+        assert!(
+            error.to_string().contains("refusing deletion"),
+            "unexpected error: {error}"
+        );
     }
 }

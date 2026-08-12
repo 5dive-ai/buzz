@@ -5,7 +5,28 @@ use buzz_media::migration::{objects_for_sidecar, parse_sidecar_key, RequestPacer
 use clap::Parser;
 
 mod media_layout_common;
-use media_layout_common::{verify_destination, CommonArgs};
+use media_layout_common::{verify_destination, CommonArgs, DestinationVerification};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillDecision {
+    Skip,
+    Copy,
+}
+
+fn decide_backfill(
+    verification: DestinationVerification,
+    sharded_key: &str,
+) -> Result<BackfillDecision> {
+    match verification {
+        DestinationVerification::LegacySourceAbsent | DestinationVerification::Verified => {
+            Ok(BackfillDecision::Skip)
+        }
+        DestinationVerification::DestinationMissing => Ok(BackfillDecision::Copy),
+        DestinationVerification::ByteMismatch => {
+            anyhow::bail!("destination verification failed: {sharded_key}")
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "buzz-media-layout-backfill")]
@@ -57,26 +78,36 @@ async fn main() -> Result<()> {
             let meta = serde_json::from_slice(&bytes).context("parse media sidecar")?;
             for object in objects_for_sidecar(community, sha, &meta)? {
                 processed += 1;
-                pacer.wait().await;
-                if verify_destination(&storage, &mut pacer, &object).await? {
-                    skipped += 1;
-                    continue;
+                let verification = verify_destination(&storage, &mut pacer, &object).await?;
+                if matches!(verification, DestinationVerification::LegacySourceAbsent) {
+                    tracing::info!(source = %object.legacy, destination = %object.sharded, "legacy source absent; skipping");
                 }
-                pacer.wait().await;
-                let source_exists = storage.head(&object.legacy).await?;
-                if !source_exists {
-                    anyhow::bail!(
-                        "legacy source missing: {} (checkpoint: {sidecar_key})",
-                        object.legacy
-                    );
+                match decide_backfill(verification, &object.sharded)? {
+                    BackfillDecision::Skip => {
+                        skipped += 1;
+                        continue;
+                    }
+                    BackfillDecision::Copy => {}
                 }
                 if args.dry_run {
                     tracing::info!(source = %object.legacy, destination = %object.sharded, "would copy");
                 } else {
                     pacer.wait().await;
                     storage.copy(&object.legacy, &object.sharded).await?;
-                    if !verify_destination(&storage, &mut pacer, &object).await? {
-                        anyhow::bail!("destination verification failed: {}", object.sharded);
+                    match verify_destination(&storage, &mut pacer, &object).await? {
+                        DestinationVerification::Verified => {}
+                        DestinationVerification::LegacySourceAbsent => {
+                            anyhow::bail!(
+                                "legacy source disappeared before verification: {}",
+                                object.legacy
+                            );
+                        }
+                        DestinationVerification::DestinationMissing => {
+                            anyhow::bail!("destination verification failed: {}", object.sharded);
+                        }
+                        DestinationVerification::ByteMismatch => {
+                            anyhow::bail!("destination verification failed: {}", object.sharded);
+                        }
                     }
                     copied += 1;
                 }
@@ -93,4 +124,56 @@ async fn main() -> Result<()> {
     }
     tracing::info!(processed, copied, skipped, dry_run = args.dry_run, checkpoint = ?checkpoint, "backfill complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_backfill, BackfillDecision};
+    use crate::media_layout_common::DestinationVerification;
+
+    #[test]
+    fn backfill_skips_absent_legacy_source() {
+        let decision = decide_backfill(
+            DestinationVerification::LegacySourceAbsent,
+            "media/aa/bb/hash.png",
+        )
+        .expect("absent legacy source should be skipped");
+
+        assert_eq!(decision, BackfillDecision::Skip);
+    }
+
+    #[test]
+    fn backfill_skips_already_verified_destination() {
+        let decision = decide_backfill(DestinationVerification::Verified, "media/aa/bb/hash.png")
+            .expect("verified destination should be skipped");
+
+        assert_eq!(decision, BackfillDecision::Skip);
+    }
+
+    #[test]
+    fn backfill_copies_when_destination_is_missing() {
+        let decision = decide_backfill(
+            DestinationVerification::DestinationMissing,
+            "media/aa/bb/hash.png",
+        )
+        .expect("missing destination should be copied");
+
+        assert_eq!(decision, BackfillDecision::Copy);
+    }
+
+    #[test]
+    fn backfill_fails_closed_on_byte_mismatch() {
+        let error = decide_backfill(
+            DestinationVerification::ByteMismatch,
+            "media/aa/bb/hash.png",
+        )
+        .expect_err("byte mismatch must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("destination verification failed"),
+            "unexpected error: {error}"
+        );
+    }
 }

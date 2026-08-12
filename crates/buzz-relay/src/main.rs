@@ -48,19 +48,12 @@ fn runtime_timeout_hook(
        + Send
        + Sync
        + 'static {
-    let statement_timeout = db_config.statement_timeout.clone();
-    let lock_timeout = db_config.lock_timeout.clone();
+    let timeouts = db_config.timeouts.clone();
     move |connection, _meta| {
-        let statement_timeout = statement_timeout.clone();
-        let lock_timeout = lock_timeout.clone();
-        Box::pin(async move {
-            buzz_db::apply_runtime_connection_timeouts(
-                connection,
-                &statement_timeout,
-                &lock_timeout,
-            )
-            .await
-        })
+        let timeouts = timeouts.clone();
+        Box::pin(
+            async move { buzz_db::apply_runtime_connection_timeouts(connection, &timeouts).await },
+        )
     }
 }
 
@@ -198,8 +191,7 @@ async fn main() -> anyhow::Result<()> {
         replica_read_max_age_ms: config.replica_read_max_age_ms,
         max_connections: config.db_pool_size,
         read_max_connections: config.db_read_pool_size,
-        statement_timeout: config.db_statement_timeout.clone(),
-        lock_timeout: config.db_lock_timeout.clone(),
+        timeouts: config.db_timeouts.clone(),
         ..DbConfig::default()
     };
     let db = Db::new(&db_config).await.map_err(|e| {

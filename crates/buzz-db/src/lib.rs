@@ -69,12 +69,18 @@ use buzz_core::{CommunityId, StoredEvent};
 pub const RUNTIME_STATEMENT_TIMEOUT: &str = "30s";
 /// Default maximum time a runtime query may wait to acquire a lock.
 pub const RUNTIME_LOCK_TIMEOUT: &str = "5s";
+/// Default maximum time a runtime session may sit idle inside an open
+/// transaction. Deliberately looser than [`RUNTIME_STATEMENT_TIMEOUT`]: this
+/// budget covers only the gaps *between* a transaction's statements, so a
+/// transaction doing continuous work is never at risk, and a wide bound still
+/// reclaims a session that has stopped working entirely.
+pub const RUNTIME_IDLE_IN_TRANSACTION_TIMEOUT: &str = "60s";
 /// Postgres spelling of "no limit", used for schema migrations.
 pub const TIMEOUT_DISABLED: &str = "0";
-/// `statement_timeout` and `lock_timeout` are `int` GUCs measured in
-/// milliseconds, so Postgres refuses anything larger regardless of the unit it
-/// is spelled with. Private on purpose: [`PgTimeout`] is the only way to build a
-/// timeout, so no caller needs to range-check by hand.
+/// The runtime timeouts are `int` GUCs measured in milliseconds, so Postgres
+/// refuses anything larger regardless of the unit it is spelled with. Private on
+/// purpose: [`PgTimeout`] is the only way to build a timeout, so no caller needs
+/// to range-check by hand.
 /// `pg_timeout_max_millis_matches_postgres` pins it to the live server.
 const PG_TIMEOUT_MAX_MILLIS: u128 = i32::MAX as u128;
 
@@ -127,6 +133,12 @@ impl PgTimeout {
     /// The default runtime lock timeout ([`RUNTIME_LOCK_TIMEOUT`]).
     pub fn lock_default() -> Self {
         Self(RUNTIME_LOCK_TIMEOUT.to_string())
+    }
+
+    /// The default idle-in-transaction timeout
+    /// ([`RUNTIME_IDLE_IN_TRANSACTION_TIMEOUT`]).
+    pub fn idle_in_transaction_default() -> Self {
+        Self(RUNTIME_IDLE_IN_TRANSACTION_TIMEOUT.to_string())
     }
 
     /// No limit at all — what schema migrations and one-shot operator tools
@@ -222,19 +234,75 @@ fn pg_timeout_millis(magnitude: &str, unit: &str) -> Option<u128> {
     }
 }
 
+/// The per-session limits that stop one caller from holding a pooled connection
+/// indefinitely.
+///
+/// Grouped rather than passed as three same-typed arguments, which would make a
+/// swapped pair a silent misconfiguration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTimeouts {
+    /// Bounds a single statement's execution time.
+    pub statement: PgTimeout,
+    /// Bounds heavyweight and row lock waits. Advisory-lock waits are bounded
+    /// by [`Self::statement`] instead.
+    pub lock: PgTimeout,
+    /// Bounds a session sitting idle inside an open transaction.
+    ///
+    /// [`Self::statement`] only counts time spent *executing*, so a session
+    /// that opens a transaction and then stops issuing statements holds its
+    /// connection — and every lock it already took — with no statement running
+    /// for the statement timeout to cancel.
+    pub idle_in_transaction: PgTimeout,
+}
+
+impl Default for RuntimeTimeouts {
+    fn default() -> Self {
+        Self {
+            statement: PgTimeout::statement_default(),
+            lock: PgTimeout::lock_default(),
+            idle_in_transaction: PgTimeout::idle_in_transaction_default(),
+        }
+    }
+}
+
+impl RuntimeTimeouts {
+    /// Every limit lifted — schema migrations and one-shot operator tools.
+    pub fn disabled() -> Self {
+        Self {
+            statement: PgTimeout::disabled(),
+            lock: PgTimeout::disabled(),
+            idle_in_transaction: PgTimeout::disabled(),
+        }
+    }
+
+    /// Read each limit from its environment variable, falling back to the
+    /// corresponding field of `defaults` with a warning.
+    pub fn from_env_or(defaults: Self) -> Self {
+        Self {
+            statement: PgTimeout::from_env_or("BUZZ_DB_STATEMENT_TIMEOUT", defaults.statement),
+            lock: PgTimeout::from_env_or("BUZZ_DB_LOCK_TIMEOUT", defaults.lock),
+            idle_in_transaction: PgTimeout::from_env_or(
+                "BUZZ_DB_IDLE_IN_TRANSACTION_TIMEOUT",
+                defaults.idle_in_transaction,
+            ),
+        }
+    }
+}
+
 /// Apply the runtime safety limits shared by writer, reader, audit, and search
-/// pools. [`PgTimeout::disabled`] lifts a limit entirely.
+/// pools. [`RuntimeTimeouts::disabled`] lifts them entirely.
 pub async fn apply_runtime_connection_timeouts(
     connection: &mut PgConnection,
-    statement_timeout: &PgTimeout,
-    lock_timeout: &PgTimeout,
+    timeouts: &RuntimeTimeouts,
 ) -> std::result::Result<(), sqlx::Error> {
     sqlx::query(
         "SELECT set_config('statement_timeout', $1, false), \
-                set_config('lock_timeout', $2, false)",
+                set_config('lock_timeout', $2, false), \
+                set_config('idle_in_transaction_session_timeout', $3, false)",
     )
-    .bind(statement_timeout.as_str())
-    .bind(lock_timeout.as_str())
+    .bind(timeouts.statement.as_str())
+    .bind(timeouts.lock.as_str())
+    .bind(timeouts.idle_in_transaction.as_str())
     .execute(connection)
     .await?;
     Ok(())
@@ -702,14 +770,10 @@ pub struct DbConfig {
     /// than the staleness gate never routes anyway, so a larger budget
     /// would only misrepresent the config.
     pub replica_read_max_age_ms: u64,
-    /// Postgres `statement_timeout` applied to every runtime connection. An
-    /// operator running a backfill or working an incident can widen this without
-    /// a code change; [`PgTimeout::disabled`] removes the cap.
-    pub statement_timeout: PgTimeout,
-    /// Postgres `lock_timeout` applied to every runtime connection. Bounds
-    /// heavyweight and row lock waits only — advisory-lock waits are bounded by
-    /// [`Self::statement_timeout`] instead.
-    pub lock_timeout: PgTimeout,
+    /// Per-session limits applied to every runtime connection. An operator
+    /// running a backfill or working an incident can widen these without a code
+    /// change; [`RuntimeTimeouts::disabled`] removes them.
+    pub timeouts: RuntimeTimeouts,
 }
 
 impl Default for DbConfig {
@@ -727,8 +791,7 @@ impl Default for DbConfig {
             max_lifetime_secs: 1800,
             idle_timeout_secs: 600,
             replica_read_max_age_ms: 0,
-            statement_timeout: PgTimeout::statement_default(),
-            lock_timeout: PgTimeout::lock_default(),
+            timeouts: RuntimeTimeouts::default(),
         }
     }
 }
@@ -867,13 +930,11 @@ impl Db {
             .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs))
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs));
-        let statement_timeout = config.statement_timeout.clone();
-        let lock_timeout = config.lock_timeout.clone();
+        let timeouts = config.timeouts.clone();
         options = options.after_connect(move |conn, _meta| {
-            let statement_timeout = statement_timeout.clone();
-            let lock_timeout = lock_timeout.clone();
+            let timeouts = timeouts.clone();
             Box::pin(async move {
-                apply_runtime_connection_timeouts(conn, &statement_timeout, &lock_timeout).await?;
+                apply_runtime_connection_timeouts(conn, &timeouts).await?;
                 if arm_floor_guard {
                     // `SET` cannot take bind parameters; `set_config` can.
                     sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
@@ -911,8 +972,7 @@ impl Db {
     /// No floor guard: replica sessions are read-only, the trigger never
     /// fires there (see [`Db::connect_pool`]).
     fn connect_read_pool(config: &DbConfig, url: &str, max_connections: u32) -> Result<PgPool> {
-        let statement_timeout = config.statement_timeout.clone();
-        let lock_timeout = config.lock_timeout.clone();
+        let timeouts = config.timeouts.clone();
         Ok(PgPoolOptions::new()
             .max_connections(max_connections)
             .min_connections(0)
@@ -920,12 +980,10 @@ impl Db {
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
             .after_connect(move |connection, _meta| {
-                let statement_timeout = statement_timeout.clone();
-                let lock_timeout = lock_timeout.clone();
-                Box::pin(async move {
-                    apply_runtime_connection_timeouts(connection, &statement_timeout, &lock_timeout)
-                        .await
-                })
+                let timeouts = timeouts.clone();
+                Box::pin(
+                    async move { apply_runtime_connection_timeouts(connection, &timeouts).await },
+                )
             })
             .connect_lazy(url)?)
     }
@@ -6737,8 +6795,11 @@ mod tests {
             database_url: scratch_url,
             max_connections: 2,
             min_connections: 2,
-            statement_timeout: TIGHT.parse().expect("test timeout literal"),
-            lock_timeout: TIGHT.parse().expect("test timeout literal"),
+            timeouts: RuntimeTimeouts {
+                statement: TIGHT.parse().expect("test timeout literal"),
+                lock: TIGHT.parse().expect("test timeout literal"),
+                idle_in_transaction: TIGHT.parse().expect("test timeout literal"),
+            },
             ..DbConfig::default()
         })
         .await
@@ -6761,8 +6822,14 @@ mod tests {
                 .fetch_one(&mut *connection)
                 .await
                 .expect("SHOW lock_timeout");
+            let idle_timeout: String =
+                sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+                    .fetch_one(&mut *connection)
+                    .await
+                    .expect("SHOW idle_in_transaction_session_timeout");
             assert_eq!(statement_timeout, TIGHT);
             assert_eq!(lock_timeout, TIGHT);
+            assert_eq!(idle_timeout, TIGHT);
             held.push(connection);
         }
         drop(held);
@@ -8586,28 +8653,36 @@ mod tests {
         let cid = CommunityId::from_uuid(community);
 
         // Assert the effective session values, not only pool-builder intent.
-        let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
-            .fetch_one(&db.pool)
-            .await
-            .expect("SHOW statement_timeout");
-        let lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
-            .fetch_one(&db.pool)
-            .await
-            .expect("SHOW lock_timeout");
-        assert_eq!(statement_timeout, RUNTIME_STATEMENT_TIMEOUT);
-        assert_eq!(lock_timeout, RUNTIME_LOCK_TIMEOUT);
-
-        let read_pool = db.read_pool.as_ref().expect("read pool configured");
-        let reader_statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
-            .fetch_one(read_pool)
-            .await
-            .expect("SHOW reader statement_timeout");
-        let reader_lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
-            .fetch_one(read_pool)
-            .await
-            .expect("SHOW reader lock_timeout");
-        assert_eq!(reader_statement_timeout, RUNTIME_STATEMENT_TIMEOUT);
-        assert_eq!(reader_lock_timeout, RUNTIME_LOCK_TIMEOUT);
+        // Compare milliseconds, not spellings: Postgres re-spells a setting on
+        // the way out (`60s` reads back as `1min`), so asserting on `SHOW`
+        // text couples the test to the server's formatting rather than to the
+        // limit actually in force.
+        for (pool, label) in [
+            (&db.pool, "writer"),
+            (
+                db.read_pool.as_ref().expect("read pool configured"),
+                "reader",
+            ),
+        ] {
+            for (setting, expected_millis) in [
+                ("statement_timeout", 30_000),
+                ("lock_timeout", 5_000),
+                ("idle_in_transaction_session_timeout", 60_000),
+            ] {
+                let millis: i64 =
+                    sqlx::query_scalar("SELECT setting::bigint FROM pg_settings WHERE name = $1")
+                        .bind(setting)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("read {setting} on the {label} pool: {error}")
+                        });
+                assert_eq!(
+                    millis, expected_millis,
+                    "{label} pool must carry the default {setting}"
+                );
+            }
+        }
 
         let effective: String = sqlx::query_scalar("SHOW buzz.created_at_floor")
             .fetch_one(&db.pool)
@@ -8669,6 +8744,16 @@ mod tests {
         drop_scratch_db(&admin, seed_pool, &name).await;
         // db pool still holds connections to the dropped DB; close it.
         db.pool.close().await;
+    }
+
+    /// Every limit set to the same value, for tests that care about one
+    /// spelling rather than about the individual limits.
+    fn uniform_timeouts(timeout: &PgTimeout) -> RuntimeTimeouts {
+        RuntimeTimeouts {
+            statement: timeout.clone(),
+            lock: timeout.clone(),
+            idle_in_transaction: timeout.clone(),
+        }
     }
 
     /// The built-in defaults bypass parsing, so prove they would survive it —
@@ -8791,7 +8876,7 @@ mod tests {
         ] {
             let parsed = PgTimeout::parse_or(Some(raw), PgTimeout::statement_default());
             assert_eq!(parsed.as_str(), canonical);
-            apply_runtime_connection_timeouts(&mut connection, &parsed, &parsed)
+            apply_runtime_connection_timeouts(&mut connection, &uniform_timeouts(&parsed))
                 .await
                 .unwrap_or_else(|error| panic!("{raw:?} normalized to {parsed}: {error}"));
         }
@@ -8811,7 +8896,7 @@ mod tests {
             .expect("connect");
 
         let boundary = PgTimeout::unchecked(PG_TIMEOUT_MAX_MILLIS.to_string());
-        apply_runtime_connection_timeouts(&mut conn, &boundary, &boundary)
+        apply_runtime_connection_timeouts(&mut conn, &uniform_timeouts(&boundary))
             .await
             .expect("PG_TIMEOUT_MAX_MILLIS must be settable");
 
@@ -8819,7 +8904,7 @@ mod tests {
         // range check performs must land inside the range too.
         let in_seconds = (PG_TIMEOUT_MAX_MILLIS / 1_000).to_string();
         let boundary_seconds = PgTimeout::unchecked(format!("{in_seconds}s"));
-        apply_runtime_connection_timeouts(&mut conn, &boundary_seconds, &boundary_seconds)
+        apply_runtime_connection_timeouts(&mut conn, &uniform_timeouts(&boundary_seconds))
             .await
             .expect("the boundary in seconds must be settable");
 
@@ -8831,8 +8916,10 @@ mod tests {
         ] {
             let err = apply_runtime_connection_timeouts(
                 &mut conn,
-                &PgTimeout::unchecked(over.clone()),
-                &PgTimeout::lock_default(),
+                &RuntimeTimeouts {
+                    statement: PgTimeout::unchecked(over.clone()),
+                    ..RuntimeTimeouts::default()
+                },
             )
             .await
             .expect_err(&format!("{over} must be rejected by Postgres"));

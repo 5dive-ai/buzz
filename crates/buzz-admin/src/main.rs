@@ -25,7 +25,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST;
 use buzz_core::tenant::{relay_url_authority, TenantContext};
-use buzz_db::{Db, DbConfig, PgTimeout};
+use buzz_db::{Db, DbConfig, RuntimeTimeouts};
 use buzz_pubsub::{EventTopic, PubSubManager};
 use clap::{Parser, Subcommand};
 use nostr::{EventBuilder, Keys, Kind, Tag};
@@ -426,11 +426,7 @@ async fn connect_db() -> Result<Db> {
     // env vars still apply for an operator who wants a bound here.
     let db = Db::new(&DbConfig {
         database_url: db_url,
-        statement_timeout: PgTimeout::from_env_or(
-            "BUZZ_DB_STATEMENT_TIMEOUT",
-            PgTimeout::disabled(),
-        ),
-        lock_timeout: PgTimeout::from_env_or("BUZZ_DB_LOCK_TIMEOUT", PgTimeout::disabled()),
+        timeouts: RuntimeTimeouts::from_env_or(RuntimeTimeouts::disabled()),
         ..DbConfig::default()
     })
     .await?;

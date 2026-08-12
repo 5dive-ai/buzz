@@ -71,12 +71,8 @@ async fn migrate_on_exempt_connection(connection: &mut sqlx::PgConnection) -> Re
 
 /// Remove both runtime limits from one connection's session.
 async fn lift_runtime_timeouts(connection: &mut sqlx::PgConnection) -> Result<()> {
-    crate::apply_runtime_connection_timeouts(
-        connection,
-        &crate::PgTimeout::disabled(),
-        &crate::PgTimeout::disabled(),
-    )
-    .await?;
+    crate::apply_runtime_connection_timeouts(connection, &crate::RuntimeTimeouts::disabled())
+        .await?;
     Ok(())
 }
 
@@ -1174,11 +1170,18 @@ mod tests {
             .expect("create public schema");
     }
 
-    /// Parse a literal the tests control, so a typo in one fails loudly here
-    /// rather than silently falling back to the runtime default.
-    fn tight_timeout(raw: &str) -> crate::PgTimeout {
-        raw.parse::<crate::PgTimeout>()
-            .expect("test timeout literal must be valid")
+    /// Every limit set to the same tight value. Parsed rather than constructed
+    /// so a typo in a literal fails loudly here instead of silently falling
+    /// back to the runtime default.
+    fn tight_timeouts(raw: &str) -> crate::RuntimeTimeouts {
+        let timeout = raw
+            .parse::<crate::PgTimeout>()
+            .expect("test timeout literal must be valid");
+        crate::RuntimeTimeouts {
+            statement: timeout.clone(),
+            lock: timeout.clone(),
+            idle_in_transaction: timeout,
+        }
     }
 
     async fn applied_versions(pool: &PgPool) -> Vec<i64> {
@@ -1215,9 +1218,9 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .after_connect(|connection, _meta| {
-                let tight = tight_timeout(TIGHT);
+                let tight = tight_timeouts(TIGHT);
                 Box::pin(async move {
-                    crate::apply_runtime_connection_timeouts(connection, &tight, &tight).await
+                    crate::apply_runtime_connection_timeouts(connection, &tight).await
                 })
             })
             .connect(&database_url)
@@ -1231,7 +1234,7 @@ mod tests {
         let mut connection = exempt_migration_connection(&pool)
             .await
             .expect("acquire exempt migration connection");
-        for setting in ["statement_timeout", "lock_timeout"] {
+        for setting in RUNTIME_TIMEOUT_SETTINGS {
             assert_eq!(
                 show_timeout(&mut connection, setting).await,
                 "0",
@@ -1244,7 +1247,7 @@ mod tests {
         drop(connection);
 
         let mut fresh = pool.acquire().await.expect("re-acquire");
-        for setting in ["statement_timeout", "lock_timeout"] {
+        for setting in RUNTIME_TIMEOUT_SETTINGS {
             assert_eq!(
                 show_timeout(&mut fresh, setting).await,
                 TIGHT,
@@ -1254,6 +1257,14 @@ mod tests {
         drop(fresh);
         pool.close().await;
     }
+
+    /// Every GUC `apply_runtime_connection_timeouts` sets, so a limit added
+    /// there without a matching exemption fails these assertions.
+    const RUNTIME_TIMEOUT_SETTINGS: [&str; 3] = [
+        "statement_timeout",
+        "lock_timeout",
+        "idle_in_transaction_session_timeout",
+    ];
 
     async fn show_timeout(connection: &mut sqlx::PgConnection, setting: &str) -> String {
         sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW {setting}")))
@@ -1344,9 +1355,9 @@ mod tests {
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .after_connect(move |connection, _meta| {
-                let timeout = tight_timeout(timeout);
+                let timeouts = tight_timeouts(timeout);
                 Box::pin(async move {
-                    crate::apply_runtime_connection_timeouts(connection, &timeout, &timeout).await
+                    crate::apply_runtime_connection_timeouts(connection, &timeouts).await
                 })
             })
             .connect(&database_url)
@@ -1453,7 +1464,7 @@ mod tests {
 
         // And the caps are still in force for traffic afterwards.
         let mut runtime = capped.acquire().await.expect("acquire after migration");
-        for setting in ["statement_timeout", "lock_timeout"] {
+        for setting in RUNTIME_TIMEOUT_SETTINGS {
             assert_eq!(
                 show_timeout(&mut runtime, setting).await,
                 TIGHT,

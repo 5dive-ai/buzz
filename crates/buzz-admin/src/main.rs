@@ -25,7 +25,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST;
 use buzz_core::tenant::{relay_url_authority, TenantContext};
-use buzz_db::{Db, DbConfig};
+use buzz_db::{Db, DbConfig, PgTimeout};
 use buzz_pubsub::{EventTopic, PubSubManager};
 use clap::{Parser, Subcommand};
 use nostr::{EventBuilder, Keys, Kind, Tag};
@@ -420,8 +420,17 @@ async fn connect_member_services() -> Result<(Db, Arc<PubSubManager>, Keys)> {
 async fn connect_db() -> Result<Db> {
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+    // No runtime caps by default. `DbConfig`'s 30s/5s are sized for the relay's
+    // request-serving traffic on a shared pool — an operator CLI is neither, and
+    // a bulk repair that outlives 30s should finish, not get cancelled. The same
+    // env vars still apply for an operator who wants a bound here.
     let db = Db::new(&DbConfig {
         database_url: db_url,
+        statement_timeout: PgTimeout::from_env_or(
+            "BUZZ_DB_STATEMENT_TIMEOUT",
+            PgTimeout::disabled(),
+        ),
+        lock_timeout: PgTimeout::from_env_or("BUZZ_DB_LOCK_TIMEOUT", PgTimeout::disabled()),
         ..DbConfig::default()
     })
     .await?;

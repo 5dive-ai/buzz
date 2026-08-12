@@ -73,26 +73,168 @@ pub const RUNTIME_LOCK_TIMEOUT: &str = "5s";
 pub const TIMEOUT_DISABLED: &str = "0";
 /// `statement_timeout` and `lock_timeout` are `int` GUCs measured in
 /// milliseconds, so Postgres refuses anything larger regardless of the unit it
-/// is spelled with. Callers building a [`DbConfig`] from operator input must
-/// range-check against this: [`apply_runtime_connection_timeouts`] runs on every
-/// pooled connection, so an unusable value fails all database access.
+/// is spelled with. Private on purpose: [`PgTimeout`] is the only way to build a
+/// timeout, so no caller needs to range-check by hand.
 /// `pg_timeout_max_millis_matches_postgres` pins it to the live server.
-pub const PG_TIMEOUT_MAX_MILLIS: u128 = i32::MAX as u128;
+const PG_TIMEOUT_MAX_MILLIS: u128 = i32::MAX as u128;
+
+/// Why a string is not a timeout Postgres would accept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgTimeoutError {
+    /// Not an integer with an optional `us`/`ms`/`s`/`min`/`h`/`d` unit.
+    Malformed,
+    /// Well-formed, but larger than Postgres can store in an `int` GUC.
+    OutOfRange {
+        /// The value in milliseconds, for the operator-facing message.
+        millis: u128,
+    },
+}
+
+impl std::fmt::Display for PgTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed => write!(
+                f,
+                "expected an integer with an optional us/ms/s/min/h/d unit"
+            ),
+            Self::OutOfRange { millis } => write!(
+                f,
+                "{millis}ms exceeds the {PG_TIMEOUT_MAX_MILLIS}ms Postgres stores in an int GUC"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PgTimeoutError {}
+
+/// A Postgres timeout that the server is known to accept.
+///
+/// Parsing is the only way to build one from operator input, so a [`DbConfig`]
+/// cannot carry a value that would break
+/// [`apply_runtime_connection_timeouts`] — which runs on every pooled
+/// connection, and would therefore fail all database access. The stored
+/// spelling is canonical: the magnitude followed by the lowercased unit, since
+/// Postgres' unit names are case-sensitive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgTimeout(String);
+
+impl PgTimeout {
+    /// The default runtime statement timeout ([`RUNTIME_STATEMENT_TIMEOUT`]).
+    pub fn statement_default() -> Self {
+        Self(RUNTIME_STATEMENT_TIMEOUT.to_string())
+    }
+
+    /// The default runtime lock timeout ([`RUNTIME_LOCK_TIMEOUT`]).
+    pub fn lock_default() -> Self {
+        Self(RUNTIME_LOCK_TIMEOUT.to_string())
+    }
+
+    /// No limit at all — what schema migrations and one-shot operator tools
+    /// run with.
+    pub fn disabled() -> Self {
+        Self(TIMEOUT_DISABLED.to_string())
+    }
+
+    /// The canonical spelling, ready to hand to Postgres.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parse operator input, falling back to `default` with a warning.
+    ///
+    /// Refusing to start on a bad timeout would be the same outage the limits
+    /// prevent, so a malformed or out-of-range value keeps the documented
+    /// default instead. `None` and blank mean "unset".
+    pub fn parse_or(raw: Option<&str>, default: Self) -> Self {
+        let Some(candidate) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return default;
+        };
+        match candidate.parse::<Self>() {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                tracing::warn!(
+                    value = candidate,
+                    default = default.as_str(),
+                    %error,
+                    "ignoring unusable Postgres timeout"
+                );
+                default
+            }
+        }
+    }
+
+    /// [`PgTimeout::parse_or`] against an environment variable.
+    pub fn from_env_or(var: &str, default: Self) -> Self {
+        Self::parse_or(std::env::var(var).ok().as_deref(), default)
+    }
+}
+
+#[cfg(test)]
+impl PgTimeout {
+    /// Build without validation, so a test can hand Postgres a value
+    /// [`FromStr`](std::str::FromStr) refuses to produce and prove the server
+    /// rejects it.
+    pub(crate) fn unchecked(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+}
+
+impl std::fmt::Display for PgTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::str::FromStr for PgTimeout {
+    type Err = PgTimeoutError;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let candidate = raw.trim();
+        let digits = candidate.chars().take_while(char::is_ascii_digit).count();
+        let (magnitude, unit) = candidate.split_at(digits);
+        let unit = unit.trim().to_ascii_lowercase();
+
+        match pg_timeout_millis(magnitude, &unit) {
+            Some(millis) if millis <= PG_TIMEOUT_MAX_MILLIS => {
+                Ok(Self(format!("{magnitude}{unit}")))
+            }
+            Some(millis) => Err(PgTimeoutError::OutOfRange { millis }),
+            None => Err(PgTimeoutError::Malformed),
+        }
+    }
+}
+
+/// Convert a Postgres timeout magnitude and unit to milliseconds, mirroring the
+/// rounding Postgres applies to sub-millisecond `us` values. `None` means the
+/// spelling is not something Postgres would accept.
+fn pg_timeout_millis(magnitude: &str, unit: &str) -> Option<u128> {
+    let value = magnitude.parse::<u128>().ok()?;
+    match unit {
+        // Round half up without the `value + 500` intermediate, which overflows
+        // for the top 500 representable microsecond values.
+        "us" => Some(value / 1_000 + u128::from(value % 1_000 >= 500)),
+        "" | "ms" => Some(value),
+        "s" => value.checked_mul(1_000),
+        "min" => value.checked_mul(60_000),
+        "h" => value.checked_mul(3_600_000),
+        "d" => value.checked_mul(86_400_000),
+        _ => None,
+    }
+}
 
 /// Apply the runtime safety limits shared by writer, reader, audit, and search
-/// pools. Values are Postgres interval strings (`"30s"`, `"500ms"`), with
-/// [`TIMEOUT_DISABLED`] lifting a limit entirely.
+/// pools. [`PgTimeout::disabled`] lifts a limit entirely.
 pub async fn apply_runtime_connection_timeouts(
     connection: &mut PgConnection,
-    statement_timeout: &str,
-    lock_timeout: &str,
+    statement_timeout: &PgTimeout,
+    lock_timeout: &PgTimeout,
 ) -> std::result::Result<(), sqlx::Error> {
     sqlx::query(
         "SELECT set_config('statement_timeout', $1, false), \
                 set_config('lock_timeout', $2, false)",
     )
-    .bind(statement_timeout)
-    .bind(lock_timeout)
+    .bind(statement_timeout.as_str())
+    .bind(lock_timeout.as_str())
     .execute(connection)
     .await?;
     Ok(())
@@ -562,12 +704,12 @@ pub struct DbConfig {
     pub replica_read_max_age_ms: u64,
     /// Postgres `statement_timeout` applied to every runtime connection. An
     /// operator running a backfill or working an incident can widen this without
-    /// a code change; [`TIMEOUT_DISABLED`] removes the cap.
-    pub statement_timeout: String,
+    /// a code change; [`PgTimeout::disabled`] removes the cap.
+    pub statement_timeout: PgTimeout,
     /// Postgres `lock_timeout` applied to every runtime connection. Bounds
     /// heavyweight and row lock waits only — advisory-lock waits are bounded by
     /// [`Self::statement_timeout`] instead.
-    pub lock_timeout: String,
+    pub lock_timeout: PgTimeout,
 }
 
 impl Default for DbConfig {
@@ -585,8 +727,8 @@ impl Default for DbConfig {
             max_lifetime_secs: 1800,
             idle_timeout_secs: 600,
             replica_read_max_age_ms: 0,
-            statement_timeout: RUNTIME_STATEMENT_TIMEOUT.to_string(),
-            lock_timeout: RUNTIME_LOCK_TIMEOUT.to_string(),
+            statement_timeout: PgTimeout::statement_default(),
+            lock_timeout: PgTimeout::lock_default(),
         }
     }
 }
@@ -6595,8 +6737,8 @@ mod tests {
             database_url: scratch_url,
             max_connections: 2,
             min_connections: 2,
-            statement_timeout: TIGHT.to_string(),
-            lock_timeout: TIGHT.to_string(),
+            statement_timeout: TIGHT.parse().expect("test timeout literal"),
+            lock_timeout: TIGHT.parse().expect("test timeout literal"),
             ..DbConfig::default()
         })
         .await
@@ -8529,10 +8671,138 @@ mod tests {
         db.pool.close().await;
     }
 
-    /// [`PG_TIMEOUT_MAX_MILLIS`] is the bound callers range-check operator input
-    /// against, so it must be the server's real bound: too high and an accepted
-    /// value still fails every `after_connect`; too low and we reject settings
-    /// Postgres would have taken.
+    /// The built-in defaults bypass parsing, so prove they would survive it —
+    /// otherwise a typo in a literal ships a value Postgres refuses.
+    #[test]
+    fn builtin_timeout_defaults_are_parseable() {
+        for default in [
+            PgTimeout::statement_default(),
+            PgTimeout::lock_default(),
+            PgTimeout::disabled(),
+        ] {
+            assert_eq!(
+                default.as_str().parse::<PgTimeout>().as_ref(),
+                Ok(&default),
+                "{default} must round-trip through the parser"
+            );
+        }
+    }
+
+    #[test]
+    fn pg_timeout_accepts_postgres_spellings_and_refuses_the_rest() {
+        let default = PgTimeout::statement_default();
+        for (accepted, canonical) in [
+            ("30s", "30s"),
+            ("500ms", "500ms"),
+            ("0", "0"),
+            ("45S", "45s"),
+            ("2MIN", "2min"),
+            (" 10 H ", "10h"),
+        ] {
+            assert_eq!(
+                PgTimeout::parse_or(Some(accepted), default.clone()).as_str(),
+                canonical,
+                "{accepted} is a valid Postgres timeout"
+            );
+        }
+
+        // A rejected value must not reach Postgres: `after_connect` would fail
+        // for every connection, which is worse than the documented default.
+        for rejected in ["", "   ", "soon", "30 seconds", "s30", "-5s", "30s;DROP"] {
+            assert_eq!(
+                PgTimeout::parse_or(Some(rejected), default.clone()),
+                default,
+                "{rejected:?} must fall back to the default"
+            );
+        }
+
+        assert_eq!(
+            PgTimeout::parse_or(None, PgTimeout::lock_default()),
+            PgTimeout::lock_default()
+        );
+    }
+
+    #[test]
+    fn pg_timeout_refuses_magnitudes_postgres_cannot_store() {
+        let default = PgTimeout::statement_default();
+        // Well-formed spellings whose millisecond value exceeds the int GUC
+        // range. Postgres rejects these in `set_config`, which would fail every
+        // pool's `after_connect`.
+        for rejected in [
+            "2147483648",
+            "2147483648ms",
+            "2147484s",
+            "35792min",
+            "597h",
+            "25d",
+            // Wider than any integer type — must fall back, not overflow.
+            "999999999999999999999999999999999999999999d",
+            "99999999999999999999999999999999999999999999999999",
+            // Parses as u128, so unlike the two above it reaches the unit
+            // conversion — where rounding must not overflow on the way to the
+            // range check.
+            &format!("{}us", u128::MAX),
+            &format!("{}us", u128::MAX - 499),
+        ] {
+            assert_eq!(
+                PgTimeout::parse_or(Some(rejected), default.clone()),
+                default,
+                "{rejected:?} is out of range for Postgres and must fall back"
+            );
+        }
+
+        // The boundary itself, and the same instant in every unit, stay valid.
+        for accepted in [
+            "2147483647",
+            "2147483647ms",
+            "2147483647000us",
+            "2147483s",
+            "35791min",
+            "596h",
+            "24d",
+        ] {
+            assert_eq!(
+                PgTimeout::parse_or(Some(accepted), default.clone()).as_str(),
+                accepted,
+                "{accepted} is inside the Postgres range"
+            );
+        }
+    }
+
+    /// Every spelling the parser emits must be usable by Postgres. A
+    /// parser-only assertion missed that Postgres rejects uppercase units even
+    /// though validation lowercases them.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn pg_timeout_canonical_spellings_are_accepted_by_postgres() {
+        let mut connection = PgConnection::connect(&admin_url().await)
+            .await
+            .expect("connect test Postgres");
+
+        for (raw, canonical) in [
+            ("500US", "500us"),
+            ("500MS", "500ms"),
+            ("2S", "2s"),
+            ("2MIN", "2min"),
+            ("2H", "2h"),
+            ("2D", "2d"),
+            ("0", "0"),
+            (" 10 S ", "10s"),
+        ] {
+            let parsed = PgTimeout::parse_or(Some(raw), PgTimeout::statement_default());
+            assert_eq!(parsed.as_str(), canonical);
+            apply_runtime_connection_timeouts(&mut connection, &parsed, &parsed)
+                .await
+                .unwrap_or_else(|error| panic!("{raw:?} normalized to {parsed}: {error}"));
+        }
+
+        connection.close().await.expect("close test Postgres");
+    }
+
+    /// `PG_TIMEOUT_MAX_MILLIS` is the bound [`PgTimeout`] range-checks operator
+    /// input against, so it must be the server's real bound: too high and an
+    /// accepted value still fails every `after_connect`; too low and we reject
+    /// settings Postgres would have taken.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn pg_timeout_max_millis_matches_postgres() {
@@ -8540,7 +8810,7 @@ mod tests {
             .await
             .expect("connect");
 
-        let boundary = PG_TIMEOUT_MAX_MILLIS.to_string();
+        let boundary = PgTimeout::unchecked(PG_TIMEOUT_MAX_MILLIS.to_string());
         apply_runtime_connection_timeouts(&mut conn, &boundary, &boundary)
             .await
             .expect("PG_TIMEOUT_MAX_MILLIS must be settable");
@@ -8548,13 +8818,10 @@ mod tests {
         // Same instant spelled in a coarser unit — the conversion the caller's
         // range check performs must land inside the range too.
         let in_seconds = (PG_TIMEOUT_MAX_MILLIS / 1_000).to_string();
-        apply_runtime_connection_timeouts(
-            &mut conn,
-            &format!("{in_seconds}s"),
-            &format!("{in_seconds}s"),
-        )
-        .await
-        .expect("the boundary in seconds must be settable");
+        let boundary_seconds = PgTimeout::unchecked(format!("{in_seconds}s"));
+        apply_runtime_connection_timeouts(&mut conn, &boundary_seconds, &boundary_seconds)
+            .await
+            .expect("the boundary in seconds must be settable");
 
         for over in [
             (PG_TIMEOUT_MAX_MILLIS + 1).to_string(),
@@ -8562,9 +8829,13 @@ mod tests {
             format!("{}s", PG_TIMEOUT_MAX_MILLIS / 1_000 + 1),
             "999999999999999999999999999999999999999999d".to_string(),
         ] {
-            let err = apply_runtime_connection_timeouts(&mut conn, &over, RUNTIME_LOCK_TIMEOUT)
-                .await
-                .expect_err(&format!("{over} must be rejected by Postgres"));
+            let err = apply_runtime_connection_timeouts(
+                &mut conn,
+                &PgTimeout::unchecked(over.clone()),
+                &PgTimeout::lock_default(),
+            )
+            .await
+            .expect_err(&format!("{over} must be rejected by Postgres"));
             let code = match &err {
                 sqlx::Error::Database(db) => db.code().map(|c| c.to_string()),
                 other => panic!("expected a database error, got {other:?}"),

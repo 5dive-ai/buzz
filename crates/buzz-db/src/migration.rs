@@ -73,8 +73,8 @@ async fn migrate_on_exempt_connection(connection: &mut sqlx::PgConnection) -> Re
 async fn lift_runtime_timeouts(connection: &mut sqlx::PgConnection) -> Result<()> {
     crate::apply_runtime_connection_timeouts(
         connection,
-        crate::TIMEOUT_DISABLED,
-        crate::TIMEOUT_DISABLED,
+        &crate::PgTimeout::disabled(),
+        &crate::PgTimeout::disabled(),
     )
     .await?;
     Ok(())
@@ -1174,6 +1174,13 @@ mod tests {
             .expect("create public schema");
     }
 
+    /// Parse a literal the tests control, so a typo in one fails loudly here
+    /// rather than silently falling back to the runtime default.
+    fn tight_timeout(raw: &str) -> crate::PgTimeout {
+        raw.parse::<crate::PgTimeout>()
+            .expect("test timeout literal must be valid")
+    }
+
     async fn applied_versions(pool: &PgPool) -> Vec<i64> {
         sqlx::query_scalar::<_, i64>(
             "SELECT version FROM _sqlx_migrations WHERE success ORDER BY version",
@@ -1208,9 +1215,10 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .after_connect(|connection, _meta| {
-                Box::pin(crate::apply_runtime_connection_timeouts(
-                    connection, TIGHT, TIGHT,
-                ))
+                let tight = tight_timeout(TIGHT);
+                Box::pin(async move {
+                    crate::apply_runtime_connection_timeouts(connection, &tight, &tight).await
+                })
             })
             .connect(&database_url)
             .await
@@ -1336,9 +1344,10 @@ mod tests {
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .after_connect(move |connection, _meta| {
-                Box::pin(crate::apply_runtime_connection_timeouts(
-                    connection, timeout, timeout,
-                ))
+                let timeout = tight_timeout(timeout);
+                Box::pin(async move {
+                    crate::apply_runtime_connection_timeouts(connection, &timeout, &timeout).await
+                })
             })
             .connect(&database_url)
             .await

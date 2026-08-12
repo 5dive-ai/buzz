@@ -27,6 +27,7 @@ pub mod loop_drive;
 pub mod model;
 pub mod ops;
 pub mod prompt;
+pub mod provider;
 pub mod session_store;
 pub mod skills;
 pub mod steer;
@@ -1009,17 +1010,11 @@ async fn cancel_session(app: &Arc<App>, params: Value) {
 /// registry) and installs it with the new `ModelConfig`. `SharedProvider` is an
 /// `Arc<Mutex<Option<..>>>` precisely so this is hot-swappable
 /// (goose `agents/types.rs:11-12`).
-/// Construct the goose provider.
-///
-/// Relay-mesh `auto` is resolved by the desktop before spawn
-/// (`managed_agents/relay_mesh.rs:relay_mesh_wire_model`), so buzz-agent sends
-/// whatever model it was given and does not know meshes exist (#5289).
+/// Construct the goose provider. See [`crate::provider`].
 async fn build_provider(
     provider_name: &str,
 ) -> Result<Arc<dyn goose::providers::base::Provider>, AgentError> {
-    goose::providers::create(provider_name, Vec::new())
-        .await
-        .map_err(|e| map_provider_error(&e.to_string()))
+    crate::provider::build(provider_name).await
 }
 
 async fn apply_model(model: &crate::model::SessionModel, model_id: &str) -> Result<(), AgentError> {
@@ -1036,7 +1031,7 @@ async fn apply_model(model: &crate::model::SessionModel, model_id: &str) -> Resu
 /// Preserve buzz-agent's error taxonomy across provider construction, so the
 /// harness's JSON-RPC code mapping (-32001 auth, -32002 model-not-found) keeps
 /// its meaning.
-fn map_provider_error(msg: &str) -> AgentError {
+pub(crate) fn map_provider_error(msg: &str) -> AgentError {
     let lower = msg.to_ascii_lowercase();
     if lower.contains("auth") || lower.contains("401") || lower.contains("api key") {
         AgentError::LlmAuth(msg.to_string())

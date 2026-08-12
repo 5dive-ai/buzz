@@ -1,5 +1,9 @@
 -- Terminal recovery for deletion requests that have not begun irreversible
 -- object deletion, plus explicit operator-global provenance ownership.
+-- These ALTER TABLE statements require ACCESS EXCLUSIVE locks; fail quickly
+-- rather than queueing behind long-running production transactions.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE community_deletion_requests
     DROP CONSTRAINT community_deletion_requests_community_id_key,
     DROP CONSTRAINT community_deletion_requests_stage_check,

@@ -1,0 +1,46 @@
+# GEPA lineage v3 = v2 + require_reply on Mia (reply guard, BUZZ_AGENT_REQUIRE_REPLY=1).
+# Promoted from Q1 per-problem probe on qemu-startup (silent-stall / "narcoleptic
+# finish" family: end_turn without DONE, then idle to the trial wall — 6+ of the
+# v2 full-89 timeouts share the shape).
+# Evidence: arm C went 4/4 (k=4 probe, jobs/gepa-q1-c) + 8/8 (k=8 confirm,
+# jobs/gepa-q1-c-confirm) on eva-team, control 3/4 with one narcoleptic death.
+# The guard never actually fired in a passing trial (zero nags in all 12
+# transcripts) — it is armed insurance, chosen over stop_hooks (also 4/4)
+# because it is the more minimal mechanism: one env var, in-process, no hook
+# server dependency, and its nag budget shares the existing stop_rejections cap.
+# v2 baseline: full-89 59/89 (66.3%) vs v0 49/89 — KEEP.
+schema_version: "1"
+condition: tb-gepa-twins-v3
+timing_signal: true
+roster:
+  - id: mia
+    kind: orchestrator
+    role: conn
+    require_reply: true
+    count: 1
+    endpoint: deepseek-ai/Deepseek-V4-Flash
+    model_revision: deepseek/deepseek-v4-flash-20260731
+    prompt:
+      path: personas/bench/gepa/mia-v2.md
+      sha256: cce6b223a0ac651ff762c4f50037b14f41d304571353a1e0797e30fffcb4b94d
+    generation:
+      thinking_effort: high
+  - id: mie
+    kind: worker
+    role: twin
+    count: 1
+    endpoint: deepseek-ai/Deepseek-V4-Flash
+    model_revision: deepseek/deepseek-v4-flash-20260731
+    prompt:
+      path: personas/bench/gepa/mie-v0.md
+      sha256: a4924e4c4507ac466a7500bb34a04a782618df41dba850b6f0f729787c48439b
+    generation:
+      thinking_effort: high
+prices:
+  deepseek-ai/Deepseek-V4-Flash:
+    input_per_million_usd: 0.14
+    cached_input_per_million_usd: 0.14
+    output_per_million_usd: 0.28
+    cache_read_rate: 0.0
+trial_budget:
+  timeout_seconds: 36000

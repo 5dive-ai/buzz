@@ -181,9 +181,14 @@ jobs:
                 BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channels list
           # ...and that case specifically must have got PAST argument
           # validation into the network, or it proves nothing about dispatch.
-          cat_seen=$(env BUZZ_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
-                         BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channels list 2>&1 >/dev/null \
-                     | jq -r '.error')
+          # Capture first, parse second. Piping the CLI straight into jq under
+          # `set -o pipefail` makes the pipeline inherit the CLI's exit 2 --
+          # which is the outcome being MEASURED -- so the assignment fails and
+          # `set -e` kills the step before the check runs. Never pipe the
+          # process whose failure is the signal.
+          relay_err=$(env BUZZ_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
+                          BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channels list 2>&1 >/dev/null) || true
+          cat_seen=$(jq -r '.error' <<<"$relay_err")
           echo "  unreachable relay: error category = ${cat_seen}"
           if [[ "$cat_seen" == "user_error" ]]; then
             echo "::error::a valid key against a dead port still reported user_error, so the call never reached the relay"

@@ -151,6 +151,15 @@ jobs:
             [[ "$rc" != "0" ]] || { echo "::error::${label}: expected a non-zero exit"; exit 1; }
             jq -e 'has("error") and has("message")' <<<"$err" >/dev/null \
               || { echo "::error::${label}: stderr is not the documented {error,message} JSON"; exit 1; }
+            # NON-VACUITY GUARD. The first version of this step passed while
+            # both cases died on `unrecognized subcommand 'channel'` -- a clap
+            # usage error satisfies the JSON contract without the CLI ever
+            # dispatching anything, so the step grades nothing. A usage error
+            # here means the smoke is broken, not the binary.
+            if jq -re '.message' <<<"$err" | grep -qE 'unrecognized subcommand|^Usage:|unexpected argument'; then
+              echo "::error::${label}: this is a clap USAGE error, so the check never reached the CLI. Fix the smoke."
+              exit 1
+            fi
             if [[ -n "$want" && "$rc" != "$want" ]]; then
               echo "::error::${label}: expected exit ${want}, got ${rc}"; exit 1
             fi
@@ -159,12 +168,22 @@ jobs:
           echo "CLI error-contract checks:"
           # No identity configured -> 'bad input' (1) per the CLI's own exit-code table.
           check_contract "no private key" 1 \
-            env -u BUZZ_PRIVATE_KEY BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channel list
+            env -u BUZZ_PRIVATE_KEY BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channels list
           # Identity present, relay unreachable -> it must reach the network and
           # fail there. Key is a throwaway constant, never a real identity.
           check_contract "unreachable relay" "" \
             env BUZZ_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
-                BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channel list
+                BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channels list
+          # ...and that case specifically must have got PAST argument
+          # validation into the network, or it proves nothing about dispatch.
+          cat_seen=$(env BUZZ_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
+                         BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channels list 2>&1 >/dev/null \
+                     | jq -r '.error')
+          echo "  unreachable relay: error category = ${cat_seen}"
+          if [[ "$cat_seen" == "user_error" ]]; then
+            echo "::error::a valid key against a dead port still reported user_error, so the call never reached the relay"
+            exit 1
+          fi
 
           # Identity must be readable from the file itself, or the install
           # script cannot tell an operator what it just put on their box.

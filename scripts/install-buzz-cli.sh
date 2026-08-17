@@ -48,6 +48,19 @@ done
 command -v curl >/dev/null || die "curl is required"
 command -v sha256sum >/dev/null || die "sha256sum is required"
 
+# readelf comes from binutils and is NOT guaranteed on a minimal server image.
+# It is only ever used to PRINT identity, never to decide whether to install,
+# so degrade to a clear message instead of refusing to run. Without this
+# wrapper a missing readelf aborts the whole script under `set -euo pipefail`,
+# because the failure happens inside a command substitution.
+build_id() { # <file>
+  local f="$1" id=""
+  if command -v readelf >/dev/null 2>&1; then
+    id="$(readelf -n "$f" 2>/dev/null | awk '/Build ID/ {print $3}')" || id=""
+  fi
+  printf '%s' "${id:-unavailable (install binutils to read it)}"
+}
+
 # Named target, printed, so a wrong-target success cannot be invisible.
 BASE="https://github.com/${REPO}/releases/download/${TAG}"
 printf 'Installing buzz CLI\n'
@@ -74,8 +87,7 @@ sed 's/^/  /' "${WORK}/PROVENANCE.txt"
 for b in buzz buzz-pair; do
   dest="${PREFIX}/${b}"
   if [[ -e "$dest" && "$FORCE" != "true" ]]; then
-    existing_id="$(readelf -n "$dest" 2>/dev/null | awk '/Build ID/ {print $3}')"
-    die "${dest} already exists (BuildID ${existing_id:-unknown}). Refusing to overwrite: an existing binary may be hand-built and in use. Re-run with --force once you have established what it is."
+    die "${dest} already exists (BuildID $(build_id "$dest")). Refusing to overwrite: an existing binary may be hand-built and in use. Re-run with --force once you have established what it is."
   fi
 done
 
@@ -95,7 +107,7 @@ printf 'installed_tag: %s\ninstalled_at:  %s\n' "$TAG" "$(date -u +%FT%TZ)" \
 # PROVENANCE.txt, and survives a copy to another box.
 printf '\nInstalled:\n'
 for b in buzz buzz-pair; do
-  note "${PREFIX}/${b}  BuildID $(readelf -n "${PREFIX}/${b}" 2>/dev/null | awk '/Build ID/ {print $3}')"
+  note "${PREFIX}/${b}  BuildID $(build_id "${PREFIX}/${b}")"
 done
 note "provenance recorded at /var/lib/buzz/installed-provenance.txt"
 

@@ -166,8 +166,13 @@ jobs:
           }
 
           echo "CLI error-contract checks:"
-          # No identity configured -> 'bad input' (1) per the CLI's own exit-code table.
-          check_contract "no private key" 1 \
+          # No identity configured -> 3. Note this is auth_error, NOT the 1
+          # ('bad input') the exit-code table might suggest for a missing
+          # argument: the CLI classifies an absent BUZZ_PRIVATE_KEY as an auth
+          # failure. Pinned at the value actually observed, not the one the
+          # documentation reads like -- and pinned deliberately, because a
+          # silent change here would change what every caller branches on.
+          check_contract "no private key" 3 \
             env -u BUZZ_PRIVATE_KEY BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channels list
           # Identity present, relay unreachable -> it must reach the network and
           # fail there. Key is a throwaway constant, never a real identity.

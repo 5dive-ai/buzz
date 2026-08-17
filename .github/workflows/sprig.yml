@@ -139,10 +139,24 @@ jobs:
           TITLE="Sprig (rolling)"
           NOTES="Rolling Linux build of Sprig (all-in-one buzz-acp + buzz-agent + buzz-dev-mcp), tracking \`main\` (\`${SHA}\`)."
 
-          gh release edit "$TAG" \
-            --prerelease \
-            --title "$TITLE" \
-            --notes "$NOTES"
+          # `gh release edit` exits 1 with "release not found" on the first
+          # ever run in a repo, because a fork inherits no releases. Create it
+          # then, edit it after. `sprig-latest` matches none of this repo's six
+          # tag triggers (relay-v*, sprig-v*, chart-v*, push-chart-v*,
+          # desktop-v*) and no workflow here listens on the `release` event, so
+          # creating the tag cannot start a workflow loop.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --prerelease \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          else
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --prerelease \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          fi
           gh release upload "$TAG" dist/* --clobber
 
   publish-tag:

@@ -1,0 +1,138 @@
+name: buzz-cli release
+
+# Cuts the Linux x86-64 `buzz` and `buzz-pair` binaries that customer boxes
+# install as /usr/local/bin/buzz and /usr/local/bin/buzz-pair (DIVE-3512).
+#
+# WHY THIS EXISTS RATHER THAN release.yml: upstream's release rail is the
+# desktop app — it triggers on `desktop-v*` tags, builds a Tauri bundle on
+# macOS, and is guarded by `if: github.repository == 'block/buzz'`, so it
+# neither runs here nor produces a server-side CLI. This is a separate, much
+# smaller rail with the same guard pointed at our own repository, so a
+# re-fork of this repo cannot fire it by accident.
+#
+# WHY ubuntu-22.04 AND NOT ubuntu-latest: the artifact is dynamically linked
+# against glibc, and a binary built on 24.04 (glibc 2.39) will not start on a
+# 22.04 box. Building on the older image means the artifact runs on both.
+#
+# The build is the provenance: every run records the commit it built, and the
+# BuildID and sha256 of what came out. An artifact without that trail must not
+# be installed on a customer box.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >-
+          Tag to publish the binaries under (e.g. cli-v0.1.0). Leave empty to
+          build and attach artifacts to the run without cutting a release.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build buzz-cli (linux x86-64)
+    # Same shape as the guard upstream puts on its own release jobs: this must
+    # not fire in anybody else's fork of this fork.
+    if: github.repository == '5dive-ai/buzz'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write # cutting the release and uploading its assets
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 \
+            -o DPkg::Lock::Timeout=120 \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            ca-certificates
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # No setup-rust step: rust-toolchain.toml pins 1.95.0 and the runner's
+      # preinstalled rustup honors it on the first cargo invocation.
+      - name: Record toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          rustc --version
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: buzz-cli-release
+
+      - name: Build
+        run: cargo build --release --locked -p buzz-cli -p buzz-pairing-cli
+
+      - name: Record provenance
+        id: prov
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/buzz dist/buzz
+          cp target/release/buzz-pair dist/buzz-pair
+
+          {
+            echo "repository:   ${GITHUB_REPOSITORY}"
+            echo "commit:       ${GITHUB_SHA}"
+            echo "workflow_run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "built_on:     $(. /etc/os-release && echo "$PRETTY_NAME") / glibc $(ldd --version | head -1 | awk '{print $NF}')"
+            echo "toolchain:    $(rustc --version)"
+            echo
+            for b in buzz buzz-pair; do
+              echo "== ${b} =="
+              echo "size:    $(stat -c%s "dist/${b}") bytes"
+              echo "sha256:  $(sha256sum "dist/${b}" | cut -d' ' -f1)"
+              echo "buildid: $(readelf -n "dist/${b}" | awk '/Build ID/ {print $3}')"
+              echo "file:    $(file -b "dist/${b}")"
+              echo
+            done
+          } | tee dist/PROVENANCE.txt
+
+          ( cd dist && sha256sum buzz buzz-pair > SHA256SUMS )
+
+      - name: Smoke the artifact
+        run: |
+          set -euo pipefail
+          # A binary that cannot report its own version is not a release
+          # candidate, whatever the build said.
+          ./dist/buzz --version
+          ./dist/buzz --help > /dev/null
+          ./dist/buzz-pair --help > /dev/null
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-cli-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "buzz-cli $TAG" \
+            --notes "$(printf 'Linux x86-64 \`buzz\` and \`buzz-pair\`, built from %s by %s/%s/actions/runs/%s.\n\nInstall with scripts/install-buzz-cli.sh. Verify against SHA256SUMS before installing.\n\n```\n%s\n```\n' \
+              "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$(cat dist/PROVENANCE.txt)")" \
+            dist/buzz dist/buzz-pair dist/SHA256SUMS dist/PROVENANCE.txt

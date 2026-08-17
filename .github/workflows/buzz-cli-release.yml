@@ -127,19 +127,44 @@ jobs:
           ./dist/buzz --help > /dev/null
           ./dist/buzz-pair --help > /dev/null
 
-          # The binary must actually dispatch, not merely print help: run a
-          # subcommand with no relay reachable and require the documented
-          # failure rather than a crash. Exit 2 is 'relay/network error' per
-          # the CLI's own exit-code contract; anything else means the artifact
-          # is broken in a way --help would not show.
-          set +e
-          BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channel list > /dev/null 2>&1
-          rc=$?
-          set -e
-          if [[ "$rc" != "2" ]]; then
-            echo "::error::expected exit 2 (relay/network error) from an unreachable relay, got $rc"
-            exit 1
-          fi
+          # The binary must actually DISPATCH, not merely parse. Assert the
+          # CLI's own documented error contract -- "Errors are JSON on stderr:
+          # {\"error\": <category>, \"message\": <detail>}" -- rather than a
+          # specific exit code, because the code depends on how far the call
+          # gets: with no key it is 1 (bad input) and never reaches the
+          # network. Both stderr payloads are printed so a future reader can
+          # see what was actually observed instead of trusting this comment.
+          #
+          # The panic check is the one that earns its place: the defect our own
+          # pairing patch fixed was a rustls CryptoProvider PANIC on wss://, and
+          # a panic is precisely what does NOT produce this JSON contract. This
+          # step is the regression guard for that class.
+          check_contract() { # <label> <expected-rc-or-empty> <cmd...>
+            local label="$1" want="$2"; shift 2
+            local err rc
+            err=$("$@" 2>&1 >/dev/null) && rc=0 || rc=$?
+            echo "  ${label}: rc=${rc} stderr=${err}"
+            if grep -q 'panicked at' <<<"$err"; then
+              echo "::error::${label}: the binary PANICKED; that is the failure mode the pairing fix exists to prevent"
+              exit 1
+            fi
+            [[ "$rc" != "0" ]] || { echo "::error::${label}: expected a non-zero exit"; exit 1; }
+            jq -e 'has("error") and has("message")' <<<"$err" >/dev/null \
+              || { echo "::error::${label}: stderr is not the documented {error,message} JSON"; exit 1; }
+            if [[ -n "$want" && "$rc" != "$want" ]]; then
+              echo "::error::${label}: expected exit ${want}, got ${rc}"; exit 1
+            fi
+          }
+
+          echo "CLI error-contract checks:"
+          # No identity configured -> 'bad input' (1) per the CLI's own exit-code table.
+          check_contract "no private key" 1 \
+            env -u BUZZ_PRIVATE_KEY BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channel list
+          # Identity present, relay unreachable -> it must reach the network and
+          # fail there. Key is a throwaway constant, never a real identity.
+          check_contract "unreachable relay" "" \
+            env BUZZ_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
+                BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channel list
 
           # Identity must be readable from the file itself, or the install
           # script cannot tell an operator what it just put on their box.

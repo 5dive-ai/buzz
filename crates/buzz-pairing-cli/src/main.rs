@@ -3,10 +3,18 @@
 //! # Usage
 //!
 //! ```text
-//! buzz-pair source --relay wss://relay.example.com [--nsec nsec1...]
+//! buzz-pair source --relay wss://relay.example.com [--nsec nsec1...|--nsec -]
 //!                  [--envelope-relay https://relay.example.com]
 //! buzz-pair target [--relay wss://relay.example.com]
 //! buzz-pair test-vectors
+//! ```
+//!
+//! `--nsec -` reads the key from the first line of stdin instead of argv, so it
+//! never lands in the world-readable `/proc/<pid>/cmdline`. Everything after
+//! that first line is still the session's stdin (the y/n SAS answer):
+//!
+//! ```text
+//! { printf '%s\n' "$nsec"; cat; } | buzz-pair source --nsec - --relay wss://…
 //! ```
 //!
 //! # Payload shape
@@ -63,7 +71,9 @@ enum Cmd {
         #[arg(long, default_value = "wss://relay.damus.io")]
         relay: String,
 
-        /// nsec (bech32) of the key to transfer. If omitted, generates a test key.
+        /// nsec (bech32) of the key to transfer, or '-' to read the nsec from
+        /// the first line of stdin (keeps the key out of argv, which is
+        /// world-readable in /proc/PID/cmdline). If omitted, generates a test key.
         #[arg(long)]
         nsec: Option<String>,
 
@@ -638,6 +648,8 @@ fn build_envelope(relay_url: &str, nsec: &str) -> Result<Zeroizing<String>, CliE
 /// Resolve the payload to send.
 ///
 /// If `nsec` is provided, parse it as bech32; otherwise generate a fresh test key.
+/// The literal `-` means "read the nsec from the first line of stdin", so the
+/// key never appears in argv (DIVE-3553).
 ///
 /// With `envelope_relay` set, the payload is the JSON envelope
 /// ([`PayloadType::Custom`]) the Buzz apps decode. Without it, the payload stays
@@ -649,9 +661,24 @@ fn resolve_payload(
 ) -> Result<(Zeroizing<String>, PayloadType), CliError> {
     let nsec = match nsec {
         Some(s) => {
+            // `--nsec -` takes the key from the first line of stdin. An argv
+            // element is world-readable in /proc/<pid>/cmdline for the whole
+            // life of the process, and a source session waits up to 120s for
+            // the handset — so the customer's key must never travel there.
+            //
+            // ORDERING: this read must happen before any session I/O, because
+            // the interactive SAS prompt reads stdin too. Both go through the
+            // one buffered `io::stdin()` handle, so the SAS answer is simply
+            // the next line; the reads are line-at-a-time and never merged.
+            let s = if s == "-" {
+                Zeroizing::new(read_line()?)
+            } else {
+                Zeroizing::new(s)
+            };
             // Validate it parses as a secret key.
-            let _sk = SecretKey::parse(&s).map_err(|e| CliError::InvalidNsec(e.to_string()))?;
-            Zeroizing::new(s)
+            let _sk =
+                SecretKey::parse(s.as_str()).map_err(|e| CliError::InvalidNsec(e.to_string()))?;
+            s
         }
         None => {
             let keys = Keys::generate();

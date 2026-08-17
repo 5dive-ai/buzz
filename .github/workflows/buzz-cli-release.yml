@@ -117,11 +117,36 @@ jobs:
       - name: Smoke the artifact
         run: |
           set -euo pipefail
-          # A binary that cannot report its own version is not a release
-          # candidate, whatever the build said.
-          ./dist/buzz --version
+          # NOTE: `buzz` has no --version. Its clap command sets no `version`
+          # attribute, so the flag is an error: {"error":"user_error",
+          # "message":"unexpected argument '--version' found"}. Do not add one
+          # here to make a smoke pass — the binary's identity on a box is its
+          # BuildID, which readelf reads straight out of the file and which
+          # this release records. That is a stronger answer than a version
+          # string the workspace stamps 0.1.0 on everything anyway.
           ./dist/buzz --help > /dev/null
           ./dist/buzz-pair --help > /dev/null
+
+          # The binary must actually dispatch, not merely print help: run a
+          # subcommand with no relay reachable and require the documented
+          # failure rather than a crash. Exit 2 is 'relay/network error' per
+          # the CLI's own exit-code contract; anything else means the artifact
+          # is broken in a way --help would not show.
+          set +e
+          BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channel list > /dev/null 2>&1
+          rc=$?
+          set -e
+          if [[ "$rc" != "2" ]]; then
+            echo "::error::expected exit 2 (relay/network error) from an unreachable relay, got $rc"
+            exit 1
+          fi
+
+          # Identity must be readable from the file itself, or the install
+          # script cannot tell an operator what it just put on their box.
+          for b in buzz buzz-pair; do
+            id=$(readelf -n "dist/${b}" | awk '/Build ID/ {print $3}')
+            [[ -n "$id" ]] || { echo "::error::${b} carries no BuildID"; exit 1; }
+          done
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

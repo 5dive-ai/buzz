@@ -90,9 +90,12 @@ cp "${WORK}/PROVENANCE.txt" /var/lib/buzz/installed-provenance.txt
 printf 'installed_tag: %s\ninstalled_at:  %s\n' "$TAG" "$(date -u +%FT%TZ)" \
   >> /var/lib/buzz/installed-provenance.txt
 
+# Identify by BuildID, not --version: `buzz` sets no clap `version` attribute,
+# so --version is a usage error. The BuildID is in the file, matches the one in
+# PROVENANCE.txt, and survives a copy to another box.
 printf '\nInstalled:\n'
 for b in buzz buzz-pair; do
-  note "${PREFIX}/${b}  ($("${PREFIX}/${b}" --version 2>/dev/null || echo 'version unavailable'))"
+  note "${PREFIX}/${b}  BuildID $(readelf -n "${PREFIX}/${b}" 2>/dev/null | awk '/Build ID/ {print $3}')"
 done
 note "provenance recorded at /var/lib/buzz/installed-provenance.txt"
 

@@ -10,11 +10,23 @@ name: Sprig image
 # No QEMU emulation.
 #
 # Triggers:
-#   - push to main (paths-filtered) → :main + :sha-<7>
+#   - push to main (paths-filtered) → build only, publish nothing
+#                                     (see PUBLISH GATE below)
 #   - tag sprig-v*                  → semver family (shared with sprig.yml's
 #                                     binary release — one tag versions both)
 #   - pull_request (paths-filtered) → build only, no push
 #   - workflow_dispatch             → manual publish at the current ref
+#
+# PUBLISH GATE (5dive fork): the image push, the buildcache export and the
+# merged manifest fire only on a `sprig-v*` tag push or a workflow_dispatch,
+# never on a `main` push or a PR — IMAGE_NAME defaults to upstream
+# `ghcr.io/block/buzz-sprig`, which this fork cannot and must not write to.
+# Mirrors docker.yml and helm-chart.yml. Builds still run on main and PRs.
+#
+# Residual: this workflow's `push:` trigger carries a `paths` filter, which
+# GitHub applies to TAG pushes too (see helm-chart.yml's note). A `sprig-v*`
+# tag on a commit touching none of those paths would therefore not publish.
+# Left as-is: a release commit bumps Cargo.toml, which is in the filter.
 #
 # NOTE: the first push creates the GHCR package PRIVATE by default. An org
 # admin must flip ghcr.io/block/buzz-sprig to public once (Package settings →
@@ -120,14 +132,14 @@ jobs:
           file: ./Dockerfile.sprig
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
           cache-from: |
             type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
           cache-to: |
-            ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
+            ${{ (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
 
       - name: Export digest
-        if: github.event_name != 'pull_request'
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
@@ -135,7 +147,7 @@ jobs:
           touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
-        if: github.event_name != 'pull_request'
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: sprig-digest-${{ matrix.arch }}
@@ -145,7 +157,7 @@ jobs:
 
   merge:
     name: Merge multi-arch manifest
-    if: github.event_name != 'pull_request'
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     needs: build
     timeout-minutes: 15

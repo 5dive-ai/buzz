@@ -16,13 +16,23 @@ name: Docker image
 # the relay image version tracks crates/buzz-relay/Cargo.toml, never desktop.
 #
 # Triggers:
-#   - push to main           → :main + :sha-<7>
-#                              + :debug-main + :debug-sha-<7>
+#   - push to main           → build both images, publish nothing
+#                              (was :main/:sha-<7> — see PUBLISH GATE below)
 #   - push tags relay-v*.*.* → :{version} + :{major}.{minor} + :{major}
 #                              + matching :debug-* tags
 #                              (+ :latest/:debug-latest for stable releases)
 #   - pull_request           → build only (no push), cache stays warm
 #   - workflow_dispatch      → manual relay-tag rescue at the tag itself
+#
+# PUBLISH GATE (5dive fork): every write to the registry — the image push, the
+# buildcache export, the merged manifest and its attestation — fires only on a
+# `relay-v*` tag push or a rescue `workflow_dispatch`, never on a `main` push or
+# a PR. Same shape as helm-chart.yml's publish job. `main` pushes and PRs still
+# build both images on both arches, so the compile signal is intact; they just
+# cannot write to IMAGE_NAME's namespace, which on this fork defaults to
+# upstream `ghcr.io/block/*` and is not ours to write to. This makes the
+# namespace boundary a control in the workflow rather than an accident of which
+# credentials happen to be missing.
 #
 # Why workflow_dispatch carries a version input:
 #   Normal releases arrive through the push:tags trigger above. The input is
@@ -175,11 +185,11 @@ jobs:
           # Push by digest, not by tag — the merge job assembles the tags
           # into one multi-arch manifest. This is what makes the native-arm
           # matrix possible.
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
           cache-from: |
             type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
           cache-to: |
-            ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
+            ${{ (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
 
       - name: Build and push debug image by digest
         id: build-debug
@@ -190,12 +200,12 @@ jobs:
           target: runtime-debug
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
           cache-from: |
             type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
 
       - name: Export release and debug digests
-        if: github.event_name != 'pull_request'
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         env:
           RELEASE_DIGEST: ${{ steps.build-release.outputs.digest }}
           DEBUG_DIGEST: ${{ steps.build-debug.outputs.digest }}
@@ -205,7 +215,7 @@ jobs:
           touch "/tmp/digests-debug/${DEBUG_DIGEST#sha256:}"
 
       - name: Upload release digest
-        if: github.event_name != 'pull_request'
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: digests-release-${{ matrix.arch }}
@@ -214,7 +224,7 @@ jobs:
           retention-days: 1
 
       - name: Upload debug digest
-        if: github.event_name != 'pull_request'
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: digests-debug-${{ matrix.arch }}
@@ -224,7 +234,7 @@ jobs:
 
   merge:
     name: Merge ${{ matrix.variant }} multi-arch manifest
-    if: github.event_name != 'pull_request'
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     needs: build
     timeout-minutes: 15
@@ -400,16 +410,16 @@ jobs:
           file: ./Dockerfile.push-gateway
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=ghcr.io/block/buzz-push-gateway,push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          outputs: type=image,name=ghcr.io/block/buzz-push-gateway,push-by-digest=true,name-canonical=true,push=${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
           cache-from: type=registry,ref=ghcr.io/block/buzz-push-gateway-buildcache:${{ matrix.arch }}
-          cache-to: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref=ghcr.io/block/buzz-push-gateway-buildcache:{0},mode=max,compression=zstd', matrix.arch) || '' }}
+          cache-to: ${{ (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') && format('type=registry,ref=ghcr.io/block/buzz-push-gateway-buildcache:{0},mode=max,compression=zstd', matrix.arch) || '' }}
       - name: Export digest
-        if: github.event_name != 'pull_request'
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: mkdir -p /tmp/gateway-digests && touch "/tmp/gateway-digests/${DIGEST#sha256:}"
       - name: Upload digest
-        if: github.event_name != 'pull_request'
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: gateway-digests-${{ matrix.arch }}
@@ -419,7 +429,7 @@ jobs:
 
   push-gateway-merge:
     name: Publish public push gateway image
-    if: github.event_name != 'pull_request'
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     needs: push-gateway-build
     timeout-minutes: 15

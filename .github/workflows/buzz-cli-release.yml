@@ -1,0 +1,226 @@
+name: buzz-cli release
+
+# Cuts the Linux x86-64 `buzz` and `buzz-pair` binaries that customer boxes
+# install as /usr/local/bin/buzz and /usr/local/bin/buzz-pair (DIVE-3512).
+#
+# WHY THIS EXISTS RATHER THAN release.yml: upstream's release rail is the
+# desktop app — it triggers on `desktop-v*` tags, builds a Tauri bundle on
+# macOS, and is guarded by `if: github.repository == 'block/buzz'`, so it
+# neither runs here nor produces a server-side CLI. This is a separate, much
+# smaller rail with the same guard pointed at our own repository, so a
+# re-fork of this repo cannot fire it by accident.
+#
+# WHY ubuntu-22.04 AND NOT ubuntu-latest: the artifact is dynamically linked
+# against glibc, and a binary built on 24.04 (glibc 2.39) will not start on a
+# 22.04 box. Building on the older image means the artifact runs on both.
+#
+# The build is the provenance: every run records the commit it built, and the
+# BuildID and sha256 of what came out. An artifact without that trail must not
+# be installed on a customer box.
+
+on:
+  # Building from the branch is how this workflow gets exercised before it is on
+  # main: workflow_dispatch only resolves against the default branch, so without
+  # this the recipe could not be run until after it was merged, which is the
+  # wrong order to find out it is broken.
+  push:
+    branches:
+      - dive-3512-buzz-cli-release
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >-
+          Tag to publish the binaries under (e.g. cli-v0.1.0). Leave empty to
+          build and attach artifacts to the run without cutting a release.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build buzz-cli (linux x86-64)
+    # Same shape as the guard upstream puts on its own release jobs: this must
+    # not fire in anybody else's fork of this fork.
+    if: github.repository == '5dive-ai/buzz'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write # cutting the release and uploading its assets
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 \
+            -o DPkg::Lock::Timeout=120 \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            ca-certificates
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # No setup-rust step: rust-toolchain.toml pins 1.95.0 and the runner's
+      # preinstalled rustup honors it on the first cargo invocation.
+      - name: Record toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          rustc --version
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: buzz-cli-release
+
+      - name: Build
+        run: cargo build --release --locked -p buzz-cli -p buzz-pairing-cli
+
+      - name: Record provenance
+        id: prov
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/buzz dist/buzz
+          cp target/release/buzz-pair dist/buzz-pair
+
+          {
+            echo "repository:   ${GITHUB_REPOSITORY}"
+            echo "commit:       ${GITHUB_SHA}"
+            echo "workflow_run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "built_on:     $(. /etc/os-release && echo "$PRETTY_NAME") / glibc $(ldd --version | head -1 | awk '{print $NF}')"
+            echo "toolchain:    $(rustc --version)"
+            echo
+            for b in buzz buzz-pair; do
+              echo "== ${b} =="
+              echo "size:    $(stat -c%s "dist/${b}") bytes"
+              echo "sha256:  $(sha256sum "dist/${b}" | cut -d' ' -f1)"
+              echo "buildid: $(readelf -n "dist/${b}" | awk '/Build ID/ {print $3}')"
+              echo "file:    $(file -b "dist/${b}")"
+              echo
+            done
+          } | tee dist/PROVENANCE.txt
+
+          ( cd dist && sha256sum buzz buzz-pair > SHA256SUMS )
+
+      - name: Smoke the artifact
+        run: |
+          set -euo pipefail
+          # NOTE: `buzz` has no --version. Its clap command sets no `version`
+          # attribute, so the flag is an error: {"error":"user_error",
+          # "message":"unexpected argument '--version' found"}. Do not add one
+          # here to make a smoke pass — the binary's identity on a box is its
+          # BuildID, which readelf reads straight out of the file and which
+          # this release records. That is a stronger answer than a version
+          # string the workspace stamps 0.1.0 on everything anyway.
+          ./dist/buzz --help > /dev/null
+          ./dist/buzz-pair --help > /dev/null
+
+          # The binary must actually DISPATCH, not merely parse. Assert the
+          # CLI's own documented error contract -- "Errors are JSON on stderr:
+          # {\"error\": <category>, \"message\": <detail>}" -- rather than a
+          # specific exit code, because the code depends on how far the call
+          # gets: with no key it is 1 (bad input) and never reaches the
+          # network. Both stderr payloads are printed so a future reader can
+          # see what was actually observed instead of trusting this comment.
+          #
+          # The panic check is the one that earns its place: the defect our own
+          # pairing patch fixed was a rustls CryptoProvider PANIC on wss://, and
+          # a panic is precisely what does NOT produce this JSON contract. This
+          # step is the regression guard for that class.
+          check_contract() { # <label> <expected-rc-or-empty> <cmd...>
+            local label="$1" want="$2"; shift 2
+            local err rc
+            err=$("$@" 2>&1 >/dev/null) && rc=0 || rc=$?
+            echo "  ${label}: rc=${rc} stderr=${err}"
+            if grep -q 'panicked at' <<<"$err"; then
+              echo "::error::${label}: the binary PANICKED; that is the failure mode the pairing fix exists to prevent"
+              exit 1
+            fi
+            [[ "$rc" != "0" ]] || { echo "::error::${label}: expected a non-zero exit"; exit 1; }
+            jq -e 'has("error") and has("message")' <<<"$err" >/dev/null \
+              || { echo "::error::${label}: stderr is not the documented {error,message} JSON"; exit 1; }
+            # NON-VACUITY GUARD. The first version of this step passed while
+            # both cases died on `unrecognized subcommand 'channel'` -- a clap
+            # usage error satisfies the JSON contract without the CLI ever
+            # dispatching anything, so the step grades nothing. A usage error
+            # here means the smoke is broken, not the binary.
+            if jq -re '.message' <<<"$err" | grep -qE 'unrecognized subcommand|^Usage:|unexpected argument'; then
+              echo "::error::${label}: this is a clap USAGE error, so the check never reached the CLI. Fix the smoke."
+              exit 1
+            fi
+            if [[ -n "$want" && "$rc" != "$want" ]]; then
+              echo "::error::${label}: expected exit ${want}, got ${rc}"; exit 1
+            fi
+          }
+
+          echo "CLI error-contract checks:"
+          # No identity configured -> 3. Note this is auth_error, NOT the 1
+          # ('bad input') the exit-code table might suggest for a missing
+          # argument: the CLI classifies an absent BUZZ_PRIVATE_KEY as an auth
+          # failure. Pinned at the value actually observed, not the one the
+          # documentation reads like -- and pinned deliberately, because a
+          # silent change here would change what every caller branches on.
+          check_contract "no private key" 3 \
+            env -u BUZZ_PRIVATE_KEY BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channels list
+          # Identity present, relay unreachable -> it must reach the network and
+          # fail there. Key is a throwaway constant, never a real identity.
+          check_contract "unreachable relay" "" \
+            env BUZZ_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
+                BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channels list
+          # ...and that case specifically must have got PAST argument
+          # validation into the network, or it proves nothing about dispatch.
+          # Capture first, parse second. Piping the CLI straight into jq under
+          # `set -o pipefail` makes the pipeline inherit the CLI's exit 2 --
+          # which is the outcome being MEASURED -- so the assignment fails and
+          # `set -e` kills the step before the check runs. Never pipe the
+          # process whose failure is the signal.
+          relay_err=$(env BUZZ_PRIVATE_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
+                          BUZZ_RELAY_URL=http://127.0.0.1:1 ./dist/buzz channels list 2>&1 >/dev/null) || true
+          cat_seen=$(jq -r '.error' <<<"$relay_err")
+          echo "  unreachable relay: error category = ${cat_seen}"
+          if [[ "$cat_seen" == "user_error" ]]; then
+            echo "::error::a valid key against a dead port still reported user_error, so the call never reached the relay"
+            exit 1
+          fi
+
+          # Identity must be readable from the file itself, or the install
+          # script cannot tell an operator what it just put on their box.
+          for b in buzz buzz-pair; do
+            id=$(readelf -n "dist/${b}" | awk '/Build ID/ {print $3}')
+            [[ -n "$id" ]] || { echo "::error::${b} carries no BuildID"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-cli-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+
+      # Only a deliberate dispatch that names a tag cuts a release. A branch
+      # push builds and uploads the run artifact and stops there.
+      - name: Publish release
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "buzz-cli $TAG" \
+            --notes "$(printf 'Linux x86-64 \`buzz\` and \`buzz-pair\`, built from %s by %s/%s/actions/runs/%s.\n\nInstall with scripts/install-buzz-cli.sh. Verify against SHA256SUMS before installing.\n\n```\n%s\n```\n' \
+              "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$(cat dist/PROVENANCE.txt)")" \
+            dist/buzz dist/buzz-pair dist/SHA256SUMS dist/PROVENANCE.txt

@@ -19,6 +19,16 @@ name: buzz-cli release
 # be installed on a customer box.
 
 on:
+  # Building from the branch is how this workflow gets exercised before it is on
+  # main: workflow_dispatch only resolves against the default branch, so without
+  # this the recipe could not be run until after it was merged, which is the
+  # wrong order to find out it is broken.
+  push:
+    branches:
+      - dive-3512-buzz-cli-release
+    paths:
+      - '.github/workflows/buzz-cli-release.yml'
+      - 'scripts/install-buzz-cli.sh'
   workflow_dispatch:
     inputs:
       release_tag:
@@ -122,8 +132,10 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      # Only a deliberate dispatch that names a tag cuts a release. A branch
+      # push builds and uploads the run artifact and stops there.
       - name: Publish release
-        if: inputs.release_tag != ''
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.release_tag }}

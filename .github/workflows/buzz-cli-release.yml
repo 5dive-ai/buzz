@@ -26,9 +26,6 @@ on:
   push:
     branches:
       - dive-3512-buzz-cli-release
-    paths:
-      - '.github/workflows/buzz-cli-release.yml'
-      - 'scripts/install-buzz-cli.sh'
   workflow_dispatch:
     inputs:
       release_tag:

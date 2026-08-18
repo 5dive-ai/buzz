@@ -10,7 +10,7 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../../shared/security/sensitive_action_authorizer.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/buzz_loading_indicator.dart';
-import '../../shared/widgets/tappable_flapping_bee.dart';
+import '../../shared/widgets/fivedive_mark.dart';
 import 'pairing_provider.dart';
 import 'pairing_qr_scanner.dart';
 
@@ -279,8 +279,8 @@ class _SasVerificationView extends StatelessWidget {
 
         Text(
           sendsIdentityToDesktop
-              ? 'This sends your full Buzz identity to the desktop\nand grants it permanent access. Only confirm a\ndesktop you trust and a recovery you started.'
-              : 'You are about to transfer your Buzz identity\nto this device. Only confirm if you initiated\nthis pairing from your desktop.',
+              ? 'This sends your full 5dive identity to the desktop\nand grants it permanent access. Only confirm a\ndesktop you trust and a recovery you started.'
+              : 'You are about to transfer your 5dive identity\nto this device. Only confirm if you initiated\nthis pairing from your desktop.',
           textAlign: TextAlign.center,
           style: context.textTheme.bodySmall?.copyWith(
             color: context.colors.onSurfaceVariant,

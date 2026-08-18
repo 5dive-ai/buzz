@@ -4,14 +4,14 @@ run-name: Build sideloadable debug APK
 on:
   workflow_dispatch:
   push:
-    branches: [dive-3575-apk]
+    branches: [dive-3578-rebrand]
 
 concurrency:
   group: sideload-apk-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   apk:
@@ -29,9 +29,28 @@ jobs:
         run: just mobile-build-android
       - name: Show APK output
         run: ls -la mobile/build/app/outputs/flutter-apk/
-      - name: Upload APK
+      - name: Name the APK for the phone
+        run: |
+          set -euo pipefail
+          cp mobile/build/app/outputs/flutter-apk/app-debug.apk 5dive-${{ github.run_number }}.apk
+          ls -la 5dive-*.apk
+      - name: Upload APK (CI artifact, needs a GitHub login to fetch)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: buzz-debug-apk
-          path: mobile/build/app/outputs/flutter-apk/*.apk
+          name: fivedive-debug-apk
+          path: 5dive-*.apk
           if-no-files-found: error
+      # A CI artifact link is useless on a phone (it 302s to a login). Publish the
+      # same bytes as a prerelease asset so the download is anonymous.
+      - name: Publish as a prerelease asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="mobile-sideload-5dive-${{ github.run_number }}"
+          gh release create "$tag" "5dive-${{ github.run_number }}.apk" \
+            --repo "${{ github.repository }}" \
+            --prerelease \
+            --title "5dive mobile (sideload debug) - $tag" \
+            --notes "Debug APK of the 5dive-branded mobile app. Android only. applicationId com.fivedive.app - installs alongside any existing Buzz app."
+          gh release view "$tag" --repo "${{ github.repository }}" --json assets --jq '.assets[].url'

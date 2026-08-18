@@ -31,13 +31,13 @@ void main() {
       expect(themePairFor(buzzDarkThemeName), buzzThemeName);
     });
 
-    test('appear as a single System-mode option labelled "Buzz"', () {
+    test('appear as a single System-mode option labelled "5dive"', () {
       final paired = themeGroups().paired.map((t) => t.name);
       expect(paired, contains(buzzThemeName));
       expect(paired, isNot(contains(buzzDarkThemeName)));
-      expect(pairedThemeLabel(buzzThemeName), 'Buzz');
-      expect(themeSelectionLabel(buzzThemeName, ThemeMode.system), 'Buzz');
-      expect(themeSelectionLabel(buzzDarkThemeName, ThemeMode.system), 'Buzz');
+      expect(pairedThemeLabel(buzzThemeName), '5dive');
+      expect(themeSelectionLabel(buzzThemeName, ThemeMode.system), '5dive');
+      expect(themeSelectionLabel(buzzDarkThemeName, ThemeMode.system), '5dive');
     });
 
     test('forces neutral rendering without changing the stored accent', () {

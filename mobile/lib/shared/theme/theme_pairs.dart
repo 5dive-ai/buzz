@@ -102,6 +102,9 @@ const _modeTokens = <String>{
 /// mode-specific tokens so `github-light` reads as "Github" and stands for both
 /// halves. Mirrors desktop's `pairedThemeLabel`.
 String pairedThemeLabel(String lightName) {
+  final override = themeDisplayNameOverrides[lightName];
+  if (override != null) return override;
+
   final stripped = lightName
       .split('-')
       .where((token) => !_modeTokens.contains(token))

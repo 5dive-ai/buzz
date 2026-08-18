@@ -4,8 +4,8 @@ import 'package:flutter/material.dart';
 ///
 /// The asset is an alpha mask cut from the same source art the launcher icons
 /// are generated from, so the home screen and the onboarding hero show one
-/// mark. It replaces upstream's tap-to-flutter bee on the welcome screen; the
-/// bee itself still drives the pull-to-refresh indicator.
+/// mark. It is the app's one brand mark: the onboarding hero and the
+/// pull-to-refresh indicator both render it.
 class FiveDiveMark extends StatelessWidget {
   /// The rendered height of the mark.
   ///

@@ -24,12 +24,32 @@ class ThemeColors {
 
   bool get isDark => bg.computeLuminance() < 0.5;
 
-  /// Human-readable display name: 'catppuccin-mocha' → 'Catppuccin Mocha'.
-  String get displayName => name
-      .split('-')
-      .map((w) => w.isNotEmpty ? '${w[0].toUpperCase()}${w.substring(1)}' : w)
-      .join(' ');
+  /// Human-readable display name: 'catppuccin-mocha' → 'Catppuccin Mocha',
+  /// unless [themeDisplayNameOverrides] renames it.
+  String get displayName =>
+      themeDisplayNameOverrides[name] ??
+      name
+          .split('-')
+          .map(
+            (w) => w.isNotEmpty ? '${w[0].toUpperCase()}${w.substring(1)}' : w,
+          )
+          .join(' ');
 }
+
+/// Labels for themes whose display name does not follow from their key.
+///
+/// The first-party pair is persisted AND published to the community relay,
+/// where Buzz Desktop reads it back (`community_theme_preference.dart`; the
+/// desktop catalog in `desktop/src/shared/theme/theme-loader.ts` holds the same
+/// 'buzz' key and rejects a preference naming a theme it does not know). The
+/// wire key therefore cannot be renamed from the mobile client alone. The
+/// label is overridden here instead — the one place both
+/// [ThemeColors.displayName] and `pairedThemeLabel` read, so the picker never
+/// shows two names for one palette.
+const themeDisplayNameOverrides = <String, String>{
+  'buzz': '5dive',
+  'buzz-dark': '5dive Dark',
+};
 
 /// Known light theme names — used to show sun/moon icons before loading.
 const lightThemeNames = <String>{

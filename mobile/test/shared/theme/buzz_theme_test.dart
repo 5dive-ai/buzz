@@ -37,10 +37,7 @@ void main() {
       expect(paired, isNot(contains(buzzDarkThemeName)));
       expect(pairedThemeLabel(buzzThemeName), '5dive');
       expect(themeSelectionLabel(buzzThemeName, ThemeMode.system), '5dive');
-      expect(
-        themeSelectionLabel(buzzDarkThemeName, ThemeMode.system),
-        '5dive',
-      );
+      expect(themeSelectionLabel(buzzDarkThemeName, ThemeMode.system), '5dive');
     });
 
     test('forces neutral rendering without changing the stored accent', () {

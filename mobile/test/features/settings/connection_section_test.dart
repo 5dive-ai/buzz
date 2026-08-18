@@ -86,7 +86,7 @@ void main() {
     expect(pairing.resetCalls, 1);
     expect(find.text('Identity recovery'), findsNothing);
     expect(
-      find.text('Buzz did not return to the foreground. Try again.'),
+      find.text('5dive did not return to the foreground. Try again.'),
       findsOneWidget,
     );
   });

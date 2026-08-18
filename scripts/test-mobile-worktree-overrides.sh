@@ -66,7 +66,7 @@ android="$wt/mobile/android/worktree.properties"
 grep -q '^BUNDLE_IDENTIFIER = com\.buzz\.buzzMobile\.feature-work-1$' "$ios" \
   && pass "iOS bundle identifier keys to the sanitized worktree directory name" \
   || fail "iOS bundle identifier must key to the worktree dir, got: $(cat "$ios")"
-grep -q '^APP_DISPLAY_NAME = Buzz (Fix_Thing-2)$' "$ios" \
+grep -q '^APP_DISPLAY_NAME = 5dive (Fix_Thing-2)$' "$ios" \
   && pass "iOS display name carries the branch label" \
   || fail "iOS display name wrong: $(cat "$ios")"
 grep -q '^label=Fix_Thing-2$' "$android" \
@@ -96,7 +96,7 @@ git -C "$wt" checkout -q -b "it's-\$a\"branch"
 grep -q "^label=it-s-a-branch$" "$android" \
   && pass "apostrophes and shell metacharacters are sanitized out of the label" \
   || fail "label must sanitize special chars, got: $(cat "$android")"
-grep -Eq "^APP_DISPLAY_NAME = Buzz \([A-Za-z0-9._-]+\)$" "$ios" \
+grep -Eq "^APP_DISPLAY_NAME = 5dive \([A-Za-z0-9._-]+\)$" "$ios" \
   && pass "iOS display name only contains resource-safe characters" \
   || fail "iOS display name has unsafe characters: $(cat "$ios")"
 
@@ -142,17 +142,17 @@ grep -q 'WorktreeOverrides' "$release_xcconfig" \
 grep -q '^BUNDLE_IDENTIFIER = com\.buzz\.buzzMobile$' "$release_xcconfig" \
   && pass "Release.xcconfig keeps the production bundle identifier" \
   || fail "Release.xcconfig must keep BUNDLE_IDENTIFIER = com.buzz.buzzMobile"
-grep -q '^APP_DISPLAY_NAME = Buzz$' "$release_xcconfig" \
+grep -q '^APP_DISPLAY_NAME = 5dive$' "$release_xcconfig" \
   && pass "Release.xcconfig keeps the production display name" \
-  || fail "Release.xcconfig must keep APP_DISPLAY_NAME = Buzz"
+  || fail "Release.xcconfig must keep APP_DISPLAY_NAME = 5dive"
 grep -q '<string>$(APP_DISPLAY_NAME)</string>' "$plist" \
   && pass "Info.plist display name resolves from build settings" \
   || fail "Info.plist CFBundleDisplayName must be \$(APP_DISPLAY_NAME)"
 grep -q 'android:label="@string/app_name"' "$manifest" \
   && pass "Android manifest label resolves from resources" \
   || fail "Android manifest label must be @string/app_name"
-grep -q 'resValue("string", "app_name", "Buzz")' "$gradle" \
-  && pass "Gradle default app_name stays Buzz" \
+grep -q 'resValue("string", "app_name", "5dive")' "$gradle" \
+  && pass "Gradle default app_name stays 5dive" \
   || fail "Gradle must declare the default app_name resValue"
 grep -q 'worktreeLabel.matches' "$gradle" \
   && pass "Gradle validates the worktree label before use" \
@@ -208,9 +208,9 @@ case "$1 $2" in
 esac
 if [[ "$1" == "devices" ]]; then exit 0; fi
 if [[ "$3 $4 $5" == "shell pm list" ]]; then
-  printf 'package:xyz.block.buzz.mobile\n'
-  printf 'package:xyz.block.buzz.mobile.feature_work_1\n'
-  printf 'package:xyz.block.buzz.mobile.w_2fast\n'
+  printf 'package:com.fivedive.app\n'
+  printf 'package:com.fivedive.app.feature_work_1\n'
+  printf 'package:com.fivedive.app.w_2fast\n'
   printf 'package:com.android.settings\n'
   exit 0
 fi
@@ -221,10 +221,10 @@ chmod +x "$stub_bin/adb"
 # No xcrun stub: the iOS pass is skipped when xcrun is absent, which also
 # keeps this test honest on Linux CI.
 clean_out="$(PATH="$stub_bin:/usr/bin:/bin" bash "$clean_script" --dry-run)"
-printf '%s\n' "$clean_out" | grep -q 'xyz\.block\.buzz\.mobile\.feature_work_1' \
+printf '%s\n' "$clean_out" | grep -q 'com\.fivedive\.app\.feature_work_1' \
   && pass "cleanup targets worktree-suffixed Android installs" \
   || fail "cleanup must list suffixed installs, got: $clean_out"
-printf '%s\n' "$clean_out" | grep -q 'xyz\.block\.buzz\.mobile\.w_2fast' \
+printf '%s\n' "$clean_out" | grep -q 'com\.fivedive\.app\.w_2fast' \
   && pass "cleanup targets letter-prefixed suffixed installs" \
   || fail "cleanup must list w_-prefixed installs, got: $clean_out"
 printf '%s\n' "$clean_out" | grep -q 'mobile\.feature_work_1' || true

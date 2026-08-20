@@ -83,7 +83,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.fivedive.app"
+        applicationId = "xyz.block.buzz.mobile"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -91,7 +91,7 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        resValue("string", "app_name", "5dive")
+        resValue("string", "app_name", "Buzz")
     }
 
     signingConfigs {
@@ -113,7 +113,7 @@ android {
                 applicationIdSuffix = worktreeIdSuffix
             }
             if (worktreeLabel != null) {
-                resValue("string", "app_name", "5dive ($worktreeLabel)")
+                resValue("string", "app_name", "Buzz ($worktreeLabel)")
             }
         }
         release {

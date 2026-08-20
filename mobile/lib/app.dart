@@ -113,7 +113,7 @@ class App extends HookConsumerWidget {
     });
 
     return MaterialApp(
-      title: '5dive',
+      title: 'Buzz',
       theme: AppTheme.light(
         colorScheme: lightScheme,
         topSectionGradient: buzzLightGradient,
@@ -162,7 +162,7 @@ class _SplashScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return const Scaffold(
       body: Center(
-        child: BuzzLoadingIndicator(size: 56, semanticLabel: 'Starting 5dive'),
+        child: BuzzLoadingIndicator(size: 56, semanticLabel: 'Starting Buzz'),
       ),
     );
   }

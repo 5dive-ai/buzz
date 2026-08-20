@@ -51,7 +51,7 @@ class _ConnectionSection extends ConsumerWidget {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
                         content: Text(
-                          '5dive did not return to the foreground. Try again.',
+                          'Buzz did not return to the foreground. Try again.',
                         ),
                       ),
                     );

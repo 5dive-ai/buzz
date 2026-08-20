@@ -50,11 +50,14 @@ class _PairingWelcomeView extends StatelessWidget {
                     shape: BoxShape.circle,
                     color: Color(0x4DFFFFFF),
                   ),
-                  child: const FiveDiveMark(height: 72, color: _onboardingInk),
+                  child: const TappableFlappingBee(
+                    width: 76,
+                    color: _onboardingInk,
+                  ),
                 ),
                 const SizedBox(height: Grid.sm),
                 Text(
-                  'Welcome to 5dive',
+                  'Welcome to Buzz',
                   textAlign: TextAlign.center,
                   style: context.textTheme.headlineSmall?.copyWith(
                     color: _onboardingInk,

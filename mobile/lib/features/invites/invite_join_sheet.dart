@@ -41,7 +41,7 @@ class InviteJoinSheet extends ConsumerWidget {
             Icon(LucideIcons.userPlus, size: 40, color: context.colors.primary),
             const SizedBox(height: Grid.sm),
             Text(
-              'Join this 5dive community?',
+              'Join this Buzz community?',
               style: context.textTheme.titleLarge,
             ),
             const SizedBox(height: Grid.xxs),

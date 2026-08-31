@@ -30,7 +30,13 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          fetch-depth: 2
+          # DIVE-3850: the file-size ratchet below asserts its base object
+          # exists (`git cat-file -e`), and on an upstream-sync PR that base is
+          # the sync merge's upstream parent -- outside a depth-2 clone. Full
+          # history for sync branches ONLY; every other PR keeps depth 2.
+          # NB the guard is inverted on purpose: 0 is FALSY in GitHub
+          # expressions, so `cond && 0 || 2` would always yield 2.
+          fetch-depth: ${{ (!(startsWith(github.head_ref, 'dive-') && endsWith(github.head_ref, '-upstream-sync'))) && 2 || 0 }}
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
@@ -96,6 +102,18 @@ jobs:
           scripts/test-rust-cache-contract.sh
           scripts/test-rust-cache-contract-regressions.sh
       - name: File size policy
+        env:
+          # DIVE-3850: on a weekly upstream-sync merge, HEAD^1 is our PRE-MERGE
+          # main, so the ratchet reads ~100 upstream commits as this PR's own
+          # diff and false-reds on files containing zero lines of ours. Graded
+          # and reproduced by quinn (DIVE-3851): same checker, same tree, only
+          # the base changed -- HEAD^1 rc=1, merge-base rc=1, upstream parent
+          # rc=0. Points the ratchet at the sync merge's upstream parent for
+          # upstream-sync branches ONLY; every other PR sees an empty string,
+          # which is falsy, and falls through to HEAD^1 unchanged.
+          # The sha is per-sync and MUST be updated by each weekly sync row.
+          # See community/wiki/a-diff-ratchet-based-on-head-caret-1-false-reds-every-wholesale-sync-merge.md
+          CHECK_FILE_SIZES_BASE: ${{ (startsWith(github.head_ref, 'dive-') && endsWith(github.head_ref, '-upstream-sync')) && 'c3132c3ee982d194cd0198ad07b57ec8bd726e4e' || '' }}
         run: just file-size-check
 
   rust-lint:

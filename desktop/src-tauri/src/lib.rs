@@ -2,6 +2,7 @@
 mod app_menu;
 mod app_state;
 mod archive;
+mod build_identity;
 mod builderlab;
 mod channel_head_cache;
 mod commands;
@@ -127,7 +128,7 @@ pub fn run() {
             }
             // Forward any deep link URLs from the duplicate launch.
             for arg in &argv {
-                if arg.starts_with("buzz://") {
+                if crate::build_identity::is_deep_link_for_build(arg) {
                     handle_deep_link_url(app, arg);
                 }
             }
@@ -397,7 +398,10 @@ pub fn run() {
             // the now-inert ~/.sprout; the frontend dedupes the toast.
             // Suppressed when a reset completed this boot: the nest was wiped and
             // a fresh ~/.sprout-less state is exactly what we want.
-            if !reset_outcome.completed && migration::migrate_legacy_nest() {
+            if !crate::build_identity::is_demo_build()
+                && !reset_outcome.completed
+                && migration::migrate_legacy_nest()
+            {
                 let _ = app_handle.emit("legacy-nest-migrated", ());
             }
 
@@ -617,6 +621,10 @@ pub fn run() {
             create_channel,
             ensure_starter_channels,
             open_dm,
+            get_bestie_assignment,
+            assign_bestie,
+            clear_bestie_assignment,
+            resolve_bestie_conversation,
             hide_dm,
             get_channel_details,
             get_channel_members,
@@ -668,6 +676,8 @@ pub fn run() {
             save_png_data_url,
             download_file,
             fetch_media_bytes,
+            cancel_media_fetch,
+            release_media_fetch,
             copy_image_to_clipboard,
             copy_text_to_clipboard,
             read_clipboard_text,
@@ -696,6 +706,7 @@ pub fn run() {
             start_managed_agent,
             stop_managed_agent,
             set_agent_managed_profiles,
+            set_thread_scoped_acp_sessions,
             set_managed_agent_start_on_app_launch,
             set_managed_agent_auto_restart,
             delete_managed_agent,
@@ -708,7 +719,6 @@ pub fn run() {
             get_baked_build_env_keys,
             get_baked_build_env,
             put_agent_session_config,
-            persist_agent_effort_level,
             get_global_agent_config,
             set_global_agent_config,
             mesh_start_node,

@@ -1,0 +1,2 @@
+DIVE-4090 probe: this file exists only on the foreign side of a merge-shaped probe PR.
+It is never merged to main.
